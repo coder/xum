@@ -263,7 +263,7 @@ describe("McpAppFrame", () => {
     cleanupDom = null;
   });
 
-  // A failed approval dismisses the strip for good, so offline Allow waits for the next client.
+  // Offline, Allow waits for the next client instead of failing.
   test.each([...GAP_MODES])(
     "Allow is disabled while offline and the prompt stays (%s)",
     async (mode) => {
@@ -451,15 +451,50 @@ describe("McpAppFrame", () => {
     expect(view.queryByRole("button", { name: "Allow" })).toBeNull();
   });
 
-  test("a failed approval request shows its error instead of a silently armed strip", async () => {
+  test("a failed approval shows its error and keeps Allow for a retry", async () => {
     invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
     viewCsp = { connectDomains: ["https://api.example.com"] };
     approveFails = new Error("config write failed");
     const { view, frame } = await renderFrame();
     await pressAllow(view.getByRole("button", { name: "Allow" }));
     await view.findByText(/config write failed/);
-    expect(view.queryByRole("button", { name: "Allow" })).toBeNull();
     expect(frame.getAttribute("srcdoc")).not.toContain("api.example.com");
+    // The failure was transient: Allow again succeeds.
+    approveFails = null;
+    await pressAllow(view.getByRole("button", { name: "Allow" }));
+    await waitFor(() =>
+      expect(view.getByTestId("mcp-app-frame").getAttribute("srcdoc")).toContain(
+        "connect-src https://api.example.com"
+      )
+    );
+    expect(approvals).toHaveLength(2);
+    expect(view.queryByText(/config write failed/)).toBeNull();
+  });
+
+  test("the strip is disabled while its approval runs", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    const responders: Array<(approvedDomains: string[], revision: number) => void> = [];
+    approveDeferred = responders;
+    const { view } = await renderFrame();
+    await pressAllow(view.getByRole("button", { name: "Allow" }));
+    await waitFor(() => expect(responders).toHaveLength(1));
+    const notNow = view.getByRole("button", { name: "Not now" }) as HTMLButtonElement;
+    expect(notNow.disabled).toBe(true);
+    expect((view.getByRole("button", { name: "Allow" }) as HTMLButtonElement).disabled).toBe(true);
+    // A Not now click while the call runs changes nothing: the user's Allow decides.
+    fireEvent.click(notNow);
+    expect(view.getByRole("alert").textContent).toContain("api.example.com");
+    await act(async () => {
+      responders[0](["https://api.example.com"], ++revision);
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(view.getByTestId("mcp-app-frame").getAttribute("srcdoc")).toContain(
+        "connect-src https://api.example.com"
+      )
+    );
+    expect(view.queryByRole("button", { name: "Not now" })).toBeNull();
   });
 
   test("the view is bound to the recorded tool call, not the card", async () => {

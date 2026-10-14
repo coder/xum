@@ -6,6 +6,7 @@ import { ExperimentsService } from "./experimentsService";
 import { TelemetryService } from "./telemetryService";
 import { MemoryService } from "./memoryService";
 import { MemoryMetaService } from "./memoryMeta";
+import { MEMORY_CONTEXT_FILE_NAME } from "./memoryContextPersistence";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import * as fs from "node:fs/promises";
 import { attachLanguageModelCleanup, runLanguageModelCleanup } from "./languageModelCleanup";
@@ -470,6 +471,14 @@ describe("pinned full-payload rollover admission", () => {
             context: { hotMemoriesBlock: fresh },
             includesHotMemories: true,
           });
+          // The new window's context is saved before its first stream, so a server restart
+          // during that turn restores these bytes instead of rebuilding them.
+          const saved = await fs.readFile(
+            path.join(fixture.config.sessionsDir, workspaceId, MEMORY_CONTEXT_FILE_NAME),
+            "utf-8"
+          );
+          expect(saved).toContain(fresh);
+          expect(saved).not.toContain("Obsolete notes");
         }
       } finally {
         await fixture.cleanup();

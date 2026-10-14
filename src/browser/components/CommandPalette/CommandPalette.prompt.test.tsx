@@ -56,6 +56,32 @@ describe("CommandPalette inline goal prompts", () => {
     cleanupDom = null;
   });
 
+  test("a select prompt whose options fail to load shows the error in the palette", async () => {
+    const view = renderPalette({
+      id: "test-select",
+      title: "Pick something",
+      section: "Tests",
+      run: () => undefined,
+      prompt: {
+        fields: [
+          {
+            type: "select",
+            name: "choice",
+            label: "Choice",
+            getOptions: () => Promise.reject(new Error("backend busy")),
+          },
+        ],
+        onSubmit: mock(),
+      },
+    });
+    fireEvent.click(view.getByRole("button", { name: "Open palette" }));
+    fireEvent.click(await view.findByText("Pick something"));
+    // An alert: the failure appears after the prompt opened, so screen readers announce it.
+    expect((await view.findByRole("alert")).textContent).toContain(
+      "Could not load options: backend busy"
+    );
+  });
+
   test("guest Escape leaves the host palette open", async () => {
     const view = renderPalette({
       id: "test-action",

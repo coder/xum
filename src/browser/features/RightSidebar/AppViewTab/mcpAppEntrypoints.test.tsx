@@ -24,7 +24,7 @@ import {
   publishProjectTrustChanged,
   publishWorkspaceMcpOverridesSaved,
 } from "@/browser/utils/workspaceMcpMutations";
-import { getRightSidebarLayoutKey } from "@/common/constants/storage";
+import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_TAB_KEY } from "@/common/constants/storage";
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 import { appViewTabFor } from "./appViewTabs";
 import { useLoadMcpAppEntrypoints, useMcpAppEntrypoints } from "./mcpAppEntrypoints";
@@ -533,6 +533,100 @@ describe("MCP App entry points", () => {
       restore();
     }
   });
+
+  test("after a restart, a tab whose entry point is gone shows unavailable, not its record", async () => {
+    // A fresh workspace ID stands in for a restarted renderer: no ref or retired key is held.
+    const target = entrypoint("Library");
+    const client = createTestApiClient({
+      mcpApps: {
+        // The server was disabled: the list lacks the entry point.
+        listEntrypoints: () => Promise.resolve([]),
+        // Its record outlives the server and says it belongs to an entry point.
+        getViewRecords: (input: { toolCallIds: string[] }) =>
+          Promise.resolve({
+            success: true as const,
+            data: input.toolCallIds.map((toolCallId) => ({
+              toolCallId,
+              view: {
+                serverName: "cad",
+                toolName: "cad.library",
+                resourceUri: "ui://cad/library",
+                arguments: {},
+                entrypoint: true,
+              },
+            })),
+          }),
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    try {
+      const { result } = renderHook(
+        () => {
+          useLoadMcpAppEntrypoints("ws-restarted", true);
+          return useMcpAppView("ws-restarted", target.viewKey);
+        },
+        { wrapper }
+      );
+      await waitFor(() => expect(result.current).toBeNull());
+      // It stays unavailable: the record never brings it back as a tool call's view, so the
+      // tab never takes the record's tool name as its label either.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(result.current).toBeNull();
+      const label = render(
+        <APIProvider client={client}>
+          <AppViewTabLabel workspaceId="ws-restarted" toolCallId={target.viewKey} />
+        </APIProvider>
+      );
+      expect(label.container.textContent).toBe("App view");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a thread entry point's tab names its scope", async () => {
+    const thread = {
+      ...entrypoint("Library"),
+      type: "thread" as const,
+      viewKey: "entrypoint:cad:cad.library:thread",
+    };
+    const client = createTestApiClient({
+      mcpApps: { listEntrypoints: () => Promise.resolve([entrypoint("Library"), thread]) },
+    });
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    function Tabs() {
+      useLoadMcpAppEntrypoints("ws-scope", true);
+      return (
+        <>
+          <div data-testid="global">
+            <AppViewTabLabel workspaceId="ws-scope" toolCallId={entrypoint("Library").viewKey} />
+            <AppViewTabTooltip workspaceId="ws-scope" toolCallId={entrypoint("Library").viewKey} />
+          </div>
+          <div data-testid="thread">
+            <AppViewTabLabel workspaceId="ws-scope" toolCallId={thread.viewKey} />
+            <AppViewTabTooltip workspaceId="ws-scope" toolCallId={thread.viewKey} />
+          </div>
+        </>
+      );
+    }
+    try {
+      const view = render(
+        <APIProvider client={client}>
+          <Tabs />
+        </APIProvider>
+      );
+      await waitFor(() => expect(view.getByTestId("thread").textContent).toContain("Library"));
+      expect(view.getByTestId("thread").textContent).toBe(
+        "Librarycad · this chatLibrary · cad · this chat"
+      );
+      expect(view.getByTestId("global").textContent).toBe("LibrarycadLibrary · cad");
+    } finally {
+      restore();
+    }
+  });
+
   test("an open keeps the entry point's place in the list", async () => {
     const first = entrypoint("Library");
     const second = {
@@ -591,6 +685,28 @@ describe("MCP App entry points", () => {
     // The next pick finds the tab and does not run the tool again.
     expect(await openMcpAppEntrypoint(client, "ws-unmounted", target)).toBeNull();
     expect(opens).toBe(1);
+  });
+
+  test("a saved palette tab keeps the tool a new layout starts with", async () => {
+    // No saved layout yet; the user asked new layouts to start on Costs (RightSidebar reads
+    // RIGHT_SIDEBAR_TAB_KEY for its default layout).
+    const target = entrypoint("Library");
+    const client = createTestApiClient({
+      mcpApps: {
+        openEntrypoint: () => Promise.resolve({ success: true as const, data: target }),
+      },
+    });
+    updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "costs");
+    try {
+      expect(await openMcpAppEntrypoint(client, "ws-unsaved", target)).toBeNull();
+      const layout = parseRightSidebarLayoutState(
+        readPersistedState<unknown>(getRightSidebarLayoutKey("ws-unsaved"), null)
+      );
+      expect(collectAllTabs(layout.root)).toEqual(["costs", appViewTabFor(target.viewKey)]);
+      expect(getFocusedActiveTab(layout, "review")).toBe("costs");
+    } finally {
+      updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
+    }
   });
 
   test("a rerun of an entry point whose tab is mounted reloads its frame", async () => {
@@ -652,6 +768,12 @@ describe("MCP App entry points", () => {
         await openMcpAppEntrypoint(client, "ws-rerun", target, () => undefined);
       });
       await waitFor(() => expect(loads).toBe(2));
+      // Exactly one reload: waitFor alone would also pass on the way to a third load. Flush
+      // React's pending renders and effects, then check that no further load started.
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(loads).toBe(2);
     } finally {
       restore();
     }

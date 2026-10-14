@@ -532,6 +532,50 @@ async function readSignIn(
   };
 }
 
+type SignInDiscovery = MCPServerOAuthConfig["discovery"];
+
+function discoveryHosts(discovery: SignInDiscovery): Set<string> {
+  return new Set(
+    [discovery?.authorizationServerBase, discovery?.registrationUrl]
+      .filter((url) => url !== undefined)
+      .map((url) => new URL(url).host)
+  );
+}
+
+/** `name changed (x → y)` for a URL that moved on its host (a host move has its own line). */
+function pathMoveLine(
+  name: string,
+  key: "authorizationServerBase" | "registrationUrl",
+  a: SignInDiscovery,
+  b: SignInDiscovery
+): string[] {
+  const [x, y] = [a?.[key], b?.[key]];
+  if (x === undefined || y === undefined || x === y) return [];
+  return new URL(x).host === new URL(y).host ? [`${name} changed (${x} → ${y})`] : [];
+}
+
+/**
+ * Review lines for the sign-in discovery URLs: one per added or removed host, and one per URL
+ * that moved on its host. Tenants share a host (`/tenant-a` → `/tenant-b`), so a path move gets
+ * its own line, also when another discovery URL changed host (#6164).
+ */
+function describeDiscoveryChanges(a: SignInDiscovery, b: SignInDiscovery): string[] {
+  const [oldHosts, newHosts] = [discoveryHosts(a), discoveryHosts(b)];
+  const lines = [
+    ...[...newHosts]
+      .filter((host) => !oldHosts.has(host))
+      .map((host) => `Sign-in at ${host} (new)`),
+    ...[...oldHosts]
+      .filter((host) => !newHosts.has(host))
+      .map((host) => `Sign-in at ${host} (removed)`),
+    ...pathMoveLine("Sign-in server", "authorizationServerBase", a, b),
+    ...pathMoveLine("Client registration", "registrationUrl", a, b),
+  ];
+  if (lines.length === 0 && stableStringify(a ?? null) !== stableStringify(b ?? null))
+    lines.push("Sign-in server changed");
+  return lines;
+}
+
 /** One review line per changed sign-in field. Secrets are named, never shown. */
 export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSignIn): string[] {
   const lines: string[] = [];
@@ -549,20 +593,7 @@ export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSig
   };
   changed("Sign-in client", a?.clientId, b?.clientId);
   changed("Token auth method", a?.tokenEndpointAuthMethod, b?.tokenEndpointAuthMethod);
-  const hosts = (oauth?: MCPServerOAuthConfig): Set<string> =>
-    new Set(
-      [oauth?.discovery?.authorizationServerBase, oauth?.discovery?.registrationUrl]
-        .filter((url) => url !== undefined)
-        .map((url) => new URL(url).host)
-    );
-  const [oldHosts, newHosts] = [hosts(a), hosts(b)];
-  for (const host of newHosts) if (!oldHosts.has(host)) lines.push(`Sign-in at ${host} (new)`);
-  for (const host of oldHosts) if (!newHosts.has(host)) lines.push(`Sign-in at ${host} (removed)`);
-  if (
-    lines.every((line) => !line.startsWith("Sign-in at")) &&
-    stableStringify(a?.discovery ?? null) !== stableStringify(b?.discovery ?? null)
-  )
-    lines.push("Sign-in server changed");
+  lines.push(...describeDiscoveryChanges(a?.discovery, b?.discovery));
   const scopes = (oauth?: MCPServerOAuthConfig): string[] => [
     ...(oauth?.baseScopes ?? []),
     ...(oauth?.defaultScopes ?? []),
@@ -3078,8 +3109,16 @@ export class AgentPluginInstallService {
    * fresh on each call: the review must show what would run now.
    */
   async getHooks(args: { name: string }): Promise<AgentPluginHooks> {
-    const { hooks, warnings } = await this.loadManagedPluginHooks(args.name);
-    const trust = await readPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name));
+    // The hook load and the trust read are two reads: an update from another process between
+    // them could show the old hook as trusted. Bracket both with discovery's journal/epoch gate,
+    // as getComponents does (Codex PRRT_kwDOPxxmWM6rb4Tz).
+    const { hooks, warnings, trust } = await this.readInsideDiscoveryGate(
+      "Plugin files changed during hook review. Refresh the hook review.",
+      async () => ({
+        ...(await this.loadManagedPluginHooks(args.name)),
+        trust: await readPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name)),
+      })
+    );
     return {
       hooks: hooks.map((hook) => ({ ...hook, review: reviewStateOf(trust, hook) })),
       warnings,
@@ -3112,9 +3151,40 @@ export class AgentPluginInstallService {
     });
   }
 
-  private async loadManagedPluginHooks(name: string) {
-    const entry = (await this.readRegistry("strict")).find((candidate) => candidate.name === name);
+  /**
+   * `name`'s registry row. Strict only for this row: one unparseable row of another plugin (after
+   * a downgrade) must not fail hook review and trust for every plugin (Codex
+   * PRRT_kwDOPxxmWM6rb4T6). A duplicate or unreadable row for this name still fails.
+   */
+  private async findOwnRegistryEntry(name: string): Promise<AgentPluginInstallEntry> {
+    const { rawEntries } = await this.readRegistryDocument("strict");
+    const rows = rawEntries.filter((raw) => this.rawEntryName(raw) === name);
+    if (rows.length > 1) {
+      throw new Error(
+        `The plugin registry (${shortenHome(this.registryFile)}) contains duplicate entries for '${name}'. Repair the file, then retry.`
+      );
+    }
+    const [entry] = this.parseRegistryEntries(rows, "strict");
+    if (rows.length === 1 && entry === undefined) {
+      throw new Error(
+        `The plugin registry entry for '${name}' cannot be read by this version of Xum (written by a newer version, or corrupted).`
+      );
+    }
     if (entry === undefined) throw new Error(`No managed plugin named '${name}'.`);
+    return entry;
+  }
+
+  /** Run `read` inside discovery's journal/epoch bracket; an overlapping installer move throws. */
+  private async readInsideDiscoveryGate<T>(changedMessage: string, read: () => Promise<T>) {
+    const gate = await journalDerivedDiscoveryGate([this.containerDir]);
+    if (gate.suppressed.length > 0) throw new Error(changedMessage);
+    const value = await read();
+    if ((await gate.confirm()).length > 0) throw new Error(changedMessage);
+    return value;
+  }
+
+  private async loadManagedPluginHooks(name: string) {
+    await this.findOwnRegistryEntry(name);
     const { plugin } = await discoverAgentPluginAt({
       pluginDir: this.targetPathFor(name),
       scope: "global",

@@ -117,6 +117,7 @@ export const CommandIds = {
 
   // Agent Plugin commands
   pluginsInstall: () => "plugins:install" as const,
+  mcpAppsRevokeViewDomains: () => "mcp-apps:revoke-view-domains" as const,
   pluginsManageComponents: () => "plugins:manage-components" as const,
   pluginsReviewHooks: () => "plugins:review-hooks" as const,
   pluginsUninstall: () => "plugins:uninstall" as const,

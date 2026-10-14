@@ -1,6 +1,7 @@
 import { useClaudeDesign } from "@/browser/hooks/useClaudeDesign";
 import { publishGlobalMcpEnablementChanged } from "@/browser/utils/workspaceMcpMutations";
 import {
+  McpAppViewDomainsLoadError,
   McpAppViewDomainsSection,
   unlistedMcpAppViewDomains,
   useMcpAppViewDomains,
@@ -1659,6 +1660,7 @@ export const MCPSettingsSection: React.FC = () => {
           showServer
           error={viewDomains.revokeError}
         />
+        <McpAppViewDomainsLoadError error={viewDomains.loadError} onRetry={viewDomains.retry} />
 
         {/* Add server form */}
         <details className="group mt-3">

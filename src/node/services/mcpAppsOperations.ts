@@ -250,6 +250,8 @@ function viewOfRecord(record: McpAppResultRecord): NonNullable<McpAppViewRecord>
     toolName: modelFacing?.toolName ?? record.toolName,
     resourceUri: record.resourceUri,
     arguments: record.arguments,
+    entrypoint: record.entrypoint,
+    outcome: record.outcome,
   };
 }
 

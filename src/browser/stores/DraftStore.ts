@@ -243,6 +243,23 @@ export function draftStoreScopeKey(scope: DraftStoreScope): string {
   return scope.kind === "pending" ? `pending:${scope.projectPath}` : draftScopeKey(scope);
 }
 
+/** Marks the field versions a confirmed write sent as saved (only the fields it wrote). */
+function confirmWrite(
+  entry: Entry,
+  wrote: { text: boolean; attachments: boolean },
+  versions: { text: number; attachments: number }
+): void {
+  if (wrote.text) {
+    entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, versions.text);
+  }
+  if (wrote.attachments) {
+    entry.confirmedAttachmentsVersion = Math.max(
+      entry.confirmedAttachmentsVersion,
+      versions.attachments
+    );
+  }
+}
+
 function isTextDirty(entry: Entry): boolean {
   return entry.textVersion > entry.confirmedTextVersion;
 }
@@ -972,6 +989,10 @@ export class DraftStore {
           ...(unsavedText !== undefined ? { text: unsavedText } : {}),
           ...(basisSends.length > 0 ? { basisSends } : {}),
         });
+        // A replaced backend's reply: the current one holds neither the removal nor the
+        // pending send, so handle it as a lost reply below (the text comes back and is saved
+        // to the current backend, and the caller does not send) (#6438).
+        this.assertCurrentClient(client);
         // The backend took the same text out of the same (or this window's unsaved) text.
         entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, removalVersion);
         entry.localSends.delete(pendingSend.sendId);
@@ -1658,6 +1679,7 @@ export class DraftStore {
     const controller = new AbortController();
     this.subscription = controller;
     const { signal } = controller;
+    this.forgetServerViews();
     if (!this.ready && !this.readyTimer) {
       // Startup must never hang on drafts (a subscription that never yields, a stuck legacy
       // import): let composers render after a bound. Writes still wait for hydration, and a late
@@ -1734,6 +1756,22 @@ export class DraftStore {
       }
     };
     run().catch((error: unknown) => console.error("Draft subscription failed:", error));
+  }
+
+  /**
+   * A subscription may reach another backend process (a new client, or a restarted backend),
+   * which numbers its revisions anew, possibly lower (its clock behind). The views and revisions
+   * of the backend before would outrank all of its replies and pushes, and put old text back
+   * over typing (#6438). Only the views: the composer keeps showing its fields, pending sends
+   * stay retained (`pendingSends`, `basisSends`), and unsaved edits keep winning over the
+   * snapshot (applyServerState). A write may go out before the new snapshot: with no view
+   * left, its reply is taken as it comes.
+   */
+  private forgetServerViews(): void {
+    for (const entry of this.entries.values()) {
+      entry.serverView = null;
+      entry.revision = Number.NEGATIVE_INFINITY;
+    }
   }
 
   private stopSubscription(): void {
@@ -1957,8 +1995,7 @@ export class DraftStore {
         await entry.inFlight;
         continue;
       }
-      const client = this.client;
-      if (!client) throw new Error("Draft save failed: not connected");
+      const client = this.writableClient();
       // The backend refuses drafts over the limit. That failure is permanent, so check here and
       // wait for the next change instead of pushing a multi-MB payload through the transport on
       // every retry. Only a loaded draft is measurable; otherwise the backend check applies.
@@ -1989,17 +2026,19 @@ export class DraftStore {
           // lost reply is retried with the same basis, which merges the same way again.
           ...(entry.basisSends.size > 0 ? { basisSends: [...entry.basisSends.values()] } : {}),
         });
+        // A reply of a replaced backend confirms nothing: the edit must reach the current one,
+        // so the loop writes it again there (#6438).
+        if (this.client !== client) continue;
         entry.flushAttempt = 0;
         entry.failing = false;
-        if (sendText) {
-          entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, textVersion);
-        }
-        if (sendAttachments) {
-          entry.confirmedAttachmentsVersion = Math.max(
-            entry.confirmedAttachmentsVersion,
-            attachmentsVersion
-          );
-        }
+        confirmWrite(
+          entry,
+          { text: sendText, attachments: sendAttachments },
+          {
+            text: textVersion,
+            attachments: attachmentsVersion,
+          }
+        );
       } catch (error) {
         this.reportSaveError(entry, key, error);
         // The backend's size refusal (measurable only there while payloads are unloaded) is
@@ -2019,6 +2058,19 @@ export class DraftStore {
       }
       this.applyWriteReply(entry, reply, { text: sendText, attachments: sendAttachments });
     }
+  }
+
+  /** The client a write may go to: connected, and drafts hydrated. */
+  private writableClient(): APIClient {
+    const client = this.client;
+    if (!client) throw new Error("Draft save failed: not connected");
+    if (!this.hydrated) throw new Error("Draft save failed: drafts are not loaded");
+    return client;
+  }
+
+  /** Throws when `client` was replaced (a new backend): its replies are not the current one's. */
+  private assertCurrentClient(client: APIClient): void {
+    if (this.client !== client) throw new Error("Draft save failed: the drafts backend changed");
   }
 
   /**
