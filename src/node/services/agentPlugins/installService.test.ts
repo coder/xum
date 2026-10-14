@@ -3051,6 +3051,22 @@ describe("AgentPluginInstallService", () => {
     expect(change?.after).toContain("GPL-3.0");
   });
 
+  test("the update review shows every fingerprinted field of an added skill (#6557)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "audit"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "audit", "SKILL.md"),
+      "---\nname: audit\ndescription: Audits\nlicense: GPL-3.0\n---\n\nBody.\n"
+    );
+    await commitAll(remoteDir, "adds a licensed skill");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary === "adds skill 'audit'");
+    expect(change?.after).toContain("GPL-3.0");
+  });
+
   test("a component review too large to show is refused, not truncated (#6570)", async () => {
     // Four skills with ~300 KB frontmatter each exceed the review text bound together.
     const big = "x".repeat(300_000);

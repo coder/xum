@@ -258,12 +258,11 @@ export function recordReviewedComponents(args: {
     skills: { ...args.previous?.skills },
     mcpServers: { ...args.previous?.mcpServers },
   };
+  // One lookup per component: a plugin can have thousands of them.
+  const refKey = (ref: ComponentRef) => JSON.stringify([ref.kind, ref.name, ref.fingerprint]);
+  const shown = new Set(args.reviewed.map(refKey));
   for (const ref of args.current) {
-    const shown = args.reviewed.some(
-      (other) =>
-        other.kind === ref.kind && other.name === ref.name && other.fingerprint === ref.fingerprint
-    );
-    if (shown) next[ref.kind][ref.name] = ref.fingerprint;
+    if (shown.has(refKey(ref))) next[ref.kind][ref.name] = ref.fingerprint;
   }
   return next;
 }

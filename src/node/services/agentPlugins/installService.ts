@@ -1878,7 +1878,7 @@ export class AgentPluginInstallService {
       if (currentServer === undefined) {
         changes.push({
           summary: `adds MCP server '${serverName}'`,
-          after: server.display,
+          after: reviewText(server),
           component,
         });
       } else if (currentServer.fingerprint !== server.fingerprint) {
@@ -1933,7 +1933,7 @@ export class AgentPluginInstallService {
         fingerprint: skill.consentFingerprint,
       };
       if (currentSkill === undefined) {
-        changes.push({ summary: `adds skill '${skillName}'`, after: skill.display, component });
+        changes.push({ summary: `adds skill '${skillName}'`, after: reviewText(skill), component });
       } else if (currentSkill.consentFingerprint !== skill.consentFingerprint) {
         // The skill's location and whole frontmatter count (#6498), so a moved skill or a new
         // frontmatter field shows here. The summary names an advertisement change when there is one.
