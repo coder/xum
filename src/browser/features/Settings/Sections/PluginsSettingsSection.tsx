@@ -58,8 +58,12 @@ function formatSource(item: AgentPluginListItem): string | null {
     .replace(/^git@([^:]+):/, "$1/")
     .replace(/\.git$/, "");
   const ref = item.source.refType === "commit" ? item.source.ref.slice(0, 12) : item.source.ref;
-  const subpath = item.source.subpath !== undefined ? `/${item.source.subpath}` : "";
-  return `${url}${subpath} @ ${ref}`;
+  return `${url}${subpathSuffix(item.source.subpath)} @ ${ref}`;
+}
+
+/** Monorepo plugin folder appended to a source URL ("/pstack"), or nothing for root installs. */
+function subpathSuffix(subpath: string | undefined): string {
+  return subpath === undefined ? "" : `/${subpath}`;
 }
 
 const Badge: React.FC<{
@@ -636,8 +640,7 @@ const AddPluginPanel: React.FC<{
                 phone widths. */}
             <p className="text-muted text-[11px] break-all">
               {preview.source.url}
-              {preview.source.subpath !== undefined ? `/${preview.source.subpath}` : ""} @{" "}
-              {preview.source.ref} →{" "}
+              {subpathSuffix(preview.source.subpath)} @ {preview.source.ref} →{" "}
               <code className="text-accent-text">{preview.targetPath}</code>
               {preview.manifest.authorName ? ` · by ${preview.manifest.authorName}` : ""}
               {preview.manifest.license ? ` · ${preview.manifest.license}` : ""}

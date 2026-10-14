@@ -4273,9 +4273,9 @@ describe("AgentPluginInstallService", () => {
       await expect(service.preview({ input: monoUrl, subpath: "link/skills" })).rejects.toThrow(
         /'link' is a symbolic link/
       );
-      await expect(
-        service.preview({ input: monoUrl, subpath: "packages/alias" })
-      ).rejects.toThrow(/'packages\/alias' is a symbolic link/);
+      await expect(service.preview({ input: monoUrl, subpath: "packages/alias" })).rejects.toThrow(
+        /'packages\/alias' is a symbolic link/
+      );
       await expect(service.preview({ input: monoUrl, subpath: "README.md" })).rejects.toThrow(
         /'README.md' is a file/
       );

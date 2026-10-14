@@ -86,7 +86,8 @@ export function normalizeAgentPluginSubpath(raw: string): string {
   if (subpath.length === 0) {
     throw new Error("The plugin subpath must not be empty.");
   }
-  if (subpath.startsWith("/") || subpath.startsWith("~") || /^[a-zA-Z]:/.test(subpath)) {
+  // `/abs`, `~/home`, and Windows drive letters (`C:`).
+  if (/^(?:[/~]|[a-zA-Z]:)/.test(subpath)) {
     throw new Error(
       `'${subpath}' is an absolute path. The plugin subpath must be relative to the repository root.`
     );
@@ -101,21 +102,25 @@ export function normalizeAgentPluginSubpath(raw: string): string {
     );
   }
   for (const segment of subpath.split("/")) {
-    if (segment.length === 0 || segment === "." || segment === "..") {
-      throw new Error(
-        `'${subpath}' is not a valid plugin subpath. Use a folder path inside the repository, like path/to/plugin (no empty, '.' or '..' parts).`
-      );
-    }
-    if (segment.toLowerCase() === ".git") {
-      throw new Error(`'${subpath}' points into the .git folder, which is not a plugin folder.`);
-    }
-    if (segment !== segment.trim()) {
-      throw new Error(
-        `'${subpath}' has a path part that starts or ends with whitespace, which is not allowed in a plugin subpath.`
-      );
-    }
+    assertValidSubpathSegment(subpath, segment);
   }
   return subpath;
+}
+
+function assertValidSubpathSegment(subpath: string, segment: string): void {
+  if (segment.length === 0 || segment === "." || segment === "..") {
+    throw new Error(
+      `'${subpath}' is not a valid plugin subpath. Use a folder path inside the repository, like path/to/plugin (no empty, '.' or '..' parts).`
+    );
+  }
+  if (segment.toLowerCase() === ".git") {
+    throw new Error(`'${subpath}' points into the .git folder, which is not a plugin folder.`);
+  }
+  if (segment !== segment.trim()) {
+    throw new Error(
+      `'${subpath}' has a path part that starts or ends with whitespace, which is not allowed in a plugin subpath.`
+    );
+  }
 }
 
 /**
@@ -174,7 +179,7 @@ export function parseAgentPluginSourceInput(rawInput: string): ParsedAgentPlugin
   }
 
   const segments = pathPart.split("/");
-  if (segments.length < 2 || segments[0].length === 0 || segments[1].length === 0) {
+  if (segments.length < 2 || segments.slice(0, 2).some((segment) => segment.length === 0)) {
     throw new Error(
       `'${input}' is not a git URL or owner/repo shorthand. Examples: coder/mux, coder/mux@main, https://github.com/coder/mux.git`
     );
@@ -187,11 +192,11 @@ export function parseAgentPluginSourceInput(rawInput: string): ParsedAgentPlugin
 
   // Everything after owner/repo is the plugin folder; normalizing here
   // rejects escapes like `owner/repo/../x` before anything is fetched.
-  const subpath =
-    segments.length > 2 ? normalizeAgentPluginSubpath(segments.slice(2).join("/")) : undefined;
   return {
     url: normalizeRepoUrlForClone(ownerRepo).cloneUrl,
     ...(refPart !== undefined ? { ref: refPart } : {}),
-    ...(subpath !== undefined ? { subpath } : {}),
+    ...(segments.length > 2
+      ? { subpath: normalizeAgentPluginSubpath(segments.slice(2).join("/")) }
+      : {}),
   };
 }

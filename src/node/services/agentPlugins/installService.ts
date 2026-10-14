@@ -426,6 +426,52 @@ function sparseCloneFlags(subpath: string | undefined): string[] {
   return subpath === undefined ? [] : ["--filter=blob:none", "--sparse"];
 }
 
+/** `git fetch` counterpart of sparseCloneFlags (the sparse checkout is set before checkout). */
+function partialFetchFlags(subpath: string | undefined): string[] {
+  return subpath === undefined ? [] : ["--filter=blob:none"];
+}
+
+/** Git tree-entry modes that are not folders, for the subpath error. Other modes are files. */
+const NON_FOLDER_GIT_MODE_KINDS: Readonly<Record<string, string>> = {
+  "120000": "a symbolic link",
+  "160000": "a git submodule",
+};
+
+/** Mode of the entry named exactly `name` in `git ls-tree -z` output, if any. */
+function lsTreeEntryMode(output: string, name: string): string | undefined {
+  for (const record of output.split("\0")) {
+    const match = /^(\d{6}) \S+ [0-9a-f]+\t([\s\S]*)$/.exec(record);
+    if (match !== null && match[2] === name) {
+      return match[1];
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Subpath for preview(): from the shorthand or the separate API argument
+ * (normalized), refusing two different ones (mirrors the ref conflict).
+ */
+function resolvePreviewSubpath(
+  parsedSubpath: string | undefined,
+  rawExplicit: string | undefined
+): string | undefined {
+  const explicit = rawExplicit?.trim() ? normalizeAgentPluginSubpath(rawExplicit) : undefined;
+  if (explicit !== undefined && parsedSubpath !== undefined && parsedSubpath !== explicit) {
+    throw new Error(
+      `Conflicting subpaths: '${parsedSubpath}' in the source and '${explicit}' in the subpath field.`
+    );
+  }
+  return parsedSubpath ?? explicit;
+}
+
+/** Throws unless `subpath` is absent or already in normalizeAgentPluginSubpath form. */
+function assertNormalizedSubpath(subpath: string | undefined): void {
+  if (subpath !== undefined && normalizeAgentPluginSubpath(subpath) !== subpath) {
+    throw new Error(`The plugin subpath '${subpath}' is not normalized. Run the preview again.`);
+  }
+}
+
 /** A plugin subpath that is missing or not a real folder at the staged commit (shown unwrapped). */
 class AgentPluginSubpathError extends Error {}
 
@@ -1398,29 +1444,12 @@ export class AgentPluginInstallService {
       if (resolved.refType === "commit") {
         await this.fetchExactSha(url, resolved.sha, dir, subpath);
       } else {
-        await runGit(
-          [
-            "clone",
-            "--depth",
-            "1",
-            "--single-branch",
-            ...sparseCloneFlags(subpath),
-            "--branch",
-            resolved.ref,
-            "-c",
-            "advice.detachedHead=false",
-            url,
-            dir,
-          ],
-          { diskQuota: this.cloneDiskQuota(dir) }
-        );
+        await this.cloneRef(url, resolved.ref, dir, subpath);
       }
       sha = (await runGit(["-C", dir, "rev-parse", "HEAD"])).trim();
       assert(isFullCommitSha(sha), "cloneResolved: rev-parse HEAD must be a full SHA");
       if (subpath === undefined) {
         await this.assertStagedTreeWithinQuota(dir);
-      } else if (resolved.refType !== "commit") {
-        await this.narrowToSubpath(dir, "HEAD", subpath, url, sha);
       }
     } catch (error) {
       await this.removeDir(dir);
@@ -1447,7 +1476,6 @@ export class AgentPluginInstallService {
     const subpath = source.subpath;
     const dir = await this.createStagingDir();
     try {
-      let clonedTrackingRef = false;
       try {
         await this.fetchExactSha(source.url, sha, dir, subpath);
       } catch (error) {
@@ -1464,23 +1492,7 @@ export class AgentPluginInstallService {
         await this.removeDir(dir);
         await fsPromises.mkdir(dir, { recursive: true });
         this.activeStagingPaths.add(dir);
-        await runGit(
-          [
-            "clone",
-            "--depth",
-            "1",
-            "--single-branch",
-            ...sparseCloneFlags(subpath),
-            "--branch",
-            source.ref,
-            "-c",
-            "advice.detachedHead=false",
-            source.url,
-            dir,
-          ],
-          { diskQuota: this.cloneDiskQuota(dir) }
-        );
-        clonedTrackingRef = true;
+        await this.cloneRef(source.url, source.ref, dir, subpath);
       }
       const head = (await runGit(["-C", dir, "rev-parse", "HEAD"])).trim();
       if (head !== sha) {
@@ -1490,14 +1502,40 @@ export class AgentPluginInstallService {
       }
       if (subpath === undefined) {
         await this.assertStagedTreeWithinQuota(dir);
-      } else if (clonedTrackingRef) {
-        await this.narrowToSubpath(dir, "HEAD", subpath, source.url, sha);
       }
     } catch (error) {
       await this.removeDir(dir);
       throw error instanceof Error ? error : new Error(getErrorMessage(error));
     }
     return subpath === undefined ? dir : this.extractSubpath(dir, subpath, source.url, sha);
+  }
+
+  /**
+   * Shallow-clone branch or tag `ref`. With `subpath`, the clone is partial
+   * and sparse and gets narrowed to the folder; callers still verify HEAD
+   * against the SHA they expect before using the tree.
+   */
+  private async cloneRef(url: string, ref: string, dir: string, subpath?: string): Promise<void> {
+    await runGit(
+      [
+        "clone",
+        "--depth",
+        "1",
+        "--single-branch",
+        ...sparseCloneFlags(subpath),
+        "--branch",
+        ref,
+        "-c",
+        "advice.detachedHead=false",
+        url,
+        dir,
+      ],
+      { diskQuota: this.cloneDiskQuota(dir) }
+    );
+    if (subpath !== undefined) {
+      const head = (await runGit(["-C", dir, "rev-parse", "HEAD"])).trim();
+      await this.narrowToSubpath(dir, "HEAD", subpath, url, head);
+    }
   }
 
   private async fetchExactSha(
@@ -1512,16 +1550,7 @@ export class AgentPluginInstallService {
     // `init` + `fetch --filter` configures the promisor remote on its own, so
     // the sparse checkout below can lazy-fetch just the subpath's blobs.
     await runGit(
-      [
-        "-C",
-        dir,
-        "fetch",
-        "--depth",
-        "1",
-        ...(subpath !== undefined ? ["--filter=blob:none"] : []),
-        "origin",
-        sha,
-      ],
+      ["-C", dir, "fetch", "--depth", "1", ...partialFetchFlags(subpath), "origin", sha],
       { diskQuota }
     );
     // Must precede the checkout: a full checkout would materialize (and
@@ -1552,9 +1581,7 @@ export class AgentPluginInstallService {
     url: string,
     sha: string
   ): Promise<void> {
-    if (normalizeAgentPluginSubpath(subpath) !== subpath) {
-      throw new AgentPluginSubpathError(`The plugin subpath '${subpath}' is not normalized.`);
-    }
+    assertNormalizedSubpath(subpath);
     const segments = subpath.split("/");
     for (let depth = 1; depth <= segments.length; depth++) {
       const prefix = segments.slice(0, depth).join("/");
@@ -1569,19 +1596,14 @@ export class AgentPluginInstallService {
         "--",
         prefix,
       ]);
-      const mode = output
-        .split("\0")
-        .map((record) => /^(\d{6}) \S+ [0-9a-f]+\t([\s\S]*)$/.exec(record))
-        .find((match) => match?.[2] === prefix)?.[1];
+      const mode = lsTreeEntryMode(output, prefix);
       if (mode === undefined) {
         throw new AgentPluginSubpathError(
           `'${subpath}' does not exist in ${url} at ${sha.slice(0, 12)}. The plugin folder may have moved or been removed upstream.`
         );
       }
       if (mode !== "040000") {
-        const kind =
-          mode === "120000" ? "a symbolic link" : mode === "160000" ? "a git submodule" : "a file";
-        throw subpathNotAFolder(subpath, url, prefix, kind);
+        throw subpathNotAFolder(subpath, url, prefix, NON_FOLDER_GIT_MODE_KINDS[mode] ?? "a file");
       }
     }
     // Lazy-fetches the subpath's blobs, so it carries the clone quota.
@@ -2393,19 +2415,7 @@ export class AgentPluginInstallService {
       );
     }
     const ref = parsed.ref ?? (explicitRef.length > 0 ? explicitRef : undefined);
-    const explicitSubpath = args.subpath?.trim()
-      ? normalizeAgentPluginSubpath(args.subpath)
-      : undefined;
-    if (
-      explicitSubpath !== undefined &&
-      parsed.subpath !== undefined &&
-      parsed.subpath !== explicitSubpath
-    ) {
-      throw new Error(
-        `Conflicting subpaths: '${parsed.subpath}' in the source and '${explicitSubpath}' in the subpath field.`
-      );
-    }
-    const subpath = parsed.subpath ?? explicitSubpath;
+    const subpath = resolvePreviewSubpath(parsed.subpath, args.subpath);
 
     const resolved = await this.resolveRemoteRef(parsed.url, ref);
     const { dir: stagedDir, sha } = await this.cloneResolved(parsed.url, resolved, subpath);
@@ -2500,14 +2510,7 @@ export class AgentPluginInstallService {
     // Same reasoning for the subpath: it is persisted and decides which
     // folder becomes the plugin root, so a direct API source must already be
     // in the normalized form preview() returns.
-    if (
-      args.source.subpath !== undefined &&
-      normalizeAgentPluginSubpath(args.source.subpath) !== args.source.subpath
-    ) {
-      throw new Error(
-        `The plugin subpath '${args.source.subpath}' is not normalized. Run the preview again.`
-      );
-    }
+    assertNormalizedSubpath(args.source.subpath);
 
     return this.runExclusive(async () => {
       const stagedDir = await this.cloneExactSha(args.source, args.expectedSha);

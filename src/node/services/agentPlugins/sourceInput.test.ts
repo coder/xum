@@ -58,8 +58,12 @@ describe("parseAgentPluginSourceInput", () => {
       ref: "main",
       subpath: "pstack",
     });
-    expect(() => parseAgentPluginSourceInput("cursor/plugins/../x")).toThrow(/not a valid plugin subpath/);
-    expect(() => parseAgentPluginSourceInput("cursor/plugins/a//b")).toThrow(/not a valid plugin subpath/);
+    expect(() => parseAgentPluginSourceInput("cursor/plugins/../x")).toThrow(
+      /not a valid plugin subpath/
+    );
+    expect(() => parseAgentPluginSourceInput("cursor/plugins/a//b")).toThrow(
+      /not a valid plugin subpath/
+    );
   });
 
   test("passes through full URLs unchanged (with query/fragment stripped)", () => {
