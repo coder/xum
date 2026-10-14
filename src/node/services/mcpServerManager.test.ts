@@ -1284,11 +1284,18 @@ describe("MCPServerManager", () => {
         1000
       );
       expect(t.reads.map((read) => read.server)).toEqual(["b"]);
+      // The dialog reads b (its read gives the save b's instance token), then saves.
+      const dialogRead = manager.readSettings("hooks-failsave-ws", "plugin:abc:b");
+      await waitFor(() => t.reads.length === 2);
+      t.reads.pop()?.settle("mm");
+      const prior = await dialogRead;
+      if (prior === null) throw new Error("expected settings");
       await manager.updateSettings(
         "hooks-failsave-ws",
         "plugin:abc:b",
         { units: "in" },
-        { properties: { units: { type: "string", title: "Units" } }, values: {} }
+        prior,
+        prior.instanceToken
       );
       t.reads.splice(0).forEach((read) => read.settle(null));
       expect(await hookSettings).toEqual({ a: { units: "mm" }, b: { units: "in" } });
