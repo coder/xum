@@ -1928,8 +1928,8 @@ describe("AgentPluginInstallService", () => {
   });
 
   test("preview and list show the interface; the logo is a contained data URL", async () => {
-    // A 16×16 PNG header: the logo check reads the size from IHDR.
-    const png = pngHeader(16, 16);
+    // A 48×48 PNG header (OpenAI's smallest square logo): the check reads the size from IHDR.
+    const png = pngHeader(48, 48);
     await fsPromises.mkdir(path.join(remoteDir, "assets"));
     await fsPromises.writeFile(path.join(remoteDir, "assets", "logo.png"), png);
     // Staging accepts an absolute link outside the managed container; only

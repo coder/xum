@@ -131,6 +131,32 @@ describe("readOpenAIExtension", () => {
     );
   });
 
+  test("invisible format characters (\\p{Cf}) are refused like direction controls", () => {
+    const read = (iface: Record<string, unknown>) =>
+      readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
+    // ZERO WIDTH SPACE: "Fig\u200bma" looks like "Figma" in Settings.
+    for (const bad of ["Fig\u200bma", "Fig\u200dma", "Fig\ufeffma", "Fig\u00adma", "Fig\u2060ma"]) {
+      expect(read({ ...validInterface, developerName: bad }).extension).toEqual({});
+    }
+    const optional = read({ ...validInterface, longDescription: "Line one\nLine\u200b two" });
+    expect(optional.extension?.interface).toEqual(validInterface);
+    expect(optional.warnings).toHaveLength(1);
+  });
+
+  test("a blank capability drops the capability list with a warning", () => {
+    const read = (capabilities: unknown) =>
+      readOpenAIExtension({
+        extensions: { "com.openai": { interface: { ...validInterface, capabilities } } },
+      });
+    for (const blank of ["", "   "]) {
+      const result = read(["Search", blank]);
+      expect(result.extension?.interface).toEqual(validInterface);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain("interface.capabilities'");
+    }
+    expect(read(["Search", "Read"]).extension?.interface?.capabilities).toEqual(["Search", "Read"]);
+  });
+
   test("an interface without its required names is dropped as a whole", () => {
     const { extension, warnings } = readOpenAIExtension({
       extensions: { "com.openai": { interface: { displayName: "Only a name" } } },

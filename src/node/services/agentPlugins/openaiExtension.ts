@@ -103,20 +103,23 @@ const RULES: Record<FieldKind, string> = {
   url: "an https URL (max 2048 characters)",
   color: "a #RRGGBB color",
   path: "a relative path inside the plugin",
-  labels: "at most 20 strings of at most 120 characters",
+  labels: "at most 20 non-empty strings of at most 120 characters",
   prompts: "at most 3 strings of at most 512 characters",
   paths: "at most 10 relative paths inside the plugin",
 };
 
 /**
- * Characters manifest text must not carry (OpenAI's package rules exclude them too): C0 and C1
- * controls, the Unicode line and paragraph separators, and the invisible direction controls
- * (LRM/RLM/ALM, embeddings/overrides, isolates), which can spoof a displayed plugin or developer.
+ * Characters manifest text must not carry. OpenAI's package rules exclude "control characters,
+ * Unicode line or paragraph separators, and unsupported invisible formatting characters"
+ * (https://developers.openai.com/plugins/deploy/submission-errors): C0 and C1 controls, U+2028
+ * and U+2029, and the whole Unicode format category (`\p{Cf}`). Cf holds the direction controls
+ * (LRM/RLM/ALM, embeddings/overrides, isolates) and the zero-width characters (U+200B, U+FEFF,
+ * soft hyphen), which can make a displayed plugin or developer name look like another (#6162).
  * `longDescription` may break lines with \n only.
  */
 const UNSAFE_TEXT =
   // eslint-disable-next-line no-control-regex -- the control characters are the point
-  /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/;
+  /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\p{Cf}]/u;
 const isText = (value: unknown, max: number, multiline = false): value is string =>
   typeof value === "string" &&
   value.length <= max &&
@@ -124,6 +127,9 @@ const isText = (value: unknown, max: number, multiline = false): value is string
   (multiline || !value.includes("\n"));
 const isTextList = (value: unknown, count: number, max: number): value is string[] =>
   Array.isArray(value) && value.length <= count && value.every((entry) => isText(entry, max));
+/** OpenAI: "Each capability must be non-empty"; a blank one would render as an empty badge. */
+const isLabelList = (value: unknown): value is string[] =>
+  isTextList(value, 20, 120) && value.every((label) => label.trim().length > 0);
 
 /** The validated value, or undefined when `value` breaks the rule for `kind`. */
 function parseField(kind: FieldKind, value: unknown, cap: number, multiline: boolean): unknown {
@@ -144,7 +150,7 @@ function parseField(kind: FieldKind, value: unknown, cap: number, multiline: boo
     case "path":
       return normalizeOpenAIRelativePath(value);
     case "labels":
-      return isTextList(value, 20, 120) ? value : undefined;
+      return isLabelList(value) ? value : undefined;
     case "prompts": {
       const prompts = typeof value === "string" ? [value] : value;
       return isTextList(prompts, 3, 512) ? prompts : undefined;
