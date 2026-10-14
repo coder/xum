@@ -29,7 +29,8 @@ restoreModulesAfterSuite([
  * old socket first). And the session the bridge shows.
  */
 let bridgeDisconnects = 0;
-let bridgeSession: { sessionName: string; status: "live" } | null = null;
+let bridgeSession: { sessionName: string; status: "live" | "error"; lastError?: string } | null =
+  null;
 void mock.module("@/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection", () => ({
   useBrowserBridgeConnection: () => ({
     session: bridgeSession,
@@ -175,6 +176,9 @@ describe.each([...GAP_MODES])("BrowserTab across a dropped connection (%s)", (mo
     await view.findByTestId("browser-page-tab-t2");
     const disconnectsBefore = bridgeDisconnects;
 
+    // The bridge's own socket fails with the connection (a retryable error). Offline, a new
+    // connect could not reach the server and would clear the last frame, so none starts.
+    bridgeSession = { sessionName: "alpha", status: "error", lastError: "bridge disconnected" };
     await drop();
     expect(bridgeDisconnects).toBe(disconnectsBefore);
 

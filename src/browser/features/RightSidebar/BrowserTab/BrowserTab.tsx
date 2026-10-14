@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { Check, ChevronDown, Globe2, Loader2, Play, TriangleAlert } from "lucide-react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
@@ -164,6 +164,8 @@ export function BrowserTab(props: BrowserTabProps) {
   const pendingTabIdRef = useRef<string | null>(null);
   const selectedSessionNameRef = useRef<string | null>(null);
   const { api } = useAPI();
+  // Null while Xum reconnects, also when `api` keeps the last client: the bridge decides on this.
+  const liveApi = useLiveAPI();
   const [discoveredSessions, setDiscoveredSessions] = useState<BrowserDiscoveredSession[]>([]);
   const [otherDiscoveredSessions, setOtherDiscoveredSessions] = useState<
     BrowserDiscoveredOtherSession[]
@@ -360,7 +362,7 @@ export function BrowserTab(props: BrowserTabProps) {
 
   useEffect(() => {
     const bridge = bridgeAction({
-      offline: api == null,
+      offline: liveApi == null,
       bridgeSession: session,
       selectedSessionName,
       selectedSessionListed: selectedDiscoveredSession != null,
@@ -414,7 +416,7 @@ export function BrowserTab(props: BrowserTabProps) {
       connect(selectedSessionName);
     }
   }, [
-    api,
+    liveApi,
     connect,
     disconnect,
     selectedDiscoveredSession,
