@@ -625,6 +625,72 @@ describe("Config", () => {
     });
   });
 
+  // #5929: a writer that skips the registration lock (a manual editor, an older build) can
+  // replace config.json between an edit's fresh read and its save. The save then refuses to
+  // overwrite the bytes it did not read.
+  describe("saveConfig after an outside write", () => {
+    const outside = JSON.stringify({ projects: [], updateChannel: "npm", note: "outside" });
+
+    async function editWithOutsideWrite(writeOutside: (file: string) => void): Promise<unknown> {
+      const configFile = path.join(tempDir, "config.json");
+      return config
+        .editConfig((value) => {
+          // The transform runs after the edit's fresh read: write the way an outside writer would.
+          writeOutside(configFile);
+          return { ...value, updateChannel: "nightly" };
+        })
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+    }
+
+    beforeEach(async () => {
+      await config.setUpdateChannel("stable");
+    });
+
+    const writers: Array<[string, (file: string) => void]> = [
+      [
+        "an atomic rename",
+        (file) => {
+          fs.writeFileSync(`${file}.outside`, outside);
+          fs.renameSync(`${file}.outside`, file);
+        },
+      ],
+      ["an in-place write", (file) => fs.writeFileSync(file, outside)],
+    ];
+    for (const [name, writeOutside] of writers) {
+      it(`rejects the edit and keeps the outside bytes after ${name}`, async () => {
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          const error = await editWithOutsideWrite(writeOutside);
+          expect(String(error)).toContain("config.json changed on disk");
+          expect(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")).toBe(outside);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+    }
+
+    it("rejects the edit when config.json appears after a read that found none", async () => {
+      fs.rmSync(path.join(tempDir, "config.json"));
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        const error = await editWithOutsideWrite((file) => fs.writeFileSync(file, outside));
+        expect(String(error)).toContain("config.json changed on disk");
+        expect(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")).toBe(outside);
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("saves an edit that reads the outside bytes first", async () => {
+      fs.writeFileSync(path.join(tempDir, "config.json"), outside);
+      await config.setUpdateChannel("nightly");
+      expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+    });
+  });
+
   describe("loadConfigOrDefault settingsBackup sanitizing", () => {
     it("degrades a malformed settingsBackup instead of returning it", () => {
       // Reaching the IPC output validator would fail the whole settings read, so one bad field
