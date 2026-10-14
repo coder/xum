@@ -94,6 +94,13 @@ A plugin skill has two names: its bare name (`tdd`) and a qualified name `<plugi
 
 You can invoke a plugin skill by its qualified name too: type `/pstack:tdd` in the composer, or mention `$pstack:tdd` in a message. The slash menu and `$` suggestions list a shadowed plugin skill under its qualified name, and typing `tdd` also matches `pstack:tdd`. If no plugin named `tdd` is installed, `$tdd:notes` loads the bare `tdd` skill and leaves `:notes` as text. If a `tdd` plugin is installed, `$tdd:notes` names one of its skills, and no skill attaches when that skill does not exist.
 
+Plugin skills often refer to their sibling skills by bare name. For example, a `pstack` skill can say "see the **tdd** skill". If a higher-precedence skill takes that bare name, Xum tells the model which skill the plugin means:
+
+- `agent_skill_read`, `/skill`, and `$skill` put a one-line note at the top of the plugin skill. The note maps each shadowed sibling to its qualified name, for example `tdd` -> `pstack:tdd`.
+- `agent_skill_read_file` adds the same note in a `pluginSkillNote` field when it reads a file of a plugin skill. The file content does not change.
+- The note lists only skills of the same plugin, at most 30. Xum adds no note when no sibling is shadowed.
+- Bare-name lookups keep the precedence above. The note does not change which skill a name loads.
+
 Skill names in `SKILL.md` frontmatter and directory names stay bare. The qualified form applies only to lookups such as `agent_skill_read`, `agent_skill_read_file`, `/skill`, and `$skill`.
 
 ## Skill layout

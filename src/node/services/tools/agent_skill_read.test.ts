@@ -14,6 +14,10 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { createAgentSkillReadTool } from "./agent_skill_read";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
+import type { ToolConfiguration } from "@/common/utils/tools/tools";
+import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
+import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { createTestToolConfig, TestTempDir, TrueRemotePathMappedRuntime } from "./testHelpers";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
@@ -512,6 +516,97 @@ describe("agent_skill_read", () => {
     };
     expect(await bodyOf("tdd")).toBe("GLOBAL");
     expect(await bodyOf("pstack:tdd")).toBe("PSTACK");
+  });
+
+  describe("plugin sibling note", () => {
+    async function writePlugin(
+      xumHome: string,
+      pluginName: string,
+      skills: Record<string, string>
+    ): Promise<void> {
+      const pluginDir = path.join(xumHome, "plugins", pluginName);
+      await fs.mkdir(pluginDir, { recursive: true });
+      await fs.writeFile(
+        path.join(pluginDir, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: pluginName,
+        })
+      );
+      for (const [name, body] of Object.entries(skills)) {
+        await writeGlobalSkill(pluginDir, name, { body });
+      }
+    }
+
+    // Production passes the turn's invocable list (turnContextAssembler); build it
+    // the same way from the same roots.
+    async function readBody(config: ToolConfiguration, name: string): Promise<string> {
+      const ctx = resolveSkillStorageContext({
+        runtime: config.runtime,
+        workspacePath: config.cwd,
+        xumScope: config.xumScope,
+      });
+      const discovery = await discoverAgentSkills(ctx.runtime, ctx.workspacePath, {
+        roots: ctx.roots,
+        containment: ctx.containment,
+      });
+      const tool = createAgentSkillReadTool({
+        ...config,
+        availableSkills: listInvocableSkills(discovery),
+      });
+      const parsed = AgentSkillReadToolResultSchema.parse(
+        await Promise.resolve(tool.execute!({ name }, mockToolCallOptions))
+      );
+      if (!parsed.success) throw new Error(parsed.error);
+      return parsed.skill.body.trim();
+    }
+
+    it("maps shadowed siblings to qualified names on plugin skills only", async () => {
+      using tempDir = new TestTempDir("test-agent-skill-read-plugin-sibling-note");
+      await writeGlobalSkill(tempDir.path, "tdd", { body: "GLOBAL TDD" });
+      await writeGlobalSkill(tempDir.path, "how", { body: "GLOBAL HOW" });
+      await writePlugin(tempDir.path, "pstack", {
+        tdd: "PSTACK TDD",
+        how: "PSTACK HOW",
+        "poteto-mode": "POTETO",
+      });
+      const config = createTestToolConfig(tempDir.path);
+
+      const poteto = await readBody(config, "poteto-mode");
+      expect(poteto).toContain("`pstack:tdd`");
+      expect(poteto).toContain("`pstack:how`");
+      expect(poteto.endsWith("\n\nPOTETO")).toBe(true);
+
+      // Bare lookups keep their precedence, and non-plugin skills get no note.
+      expect(await readBody(config, "tdd")).toBe("GLOBAL TDD");
+
+      // A plugin skill never maps itself.
+      const pstackTdd = await readBody(config, "pstack:tdd");
+      expect(pstackTdd).toContain("`pstack:how`");
+      expect(pstackTdd).not.toContain("`pstack:tdd`");
+      expect(pstackTdd.endsWith("\n\nPSTACK TDD")).toBe(true);
+    });
+
+    it("lists only the reading plugin's siblings", async () => {
+      using tempDir = new TestTempDir("test-agent-skill-read-plugin-sibling-two-plugins");
+      await writeGlobalSkill(tempDir.path, "tdd", { body: "GLOBAL TDD" });
+      await writeGlobalSkill(tempDir.path, "review", { body: "GLOBAL REVIEW" });
+      await writePlugin(tempDir.path, "alpha", { tdd: "ALPHA TDD", "alpha-main": "ALPHA" });
+      // beta's shadowed `review` (and `tdd`) are no siblings of alpha's skills.
+      await writePlugin(tempDir.path, "beta", { tdd: "BETA TDD", review: "BETA REVIEW" });
+
+      const alpha = await readBody(createTestToolConfig(tempDir.path), "alpha-main");
+      const mappedTargets = [...alpha.matchAll(/`[^`]+` -> `([^`]+)`/g)].map((m) => m[1]);
+      expect(mappedTargets).toEqual(["alpha:tdd"]);
+    });
+
+    it("leaves the body unchanged when no sibling is shadowed", async () => {
+      using tempDir = new TestTempDir("test-agent-skill-read-plugin-sibling-none");
+      await writeGlobalSkill(tempDir.path, "unrelated", { body: "GLOBAL" });
+      await writePlugin(tempDir.path, "solo", { "solo-main": "SOLO", helper: "HELPER" });
+
+      expect(await readBody(createTestToolConfig(tempDir.path), "solo-main")).toBe("SOLO");
+    });
   });
 
   it("does not split a surrogate pair at the length cap", () => {

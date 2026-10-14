@@ -382,6 +382,54 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(getMessageText(messages[2])).toBe("do X");
   });
 
+  it("maps a plugin skill's shadowed siblings in its snapshot", async () => {
+    // A project `tdd` shadows pstack's `tdd`, which poteto-mode names by bare name.
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "tdd",
+      skillBody: "PROJECT-TDD",
+    });
+    const pluginDir = path.join(workspacePath, ".mux", "plugins", "pstack");
+    await fs.mkdir(pluginDir, { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "pstack",
+      })
+    );
+    for (const [name, body] of [
+      ["tdd", "PSTACK-TDD"],
+      ["poteto-mode", "See the **tdd** skill. POTETO-BODY"],
+    ]) {
+      const skillDir = path.join(pluginDir, "skills", name);
+      await fs.mkdir(skillDir, { recursive: true });
+      await fs.writeFile(
+        path.join(skillDir, "SKILL.md"),
+        `---\nname: ${name}\ndescription: Plugin ${name}\n---\n\n${body}\n`
+      );
+    }
+    const { session, messages } = await createSessionHarness({ workspacePath });
+
+    const result = await session.sendMessage("do X", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "normal",
+        agentSkillRefs: [
+          { skillName: "poteto-mode", scope: "project", source: "slash" },
+          { skillName: "tdd", scope: "project", source: "inline" },
+        ],
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const [poteto, bare] = messages.map(getMessageText);
+    expect(poteto).toContain("`pstack:tdd`");
+    expect(poteto.indexOf("`pstack:tdd`")).toBeLessThan(poteto.indexOf("POTETO-BODY"));
+    expect(bare).toContain("PROJECT-TDD");
+    expect(bare).not.toContain("pstack:");
+  });
+
   it("dedupes identical skill snapshots when recently inserted", async () => {
     const workspaceId = "ws-test";
 

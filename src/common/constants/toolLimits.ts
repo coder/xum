@@ -74,3 +74,7 @@ export const MCP_PROMPT_MAX_ARGUMENTS = 64;
 // Per-skill description cap in the agent_skill_read index: skill frontmatter allows long
 // descriptions, and every workspace pays the index before its first message.
 export const AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS = 280;
+
+// Max sibling mappings in the note Xum puts on a plugin skill whose sibling skills
+// other skills shadow (pluginSiblingNote.ts). Bounds the note for large plugins.
+export const PLUGIN_SIBLING_NOTE_MAX_SKILLS = 30;

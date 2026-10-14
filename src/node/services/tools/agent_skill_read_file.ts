@@ -7,6 +7,7 @@ import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
 import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
+import { formatPluginSiblingNote } from "@/node/services/agentSkills/pluginSiblingNote";
 import { readPluginFileWithinRootCapped } from "@/node/services/agentPlugins/discovery";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
@@ -292,13 +293,23 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           throw err;
         }
 
-        return readContentWithFileReadLimits({
+        const result = readContentWithFileReadLimits({
           fullContent,
           fileSize: resultFileSize,
           modifiedTime: resultModifiedTime,
           offset,
           limit,
         });
+        // Files of a plugin skill (playbooks, references) name sibling skills
+        // by bare name too. The note is a separate field so `content` line
+        // numbers stay exact.
+        if (!result.success || resolvedSkill.pluginName == null) return result;
+        const siblingNote = formatPluginSiblingNote({
+          pluginName: resolvedSkill.pluginName,
+          skillName: resolvedSkill.package.directoryName,
+          skills: config.availableSkills ?? [],
+        });
+        return siblingNote != null ? { ...result, pluginSkillNote: siblingNote } : result;
       } catch (error) {
         return {
           success: false,

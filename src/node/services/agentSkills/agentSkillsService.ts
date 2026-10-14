@@ -921,6 +921,11 @@ export interface ResolvedAgentSkill {
    * outside content.
    */
   pluginRoot?: string;
+  /**
+   * Plugin name for Agent Plugin skills, so callers can tell the model the
+   * qualified names of this plugin's shadowed siblings (pluginSiblingNote.ts).
+   */
+  pluginName?: string;
 }
 
 async function readAgentSkillFromDir(
@@ -928,7 +933,8 @@ async function readAgentSkillFromDir(
   skillDir: string,
   directoryName: SkillName,
   scope: AgentSkillScope,
-  pluginRoot?: string
+  pluginRoot?: string,
+  pluginName?: string
 ): Promise<ResolvedAgentSkill> {
   const skillFilePath = runtime.normalizePath("SKILL.md", skillDir);
 
@@ -985,6 +991,7 @@ async function readAgentSkillFromDir(
     skillDir,
     sourceRuntime: runtime,
     ...(pluginRoot != null ? { pluginRoot } : {}),
+    ...(pluginName != null ? { pluginName } : {}),
   };
 }
 
@@ -1084,7 +1091,8 @@ export async function readAgentSkill(
         skillDir,
         name,
         candidate.scope,
-        candidate.pluginRoot
+        candidate.pluginRoot,
+        candidate.pluginName
       );
     } catch (error) {
       // An unreadable skill (transport, permission) must not let a lower-scope

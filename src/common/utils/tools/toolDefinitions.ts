@@ -2097,24 +2097,28 @@ export const XumConfigWriteToolResultSchema = z.union([
 /**
  * File read tool result - content or error.
  */
+const FileReadSuccessResultSchema = z.object({
+  success: z.literal(true),
+  file_size: z.number(),
+  modifiedTime: z.string(),
+  lines_read: z.number(),
+  content: z
+    .string()
+    .describe(
+      "File content with line numbers prepended as '<line_number>\\t<content>'. " +
+        "Line numbers are not part of the actual file content."
+    ),
+  warning: z.string().optional(),
+});
+
+const FileReadErrorResultSchema = z.object({
+  success: z.literal(false),
+  error: z.string(),
+});
+
 export const FileReadToolResultSchema = z.union([
-  z.object({
-    success: z.literal(true),
-    file_size: z.number(),
-    modifiedTime: z.string(),
-    lines_read: z.number(),
-    content: z
-      .string()
-      .describe(
-        "File content with line numbers prepended as '<line_number>\\t<content>'. " +
-          "Line numbers are not part of the actual file content."
-      ),
-    warning: z.string().optional(),
-  }),
-  z.object({
-    success: z.literal(false),
-    error: z.string(),
-  }),
+  FileReadSuccessResultSchema,
+  FileReadErrorResultSchema,
 ]);
 
 const AttachFileToolTextPartSchema = z
@@ -2226,7 +2230,15 @@ export const AgentSkillReadToolResultSchema = z.union([
  * Agent Skill read_file tool result.
  * Uses the same shape/limits as file_read.
  */
-export const AgentSkillReadFileToolResultSchema = FileReadToolResultSchema;
+/**
+ * agent_skill_read_file result: file_read's, plus the plugin sibling note
+ * (pluginSiblingNote.ts) for files of a plugin skill. The note is a separate
+ * field so `content` line numbers stay exact.
+ */
+export const AgentSkillReadFileToolResultSchema = z.union([
+  FileReadSuccessResultSchema.extend({ pluginSkillNote: z.string().optional() }),
+  FileReadErrorResultSchema,
+]);
 
 /**
  * models_list tool result. Mirrors the shared `AvailableModel` domain type

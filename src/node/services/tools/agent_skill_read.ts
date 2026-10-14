@@ -1,6 +1,6 @@
 import { tool } from "ai";
 
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { AgentSkillDescriptor, InvocableSkill } from "@/common/types/agentSkill";
 import type { AgentSkillReadToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
@@ -17,6 +17,10 @@ import {
   resolveSkillDirectory,
   substituteSkillDirectoryPlaceholders,
 } from "@/node/services/agentSkills/skillDirectory";
+import {
+  formatPluginSiblingNote,
+  prependPluginSiblingNote,
+} from "@/node/services/agentSkills/pluginSiblingNote";
 
 /** Single-line skill description for the index, cut with an ellipsis past the cap. */
 export function formatSkillIndexDescription(description: string): string {
@@ -78,17 +82,31 @@ function buildSkillReadDescription(config: ToolConfiguration): string {
  */
 function buildSkillReadSuccess(
   resolved: ResolvedAgentSkill,
-  workspaceRuntime: Runtime
+  workspaceRuntime: Runtime,
+  availableSkills: readonly InvocableSkill[]
 ): AgentSkillReadToolResult {
   const dir = resolveSkillDirectory(resolved, workspaceRuntime);
   const location = dir.available
     ? { skillDir: dir.skillDir, ...(dir.pluginRoot != null ? { pluginRoot: dir.pluginRoot } : {}) }
     : { skillDirUnavailable: dir.reason };
+  // A plugin skill's bare references to its siblings must reach the plugin's
+  // own skills, not higher-precedence skills with the same name.
+  const siblingNote =
+    resolved.pluginName != null
+      ? formatPluginSiblingNote({
+          pluginName: resolved.pluginName,
+          skillName: resolved.package.directoryName,
+          skills: availableSkills,
+        })
+      : null;
   return {
     success: true,
     skill: {
       ...resolved.package,
-      body: substituteSkillDirectoryPlaceholders(resolved.package.body, dir),
+      body: prependPluginSiblingNote(
+        substituteSkillDirectoryPlaceholders(resolved.package.body, dir),
+        siblingNote
+      ),
     },
     ...location,
   };
@@ -135,7 +153,9 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
           includeClaudeSkills,
         });
         // Judged against config.runtime: that is where the model's bash runs.
-        return buildSkillReadSuccess(resolved, config.runtime);
+        // availableSkills is this turn's invocable list from the same skill
+        // storage context, so the sibling note costs no extra discovery.
+        return buildSkillReadSuccess(resolved, config.runtime, config.availableSkills ?? []);
       } catch (error) {
         return {
           success: false,
