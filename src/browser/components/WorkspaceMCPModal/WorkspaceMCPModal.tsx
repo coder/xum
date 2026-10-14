@@ -8,6 +8,7 @@ import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useAPI } from "@/browser/contexts/API";
 import { cn } from "@/common/lib/utils";
 import type { MCPServerIdentity, MCPServerInfo, WorkspaceMCPOverrides } from "@/common/types/mcp";
+import type { MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
 import {
   Dialog,
   DialogContent,
@@ -88,6 +89,9 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   const savedEnabledServers = useRef(new Set<string>());
   // One rule for every settings result (read or save): only a server's latest request applies.
   const [settingsRequests] = useState(() => new SettingsRequests());
+  // Servers whose settings save is in flight. Refresh Tools waits for it: its settings read
+  // would take a newer request ID, could show the pre-save values, and drop the save's result.
+  const [savingSettings, setSavingSettings] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   // Mounted settings sections by server name (ref callbacks drop unmounted ones).
@@ -362,6 +366,17 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
     });
   }, []);
 
+  /** A settings save of `serverName` starts; the returned callback settles it. */
+  const beginSettingsSave = (serverName: string) => {
+    setSavingSettings((prev) => ({ ...prev, [serverName]: true }));
+    const request = settingsRequests.take(settingsRequests.current(), serverName);
+    return (values: MCPSettingsSnapshot["values"] | null) => {
+      setSavingSettings((prev) => ({ ...prev, [serverName]: false }));
+      if (values !== null && request.isLatest())
+        setServerSettings((prev) => applySavedSettings(prev, serverName, values));
+    };
+  };
+
   // Save overrides
   const handleSave = useCallback(async () => {
     if (!api || overridesRevision === null) return;
@@ -538,7 +553,9 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                           // Safari lets a flex-item button shrink below its nowrap label.
                           className="shrink-0"
                           onClick={() => void fetchTools(name)}
-                          disabled={isLoadingTools}
+                          disabled={
+                            isLoadingTools === true || getOwn(savingSettings, name) === true
+                          }
                         >
                           {isLoadingTools ? (
                             <Loader2 className="h-4 w-4 animate-spin" />
@@ -573,23 +590,15 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                       <div className="text-content-secondary mt-2 text-sm">No tools available</div>
                     )}
 
-                    {effectivelyEnabled &&
-                      (() => {
-                        const entry = getOwn(serverSettings, name);
-                        if (entry === undefined) return null;
-                        if ("error" in entry)
-                          return (
-                            <div className="text-content-secondary mt-4 border-t pt-4 text-xs wrap-anywhere">
-                              Settings unavailable: {entry.error}
-                            </div>
-                          );
-                        if ("notConnected" in entry)
-                          return (
-                            <div className="text-content-secondary mt-4 border-t pt-4 text-xs">
-                              Connect the server to see its settings
-                            </div>
-                          );
-                        return (
+                    {(() => {
+                      const entry = getOwn(serverSettings, name);
+                      if (entry === undefined) return null;
+                      if (!("snapshot" in entry))
+                        return <ServerSettingsNote entry={entry} hidden={!effectivelyEnabled} />;
+                      // Hidden, not unmounted, while the server is switched off: the section
+                      // keeps its draft, and the dialog's Save still sees the unsaved edit.
+                      return (
+                        <div hidden={!effectivelyEnabled}>
                           <MCPServerSettingsSection
                             key={entry.fetchId}
                             ref={(section) => {
@@ -599,21 +608,11 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                             workspaceId={workspaceId}
                             serverName={name}
                             snapshot={entry.snapshot}
-                            beginSave={() => {
-                              const request = settingsRequests.take(
-                                settingsRequests.current(),
-                                name
-                              );
-                              return (values) => {
-                                if (request.isLatest())
-                                  setServerSettings((prev) =>
-                                    applySavedSettings(prev, name, values)
-                                  );
-                              };
-                            }}
+                            beginSave={() => beginSettingsSave(name)}
                           />
-                        );
-                      })()}
+                        </div>
+                      );
+                    })()}
                   </div>
                 );
               })}
@@ -624,3 +623,23 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
     </Dialog>
   );
 };
+
+/** A server's settings note when no snapshot is shown: a failed read, or a server not running. */
+function ServerSettingsNote(props: {
+  entry: { error: string } | { notConnected: true };
+  /** The server is switched off in this dialog. */
+  hidden: boolean;
+}) {
+  if (props.hidden) return null;
+  if ("error" in props.entry)
+    return (
+      <div className="text-content-secondary mt-4 border-t pt-4 text-xs wrap-anywhere">
+        Settings unavailable: {props.entry.error}
+      </div>
+    );
+  return (
+    <div className="text-content-secondary mt-4 border-t pt-4 text-xs">
+      Connect the server to see its settings
+    </div>
+  );
+}

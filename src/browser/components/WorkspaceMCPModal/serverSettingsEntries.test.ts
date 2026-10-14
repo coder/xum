@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
+import { getOwn } from "@/common/utils/getOwn";
 import type { MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
 import {
   applySavedSettings,
+  settingsErrors,
   SettingsRequests,
   type ServerSettingsEntry,
 } from "./serverSettingsEntries";
@@ -43,4 +45,15 @@ test("a save's values become the snapshot's values", () => {
     snapshot: snapshot("mm"),
   });
   expect(applySavedSettings({}, "cad", { units: "mm" })).toEqual({});
+});
+
+test("validation errors keep a setting named __proto__", () => {
+  // JSON.parse keeps "__proto__" as an own key, as the IPC payload does.
+  const properties = JSON.parse(
+    '{"__proto__": {"type": "string", "title": "Proto", "maxLength": 1}}'
+  ) as MCPSettingsSnapshot["properties"];
+  const draft = JSON.parse('{"__proto__": "too long"}') as MCPSettingsSnapshot["values"];
+  const errors = settingsErrors(properties, draft);
+  expect(Object.keys(errors)).toEqual(["__proto__"]);
+  expect(getOwn(errors, "__proto__")).toBe("Proto must be at most 1 characters");
 });

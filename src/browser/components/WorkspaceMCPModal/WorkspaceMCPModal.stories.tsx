@@ -946,6 +946,61 @@ export const WorkspaceMCPServerSettingsUnsavedOnSave: Story = {
   },
 };
 
+/**
+ * Switching a server off keeps its settings draft: switched back on, the edit is still there,
+ * and while it is off the dialog's Save still says the edit is unsaved.
+ */
+export const WorkspaceMCPServerSettingsDraftAcrossToggle: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => renderWorkspaceMCPModal(settingsStoryOptions()),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const zoom = section.getByLabelText("Default zoom setting");
+    await userEvent.clear(zoom);
+    await userEvent.type(zoom, "3");
+    const toggle = modal.getByRole("switch", { name: "Toggle cad MCP server" });
+    await userEvent.click(toggle);
+    await waitFor(() => expect(section.getByLabelText("Default zoom setting")).not.toBeVisible());
+    await userEvent.click(modal.getByRole("button", { name: "Save" }));
+    await expect(modal.findByText(/Unsaved settings for cad/)).resolves.toBeInTheDocument();
+    await userEvent.click(toggle);
+    const shown = within(await modal.findByTestId("mcp-server-settings"));
+    await expect(shown.getByLabelText("Default zoom setting")).toHaveValue(3);
+  },
+};
+
+const refreshDuringSaveGate = storyGate();
+
+/**
+ * Refresh Tools reads settings too. While a save is in flight that read could show the
+ * pre-save values and drop the save's result, so Refresh Tools waits for the save.
+ */
+export const WorkspaceMCPServerSettingsRefreshDuringSave: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () =>
+    renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settingsUpdateGate: refreshDuringSaveGate,
+    }),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    await userEvent.click(await modal.findByRole("button", { name: "Fetch Tools" }));
+    const refresh = await modal.findByRole("button", { name: "Refresh Tools" });
+    await waitFor(() => expect(refresh).toBeEnabled());
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const zoom = section.getByLabelText("Default zoom setting");
+    await userEvent.clear(zoom);
+    await userEvent.type(zoom, "3");
+    await userEvent.click(section.getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(zoom).toBeDisabled());
+    await expect(refresh).toBeDisabled();
+    refreshDuringSaveGate.open();
+    await waitFor(() => expect(refresh).toBeEnabled());
+    await expect(section.getByLabelText("Default zoom setting")).toHaveValue(3);
+  },
+};
+
 /** Pick `option` in a Radix select (its list renders in a portal). */
 async function chooseSetting(
   canvasElement: HTMLElement,
@@ -1004,7 +1059,7 @@ export const WorkspaceMCPServerSettingsReopen: Story = {
 
 /**
  * After a save, the saved value is the form's base: choosing the previous value
- * again is a change, also after the section remounts (server toggled off and on).
+ * again is a change, also after the server is toggled off and on.
  */
 export const WorkspaceMCPServerSettingsOldValueAgain: Story = {
   parameters: { pixel: PIXEL_DISABLED },
@@ -1014,10 +1069,11 @@ export const WorkspaceMCPServerSettingsOldValueAgain: Story = {
     const modal = within(await findWorkspaceMCPDialog(canvasElement));
     const toggle = modal.getByRole("switch", { name: "Toggle cad MCP server" });
     await userEvent.click(toggle);
-    await waitFor(() => expect(modal.queryByTestId("mcp-server-settings")).toBeNull());
+    await waitFor(() => expect(modal.getByTestId("mcp-server-settings")).not.toBeVisible());
     await userEvent.click(toggle);
 
     const section = within(await modal.findByTestId("mcp-server-settings"));
+    await waitFor(() => expect(section.getByLabelText("Units setting")).toBeVisible());
     await expect(section.getByLabelText("Units setting")).toHaveTextContent("in");
     await chooseSetting(canvasElement, section.getByLabelText("Units setting"), "mm");
     await waitFor(() =>

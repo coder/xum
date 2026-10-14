@@ -1,5 +1,9 @@
 import { getOwn } from "@/common/utils/getOwn";
-import type { MCPSettingsSnapshot, MCPSettingValue } from "@/common/utils/mcpSettings";
+import {
+  validateMCPSettingValue,
+  type MCPSettingsSnapshot,
+  type MCPSettingValue,
+} from "@/common/utils/mcpSettings";
 
 /** One server's settings in the workspace MCP dialog. `fetchId` is the read's request ID. */
 export type ServerSettingsEntry =
@@ -46,4 +50,20 @@ export function applySavedSettings(
   const current = getOwn(entries, serverName);
   if (current === undefined || !("snapshot" in current)) return entries;
   return { ...entries, [serverName]: { ...current, snapshot: { ...current.snapshot, values } } };
+}
+
+/** Validation errors of a settings draft, by setting name. */
+export function settingsErrors(
+  properties: MCPSettingsSnapshot["properties"],
+  draft: MCPSettingsSnapshot["values"]
+): Record<string, string> {
+  // Null prototype: on a plain object, `errors["__proto__"] = ...` sets the prototype instead
+  // of an own key, so an invalid `__proto__` setting showed no error and Save stayed enabled.
+  const errors = Object.create(null) as Record<string, string>;
+  for (const [name, value] of Object.entries(draft)) {
+    const schema = getOwn(properties, name);
+    const message = schema && validateMCPSettingValue(schema, value);
+    if (message) errors[name] = `${schema.title} ${message}`;
+  }
+  return errors;
 }
