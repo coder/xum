@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -100,6 +101,7 @@ test("block mode stops a regressing commit before it runs, unless it carries Cra
     "env -u GIT_DIR git commit -am x",
     "env -i PATH=$PATH GIT_AUTHOR_NAME='a b' git commit -am x",
     "git -c core.editor=true --no-pager commit -am x",
+    "git -c user.name=a\\ b commit -am x",
     "git status; git commit -am x",
   ]) {
     expect({ commit, status: runGate(gate, "pre", commit).status }).toEqual({ commit, status: 1 });
@@ -230,8 +232,13 @@ test("a scorer that ignores SIGTERM is killed before Xum's hook limit", () => {
 function projectIn(mode: "warn" | "block"): string {
   const project = join(dir, `project-${mode}`);
   mkdirSync(join(project, ".xum"), { recursive: true });
-  for (const file of ["tool_pre", "tool_post", "hook_chain.sh"]) {
-    cpSync(join(REPO, ".xum", file), join(project, ".xum", file));
+  // Switching to block renames tool_pre.block to tool_pre (see its header).
+  for (const [from, to] of [
+    ["tool_pre.block", "tool_pre"],
+    ["tool_post", "tool_post"],
+    ["hook_chain.sh", "hook_chain.sh"],
+  ]) {
+    cpSync(join(REPO, ".xum", from), join(project, ".xum", to));
   }
   const gate = gateIn(mode);
   cpSync(dirname(gate), join(project, "scripts/crap"), { recursive: true });
@@ -269,12 +276,23 @@ function runHook(hook: string, script: string, extraEnv: NodeJS.ProcessEnv = {})
   return { status: result.status, out: result.stdout + result.stderr };
 }
 
+test("warn mode ships no project tool_pre that would replace the user's own hooks", () => {
+  // Any project tool_pre switches Xum to the tool_pre/tool_post model, which
+  // skips a user's legacy ~/.xum/tool_hook.
+  const mode = /^CRAP_GATE_MODE=(\w+)$/m.exec(
+    readFileSync(join(import.meta.dir, "agent-gate.sh"), "utf8")
+  )?.[1];
+  expect(mode).toBe("warn");
+  expect(existsSync(join(REPO, ".xum/tool_pre"))).toBe(false);
+  expect(existsSync(join(REPO, ".xum/tool_pre.block"))).toBe(true);
+});
+
 test("the project hooks run the user's own hooks and pass their exit codes through", () => {
   // Xum runs the project's .xum/tool_pre instead of ~/.xum/tool_pre, so the
   // shipped hooks must run the user's. Warn mode: no gate before the commit.
   // These two calls run no scorer, so they can move HOME to test the default
   // ~/.xum (an empty XUM_ROOT counts as unset).
-  const pre = join(REPO, ".xum/tool_pre");
+  const pre = join(projectIn("warn"), ".xum/tool_pre");
   const home = { HOME: join(dir, "home"), XUM_ROOT: "" };
   expect(runHook(pre, "git commit -am x", home)).toEqual({ status: 0, out: "" });
   userHook(join(dir, "home/.xum"), "tool_pre", 3);
@@ -282,6 +300,10 @@ test("the project hooks run the user's own hooks and pass their exit codes throu
     status: 3,
     out: "user tool_pre: git commit -am x\n",
   });
+
+  // An SSH workspace's home is ~/.mux, even next to a ~/.xum.
+  userHook(join(dir, "home/.mux"), "tool_pre", 7);
+  expect(runHook(pre, "ls", { ...home, XUM_RUNTIME: "ssh" }).status).toBe(7);
 
   // Leftover homes, as Xum's getXumHome() picks them: a leftover ~/.mux, and
   // the home an empty ~/.xum's .legacy-fallback marker names.
@@ -302,7 +324,7 @@ test("the project hooks run the user's own hooks and pass their exit codes throu
 
   // tool_post: the user's hook runs after the project's report, also after a
   // file tool, whose formatting step returns early without a file path.
-  const post = join(projectIn("warn"), ".xum/tool_post");
+  const post = join(dirname(pre), "tool_post");
   userHook(join(dir, "home/.xum"), "tool_post", 2);
   const reported = runHook(post, "git commit -am x");
   expect(reported.status).toBe(2);
@@ -371,7 +393,7 @@ test("non-commit calls start no process", () => {
     [shippedGate, "post", "file_read", "git commit -am x"],
     [shippedGate, "pre", "bash", "git commit -am x"],
     [join(REPO, ".xum/tool_post"), "", "file_read", ""],
-    [join(REPO, ".xum/tool_pre"), "", "bash", "git commit -am x"],
+    [join(projectIn("warn"), ".xum/tool_pre"), "", "bash", "git commit -am x"],
     [blockPre, "", "file_read", "git commit -am x"],
   ]) {
     const result = spawnSync(hook, phase ? [phase] : [], {

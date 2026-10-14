@@ -6,21 +6,27 @@
 # that blocks still blocks.
 # Only bash builtins up to the exec: the hooks run around every tool call.
 
-# The Xum home in the order getXumHome() and the runtimes use: XUM_ROOT or
-# MUX_ROOT, a Docker workspace's /var/mux, then ~/.xum if it has entries, the
-# leftover home its .legacy-fallback marker names, ~/.xum, ~/.mux, ~/.cmux
-# (-dev variants under a development server). An SSH workspace uses ~/.mux, and
-# this finds it unless the remote host also has a ~/.xum.
+# The Xum home the way the runtimes pick it: XUM_ROOT or MUX_ROOT, ~/.mux in an
+# SSH workspace, /var/mux in a Docker one (XUM_RUNTIME says which), else
+# getXumHome()'s order: ~/.xum if it has entries, the leftover home its
+# .legacy-fallback marker names, ~/.xum, ~/.mux, ~/.cmux (-dev variants under a
+# development server).
 xum_home() {
   local root=${XUM_ROOT:-${MUX_ROOT:-}} suffix="" marker entry
   if [[ -n "$root" ]]; then
     printf '%s' "$root"
     return
   fi
-  if [[ -d /var/mux ]]; then
-    printf '%s' /var/mux
-    return
-  fi
+  case ${XUM_RUNTIME:-} in
+    ssh)
+      printf '%s' "$HOME/.mux"
+      return
+      ;;
+    docker)
+      printf '%s' /var/mux
+      return
+      ;;
+  esac
   [[ "${NODE_ENV:-}" == "development" ]] && suffix=-dev
   local canonical=$HOME/.xum$suffix
   if [[ -d "$canonical" ]]; then

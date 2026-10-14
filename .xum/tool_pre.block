@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# .xum/tool_pre - CRAP gate before agent `git commit` / `git push` (block mode
-# only), then the user's own tool_pre (see hook_chain.sh).
+# .xum/tool_pre for block mode: CRAP gate before agent `git commit` / `git push`,
+# then the user's own tool_pre (see hook_chain.sh).
+#
+# Warn mode ships this file as tool_pre.block, which Xum ignores. Any project
+# tool_pre switches Xum to the tool_pre/tool_post model for this repo, and that
+# model never runs a user's legacy ~/.xum/tool_hook. Block mode needs the hook
+# anyway; switch with the CRAP_GATE_MODE line and
+#   git mv .xum/tool_pre.block .xum/tool_pre
 here=${0%/*}
 gate=$here/../scripts/crap/agent-gate.sh
 source "$here/hook_chain.sh"

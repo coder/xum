@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # CRAP gate for agent `git commit` and `git push` calls. .xum/tool_post calls
 # it with "post", and in block mode .xum/tool_pre calls it with "pre". Both
-# hooks then run the user's own ~/.xum hook: Xum runs the project's hook
-# instead of the user's. See .xum/skills/crap-gate.
+# hooks then run the user's own hook: Xum runs the project's hook instead of
+# the user's. See .xum/skills/crap-gate.
+#
+# Warn mode ships the pre hook as .xum/tool_pre.block (see its header). To
+# switch to block, set the mode below and rename it to .xum/tool_pre.
 #
 # Xum shows a tool_pre's output only when it blocks (non-zero exit), so:
 #   block: tool_pre runs the check and exits 1 on violations; the agent sees
@@ -48,7 +51,7 @@ fi
 # match. Variable assignments and env/command/time/sudo with their options may
 # come first (GIT_EDITOR=true git commit, env -u GIT_DIR git push).
 q="'"
-word="(\"[^\"]*\"|${q}[^${q}]*${q}|[^[:space:];&|\"${q}]+)+"
+word="(\\\\.|\"[^\"]*\"|${q}[^${q}]*${q}|[^[:space:];&|\"${q}\\\\]+)+"
 prefix="([A-Za-z_][A-Za-z0-9_]*=(${word})?|env|command|time|sudo|(-[uC]|--unset|--chdir)[[:space:]]+${word}|-[^[:space:];&|]*)[[:space:]]+"
 global="[[:space:]]+((-[Cc]|--git-dir|--work-tree|--namespace|--config-env)[[:space:]]+${word}|-[^[:space:];&|]*)"
 git_write="(^|[;&|({"$'\n'"])[[:space:]]*(${prefix})*git(${global})*[[:space:]]+(commit|push)([[:space:];&|)]|\$)"
