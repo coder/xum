@@ -188,9 +188,12 @@ function withSliceEnd(state: RevealState, messages: readonly RevealRow[], to: nu
   const endMessageId = to < messages.length ? messages[to].id : null;
   const endIndexHint = endMessageId === null ? 0 : to;
   if (state.endMessageId === endMessageId && state.endIndexHint === endIndexHint) return state;
-  const endRows = endMessageId === null ? [] : messages.map((row) => row.id);
-  return { ...state, endMessageId, endIndexHint, endRows };
+  return { ...state, endMessageId, endIndexHint, endRows: sliceEndIds(messages, endMessageId) };
 }
+
+/** Ids only while detached, none at the tail: no obsolete transcript stays reachable (#6669). */
+const sliceEndIds = (messages: readonly RevealRow[], endMessageId: string | null) =>
+  endMessageId === null ? [] : messages.map((row) => row.id);
 
 interface RevealSnapshot {
   messages: readonly RevealRow[];
@@ -272,14 +275,24 @@ function isBudgetSpent(
   return slice.toIndex < length || length - slice.fromIndex >= state.autoRowLimit;
 }
 
-/** Load older with a cap in force: walk to the row one budget older (revealThrough's rule). */
-function moreTargetState(
+/**
+ * Load older: attached, main's rule (one more budget of mounted rows). Detached, or about to be,
+ * the walk ends at the row one budget older (revealThrough's target rule) instead of a count, so
+ * no deletion elsewhere can lengthen it (F20 PR3a-2); a vanished target ends it early.
+ */
+function revealMoreState(
   previous: RevealState,
   snapshot: RevealSnapshot,
+  max: number | undefined,
   isSafeCut: IsSafeCut
 ): RevealState {
-  if (previous.generation !== snapshot.generation || snapshot.fromIndex === 0) return previous;
+  if (previous.generation !== snapshot.generation) return previous;
   const length = snapshot.messages.length;
+  const limit = length - snapshot.fromIndex + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS;
+  if (max === undefined || (snapshot.toIndex === length && limit <= max)) {
+    return previous.autoRowLimit >= limit ? previous : { ...previous, autoRowLimit: limit };
+  }
+  if (snapshot.fromIndex === 0) return previous;
   const cut = nearestSafeCutAtOrBefore(
     snapshot.fromIndex - TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
     length,
@@ -289,15 +302,17 @@ function moreTargetState(
 }
 
 /**
- * Where a detached slice starts once its start row is gone (#6669 round 7): as many rows before
- * the end as were mounted, so every surviving mounted row stays mounted even when the deleted run
- * put the old start index past the new length. Rows deleted below it mount instead, never more.
+ * Where the slice starts once its start row is gone. Attached: main's rule, the old index. Detached
+ * (#6669 round 7): as many rows before the end as were mounted, so every surviving mounted row
+ * stays mounted even when the deleted run put the old start index past the new length. Rows
+ * deleted below it mount instead, never more.
  */
-function detachedStartFallback(
+function vanishedStartFallback(
   state: RevealState,
   messages: readonly RevealRow[],
   isSafeCut: IsSafeCut
 ): number {
+  if (state.endMessageId === null) return state.anchorIndexHint;
   const mountedBefore = state.endIndexHint - state.anchorIndexHint;
   return storedSliceEnd(state, messages, isSafeCut) - mountedBefore;
 }
@@ -472,9 +487,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
     fromIndex = nearestSafeCutAtOrBefore(
       anchorIndex !== -1
         ? anchorIndex
-        : current.endMessageId === null
-          ? current.anchorIndexHint
-          : detachedStartFallback(current, args.messages, args.isSafeCut),
+        : vanishedStartFallback(current, args.messages, args.isSafeCut),
       length,
       args.isSafeCut
     );
@@ -572,19 +585,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   // the rows and boundary it just rendered.
   const revealMore = () => {
     const snapshot = latest.current;
-    const length = snapshot.messages.length;
-    const limit = length - snapshot.fromIndex + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS;
-    if (max !== undefined && (snapshot.toIndex < length || limit > max)) {
-      // Detached, or about to be: the walk ends at a target row instead of a count, so no
-      // deletion elsewhere can lengthen it (F20 PR3a-2). A vanished target ends it early.
-      setState((previous) => moreTargetState(previous, snapshot, args.isSafeCut));
-      return;
-    }
-    setState((previous) =>
-      previous.generation !== snapshot.generation || previous.autoRowLimit >= limit
-        ? previous
-        : { ...previous, autoRowLimit: limit }
-    );
+    setState((previous) => revealMoreState(previous, snapshot, max, args.isSafeCut));
   };
   const revealNewer = () => {
     setState((previous) => revealNewerState(previous, latest.current, max, args.isSafeCut));
