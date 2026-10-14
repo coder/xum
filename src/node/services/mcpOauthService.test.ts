@@ -220,6 +220,18 @@ describe("McpOauthService store", () => {
     }
   });
 
+  test("a corrupt store whose repair cannot be written still serves from memory", async () => {
+    if (process.getuid?.() === 0) return; // root ignores the read-only directory
+    await fs.writeFile(getStoreFilePath(xumHome), "{ not json");
+    await fs.chmod(xumHome, 0o500);
+    try {
+      expect(await service.hasAuthTokens({ serverUrl })).toBe(false);
+      expect((await service.logout({ serverUrl })).success).toBe(true);
+    } finally {
+      await fs.chmod(xumHome, 0o700);
+    }
+  });
+
   test("a sign-out whose store write fails can be retried (#6122)", async () => {
     if (process.getuid?.() === 0) return; // root ignores the read-only directory
     await seedStoredCredentials({

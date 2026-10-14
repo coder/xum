@@ -2279,7 +2279,9 @@ export class McpOauthService {
     try {
       await this.persistStoreLocked(store);
     } catch (error) {
-      // Store read/repair must never crash the app at startup.
+      // Store read/repair must never crash the app at startup. Keep the in-memory state: the
+      // failed write dropped the cache, and the file still holds what the repair replaces.
+      this.store = store;
       log.warn("[MCP OAuth] Failed to persist store file; continuing with in-memory state", {
         error,
       });

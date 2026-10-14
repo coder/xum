@@ -2207,6 +2207,23 @@ describe("AgentPluginInstallService", () => {
       await Promise.all([failing.dispose(), oauth.dispose()]);
     });
 
+    test("a record of an unknown version is kept, and discovery stays closed", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      const newer = JSON.stringify({ version: 2, urls: [serverUrl], extra: true });
+      await fsPromises.writeFile(file, newer);
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      await restarted.list();
+      expect(await fsPromises.readFile(file, "utf-8")).toBe(newer);
+      expect(await discovered()).toBe(0);
+      await Promise.all([failing.dispose(), oauth.dispose()]);
+    });
+
     test("survives an uninstall of the plugin", async () => {
       const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
       await result;

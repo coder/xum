@@ -508,20 +508,24 @@ function createSecretReader(): SecretReader {
 }
 
 /**
- * Throws on a corrupt record. SECURITY: it may name sign-outs that never ran, so it keeps the
+ * Throws on a corrupt record or one of another version. SECURITY: it may name sign-outs that never ran, so it keeps the
  * discovery fence until the user repairs or deletes it. Reading it as "nothing pending" would
  * admit the plugin with its old sign-in's tokens.
  */
 function parsePendingSignOuts(raw: string, file: string): string[] {
-  let value: unknown;
+  let record: unknown;
   try {
-    value = (JSON.parse(raw) as { urls?: unknown } | null)?.urls;
+    record = JSON.parse(raw);
   } catch {
-    value = undefined;
+    record = undefined;
   }
+  // Another version's record is kept as it is: an upgrade can still finish it.
+  const fields =
+    typeof record === "object" && record !== null ? (record as Record<string, unknown>) : {};
+  const value = fields.version === 1 ? fields.urls : undefined;
   if (!Array.isArray(value) || !value.every((url) => typeof url === "string"))
     throw new Error(
-      `The pending plugin sign-out record (${shortenHome(file)}) is corrupt. Sign out of the plugin MCP servers in Settings, then delete the file.`
+      `The pending plugin sign-out record (${shortenHome(file)}) is corrupt or from another Xum version. Sign out of the plugin MCP servers in Settings, then delete the file.`
     );
   return value;
 }
