@@ -239,6 +239,43 @@ describe("MCP App entry points", () => {
     expect(replaced).toEqual([appViewTabFor(target.viewKey)]);
   });
 
+  test("two opens of one entry point started together share one tool call", async () => {
+    let opens = 0;
+    let finish: (() => void) | null = null;
+    const target = entrypoint("Library");
+    const client = createTestApiClient({
+      mcpApps: {
+        openEntrypoint: () => {
+          opens += 1;
+          return new Promise((resolve) => {
+            finish = () => resolve({ success: true as const, data: target });
+          });
+        },
+      },
+    });
+    // E.g. two split-pane launchers: each shows (or drops) the shared result itself.
+    const shown: unknown[][] = [[], []];
+    const first = openMcpAppEntrypoint(client, "ws-together", target, (view) =>
+      shown[0].push(view)
+    );
+    const second = openMcpAppEntrypoint(client, "ws-together", target, (view) =>
+      shown[1].push(view)
+    );
+    await waitFor(() => expect(finish).not.toBeNull());
+    act(() => finish?.());
+    expect(await Promise.all([first, second])).toEqual([null, null]);
+    expect(opens).toBe(1);
+    expect(shown[0]).toHaveLength(1);
+    expect(shown[1][0]).toBe(shown[0][0]);
+    // Settled: a later open is a new one (the tab is not in this layout, so it runs again).
+    finish = null;
+    const third = openMcpAppEntrypoint(client, "ws-together", target, () => undefined);
+    await waitFor(() => expect(finish).not.toBeNull());
+    act(() => finish?.());
+    expect(await third).toBeNull();
+    expect(opens).toBe(2);
+  });
+
   test("a picked entry point whose record was evicted runs again", async () => {
     let opens = 0;
     const target = entrypoint("Library");

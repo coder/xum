@@ -27,10 +27,44 @@ export async function openMcpAppEntrypoint(
   /** Where the tab goes; by default the focused pane (OPEN_MCP_APP_VIEW). */
   show: (view: McpAppViewRef) => void = (view) => focusMcpAppViewTab(workspaceId, view.toolCallId)
 ): Promise<string | null> {
+  const resolved = await resolveEntrypointView(api, workspaceId, entrypoint);
+  if (typeof resolved === "string") return resolved;
+  show(resolved);
+  return null;
+}
+
+/**
+ * Opens in flight, by workspace and view key. The tab is added only once an open returns, so
+ * two opens of one entry point (two split-pane launchers, or the palette while a launcher open
+ * runs) would both find no tab and call the tool twice, racing on one view record. A second
+ * open joins the first instead; each caller still decides itself whether to show the result.
+ */
+const inFlightOpens = new Map<string, Promise<McpAppViewRef | string>>();
+
+function resolveEntrypointView(
+  api: APIClient,
+  workspaceId: string,
+  entrypoint: McpAppEntrypoint
+): Promise<McpAppViewRef | string> {
+  const key = `${workspaceId}\u0000${entrypoint.viewKey}`;
+  const joined = inFlightOpens.get(key);
+  if (joined !== undefined) return joined;
+  const open = resolveEntrypointViewOnce(api, workspaceId, entrypoint).finally(() => {
+    inFlightOpens.delete(key);
+  });
+  inFlightOpens.set(key, open);
+  return open;
+}
+
+/** The view to show, or an error message. */
+async function resolveEntrypointViewOnce(
+  api: APIClient,
+  workspaceId: string,
+  entrypoint: McpAppEntrypoint
+): Promise<McpAppViewRef | string> {
   try {
     if (await hasCurrentTab(api, workspaceId, entrypoint)) {
-      show(entrypointViewRef(workspaceId, entrypoint));
-      return null;
+      return entrypointViewRef(workspaceId, entrypoint);
     }
     const result = await api.mcpApps.openEntrypoint({
       workspaceId,
@@ -40,8 +74,7 @@ export async function openMcpAppEntrypoint(
     });
     if (!result.success) return result.error;
     // The backend's answer, not the listed entry point: its view (resourceUri) can have moved.
-    show(openedMcpAppEntrypoint(workspaceId, result.data));
-    return null;
+    return openedMcpAppEntrypoint(workspaceId, result.data);
   } catch (error) {
     return getErrorMessage(error);
   }
