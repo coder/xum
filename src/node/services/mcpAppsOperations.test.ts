@@ -270,7 +270,7 @@ describe("MCP Apps view domain approvals", () => {
     const { ctx, projects } = projectConfig();
     expect(await approveMcpAppViewDomains(ctx, approve(["https://api.example.com/"]))).toEqual({
       success: true,
-      data: { approvedDomains: ["https://api.example.com"] },
+      data: { approvedDomains: ["https://api.example.com"], revision: expect.any(Number) },
     });
     // A grown list adds only the new origin.
     await approveMcpAppViewDomains(
@@ -366,7 +366,7 @@ describe("MCP Apps view domain approvals", () => {
     );
     expect(result).toEqual({
       success: true,
-      data: { approvedDomains: ["https://api.example.com"] },
+      data: { approvedDomains: ["https://api.example.com"], revision: expect.any(Number) },
     });
   });
 
@@ -380,6 +380,50 @@ describe("MCP Apps view domain approvals", () => {
       (await approveMcpAppViewDomains(ctx, approve(["https://new.example.com"]))).success
     ).toBe(false);
     expect(projects.get("/repo")?.mcpAppViewDomains?.charts).toEqual(full);
+  });
+
+  test("each approval list carries its backend commit revision, in commit order", async () => {
+    const { ctx } = projectConfig();
+    const config = ctx.config as unknown as {
+      editConfig: (fn: (c: unknown) => unknown) => Promise<void>;
+    };
+    const commit = config.editConfig;
+    // The first request's edit waits until the second one committed: the later request
+    // commits first, as when its RPC reaches the config queue first.
+    let releaseFirst = () => undefined as void;
+    const held = new Promise<void>((resolve) => (releaseFirst = resolve));
+    let edits = 0;
+    config.editConfig = async (fn) => {
+      if (edits++ === 0) await held;
+      return commit(fn);
+    };
+    const first = approveMcpAppViewDomains(ctx, approve(["https://a.example.com"]));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const second = await approveMcpAppViewDomains(ctx, approve(["https://b.example.com"]));
+    releaseFirst();
+    const firstResult = await first;
+    if (!firstResult.success || !second.success) throw new Error("approval failed");
+    expect(second.data.approvedDomains).toEqual(["https://b.example.com"]);
+    expect(firstResult.data.approvedDomains).toEqual([
+      "https://b.example.com",
+      "https://a.example.com",
+    ]);
+    // The complete list was committed last, so it carries the newer revision.
+    expect(firstResult.data.revision).toBeGreaterThan(second.data.revision);
+    // A read after both commits is at least as new as the last one.
+    const view = await getMcpAppView(ctx, request(), undefined, noWarm);
+    if (!view.success) throw new Error(view.error);
+    expect(view.data.approvedDomainsRevision).toBeGreaterThanOrEqual(firstResult.data.revision);
+    // A revoke committed later is newer still, and so is a read after it.
+    const revoked = await revokeMcpAppViewDomains(ctx, {
+      projectPath: "/repo",
+      serverName: "charts",
+    });
+    expect(revoked.revision).toBeGreaterThan(firstResult.data.revision);
+    const after = await getMcpAppView(ctx, request(), undefined, noWarm);
+    expect(after.success && after.data.approvedDomainsRevision).toBeGreaterThanOrEqual(
+      revoked.revision
+    );
   });
 
   test("one request carries a view's whole pending batch (resource and connect lists)", () => {

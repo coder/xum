@@ -32,8 +32,12 @@ let viewCsp: McpAppView["csp"] = {};
 let approvals: Array<{ serverName: string; origins: string[] }> = [];
 let approveFails: Error | null = null;
 let approvalProjectPath: string | null = "/repo";
-// When set, each approve call waits for the test to resolve it with the list it returns.
-let approveDeferred: Array<(approvedDomains: string[]) => void> | null = null;
+// When set, each approve call waits for the test to resolve it with the list it returns and the
+// backend commit revision of that list.
+let approveDeferred: Array<(approvedDomains: string[], revision: number) => void> | null = null;
+// Backend commit revisions. Never reset: the approval store outlives a test and keeps the list
+// with the newest revision.
+let revision = Date.now() * 1000;
 let toolCalls: Array<{
   serverName: string;
   toolName: string;
@@ -55,6 +59,8 @@ function serverApi(): TestApiOverrides<APIClient> {
             result: { content: [] },
             invocation,
             approvalProjectPath,
+            // Read now, like the backend: newer than every list published so far.
+            approvedDomainsRevision: ++revision,
           },
         });
       },
@@ -64,14 +70,14 @@ function serverApi(): TestApiOverrides<APIClient> {
         const deferred = approveDeferred;
         if (deferred) {
           return new Promise((resolve) =>
-            deferred.push((approvedDomains) =>
-              resolve({ success: true as const, data: { approvedDomains } })
+            deferred.push((approvedDomains, committed) =>
+              resolve({ success: true as const, data: { approvedDomains, revision: committed } })
             )
           );
         }
         return Promise.resolve({
           success: true as const,
-          data: { approvedDomains: input.origins },
+          data: { approvedDomains: input.origins, revision: ++revision },
         });
       },
       callTool: (input: {
@@ -270,7 +276,7 @@ describe("McpAppFrame", () => {
   test("an older approval response never replaces a newer one", async () => {
     invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
     viewCsp = { connectDomains: ["https://a.example.com", "https://b.example.com"] };
-    const responders: Array<(approvedDomains: string[]) => void> = [];
+    const responders: Array<(approvedDomains: string[], revision: number) => void> = [];
     approveDeferred = responders;
     const view = render(
       <>
@@ -286,16 +292,54 @@ describe("McpAppFrame", () => {
     await waitFor(() => expect(responders).toHaveLength(2));
     // The backend wrote both; the second request's (complete) answer arrives first.
     const both = ["https://a.example.com", "https://b.example.com"];
+    const older = ++revision;
+    const newer = ++revision;
     await act(async () => {
-      responders[1](both);
+      responders[1](both, newer);
       await Promise.resolve();
     });
     await act(async () => {
-      responders[0](["https://a.example.com"]);
+      responders[0](["https://a.example.com"], older);
       await Promise.resolve();
     });
     await waitFor(() => {
       for (const frame of view.getAllByTestId("mcp-app-frame")) {
+        expect(frame.getAttribute("srcdoc")).toContain("https://b.example.com");
+      }
+    });
+    expect(view.queryAllByRole("button", { name: "Allow" })).toHaveLength(0);
+  });
+
+  test("the list committed last wins, even when its request started first", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://a.example.com", "https://b.example.com"] };
+    const responders: Array<(approvedDomains: string[], revision: number) => void> = [];
+    approveDeferred = responders;
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws" view={VIEW} />
+        <McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />
+      </>,
+      { wrapper: Wrapper }
+    );
+    await waitFor(() => expect(view.getAllByRole("button", { name: "Allow" })).toHaveLength(2));
+    const [first, second] = view.getAllByRole("button", { name: "Allow" });
+    await pressAllow(first);
+    await pressAllow(second);
+    await waitFor(() => expect(responders).toHaveLength(2));
+    // The second request reached the config first and stored only its own origin. The first
+    // request committed after it, so its answer is the complete list.
+    await act(async () => {
+      responders[1](["https://b.example.com"], ++revision);
+      await Promise.resolve();
+    });
+    await act(async () => {
+      responders[0](["https://b.example.com", "https://a.example.com"], ++revision);
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      for (const frame of view.getAllByTestId("mcp-app-frame")) {
+        expect(frame.getAttribute("srcdoc")).toContain("https://a.example.com");
         expect(frame.getAttribute("srcdoc")).toContain("https://b.example.com");
       }
     });

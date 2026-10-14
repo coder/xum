@@ -21,6 +21,7 @@ import type {
   McpAppViewRecordsRequestSchema,
   McpAppViewRequestSchema,
 } from "@/common/orpc/schemas/mcpApps";
+import type { ProjectsConfig } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getOwn } from "@/common/utils/getOwn";
@@ -71,6 +72,37 @@ async function approvalProjectPathOf(
     server?.configLayer === "project" ||
     (server?.configLayer === undefined && server?.plugin?.sourceScope === "project");
   return fromProject ? owner : null;
+}
+
+/**
+ * Commit order of view-domain approval lists (#6181). Every list this backend returns (getView,
+ * approve, revoke) carries a revision, and the renderer keeps the list with the newest one
+ * (mcpAppViewDomainsStore.ts), so it follows the order of config commits, not of requests.
+ *
+ * An approve or revoke takes the next revision inside its config edit: edits run one at a time
+ * (Config.editConfig), so revisions follow commit order. Once the write landed, the revision
+ * counts as committed. A read takes the committed revision before it reads the config, so the
+ * list it reads is at least that new. A later live follow can publish its reads the same way.
+ *
+ * Process memory only. The counter starts at the boot time in microseconds, so revisions after a
+ * backend restart stay above those a renderer still holds from before it (unless the clock went
+ * back). Edits by another process are not counted: they reach a view when it next mounts.
+ */
+let assignedViewDomainsRevision = Date.now() * 1000;
+let committedViewDomainsRevision = assignedViewDomainsRevision;
+
+/** Runs one approval-list edit and returns the revision of its commit. */
+async function editViewDomains(
+  context: McpAppsContext,
+  edit: (config: ProjectsConfig) => ProjectsConfig
+): Promise<number> {
+  let revision = 0;
+  await context.config.editConfig((config) => {
+    revision = ++assignedViewDomainsRevision;
+    return edit(config);
+  });
+  committedViewDomainsRevision = Math.max(committedViewDomainsRevision, revision);
+  return revision;
 }
 
 /** Origins the user allowed `serverName`'s views to reach in `projectPath`. */
@@ -150,6 +182,8 @@ export async function getMcpAppView(
         ...resource,
         resultAvailable: result !== null,
         result,
+        // Taken before the read below: the list read is at least this new.
+        approvedDomainsRevision: committedViewDomainsRevision,
         approvedDomains: approvedDomainsIn(context, approvalProjectPath, boundServerName),
         approvalProjectPath,
         invocation:
@@ -339,7 +373,7 @@ export async function updateMcpAppModelContext(
 export async function approveMcpAppViewDomains(
   context: McpAppsContext,
   input: z.infer<typeof McpAppApproveDomainsRequestSchema>
-): Promise<Result<{ approvedDomains: string[] }, string>> {
+): Promise<Result<{ approvedDomains: string[]; revision: number }, string>> {
   assertMcpAppsEnabled(context);
   const record = await context.mcpServerManager.getMcpAppResult(
     input.workspaceId,
@@ -365,7 +399,7 @@ export async function approveMcpAppViewDomains(
   }
   let approvedDomains: string[] = [];
   let full = false;
-  await context.config.editConfig((config) => {
+  const revision = await editViewDomains(context, (config) => {
     const project = config.projects.get(projectPath);
     if (!project) throw new Error(`Project not found: ${projectPath}`);
     const domains = project.mcpAppViewDomains;
@@ -389,7 +423,7 @@ export async function approveMcpAppViewDomains(
       error: `A server can be allowed at most ${MCP_APP_VIEW_DOMAINS_MAX} domains in a project`,
     };
   }
-  return { success: true, data: { approvedDomains } };
+  return { success: true, data: { approvedDomains, revision } };
 }
 
 /** Every project's approvals, for Settings → MCP (one call, not one per server). */
@@ -406,12 +440,13 @@ export function listMcpAppViewDomains(context: McpAppsContext): McpAppViewDomain
 export async function revokeMcpAppViewDomains(
   context: McpAppsContext,
   input: { projectPath: string; serverName: string }
-): Promise<void> {
-  await context.config.editConfig((config) => {
+): Promise<{ revision: number }> {
+  const revision = await editViewDomains(context, (config) => {
     const project = config.projects.get(input.projectPath);
     if (project?.mcpAppViewDomains?.[input.serverName] === undefined) return config;
     const { [input.serverName]: _revoked, ...rest } = project.mcpAppViewDomains;
     project.mcpAppViewDomains = Object.keys(rest).length > 0 ? rest : undefined;
     return config;
   });
+  return { revision };
 }

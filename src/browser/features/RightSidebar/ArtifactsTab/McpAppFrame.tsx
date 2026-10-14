@@ -21,12 +21,7 @@ import {
   type McpAppHostContext,
 } from "./mcpAppHost";
 import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
-import {
-  beginMcpAppViewDomainsRequest,
-  currentMcpAppViewDomainsSeq,
-  publishMcpAppViewDomains,
-  useMcpAppViewDomains,
-} from "./mcpAppViewDomainsStore";
+import { publishMcpAppViewDomains, useMcpAppViewDomains } from "./mcpAppViewDomainsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
@@ -82,8 +77,6 @@ interface Loaded {
   toolCallId: string;
   view: McpAppView | null;
   error: string | null;
-  /** currentMcpAppViewDomainsSeq() when the fetch started: newer approval changes win. */
-  domainsSeq: number;
 }
 
 interface PendingConsent {
@@ -223,20 +216,19 @@ export function McpAppFrame(props: {
   useEffect(() => {
     if (!api || viewLoaded) return;
     const controller = new AbortController();
-    const domainsSeq = currentMcpAppViewDomainsSeq();
     api.mcpApps
       .getView({ workspaceId, toolCallId, serverName, resourceUri }, { signal: controller.signal })
       .then((result) => {
         if (controller.signal.aborted) return;
         setLoaded(
           result.success
-            ? { toolCallId, view: result.data, error: null, domainsSeq }
-            : { toolCallId, view: null, error: result.error, domainsSeq }
+            ? { toolCallId, view: result.data, error: null }
+            : { toolCallId, view: null, error: result.error }
         );
       })
       .catch((error: unknown) => {
         if (!controller.signal.aborted) {
-          setLoaded({ toolCallId, view: null, error: getErrorMessage(error), domainsSeq });
+          setLoaded({ toolCallId, view: null, error: getErrorMessage(error) });
         }
       });
     return () => controller.abort();
@@ -247,10 +239,10 @@ export function McpAppFrame(props: {
   // name, sanitized arguments); the card's display values are only a fallback without one.
   const boundServerName = current?.view?.invocation?.serverName ?? serverName;
   const approvalProjectPath = current?.view?.approvalProjectPath ?? null;
-  // An approval made in another frame of this server after this view loaded applies here too.
+  // An approval or revoke of this server committed after this view's read applies here too.
   const published = useMcpAppViewDomains(approvalProjectPath, boundServerName);
   const approved =
-    published != null && current != null && published.seq > current.domainsSeq
+    published != null && published.revision > (current?.view?.approvedDomainsRevision ?? 0)
       ? published.origins
       : (current?.view?.approvedDomains ?? []);
   const grant = current?.view ? grantMcpAppCsp(current.view.csp, approved) : null;
@@ -279,7 +271,6 @@ export function McpAppFrame(props: {
     // Offline the prompt stays, with Allow disabled: a failed call would dismiss it for good.
     if (!liveApi) return;
     try {
-      const requestSeq = beginMcpAppViewDomainsRequest();
       const result = await liveApi.mcpApps.approveViewDomains({
         workspaceId,
         toolCallId,
@@ -294,7 +285,7 @@ export function McpAppFrame(props: {
           approvalProjectPath,
           boundServerName,
           result.data.approvedDomains,
-          requestSeq
+          result.data.revision
         );
       }
     } catch (error) {

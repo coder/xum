@@ -441,6 +441,9 @@ type MockMcpTestResult =
  * ```
  */
 export function createMockORPCClient(options: MockORPCClientOptions = {}): APIClient {
+  // Above every revision an earlier story published: the renderer's approval store outlives a
+  // story, and keeps the list with the newest revision (mcpAppViewDomainsStore.ts).
+  let mockViewDomainsRevision = Date.now() * 1000;
   const mockViewDomains = new Map<
     string,
     { projectPath: string; serverName: string; origins: string[] }
@@ -2434,7 +2437,15 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         const view = mcpApps?.views[input.toolCallId];
         return Promise.resolve(
           view
-            ? { success: true as const, data: view }
+            ? {
+                success: true as const,
+                // Read now, like the backend: newer than every approval published so far.
+                data: {
+                  ...view,
+                  approvedDomainsRevision:
+                    view.approvedDomainsRevision ?? ++mockViewDomainsRevision,
+                },
+              }
             : { success: false as const, error: `No view for ${input.toolCallId}` }
         );
       },
@@ -2458,13 +2469,13 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         mockViewDomains.set(key, entry);
         return Promise.resolve({
           success: true as const,
-          data: { approvedDomains: entry.origins },
+          data: { approvedDomains: entry.origins, revision: ++mockViewDomainsRevision },
         });
       },
       listViewDomains: () => Promise.resolve([...mockViewDomains.values()]),
       revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
         mockViewDomains.delete(JSON.stringify([input.projectPath, input.serverName]));
-        return Promise.resolve();
+        return Promise.resolve({ revision: ++mockViewDomainsRevision });
       },
       // Story views are always in the story transcript, so no record lookup finds one.
       getViewRecords: (input: { toolCallIds: string[] }) =>
