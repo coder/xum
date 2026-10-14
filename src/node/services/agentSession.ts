@@ -352,6 +352,10 @@ import { execBuffered } from "@/node/utils/runtime/helpers";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
 import type { MemorySessionContext } from "@/node/services/memoryService";
+import {
+  type CachedMemoryContext,
+  MemoryContextStore,
+} from "@/node/services/memoryContextPersistence";
 import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -1090,11 +1094,16 @@ interface AgentSessionOptions {
   callerOwnsTurnEnd?: boolean;
 }
 
-interface CachedMemoryContext {
-  context: MemorySessionContext | null;
-  includesHotMemories: boolean;
-  memoryEnabled: boolean;
-  hotSetEnabled: boolean;
+/** Memory/HotSet gate changes must not reuse a context built under the old gates. */
+function canReuseMemoryContext(
+  cached: CachedMemoryContext | undefined,
+  wanted: { memoryEnabled: boolean; hotSetEnabled: boolean; includeHotMemories: boolean }
+): cached is CachedMemoryContext {
+  return (
+    cached?.memoryEnabled === wanted.memoryEnabled &&
+    cached.hotSetEnabled === wanted.hotSetEnabled &&
+    (cached.includesHotMemories || !wanted.includeHotMemories)
+  );
 }
 
 interface SendMessageInternalOptions {
@@ -1604,15 +1613,21 @@ export class AgentSession {
    * the memory tool.
    *
    * Frozen per context window (#5248, user-requested prompt-cache stability):
-   * only a new window (compaction, rollover, reset) or a new session clears
-   * it. Memory writes do not, neither this session's nor other sessions' or
-   * Dream's. Rebuilding after every write rewrote the memory tool description
-   * and system prompt, so the next turn missed the provider cache for the
-   * whole transcript; 37% of measured turns carry a write. Freshness
-   * trade-off: the agent sees its own writes through the memory tool results
-   * and live `memory view`; other writers' notes appear at the next window.
+   * only a new window (compaction, rollover, reset) clears it. Memory writes do
+   * not, neither this session's nor other sessions' or Dream's. Rebuilding
+   * after every write rewrote the memory tool description and system prompt,
+   * so the next turn missed the provider cache for the whole transcript; 37%
+   * of measured turns carry a write. Freshness trade-off: the agent sees its
+   * own writes through the memory tool results and live `memory view`; other
+   * writers' notes appear at the next window.
+   *
+   * memoryContextStore saves it in the session dir, so a server restart keeps
+   * the window's bytes too (see MEMORY_CONTEXT_FILE_NAME for the live failure).
    */
   private memoryContextByModelString = new Map<string, CachedMemoryContext>();
+  private readonly memoryContextStore: MemoryContextStore;
+  /** Restores the saved window context once per session; resolved after a window boundary. */
+  private memoryContextRestore: Promise<void> | undefined;
 
   /**
    * Cache the last-known experiment state so we don't spam metadata refresh
@@ -1801,6 +1816,7 @@ export class AgentSession {
 
     this.workspaceId = trimmedWorkspaceId;
     this.config = config;
+    this.memoryContextStore = new MemoryContextStore(config, trimmedWorkspaceId);
     this.historyService = historyService;
     this.compactionCancellation = new CompactionCancellation(
       historyService.getCompactionCancellationStorage(trimmedWorkspaceId)
@@ -6659,7 +6675,7 @@ export class AgentSession {
     this.lastUsageState = undefined;
     this.contextController.reset("settings-changed");
     this.clearFileState();
-    this.memoryContextByModelString.clear();
+    await this.discardMemoryContext();
     if (!options?.deferCarryoverDiscard) await this.discardContextResetCarryover();
     try {
       await sandboxHostService.discardScope(
@@ -7097,9 +7113,11 @@ export class AgentSession {
           })
         : prepared;
     return Ok({
-      start: (startOptions) => {
-        // The candidate's snapshot is the new window's frozen memory context.
+      start: async (startOptions) => {
+        // The candidate's snapshot is the new window's frozen memory context. Save it before
+        // the stream: a restart during this turn must not rebuild the window's bytes.
         this.memoryContextByModelString = cache;
+        await this.memoryContextStore.save(cache);
         return prepared.data.start(startOptions);
       },
       [Symbol.asyncDispose]: () => prepared.data[Symbol.asyncDispose](),
@@ -12915,7 +12933,7 @@ export class AgentSession {
    * post-compaction.json) and the periodic capture of qualified carryover.
    */
   async clearPostCompactionState(): Promise<void> {
-    this.memoryContextByModelString.clear();
+    await this.discardMemoryContext();
     // In-memory clears stay unconditional: they stop THIS session from
     // injecting carryover even when the durable discard below fails.
     this.compactionOccurred = false;
@@ -12949,13 +12967,12 @@ export class AgentSession {
     const enabled = (id: ExperimentId) => this.aiService.isExperimentEnabled(id);
     const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
     const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
+    // The rollover candidate cache belongs to a window that may never start: only the
+    // live map is restored from and saved to disk.
+    const live = cache === this.memoryContextByModelString;
+    if (live) await this.restoreMemoryContext();
     const cached = cache.get(modelString);
-    // Memory/HotSet gate changes must not reuse a context built under the old gates.
-    if (
-      cached?.memoryEnabled === memoryEnabled &&
-      cached.hotSetEnabled === hotSetEnabled &&
-      (cached.includesHotMemories || !includeHotMemories)
-    ) {
+    if (canReuseMemoryContext(cached, { memoryEnabled, hotSetEnabled, includeHotMemories })) {
       return cached.context ?? undefined;
     }
 
@@ -12972,7 +12989,35 @@ export class AgentSession {
       memoryEnabled,
       hotSetEnabled,
     });
+    // Re-check: a rollover can start while the build is awaited.
+    if (cache === this.memoryContextByModelString) await this.memoryContextStore.save(cache);
     return context ?? undefined;
+  }
+
+  /**
+   * Restore the window's saved memory context once per session (the first resolve after a
+   * server restart). Entries this process already built win: they are what it sent.
+   */
+  private restoreMemoryContext(): Promise<void> {
+    this.memoryContextRestore ??= (async () => {
+      const map = this.memoryContextByModelString;
+      const saved = await this.memoryContextStore.load();
+      // load() returns nothing when a window boundary ran during the read. A rollover that
+      // started meanwhile swapped in its own map: the saved file is not its window.
+      if (this.memoryContextByModelString !== map || saved.size === 0) return;
+      for (const [modelString, cached] of saved) {
+        if (!map.has(modelString)) map.set(modelString, cached);
+      }
+    })();
+    return this.memoryContextRestore;
+  }
+
+  /** A window boundary: drop the cached context in memory and on disk. */
+  private async discardMemoryContext(): Promise<void> {
+    this.memoryContextByModelString.clear();
+    // The saved file belongs to the window that just ended: never restore it.
+    this.memoryContextRestore = Promise.resolve();
+    await this.memoryContextStore.discard();
   }
 
   /**
@@ -12996,7 +13041,7 @@ export class AgentSession {
       // Compaction boundary: invalidate the session-cached memory context so
       // the next stream recomputes the index and hot set from current
       // files/pins/usage stats.
-      this.memoryContextByModelString.clear();
+      await this.discardMemoryContext();
       // Clear file state cache since history context is gone
       this.clearFileState();
 

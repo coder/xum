@@ -9,6 +9,7 @@ import type { AIService } from "./aiService";
 import type { MemorySessionContext } from "./memoryService";
 import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { MEMORY_CONTEXT_FILE_NAME } from "./memoryContextPersistence";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { Err } from "@/common/types/result";
 import type { HistoryService } from "./historyService";
@@ -17,9 +18,9 @@ import { createTestHistoryService } from "./testHistoryService";
 /**
  * Behavior under test: the memory session context (index snapshot +
  * hot-memories block) is computed once per model in a context window and
- * recomputed only at window boundaries (compaction, rollover, reset) or in a
- * new session, never after a memory write, so the injected bytes stay
- * prompt-cache-stable (#5248).
+ * recomputed only at window boundaries (compaction, rollover, reset), never
+ * after a memory write or a server restart, so the injected bytes stay
+ * prompt-cache-stable (#5248) and replayed Anthropic thinking stays valid.
  */
 
 const WORKSPACE_ID = "workspace-hot-memories-test";
@@ -277,6 +278,111 @@ describe("AgentSession memory context", () => {
       memoryEnabled = true;
       hotSetEnabled = true;
       expect((await priv.resolveMemoryContext("primary"))?.hotMemoriesBlock).toBe("primary");
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  // A server restart creates a new AgentSession for the same context window. Before the
+  // context was saved in the session dir, the restart rebuilt it from memory files that
+  // other agents had changed. Anthropic then rejected every replayed thinking block ("The
+  // `system` prompt / `tools` list differs"), and the prompt cache missed.
+  test("keeps the window's context across a server restart", async () => {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    let version = 0;
+    const buildMemorySessionContext = mock(() => {
+      version++;
+      return Promise.resolve<MemorySessionContext>({
+        indexEntries: [{ path: `/memories/global/v${version}.md`, description: "note" }],
+        hotMemoriesBlock: `<hot_memories>v${version}</hot_memories>`,
+      });
+    });
+
+    const before = await createSession({ historyService, config, buildMemorySessionContext });
+    let first: MemorySessionContext | undefined;
+    try {
+      first = await (before as unknown as PrivateSessionAccess).resolveMemoryContext("test-model");
+    } finally {
+      await before.dispose();
+    }
+
+    const after = await createSession({ historyService, config, buildMemorySessionContext });
+    try {
+      const priv = after as unknown as PrivateSessionAccess;
+      expect(await priv.resolveMemoryContext("test-model")).toEqual(first);
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
+      // A model the old process never resolved still gets its own fresh context.
+      expect((await priv.resolveMemoryContext("other-model"))?.hotMemoriesBlock).toBe(
+        "<hot_memories>v2</hot_memories>"
+      );
+    } finally {
+      await after.dispose();
+    }
+  });
+
+  test.each(["reset", "new segment", "compaction"] as const)(
+    "rebuilds after a restart when a %s boundary ended the saved window",
+    async (boundary) => {
+      const { historyService, config, cleanup } = await createTestHistoryService();
+      historyCleanup = cleanup;
+
+      let version = 0;
+      const buildMemorySessionContext = mock(() => {
+        version++;
+        return Promise.resolve<MemorySessionContext>({
+          indexEntries: [],
+          hotMemoriesBlock: `<hot_memories>v${version}</hot_memories>`,
+        });
+      });
+
+      const before = await createSession({ historyService, config, buildMemorySessionContext });
+      try {
+        const priv = before as unknown as PrivateSessionAccess;
+        await priv.resolveMemoryContext("test-model");
+        if (boundary === "reset") await priv.applyContextResetSideEffects();
+        else if (boundary === "new segment") await priv.clearPostCompactionState();
+        else {
+          await writePendingPostCompactionState(path.join(config.sessionsDir, WORKSPACE_ID));
+          await priv.getPostCompactionAttachmentsIfNeeded();
+        }
+      } finally {
+        await before.dispose();
+      }
+
+      const after = await createSession({ historyService, config, buildMemorySessionContext });
+      try {
+        expect(
+          (await (after as unknown as PrivateSessionAccess).resolveMemoryContext("test-model"))
+            ?.hotMemoriesBlock
+        ).toBe("<hot_memories>v2</hot_memories>");
+      } finally {
+        await after.dispose();
+      }
+    }
+  );
+
+  test("rebuilds the context when the saved file is malformed", async () => {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    const sessionDir = path.join(config.sessionsDir, WORKSPACE_ID);
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(path.join(sessionDir, MEMORY_CONTEXT_FILE_NAME), "{not json");
+    const buildMemorySessionContext = mock(() =>
+      Promise.resolve<MemorySessionContext>({
+        indexEntries: [],
+        hotMemoriesBlock: "<hot_memories>fresh</hot_memories>",
+      })
+    );
+    const session = await createSession({ historyService, config, buildMemorySessionContext });
+    try {
+      expect(
+        (await (session as unknown as PrivateSessionAccess).resolveMemoryContext("test-model"))
+          ?.hotMemoriesBlock
+      ).toBe("<hot_memories>fresh</hot_memories>");
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
     } finally {
       await session.dispose();
     }
