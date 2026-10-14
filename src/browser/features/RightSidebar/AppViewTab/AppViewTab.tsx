@@ -9,6 +9,7 @@ import {
   openMcpAppViewTab,
   reloadMcpAppView,
   useMcpAppView,
+  useMcpAppViewLookupFailed,
   useMcpAppViewReloadKey,
   useMcpAppViews,
   type McpAppViewRef,
@@ -116,6 +117,7 @@ export function AppViewTabPanel(props: {
   const viewKey = props.toolCallId ?? "";
   const view = useMcpAppView(props.workspaceId, viewKey);
   const reloadKey = useMcpAppViewReloadKey(props.workspaceId, viewKey);
+  const lookupFailed = useMcpAppViewLookupFailed(props.workspaceId, viewKey);
   const { workspaceId, toolCallId } = props;
   useEffect(() => {
     if (toolCallId == null) return;
@@ -125,14 +127,28 @@ export function AppViewTabPanel(props: {
   if (view == null) {
     return (
       <div className="flex flex-col items-start gap-2 p-4 text-xs">
-        <span className="text-muted">This view is no longer available.</span>
-        <button
-          type="button"
-          onClick={props.onClose}
-          className="border-border-light focus-visible:ring-accent rounded border px-2 py-0.5 focus-visible:ring-1"
-        >
-          Close
-        </button>
+        <span className="text-muted">
+          {lookupFailed ? "This view could not be loaded." : "This view is no longer available."}
+        </span>
+        <div className="flex gap-2">
+          {lookupFailed && (
+            // The record request failed (not a missing record): asking again can find the view.
+            <button
+              type="button"
+              onClick={() => reloadMcpAppView(workspaceId, viewKey)}
+              className="border-border-light focus-visible:ring-accent rounded border px-2 py-0.5 focus-visible:ring-1"
+            >
+              Reload
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={props.onClose}
+            className="border-border-light focus-visible:ring-accent rounded border px-2 py-0.5 focus-visible:ring-1"
+          >
+            Close
+          </button>
+        </div>
       </div>
     );
   }

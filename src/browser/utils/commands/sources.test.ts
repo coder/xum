@@ -2665,6 +2665,36 @@ test("an entry point picked from the palette while disconnected says so in a toa
   });
 });
 
+// An open entry point's tab only gets focus from Open while its record is current, so a failed
+// load needs Reload from the keyboard too.
+test("an entry point with an open tab gets a Reload command that focuses its tab", async () => {
+  const entrypoint = (toolName: string) => ({
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName,
+    title: toolName,
+    resourceUri: "ui://cad/view",
+    type: "global" as const,
+    viewKey: `entrypoint:cad:${toolName}:global`,
+  });
+  const [open, closed] = [entrypoint("cad.open"), entrypoint("cad.closed")];
+  await withTestWindow(() => {
+    updateRightSidebarLayout("w1", (state) => withAppViewTab(state, open.viewKey));
+    const actions = getActions({ artifactsEnabled: true, mcpAppEntrypoints: [open, closed] });
+    expect(actions.some((a) => a.id === CommandIds.navReloadAppView(closed.viewKey))).toBe(false);
+    const reload = actions.find((a) => a.id === CommandIds.navReloadAppView(open.viewKey));
+    const focused: unknown[] = [];
+    const onFocus = (event: Event) => focused.push((event as CustomEvent).detail);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onFocus);
+    try {
+      void reload?.run();
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onFocus);
+    }
+    expect(focused).toEqual([{ workspaceId: "w1", toolCallId: open.viewKey }]);
+  });
+});
+
 test("a tool's global and thread entry points get palette commands that read differently", () => {
   const entrypoint = (type: "global" | "thread") => ({
     serverName: "cad",

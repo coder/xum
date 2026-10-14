@@ -69,19 +69,51 @@ function entrypointActions(
   entrypoints: readonly McpAppEntrypoint[],
   navigation: string
 ): CommandAction[] {
-  return entrypoints.map((entrypoint) => ({
-    id: CommandIds.navOpenAppEntrypoint(entrypoint.viewKey),
-    title: `Open Plugin View: ${entrypoint.title}`,
-    subtitle: mcpAppEntrypointDescription(entrypoint),
-    section: navigation,
-    keywords: ["plugin", "view", "app", "mcp", entrypoint.serverName],
-    run: async () => {
-      const error = api
-        ? await openMcpAppEntrypoint(api, workspaceId, entrypoint)
-        : MCP_APP_ENTRYPOINT_NOT_CONNECTED;
-      if (error !== null) showCommandFeedbackToast({ type: "error", message: error });
+  return entrypoints.flatMap((entrypoint) => {
+    const subtitle = mcpAppEntrypointDescription(entrypoint);
+    const open: CommandAction = {
+      id: CommandIds.navOpenAppEntrypoint(entrypoint.viewKey),
+      title: `Open Plugin View: ${entrypoint.title}`,
+      subtitle,
+      section: navigation,
+      keywords: ["plugin", "view", "app", "mcp", entrypoint.serverName],
+      run: async () => {
+        const error = api
+          ? await openMcpAppEntrypoint(api, workspaceId, entrypoint)
+          : MCP_APP_ENTRYPOINT_NOT_CONNECTED;
+        if (error !== null) showCommandFeedbackToast({ type: "error", message: error });
+      },
+    };
+    // An entry point's tab is keyed by its view key. Open only focuses that tab while its
+    // record is current, so a failed load needs this action to retry from the keyboard.
+    const reload = reloadAppViewAction(workspaceId, entrypoint.viewKey, {
+      title: `Reload Plugin View: ${entrypoint.title}`,
+      subtitle,
+      section: navigation,
+      keywords: ["plugin", "view", "app", "mcp", "reload", "retry", entrypoint.serverName],
+    });
+    return reload == null ? [open] : [open, reload];
+  });
+}
+
+/**
+ * "Reload" for an app tab that is open (after a failed load, or a stuck view): remounts the
+ * tab's frame, which loads the view again, and focuses the tab. Null when no tab is open.
+ */
+function reloadAppViewAction(
+  workspaceId: string,
+  toolCallId: string,
+  action: Pick<CommandAction, "title" | "subtitle" | "section" | "keywords">
+): CommandAction | null {
+  if (!hasTab(readRightSidebarLayout(workspaceId), appViewTabFor(toolCallId))) return null;
+  return {
+    ...action,
+    id: CommandIds.navReloadAppView(toolCallId),
+    run: () => {
+      reloadMcpAppView(workspaceId, toolCallId);
+      focusMcpAppViewTab(workspaceId, toolCallId);
     },
-  }));
+  };
 }
 
 /**
@@ -544,21 +576,14 @@ function appViewActions(
       keywords: ["app", "view", "mcp", "tab", view.serverName],
       run: () => openMcpAppViewTab(wsId, view),
     };
-    // The keyboard path to an open tab's Reload (after a failed load, or a stuck view): remounts
-    // the tab's frame, which loads the view again, and focuses the tab.
-    if (!hasTab(readRightSidebarLayout(wsId), appViewTabFor(view.toolCallId))) return [open];
-    const reload: CommandAction = {
-      id: CommandIds.navReloadAppView(view.toolCallId),
+    // The keyboard path to an open tab's Reload.
+    const reload = reloadAppViewAction(wsId, view.toolCallId, {
       title: `Reload App View: ${view.label}`,
       subtitle,
       section: navigationSection,
       keywords: ["app", "view", "mcp", "reload", "retry", view.serverName],
-      run: () => {
-        reloadMcpAppView(wsId, view.toolCallId);
-        focusMcpAppViewTab(wsId, view.toolCallId);
-      },
-    };
-    return [open, reload];
+    });
+    return reload == null ? [open] : [open, reload];
   });
 }
 

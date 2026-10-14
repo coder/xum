@@ -59,6 +59,8 @@ describe("AppViewTabPanel", () => {
       expect(await view.findByText("This view is no longer available.")).toBeTruthy();
       expect(view.getByText("App view")).toBeTruthy();
       expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+      // A missing record is final: asking again cannot find the view.
+      expect(view.queryByRole("button", { name: "Reload" })).toBeNull();
       fireEvent.click(view.getByRole("button", { name: "Close" }));
       expect(closed).toBe(1);
     } finally {
@@ -275,8 +277,8 @@ describe("AppViewTabPanel", () => {
     );
     try {
       const first = render(labels(true));
-      // Until it is retried, a failed lookup reads as unavailable.
-      expect(await first.findByText("This view is no longer available.")).toBeTruthy();
+      // Until it is retried, a failed lookup shows no view, only Reload and Close.
+      expect(await first.findByRole("button", { name: "Reload" })).toBeTruthy();
       // Three restored tabs, one request.
       expect(requests).toEqual([["b1", "b2", "b3"]]);
       first.unmount();
@@ -289,6 +291,66 @@ describe("AppViewTabPanel", () => {
         ["b1", "b2", "b3"],
         ["b1", "b2", "b3"],
       ]);
+    } finally {
+      registered.mockRestore();
+      state.mockRestore();
+    }
+  });
+
+  // E.g. the backend restarted while the layout was restored: the tab must not stay stuck until
+  // it remounts.
+  test("a restored tab whose record lookup failed offers Reload, which asks again", async () => {
+    const store = useWorkspaceStoreRaw();
+    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(
+      (id) => id === "ws-retry"
+    );
+    const state = spyOn(store, "getWorkspaceState").mockImplementation(
+      () =>
+        ({
+          messages: [],
+          loading: false,
+          isHydratingTranscript: false,
+        }) as unknown as WorkspaceState
+    );
+    let reachable = false;
+    const client = createTestApiClient({
+      mcpApps: {
+        getViewRecords: (input: { toolCallIds: string[] }) => {
+          if (!reachable) return Promise.reject(new Error("disconnected"));
+          return Promise.resolve({
+            success: true as const,
+            data: input.toolCallIds.map((toolCallId) => ({
+              toolCallId,
+              view: {
+                serverName: "dice",
+                toolName: "dice_show_dice_board",
+                resourceUri: "ui://dice/board.html",
+                arguments: {},
+              },
+            })),
+          });
+        },
+        getView: () => new Promise<never>(() => undefined),
+      },
+    });
+    try {
+      const view = render(
+        <ThemeProvider forcedTheme="dark">
+          <APIProvider client={client}>
+            <AppViewTabLabel workspaceId="ws-retry" toolCallId="call-r" />
+            <AppViewTabPanel
+              workspaceId="ws-retry"
+              toolCallId="call-r"
+              onClose={() => undefined}
+            />
+          </APIProvider>
+        </ThemeProvider>
+      );
+      const reload = await view.findByRole("button", { name: "Reload" });
+      reachable = true;
+      fireEvent.click(reload);
+      expect(await view.findByText("dice_show_dice_board")).toBeTruthy();
+      expect(view.queryByRole("button", { name: "Reload" })).toBeNull();
     } finally {
       registered.mockRestore();
       state.mockRestore();

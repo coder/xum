@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
@@ -543,7 +543,7 @@ describe("RightSidebarOverview", () => {
   // The Artifacts tab lists only files, so More cannot lead there for hidden app views.
   test("More lists the hidden app views in the card", async () => {
     const appsWorkspace = "ws-apps-more";
-    for (const id of ["v1", "v2", "v3", "v4"]) {
+    const addView = (id: string) =>
       openMcpAppViewTab(appsWorkspace, {
         toolCallId: id,
         serverName: "dice",
@@ -554,7 +554,7 @@ describe("RightSidebarOverview", () => {
         cancelled: false,
         failed: false,
       });
-    }
+    for (const id of ["v1", "v2", "v3", "v4"]) addView(id);
     const { view, opened } = renderOverview([workspace({ id: appsWorkspace })], {
       artifactsEnabled: true,
       client: emptyArtifactsClient(),
@@ -567,6 +567,15 @@ describe("RightSidebarOverview", () => {
     expect(rows()).toEqual(["Roll v4", "Roll v3", "Roll v2", "Roll v1"]);
     expect(opened).toEqual([]);
     expect(document.activeElement?.textContent).toBe("Roll v1");
+
+    // A newer view arrives on top and shifts the rows: focus stays where the user moved it.
+    const composer = document.createElement("textarea");
+    document.body.appendChild(composer);
+    composer.focus();
+    act(() => addView("v5"));
+    await waitFor(() => expect(rows()[0]).toBe("Roll v5"));
+    expect(document.activeElement).toBe(composer);
+    composer.remove();
   });
 
   test("tells repeated MCP app calls apart and marks failed ones", async () => {

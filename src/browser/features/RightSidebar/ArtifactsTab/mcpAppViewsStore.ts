@@ -255,7 +255,8 @@ export function useMcpAppViews(workspaceId: string): readonly McpAppViewRef[] {
  * Lookups of views the loaded transcript lacks, by workspace and tool call: "pending" while the
  * backend is asked, "missing" when it answered that it has no result record, "failed" when the
  * request failed. Only "missing" is final: a failed lookup runs again the next time a tab asks
- * (it remounts, or the API client reconnects). A found view joins the session list
+ * (it remounts, the API client reconnects, or the user reloads the view: reloadMcpAppView).
+ * A found view joins the session list
  * (viewsByWorkspace) and its entry is dropped.
  */
 const recordLookups = new Map<string, "pending" | "missing" | "failed">();
@@ -395,15 +396,28 @@ export function useMcpAppView(
     recordLookups.get(lookupKey(workspaceId, toolCallId))
   );
   const lookUp = view === null && entrypoint === undefined && !loading && toolCallId !== "";
+  // A reload retries a failed lookup (lookUpViewRecord skips only pending and missing ones).
+  const reloadKey = useMcpAppViewReloadKey(workspaceId, toolCallId);
   // Fetching from the backend is an external side effect, so an effect, not render.
   useEffect(() => {
     if (lookUp && api != null) lookUpViewRecord(api, workspaceId, toolCallId);
-  }, [lookUp, api, workspaceId, toolCallId]);
+  }, [lookUp, api, workspaceId, toolCallId, reloadKey]);
   if (view !== null) return view;
   // Retired (null) or still being listed ("loading").
   if (entrypoint !== undefined) return entrypoint;
   // A failed lookup shows as unavailable until it is retried.
   return loading || (lookUp && lookup !== "missing" && lookup !== "failed") ? "loading" : null;
+}
+
+/**
+ * Whether the view's record lookup failed (the request, not a missing record), so a retry
+ * (reloadMcpAppView) can still find it. useMcpAppView returns null for both.
+ */
+export function useMcpAppViewLookupFailed(workspaceId: string, toolCallId: string): boolean {
+  return useSyncExternalStore(
+    subscribe,
+    () => recordLookups.get(lookupKey(workspaceId, toolCallId)) === "failed"
+  );
 }
 
 /**

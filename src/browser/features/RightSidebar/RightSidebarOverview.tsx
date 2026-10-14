@@ -398,8 +398,9 @@ const OverviewOutputs: React.FC<{
   const api = useOptionalAPI()?.api ?? null;
   const appViews = useMcpAppViews(props.workspaceId);
   // The Artifacts tab lists only files, so More reveals hidden app views here (like side chats):
-  // the number of app rows shown before, null until then.
-  const [revealedFrom, setRevealedFrom] = React.useState<number | null>(null);
+  // the first view it revealed, null until then. An ID, not a row index: newer views arrive at
+  // the top, and an index would then point a later render's focus at another row.
+  const [revealedViewId, setRevealedViewId] = React.useState<string | null>(null);
   const [files, setFiles] = React.useState<readonly ArtifactEntry[]>([]);
   // The backend capped its walk (entry limit, depth, unreadable folders): more files exist than
   // `files` holds, so the "more" row cannot give an exact count.
@@ -442,7 +443,7 @@ const OverviewOutputs: React.FC<{
   // app result is never pushed out by files, each kind keeps at least one of the capped rows
   // when it has any. A file opens in the Artifacts tab; an app view in its own app tab (Artifacts
   // lists only files). Either tab gets focus (the activated row unmounts as the sidebar expands).
-  const appRows = overviewAppRows(appViews.length, files.length, revealedFrom != null);
+  const appRows = overviewAppRows(appViews.length, files.length, revealedViewId != null);
   const fileRows = Math.min(files.length, Math.max(0, OVERVIEW_MAX_LIST_ROWS - appRows));
   const hiddenAppViews = appViews.length - appRows;
   const shown: Array<{
@@ -473,7 +474,7 @@ const OverviewOutputs: React.FC<{
       label: view.label,
       sub: details[index] || null,
       // The first row the More row revealed takes focus, as for side chats.
-      focusOnMount: index === revealedFrom,
+      focusOnMount: view.toolCallId === revealedViewId,
       // Through the view store, like the tool card and the palette: it keeps the view's ref, so
       // the tab still resolves after compaction drops the call from the loaded transcript.
       open: () => openMcpAppViewTab(props.workspaceId, view),
@@ -499,7 +500,9 @@ const OverviewOutputs: React.FC<{
         count={files.length + appViews.length - shown.length}
         atLeast={filesTruncated}
         onClick={() =>
-          hiddenAppViews > 0 ? setRevealedFrom(appRows) : props.onOpenTab("artifacts")
+          hiddenAppViews > 0
+            ? setRevealedViewId(appViews[appRows].toolCallId)
+            : props.onOpenTab("artifacts")
         }
       />
     </OverviewSection>
