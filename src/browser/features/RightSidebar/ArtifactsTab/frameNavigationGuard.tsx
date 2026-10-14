@@ -18,8 +18,9 @@ import { Notice } from "./SourceText";
  * second load after a navigation the user started (a tapped link), and for as long as it stays
  * open when the artifact itself redirects while its srcdoc is still loading (then the
  * destination's load is the first one seen here). The desktop app blocks the navigation itself.
- * MCP App views do not rely on the load count alone: their preamble announces when the document
- * starts to leave, and the host drops the bridge then (mcpAppPreambleScript in mcpAppCsp.ts).
+ * MCP App views do not rely on the load count: the host talks to them only over their
+ * document's own MessagePort, which a page the frame navigates to cannot reach
+ * (mcpAppDocumentChannel.ts).
  */
 export function useFrameNavigationGuard(srcDoc: string | null) {
   // Loads seen for the srcdoc currently in the frame; a new srcdoc or a reload starts over.
@@ -56,7 +57,7 @@ export function useFrameNavigationGuard(srcDoc: string | null) {
       leave();
       return false;
     },
-    /** The frame told the host it is leaving its document (MCP App views: mcpAppCsp.ts). */
+    /** The frame told the host its document unloaded (MCP App views: mcpAppDocumentChannel.ts). */
     leave,
     reload: () => {
       navigatedRef.current = false;

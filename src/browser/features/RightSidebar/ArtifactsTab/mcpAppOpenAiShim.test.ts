@@ -6,6 +6,7 @@ import { Window } from "happy-dom";
 import { installDom } from "../../../../../tests/ui/dom";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
 import { buildMcpAppCsp, mcpAppPreambleScript } from "./mcpAppCsp";
+import { createMcpAppDocumentChannel } from "./mcpAppDocumentChannel";
 import { createMcpAppHost, type McpAppConsentRequest } from "./mcpAppHost";
 import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
 
@@ -37,14 +38,15 @@ const SEED: McpAppOpenAiSeed = {
 function viewDocument(viewHtml: string, seed: McpAppOpenAiSeed = SEED): string {
   return finalizeSandboxedDocument(parseArtifactHtml(viewHtml), {
     csp: buildMcpAppCsp(GRANTED),
-    bridgeScript: [
-      mcpAppPreambleScript({ nonce: "00", leaveOnBeforeUnload: false }),
-      mcpAppOpenAiShimScript(seed),
-    ],
+    bridgeScript: [mcpAppPreambleScript("00"), mcpAppOpenAiShimScript(seed)],
   });
 }
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+/** Port messages arrive asynchronously: wait for a few round trips. */
+async function settle() {
+  for (let i = 0; i < 5; i++) await tick();
+}
 
 /**
  * Run a view document (scripts on) in its own happy-dom window, wired to a real host through a
@@ -67,7 +69,18 @@ async function runView(
     },
   }) as unknown as ViewWindow;
   // Bun's vm contexts lack the JS builtins happy-dom expects there; lend this realm's.
-  for (const name of ["Object", "Array", "Map", "Promise", "JSON", "String", "Number", "Error"]) {
+  // MessageChannel too: happy-dom has none, and the preamble opens the host channel with it.
+  for (const name of [
+    "Object",
+    "Array",
+    "Map",
+    "Promise",
+    "JSON",
+    "String",
+    "Number",
+    "Error",
+    "MessageChannel",
+  ]) {
     Object.defineProperty(win, name, { value: (globalThis as Record<string, unknown>)[name] });
   }
   const warnings: string[] = [];
@@ -76,18 +89,24 @@ async function runView(
   const consents: McpAppConsentRequest[] = [];
   const composer: string[] = [];
   const calls: Array<{ toolName: string; args: unknown }> = [];
-  const parent = {
-    postMessage: (message: { method?: string; params?: unknown }) => {
-      posted.push(message);
+  // The view document's channel (mcpAppDocumentChannel.ts), as McpAppFrame binds it.
+  const channel = createMcpAppDocumentChannel("00");
+  channel.setReceiver({
+    message: (message) => {
+      posted.push(message as { method?: string; params?: unknown });
       if (!options.silentHost) void host.handleMessage(message);
     },
+    leave: () => undefined,
+  });
+  const parent = {
+    postMessage: (data: unknown, _origin: string, ports: MessagePort[] = []) =>
+      channel.acceptOpen({ data, ports }),
   };
   Object.defineProperty(win, "parent", { value: parent, configurable: true });
   const host = createMcpAppHost({
     serverName: "dice",
     grantedCsp: GRANTED,
-    postToView: (data) =>
-      win.dispatchEvent(new win.MessageEvent("message", { data, source: parent as never })),
+    postToView: (data) => channel.post(data),
     getHostContext: () => ({
       theme: "dark",
       styles: { variables: {} },
@@ -126,7 +145,7 @@ async function runView(
       options.seed
     )
   );
-  for (let i = 0; i < 5; i++) await tick();
+  await settle();
   return { win, host, posted, consents, composer, calls, warnings };
 }
 
@@ -172,6 +191,7 @@ describe("window.openai shim", () => {
     expect(t.win.document.documentElement.lang).toBe("de-DE");
     // host-context-changed fires the event too.
     t.host.sendHostContextChanged({ theme: "light" });
+    await settle();
     expect(t.win.events.at(-1)).toEqual({ theme: "light" });
   });
 
@@ -296,10 +316,13 @@ describe("window.openai shim", () => {
       t.posted.filter((m) => (m as { id?: unknown }).id === "host-1").length;
     const shimOnly = await runView("window.openai.toolOutput;");
     void shimOnly.host.teardown("unmount");
+    await settle();
     expect(teardownReplies(shimOnly)).toBe(1);
     const hybrid = await runView("window.openai.toolOutput;");
     connectStandardClient(hybrid);
+    await settle();
     void hybrid.host.teardown("unmount");
+    await settle();
     expect(teardownReplies(hybrid)).toBe(0);
   });
 

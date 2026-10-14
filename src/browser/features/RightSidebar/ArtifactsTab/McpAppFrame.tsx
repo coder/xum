@@ -10,18 +10,18 @@ import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { getErrorMessage } from "@/common/utils/errors";
 import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
-import { createBridgeRateLimiter, passesFrameGate } from "./artifactBridge";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
 import {
   buildMcpAppCsp,
-  createMcpAppDocumentGate,
   grantMcpAppCsp,
   type McpAppCspGrant,
-  type McpAppDocumentGate,
-  type McpAppDocumentVerdict,
   mcpAppPreambleScript,
-  newMcpAppDocumentNonce,
 } from "./mcpAppCsp";
+import {
+  createMcpAppDocumentChannel,
+  type McpAppDocumentChannel,
+  newMcpAppDocumentNonce,
+} from "./mcpAppDocumentChannel";
 import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
 import {
   createMcpAppHost,
@@ -154,8 +154,8 @@ function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
  * allow-same-origin). The spec's double-iframe proxy exists so web hosts can give a view an
  * origin other than their own; a sandboxed srcdoc frame already has a unique opaque origin, so
  * it cannot reach the app's DOM, storage, cookies or API, and no proxy frame is needed (the
- * desktop-host model). Messages are accepted only from this frame's window, rate limited and
- * zod-validated; tool calls go only to the view's own server through the backend, which
+ * desktop-host model). Host and view talk only over the view document's own MessagePort
+ * (mcpAppDocumentChannel.ts), rate limited and zod-validated; tool calls go only to the view's own server through the backend, which
  * enforces visibility and consent.
  */
 /**
@@ -179,16 +179,6 @@ function isAllowDisabled(armed: boolean, liveApi: unknown): boolean {
   return !armed || liveApi == null;
 }
 
-/** What the host does with a message, by the document gate's verdict. */
-const VIEW_MESSAGE_ACTIONS: Record<
-  McpAppDocumentVerdict,
-  (data: unknown, host: McpAppHost, leaveDocument: () => void) => void
-> = {
-  deliver: (data, host) => void host.handleMessage(data),
-  drop: () => undefined,
-  left: (_data, _host, leaveDocument) => leaveDocument(),
-};
-
 /** What identifies the view document's content (not its nonce); null while there is none. */
 function mcpAppViewDocumentKey(loaded: Loaded | null, grant: McpAppCspGrant | null) {
   if (loaded?.view == null || grant == null) return null;
@@ -208,29 +198,25 @@ function buildMcpAppViewSrcDoc(
   if (loaded?.view == null || grant == null || viewDocument == null) return null;
   return finalizeSandboxedDocument(parseArtifactHtml(loaded.view.html), {
     csp: buildMcpAppCsp(grant.granted),
-    bridgeScript: [
-      mcpAppPreambleScript({ nonce: viewDocument.nonce, leaveOnBeforeUnload: !isDesktopMode() }),
-      mcpAppOpenAiShimScript(openAiSeed),
-    ],
+    bridgeScript: [mcpAppPreambleScript(viewDocument.nonce), mcpAppOpenAiShimScript(openAiSeed)],
   });
 }
 
 /**
- * One nonce and gate per loaded view document (mcpAppPreambleScript): a new grant, tool call or
- * Reload loads a new one, and the leave of the document it replaces must not close it. Kept
- * across host rebuilds of the same document, which announces itself only once. Null until
- * the first render with a document.
+ * One nonce and host channel per loaded view document (mcpAppDocumentChannel.ts): a new grant,
+ * tool call or Reload loads a new one. Kept across host rebuilds of the same document, which
+ * announces itself only once. Null until the first render with a document.
  */
 function useMcpAppViewDocument(documentKey: string | null, frameKey: number) {
   const key = documentKey == null ? null : `${frameKey}:${documentKey}`;
   const [loaded, setLoaded] = useState<{
     key: string;
     nonce: string;
-    accept: McpAppDocumentGate;
+    channel: McpAppDocumentChannel;
   } | null>(null);
   if (key != null && loaded?.key !== key) {
     const nonce = newMcpAppDocumentNonce();
-    setLoaded({ key, nonce, accept: createMcpAppDocumentGate(nonce) });
+    setLoaded({ key, nonce, channel: createMcpAppDocumentChannel(nonce) });
   }
   return loaded?.key === key ? loaded : null;
 }
@@ -266,7 +252,6 @@ export function McpAppFrame(props: {
   const consentRef = useRef<PendingConsent | null>(null);
   const consentArming = useConfirmArmed(consent?.id ?? null);
   const [height, setHeight] = useState<number | null>(null);
-  const [allowMessage] = useState(() => createBridgeRateLimiter());
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const hostRef = useRef<McpAppHost | null>(null);
@@ -375,14 +360,17 @@ export function McpAppFrame(props: {
 
   // Values the long-lived host reads at message time.
   const latest = useRef({ theme, view, result: current?.view ?? null, onClose: props.onClose });
-  useEffect(() => {
+  // A layout effect ahead of the host's: a view that initializes at once must get this render's
+  // result (onInitialized reads it).
+  useLayoutEffect(() => {
     latest.current = { theme, view, result: current?.view ?? null, onClose: props.onClose };
   });
 
   // A layout effect: the listener must be in place before the frame's preamble announces its
-  // document, or the gate would never open.
+  // document, or its channel would never open.
   useLayoutEffect(() => {
     if (srcDoc == null || grant == null || viewDocument == null || guard.navigated) return;
+    const { channel } = viewDocument;
     const getHostContext = (): McpAppHostContext => ({
       theme: latest.current.theme,
       styles: { variables: readStyleVariables() },
@@ -413,7 +401,7 @@ export function McpAppFrame(props: {
       grantedCsp: grant.granted,
       // Never into a frame that navigated away from the view (frameNavigationGuard.tsx).
       postToView: (message) => {
-        if (!navigatedRef.current) frameRef.current?.contentWindow?.postMessage(message, "*");
+        if (!navigatedRef.current) channel.post(message);
       },
       getHostContext,
       callTool: async (toolName, args, consented) => {
@@ -503,22 +491,24 @@ export function McpAppFrame(props: {
         console.debug(`[MCP Apps] ${boundServerName}: ${message}`, data ?? ""),
     });
     hostRef.current = host;
-    // SECURITY: only messages of the document built here, from its open announcement until it
-    // starts to leave; its leave counts as a navigation (mcpAppPreambleScript).
+    // SECURITY: the host talks only over the channel of the document built here; its port
+    // arrives with the document's open announcement (mcpAppDocumentChannel.ts).
+    channel.setReceiver({
+      message: (data) => {
+        if (!navigatedRef.current) void host.handleMessage(data);
+      },
+      leave: leaveDocument,
+    });
     const handler = (event: MessageEvent) => {
-      const verdict = navigatedRef.current
-        ? "drop"
-        : viewDocument.accept(
-            event.data,
-            passesFrameGate(event, frameRef.current?.contentWindow, allowMessage)
-          );
-      VIEW_MESSAGE_ACTIONS[verdict](event.data, host, leaveDocument);
+      const frameWindow = navigatedRef.current ? null : frameRef.current?.contentWindow;
+      if (frameWindow != null && event.source === frameWindow) channel.acceptOpen(event);
     };
     window.addEventListener("message", handler);
     return () => {
       window.removeEventListener("message", handler);
       // Best effort when the view is switched away; Close waits for the reply instead.
       void host.teardown("unmount");
+      channel.setReceiver(null);
       hostRef.current = null;
       consentRef.current?.resolve(false);
       consentRef.current = null;
@@ -526,15 +516,17 @@ export function McpAppFrame(props: {
     };
     // The host lives as long as the document; `grant` is derived from the same inputs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    srcDoc,
-    workspaceId,
-    serverName,
-    boundServerName,
-    allowMessage,
-    guard.navigated,
-    navigatedRef,
-  ]);
+  }, [srcDoc, workspaceId, serverName, boundServerName, guard.navigated, navigatedRef]);
+  // Close the channel of the document a new one replaced. A setup, not a cleanup: StrictMode
+  // replays effects (setup, cleanup, setup), and a cleanup would close the live channel. Setups
+  // run after every cleanup of the commit, so the old host's teardown still went out on it. An
+  // unmounted frame's channel has no receiver left and is dropped with the component.
+  const previousDocument = useRef(viewDocument);
+  useLayoutEffect(() => {
+    const previous = previousDocument.current;
+    previousDocument.current = viewDocument;
+    if (previous != null && previous !== viewDocument) previous.channel.close();
+  }, [viewDocument]);
 
   // Keep the view's theme current without reloading it.
   useEffect(() => {

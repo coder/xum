@@ -446,7 +446,7 @@ describe("in-page links", () => {
   // jumps to the target itself. HTML artifacts and MCP App views both get it.
   test.each([
     ["HTML artifact bridge", buildArtifactBridgeScript("light")],
-    ["MCP App preamble", mcpAppPreambleScript({ nonce: "00", leaveOnBeforeUnload: true })],
+    ["MCP App preamble", mcpAppPreambleScript("00")],
   ])("%s jumps to # targets inside the frame document", async (_name, script) => {
     const win = new HappyWindow({ url: "http://localhost/workspace/abc" });
     const doc = win.document;

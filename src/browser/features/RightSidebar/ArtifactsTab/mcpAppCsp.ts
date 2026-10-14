@@ -1,7 +1,7 @@
 import type { McpAppCspDeclaration } from "@/common/orpc/schemas/mcpApps";
-import assert from "@/common/utils/assert";
 import { mcpAppGrantableOrigin } from "@/common/utils/mcpApps";
 import { ARTIFACT_IN_PAGE_LINK_SCRIPT } from "./artifactBridge";
+import { mcpAppDocumentChannelScript } from "./mcpAppDocumentChannel";
 
 /**
  * CSP for MCP Apps views (artifacts experiment).
@@ -50,9 +50,6 @@ export function grantMcpAppCsp(
   return { granted, pending: [...new Set(pending)], notGranted: [...new Set(notGranted)] };
 }
 
-/** Key of the preamble's document announcements (never a JSON-RPC message). */
-const MCP_APP_DOCUMENT_MARKER = "xumMcpAppDocument";
-
 /**
  * First script of every view document (after the CSP meta, before any view script).
  *
@@ -62,33 +59,10 @@ const MCP_APP_DOCUMENT_MARKER = "xumMcpAppDocument";
  * reference, and `frame-src 'none'` keeps it from reaching a fresh window's constructors through
  * a child frame. HTML artifacts get the same removal from their bridge script.
  * It also makes in-page `#` links jump within the view instead of navigating it away (same
- * reason as for HTML artifacts: ARTIFACT_IN_PAGE_LINK_SCRIPT).
- *
- * SECURITY AUDIT: it also binds the host bridge to this document (#6187). A page the frame
- * navigates to keeps the frame's window, so the source-window gate alone accepts it, and in
- * browser mode nothing blocks the navigation (the desktop app does: subframeNavigation.ts).
- * So the preamble announces the document with the host's per-document nonce before any view
- * script runs, and announces it gone when it starts to leave. The host accepts messages only
- * in between (createMcpAppDocumentGate). Its capture listeners are registered before any view
- * script, so no view listener runs ahead of them.
- * - Browser mode: the leave goes out on `beforeunload`, before the navigation request starts,
- *   so it reaches the host ahead of every message of the next page.
- * - `pagehide` covers what `beforeunload` misses: Chromium fires no `beforeunload` for a
- *   redirect while the srcdoc still loads. Its message arrived ahead of the next page's first
- *   message in Chromium, but no spec orders the two. The load count of
- *   useFrameNavigationGuard stays as a second check.
- * - Desktop app: the navigation is blocked after `beforeunload`, and the view must keep
- *   working, so only `pagehide` (the document really unloads) counts there.
- * A view that hands its nonce to the page it navigates to gains nothing: the gate never
- * reopens after a leave, and the view could put its data in the navigation URL anyway.
+ * reason as for HTML artifacts: ARTIFACT_IN_PAGE_LINK_SCRIPT), and gives the view its host
+ * channel, bound to this document (mcpAppDocumentChannelScript).
  */
-export function mcpAppPreambleScript(document: {
-  nonce: string;
-  /** Announce the leave on `beforeunload` (browser mode), not only on `pagehide`. */
-  leaveOnBeforeUnload: boolean;
-}): string {
-  assert(/^[0-9a-f]+$/.test(document.nonce), "MCP App document nonce must be hex");
-  const leaveEvents = document.leaveOnBeforeUnload ? ["beforeunload", "pagehide"] : ["pagehide"];
+export function mcpAppPreambleScript(nonce: string): string {
   return `(function () {
   "use strict";
   Object.getOwnPropertyNames(window).forEach(function (name) {
@@ -96,77 +70,9 @@ export function mcpAppPreambleScript(document: {
       try { delete window[name]; } catch (error) {}
     }
   });
-  // window.parent is replaceable: keep the real one before any view script runs.
-  var host = window.parent;
-  var announce = function (type) {
-    host.postMessage({ ${MCP_APP_DOCUMENT_MARKER}: 1, type: type, nonce: "${document.nonce}" }, "*");
-  };
-  var left = false;
-  var leave = function () {
-    if (left) return;
-    left = true;
-    announce("leave");
-  };
-  ${JSON.stringify(leaveEvents)}.forEach(function (type) {
-    window.addEventListener(type, leave, true);
-  });
-  announce("open");
+  ${mcpAppDocumentChannelScript(nonce)}
   ${ARTIFACT_IN_PAGE_LINK_SCRIPT}
 })();`;
-}
-
-/** A fresh nonce for one view document. getRandomValues also works outside secure contexts. */
-export function newMcpAppDocumentNonce(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-/**
- * What to do with one message: hand it to the host, drop it, or drop it because the document
- * just announced its leave (then the frame is treated as navigated away).
- */
-export type McpAppDocumentVerdict = "deliver" | "drop" | "left";
-
-/** `fromFrame`: the message passed the source-window gate (passesFrameGate). */
-export type McpAppDocumentGate = (data: unknown, fromFrame: boolean) => McpAppDocumentVerdict;
-
-/**
- * The host side of the preamble's announcements for the document built with `nonce`. Fail
- * closed: nothing is delivered before the document's own open announcement, and nothing after
- * its leave, for good. Announcements with another nonce (an earlier document of the same
- * frame, or a forgery) are dropped and change nothing.
- *
- * A leave counts from any source: Chromium runs `pagehide` once the next document committed,
- * so its message no longer comes from the frame's window. A leave can only close the bridge,
- * and only a holder of the nonce can send it.
- */
-/** What one message is for the gate of the document with `nonce`. */
-function documentEvent(
-  data: unknown,
-  nonce: string,
-  fromFrame: boolean
-): "message" | "open" | "leave" | "ignore" {
-  if (typeof data !== "object" || data === null || !(MCP_APP_DOCUMENT_MARKER in data)) {
-    return "message";
-  }
-  const announcement = data as { type?: unknown; nonce?: unknown };
-  if (announcement.nonce !== nonce) return "ignore";
-  if (announcement.type === "leave") return "leave";
-  return announcement.type === "open" && fromFrame ? "open" : "ignore";
-}
-
-export function createMcpAppDocumentGate(nonce: string): McpAppDocumentGate {
-  let state: "waiting" | "open" | "left" = "waiting";
-  return (data, fromFrame) => {
-    const event = documentEvent(data, nonce, fromFrame);
-    if (state === "left") return "drop";
-    if (event === "leave") {
-      state = "left";
-      return "left";
-    }
-    if (event === "open" && state === "waiting") state = "open";
-    return event === "message" && fromFrame && state === "open" ? "deliver" : "drop";
-  };
 }
 
 export function buildMcpAppCsp(granted: GrantedMcpAppCsp): string {
