@@ -106,20 +106,14 @@ export const FIRST_RUN_TEMPLATE_ID = "xum-pre-template";
 const FIRST_RUN_MODULES_ID = "xum-pre-modules";
 
 /**
- * The early script (plan section 5.6): JavaScript for an inline <script> on the served "/", after
- * the slashless redirect, the <base> tag and the module list (PR 4b injects all four). It decides
- * whether the wizard will open on its gateway step, and only then shows the static view:
- * 1. The paint-cache key is set (this browser saw the wizard viewed) or the tab is hidden (no frames
- *    there): load the app at once, with no API call and no view.
- * 2. Otherwise POST the viewed splash list and the provider config together, with the URL's or the
- *    stored token. A failure, a 401 (the app then shows its token prompt) or no answer within
- *    1,000 ms (one abort timer: the deadline of a network call, the script's only timer) loads the
- *    app with no view, as today.
- * 3. Show the view when the wizard is not viewed, no provider is configured and no gateway coupon is
- *    set (OnboardingWizardSplash then opens on the gateway step). Load the app two frames later,
- *    after the frame that paints the view, or at once when the tab turns hidden.
- * The app's module script removes the view if it fails to load. The app removes it otherwise.
- * It holds no request or user data, and inserts the view from a template clone, never as HTML.
+ * The early script (plan section 5.6), for an inline <script> on the served "/" after the slashless
+ * redirect, the <base> tag and the module list (PR 4b injects them). Its only timer is the 1,000 ms
+ * abort of its two POSTs. With the paint-cache key set or a hidden tab it loads the app at once,
+ * with no API call. A failed, 401 or aborted POST loads the app with no view, as today. The view
+ * shows only when the wizard opens on the gateway step as captured: not viewed, no configured
+ * provider, and no gateway coupon (a coupon swaps that step's panel). The app then loads two frames
+ * later, or at once when the tab turns hidden. A failed module script removes the view.
+ * SECURITY AUDIT: no request or user data; the view comes from a template clone, never HTML.
  */
 export const FIRST_RUN_EARLY_SCRIPT = `(() => {
   const path = location.pathname;
@@ -128,7 +122,16 @@ export const FIRST_RUN_EARLY_SCRIPT = `(() => {
   const loadApp = () => {
     if (loaded) return;
     loaded = true;
-    const list = JSON.parse(document.getElementById(${JSON.stringify(FIRST_RUN_MODULES_ID)}).textContent);
+    let list;
+    try {
+      list = JSON.parse(document.getElementById(${JSON.stringify(FIRST_RUN_MODULES_ID)}).textContent);
+      if (typeof list.script !== "string" || !Array.isArray(list.preload)) throw new Error("bad list");
+    } catch (error) {
+      // No list, no app to load: at least drop the view, so it does not stay up as if it worked.
+      document.getElementById(${JSON.stringify(FIRST_RUN_VIEW_ID)})?.remove();
+      console.error("first-run view: no usable module list", error);
+      return;
+    }
     for (const href of list.preload) {
       const link = document.createElement("link");
       Object.assign(link, { rel: "modulepreload", crossOrigin: "", href });

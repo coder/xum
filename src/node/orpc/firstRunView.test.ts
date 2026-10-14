@@ -2,7 +2,7 @@
  * The early script of the static first-run view (T3 #5971, C step 2, plan section 5.6, PR 4a),
  * run in happy-dom with a fake fetch, timers and frames, so every path is deterministic.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
 import { AUTH_TOKEN_KEY, ONBOARDING_VIEWED_KEY } from "@/common/constants/storage";
@@ -26,7 +26,9 @@ afterEach(async () => {
 // Element checks compare to null in a boolean: a failing expect on an element dumps megabytes.
 
 /** Runs the script on a served "/" (the module list, then the template), with fakes for its inputs. */
-function run(o: { url?: string; viewed?: boolean; token?: string; hidden?: boolean } = {}) {
+function run(
+  o: { url?: string; viewed?: boolean; token?: string; hidden?: boolean; list?: string } = {}
+) {
   const window = new GlobalWindow({
     url: o.url ?? "http://127.0.0.1/",
     settings: { disableJavaScriptFileLoading: true, handleDisabledFileLoadingAsSuccess: true },
@@ -34,7 +36,7 @@ function run(o: { url?: string; viewed?: boolean; token?: string; hidden?: boole
   dom = window;
   const doc = window.document as unknown as Document;
   const list = { script: "./main-A.js", preload: ["./api-B.js"] };
-  doc.head.innerHTML = `<script type="application/json" id="${FIRST_RUN_MODULES_ID}">${JSON.stringify(list)}</script>`;
+  doc.head.innerHTML = `<script type="application/json" id="${FIRST_RUN_MODULES_ID}">${o.list ?? JSON.stringify(list)}</script>`;
   doc.body.innerHTML = `<div id="root"></div><template id="${FIRST_RUN_TEMPLATE_ID}">${FIRST_RUN_VIEW_HTML}</template>`;
   if (o.viewed) window.localStorage.setItem(ONBOARDING_VIEWED_KEY, "true");
   if (o.token) window.localStorage.setItem(AUTH_TOKEN_KEY, o.token);
@@ -117,12 +119,6 @@ describe("the early script", () => {
     expect(page.timers.map((t) => [t.ms, t.cleared])).toEqual([[1000, true]]);
   });
 
-  // Catches a stored token that is not sent when the URL has none.
-  test("sends the stored token when the URL has none", () => {
-    const page = run({ token: "stored" });
-    expect(page.calls[0].headers.Authorization).toBe("Bearer stored");
-  });
-
   // Each row catches the removal of its own branch: the view would show, or the app never loads.
   test.each([
     ["the wizard was viewed", (p: Page) => p.answer(["onboarding-wizard-v1"], {})],
@@ -174,9 +170,11 @@ describe("the early script", () => {
     expect(page.view() === null).toBe(true);
   });
 
-  // Catches an insert that does not wait for the parser: in the <head>, the <template> comes later.
+  // Catches an insert that does not wait for the parser (in the <head>, the <template> comes later),
+  // and a stored token that is not sent when the URL has none.
   test("waits for DOMContentLoaded when the POSTs answer before the template is parsed", async () => {
-    const page = run();
+    const page = run({ token: "stored" });
+    expect(page.calls[0].headers.Authorization).toBe("Bearer stored");
     const doc = dom!.document;
     const template = doc.getElementById(FIRST_RUN_TEMPLATE_ID)!;
     template.remove();
@@ -186,6 +184,21 @@ describe("the early script", () => {
     doc.body.append(template);
     doc.dispatchEvent(new dom!.Event("DOMContentLoaded"));
     expect(page.view() === null).toBe(false);
+  });
+
+  // Catches an unguarded module list: the throw would leave the view up with no app behind it.
+  test("drops the view when the module list is unusable", async () => {
+    const error = spyOn(console, "error").mockImplementation(() => undefined);
+    const page = run({ list: '{"script": 1}' });
+    await page.answer([], {});
+    page.flushFrames();
+    page.flushFrames();
+    expect([page.view() === null, page.apps().length, error.mock.calls.length]).toEqual([
+      true,
+      0,
+      1,
+    ]);
+    error.mockRestore();
   });
 
   // Catches a script that runs on a slashless URL, which the redirect script navigates away from.
