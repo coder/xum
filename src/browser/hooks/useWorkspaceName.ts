@@ -5,16 +5,16 @@ import {
   createSessionValueStore,
   truncateStringToChars,
 } from "@/browser/utils/boundedPersistedValue";
-import { getWorkspaceNameStateKey } from "@/common/constants/storage";
+import {
+  getWorkspaceNameStateKey,
+  WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS,
+} from "@/common/constants/storage";
 import {
   WorkspaceNamePersistedStateSchema,
   type WorkspaceIdentity,
   type WorkspaceNamePersistedState,
 } from "@/common/orpc/schemas/drafts";
-import {
-  WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS,
-  toStoredMessage,
-} from "@/common/utils/workspaceNameState";
+import { toStoredMessage } from "@/common/utils/workspaceNameState";
 import type { NameGenerationError } from "@/common/types/errors";
 import {
   validateWorkspaceBranchName,

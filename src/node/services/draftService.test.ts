@@ -7,10 +7,8 @@ import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { DEFAULT_CREATION_DRAFT_ID, MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
-import {
-  WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS,
-  toStoredMessage,
-} from "@/common/utils/workspaceNameState";
+import { WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS } from "@/common/constants/storage";
+import { toStoredMessage } from "@/common/utils/workspaceNameState";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import type {
   DraftAttachment,
