@@ -585,6 +585,22 @@ async function listSkillDirectoriesFromRuntime(
     .filter(Boolean);
 }
 
+/** A loaded skill whose SKILL.md `name` is only a display name gets a non-fatal warning. */
+function pushDisplayNameWarning(
+  options: { skillWarnings?: AgentSkillIssue[] } | undefined,
+  skill: Omit<AgentSkillIssue, "message" | "hint"> & { displayName?: string }
+): void {
+  if (options?.skillWarnings == null || skill.displayName === undefined) return;
+  const { displayName, ...identity } = skill;
+  const id = identity.directoryName;
+  log.debug(`Skill '${id}' (${identity.scope}) uses display name '${displayName}'`);
+  options.skillWarnings.push({
+    ...identity,
+    message: `SKILL.md name '${displayName}' is not the directory name, so Xum loads the skill as '${id}'.`,
+    hint: `Invoke it as /${id}. Set name: ${id} to remove this warning.`,
+  });
+}
+
 async function readSkillDescriptorFromDir(
   runtime: Runtime,
   skillDir: string,
@@ -699,7 +715,7 @@ async function readSkillDescriptorFromDir(
       whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
       paths: resolveSkillPaths(parsed.frontmatter),
       ...(options?.pluginName !== undefined ? { pluginName: options.pluginName } : {}),
-      ...(parsed.displayName !== undefined ? { displayName: parsed.displayName } : {}),
+      displayName: parsed.displayName,
     };
 
     const validated = AgentSkillDescriptorSchema.safeParse(descriptor);
@@ -712,17 +728,12 @@ async function readSkillDescriptorFromDir(
       return null;
     }
 
-    if (parsed.displayName !== undefined) {
-      log.debug(`Skill '${directoryName}' (${scope}) uses display name '${parsed.displayName}'`);
-      options?.skillWarnings?.push({
-        directoryName,
-        scope,
-        displayPath: skillFilePath,
-        message: `SKILL.md name '${parsed.displayName}' is not the directory name, so Xum loads the skill as '${directoryName}'.`,
-        hint: `Invoke it as /${directoryName}. Set name: ${directoryName} to remove this warning.`,
-      });
-    }
-
+    pushDisplayNameWarning(options, {
+      directoryName,
+      scope,
+      displayPath: skillFilePath,
+      displayName: parsed.displayName,
+    });
     return validated.data;
   } catch (err) {
     const message = err instanceof AgentSkillParseError ? err.message : getErrorMessage(err);
@@ -733,6 +744,26 @@ async function readSkillDescriptorFromDir(
     );
     return null;
   }
+}
+
+const SKILL_ISSUE_SCOPE_ORDER: Readonly<Record<AgentSkillScope, number>> = {
+  project: 0,
+  global: 1,
+  "built-in": 2,
+};
+
+function compareSkillIssues(a: AgentSkillIssue, b: AgentSkillIssue): number {
+  const scopeDiff = SKILL_ISSUE_SCOPE_ORDER[a.scope] - SKILL_ISSUE_SCOPE_ORDER[b.scope];
+  if (scopeDiff !== 0) return scopeDiff;
+  return a.directoryName.localeCompare(b.directoryName);
+}
+
+/** Omitted when empty so payloads for valid skills stay identical. */
+function skillWarningsResult(
+  skillWarnings: AgentSkillIssue[]
+): Pick<AgentSkillDiscoveryResult, "skillWarnings"> {
+  if (skillWarnings.length === 0) return {};
+  return { skillWarnings: [...skillWarnings].sort(compareSkillIssues) };
 }
 
 export interface AgentSkillDiscoveryResult {
@@ -819,13 +850,13 @@ export async function discoverAgentSkills(
       if (shadowed && !shadowedPluginSkills.isReachable(scan.pluginName, directoryName)) continue;
       // Shadowed reads must not change invalidSkills, so bare-name users see
       // identical diagnostics.
-      const issues: AgentSkillIssue[] = shadowed ? [] : invalidSkills;
-      const warnings: AgentSkillIssue[] = shadowed ? [] : skillWarnings;
+      const diagnostics: { invalidSkills: AgentSkillIssue[]; skillWarnings: AgentSkillIssue[] } =
+        shadowed ? { invalidSkills: [], skillWarnings: [] } : { invalidSkills, skillWarnings };
 
       const skillDir = scan.runtime.normalizePath(directoryName, resolvedRoot);
       const skillFilePath = scan.runtime.normalizePath("SKILL.md", skillDir);
       const pushInvalidSkill = (message: string, hint: string): void => {
-        issues.push({
+        diagnostics.invalidSkills.push({
           directoryName,
           scope: scan.scope,
           displayPath: skillFilePath,
@@ -850,8 +881,7 @@ export async function discoverAgentSkills(
         directoryName,
         scan.scope,
         {
-          invalidSkills: issues,
-          skillWarnings: warnings,
+          ...diagnostics,
           ...(scan.pluginName !== undefined ? { pluginName: scan.pluginName } : {}),
           ...(scan.pluginRoot !== undefined ? { pluginRoot: scan.pluginRoot } : {}),
         }
@@ -902,26 +932,14 @@ export async function discoverAgentSkills(
   const skills = dedupeByName ? Array.from(byName.values()) : discoveredSkills;
   skills.sort((a, b) => a.name.localeCompare(b.name));
 
-  const scopeOrder: Readonly<Record<AgentSkillScope, number>> = {
-    project: 0,
-    global: 1,
-    "built-in": 2,
-  };
-  const compareIssues = (a: AgentSkillIssue, b: AgentSkillIssue): number => {
-    const scopeDiff = scopeOrder[a.scope] - scopeOrder[b.scope];
-    if (scopeDiff !== 0) return scopeDiff;
-    return a.directoryName.localeCompare(b.directoryName);
-  };
-  invalidSkills.sort(compareIssues);
-  skillWarnings.sort(compareIssues);
+  invalidSkills.sort(compareSkillIssues);
 
   return {
     skills,
     invalidSkills,
     unavailableSources,
     ...shadowedPluginSkills.toResult(),
-    // Omitted when empty so payloads for valid skills stay identical.
-    ...(skillWarnings.length > 0 ? { skillWarnings } : {}),
+    ...skillWarningsResult(skillWarnings),
   };
 }
 

@@ -462,6 +462,18 @@ async function pathExists(candidate: string): Promise<boolean> {
   }
 }
 
+/** Preview warning for a skill whose SKILL.md `name` is only a display name. */
+function displayNameWarnings(
+  label: string,
+  dirName: string,
+  displayName: string | undefined
+): string[] {
+  if (displayName === undefined) return [];
+  return [
+    `${label}/${dirName}: SKILL.md name '${displayName}' is not the directory name; it loads as '${dirName}'`,
+  ];
+}
+
 function shortenHome(absPath: string): string {
   const home = os.homedir();
   if (absPath === home) {
@@ -2002,11 +2014,7 @@ export class AgentPluginInstallService {
           // Mirror runtime discovery: a display name loads under the dir name.
           allowDisplayName: true,
         });
-        if (parsed.displayName !== undefined) {
-          warnings.push(
-            `${label}/${dirName}: SKILL.md name '${parsed.displayName}' is not the directory name; it loads as '${dirName}'`
-          );
-        }
+        warnings.push(...displayNameWarnings(label, dirName, parsed.displayName));
         skills.push({
           name: parsed.frontmatter.name,
           ...(parsed.frontmatter.description !== undefined

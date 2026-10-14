@@ -165,7 +165,8 @@ describe("agent_skill_write", () => {
     await fs.mkdir(path.join(canonicalRoot, "demo-skill", "references"), { recursive: true });
     await fs.writeFile(
       path.join(canonicalRoot, "demo-skill", SKILL_FILENAME),
-      "---\nname: wrong-name\ndescription: Invalid canonical manifest\n---\n",
+      // No description: discovery rejects this manifest, so the legacy package merges in.
+      "---\nname: wrong-name\n---\n",
       "utf-8"
     );
     await fs.writeFile(

@@ -51,6 +51,26 @@ function qualifyDisplayName(value: unknown): string | undefined {
 }
 
 /**
+ * Swap a qualifying non-ID `name` for the directory name (see allowDisplayName).
+ * `displayField` is spread into the result, so the key is absent when unused.
+ */
+function applyDisplayName(
+  raw: Record<string, unknown>,
+  input: { directoryName?: SkillName; allowDisplayName?: boolean }
+): { frontmatterInput: Record<string, unknown>; displayField: { displayName?: string } } {
+  const unchanged = { frontmatterInput: raw, displayField: {} };
+  if (!input.allowDisplayName || !input.directoryName || raw.name === input.directoryName) {
+    return unchanged;
+  }
+  const displayName = qualifyDisplayName(raw.name);
+  if (displayName === undefined) return unchanged;
+  return {
+    frontmatterInput: { ...raw, name: input.directoryName },
+    displayField: { displayName },
+  };
+}
+
+/**
  * Parse a SKILL.md file into validated frontmatter + markdown body.
  *
  * Defensive constraints:
@@ -108,15 +128,7 @@ export function parseSkillMarkdown(input: {
 
   assertObject(raw, "SKILL.md YAML frontmatter must be a mapping/object.");
 
-  let frontmatterInput: Record<string, unknown> = raw;
-  let displayName: string | undefined;
-  if (input.allowDisplayName && input.directoryName && raw.name !== input.directoryName) {
-    displayName = qualifyDisplayName(raw.name);
-    if (displayName !== undefined) {
-      frontmatterInput = { ...raw, name: input.directoryName };
-    }
-  }
-
+  const { frontmatterInput, displayField } = applyDisplayName(raw, input);
   const parsed = AgentSkillFrontmatterSchema.safeParse(frontmatterInput);
   if (!parsed.success) {
     throw new AgentSkillParseError(
@@ -132,7 +144,5 @@ export function parseSkillMarkdown(input: {
     );
   }
 
-  return displayName !== undefined
-    ? { frontmatter: parsed.data, body, displayName }
-    : { frontmatter: parsed.data, body };
+  return { frontmatter: parsed.data, body, ...displayField };
 }

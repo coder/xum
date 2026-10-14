@@ -30,6 +30,15 @@ function filterAndMapSuggestions<T extends SuggestionDefinition>(
     .map((definition) => build(definition));
 }
 
+/** A display name (SKILL.md `name` that is not the ID) labels the entry; matching stays on the ID. */
+function formatSkillDescription(
+  skill: { description: string; displayName?: string },
+  scopeLabel: string
+): string {
+  const label = skill.displayName ? `${skill.displayName}: ` : "";
+  return `${label}${skill.description} (${scopeLabel})`;
+}
+
 function buildTopLevelSuggestions(
   partial: string,
   context: SlashSuggestionContext
@@ -69,8 +78,7 @@ function buildTopLevelSuggestions(
     .filter((skill) => !SLASH_COMMAND_DEFINITION_MAP.has(skill.name))
     .map((skill) => ({
       key: skill.name,
-      // A display name (SKILL.md `name` that is not the ID) labels the entry; matching stays on the ID.
-      description: `${skill.displayName ? `${skill.displayName}: ` : ""}${skill.description} (${formatScopeLabel(skill.scope)})`,
+      description: formatSkillDescription(skill, formatScopeLabel(skill.scope)),
       argumentHint: skill.argumentHint,
     }));
 
