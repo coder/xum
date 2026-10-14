@@ -213,9 +213,19 @@ export function normalizeOpenAIRelativePath(value: unknown): string | undefined 
  */
 export const MAX_HOOK_POINTER_ENTRIES = 32;
 
-function readHooks(raw: unknown, warnings: string[]): OpenAIPluginHooksEntry[] {
+/** The first MAX_HOOK_POINTER_ENTRIES entries; one warning reports the rest. */
+function capHookEntries(raw: unknown, warnings: string[]): unknown[] {
   const all: unknown[] = Array.isArray(raw) ? raw : [raw];
-  const entries = all.slice(0, MAX_HOOK_POINTER_ENTRIES);
+  if (all.length > MAX_HOOK_POINTER_ENTRIES) {
+    warnings.push(
+      `'${FIELD}.hooks' has ${all.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
+    );
+  }
+  return all.slice(0, MAX_HOOK_POINTER_ENTRIES);
+}
+
+function readHooks(raw: unknown, warnings: string[]): OpenAIPluginHooksEntry[] {
+  const entries = capHookEntries(raw, warnings);
   const hooks: OpenAIPluginHooksEntry[] = [];
   for (const entry of entries) {
     if (isPlainObject(entry)) {
@@ -230,11 +240,6 @@ function readHooks(raw: unknown, warnings: string[]): OpenAIPluginHooksEntry[] {
       continue;
     }
     hooks.push(relative);
-  }
-  if (all.length > entries.length) {
-    warnings.push(
-      `'${FIELD}.hooks' has ${all.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
-    );
   }
   return hooks;
 }
@@ -270,13 +275,22 @@ export function readOpenAIExtension(manifest: Pick<AgentPluginManifest, "extensi
     const parsed = readInterface(raw.interface, warnings);
     if (parsed !== undefined) extension.interface = parsed;
   }
+  readSubmissionMetadata(raw, extension, warnings);
+  return { extension, warnings };
+}
+
+/** Copy `review` and `publication` as opaque objects; any other shape warns. */
+function readSubmissionMetadata(
+  raw: Record<string, unknown>,
+  extension: OpenAIPluginExtension,
+  warnings: string[]
+): void {
   for (const key of ["review", "publication"] as const) {
     const value = raw[key];
     if (value === undefined) continue;
     if (isPlainObject(value)) extension[key] = value;
     else warnings.push(`'${FIELD}.${key}' must be an object; ignoring`);
   }
-  return { extension, warnings };
 }
 
 /** Codex top-level fields that move into `extensions["com.openai"]`. */

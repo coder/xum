@@ -153,7 +153,7 @@ describe("readOpenAIExtension", () => {
     // The late valid entry is past the cap, so no entry is valid: the default file stays off.
     expect(extension).toEqual({ hooks: [] });
     expect(warnings).toHaveLength(MAX_HOOK_POINTER_ENTRIES + 1);
-    expect(warnings.at(-1)).toContain("100001 entries");
+    expect(warnings.filter((warning) => warning.includes("100001 entries"))).toHaveLength(1);
   });
 
   test("keeps review and publication as opaque objects; other shapes warn", () => {
