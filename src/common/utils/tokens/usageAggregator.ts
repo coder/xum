@@ -47,6 +47,19 @@ export function addLongContextTokens(
   };
 }
 
+export function scaleLongContextTokens(
+  share: LongContextTokens,
+  factor: number
+): LongContextTokens {
+  return {
+    input: share.input * factor,
+    cached: share.cached * factor,
+    cacheCreate: share.cacheCreate * factor,
+    cacheCreate1h: share.cacheCreate1h * factor,
+    output: share.output * factor,
+  };
+}
+
 /**
  * Bounds a long-context share by the usage it belongs to (`totals`, all of its tokens), so a
  * malformed share cannot price more tokens than the usage has. The 1h part also stays within

@@ -19,7 +19,7 @@ import {
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import assert from "@/common/utils/assert";
 import { EventLoopYielder } from "@/node/utils/concurrency/eventLoopYielder";
-import { createDisplayUsage } from "./displayUsage";
+import { createDisplayUsage, readTurnSteps } from "./displayUsage";
 import type { ChatUsageDisplay } from "./usageAggregator";
 
 // Re-export for backward compatibility
@@ -342,7 +342,8 @@ export function extractSyncMetadata(
           message.metadata.usage,
           runtimeModel,
           message.metadata.providerMetadata,
-          metadataModel
+          metadataModel,
+          readTurnSteps(message.metadata)
         );
         if (usage) {
           usageHistory.push(usage);

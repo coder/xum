@@ -8,7 +8,11 @@ import { DuckDBAppender, DuckDBDateValue, type DuckDBConnection } from "@duckdb/
 import { EventRowSchema, type EventRow } from "@/common/orpc/schemas/analytics";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getErrorMessage } from "@/common/utils/errors";
-import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import {
+  createDisplayUsage,
+  readTurnSteps,
+  type TurnSteps,
+} from "@/common/utils/tokens/displayUsage";
 import modelsData from "@/common/utils/tokens/models.json";
 import { modelsExtra } from "@/common/utils/tokens/models-extra";
 import { log } from "@/node/services/log";
@@ -351,6 +355,8 @@ function buildIngestEventRow(params: {
   metadataModel?: string;
   usage: LanguageModelV2Usage;
   providerMetadata?: Record<string, unknown>;
+  /** Main turn rows only: prices the context tier of turns without per-request shares. */
+  turnSteps?: TurnSteps;
   toolName: string | null;
   timestamp: number | null;
   durationMs: number | null;
@@ -367,7 +373,8 @@ function buildIngestEventRow(params: {
     params.usage,
     params.model ?? "unknown",
     params.providerMetadata,
-    params.metadataModel
+    params.metadataModel,
+    params.turnSteps
   );
   assert(displayUsage, "createDisplayUsage should return data for parsed usage payloads");
 
@@ -812,6 +819,7 @@ function extractIngestEvents(params: {
       metadataModel: toOptionalString(metadata.metadataModel),
       usage,
       providerMetadata: isRecord(metadata.providerMetadata) ? metadata.providerMetadata : undefined,
+      turnSteps: readTurnSteps(metadata),
       toolName: null,
       timestamp,
       durationMs,

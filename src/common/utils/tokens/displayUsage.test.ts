@@ -688,6 +688,53 @@ describe("long-context tiers chosen per request", () => {
     expect(recomputeUsageCosts(aggregate, MODEL, { aggregatedUsage: true })).toEqual(aggregate);
   });
 
+  describe("turns recorded without per-request shares", () => {
+    /** A legacy row: the summed usage plus the last step and step count, no shares. */
+    const legacyTurn = (prompts: number[]) => {
+      const steps = prompts.map((inputTokens) => step({ inputTokens }));
+      const lastStep = steps[steps.length - 1];
+      return {
+        steps,
+        price: () =>
+          createDisplayUsage(turnUsage(steps), MODEL, undefined, undefined, {
+            lastStepUsage: lastStep.usage,
+            stepCount: steps.length,
+          })!,
+      };
+    };
+
+    test("a last step at or under the threshold prices the whole turn at base rates", () => {
+      const turn = legacyTurn([60_000, 80_000, 100_000]);
+      expect(totalCost(turn.price())).toBeCloseTo(totalCost(priceRequests(turn.steps)), 12);
+    });
+
+    test("a mid-turn compaction prices the earlier steps long and the last step base", () => {
+      // The earlier steps average over the threshold, so at least one of them crossed it.
+      const turn = legacyTurn([120_000, 150_000, 30_000]);
+      expect(totalCost(turn.price())).toBeCloseTo(totalCost(priceRequests(turn.steps)), 12);
+    });
+
+    test("a last step over the threshold prices the steps past it long", () => {
+      // Prompts grow evenly; the last five of ten steps are over the threshold.
+      const turn = legacyTurn([20, 40, 60, 80, 100, 120, 140, 160, 180, 200].map((k) => k * 1_000));
+      const estimate = totalCost(turn.price());
+      expect(estimate / totalCost(priceRequests(turn.steps))).toBeCloseTo(1, 1);
+      expect(estimate).toBeLessThan(totalCost(createDisplayUsage(turnUsage(turn.steps), MODEL)!));
+    });
+
+    test("a recorded per-request share wins over the last-step estimate", () => {
+      const steps = [step({ inputTokens: 80_000 }), step({ inputTokens: 130_000 })];
+      const usage = createDisplayUsage(
+        turnUsage(steps),
+        MODEL,
+        accumulateStepsProviderMetadata(steps, MODEL),
+        undefined,
+        { lastStepUsage: steps[1].usage, stepCount: 2 }
+      )!;
+      expect(totalCost(usage)).toBeCloseTo(totalCost(priceRequests(steps)), 12);
+    });
+  });
+
   test("a malformed persisted share prices no more than every token at the long rate", () => {
     const allLong = priceTurn([step({ inputTokens: 130_000, cachedInputTokens: 30_000 })]);
     const huge = 1e12;

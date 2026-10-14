@@ -379,13 +379,20 @@ describe("Anthropic 1h-TTL cache-write share", () => {
     expect(getAnthropicCacheWrite1hTokens(threeSteps, 8_000)).toBe(4_500);
   });
 
-  test("keeps an old multi-step row at the 5m price instead of extrapolating its last step", () => {
-    // Pre-fix multi-step rows kept the summed total but only the last step's raw split,
-    // and earlier steps can have a different 5m/1h mix.
-    const oldRow = { anthropic: { ...step(0, 2_000).anthropic, cacheCreationInputTokens: 9_000 } };
-    expect(getAnthropicCacheWrite1hTokens(oldRow, 9_000)).toBe(0);
-    // A split that covers the whole total is exact and still priced.
+  // Pre-fix multi-step rows kept the summed total but only the last step's raw split.
+  const oldRow = (fiveMinute: number, oneHour: number) => ({
+    anthropic: { ...step(fiveMinute, oneHour).anthropic, cacheCreationInputTokens: 9_000 },
+  });
+
+  test("prices all of an old multi-step row's writes as 1h when its last step wrote only 1h", () => {
+    expect(getAnthropicCacheWrite1hTokens(oldRow(0, 2_000), 9_000)).toBe(9_000);
+    // A split that covers the whole total is exact and still priced as reported.
     expect(getAnthropicCacheWrite1hTokens(step(1_000, 1_000), 2_000)).toBe(1_000);
+  });
+
+  test("keeps an old multi-step row at the 5m price when its last step wrote any 5m", () => {
+    expect(getAnthropicCacheWrite1hTokens(oldRow(500, 1_500), 9_000)).toBe(0);
+    expect(getAnthropicCacheWrite1hTokens(oldRow(2_000, 0), 9_000)).toBe(0);
   });
 
   test("a malformed 5m share keeps the 5m price instead of scaling the 1h share", () => {

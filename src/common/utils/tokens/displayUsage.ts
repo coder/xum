@@ -7,11 +7,14 @@
 
 import { getModelStats, type ModelStats } from "./modelStats";
 import { readReportedServiceTier, withServiceTierPricing } from "./serviceTierPricing";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import {
+  addLongContextTokens,
   clampLongContextTokens,
   getCacheCreate1hTokens,
   getLongContextTokens,
   NO_LONG_CONTEXT_TOKENS,
+  scaleLongContextTokens,
   type ChatUsageDisplay,
   type LongContextTokens,
 } from "./usageAggregator";
@@ -82,20 +85,96 @@ function hasTieredPricing(modelStats: ModelStats): boolean {
 }
 
 /**
+ * What a turn row records about its steps besides the summed usage. Rows from builds before
+ * per-request long-context shares price their tier from it.
+ */
+export interface TurnSteps {
+  /** The last step's usage (`metadata.contextUsage`). */
+  lastStepUsage: AiSdkUsageLike;
+  /** The last step's provider metadata (`metadata.contextProviderMetadata`). */
+  lastStepProviderMetadata?: Record<string, unknown>;
+  /** The number of steps (`metadata.stepStartPartIndices`); absent counts as one. */
+  stepCount?: number;
+}
+
+/** The turn's step record from persisted message metadata, which is not schema-validated. */
+export function readTurnSteps(metadata: {
+  contextUsage?: unknown;
+  contextProviderMetadata?: unknown;
+  stepStartPartIndices?: unknown;
+}): TurnSteps | undefined {
+  if (!isPlainObject(metadata.contextUsage)) return undefined;
+  return {
+    lastStepUsage: metadata.contextUsage as AiSdkUsageLike,
+    ...(isPlainObject(metadata.contextProviderMetadata) && {
+      lastStepProviderMetadata: metadata.contextProviderMetadata,
+    }),
+    ...(Array.isArray(metadata.stepStartPartIndices) && {
+      stepCount: metadata.stepStartPartIndices.length,
+    }),
+  };
+}
+
+/**
+ * Estimates the long-context share of a turn recorded without per-request shares from its
+ * last step, the only step a legacy row keeps. Prompts usually grow within a turn, so a last
+ * step at or under the threshold means no step crossed it, unless the earlier steps average
+ * over it (a mid-turn compaction): then they price long and the last step base. Over it,
+ * prompts are taken to grow evenly from the first step to the last, and the steps past the
+ * threshold take their share of every token class. On the gateway's per-request ledger
+ * (Sept 15 to Oct 14) this came within 2% per model and the compaction rule was exact, while
+ * pricing only the last step long was 13-67% low and the whole turn 6-58% high. Undefined
+ * when the last step's counts are malformed.
+ */
+function estimateLongContextTokens(
+  threshold: number,
+  tokens: UsageTokens,
+  steps: TurnSteps
+): LongContextTokens | undefined {
+  const lastStep = readUsageTokens(steps.lastStepUsage, steps.lastStepProviderMetadata);
+  const lastPrompt = getPromptTokens(lastStep);
+  if (!Number.isFinite(lastPrompt)) return undefined;
+  const summedPrompt = getPromptTokens(tokens);
+  const stepCount = Math.max(1, steps.stepCount ?? 1);
+  const totals = toLongContextTokens(tokens);
+  if (lastPrompt <= threshold) {
+    const earlierSteps = stepCount - 1;
+    const earlierStepsOver =
+      earlierSteps > 0 && summedPrompt - lastPrompt > threshold * earlierSteps;
+    return earlierStepsOver
+      ? addLongContextTokens(totals, scaleLongContextTokens(toLongContextTokens(lastStep), -1))
+      : NO_LONG_CONTEXT_TOKENS;
+  }
+  const firstPrompt = Math.min(
+    lastPrompt,
+    Math.max(0, (2 * summedPrompt) / stepCount - lastPrompt)
+  );
+  if (stepCount === 1 || firstPrompt >= threshold) return totals;
+  const stepsOver = (stepCount * (lastPrompt - threshold)) / (lastPrompt - firstPrompt);
+  const share = (stepsOver * (threshold + lastPrompt)) / (2 * summedPrompt);
+  return scaleLongContextTokens(totals, Math.min(1, share));
+}
+
+/**
  * The share of `tokens` to price at long-context rates; undefined for models without tiered
  * pricing. Providers choose the tier per request from its prompt size and apply it to the
  * whole request (input, cache reads and writes, output). `recorded` is the per-request share
- * summed over the usage's requests; without it the usage prices as one request.
+ * summed over the usage's requests. Without it a turn's tier is estimated from its `steps`,
+ * and other usage prices as one request.
  */
 function resolveLongContextTokens(
   modelStats: ModelStats,
   tokens: UsageTokens,
-  recorded: LongContextTokens | undefined
+  recorded: LongContextTokens | undefined,
+  steps: TurnSteps | undefined
 ): LongContextTokens | undefined {
   const threshold = modelStats.tiered_pricing_threshold_tokens;
   if (threshold === undefined) return undefined;
   const totals = toLongContextTokens(tokens);
-  if (recorded !== undefined) return clampLongContextTokens(recorded, totals);
+  const share =
+    recorded ??
+    (steps === undefined ? undefined : estimateLongContextTokens(threshold, tokens, steps));
+  if (share !== undefined) return clampLongContextTokens(share, totals);
   return getPromptTokens(tokens) > threshold ? totals : NO_LONG_CONTEXT_TOKENS;
 }
 
@@ -144,12 +223,16 @@ function calculateUsageCosts(
  *
  * This function transforms raw AI SDK usage data into a format suitable
  * for display in the UI. It does NOT require the tokenizer.
+ *
+ * Pass `turnSteps` when `usage` is a persisted turn's summed usage: it prices the context
+ * tier of turns recorded without per-request long-context shares.
  */
 export function createDisplayUsage(
   usage: AiSdkUsageLike | undefined,
   model: string,
   providerMetadata?: Record<string, unknown>,
-  metadataModelOverride?: string
+  metadataModelOverride?: string,
+  turnSteps?: TurnSteps
 ): ChatUsageDisplay | undefined {
   if (!usage) return undefined;
 
@@ -180,7 +263,8 @@ export function createDisplayUsage(
     longContextTokens = resolveLongContextTokens(
       modelStats,
       tokens,
-      readLongContextTokens(providerMetadata)
+      readLongContextTokens(providerMetadata),
+      turnSteps
     );
     const costs = calculateUsageCosts(modelStats, tokens, longContextTokens);
     inputCost = costs.inputCost;
@@ -326,7 +410,7 @@ export function recomputeUsageCosts(
   const costs = calculateUsageCosts(
     pricedStats,
     tokens,
-    resolveLongContextTokens(pricedStats, tokens, longContextTokens)
+    resolveLongContextTokens(pricedStats, tokens, longContextTokens, undefined)
   );
 
   return {

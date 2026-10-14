@@ -920,6 +920,28 @@ describe("SessionUsageService", () => {
       );
     });
 
+    it("rebuilds a legacy multi-step turn at the context tier of its steps", async () => {
+      // Haiku 5.5 bills a request at 5x once its prompt passes 100K tokens. This row predates
+      // per-request shares: two 85K steps sum to 170K, but its last step is under the threshold.
+      const workspaceId = "legacy-tier-rebuild-workspace";
+      const model = "anthropic:claude-haiku-5-5";
+      const assistantMessage = createMuxMessage("msg-legacy-tier", "assistant", "Hello", {
+        historySequence: 1,
+        timestamp: Date.now(),
+        model,
+        usage: { inputTokens: 170_000, outputTokens: 1_000, totalTokens: 171_000 },
+        contextUsage: { inputTokens: 85_000, outputTokens: 500, totalTokens: 85_500 },
+        stepStartPartIndices: [0, 1],
+      });
+
+      await service.rebuildFromMessages(workspaceId, [assistantMessage]);
+
+      const result = await service.getSessionUsage(workspaceId);
+      const usage = result?.byModel[normalizeToCanonical(model)];
+      expect(usage?.input.cost_usd).toBeCloseTo(170_000 * 0.1e-6, 12);
+      expect(usage?.output.cost_usd).toBeCloseTo(1_000 * 0.5e-6, 12);
+    });
+
     it("keys recovered Coder usage by the persisted metadata model", async () => {
       // Recovery runs AFTER mutable instance metadata may have changed: here
       // the custom instance is gone from providers config entirely, so

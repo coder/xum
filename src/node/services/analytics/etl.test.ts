@@ -96,6 +96,7 @@ function makeAssistantLine(
     toolModelUsages?: unknown[];
     modelFallback?: unknown;
     partial?: boolean;
+    extraMetadata?: Record<string, unknown>;
   } = {}
 ): string {
   return JSON.stringify({
@@ -116,6 +117,7 @@ function makeAssistantLine(
       ...(opts.toolModelUsages != null ? { toolModelUsages: opts.toolModelUsages } : {}),
       ...(opts.modelFallback != null ? { modelFallback: opts.modelFallback } : {}),
       ...(opts.partial != null ? { partial: opts.partial } : {}),
+      ...opts.extraMetadata,
     },
   });
 }
@@ -449,6 +451,38 @@ describe("appendEvents", () => {
     expect(Number(rows[0].input_cost_usd)).toBeGreaterThan(0);
     expect(Number(rows[0].output_cost_usd)).toBeGreaterThan(0);
     expect(Number(rows[0].total_cost_usd)).toBeGreaterThan(0);
+  });
+
+  test("prices a legacy multi-step turn at the context tier of its steps", async () => {
+    // Haiku 5.5 bills a request at 5x once its prompt passes 100K tokens. This row predates
+    // per-request shares: two 85K steps sum to 170K, but its last step is under the threshold.
+    const conn = await createTestConn();
+    const sessionDir = await createTempSessionDir();
+    await writeChatJsonl(sessionDir, [
+      makeUserLine(),
+      makeAssistantLine({
+        model: "anthropic:claude-haiku-5-5",
+        inputTokens: 170_000,
+        outputTokens: 1_000,
+        extraMetadata: {
+          contextUsage: { inputTokens: 85_000, outputTokens: 500 },
+          stepStartPartIndices: [0, 1],
+        },
+      }),
+    ]);
+
+    const parsed = await parseWorkspaceFromDisk("ws-legacy-tier", sessionDir, {});
+    assert(parsed, "legacy tier test expected parseWorkspaceFromDisk to parse workspace");
+    await appendEvents(conn, parsed.events);
+
+    const rows = await queryRows(
+      conn,
+      "SELECT input_cost_usd, output_cost_usd FROM events WHERE workspace_id = ?",
+      ["ws-legacy-tier"]
+    );
+    expect(rows).toHaveLength(1);
+    expect(Number(rows[0].input_cost_usd)).toBeCloseTo(170_000 * 0.1e-6, 12);
+    expect(Number(rows[0].output_cost_usd)).toBeCloseTo(1_000 * 0.5e-6, 12);
   });
 
   test("keeps tool_name aligned across fresh and migrated events tables", async () => {
