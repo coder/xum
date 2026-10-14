@@ -82,6 +82,7 @@ import {
   type PinnedDropEdge,
   type PinnedMoveDirection,
 } from "@/browser/utils/ui/pinnedReorder";
+import { isWorkspaceRowRendered } from "@/browser/utils/ui/workspaceDomNav";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { SidebarCollapseButton } from "../SidebarCollapseButton/SidebarCollapseButton";
 import { ConfirmationModal } from "../ConfirmationModal/ConfirmationModal";
@@ -108,6 +109,7 @@ import { TitleEditProvider, useTitleEdit } from "@/browser/contexts/WorkspaceTit
 import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { useWorkspaceActionKeybinds } from "./useWorkspaceActionKeybinds";
 import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
 import {
   PositionedMenu,
@@ -652,11 +654,12 @@ const ProjectDragLayer: React.FC = () => {
 /**
  * Handles F2 (edit title) and Shift+F2 (generate new title) keybinds.
  * Rendered inside TitleEditProvider so it can access useTitleEdit().
+ * Both keys also work with the sidebar collapsed (#6328): Shift+F2 needs no row, and F2 leaves a
+ * workspace whose row is not rendered to the workspace header (WorkspaceMenuBar).
  */
 function SidebarTitleEditKeybinds(props: {
   selectedWorkspace: WorkspaceSelection | undefined;
   sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>;
-  collapsed: boolean;
 }) {
   const { requestEdit, wrapGenerateTitle } = useTitleEdit();
   const liveApi = useLiveAPI();
@@ -675,12 +678,13 @@ function SidebarTitleEditKeybinds(props: {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (props.collapsed) return;
       if (!props.selectedWorkspace) return;
       if (isEditableElement(e.target)) return;
       const wsId = props.selectedWorkspace.workspaceId;
 
       if (matchesKeybind(e, KEYBINDS.EDIT_WORKSPACE_TITLE)) {
+        // No row to edit in: the workspace header takes the key.
+        if (!isWorkspaceRowRendered(wsId)) return;
         e.preventDefault();
         const meta = props.sortedWorkspacesByProject
           .get(props.selectedWorkspace.projectPath)
@@ -695,7 +699,6 @@ function SidebarTitleEditKeybinds(props: {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
-    props.collapsed,
     props.selectedWorkspace,
     props.sortedWorkspacesByProject,
     requestEdit,
@@ -1111,6 +1114,14 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     },
     [liveApi, runtimeStatusStore, workspaceStopRuntimeError]
   );
+
+  useWorkspaceActionKeybinds({
+    selectedWorkspaceId: visibleSelectedWorkspaceId,
+    getWorkspaceMetadata: (workspaceId) => workspaceStore.getWorkspaceMetadata(workspaceId),
+    runtimeStatusStore,
+    onForkWorkspace: (workspaceId) => void handleForkWorkspace(workspaceId),
+    onStopRuntime: (workspaceId) => void handleStopRuntime(workspaceId),
+  });
 
   const hasActiveStream = useCallback(
     (workspaceId: string) => {
@@ -2530,7 +2541,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       <SidebarTitleEditKeybinds
         selectedWorkspace={selectedWorkspace ?? undefined}
         sortedWorkspacesByProject={sortedWorkspacesByProject}
-        collapsed={collapsed}
       />
       {/* Outside the collapsed-only UI: the watchers live exactly as long as the visibility map
           they fill, so a collapsed sidebar or section never leaves a stale value in it. */}

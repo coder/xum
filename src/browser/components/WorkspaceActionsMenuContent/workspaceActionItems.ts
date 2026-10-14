@@ -58,8 +58,8 @@ interface TopBarActionsState extends CommonActionsState {
 export type WorkspaceActionsState = SidebarActionsState | TopBarActionsState;
 
 /**
- * The one decision of which items each menu shows, in the approved group order: Title (sidebar
- * only), Settings, View (top bar only), Sidebar row, Lifecycle. Empty groups are dropped, so the menu draws a
+ * The one decision of which items each menu shows, in the approved group order: Title,
+ * Settings, View (top bar only), Sidebar row, Lifecycle. Empty groups are dropped, so the menu draws a
  * separator only between groups that show.
  */
 export function getWorkspaceActionGroups(state: WorkspaceActionsState): WorkspaceActionId[][] {
@@ -71,8 +71,8 @@ export function getWorkspaceActionGroups(state: WorkspaceActionsState): Workspac
   const topBar = state.surface === "topbar" ? state : null;
   const sidebar = state.surface === "sidebar" ? state : null;
   const groups: Array<Array<WorkspaceActionId | false>> = [
-    // The sidebar row owns the inline title edit, so the Title group is sidebar-only.
-    sidebar ? ["editTitle", "generateTitle"] : [],
+    // The top bar edits the title in the header itself, so it works with the row hidden (#6328).
+    ["editTitle", "generateTitle"],
     ["configureMcp", !isSubAgent && "configureHeartbeat", "configureMessaging"],
     topBar
       ? [

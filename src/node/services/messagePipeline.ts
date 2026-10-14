@@ -17,10 +17,8 @@ import { extractToolMediaAsUserMessages } from "@/node/utils/messages/extractToo
 import { sanitizeAnthropicPdfFilenames } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import { convertDataUriFilePartsForSdk } from "@/node/utils/messages/convertDataUriFilePartsForSdk";
 import { insertStepStartPartsForSdk } from "@/node/utils/messages/insertStepStartPartsForSdk";
-import {
-  attachReasoningReplayMetadata,
-  stripReasoningReplay,
-} from "@/node/utils/messages/reasoningProviderOptions";
+import { planAnthropicThinkingStrip } from "@/node/utils/messages/anthropicThinkingReplay";
+import { attachReasoningReplayMetadata } from "@/node/utils/messages/reasoningProviderOptions";
 import type { MuxMessage } from "@/common/types/message";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -38,7 +36,6 @@ import {
   normalizeLegacyToolSearchMessages,
 } from "@/common/utils/tools/toolCatalog";
 import { applyCacheControl, type AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
-import { findLatestContextBoundaryIndex } from "@/common/utils/messages/compactionBoundary";
 import { log } from "./log";
 
 /** Options for the full message preparation pipeline. */
@@ -192,10 +189,23 @@ export async function prepareMessagesForProvider(
   // providerMetadata, the only field convertToModelMessages forwards to the request.
   const messagesWithReasoningReplay = attachReasoningReplayMetadata(messagesWithSdkSafeFileParts);
 
+  // Preserved thinking: a thinking-replay receipt (MuxMetadata.anthropicThinkingReplay) says a
+  // request of that turn sent earlier Anthropic thinking without its blocks. Removed blocks
+  // must never come back: putting them back invalidates every block produced while they were
+  // gone, so the next turn would 400 and pay the repair again. Blocks the turn kept sending
+  // after the strip stay (anthropicThinkingReplayFromStep), or every later turn would rewrite
+  // the previous turn's tail (prompt-cache prefix). Mark here, while part indices still match
+  // the persisted step boundaries; the strip runs after conversion and the provider transforms.
+  const thinkingStrip = planAnthropicThinkingStrip(
+    providerForMessages,
+    messagesWithReasoningReplay,
+    replayReceiptMessages ?? messagesWithSentinel
+  );
+
   // Restore each assistant row's step boundaries, so the rebuild splits messages where the
   // in-turn steps did (prompt-cache prefix). Last: every transform above keeps assistant parts
   // 1:1, so the persisted stepStartPartIndices still point at the right parts.
-  const messagesWithStepStarts = insertStepStartPartsForSdk(messagesWithReasoningReplay);
+  const messagesWithStepStarts = insertStepStartPartsForSdk(thinkingStrip.messages);
 
   // --- Convert to ModelMessage format ---
 
@@ -234,17 +244,8 @@ export async function prepareMessagesForProvider(
       anthropicBindsThinkingToPrefix(resolveModelForMetadata(modelString, providersConfig ?? null)),
   });
 
-  // Preserved thinking: a repaired signature rejection removed every Anthropic thinking
-  // block from that request (MuxMetadata.anthropicThinkingReplay). Removed blocks must never
-  // come back: putting them back invalidates every block produced while they were gone, so
-  // the next turn would 400 and pay the repair again. Keep them out for the rest of the
-  // context segment. Same strip as the one-request repair (stripReasoningReplay), which also
-  // covers adaptive thinking, where transformModelMessages ignores anthropicStripReasoning.
-  const segmentMessages =
-    providerForMessages === "anthropic" &&
-    hasAnthropicReplayReceipt(replayReceiptMessages ?? messagesWithSentinel)
-      ? stripReasoningReplay(transformedMessages, "anthropic")
-      : transformedMessages;
+  // The receipt's strip, planned above (an old receipt strips the whole segment).
+  const segmentMessages = thinkingStrip.strip(transformedMessages);
 
   // Dedupe after transformModelMessages: its orphan strip (self-healing for
   // interrupted/corrupted history) can remove a result whose reference would
@@ -272,23 +273,6 @@ export async function prepareMessagesForProvider(
   }
 
   return finalMessages;
-}
-
-/**
- * True when an assistant row after the latest compaction or reset boundary carries the
- * Anthropic thinking-repair receipt. The main caller already slices from that boundary;
- * finding it again here keeps other callers correct too. The boundary row itself is not
- * checked: a new segment starts replay again, and compaction tail copies
- * (rlmPreservedTailCopy) do not copy the receipt for the same reason.
- */
-function hasAnthropicReplayReceipt(messages: MuxMessage[]): boolean {
-  const segmentStart = findLatestContextBoundaryIndex(messages) + 1;
-  return messages
-    .slice(segmentStart)
-    .some(
-      (message) =>
-        message.role === "assistant" && message.metadata?.anthropicThinkingReplay === "off"
-    );
 }
 
 type AssistantContentArray = Exclude<AssistantModelMessage["content"], string>;

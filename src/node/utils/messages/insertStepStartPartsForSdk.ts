@@ -11,7 +11,7 @@ export type MuxMessageWithStepStarts = Omit<MuxMessage, "parts"> & {
  * Indices this helper can trust: safe integers in strictly ascending order that start at 0.
  * Every producer seeds the list with 0 (the first step), so a list without it is corrupted.
  */
-function isTrustedStepStartList(indices: unknown): indices is number[] {
+export function isTrustedStepStartList(indices: unknown): indices is number[] {
   return (
     Array.isArray(indices) &&
     indices[0] === 0 &&

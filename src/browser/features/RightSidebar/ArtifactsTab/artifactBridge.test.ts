@@ -14,6 +14,7 @@ import {
   buildArtifactBridgeScript,
   createBridgeRateLimiter,
 } from "./artifactBridge";
+import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { MCP_APP_PREAMBLE_SCRIPT } from "./mcpAppCsp";
 
 // Identity is all the acceptance check uses, so plain objects stand in for windows.
@@ -70,13 +71,17 @@ describe("acceptArtifactFrameMessage", () => {
 
 /** Run the bridge script against a minimal window; returns its keydown handler and posts. */
 function runBridgeScript() {
-  const listeners = new Map<string, (event: unknown) => void>();
+  // Every listener, in registration order: keys use a capture listener and a bubble one.
+  const listeners: Array<{ type: string; listener: (event: unknown) => void }> = [];
   const posted: unknown[] = [];
+  // window.setTimeout callbacks, run once a key press has gone through every listener.
+  const timers: Array<() => void> = [];
   const fakeWindow: { xum?: { openWorkspace: (id: unknown) => void } } & Record<string, unknown> = {
     parent: { postMessage: (message: unknown) => posted.push(message) },
     addEventListener: (type: string, listener: (event: unknown) => void) => {
-      listeners.set(type, listener);
+      listeners.push({ type, listener });
     },
+    setTimeout: (callback: () => void) => timers.push(callback),
   };
   // The script mirrors the theme onto the root element (data-xum-theme).
   const fakeDocument = {
@@ -91,15 +96,36 @@ function runBridgeScript() {
     buildArtifactBridgeScript("dark")
   ) as (window: unknown, document: unknown, customEvent: unknown) => void;
   run(fakeWindow, fakeDocument, class {});
-  const keydown = (key: string, target: unknown, shiftKey = false) =>
-    listeners.get("keydown")?.({
+  /**
+   * One key press through every keydown listener, then the timers. `defaultPrevented`: a
+   * handler the artifact registered after the bridge's listeners kept the key.
+   */
+  const keydown = (
+    key: string,
+    target: unknown,
+    shiftKey = false,
+    extra: {
+      ctrlKey?: boolean;
+      repeat?: boolean;
+      defaultPrevented?: boolean;
+      composedPath?: unknown[];
+    } = {}
+  ) => {
+    const event = {
       key,
       target,
       shiftKey,
-      ctrlKey: false,
+      ctrlKey: extra.ctrlKey ?? false,
+      repeat: extra.repeat ?? false,
       metaKey: false,
       altKey: false,
-    });
+      defaultPrevented: false,
+      ...(extra.composedPath ? { composedPath: () => extra.composedPath } : {}),
+    };
+    for (const entry of listeners) if (entry.type === "keydown") entry.listener(event);
+    event.defaultPrevented = extra.defaultPrevented ?? false;
+    for (const timer of timers.splice(0)) timer();
+  };
   return { keydown, posted, xum: fakeWindow.xum };
 }
 
@@ -121,6 +147,25 @@ describe("bridge script keys", () => {
     expect(bridge.posted).toEqual([]);
     bridge.keydown("F", div, true);
     expect(bridge.posted).toEqual([{ xumArtifact: 1, type: "key", key: "F", shiftKey: true }]);
+  });
+
+  test("the plain annotate key is posted unless typed, chorded, or kept by the artifact", () => {
+    // The keybind's own key: a keybind the shim cannot forward fails here, not at startup.
+    const key = KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE.key.toLowerCase();
+    const bridge = runBridgeScript();
+    bridge.keydown(key, input);
+    bridge.keydown(key.toUpperCase(), div, true);
+    bridge.keydown(key, div, false, { ctrlKey: true });
+    bridge.keydown(key, div, false, { repeat: true });
+    bridge.keydown(key, div, false, { defaultPrevented: true });
+    // Typed in an input inside a web component: window sees the (non-editable) shadow host.
+    bridge.keydown(key, div, false, { composedPath: [input, div] });
+    expect(bridge.posted).toEqual([]);
+    bridge.keydown(key, div);
+    // Caps Lock gives the upper case without Shift.
+    bridge.keydown(key.toUpperCase(), div);
+    const c = { xumArtifact: 1, type: "key", key: "C", shiftKey: false };
+    expect(bridge.posted).toEqual([c, c]);
   });
 });
 

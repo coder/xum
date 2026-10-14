@@ -111,6 +111,17 @@ export type RolledUpChildEntry = z.infer<typeof RolledUpChildEntrySchema>;
  * Cumulative session usage file format.
  * Stored in ~/.xum/sessions/{workspaceId}/session-usage.json
  */
+/** Clock skew tolerated between the machine that wrote a fork marker and this one. */
+const FORK_BOUNDARY_MAX_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
+
+function isPlausibleForkBoundary(timestamp: number): boolean {
+  return (
+    Number.isSafeInteger(timestamp) &&
+    timestamp >= 0 &&
+    timestamp <= Date.now() + FORK_BOUNDARY_MAX_FUTURE_SKEW_MS
+  );
+}
+
 export const SessionUsageFileSchema = z.object({
   byModel: z.record(z.string(), ChatUsageDisplaySchema),
   lastRequest: z
@@ -128,5 +139,15 @@ export const SessionUsageFileSchema = z.object({
     .record(z.string(), z.union([z.literal(true), RolledUpChildEntrySchema]))
     .optional(),
   tokenStatsCache: SessionUsageTokenStatsCacheSchema.optional(),
+  /**
+   * Set when a fork reset this ledger: the newest timestamp (ms since epoch) among the rows
+   * the fork copied from its parent. Rows at or before it are inherited, so per-turn views
+   * skip them; every row the fork writes itself is newer. A timestamp, not a history
+   * sequence: editing an inherited message in the fork reuses lower sequences.
+   * Self-healing: a value that cannot be a real timestamp (fractional, negative, or later
+   * than now plus clock skew, which would hide every turn) is dropped, and the workspace
+   * then shows every turn, as old forks without the marker do.
+   */
+  forkedAt: z.number().refine(isPlausibleForkBoundary).optional().catch(undefined),
   version: z.literal(1),
 });

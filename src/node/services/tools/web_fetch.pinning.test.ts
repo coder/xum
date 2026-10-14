@@ -17,6 +17,7 @@ import {
 } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as http from "node:http";
+import * as https from "node:https";
 import * as net from "node:net";
 import * as path from "node:path";
 import type { ExecResult } from "@/node/utils/runtime/helpers";
@@ -25,14 +26,34 @@ import * as blockedTargets from "@/node/utils/network/blockedTargets";
 import type { WebFetchToolResult } from "@/common/types/tools";
 import { createWebFetchTool } from "./web_fetch";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { ICONS_EXAMPLE_TLS } from "../../../../tests/fixtures/tls/iconsExample";
+import { WEB_FETCH_MAX_ADDRESS_ATTEMPTS } from "@/common/constants/toolLimits";
 
 type ExecArgs = Parameters<typeof runtimeHelpers.execBuffered>;
 const realExecBuffered = runtimeHelpers.execBuffered;
 const realIsBlockedIpAddress = blockedTargets.isBlockedIpAddress;
-const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "127.0.0.2", "::1"]);
+const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "127.0.0.2", "127.0.0.3", "::1"]);
 const PROXY_ENV = ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "ALL_PROXY"];
 const PROXY_ENV_ALL = [...PROXY_ENV, "all_proxy", "NO_PROXY", "no_proxy", "CURL_HOME"];
 const hasCurl = Bun.which("curl") != null;
+// web_fetch falls back to another address only on curl 8.7+ (it needs %{proxy_used}); older
+// curl, like the Ubuntu 22.04 CI runner's, keeps one attempt (#5977). Assert the real version.
+const curlFallsBack = (() => {
+  if (!hasCurl) return false;
+  const match = /^curl (\d+)\.(\d+)\./.exec(
+    Bun.spawnSync(["curl", "-q", "--version"]).stdout.toString()
+  );
+  if (!match) throw new Error("could not read the curl version for the fallback tests");
+  const [major, minor] = [Number(match[1]), Number(match[2])];
+  return major > 8 || (major === 8 && minor >= 7);
+})();
+// Probed at load, because it.skipIf needs the answer before the suite runs (#5990): a host
+// without ::1 shows the IPv6 case as skipped, and CI fails it instead of losing coverage.
+const hasIpv6Loopback = await new Promise<boolean>((resolve) => {
+  const probe = net.createServer();
+  probe.once("error", () => resolve(false));
+  probe.listen(0, "::1", () => probe.close(() => resolve(true)));
+});
 
 interface Hit {
   host: string | undefined;
@@ -129,7 +150,7 @@ describe.skipIf(!hasCurl)("web_fetch pins the validated address (real curl)", ()
 
   beforeAll(async () => {
     v4 = await startHttpFixture("127.0.0.1");
-    v6 = await startHttpFixture("::1").catch(() => null); // hosts without IPv6 skip that case
+    v6 = hasIpv6Loopback ? await startHttpFixture("::1").catch(() => null) : null;
   });
   afterAll(async () => {
     for (const fixture of [v4, v6]) {
@@ -194,13 +215,16 @@ describe.skipIf(!hasCurl)("web_fetch pins the validated address (real curl)", ()
     expect(await fetchUrl(`http://rebind.test.:${v4.port}/`)).toMatchObject({ success: true });
   });
 
-  it("connects to a validated IPv6 address", async () => {
-    if (v6 == null) return console.warn("skipped: no IPv6 loopback on this host");
-    dns = { "rebind6.test": ["::1"] };
-    const result = await fetchUrl(`http://rebind6.test:${v6.port}/`);
-    expect(result).toMatchObject({ success: true, content: "pinned ok" });
-    expect(v6.hits).toEqual([{ host: `rebind6.test:${v6.port}`, path: "/" }]);
-  });
+  it.skipIf(!hasIpv6Loopback && process.env.CI !== "true")(
+    "connects to a validated IPv6 address",
+    async () => {
+      if (v6 == null) throw new Error("no IPv6 loopback (::1) fixture: IPv6 pinning is untested");
+      dns = { "rebind6.test": ["::1"] };
+      const result = await fetchUrl(`http://rebind6.test:${v6.port}/`);
+      expect(result).toMatchObject({ success: true, content: "pinned ok" });
+      expect(v6.hits).toEqual([{ host: `rebind6.test:${v6.port}`, path: "/" }]);
+    }
+  );
 
   it("validates and pins each redirect hop, and still blocks a private redirect", async () => {
     dns = {
@@ -241,23 +265,59 @@ describe.skipIf(!hasCurl)("web_fetch pins the validated address (real curl)", ()
     }
   );
 
-  it("makes exactly one attempt when the selected address is dead (no fallback)", async () => {
+  /** The address each curl attempt was pinned to, in order. */
+  const pinnedAddresses = () =>
+    fetchCommands.map((command) => /--connect-to '[^:]+:\d+:(.+):\d+'/.exec(command)?.[1]);
+
+  it(`${curlFallsBack ? "falls back to" : "does not fall back (curl < 8.7) to"} the next validated address when the first is unreachable (#5977)`, async () => {
     // 127.0.0.2 is validated and listed first, but nothing listens there.
     dns = { "rebind.test": ["127.0.0.2", "127.0.0.1"] };
+    const result = await fetchUrl(`http://rebind.test:${v4.port}/`);
+    if (curlFallsBack) {
+      expect(result).toMatchObject({ success: true, content: "pinned ok" });
+      expect(pinnedAddresses()).toEqual(["127.0.0.2", "127.0.0.1"]);
+      expect(v4.hits).toEqual([{ host: `rebind.test:${v4.port}`, path: "/" }]);
+    } else {
+      expect(result).toMatchObject({
+        success: false,
+        error: "Failed to fetch URL: Failed to connect",
+      });
+      expect(pinnedAddresses()).toEqual(["127.0.0.2"]);
+      expect(v4.hits).toEqual([]);
+    }
+  });
+
+  it("tries each validated address once, then reports the connect failure", async () => {
+    dns = { "rebind.test": ["127.0.0.2", "127.0.0.3"] };
     const result = await fetchUrl(`http://rebind.test:${v4.port}/`);
     expect(result).toMatchObject({
       success: false,
       error: "Failed to fetch URL: Failed to connect",
     });
-    expect(fetchCommands).toHaveLength(1);
-    expect(v4.hits).toEqual([]);
+    expect(pinnedAddresses()).toEqual(curlFallsBack ? ["127.0.0.2", "127.0.0.3"] : ["127.0.0.2"]);
+  });
+
+  it("does not retry another address after a TLS failure", async () => {
+    const tls = https.createServer(ICONS_EXAMPLE_TLS, (_req, res) => res.end("tls ok"));
+    await new Promise<void>((resolve) => tls.listen(0, "127.0.0.1", resolve));
+    try {
+      const port = (tls.address() as net.AddressInfo).port;
+      // The certificate does not cover rebind.test, so curl stops with exit 60.
+      dns = { "rebind.test": ["127.0.0.1", "127.0.0.2"] };
+      const result = await fetchUrl(`https://rebind.test:${port}/`);
+      expect(result.success).toBe(false);
+      expect(pinnedAddresses()).toEqual(["127.0.0.1"]);
+    } finally {
+      await new Promise<void>((resolve) => tls.close(() => resolve()));
+    }
   });
 
   it("makes exactly one attempt when the proxy denies the tunnel", async () => {
     const proxy = await startProxyFixture("deny");
     try {
       process.env.http_proxy = `http://${proxy.url}`;
-      dns = { "rebind.test": ["127.0.0.1"] };
+      // A second validated address must not be tried: the proxy, not the address, refused.
+      dns = { "rebind.test": ["127.0.0.1", "127.0.0.2"] };
       expect(await fetchUrl(`http://rebind.test:${v4.port}/`)).toMatchObject({ success: false });
       expect(fetchCommands).toHaveLength(1);
       expect(proxy.targets).toEqual([`CONNECT 127.0.0.1:${v4.port} HTTP/1.1`]);
@@ -304,12 +364,25 @@ describe("web_fetch curl version probe", () => {
   const httpOk = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nok";
   const url = "https://93.184.216.34/page"; // public IP literal: no resolver call
 
-  function setup(probe: () => Promise<ExecResult>, fetch: (command: string) => ExecResult) {
+  function setup(
+    probe: () => Promise<ExecResult>,
+    fetch: (command: string) => ExecResult,
+    target = url,
+    dnsAnswer: string[] = []
+  ) {
     const calls = { probes: 0, fetches: [] as string[] };
     spyOn(runtimeHelpers, "execBuffered").mockImplementation((_runtime, command) => {
       if (command === "curl -q --version") {
         calls.probes++;
         return probe();
+      }
+      if (command.startsWith("if command -v python3")) {
+        return Promise.resolve({
+          stdout: JSON.stringify(dnsAnswer),
+          stderr: "",
+          exitCode: 0,
+          duration: 1,
+        });
       }
       calls.fetches.push(command);
       return Promise.resolve(fetch(command));
@@ -318,7 +391,7 @@ describe("web_fetch curl version probe", () => {
     const tool = createWebFetchTool(createTestToolConfig(dir.path));
     const run = async () =>
       (await tool.execute!(
-        { url },
+        { url: target },
         { toolCallId: "p", messages: [], context: undefined }
       )) as WebFetchToolResult;
     return { calls, run, [Symbol.dispose]: () => dir[Symbol.dispose]() };
@@ -342,6 +415,7 @@ describe("web_fetch curl version probe", () => {
       ["XUM_CURL_ROUTE=93.184.216.34;0", true],
       ["XUM_CURL_ROUTE=10.9.9.9;1", true], // through a proxy: remote_ip is the proxy
       ["XUM_CURL_ROUTE=10.9.9.9;0", false], // direct to another address
+      ["XUM_CURL_ROUTE=;0", false], // direct, with a response but no reported address (#5990)
       ["", false], // missing route line with a response
       ["XUM_CURL_ROUTE=garbage", false],
     ];
@@ -351,6 +425,71 @@ describe("web_fetch curl version probe", () => {
       expect({ stderr, success: result.success }).toEqual({ stderr, success: allowed });
       expect(env.calls.fetches[0]).toContain("%{proxy_used}");
     }
+  });
+
+  it("on curl 8.7+, reports a failed connection as the curl error, not a wrong route", async () => {
+    // curl that never connected reports an empty address and no response (#5990).
+    using env = setup(version("8.7.1"), () => ({
+      stdout: "",
+      stderr: "curl: (7) Failed to connect\nXUM_CURL_ROUTE=;0",
+      exitCode: 7,
+      duration: 1,
+    }));
+    expect(await env.run()).toEqual({
+      success: false,
+      error: "Failed to fetch URL: Failed to connect",
+    });
+  });
+
+  it.each([
+    ["8.7.1", 2],
+    ["8.5.0", 1],
+  ] as const)(
+    "on curl %s, a direct connect failure makes %i attempt(s) (#5977)",
+    async (curlVersion, attempts) => {
+      // Before 8.7 there is no route line, so a refused CONNECT and a dead address look
+      // the same: keep one attempt rather than retry blind.
+      using env = setup(
+        version(curlVersion),
+        () => ({
+          stdout: "",
+          stderr: "curl: (7) Failed to connect\nXUM_CURL_ROUTE=;0",
+          exitCode: 7,
+          duration: 1,
+        }),
+        "https://dual.test/page",
+        ["93.184.216.34", "93.184.216.35"]
+      );
+      expect(await env.run()).toEqual({
+        success: false,
+        error: "Failed to fetch URL: Failed to connect",
+      });
+      expect(env.calls.fetches).toHaveLength(attempts);
+    }
+  );
+
+  it("caps the address fallback at WEB_FETCH_MAX_ADDRESS_ATTEMPTS attempts (#5977)", async () => {
+    const answers = [
+      "93.184.216.31",
+      "93.184.216.32",
+      "93.184.216.33",
+      "93.184.216.34",
+      "93.184.216.35",
+    ];
+    using env = setup(
+      version("8.7.1"),
+      () => ({
+        stdout: "",
+        stderr: "curl: (7) Failed to connect\nXUM_CURL_ROUTE=;0",
+        exitCode: 7,
+        duration: 1,
+      }),
+      "https://many.test/page",
+      answers
+    );
+    expect(await env.run()).toMatchObject({ success: false });
+    expect(env.calls.fetches).toHaveLength(WEB_FETCH_MAX_ADDRESS_ATTEMPTS);
+    expect(WEB_FETCH_MAX_ADDRESS_ATTEMPTS).toBeLessThan(answers.length);
   });
 
   it("on curl before 8.7, pins without the route check", async () => {

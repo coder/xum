@@ -1817,6 +1817,37 @@ describe("WorkspaceStore", () => {
       }
     });
 
+    it("warns and retries when a client change aborts the attempt mid-error", async () => {
+      const workspaceId = "workspace-error-after-client-change";
+      let subscriptions = 0;
+      // eslint-disable-next-line require-yield -- the attempt only waits, then fails
+      mockOnChat.mockImplementation(async function* (_input, options) {
+        subscriptions++;
+        if (subscriptions > 1) return await waitForAbortSignal(options?.signal);
+        await waitForAbortSignal(options?.signal);
+        // The transport fails with its own error, not an AbortError.
+        throw new Error("transport closed");
+      });
+      const consoleWarn = spyOn(console, "warn").mockImplementation(() => undefined);
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        createAndAddWorkspace(store, workspaceId);
+        expect(await waitUntil(() => subscriptions === 1)).toBe(true);
+        // A new client object, so the store treats it as a client change.
+        store.setClient({ ...mockClient } as unknown as Parameters<WorkspaceStore["setClient"]>[0]);
+
+        expect(await waitUntil(() => subscriptions === 2)).toBe(true);
+        expect(consoleWarn.mock.calls.map(([message]: unknown[]) => message)).toContain(
+          `[WorkspaceStore] onChat subscription aborted for ${workspaceId}; retrying...`
+        );
+        expect(consoleError).not.toHaveBeenCalled();
+      } finally {
+        consoleWarn.mockRestore();
+        consoleError.mockRestore();
+        mockChatScript([], { keepOpen: true });
+      }
+    });
+
     it("keeps the pending first-message row while hidden snapshot rows stream in", async () => {
       // Skill, MCP prompt, and @file first sends persist hidden synthetic user rows before the
       // durable message; each live event bumps state, so the row must survive that bump.
@@ -3849,6 +3880,41 @@ describe("WorkspaceStore", () => {
       } finally {
         for (const undo of restore) undo();
       }
+    });
+
+    it("forwards a legacy auto-retry boolean once and drops it after the subscribe", async () => {
+      const workspaceId = "workspace-auto-retry-forward";
+      const autoRetryKey = getAutoRetryKey(workspaceId);
+      global.window.localStorage.setItem(autoRetryKey, JSON.stringify(false));
+      let storedAtSubscribe: string | null = "unread";
+      // A plain function runs when the store calls onChat; a generator body would run later.
+      mockOnChat.mockImplementation(((
+        input?: { workspaceId: string },
+        options?: { signal?: AbortSignal }
+      ) => {
+        if (input?.workspaceId === workspaceId) {
+          storedAtSubscribe = global.window.localStorage.getItem(autoRetryKey);
+        }
+        // eslint-disable-next-line require-yield -- an open stream that never yields
+        return (async function* () {
+          await waitForAbortSignal(options?.signal);
+        })();
+      }) as unknown as Parameters<typeof mockOnChat.mockImplementation>[0]);
+
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => mockOnChat.mock.calls.length > 0, 1_000)).toBe(true);
+
+      expect(mockOnChat.mock.calls[0]?.[0]).toMatchObject({
+        workspaceId,
+        legacyAutoRetryEnabled: false,
+        batchReplay: true,
+        replayWindow: true,
+      });
+      // Still stored while the subscribe runs, so a failed subscribe can forward it again.
+      expect(storedAtSubscribe).toBe("false");
+      expect(await waitUntil(() => global.window.localStorage.getItem(autoRetryKey) === null)).toBe(
+        true
+      );
     });
 
     it("sanitizes malformed legacy auto-retry values before subscribing", async () => {
@@ -8521,6 +8587,98 @@ describe("WorkspaceStore", () => {
       ]);
       expect(turns[0].readRatio).toBeCloseTo(29_000 / 31_000, 12);
       expect(turns[1].rewriteCostUsd).toBeGreaterThan(0);
+    });
+
+    it("does not price a legacy custom-model turn through the live provider mapping", async () => {
+      const workspaceId = "turn-cache-health-live-mapping";
+      // The live config maps the custom model to a priced one; the persisted row has no
+      // record-time metadataModel, so (as in the session-usage rebuild) it stays unpriced.
+      mockGetProvidersConfig.mockResolvedValueOnce({
+        ollama: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          models: [{ id: "custom", mappedToModel: "anthropic:claude-sonnet-5-5" }],
+        },
+      });
+      const assistantRow = (id: string, historySequence: number, metadataModel?: string) => ({
+        type: "message" as const,
+        id,
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: id }],
+        metadata: {
+          historySequence,
+          timestamp: historySequence,
+          model: "ollama:custom",
+          ...(metadataModel !== undefined ? { metadataModel } : {}),
+          usage: { inputTokens: 31_000, cachedInputTokens: 0, outputTokens: 10 },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 30_000 } },
+        },
+      });
+
+      mockChatScript([
+        Promise.resolve(),
+        assistantRow("legacy-turn", 1),
+        assistantRow("pinned-turn", 2, "anthropic:claude-sonnet-5-5"),
+        { type: "caught-up", historyReplayStatus: "complete" },
+      ]);
+
+      createAndAddWorkspace(store, workspaceId);
+      providerConfigChanges.push(undefined);
+      await tick(10);
+      // The pushed change refetched the config, so the mapping is live in the store.
+      expect(mockGetProvidersConfig.mock.calls.length).toBeGreaterThanOrEqual(2);
+
+      const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+      expect(turns.map((turn) => [turn.messageId, turn.rewriteCostUsd !== undefined])).toEqual([
+        ["pinned-turn", true],
+        ["legacy-turn", false],
+      ]);
+    });
+
+    it("leaves a fork's inherited turns out of its prompt-cache table", async () => {
+      const workspaceId = "turn-cache-health-fork";
+      const FORKED_AT = 5_000;
+      mockGetSessionUsage.mockImplementation((input) =>
+        Promise.resolve(
+          input.workspaceId === workspaceId
+            ? { byModel: {}, version: 1, forkedAt: FORKED_AT }
+            : undefined
+        )
+      );
+      const assistantRow = (id: string, historySequence: number, timestamp: number) => ({
+        type: "message" as const,
+        id,
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: id }],
+        metadata: {
+          historySequence,
+          timestamp,
+          model: "anthropic:claude-sonnet-5-5",
+          usage: { inputTokens: 31_000, cachedInputTokens: 0, outputTokens: 10 },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 30_000 } },
+        },
+      });
+
+      mockChatScript([
+        Promise.resolve(),
+        assistantRow("inherited-turn", 1, FORKED_AT - 1),
+        assistantRow("inherited-last-turn", 2, FORKED_AT),
+        // An edit of an inherited message in the fork reuses a lower history sequence.
+        assistantRow("own-turn", 2, FORKED_AT + 1),
+        { type: "caught-up", historyReplayStatus: "complete" },
+      ]);
+
+      try {
+        createAndAddWorkspace(store, workspaceId);
+        await tick(10);
+        expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId });
+
+        const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+        expect(turns.map((turn) => turn.messageId)).toEqual(["own-turn"]);
+      } finally {
+        mockGetSessionUsage.mockImplementation(() => Promise.resolve(undefined));
+      }
     });
 
     it("leaves a legacy turn without a record-time model unpriced instead of using the current model", async () => {

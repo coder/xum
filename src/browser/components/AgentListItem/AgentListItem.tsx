@@ -68,7 +68,6 @@ import {
   type WorkspaceDragItem,
 } from "../WorkspaceSectionDropZone/WorkspaceSectionDropZone";
 import type { PinnedDropEdge } from "@/browser/utils/ui/pinnedReorder";
-import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
 import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
 import { requestGenerateWorkspaceTitle } from "../WorkspaceActionsMenuContent/workspaceActionHandlers";
 import { LazyFeature } from "../LazyFeature/LazyFeature";
@@ -655,9 +654,6 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   // The menu's settings dialogs mount on demand, so a row with its menu closed runs none of
   // their hooks or subscriptions (#6202).
   const [openModal, setOpenModal] = useState<"heartbeat" | "mcp" | "messaging" | null>(null);
-  const closeModalOnHide = (open: boolean) => {
-    if (!open) setOpenModal(null);
-  };
   const overflowMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const overflowMenuFrameRef = useRef<number | null>(null);
 
@@ -1263,15 +1259,6 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                   />
                 </PopoverContent>
               </Popover>
-              {/* Mounted on demand so each sidebar row skips the modal's hooks and
-                  context requirements until the user opens it. */}
-              {openModal === "heartbeat" && (
-                <WorkspaceHeartbeatModal
-                  workspaceId={workspaceId}
-                  open
-                  onOpenChange={closeModalOnHide}
-                />
-              )}
             </ActionButtonWrapper>
           )
         )}
@@ -1424,7 +1411,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
       </div>
       {/* Outside the clickable row: React bubbles a portal's events through its React parents,
           and a click on a dialog's backdrop (outside [role="dialog"]) would select the row. */}
-      {(openModal === "mcp" || openModal === "messaging") && (
+      {openModal !== null && (
         // No loading fallback: the small chunk arrives in a moment, and an empty slot keeps the
         // sidebar rows still. A failed load shows LazyFeature's Reload message under the row.
         <LazyFeature name="Workspace settings">

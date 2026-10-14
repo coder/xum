@@ -9,8 +9,11 @@ import type { OnStepSettled } from "./streamManager";
 import { measureAssembledRequestBudgetForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
+import { measureCompactionInputTokens } from "./compactionInputSizing";
 import {
   anthropicBetweenToolsRouteAvailable,
+  canSwitchToAnthropic1MContext,
   isAnthropic1MEffectivelyEnabled,
 } from "@/common/utils/ai/providerOptions";
 import * as path from "path";
@@ -366,6 +369,17 @@ export interface StreamMessageOptions {
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**
+   * Compaction requests only: the share of the compaction input budget to trim to (default 1).
+   * AgentSession passes 0.5 for the one retry after the request hit context_exceeded.
+   */
+  compactionInputBudgetScale?: number;
+  /**
+   * Compaction requests only: AgentSession still holds the one context_exceeded retry of this
+   * request (resolveCompactionRetryPlan). Without it, a model that could switch to 1M context is
+   * trimmed on this attempt too, since nothing would retry it at 1M.
+   */
+  compactionContextRetryAvailable?: boolean;
+  /**
    * Model floor already resolved by AgentSession (config.json
    * minThinkingLevelByModel → resolveMinimumThinkingLevel). Passed down so
    * mid-turn overrides clamp against the same floor as the send-time level;
@@ -455,6 +469,88 @@ function pinCoderInstanceRawProvidersConfig(
       additionalProviders: [{ name: instance.name, type: instance.type }],
     },
   };
+}
+
+/**
+ * The estimated token budget a compaction request's history must fit (trimCompactionInput):
+ * SUMMARIZER_INPUT_FRACTION of the model's effective window, the share continuous compaction's
+ * summarizer uses, so the system prompt and the summary fit beside it. Per attempt, because a
+ * fallback model has its own window. Undefined, so nothing is trimmed, when the window is
+ * unknown, or when the model can still switch to 1M context and a retry is left
+ * (`contextRetryAvailable`): its context_exceeded retry does that and trims to the 1M window,
+ * which keeps more history than a trim to 200k would.
+ */
+export function resolveCompactionInputBudgetTokens(
+  modelString: string,
+  providerOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  scale = 1,
+  contextRetryAvailable = true
+): number | undefined {
+  assert(scale > 0 && scale <= 1, "compaction input budget scale must be in (0, 1]");
+  if (retriesAt1MContext(modelString, providerOptions, providersConfig, contextRetryAvailable)) {
+    return undefined;
+  }
+  const limit = getEffectiveContextLimit(
+    modelString,
+    isAnthropic1MEffectivelyEnabled(modelString, providerOptions, providersConfig),
+    providersConfig,
+    { openaiWireFormat: providerOptions?.openai?.wireFormat }
+  );
+  return limit == null ? undefined : Math.floor(limit * SUMMARIZER_INPUT_FRACTION * scale);
+}
+
+/** The context_exceeded retry will switch this model to 1M context (see above). */
+function retriesAt1MContext(
+  modelString: string,
+  providerOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  contextRetryAvailable: boolean
+): boolean {
+  return (
+    contextRetryAvailable &&
+    canSwitchToAnthropic1MContext(modelString, providerOptions, providersConfig)
+  );
+}
+
+/**
+ * assemblePromptPayload's compaction budget option: set for compaction requests only. A retry
+ * (scale set) on a model whose window is unknown has no window to derive a budget from; it
+ * trims to `scale` of the history's own estimate instead, so it does not resend the history
+ * that just hit context_exceeded unchanged.
+ */
+async function compactionInputBudgetOption(
+  isCompactionRequest: boolean,
+  model: {
+    modelString: string;
+    providerOptions: MuxProviderOptions | undefined;
+    providersConfig: ProvidersConfigMap | null | undefined;
+  },
+  history: MuxMessage[],
+  scale: number | undefined,
+  contextRetryAvailable: boolean
+): Promise<{ compactionInputBudgetTokens?: number }> {
+  if (!isCompactionRequest) return {};
+  const budget =
+    resolveCompactionInputBudgetTokens(
+      model.modelString,
+      model.providerOptions,
+      model.providersConfig,
+      scale,
+      contextRetryAvailable
+    ) ?? (scale == null ? undefined : await retryBudgetFromHistory(history, model, scale));
+  return budget == null ? {} : { compactionInputBudgetTokens: budget };
+}
+
+/** `scale` of the history's model-aware size: the same measure the trim then fits to it. */
+async function retryBudgetFromHistory(
+  history: MuxMessage[],
+  model: { modelString: string },
+  scale: number
+): Promise<number | undefined> {
+  const size = await measureCompactionInputTokens(history, model.modelString);
+  const budget = Math.floor(size * scale);
+  return budget > 0 ? budget : undefined;
 }
 
 /**
@@ -592,7 +688,7 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   desktopSessionManager?: DesktopSessionManager;
   computerUseService?: ComputerUseService;
   /** Routes AI calls from bash commands through Xum so their spend is accounted. */
-  bashAiProxy?: Pick<BashAiProxyService, "envFor">;
+  bashAiProxy?: Pick<BashAiProxyService, "envFor" | "noteBlocked">;
 }
 
 /**
@@ -952,6 +1048,43 @@ export class TurnRequestBuilder {
     return { type: "finished", result: Err({ type: errorType, message: errorMessage }) };
   }
 
+  /**
+   * AI calls from bash commands bypass the chat stream. Point their SDKs at the local proxy so
+   * the spend lands in this workspace's ledger (Costs tab and Analytics). envFor() skips any
+   * provider that project secrets configure: secrets override xumEnv in the bash tool, and a
+   * proxy URL must never pair with a real key.
+   * Best effort: a proxy problem leaves bash without the pair and never fails the turn.
+   * Untrusted projects and the project-automation kill switch blank provider keys in bash
+   * (gitNoRepoAutomationEnv), so repo code there must not spend through the proxy either.
+   * Add nothing rather than a proxy URL whose key the bash tool then blanks.
+   */
+  private async bashAiProxyEnv(
+    workspaceId: string,
+    runtimeType: ReturnType<typeof getRuntimeType>,
+    secretKeys: readonly string[],
+    sharedExecutionTrusted: boolean
+  ): Promise<Record<string, string> | undefined> {
+    const bashAiProxy = this.dependencies.bindings.bashAiProxy;
+    if (!bashAiProxy) return undefined;
+    if (!sharedExecutionTrusted) {
+      // Say why bash gets no proxy variables, so a user who turned the switch on can find out.
+      bashAiProxy.noteBlocked(
+        workspaceId,
+        projectAutomationDisabled() ? "kill_switch" : "untrusted"
+      );
+      return undefined;
+    }
+    try {
+      return await bashAiProxy.envFor(workspaceId, runtimeType, secretKeys);
+    } catch (error) {
+      log.warn("[bash-ai-proxy] env setup failed; bash AI calls stay uncounted", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return undefined;
+    }
+  }
+
   private async prepareOrThrow(
     opts: StreamMessageOptions,
     context: TurnRequestBuildContext
@@ -1005,6 +1138,8 @@ export class TurnRequestBuilder {
       contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
       openaiTruncationModeOverride,
+      compactionInputBudgetScale,
+      compactionContextRetryAvailable,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
     } = opts;
@@ -2117,31 +2252,15 @@ export class TurnRequestBuilder {
       scratchDir,
     });
     const projectSecretsRecord = await secretsToRecord(projectSecrets);
-    // AI calls from bash commands bypass the chat stream. Point their SDKs at the local proxy so
-    // the spend lands in this workspace's ledger (Costs tab and Analytics). envFor() skips any
-    // provider that project secrets configure: secrets override xumEnv in the bash tool, and a
-    // proxy URL must never pair with a real key.
-    // Best effort: a proxy problem leaves bash without the pair and never fails the turn.
-    // Untrusted projects and the project-automation kill switch blank provider keys in bash
-    // (gitNoRepoAutomationEnv), so repo code there must not spend through the proxy either.
-    // Add nothing rather than a proxy URL whose key the bash tool then blanks.
-    if (sharedExecutionTrusted) {
-      try {
-        Object.assign(
-          xumEnv,
-          await this.dependencies.bindings.bashAiProxy?.envFor(
-            workspaceId,
-            runtimeType,
-            Object.keys(projectSecretsRecord)
-          )
-        );
-      } catch (error) {
-        log.warn("[bash-ai-proxy] env setup failed; bash AI calls stay uncounted", {
-          workspaceId,
-          error: getErrorMessage(error),
-        });
-      }
-    }
+    Object.assign(
+      xumEnv,
+      await this.bashAiProxyEnv(
+        workspaceId,
+        runtimeType,
+        Object.keys(projectSecretsRecord),
+        sharedExecutionTrusted
+      )
+    );
     const getWorkflowProjectTrusted = () =>
       isWorkspaceProjectTrusted(this.dependencies.config, metadata);
 
@@ -2908,6 +3027,18 @@ export class TurnRequestBuilder {
         const firstStepToolNames = new Set(
           forcedFirstStepToolNames?.length ? forcedFirstStepToolNames : toolNamesForSentinel
         );
+        // Recorded in the DevTools run so the replay verifier trims the same way.
+        const compactionInputBudget = await compactionInputBudgetOption(
+          isCompactionRequest,
+          {
+            modelString: seed.rawModelString,
+            providerOptions: effectiveMuxProviderOptions,
+            providersConfig: seed.providersConfig,
+          },
+          attemptProviderRequestMessages,
+          compactionInputBudgetScale,
+          compactionContextRetryAvailable === true
+        );
         // Shared by the initial build and thinking rebuilds so their assembly
         // inputs cannot drift apart mid-turn. `measureOnly` assembles a candidate history and
         // returns its estimate without throwing: it runs after `request.assemble`, so no hook,
@@ -2937,6 +3068,7 @@ export class TurnRequestBuilder {
               anthropicCacheTtl: effectiveAnthropicCacheTtl,
               workspaceId,
               tagHistoryItemIds: tokenBudgetEnabled,
+              ...compactionInputBudget,
               requestContextMessage: mcpAppContextMessage,
             },
             {
@@ -3005,6 +3137,7 @@ export class TurnRequestBuilder {
           engineSystem: attemptPayload.system,
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
           contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
+          ...compactionInputBudget,
           measureMessages: (history: MuxMessage[]) =>
             assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel, { history }),
           systemMessageTokens: attemptSystemTokens,
@@ -3295,6 +3428,11 @@ export class TurnRequestBuilder {
       const toolsForStream = primaryRequest.engineTools;
 
       const devToolsService = this.dependencies.devToolsService;
+      // Queues this turn's run metadata with a request's compaction budget: the primary's
+      // below, each refusal fallback's own one (another window) in modelFallback.prepare, so
+      // replay rebuilds the request each run sent.
+      let queueRunMetadata: (compactionInputBudgetTokens: number | undefined) => void = () =>
+        undefined;
       const canQueueDevToolsRunMetadata =
         devToolsService?.enabled === true &&
         typeof modelResult.data.model !== "string" &&
@@ -3306,7 +3444,8 @@ export class TurnRequestBuilder {
         // when middleware is guaranteed to run (LanguageModelV3).
         pendingRunMetadataId = String(streamToken);
         context.startupState.pendingRunMetadataId = pendingRunMetadataId;
-        devToolsService.setPendingRunMetadata(workspaceId, pendingRunMetadataId, {
+        const metadataId = pendingRunMetadataId;
+        const runMetadata = {
           toolPolicy:
             effectiveToolPolicy != null && effectiveToolPolicy.length > 0
               ? effectiveToolPolicy
@@ -3318,7 +3457,14 @@ export class TurnRequestBuilder {
           ...(promptCacheScope.contextEpoch != null
             ? { contextEpoch: promptCacheScope.contextEpoch }
             : {}),
-        });
+        };
+        queueRunMetadata = (compactionInputBudgetTokens) =>
+          devToolsService.setPendingRunMetadata(workspaceId, metadataId, {
+            ...runMetadata,
+            // Undefined unless this is a budgeted compaction request (JSON drops the key).
+            compactionInputBudgetTokens,
+          });
+        queueRunMetadata(primaryRequest.compactionInputBudgetTokens);
         this.dependencies.trackPendingDevToolsRunMetadata(
           assistantMessageId,
           workspaceId,
@@ -3390,6 +3536,8 @@ export class TurnRequestBuilder {
                 }
                 let nextHeaders = nextRequest.headers;
                 if (pendingRunMetadataId != null) {
+                  // The fallback's run is created after this, under the same metadata ID.
+                  queueRunMetadata(nextRequest.compactionInputBudgetTokens);
                   nextHeaders = {
                     ...nextHeaders,
                     [DEVTOOLS_RUN_METADATA_ID_HEADER]: pendingRunMetadataId,
