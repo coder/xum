@@ -41,6 +41,7 @@ import {
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { appendPinnedTimestamp, reassignPinnedTimestamps } from "@/common/utils/pin";
 import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { setWorkspaceAiMetadata } from "@/browser/utils/aiSelectionIntent";
@@ -406,8 +407,20 @@ function buildActiveWorkspaceMetadataMap(
   return metadataMap;
 }
 
+/** The workspace IDs whose last metadata update arrived after `arrival` (an arrival count). */
+function getIdsArrivedAfter(lastByWorkspaceId: Map<string, number>, arrival: number): Set<string> {
+  const ids = new Set<string>();
+  for (const [workspaceId, arrivedAt] of lastByWorkspaceId) {
+    if (arrivedAt > arrival) ids.add(workspaceId);
+  }
+  return ids;
+}
+
 export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const { api } = useAPI();
+  // Handlers use only the live client: offline they keep returning their result (for example
+  // { success: false }), even while useAPI() keeps the last client during a reconnect.
+  const liveApi = useLiveAPI();
 
   // Get project refresh function from ProjectContext
   const {
@@ -465,11 +478,14 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     [workspaceStore]
   );
   // The discard waits for a live server: useAPI().api can keep the last client while offline.
-  useDiscardSideChatOnLeave(useLiveAPI(), currentWorkspaceId, workspaceMetadata);
+  useDiscardSideChatOnLeave(liveApi, currentWorkspaceId, workspaceMetadata);
   // The routed creation draft id, for the startup creation-draft storage GC (never collected).
   const routedDraftIdRef = useRef<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
+  // For the metadata effect: a new client shows the loader again until a first snapshot loads.
+  const loadedRef = useRef(loaded);
+  loadedRef.current = loaded;
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [workspaceDraftPromotionsByProject, setWorkspaceDraftPromotionsByProject] =
@@ -889,13 +905,16 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   // The metadata stream owns the initial load: its first event is a snapshot built after the
   // server attached the listener, so no change can fall between the load and the updates (#5189).
   useEffect(() => {
-    setLoading(true);
+    // After a first snapshot, a new client (reconnect) reloads behind the shown metadata, so
+    // neither `loading` nor `loaded` resets here.
     if (!api) {
       // api not available yet - effect will run again when api connects
-      setLoaded(false);
       setLoadError("API not connected");
       return;
     }
+    // No snapshot loaded yet (a failure or a lost connection ended the last load): the new client
+    // shows the loader again, or the app would leave it with an empty metadata map.
+    if (!loadedRef.current) setLoading(true);
     const controller = new AbortController();
     const { signal } = controller;
     let snapshotApplied = false;
@@ -1111,12 +1130,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       trunkBranch: string,
       runtimeConfig?: RuntimeConfig
     ) => {
-      if (!api) throw new Error("API not connected");
+      if (!liveApi) throw new Error("API not connected");
       console.assert(
         typeof trunkBranch === "string" && trunkBranch.trim().length > 0,
         "Expected trunk branch to be provided when creating a workspace"
       );
-      const result = await api.workspace.create({
+      const result = await liveApi.workspace.create({
         projectPath,
         branchName,
         trunkBranch,
@@ -1146,7 +1165,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         throw new Error(result.error);
       }
     },
-    [api, refreshProjects, setWorkspaceMetadata]
+    [liveApi, refreshProjects, setWorkspaceMetadata]
   );
 
   // Shared by workspace removal and user-confirmed sub-agent removal (#5106): both end with the
@@ -1156,7 +1175,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       workspaceId: string,
       remove: (client: APIClient) => Promise<WorkspaceRemoveResult>
     ): Promise<WorkspaceRemoveResult> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
 
       // Capture state before the async operation.
       // We check currentWorkspaceId (from URL) rather than selectedWorkspace
@@ -1169,7 +1188,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       const parentSelection = getParentWorkspaceSelection(metadata, workspaceMetadata);
 
       try {
-        const result = await remove(api);
+        const result = await remove(liveApi);
         if (result.success) {
           // Clean up workspace-specific localStorage keys
           deleteWorkspaceStorage(workspaceId);
@@ -1218,7 +1237,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       selectedWorkspace,
       setSelectedWorkspace,
       workspaceMetadata,
-      api,
+      liveApi,
       setWorkspaceMetadata,
     ]
   );
@@ -1262,9 +1281,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       workspaceId: string,
       newTitle: string
     ): Promise<{ success: boolean; error?: string }> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
       try {
-        const result = await api.workspace.updateTitle({ workspaceId, title: newTitle });
+        const result = await liveApi.workspace.updateTitle({ workspaceId, title: newTitle });
         if (result.success) {
           // Workspace metadata subscription handles the title update automatically.
           // No need to refetch all metadata - this avoids expensive post-compaction
@@ -1280,7 +1299,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: errorMessage };
       }
     },
-    [api]
+    [liveApi]
   );
 
   /**
@@ -1291,7 +1310,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
    */
   const setWorkspacePinned = useCallback(
     async (workspaceId: string, pinned: boolean): Promise<{ success: boolean; error?: string }> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
 
       let previousPinnedAtById: Map<string, string | undefined> | null = null;
       setWorkspaceMetadata((prev) => {
@@ -1336,7 +1355,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       };
 
       try {
-        const result = await api.workspace.setPinned({ workspaceId, pinned });
+        const result = await liveApi.workspace.setPinned({ workspaceId, pinned });
         if (result.success) {
           return { success: true };
         }
@@ -1350,7 +1369,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: errorMessage };
       }
     },
-    [api, setWorkspaceMetadata]
+    [liveApi, setWorkspaceMetadata]
   );
 
   /**
@@ -1362,7 +1381,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
    */
   const reorderPinnedWorkspaces = useCallback(
     async (workspaceIds: string[]): Promise<{ success: boolean; error?: string }> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
 
       let previousPinnedAtById: Map<string, string> | undefined;
       let optimisticPinnedAtById: Map<string, string> | undefined;
@@ -1412,7 +1431,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       };
 
       try {
-        const result = await api.workspace.reorderPinned({ workspaceIds });
+        const result = await liveApi.workspace.reorderPinned({ workspaceIds });
         if (result.success) {
           return { success: true };
         }
@@ -1426,7 +1445,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: errorMessage };
       }
     },
-    [api, setWorkspaceMetadata]
+    [liveApi, setWorkspaceMetadata]
   );
 
   const [archivingWorkspaceIds, setArchivingWorkspaceIds] = useState<ReadonlySet<string>>(
@@ -1438,14 +1457,14 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     async (
       workspaceId: string
     ): Promise<{ success: boolean; error?: string; data?: ArchivePreflightResult }> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
 
       try {
         const result = await trackArchivingRequest(
           archivingRequestCounts.current,
           setArchivingWorkspaceIds,
           workspaceId,
-          () => api.workspace.preflightArchive({ workspaceId })
+          () => liveApi.workspace.preflightArchive({ workspaceId })
         );
         if (result.success) {
           return { success: true, data: result.data };
@@ -1455,7 +1474,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: getErrorMessage(error) };
       }
     },
-    [api]
+    [liveApi]
   );
 
   const archiveWorkspace = useCallback(
@@ -1463,7 +1482,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       workspaceId: string,
       options?: { acknowledgedUntrackedPaths?: string[] }
     ): Promise<{ success: boolean; error?: string; data?: ArchiveWorkspaceResult }> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
 
       try {
         const result = await trackArchivingRequest(
@@ -1471,7 +1490,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           setArchivingWorkspaceIds,
           workspaceId,
           () =>
-            api.workspace.archive({
+            liveApi.workspace.archive({
               workspaceId,
               acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
             })
@@ -1516,14 +1535,14 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: errorMessage };
       }
     },
-    [api]
+    [liveApi]
   );
 
   const unarchiveWorkspace = useCallback(
     async (workspaceId: string): Promise<{ success: boolean; error?: string }> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
       try {
-        const result = await api.workspace.unarchive({ workspaceId });
+        const result = await liveApi.workspace.unarchive({ workspaceId });
         if (result.success) {
           // Workspace metadata subscription handles the state update automatically.
           return { success: true };
@@ -1537,12 +1556,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: errorMessage };
       }
     },
-    [api]
+    [liveApi]
   );
 
   const refreshWorkspaceMetadata = useCallback(async () => {
     if (!api) {
-      setLoaded(false);
+      // Keep `loaded` and the shown metadata: the reconnect reloads them.
       setLoadError("API not connected");
       return;
     }
@@ -1553,10 +1572,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       // A snapshot that arrived after the request, plus the updates after it, supersedes this list.
       if (arrivals.lastSnapshot > requestedAt) return;
       // Rows an update touched after the request keep their current state, including a deletion.
-      const touchedIds = new Set<string>();
-      for (const [workspaceId, arrivedAt] of arrivals.lastByWorkspaceId) {
-        if (arrivedAt > requestedAt) touchedIds.add(workspaceId);
-      }
+      const touchedIds = getIdsArrivedAfter(arrivals.lastByWorkspaceId, requestedAt);
       const listed = buildActiveWorkspaceMetadataMap(
         metadataList.filter((metadata) => !touchedIds.has(metadata.id))
       );
@@ -1571,6 +1587,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       setLoaded(true);
       setLoadError(null);
     } catch (error) {
+      // A lost connection is no load error: the reconnect reloads.
+      if (isConnectionLostError(error)) return;
       console.error("Failed to load workspace metadata:", error);
       // Keep the previous metadata map on failure so scoped preferences are not pruned.
       setLoadError(getErrorMessage(error));
@@ -1579,15 +1597,15 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
   const getWorkspaceInfo = useCallback(
     async (workspaceId: string) => {
-      if (!api) return null;
-      const metadata = await api.workspace.getInfo({ workspaceId });
+      if (!liveApi) return null;
+      const metadata = await liveApi.workspace.getInfo({ workspaceId });
       if (metadata) {
         ensureCreatedAt(metadata);
         setWorkspaceAiMetadata(metadata.id, metadata);
       }
       return metadata;
     },
-    [api]
+    [liveApi]
   );
 
   const promoteWorkspaceDraft = useCallback(

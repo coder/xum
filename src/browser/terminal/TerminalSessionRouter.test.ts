@@ -191,6 +191,78 @@ describe("TerminalSessionRouter across reconnects", () => {
     expect(second.attaches).toHaveLength(1);
   });
 
+  test("a resize that fails is not sent again after a reconnect", async () => {
+    const first = fakeServer("first");
+    const router = new TerminalSessionRouter(first.client);
+    router.subscribe("t1", recorder().callbacks);
+    await settle();
+    await router.resize("t1", 100, 30);
+    first.holdNextResize();
+    const failed = router.resize("t1", 120, 40).catch((error: unknown) => error);
+    first.settleResize(new Error("connection lost"));
+    expect(await failed).toEqual(new Error("connection lost"));
+
+    const second = fakeServer("second");
+    router.setClient(second.client);
+    await settle();
+    expect(second.resizes).toEqual([{ cols: 100, rows: 30 }]);
+  });
+
+  // The view already shows its initial size: a request lost with the connection must not drop it.
+  test("an initial size lost with the connection is sent again after a reconnect", async () => {
+    const first = fakeServer("first");
+    const router = new TerminalSessionRouter(first.client);
+    router.subscribe("t1", recorder().callbacks);
+    await settle();
+    first.holdNextResize();
+    router.syncSize("t1", 120, 40);
+    first.settleResize(new Error("connection lost"));
+    await settle();
+
+    const second = fakeServer("second");
+    router.setClient(second.client);
+    await settle();
+    expect(second.resizes).toEqual([{ cols: 120, rows: 40 }]);
+  });
+
+  test("a subscriber that joins during a reattach gets the new screen once", async () => {
+    const first = fakeServer("first");
+    const router = new TerminalSessionRouter(first.client);
+    router.subscribe("t1", recorder().callbacks);
+    await settle();
+    first.attaches[0]?.push({ type: "screenState", data: "screen-1" });
+    await settle();
+
+    const second = fakeServer("second");
+    router.setClient(second.client);
+    await settle();
+    // Joins with screen-1 cached; the reattach screen lands before its deferred delivery runs.
+    const late = recorder();
+    router.subscribe("t1", late.callbacks);
+    second.attaches[0]?.push({ type: "screenState", data: "screen-2" });
+    await settle();
+    expect(late.screens).toEqual([{ state: "screen-2", replace: true }]);
+  });
+
+  // No output during the gap: the reattach screen has the same text as the cached one.
+  test("a subscriber that joins during a reattach gets an identical new screen once", async () => {
+    const first = fakeServer("first");
+    const router = new TerminalSessionRouter(first.client);
+    router.subscribe("t1", recorder().callbacks);
+    await settle();
+    first.attaches[0]?.push({ type: "screenState", data: "screen-1" });
+    await settle();
+
+    const second = fakeServer("second");
+    router.setClient(second.client);
+    await settle();
+    const late = recorder();
+    router.subscribe("t1", late.callbacks);
+    second.attaches[0]?.push({ type: "screenState", data: "screen-1" });
+    await settle();
+    expect(late.screens).toEqual([{ state: "screen-1", replace: true }]);
+  });
+
   test("an exited session is not restarted", async () => {
     const first = fakeServer("first");
     const router = new TerminalSessionRouter(first.client);

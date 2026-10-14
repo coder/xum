@@ -42,6 +42,8 @@ const DialogOverlay = React.forwardRef<
 ));
 DialogOverlay.displayName = DialogPrimitive.Overlay.displayName;
 
+const NO_ANIMATION: React.CSSProperties = { animation: "none" };
+
 const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & {
@@ -56,6 +58,8 @@ const DialogContent = React.forwardRef<
      * cancel an inline edit) instead of dismissing the dialog.
      */
     allowEditableEscape?: boolean;
+    /** Open without the entry animation, when the same frame is already on screen. */
+    skipEntryAnimation?: boolean;
   }
 >(
   (
@@ -66,6 +70,7 @@ const DialogContent = React.forwardRef<
       maxWidth,
       maxHeight,
       allowEditableEscape = false,
+      skipEntryAnimation = false,
       style,
       onEscapeKeyDown,
       ...props
@@ -73,7 +78,7 @@ const DialogContent = React.forwardRef<
     ref
   ) => (
     <DialogPortal>
-      <DialogOverlay />
+      <DialogOverlay style={skipEntryAnimation ? NO_ANIMATION : undefined} />
       <DialogPrimitive.Content
         ref={ref}
         onEscapeKeyDown={(e) => {
@@ -101,7 +106,12 @@ const DialogContent = React.forwardRef<
           maxHeight && "overflow-y-auto",
           className
         )}
-        style={{ ...(maxWidth && { maxWidth }), ...(maxHeight && { maxHeight }), ...style }}
+        style={{
+          ...(maxWidth && { maxWidth }),
+          ...(maxHeight && { maxHeight }),
+          ...(skipEntryAnimation && NO_ANIMATION),
+          ...style,
+        }}
         {...props}
       >
         {children}

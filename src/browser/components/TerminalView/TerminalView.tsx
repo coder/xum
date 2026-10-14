@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, useCallback, useLayoutEffect } from "react";
 import { init, Terminal, FitAddon } from "ghostty-web";
 import { useAPI } from "@/browser/contexts/API";
+import { isStreamFailure } from "@/browser/contexts/connectionLink";
 import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { normalizeTerminalFontConfig } from "@/common/constants/storage";
 import { useTerminalRouter } from "@/browser/terminal/TerminalRouterContext";
@@ -350,8 +351,9 @@ export function TerminalView({
           }
           break;
         }
-      } catch {
-        if (!controller.signal.aborted) {
+      } catch (error) {
+        // A lost connection is not an exit: the next client runs this effect again.
+        if (isStreamFailure(error, controller.signal)) {
           // Treat failed subscriptions as exits (session ended before listener attached).
           handleExit(0);
         }
@@ -403,7 +405,7 @@ export function TerminalView({
 
     // Send initial resize to sync PTY dimensions
     const { cols, rows } = term;
-    void router.resize(sessionId, cols, rows);
+    router.syncSize(sessionId, cols, rows);
 
     return unsubscribe;
   }, [visible, terminalReady, sessionId, router, handleExit]);

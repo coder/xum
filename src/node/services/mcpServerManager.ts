@@ -1,15 +1,18 @@
+import { MCP_TOOL_ORIGIN } from "@/node/services/agentPlugins/codexToolNames";
+import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { isPluginMcpServerAllowed, type PluginMcpPolicy } from "./agentPlugins/registry";
 import { getOwn } from "@/common/utils/getOwn";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { OAuthClientProvider, PriorDiscovery } from "@modelcontextprotocol/client";
-import type { Tool } from "ai";
+import { jsonSchema, type Tool } from "ai";
 import { getExecutionScope } from "./tools/withExecutionScope";
 import { MCPIconRegistry, type MCPIconOwner } from "./mcpIconRegistry";
 import { resolveServerIcon } from "./mcpServerIcon";
 import {
   buildToolCallDisplay,
   describeConnection,
+  displayConnectionKey,
   normalizeServerIdentity,
   takeStandardDisplayMeta,
   type IconCandidate,
@@ -39,8 +42,18 @@ import type {
   McpAppResultStore,
 } from "@/node/services/mcpAppResultStore";
 import { extractMcpAppResource, type McpAppResource } from "@/node/services/mcpAppResource";
-import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
-import { isAppCallableTool, isMcpAppResourceUri, isModelVisibleTool } from "@/common/utils/mcpApps";
+import type { McpAppEntrypoint, McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
+import {
+  isAppCallableTool,
+  isMcpAppResourceUri,
+  isModelVisibleTool,
+  MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS,
+  MCP_APP_TOOL_CALL_WINDOW_MS,
+  MCP_APP_TOOL_CALLS_PER_WINDOW,
+  mcpAppEntrypointKey,
+  type MCPAppEntrypointType,
+} from "@/common/utils/mcpApps";
+import { sanitizeText } from "@/common/utils/mcp/displayText";
 import { log } from "@/node/services/log";
 import { MCPStdioTransport, MCP_STDIO_KILL_JOIN_MS } from "@/node/services/mcpStdioTransport";
 import type {
@@ -580,6 +593,13 @@ const PENDING_REPAIR_WAIT_MS = 10_000;
  * gate as a whole — not each helper — is bounded.
  */
 const CALL_GATE_TIMEOUT_MS = 30_000;
+
+/**
+ * How long listing or opening MCP App entry points waits for a server's tools/list refresh
+ * (tools/list_changed) before it uses the catalog it holds: one stalled server must not hold
+ * back the launcher. A fresh list answers from the SDK's response cache at once.
+ */
+export const MCP_APP_CATALOG_REFRESH_TIMEOUT_MS = 2_000;
 /** Iterations a served tool call spends waiting for override state to settle before failing closed. */
 const CALL_GATE_MAX_ATTEMPTS = 5;
 
@@ -1362,11 +1382,16 @@ interface MCPServerInstance {
   tools: Record<string, Tool>;
   prompts: MCPPrompt[];
   getPrompt: MCPClientHandle["getPrompt"];
+  /** Codex plugin hooks (see MCPServerManager.callToolForPluginHook). */
+  callToolForHook: MCPClientHandle["callToolForHook"];
   /**
    * MCP Apps (artifacts experiment): present only when the connection announced the
    * extension. Tool metadata includes tools hidden from the model.
    */
-  apps?: Pick<MCPClientHandle, "toolUi" | "hasTool" | "callToolForApp" | "readResource">;
+  apps?: Pick<
+    MCPClientHandle,
+    "toolUi" | "hasTool" | "callToolForApp" | "readResource" | "appEntrypoints"
+  >;
   /** OpenAI structured settings (`openai/settings`); its tools are hidden from the model. */
   settings?: Pick<MCPClientHandle, "settingsCapability" | "callSettingsTool">;
   /** True once the underlying MCP client/transport has been closed. */
@@ -1656,6 +1681,21 @@ export class MCPServerManager {
   >();
   /** Dedupes send-path background tool refreshes per instance; see refreshInstanceToolsInBackground. */
   private readonly toolRefreshesInFlight = new WeakMap<MCPServerInstance, Promise<void>>();
+  /**
+   * Prompt catalogs of idle-stopped servers, by workspace, with the start
+   * config they were fetched under. The restart seeds each restarted
+   * instance's catalog from here before its awaited prompts/list, so a list
+   * that fails or times out (10 s) keeps the previous catalog instead of an
+   * empty one. Otherwise the `mcp_prompt_get` description loses that server's
+   * prompts for a turn, and the changed tools section rewrites the whole
+   * cached Anthropic prompt (seen live: Notion prompts dropped after an idle
+   * restart). Consumed by the next cold start; dropped on removal-style stops
+   * and plugin key-prefix invalidations.
+   */
+  private readonly idleStoppedPromptCatalogs = new Map<
+    string,
+    { configSignature: string; prompts: Map<string, MCPPrompt[]> }
+  >();
   // Bumped by removal-style stops (stopServers without retainRestartOptions).
   // Startups run outside any lock shared with removal, so an abort-abandoned
   // startup can finish after the workspace is gone; the epoch check makes it
@@ -2480,21 +2520,33 @@ export class MCPServerManager {
         name: instance.name,
         toolCount: Object.keys(instance.tools).length,
       });
-      const refresh = instance
-        .refreshTools()
-        .catch((error: unknown) => {
-          log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
-            name: instance.name,
-            error: getErrorMessage(error),
-          });
-        })
-        .finally(() => {
-          if (this.toolRefreshesInFlight.get(instance) === refresh) {
-            this.toolRefreshesInFlight.delete(instance);
-          }
-        });
-      this.toolRefreshesInFlight.set(instance, refresh);
+      void this.refreshInstanceTools(instance);
     }
+  }
+
+  /**
+   * One deduped tools/list refresh of a modern-era instance; never rejects (a failed refresh
+   * keeps the cached tools). Legacy instances have no refresh and resolve at once.
+   */
+  private refreshInstanceTools(instance: MCPServerInstance): Promise<void> {
+    const inFlight = this.toolRefreshesInFlight.get(instance);
+    if (inFlight !== undefined) return inFlight;
+    if (instance.isClosed || !instance.refreshTools) return Promise.resolve();
+    const refresh = instance
+      .refreshTools()
+      .catch((error: unknown) => {
+        log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
+          name: instance.name,
+          error: getErrorMessage(error),
+        });
+      })
+      .finally(() => {
+        if (this.toolRefreshesInFlight.get(instance) === refresh) {
+          this.toolRefreshesInFlight.delete(instance);
+        }
+      });
+    this.toolRefreshesInFlight.set(instance, refresh);
+    return refresh;
   }
 
   /**
@@ -2513,6 +2565,36 @@ export class MCPServerManager {
       }
     });
     entry.promptRefreshInFlight = refresh;
+  }
+
+  /**
+   * Give servers restarted after an idle stop the catalog they had before it
+   * (see idleStoppedPromptCatalogs). Only under the identical start config:
+   * any config change (server added, removed, edited, signed in) starts
+   * empty as before. The awaited refresh still replaces the seed on success.
+   */
+  private seedPromptsFromIdleStop(
+    workspaceId: string,
+    configSignature: string,
+    instances: Map<string, MCPServerInstance>
+  ): void {
+    const saved = this.idleStoppedPromptCatalogs.get(workspaceId);
+    if (saved === undefined) return;
+    this.idleStoppedPromptCatalogs.delete(workspaceId);
+    if (saved.configSignature !== configSignature) return;
+    for (const [serverName, instance] of instances) {
+      const prompts = saved.prompts.get(serverName);
+      if (prompts !== undefined && instance.prompts.length === 0) instance.prompts = prompts;
+    }
+  }
+
+  /** A replaced plugin tree can serve other prompts under the same start config. */
+  private forgetIdleStoppedPrompts(serverKeyPrefix: string): void {
+    for (const saved of this.idleStoppedPromptCatalogs.values()) {
+      for (const serverName of [...saved.prompts.keys()]) {
+        if (serverName.startsWith(serverKeyPrefix)) saved.prompts.delete(serverName);
+      }
+    }
   }
 
   private async refreshInstancePrompts(
@@ -2617,6 +2699,12 @@ export class MCPServerManager {
         log.info("[MCP] Stopping idle servers", {
           workspaceId,
           idleMinutes: Math.round(idleMs / 60_000),
+        });
+        this.idleStoppedPromptCatalogs.set(workspaceId, {
+          configSignature: entry.configSignature,
+          prompts: new Map(
+            [...entry.instances].map(([serverName, instance]) => [serverName, instance.prompts])
+          ),
         });
         void this.stopServers(workspaceId, { retainRestartOptions: true });
       }
@@ -3833,6 +3921,7 @@ export class MCPServerManager {
       );
       // Still-waiting servers were not attempted this time but are still down.
       const startFailedNames = [...startedFailedNames, ...carriedBackoff.waiting];
+      this.seedPromptsFromIdleStop(workspaceId, signature, instances);
 
       const stats = this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames);
 
@@ -4597,6 +4686,91 @@ export class MCPServerManager {
   }
 
   /**
+   * tools/call for a Codex-format plugin hook, on a server that is ALREADY running and enabled in
+   * this workspace. It never starts or reconnects a server (Codex: hooks use an existing
+   * connection), so a hook whose server is off, excluded or not yet started fails, and the
+   * runner fails open. The caller builds `serverKey` from the hook's own plugin instance, so a
+   * hook can never reach another plugin's or the user's servers.
+   *
+   * The cached enabled set only gates the cheap early refusal. The dispatch itself goes through
+   * invokeServerOperation (Codex PRRT_kwDOPxxmWM6rNIIg), like an MCP Apps tool call: it re-reads
+   * the overrides and runs inside the epoch and admission fences, so a server that another
+   * backend or a direct settings edit disabled after the last serve is refused.
+   */
+  async callToolForPluginHook(
+    workspaceId: string,
+    serverKey: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    options: { signal: AbortSignal }
+  ): Promise<unknown> {
+    const entry = this.workspaceServers.get(workspaceId);
+    if (!entry?.enabledServerNames.has(serverKey)) {
+      throw new Error(`MCP server '${serverKey}' is not enabled in this workspace`);
+    }
+    const instance = entry.instances.get(serverKey);
+    if (instance === undefined || instance.isClosed) {
+      throw new Error(`MCP server '${serverKey}' is not running`);
+    }
+    // The served-tool gate (Codex PRRT_kwDOPxxmWM6rN775, PRRT_kwDOPxxmWM6rN8uX): it re-derives
+    // enablement and the project/workspace tool allowlists at the call, inside the epoch and
+    // admission fences, like a model's MCP tool call. `reconcile: false`: where a model's call
+    // would re-serve (and so start or reconnect servers), a hook call is refused instead.
+    const hookTool: Tool = {
+      inputSchema: jsonSchema({ type: "object" }),
+      execute: () => {
+        // Dispatch-time instance: the gate's checks ran synchronously before this.
+        const current = this.workspaceServers.get(workspaceId)?.instances.get(serverKey);
+        if (current === undefined || current.isClosed) {
+          throw new Error(`MCP server '${serverKey}' is not running`);
+        }
+        this.markActivity(workspaceId);
+        return current.callToolForHook(toolName, args, options);
+      },
+    };
+    const gated = this.gateServedToolOnEnablement(
+      workspaceId,
+      serverKey,
+      toolName,
+      hookTool,
+      entry.enabledServers[serverKey],
+      { reconcile: false }
+    );
+    assert(gated.execute !== undefined, "the gate keeps execute");
+    return await gated.execute(args, {
+      toolCallId: `plugin-hook:${toolName}`,
+      messages: [],
+      abortSignal: options.signal,
+      context: undefined,
+    });
+  }
+
+  /**
+   * Whether callToolForPluginHook would dispatch `toolName` on `serverKey` now, from cached state
+   * only (no disk read, no serve): enabled (an override publication repairs this set) and running,
+   * not invalidated, and allowed by the project and workspace tool allowlists. The runner asks
+   * before it denies a call that is too large for the hook to check.
+   */
+  canCallToolForPluginHook(workspaceId: string, serverKey: string, toolName: string): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    const info = entry?.enabledServers[serverKey];
+    const instance = entry?.instances.get(serverKey);
+    if (
+      entry === undefined ||
+      info === undefined ||
+      instance === undefined ||
+      instance.isClosed ||
+      !entry.enabledServerNames.has(serverKey) ||
+      this.overridesInvalidationGenerations.has(workspaceId)
+    ) {
+      return false;
+    }
+    const overrides = this.lastWorkspaceRequestOptions.get(workspaceId)?.overrides;
+    const allowlist = effectiveToolAllowlist(serverKey, info.toolAllowlist, overrides);
+    return allowlist === null || allowlist.has(toolName);
+  }
+
+  /**
    * Whether a send or prompt discovery recorded this workspace's request options. Without them
    * server operations cannot start servers (invokeServerOperation), e.g. right after a restart.
    */
@@ -4973,11 +5147,7 @@ export class MCPServerManager {
         if (dispatched !== null) return dispatched;
         const apps = requireAppsConnection(instance);
         // Read synchronously at dispatch, from the same state the served-tool gate uses.
-        const allowlist = effectiveToolAllowlist(
-          serverName,
-          this.workspaceServers.get(workspaceId)?.enabledServers[serverName]?.toolAllowlist,
-          this.lastWorkspaceRequestOptions.get(workspaceId)?.overrides
-        );
+        const allowlist = this.appToolAllowlist(workspaceId, serverName);
         const refusal = checkMcpAppToolCall(apps, toolName, options.consented, allowlist);
         if (refusal !== null) return Promise.resolve(refusal);
         log.info("[MCP Apps] View-initiated tools/call", { workspaceId, serverName, toolName });
@@ -4989,6 +5159,195 @@ export class MCPServerManager {
       (result) => result,
       options
     );
+  }
+
+  /**
+   * MCP App entry points of the workspace's enabled, connected servers. The tool allowlist
+   * applies (opening one calls the tool); `_meta.ui.visibility` does not (spec).
+   */
+  async listMcpAppEntrypoints(
+    workspaceId: string,
+    signal?: AbortSignal
+  ): Promise<McpAppEntrypoint[]> {
+    if (this.mcpApps?.isEnabled() !== true) return [];
+    await this.refreshAppCatalogs(this.appInstances(workspaceId), signal);
+    // Read again: the servers can stop or restart while the refresh runs.
+    return this.appInstances(workspaceId).flatMap(({ serverName, apps }) => {
+      const allowlist = this.appToolAllowlist(workspaceId, serverName);
+      const serverLabel = this.appServerLabel(workspaceId, serverName);
+      return apps
+        .appEntrypoints()
+        .filter((tool) => allowlist === null || allowlist.has(tool.toolName))
+        .flatMap((tool) =>
+          tool.types.map((type) => ({
+            serverName,
+            serverLabel,
+            toolName: tool.toolName,
+            title: tool.title,
+            resourceUri: tool.resourceUri,
+            type,
+            viewKey: mcpAppEntrypointKey(serverName, tool.toolName, type),
+          }))
+        );
+    });
+  }
+
+  /**
+   * The send path refreshes tool catalogs in the background, so after tools/list_changed the
+   * held catalog is stale until the next send. Wait for a refresh, bounded per server by the
+   * signal and MCP_APP_CATALOG_REFRESH_TIMEOUT_MS: a server that has not answered by then keeps
+   * the catalog it holds. Through the SDK's response cache a still-fresh list costs no round trip.
+   */
+  private async refreshAppCatalogs(
+    instances: ReadonlyArray<{ instance: MCPServerInstance }>,
+    signal: AbortSignal | undefined
+  ): Promise<void> {
+    await Promise.all(
+      instances.map(({ instance }) =>
+        raceWithAbortAndTimeout(this.refreshInstanceTools(instance), {
+          ...(signal !== undefined ? { signal } : {}),
+          timeoutMs: MCP_APP_CATALOG_REFRESH_TIMEOUT_MS,
+        })
+      )
+    );
+  }
+
+  /** The workspace's enabled, open instances with an MCP Apps connection. */
+  private appInstances(workspaceId: string): Array<{
+    serverName: string;
+    instance: MCPServerInstance;
+    apps: NonNullable<MCPServerInstance["apps"]>;
+  }> {
+    const entry = this.workspaceServers.get(workspaceId);
+    if (entry === undefined) return [];
+    return [...entry.instances].flatMap(([serverName, instance]) =>
+      entry.enabledServerNames.has(serverName) && !instance.isClosed && instance.apps
+        ? [{ serverName, instance, apps: instance.apps }]
+        : []
+    );
+  }
+
+  /**
+   * Open an entry point: call its tool with `{}` (the spec's entry point arguments) on
+   * `serverName` only, and store the result as the view record under the entry point's key, so
+   * its tab mounts (and remounts after a reload) through getMcpAppView. No chat row is written.
+   * Rate limited like a view's own tool calls, per workspace and server.
+   */
+  async openMcpAppEntrypoint(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    type: MCPAppEntrypointType,
+    options?: { signal?: AbortSignal }
+  ): Promise<McpAppEntrypoint> {
+    assert(this.mcpApps, "MCP Apps support is not configured");
+    const store = this.mcpApps.store;
+    // The dispatch below reads the server's catalog: refresh it first, so an entry point that
+    // tools/list_changed removed is refused. A cold server lists its tools as it starts.
+    await this.refreshAppCatalogs(
+      this.appInstances(workspaceId).filter((app) => app.serverName === serverName),
+      options?.signal
+    );
+    // One-shot dispatch, as in callMcpAppTool: an epoch retry must not call the tool twice.
+    let dispatched: Promise<McpAppEntrypoint> | null = null;
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP Apps entry point '${serverName}/${toolName}'`,
+      (instance): Promise<McpAppEntrypoint> => {
+        if (dispatched !== null) return dispatched;
+        const apps = requireAppsConnection(instance);
+        const tool = apps
+          .appEntrypoints()
+          .find((candidate) => candidate.toolName === toolName && candidate.types.includes(type));
+        const allowlist = this.appToolAllowlist(workspaceId, serverName);
+        if (tool === undefined || (allowlist !== null && !allowlist.has(toolName))) {
+          return Promise.reject(
+            new Error(`'${serverName}' has no ${type} entry point named '${toolName}'`)
+          );
+        }
+        // Budgeted only once the entry point is known to exist, so the budget map holds only
+        // servers the workspace runs (an unknown name never adds an entry).
+        if (!this.allowEntrypointCall(workspaceId, serverName)) {
+          return Promise.reject(
+            new Error(`Too many entry point opens for '${serverName}'; try again shortly`)
+          );
+        }
+        log.info("[MCP Apps] Opening an entry point", { workspaceId, serverName, toolName, type });
+        const viewKey = mcpAppEntrypointKey(serverName, toolName, type);
+        dispatched = apps.callToolForApp(toolName, {}, options).then(async (result) => {
+          await store.record(workspaceId, {
+            toolCallId: viewKey,
+            serverName,
+            toolName,
+            resourceUri: tool.resourceUri,
+            arguments: {},
+            result,
+          });
+          return {
+            serverName,
+            serverLabel: this.appServerLabel(workspaceId, serverName),
+            toolName,
+            title: tool.title,
+            resourceUri: tool.resourceUri,
+            type,
+            viewKey,
+          };
+        });
+        return dispatched;
+      },
+      (result) => result,
+      options
+    );
+  }
+
+  /**
+   * What a user sees for a server: a plugin server's key carries an internal instance ID
+   * (`plugin:<hex>:<server>`), so it shows as "<plugin> · <server>" from its provenance.
+   * Other servers show their (display-sanitized) key.
+   */
+  private appServerLabel(workspaceId: string, serverName: string): string {
+    const plugin = this.workspaceServers.get(workspaceId)?.enabledServers[serverName]?.plugin;
+    // Both parts come from plugin files: cleaned like entry point titles, so bidi or control
+    // characters cannot reorder or wrap the label. A part that cleans to nothing falls back to
+    // the key's display form.
+    const parts = [plugin?.pluginName, plugin?.serverName].map((part) =>
+      sanitizeText(part, MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS)
+    );
+    return parts.every((part) => part !== undefined)
+      ? parts.join(" · ")
+      : displayConnectionKey(serverName);
+  }
+
+  /** Effective tool allowlist of a server for MCP Apps calls (read at dispatch). */
+  private appToolAllowlist(workspaceId: string, serverName: string): Set<string> | null {
+    return effectiveToolAllowlist(
+      serverName,
+      this.workspaceServers.get(workspaceId)?.enabledServers[serverName]?.toolAllowlist,
+      this.lastWorkspaceRequestOptions.get(workspaceId)?.overrides
+    );
+  }
+
+  private readonly entrypointCallWindows = new Map<string, { start: number; count: number }>();
+
+  /** Entry point budgets of a stopped workspace would otherwise outlive it. */
+  private dropEntrypointBudgets(workspaceId: string): void {
+    for (const key of this.entrypointCallWindows.keys()) {
+      if (key.startsWith(`${workspaceId}\0`)) this.entrypointCallWindows.delete(key);
+    }
+  }
+
+  /** The view tool-call budget (mcpAppHost), applied per workspace and server. */
+  private allowEntrypointCall(workspaceId: string, serverName: string): boolean {
+    const key = `${workspaceId}\0${serverName}`;
+    const now = Date.now();
+    const window = this.entrypointCallWindows.get(key);
+    if (window === undefined || now - window.start >= MCP_APP_TOOL_CALL_WINDOW_MS) {
+      this.entrypointCallWindows.set(key, { start: now, count: 1 });
+      return true;
+    }
+    window.count += 1;
+    return window.count <= MCP_APP_TOOL_CALLS_PER_WINDOW;
   }
 
   /**
@@ -5250,6 +5609,7 @@ export class MCPServerManager {
     // epoch snapshot against this record and close matching instances
     // instead of publishing them.
     this.prefixInvalidations.set(prefix, ++this.prefixInvalidationClock);
+    this.forgetIdleStoppedPrompts(prefix);
 
     // Close ONLY the matching instances. The rest of the workspace's servers
     // stay running: a live agent stream may hold a lease or be mid tool call
@@ -5430,7 +5790,9 @@ export class MCPServerManager {
       this.lastWorkspaceRequestOptions.delete(workspaceId);
       this.workspaceOptionsMutationCounts.delete(workspaceId);
       this.latestWorkspaceOverrides.delete(workspaceId);
+      this.idleStoppedPromptCatalogs.delete(workspaceId);
     }
+    this.dropEntrypointBudgets(workspaceId);
     const entry = this.workspaceServers.get(workspaceId);
     if (!entry) return;
 
@@ -5861,7 +6223,9 @@ export class MCPServerManager {
     serverName: string,
     toolName: string,
     tool: Tool,
-    servedInfo: MCPServerInfo | undefined
+    servedInfo: MCPServerInfo | undefined,
+    /** false (plugin hooks): refuse instead of re-serving, so the gate never starts a server. */
+    gateOptions: { reconcile: boolean } = { reconcile: true }
   ): Tool {
     if (!tool.execute) {
       return tool;
@@ -6002,7 +6366,11 @@ export class MCPServerManager {
                     this.forgetWorkspaceOverrides(workspaceId);
                   }
                 }
-                if (this.overridesInvalidationGenerations.has(workspaceId)) {
+                // Without reconciling, the live marker makes decide() refuse the call.
+                if (
+                  gateOptions.reconcile &&
+                  this.overridesInvalidationGenerations.has(workspaceId)
+                ) {
                   const latest = this.lastWorkspaceRequestOptions.get(workspaceId);
                   if (latest !== undefined) {
                     await this.ensureWorkspaceServers(latest, false, abortSignal);
@@ -6066,15 +6434,18 @@ export class MCPServerManager {
             ) {
               throw revoked(`server '${serverName}'`);
             }
+            // Object.hasOwn, not `in`: a tool named after an Object.prototype member
+            // (constructor, toString) would otherwise pass an allowlist that excludes it (Codex
+            // PRRT_kwDOPxxmWM6rb5ps).
             if (
-              !(
-                toolName in
+              !Object.hasOwn(
                 this.applyToolAllowlist(
                   serverName,
                   { [toolName]: tool },
                   info.toolAllowlist,
                   overrides
-                )
+                ),
+                toolName
               )
             ) {
               throw revoked(`tool '${serverName}/${toolName}'`);
@@ -6227,7 +6598,14 @@ export class MCPServerManager {
           });
         }
 
-        aggregated[result.toolName] = gate(instance.name, toolName, tool);
+        // Tag a copy with its origin for Codex plugin hooks: the served tool can be frozen, and
+        // the instance's own tool must stay as wrapRawTools built it.
+        const served = cloneToolPreservingDescriptors(gate(instance.name, toolName, tool));
+        Object.defineProperty(served, MCP_TOOL_ORIGIN, {
+          value: { serverName: instance.name, toolName },
+          enumerable: true,
+        });
+        aggregated[result.toolName] = served;
         toolServerNames[result.toolName] = instance.name;
       }
     }
@@ -6981,6 +7359,8 @@ export class MCPServerManager {
           prompts: [],
           getPrompt: (promptName, args, options) =>
             readyClient.getPrompt(promptName, args, options),
+          callToolForHook: (toolName, args, options) =>
+            readyClient.callToolForHook(toolName, args, options),
           ...(appResultStore ? { apps: readyClient } : {}),
           settings: readyClient,
           refreshPrompts: (options) => readyClient.prompts(options),
@@ -7283,6 +7663,8 @@ export class MCPServerManager {
         tools,
         prompts: [],
         getPrompt: (promptName, args, options) => activeClient.getPrompt(promptName, args, options),
+        callToolForHook: (toolName, args, options) =>
+          activeClient.callToolForHook(toolName, args, options),
         ...(appResultStore ? { apps: activeClient } : {}),
         settings: activeClient,
         refreshPrompts: (options) => activeClient.prompts(options),

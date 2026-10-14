@@ -234,6 +234,13 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
    * persists it instead of classifying (and billing) again.
    */
   autoModelRouting?: AutoModelRoutingRecord;
+  /**
+   * The diverted send already ran the message.send prompt hooks: the redispatch must not run them
+   * a second time. Only Xum sets it (stripClientPluginSendHookFields drops a client's).
+   */
+  pluginSendHooksApplied?: true;
+  /** The diverted send's prompt-hook context, restored on the redispatched user row. */
+  pluginHookContext?: PluginHookContextEntry[];
 }
 
 /**
@@ -1003,6 +1010,12 @@ export function hasTokenUsage(
   );
 }
 
+/** One plugin's message.send context for a user row (see MuxMetadata.pluginHookContext). */
+export interface PluginHookContextEntry {
+  pluginId: string;
+  text: string;
+}
+
 /**
  * Record of a model-fallback chain application. `requestedModel` is the model
  * originally asked for; `refusedModels` lists every model that refused, in
@@ -1175,6 +1188,13 @@ export interface MuxMetadata {
    * reconciliation.
    */
   taskTurnKind?: TaskTurnKind;
+  /**
+   * Context that message.send prompt hooks (Codex UserPromptSubmit `additionalContext`) added
+   * for this user row. Request building renders it into this message's content
+   * (renderPluginHookContextForProvider), never into the system prompt, so the cached prefix
+   * stays stable and later turns keep it. Not shown in the user's bubble.
+   */
+  pluginHookContext?: PluginHookContextEntry[];
 
   /**
    * ACP-only correlation id propagated through stream events so prompt() can

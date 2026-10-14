@@ -68,3 +68,19 @@ export function pageToolTextForResult(
     note: `Text continues: read the next page with ${call.replace("<offset>", next)}.`,
   };
 }
+
+/**
+ * One page of a completed task report. Reports are persisted, so the note points at the
+ * task_await call that re-fetches the next page (from task_await itself or a foreground task).
+ */
+export function pageTaskReportForResult(
+  taskId: string,
+  reportMarkdown: string,
+  offsetChars: number | null | undefined
+): ToolTextPage & { note?: string } {
+  return pageToolTextForResult(
+    reportMarkdown,
+    offsetChars,
+    `task_await(task_ids: ["${taskId}"], timeout_secs: 0, offset_chars: <offset>)`
+  );
+}

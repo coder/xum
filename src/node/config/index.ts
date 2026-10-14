@@ -37,6 +37,7 @@ import {
   sanitizeModelFallbacks,
 } from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
+import { PREVIOUS_TASK_SETTINGS_DEFAULTS } from "@/common/config/schemas/taskSettings";
 import {
   getDefaultAutoModelRoutingConfig,
   normalizeAutoModelRoutingConfig,
@@ -647,6 +648,40 @@ function normalizeConfigMigrations(value: unknown): AppConfigMigrations {
   return migrations;
 }
 
+/**
+ * Move task limits that still hold PREVIOUS_TASK_SETTINGS_DEFAULTS to the current defaults and
+ * keep every other value. Saves write the normalized settings, so an old default on disk is
+ * almost always Xum's write, not the user's choice. Known limit: a user who picked exactly an
+ * old default is moved once; after the migration flag is set, a value they set back sticks.
+ */
+function raisePreviousTaskSettingsDefaults(raw: unknown): Record<string, unknown> {
+  const record =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? { ...(raw as Record<string, unknown>) }
+      : {};
+  for (const key of ["maxParallelAgentTasks", "maxTaskNestingDepth"] as const) {
+    if (record[key] === PREVIOUS_TASK_SETTINGS_DEFAULTS[key]) {
+      record[key] = DEFAULT_TASK_SETTINGS[key];
+    }
+  }
+  return record;
+}
+
+/**
+ * Run the one-time raised-defaults migration on `parsed` (mutated in place) and return whether
+ * the config now needs a write-back: true when it already did or when this migration ran.
+ */
+function migrateRaisedTaskSettingsDefaults(
+  parsed: Partial<AppConfigOnDisk> & Record<string, unknown>,
+  configModified: boolean
+): boolean {
+  const migrations = normalizeConfigMigrations(parsed.migrations);
+  if (migrations.taskSettingsDefaultsRaised === true) return configModified;
+  parsed.taskSettings = raisePreviousTaskSettingsDefaults(parsed.taskSettings);
+  parsed.migrations = { ...migrations, taskSettingsDefaultsRaised: true };
+  return true;
+}
+
 function parseOptionalPort(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
     return undefined;
@@ -946,23 +981,31 @@ interface StoredProjectEntry {
 }
 
 /**
- * Merge one group of aliases (stored keys that normalize to the same path), or return null when
- * a merge would have to choose between two different rows with the same id. Rows with distinct
+ * Merge one group of aliases (stored keys that normalize to the same path). Rows with distinct
  * ids are combined, and a duplicate row is kept once. Rows are compared with their properties in
  * sorted order: the same row written with another property order is a duplicate, not a conflict
- * that would drop the earlier aliases' rows (#5929). Project settings come from
- * the last entry, as the previous `new Map(pairs)` loader did: a setting only an earlier alias
- * holds may be one the user cleared since. The project is trusted only when every alias was:
- * the canonical spelling says nothing about which alias the user trusted.
+ * (#5929). Two different rows with one id are a conflict. The project keeps one row for that id,
+ * at the first row's position, with the content of the last alias that holds it: the row the
+ * previous `new Map(pairs)` loader kept. Two live rows with one id would break removeWorkspace and
+ * the metadata index, so the loader backs up the original bytes, which keep the other variant
+ * (see Config.preserveAliasConflictBytes). Project settings come from the last entry, as the
+ * previous loader did: a setting only an earlier alias holds may be one the user cleared since.
+ * The project is trusted only when every alias was: the canonical spelling says nothing about
+ * which alias the user trusted.
  */
-function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null {
+function mergeProjectAliases(group: StoredProjectEntry[]): {
+  config: ProjectConfig;
+  conflictingIds: string[];
+} {
   const workspaces: ProjectConfig["workspaces"] = [];
-  const rowJsonById = new Map<string, string>();
+  const rowById = new Map<string, { index: number; json: string }>();
+  const conflictingIds = new Set<string>();
   // Legacy rows without an id: an identical copy in two aliases is one workspace. Keeping
   // both would let the id migration give both copies the same stable id.
   const idlessRowJson = new Set<string>();
   for (const { config } of group) {
-    if (!Array.isArray(config.workspaces)) return null;
+    // normalizeProjectRuntimeSettings gives every entry a workspaces array.
+    assert(Array.isArray(config.workspaces), "project alias entry has no workspaces array");
     for (const workspace of config.workspaces) {
       const json = stableStringify(workspace);
       if (!workspace.id) {
@@ -970,12 +1013,14 @@ function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null 
         idlessRowJson.add(json);
         continue;
       }
-      const seenJson = rowJsonById.get(workspace.id);
-      if (seenJson === undefined) {
-        rowJsonById.set(workspace.id, json);
+      const seen = rowById.get(workspace.id);
+      if (seen === undefined) {
+        rowById.set(workspace.id, { index: workspaces.length, json });
         workspaces.push(workspace);
-      } else if (seenJson !== json) {
-        return null;
+      } else if (seen.json !== json) {
+        conflictingIds.add(workspace.id);
+        workspaces[seen.index] = workspace;
+        seen.json = json;
       }
     }
   }
@@ -986,17 +1031,27 @@ function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null 
   } else if (group.some(({ config }) => config.trusted !== undefined)) {
     merged.trusted = false;
   }
-  return merged;
+  return { config: merged, conflictingIds: [...conflictingIds] };
+}
+
+/** An alias group whose merge kept one of two different rows with the same id. */
+interface ProjectAliasConflict {
+  path: string;
+  storedKeys: string[];
+  conflictingIds: string[];
 }
 
 /**
  * Build the project map from the loaded entries. Stored keys that normalize to the same path
  * ("/repo" and "/repo/") are aliases of one project. `new Map(pairs)` used to keep only the last
  * alias, so the next save dropped the other aliases' workspace rows. Group every alias first,
- * then merge the group's rows. A group with two different rows under one id still keeps only
- * its last entry, as before (#5929).
+ * then merge the group's rows. Groups with a same-id conflict go to `conflicts`, so the caller
+ * can back up the original bytes before a save drops the other variant (#5929).
  */
-function buildProjectsFromStoredEntries(entries: StoredProjectEntry[]): Map<string, ProjectConfig> {
+function buildProjectsFromStoredEntries(
+  entries: StoredProjectEntry[],
+  conflicts: ProjectAliasConflict[]
+): Map<string, ProjectConfig> {
   const groups = new Map<string, StoredProjectEntry[]>();
   for (const entry of entries) {
     const group = groups.get(entry.key);
@@ -1011,19 +1066,12 @@ function buildProjectsFromStoredEntries(entries: StoredProjectEntry[]): Map<stri
     }
     const storedKeys = group.map((entry) => entry.storedKey);
     const merged = mergeProjectAliases(group);
-    if (merged) {
+    if (merged.conflictingIds.length > 0) {
+      conflicts.push({ path: key, storedKeys, conflictingIds: merged.conflictingIds });
+    } else {
       log.warn("Merged project config entries with the same path", { path: key, storedKeys });
-      projects.set(key, merged);
-      continue;
     }
-    // Conflicting aliases keep main's behavior (`new Map(pairs)`): the last entry wins, at the
-    // position of the first. Keeping every conflicting entry under its own key broke trust and
-    // project mutators, which look up the stripped path; a lossless design is #5929.
-    log.error("Project config entries share a path but conflict; keeping the last entry", {
-      path: key,
-      storedKeys,
-    });
-    projects.set(key, group[group.length - 1].config);
+    projects.set(key, merged.config);
   }
   return projects;
 }
@@ -1135,6 +1183,80 @@ interface ConfigLoadFailureState {
 // instances (e.g. runtimeFactory per runtime check), so instance-local dedupe would
 // re-log the same corrupt-config error once per instance.
 const configLoadFailureStates = new Map<string, ConfigLoadFailureState>();
+
+// Config files whose last load merged conflicting alias rows but could not back up the bytes
+// (#5929): the backup error for the edit refusal, and a log-dedupe signature (content hash plus
+// errno code: fs messages embed the timestamped sidecar path). Process-scoped as above.
+const aliasConflictBackupFailures = new Map<string, { message: string; signature: string }>();
+
+/**
+ * A `config.json.<tag>-*` sidecar that already holds exactly `rawBytes`, tightened to 0600, or
+ * null when none does.
+ */
+function findIdenticalConfigSidecar(
+  configFile: string,
+  tag: string,
+  rawBytes: Buffer
+): string | null {
+  const configDir = path.dirname(configFile);
+  const prefix = `${path.basename(configFile)}.${tag}-`;
+  // Reuse a byte-identical sidecar only if it can also be secured: one from an older
+  // build may be world-readable, so tighten it to 0600 before trusting it as the
+  // backup. Skip candidates that are unreadable or untightenable (e.g. owned by
+  // another user) and keep scanning; a later usable duplicate must still be found
+  // even when creating a fresh sidecar would fail (read-only dir, full disk).
+  for (const entry of fs.readdirSync(configDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.startsWith(prefix)) {
+      continue;
+    }
+    const candidatePath = path.join(configDir, entry.name);
+    try {
+      if (fs.readFileSync(candidatePath).equals(rawBytes)) {
+        fs.chmodSync(candidatePath, 0o600);
+        return candidatePath;
+      }
+    } catch {
+      // Unusable candidate; keep scanning.
+    }
+  }
+  return null;
+}
+
+/**
+ * Write `rawBytes` next to config.json as `config.json.<tag>-<ms>`, or reuse a byte-identical
+ * sidecar with that tag. Throws when neither works. Shared by the corrupt-file backup and the
+ * alias-conflict backup (#5929).
+ */
+function writeConfigBytesSidecar(
+  configFile: string,
+  tag: string,
+  rawBytes: Buffer
+): { path: string; reused: boolean } {
+  const reusedPath = findIdenticalConfigSidecar(configFile, tag, rawBytes);
+  if (reusedPath !== null) return { path: reusedPath, reused: true };
+  // Write the bytes the caller parsed (not a re-read of the file, which another process
+  // may have replaced), leaving the source in place so throwOnError cleanup guards
+  // continue to reject it. "wx" creates exclusively; on a same-millisecond collision
+  // retry with a suffix instead of overwriting an earlier snapshot. Mode 0600 so the
+  // backup is no more readable than a protected source file.
+  const basePath = `${configFile}.${tag}-${Date.now()}`;
+  let backupPath = basePath;
+  for (let suffix = 1; ; suffix++) {
+    try {
+      fs.writeFileSync(backupPath, rawBytes, { flag: "wx", mode: 0o600 });
+      break;
+    } catch (writeError) {
+      if ((writeError as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw writeError;
+      }
+      backupPath = `${basePath}-${suffix}`;
+    }
+  }
+  // The creation mode is reduced by the process umask (a 0777 umask yields an
+  // owner-unreadable file); chmod is not, so pin the final mode explicitly.
+  fs.chmodSync(backupPath, 0o600);
+  return { path: backupPath, reused: false };
+}
 
 /** Location of config.json under a Xum root (also used by callers that must stat it without a Config). */
 export function configFilePath(rootDir: string): string {
@@ -1503,58 +1625,13 @@ export class Config {
     let backupConfirmed = false;
     if (rawBytes !== undefined) {
       try {
-        const configDir = path.dirname(this.configFile);
-        const corruptPrefix = `${path.basename(this.configFile)}.corrupt-`;
-        // Reuse a byte-identical sidecar only if it can also be secured: one from an older
-        // build may be world-readable, so tighten it to 0600 before trusting it as the
-        // backup. Skip candidates that are unreadable or untightenable (e.g. owned by
-        // another user) and keep scanning; a later usable duplicate must still be found
-        // even when creating a fresh sidecar would fail (read-only dir, full disk).
-        let reusedPath: string | null = null;
-        for (const entry of fs.readdirSync(configDir, { withFileTypes: true })) {
-          if (!entry.isFile() || !entry.name.startsWith(corruptPrefix)) {
-            continue;
-          }
-          const candidatePath = path.join(configDir, entry.name);
-          try {
-            if (fs.readFileSync(candidatePath).equals(rawBytes)) {
-              fs.chmodSync(candidatePath, 0o600);
-              reusedPath = candidatePath;
-              break;
-            }
-          } catch {
-            // Unusable candidate; keep scanning.
-          }
-        }
-        if (reusedPath) {
-          backupStatus = `Backup skipped because identical bytes already exist at ${reusedPath}.`;
-          backupDetail = reusedPath;
+        const sidecar = writeConfigBytesSidecar(this.configFile, "corrupt", rawBytes);
+        if (sidecar.reused) {
+          backupStatus = `Backup skipped because identical bytes already exist at ${sidecar.path}.`;
         } else {
-          // Write the bytes that actually failed parsing (not a re-read of the file, which
-          // another process may have replaced), leaving the corrupt source in place so
-          // throwOnError cleanup guards continue to reject it. "wx" creates exclusively;
-          // on a same-millisecond collision retry with a suffix instead of overwriting an
-          // earlier snapshot. Mode 0600 so the backup is no more readable than a
-          // protected source file.
-          const basePath = `${this.configFile}.corrupt-${Date.now()}`;
-          let backupPath = basePath;
-          for (let suffix = 1; ; suffix++) {
-            try {
-              fs.writeFileSync(backupPath, rawBytes, { flag: "wx", mode: 0o600 });
-              break;
-            } catch (writeError) {
-              if ((writeError as NodeJS.ErrnoException).code !== "EEXIST") {
-                throw writeError;
-              }
-              backupPath = `${basePath}-${suffix}`;
-            }
-          }
-          // The creation mode is reduced by the process umask (a 0777 umask yields an
-          // owner-unreadable file); chmod is not, so pin the final mode explicitly.
-          fs.chmodSync(backupPath, 0o600);
-          backupStatus = `The original bytes were backed up to ${backupPath}.`;
-          backupDetail = backupPath;
+          backupStatus = `The original bytes were backed up to ${sidecar.path}.`;
         }
+        backupDetail = sidecar.path;
         backupConfirmed = true;
       } catch (backupError) {
         const backupErrorMessage =
@@ -1716,6 +1793,63 @@ export class Config {
     return { ids, hasWorkspaceEntriesWithoutIds };
   }
 
+  /**
+   * After a cacheable load: cache it for readers that passed a snapshot `key`, or give an edit's
+   * fresh read back the snapshot it kept (see readConfigOrDefault).
+   */
+  private storeLoadedSnapshot(
+    config: ProjectsConfig,
+    parsed: Partial<AppConfigOnDisk>,
+    key: string | undefined,
+    kept: Config["configSnapshot"]
+  ): void {
+    if (key !== undefined) {
+      this.configSnapshot = {
+        key,
+        config,
+        writeId: typeof parsed.writeId === "string" ? parsed.writeId : "-",
+      };
+    } else if (kept !== undefined) {
+      this.configSnapshot = kept;
+    }
+  }
+
+  /**
+   * Back up the loaded bytes when the load merged alias rows that conflict (#5929): the merged
+   * view keeps one variant of each conflicting row, and the backup keeps the other. Returns false
+   * when the backup failed. Edits then refuse to write until a later load backs the bytes up, so
+   * config.json keeps both variants meanwhile. Reads still get the merged view, not defaults.
+   */
+  private preserveAliasConflictBytes(rawBytes: Buffer, conflicts: ProjectAliasConflict[]): boolean {
+    if (conflicts.length === 0) {
+      aliasConflictBackupFailures.delete(this.configFile);
+      return true;
+    }
+    try {
+      const sidecar = writeConfigBytesSidecar(this.configFile, "alias-conflict", rawBytes);
+      aliasConflictBackupFailures.delete(this.configFile);
+      // A reused sidecar means an earlier load already logged this content.
+      if (!sidecar.reused) {
+        log.error(
+          `Project config entries share a path but hold different rows with the same id. Xum keeps the last alias's row for each such id. The original config.json bytes, with every variant, were backed up to ${sidecar.path}.`,
+          { conflicts }
+        );
+      }
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const signature = `${crypto.createHash("sha256").update(rawBytes).digest("hex")}:${(error as NodeJS.ErrnoException).code ?? message}`;
+      if (aliasConflictBackupFailures.get(this.configFile)?.signature !== signature) {
+        log.error(
+          `Project config entries share a path but hold different rows with the same id, and the backup of ${this.configFile} failed (${message}). Settings changes will not overwrite config.json until a backup succeeds.`,
+          { conflicts }
+        );
+      }
+      aliasConflictBackupFailures.set(this.configFile, { message, signature });
+      return false;
+    }
+  }
+
   /** Failure state this instance's last failed load wrote; see getConfigLoadError. */
   private observedLoadFailure: ConfigLoadFailureState | undefined;
   private configSnapshot?: {
@@ -1820,24 +1954,25 @@ export class Config {
           if (options?.throwOnError) throw error;
           cacheable = false;
         }
-        const config = this.normalizeParsedConfig(parsed);
-        if (key !== undefined && cacheable) {
-          this.configSnapshot = {
-            key,
-            config,
-            writeId: typeof parsed.writeId === "string" ? parsed.writeId : "-",
-          };
-        } else if (cacheable && kept !== undefined) {
-          // Give it back only after a successful, cacheable read. A failed read leaves it
-          // cleared: otherwise later gate loads would hit it and never retry the read that
-          // clears a recorded load failure, refusing every edit until a restart.
-          this.configSnapshot = kept;
-        }
+        const aliasConflicts: ProjectAliasConflict[] = [];
+        const config = this.normalizeParsedConfig(parsed, aliasConflicts);
+        // The merged view keeps one variant of a conflicting row, so the next save would drop
+        // the other one. Back up the bytes first. Every save loads through here, so no save
+        // can run on this view before the backup exists (#5929).
+        if (!this.preserveAliasConflictBytes(rawBytes, aliasConflicts)) cacheable = false;
+        // An uncacheable load stores nothing and leaves `kept` cleared: otherwise later gate
+        // loads would hit it and never retry the read that clears a recorded load failure (or
+        // the alias-conflict backup), refusing every edit until a restart.
+        if (cacheable) this.storeLoadedSnapshot(config, parsed, key, kept);
         configLoadFailureStates.delete(this.configFile);
         return config;
       }
+      // The last load decides the alias-conflict gate (#5929): a missing or corrupt file has
+      // no merged rows to protect, and the corrupt-file gate below covers the latter.
+      aliasConflictBackupFailures.delete(this.configFile);
       configLoadFailureStates.delete(this.configFile);
     } catch (error) {
+      aliasConflictBackupFailures.delete(this.configFile);
       this.handleConfigLoadFailure(rawBytes, error);
       if (options?.throwOnError) throw error;
     }
@@ -1863,6 +1998,7 @@ export class Config {
         defaultModelFallbacksSeededFable51: true,
         persistentSubagentsDefaulted: true,
         agentHeartbeatsSeeded: true,
+        taskSettingsDefaultsRaised: true,
       },
     };
   }
@@ -1951,7 +2087,8 @@ export class Config {
   }
 
   private normalizeConfigProjects(
-    projects: AppConfigOnDisk["projects"] | undefined
+    projects: AppConfigOnDisk["projects"] | undefined,
+    aliasConflicts: ProjectAliasConflict[]
   ): Map<string, ProjectConfig> {
     const rawPairs = Array.isArray(projects) ? projects : [];
     // Migrate: normalize project paths by stripping trailing slashes
@@ -1987,11 +2124,12 @@ export class Config {
           config: normalizeProjectRuntimeSettings(projectConfig),
         };
       });
-    return buildProjectsFromStoredEntries(storedEntries);
+    return buildProjectsFromStoredEntries(storedEntries, aliasConflicts);
   }
 
   private normalizeParsedConfig(
-    parsed: Partial<AppConfigOnDisk> & Record<string, unknown>
+    parsed: Partial<AppConfigOnDisk> & Record<string, unknown>,
+    aliasConflicts: ProjectAliasConflict[]
   ): ProjectsConfig {
     decodeCyberReasoningModesFromDisk(parsed);
     let configModified = false;
@@ -2130,7 +2268,9 @@ export class Config {
       shouldInvalidateSessionUsageCaches = true;
     }
 
-    const projectsMap = deriveProjectHierarchy(this.normalizeConfigProjects(parsed.projects));
+    const projectsMap = deriveProjectHierarchy(
+      this.normalizeConfigProjects(parsed.projects, aliasConflicts)
+    );
 
     // Run before the subproject merge below so a hierarchy edge case
     // cannot relocate a legacy workspace into a parent project first.
@@ -2197,6 +2337,9 @@ export class Config {
       parsed.migrations = { ...heartbeatMigrations, agentHeartbeatsSeeded: true };
       configModified = true;
     }
+    // The task-limit defaults were raised for orchestration fan-out and depth. Configs that
+    // still hold the previous defaults (written by every save) move once; explicit values stay.
+    configModified = migrateRaisedTaskSettingsDefaults(parsed, configModified);
     const taskSettings = normalizeTaskSettings(parsed.taskSettings);
 
     const muxGatewayEnabled = parseOptionalBoolean(parsed.muxGatewayEnabled);
@@ -3363,6 +3506,7 @@ export class Config {
    * binds the approval to the current bytes and shrinks the window to the atomic write itself.
    */
   private assertConfigWritable(): void {
+    this.assertAliasConflictsBackedUp();
     const failureState = configLoadFailureStates.get(this.configFile);
     if (!failureState) return;
     const rejectEdit = (reason: string): never => {
@@ -3395,6 +3539,18 @@ export class Config {
         "the file changed after this edit loaded it and the new content has no confirmed backup. Retry the settings change."
       );
     }
+  }
+
+  /**
+   * The alias-conflict part of the edit gate (#5929): the last load merged rows that conflict
+   * but could not back up the bytes, so a save would drop the variant the merge did not keep.
+   */
+  private assertAliasConflictsBackedUp(): void {
+    const failure = aliasConflictBackupFailures.get(this.configFile);
+    if (failure === undefined) return;
+    const message = `Skipping config write to ${this.configFile}: config.json has project entries that conflict, and Xum could not back them up (${failure.message}). Fix the backup failure, then retry.`;
+    log.error(message);
+    throw new Error(message);
   }
 
   private describeConfigLoadFailure(state: ConfigLoadFailureState): string {

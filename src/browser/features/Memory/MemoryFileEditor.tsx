@@ -1,12 +1,20 @@
-import { useEffect, useRef, useState, type KeyboardEvent, type Ref, type RefObject } from "react";
+import {
+  lazy,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type Ref,
+  type RefObject,
+} from "react";
 import { flushSync } from "react-dom";
 import { ArrowLeft } from "lucide-react";
 
 import { Button } from "@/browser/components/Button/Button";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
 import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { useAPI } from "@/browser/contexts/API";
-import { MarkdownFilePreview } from "@/browser/features/Messages/MarkdownFilePreview";
 import { RowActionButton } from "@/browser/features/RightSidebar/GoalBoardSections";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import {
@@ -19,6 +27,16 @@ import { cn } from "@/common/lib/utils";
 import type { MemorySaveError } from "@/common/orpc/schemas/memory";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getLanguageFromPath } from "@/common/utils/git/languageDetector";
+
+// Loaded through the workspace page's chunk, which already holds the Markdown stack. Why: a static
+// import here also put the stack in Settings' load, and with two lazy importers Rollup moved it out
+// of the page chunk into a shared one; the two files cost the workspace page ~20 KB more brotli on
+// the bandwidth-bound mobile load (#6334). Importing any other module would split it the same way.
+const MarkdownFilePreview = lazy(() =>
+  import("@/browser/components/AIView/AIView").then((m) => ({
+    default: m.MarkdownFilePreview,
+  }))
+);
 
 type ViewMode = "preview" | "edit";
 
@@ -178,7 +196,9 @@ function MemoryFileBody(props: {
     <>
       {props.mode === "preview" && (
         <div className="min-h-48 flex-1 overflow-auto p-3">
-          <MarkdownFilePreview content={props.draft} />
+          <LazyFeature name="Preview">
+            <MarkdownFilePreview content={props.draft} />
+          </LazyFeature>
         </div>
       )}
       {/* Stays mounted (hidden) in Preview, as GitHub's Write/Preview tabs

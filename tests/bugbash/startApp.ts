@@ -47,6 +47,7 @@ import { type AiMode, AiModeError, resolveAiMode } from "./aiMode";
 import { proxySocketMounted, sandboxShaped } from "./sandbox/inContainer";
 import { startFakeProvider } from "./fakeProvider";
 import { seedMcpChat, writeMcpConfig } from "./mcpapps/seed";
+import { seedPluginHooks, writePluginSources } from "./pluginHookFixtures";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "../..");
 const SERVER_ENTRY = path.join(REPO_ROOT, "dist/cli/index.js");
@@ -268,7 +269,9 @@ async function seed(
   xumRoot: string,
   child: ChildProcess,
   ai: AiMode,
-  fakeProviderOrigin: string | undefined
+  fakeProviderOrigin: string | undefined,
+  pluginSources: Map<string, string>,
+  gitEnv: NodeJS.ProcessEnv
 ): Promise<string> {
   await api(base, "splashScreens/markSplashScreenViewed", { splashId: "onboarding-wizard-v1" });
   await api(base, "experiments/set", { experimentId: "artifacts", enabled: true });
@@ -366,6 +369,13 @@ async function seed(
     JSON.stringify({ users: 1200, churn: 0.031, regions: ["eu", "us"] }, null, 2)
   );
   fs.writeFileSync(path.join(artifactsDir, "notes.txt"), "Plain text artifact.\n");
+  // Codex-format plugin hooks: installable sources and a few installed plugins to review.
+  await seedPluginHooks(
+    (route, body) => api(base, route, body),
+    pluginSources,
+    gitEnv,
+    artifactsDir
+  );
   // An HTML artifact with in-page "#" links (repros/artifactsInPageLinks.e2e.ts). Dated an hour
   // back so it lists last and the newest artifact stays the one the tab opens by default.
   const guide = path.join(artifactsDir, "guide.html");
@@ -553,6 +563,7 @@ async function main(): Promise<void> {
     fs.mkdirSync(home, { recursive: true });
     if (ai.mode === "real") writeNoToolAgents(xumRoot);
     createDemoRepo(projectPath, env);
+    const pluginSources = writePluginSources(path.join(tempRoot, "plugin-sources"), env);
     if (mcpApps) writeMcpConfig(xumRoot);
 
     const seedPort = await getFreePort();
@@ -566,7 +577,9 @@ async function main(): Promise<void> {
         xumRoot,
         current,
         ai,
-        fakeProvider?.origin
+        fakeProvider?.origin,
+        pluginSources,
+        env
       );
     } finally {
       current.kill("SIGTERM");

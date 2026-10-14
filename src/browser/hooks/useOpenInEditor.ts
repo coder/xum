@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { openInEditor } from "@/browser/utils/openInEditor";
@@ -13,7 +13,8 @@ export type { OpenInEditorResult } from "@/browser/utils/openInEditor";
  * `src/browser/utils/openInEditor.ts`.
  */
 export function useOpenInEditor() {
-  const { api } = useAPI();
+  // The live client only: offline, openInEditor() returns its "API not available" result.
+  const api = useLiveAPI();
   const { open: openSettings } = useSettings();
 
   return useCallback(

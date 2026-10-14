@@ -58,6 +58,7 @@ export type OnChatDowngradeReason = z.infer<typeof schemas.OnChatDowngradeReason
 export type StreamErrorMessage = z.infer<typeof schemas.StreamErrorMessageSchema>;
 export type DeleteMessage = z.infer<typeof schemas.DeleteMessageSchema>;
 export type GoalBudgetLimitedEvent = z.infer<typeof schemas.GoalBudgetLimitedEventSchema>;
+export type PluginHookNoticeEvent = z.infer<typeof schemas.PluginHookNoticeEventSchema>;
 export type WorkspaceInitEvent = z.infer<typeof schemas.WorkspaceInitEventSchema>;
 export type UpdateStatus = z.infer<typeof schemas.UpdateStatusSchema>;
 export type RestartBlocker = z.infer<typeof schemas.RestartBlockerSchema>;
@@ -176,6 +177,10 @@ export function isInitEnd(
 
 export function isGoalBudgetLimitedEvent(msg: WorkspaceChatMessage): msg is GoalBudgetLimitedEvent {
   return (msg as { type?: string }).type === "goal-budget-limited";
+}
+
+export function isPluginHookNoticeEvent(msg: WorkspaceChatMessage): msg is PluginHookNoticeEvent {
+  return (msg as { type?: string }).type === "plugin-hook-notice";
 }
 
 export function isQueuedMessageChanged(

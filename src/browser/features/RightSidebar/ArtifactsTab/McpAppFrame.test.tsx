@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
@@ -40,8 +41,8 @@ let toolCalls: Array<{
   consented: boolean;
 }> = [];
 
-function Wrapper(props: { children: ReactNode }) {
-  const api: TestApiOverrides<APIClient> = {
+function serverApi(): TestApiOverrides<APIClient> {
+  return {
     mcpApps: {
       getView: () => {
         return Promise.resolve({
@@ -94,9 +95,12 @@ function Wrapper(props: { children: ReactNode }) {
       },
     },
   };
+}
+
+function Wrapper(props: { children: ReactNode }) {
   return (
     <ThemeProvider forcedTheme="dark">
-      <APIProvider client={createTestApiClient(api)}>{props.children}</APIProvider>
+      <APIProvider client={createTestApiClient(serverApi())}>{props.children}</APIProvider>
     </ThemeProvider>
   );
 }
@@ -175,6 +179,39 @@ describe("McpAppFrame", () => {
     cleanupDom?.();
     cleanupDom = null;
   });
+
+  // A failed approval dismisses the strip for good, so offline Allow waits for the next client.
+  test.each([...GAP_MODES])(
+    "Allow is disabled while offline and the prompt stays (%s)",
+    async (mode) => {
+      invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+      viewCsp = { connectDomains: ["https://api.example.com"] };
+      const harness = createConnectionHarness(mode, serverApi);
+      const view = render(
+        <ThemeProvider forcedTheme="dark">
+          <harness.Wrapper>
+            <McpAppFrame workspaceId="ws" view={VIEW} />
+          </harness.Wrapper>
+        </ThemeProvider>
+      );
+      await view.findByTestId("mcp-app-frame");
+      const allow = () => view.getByRole("button", { name: "Allow" }) as HTMLButtonElement;
+      await waitFor(() => expect(allow().disabled).toBe(false), {
+        timeout: CONFIRM_ARM_DELAY_MS + 1000,
+      });
+
+      await harness.drop();
+      expect(allow().disabled).toBe(true);
+      harness.reconnect();
+      await waitFor(() => expect(allow().disabled).toBe(false));
+      await pressAllow(allow());
+      await waitFor(() =>
+        expect(approvals).toEqual([
+          { serverName: "charts-raw", origins: ["https://api.example.com"] },
+        ])
+      );
+    }
+  );
 
   test("declared domains run under the base policy until the user allows them", async () => {
     invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };

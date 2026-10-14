@@ -19,18 +19,32 @@ function setup(options: {
   const api = createTestApiClient({
     tasks: { previewRemoval: () => Promise.resolve(options.preview) },
   });
+  const live = { api: api as typeof api | null };
   const run = () =>
     confirmAndRemoveSubagent({
-      api,
+      getApi: () => live.api,
       confirm,
       removeSubagent,
       workspaceId: "child",
       title: "Child",
     });
-  return { api, confirm, removeSubagent, run };
+  return { api, live, confirm, removeSubagent, run };
 }
 
 describe("confirmAndRemoveSubagent (#5106)", () => {
+  test("a connection lost while the dialog is open removes nothing", async () => {
+    const offline = setup({
+      preview: { success: true, data: { summary: null, paths: [] } },
+      confirmed: true,
+    });
+    offline.confirm.mockImplementation(() => {
+      offline.live.api = null;
+      return Promise.resolve(true);
+    });
+    expect(await offline.run()).toEqual({ kind: "error", message: "API not connected" });
+    expect(offline.removeSubagent).not.toHaveBeenCalled();
+  });
+
   test("lists the unpreserved work and removes only after the user confirms", async () => {
     const preview = {
       summary: "Removing this sub-agent would delete files.",

@@ -120,6 +120,17 @@ function snapshotField(
   return paging.nextCharOffset != null || paging.startCharOffset != null ? { snapshot } : {};
 }
 
+/**
+ * Only the first page carries the frontmatter: its license and metadata strings have no size
+ * bound, and later pages read the same pinned copy anyway.
+ */
+function firstPageFrontmatter(
+  paging: Omit<ToolTextPage, "text">,
+  frontmatter: PinnedSkill["parsed"]["frontmatter"]
+): { frontmatter?: PinnedSkill["parsed"]["frontmatter"] } {
+  return paging.startCharOffset == null ? { frontmatter } : {};
+}
+
 function joinNotes(...notes: Array<string | undefined>): { note?: string } {
   const present = notes.filter((note): note is string => note != null);
   return present.length > 0 ? { note: present.join(" ") } : {};
@@ -146,7 +157,7 @@ export const createSkillsCatalogReadTool: ToolFactory = (_config: ToolConfigurat
           owner,
           repo,
           path: fetched.path,
-          frontmatter: parsed.frontmatter,
+          ...firstPageFrontmatter(paging, parsed.frontmatter),
           body,
           url: `https://github.com/${owner}/${repo}/blob/${fetched.branch}/${fetched.path}`,
           ...paging,

@@ -21,7 +21,17 @@ import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { PreparedStreamMessage } from "./turnRequestBuilder";
-import type { RequestAssemblySnapshot } from "./events/eventSpine";
+import type {
+  MessageSendOrigin,
+  RequestAssemblySnapshot,
+  TurnStopContext,
+} from "./events/eventSpine";
+import {
+  lastAssistantText,
+  type MessageSendHookInput,
+  type MessageSendHookOutcome,
+  type TurnStopHookOutcome,
+} from "./agentPlugins/promptHooks";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import {
   isProviderEligibleMessage,
@@ -203,6 +213,7 @@ import {
   type MuxFilePart,
   type MuxMessage,
   type MuxMetadata,
+  type PluginHookContextEntry,
   type StartupRetrySendOptions,
   type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
@@ -258,6 +269,7 @@ import {
   inheritOpenWorkspaceTurnMetadata,
   computeKeepRecentTailStamp,
   isCompactionRequestMetadata,
+  type CompactionRequestMetadata,
 } from "./contextManagement/compactionRequests";
 import {
   RetryManager,
@@ -314,6 +326,13 @@ import {
   stringifyAgentSkillFrontmatter,
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { substituteSkillArguments } from "@/node/services/agentSkills/skillArguments";
+import {
+  assertSkillDirectoryPlaceholdersResolved,
+  prependSkillDirectoryOffHostNote,
+  resolveSkillDirectory,
+  skillDirectoryEnv,
+  substituteSkillDirectoryPlaceholdersOutsideDirectives,
+} from "@/node/services/agentSkills/skillDirectory";
 import {
   injectSkillDynamicContext,
   SKILL_DYNAMIC_COMMAND_TIMEOUT_MS,
@@ -469,6 +488,15 @@ class FollowUpReadError extends Error {}
  * records stay in history for the UI but never reach a provider, so routing (evaluator context,
  * attachment gating) must use the same hidden-record filter as the chat request.
  */
+/**
+ * The model a compaction request overflowed on: the one its failed stream ran on (a refusal
+ * fallback after a swap), or the requested model when the error does not say (a pre-start
+ * failure). The retry plan depends on the model whose window was too small.
+ */
+function overflowedModel(request: { modelString: string }, failedModel: string | undefined) {
+  return failedModel ?? request.modelString;
+}
+
 function isProviderVisibleUserRow(message: MuxMessage): boolean {
   return (
     message.role === "user" && isProviderEligibleMessage(message) && !isModelHiddenMessage(message)
@@ -479,6 +507,124 @@ function stripGoalInterventionPolicy(options: SendMessageOptions): SendMessageOp
   const streamOptions: SendMessageOptions = { ...options };
   delete streamOptions.goalInterventionPolicy;
   return streamOptions;
+}
+
+/**
+ * Origin a message.send prompt hook sees, derived from the send's own provenance (first match
+ * wins):
+ * - plan-review: plan-review feedback metadata.
+ * - goal: goal-loop turns (goalKind / goalContinuation, sub-agent goal task turns).
+ * - task: TaskService task turns (taskTurnKind), delegated workspace turns, and automatic
+ *   agent-attributed rows that are not synthetic (sub-agent briefs).
+ * - system: every other synthetic or automatic send (auto-resume, compaction follow-ups,
+ *   bash-monitor wakes, workflow continuations, parent wakes with child reports, heartbeats).
+ * - user: everything else (typed messages, edits, queued user messages).
+ */
+function resolveMessageSendOrigin(
+  muxMetadata: unknown,
+  internal: SendMessageInternalOptions | undefined,
+  acceptanceOrigin: TurnAcceptanceOrigin
+): MessageSendOrigin {
+  if (carriesPlanReviewMetadata(muxMetadata)) return "plan-review";
+  const taskTurnKind = internal?.taskTurnKind;
+  if (
+    internal?.goalKind != null ||
+    internal?.goalContinuation === true ||
+    taskTurnKind === "goal_continuation" ||
+    taskTurnKind === "goal_budget_limit"
+  )
+    return "goal";
+  const metadataType =
+    typeof muxMetadata === "object" && muxMetadata !== null && "type" in muxMetadata
+      ? muxMetadata.type
+      : undefined;
+  if (taskTurnKind != null || metadataType === "workspace-turn-task") return "task";
+  if (
+    acceptanceOrigin === "automatic" &&
+    internal?.agentInitiated === true &&
+    internal.synthetic !== true
+  )
+    return "task";
+  if (internal?.synthetic === true || acceptanceOrigin === "automatic") return "system";
+  return "user";
+}
+
+/** Raw JSON boundary for a persisted follow-up's hook context: malformed entries are dropped. */
+function coercePluginHookContext(value: unknown): PluginHookContextEntry[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const entries = value.filter(
+    (entry: unknown): entry is PluginHookContextEntry =>
+      typeof entry === "object" &&
+      entry !== null &&
+      "pluginId" in entry &&
+      typeof entry.pluginId === "string" &&
+      "text" in entry &&
+      typeof entry.text === "string"
+  );
+  return entries.length > 0 ? entries : undefined;
+}
+
+/** Key of a compaction request's follow-up: same precedence as getCompactionFollowUpContent. */
+function compactionFollowUpKey(
+  muxMetadata: CompactionRequestMetadata
+): "followUpContent" | "continueMessage" {
+  return muxMetadata.parsed.followUpContent != null ? "followUpContent" : "continueMessage";
+}
+
+/**
+ * A compaction request's follow-up as the redispatch will send it (dispatchPendingFollowUpOnce):
+ * review notes are formatted into the prompt, so a review-only follow-up is a real prompt and
+ * the hooks see every review. Undefined when it is empty.
+ */
+function compactionFollowUpText(muxMetadata: CompactionRequestMetadata): string | undefined {
+  const followUp = muxMetadata.parsed[compactionFollowUpKey(muxMetadata)];
+  if (followUp == null) return undefined;
+  const text: unknown = followUp.text;
+  const hasText = typeof text === "string" && text.trim().length > 0;
+  const hasReviews = (followUp.reviews?.length ?? 0) > 0;
+  // Legacy continueMessage follow-ups carried attachments as imageParts.
+  const files: unknown =
+    "fileParts" in followUp
+      ? followUp.fileParts
+      : "imageParts" in followUp
+        ? followUp.imageParts
+        : undefined;
+  const hasFiles = Array.isArray(files) && files.length > 0;
+  // A follow-up with no text, reviews or files sends nothing the hooks could check. An
+  // attachment-only one reaches them with empty text, like a direct attachment-only send.
+  if (!hasText && !hasReviews && !hasFiles) return undefined;
+  const prompt = prepareUserMessageForSend({
+    text: typeof text === "string" ? text : "",
+    reviews: followUp.reviews,
+  }).finalText;
+  return prompt.trim().length > 0 || hasFiles ? prompt : undefined;
+}
+
+/**
+ * Mark a manual /compact follow-up that the message.send hooks already checked at admission: the
+ * post-compaction redispatch reuses this outcome (pluginSendHooksApplied) instead of running the
+ * hooks a second time as a system send, and its row gets the admission context. Built here from
+ * the hook outcome, never from client input (stripClientPluginSendHookFields drops a client's).
+ */
+function withHookedCompactionFollowUp(
+  muxMetadata: Extract<MuxMessageMetadata, { type: "compaction-request" }>,
+  context: PluginHookContextEntry[] | undefined
+): Extract<MuxMessageMetadata, { type: "compaction-request" }> {
+  const parsed: CompactionRequestMetadata["parsed"] = muxMetadata.parsed;
+  const key = compactionFollowUpKey({ type: "compaction-request", parsed });
+  const followUp = parsed[key];
+  assert(followUp != null, "a hooked compaction follow-up exists");
+  return {
+    ...muxMetadata,
+    parsed: {
+      ...muxMetadata.parsed,
+      [key]: {
+        ...followUp,
+        pluginSendHooksApplied: true,
+        ...(context != null && context.length > 0 ? { pluginHookContext: context } : {}),
+      },
+    },
+  };
 }
 
 function getGoalStreamOriginKind(input: {
@@ -507,6 +653,24 @@ function coerceGoalId(value: unknown): string | undefined {
 }
 
 const PDF_MEDIA_TYPE = "application/pdf";
+/** Codex Stop: a turn.stop hook continues one user turn at most this many times. */
+const MAX_STOP_HOOK_CONTINUATIONS = 3;
+const STOP_HOOK_CONTINUATION_DEDUPE_KEY = "stop-hook-continuation";
+
+/** The ended stream's provenance that its turn.stop continuation keeps. */
+interface StopContinuationProvenance {
+  goalKind?: GoalSyntheticMessageKind;
+  goalId?: string;
+  agentInitiated?: boolean;
+  /** The stream was a delegated workspace turn: WorkspaceTurnManager owns its end. */
+  delegatedWorkspaceTurn: boolean;
+  /**
+   * A client outside this session owns the turn's end: an ACP prompt (its `prompt()` resolves on
+   * this stream-end) or a caller with `callerOwnsTurnEnd` (`xum run`, which stops waiting and can
+   * exit). A continuation queued after stream-end would run after that owner saw the turn end.
+   */
+  externallyOwnedTurn: boolean;
+}
 
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
   if (!metadata) return [];
@@ -829,6 +993,19 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   captureRequestAssemblySnapshot?(
     workspaceId: string
   ): Promise<Result<RequestAssemblySnapshot, SendMessageError>>;
+  /** Whether any message.send hook is registered (lets a send skip work done only for hooks). */
+  hasMessageSendHooks?(): boolean;
+  /** The message.send prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
+  runMessageSendHooks?(
+    workspaceId: string,
+    input: MessageSendHookInput,
+    cancelSignal?: AbortSignal
+  ): Promise<MessageSendHookOutcome>;
+  /** The turn.stop prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
+  runTurnStopHooks?(
+    workspaceId: string,
+    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">
+  ): Promise<TurnStopHookOutcome>;
   resolveXumToolScopeForWorkspace?(
     metadata: WorkspaceMetadata,
     runtime: Runtime,
@@ -905,6 +1082,12 @@ interface AgentSessionOptions {
   onTurnSuperseded?: (previous: symbol, next: symbol) => void;
   /** Test seam for PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS (see completion policy). */
   planSnapshotCaptureTimeoutMs?: number;
+  /**
+   * The caller waits for each stream-end and treats it as the end of the turn (`xum run`). The
+   * turn.stop hooks still run for its turns, but cannot continue them: a continuation queued
+   * after stream-end would run after the caller stopped waiting.
+   */
+  callerOwnsTurnEnd?: boolean;
 }
 
 interface CachedMemoryContext {
@@ -1009,6 +1192,19 @@ interface SendMessageInternalOptions {
    */
   skipOnSendCompaction?: boolean;
   /**
+   * Skip the message.send prompt hooks (Codex UserPromptSubmit). Set only for a turn.stop
+   * continuation: Codex records a Stop continuation directly as a conversation item and runs
+   * UserPromptSubmit only for submitted user input (codex-rs session/turn.rs and
+   * hook_runtime.rs inspect_pending_input), so a continuation never reaches those hooks.
+   */
+  skipPromptHooks?: boolean;
+  /**
+   * Texts sent after a queued compaction request and batched into it (MessageQueue joins them
+   * into the request's message). The message.send prompt hooks run on these texts only: the
+   * compaction prompt never reaches them, but separately sent user text must.
+   */
+  textBatchedBehindCompaction?: string;
+  /**
    * Task-attempt obligation for this send (see TurnAdmissionToken): notified of the coordinator's
    * admission inside the synchronous prepare callback. Its staleness is already composed into
    * `admissionStale` by WorkspaceService.
@@ -1019,6 +1215,12 @@ interface SendMessageInternalOptions {
    * under the history write lock at the trigger append (see checkCompactionFollowUpStillPending).
    */
   compactionFollowUpSummary?: MuxMessage;
+  /**
+   * This send's text already went through the message.send prompt hooks (an on-send compaction
+   * follow-up re-sending the diverted message): the hooks run once per message, so the session
+   * skips them and keeps the context they added.
+   */
+  pluginSendHooksApplied?: { context?: PluginHookContextEntry[] };
 }
 
 /**
@@ -1121,6 +1323,7 @@ export class AgentSession {
   private readonly autoModelRouter?: Pick<AutoModelRouter, "classify">;
   private readonly keepBackgroundProcesses: boolean;
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
+  private readonly callerOwnsTurnEnd: boolean;
   private readonly onPostCompactionStateChange?: () => void;
   private readonly hasExternalSendPreflight?: () => boolean;
   private readonly hasExternalManualSendPreflight?: () => boolean;
@@ -1155,6 +1358,8 @@ export class AgentSession {
     [];
   private readonly initListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
+  /** Unsubscribes the plugin-hook notice relay (see the constructor). */
+  private readonly unsubscribePluginHookNotices: () => void;
   private readonly stopEmptyErroredReplyDeletes: () => void;
   private readonly coordinator = new TurnCoordinator({
     streamStarted: (payload) => {
@@ -1282,6 +1487,11 @@ export class AgentSession {
   private readonly contextController: SessionContextController;
   private readonly compactionCancellation: CompactionCancellation;
   private compactionStopGeneration = 0;
+  /**
+   * turn.stop continuations queued since the last manual send or the last turn Stop did not
+   * continue: the hooks see `stopHookActive`, and the cap ends the loop.
+   */
+  private stopHookContinuations = 0;
   private pendingResumeIntent?: AbortController;
 
   private readonly retryManager: RetryManager;
@@ -1571,6 +1781,7 @@ export class AgentSession {
       autoModelRouter,
       keepBackgroundProcesses,
       sanitizeCliWorkspaceRegistration,
+      callerOwnsTurnEnd,
       onCompactionComplete,
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
@@ -1612,6 +1823,7 @@ export class AgentSession {
     this.autoModelRouter = autoModelRouter;
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
+    this.callerOwnsTurnEnd = callerOwnsTurnEnd ?? false;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
     this.hasExternalManualSendPreflight = hasExternalManualSendPreflight;
@@ -1725,6 +1937,17 @@ export class AgentSession {
 
     this.attachAiListeners();
     this.attachInitListeners();
+    // A plugin hook's systemMessage reaches the user as a live chat event only: it is never
+    // written to history, so no request (and no replay) can carry it to the model.
+    this.unsubscribePluginHookNotices = eventSpine.subscribe("plugin.hook.notice", (notice) => {
+      if (notice.workspaceId !== this.workspaceId) return;
+      this.emitChatEvent({
+        type: "plugin-hook-notice",
+        workspaceId: notice.workspaceId,
+        plugin: notice.pluginName,
+        message: notice.message,
+      });
+    });
     // A subscription is lazy: protect an existing engine before any caller can
     // send through this new session, even before replay is first pulled.
     const existingStream = this.streamManager.getStreamInfo(this.workspaceId);
@@ -1843,6 +2066,7 @@ export class AgentSession {
         // recovery policy, but still presents its captured terminal exactly once below.
         for (const { event, handler } of this.aiListeners) this.aiService.off(event, handler);
         this.aiListeners.length = 0;
+        this.unsubscribePluginHookNotices();
         for (const { event, handler } of this.initListeners)
           this.initStateManager.off(event, handler as never);
         this.initListeners.length = 0;
@@ -4343,6 +4567,84 @@ export class AgentSession {
     }
   }
 
+  /**
+   * Run the message.send prompt hooks once for this message. A compaction request's own text
+   * never reaches them, only the user text it carries (see the compaction branch below). A send
+   * that already ran them (an on-send compaction follow-up) skips them.
+   *
+   * Only a send a person made (typed, edited, queued, plan-review feedback) can be blocked.
+   * Automatic senders (goals, tasks, wakes, follow-ups) retry a refused send, so a block would
+   * loop: their sends run the whole chain, keep the hooks' context and ignore every block.
+   */
+  private async runPluginSendHooks(
+    message: string,
+    muxMetadata: unknown,
+    internal: SendMessageInternalOptions | undefined,
+    acceptanceOrigin: TurnAcceptanceOrigin
+  ): Promise<
+    MessageSendHookOutcome & {
+      /** The hooks checked the request's follow-up; its outcome travels with the follow-up. */
+      followUpHook?: { context?: PluginHookContextEntry[] };
+    }
+  > {
+    const applied = internal?.pluginSendHooksApplied;
+    if (applied != null) {
+      return applied.context != null && applied.context.length > 0
+        ? { kind: "context", entries: applied.context }
+        : { kind: "none" };
+    }
+    const runMessageSendHooks = this.aiService.runMessageSendHooks?.bind(this.aiService);
+    if (runMessageSendHooks == null) return { kind: "none" };
+    const canBlock = internal?.synthetic !== true && acceptanceOrigin === "manual";
+    // A turn.stop continuation never reaches the hooks (see skipPromptHooks).
+    if (internal?.skipPromptHooks === true) return { kind: "none" };
+    const run = (text: string) =>
+      runMessageSendHooks(
+        this.workspaceId,
+        {
+          text,
+          origin: resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin),
+          canBlock,
+        },
+        internal?.cancelSignal
+      );
+    if (!isCompactionRequestMetadata(muxMetadata))
+      return this.assertSendHookOutcome(await run(message), canBlock);
+    // A compaction request carries up to two user messages; its own prompt never reaches the
+    // hooks. The follow-up and the texts batched behind the request each get their own run, so
+    // each one's context stays with the row that carries that text: the follow-up's travels with
+    // the follow-up (withHookedCompactionFollowUp), the batched texts' stays on this row. A
+    // manual request's follow-up is checked here, where a block can still stop the whole send:
+    // it later dispatches as an automatic send, which no plugin may block. Automatic requests
+    // (mid-stream, idle, heartbeat) carry no user text in their follow-up.
+    const followUpText = canBlock ? compactionFollowUpText(muxMetadata) : undefined;
+    const batchedText = internal?.textBatchedBehindCompaction;
+    const followUp =
+      followUpText != null
+        ? this.assertSendHookOutcome(await run(followUpText), canBlock)
+        : undefined;
+    if (followUp?.kind === "blocked") return followUp;
+    const request =
+      // Empty text with attachments behind the request is still a send (Codex
+      // PRRT_kwDOPxxmWM6rZqyv): the queue reports it as "".
+      batchedText != null
+        ? this.assertSendHookOutcome(await run(batchedText), canBlock)
+        : ({ kind: "none" } as const);
+    if (request.kind === "blocked" || followUp == null) return request;
+    return {
+      ...request,
+      followUpHook: followUp.kind === "context" ? { context: followUp.entries } : {},
+    };
+  }
+
+  private assertSendHookOutcome(
+    outcome: MessageSendHookOutcome,
+    canBlock: boolean
+  ): MessageSendHookOutcome {
+    assert(canBlock || outcome.kind !== "blocked", "a send no plugin may refuse was blocked");
+    return outcome;
+  }
+
   private async prepareMessage(
     message: string,
     options: (SendMessageOptions & { fileParts?: FilePart[] }) | undefined,
@@ -4634,6 +4936,67 @@ export class AgentSession {
       return refuseBeforeAcceptance(
         createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
       );
+
+    // A new prompt starts a new turn for Stop: a person's send, or any other send that runs the
+    // message.send hooks (Codex runs UserPromptSubmit for every input but a Stop continuation).
+    // An on-send compaction follow-up continues its own send. A continuation that never started
+    // (refused before streaming) so leaves no stopHookActive behind for the next turn.
+    if (
+      attempt.acceptanceOrigin === "manual" ||
+      (internal?.skipPromptHooks !== true &&
+        internal?.pluginSendHooksApplied == null &&
+        !isCompactionRequestMetadata(options?.muxMetadata))
+    )
+      this.stopHookContinuations = 0;
+
+    // A client retry of an accepted send (same send ids after a lost response) adds nothing:
+    // the accepted row wins over anything the hooks decide.
+    const sendIdsAlreadyAccepted = async (): Promise<boolean> => {
+      if (sendIdentities.length === 0) return false;
+      const known = await this.historyService.decideSendIds(this.workspaceId, sendIdentities);
+      return known.success && this.settleKnownSendIds(known.data, attempt)?.success === true;
+    };
+    // Checked before the hooks run, so their side effects (logs, notifications) do not repeat
+    // for such a retry. History is read only when hooks exist.
+    if (this.aiService.hasMessageSendHooks?.() === true && (await sendIdsAlreadyAccepted())) {
+      return Ok(undefined);
+    }
+
+    // Prompt hooks (message.send): before the pricing gate (its rejected-input row), routing,
+    // @file snapshots, edit truncation and every history write, so a block leaves history
+    // unchanged.
+    const pluginSend = await this.runPluginSendHooks(
+      message,
+      options?.muxMetadata,
+      internal,
+      attempt.acceptanceOrigin
+    );
+    if (await cancelBeforeAcceptance()) {
+      return Ok(undefined);
+    }
+    // The hooks can take seconds: recheck admission before acting on their outcome. A send whose
+    // admission went stale meanwhile must get the stale refusal, not a permanent plugin block.
+    if (isAdmissionStale())
+      return refuseBeforeAcceptance(
+        createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+      );
+    if (pluginSend.kind === "blocked") {
+      // The original send can be accepted while the hooks ran (a retry racing it): its block
+      // must not report failure for a message history now holds.
+      if (await sendIdsAlreadyAccepted()) return Ok(undefined);
+      const blockedError: SendMessageError = {
+        type: "plugin_blocked",
+        plugin: pluginSend.pluginName,
+        reason: pluginSend.reason,
+      };
+      // A direct send shows the reason in its composer toast and keeps the draft. A queued send
+      // has no caller UI, so the reason goes into the transcript (completePreparation restores
+      // the queued input to the composer).
+      if (attempt.queued) {
+        this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(blockedError)));
+      }
+      return refuseBeforeAcceptance(blockedError);
+    }
 
     // Last-line-of-defence pricing gate: every dispatch path (initial sends,
     // sendQueuedMessages, dispatchPendingFollowUp,
@@ -5134,6 +5497,13 @@ export class AgentSession {
               : typedMuxMetadata
           )
         : typedMuxMetadata;
+    // A manual /compact whose follow-up the hooks checked: that run's context belongs to the
+    // follow-up (the message the model acts on), so it travels there instead of onto this
+    // summarization request. Context from texts batched behind the request stays on this row.
+    const persistedMuxMetadata =
+      pluginSend.followUpHook != null && stampedMuxMetadata?.type === "compaction-request"
+        ? withHookedCompactionFollowUp(stampedMuxMetadata, pluginSend.followUpHook.context)
+        : stampedMuxMetadata;
 
     const userMessage = createMuxMessage(
       messageId,
@@ -5154,7 +5524,7 @@ export class AgentSession {
         ...(optionsForStream.autoModelRoutingRecord != null
           ? { autoModelRouting: optionsForStream.autoModelRoutingRecord }
           : {}),
-        muxMetadata: stampedMuxMetadata, // Pass through frontend metadata as black-box
+        muxMetadata: persistedMuxMetadata, // Pass through frontend metadata as black-box
         ...(acpPromptId != null ? { acpPromptId } : {}),
         ...(goalKind != null ? { kind: goalKind } : {}),
         // Scope goal-loop rows to their goal so a replaced goal's continuation
@@ -5164,6 +5534,9 @@ export class AgentSession {
         // Persist the queue-entry authoring time so goal-safety reconciliation
         // can re-derive the pre-goal/post-goal distinction after a restart.
         ...(internal?.enqueuedAtMs != null ? { enqueuedAtMs: internal.enqueuedAtMs } : {}),
+        // Hook context belongs to this message (Codex adds it to the conversation here), not to
+        // the system prompt: a per-send system change would miss the whole cached prefix.
+        ...(pluginSend.kind === "context" ? { pluginHookContext: pluginSend.entries } : {}),
         // Auto-resume and other system-generated messages are synthetic + UI-visible
         ...(internal?.synthetic && {
           synthetic: true,
@@ -5290,6 +5663,9 @@ export class AgentSession {
         muxMetadata: typedMuxMetadata,
         // Pre-gate decision: the follow-up re-gates against the post-compaction context.
         autoModelRouting: routedOptions.autoModelRoutingRecord,
+        // `message` already ran the prompt hooks: the follow-up must not run them again.
+        pluginSendHooksApplied: true,
+        pluginHookContext: pluginSend.kind === "context" ? pluginSend.entries : undefined,
         replacement: manualReplacement || automaticReplacement,
         cancelBeforeAcceptance,
       });
@@ -8591,6 +8967,7 @@ export class AgentSession {
         }),
         openaiTruncationModeOverride,
         ...this.compactionRetryInputBudget(),
+        compactionContextRetryAvailable: this.hasCompactionContextRetry(),
         // Mid-turn thinking overrides clamp against the same floor as the
         // send-time level above (single source of truth for the floor).
         minThinkingLevel,
@@ -8781,9 +9158,11 @@ export class AgentSession {
     return supports1MContext(modelString, this.getProvidersConfigSafe());
   }
 
+  /** `options` with 1M context on for `modelString`; the request still runs on `requestModel`. */
   private withAnthropic1MContext(
     modelString: string,
-    options: SendMessageOptions | undefined
+    options: SendMessageOptions | undefined,
+    requestModel: string
   ): SendMessageOptions | null {
     const providerOptions = withAnthropic1MContextIntent(modelString, options?.providerOptions);
     // Providers config resolves Coder gateway instances (the raw
@@ -8795,7 +9174,7 @@ export class AgentSession {
     }
     return options
       ? { ...options, providerOptions }
-      : { model: modelString, agentId: WORKSPACE_DEFAULTS.agentId, providerOptions };
+      : { model: requestModel, agentId: WORKSPACE_DEFAULTS.agentId, providerOptions };
   }
 
   private isGptClassModel(modelString: string): boolean {
@@ -8809,27 +9188,33 @@ export class AgentSession {
    * input budget. Anthropic models that can switch to 1M: 1M context, whose larger window sets
    * the trim budget (their first attempt is not trimmed, see resolveCompactionInputBudgetTokens).
    * Every other model: half the input budget, so trimCompactionInput drops more old history.
+   * `model` is the model that overflowed: a refusal fallback when the stream swapped to one.
+   * The retry still starts on the requested model, and its fallback rebuild gets the same
+   * options and budget scale.
    */
-  private resolveCompactionRetryPlan(context: {
-    modelString: string;
-    options?: SendMessageOptions;
-  }): {
+  private resolveCompactionRetryPlan(
+    context: {
+      modelString: string;
+      options?: SendMessageOptions;
+    },
+    model: string
+  ): {
     options?: SendMessageOptions;
     label: string;
     openaiTruncation?: "auto";
     budgetScale?: number;
   } {
     const halfBudget = COMPACTION_RETRY_INPUT_BUDGET_SCALE;
-    if (this.isGptClassModel(context.modelString)) {
+    if (this.isGptClassModel(model)) {
       const label = "OpenAI truncation";
       return { options: context.options, label, openaiTruncation: "auto", budgetScale: halfBudget };
     }
     const providersConfig = this.activeStreamContext?.providersConfig ?? null;
     if (
-      this.supports1MContextRetry(context.modelString) &&
-      !this.is1MContextEnabledForModel(context.modelString, context.options, providersConfig)
+      this.supports1MContextRetry(model) &&
+      !this.is1MContextEnabledForModel(model, context.options, providersConfig)
     ) {
-      const with1M = this.withAnthropic1MContext(context.modelString, context.options);
+      const with1M = this.withAnthropic1MContext(model, context.options, context.modelString);
       if (with1M) return { options: with1M, label: "Anthropic 1M context" };
     }
     const label = "half the compaction input budget";
@@ -8843,9 +9228,22 @@ export class AgentSession {
     return scale != null ? { compactionInputBudgetScale: scale } : {};
   }
 
+  /**
+   * Whether this stream's compaction request still has its one context_exceeded retry. A
+   * compact-agent stream without compaction-request metadata has none (no
+   * activeCompactionRequest), so TurnRequestBuilder trims its first attempt even on a model
+   * that could retry at 1M.
+   */
+  private hasCompactionContextRetry(): boolean {
+    const request = this.activeCompactionRequest;
+    return request != null && !this.compactionRetryAttempts.has(request.id);
+  }
+
   private async maybeRetryCompactionOnContextExceeded(data: {
     messageId: string;
     errorType?: string;
+    /** The model whose request failed (StreamErrorPayload.model), when the engine knows it. */
+    model?: string;
   }): Promise<boolean> {
     const expectedTurnId = this.coordinator.turnId;
     const expectedOperationId = this.coordinator.operationId;
@@ -8869,10 +9267,11 @@ export class AgentSession {
       label: retryLabel,
       openaiTruncation,
       budgetScale,
-    } = this.resolveCompactionRetryPlan(context);
+    } = this.resolveCompactionRetryPlan(context, overflowedModel(context, data.model));
     log.info(`Compaction hit context limit; retrying once with ${retryLabel}`, {
       workspaceId: this.workspaceId,
       model: context.modelString,
+      failedModel: data.model,
       compactionRequestId: context.id,
     });
 
@@ -9329,6 +9728,7 @@ export class AgentSession {
       await this.maybeRetryCompactionOnContextExceeded({
         messageId: data.messageId,
         errorType: data.errorType,
+        model: data.model,
       })
     ) {
       return; // retry set PREPARING
@@ -9760,6 +10160,18 @@ export class AgentSession {
     const streamEndPayload = payload;
     const activeStreamGoalKind = this.activeStreamContext?.goalKind;
     const activeStreamOptions = this.activeStreamContext?.options;
+    // A turn.stop continuation keeps this stream's goal provenance (read before the reset below).
+    const activeStreamProvenance: StopContinuationProvenance = {
+      goalKind: activeStreamGoalKind,
+      goalId: this.activeStreamContext?.goalId,
+      agentInitiated: this.activeStreamContext?.agentInitiated,
+      delegatedWorkspaceTurn: this.activeStreamContext?.workspaceTurnMetadata != null,
+      externallyOwnedTurn:
+        this.callerOwnsTurnEnd ||
+        payload.acpPromptId != null ||
+        (normalizeAcpPromptId(activeStreamOptions?.acpPromptId) ??
+          extractAcpPromptId(activeStreamOptions?.muxMetadata)) != null,
+    };
 
     let goalContinuationRequest: {
       sendOptions: SendMessageOptions;
@@ -9898,6 +10310,17 @@ export class AgentSession {
           return;
       }
 
+      if (!handled && !this.coordinator.editBlocked()) {
+        // Before the queue flush: a continuation is queued work, so the flush dispatches it and
+        // the goal loop waits for it, and input the user queued meanwhile wins over it.
+        await this.runTurnStopHooks(streamEndPayload, activeStreamOptions, activeStreamProvenance);
+        if (
+          !this.coordinator.isCurrentTurn(turn) ||
+          !this.coordinator.isCurrentOperation(operation)
+        )
+          return;
+      }
+
       // Stream end: auto-send queued messages (for user messages typed during streaming)
       // and suppress goal continuations for external slash workflow follow-ups waiting on idle.
       // P2: if an edit is waiting, skip the queue flush so the edit truncates first.
@@ -10012,6 +10435,107 @@ export class AgentSession {
         }
       }
     }
+  }
+
+  /**
+   * Run the turn.stop prompt hooks (Codex Stop) for a turn that ended normally. A continuation
+   * (Codex `decision: "block"`) queues its prompt as a new synthetic user row, at most
+   * MAX_STOP_HOOK_CONTINUATIONS times per user turn. Sub-agent turns skip the hooks: TaskService
+   * owns their stream end (Codex has SubagentStop for them). A delegated workspace turn
+   * (`workspace-turn-task`) skips them for the same reason: WorkspaceTurnManager settles its
+   * handle from this stream end, and can remove a disposable workspace, while a slow hook still
+   * runs, so a continuation would arrive after the caller already got the turn as finished.
+   */
+  private async runTurnStopHooks(
+    payload: StreamEndEvent,
+    options: SendMessageOptions | undefined,
+    provenance: StopContinuationProvenance
+  ): Promise<void> {
+    if (this.aiService.runTurnStopHooks == null) return;
+    if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
+    if (provenance.delegatedWorkspaceTurn) return;
+    // A hard Stop can land while a slow hook runs, after the stream ended: it then finds no live
+    // stream to supersede and clears the queue before the hook returns. Its epoch fences the
+    // continuation instead (rechecked below, after the last await).
+    const stopEpochAtHook = this.getStopEpoch();
+    const outcome = await this.aiService.runTurnStopHooks(this.workspaceId, {
+      messageId: payload.messageId,
+      lastAssistantMessage: lastAssistantText(payload.parts),
+      stopHookActive: this.stopHookContinuations > 0,
+    });
+    if (outcome.kind === "none" || options == null) {
+      this.stopHookContinuations = 0;
+      return;
+    }
+    // The hook ran (its notices are shown), but it cannot continue a turn whose end an outside
+    // client already received (Codex PRRT_kwDOPxxmWM6rxPMC).
+    if (provenance.externallyOwnedTurn) {
+      log.info("Prompt hooks: an ACP or xum run turn cannot be continued by turn.stop", {
+        workspaceId: this.workspaceId,
+      });
+      this.stopHookContinuations = 0;
+      return;
+    }
+    // A goal turn's continuation stays a goal turn: the goal counts its turns and cost against
+    // its caps. Like a redispatched goal follow-up, it runs only while the goal still admits a
+    // continuation (still active, same goal, no Pause or Stop since): a goal that just reached
+    // its turn or cost limit, or a budget wrap-up, ends here.
+    let goalAdmissionStale: (() => boolean) | undefined;
+    if (provenance.goalKind != null && this.workspaceGoalService != null) {
+      const admission =
+        provenance.goalId == null
+          ? { admissible: false as const }
+          : await this.workspaceGoalService.buildGoalRedispatchAdmission(
+              this.workspaceId,
+              provenance.goalId,
+              GOAL_CONTINUATION_KIND
+            );
+      if (!admission.admissible) {
+        log.info("Prompt hooks: the goal no longer admits a turn.stop continuation", {
+          workspaceId: this.workspaceId,
+          goalKind: provenance.goalKind,
+        });
+        this.stopHookContinuations = 0;
+        return;
+      }
+      goalAdmissionStale = admission.admissionStale;
+    }
+    // Queued work (typed input, wakes) is the next turn instead; the user turn ends here. A user
+    // send still in its preflight (this session's or WorkspaceService's) is not queued yet, but
+    // it wins too: the continuation must not run another model turn ahead of newer input.
+    if (this.hasPendingManualFollowUp() || this.hasManualSendInPreflight()) {
+      this.stopHookContinuations = 0;
+      return;
+    }
+    // A Stop since the hook started ends the turn: no continuation runs after it.
+    if (this.isStopInProgress() || this.getStopEpoch() !== stopEpochAtHook) {
+      this.stopHookContinuations = 0;
+      return;
+    }
+    if (this.stopHookContinuations >= MAX_STOP_HOOK_CONTINUATIONS) {
+      log.warn("Prompt hooks: turn.stop continuation cap reached; ending the turn", {
+        workspaceId: this.workspaceId,
+      });
+      this.stopHookContinuations = 0;
+      return;
+    }
+    this.stopHookContinuations++;
+    this.queueMessage(
+      outcome.prompt,
+      { ...pickStartupRetrySendOptions(options), model: options.model },
+      {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+        ...(provenance.agentInitiated === true ? { agentInitiated: true } : {}),
+        ...(provenance.goalKind != null
+          ? { goalKind: GOAL_CONTINUATION_KIND, goalId: provenance.goalId }
+          : {}),
+        ...(goalAdmissionStale != null ? { admissionStale: goalAdmissionStale } : {}),
+        dedupeKey: STOP_HOOK_CONTINUATION_DEDUPE_KEY,
+        // Codex runs no UserPromptSubmit hook for a Stop continuation (see skipPromptHooks).
+        skipPromptHooks: true,
+      }
+    );
   }
 
   private attachAiListeners(): void {
@@ -10465,6 +10989,9 @@ export class AgentSession {
       workspaceTurnContinuation?: boolean;
       /** Automatic sub-agent turn provenance carried to the dispatched send. */
       taskTurnKind?: TaskTurnKind;
+      /** Goal-loop provenance carried to the dispatched send (seals the entry). */
+      goalKind?: GoalSyntheticMessageKind;
+      goalId?: string;
       /** Coalescing: drop the message when an entry with the same key is already queued. */
       dedupeKey?: string;
       /** Isolate this keyed message so it can be selectively superseded later. */
@@ -10482,6 +11009,8 @@ export class AgentSession {
       admissionStale?: () => boolean;
       /** See SendMessageInternalOptions.skipOnSendCompaction. */
       skipOnSendCompaction?: boolean;
+      /** See SendMessageInternalOptions.skipPromptHooks. */
+      skipPromptHooks?: boolean;
       /** Task-attempt obligation owned by the entry until its dispatch or removal. */
       turnAdmission?: TurnAdmissionToken;
       compactionAdmissionStale?: () => boolean;
@@ -12195,6 +12724,14 @@ export class AgentSession {
       admissionStale: followUpAdmissionStale,
       turnAdmission,
       compactionFollowUpSummary: lastMessage,
+      // The diverted send already ran the prompt hooks.
+      ...(followUp.pluginSendHooksApplied === true
+        ? {
+            pluginSendHooksApplied: {
+              context: coercePluginHookContext(followUp.pluginHookContext),
+            },
+          }
+        : {}),
     });
     if (!sendResult.success) {
       const heartbeatAfterSend = isHeartbeatFollowUp ? heartbeatState() : "on";
@@ -12877,10 +13414,21 @@ export class AgentSession {
         muxMetadata.skillName === ref.skillName
           ? (muxMetadata.arguments ?? "")
           : null;
-      const substitutedBody =
+      const argumentBody =
         slashArgumentText != null
           ? substituteSkillArguments(skill.body, slashArgumentText).body
           : skill.body;
+      // ${CLAUDE_SKILL_DIR}/${CLAUDE_PLUGIN_ROOT} next: after arguments (Claude Code's
+      // order), before dynamic context. Directive lines keep the placeholders and get
+      // the values as env vars, so !`sh "${CLAUDE_SKILL_DIR}/x.sh"` runs the bundled
+      // script without reparsing the path as shell. `runtime` is where bash runs.
+      const skillDirectory = resolveSkillDirectory(resolved, runtime, {
+        discoveredOutsideWorkspace: skillDiscoveryPath !== workspacePath,
+      });
+      const substitutedBody = substituteSkillDirectoryPlaceholdersOutsideDirectives(
+        argumentBody,
+        skillDirectory
+      );
 
       // Dynamic context injection (default-off experiment): replace whole-line
       // !`command` directives with their output. Ordering matters: it runs after
@@ -12889,13 +13437,18 @@ export class AgentSession {
       // (different command outputs naturally produce distinct snapshots). Every
       // ref in this materialization path is user-initiated (slash "/skill" or
       // inline "$skill"); the model-side agent_skill_read tool takes a separate
-      // path and always sees the raw body.
-      const body = await this.maybeInjectSkillDynamicContext({
+      // path and never runs directives (it only substitutes skill directories).
+      const injectedBody = await this.maybeInjectSkillDynamicContext({
         skillName: skill.frontmatter.name,
         body: substitutedBody,
         runtime,
         workspacePath,
+        env: skillDirectoryEnv(skillDirectory),
       });
+      // Host-read skills in off-host workspaces (e.g. global plugin skills on
+      // SSH/Docker) tell the model their files are not where bash runs. Added
+      // before hashing so the snapshot hash covers the note.
+      const body = prependSkillDirectoryOffHostNote(injectedBody, skillDirectory);
 
       // Include the parsed YAML frontmatter in the hash so frontmatter-only edits (e.g. description)
       // generate a new snapshot and keep the UI hover preview in sync. The hash also covers
@@ -12952,6 +13505,8 @@ export class AgentSession {
     body: string;
     runtime: Runtime;
     workspacePath: string;
+    /** Skill-directory variables for directive commands (skillDirectoryEnv). */
+    env: Record<string, string>;
   }): Promise<string> {
     if (!this.aiService.isExperimentEnabled(EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT)) {
       return args.body;
@@ -12975,8 +13530,13 @@ export class AgentSession {
         // lives behind hook/trust plumbing that is not reachable here, and directive
         // commands should not depend on tool-specific env anyway.
         execute: async (command) => {
+          // Never run a directive with an unresolved skill-directory placeholder:
+          // the shell would expand it to "" and target a path at the filesystem
+          // root. The thrown reason becomes the directive's failure note.
+          assertSkillDirectoryPlaceholdersResolved(command, args.env);
           const execResult = await execBuffered(args.runtime, command, {
             cwd: args.workspacePath,
+            env: args.env,
             // Runtime-level timeout (seconds) actually kills the process; the
             // module-level race in injectSkillDynamicContext bounds our wait.
             timeout: Math.ceil(SKILL_DYNAMIC_COMMAND_TIMEOUT_MS / 1000),

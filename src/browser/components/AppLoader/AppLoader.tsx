@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, type ReactNode } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, type ReactNode } from "react";
 import App from "../../App";
 import { AuthTokenModal } from "../AuthTokenModal/AuthTokenModal";
 import { ThemeProvider } from "../../contexts/ThemeContext";
@@ -20,18 +20,35 @@ import { WorkspaceProvider, useWorkspaceContext } from "../../contexts/Workspace
 import { RouterProvider } from "../../contexts/RouterContext";
 import { TerminalRouterProvider } from "../../terminal/TerminalRouterContext";
 import { UpdateRestartOverlay } from "@/browser/components/UpdateRestartOverlay/UpdateRestartOverlay";
+import { removeFirstRunView } from "@/browser/features/SplashScreens/SplashScreenProvider";
 
 const USER_PREFERENCES_BOOTSTRAP_TIMEOUT_MS = 2000;
 
+/**
+ * T3 #5971, C step 2: the static first-run view covers the page until the live wizard replaces it.
+ * It must never cover the token prompt, a startup error or the reconnect screen.
+ */
+export function FirstRunViewConnectionGuard() {
+  const { status } = useAPI();
+  const blocked = status === "auth_required" || status === "error" || status === "reconnecting";
+  useLayoutEffect(() => {
+    if (blocked) removeFirstRunView();
+  }, [blocked]);
+  return null;
+}
+
 function UserPreferencesStartupGate(props: { children: ReactNode }) {
   const apiState = useAPI();
+  // The bound runs only while connected: a drop cancels it, and the reconnect starts it again,
+  // so the timeout cannot pick the launch route from code defaults while offline.
+  const liveApi = useLiveAPI();
   const [ready, setReady] = useState(false);
   const bootstrappedRef = useRef(false);
 
   // The bound starts once the API client exists: a token prompt or a slow connect must not use it
   // up, or RouterProvider picks the launch route from code defaults.
   useEffect(() => {
-    if (bootstrappedRef.current || !apiState.api) {
+    if (bootstrappedRef.current || !liveApi) {
       return;
     }
 
@@ -79,7 +96,7 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
         clearTimeout(timeoutId);
       }
     };
-  }, [apiState.api]);
+  }, [liveApi]);
 
   // bootstrappedRef is set together with `ready`, so `ready` alone decides here; reading
   // the ref during render would make React Compiler skip this component.
@@ -143,6 +160,7 @@ export function AppLoader(props: AppLoaderProps) {
   return (
     <ThemeProvider>
       <APIProvider client={props.client}>
+        <FirstRunViewConnectionGuard />
         <UserPreferencesStartupGate>
           <RouterProvider>
             <ProjectProvider>

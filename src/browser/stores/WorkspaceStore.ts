@@ -67,6 +67,8 @@ import {
   isMuxMessage,
   isHeldInputsChanged,
   isQueuedMessageChanged,
+  isGoalBudgetLimitedEvent,
+  isPluginHookNoticeEvent,
   isRestoreToInput,
   isRuntimeStatus,
 } from "@/common/orpc/types";
@@ -1398,6 +1400,15 @@ export class WorkspaceStore {
       // Avoid a double-bump if an init-output idle bump is pending.
       this.cancelPendingIdleBump(workspaceId);
       this.states.bump(workspaceId);
+    },
+    // Toast-only events (the aggregator queues the toast and changes no rows). Both are live
+    // only: handleChatMessage processes them at once, never buffered, so they always show their
+    // toast (unlike stream-error, whose replay must not re-show it).
+    "plugin-hook-notice": (_workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
+    },
+    "goal-budget-limited": (_workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
     },
     "queued-message-changed": (workspaceId, aggregator, data) => {
       if (!isQueuedMessageChanged(data)) return;
@@ -5353,6 +5364,14 @@ export class WorkspaceStore {
       // WorkspaceState may now clear its buffered active-stream fallback based on the appended
       // terminal error, so invalidate after the pending-events snapshot is up to date.
       this.states.bump(workspaceId);
+      return;
+    }
+
+    if (isPluginHookNoticeEvent(data) || isGoalBudgetLimitedEvent(data)) {
+      // Live-only toasts: the server never saves or replays them, and they change no rows. Show
+      // them at once, never buffered, so no caught-up outcome (a failed replay drops the buffer)
+      // can lose them.
+      this.processStreamEvent(workspaceId, aggregator, data);
       return;
     }
 

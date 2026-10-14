@@ -98,7 +98,7 @@ include fmt.mk
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
-.PHONY: benchmark-terminal bench bench-compare first-load-js page-timing bug-bash mcp-apps-e2e
+.PHONY: benchmark-terminal bench bench-compare first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
@@ -825,6 +825,9 @@ first-load-js: ## Report first-load JS bytes of dist/ (run make build-renderer f
 
 page-timing: node_modules/.installed ## Paired mobile UCS/IR timing of two built trees (PAGE_TIMING_ARGS; see scripts/perf/pageTiming.ts)
 	@node --import tsx scripts/perf/pageTiming.ts $(PAGE_TIMING_ARGS)
+
+first-run-view-parity: node_modules/.installed ## Static vs live first-run view boxes and screenshots, 4 widths x 2 themes (FIRST_RUN_VIEW_PARITY_ARGS; see scripts/perf/firstRunViewParity.ts)
+	@node --import tsx scripts/perf/firstRunViewParity.ts $(FIRST_RUN_VIEW_PARITY_ARGS)
 
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
 	@# Pin Harbor with the Daytona extra so scheduled ingestion does not break on future CLI or adapter API drift.
