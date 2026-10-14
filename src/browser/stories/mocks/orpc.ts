@@ -423,6 +423,11 @@ type MockMcpTestResult =
   | { success: true; tools: string[]; serverInfo?: MCPServerIdentity; icon?: string }
   | { success: false; error: string };
 
+// Backend commit revisions of the mock's view-domain approvals, shared by every mock client: the
+// renderer's approval store outlives a story and keeps the list with the newest revision
+// (mcpAppViewDomainsStore.ts). Not time-based, since .storybook/preview.tsx freezes Date.
+let mockViewDomainsRevision = 0;
+
 /**
  * Creates a mock ORPC client for Storybook.
  *
@@ -441,9 +446,6 @@ type MockMcpTestResult =
  * ```
  */
 export function createMockORPCClient(options: MockORPCClientOptions = {}): APIClient {
-  // Above every revision an earlier story published: the renderer's approval store outlives a
-  // story, and keeps the list with the newest revision (mcpAppViewDomainsStore.ts).
-  let mockViewDomainsRevision = Date.now() * 1000;
   const mockViewDomains = new Map<
     string,
     { projectPath: string; serverName: string; origins: string[] }
