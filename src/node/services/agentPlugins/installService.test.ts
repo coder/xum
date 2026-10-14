@@ -1955,9 +1955,8 @@ describe("AgentPluginInstallService", () => {
 
     const preview = await service.preview({ input: remoteDir });
     expect(preview.skills.map((skill) => skill.name).sort()).toEqual(["greet", "poteto-mode"]);
-    expect(preview.warnings).toEqual([
-      expect.stringMatching(/^skills\/poteto-mode: .*'Poteto Mode'.*'poteto-mode'/),
-    ]);
+    expect(preview.warnings).toHaveLength(1);
+    expect(preview.warnings[0]).toMatch(/^skills\/poteto-mode: .*'Poteto Mode'.*'poteto-mode'/);
   });
 
   test("preview and list show the interface; the logo is a contained data URL", async () => {
