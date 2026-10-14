@@ -665,6 +665,70 @@ describe("AgentPluginHookService", () => {
     expect(prefixes).toEqual([buildPluginServerKey(instanceId, "")]);
   });
 
+  test("one dispatch starts every plugin's settings read before it waits on the first", async () => {
+    // #6186: the spine runs plugin middleware serially, so serial reads add one timeout each.
+    const harness = await createHarness();
+    for (const name of ["first-plugin", "second-plugin"]) {
+      await writeHookPlugin(
+        harness.container,
+        name,
+        `({ "request.assemble": (input) => ({ context: input.settings.s.v }) })`
+      );
+    }
+    const prefixes: string[] = [];
+    const firstReached = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    harness.service.setSettingsProvider(async (_workspaceId, prefix) => {
+      prefixes.push(prefix);
+      firstReached.resolve();
+      await gate.promise;
+      return { s: { v: prefix } };
+    });
+    await harness.ensure();
+    const ctx: RequestAssembleContext = {
+      workspaceId: WORKSPACE_ID,
+      modelString: "model",
+      systemMessage: "base",
+      tools: {},
+    };
+    const running = harness.spine.run("request.assemble", ctx);
+    await firstReached.promise;
+    const startedBeforeFirstSettled = new Set(prefixes).size;
+    gate.resolve();
+    await running;
+    expect(startedBeforeFirstSettled).toBe(2);
+    // Each hook still gets only its own plugin's settings.
+    const contributed = ctx.systemMessage.split("\n\n").slice(1);
+    expect(new Set(contributed)).toEqual(new Set(prefixes));
+    expect(contributed).toHaveLength(2);
+  });
+
+  test("hook settings above the size cap are omitted with a flag", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "big-settings",
+      `({ "request.assemble": (input) => ({ context: Object.keys(input.settings).length + ":" + input.settingsOmitted }) })`
+    );
+    let value = "x";
+    harness.service.setSettingsProvider(() => Promise.resolve({ cad: { notes: value } }));
+    await harness.ensure();
+    const assemble = async () => {
+      const ctx: RequestAssembleContext = {
+        workspaceId: WORKSPACE_ID,
+        modelString: "model",
+        systemMessage: "base",
+        tools: {},
+      };
+      await harness.spine.run("request.assemble", ctx);
+      return ctx.systemMessage;
+    };
+    expect(await assemble()).toBe("base\n\n1:undefined");
+    // About what four servers at the per-server limits can send.
+    value = "x".repeat(400 * 1024);
+    expect(await assemble()).toBe("base\n\n0:true");
+  });
+
   test.each(["dispose", "epoch"] as const)(
     "a %s that lands while a hook reads its settings stops the call",
     async (mode) => {

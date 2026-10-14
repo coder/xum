@@ -4804,7 +4804,7 @@ export class MCPServerManager {
    * workspace whose config key starts with `keyPrefix` (one plugin instance)
    * and that has `openai/settings`, keyed by the plugin's own server name.
    * Uses the cache; an empty cache is read once with a short timeout (all
-   * misses concurrently), and a failed read yields `{}` for that server.
+   * misses concurrently), and a failed read yields the current cache or `{}`.
    * Never starts servers and never throws: hooks must not stall or break the turn.
    */
   async getSettingsForPluginHooks(
@@ -4814,42 +4814,91 @@ export class MCPServerManager {
   ): Promise<Record<string, Record<string, MCPSettingValue>>> {
     // Null prototype: a plugin server named "__proto__" stays an own key (JSON keeps it).
     const settings = Object.create(null) as Record<string, Record<string, MCPSettingValue>>;
+    // An override change waiting for repairEnablement can disable a server the entry still
+    // lists as enabled (#6186): wait for it, bounded like the read, and fail closed on timeout.
+    // Only awaits when a repair is pending: without one, the reads start synchronously.
+    const pendingRepair = this.pendingEnablementRepairs.get(workspaceId);
+    if (
+      pendingRepair !== undefined &&
+      (await raceWithAbortAndTimeout(pendingRepair, { timeoutMs })).kind !== "ok"
+    )
+      return settings;
     const entry = this.workspaceServers.get(workspaceId);
     if (entry === undefined) return settings;
-    const misses: Array<Promise<void>> = [];
+    const sources: Array<{
+      name: string;
+      instance: MCPServerInstance;
+      pluginServerName: string;
+      read?: Promise<Record<string, MCPSettingValue> | undefined>;
+    }> = [];
     for (const [name, instance] of entry.instances) {
-      const pluginServerName = entry.enabledServers[name]?.plugin?.serverName;
-      if (
-        !name.startsWith(keyPrefix) ||
-        pluginServerName === undefined ||
-        !entry.enabledServerNames.has(name) ||
-        instance.isClosed ||
-        instance.settings?.settingsCapability() === undefined
-      )
-        continue;
+      const pluginServerName = name.startsWith(keyPrefix)
+        ? this.hookSettingsServerName(workspaceId, name, instance)
+        : undefined;
+      if (pluginServerName === undefined) continue;
       const cached = this.settingsCache.get(instance)?.get(workspaceId);
-      if (cached !== undefined) {
-        settings[pluginServerName] = cached;
-        continue;
-      }
-      misses.push(
-        this.readSettingsForHooks(instance, workspaceId, timeoutMs).then((values) => {
-          // Recheck after the await: a server disabled, removed or replaced meanwhile must not
-          // hand its settings to the hook.
-          const current = this.workspaceServers.get(workspaceId);
-          if (
-            current?.instances.get(name) !== instance ||
-            !current.enabledServerNames.has(name) ||
-            instance.isClosed
-          )
-            return;
-          settings[pluginServerName] = values ?? {};
-        })
-      );
+      sources.push({
+        name,
+        instance,
+        pluginServerName,
+        ...(cached === undefined
+          ? { read: this.readSettingsForHooks(instance, workspaceId, timeoutMs) }
+          : {}),
+      });
     }
     // Concurrently: misses on several servers share one timeout window instead of adding up.
-    await Promise.all(misses);
+    const reads = await Promise.all(
+      sources.map((source) => source.read ?? Promise.resolve(undefined))
+    );
+    sources.forEach((source, index) => {
+      // Recheck every collected server, cached ones too (#6186): a server disabled, removed or
+      // replaced during any read must not hand its settings to the hook.
+      if (!this.isHookSettingsSourceCurrent(workspaceId, source.name, source.instance)) return;
+      // The cache first: a save that settled during a failed or older read holds newer values.
+      settings[source.pluginServerName] =
+        this.settingsCache.get(source.instance)?.get(workspaceId) ?? reads[index] ?? {};
+    });
     return settings;
+  }
+
+  /**
+   * The plugin's own name for server `name` when `instance` can give a hook settings now: a
+   * plugin server that is current (isHookSettingsSourceCurrent) and has `openai/settings`.
+   */
+  private hookSettingsServerName(
+    workspaceId: string,
+    name: string,
+    instance: MCPServerInstance
+  ): string | undefined {
+    const pluginServerName =
+      this.workspaceServers.get(workspaceId)?.enabledServers[name]?.plugin?.serverName;
+    if (
+      pluginServerName === undefined ||
+      !this.isHookSettingsSourceCurrent(workspaceId, name, instance) ||
+      instance.settings?.settingsCapability() === undefined
+    )
+      return undefined;
+    return pluginServerName;
+  }
+
+  /**
+   * Whether `instance` may give its settings to a hook now: still this workspace's running
+   * instance for `name` and enabled, with no override invalidation or enablement repair pending
+   * (as canCallToolForPluginHook: hooks fail closed instead of re-deriving enablement).
+   */
+  private isHookSettingsSourceCurrent(
+    workspaceId: string,
+    name: string,
+    instance: MCPServerInstance
+  ): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    return (
+      entry?.instances.get(name) === instance &&
+      entry.enabledServerNames.has(name) &&
+      !instance.isClosed &&
+      !this.overridesInvalidationGenerations.has(workspaceId) &&
+      !this.pendingEnablementRepairs.has(workspaceId)
+    );
   }
 
   private readSettingsForHooks(
@@ -4876,7 +4925,7 @@ export class MCPServerManager {
           return this.settingsCache.get(instance)?.get(workspaceId) ?? parsed.values;
         } catch (error) {
           log.warn(
-            `[MCP] Settings read for plugin hooks failed for '${instance.name}'; passing {}`,
+            `[MCP] Settings read for plugin hooks failed for '${instance.name}'; passing the cached values or {}`,
             {
               workspaceId,
               error: getErrorMessage(error),

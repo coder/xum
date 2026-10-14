@@ -72,6 +72,11 @@ const HOOK_CONTEXT_INLINE_MAX_CHARS = 4_096;
 const HOOK_CONTEXT_MAX_CHARS = 64 * 1024;
 /** Tool results larger than this (as JSON) are omitted from tool.execute.after input. */
 const HOOK_RESULT_INPUT_MAX_CHARS = 256 * 1024;
+/**
+ * `settings` larger than this (as JSON) are omitted from hook input (#6186): one server can send
+ * about 400 KB, and each settings-capable server of the plugin adds more.
+ */
+const HOOK_SETTINGS_INPUT_MAX_CHARS = 64 * 1024;
 
 function sha256Hex(text: string): string {
   return crypto.createHash("sha256").update(text, "utf-8").digest("hex");
@@ -631,6 +636,32 @@ export class AgentPluginHookService {
   }
 
   /**
+   * This plugin's settings, after starting the reads of every sibling plugin with the same hook
+   * point (#6186). The spine runs plugin middleware serially, so plugins that each wait on their
+   * own unresponsive settings server would add one timeout each. The siblings' own calls later
+   * join the reads the MCP manager already has in flight, so the dispatch waits about one timeout.
+   */
+  private readHookSettings(
+    workspaceId: string,
+    state: LoadedPluginHookState,
+    hookName: PluginHookPoint
+  ): Promise<Record<string, unknown>> {
+    const provider = this.settingsProvider;
+    if (provider === undefined) {
+      return Promise.resolve({});
+    }
+    for (const sibling of this.registrations.get(workspaceId)?.states ?? []) {
+      if (sibling !== state && !sibling.disposed && sibling.hookNames.includes(hookName)) {
+        // Only starts the read: the result is discarded, and the provider never throws.
+        provider(workspaceId, sibling.serverKeyPrefix, this.settingsTimeoutMs).catch(
+          () => undefined
+        );
+      }
+    }
+    return provider(workspaceId, state.serverKeyPrefix, this.settingsTimeoutMs);
+  }
+
+  /**
    * Invoke one hook in the plugin's mount. Returns null on any failure
    * (crash, timeout, malformed output) — log, skip, continue.
    */
@@ -653,9 +684,7 @@ export class AgentPluginHookService {
     // lands during this read must stop the call, or withPersistentMount would
     // recreate the dropped mount and run the removed hook once more
     // (the last review fix of #6040).
-    const settings =
-      (await this.settingsProvider?.(workspaceId, state.serverKeyPrefix, this.settingsTimeoutMs)) ??
-      {};
+    const settings = await this.readHookSettings(workspaceId, state, hookName);
     if (await this.retireIfEpochStale(workspaceId)) {
       return null;
     }
@@ -665,7 +694,7 @@ export class AgentPluginHookService {
       return null;
     }
     try {
-      const inputJson = JSON.stringify({ ...input, settings });
+      const inputJson = buildHookInputJson(input, settings, `'${state.pluginName}' ${hookName}`);
       assert(typeof inputJson === "string", "hook input must be JSON-serializable");
       const evalResult = await this.sandboxHost.withPersistentMount(
         state.mountOptions,
@@ -732,6 +761,27 @@ export class AgentPluginHookService {
       log.warn(`Agent plugin hooks: failed to drop sandbox scope ${scopeKey}`, { error });
     }
   }
+}
+
+/**
+ * Hook input as JSON, with `settings` omitted above the size cap. `settingsOmitted` tells the
+ * hook why `settings` is empty, like `resultOmitted`. `label` names the hook in the warning.
+ */
+function buildHookInputJson(
+  input: Record<string, unknown>,
+  settings: Record<string, unknown>,
+  label: string
+): string {
+  const settingsJson: string | undefined = JSON.stringify(settings);
+  const settingsOmitted = (settingsJson?.length ?? 0) > HOOK_SETTINGS_INPUT_MAX_CHARS;
+  if (settingsOmitted) {
+    log.warn(
+      `Agent plugin hooks: ${label} settings exceed ${HOOK_SETTINGS_INPUT_MAX_CHARS} chars; omitting them`
+    );
+  }
+  return JSON.stringify(
+    settingsOmitted ? { ...input, settings: {}, settingsOmitted } : { ...input, settings }
+  );
 }
 
 /**

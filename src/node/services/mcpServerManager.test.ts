@@ -1102,6 +1102,126 @@ describe("MCPServerManager", () => {
     expect(manager.getCachedSettings("hooks-race-ws", "plugin:abc:saved")).toEqual({ units: "in" });
   });
 
+  describe("settings for plugin hooks: revalidation (#6186)", () => {
+    // One plugin "abc" with servers a and b; each read waits for the test to settle it.
+    async function setup(workspaceId: string) {
+      const tmp = new DisposableTempDir(`mcp-hook-settings-${workspaceId}`);
+      const pluginServer = (command: string, serverName: string) => ({
+        ...stdioConfig(command),
+        env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: path.join(tmp.path, "data") },
+        plugin: {
+          pluginName: "cad",
+          serverName,
+          sourceScope: "global" as const,
+          sourceLocation: "x",
+        },
+      });
+      const all = {
+        "plugin:abc:a": pluginServer(`${workspaceId}-a`, "a"),
+        "plugin:abc:b": pluginServer(`${workspaceId}-b`, "b"),
+      };
+      configService.listServers.mockResolvedValue(all);
+      const schema = { type: "object", properties: { units: { type: "string", title: "Units" } } };
+      const result = (units: string): mcpSdk.MCPRawCallToolResult => ({
+        content: [],
+        structuredContent: { schema, values: { units } },
+      });
+      const reads: Array<{ server: string; settle: (units: string | null) => void }> = [];
+      // While set, reads answer at once with these units.
+      let immediateUnits: string | undefined = "mm";
+      const settingsServer = (server: string) => ({
+        tools: { draw: testTool() },
+        settings: {
+          settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+          callSettingsTool: (name: string, args: Record<string, unknown>) => {
+            if (name === "s.update") {
+              const set = args.set as { units: string };
+              return Promise.resolve(result(set.units));
+            }
+            if (immediateUnits !== undefined) return Promise.resolve(result(immediateUnits));
+            return new Promise<mcpSdk.MCPRawCallToolResult>((resolve, reject) =>
+              reads.push({
+                server,
+                // null: the read fails (a server error or a timeout).
+                settle: (units) =>
+                  units === null ? reject(new Error("server down")) : resolve(result(units)),
+              })
+            );
+          },
+        },
+      });
+      servers.serve(`${workspaceId}-a`, settingsServer("a"));
+      servers.serve(`${workspaceId}-b`, settingsServer("b"));
+      await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+      // Fill a's cache through the dialog read path.
+      await manager.readSettings(workspaceId, "plugin:abc:a");
+      immediateUnits = undefined;
+      return { tmp, all, reads };
+    }
+
+    test("a server that a pending override change disables gets no settings", async () => {
+      const t = await setup("hooks-repair-ws");
+      using _tmp = t.tmp;
+      // Hold the enablement repair of the publication below.
+      const repairGate = Promise.withResolvers<void>();
+      configService.listServers.mockImplementationOnce(async () => {
+        await repairGate.promise;
+        return t.all;
+      });
+      const publication = manager.applyWorkspaceOverrides("hooks-repair-ws", {
+        disabledServers: ["plugin:abc:a", "plugin:abc:b"],
+      });
+      // a is cached and b is not: neither may reach a hook while the repair runs.
+      const hookSettings = manager.getSettingsForPluginHooks(
+        "hooks-repair-ws",
+        "plugin:abc:",
+        1000
+      );
+      repairGate.resolve();
+      await publication;
+      const started = t.reads.map((read) => read.server);
+      t.reads.splice(0).forEach((read) => read.settle("cm"));
+      expect(await hookSettings).toEqual({});
+      // The disabled server b is not even read.
+      expect(started).toEqual([]);
+    });
+
+    test("a cached server disabled while a sibling's read is in flight is left out", async () => {
+      const t = await setup("hooks-sibling-ws");
+      using _tmp = t.tmp;
+      const hookSettings = manager.getSettingsForPluginHooks(
+        "hooks-sibling-ws",
+        "plugin:abc:",
+        1000
+      );
+      expect(t.reads.map((read) => read.server)).toEqual(["b"]);
+      await manager.applyWorkspaceOverrides("hooks-sibling-ws", {
+        disabledServers: ["plugin:abc:a"],
+      });
+      t.reads.splice(0).forEach((read) => read.settle("cm"));
+      expect(await hookSettings).toEqual({ b: { units: "cm" } });
+    });
+
+    test("a failed hook read returns the values a save cached meanwhile", async () => {
+      const t = await setup("hooks-failsave-ws");
+      using _tmp = t.tmp;
+      const hookSettings = manager.getSettingsForPluginHooks(
+        "hooks-failsave-ws",
+        "plugin:abc:",
+        1000
+      );
+      expect(t.reads.map((read) => read.server)).toEqual(["b"]);
+      await manager.updateSettings(
+        "hooks-failsave-ws",
+        "plugin:abc:b",
+        { units: "in" },
+        { properties: { units: { type: "string", title: "Units" } }, values: {} }
+      );
+      t.reads.splice(0).forEach((read) => read.settle(null));
+      expect(await hookSettings).toEqual({ a: { units: "mm" }, b: { units: "in" } });
+    });
+  });
+
   test("settings: a noStart read never starts or restarts the server", async () => {
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-nostart") });
     servers.serve("settings-nostart", {
