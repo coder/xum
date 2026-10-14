@@ -92,8 +92,9 @@ interface RevealState {
   endMessageId: string | null;
   endIndexHint: number;
   /**
-   * Ids of the rows `endIndexHint` indexes, for the fallback when the end row is gone; [] at the
-   * tail. Ids only, so a detached slice never keeps an obsolete transcript reachable (#6669).
+   * Ids of the next unmounted rows after the end row, for the fallback when it is gone; [] at the
+   * tail. Ids only, so a detached slice never keeps an obsolete transcript reachable (#6669), and
+   * at most `maxMountedRows` of them, so a step costs O(cap), not O(transcript) (#6676 review).
    */
   endRows: readonly string[];
 }
@@ -137,24 +138,25 @@ function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCu
   if (id === null) return rows.length;
   const found = rows[hint]?.id === id ? hint : rows.findIndex((row) => row.id === id);
   if (found !== -1) return nearestSafeCutAtOrBefore(found, rows.length, isSafeCut);
-  return endAtNearestUnmountedRow(rows, endRows, hint, isSafeCut);
+  return endAtNearestUnmountedRow(rows, endRows, isSafeCut);
 }
 
 /**
  * Where the end goes once its row is gone, even when one reconciliation also deleted mounted rows
- * before it (#6667 review): the nearest still-present row that was unmounted (`endRows[hint+1..]`),
- * so mounted rows replaced since stay mounted. If none survives, every row the reader had not
- * reached is gone and the slice ends at the tail: unmounting what follows could hide read rows.
+ * before it (#6667 review): the nearest still-present row that was unmounted (`endRows`), so
+ * mounted rows replaced since stay mounted. If none survives, the slice ends at the tail, which the
+ * cap then clamps: unmounting what follows could hide read rows. `endRows` holds one cap of rows.
+ * With all of them gone too, the clamp can mount a few more unread rows than the nearest survivor
+ * would (as many as the update deleted inside the slice); it never hides one.
  */
 function endAtNearestUnmountedRow(
   rows: readonly RevealRow[],
   endRows: readonly string[],
-  hint: number,
   isSafeCut: IsSafeCut
 ): number {
   const indexById = new Map(rows.map((row, index) => [row.id, index]));
-  for (let newer = hint + 1; newer < endRows.length; newer += 1) {
-    const index = indexById.get(endRows[newer]);
+  for (const id of endRows) {
+    const index = indexById.get(id);
     if (index !== undefined) return nearestSafeCutAtOrBefore(index, rows.length, isSafeCut);
   }
   return rows.length;
@@ -188,12 +190,12 @@ function withSliceEnd(state: RevealState, messages: readonly RevealRow[], to: nu
   const endMessageId = to < messages.length ? messages[to].id : null;
   const endIndexHint = endMessageId === null ? 0 : to;
   if (state.endMessageId === endMessageId && state.endIndexHint === endIndexHint) return state;
-  return { ...state, endMessageId, endIndexHint, endRows: sliceEndIds(messages, endMessageId) };
+  return { ...state, endMessageId, endIndexHint, endRows: sliceEndIds(state, messages, to) };
 }
 
-/** Ids only while detached, none at the tail: no obsolete transcript stays reachable (#6669). */
-const sliceEndIds = (messages: readonly RevealRow[], endMessageId: string | null) =>
-  endMessageId === null ? [] : messages.map((row) => row.id);
+/** Ids of up to one cap of rows after the end row; none at the tail (see `endRows`). */
+const sliceEndIds = (state: RevealState, messages: readonly RevealRow[], to: number) =>
+  messages.slice(to + 1, to + 1 + (state.maxMountedRows ?? 0)).map((row) => row.id);
 
 interface RevealSnapshot {
   messages: readonly RevealRow[];
