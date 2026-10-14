@@ -2241,6 +2241,24 @@ describe("AgentPluginInstallService", () => {
       await oauth.dispose();
     });
 
+    test("a sign-out that never settles does not hang discovery", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 10,
+      });
+      const hung = {
+        logout: () => new Promise<never>(() => undefined),
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService;
+      restarted.setMcpOauthService(hung);
+      // The pending record keeps the container closed while the sign-out hangs.
+      expect(await discovered()).toBe(0);
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+    });
+
     test("survives an uninstall of the plugin", async () => {
       const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
       await result;

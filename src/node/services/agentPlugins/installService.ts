@@ -186,6 +186,15 @@ const JOURNAL_RECONCILIATION_TIMEOUT_MS = 30_000;
 const LS_REMOTE_TIMEOUT_MS = 30_000;
 const CLONE_TIMEOUT_MS = 120_000;
 
+/** Waits for the startup sign-out pass at most timeoutMs, then lets discovery go on. */
+async function waitForPendingSignOuts(
+  pass: Promise<void>,
+  timeoutMs = JOURNAL_RECONCILIATION_TIMEOUT_MS
+): Promise<void> {
+  const settled = await raceWithAbortAndTimeout(pass, { timeoutMs });
+  if (settled.kind === "timeout") log.warn("Pending plugin sign-outs timed out", { timeoutMs });
+}
+
 /** Deterministic JSON with recursively sorted object keys (fingerprinting). */
 function stableStringify(value: unknown): string {
   return JSON.stringify(value, (_key, val: unknown) => {
@@ -3366,7 +3375,11 @@ export class AgentPluginInstallService {
     this.mcpOauthService = service;
     // The startup pass ran without this service: finish pending sign-outs now, before the
     // first agent request scans the container.
-    this.pendingSignOutReady = this.startPendingSignOutPass().then(() => this.pendingSignOutPass);
+    // Bounded like journal recovery: a hung logout (stalled store I/O) must not hang every
+    // discovery request. On timeout discovery goes on, and the journal bracket keeps the
+    // container closed while the sign-out is still pending.
+    const pass = this.startPendingSignOutPass().then(() => this.pendingSignOutPass);
+    this.pendingSignOutReady = waitForPendingSignOuts(pass, this.deps.reconciliationTimeoutMs);
   }
 
   /** Started by setMcpOauthService. */
