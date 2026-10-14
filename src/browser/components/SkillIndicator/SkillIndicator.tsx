@@ -1,4 +1,5 @@
 import React from "react";
+import { formatQualifiedSkillName } from "@/common/utils/agentSkills/skillLookupName";
 import { AlertTriangle, Check, CloudOff, EyeOff, XCircle } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { SkillIcon } from "@/browser/components/icons/SkillIcon/SkillIcon";
@@ -8,8 +9,8 @@ import type {
   SkillLoadError,
 } from "@/browser/utils/messages/StreamingMessageAggregator";
 import type {
-  AgentSkillDescriptor,
   AgentSkillIssue,
+  InvocableSkill,
   AgentSkillScope,
   AgentSkillUnavailableSource,
 } from "@/common/types/agentSkill";
@@ -17,8 +18,8 @@ import type {
 interface SkillIndicatorProps {
   /** Skills that have been loaded in the current session */
   loadedSkills: LoadedSkill[];
-  /** All available skills discovered for this project */
-  availableSkills: AgentSkillDescriptor[];
+  /** All available skills discovered for this project (shadowed plugin skills qualified) */
+  availableSkills: InvocableSkill[];
   /** Skills that were discovered but couldn't be loaded (SKILL.md parse errors, etc.) */
   invalidSkills?: AgentSkillIssue[];
   /** Skills roots that could not be read (e.g. the SSH host did not answer) */
@@ -39,16 +40,32 @@ const SCOPE_CONFIG: Array<{ scope: AgentSkillScope; label: string }> = [
 
 interface SkillsPopoverContentProps {
   loadedSkills: LoadedSkill[];
-  availableSkills: AgentSkillDescriptor[];
+  availableSkills: InvocableSkill[];
   invalidSkills: AgentSkillIssue[];
   unavailableSources: AgentSkillUnavailableSource[];
   skillLoadErrors: SkillLoadError[];
 }
 
-const SkillsPopoverContent: React.FC<SkillsPopoverContentProps> = (props) => {
-  const loadedSkillNames = new Set(props.loadedSkills.map((skill) => skill.name));
+/**
+ * Loaded skill names, with a qualified `<plugin>:<skill>` read folded onto the
+ * winning plugin skill that the list shows under its bare name.
+ */
+function getLoadedSkillNames(
+  loadedSkills: LoadedSkill[],
+  availableSkills: InvocableSkill[]
+): Set<string> {
+  const names = new Set(loadedSkills.map((skill) => skill.name));
+  for (const skill of availableSkills) {
+    if (skill.pluginName == null) continue;
+    if (names.delete(formatQualifiedSkillName(skill.pluginName, skill.name))) names.add(skill.name);
+  }
+  return names;
+}
 
-  const skillsByScope = new Map<AgentSkillScope, AgentSkillDescriptor[]>();
+const SkillsPopoverContent: React.FC<SkillsPopoverContentProps> = (props) => {
+  const loadedSkillNames = getLoadedSkillNames(props.loadedSkills, props.availableSkills);
+
+  const skillsByScope = new Map<AgentSkillScope, InvocableSkill[]>();
   for (const skill of props.availableSkills) {
     const existing = skillsByScope.get(skill.scope) ?? [];
     existing.push(skill);
@@ -207,7 +224,7 @@ const SkillsPopoverContent: React.FC<SkillsPopoverContentProps> = (props) => {
  * Hover to preview skills organized by scope (Project, Global, Built-in); click to pin the list open.
  */
 export const SkillIndicator: React.FC<SkillIndicatorProps> = (props) => {
-  const loadedCount = props.loadedSkills.length;
+  const loadedCount = getLoadedSkillNames(props.loadedSkills, props.availableSkills).size;
   const totalCount = props.availableSkills.length;
   const invalidCount = props.invalidSkills?.length ?? 0;
   const unavailableCount = props.unavailableSources?.length ?? 0;

@@ -734,7 +734,7 @@ function CreationControlsContent(props: CreationControlsProps) {
             </Tooltip>
             {/* Magic wand / loading indicator */}
             {nameState.isGenerating ? (
-              <Loader2 className="text-accent h-3.5 w-3.5 shrink-0 animate-spin" />
+              <Loader2 className="text-accent-text h-3.5 w-3.5 shrink-0 animate-spin" />
             ) : (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -751,7 +751,7 @@ function CreationControlsContent(props: CreationControlsProps) {
                       className={cn(
                         "h-3.5 w-3.5 transition-colors",
                         nameState.autoGenerate
-                          ? "text-accent"
+                          ? "text-accent-text"
                           : "text-muted-foreground opacity-50 hover:opacity-75"
                       )}
                     />

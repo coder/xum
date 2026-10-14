@@ -9,6 +9,7 @@ import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { getErrorMessage } from "@/common/utils/errors";
+import { PlatformPaths } from "@/common/utils/paths";
 import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
 import {
@@ -31,8 +32,7 @@ import {
 } from "./mcpAppHost";
 import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
 import {
-  beginMcpAppViewDomainsRequest,
-  currentMcpAppViewDomainsSeq,
+  newestMcpAppViewDomains,
   publishMcpAppViewDomains,
   useMcpAppViewDomains,
 } from "./mcpAppViewDomainsStore";
@@ -91,8 +91,6 @@ interface Loaded {
   toolCallId: string;
   view: McpAppView | null;
   error: string | null;
-  /** currentMcpAppViewDomainsSeq() when the fetch started: newer approval changes win. */
-  domainsSeq: number;
 }
 
 interface PendingConsent {
@@ -221,6 +219,23 @@ function useMcpAppViewDocument(documentKey: string | null, frameKey: number) {
   return loaded?.key === key ? loaded : null;
 }
 
+/** The domain prompt's text: the origins, and the project that keeps the approval. */
+function DomainsPromptText(props: { origins: readonly string[]; projectPath: string | null }) {
+  return (
+    <div className="text-foreground min-w-0 flex-1 break-words">
+      This view wants to reach: {props.origins.map((origin) => new URL(origin).host).join(", ")}
+      {/* For a task of a multi-project workspace this is the first project, not the task's own
+          (approvalProjectPathOf). */}
+      {props.projectPath != null && (
+        <span className="text-muted">
+          {" "}
+          (for project {PlatformPaths.getProjectName(props.projectPath)})
+        </span>
+      )}
+    </div>
+  );
+}
+
 export function McpAppFrame(props: {
   workspaceId: string;
   view: McpAppViewRef;
@@ -273,20 +288,19 @@ export function McpAppFrame(props: {
   useEffect(() => {
     if (!api || viewLoaded) return;
     const controller = new AbortController();
-    const domainsSeq = currentMcpAppViewDomainsSeq();
     api.mcpApps
       .getView({ workspaceId, toolCallId, serverName, resourceUri }, { signal: controller.signal })
       .then((result) => {
         if (controller.signal.aborted) return;
         setLoaded(
           result.success
-            ? { toolCallId, view: result.data, error: null, domainsSeq }
-            : { toolCallId, view: null, error: result.error, domainsSeq }
+            ? { toolCallId, view: result.data, error: null }
+            : { toolCallId, view: null, error: result.error }
         );
       })
       .catch((error: unknown) => {
         if (!controller.signal.aborted) {
-          setLoaded({ toolCallId, view: null, error: getErrorMessage(error), domainsSeq });
+          setLoaded({ toolCallId, view: null, error: getErrorMessage(error) });
         }
       });
     return () => controller.abort();
@@ -297,12 +311,9 @@ export function McpAppFrame(props: {
   // name, sanitized arguments); the card's display values are only a fallback without one.
   const boundServerName = current?.view?.invocation?.serverName ?? serverName;
   const approvalProjectPath = current?.view?.approvalProjectPath ?? null;
-  // An approval made in another frame of this server after this view loaded applies here too.
+  // An approval or revoke of this server committed after this view's read applies here too.
   const published = useMcpAppViewDomains(approvalProjectPath, boundServerName);
-  const approved =
-    published != null && current != null && published.seq > current.domainsSeq
-      ? published.origins
-      : (current?.view?.approvedDomains ?? []);
+  const approved = newestMcpAppViewDomains(published, current?.view);
   const grant = current?.view ? grantMcpAppCsp(current.view.csp, approved) : null;
   // Only a view with a result record can be approved (the record binds its server), and only
   // when a user project can own the approval (approvalProjectPathOf in mcpAppsOperations.ts):
@@ -329,7 +340,6 @@ export function McpAppFrame(props: {
     // Offline the prompt stays, with Allow disabled: a failed call would dismiss it for good.
     if (!liveApi) return;
     try {
-      const requestSeq = beginMcpAppViewDomainsRequest();
       const result = await liveApi.mcpApps.approveViewDomains({
         workspaceId,
         toolCallId,
@@ -344,7 +354,7 @@ export function McpAppFrame(props: {
           approvalProjectPath,
           boundServerName,
           result.data.approvedDomains,
-          requestSeq
+          result.data.revision
         );
       }
     } catch (error) {
@@ -517,15 +527,21 @@ export function McpAppFrame(props: {
     // The host lives as long as the document; `grant` is derived from the same inputs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [srcDoc, workspaceId, serverName, boundServerName, guard.navigated, navigatedRef]);
-  // Close the channel of the document a new one replaced. A setup, not a cleanup: StrictMode
-  // replays effects (setup, cleanup, setup), and a cleanup would close the live channel. Setups
-  // run after every cleanup of the commit, so the old host's teardown still went out on it. An
-  // unmounted frame's channel has no receiver left and is dropped with the component.
-  const previousDocument = useRef(viewDocument);
+  // Close the channel of a document that left the frame: a new one replaced it, or the view
+  // unmounted (the HTML standard asks to close discarded ports). StrictMode replays effects
+  // (setup, cleanup, setup) synchronously, so the cleanup closes only in a microtask, and only
+  // if no setup took the same document back by then. The host's own cleanup runs before it, so
+  // its teardown still went out on the channel.
+  const mountedDocument = useRef<typeof viewDocument>(null);
   useLayoutEffect(() => {
-    const previous = previousDocument.current;
-    previousDocument.current = viewDocument;
-    if (previous != null && previous !== viewDocument) previous.channel.close();
+    if (viewDocument == null) return;
+    mountedDocument.current = viewDocument;
+    return () => {
+      mountedDocument.current = null;
+      queueMicrotask(() => {
+        if (mountedDocument.current !== viewDocument) viewDocument.channel.close();
+      });
+    };
   }, [viewDocument]);
 
   // Keep the view's theme current without reloading it.
@@ -584,10 +600,7 @@ export function McpAppFrame(props: {
           role="alert"
           className="border-border-light bg-background-secondary flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-xs"
         >
-          <div className="text-foreground min-w-0 flex-1 break-words">
-            This view wants to reach:{" "}
-            {domainsPrompt.map((origin) => new URL(origin).host).join(", ")}
-          </div>
+          <DomainsPromptText origins={domainsPrompt} projectPath={approvalProjectPath} />
           <button
             type="button"
             // Disabled briefly after the strip appears (confirmArming.ts), like the consent strip.

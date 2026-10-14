@@ -483,10 +483,12 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
               >
                 <Route
                   aria-hidden="true"
-                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent" : "text-muted")}
+                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent-text" : "text-muted")}
                 />
                 <span className="flex min-w-0 flex-1 items-baseline gap-1">
-                  <span className={cn("min-w-0 truncate", autoActive && "text-accent")}>Auto</span>
+                  <span className={cn("min-w-0 truncate", autoActive && "text-accent-text")}>
+                    Auto
+                  </span>
                   <span className="text-muted shrink-0 text-[10px]">Route by difficulty</span>
                 </span>
               </button>
@@ -524,14 +526,14 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                         provider={modelProvider}
                         className={cn(
                           "h-3 w-3 shrink-0",
-                          isModelSelected(model) ? "text-accent" : "text-muted"
+                          isModelSelected(model) ? "text-accent-text" : "text-muted"
                         )}
                       />
                       <span className="flex min-w-0 flex-1 items-baseline gap-1">
                         <span
                           className={cn(
                             "min-w-0 truncate",
-                            isModelSelected(model) && "text-accent"
+                            isModelSelected(model) && "text-accent-text"
                           )}
                         >
                           {formatModelDisplayName(modelName)}

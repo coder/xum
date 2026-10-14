@@ -18,6 +18,12 @@
  *
  * The secondary-text stories check every `--color-secondary` text in dark and flexoki-dark, on
  * the main surface and in the slash command list (#6021).
+ *
+ * The flexoki-light workspace story and the code stories' branch name check flexoki-light's
+ * muted and secondary token, and the Models story checks light `--color-muted-light` (#5984).
+ *
+ * The accent-link stories check markdown links in dark and flexoki-dark, which use the text-only
+ * accent token (#5946).
  */
 
 import { expect, userEvent, waitFor, within } from "@storybook/test";
@@ -169,15 +175,21 @@ async function waitForWorkspace(canvasElement: HTMLElement) {
   );
 }
 
-export const WorkspaceWithSidebars: AppStory = {
-  globals: { theme: "light" },
+const workspaceWithSidebarsStory = (theme: ThemeMode, token: string): AppStory => ({
+  globals: { theme },
   parameters: lightContract,
   render: () => <AppWithMocks setup={() => setupWorkspaceWithSidebars({ flatSidebar: false })} />,
   play: async ({ canvasElement }) => {
     await waitForWorkspace(canvasElement);
-    await expectTokenTextsReadable(canvasElement, { "--color-muted": 3 });
+    await expectTokenTextsReadable(canvasElement, { [token]: 3 });
   },
-};
+});
+
+export const WorkspaceWithSidebars = workspaceWithSidebarsStory("light", "--color-muted");
+export const WorkspaceWithSidebarsFlexokiLight = workspaceWithSidebarsStory(
+  "flexoki-light",
+  "--color-secondary"
+);
 
 // The flat sidebar's header adds "New chat", a `--color-muted` text since #6010 (it was the one
 // `--color-secondary` text on these screens), so it counts toward the muted minimum.
@@ -305,6 +317,30 @@ export const Settings: AppStory = {
   },
 };
 
+/**
+ * Light `--color-muted-light` text in Settings > Models: model rows label their aliases and
+ * limits with it. It now aliases `--color-muted`, so the texts match both tokens (#5984).
+ */
+export const MutedLightModels: AppStory = {
+  globals: { theme: "light" },
+  parameters: lightContract,
+  render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
+  play: async ({ canvasElement }) => {
+    const dialog = await openSettingsDialog(canvasElement);
+    await userEvent.click(within(dialog).getByRole("button", { name: "Models" }));
+    const found = await waitFor(
+      () => {
+        const texts = tokenTextContrasts(dialog, ["--color-muted-light"]);
+        if (texts.length < 5)
+          throw new Error(`expected 5+ muted-light texts, found ${texts.length}`);
+        return texts;
+      },
+      { timeout: 15_000 }
+    );
+    await expectReadable(found.map((entry) => ({ ...entry, label: entry.token })));
+  },
+};
+
 // ─── Code colors (#5980) and the selected-tab count (#5965) ─────────────────────────────────
 
 const CODE_ANSWER = [
@@ -415,7 +451,7 @@ const selectedTab = (root: HTMLElement) => [
  * screen does not happen to render (for example the warning token) is still proven, including
  * on the review diff's green and red line tints.
  */
-async function expectCodeReadable(canvasElement: HTMLElement, theme: ThemeMode) {
+async function expectCodeReadable(canvasElement: HTMLElement) {
   await within(canvasElement).findByText("Renamed", { exact: false }, { timeout: 15_000 });
   // The diff's added and removed lines carry a green and a red tint over the code background.
   // Look the tokens up on every retry: the diff can highlight after the first 8 tokens render.
@@ -439,14 +475,11 @@ async function expectCodeReadable(canvasElement: HTMLElement, theme: ThemeMode) 
     )
   );
   const tab = await findTexts("selected tab", 2, () => selectedTab(canvasElement));
-  // The branch name shows in the chat header and in the footer's branch selector (text-muted).
-  // Light only: flexoki-light's muted token is 4.47:1 on the footer, a token decision (#5984).
-  const branch =
-    theme === "light"
-      ? await findTexts("branch name", 2, () =>
-          within(canvasElement).queryAllByText("feature/light-code")
-        )
-      : [];
+  // The branch name shows in the chat header and in the footer's branch selector (text-muted),
+  // in both light themes since the flexoki-light muted token change (#5984).
+  const branch = await findTexts("branch name", 2, () =>
+    within(canvasElement).queryAllByText("feature/light-code")
+  );
   await expectReadable([...tokens, ...inlineCode, ...tab, ...branch]);
 
   const replacements = Object.values(SHIKI_COLOR_REPLACEMENTS[SHIKI_LIGHT_THEME]);
@@ -511,7 +544,7 @@ const codeStory = (theme: ThemeMode): AppStory => ({
   // With the seeded review, tokens also sit under the review-range highlight (#6006).
   render: () => <AppWithMocks setup={() => setupCodeWorkspace("review", true)} />,
   play: async ({ canvasElement }) => {
-    await expectCodeReadable(canvasElement, theme);
+    await expectCodeReadable(canvasElement);
   },
 });
 
@@ -656,3 +689,45 @@ const darkSecondaryStory = (theme: ThemeMode): AppStory => ({
 
 export const SecondaryTextDark = darkSecondaryStory("dark");
 export const SecondaryTextFlexokiDark = darkSecondaryStory("flexoki-dark");
+
+// ─── Dark accent text (#5946) ────────────────────────────────────────────────────────────────
+
+/** An assistant answer with markdown links on the main surface, then Settings. */
+function setupAccentLinkWorkspace() {
+  return setupSimpleChatStory({
+    workspaceId: "ws-dark-accent",
+    workspaceName: "feature/dark-accent",
+    projectName: "my-app",
+    messages: [
+      createUserMessage("u1", "Where is the setup guide?", {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP - 60_000,
+      }),
+      createAssistantMessage(
+        "a1",
+        "See the [setup guide](https://example.com/setup) and the [release notes](https://example.com/notes).",
+        { historySequence: 2, timestamp: STABLE_TIMESTAMP }
+      ),
+    ],
+  });
+}
+
+const darkAccentLinkStory = (theme: ThemeMode): AppStory => ({
+  globals: { theme },
+  parameters: lightContract,
+  render: () => <AppWithMocks setup={setupAccentLinkWorkspace} />,
+  play: async ({ canvasElement }) => {
+    const links = await findTexts("markdown link", 2, () => [
+      ...canvasElement.querySelectorAll<HTMLElement>(".markdown-content a"),
+    ]);
+    // The selected Settings section is accent text on an accent tint (flexoki-dark: 4.37:1 before).
+    const dialog = await openSettingsDialog(canvasElement);
+    const section = await findTexts("selected Settings section", 1, () => [
+      within(dialog).getByRole("button", { name: "General" }),
+    ]);
+    await expectReadable([...links, ...section]);
+  },
+});
+
+export const AccentLinksDark = darkAccentLinkStory("dark");
+export const AccentLinksFlexokiDark = darkAccentLinkStory("flexoki-dark");

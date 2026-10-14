@@ -135,9 +135,11 @@ class DocumentChannel implements McpAppDocumentChannel {
 
   private receive(data: unknown): void {
     const receiver = this.closed ? null : this.receiver;
-    if (receiver == null || !this.allowMessage()) return;
+    if (receiver == null) return;
+    // Not rate limited: the unload must close the frame even after a burst. It can only close
+    // the view's own frame.
     if (isAnnouncement(data, "leave")) receiver.leave();
-    else receiver.message(data);
+    else if (this.allowMessage()) receiver.message(data);
   }
 }
 
