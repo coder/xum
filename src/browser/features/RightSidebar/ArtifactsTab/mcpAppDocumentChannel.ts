@@ -71,6 +71,13 @@ function isAnnouncement(data: unknown, type: "open" | "leave"): boolean {
   );
 }
 
+/** The port of `event` when it is the open announcement of the document with `nonce`. */
+function openedPort(event: Pick<MessageEvent, "data" | "ports">, nonce: string) {
+  if (!isAnnouncement(event.data, "open")) return null;
+  const matches = (event.data as { nonce?: unknown }).nonce === nonce;
+  return matches && event.ports.length === 1 ? event.ports[0] : null;
+}
+
 export interface McpAppDocumentReceiver {
   message: (data: unknown) => void;
   /** The document unloaded (it navigated away). */
@@ -95,35 +102,45 @@ export interface McpAppDocumentChannel {
  * frame, across host rebuilds (the document announces itself once). Rate limited per document,
  * so a burst of an earlier document cannot drop this one's messages.
  */
-export function createMcpAppDocumentChannel(nonce: string): McpAppDocumentChannel {
-  let port: MessagePort | null = null;
-  let closed = false;
-  let receiver: McpAppDocumentReceiver | null = null;
-  const allowMessage = createBridgeRateLimiter();
-  const receive = (data: unknown) => {
-    if (closed || receiver == null || !allowMessage()) return;
+class DocumentChannel implements McpAppDocumentChannel {
+  // Bound once by the document's open announcement; the port is never replaced.
+  private port: MessagePort | null = null;
+  private closed = false;
+  private receiver: McpAppDocumentReceiver | null = null;
+  private readonly allowMessage = createBridgeRateLimiter();
+
+  constructor(private readonly nonce: string) {}
+
+  acceptOpen = (event: Pick<MessageEvent, "data" | "ports">): boolean => {
+    if (this.port != null || this.closed) return false;
+    const opened = openedPort(event, this.nonce);
+    if (opened == null) return false;
+    this.port = opened;
+    opened.onmessage = (message) => this.receive(message.data);
+    return true;
+  };
+
+  setReceiver = (next: McpAppDocumentReceiver | null): void => {
+    this.receiver = next;
+  };
+
+  post = (message: unknown): void => {
+    if (!this.closed) this.port?.postMessage(message);
+  };
+
+  close = (): void => {
+    this.closed = true;
+    this.port?.close();
+  };
+
+  private receive(data: unknown): void {
+    const receiver = this.closed ? null : this.receiver;
+    if (receiver == null || !this.allowMessage()) return;
     if (isAnnouncement(data, "leave")) receiver.leave();
     else receiver.message(data);
-  };
-  return {
-    acceptOpen: (event) => {
-      if (port != null || closed || !isAnnouncement(event.data, "open")) return false;
-      if ((event.data as { nonce?: unknown }).nonce !== nonce || event.ports.length !== 1) {
-        return false;
-      }
-      port = event.ports[0];
-      port.onmessage = (message) => receive(message.data);
-      return true;
-    },
-    setReceiver: (next) => {
-      receiver = next;
-    },
-    post: (message) => {
-      if (!closed) port?.postMessage(message);
-    },
-    close: () => {
-      closed = true;
-      port?.close();
-    },
-  };
+  }
+}
+
+export function createMcpAppDocumentChannel(nonce: string): McpAppDocumentChannel {
+  return new DocumentChannel(nonce);
 }
