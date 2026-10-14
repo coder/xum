@@ -2497,6 +2497,172 @@ describe("Config", () => {
       }
     });
 
+    /** Replace a symlink atomically, as a dotfiles manager does. */
+    function repointLink(link: string, target: string): void {
+      fs.symlinkSync(target, `${link}.tmp`);
+      fs.renameSync(`${link}.tmp`, link);
+    }
+
+    it("notifies when the missing target of a dangling config.json symlink appears", async () => {
+      const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      try {
+        // Neither the target nor its folder exists yet.
+        const target = path.join(targetRoot, "dotfiles", "xum.json");
+        fs.symlinkSync(target, path.join(tempDir, "config.json"));
+        const next = nextNotification(config);
+        fs.mkdirSync(path.dirname(target));
+        fs.writeFileSync(target, JSON.stringify({ projects: [], updateChannel: "nightly" }));
+        await next.promise;
+        next.unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(targetRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("follows a repointed symlinked folder in the config.json target path", async () => {
+      const dotfiles = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-dotfiles-"));
+      try {
+        for (const [name, updateChannel] of [
+          ["a", undefined],
+          ["b", "npm"],
+        ] as const) {
+          fs.mkdirSync(path.join(dotfiles, name));
+          fs.writeFileSync(
+            path.join(dotfiles, name, "xum.json"),
+            JSON.stringify({ projects: [], updateChannel })
+          );
+        }
+        const current = path.join(dotfiles, "current");
+        fs.symlinkSync(path.join(dotfiles, "a"), current);
+        fs.symlinkSync(path.join(current, "xum.json"), path.join(tempDir, "config.json"));
+        let notified = Promise.withResolvers<void>();
+        const unsubscribe = config.onConfigChanged(() => notified.resolve());
+        // Only `current` changes: config.json and both target folders stay as they were.
+        repointLink(current, path.join(dotfiles, "b"));
+        await notified.promise;
+        expect(config.getUpdateChannel()).toBe("npm");
+        notified = Promise.withResolvers<void>();
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(dotfiles, { recursive: true, force: true });
+      }
+    });
+
+    it("follows a second relink that lands while the watches are reinstalled", async () => {
+      const dirs = ["a", "b", "c1", "c2"].map((name) =>
+        fs.mkdtempSync(path.join(os.tmpdir(), `mux-test-target-${name}-`))
+      );
+      const [dirA, dirB, dirC1, dirC2] = dirs;
+      const link = path.join(tempDir, "config.json");
+      // A second link in dirB: dirB gets its first watch in the reinstall, so a repoint of
+      // this link before that watch exists produces no event at all.
+      const innerLink = path.join(dirB, "link.json");
+      const realWatch = fs.watch;
+      // Armed after the first setup: the second relink belongs to the reinstall.
+      let armed = false;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (armed && fs.realpathSync(String(args[0])) === fs.realpathSync(dirB)) {
+          armed = false;
+          repointLink(innerLink, path.join(dirC2, "config.json"));
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      try {
+        for (const dir of [dirA, dirC1, dirC2]) {
+          fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ projects: [] }));
+        }
+        fs.symlinkSync(path.join(dirC1, "config.json"), innerLink);
+        fs.symlinkSync(path.join(dirA, "config.json"), link);
+        let notified = Promise.withResolvers<void>();
+        const unsubscribe = config.onConfigChanged(() => notified.resolve());
+        armed = true;
+        repointLink(link, innerLink);
+        await notified.promise;
+        expect(armed).toBe(false);
+        notified = Promise.withResolvers<void>();
+        // The save lands in dirC2: only a watch on dirC2 sees it.
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        watchSpy.mockRestore();
+        for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps the config dir watch when the target folder's watch fails", async () => {
+      const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-a-"));
+      const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-b-"));
+      const link = path.join(tempDir, "config.json");
+      const watchers = new Map<string, fs.FSWatcher>();
+      const realWatch = fs.watch;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        const watcher = realWatch(...args);
+        watchers.set(fs.realpathSync(String(args[0])), watcher);
+        return watcher;
+      }) as typeof fs.watch);
+      const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
+      try {
+        fs.writeFileSync(path.join(dirA, "config.json"), JSON.stringify({ projects: [] }));
+        fs.writeFileSync(
+          path.join(dirB, "config.json"),
+          JSON.stringify({ projects: [], updateChannel: "npm" })
+        );
+        fs.symlinkSync(path.join(dirA, "config.json"), link);
+        let notified = Promise.withResolvers<void>();
+        const unsubscribe = config.onConfigChanged(() => notified.resolve());
+        const rootWatcher = watchers.get(fs.realpathSync(tempDir));
+        const targetWatcher = watchers.get(fs.realpathSync(dirA));
+        if (!rootWatcher || !targetWatcher) throw new Error("expected config and target watches");
+        const rootClose = spyOn(rootWatcher, "close");
+        // The target folder's mount went away.
+        targetWatcher.emit("error", new Error("EPERM: operation not permitted"));
+        expect(rootClose).not.toHaveBeenCalled();
+        // The config dir watch still follows a relink.
+        repointLink(link, path.join(dirB, "config.json"));
+        await notified.promise;
+        notified = Promise.withResolvers<void>();
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        debugSpy.mockRestore();
+        watchSpy.mockRestore();
+        fs.rmSync(dirA, { recursive: true, force: true });
+        fs.rmSync(dirB, { recursive: true, force: true });
+      }
+    });
+
+    it("logs a throwing listener's error on another process's edit and still notifies the rest", async () => {
+      await config.setUpdateChannel("npm");
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      // Subscribed first, so an unguarded emit would stop before the next listener.
+      const unsubscribeThrowing = config.onConfigChanged(() => {
+        throw new Error("listener failed");
+      });
+      const next = nextNotification(config);
+      try {
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await next.promise;
+        expect(errorSpy).toHaveBeenCalled();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        next.unsubscribe();
+        unsubscribeThrowing();
+        errorSpy.mockRestore();
+      }
+    });
+
     it("stops watching for good once stopWatchingConfigFile runs", () => {
       const watchers: fs.FSWatcher[] = [];
       const realWatch = fs.watch;
