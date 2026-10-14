@@ -136,7 +136,7 @@ import {
 } from "@/browser/utils/chatEditing";
 
 import { type ThinkingLevel } from "@/common/types/thinking";
-import { normalizeRuntimeEnablement, RUNTIME_MODE } from "@/common/types/runtime";
+import { normalizeRuntimeEnablement } from "@/common/types/runtime";
 import {
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
@@ -185,6 +185,7 @@ import {
   resolveInlineSkillRefsForSend,
   resolveMcpPromptRefsForSend,
   validateCreationRuntime,
+  creationRuntimeBlocksSend,
   filePartsToChatAttachments,
   type SkillResolutionTarget,
 } from "./utils";
@@ -959,18 +960,17 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const hasTypedText = input.trim().length > 0;
   const hasImages = attachments.length > 0;
   const hasReviews = reviewData !== undefined;
-  // Disable send while Coder presets are loading (user could bypass preset validation)
-  const coderPresetsLoading =
-    coderState.enabled && !coderState.coderConfig?.existingWorkspace && coderState.loadingPresets;
-  // #6033: the trunk branch stays empty until the branch list loads, and the backend refuses
-  // every runtime except local without one, so a creation send must wait for the list. A failed
-  // list keeps it closed too (#6055).
-  const creationBranchesLoading =
+  // A creation send waits for the branch list (#6033) and, for a Dev Container, the current
+  // runtime probe (#6383).
+  const creationRuntimeLoading =
     variant === "creation" &&
     props.kind !== "scratch" &&
-    creationState.branchLoad !== "loaded" &&
-    creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
-  useReportCreationSendBlocked(creationBranchesLoading, props);
+    creationRuntimeBlocksSend(
+      creationState.selectedRuntime,
+      creationState.branchLoad,
+      creationState.runtimeAvailabilityFresh
+    );
+  useReportCreationSendBlocked(creationRuntimeLoading, props);
   const isProcessingAttachments = processingAttachmentCount > 0;
   const hasSendableDraft = hasTypedText || hasImages || hasReviews;
   // Workspace sends/edits mutate history relative to the visible transcript, so they wait for
@@ -992,8 +992,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     !disabled &&
     !sendInFlightBlocksInput &&
     !isProcessingAttachments &&
-    !coderPresetsLoading &&
-    !creationBranchesLoading &&
+    // The Coder presets (new mode) or workspaces (existing mode) of the current client are
+    // loading: a reconnect keeps the shown lists, but the server can have changed them.
+    !coderState.blocksSend &&
+    !creationRuntimeLoading &&
     !transcriptBlocksSend &&
     !editPreconditionInvalidated;
   const runningGoalActive =

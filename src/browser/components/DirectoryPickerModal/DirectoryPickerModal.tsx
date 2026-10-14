@@ -18,6 +18,16 @@ import { getErrorMessage } from "@/common/utils/errors";
 
 const OPEN_KEYBIND = { key: "o", ctrl: true };
 
+/** What a failed listDirectory shows. A missing folder offers to create it. */
+function listDirectoryFailure(error: unknown): { error: string; canCreateFolder: boolean } {
+  const errorMessage = typeof error === "string" ? error : "Unknown error";
+  // Detect "no such file or directory" to offer folder creation
+  if (errorMessage.includes("ENOENT") || errorMessage.includes("no such file or directory")) {
+    return { error: "Folder doesn't exist.", canCreateFolder: true };
+  }
+  return { error: `Failed to load directory: ${errorMessage}`, canCreateFolder: false };
+}
+
 interface DirectoryPickerModalProps {
   isOpen: boolean;
   initialPath: string;
@@ -42,9 +52,16 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
   const [showHiddenFiles, setShowHiddenFiles] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const treeRef = useRef<HTMLDivElement>(null);
+  // The directory shown, or the last one requested: a reconnect reloads it (#6383).
+  const currentPathRef = useRef(initialPath || ".");
+  // The initialPath this open was set up for (null while closed), so the open-time setup runs
+  // once per open and not again when a reconnect brings a new client.
+  const openedPathRef = useRef<string | null>(null);
 
+  // `keepSelection`: a reload of the same directory, which keeps the typed path and selection.
   const loadDirectory = useCallback(
-    async (path: string) => {
+    async (path: string, keepSelection = false) => {
+      currentPathRef.current = path;
       if (!liveApi) {
         setError("Not connected to server");
         return;
@@ -57,21 +74,16 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
         const result = await liveApi.general.listDirectory({ path });
 
         if (!result.success) {
-          const errorMessage = typeof result.error === "string" ? result.error : "Unknown error";
-          // Detect "no such file or directory" to offer folder creation
-          const isNotFound =
-            errorMessage.includes("ENOENT") || errorMessage.includes("no such file or directory");
-          if (isNotFound) {
-            setCanCreateFolder(true);
-            setError("Folder doesn't exist.");
-          } else {
-            setError(`Failed to load directory: ${errorMessage}`);
-          }
+          const failure = listDirectoryFailure(result.error);
+          setCanCreateFolder(failure.canCreateFolder);
+          setError(failure.error);
           setRoot(null);
           return;
         }
 
         setRoot(result.data);
+        currentPathRef.current = result.data.path;
+        if (keepSelection) return;
         setPathInput(result.data.path);
         setSelectedIndex(0);
       } catch (err) {
@@ -87,11 +99,21 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
 
   // Sync pathInput with initialPath when modal opens (component stays mounted)
   useEffect(() => {
-    if (!isOpen) return;
-    setPathInput(initialPath || "");
-    setShowHiddenFiles(false);
-    void loadDirectory(initialPath || ".");
-  }, [isOpen, initialPath, loadDirectory]);
+    if (!isOpen) {
+      openedPathRef.current = null;
+      return;
+    }
+    if (openedPathRef.current !== initialPath) {
+      openedPathRef.current = initialPath;
+      setPathInput(initialPath || "");
+      setShowHiddenFiles(false);
+      void loadDirectory(initialPath || ".");
+      return;
+    }
+    // A new client (reconnect) while open: reload the shown directory, and keep what the user
+    // typed or selected. While offline (no client), keep the shown directory as it is.
+    if (liveApi) void loadDirectory(currentPathRef.current, true);
+  }, [isOpen, initialPath, liveApi, loadDirectory]);
 
   const handleNavigateTo = useCallback(
     (path: string) => {
@@ -121,15 +143,9 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
       try {
         const result = await liveApi.general.listDirectory({ path: trimmedInput });
         if (!result.success) {
-          const errorMessage = typeof result.error === "string" ? result.error : "Unknown error";
-          const isNotFound =
-            errorMessage.includes("ENOENT") || errorMessage.includes("no such file or directory");
-          if (isNotFound) {
-            setCanCreateFolder(true);
-            setError("Folder doesn't exist.");
-          } else {
-            setError(`Failed to load directory: ${errorMessage}`);
-          }
+          const failure = listDirectoryFailure(result.error);
+          setCanCreateFolder(failure.canCreateFolder);
+          setError(failure.error);
           setRoot(null);
           return;
         }

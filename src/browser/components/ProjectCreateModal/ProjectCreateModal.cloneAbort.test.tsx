@@ -128,6 +128,26 @@ describe("ProjectAddForm", () => {
     await waitFor(() => expect(onIsCreatingChange).toHaveBeenCalledWith(false));
   });
 
+  // #6383: a load on the kept client fails while offline; the next client must load it.
+  test.each([...GAP_MODES])(
+    "opened while offline, it loads the default clone directory after the reconnect (%s)",
+    async (mode) => {
+      const harness = createConnectionHarness(mode, () => ({
+        projects: { getDefaultProjectDir: () => Promise.resolve("/projects") },
+      }));
+      await harness.drop();
+      const view = render(<ProjectAddForm isOpen onSuccess={() => undefined} />, {
+        wrapper: harness.Wrapper,
+      });
+      fireEvent.click(view.getByText("Clone repo"));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(view.queryByDisplayValue("/projects")).toBeNull();
+
+      harness.reconnect();
+      await view.findByDisplayValue("/projects");
+    }
+  );
+
   test.each([...GAP_MODES])(
     "adding the existing clone while offline says it is not connected (%s)",
     async (mode) => {

@@ -44,7 +44,11 @@ import { isInitialStagingLocked } from "@/browser/features/ChatInput/initialStag
 import { GlobalWindow } from "happy-dom";
 import type { PendingFileChatAttachment } from "./ChatAttachments";
 import type { WorkspaceCreatedOptions } from "./types";
-import { useCreationWorkspace, type CreationSendResult } from "./useCreationWorkspace";
+import {
+  useCreationWorkspace,
+  type CreationSendResult,
+  type RuntimeAvailabilityMap,
+} from "./useCreationWorkspace";
 
 // Composer drafts live in the (singleton) draft store; each test starts from empty drafts.
 const workspaceDraft = () =>
@@ -768,6 +772,82 @@ describe("useCreationWorkspace", () => {
       act(() => answerBranches?.());
       await waitFor(() => expect(resultRef.current?.branches).toEqual(["main", "next"]));
       expect(resultRef.current?.branchLoad).toBe("loaded");
+    });
+
+    // #6383: a Dev Container config removed while offline must not be sent while the new probe
+    // runs. The shown configs stay, but the send preflight waits for the current probe.
+    test("refuses a Dev Container send until the reconnect probe answers", async () => {
+      const gone = ".devcontainer/gone/devcontainer.json";
+      const kept = ".devcontainer/devcontainer.json";
+      draftSettingsState = createDraftSettingsHarness({
+        selectedRuntime: { mode: "devcontainer", configPath: gone },
+      });
+      const { workspaceApi, nameGenerationApi } = setupWindow({
+        nameGeneration: mock(
+          (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
+            Promise.resolve({
+              success: true,
+              data: { name: "generated-name", modelUsed: "anthropic:claude-haiku-4-5" },
+            } as NameGenerationResult)
+        ),
+      });
+      const availability = (paths: string[]): RuntimeAvailabilityMap => ({
+        local: { available: true },
+        worktree: { available: true },
+        ssh: { available: true },
+        docker: { available: true },
+        devcontainer: {
+          available: true,
+          configs: paths.map((path) => ({ path, label: path })),
+        },
+      });
+      const withProbe = (probe: () => Promise<RuntimeAvailabilityMap>) => {
+        const client = currentORPCClient;
+        if (!client) throw new Error("setupWindow() sets the client");
+        currentORPCClient = {
+          ...client,
+          projects: { ...client.projects, runtimeAvailability: probe },
+        };
+      };
+      withProbe(() => Promise.resolve(availability([gone, kept])));
+      const harness = createConnectionHarness(mode, () => currentORPCClient ?? {});
+      const resultRef: { current: ReturnType<typeof useCreationWorkspace> | null } = {
+        current: null,
+      };
+      function Harness() {
+        resultRef.current = useCreationWorkspace({
+          projectPath: TEST_PROJECT_PATH,
+          onWorkspaceCreated: () => undefined,
+          message: "hello",
+        });
+        return null;
+      }
+      render(
+        <harness.Wrapper>
+          <Harness />
+        </harness.Wrapper>
+      );
+      await waitFor(() => expect(resultRef.current?.runtimeAvailabilityFresh).toBe(true));
+      await waitFor(() => expect(nameGenerationApi.generate).toHaveBeenCalled());
+
+      let answerProbe: (() => void) | null = null;
+      const probeAnswered = new Promise<void>((resolve) => (answerProbe = resolve));
+      withProbe(() => probeAnswered.then(() => availability([kept])));
+      await harness.drop();
+      harness.reconnect();
+      await waitFor(() => expect(resultRef.current?.branchLoad).toBe("loaded"));
+
+      expect(resultRef.current?.runtimeAvailabilityState.status).toBe("loaded");
+      expect(resultRef.current?.runtimeAvailabilityFresh).toBe(false);
+      let result: CreationSendResult | undefined;
+      await act(async () => {
+        result = await resultRef.current?.handleSend("hello");
+      });
+      expect(result).toEqual({ success: false });
+      expect(workspaceApi.create).not.toHaveBeenCalled();
+
+      act(() => answerProbe?.());
+      await waitFor(() => expect(resultRef.current?.runtimeAvailabilityFresh).toBe(true));
     });
   });
 
