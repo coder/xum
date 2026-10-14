@@ -34,7 +34,12 @@ import type {
   SendStatus,
 } from "@/common/orpc/schemas/drafts";
 import type { FilePart } from "@/common/orpc/types";
-import { hasDraftBlock, joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
+import {
+  hasDraftBlock,
+  joinDraftText,
+  removeSentText,
+  takeSentText,
+} from "@/common/utils/composerDraftText";
 import {
   draftJsonBytes,
   draftScopeKey,
@@ -206,6 +211,13 @@ interface Entry {
    */
   basisSends: Map<string, BasisSend>;
   /**
+   * #6405: the composer text at Enter (`sent`) while its send has not taken it. `last` is the
+   * text the latest setText wrote; `intact` stays true while every edit since Enter came through
+   * setText and appended to the text before it (keys typed after `sent`). Only then does the take cut
+   * exactly that prefix: a replaced or restored text keeps the whitespace rule (removeSentText).
+   */
+  sendMark: { sent: string; last: string; intact: boolean } | null;
+  /**
    * The newest server view (any push, snapshot or write reply). A field with an unsaved edit
    * keeps the edit; once its write is confirmed, the field takes this view.
    */
@@ -258,6 +270,21 @@ function confirmWrite(
       versions.attachments
     );
   }
+}
+
+/**
+ * A local edit to `next` keeps the send mark only if it appends to the text the mark last saw
+ * (so the sent text stays its prefix). A delete or a replace ends it.
+ */
+function followSendMark(entry: Entry, next: string): void {
+  const mark = entry.sendMark;
+  if (!mark) return;
+  mark.intact &&= entry.text === mark.last && next.startsWith(mark.last);
+  mark.last = next;
+}
+
+function typedAfterSendField(typedHere: boolean, text: string): { typedAfterSendText?: string } {
+  return typedHere ? { typedAfterSendText: text } : {};
 }
 
 function isTextDirty(entry: Entry): boolean {
@@ -777,10 +804,29 @@ export class DraftStore {
     const entry = this.getOrCreateEntry(scope);
     const next = typeof value === "function" ? value(entry.text) : value;
     if (next === entry.text) return;
+    followSendMark(entry, next);
     entry.text = next;
     entry.textVersion++;
     this.recompute(entry);
     this.scheduleFlush(entry);
+  }
+
+  /** #6405: Enter on `text`; keys typed until its send takes it follow it (see Entry.sendMark). */
+  markSendStart(scope: DraftStoreScope, text: string): void {
+    const entry = this.getOrCreateEntry(scope);
+    entry.sendMark = { sent: text, last: entry.text, intact: entry.text === text };
+  }
+
+  /**
+   * Whether the text holds `sent` followed only by keys typed after Enter (see Entry.sendMark).
+   * Ends the mark: one take per Enter.
+   */
+  takeSendMark(scope: DraftStoreScope, sent: string): boolean {
+    const entry = this.entries.get(draftStoreScopeKey(scope));
+    if (!entry) return false;
+    const mark = entry.sendMark;
+    entry.sendMark = null;
+    return mark?.intact === true && mark.sent === sent && mark.last === entry.text;
   }
 
   /**
@@ -958,6 +1004,10 @@ export class DraftStore {
       };
       const textBefore = entry.text;
       const unsavedText = isTextDirty(entry) ? textBefore : undefined;
+      // #6405: keys typed after Enter follow the sent text, and the take cuts exactly that prefix
+      // (takeSentText). The backend cuts it only from this same text (saved or not), never from
+      // a newer one another window wrote.
+      const typedHere = this.takeSendMark(scope, input.text);
       const missing = input.attachments.filter(
         (sent) => !entry.attachments.some(({ id }) => id === sent.id)
       );
@@ -968,7 +1018,7 @@ export class DraftStore {
         entry.attachments = [...entry.attachments, ...missing];
         entry.attachmentCount += missing.length;
       }
-      const textAfter = removeSentText(textBefore, input.text);
+      const textAfter = takeSentText(textBefore, input.text, typedHere);
       if (textAfter !== textBefore) {
         entry.text = textAfter;
         entry.textVersion++;
@@ -987,6 +1037,7 @@ export class DraftStore {
           pendingSend,
           attachments: input.attachments,
           ...(unsavedText !== undefined ? { text: unsavedText } : {}),
+          ...typedAfterSendField(typedHere, textBefore),
           ...(basisSends.length > 0 ? { basisSends } : {}),
         });
         // A replaced backend's reply: the current one holds neither the removal nor the
@@ -1012,7 +1063,10 @@ export class DraftStore {
           attachmentIds: pendingSend.attachmentIds,
           undone: true,
         });
-        if (entry.text !== textBefore && removeSentText(entry.text, input.text) === entry.text) {
+        // Put the text back unless the composer holds it again as a whole block: keys can be
+        // typed during this request (#6405), so a text that merely starts with it ("okay" after
+        // "ok") gets it back beside it.
+        if (textAfter !== textBefore && !hasDraftBlock(entry.text, input.text)) {
           entry.text = joinDraftText(input.text, entry.text);
           entry.textVersion++;
         }
@@ -1481,6 +1535,7 @@ export class DraftStore {
       pendingSends: [],
       localSends: new Map(),
       basisSends: new Map(),
+      sendMark: null,
       serverView: null,
       view: EMPTY_VIEW,
     };
