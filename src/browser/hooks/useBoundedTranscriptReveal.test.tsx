@@ -714,5 +714,27 @@ describe("useBoundedTranscriptReveal", () => {
       for (const cap of [TRANSCRIPT_REVEAL_AUTO_MAX_ROWS, MAX + 0.5])
         expect(() => renderSlice(cap)).toThrow();
     });
+
+    // One reconciliation each (#6667 review deferrals, F20 PR3a-1).
+    test("deleting unmounted newer rows keeps a paused detached slice paused", () => {
+      const { frames, reveal, readBack, setProps, props } = renderSlice(MAX);
+      readBack();
+      const { fromIndex, toIndex } = reveal();
+      setProps({ messages: props().messages.filter((_, i) => i < toIndex || i > toIndex + 100) });
+      expect(frames.hasPending()).toBe(false);
+      expect(reveal()).toMatchObject({ fromIndex, toIndex });
+    });
+
+    test("deleting the end rows on both sides of the edge falls back to the newest kept row", () => {
+      const { reveal, readBack, setProps, props } = renderSlice(MAX);
+      readBack();
+      const { toIndex } = reveal();
+      const keptId = props().messages[toIndex - 51].id;
+      setProps({
+        messages: props().messages.filter((_, i) => i < toIndex - 50 || i > toIndex),
+      });
+      expect(reveal().toIndex).toBe(toIndex - 50);
+      expect(props().messages[reveal().toIndex - 1].id).toBe(keptId);
+    });
   });
 });
