@@ -6,11 +6,16 @@
  * - `parse*` throws when the output does not match Codex's output schema: an unknown field
  *   (Codex's wire structs use `deny_unknown_fields`; the generated output schemas set
  *   `additionalProperties: false`), a wrong type or a value outside an enum. Nothing of it applies.
- * - A result with `invalid` set parsed but breaks a semantic rule (a block without a reason, a
+ * - A result with `invalid` set parsed but breaks a semantic rule (a reason without a decision, a
  *   field the event does not support). Codex still shows its `systemMessage` and ignores the rest.
  *
- * Xum differences: JSON null on any optional field reads as absent (Codex PRRT_kwDOPxxmWM6rgpoH),
- * and `structuredContent` is read when the result has no text (Codex reads text only).
+ * Xum differences:
+ * - An explicit PreToolUse deny and a PostToolUse block or stop always apply, also when Codex
+ *   would void the output for a semantic rule (no reason, suppressOutput, continue: false next to
+ *   a deny). A trusted guard's refusal must not let a model-controlled call through (Codex
+ *   security review PRRT_kwDOPxxmWM6sQaTD). Only a malformed output fails open.
+ * - JSON null on any optional field reads as absent (Codex PRRT_kwDOPxxmWM6rgpoH).
+ * - `structuredContent` is read when the result has no text (Codex reads text only).
  */
 import { isPlainObject } from "./manifest";
 
@@ -91,16 +96,27 @@ export function parsePreToolUseOutput(result: unknown): PreToolUseOutput | null 
   const wire = readWire(result, "PreToolUse");
   if (wire === null) return null;
   const { raw, specific } = wire;
-  const universal = unsupportedUniversal(raw, "PreToolUse", { allowContinueFalse: false });
   // Codex: any hook-specific decision field means the legacy `decision`/`reason` pair is not
   // consulted (PRRT_kwDOPxxmWM6r6NnG).
+  const chosen = hasSpecificDecision(specific)
+    ? preSpecificDecision(specific)
+    : preLegacyDecision(raw);
+  // PreToolUse does not support continue: false or stopReason. Codex voids such an output; Xum
+  // still honors its deny (see NO_REASON) and voids only the other decisions.
+  const unsupported =
+    raw.continue === false
+      ? "returned unsupported continue false"
+      : raw.stopReason != null
+        ? "returned unsupported stopReason"
+        : undefined;
   const decision: Decision<PreToolUseOutput> =
-    universal !== undefined
-      ? { invalid: universal }
-      : hasSpecificDecision(specific)
-        ? preSpecificDecision(specific)
-        : preLegacyDecision(raw);
-  return withContext(raw, decision, specific, !("invalid" in decision));
+    unsupported !== undefined && !("denyReason" in chosen) ? { invalid: unsupported } : chosen;
+  return withContext(
+    raw,
+    decision,
+    specific,
+    unsupported === undefined && !("invalid" in decision)
+  );
 }
 
 function hasSpecificDecision(specific: Record<string, unknown>): boolean {
@@ -109,33 +125,38 @@ function hasSpecificDecision(specific: Record<string, unknown>): boolean {
   );
 }
 
+/**
+ * Xum honors an explicit deny even when Codex would void the output for a missing reason or an
+ * extra field next to it (Codex security review PRRT_kwDOPxxmWM6sQaTD): a trusted guard that
+ * denies a model-controlled call must not let it run. Only a malformed output (readWire) fails
+ * open, as in Codex.
+ */
+const NO_REASON = "No reason given by the hook.";
+
 function preSpecificDecision(specific: Record<string, unknown>): Decision<PreToolUseOutput> {
-  const permissionDecision = enumField(specific, "permissionDecision", ["allow", "deny", "ask"]);
-  const updatedInput: unknown = specific.updatedInput;
-  if (updatedInput != null) {
-    return permissionDecision === "allow"
-      ? { updatedInput }
-      : { invalid: "returned updatedInput without permissionDecision allow" };
+  const permissionDecision = specific.permissionDecision;
+  if (permissionDecision === "deny") {
+    return { denyReason: trimmed(stringField(specific, "permissionDecisionReason")) ?? NO_REASON };
   }
-  switch (permissionDecision) {
-    case "allow":
-    case "ask":
-      return { invalid: `returned unsupported permissionDecision ${permissionDecision}` };
-    case "deny":
-      return requireReason(stringField(specific, "permissionDecisionReason"), (denyReason) => ({
-        denyReason,
-      }));
-    default:
-      return { invalid: "returned permissionDecisionReason without permissionDecision" };
+  if (permissionDecision === "allow" && specific.updatedInput != null) {
+    return { updatedInput: specific.updatedInput };
   }
+  if (specific.updatedInput != null) {
+    return { invalid: "returned updatedInput without permissionDecision allow" };
+  }
+  return permissionDecision == null
+    ? { invalid: "returned permissionDecisionReason without permissionDecision" }
+    : {
+        invalid: `returned unsupported permissionDecision ${stringField(specific, "permissionDecision") ?? ""}`,
+      };
 }
 
 function preLegacyDecision(raw: Record<string, unknown>): Decision<PreToolUseOutput> {
-  switch (enumField(raw, "decision", ["approve", "block"])) {
+  switch (raw.decision) {
     case "approve":
       return { invalid: "returned unsupported decision approve" };
     case "block":
-      return requireReason(stringField(raw, "reason"), (denyReason) => ({ denyReason }));
+      return { denyReason: trimmed(stringField(raw, "reason")) ?? NO_REASON };
     default:
       return raw.reason != null ? { invalid: "returned reason without decision" } : {};
   }
@@ -145,32 +166,29 @@ export function parsePostToolUseOutput(result: unknown): PostToolUseOutput | nul
   const wire = readWire(result, "PostToolUse");
   if (wire === null) return null;
   const { raw, specific } = wire;
-  const invalid =
-    unsupportedUniversal(raw, "PostToolUse", { allowContinueFalse: true }) ??
-    (specific.updatedMCPToolOutput != null
-      ? "returned unsupported updatedMCPToolOutput"
-      : undefined) ??
-    invalidBlock(raw);
-  // Codex checks continue: false before any invalid field, so it stops even then; an invalid
-  // output only loses its context (post_tool_use.rs).
+  const invalid = postInvalid(raw, specific);
   const decision: Decision<PostToolUseOutput> =
     raw.continue === false
       ? { stopFeedback: stopFeedback(raw) }
-      : invalid !== undefined
-        ? { invalid }
-        : blockReasonOf(raw);
+      : raw.decision === "block"
+        ? { blockReason: trimmed(stringField(raw, "reason")) ?? NO_REASON }
+        : invalid !== undefined
+          ? { invalid }
+          : {};
   return withContext(raw, decision, specific, invalid === undefined);
 }
 
-/** continue: false feeds the model `reason`, else `stopReason` (Codex post_tool_use.rs). */
-function stopFeedback(raw: Record<string, unknown>): string {
-  const feedback = trimmed(stringField(raw, "reason")) ?? trimmed(stringField(raw, "stopReason"));
-  return feedback ?? "PostToolUse hook stopped execution";
-}
-
-/** Codex: a block needs a non-empty reason, and a continuing hook's reason needs a block. */
-function invalidBlock(raw: Record<string, unknown>): string | undefined {
-  const block = enumField(raw, "decision", ["block"]) === "block";
+/**
+ * Codex's semantic rules for PostToolUse. Codex voids such an output; Xum drops only its context
+ * and keeps a block or stop, as for a PreToolUse deny: it hides an output the hook refused (see
+ * NO_REASON).
+ */
+function postInvalid(
+  raw: Record<string, unknown>,
+  specific: Record<string, unknown>
+): string | undefined {
+  const block = raw.decision === "block";
+  if (specific.updatedMCPToolOutput != null) return "returned unsupported updatedMCPToolOutput";
   if (block && trimmed(stringField(raw, "reason")) === undefined) {
     return "returned a block without a non-empty reason";
   }
@@ -180,8 +198,10 @@ function invalidBlock(raw: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
-function blockReasonOf(raw: Record<string, unknown>): { blockReason?: string } {
-  return raw.decision === "block" ? { blockReason: trimmed(stringField(raw, "reason")) } : {};
+/** continue: false feeds the model `reason`, else `stopReason` (Codex post_tool_use.rs). */
+function stopFeedback(raw: Record<string, unknown>): string {
+  const feedback = trimmed(stringField(raw, "reason")) ?? trimmed(stringField(raw, "stopReason"));
+  return feedback ?? "PostToolUse hook stopped execution";
 }
 
 export function parseUserPromptSubmitOutput(result: unknown): UserPromptSubmitOutput | null {
@@ -196,22 +216,26 @@ export function parseUserPromptSubmitOutput(result: unknown): UserPromptSubmitOu
   const wire = readWire(result, "UserPromptSubmit", text);
   if (wire === null) return null;
   const { raw, specific } = wire;
-  // Codex drops the context only for a block without a reason, also when continue: false stops.
-  const blockWithoutReason =
-    enumField(raw, "decision", ["block"]) === "block" &&
-    trimmed(stringField(raw, "reason")) === undefined;
-  return withContext(raw, promptDecision(raw), specific, !blockWithoutReason);
+  // Codex's only semantic rule here: a block needs a non-empty reason. Such a block fails open
+  // and loses its context, also when continue: false stops the prompt. A reason without a
+  // decision is ignored (PRRT_kwDOPxxmWM6sQVfe).
+  const invalidBlock =
+    raw.decision === "block" && trimmed(stringField(raw, "reason")) === undefined;
+  return withContext(raw, promptDecision(raw, invalidBlock), specific, !invalidBlock);
 }
 
-function promptDecision(raw: Record<string, unknown>): Decision<UserPromptSubmitOutput> {
+function promptDecision(
+  raw: Record<string, unknown>,
+  invalidBlock: boolean
+): Decision<UserPromptSubmitOutput> {
   if (raw.continue === false) {
     // Codex stops the prompt and keeps `stopReason` (user_prompt_submit.rs). Showing `reason`
     // when there is no stopReason is a Xum display choice (PRRT_kwDOPxxmWM6rb29w).
     const why = trimmed(stringField(raw, "stopReason")) ?? trimmed(stringField(raw, "reason"));
     return why !== undefined ? { stopped: true, blockReason: why } : { stopped: true };
   }
-  const invalid = invalidBlock(raw);
-  return invalid !== undefined ? { invalid } : blockReasonOf(raw);
+  if (invalidBlock) return { invalid: "returned a block without a non-empty reason" };
+  return raw.decision === "block" ? { blockReason: trimmed(stringField(raw, "reason")) } : {};
 }
 
 export function parseStopOutput(result: unknown): StopOutput | null {
@@ -233,17 +257,6 @@ export function parseStopOutput(result: unknown): StopOutput | null {
 }
 
 type Decision<T> = Omit<T, "systemMessage" | "additionalContext">;
-
-/** Codex: a block or deny needs a non-empty reason, else the output is invalid (fails open). */
-function requireReason<T>(
-  reason: string | undefined,
-  build: (text: string) => T
-): T | { invalid: string } {
-  const text = trimmed(reason);
-  return text === undefined
-    ? { invalid: "returned a block without a non-empty reason" }
-    : build(text);
-}
 
 /** systemMessage always; additionalContext only when Codex keeps it (`keepContext`). */
 function withContext<T extends Common & { additionalContext?: string }>(
@@ -278,6 +291,10 @@ function readWire(
   typed(raw, ["continue", "suppressOutput"], "boolean");
   typed(raw, ["stopReason", "systemMessage", "reason"], "string");
   typed(specific, ["permissionDecisionReason", "additionalContext"], "string");
+  // Every enum is checked here, also one a later rule ignores: Codex's schema rejects the whole
+  // output first (PRRT_kwDOPxxmWM6sQVfa, PRRT_kwDOPxxmWM6sQVfk).
+  enumField(raw, "decision", event === "PreToolUse" ? ["approve", "block"] : ["block"]);
+  enumField(specific, "permissionDecision", ["allow", "deny", "ask"]);
   return { raw, specific };
 }
 
@@ -314,7 +331,7 @@ function joinedText(result: unknown): string | undefined {
   const content: unknown[] = Array.isArray(result.content) ? result.content : [];
   const parts = content.flatMap(textOf);
   // Joined length (one newline between parts), checked before joining or parsing.
-  const length = parts.reduce((sum, part) => sum + part.length + 1, 0);
+  const length = parts.reduce((sum, part) => sum + part.length, Math.max(0, parts.length - 1));
   if (length > HOOK_RESULT_MAX_CHARS) {
     throw new Error(`the result is over ${HOOK_RESULT_MAX_CHARS} characters`);
   }
@@ -362,21 +379,6 @@ function enumField(record: Record<string, unknown>, field: string, allowed: stri
 function stringField(record: Record<string, unknown>, field: string): string | undefined {
   const value = record[field];
   return typeof value === "string" ? value : undefined;
-}
-
-/** Codex's continue: false, stopReason and suppressOutput support differs per event. */
-function unsupportedUniversal(
-  raw: Record<string, unknown>,
-  event: "PreToolUse" | "PostToolUse",
-  rules: { allowContinueFalse: boolean }
-): string | undefined {
-  if (!rules.allowContinueFalse && raw.continue === false)
-    return "returned unsupported continue false";
-  if (!rules.allowContinueFalse && raw.stopReason != null) return "returned unsupported stopReason";
-  // Codex rejects suppressOutput: true on both tool events (PRRT_kwDOPxxmWM6rZbTo).
-  if (raw.suppressOutput === true)
-    return `returned suppressOutput, which ${event} does not support`;
-  return undefined;
 }
 
 function common(raw: Record<string, unknown>): Common {

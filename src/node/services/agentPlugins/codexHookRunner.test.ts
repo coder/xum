@@ -243,19 +243,20 @@ describe("PreToolUse", () => {
     }
   });
 
-  test("an explicit continue: true is the default and keeps a deny; continue: false fails open", async () => {
-    // Codex P1 (PRRT_kwDOPxxmWM6rQe1X): output_parser.rs rejects only continue: false.
-    const denies = [
+  test("continue: true is the default and keeps a deny; continue: false keeps a deny too", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rQe1X): output_parser.rs rejects only continue: false. Codex
+    // voids the whole output then; Xum still honors an explicit deny (PRRT_kwDOPxxmWM6sQaTD).
+    const denies = [true, false].flatMap((value) => [
       json({
-        continue: true,
+        continue: value,
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
           permissionDecision: "deny",
           permissionDecisionReason: "x",
         },
       }),
-      json({ continue: true, decision: "block", reason: "x" }),
-    ];
+      json({ continue: value, decision: "block", reason: "x" }),
+    ]);
     for (const output of denies) {
       const { spine } = setup([hook("PreToolUse")], () => output);
       const ctx = await runTool(spine, "bash", {});
@@ -264,10 +265,20 @@ describe("PreToolUse", () => {
         error: "Tool call blocked by plugin 'guard' hook: x",
       });
     }
-    const unsupported = setup([hook("PreToolUse")], () =>
-      json({ continue: false, decision: "block", reason: "x" })
+    // Without a deny, the unsupported field voids the output (its rewrite does not apply).
+    const rewrite = setup([hook("PreToolUse")], () =>
+      json({
+        continue: false,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          updatedInput: { script: "safe" },
+        },
+      })
     );
-    expect((await runTool(unsupported.spine, "bash", {})).executed).toBe(true);
+    const schema = { type: "object", properties: { script: { type: "string" } } };
+    const ran = await runTool(rewrite.spine, "bash", { script: "ls" }, schema);
+    expect(ran.result).toEqual({ ran: { script: "ls" } });
   });
 
   test("a deny keeps its own context and the context of earlier hooks", async () => {
@@ -777,27 +788,43 @@ describe("Codex output rules (output_parser.rs)", () => {
     expect(await runTurnStopHooks(stop.spine, workspaceId, stopInput)).toEqual({ kind: "none" });
   });
 
-  test("a block or deny without a non-empty reason fails open on every tool event", async () => {
-    const outputs = [
+  test("an explicit deny or block holds without a reason or with suppressOutput", async () => {
+    // Codex voids these outputs; a trusted guard's explicit deny must still stop a
+    // model-controlled call (Codex security review PRRT_kwDOPxxmWM6sQaTD).
+    const denies = [
       json({ decision: "block" }),
       json({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny" } }),
+      json({ suppressOutput: true, systemMessage: "Seen.", decision: "block", reason: "x" }),
     ];
-    for (const output of outputs) {
+    for (const output of denies) {
       const { spine } = setup([hook("PreToolUse")], () => output);
-      expect((await runTool(spine, "bash", {})).executed).toBe(true);
+      expect((await runTool(spine, "bash", {})).executed).toBe(false);
     }
-    const post = setup([hook("PostToolUse")], () => json({ decision: "block", reason: " " }));
-    expect((await runTool(post.spine, "bash", {})).result).toEqual({ ran: {} });
+    for (const output of [
+      json({ decision: "block", reason: " " }),
+      json({ suppressOutput: true, decision: "block", reason: "x" }),
+    ]) {
+      const post = setup([hook("PostToolUse")], () => output);
+      const ctx = await runTool(post.spine, "bash", {});
+      expect(JSON.stringify(ctx.result)).toContain("[plugin:guard]");
+      expect(ctx.postBlocked).toBe(true);
+    }
   });
 
-  test("suppressOutput on a tool event fails open, but its systemMessage still shows", async () => {
+  test("an invalid decision value is malformed even when another field decides", async () => {
     const pre = setup([hook("PreToolUse")], () =>
-      json({ suppressOutput: true, systemMessage: "Seen.", decision: "block", reason: "x" })
+      json({
+        decision: "invalid",
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: "x",
+        },
+      })
     );
     expect((await runTool(pre.spine, "bash", {})).executed).toBe(true);
-    expect(pre.notices).toEqual(["Seen."]);
     const post = setup([hook("PostToolUse")], () =>
-      json({ suppressOutput: true, decision: "block", reason: "x" })
+      json({ continue: false, decision: "Block", stopReason: "x" })
     );
     expect((await runTool(post.spine, "bash", {})).result).toEqual({ ran: {} });
   });
@@ -837,13 +864,27 @@ describe("Codex output rules (output_parser.rs)", () => {
       json({
         continue: false,
         reason: "Why.",
-        suppressOutput: true,
-        hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: "Dropped." },
+        hookSpecificOutput: {
+          hookEventName: "PostToolUse",
+          additionalContext: "Dropped.",
+          updatedMCPToolOutput: { content: [] },
+        },
       })
     );
     expect((await runTool(invalidStop.spine, "bash", {})).result).toEqual({
       error: "[plugin:guard] Why.",
     });
+  });
+
+  test("UserPromptSubmit: a reason without a decision is ignored, and the context kept", async () => {
+    expect(
+      await prompt(
+        json({
+          reason: "unused",
+          hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: "Kept." },
+        })
+      )
+    ).toEqual({ kind: "context", entries: [{ pluginId: "guard", text: "Kept." }] });
   });
 
   test("UserPromptSubmit: continue: false shows stopReason over reason", async () => {
@@ -871,6 +912,11 @@ describe("Codex output rules (output_parser.rs)", () => {
     const huge = json({ decision: "block", reason: "x".repeat(1024 * 1024) });
     const { spine } = setup([hook("PreToolUse")], () => huge);
     expect((await runTool(spine, "bash", {})).executed).toBe(true);
+    // Exactly at the cap still applies: only separators between parts count.
+    const block = JSON.stringify({ decision: "block", reason: "x" });
+    const atCap = { content: [{ type: "text", text: block.padEnd(1024 * 1024, " ") }] };
+    const capped = setup([hook("PreToolUse")], () => atCap);
+    expect((await runTool(capped.spine, "bash", {})).executed).toBe(false);
   });
 });
 
