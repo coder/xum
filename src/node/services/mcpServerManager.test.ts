@@ -9836,6 +9836,15 @@ describe("prepareStdioLaunch", () => {
         XUM_TEST_FWD_SET: "host",
         XUM_TEST_FWD_SHADOWED: "configured",
       });
+      // An inherited Object.prototype member is not a host variable.
+      const inherited = await prepareStdioLaunch({
+        transport: "stdio",
+        command: "node",
+        args: [],
+        forwardEnv: ["constructor", "toString"],
+        disabled: false,
+      });
+      expect(inherited.env).toBeUndefined();
     } finally {
       names.forEach((name, index) => {
         if (saved[index] === undefined) delete process.env[name];

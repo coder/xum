@@ -258,6 +258,9 @@ describe("loadPluginMcpServers", () => {
         mcpServers: {
           // Codex accepts a bare name or { name, source } (codex-rs config mcp_types.rs).
           named: { command: "node", env_vars: ["API_TOKEN", { name: "REGION", source: "local" }] },
+          // Codex reads null as an absent optional list (serde Option), on any transport.
+          nullList: { command: "node", env_vars: null },
+          nullRemote: { url: "https://b.example.com/mcp", env_vars: null },
           notList: { command: "node", env_vars: "API_TOKEN" },
           // Codex refuses source "remote" for a plugin that runs in the local environment.
           remoteSource: { command: "node", env_vars: [{ name: "X", source: "remote" }] },
@@ -270,12 +273,19 @@ describe("loadPluginMcpServers", () => {
       { fileName: ".mcp.json" }
     );
     const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
-    const infos = Object.values(servers) as MCPStdioServerInfo[];
-    expect(infos.map((s) => [s.plugin?.serverName, s.forwardEnv])).toEqual([
+    const infos = Object.values(servers);
+    expect(
+      infos.map((s) => [s.plugin?.serverName, s.transport === "stdio" ? s.forwardEnv : s.url])
+    ).toEqual([
       ["named", ["API_TOKEN", "REGION"]],
+      ["nullList", undefined],
+      ["nullRemote", "https://b.example.com/mcp"],
     ]);
     // Only names: no host value is read at load time.
-    expect(Object.keys(infos[0].env ?? {})).toEqual(["PLUGIN_ROOT", "PLUGIN_DATA"]);
+    expect(Object.keys((infos[0] as MCPStdioServerInfo).env ?? {})).toEqual([
+      "PLUGIN_ROOT",
+      "PLUGIN_DATA",
+    ]);
     expect(diagnostics.map((d) => [d.severity, /server '(\w+)'/.exec(d.message)?.[1]])).toEqual([
       ["error", "notList"],
       ["error", "remoteSource"],

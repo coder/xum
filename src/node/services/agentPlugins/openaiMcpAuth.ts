@@ -347,7 +347,8 @@ export function translateCodexMcpEntry(entry: Record<string, unknown>): {
   if (type !== undefined) rest.type = type;
   if (rest.cwd !== undefined) rest.cwd = portableCodexCwd(rest.cwd);
   // Xum reads OAuth settings only on remote servers, and env_vars is stdio-only.
-  if (envVars !== undefined)
+  // Codex reads `env_vars: null` as absent (an optional list in mcp_types.rs).
+  if (envVars != null)
     return { entry: rest, ignored, warnings, ...readCodexEnvVars(envVars, rest.type) };
 
   const auth: Record<string, unknown> = {};

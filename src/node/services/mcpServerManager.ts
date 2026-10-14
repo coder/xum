@@ -962,12 +962,13 @@ function withForwardedHostEnv(
   forwardEnv: string[] | undefined,
   env: Record<string, string> | undefined
 ): Record<string, string> | undefined {
-  const forwarded: Record<string, string> = {};
-  for (const name of forwardEnv ?? []) {
-    const value = process.env[name];
-    if (value !== undefined) forwarded[name] = value;
-  }
-  return Object.keys(forwarded).length > 0 ? { ...forwarded, ...env } : env;
+  // Own properties only: `constructor` would read an inherited function. Object.fromEntries
+  // keeps a host variable named `__proto__`, which an assignment would drop.
+  const forwarded = (forwardEnv ?? []).flatMap((name): Array<[string, string]> => {
+    const value = Object.hasOwn(process.env, name) ? process.env[name] : undefined;
+    return typeof value === "string" ? [[name, value]] : [];
+  });
+  return forwarded.length > 0 ? { ...Object.fromEntries(forwarded), ...env } : env;
 }
 
 /**
