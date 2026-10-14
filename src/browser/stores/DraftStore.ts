@@ -554,10 +554,6 @@ export class DraftStore {
     this.client = client;
     // A new connection may reach another backend process: ask for its receiver id again.
     this.receiver = null;
-    // And no write until its snapshot: the store's views and revisions belong to the backend
-    // before, so a reply in between could not be compared with anything it knows (#6438).
-    // Edits stay in memory meanwhile; the snapshot handler saves them.
-    this.hydrated = false;
     // A retry scheduled for the old connection must not outlive it; the new connection's
     // snapshot resolves the entries again and re-arms retries.
     for (const tracking of this.sendTracking.values()) {
@@ -1768,9 +1764,8 @@ export class DraftStore {
    * of the backend before would outrank all of its replies and pushes, and put old text back
    * over typing (#6438). Only the views: the composer keeps showing its fields, pending sends
    * stay retained (`pendingSends`, `basisSends`), and unsaved edits keep winning over the
-   * snapshot (applyServerState). On a new client no write goes out before the snapshot
-   * (setClient); a resubscribe to the same client may write, and with no view left its replies
-   * are taken as they come.
+   * snapshot (applyServerState). A write may go out before the new snapshot: with no view
+   * left, its reply is taken as it comes.
    */
   private forgetServerViews(): void {
     for (const entry of this.entries.values()) {
@@ -2065,7 +2060,7 @@ export class DraftStore {
     }
   }
 
-  /** The client a write may go to: connected, and its backend's snapshot applied (#6438). */
+  /** The client a write may go to: connected, and drafts hydrated. */
   private writableClient(): APIClient {
     const client = this.client;
     if (!client) throw new Error("Draft save failed: not connected");

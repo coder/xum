@@ -933,10 +933,10 @@ describe("DraftStore", () => {
     expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
   });
 
-  // #6438, review round 3: the store stayed hydrated across the switch, so an edit was saved to
-  // the new backend before its snapshot arrived. That reply was compared with the old backend's
-  // view, lost to it, and the old text came back. No write goes out in that window now.
-  test("an edit waits for a new backend's snapshot before it is saved, and keeps the typed text", async () => {
+  // #6438, review round 3: an edit saved to a new backend before its snapshot arrived. That
+  // reply was compared with the old backend's view, lost to it, and the old text came back. Each
+  // subscription start forgets the old views, so the reply is taken as it comes.
+  test("an edit saved to a new backend before its snapshot keeps the typed text", async () => {
     using tempDir = new TestTempDir("draft-store-new-backend-early-write");
     const { config, client } = await createHarness(tempDir);
     const store = createStore(client);
@@ -960,16 +960,19 @@ describe("DraftStore", () => {
     store.setClient(next.client);
 
     store.setText(WS_SCOPE, "typed after the switch");
-    expect(await flushError(store)).toContain("drafts are not loaded");
-    expect(next.control.updates).toBe(0);
+    await store.flush(WS_SCOPE);
+    expect(next.control.updates).toBeGreaterThan(0);
     expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
 
     releaseSnapshot();
     await waitFor(() => store.isHydrated());
     await store.flush(WS_SCOPE);
-    expect(next.control.updates).toBeGreaterThan(0);
     expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
     expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
+    store.setText(WS_SCOPE, "typed later");
+    await store.flush(WS_SCOPE);
+    expect(store.getText(WS_SCOPE)).toBe("typed later");
+    expect((await service.get(WS_SCOPE)).text).toBe("typed later");
   });
 
   // #6438: forgetting the views on a reconnect must not touch what the composer shows.
@@ -1040,10 +1043,9 @@ describe("DraftStore", () => {
       releaseSnapshot = resolve;
     });
     store.setClient(next.client);
-    // The old backend answers before the new one's snapshot: nothing is written there yet.
+    // The old backend answers before the new one's snapshot.
     release();
     await inFlight;
-    expect(next.control.updates).toBe(0);
     releaseSnapshot();
     await waitFor(() => store.isHydrated());
     await store.flush(WS_SCOPE);
