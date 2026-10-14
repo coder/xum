@@ -73,11 +73,10 @@ const HOOK_CONTEXT_MAX_CHARS = 64 * 1024;
 /** Tool results larger than this (as JSON) are omitted from tool.execute.after input. */
 const HOOK_RESULT_INPUT_MAX_CHARS = 256 * 1024;
 /**
- * `settings` larger than this many UTF-8 bytes (as JSON) are omitted from hook input (#6186): one
- * server can send about 400 KB, and each settings-capable server of the plugin adds more. Bytes,
- * not UTF-16 units: non-ASCII settings would otherwise pass at up to three times the size.
+ * `settings` larger than this (as JSON) are omitted from hook input (#6186): one server can send
+ * about 400 KB, and each settings-capable server of the plugin adds more.
  */
-const HOOK_SETTINGS_INPUT_MAX_BYTES = 64 * 1024;
+const HOOK_SETTINGS_INPUT_MAX_CHARS = 64 * 1024;
 
 function sha256Hex(text: string): string {
   return crypto.createHash("sha256").update(text, "utf-8").digest("hex");
@@ -794,11 +793,10 @@ function buildHookInputJson(
   label: string
 ): string {
   const settingsJson: string | undefined = JSON.stringify(settings);
-  const settingsBytes = settingsJson === undefined ? 0 : Buffer.byteLength(settingsJson, "utf8");
-  const settingsOmitted = settingsBytes > HOOK_SETTINGS_INPUT_MAX_BYTES;
+  const settingsOmitted = (settingsJson?.length ?? 0) > HOOK_SETTINGS_INPUT_MAX_CHARS;
   if (settingsOmitted) {
     log.warn(
-      `Agent plugin hooks: ${label} settings exceed ${HOOK_SETTINGS_INPUT_MAX_BYTES} bytes; omitting them`
+      `Agent plugin hooks: ${label} settings exceed ${HOOK_SETTINGS_INPUT_MAX_CHARS} chars; omitting them`
     );
   }
   return JSON.stringify(
