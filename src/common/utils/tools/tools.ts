@@ -108,6 +108,17 @@ import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { FileState } from "@/node/services/agentSession";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { InvocableSkill } from "@/common/types/agentSkill";
+import {
+  FILE_EDIT_TOOL_NAMES,
+  FILE_READ_TOOL_NAMES,
+  PATH_SKILLS_RESULT_FIELD,
+} from "@/common/types/tools";
+import { extractToolFilePath } from "@/common/utils/tools/toolInputFilePath";
+import {
+  formatPathSkillsResultField,
+  type PathSkillActivation,
+} from "@/node/services/agentSkills/pathSkillActivation";
+import { isPtcBridgedExecution } from "@/node/services/ptc/toolBridge";
 import type { GoalDefaults } from "@/constants/goals";
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
 
@@ -337,6 +348,12 @@ export interface ToolConfiguration {
   /** Available skills for the agent_skill_read tool description (dynamic context) */
   availableSkills?: InvocableSkill[];
   /**
+   * Path-scoped skill activation (`paths` frontmatter). Per-turn state shared by every
+   * tool rebuild in the turn, so a skill surfaces once per context window. Absent when
+   * no skill can activate: file tools then stay unwrapped.
+   */
+  pathSkillActivation?: PathSkillActivation;
+  /**
    * Session-segment memory index for the memory tool description (dynamic
    * context, same disclosure mechanic as skills). Absent when no snapshot was
    * resolved (e.g. non-stream tool builds): the tool falls back to its base
@@ -494,6 +511,109 @@ function wrapToolExecuteWithModelOnlyNotifications(
   };
 
   return wrappedTool;
+}
+
+/** The plain-object result of a tool call that reported `success: true`, else undefined. */
+function asSuccessfulToolResult(result: unknown): Record<string, unknown> | undefined {
+  if (result == null || typeof result !== "object" || Array.isArray(result)) {
+    return undefined;
+  }
+  const record = result as Record<string, unknown>;
+  return record.success === true ? record : undefined;
+}
+
+/**
+ * Attach the persisted `path_skills` pointer to a successful direct file tool result
+ * whose file matches a path-scoped skill. PTC-bridged calls are skipped: their results
+ * go to the code_execution guest, not straight to the model.
+ */
+function attachPathSkills(
+  result: unknown,
+  args: unknown,
+  options: unknown,
+  activation: PathSkillActivation
+): unknown {
+  const record = asSuccessfulToolResult(result);
+  const filePath = extractToolFilePath(args);
+  if (record === undefined || filePath === undefined || isPtcBridgedExecution(options)) {
+    return result;
+  }
+  const matches = activation.takeMatches(filePath);
+  if (matches.length === 0) {
+    return result;
+  }
+  return { ...record, [PATH_SKILLS_RESULT_FIELD]: formatPathSkillsResultField(matches) };
+}
+
+/**
+ * A skill the model reads mid-turn is already in context: later matching file calls
+ * in the same turn must not point at it again. (Earlier turns are covered by the
+ * history scan in createPathSkillActivation.)
+ */
+function markReadSkillSurfaced(
+  result: unknown,
+  args: unknown,
+  activation: PathSkillActivation
+): void {
+  const name = args != null && typeof args === "object" ? (args as { name?: unknown }).name : null;
+  if (asSuccessfulToolResult(result) !== undefined && typeof name === "string") {
+    activation.markSurfaced(name);
+  }
+}
+
+/** The slice of an AI SDK tool this wrapper reads and replaces (no `any` casts). */
+interface ExecutableTool {
+  execute?: (args: unknown, options: unknown) => unknown;
+}
+
+function wrapToolExecuteWithPathSkills(
+  toolName: string,
+  baseTool: Tool,
+  activation: PathSkillActivation
+): Tool {
+  const executeFn = (baseTool as ExecutableTool).execute;
+  if (typeof executeFn !== "function") {
+    return baseTool;
+  }
+
+  // Avoid mutating cached tools in place; repeated getToolsForModel() calls must not
+  // stack wrappers.
+  const wrappedTool = cloneToolPreservingDescriptors(baseTool);
+  (wrappedTool as ExecutableTool).execute = async (args: unknown, options: unknown) => {
+    const result: unknown = await executeFn.call(baseTool, args, options);
+    // Matching never fails the tool call: on error the original result is returned.
+    try {
+      if (toolName === "agent_skill_read") {
+        markReadSkillSurfaced(result, args, activation);
+        return result;
+      }
+      return attachPathSkills(result, args, options, activation);
+    } catch (error) {
+      log.debug("[getToolsForModel] path skill activation failed", { error, toolName });
+      return result;
+    }
+  };
+
+  return wrappedTool;
+}
+
+function wrapFileToolsWithPathSkills(
+  tools: Record<string, Tool>,
+  config: ToolConfiguration
+): Record<string, Tool> {
+  const activation = config.pathSkillActivation;
+  if (activation == null) {
+    return tools;
+  }
+
+  const wrappedTools: Record<string, Tool> = { ...tools };
+  for (const toolName of [...FILE_READ_TOOL_NAMES, ...FILE_EDIT_TOOL_NAMES, "agent_skill_read"]) {
+    const baseTool = tools[toolName];
+    if (baseTool != null) {
+      wrappedTools[toolName] = wrapToolExecuteWithPathSkills(toolName, baseTool, activation);
+    }
+  }
+  return wrappedTools;
 }
 
 function wrapToolsWithModelOnlyNotifications(
@@ -1139,7 +1259,11 @@ export async function getToolsForModel(
     finalTools = augmentedTools;
   }
 
-  // Apply hook wrapping first (hooks wrap each tool execution)
+  // Path-scoped skill pointers ride the file tool results and are persisted. Wrap
+  // inside the hooks so matching sees the args a tool.execute hook may have rewritten.
+  finalTools = wrapFileToolsWithPathSkills(finalTools, config);
+
+  // Apply hook wrapping (hooks wrap each tool execution)
   finalTools = wrapToolsWithHooks(finalTools, config);
 
   // Then apply model-only notifications (adds notifications to results)

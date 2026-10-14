@@ -11,33 +11,31 @@ const read = (meta: unknown) =>
   );
 
 describe("extractMcpAppResource CSP", () => {
-  test("reads ChatGPT's openai/widgetCSP alias next to ui.csp, without redirect_domains", () => {
+  test("reads ChatGPT's openai/widgetCSP alias for lists ui.csp omits, without redirect_domains", () => {
     const resource = read({
       ui: { csp: { connectDomains: ["https://api.example.com"] } },
       "openai/widgetCSP": {
-        connect_domains: ["https://api.example.com", "https://alias.example.com"],
+        connect_domains: ["https://api.example.com", "https://stale.example.com"],
         resource_domains: ["https://cdn.example.com"],
         frame_domains: ["https://frame.example.com"],
         redirect_domains: ["https://redirect.example.com"],
       },
     });
+    // ui.csp declares connectDomains, so the stale legacy connect list adds nothing.
     expect(resource.csp).toEqual({
-      connectDomains: ["https://api.example.com", "https://alias.example.com"],
+      connectDomains: ["https://api.example.com"],
       resourceDomains: ["https://cdn.example.com"],
       frameDomains: ["https://frame.example.com"],
     });
     expect(read({}).csp).toEqual({});
   });
 
-  test("merged lists stay within the declaration limit the view schema accepts", () => {
-    const hosts = (prefix: string) =>
-      Array.from({ length: 32 }, (_, i) => `https://${prefix}${i}.example.com`);
+  test("an empty standard list overrides the legacy list", () => {
     const resource = read({
-      ui: { csp: { connectDomains: hosts("ui") } },
-      "openai/widgetCSP": { connect_domains: hosts("alias") },
+      ui: { csp: { connectDomains: [] } },
+      "openai/widgetCSP": { connect_domains: ["https://stale.example.com"] },
     });
-    // _meta.ui.csp comes first and wins the slots.
-    expect(resource.csp.connectDomains).toEqual(hosts("ui"));
+    expect(resource.csp).toEqual({ connectDomains: [] });
     expect(McpAppCspDeclarationSchema.safeParse(resource.csp).success).toBe(true);
   });
 });
