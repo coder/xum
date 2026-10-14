@@ -127,8 +127,8 @@ function digest(input: unknown): string {
   return createHash("sha256").update(stableStringify(input)).digest("hex");
 }
 
-/** Fingerprint of everything a plugin MCP server launches or connects with. */
-export function serverConsentFingerprint(info: MCPServerInfo, paths: ConsentPaths): string {
+/** Everything a plugin MCP server launches or connects with, paths normalized (the hashed part). */
+function serverConsentSubject(info: MCPServerInfo, paths: ConsentPaths): unknown {
   const server =
     info.transport === "stdio"
       ? pick(info, STDIO_FIELDS)
@@ -136,11 +136,40 @@ export function serverConsentFingerprint(info: MCPServerInfo, paths: ConsentPath
           ...pick(info, HTTP_FIELDS),
           ...(info.oauth !== undefined ? { oauth: pick(info.oauth, OAUTH_FIELDS) } : {}),
         };
+  return normalizeValue(server, paths);
+}
+
+/** Fingerprint of everything a plugin MCP server launches or connects with. */
+export function serverConsentFingerprint(info: MCPServerInfo, paths: ConsentPaths): string {
   return digest({
     scheme: CONSENT_SCHEME,
     kind: "mcpServer",
-    server: normalizeValue(server, paths),
+    server: serverConsentSubject(info, paths),
   });
+}
+
+/**
+ * The fingerprinted fields as text, for a review whose summary looks unchanged (a header or
+ * OAuth scope change). Secret sources are excluded from the subject, so this shows no secret.
+ */
+export function serverConsentDetail(info: MCPServerInfo, paths: ConsentPaths): string {
+  return stableStringify(serverConsentSubject(info, paths));
+}
+
+interface SkillConsentInput {
+  relativeDir: string;
+  frontmatter: Readonly<Record<string, unknown>>;
+}
+
+function skillConsentSubject(args: SkillConsentInput): { dir: string; frontmatter: unknown } {
+  const { paths } = args.frontmatter;
+  return {
+    dir: args.relativeDir.replaceAll("\\", "/"),
+    frontmatter: {
+      ...args.frontmatter,
+      ...(Array.isArray(paths) ? { paths: [...(paths as unknown[])].map(String).sort() } : {}),
+    },
+  };
 }
 
 /**
@@ -149,20 +178,13 @@ export function serverConsentFingerprint(info: MCPServerInfo, paths: ConsentPath
  * not covered: no review shows it, and the update review has always treated a body edit as
  * capability-neutral. `paths` patterns are OR-ed, so their order does not count.
  */
-export function skillConsentFingerprint(args: {
-  relativeDir: string;
-  frontmatter: Readonly<Record<string, unknown>>;
-}): string {
-  const { paths } = args.frontmatter;
-  return digest({
-    scheme: CONSENT_SCHEME,
-    kind: "skill",
-    dir: args.relativeDir.replaceAll("\\", "/"),
-    frontmatter: {
-      ...args.frontmatter,
-      ...(Array.isArray(paths) ? { paths: [...(paths as unknown[])].map(String).sort() } : {}),
-    },
-  });
+export function skillConsentFingerprint(args: SkillConsentInput): string {
+  return digest({ scheme: CONSENT_SCHEME, kind: "skill", ...skillConsentSubject(args) });
+}
+
+/** The fingerprinted skill fields as text, for a review whose advertisement looks unchanged. */
+export function skillConsentDetail(args: SkillConsentInput): string {
+  return stableStringify(skillConsentSubject(args));
 }
 
 /** Reviewed fingerprints of one install, by component name (registry `componentConsent`). */

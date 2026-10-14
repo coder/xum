@@ -83,7 +83,9 @@ import {
   countUnreviewed,
   isComponentConsented,
   recordReviewedComponents,
+  serverConsentDetail,
   serverConsentFingerprint,
+  skillConsentDetail,
   skillConsentFingerprint,
   type ComponentConsent,
 } from "./componentConsent";
@@ -212,6 +214,8 @@ function stableStringify(value: unknown): string {
 type CollectedPluginSkill = AgentPluginPreviewSkill & {
   /** Load-time consent fingerprint (componentConsent.ts): root-relative dir + frontmatter. */
   consentFingerprint: string;
+  /** The fingerprinted fields as text (componentConsent.ts skillConsentDetail). */
+  consentDetail: string;
   whenToUse?: string;
   advertise?: boolean;
   paths?: string[];
@@ -238,6 +242,31 @@ function skillChangeSummary(current: SurfaceSkill, staged: SurfaceSkill, name: s
   return current.fingerprint !== staged.fingerprint
     ? `changes the model-visible advertisement of skill '${name}'`
     : `changes the definition of skill '${name}'`;
+}
+
+/** Both consent views of one skill (componentConsent.ts). */
+function skillConsentFields(args: Parameters<typeof skillConsentFingerprint>[0]): {
+  consentFingerprint: string;
+  consentDetail: string;
+} {
+  return {
+    consentFingerprint: skillConsentFingerprint(args),
+    consentDetail: skillConsentDetail(args),
+  };
+}
+
+/**
+ * Before/after for a changed skill or server. When the usual summaries are equal, a
+ * non-displayed fingerprinted field changed (a header, an OAuth scope, a frontmatter key):
+ * show the fingerprinted fields so the user can see what they approve.
+ */
+function reviewValues(
+  current: { display: string; consentDetail: string },
+  staged: { display: string; consentDetail: string }
+): { before: string; after: string } {
+  return current.display !== staged.display
+    ? { before: current.display, after: staged.display }
+    : { before: current.consentDetail, after: staged.consentDetail };
 }
 
 /** List row field: managed rows count imported components that need a review (#6498). */
@@ -343,8 +372,8 @@ function consentAtInstall(
 
 function omitConsentFingerprint(
   skill: CollectedPluginSkill
-): Omit<CollectedPluginSkill, "consentFingerprint"> {
-  const { consentFingerprint, ...rest } = skill;
+): Omit<CollectedPluginSkill, "consentFingerprint" | "consentDetail"> {
+  const { consentFingerprint, consentDetail: _consentDetail, ...rest } = skill;
   assert(consentFingerprint.length > 0, "collected skills carry a consent fingerprint");
   return rest;
 }
@@ -619,6 +648,8 @@ interface SurfaceSkill {
   fingerprint: string;
   consentFingerprint: string;
   display: string;
+  /** Shown instead of `display` when only non-displayed fingerprinted fields changed. */
+  consentDetail: string;
 }
 
 interface SurfaceServer {
@@ -627,6 +658,8 @@ interface SurfaceServer {
   /** Load-time consent fingerprint (componentConsent.ts). */
   consentFingerprint: string;
   display: string;
+  /** Shown instead of `display` when only non-displayed fingerprinted fields changed. */
+  consentDetail: string;
   signIn?: SurfaceSignIn;
 }
 
@@ -1696,6 +1729,7 @@ export class AgentPluginInstallService {
       skills.set(skill.name, {
         ...describeSkillAdvertisement(skill),
         consentFingerprint: skill.consentFingerprint,
+        consentDetail: skill.consentDetail,
       });
     }
     const agents = new Map<string, string>();
@@ -1737,6 +1771,7 @@ export class AgentPluginInstallService {
         servers.set(info.plugin.serverName, {
           fingerprint,
           consentFingerprint,
+          consentDetail: serverConsentDetail(info, paths),
           display: this.describeMcpServer(info, rewrite, finalTargetPath).summary,
           ...(signIn !== undefined ? { signIn } : {}),
         });
@@ -1835,8 +1870,7 @@ export class AgentPluginInstallService {
         const authLines = describeSignInChanges(currentServer.signIn, server.signIn);
         changes.push({
           summary: [`changes MCP server '${serverName}'`, ...authLines].join(": "),
-          before: currentServer.display,
-          after: server.display,
+          ...reviewValues(currentServer, server),
           component,
         });
       }
@@ -1889,8 +1923,7 @@ export class AgentPluginInstallService {
         // frontmatter field shows here. The summary names an advertisement change when there is one.
         changes.push({
           summary: skillChangeSummary(currentSkill, skill, skillName),
-          before: currentSkill.display,
-          after: skill.display,
+          ...reviewValues(currentSkill, skill),
           component,
         });
       }
@@ -2128,7 +2161,7 @@ export class AgentPluginInstallService {
         });
         skills.push({
           name: parsed.frontmatter.name,
-          consentFingerprint: skillConsentFingerprint({
+          ...skillConsentFields({
             relativeDir: path.relative(pluginRoot, path.join(skillsDir, dirName)),
             frontmatter: parsed.frontmatter,
           }),
@@ -4566,8 +4599,16 @@ export class AgentPluginInstallService {
       );
       return { ...entry, componentConsent };
     });
-    // Newly consented servers can start: reconcile after the lock, like setComponents.
-    await this.deps.mcpServerManager?.reconcilePluginComponents();
+    // Newly consented servers can start: reconcile after the lock, like setComponents. The
+    // consent is committed, so a reconcile failure must not report the review as failed.
+    try {
+      await this.deps.mcpServerManager?.reconcilePluginComponents();
+    } catch (error) {
+      log.warn("Component review saved, but MCP reconciliation failed", {
+        name: args.name,
+        error: getErrorMessage(error),
+      });
+    }
     return data;
   }
 

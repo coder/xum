@@ -1617,6 +1617,31 @@ describe("AgentPluginInstallService", () => {
     expect((await service.list())[0].reviewRequiredCount).toBe(1);
   });
 
+  test("a committed component review succeeds when MCP reconciliation fails (#6557)", async () => {
+    const reconcilePluginComponents = mock(() => Promise.reject(new Error("reconcile failed")));
+    const reviewer = new AgentPluginInstallService(config, {
+      mcpServerManager: { reconcilePluginComponents } as unknown as MCPServerManager,
+    });
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+
+    const review = await reviewer.previewComponentReview({ name: "demo-plugin" });
+    const confirmed = await reviewer.confirmComponentReview({
+      name: "demo-plugin",
+      expectedLockedSha: review.fromSha,
+      reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+    });
+
+    expect(reconcilePluginComponents).toHaveBeenCalledTimes(1);
+    expect(Object.keys(confirmed.componentConsent?.mcpServers ?? {})).toEqual(["echo"]);
+    expect((await reviewer.list())[0].reviewRequiredCount).toBe(0);
+  });
+
   test("an update records consent only for the changes the user reviewed (#6498)", async () => {
     const preview = await service.preview({ input: remoteDir });
     const installed = await service.install({
@@ -2983,6 +3008,47 @@ describe("AgentPluginInstallService", () => {
     const review = await service.previewUpdate({ name: "demo-plugin" });
     const change = review.changes.find((c) => c.summary.includes("skill 'greet'"));
     expect(change?.before).not.toBe(change?.after);
+  });
+
+  test("the update review shows a skill change outside its advertisement (#6557)", async () => {
+    const skillWithLicense = (license: string) =>
+      `---\nname: greet\ndescription: Greets people\nlicense: ${license}\n---\n\nSay hi.\n`;
+    const skillFile = path.join(remoteDir, "skills", "greet", "SKILL.md");
+    await fsPromises.writeFile(skillFile, skillWithLicense("MIT"));
+    await commitAll(remoteDir, "MIT skill");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(skillFile, skillWithLicense("GPL-3.0"));
+    await commitAll(remoteDir, "license-only change");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary.includes("skill 'greet'"));
+    expect(change?.before).toContain("MIT");
+    expect(change?.after).toContain("GPL-3.0");
+  });
+
+  test("the update review shows an MCP server change outside its summary (#6557)", async () => {
+    // The summary shows the URL only, so a transport-only change looks unchanged there.
+    const mcpWithType = (type: string) =>
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: { docs: { type, url: "https://mcp.example.test/mcp" } },
+      });
+    await fsPromises.writeFile(path.join(remoteDir, "mcp.json"), mcpWithType("streamable-http"));
+    await commitAll(remoteDir, "streamable http");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(path.join(remoteDir, "mcp.json"), mcpWithType("sse"));
+    await commitAll(remoteDir, "transport-only change");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary.includes("MCP server 'docs'"));
+    expect(change?.before).toContain('"transport":"http"');
+    expect(change?.after).toContain('"transport":"sse"');
   });
 
   test("update accepts a skill paths reordering as capability-neutral", async () => {
