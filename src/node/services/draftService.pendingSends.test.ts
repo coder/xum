@@ -125,6 +125,54 @@ describe("DraftService pending sends", () => {
     expect((await service.get(SCOPE)).text).toBe("from the other window");
   });
 
+  // #6405: the composer stays on from Enter, so keys typed before the take follow the sent text.
+  it("keeps keys typed right after the sent text, without the sent text", async () => {
+    using tempDir = new TestTempDir("drafts-pending-typed-after");
+    const { file, service } = await createHarness(tempDir);
+    await service.update({ scope: SCOPE, text: "first message" });
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s1", "first message"),
+      attachments: [],
+      text: "first messagex",
+      typedAfterSendText: "first messagex",
+    });
+    expect((await service.get(SCOPE)).text).toBe("x");
+    expect((await readFile(file)).text).toBe("first message\n\nx");
+  });
+
+  it("takes the typed-after prefix only from the text the sender typed it into", async () => {
+    using tempDir = new TestTempDir("drafts-pending-other-prefix");
+    const { service } = await createHarness(tempDir);
+    // Another window wrote it: it only starts with the sent text.
+    await service.update({ scope: SCOPE, text: "yesterday" });
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s1", "yes"),
+      attachments: [],
+    });
+    expect((await service.get(SCOPE)).text).toBe("yesterday");
+    // The sender saved its typing, then another window wrote a newer text before the take.
+    await service.update({ scope: SCOPE, text: "yesx" });
+    await service.update({ scope: SCOPE, text: "yes, from the other window" });
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s2", "yes"),
+      attachments: [],
+      typedAfterSendText: "yesx",
+    });
+    expect((await service.get(SCOPE)).text).toBe("yes, from the other window");
+    // Saved and unchanged since: the prefix goes.
+    await service.update({ scope: SCOPE, text: "yesx" });
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s3", "yes"),
+      attachments: [],
+      typedAfterSendText: "yesx",
+    });
+    expect((await service.get(SCOPE)).text).toBe("x");
+  });
+
   it("beginSend is idempotent by send id and refuses another payload under it", async () => {
     using tempDir = new TestTempDir("drafts-pending-idempotent");
     const { file, service } = await createHarness(tempDir);

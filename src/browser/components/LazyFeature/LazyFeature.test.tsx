@@ -68,4 +68,26 @@ describe("LazyFeature", () => {
       consoleError.mockRestore();
     }
   });
+
+  // A page-level boundary: the loaded page holds the `main` landmark, so its other states must too.
+  test("frame wraps both the loading and the failure state", async () => {
+    const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const lazy = deferredLazy();
+      const view = render(
+        <LazyFeature name="Page" fallback="Opening" frame={(state) => <main>{state}</main>}>
+          <lazy.Component />
+        </LazyFeature>
+      );
+      expect(view.getByRole("main").textContent).toBe("Opening");
+
+      lazy.settle.reject(new Error("Failed to fetch dynamic module"));
+
+      const reload = await view.findByRole("button", { name: "Reload" });
+      expect(view.getAllByRole("main")).toHaveLength(1);
+      expect(view.getByRole("main").contains(reload)).toBe(true);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
 });

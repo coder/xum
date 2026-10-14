@@ -1,13 +1,20 @@
-import { expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { GlobalWindow } from "happy-dom";
 import {
+  PAGE_SETUP,
+  TARGET,
   hostIsQuiet,
+  hostState,
   pairDiffs,
   qualifyHostPage,
+  reapRun,
+  runOnQuietHost,
   seedRewrites,
   serviceWorkerProofFailures,
   usefulContentShown,
   type Run,
 } from "./pageTimingCore";
+import { probe, STATIC_VIEW_ID } from "./pageTimingProbe";
 
 test("UCS takes the later of Element Timing and visibility, and a static view counts only for UCS (any)", () => {
   const record = {
@@ -45,6 +52,33 @@ test("the host rule needs both a low load and low CPU pressure", () => {
   expect(hostIsQuiet(1, null, 32)).toBe(true); // no PSI (macOS, older kernels)
 });
 
+test("each run records the host's 1-minute load and PSI cpu some avg10, or null without PSI", () => {
+  const psi = "some avg10=12.50 avg60=3.00 avg300=1.00 total=9\nfull avg10=0.00 avg60=0.00";
+  expect(hostState(3.2, psi)).toEqual({ load1: 3.2, cpuSomeAvg10: 12.5 });
+  expect(hostState(3.2, null)).toEqual({ load1: 3.2, cpuSomeAvg10: null });
+  expect(() => hostState(3.2, "garbage")).toThrow("/proc/pressure/cpu");
+});
+
+test("processes of a run that outlive the server by 10 s are killed before it returns, and the run is invalid", async () => {
+  let [alive, killed, sleeps] = [[41, 42], [] as number[], 0];
+  // A real macrotask per poll: a reaper that never ends fails on the test timeout instead of hanging.
+  const sleep = () => new Promise<void>((resolve) => setImmediate(() => resolve(void sleeps++)));
+  const kill = (pid: number) => {
+    killed.push(pid);
+    alive = alive.filter((p) => p !== pid);
+    if (pid === 41) alive.push(43); // 41 forks after the SIGKILL was sent: the child is killed too
+  };
+  await expect(reapRun(() => alive, kill, sleep)).rejects.toThrow("were killed");
+  expect([killed, alive, sleeps]).toEqual([[41, 42, 43], [], 102]); // 100 waits of 100 ms first
+  let polls = 3; // exits on its own within the wait: nothing is killed
+  await reapRun(() => (polls-- > 0 ? [7] : []), kill, sleep);
+  expect(killed).toEqual([41, 42, 43]);
+  let late = 130; // gone 30 polls after its SIGKILL (uninterruptible I/O): the reaper still waits for it
+  const lingering = () => (late-- > 0 ? [9] : []);
+  await expect(reapRun(lingering, () => {}, sleep)).rejects.toThrow("were killed");
+  expect(late).toBeLessThan(0);
+});
+
 test("paired differences are head - base in pair order, and a missing or doubled arm is refused", () => {
   const run = (pair: number, arm: Run["arm"], ucs: number): Run => ({
     page: "p2",
@@ -60,7 +94,7 @@ test("paired differences are head - base in pair order, and a missing or doubled
   expect(() => pairDiffs([...runs, run(1, "head", 7)], "p2", "ucs")).toThrow("two head runs");
 });
 
-test("a page's MDI pools the pairs of every A/A block it ran", () => {
+test("a page's MDI pools the pairs of every A/A block it ran, and a qualified page's MDI meets the limits", () => {
   const quiet = [0.02, -0.03, 0.01, 0, -0.01, 0.04, -0.02, 0.03];
   const noisy = [0.2, 0.25, 0.21, 0.19, 0.22, 0.3, 0.18, 0.2]; // median 0.205 fails qualification
   const one = qualifyHostPage([{ ucs: noisy, ir: quiet }]);
@@ -69,10 +103,16 @@ test("a page's MDI pools the pairs of every A/A block it ran", () => {
     { ucs: noisy, ir: quiet },
     { ucs: quiet, ir: quiet },
   ]);
-  expect(two.qualification).toBe("qualified");
+  expect(two.qualification).toBe("inconclusive"); // block 2 passes alone, the pooled MDI misses 0.25 s
   // Alone, the quiet block's d(7) is at most 0.04 s (MDI <= 0.08 s). The pooled MDI keeps the noisy pairs.
   expect(one.mdi.ucs).toBeGreaterThanOrEqual(0.36);
-  expect(two.mdi.ucs).toBeGreaterThan(0.08);
+  expect(two.mdi.ucs).toBeGreaterThan(0.25);
+  const near = Array<number>(8).fill(0.11); // fails on its median only: the pooled MDI stays <= 0.22 s
+  const blocks = [
+    { ucs: near, ir: quiet },
+    { ucs: quiet, ir: quiet },
+  ];
+  expect(qualifyHostPage(blocks).qualification).toBe("qualified");
 });
 
 test("a seed check ignores only the token stats cache the app adds to session-usage.json", () => {
@@ -85,4 +125,156 @@ test("a seed check ignores only the token stats cache the app adds to session-us
   expect(check('{"byModel":{"m":{}},"version":1,"tokenStatsCache":{}}')).toEqual([usage]);
   expect(check("{")).toEqual([usage]);
   expect(check(String(seed), [cfg], [usage])).toEqual([cfg, usage]);
+});
+
+test("never holds the lock while the host is busy, and bounds its waits and lock takes", async () => {
+  const events: string[] = [];
+  const withLock = <R>(fn: () => Promise<R>) => {
+    events.push("lock");
+    return fn().finally(() => events.push("unlock"));
+  };
+  const run = async () => void events.push("run");
+  const sleep = async () => void events.push("sleep");
+  // Busy twice, then quiet. Busy again at the probe inside the first hold, then quiet.
+  const probes = [false, false, true, false, true, true];
+  await runOnQuietHost({ isQuiet: () => probes.shift() ?? true, sleep }, withLock, run);
+  expect(events.splice(0)).toEqual(["sleep", "sleep", "lock", "unlock", "lock", "run", "unlock"]);
+  const flips = [true, false, true, false, true, false]; // quiet outside the lock, busy inside it
+  const flipping = { isQuiet: () => flips.shift() ?? false, sleep };
+  await expect(runOnQuietHost(flipping, withLock, run, 3)).rejects.toThrow("every lock take");
+  expect(events.splice(0)).toEqual(["lock", "unlock", "lock", "unlock", "lock", "unlock"]);
+  let busyProbes = 100; // busy for longer than the 60 probes (10 minutes) of one wait
+  const busy = { isQuiet: () => --busyProbes < 0, sleep };
+  await expect(runOnQuietHost(busy, withLock, run)).rejects.toThrow("busy for 10 minutes");
+  expect(events).not.toContain("lock");
+});
+
+// Pins p1 and p2 (plan section 5.6, PR 3c): adding p1r must not change what they open or match.
+// Catches, for example, a table that seeds p1 or sends p2 to "/".
+test("p1 and p2 keep today's root, route and target", () => {
+  const id = "a1b2c3d4e5";
+  const setup = (page: "p1" | "p2") => ({
+    seeded: PAGE_SETUP[page].seeded,
+    route: PAGE_SETUP[page].route(id),
+    target: TARGET[page],
+  });
+  expect(setup("p1")).toEqual({
+    seeded: false,
+    route: "/",
+    target: { selector: "p", text: "OSS contributors with GitHub accounts" },
+  });
+  expect(setup("p2")).toEqual({
+    seeded: true,
+    route: `/workspace/${id}`,
+    target: { selector: ".code-line", text: "export function subtract(" },
+  });
+});
+
+describe("the probe's IR check", () => {
+  // The probe runs in the page, so it reads these as globals. The test lends it a happy-dom window.
+  const names = [
+    "window",
+    "document",
+    "Navigator",
+    "MutationObserver",
+    "getComputedStyle",
+    "requestAnimationFrame",
+    "HTMLTextAreaElement",
+    "Event",
+  ] as const;
+  const saved = new Map<string, PropertyDescriptor | undefined>();
+  let dom: GlobalWindow;
+
+  beforeEach(() => {
+    dom = new GlobalWindow({ url: "http://localhost/" });
+    for (const name of [...names, "PerformanceObserver"]) {
+      saved.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+    }
+    for (const name of names) {
+      const value = (dom as unknown as Record<string, unknown>)[name];
+      const bound = typeof value === "function" && /^[a-z]/.test(name) ? value.bind(dom) : value;
+      Object.defineProperty(globalThis, name, { value: bound, configurable: true, writable: true });
+    }
+    // Element Timing is UCS, not IR: a no-op observer keeps this test on the IR path.
+    const observer = class {
+      observe() {}
+    };
+    Object.defineProperty(globalThis, "PerformanceObserver", {
+      value: observer,
+      configurable: true,
+      writable: true,
+    });
+  });
+
+  afterEach(async () => {
+    for (const [name, descriptor] of saved) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete (globalThis as Record<string, unknown>)[name];
+    }
+    await dom.happyDOM.close();
+  });
+
+  /** Starts the probe in IR mode, renders `html`, and waits for its IR (seconds, or null). */
+  async function irOf(page: keyof typeof TARGET, html: string, wire: (doc: Document) => void) {
+    probe({ target: TARGET[page], mode: "ir", page, staticViewId: STATIC_VIEW_ID });
+    dom.document.body.innerHTML = html;
+    wire(dom.document as unknown as Document);
+    for (
+      let i = 0;
+      i < 50 &&
+      (dom as unknown as { __pageTiming: { ir: number | null } }).__pageTiming.ir === null;
+      i++
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return (dom as unknown as { __pageTiming: { ir: number | null } }).__pageTiming.ir;
+  }
+  const onClick = (doc: Document, label: string, effect: () => void) => {
+    const button = [...doc.querySelectorAll("button")].find((b) => b.textContent === label)!;
+    let clicks = 0;
+    button.addEventListener("click", () => (clicks++, effect()));
+    return () => clicks;
+  };
+
+  // Pins p1 and p2. Catches a p1r branch that also takes another page (for example `page !== "p2"`).
+  test("p1: one click on the wizard's Next, ready once step 2 shows", async () => {
+    let clicks = () => 0;
+    const ir = await irOf("p1", '<div role="dialog"><button>Next</button></div>', (doc) => {
+      clicks = onClick(doc, "Next", () =>
+        doc
+          .querySelector("[role=dialog]")!
+          .insertAdjacentHTML("beforeend", '<div role="img" aria-label="Step 2 of 7"></div>')
+      );
+    });
+    expect(ir).not.toBeNull();
+    expect(clicks()).toBe(1);
+  });
+
+  test("p2: typed text stays and Send is enabled", async () => {
+    const html =
+      '<textarea aria-label="Message"></textarea><button aria-label="Send message" disabled>Send</button>';
+    let box: HTMLTextAreaElement | null = null;
+    const ir = await irOf("p2", html, (doc) => {
+      box = doc.querySelector("textarea");
+      const send = doc.querySelector<HTMLButtonElement>("button")!;
+      box!.addEventListener("input", () => (send.disabled = box!.value === ""));
+    });
+    expect(ir).not.toBeNull();
+    expect(box!.value).toBe("hi");
+  });
+
+  // Catches a probe without a p1r branch: it never clicks, so IR stays null.
+  test("p1r: one click on Open Provider Settings, ready once the provider settings show", async () => {
+    let clicks = () => 0;
+    const ir = await irOf("p1r", "<main><button>Open Provider Settings</button></main>", (doc) => {
+      clicks = onClick(doc, "Open Provider Settings", () =>
+        doc.body.insertAdjacentHTML(
+          "beforeend",
+          "<p>Configure API keys and endpoints for AI providers. Keys are stored in <code>~/.xum/providers.jsonc</code></p>"
+        )
+      );
+    });
+    expect(ir).not.toBeNull();
+    expect(clicks()).toBe(1);
+  });
 });

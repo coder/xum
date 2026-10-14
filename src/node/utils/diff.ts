@@ -147,14 +147,18 @@ function buildHunks(
 
       // Add deletions (old lines not in new)
       while (oldIdx < oldLines.length && (!match || oldIdx < match[0])) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         currentHunk!.lines.push(`-${oldLines[oldIdx]}`);
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         currentHunk!.oldCount++;
         oldIdx++;
       }
 
       // Add additions (new lines not in old)
       while (newIdx < newLines.length && (!match || newIdx < match[1])) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         currentHunk!.lines.push(`+${newLines[newIdx]}`);
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         currentHunk!.newCount++;
         newIdx++;
       }

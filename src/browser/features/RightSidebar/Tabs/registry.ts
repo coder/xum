@@ -6,7 +6,12 @@
  * helpers should depend on the lightweight `tabConfig` directly.
  */
 
-import { getSideChatTabWorkspaceId, isNewTab, type TabType } from "@/browser/types/rightSidebar";
+import {
+  getAppViewTabKey,
+  getSideChatTabWorkspaceId,
+  isNewTab,
+  type TabType,
+} from "@/browser/types/rightSidebar";
 import { getTabConfig, isBaseTabId } from "./tabConfig";
 import type { ReviewStats as RegistryReviewStats } from "./tabRegistry";
 
@@ -18,6 +23,9 @@ const TERMINAL_TAB_CONTENT_CLASS_NAME = "overflow-hidden p-0";
 const TERMINAL_TAB_NAME = "Terminal";
 
 const SIDE_CHAT_TAB_NAME = "Side chat";
+const APP_VIEW_TAB_NAME = "App view";
+// An MCP App view fills the pane and scrolls inside its own frame.
+const APP_VIEW_TAB_CONTENT_CLASS_NAME = "overflow-hidden p-0";
 const NEW_TAB_NAME = "New tab";
 // The New tab launcher scrolls when its tool list is taller than the pane.
 const NEW_TAB_CONTENT_CLASS_NAME = "overflow-y-auto p-0";
@@ -29,6 +37,7 @@ export function getTabName(tab: TabType): string {
   if (isBaseTabId(tab)) return getTabConfig(tab).name;
   if (isNewTab(tab)) return NEW_TAB_NAME;
   if (getSideChatTabWorkspaceId(tab) != null) return SIDE_CHAT_TAB_NAME;
+  if (getAppViewTabKey(tab) != null) return APP_VIEW_TAB_NAME;
   return TERMINAL_TAB_NAME;
 }
 
@@ -37,5 +46,6 @@ export function getTabContentClassName(tab: TabType): string {
   if (isBaseTabId(tab)) return getTabConfig(tab).contentClassName;
   if (isNewTab(tab)) return NEW_TAB_CONTENT_CLASS_NAME;
   if (getSideChatTabWorkspaceId(tab) != null) return SIDE_CHAT_TAB_CONTENT_CLASS_NAME;
+  if (getAppViewTabKey(tab) != null) return APP_VIEW_TAB_CONTENT_CLASS_NAME;
   return TERMINAL_TAB_CONTENT_CLASS_NAME;
 }

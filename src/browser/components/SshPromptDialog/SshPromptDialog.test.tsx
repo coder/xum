@@ -435,4 +435,39 @@ describe("SshPromptDialog", () => {
     // Queue cleared → dialog dismissed
     expect(queryByRole("button", { name: "Reject" })).toBeNull();
   });
+
+  // After the switch a drop keeps the last client. The prompt's responder can be gone, so the
+  // dialog must drop the prompt; the reconnect delivers a fresh snapshot.
+  it("drops a shown prompt when the connection is lost with a kept client", async () => {
+    const authenticate = () => undefined;
+    const retry = () => undefined;
+    const client = createTestApiClient(api!);
+    const live = { status: "connected" as const, api: client, error: null, authenticate, retry };
+    const kept = {
+      status: "reconnecting" as const,
+      api: client,
+      error: null,
+      attempt: 1,
+      authenticate,
+      retry,
+    };
+    const view = render(
+      <APIContext.Provider value={live}>
+        <SshPromptDialog />
+      </APIContext.Provider>
+    );
+    await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
+    await enqueueRequest(MOCK_REQUEST);
+    expect(view.queryByRole("button", { name: "Reject" })).not.toBeNull();
+
+    view.rerender(
+      <APIContext.Provider value={kept}>
+        <SshPromptDialog />
+      </APIContext.Provider>
+    );
+    await act(async () => {
+      await flushReactWork();
+    });
+    expect(view.queryByRole("button", { name: "Reject" })).toBeNull();
+  });
 });

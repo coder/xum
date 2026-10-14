@@ -83,6 +83,7 @@ async function waitForFileEditOrAbort<TMetadata>(
       }
 
       abortSignal.removeEventListener("abort", onAbort);
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       resolve(getAbortedFileEditResult(abortSignal)!);
     };
 

@@ -182,6 +182,41 @@ describe("applyWorkspaceChatEventToAggregator", () => {
     dismissChatError("parent-1", "Child workspace exceeded the parent's goal budget.");
   });
 
+  test("a plugin hook notice becomes a toast, never a transcript row", () => {
+    const aggregator = new StubAggregator();
+    const event: WorkspaceChatMessage = {
+      type: "plugin-hook-notice",
+      workspaceId: "ws-notice",
+      plugin: "guard",
+      message: "Checked the command.",
+    };
+
+    expect(applyWorkspaceChatEventToAggregator(aggregator, event)).toBe("ignored");
+    expect(aggregator.calls).toEqual([]);
+    expect(peekChatError("ws-notice")).toBe("Plugin guard: Checked the command.");
+    dismissChatError("ws-notice", "Plugin guard: Checked the command.");
+
+    // Replay (no side effects) shows nothing.
+    applyWorkspaceChatEventToAggregator(aggregator, event, { allowSideEffects: false });
+    expect(peekChatError("ws-notice")).toBeUndefined();
+  });
+
+  test("a long plugin hook notice is cut to a toast-safe length", () => {
+    const long = "x".repeat(16 * 1024);
+    applyWorkspaceChatEventToAggregator(new StubAggregator(), {
+      type: "plugin-hook-notice",
+      workspaceId: "ws-long-notice",
+      plugin: "guard",
+      message: long,
+    });
+
+    const shown = peekChatError("ws-long-notice");
+    expect(shown?.startsWith("Plugin guard: xxx")).toBe(true);
+    expect(shown?.endsWith("…")).toBe(true);
+    expect(shown!.length).toBeLessThan(1_000);
+    dismissChatError("ws-long-notice", shown!);
+  });
+
   test("stream-abort clears token state before calling handleStreamAbort", () => {
     const aggregator = new StubAggregator();
 

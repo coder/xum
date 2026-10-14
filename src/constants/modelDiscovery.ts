@@ -10,12 +10,15 @@ export const MODEL_DISCOVERY_LIMITS = {
   bytes: 2 * 1024 * 1024,
 } as const;
 
+export const META_API_BASE_URL = "https://api.meta.ai/v1";
+
 // Match the inference adapters; compatible APIs do not share a universal /v1 prefix.
 export const MODEL_DISCOVERY_BASE_URLS: Partial<Record<ProviderName, string>> = {
   anthropic: "https://api.anthropic.com/v1",
   openai: "https://api.openai.com/v1",
   google: "https://generativelanguage.googleapis.com/v1beta",
   xai: "https://api.x.ai/v1",
+  meta: META_API_BASE_URL,
   deepseek: "https://api.deepseek.com",
   moonshotai: "https://api.moonshot.ai/v1",
   openrouter: "https://openrouter.ai/api/v1",

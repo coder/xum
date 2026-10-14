@@ -3,8 +3,19 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
-import { setTodosForSessionDir } from "./todo";
+import { createTodoWriteTool, setTodosForSessionDir } from "./todo";
+import { createTestToolConfig, mockToolCallOptions } from "./testHelpers";
 import type { TodoItem } from "@/common/types/tools";
+import { MAX_TODOS } from "@/common/constants/toolLimits";
+
+/** A valid ordered list: about two thirds completed, one in progress, the rest pending. */
+function buildTodos(count: number): TodoItem[] {
+  const completed = Math.max(0, count - Math.ceil(count / 3));
+  return Array.from({ length: count }, (_, index) => ({
+    content: `Step ${index + 1}`,
+    status: index < completed ? "completed" : index === completed ? "in_progress" : "pending",
+  }));
+}
 
 describe("Todo Storage", () => {
   const workspaceId = "test-workspace";
@@ -95,37 +106,19 @@ describe("Todo Storage", () => {
       expect(storedTodos).toEqual([]);
     });
 
-    it("should reject when exceeding MAX_TODOS limit", async () => {
-      // Create a list with 8 items (exceeds MAX_TODOS = 7)
-      const tooManyTodos: TodoItem[] = [
-        { content: "Task 1", status: "completed" },
-        { content: "Task 2", status: "completed" },
-        { content: "Task 3", status: "completed" },
-        { content: "Task 4", status: "completed" },
-        { content: "Task 5", status: "in_progress" },
-        { content: "Task 6", status: "pending" },
-        { content: "Task 7", status: "pending" },
-        { content: "Task 8", status: "pending" },
-      ];
+    it("should reject one item over MAX_TODOS with the count and keep the stored list", async () => {
+      const storedTodos = buildTodos(3);
+      await setTodosForSessionDir(workspaceId, workspaceSessionDir, storedTodos);
 
       await expect(
-        setTodosForSessionDir(workspaceId, workspaceSessionDir, tooManyTodos)
-      ).rejects.toThrow(/Too many TODOs \(8\/7\)/i);
-      await expect(
-        setTodosForSessionDir(workspaceId, workspaceSessionDir, tooManyTodos)
-      ).rejects.toThrow(/Keep high precision at the center/i);
+        setTodosForSessionDir(workspaceId, workspaceSessionDir, buildTodos(MAX_TODOS + 1))
+      ).rejects.toThrow(`(${MAX_TODOS + 1}/${MAX_TODOS})`);
+      // A rejected write must leave the previous list in place.
+      expect(await readTodosForSessionDir(workspaceSessionDir)).toEqual(storedTodos);
     });
 
     it("should accept exactly MAX_TODOS items", async () => {
-      const maxTodos: TodoItem[] = [
-        { content: "Old work (2 tasks)", status: "completed" },
-        { content: "Recent task", status: "completed" },
-        { content: "Current work", status: "in_progress" },
-        { content: "Next step 1", status: "pending" },
-        { content: "Next step 2", status: "pending" },
-        { content: "Next step 3", status: "pending" },
-        { content: "Future work (5 items)", status: "pending" },
-      ];
+      const maxTodos = buildTodos(MAX_TODOS);
 
       await setTodosForSessionDir(workspaceId, workspaceSessionDir, maxTodos);
       expect(await readTodosForSessionDir(workspaceSessionDir)).toEqual(maxTodos);
@@ -296,6 +289,44 @@ describe("Todo Storage", () => {
         await fs.rm(tempDir1, { recursive: true, force: true });
         await fs.rm(tempDir2, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe("todo_write tool", () => {
+    it("accepts a 9-step playbook plus 6 task items without merging steps", async () => {
+      // Playbook routers (pstack) copy every playbook step into the list before task items.
+      // Literal list on purpose: it pins the size the cap must support, independent of MAX_TODOS.
+      const playbookSteps = [
+        "Read the task",
+        "Explore the code",
+        "Write the plan",
+        "Implement",
+        "Validate",
+        "Dogfood",
+        "Open the PR",
+        "Babysit CI",
+        "Report",
+      ];
+      const taskItems = [
+        "Raise the cap",
+        "Fix the panel scroll",
+        "Add tests",
+        "Add stories",
+        "Run static-check",
+        "Write the PR body",
+      ];
+      const todos: TodoItem[] = [
+        ...playbookSteps.map((content) => ({ content, status: "completed" as const })),
+        { content: taskItems[0], status: "in_progress" },
+        ...taskItems.slice(1).map((content) => ({ content, status: "pending" as const })),
+      ];
+      expect(todos).toHaveLength(15);
+
+      const tool = createTodoWriteTool(createTestToolConfig(workspaceSessionDir));
+      const result: unknown = await tool.execute!({ todos }, mockToolCallOptions);
+
+      expect(result).toEqual({ success: true, count: 15 });
+      expect(await readTodosForSessionDir(workspaceSessionDir)).toEqual(todos);
     });
   });
 });

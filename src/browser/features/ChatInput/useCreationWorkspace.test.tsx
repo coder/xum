@@ -1,6 +1,7 @@
 import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
   getAutoRoutingPick,
@@ -709,6 +710,65 @@ describe("useCreationWorkspace", () => {
     mock.restore();
     // Reset global window/document/localStorage between tests
     restoreDomGlobals();
+  });
+
+  // A reconnect reloads branches and runtime availability through the new client. The creation
+  // controls keep the shown values until the reload answers. `branchLoad` is the send barrier
+  // (#6033), so it is "loading" until the new branch list answers.
+  describe.each([...GAP_MODES])("reload after a reconnect (%s)", (mode) => {
+    test("keeps the shown branches and runtimes, and blocks the send, until the reload answers", async () => {
+      setupWindow({
+        listBranches: mock(() => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })),
+      });
+      const harness = createConnectionHarness(mode, () => currentORPCClient ?? {});
+      const resultRef: { current: ReturnType<typeof useCreationWorkspace> | null } = {
+        current: null,
+      };
+      function Harness() {
+        resultRef.current = useCreationWorkspace({
+          projectPath: TEST_PROJECT_PATH,
+          onWorkspaceCreated: () => undefined,
+          message: "",
+        });
+        return null;
+      }
+      render(
+        <harness.Wrapper>
+          <Harness />
+        </harness.Wrapper>
+      );
+      await waitFor(() => expect(resultRef.current?.branchLoad).toBe("loaded"));
+      await waitFor(() =>
+        expect(resultRef.current?.runtimeAvailabilityState.status).toBe("loaded")
+      );
+
+      let answerBranches: (() => void) | null = null;
+      const branchesAnswered = new Promise<void>((resolve) => (answerBranches = resolve));
+      const previous = currentORPCClient;
+      if (!previous) throw new Error("setupWindow() sets the client");
+      currentORPCClient = {
+        ...previous,
+        projects: {
+          ...previous.projects,
+          listBranches: () =>
+            branchesAnswered.then(() => ({ branches: ["main", "next"], recommendedTrunk: "main" })),
+          runtimeAvailability: () => new Promise(() => undefined),
+        },
+      };
+      await harness.drop();
+      harness.reconnect();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+
+      expect(resultRef.current?.branchLoad).toBe("loading");
+      expect(resultRef.current?.branches).toEqual(["main"]);
+      expect(resultRef.current?.runtimeAvailabilityState.status).toBe("loaded");
+
+      act(() => answerBranches?.());
+      await waitFor(() => expect(resultRef.current?.branches).toEqual(["main", "next"]));
+      expect(resultRef.current?.branchLoad).toBe("loaded");
+    });
   });
 
   test("loads branches when projectPath is provided", async () => {

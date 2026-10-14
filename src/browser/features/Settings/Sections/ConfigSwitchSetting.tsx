@@ -7,7 +7,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/browser/components/Tooltip/Tooltip";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 
 export type SettingsApi = NonNullable<ReturnType<typeof useAPI>["api"]>;
 
@@ -24,9 +24,19 @@ interface ConfigSwitchSettingProps {
   saveErrorMessage: string;
 }
 
+/**
+ * The switch is locked until the saved value loads, and offline: a toggle could not reach the
+ * server, so it must not look applied.
+ */
+function isSwitchLocked(enabled: boolean | null, offline: boolean): boolean {
+  return enabled === null || offline;
+}
+
 /** A switch backed by one boolean in the backend config. */
 export function ConfigSwitchSetting(props: ConfigSwitchSettingProps) {
   const { api } = useAPI();
+  // Offline the switch is disabled: a toggle could not reach the server.
+  const offline = useLiveAPI() == null;
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Serialize writes so rapid toggles persist the last choice, and roll back only when the
@@ -91,7 +101,7 @@ export function ConfigSwitchSetting(props: ConfigSwitchSettingProps) {
       </div>
       <Switch
         checked={enabled ?? props.placeholderChecked}
-        disabled={enabled === null}
+        disabled={isSwitchLocked(enabled, offline)}
         onCheckedChange={handleChange}
         aria-label={props.ariaLabel}
       />

@@ -47,7 +47,11 @@ import {
 import { ArtifactKindSchema } from "@/common/orpc/schemas/artifacts";
 import { z } from "zod";
 import { AgentIdSchema } from "@/common/schemas/ids";
-import { AgentSkillPackageSchema, SkillNameSchema } from "@/common/orpc/schemas/agentSkill";
+import {
+  AgentSkillPackageSchema,
+  SkillLookupNameSchema,
+  SkillNameSchema,
+} from "@/common/orpc/schemas/agentSkill";
 import {
   BestOfGroupSchema,
   WorkspaceHeartbeatSettingsSchema,
@@ -167,14 +171,6 @@ const ToolOutputUiOnlySchema = z.object({
     .object({
       notifiedVia: z.enum(["electron", "browser"]),
       workspaceId: z.string().optional(),
-    })
-    .optional(),
-  /** attach_file registered an artifact version (Artifacts M4); UI-only, never sent to the model. */
-  artifact: z
-    .object({
-      id: z.string(),
-      version: z.number().int().positive(),
-      path: z.string(),
     })
     .optional(),
 });
@@ -595,6 +591,9 @@ const TaskToolCompletedReportSchema = z
   .object({
     taskId: z.string(),
     reportMarkdown: z.string(),
+    /** Set when reportMarkdown is the first page of a longer report; note names the next read. */
+    nextCharOffset: z.number().optional(),
+    note: z.string().optional(),
     title: z.string().optional(),
     structuredOutput: z.unknown().optional(),
     planFilePath: z.string().optional(),
@@ -648,6 +647,8 @@ export const TaskToolCompletedResultSchema = z
     taskId: z.string().optional(),
     taskIds: z.array(z.string()).min(1).optional(),
     reportMarkdown: z.string().optional(),
+    /** Set when reportMarkdown is the first page of a longer report (see note). */
+    nextCharOffset: z.number().optional(),
     title: z.string().optional(),
     structuredOutput: z.unknown().optional(),
     planFilePath: z.string().optional(),
@@ -747,6 +748,12 @@ export const TaskAwaitToolArgsSchema = z
       .describe(
         "Return once this many awaited tasks complete (default 1, clamped to the count). Use the batch size when you must compare every result, e.g. best-of-n."
       ),
+    offset_chars: z
+      .number()
+      .int()
+      .min(0)
+      .nullish()
+      .describe("Long reports come in pages: pass the previous result's nextCharOffset."),
   })
   .strict()
   .superRefine((args, ctx) => {
@@ -755,6 +762,40 @@ export const TaskAwaitToolArgsSchema = z
         code: z.ZodIssueCode.custom,
         message: "filter_exclude requires filter to be set",
         path: ["filter_exclude"],
+      });
+    }
+    // One offset pages one report: with several IDs (or none, which awaits every task), each
+    // other completed report would silently lose its first offset_chars characters.
+    const ids = new Set(args.task_ids ?? []);
+    const offset = args.offset_chars ?? 0;
+    // Bash output has no report pages: each read returns the next unread output by itself, so
+    // an offset there would only mislead the model into thinking it skipped or re-read output.
+    const bashId = offset > 0 ? [...ids].find((id) => id.startsWith("bash:")) : undefined;
+    if (bashId !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "offset_chars pages agent reports, not bash output. Bash output pages by itself: call " +
+          `task_await(task_ids: [${JSON.stringify(bashId)}], timeout_secs: 0) without offset_chars ` +
+          "to read the next unread output.",
+        path: ["offset_chars"],
+      });
+      return;
+    }
+    if (offset > 0 && ids.size !== 1) {
+      const calls = [...ids].map(
+        (id) =>
+          `task_await(task_ids: [${JSON.stringify(id)}], timeout_secs: 0, offset_chars: ${offset})`
+      );
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "offset_chars pages one report, so it needs exactly one task ID. Call " +
+          (calls.length > 0
+            ? calls.join(" or ")
+            : `task_await(task_ids: ["<id>"], timeout_secs: 0, offset_chars: ${offset})`) +
+          ", and await other tasks without offset_chars.",
+        path: ["offset_chars"],
       });
     }
   });
@@ -829,6 +870,10 @@ export const TaskAwaitToolCompletedResultSchema = z
     elapsed_ms: z.number().optional(),
     exitCode: z.number().optional(),
     note: z.string().optional(),
+    /** Set when reportMarkdown is one page of a longer report (see offset_chars). */
+    nextCharOffset: z.number().optional(),
+    /** Where this reportMarkdown page starts, when the call passed offset_chars. */
+    startCharOffset: z.number().optional(),
     artifacts: TaskAwaitToolArtifactsSchema.optional(),
   })
   .strict();
@@ -1050,6 +1095,8 @@ const TaskSendMessageTargetRelationSchema = z.enum([
   "sibling",
   "ancestor",
   "unrelated",
+  "main_chat",
+  "side_chat",
 ]);
 
 const TaskSendMessageToolAcceptedResultSchema = z
@@ -1559,7 +1606,7 @@ export const TaskListToolTaskSchema = z
   .object({
     taskId: z.string(),
     status: TaskListStatusSchema,
-    // Absent only on the scope:"tree" root workspace row, which has no parent.
+    // Absent on plain workspace rows, including direct main/side-chat links without task ancestry.
     parentWorkspaceId: z.string().optional(),
     agentType: z.string().optional(),
     workspaceName: z.string().optional(),
@@ -1573,9 +1620,12 @@ export const TaskListToolTaskSchema = z
     workflowProgress: WorkflowProgressSummarySchema.optional(),
     /**
      * Present under scope:"tree" and scope:"instance": this row's relationship to the calling
-     * workspace. "unrelated" (instance scope) means no shared task-tree ancestry.
+     * workspace. "unrelated" (instance scope) means no shared task-tree ancestry. main_chat/side_chat
+     * describe direct conversation links only, without ownership or lifecycle privileges.
      */
-    relationship: z.enum(["self", "ancestor", "sibling", "descendant", "unrelated"]).optional(),
+    relationship: z
+      .enum(["self", "ancestor", "sibling", "descendant", "unrelated", "main_chat", "side_chat"])
+      .optional(),
     /** scope:"instance" only — the project the root workspace belongs to. */
     projectPath: z.string().optional(),
     /** scope:"instance" only — availability snapshot at listing time, not a guarantee. */
@@ -1718,6 +1768,10 @@ export const AgentReportToolResultSchema = z.discriminatedUnion("success", [
 ]);
 const FILE_TOOL_PATH = z.string().describe("File path (absolute or workspace-relative)");
 const SKILL_NAME_PARAM = SkillNameSchema.describe("Skill directory name");
+// Read tools only: writes and deletes keep the bare SKILL_NAME_PARAM.
+const SKILL_LOOKUP_NAME_PARAM = SkillLookupNameSchema.describe(
+  "Skill name, or <plugin>:<skill> for a plugin's skill"
+);
 const FILE_LINE_RANGE_FIELDS = {
   offset: z.number().int().positive().nullish().describe("1-based start line (default 1)"),
   limit: z.number().int().positive().nullish().describe("Max lines from offset (default all)"),
@@ -2049,24 +2103,28 @@ export const XumConfigWriteToolResultSchema = z.union([
 /**
  * File read tool result - content or error.
  */
+const FileReadSuccessResultSchema = z.object({
+  success: z.literal(true),
+  file_size: z.number(),
+  modifiedTime: z.string(),
+  lines_read: z.number(),
+  content: z
+    .string()
+    .describe(
+      "File content with line numbers prepended as '<line_number>\\t<content>'. " +
+        "Line numbers are not part of the actual file content."
+    ),
+  warning: z.string().optional(),
+});
+
+const FileReadErrorResultSchema = z.object({
+  success: z.literal(false),
+  error: z.string(),
+});
+
 export const FileReadToolResultSchema = z.union([
-  z.object({
-    success: z.literal(true),
-    file_size: z.number(),
-    modifiedTime: z.string(),
-    lines_read: z.number(),
-    content: z
-      .string()
-      .describe(
-        "File content with line numbers prepended as '<line_number>\\t<content>'. " +
-          "Line numbers are not part of the actual file content."
-      ),
-    warning: z.string().optional(),
-  }),
-  z.object({
-    success: z.literal(false),
-    error: z.string(),
-  }),
+  FileReadSuccessResultSchema,
+  FileReadErrorResultSchema,
 ]);
 
 const AttachFileToolTextPartSchema = z
@@ -2160,6 +2218,13 @@ export const AgentSkillReadToolResultSchema = z.union([
   z.object({
     success: z.literal(true),
     skill: AgentSkillPackageSchema,
+    // Optional: results persisted before these fields existed lack them.
+    /** Absolute skill directory, valid where the workspace's bash runs. */
+    skillDir: z.string().optional(),
+    /** Agent Plugin skills only: absolute plugin root, valid where bash runs. */
+    pluginRoot: z.string().optional(),
+    /** Why `skillDir` is absent (built-in skill, or files not where bash runs). */
+    skillDirUnavailable: z.string().optional(),
   }),
   z.object({
     success: z.literal(false),
@@ -2168,10 +2233,14 @@ export const AgentSkillReadToolResultSchema = z.union([
 ]);
 
 /**
- * Agent Skill read_file tool result.
- * Uses the same shape/limits as file_read.
+ * agent_skill_read_file result: file_read's, plus the plugin sibling note
+ * (pluginSiblingNote.ts) for files of a plugin skill. The note is a separate
+ * field so `content` line numbers stay exact.
  */
-export const AgentSkillReadFileToolResultSchema = FileReadToolResultSchema;
+export const AgentSkillReadFileToolResultSchema = z.union([
+  FileReadSuccessResultSchema.extend({ pluginSkillNote: z.string().optional() }),
+  FileReadErrorResultSchema,
+]);
 
 /**
  * models_list tool result. Mirrors the shared `AvailableModel` domain type
@@ -2751,10 +2820,10 @@ export const TOOL_DEFINITIONS = {
   agent_skill_read: {
     resultSchema: AgentSkillReadToolResultSchema,
     description:
-      "Load a skill's SKILL.md (frontmatter + body) by name; read its other files with agent_skill_read_file.",
+      "Load a skill's SKILL.md (frontmatter + body) by name; read its other files with agent_skill_read_file. skillDir in the result is the skill's absolute directory where bash runs (relative paths in the skill resolve against it); if absent, skillDirUnavailable says why.",
     schema: z
       .object({
-        name: SKILL_NAME_PARAM,
+        name: SKILL_LOOKUP_NAME_PARAM,
       })
       .strict(),
   },
@@ -2763,7 +2832,7 @@ export const TOOL_DEFINITIONS = {
     description: "Read a file in a skill directory, like file_read.",
     schema: z
       .object({
-        name: SKILL_NAME_PARAM,
+        name: SKILL_LOOKUP_NAME_PARAM,
         filePath: z
           .string()
           .min(1)
@@ -2788,7 +2857,7 @@ export const TOOL_DEFINITIONS = {
   },
   models_list: {
     description:
-      "List selectable (non-hidden) models with aliases and thinking levels; a config snapshot, not an availability probe. Pass an ID only for a requested override; else leave `task.model` unset.",
+      "List model suggestions with aliases and thinking levels; not exhaustive or an availability probe. Other provider:model IDs may work with a configured provider. Pass an ID only for a requested override; else leave `task.model` unset.",
     schema: z.object({}).strict(),
     resultSchema: ModelsListToolResultSchema,
   },
@@ -2848,6 +2917,16 @@ export const TOOL_DEFINITIONS = {
         owner: z.string().describe("GitHub owner from skills_catalog_search"),
         repo: z.string().describe("GitHub repo from skills_catalog_search"),
         skillId: SkillNameSchema.describe("Skill ID from skills_catalog_search"),
+        offset_chars: z
+          .number()
+          .int()
+          .min(0)
+          .nullish()
+          .describe("Long bodies come in pages: pass the previous result's nextCharOffset."),
+        snapshot: z
+          .string()
+          .nullish()
+          .describe("With offset_chars: the previous result's snapshot."),
       })
       .strict(),
   },
@@ -3010,7 +3089,7 @@ export const TOOL_DEFINITIONS = {
   task_send_message: {
     resultSchema: TaskSendMessageToolResultSchema,
     description:
-      'Send plain text to another agent workspace in this Xum instance: a descendant, a same-tree peer (sibling, cousin, ancestor or root; list them with task_list scope:"tree"), or an unrelated workspace whose ID you already know (an envelope "from" address or an ID from the user). The relationship is computed server-side. ' +
+      'Send plain text to another agent workspace in this Xum instance: a descendant, a same-tree peer (sibling, cousin, ancestor or root; list them with task_list scope:"tree"), a direct main/side-chat link, or an unrelated workspace whose ID you already know (an envelope "from" address or an ID from the user). The relationship is computed server-side. Side chats may only message their own main chat; main chats may message their directly linked side chats. This link grants no task ownership or lifecycle control. ' +
       "\n\nDescendants receive trusted guidance: busy work is interrupted or queued at the requested boundary, and an inactive child reawakens in the same workspace with the same task ID and title; its checkout is not refreshed (see task for reuse rules). " +
       "\n\nOther targets receive an untrusted <mux_agent_message> envelope with your ID as the reply address. Peers cannot reawaken inactive sub-agents; idle roots wake; stopped or archived targets refuse. A busy unrelated target gets the message at its next tool boundary unless it holds messages until turn end, and runs it under its own agent and settings. A root running a delegated turn you do not own returns queued with awaitsDelegatedTurn: the message runs as a new turn after that turn (best-effort; dropped if withdrawn); do not resend. Never ask a peer for work your own constraints forbid. " +
       "\n\nUnrelated targets need the recipient's opt-in and local or worktree runtimes on both ends; peer sends are throttled and refused for workflow-owned or best-of endpoints (the error says why). Messaging grants no extra control. Not for bash tasks, workflow runs or workspace-turn handles.",
@@ -3058,7 +3137,7 @@ export const TOOL_DEFINITIONS = {
     resultSchema: TaskListToolResultSchema,
     description:
       "List this workspace's descendant tasks: sub-agents, background bash and top-level workflow runs (workflow-owned tasks are omitted). Use it to rediscover work after compaction, restart or an uncertain workflow_run (omit statuses then; pending runs may need workflow_resume), not to wait: use task_await. Rows with bestOf are grouped candidates, not bench members. " +
-      '\n\nscope:"tree" lists every workspace in this task tree with its relationship to you; rows are task_send_message targets except your own, best-of candidates and inactive non-descendants. scope:"instance" (local/worktree only) lists consenting root workspaces in this Xum instance, newest first, with an activity snapshot.',
+      '\n\nscope:"tree" lists this task tree with relationships to you, plus direct main_chat/side_chat links as workspace rows without task ancestry or lifecycle privileges; a side chat sees only its own main chat link. Other tree rows are task_send_message targets except your own, best-of candidates and inactive non-descendants. scope:"instance" (local/worktree only; unavailable to side chats) lists consenting root workspaces in this Xum instance, newest first, with an activity snapshot.',
     schema: TaskListToolArgsSchema,
   },
   workflow_run: {
@@ -3139,7 +3218,7 @@ export const TOOL_DEFINITIONS = {
     resultSchema: ArtifactToolResultSchema,
     description:
       "When a result is ready to look at, publish its file under $XUM_SCRATCH_DIR/artifacts/ as a labeled version in the user's Artifacts tab, shown as a chat card. " +
-      "Republishing a path adds a version (identical bytes add none); unpublished changes get one unlabeled version at turn end.",
+      "Republishing a path adds a version (identical bytes add none); unpublished changes add no version.",
     schema: z
       .object({
         path: z.string().describe("Relative to $XUM_SCRATCH_DIR/artifacts, or absolute inside it."),
@@ -3451,16 +3530,16 @@ export function getToolSchemas(): Record<string, ToolSchema> {
 }
 
 /**
- * Google's mixed built-in + function tool path is currently supported for Gemini 3.
+ * Google's mixed built-in + function tool path is supported for Gemini 3 and Gemini 4 Argon.
  * Keep native Google tools gated here so the prompt allowlist matches the actual toolset.
  */
 export function supportsGoogleNativeToolsWithFunctionTools(modelId: string): boolean {
   const bareModelId = modelId.split("/").pop() ?? modelId;
-  const match = /^gemini-(\d+)(?:[.-]|$)/.exec(bareModelId);
-  if (!match) return false;
-  const major = Number.parseInt(match[1], 10);
-  // The installed @ai-sdk/google mixed native/function serialization path is Gemini 3-only.
-  return major === 3;
+  // Gemini 4 Argon documents Search grounding and URL context alongside function calling,
+  // and @ai-sdk/google gives every post-2.x Gemini ID the mixed native/function
+  // serialization (includeServerSideToolInvocations). Other Gemini 4 IDs stay off until
+  // their docs list the same tools.
+  return /^gemini-(?:3(?:[.-]|$)|4-argon)/.test(bareModelId);
 }
 
 /**

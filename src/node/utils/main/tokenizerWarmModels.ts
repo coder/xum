@@ -54,6 +54,7 @@ function collectConfiguredModels(config: ProjectsConfig): string[] {
   // The config can hold junk, so nothing here trusts the types.
   const stack: Array<{ value: unknown; depth: number }> = [{ value: config, depth: 0 }];
   while (stack.length > 0) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const { value, depth } = stack.pop()!;
     if (depth > MAX_WALK_DEPTH || !isRecord(value)) {
       continue;

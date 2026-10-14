@@ -53,6 +53,7 @@ import {
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "./discovery";
+import { buildPluginServerKey, resolvePluginInstanceId } from "./mcpConfig";
 import { readMutationEpochToken, STAGING_DIR_NAME } from "./journals";
 import {
   buildHookInvokeScript,
@@ -71,6 +72,12 @@ const HOOK_CONTEXT_INLINE_MAX_CHARS = 4_096;
 const HOOK_CONTEXT_MAX_CHARS = 64 * 1024;
 /** Tool results larger than this (as JSON) are omitted from tool.execute.after input. */
 const HOOK_RESULT_INPUT_MAX_CHARS = 256 * 1024;
+/**
+ * `settings` larger than this many UTF-8 bytes (as JSON) are omitted from hook input (#6186): one
+ * server can send about 400 KB, and each settings-capable server of the plugin adds more. Bytes,
+ * not UTF-16 units: non-ASCII settings would otherwise pass at up to three times the size.
+ */
+const HOOK_SETTINGS_INPUT_MAX_BYTES = 64 * 1024;
 
 function sha256Hex(text: string): string {
   return crypto.createHash("sha256").update(text, "utf-8").digest("hex");
@@ -86,8 +93,20 @@ export interface EnsureWorkspaceHooksArgs {
   xumHome: string;
   /** Host checkout root for project containers; omit for off-host workspaces. */
   projectRoot?: string;
+  /** Project identity for project-plugin instance IDs (same as the plugin MCP provider). */
+  projectKey?: string;
   projectTrusted: boolean;
 }
+
+/**
+ * Structured settings (`openai/settings`) of one plugin instance's MCP
+ * servers in a workspace, keyed by server name. Must never throw.
+ */
+export type PluginHookSettingsProvider = (
+  workspaceId: string,
+  serverKeyPrefix: string,
+  timeoutMs: number
+) => Promise<Record<string, Record<string, unknown>>>;
 
 /** One discovered plugin with a hooks.js, plus its pinned source snapshot. */
 interface DiscoveredHookPlugin {
@@ -100,6 +119,8 @@ interface DiscoveredHookPlugin {
 interface LoadedPluginHookState {
   pluginName: string;
   grants: CapabilityGrants;
+  /** `plugin:<instanceId>:`: this plugin's MCP server keys (hook `settings`). */
+  serverKeyPrefix: string;
   /** Pinned hooks.js source; re-evaluated when the mount is rebuilt. */
   source: string;
   mountOptions: AcquireMountOptions;
@@ -140,7 +161,12 @@ interface AgentPluginHookServiceDeps {
   runtimeFactoryLoader?: () => Promise<IJSRuntimeFactory>;
   /** Container computation seam (tests pin containers to temp dirs). */
   computeContainers?: typeof computeAgentPluginContainers;
+  /** Deadline for a hook-time settings read (cache miss only). */
+  settingsTimeoutMs?: number;
 }
+
+/** A cache-miss settings read is short: it runs inside a tool call's hook. */
+const HOOK_SETTINGS_TIMEOUT_MS = 1_000;
 
 function loadQuickJSRuntimeFactory(): Promise<IJSRuntimeFactory> {
   // The heavy QuickJS WASM stack loads at first runtime creation
@@ -156,6 +182,8 @@ export class AgentPluginHookService {
   private readonly hookTimeoutMs: number;
   private readonly runtimeFactoryLoader: () => Promise<IJSRuntimeFactory>;
   private readonly computeContainers: typeof computeAgentPluginContainers;
+  private readonly settingsTimeoutMs: number;
+  private settingsProvider: PluginHookSettingsProvider | undefined;
 
   private readonly registrations = new Map<string, WorkspaceHookRegistration>();
   /** Serializes ensure/dispose per workspace (concurrent sends must not race teardown). */
@@ -170,6 +198,12 @@ export class AgentPluginHookService {
     this.hookTimeoutMs = deps.hookTimeoutMs ?? HOOK_EVAL_TIMEOUT_MS;
     this.runtimeFactoryLoader = deps.runtimeFactoryLoader ?? loadQuickJSRuntimeFactory;
     this.computeContainers = deps.computeContainers ?? computeAgentPluginContainers;
+    this.settingsTimeoutMs = deps.settingsTimeoutMs ?? HOOK_SETTINGS_TIMEOUT_MS;
+  }
+
+  /** The MCP manager is built after this module-level singleton. */
+  setSettingsProvider(provider: PluginHookSettingsProvider): void {
+    this.settingsProvider = provider;
   }
 
   /** Normal and headless requests share the same broken-plugin isolation posture. */
@@ -284,6 +318,14 @@ export class AgentPluginHookService {
     const state: LoadedPluginHookState = {
       pluginName: plugin.name,
       grants: candidate.grants,
+      // Same instance ID as the plugin's MCP servers (one hashing rule).
+      serverKeyPrefix: buildPluginServerKey(
+        resolvePluginInstanceId(plugin, {
+          projectRoot: args.projectRoot,
+          projectKey: args.projectKey,
+        }),
+        ""
+      ),
       source: candidate.source,
       mountOptions: {
         lifetime: "persistent",
@@ -595,6 +637,33 @@ export class AgentPluginHookService {
   }
 
   /**
+   * This plugin's settings, after starting the reads of every sibling plugin that can run the
+   * same hook point (#6186): on a tool hook, only siblings that grant `toolName`. The spine runs plugin middleware serially, so plugins that each wait on their
+   * own unresponsive settings server would add one timeout each. The siblings' own calls later
+   * join the reads the MCP manager already has in flight, so the dispatch waits about one timeout.
+   */
+  private readHookSettings(
+    workspaceId: string,
+    state: LoadedPluginHookState,
+    hookName: PluginHookPoint,
+    toolName: string | undefined
+  ): Promise<Record<string, unknown>> {
+    const provider = this.settingsProvider;
+    if (provider === undefined) {
+      return Promise.resolve({});
+    }
+    for (const sibling of this.registrations.get(workspaceId)?.states ?? []) {
+      if (sibling !== state && canRunHook(sibling, hookName, toolName)) {
+        // Only starts the read: the result is discarded, and the provider never throws.
+        provider(workspaceId, sibling.serverKeyPrefix, this.settingsTimeoutMs).catch(
+          () => undefined
+        );
+      }
+    }
+    return provider(workspaceId, state.serverKeyPrefix, this.settingsTimeoutMs);
+  }
+
+  /**
    * Invoke one hook in the plugin's mount. Returns null on any failure
    * (crash, timeout, malformed output) — log, skip, continue.
    */
@@ -607,6 +676,18 @@ export class AgentPluginHookService {
     if (state.disposed) {
       return null;
     }
+    // Preflight: a plugin already revoked (here or by another backend's committed update or
+    // uninstall) must not even have its settings server contacted.
+    if (await this.retireIfEpochStale(workspaceId)) {
+      return null;
+    }
+    // Every hook point gets `settings` from the plugin's own MCP servers.
+    // Read BEFORE the revocation checks below: an uninstall or teardown that
+    // lands during this read must stop the call, or withPersistentMount would
+    // recreate the dropped mount and run the removed hook once more
+    // (the last review fix of #6040).
+    const toolName = typeof input.toolName === "string" ? input.toolName : undefined;
+    const settings = await this.readHookSettings(workspaceId, state, hookName, toolName);
     if (await this.retireIfEpochStale(workspaceId)) {
       return null;
     }
@@ -616,7 +697,7 @@ export class AgentPluginHookService {
       return null;
     }
     try {
-      const inputJson = JSON.stringify(input);
+      const inputJson = buildHookInputJson(input, settings, `'${state.pluginName}' ${hookName}`);
       assert(typeof inputJson === "string", "hook input must be JSON-serializable");
       const evalResult = await this.sandboxHost.withPersistentMount(
         state.mountOptions,
@@ -683,6 +764,46 @@ export class AgentPluginHookService {
       log.warn(`Agent plugin hooks: failed to drop sandbox scope ${scopeKey}`, { error });
     }
   }
+}
+
+/**
+ * Whether a plugin's hook would run for this hook point (and, on a tool hook, this tool). The
+ * sibling settings prefetch skips the rest: a read of a plugin that cannot run is not only
+ * wasted, a failed read is memoized per server instance, so a transient failure would cost that
+ * plugin its settings later.
+ */
+function canRunHook(
+  state: LoadedPluginHookState,
+  hookName: PluginHookPoint,
+  toolName: string | undefined
+): boolean {
+  return (
+    !state.disposed &&
+    state.hookNames.includes(hookName) &&
+    (toolName === undefined || isBridgeToolGranted(state.grants, toolName))
+  );
+}
+
+/**
+ * Hook input as JSON, with `settings` omitted above the size cap. `settingsOmitted` tells the
+ * hook why `settings` is empty, like `resultOmitted`. `label` names the hook in the warning.
+ */
+function buildHookInputJson(
+  input: Record<string, unknown>,
+  settings: Record<string, unknown>,
+  label: string
+): string {
+  const settingsJson: string | undefined = JSON.stringify(settings);
+  const settingsBytes = settingsJson === undefined ? 0 : Buffer.byteLength(settingsJson, "utf8");
+  const settingsOmitted = settingsBytes > HOOK_SETTINGS_INPUT_MAX_BYTES;
+  if (settingsOmitted) {
+    log.warn(
+      `Agent plugin hooks: ${label} settings exceed ${HOOK_SETTINGS_INPUT_MAX_BYTES} bytes; omitting them`
+    );
+  }
+  return JSON.stringify(
+    settingsOmitted ? { ...input, settings: {}, settingsOmitted } : { ...input, settings }
+  );
 }
 
 /**

@@ -63,9 +63,11 @@ Xum also discovers skills packaged in [Agent Plugins 1.0.0](https://agent-plugin
 - **Workspace-local**: `.xum/plugins/<plugin>/` and `.agents/plugins/<plugin>/`
 - **Global**: `~/.xum/plugins/<plugin>/` and `~/.agents/plugins/<plugin>/`
 
+Xum reads plugins from the Xum host only. SSH, Docker, and devcontainer workspaces load the global plugins (their skills, agents, and workflows) from the Xum host. Xum does not load project plugins inside an SSH or Docker checkout, because that checkout is not on the Xum host.
+
 Plugin skills have the lowest precedence within their scope and are read-only. A broken plugin (or a broken skill inside one) never affects other plugins or skills. Plugins can also ship MCP servers; see [MCP servers](/config/mcp-servers#agent-plugins-servers).
 
-Global plugins can be installed from git via **Settings → Plugins** (paste a git URL or `owner/repo[@ref]`). The preview lists the full package before anything is written. Select which skills and MCP servers to import; both groups start with all current items selected and support **Select all** and **Clear**. You can install with neither group selected. Agents, workflows, slash commands, and hooks are unaffected by this choice; review their disclosures too. Imported MCP servers remain disabled until you enable them per workspace.
+Global plugins can be installed from git via **Settings → Plugins** (paste a git URL or `owner/repo[/path/to/plugin][@ref]`). For a plugin inside a monorepo, add its folder after `owner/repo`, for example `cursor/plugins/pstack`. Xum then downloads only that folder's files (a sparse, partial clone) and installs it as the plugin, and the consent preview and update reviews cover only that folder. For a full git URL (`https://`, SSH, non-GitHub hosts), enter the folder in the **Plugin folder** field instead. The preview lists the full package before anything is written. Select which skills and MCP servers to import; both groups start with all current items selected and support **Select all** and **Clear**. You can install with neither group selected. Agents, workflows, slash commands, and hooks are unaffected by this choice; review their disclosures too. Imported MCP servers remain disabled until you enable them per workspace.
 
 Installed rows show imported-of-available counts. For a managed, present plugin, choose **Manage components** (or **Manage Plugin Components…** in the command palette) to change which skills and MCP servers are imported from its locked installed version without fetching the remote. Deselect imported components, select new ones, or use **Select all** and **Clear** for a whole group. Review the add/remove counts and choose **Save changes**, or **Cancel** to discard your draft. Saving an empty selection keeps the plugin installed with no skills or MCP servers imported; uninstall is a separate action. If the installed files or saved selection change during review, the inventory refreshes and you must review and save again.
 
@@ -73,12 +75,47 @@ Removing imports does not delete source files, plugin data, or workspace MCP set
 
 Updates preserve explicit selections: newly available skills and MCP servers stay unimported until you add them. Updates still require consent for full-package capability changes, including unimported components. Older managed installs without a saved selection continue importing everything, including new components on update. Unmanaged and project-local plugins are unchanged.
 
+#### Component review
+
+Xum loads a skill or MCP server from a managed plugin only after you review that exact version of it. Xum records what you approved at install, at each update, and in a component review. If its reviewed definition changes later, or if a newer Xum reads more of the plugin than you saw, it stops loading until you review it again. For a skill, the definition is its folder in the plugin and its `SKILL.md` frontmatter. A change to the skill's instructions (the `SKILL.md` body) does not need a new review. For an MCP server, the definition is everything Xum starts or connects with, such as the command, arguments, environment, URL and OAuth settings.
+
+After you upgrade to a Xum version with component review, every managed plugin needs one review. Its skills and MCP servers do not load until then. Xum does not approve them for you, because your earlier approval did not record what you saw.
+
+To review a plugin:
+
+1. Open **Settings → Plugins**. Each plugin that needs a review shows **needs review**, and a notice at the top says that its components do not load.
+2. Select **Review** on the plugin. The review lists each skill and MCP server with the fields you approve.
+3. Select **Approve components** to load them. You can also run **Review Plugin Components…** from the command palette.
+
+Plugins in `~/.agents/plugins` and project plugins are not managed installs. They load as before.
+
 <Warning>
   Import selection controls discovery, not filesystem access: skipped files remain in the plugin
   directory and can still be read. It is not a filesystem sandbox. Older Xum versions may ignore the
   selection field and expose every component. Losing the install registry also loses selection; the
   remaining directory cannot be distinguished from an unmanaged plugin and may expose everything.
 </Warning>
+
+#### Plugin skill namespaces
+
+A plugin skill has two names: its bare name (`tdd`) and a qualified name `<plugin>:<skill>` (`pstack:tdd`), the same convention Claude Code uses for plugin components.
+
+- A bare name keeps the precedence above. If you have a global `tdd` skill, `tdd` loads your skill and `pstack:tdd` loads the skill from the `pstack` plugin.
+- A qualified name only loads a skill from the named plugin. It never falls back to a project, global, or built-in skill. If a project plugin and a global plugin have the same plugin name, the project plugin wins.
+- If two plugins ship the same skill name, the bare name loads the first one, and each stays reachable as `alpha:tdd` and `beta:tdd`.
+- When a plugin skill loses its bare name to another skill, the model's skill index lists it under its qualified name. Plugin skills that win their bare name are listed only once, under the bare name.
+- A qualified name with no match (for example `nope:tdd` or `pstack:missing`) fails with `Agent skill not found: <name>`.
+
+You can invoke a plugin skill by its qualified name too: type `/pstack:tdd` in the composer, or mention `$pstack:tdd` in a message. The slash menu and `$` suggestions list a shadowed plugin skill under its qualified name, and typing `tdd` also matches `pstack:tdd`. If no plugin named `tdd` is installed, `$tdd:notes` loads the bare `tdd` skill and leaves `:notes` as text. If a `tdd` plugin is installed, `$tdd:notes` names one of its skills, and no skill attaches when that skill does not exist.
+
+Plugin skills often refer to their sibling skills by bare name. For example, a `pstack` skill can say "see the **tdd** skill". If a higher-precedence skill takes that bare name, Xum tells the model which skill the plugin means:
+
+- `agent_skill_read`, `/skill`, and `$skill` put a one-line note at the top of the plugin skill. The note maps each shadowed sibling to its qualified name, for example `tdd` -> `pstack:tdd`.
+- `agent_skill_read_file` adds the same note in a `pluginSkillNote` field when it reads a file of a plugin skill. The file content does not change.
+- The note lists only skills of the same plugin, at most 30. Xum adds no note when no sibling is shadowed.
+- Bare-name lookups keep the precedence above. The note does not change which skill a name loads.
+
+Skill names in `SKILL.md` frontmatter and directory names stay bare. The qualified form applies only to lookups such as `agent_skill_read`, `agent_skill_read_file`, `/skill`, and `$skill`.
 
 ## Skill layout
 
@@ -93,6 +130,42 @@ A skill is a directory named after the skill:
 ```
 
 Skill directory names must match `^[a-z0-9]+(?:-[a-z0-9]+)*$` (1–64 chars).
+The directory name is the skill ID. A directory name that does not match is an error, and Xum does not load the skill.
+
+## Bundled files and the skill directory
+
+A skill can ship scripts and other files next to `SKILL.md`. The skill does not need to know where it is installed: Xum tells the agent.
+
+- The `agent_skill_read` result includes `skillDir`, the absolute path of the skill's directory. Plugin skills also get `pluginRoot`, the absolute path of the plugin. Both paths are valid where the workspace's `bash` runs, so the agent can run a bundled script or pass the path to a sub-agent.
+- Xum replaces these placeholders in the skill body. They use the same names as Claude Code, so skills written for Claude Code work unchanged:
+  - `${CLAUDE_SKILL_DIR}`: the skill's directory.
+  - `${CLAUDE_PLUGIN_ROOT}`: the plugin's directory. Xum replaces it only in plugin skills.
+
+Xum replaces the placeholders when the agent loads a skill with `agent_skill_read` and when you invoke it (`/{skill-name}` or `$skill-name`). For invoked skills, the order is: [arguments](#skill-arguments), then placeholders (except on directive lines), then [dynamic context](#dynamic-context-injection-experiment). A directive such as `` !`sh "${CLAUDE_SKILL_DIR}/scripts/status.sh"` `` therefore runs the bundled script. In directives, Xum does not insert the path into the command: it sets `CLAUDE_SKILL_DIR` and `CLAUDE_PLUGIN_ROOT` as environment variables, and the shell expands them. Quote them, because a path can contain spaces.
+
+```md
+---
+name: release-notes
+description: Draft release notes from merged PRs
+---
+
+Run `sh "${CLAUDE_SKILL_DIR}/scripts/collect.sh"` and summarize its output.
+```
+
+When you invoke a skill (`/{skill-name}` or `$skill-name`), the first line of the skill text the agent gets names the skill's directory (and the plugin root for plugin skills). The agent can then open bundled files without searching for them. If the path contains a backtick, a `<` or `>`, or a control character, that line tells the agent to call `agent_skill_read` for the path instead. Skill text in older messages does not change.
+
+Xum reports a directory only when the path is valid where `bash` runs. Otherwise `skillDir` is absent and `skillDirUnavailable` tells the agent why. For an invoked skill whose files are on the Xum host while `bash` runs elsewhere, the first line says so instead. The agent can still read every bundled file with `agent_skill_read_file`.
+
+| Skill                                              | Local and worktree workspaces | SSH and Docker workspaces                            | Devcontainer workspaces |
+| -------------------------------------------------- | ----------------------------- | ---------------------------------------------------- | ----------------------- |
+| Project skills                                     | Path                          | Path (on the remote)                                 | No path                 |
+| Global and universal skills                        | Path                          | Docker: path. SSH: no path (read on the Xum host)    | No path                 |
+| Plugin skills (read on the Xum host)               | Path                          | Global plugins: no path. Project plugins: not loaded | No path                 |
+| Built-in skills (bundled in the app, no directory) | No path                       | No path                                              | No path                 |
+
+When you invoke a project skill in the first message of a new worktree workspace, Xum reads the skill from the project's main checkout, because the new worktree can lack it. That copy is not the worktree's, so the placeholders stay literal. If the worktree has the skill, the agent gets its path from `agent_skill_read`.
+
+When there is no directory, the placeholders stay as literal text. Xum does not run a dynamic context directive that names one of these variables when it has no value (a shell would expand it to an empty path). The directive's line then says why it did not run. Xum does not expand `${PLUGIN_ROOT}` in skill bodies: Agent Plugins defines it only for [MCP server](/config/mcp-servers#agent-plugins-servers) configuration.
 
 ## `SKILL.md` format
 
@@ -101,7 +174,7 @@ Xum enforces a 1MB maximum file size for `SKILL.md`.
 
 Required fields:
 
-- `name`: must match the directory name
+- `name`: must match the directory name (see [Display names](#display-names))
 - `description`: short summary shown in Xum’s skills index
 
 Optional fields:
@@ -114,8 +187,24 @@ Optional fields:
 - `user-invocable` (boolean) — set to `false` to hide a skill from user-facing invocation surfaces (see [Controlling who invokes a skill](#controlling-who-invokes-a-skill)).
 - `argument-hint` (string) — short hint describing the arguments a skill expects (for example `[issue-number]`), shown next to the skill in invocation UIs (see [Skill arguments](#skill-arguments)).
 - `when_to_use` (string) — extra model-facing guidance appended to the skill’s entry in the skills index. The kebab-case spelling `when-to-use` is also accepted; the underscore spelling wins if both are set.
+- `paths` (list or comma-separated string) — globs that limit the skill to matching files (see [Path-scoped skills](#path-scoped-skills)).
 
 Xum ignores unknown frontmatter keys (for example `allowed-tools`).
+
+### Display names
+
+Some skills from other tools set a `name` that is not kebab-case or is not the directory name, for example `name: Poteto Mode` in `poteto-mode/`.
+Xum loads such a skill from a project, global or plugin skills root under its directory name.
+Xum shows the `name` as a display name in the slash menu and the skills list, with a warning.
+The display name must be a single line of at most 64 characters, with no control or invisible formatting characters.
+
+The skill ID stays the directory name:
+
+- Invoke the skill as `/poteto-mode`.
+- The agent loads it with `agent_skill_read({ name: "poteto-mode" })`.
+- A plugin skill is also reachable as `<plugin>:poteto-mode`.
+
+Set `name` to the directory name to remove the warning. A missing `name` is still an error.
 
 ## Controlling who invokes a skill
 
@@ -138,6 +227,27 @@ Set `disable-model-invocation: true` (or the Xum-specific `advertise: false`) in
 - **Can still be invoked** via `/{skill-name}` slash command or `agent_skill_read({ name: "skill-name" })`
 - **Still appear** in Xum’s UI lists (for example `/` slash suggestions) and in ACP clients’ command lists
 - **Are useful for**: skills meant only for sub-agents, advanced users, or internal orchestration
+
+### Path-scoped skills
+
+Set `paths` to make a skill apply only to some files. Cursor and Claude Code use the same key, so portable skills work unchanged.
+
+```yaml
+---
+name: ts-rules
+description: TypeScript conventions for this repo.
+paths: ["**/*.ts", "**/*.tsx"]
+---
+```
+
+- **Syntax:** a YAML list, or one comma-separated string (`paths: "src/**/*.ts, *.{ts,tsx}"`). In the string form, a comma inside `{}` belongs to the glob, and patterns with `[` or `(` (character classes, extglobs) need the list form.
+- **Matching:** each glob is relative to the workspace root. `**/*.ts` matches `foo.ts` and `src/foo.ts`. Files in dot folders (for example `.github/`) match too. Files outside the workspace never match.
+- **Trigger:** a successful `file_read` or `file_edit_*` call on a matching file. Calls made from inside `code_execution` do not trigger it.
+- **What the model gets:** the tool result gets a `path_skills` field with the skill name and description, and asks the model to read the skill with `agent_skill_read`. Xum does not insert the skill body. Each skill surfaces at most once per context window. Xum skips it if the model already read the skill in that window.
+- **Limits:** at most 3 skills surface per tool call, and only the first 100 model-invocable path-scoped skills can activate.
+- **Index:** path-scoped skills are not in the model-facing skills index. They stay readable by name and invocable with `/{skill-name}`.
+- **`disable-model-invocation: true` wins:** a skill with both keys never surfaces on its own. It loads only when invoked explicitly.
+- **Invalid patterns:** an empty list, an unclosed bracket, an empty entry, a negated pattern (`!…`), a backslash (use `/`), an absolute path, or a `..` segment makes the whole skill invalid. Xum shows it with the error in the skills indicator and loads the other skills.
 
 ### Example: `deep-review` skill
 
@@ -248,7 +358,7 @@ Substitution rules:
 - Placeholders are substituted everywhere in the body, including code blocks.
 - Only a single digit is consumed: `$10` means `$1` followed by a literal `0`.
 - If the body contains no placeholders, nothing changes: the arguments simply remain visible in your message (for example “Using skill deploy: 123”).
-- Substitution applies only to slash invocations. Inline `$skill-name` references and model-initiated `agent_skill_read` loads receive the raw body.
+- Substitution applies only to slash invocations. Inline `$skill-name` references and model-initiated `agent_skill_read` loads receive the body without argument substitution (Xum still replaces the [skill directory placeholders](#bundled-files-and-the-skill-directory)).
 
 Use the `argument-hint` frontmatter field to document the expected arguments in invocation UIs.
 
@@ -276,7 +386,7 @@ Rules and limits:
 - Directives must occupy the whole line; mid-line `` !`...` `` is ignored.
 - Directives run after [argument substitution](#skill-arguments), so `` !`git log $1` `` sees resolved arguments.
 - Commands run sequentially in the workspace directory, with a 10-second timeout and a 16KB output cap per command, and at most 10 directives per skill. A failing command injects its output plus an `[exit code N]` note instead of aborting the invocation.
-- Directives run only when **you** invoke a skill (`/{skill-name}` or a `$skill-name` reference). Skills the model loads via `agent_skill_read` always receive the raw body — the model cannot trigger command execution this way.
+- Directives run only when **you** invoke a skill (`/{skill-name}` or a `$skill-name` reference). Skills the model loads via `agent_skill_read` never run directives — the model cannot trigger command execution this way.
 - Enabling the experiment requires flipping the toggle in Settings yourself; remote experiment rollout can never switch it on.
 
 <Warning>

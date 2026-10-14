@@ -13,6 +13,7 @@ import { createHistoryStringEvidence, createHistoryNumberEvidence } from "./hist
 const INVALID = Symbol("invalid history projection");
 // zod >= 4.5 bounds string length in code points. A code point takes at most two UTF-16
 // units, so this many units always hold one code point past the largest bound.
+// eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
 const STRING_PREFIX = 2 * (WorkflowScriptDescriptorSchema.shape.description.maxLength! + 1);
 type StringFacts = ReturnType<ReturnType<typeof createHistoryStringEvidence>["finish"]>;
 interface Value {
@@ -182,11 +183,15 @@ export function createHistoryMessageEvidence(
     } else if (frame.context === "json") {
       // JSON.parse keeps the last occurrence, including an invalid value overwritten later.
       // z.record deliberately ignores this key, including its value's validation.
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       if (frame.key!.prefix !== "__proto__")
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         frame.fields.set(frame.key!.sha256, { value: item.value !== INVALID });
     } else {
       const shape = fields[frame.context as keyof typeof fields];
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const key = frame.key!.prefix;
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       if (shape && Object.hasOwn(shape, key) && key.length === frame.key!.length)
         frame.fields.set(key, item);
       // zod >= 4.5 `.strict()` reports an own `__proto__` key (JSON.parse makes one) as
@@ -210,6 +215,7 @@ export function createHistoryMessageEvidence(
           break;
         case "endObject":
         case "endArray": {
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           const frame = frames.pop()!;
           let value: unknown;
           if (frame.array) {
@@ -249,6 +255,7 @@ export function createHistoryMessageEvidence(
           break;
         }
         case "stringChunk":
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           string!.push(token.value);
           if (date !== undefined)
             for (const character of token.value) {
@@ -266,7 +273,9 @@ export function createHistoryMessageEvidence(
           break;
         case "endKey":
         case "endString": {
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           const facts = string!.finish();
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           if (isKey) frames.at(-1)!.key = facts;
           else deliver({ value: date ?? facts.prefix, string: facts });
           string = undefined;
@@ -276,9 +285,11 @@ export function createHistoryMessageEvidence(
           number = createHistoryNumberEvidence(sourceBytes);
           break;
         case "numberChunk":
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           number!.push(token.value);
           break;
         case "endNumber": {
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           const value = number!.finish().value;
           deliver({ value: nextContext() === "json" && !Number.isFinite(value) ? INVALID : value });
           number = undefined;

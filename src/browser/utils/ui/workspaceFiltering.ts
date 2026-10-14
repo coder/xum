@@ -1282,6 +1282,7 @@ export function partitionWorkspacesBySection(
   for (const workspace of workspaces) {
     const effectiveSectionId = resolveEffectiveSectionId(workspace, byId, sectionIds);
     if (effectiveSectionId) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const list = bySectionId.get(effectiveSectionId)!;
       list.push(workspace);
     } else {

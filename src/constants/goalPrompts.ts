@@ -12,27 +12,35 @@ import {
 
 /**
  * Completion summary for a text-only goal_continuation turn treated as implicit completion: the
- * last non-empty text part, trimmed and length-capped; falls back to a constant. Shared by the
- * top-level goal loop (AgentSession) and sub-agent arbitration (TaskService).
+ * final text block (the last run of consecutive text parts), trimmed and length-capped; falls
+ * back to a constant. Shared by the top-level goal loop (AgentSession) and sub-agent arbitration
+ * (TaskService).
+ *
+ * StreamManager stores each streamed text delta as its own part (merged only at display time), so
+ * the last text part alone is just the final chunk ("?", "iku."): join the whole block.
  */
 export function synthesizeSilentContinuationSummary(parts: StreamEndEvent["parts"]): string {
-  for (let index = parts.length - 1; index >= 0; index -= 1) {
-    const part = parts[index];
-    if (part.type !== "text") {
-      continue;
+  let end = parts.length - 1;
+  for (;;) {
+    while (end >= 0 && parts[end].type !== "text") end -= 1;
+    if (end < 0) return SILENT_CONTINUATION_COMPLETION_SUMMARY_FALLBACK;
+    let start = end;
+    while (start > 0 && parts[start - 1].type === "text") start -= 1;
+    const trimmed = parts
+      .slice(start, end + 1)
+      .map((part) => (part.type === "text" ? part.text : ""))
+      .join("")
+      .trim();
+    if (trimmed.length > 0) {
+      if (trimmed.length <= SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH) {
+        return trimmed;
+      }
+      // Reserve one character for the ellipsis so the persisted summary
+      // stays under the configured cap.
+      return `${trimmed.slice(0, SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH - 1)}…`;
     }
-    const trimmed = part.text.trim();
-    if (trimmed.length === 0) {
-      continue;
-    }
-    if (trimmed.length <= SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH) {
-      return trimmed;
-    }
-    // Reserve one character for the ellipsis so the persisted summary
-    // stays under the configured cap.
-    return `${trimmed.slice(0, SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH - 1)}…`;
+    end = start - 1;
   }
-  return SILENT_CONTINUATION_COMPLETION_SUMMARY_FALLBACK;
 }
 
 function formatElapsedDuration(elapsedMs: number): string {

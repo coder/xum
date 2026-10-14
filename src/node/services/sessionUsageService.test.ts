@@ -672,10 +672,24 @@ describe("SessionUsageService", () => {
 
       await service.recordUsage(workspaceId, model, createUsageWithCosts(100, 50, 0.12, 0.08));
 
-      await service.resetSessionUsage(workspaceId);
+      await service.resetSessionUsage(workspaceId, 1_000);
 
       const result = await service.getSessionUsage(workspaceId);
-      expect(result).toEqual({ byModel: {}, version: 1 });
+      expect(result).toEqual({ byModel: {}, version: 1, forkedAt: 1_000 });
+    });
+
+    it("keeps the fork marker as the fork records its own usage", async () => {
+      const workspaceId = "forked-workspace";
+      await service.resetSessionUsage(workspaceId, 1_000);
+      await service.recordUsage(
+        workspaceId,
+        "claude-sonnet-4-20250514",
+        createUsageWithCosts(100, 50, 0.12, 0.08)
+      );
+
+      const result = await service.getSessionUsage(workspaceId);
+      expect(result?.forkedAt).toBe(1_000);
+      expect(Object.keys(result?.byModel ?? {})).toHaveLength(1);
     });
   });
 

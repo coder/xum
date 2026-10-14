@@ -275,6 +275,11 @@ export interface GoalContinuationRuntimeBridge {
     options: SendMessageOptions,
     isCurrent: () => boolean
   ): Promise<string | null>;
+  /**
+   * Cancel a scheduled auto-retry of this goal's automatic turn. Pause and completion call it
+   * so the retry stops resending the goal's prompt and its countdown clears at once.
+   */
+  abandonGoalAutoRetry?(workspaceId: string, goalId: string): void;
 }
 
 type PendingGoalContinuationSource = "stream_end" | "kickoff" | "budget_wrapup" | "stream_error";
@@ -3115,9 +3120,15 @@ export class WorkspaceGoalService {
       if (completionSummary == null || completionSummary.length === 0) {
         throw new WorkspaceGoalTransitionError("Completion summary is required.");
       }
-      if (current.status !== "active" && current.status !== "budget_limited") {
+      // Paused goals may complete directly: the work can finish while the loop
+      // is paused, and completion never re-arms continuations.
+      if (
+        current.status !== "active" &&
+        current.status !== "budget_limited" &&
+        current.status !== "paused"
+      ) {
         throw new WorkspaceGoalTransitionError(
-          "Cannot complete a goal that is not active or budget-limited."
+          "Cannot complete a goal that is not active, paused or budget-limited."
         );
       }
     }
@@ -3314,6 +3325,32 @@ export class WorkspaceGoalService {
         ? this.budgetDeltaProperties("turn-cap", current?.turnCap ?? null, next.turnCap)
         : {}),
     });
+  }
+
+  /**
+   * A non-user initiator (the model) may complete a paused goal, but not while goals are queued
+   * after it: completing would promote the next goal and arm its kickoff, so model output could
+   * undo the user's Pause. Callers hold the goal file lock, which also guards the board, so the
+   * check and the write see one board.
+   */
+  private async refusePausedCompletionWithQueuedGoals(
+    workspaceId: string,
+    current: GoalRecordV1 | null,
+    input: SetGoalInput
+  ): Promise<void> {
+    if (
+      input.status !== "complete" ||
+      current?.status !== "paused" ||
+      (input.initiator ?? "user") === "user"
+    ) {
+      return;
+    }
+    const board = await this.readBoard(workspaceId);
+    if (board.upcoming.length > 0) {
+      throw new WorkspaceGoalTransitionError(
+        "Cannot complete a paused goal while other goals are queued after it: completing would start the next goal. Ask the user to resume or complete it."
+      );
+    }
   }
 
   private emitStatusLifecycle(
@@ -4014,6 +4051,7 @@ export class WorkspaceGoalService {
       if (conflict) {
         return Err(conflict);
       }
+      await this.refusePausedCompletionWithQueuedGoals(input.workspaceId, current, input);
       const trimmedObjective = input.objective?.trim();
       const objective =
         trimmedObjective && trimmedObjective.length > 0 ? trimmedObjective : current?.objective;
@@ -4408,6 +4446,7 @@ export class WorkspaceGoalService {
       this.recordGoalSet(input.workspaceId, result.data, { notifyBoard: false });
     }
     if (completing) {
+      this.goalContinuationBridge?.abandonGoalAutoRetry?.(input.workspaceId, result.data.goalId);
       this.timelineRecorder.record(input.workspaceId, {
         kind: "goal.completed",
         source: {
@@ -4434,6 +4473,7 @@ export class WorkspaceGoalService {
         return result;
       }
       this.pendingContinuationCandidates.delete(input.workspaceId);
+      this.goalContinuationBridge?.abandonGoalAutoRetry?.(input.workspaceId, result.data.goalId);
       const pauseBoundaryReady = await this.appendGoalPauseBoundaryIfNeeded(
         input.workspaceId,
         result.data.goalId

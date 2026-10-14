@@ -8,7 +8,7 @@
  * - `real`: real or fail; no fallback.
  * - `mock`: XUM_MOCK_AI (canned replies, `[mock:...]` scripted flows).
  *
- * BUGBASH_APP_MODEL (`<provider>:<model>`, default Haiku 4.5) is the app's model. Its provider
+ * BUGBASH_APP_MODEL (`<provider>:<model>`, default Haiku 5.5) is the app's model. Its provider
  * reads the standard variables (ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL, OPENAI_API_KEY and
  * OPENAI_BASE_URL); base URLs include `/v1`.
  *
@@ -28,13 +28,13 @@ export type AiMode =
       mode: "real";
       reason: string;
       provider: "anthropic" | "openai";
-      /** Full model string as Xum takes it, for example `anthropic:claude-haiku-4-5`. */
+      /** Full model string as Xum takes it, for example `anthropic:claude-haiku-5-5`. */
       model: string;
       apiKey: string;
       baseUrl: string;
     };
 
-export const DEFAULT_APP_MODEL = "anthropic:claude-haiku-4-5";
+export const DEFAULT_APP_MODEL = "anthropic:claude-haiku-5-5";
 const PROBE_TIMEOUT_MS = 10_000;
 
 const PROVIDERS = {

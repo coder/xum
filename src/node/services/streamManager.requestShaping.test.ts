@@ -536,7 +536,8 @@ describe("StreamManager - tool search activeTools scoping", () => {
 
   test("an in-turn Anthropic thinking strip leaves a replay receipt on the turn's row", async () => {
     // Preserved thinking: once prepareStep stripped earlier blocks, the next turn must not
-    // put them back. The row carries the same receipt the signature repair writes.
+    // put them back. The row carries the same receipt the signature repair writes, with the
+    // point at the step whose request first stripped: that step's thinking keeps replaying.
     const inTurn: ModelMessage[] = [
       { role: "user", content: "hello" },
       {
@@ -558,7 +559,7 @@ describe("StreamManager - tool search activeTools scoping", () => {
         ],
       },
     ];
-    const run = async (changeToolSet: boolean) => {
+    const run = async (changeToolSet: boolean, prepareAhead = false) => {
       const toolSearchState: ToolSearchStreamState = {
         catalog: [{ name: "slack_send_message", description: "Send a message", paramText: "" }],
         deferredToolNames: new Set(["slack_send_message"]),
@@ -566,18 +567,27 @@ describe("StreamManager - tool search activeTools scoping", () => {
         activatedToolNames: new Set(),
         native: false,
       };
-      // Drive prepareStep from inside the stream, as the SDK does between steps.
+      const step = (text: string) => [
+        { type: "start-step" },
+        { type: "text-delta", text },
+        { type: "finish-step", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } },
+      ];
+      // Drive prepareStep from inside the stream, as the SDK does between steps. The SDK
+      // can prepare a step before the consumer read the previous step (prepareAhead).
       const streamText = mock((options: Parameters<typeof aiSdk.streamText>[0]) =>
         createStreamResultForTests(
           (async function* () {
-            await prepareStepForTests(options, inTurn, 1);
-            if (changeToolSet) toolSearchState.activatedToolNames.add("slack_send_message");
-            await prepareStepForTests(options, inTurn, 2);
-            yield { type: "text-delta", text: "ok" };
-            yield {
-              type: "finish-step",
-              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-            };
+            await prepareStepForTests(options, inTurn, 0);
+            if (prepareAhead) {
+              if (changeToolSet) toolSearchState.activatedToolNames.add("slack_send_message");
+              await prepareStepForTests(options, inTurn, 1);
+            }
+            yield* step("first");
+            if (!prepareAhead) {
+              if (changeToolSet) toolSearchState.activatedToolNames.add("slack_send_message");
+              await prepareStepForTests(options, inTurn, 1);
+            }
+            yield* step("second");
             yield { type: "finish", finishReason: "stop" };
           })()
         )
@@ -604,12 +614,13 @@ describe("StreamManager - tool search activeTools scoping", () => {
       await result.data.completion;
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       if (!history.success) throw new Error(history.error);
-      return history.data.find((message) => message.id === messageId)?.metadata
-        ?.anthropicThinkingReplay;
+      const metadata = history.data.find((message) => message.id === messageId)?.metadata;
+      return [metadata?.anthropicThinkingReplay, metadata?.anthropicThinkingReplayFromStep];
     };
 
-    expect(await run(true)).toBe("off");
-    expect(await run(false)).toBeUndefined();
+    expect(await run(true)).toEqual(["off", 1]);
+    expect(await run(true, true)).toEqual(["off", 1]);
+    expect(await run(false)).toEqual([undefined, undefined]);
   });
 
   test("after a tool-set change, between_tools still replays reasoning created after it (#5279)", async () => {

@@ -13,6 +13,7 @@ import { computeProvidersConfigFingerprint } from "@/common/utils/providers/conf
 import { getToolAvailabilityOptions } from "@/common/utils/tools/toolAvailability";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
+import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
 import type { SessionUsageService, SessionUsageTokenStatsCacheV1 } from "./sessionUsageService";
 import { log } from "./log";
 import type { AIService } from "./aiService";
@@ -252,8 +253,10 @@ export class TokenizerService {
     // Plan-review records (snapshots can be tens of thousands of tokens) never reach a provider
     // request, so they must not count as context. The cache's history identity below still
     // describes the raw rows, which is what the client compares for freshness.
-    const countedMessages = activeContextMessages.filter(
-      (message) => !isPlanReviewRecordMessage(message)
+    // Prompt-hook context lives in metadata and becomes text only in the request, so render it
+    // here too: the token display must count what the provider receives.
+    const countedMessages = renderPluginHookContextForProvider(
+      activeContextMessages.filter((message) => !isPlanReviewRecordMessage(message))
     );
 
     const stats = await calculateTokenStats(

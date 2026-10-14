@@ -13,11 +13,19 @@ import { withExecutionScope } from "./tools/withExecutionScope";
 const fixture = path.resolve(import.meta.dir, "../../../tests/fixtures/mcp/apps-server.ts");
 const clients: MCPClientHandle[] = [];
 
-async function connect(mcpApps: boolean) {
+/** The test process's environment (defined values only) plus `extra`. */
+function fixtureEnv(extra: Record<string, string>): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) if (value !== undefined) env[key] = value;
+  return { ...env, ...extra };
+}
+
+async function connect(mcpApps: boolean, env?: Record<string, string>) {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [fixture],
     stderr: "pipe",
+    ...(env !== undefined ? { env: fixtureEnv(env) } : {}),
   });
   const client = await createMCPClient({ transport, mcpApps });
   clients.push(client);
@@ -71,6 +79,73 @@ describe("MCP Apps client gating", () => {
     // Hidden tools stay known for view calls.
     expect(client.hasTool("refresh_chart")).toBe(true);
     expect(client.toolUi("refresh_chart")?.visibility).toEqual(["app"]);
+    // A settings layout action on an app tool opens the app; it is not run as a regular tool.
+    expect(client.settingsToolAction("show_chart")?.opensApp).toBe(true);
+  });
+});
+
+describe("MCP Apps tools/list_changed", () => {
+  test("the client re-lists a server's tools on tools/list_changed, then reports it", async () => {
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [fixture],
+      stderr: "pipe",
+      env: fixtureEnv({ APPS_FIXTURE_LIST_CHANGED: "1" }),
+    });
+    const changed = Promise.withResolvers<void>();
+    const client = await createMCPClient({
+      transport,
+      mcpApps: true,
+      onToolsListChanged: () => changed.resolve(),
+    });
+    clients.push(client);
+    await client.tools();
+    expect(client.appEntrypoints().map((tool) => tool.toolName)).not.toContain("parts_library");
+    // The server adds an entry point tool and announces it (a legacy-era server: the manager
+    // has no other refresh for its catalog).
+    await client.callToolForApp("refresh_chart", {});
+    await changed.promise;
+    expect(client.appEntrypoints().map((tool) => tool.toolName)).toContain("parts_library");
+  });
+});
+
+describe("MCP App entry points", () => {
+  test("skips entry points whose tool names the routes refuse (empty, over-long)", async () => {
+    // One bad name in the list would fail the listEntrypoints output schema for every server.
+    const client = await connect(true, { APPS_FIXTURE_BAD_ENTRYPOINT_NAMES: "1" });
+    await client.tools();
+    expect(client.appEntrypoints().map((entry) => entry.toolName)).toEqual([
+      "show_chart",
+      "refresh_chart",
+      "legacy_view",
+    ]);
+  });
+
+  test("lists entry points with the spec's title order; visibility does not hide them", async () => {
+    expect((await connect(false)).appEntrypoints()).toEqual([]);
+    const client = await connect(true);
+    await client.tools();
+    expect(client.appEntrypoints()).toEqual([
+      {
+        toolName: "show_chart",
+        title: "Show chart",
+        resourceUri: "ui://chart/view",
+        types: ["global"],
+      },
+      // App-only (hidden from the model) and titled by annotations; the file entry is skipped.
+      {
+        toolName: "refresh_chart",
+        title: "Refresh chart",
+        resourceUri: "ui://chart/view",
+        types: ["thread"],
+      },
+      {
+        toolName: "legacy_view",
+        title: "legacy_view",
+        resourceUri: "ui://chart/legacy",
+        types: ["global"],
+      },
+    ]);
   });
 });
 
@@ -90,6 +165,16 @@ describe("MCP Apps view resources", () => {
     );
     expect(blob.html).toBe(view.html);
     expect(blob.prefersBorder).toBeNull();
+  });
+
+  test("accepts ChatGPT's text/html+skybridge templates", () => {
+    const uri = "ui://widget/board.html";
+    const view = extractMcpAppResource(
+      { contents: [{ uri, mimeType: "text/html+skybridge", text: "<div id=board></div>" }] },
+      uri
+    );
+    expect(view.html).toBe("<div id=board></div>");
+    expect(view.csp).toEqual({});
   });
 
   test("rejects the wrong mime type, oversized views and mismatched URIs", async () => {
@@ -194,7 +279,33 @@ describe("MCP Apps failed tool calls", () => {
       resourceUri: "ui://chart/view",
       arguments: { title: "Q3" },
       result: null,
+      outcome: "interrupted",
     });
+  });
+
+  test("a call that throws records a failed outcome", async () => {
+    using tempDir = new DisposableTempDir("mcp-apps-results");
+    const client = await connect(true);
+    const store = new McpAppResultStore((workspaceId) => path.join(tempDir.path, workspaceId));
+    const scope = { workspaceId: "ws1", messageId: "m1", token: "t1" };
+    const raw = await client.tools();
+    // Same tool object, so its view declaration stays attached (getMCPToolUi).
+    raw.show_chart.execute = () => Promise.reject(new Error("server crashed"));
+    const tools = withExecutionScope(
+      wrapMCPTools(raw, { appResults: { serverName: "apps", store } }),
+      scope
+    );
+    let threw = false;
+    try {
+      await tools.show_chart.execute!(
+        { title: "Q3" },
+        { toolCallId: "call-3", messages: [], context: undefined }
+      );
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+    expect(await store.get("ws1", "call-3")).toMatchObject({ result: null, outcome: "failed" });
   });
 });
 

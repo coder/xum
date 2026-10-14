@@ -1644,10 +1644,11 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       return;
     }
 
+    const api = apiState.api;
     let ignore = false;
     const discover = async () => {
       try {
-        const runs = await apiState.api.workflows.listRuns({ workspaceId });
+        const runs = await api.workflows.listRuns({ workspaceId });
         const foregroundRun = findForegroundWorkflowRun({
           runs,
           args: launchArgs,
@@ -1687,10 +1688,11 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       return;
     }
 
+    const api = apiState.api;
     let ignore = false;
     const discover = async () => {
       try {
-        const nextRun = await apiState.api.workflows.getRun({
+        const nextRun = await api.workflows.getRun({
           workspaceId,
           runId: exactDiscoveryRunId,
         });
@@ -1741,10 +1743,11 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       return;
     }
 
+    const api = apiState.api;
     let ignore = false;
     const refresh = async () => {
       try {
-        const nextRun = await apiState.api.workflows.getRun({
+        const nextRun = await api.workflows.getRun({
           workspaceId: workflowWorkspaceId,
           runId,
         });
@@ -1776,10 +1779,11 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       return;
     }
 
+    const api = apiState.api;
     let ignore = false;
     const refresh = async () => {
       try {
-        const nextRun = await apiState.api.workflows.getRun({
+        const nextRun = await api.workflows.getRun({
           workspaceId: run.workspaceId,
           runId,
         });

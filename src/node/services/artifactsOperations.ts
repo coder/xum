@@ -305,26 +305,6 @@ export async function getArtifactsCapabilities(
 
 export type AvailableArtifactsLocation = Exclude<ArtifactsLocation, { kind: "unavailable" }>;
 
-/** List an available location (host fs or Runtime). Runtime failures throw. */
-export async function listArtifactsAtLocation(
-  location: AvailableArtifactsLocation,
-  abortSignal?: AbortSignal
-): Promise<Extract<ArtifactListing, { available: true }>> {
-  if (location.kind === "runtime") {
-    return {
-      available: true,
-      ...(await listArtifactsOnRuntime(location.runtime, location.dir, abortSignal)),
-    };
-  }
-  return {
-    available: true,
-    dir: location.dir,
-    ...(await listArtifactsInDir(location.dir, {
-      requireDescriptorPaths: location.containerWritable,
-    })),
-  };
-}
-
 /** Raw bytes of one file at an available location, capped. Runtime failures throw. */
 export async function readArtifactBytesAtLocation(
   location: AvailableArtifactsLocation,

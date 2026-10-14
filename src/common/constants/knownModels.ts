@@ -5,7 +5,15 @@
 import type { OpenAICyberAccessProgram } from "../types/openaiAccessPrograms";
 import { formatModelDisplayName } from "../utils/ai/modelDisplay";
 
-type ModelProvider = "anthropic" | "openai" | "google" | "xai" | "deepseek" | "moonshotai" | "zai";
+type ModelProvider =
+  | "anthropic"
+  | "openai"
+  | "google"
+  | "xai"
+  | "meta"
+  | "deepseek"
+  | "moonshotai"
+  | "zai";
 
 interface KnownModelDefinition {
   /** Provider identifier used by SDK factories */
@@ -168,6 +176,15 @@ const MODEL_DEFINITIONS = {
     aliases: ["gemini-flash"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },
+  // Gemini 4 Argon - Google's flagship reasoning model, GA on the paid Gemini API on
+  // October 13, 2026 (stable ID `gemini-4-argon`; not on the free tier). See
+  // models-extra for limits and pricing.
+  GEMINI_4_ARGON: {
+    provider: "google",
+    providerModelId: "gemini-4-argon",
+    aliases: ["argon", "gemini-argon", "gemini-4"],
+    tokenizerOverride: "google/gemini-2.5-pro",
+  },
   // Grok 4.7 - xAI's frontier coding and knowledge-work model, released September 21,
   // 2026. Supersedes Grok 4.6 at identical pricing and specs ($2/M in, $6/M out, 500K
   // context, native xhigh); Grok 4.6 remains usable as the custom model string
@@ -209,6 +226,12 @@ const MODEL_DEFINITIONS = {
     // K3's tokenizer isn't published in ai-tokenizer yet; reuse Kimi K2 (the newest
     // Moonshot tokenizer available) for approximate counting.
     tokenizerOverride: "moonshotai/kimi-k2",
+  },
+  // Only the public Muse Wonder API model, not Muse Code's Wonder Full variant.
+  MUSE_WONDER: {
+    provider: "meta",
+    providerModelId: "muse-wonder-1.0",
+    aliases: ["muse", "wonder", "muse-wonder"],
   },
   GLM_53_FLASH: {
     provider: "zai",
@@ -287,6 +310,7 @@ export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   ...Object.fromEntries(
     Object.values(KNOWN_MODELS)
       .filter((model) => Boolean(model.tokenizerOverride))
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       .map((model) => [model.id, model.tokenizerOverride!])
   ),
 };

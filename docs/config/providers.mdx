@@ -22,6 +22,7 @@ Most providers only need an API key. The UI handles validation and shows which p
 | **OpenAI**         | GPT-6                       | [platform.openai.com](https://platform.openai.com/)     |
 | **Google**         | Gemini Pro, Flash           | [aistudio.google.com](https://aistudio.google.com/)     |
 | **xAI**            | Grok                        | [console.x.ai](https://console.x.ai/)                   |
+| **Meta**           | Muse Wonder                 | [dev.meta.ai](https://dev.meta.ai/docs)                 |
 | **DeepSeek**       | DeepSeek Chat, Reasoner     | [platform.deepseek.com](https://platform.deepseek.com/) |
 | **Moonshot AI**    | Kimi K3                     | [platform.moonshot.ai](https://platform.moonshot.ai/)   |
 | **Z.ai**           | GLM 5.3 Flash               | [z.ai](https://z.ai/model-api)                          |
@@ -46,6 +47,7 @@ Providers also read from environment variables as fallback:
 | Google         | `GOOGLE_GENERATIVE_AI_API_KEY` or `GOOGLE_API_KEY` |
 | xAI            | `XAI_API_KEY`                                      |
 | OpenRouter     | `OPENROUTER_API_KEY`                               |
+| meta           | `META_MODEL_API_KEY` or `MODEL_API_KEY`            |
 | DeepSeek       | `DEEPSEEK_API_KEY`                                 |
 | Moonshot AI    | `MOONSHOT_API_KEY`                                 |
 | Z.ai           | `ZAI_API_KEY`                                      |
@@ -90,6 +92,8 @@ Scripts that the agent runs in the bash tool (test harnesses, `make bug-bash`, S
 - Bash commands in `xum run` and `xum workflow` sessions do not get the variables.
 - Commands in untrusted projects, and every command while `XUM_DISABLE_PROJECT_AUTOMATION=1` is set, get no variables: Xum blanks provider keys there, so repo code cannot spend through the proxy. Revoking a project's trust also refuses calls from its commands that are still running.
 - A provider without a Xum API key (for example OpenAI with Codex OAuth only) gets no variables. A provider that your [project secrets](/config/project-secrets) configure keeps the secret values. This includes `OPENAI_ORG_ID` and `OPENAI_PROJECT_ID`.
+- Xum logs each skipped provider once per workspace, with the reason, for example `[bash-ai-proxy] skipped anthropic: a secret sets ANTHROPIC_API_KEY`. The calls of a skipped provider are not counted.
+- A secret replaces only the variables it sets. A secret `ANTHROPIC_API_KEY` next to the `ANTHROPIC_BASE_URL` or `ANTHROPIC_AUTH_TOKEN` of the Xum process sends that key to the host's endpoint, and a gateway can answer 403. Xum logs a warning for this mix (not in `xum run` and `xum workflow` sessions). See [Provider keys in secrets](/config/project-secrets#provider-keys-in-secrets).
 - The proxy allows Messages, Responses, Chat Completions, token counting and model listing. Other paths get 404.
 - The port, the keys and the forwarded ports stay the same when Xum restarts, so background commands keep working. Xum keeps them in `~/.xum/bash-ai-proxy.json`. Deleting that file changes all keys. At startup Xum opens the forwards to SSH hosts again, but not to Coder workspaces, because connecting can start a stopped workspace. Their forward comes back with the next agent turn there.
 - If the saved port is busy when Xum starts, Xum uses another port for that session and keeps the saved one. Commands started in that session lose access after the next restart.
@@ -128,6 +132,23 @@ For advanced options not exposed in the UI, edit `~/.xum/providers.jsonc` direct
   },
 }
 ```
+
+### Meta
+
+Configure **Meta** in Settings → Providers with a Meta Model API key, or set
+`MODEL_API_KEY` as in Meta's quickstart. `META_MODEL_API_KEY` is also supported
+and takes precedence when both are set. The default endpoint is `https://api.meta.ai/v1`.
+Select **Muse Wonder** (`meta:muse-wonder-1.0`), or use `/model wonder`.
+
+Muse Wonder is in preview with a 1,048,576-token context window. Xum uses a
+practical output cap of 131,072 tokens from [models.dev](https://models.dev).
+[Published pricing](https://dev.meta.ai/docs/pricing-rate-limits) is $4 per million
+input tokens, $0.20 per million cached input tokens, and $20 per million output
+tokens, with no long-context premium.
+
+Reasoning is private: Xum offers low, medium, high, xhigh, and max effort, not off.
+Muse Wonder Full is only available in Muse Code, not the Model API; max effort
+does not select Full. See the [Meta API documentation](https://dev.meta.ai/docs).
 
 ### OpenAI wire format
 

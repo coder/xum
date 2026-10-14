@@ -14,8 +14,11 @@ import { toImageDataUrl, type createArtifactAssetLoader } from "./artifactAssets
 
 export interface SandboxedDocumentOptions {
   csp: string;
-  /** Artifact bridge (window.xum); MCP Apps views get only their preamble (mcpAppCsp.ts). */
-  bridgeScript?: string;
+  /**
+   * Artifact bridge (window.xum); MCP Apps views get their preamble (mcpAppCsp.ts) and the
+   * window.openai shim instead. Several scripts run in order, each as its own element.
+   */
+  bridgeScript?: string | readonly string[];
 }
 
 function insertSecurityPreamble(doc: Document, options: SandboxedDocumentOptions) {
@@ -28,10 +31,16 @@ function insertSecurityPreamble(doc: Document, options: SandboxedDocumentOptions
   meta.setAttribute("http-equiv", "Content-Security-Policy");
   meta.setAttribute("content", options.csp);
   head.insertBefore(meta, head.firstChild);
-  if (options.bridgeScript !== undefined) {
+  const scripts =
+    typeof options.bridgeScript === "string"
+      ? [options.bridgeScript]
+      : (options.bridgeScript ?? []);
+  let previous: Element = meta;
+  for (const source of scripts) {
     const script = doc.createElement("script");
-    script.textContent = options.bridgeScript;
-    meta.after(script);
+    script.textContent = source;
+    previous.after(script);
+    previous = script;
   }
 }
 

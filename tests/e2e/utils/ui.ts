@@ -512,10 +512,14 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
 
   /** Open a tool from the right sidebar's New tab launcher ("+" first adds/shows the New tab). */
   async function openFromNewTab(toolName: string): Promise<void> {
+    // Tools are opt-in now: wait for either the collapsed expand action or the open strip.
+    const expandButton = page.getByRole("button", { name: /^Expand (right )?sidebar$/ });
     const addButton = page
       .getByRole("complementary", { name: "Workspace insights" })
       .getByRole("button", { name: "New tab", exact: true })
       .first();
+    await expect(expandButton.or(addButton)).toBeVisible();
+    if (await expandButton.isVisible()) await expandButton.click();
     await expect(addButton).toBeVisible();
     await addButton.click();
     const row = page

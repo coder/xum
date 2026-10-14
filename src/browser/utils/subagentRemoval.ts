@@ -14,7 +14,8 @@ export type SubagentRemovalNotice = { kind: "error" | "warning"; message: string
  * returns a warning, not an error (#5190).
  */
 export async function confirmAndRemoveSubagent(params: {
-  api: APIClient | null;
+  /** The live client now (null while offline): read again after the user confirms. */
+  getApi: () => APIClient | null;
   confirm: (options: ConfirmDialogOptions) => Promise<boolean>;
   removeSubagent: (
     workspaceId: string,
@@ -23,11 +24,13 @@ export async function confirmAndRemoveSubagent(params: {
   workspaceId: string;
   title: string;
 }): Promise<SubagentRemovalNotice> {
-  if (params.api == null) return { kind: "error", message: "API not connected" };
+  const notConnected = { kind: "error", message: "API not connected" } as const;
+  const api = params.getApi();
+  if (api == null) return notConnected;
   // Palette actions run fire-and-forget, so a transport failure must come back as an error too.
   let preview: Awaited<ReturnType<APIClient["tasks"]["previewRemoval"]>>;
   try {
-    preview = await params.api.tasks.previewRemoval({ taskId: params.workspaceId });
+    preview = await api.tasks.previewRemoval({ taskId: params.workspaceId });
   } catch (error) {
     return { kind: "error", message: getErrorMessage(error) };
   }
@@ -41,8 +44,13 @@ export async function confirmAndRemoveSubagent(params: {
     confirmVariant: "destructive",
   });
   if (!confirmed) return null;
+  // The connection can drop while the dialog is open.
+  if (params.getApi() == null) return notConnected;
   // The backend refuses if the work changed since this preview (#5106).
-  const result = await params.removeSubagent(params.workspaceId, preview.data);
+  return removalNotice(await params.removeSubagent(params.workspaceId, preview.data));
+}
+
+function removalNotice(result: WorkspaceRemoveResult): SubagentRemovalNotice {
   if (!result.success) {
     return { kind: "error", message: result.error ?? "Failed to remove the sub-agent" };
   }

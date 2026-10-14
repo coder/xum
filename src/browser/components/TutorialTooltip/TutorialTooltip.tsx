@@ -51,6 +51,7 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
 
     const calculatePosition = () => {
       const target = targetEl.getBoundingClientRect();
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const tooltip = tooltipRef.current!.getBoundingClientRect();
       const viewportWidth = window.innerWidth;
       const viewportHeight = window.innerHeight;

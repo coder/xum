@@ -5,13 +5,10 @@ import * as path from "path";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import * as artifactStoreModule from "./artifactStore";
 import {
-  createArtifactTurnSnapshotHooks,
   generateArtifactsIndexAttachment,
   getToolArtifactsLocation,
   publishArtifactVersion,
-  registerAttachedArtifact,
   resolveArtifactToolPath,
-  snapshotArtifactsAtTurnEnd,
 } from "./artifactVersionsOperations";
 import * as artifactsOperationsModule from "./artifactsOperations";
 import type { AvailableArtifactsLocation } from "./artifactsOperations";
@@ -52,7 +49,7 @@ async function versionsOf(relPath: string) {
 }
 
 const publish = (relPath: string, label: string | null = null) =>
-  publishArtifactVersion({ sessionDir, location, relPath, source: "publish", label });
+  publishArtifactVersion({ sessionDir, location, relPath, label });
 
 describe("artifact version store", () => {
   test("republishing bumps the version; identical bytes add none", async () => {
@@ -142,6 +139,58 @@ describe("artifact version store", () => {
     expect(stored?.bytes.toString()).toBe("fresh");
   });
 
+  test("republishing the same bytes with a kind keeps that kind", async () => {
+    await write("flow.txt", "graph TD; A-->B");
+    await publish("flow.txt");
+    const again = await publishArtifactVersion({
+      sessionDir,
+      location,
+      relPath: "flow.txt",
+      label: null,
+      kind: "mermaid",
+    });
+    expect(again).toMatchObject({ success: true, kind: "mermaid", result: { created: false } });
+    expect((await versionsOf("flow.txt")).map((v) => v.kind)).toEqual(["mermaid"]);
+  });
+
+  test("an index from older builds lists its turn-end and attach_file versions", async () => {
+    // Older builds also wrote these sources and two bookkeeping fields. Rejecting them would
+    // move the whole history aside as a corrupt index.
+    await write("legacy.md", "v3");
+    const dir = path.join(getArtifactVersionsRoot(sessionDir), getArtifactId("legacy.md"));
+    await fs.mkdir(dir, { recursive: true });
+    const old = (version: number, source: string) => ({
+      version,
+      label: source === "turn-end" ? null : "legacy.md",
+      source,
+      createdAtMs: version,
+      sha256: `sha-${version}`,
+      size: 2,
+      path: "legacy.md",
+      sourceModifiedMs: version,
+    });
+    await fs.writeFile(
+      path.join(dir, "index.json"),
+      JSON.stringify({
+        id: getArtifactId("legacy.md"),
+        path: "legacy.md",
+        pin: null,
+        lastPublishedAtMs: 2,
+        versions: [old(1, "attach_file"), old(2, "turn-end")],
+      })
+    );
+    expect((await versionsOf("legacy.md")).map((v) => v.source)).toEqual([
+      "attach_file",
+      "turn-end",
+    ]);
+    await publish("legacy.md", "Third");
+    expect((await versionsOf("legacy.md")).map((v) => [v.version, v.source])).toEqual([
+      [1, "attach_file"],
+      [2, "turn-end"],
+      [3, "publish"],
+    ]);
+  });
+
   test("ids differ for paths that slug alike", () => {
     expect(getArtifactId("a b.md")).not.toBe(getArtifactId("a-b.md"));
   });
@@ -151,287 +200,6 @@ describe("artifact version store", () => {
       success: false,
       error: "Artifact not found: nope.md",
     });
-  });
-});
-
-describe("turn-end snapshots", () => {
-  test("ten edits in one turn give one version per changed file", async () => {
-    const turnStartedAtMs = Date.now();
-    for (let i = 0; i < 10; i++) await write("notes.md", `edit ${i}`);
-    await write("data.json", "{}");
-    const snap = await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs });
-    expect(snap.sort()).toEqual(["data.json", "notes.md"]);
-    expect(await versionsOf("notes.md")).toMatchObject([
-      { version: 1, source: "turn-end", label: null },
-    ]);
-  });
-
-  test("the host-maintained goal status board is never snapshotted", async () => {
-    await write("goal.status.html", "<p>status</p>");
-    await write("nested/goal.status.html", "<p>user file</p>");
-    const snap = await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 });
-    expect(snap).toEqual(["nested/goal.status.html"]);
-    expect(await versionsOf("goal.status.html")).toHaveLength(0);
-  });
-
-  test("an unchanged file gets no new version", async () => {
-    await write("notes.md", "same");
-    await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 });
-    // Touch without changing bytes: mtime differs, so the file is read, but the hash matches.
-    const later = new Date(Date.now() + 5000);
-    await fs.utimes(path.join(artifactsDir, "notes.md"), later, later);
-    const snap = await snapshotArtifactsAtTurnEnd({
-      sessionDir,
-      location,
-      turnStartedAtMs: Date.now(),
-    });
-    expect(snap).toEqual([]);
-    expect(await versionsOf("notes.md")).toHaveLength(1);
-  });
-
-  test("a same-size rewrite in the second of the recorded mtime is still snapshotted", async () => {
-    await write("same.md", "aaaa");
-    const mtimeMs = 1_700_000_000_000;
-    const file = path.join(artifactsDir, "same.md");
-    await fs.utimes(file, mtimeMs / 1000, mtimeMs / 1000);
-    // Recorded 200 ms after that mtime: a rewrite later in the same second keeps the mtime.
-    await recordArtifactVersion({
-      sessionDir,
-      relPath: "same.md",
-      bytes: Buffer.from("aaaa"),
-      source: "turn-end",
-      label: null,
-      sourceModifiedMs: mtimeMs,
-      nowMs: mtimeMs + 200,
-    });
-    await fs.writeFile(file, "bbbb");
-    await fs.utimes(file, mtimeMs / 1000, mtimeMs / 1000);
-
-    const snap = await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 });
-
-    expect(snap).toEqual(["same.md"]);
-    expect(await versionsOf("same.md")).toHaveLength(2);
-  });
-
-  test("any publish during the turn suppresses the snapshot, even a deduped one", async () => {
-    await write("a.md", "a");
-    await write("b.md", "b");
-    await publish("a.md", "A");
-    const turnStartedAtMs = Date.now();
-    await write("b.md", "b changed");
-    // Same bytes as v1: no new version, but it still counts as this turn's publish.
-    const republish = await publish("a.md", "A");
-    expect(republish.success && republish.result.created).toBe(false);
-    expect(await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs })).toEqual([]);
-    expect(await versionsOf("b.md")).toHaveLength(0);
-  });
-
-  test("a publish before the turn does not suppress it", async () => {
-    await write("a.md", "a");
-    await publish("a.md", "A");
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    const turnStartedAtMs = Date.now();
-    await write("a.md", "a2");
-    expect(await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs })).toEqual([
-      "a.md",
-    ]);
-  });
-
-  test("hooks snapshot only after a recorded start, and only when enabled", async () => {
-    let enabled = true;
-    let now = 1000;
-    const hooks = createArtifactTurnSnapshotHooks({
-      isEnabled: () => enabled,
-      sessionDir,
-      resolveLocation: () => Promise.resolve(location),
-      now: () => now,
-    });
-    await write("x.md", "1");
-    // Completion without a start (e.g. after a restart mid-turn): no snapshot.
-    await hooks.onLogicalTurnCompleted(new AbortController().signal);
-    expect(await versionsOf("x.md")).toHaveLength(0);
-    hooks.onLogicalTurnStarted();
-    enabled = false;
-    await hooks.onLogicalTurnCompleted(new AbortController().signal);
-    expect(await versionsOf("x.md")).toHaveLength(0);
-    enabled = true;
-    now = Date.now();
-    hooks.onLogicalTurnStarted();
-    await hooks.onLogicalTurnCompleted(new AbortController().signal);
-    expect(await versionsOf("x.md")).toHaveLength(1);
-  });
-
-  test("an aborted turn-end snapshot writes no versions", async () => {
-    await write("y.md", "1");
-    const controller = new AbortController();
-    const resolved = Promise.withResolvers<typeof location>();
-    const hooks = createArtifactTurnSnapshotHooks({
-      isEnabled: () => true,
-      sessionDir,
-      resolveLocation: () => resolved.promise,
-    });
-    hooks.onLogicalTurnStarted();
-    const running = hooks.onLogicalTurnCompleted(controller.signal);
-    // The bound fires while the hook is still resolving where artifacts live.
-    controller.abort();
-    resolved.resolve(location);
-    await running;
-    expect(await versionsOf("y.md")).toHaveLength(0);
-
-    // Aborted between reading a file and recording it: still nothing is written.
-    const midRead = new AbortController();
-    const readOriginal = artifactsOperationsModule.readArtifactBytesAtLocation;
-    const read = spyOn(artifactsOperationsModule, "readArtifactBytesAtLocation");
-    read.mockImplementationOnce(async (...args) => {
-      const result = await readOriginal(...args);
-      midRead.abort();
-      return result;
-    });
-    try {
-      expect(
-        await snapshotArtifactsAtTurnEnd({
-          sessionDir,
-          location,
-          turnStartedAtMs: 0,
-          abortSignal: midRead.signal,
-        })
-      ).toEqual([]);
-    } finally {
-      read.mockRestore();
-    }
-    expect(await versionsOf("y.md")).toHaveLength(0);
-  });
-});
-
-describe("snapshot metadata on unchanged bytes", () => {
-  test("unchanged host files are not re-read; a cp -p replacement still is", async () => {
-    const hooks = createArtifactTurnSnapshotHooks({
-      isEnabled: () => true,
-      sessionDir,
-      resolveLocation: () => Promise.resolve(location),
-    });
-    const turn = async () => {
-      hooks.onLogicalTurnStarted();
-      await hooks.onLogicalTurnCompleted(new AbortController().signal);
-    };
-    await write("big.md", "aaaa");
-    const file = path.join(artifactsDir, "big.md");
-    // Whole seconds in the past: the file's last change is settled when it is first hashed.
-    const mtimeMs = Math.floor(Date.now() / 1000) * 1000 - 20_000;
-    await fs.utimes(file, mtimeMs / 1000, mtimeMs / 1000);
-    await new Promise((resolve) => setTimeout(resolve, 1_100));
-    const read = spyOn(artifactsOperationsModule, "readArtifactBytesAtLocation");
-    try {
-      await turn();
-      expect(read).toHaveBeenCalledTimes(1);
-      await turn();
-      expect(read).toHaveBeenCalledTimes(1);
-      // Same size and mtime (`cp -p`), but the rewrite moves ctime: it is read and versioned.
-      await fs.writeFile(file, "bbbb");
-      await fs.utimes(file, mtimeMs / 1000, mtimeMs / 1000);
-      await turn();
-      expect(read).toHaveBeenCalledTimes(2);
-    } finally {
-      read.mockRestore();
-    }
-    expect((await versionsOf("big.md")).map((v) => v.version)).toEqual([1, 2]);
-  });
-
-  test("a touched but unchanged file adds no version", async () => {
-    await write("touched.md", "same");
-    const file = path.join(artifactsDir, "touched.md");
-    const setMtime = (ms: number) => fs.utimes(file, ms / 1000, ms / 1000);
-    // Whole seconds in the past, so both mtimes are unambiguous when read.
-    const base = Math.floor(Date.now() / 1000) * 1000;
-    await setMtime(base - 20_000);
-    await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 });
-    await setMtime(base - 10_000);
-    expect(await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 })).toEqual(
-      []
-    );
-    expect(await versionsOf("touched.md")).toHaveLength(1);
-  });
-
-  test("a same-size replacement that keeps the mtime (cp -p) is still snapshotted", async () => {
-    await write("copied.md", "aaaa");
-    const file = path.join(artifactsDir, "copied.md");
-    // Whole seconds in the past, so the recorded mtime is unambiguous.
-    const mtimeMs = Math.floor(Date.now() / 1000) * 1000 - 20_000;
-    await fs.utimes(file, mtimeMs / 1000, mtimeMs / 1000);
-    await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 });
-    await fs.writeFile(file, "bbbb");
-    await fs.utimes(file, mtimeMs / 1000, mtimeMs / 1000);
-
-    expect(await snapshotArtifactsAtTurnEnd({ sessionDir, location, turnStartedAtMs: 0 })).toEqual([
-      "copied.md",
-    ]);
-    expect(await versionsOf("copied.md")).toHaveLength(2);
-  });
-
-  test("an mtime read within its own second is not trusted", async () => {
-    const mtimeMs = 1_700_000_000_000;
-    await recordArtifactVersion({
-      sessionDir,
-      relPath: "fresh.md",
-      bytes: Buffer.from("x"),
-      source: "turn-end",
-      label: null,
-      sourceModifiedMs: mtimeMs,
-      nowMs: mtimeMs + 999,
-    });
-    expect((await versionsOf("fresh.md"))[0]?.sourceModifiedMs).toBeUndefined();
-  });
-
-  test("republishing the same bytes with a kind keeps that kind", async () => {
-    await write("flow.txt", "graph TD; A-->B");
-    await publish("flow.txt");
-    const again = await publishArtifactVersion({
-      sessionDir,
-      location,
-      relPath: "flow.txt",
-      source: "publish",
-      label: null,
-      kind: "mermaid",
-    });
-    expect(again).toMatchObject({ success: true, kind: "mermaid", result: { created: false } });
-    expect((await versionsOf("flow.txt")).map((v) => v.kind)).toEqual(["mermaid"]);
-  });
-});
-
-describe("runtime snapshot metadata", () => {
-  test("a same-size rewrite on a runtime whose clock lags the host is still snapshotted", async () => {
-    // A LocalRuntime over the same folder stands in for an SSH host (whole-second stat).
-    const runtimeLocation: AvailableArtifactsLocation = {
-      kind: "runtime",
-      runtime: new LocalRuntime(root),
-      dir: artifactsDir,
-    };
-    await write("skew.md", "aaaa");
-    const remoteMtimeMs = 1_700_000_000_000;
-    const file = path.join(artifactsDir, "skew.md");
-    await fs.utimes(file, remoteMtimeMs / 1000, remoteMtimeMs / 1000);
-    // Read within that remote second, but the host clock runs 1.5 s ahead, so the host-side
-    // check calls the mtime unambiguous.
-    await recordArtifactVersion({
-      sessionDir,
-      relPath: "skew.md",
-      bytes: Buffer.from("aaaa"),
-      source: "turn-end",
-      label: null,
-      sourceModifiedMs: remoteMtimeMs,
-      nowMs: remoteMtimeMs + 1500,
-    });
-    await fs.writeFile(file, "bbbb");
-    await fs.utimes(file, remoteMtimeMs / 1000, remoteMtimeMs / 1000);
-
-    expect(
-      await snapshotArtifactsAtTurnEnd({
-        sessionDir,
-        location: runtimeLocation,
-        turnStartedAtMs: 0,
-      })
-    ).toEqual(["skew.md"]);
-    expect(await versionsOf("skew.md")).toHaveLength(2);
   });
 });
 
@@ -456,7 +224,6 @@ describe("interrupted publish", () => {
           sessionDir,
           location,
           relPath: "doc.md",
-          source: "publish",
           label: null,
           abortSignal: controller.signal,
         })
@@ -476,7 +243,6 @@ describe("interrupted publish", () => {
         sessionDir,
         relPath: "late.md",
         bytes: Buffer.from("x"),
-        source: "publish",
         label: null,
         abortSignal: controller.signal,
       });
@@ -505,7 +271,6 @@ describe("interrupted publish", () => {
         sessionDir,
         relPath: "doc.md",
         bytes: Buffer.from("v2"),
-        source: "publish",
         label: null,
         abortSignal: controller.signal,
       });
@@ -516,56 +281,6 @@ describe("interrupted publish", () => {
     }
     expect(error).toBeInstanceOf(Error);
     expect(await readArtifactIndex(sessionDir, getArtifactId("doc.md"))).toEqual(before);
-  });
-});
-
-describe("attach_file registration", () => {
-  test("registers rich documents inside the artifacts dir with the given bytes", async () => {
-    const registered = await registerAttachedArtifact({
-      sessionDir,
-      location,
-      resolvedPath: path.join(artifactsDir, "plots", "chart.svg"),
-      bytes: Buffer.from("<svg/>"),
-    });
-    expect(registered).toEqual({
-      id: getArtifactId("plots/chart.svg"),
-      version: 1,
-      path: "plots/chart.svg",
-    });
-    expect(await versionsOf("plots/chart.svg")).toMatchObject([
-      { source: "attach_file", label: "chart.svg" },
-    ]);
-  });
-
-  test("ignores files outside the artifacts dir and non-document kinds", async () => {
-    const outside = await registerAttachedArtifact({
-      sessionDir,
-      location,
-      resolvedPath: path.join(root, "elsewhere.md"),
-      bytes: Buffer.from("x"),
-    });
-    const image = await registerAttachedArtifact({
-      sessionDir,
-      location,
-      resolvedPath: path.join(artifactsDir, "photo.png"),
-      bytes: Buffer.from("png"),
-    });
-    expect([outside, image]).toEqual([null, null]);
-  });
-
-  test("expands a home-relative remote artifacts dir before matching", async () => {
-    const registered = await registerAttachedArtifact({
-      sessionDir,
-      location: {
-        kind: "runtime",
-        runtime: new LocalRuntime(sessionDir),
-        dir: "~/.mux/workspace-scratch/ws/artifacts",
-      },
-      resolvedPath: "/home/u/.mux/workspace-scratch/ws/artifacts/r.md",
-      bytes: Buffer.from("r"),
-      resolveRuntimePath: (p) => Promise.resolve(p.replace(/^~/, "/home/u")),
-    });
-    expect(registered?.path).toBe("r.md");
   });
 });
 
@@ -670,7 +385,6 @@ describe("recordArtifactVersion across processes", () => {
       sessionDir,
       relPath: "locked.md",
       bytes: Buffer.from("1"),
-      source: "publish",
       label: null,
     }).finally(() => {
       settled = true;
@@ -689,7 +403,7 @@ describe("recordArtifactVersion across processes", () => {
 
 describe("recordArtifactVersion pin", () => {
   test("keeps the pin when omitted and clears it on null", async () => {
-    const base = { sessionDir, relPath: "p.md", source: "publish" as const, label: null };
+    const base = { sessionDir, relPath: "p.md", label: null };
     await recordArtifactVersion({ ...base, bytes: Buffer.from("1"), pin: "project" });
     const kept = await recordArtifactVersion({ ...base, bytes: Buffer.from("2") });
     expect(kept.pin).toBe("project");
@@ -702,7 +416,7 @@ describe("recordArtifactVersion pin", () => {
 describe("post-compaction artifacts index", () => {
   test("lists latest versions newest first, and nothing without versions", async () => {
     expect(await generateArtifactsIndexAttachment(sessionDir)).toBeNull();
-    const base = { sessionDir, source: "publish" as const };
+    const base = { sessionDir };
     await recordArtifactVersion({
       ...base,
       relPath: "old.md",

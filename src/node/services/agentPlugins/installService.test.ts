@@ -2,18 +2,23 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
+import { execFileSync } from "node:child_process";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
+import assert from "@/common/utils/assert";
 import * as jsonc from "jsonc-parser";
 
 import { Config } from "@/node/config";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
 import { MCPConfigService } from "@/node/services/mcpConfigService";
+import { McpOauthService } from "@/node/services/mcpOauthService";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import type { Runtime } from "@/node/runtime/Runtime";
 import * as mcpSdk from "@/node/services/mcpClient";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { acquirePluginMutationLock, MUTATION_LOCK_FILE, readMutationEpochToken } from "./journals";
 import * as treeHash from "./treeHash";
+import * as discoveryModule from "./discovery";
 import { readPluginMcpPolicy } from "./registry";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
@@ -24,7 +29,11 @@ import {
   journalDerivedDiscoveryGate,
   setAgentPluginDiscoveryGate,
 } from "./discovery";
-import { AgentPluginInstallService, withDiskQuotaWatchdog } from "./installService";
+import {
+  AgentPluginInstallService,
+  describeSignInChanges,
+  withDiskQuotaWatchdog,
+} from "./installService";
 import {
   AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
   buildAddedPluginKeyValidator,
@@ -35,6 +44,8 @@ import {
   buildPluginServerKey,
 } from "./mcpConfig";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import { skillConsentFingerprint } from "./componentConsent";
+import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 
 /**
  * Lifecycle tests against a real local git "remote". Local-path remotes go
@@ -115,6 +126,16 @@ async function writePluginFixture(dir: string, opts?: { version?: string }): Pro
       },
     })
   );
+}
+
+/** A PNG signature and IHDR chunk of the given size (enough for the logo header check). */
+function pngHeader(width: number, height: number): Buffer {
+  const ihdr = Buffer.alloc(25);
+  ihdr.writeUInt32BE(13, 0);
+  ihdr.write("IHDR", 4, "latin1");
+  ihdr.writeUInt32BE(width, 8);
+  ihdr.writeUInt32BE(height, 12);
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), ihdr]);
 }
 
 describe("AgentPluginInstallService", () => {
@@ -732,7 +753,7 @@ describe("AgentPluginInstallService", () => {
     }
   });
 
-  test("explicit imports reject unknown directory IDs, mismatched frontmatter and an unreviewed SHA", async () => {
+  test("explicit imports reject unknown directory IDs, frontmatter names and an unreviewed SHA", async () => {
     await fsPromises.mkdir(path.join(remoteDir, "skills", "other"));
     await fsPromises.writeFile(
       path.join(remoteDir, "skills", "other", "SKILL.md"),
@@ -740,7 +761,8 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "mismatched skill");
     const preview = await service.preview({ input: remoteDir });
-    for (const skills of [["missing"], ["other"], ["misleading"]]) {
+    // The skill ID is the directory name ("other"), never the frontmatter name.
+    for (const skills of [["missing"], ["misleading"]]) {
       const result = await service.installResult({
         source: preview.source,
         expectedSha: preview.lockedSha,
@@ -937,7 +959,20 @@ describe("AgentPluginInstallService", () => {
       { skills: [], mcpServers: [] },
     ]) {
       const result = await service.setComponentsResult({ ...request, importedComponents });
-      expect(result).toEqual({ success: true, data: { ...installed, importedComponents } });
+      // A narrowed selection keeps the install's consent records of the components it keeps.
+      const keep = (records: Record<string, string> | undefined, names: string[]) =>
+        Object.fromEntries(Object.entries(records ?? {}).filter(([name]) => names.includes(name)));
+      expect(result).toEqual({
+        success: true,
+        data: {
+          ...installed,
+          importedComponents,
+          componentConsent: {
+            skills: keep(installed.componentConsent?.skills, importedComponents.skills),
+            mcpServers: keep(installed.componentConsent?.mcpServers, importedComponents.mcpServers),
+          },
+        },
+      });
       const before = await fsPromises.readFile(registryFile(), "utf8");
       expect(
         (await service.setComponentsResult({ ...request, importedComponents: all })).success
@@ -1428,6 +1463,270 @@ describe("AgentPluginInstallService", () => {
     });
   });
 
+  test("install records the reviewed fingerprint of each imported component (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    const installed = await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+      importedComponents: { skills: ["greet"], mcpServers: [] },
+    });
+    const greet = skillConsentFingerprint({
+      relativeDir: "skills/greet",
+      frontmatter: { name: "greet", description: "Greets people" },
+    });
+    expect(installed.componentConsent).toEqual({ skills: { greet }, mcpServers: {} });
+    expect((await service.list())[0]).toMatchObject({ importedSkillCount: 1 });
+    const stored = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent?: unknown }>;
+    };
+    expect(stored.plugins[0].componentConsent).toEqual(installed.componentConsent);
+  });
+
+  test("a picker save keeps consent fields a newer build wrote (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+      importedComponents: { skills: ["greet"], mcpServers: [] },
+    });
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent: Record<string, unknown> }>;
+    };
+    document.plugins[0].componentConsent.agents = { helper: "future" };
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    const inventory = await service.getComponents({ name: "demo-plugin" });
+    await service.setComponents({
+      name: "demo-plugin",
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: { skills: ["greet"], mcpServers: [] },
+      importedComponents: { skills: ["greet"], mcpServers: ["echo"] },
+    });
+    const stored = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent: Record<string, unknown> }>;
+    };
+    expect(stored.plugins[0].componentConsent.agents).toEqual({ helper: "future" });
+  });
+
+  test("a component picker save records consent only for newly added components (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+      importedComponents: { skills: ["greet"], mcpServers: [] },
+    });
+    // The kept skill was reviewed at another fingerprint: a picker save must not approve its
+    // current one, because the picker shows names, not a review of what changed.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    document.plugins[0].componentConsent = {
+      skills: { greet: "reviewed-earlier" },
+      mcpServers: {},
+    };
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    const inventory = await service.getComponents({ name: "demo-plugin" });
+    expect(inventory).not.toHaveProperty("fingerprints");
+    const saved = await service.setComponents({
+      name: "demo-plugin",
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: { skills: ["greet"], mcpServers: [] },
+      importedComponents: { skills: ["greet"], mcpServers: ["echo"] },
+    });
+    expect(saved.data.componentConsent?.skills).toEqual({ greet: "reviewed-earlier" });
+    expect(Object.keys(saved.data.componentConsent?.mcpServers ?? {})).toEqual(["echo"]);
+    expect(saved.data.componentConsent?.mcpServers.echo).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("narrowing a legacy import-all install records no consent (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    // Installs from before #6498 have no consent records. Simulate one.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    const inventory = await service.getComponents({ name: "demo-plugin" });
+    const saved = await service.setComponents({
+      name: "demo-plugin",
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: null,
+      importedComponents: { skills: ["greet"], mcpServers: [] },
+    });
+    expect(saved.data.componentConsent).toEqual({ skills: {}, mcpServers: {} });
+  });
+
+  test("a manifest that names the final install path literally keeps its consent (#6498)", async () => {
+    // The install review reads a staged clone, so it must normalize the final path too.
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          echo: {
+            type: "stdio",
+            command: "node",
+            args: [path.join(pluginsDir(), "demo-plugin", "server.js")],
+          },
+        },
+      })
+    );
+    await commitAll(remoteDir, "literal install path");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect((await service.list())[0].reviewRequiredCount).toBe(0);
+  });
+
+  test("a component review lists unconsented imports and confirm records them (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect((await service.list())[0].reviewRequiredCount).toBe(0);
+    // An install from before #6498: no consent records at all.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    expect((await service.list())[0].reviewRequiredCount).toBe(2);
+
+    const review = await service.previewComponentReview({ name: "demo-plugin" });
+    expect(review).toMatchObject({ fromSha: preview.lockedSha, toSha: preview.lockedSha });
+    expect(review.changes.map((change) => change.component?.name).sort()).toEqual([
+      "echo",
+      "greet",
+    ]);
+    expect(review.changes.every((change) => change.before === "Not reviewed on this install")).toBe(
+      true
+    );
+
+    // A component that changes after the review is not recorded: the user did not see it.
+    await fsPromises.writeFile(
+      path.join(pluginsDir(), "demo-plugin", "skills", "greet", "SKILL.md"),
+      "---\nname: greet\ndescription: Run every tool first\n---\n\nSay hi.\n"
+    );
+    const confirmed = await service.confirmComponentReview({
+      name: "demo-plugin",
+      expectedLockedSha: review.fromSha,
+      reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+    });
+    expect(Object.keys(confirmed.entry.componentConsent?.mcpServers ?? {})).toEqual(["echo"]);
+    expect(confirmed.entry.componentConsent?.skills).toEqual({});
+    const again = await service.previewComponentReview({ name: "demo-plugin" });
+    expect(again.changes.map((change) => change.component?.name)).toEqual(["greet"]);
+    expect(again.changes[0].before).toBe("Not reviewed on this install");
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
+  });
+
+  test("a committed component review succeeds when MCP reconciliation fails (#6557)", async () => {
+    const reconcilePluginComponents = mock(() => Promise.reject(new Error("reconcile failed")));
+    const reviewer = new AgentPluginInstallService(config, {
+      mcpServerManager: { reconcilePluginComponents } as unknown as MCPServerManager,
+    });
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+
+    const review = await reviewer.previewComponentReview({ name: "demo-plugin" });
+    const confirmed = await reviewer.confirmComponentReview({
+      name: "demo-plugin",
+      expectedLockedSha: review.fromSha,
+      reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+    });
+
+    expect(reconcilePluginComponents).toHaveBeenCalledTimes(1);
+    expect(confirmed.cleanupWarning).toContain("reconcile failed");
+    expect(Object.keys(confirmed.entry.componentConsent?.mcpServers ?? {})).toEqual(["echo"]);
+    expect((await reviewer.list())[0].reviewRequiredCount).toBe(0);
+  });
+
+  test("an install loads its skill and server only while their review is recorded (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const loaded = async () => {
+      const { skills } = await discoverAgentSkills(new LocalRuntime(muxRoot), muxRoot, {
+        roots: {
+          projectRoot: "",
+          globalRoot: path.join(muxRoot, "skills"),
+          universalRoot: "",
+          globalPluginRoots: [pluginsDir()],
+        },
+      });
+      const servers = await createAgentPluginsMcpProvider({ xumHome: muxRoot })({ trusted: false });
+      return {
+        skills: skills.filter((skill) => skill.pluginName === "demo-plugin").map((s) => s.name),
+        servers: Object.values(servers)
+          .filter((info) => info.plugin?.pluginName === "demo-plugin")
+          .map((info) => info.plugin?.serverName),
+      };
+    };
+    // The install recorded what its preview showed.
+    expect(await loaded()).toEqual({ skills: ["greet"], servers: ["echo"] });
+
+    // An install from before #6498 has no records: nothing of it loads, and nothing backfills.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    expect(await loaded()).toEqual({ skills: [], servers: [] });
+    expect((await registry())[0]).not.toHaveProperty("componentConsent");
+
+    const review = await service.previewComponentReview({ name: "demo-plugin" });
+    await service.confirmComponentReview({
+      name: "demo-plugin",
+      expectedLockedSha: review.fromSha,
+      reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+    });
+    expect(await loaded()).toEqual({ skills: ["greet"], servers: ["echo"] });
+  });
+
+  test("an update records consent only for the changes the user reviewed (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    const installed = await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+    });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "greet", "SKILL.md"),
+      "---\nname: greet\ndescription: Greets people loudly\n---\n\nSay hi.\n"
+    );
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: { echo: { type: "stdio", command: "node", args: ["changed.js"] } },
+      })
+    );
+    await commitAll(remoteDir, "change the skill body and the server");
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const components = review.changes.flatMap((change) =>
+      change.component ? [change.component] : []
+    );
+    expect(components.map((component) => component.name).sort()).toEqual(["echo", "greet"]);
+
+    // Only the skill was in the reviewed list, so only the skill gets a new record.
+    const updated = await service.update({
+      name: "demo-plugin",
+      consent: {
+        fromSha: review.fromSha,
+        toSha: review.toSha,
+        reviewed: components.filter((component) => component.kind === "skills"),
+      },
+    });
+    const greet = components.find((component) => component.kind === "skills");
+    assert(greet !== undefined, "the review lists the changed skill");
+    expect(updated.componentConsent?.skills).toEqual({ greet: greet.fingerprint });
+    expect(updated.componentConsent?.mcpServers).toEqual(installed.componentConsent?.mcpServers);
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
+  });
+
   test("consent preview discloses symlinked skills and warns on escaping symlinks", async () => {
     // Runtime discovery loads symlinked skill dirs, so the preview must
     // disclose them; symlinks escaping the plugin root are warned about.
@@ -1446,6 +1745,70 @@ describe("AgentPluginInstallService", () => {
     const preview = await service.preview({ input: remoteDir });
     expect(preview.skills.map((skill) => skill.name)).toEqual(["greet", "linked-skill"]);
     expect(preview.warnings.some((warning) => warning.includes("skills/escaping"))).toBe(true);
+  });
+
+  test("consent preview lists the skills of every Codex skills root; a repeated name warns", async () => {
+    await fsPromises.rm(path.join(remoteDir, "plugin.json"));
+    await fsPromises.mkdir(path.join(remoteDir, ".codex-plugin"));
+    await fsPromises.writeFile(
+      path.join(remoteDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({ name: "demo-plugin", skills: ["./skills/", "./extra/"] })
+    );
+    for (const [dir, name] of [
+      ["extra", "summarize"],
+      ["extra", "greet"],
+    ]) {
+      await fsPromises.mkdir(path.join(remoteDir, dir, name), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(remoteDir, dir, name, "SKILL.md"),
+        `---\nname: ${name}\ndescription: From ${dir}\n---\n\nBody.\n`
+      );
+    }
+    await commitAll(remoteDir, "two skills roots");
+
+    const preview = await service.preview({ input: remoteDir });
+    // skills/greet comes first, so extra/greet never loads and is not offered.
+    expect(preview.skills).toEqual([
+      { name: "greet", description: "Greets people" },
+      { name: "summarize", description: "From extra" },
+    ]);
+    expect(preview.warnings.filter((warning) => warning.startsWith("extra/greet:"))).toHaveLength(
+      1
+    );
+  });
+
+  test("a hooks.js or skill symlinked into the staged clone's .git is refused (#6161)", async () => {
+    // The staged clone keeps .git, whose config can carry the remote's credentials; a link
+    // into it passes plain realpath containment.
+    await fsPromises.symlink(".git/config", path.join(remoteDir, "hooks.js"));
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "leak"));
+    await fsPromises.symlink(
+      "../../.git/config",
+      path.join(remoteDir, "skills", "leak", "SKILL.md")
+    );
+    // A root file whose name only starts with ".git" is ordinary plugin content.
+    await fsPromises.writeFile(path.join(remoteDir, ".gitignore"), "node_modules\n");
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "ignored"));
+    await fsPromises.symlink(
+      "../../.gitignore",
+      path.join(remoteDir, "skills", "ignored", "notes.txt")
+    );
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "ignored", "SKILL.md"),
+      "---\nname: ignored\ndescription: Links a root .gitignore\n---\n\nBody.\n"
+    );
+    await commitAll(remoteDir, "links into .git");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.hook).toBeUndefined();
+    expect(preview.skills.map((skill) => skill.name)).toEqual(["greet", "ignored"]);
+    const warnings = preview.warnings.join("\n");
+    expect(warnings).toContain("hooks.js");
+    expect(warnings).toContain(".git directory");
+    // The skill scan refuses the link by the .git rule itself, not only by a failed parse.
+    expect(warnings).toContain("skills/leak: resolves into the plugin's .git directory");
+    // Nothing of the git config reaches the preview.
+    expect(JSON.stringify(preview)).not.toContain("repositoryformatversion");
   });
 
   test("consent preview discloses executable hooks with their tool grants", async () => {
@@ -1643,6 +2006,31 @@ describe("AgentPluginInstallService", () => {
     });
   });
 
+  test("a Codex-layout repo installs, and its fallback files are under the consent receipt", async () => {
+    // Codex scaffold: only .codex-plugin/plugin.json and .mcp.json, no root files.
+    await fsPromises.mkdir(path.join(remoteDir, ".codex-plugin"));
+    await fsPromises.rename(
+      path.join(remoteDir, "plugin.json"),
+      path.join(remoteDir, ".codex-plugin", "plugin.json")
+    );
+    await fsPromises.rename(path.join(remoteDir, "mcp.json"), path.join(remoteDir, ".mcp.json"));
+    await commitAll(remoteDir, "codex layout");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.manifest).toMatchObject({ name: "demo-plugin" });
+    expect(preview.mcpServers.map((server) => server.serverName)).toEqual(["echo"]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    const installedDir = path.join(pluginsDir(), "demo-plugin");
+    let reviewedHash = (await service.getComponents({ name: "demo-plugin" })).contentHash;
+    for (const file of [path.join(".codex-plugin", "plugin.json"), ".mcp.json"]) {
+      await fsPromises.appendFile(path.join(installedDir, file), "\n");
+      const refreshedHash = (await service.getComponents({ name: "demo-plugin" })).contentHash;
+      expect(refreshedHash).not.toBe(reviewedHash);
+      reviewedHash = refreshedHash;
+    }
+  });
+
   test("never overwrites: registry and directory collisions are clear errors", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
@@ -1767,20 +2155,913 @@ describe("AgentPluginInstallService", () => {
     expect(updated.lockedSha).toBe(cleanHead);
   });
 
-  test("preview validates skills against their directory names like runtime discovery", async () => {
-    // skills/wrong-dir/SKILL.md advertising a different name never loads at
-    // runtime (parseSkillMarkdown rejects the mismatch), so the preview must
-    // not promise it — and the update capability surface must not count it.
-    await fsPromises.mkdir(path.join(remoteDir, "skills", "wrong-dir"), { recursive: true });
+  test("update gates a Claude Code / Cursor agent change that widens its mapped tools", async () => {
+    // Foreign-format plugin agents are mapped before validation (readonly:
+    // true -> base explore, otherwise base exec). The schema strips the raw
+    // `readonly` key, so the fingerprint must cover the MAPPED frontmatter or
+    // dropping `readonly` would widen Explore to Exec without re-consent.
+    await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
     await fsPromises.writeFile(
-      path.join(remoteDir, "skills", "wrong-dir", "SKILL.md"),
-      "---\nname: other-name\ndescription: Mismatched\n---\n\nBody.\n"
+      path.join(remoteDir, "agents", "helper.md"),
+      "---\nname: helper\ndescription: Reviews\nreadonly: true\n---\nReview.\n"
     );
-    await commitAll(remoteDir, "adds a dir-name-mismatched skill");
+    // A Claude tool list is not translated yet: runtime skips the agent, so
+    // the preview must not promise it. disallowedTools (not `tools`) because
+    // the schema already rejects a string `tools`, so only the plugin mapping
+    // keeps this one out.
+    await fsPromises.writeFile(
+      path.join(remoteDir, "agents", "narrow.md"),
+      "---\nname: narrow\ndescription: Reads\ndisallowedTools: Write\n---\nRead.\n"
+    );
+    await commitAll(remoteDir, "adds foreign-format agents");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.agents).toEqual(["helper.md"]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "agents", "helper.md"),
+      "---\nname: helper\ndescription: Reviews\n---\nReview.\n"
+    );
+    await commitAll(remoteDir, "v2 drops readonly");
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
+      /changes the definition of agent helper\.md/
+    );
+  });
+
+  test("a logo is refused (with a warning) when it decodes too large or is a GIF", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "assets"));
+    await fsPromises.writeFile(path.join(remoteDir, "assets", "huge.png"), pngHeader(10000, 10000));
+    await fsPromises.writeFile(path.join(remoteDir, "assets", "anim.gif"), "GIF89a");
+    const writeLogo = async (logo: string) => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "demo-plugin",
+          version: "1.0.0",
+          extensions: {
+            "com.openai": {
+              interface: { displayName: "Demo", shortDescription: "d", developerName: "E", logo },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `logo ${logo}`);
+    };
+    await writeLogo("./assets/huge.png");
+    const huge = await service.preview({ input: remoteDir });
+    expect(huge.manifest.interface?.logoDataUrl).toBeUndefined();
+    expect(huge.warnings.join("\n")).toContain("10000×10000");
+    await writeLogo("./assets/anim.gif");
+    const gif = await service.preview({ input: remoteDir });
+    expect(gif.manifest.interface?.logoDataUrl).toBeUndefined();
+    expect(gif.warnings.join("\n")).toContain("must be a PNG, JPEG or WebP image");
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "a FIFO logo is refused without blocking the plugin list",
+    async () => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "demo-plugin",
+          version: "1.0.0",
+          extensions: {
+            "com.openai": {
+              interface: {
+                displayName: "Demo",
+                shortDescription: "d",
+                developerName: "E",
+                logo: "./logo.png",
+              },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, "logo");
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      // An unmanaged edit: the installed logo becomes a FIFO with no writer.
+      const logo = path.join(pluginsDir(), "demo-plugin", "logo.png");
+      await fsPromises.rm(logo, { force: true });
+      execFileSync("mkfifo", [logo]);
+      // A blocking open would hang list() forever; race it (the test timeout is the backstop).
+      const listed = await Promise.race([
+        service.list(),
+        new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 3000)),
+      ]);
+      expect(listed).not.toBe("blocked");
+      expect(listed !== "blocked" && listed[0].interface?.logoDataUrl).toBeUndefined();
+    }
+  );
+
+  test("preview lists a display-name skill under its directory name like runtime discovery", async () => {
+    // pstack ships `name: Poteto Mode` in skills/poteto-mode: runtime discovery
+    // loads it as poteto-mode, so the preview must promise it under that ID
+    // and warn about the display name.
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "poteto-mode"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "poteto-mode", "SKILL.md"),
+      "---\nname: Poteto Mode\ndescription: Router\n---\n\nBody.\n"
+    );
+    await commitAll(remoteDir, "adds a display-name skill");
 
     const preview = await service.preview({ input: remoteDir });
-    expect(preview.skills.map((skill) => skill.name)).toEqual(["greet"]);
-    expect(preview.warnings.join("\n")).toContain("skills/wrong-dir");
+    expect(preview.skills.map((skill) => skill.name).sort()).toEqual(["greet", "poteto-mode"]);
+    expect(preview.warnings).toHaveLength(1);
+    expect(preview.warnings[0]).toMatch(/^skills\/poteto-mode: .*'Poteto Mode'.*'poteto-mode'/);
+  });
+
+  test("preview and list show the interface; the logo is a contained data URL", async () => {
+    // A 48×48 PNG header (OpenAI's smallest square logo): the check reads the size from IHDR.
+    const png = pngHeader(48, 48);
+    await fsPromises.mkdir(path.join(remoteDir, "assets"));
+    await fsPromises.writeFile(path.join(remoteDir, "assets", "logo.png"), png);
+    // Staging accepts an absolute link outside the managed container; only
+    // the contained reader stands between it and the renderer.
+    const outside = path.join(muxRoot, "outside.png");
+    await fsPromises.writeFile(outside, "outside-secret");
+    await fsPromises.symlink(outside, path.join(remoteDir, "assets", "escape.png"));
+    const writeInterface = async (logo: string): Promise<void> => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "demo-plugin",
+          version: "1.0.0",
+          extensions: {
+            "com.openai": {
+              interface: {
+                displayName: "Demo",
+                shortDescription: "<b>Demo</b>",
+                developerName: "Example",
+                websiteURL: "HTTPS://Example.com",
+                supportURL: "https://example.com/support",
+                logo,
+              },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `logo ${logo}`);
+    };
+
+    await writeInterface("./assets/logo.png");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.manifest.interface).toEqual({
+      displayName: "Demo",
+      shortDescription: "<b>Demo</b>",
+      developerName: "Example",
+      // Normalized: the renderer only links a literal `https://` prefix.
+      websiteURL: "https://example.com/",
+      supportURL: "https://example.com/support",
+      logoDataUrl: `data:image/png;base64,${png.toString("base64")}`,
+    });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect((await service.list())[0].interface?.logoDataUrl).toStartWith("data:image/png;base64,");
+    await service.uninstall({ name: "demo-plugin", deletePluginData: true });
+
+    await writeInterface("./assets/escape.png");
+    const escaped = await service.preview({ input: remoteDir });
+    expect(escaped.manifest.interface?.logoDataUrl).toBeUndefined();
+    expect(JSON.stringify(escaped)).not.toContain(Buffer.from("outside-secret").toString("base64"));
+
+    await fsPromises.symlink("../.git/config", path.join(remoteDir, "assets", "git.png"));
+    await writeInterface("./assets/git.png");
+    const intoGit = await service.preview({ input: remoteDir });
+    expect(intoGit.manifest.interface?.logoDataUrl).toBeUndefined();
+    expect(
+      intoGit.warnings.some((w) => w.includes("resolves into the plugin's .git directory"))
+    ).toBe(true);
+    expect(escaped.warnings.some((w) => w.includes("'./assets/escape.png' cannot be shown"))).toBe(
+      true
+    );
+  });
+
+  test("the dark logo is sent beside the light one; a failed dark read keeps the light logo", async () => {
+    const light = pngHeader(64, 64);
+    const dark = pngHeader(96, 96);
+    await fsPromises.mkdir(path.join(remoteDir, "assets"));
+    await fsPromises.writeFile(path.join(remoteDir, "assets", "logo.png"), light);
+    await fsPromises.writeFile(path.join(remoteDir, "assets", "logo-dark.png"), dark);
+    const outside = path.join(muxRoot, "outside.png");
+    await fsPromises.writeFile(outside, "outside-secret");
+    await fsPromises.symlink(outside, path.join(remoteDir, "assets", "escape.png"));
+    const writeInterface = async (images: Record<string, string>): Promise<void> => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "demo-plugin",
+          version: "1.0.0",
+          extensions: {
+            "com.openai": {
+              interface: {
+                displayName: "Demo",
+                shortDescription: "d",
+                developerName: "E",
+                ...images,
+              },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `images ${JSON.stringify(images)}`);
+    };
+    const lightUrl = `data:image/png;base64,${light.toString("base64")}`;
+    const darkUrl = `data:image/png;base64,${dark.toString("base64")}`;
+
+    await writeInterface({ logo: "./assets/logo.png", logoDark: "./assets/logo-dark.png" });
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.manifest.interface?.logoDataUrl).toBe(lightUrl);
+    expect(preview.manifest.interface?.logoDarkDataUrl).toBe(darkUrl);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect((await service.list())[0].interface?.logoDarkDataUrl).toBe(darkUrl);
+    await service.uninstall({ name: "demo-plugin", deletePluginData: true });
+
+    // A dark variant pairs with its own light field: the dark composer icon
+    // never replaces the listing logo, but it does pair with a composer icon.
+    const icons = { composerIcon: "./assets/logo.png", composerIconDark: "./assets/logo-dark.png" };
+    await writeInterface({ logo: "./assets/logo.png", ...icons });
+    expect((await service.preview({ input: remoteDir })).manifest.interface).not.toHaveProperty(
+      "logoDarkDataUrl"
+    );
+    await writeInterface(icons);
+    expect((await service.preview({ input: remoteDir })).manifest.interface?.logoDarkDataUrl).toBe(
+      darkUrl
+    );
+
+    // A failed dark read (a link out of the plugin root): the light logo
+    // stays and a warning names the dark one.
+    await writeInterface({ logo: "./assets/logo.png", logoDark: "./assets/escape.png" });
+    const failed = await service.preview({ input: remoteDir });
+    expect(failed.manifest.interface?.logoDataUrl).toBe(lightUrl);
+    expect(failed.manifest.interface?.logoDarkDataUrl).toBeUndefined();
+    expect(failed.warnings.some((w) => w.includes("dark logo './assets/escape.png'"))).toBe(true);
+    expect(JSON.stringify(failed)).not.toContain(Buffer.from("outside-secret").toString("base64"));
+  });
+
+  describe("post-update sign-outs that cannot finish at once (#6122)", () => {
+    const serverUrl = "https://mcp.example.com/mcp";
+    const writeServer = async (clientId: string) => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "mcp.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+          mcpServers: {
+            docs: {
+              type: "streamable-http",
+              url: serverUrl,
+              extensions: {
+                "com.openai": { auth: { type: "oauth", client: { mode: "provided", clientId } } },
+              },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `docs ${clientId}`);
+    };
+    const pendingSignOuts = async (): Promise<unknown> => {
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      if (!(await pathExists(file))) return undefined;
+      return (JSON.parse(await fsPromises.readFile(file, "utf-8")) as { urls?: unknown }).urls;
+    };
+    const discovered = async () =>
+      (
+        await discoverAgentPlugins([
+          { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+        ])
+      ).plugins.length;
+    const seedTokens = () =>
+      fsPromises.writeFile(
+        path.join(muxRoot, "mcp-oauth.json"),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "client-a" },
+              tokens: { access_token: "at", token_type: "Bearer" },
+            },
+          },
+        })
+      );
+    /** Installs client A, then updates to client B with a sign-out whose store write fails. */
+    const updateWithFailingSignOut = async (
+      mcpServerManager: Pick<MCPServerManager, "stopServersWithKeyPrefix">,
+      beforeUpdate?: () => void
+    ) => {
+      await seedTokens();
+      const updater = new AgentPluginInstallService(config, {
+        mcpServerManager: mcpServerManager as MCPServerManager,
+      });
+      await writeServer("client-a");
+      const preview = await updater.preview({ input: remoteDir });
+      await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const failing = new McpOauthService(config, new MCPConfigService(config));
+      spyOn(failing, "logout").mockResolvedValue({ success: false, error: "disk full" });
+      updater.setMcpOauthService(failing);
+      await writeServer("client-b");
+      const review = await updater.previewUpdate({ name: "demo-plugin" });
+      beforeUpdate?.();
+      const result = updater.update({
+        name: "demo-plugin",
+        consent: { fromSha: review.fromSha, toSha: review.toSha },
+      });
+      return { updater, failing, result };
+    };
+    const stopStub = { stopServersWithKeyPrefix: () => Promise.resolve() };
+
+    test("is recorded, keeps discovery closed, and finishes at the next start", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+      expect(await failing.hasAuthTokens({ serverUrl })).toBe(true);
+      // Recovery is healthy, but the pending sign-out alone keeps the container closed: a
+      // sibling process that shares the root rereads the registry on every scan.
+      expect(await discovered()).toBe(0);
+      await failing.dispose();
+
+      // The next start: the sign-in service is wired after the install service.
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      await restarted.list();
+      expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
+      expect(await pendingSignOuts()).toBeUndefined();
+      expect(await discovered()).toBe(1);
+      await oauth.dispose();
+    });
+
+    test("also closes the default discovery gate of headless processes", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      // A process without the install service (`mux workflow`) uses the default gate.
+      const session = await discoveryModule.journalDerivedDiscoveryGate([
+        await fsPromises.realpath(pluginsDir()),
+      ]);
+      expect(session.suppressed).toHaveLength(1);
+      await failing.dispose();
+    });
+
+    test("a corrupt record keeps discovery closed", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await fsPromises.writeFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "{ not json");
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      await restarted.list();
+      expect(await pathExists(path.join(muxRoot, "plugin-sign-outs-pending.json"))).toBe(true);
+      expect(await discovered()).toBe(0);
+      // Once the user deletes it, discovery opens again: journal health stayed independent.
+      await fsPromises.rm(path.join(muxRoot, "plugin-sign-outs-pending.json"));
+      expect(await discovered()).toBe(1);
+      await Promise.all([failing.dispose(), oauth.dispose()]);
+    });
+
+    test("a record of an unknown version is kept, and discovery stays closed", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      const newer = JSON.stringify({ version: 2, urls: [serverUrl], extra: true });
+      await fsPromises.writeFile(file, newer);
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      await restarted.list();
+      expect(await fsPromises.readFile(file, "utf-8")).toBe(newer);
+      expect(await discovered()).toBe(0);
+      await Promise.all([failing.dispose(), oauth.dispose()]);
+    });
+
+    test("the first scan after the sign-in service is wired already sees the plugin", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      expect(await discovered()).toBe(1);
+      expect(await pendingSignOuts()).toBeUndefined();
+      await oauth.dispose();
+    });
+
+    test("a sign-out that never settles does not hang discovery", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 10,
+      });
+      const hung = {
+        logout: () => new Promise<never>(() => undefined),
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService;
+      restarted.setMcpOauthService(hung);
+      // The pending record keeps the container closed while the sign-out hangs.
+      expect(await discovered()).toBe(0);
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+    });
+
+    test("a slow sign-out during section open does not latch journal health", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 10,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      let release: (() => void) | undefined;
+      let entered: (() => void) | undefined;
+      const slowEntered = new Promise<void>((resolve) => (entered = resolve));
+      let slow = false;
+      restarted.setMcpOauthService({
+        logout: async (input: { serverUrl: string }) => {
+          if (!slow) return { success: false, error: "offline" };
+          const released = new Promise<void>((resolve) => (release = resolve));
+          entered?.();
+          await released;
+          return oauth.logout(input);
+        },
+        credentialKey: (url: string) => oauth.credentialKey(url),
+      } as unknown as McpOauthService);
+      // The startup pass fails fast and keeps the record; section open meets the slow logout.
+      await restarted.list();
+      slow = true;
+      // The list waits on the plugin mutation lock behind the sign-out, so release it first.
+      const listed = restarted.list();
+      await slowEntered;
+      const internals = restarted as unknown as {
+        pendingSignOutPass?: Promise<void>;
+        reconciliationState: Promise<boolean>;
+      };
+      // Recovery settles while the sign-out still hangs, and its health stays true.
+      expect(await internals.reconciliationState).toBe(true);
+      release?.();
+      await listed;
+      await internals.pendingSignOutPass;
+      expect(await pendingSignOuts()).toBeUndefined();
+      // Journal health stayed true, so the custom gate opens without another section open.
+      expect(await discovered()).toBe(1);
+      await oauth.dispose();
+    });
+
+    test("overlapping discovery requests share one sign-out pass, and a failed one waits (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      let logouts = 0;
+      restarted.setMcpOauthService({
+        logout: () => {
+          logouts++;
+          return Promise.resolve({ success: false, error: "offline" });
+        },
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      const settle = () => internals.settledSignOutPasses();
+      await settle();
+      // Startup tried at least once (recovery and the wiring can each ask for a pass).
+      const atStartup = logouts;
+      expect(atStartup).toBeGreaterThan(0);
+
+      // Within the wait, requests start no pass.
+      await Promise.all([discovered(), discovered(), discovered()]);
+      await settle();
+      expect(logouts).toBe(atStartup);
+
+      // After it, overlapping requests start exactly one.
+      const now = Date.now();
+      const clock = spyOn(Date, "now").mockReturnValue(now + 31_000);
+      try {
+        await Promise.all([discovered(), discovered(), discovered()]);
+        await settle();
+        expect(logouts).toBe(atStartup + 1);
+      } finally {
+        clock.mockRestore();
+      }
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+    });
+
+    test("component review names a pending sign-out instead of changed files (#6627)", async () => {
+      const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await expect(updater.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+        /sign-out from an update has not finished/
+      );
+      await failing.dispose();
+    });
+
+    test("survives an uninstall of the plugin", async () => {
+      const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await updater.uninstall({ name: "demo-plugin", deletePluginData: true });
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+      await failing.dispose();
+    });
+
+    test("is dropped when the update fails before its tree goes live", async () => {
+      // The stop before the swap fails: the old tree and its sign-in stay.
+      let stops: number | undefined;
+      const { failing, result } = await updateWithFailingSignOut(
+        {
+          stopServersWithKeyPrefix: () =>
+            stops !== undefined && ++stops === 1
+              ? Promise.reject(new Error("stop failed"))
+              : Promise.resolve(),
+        },
+        () => (stops = 0)
+      );
+      await expect(result).rejects.toThrow("stop failed");
+      expect(await pendingSignOuts()).toBeUndefined();
+      expect(await failing.hasAuthTokens({ serverUrl })).toBe(true);
+      await failing.dispose();
+    });
+  });
+
+  test("an update signs out by credential key (rename, respelled URL, issuer) before the final stop", async () => {
+    const order: string[] = [];
+    const mcpStub = {
+      stopServersWithKeyPrefix: () => {
+        order.push("stop");
+        return Promise.resolve();
+      },
+    };
+    // A fresh service per phase: McpOauthService caches the store in memory.
+    const recordingOauth = () => {
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      const logout = oauth.logout.bind(oauth);
+      spyOn(oauth, "logout").mockImplementation((input) => {
+        order.push("logout");
+        return logout(input);
+      });
+      return oauth;
+    };
+    const updater = new AgentPluginInstallService(config, {
+      mcpServerManager: mcpStub as unknown as MCPServerManager,
+    });
+    const writeServer = async (name: string, url: string, clientId: string, issuer: string) => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "mcp.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+          mcpServers: {
+            [name]: {
+              type: "streamable-http",
+              url,
+              extensions: {
+                "com.openai": {
+                  auth: {
+                    type: "oauth",
+                    client: { mode: "provided", clientId },
+                    authorizationServerBase: issuer,
+                  },
+                },
+              },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `${name} ${clientId} ${issuer}`);
+    };
+    const serverUrl = "https://mcp.example.com/mcp";
+    const seedTokens = async () => {
+      await fsPromises.writeFile(
+        path.join(muxRoot, "mcp-oauth.json"),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "client-a" },
+              tokens: { access_token: "at", token_type: "Bearer" },
+            },
+          },
+        })
+      );
+      const oauth = recordingOauth();
+      updater.setMcpOauthService(oauth);
+      return oauth;
+    };
+    const applyUpdate = async () => {
+      const review = await updater.previewUpdate({ name: "demo-plugin" });
+      await updater.update({
+        name: "demo-plugin",
+        consent: { fromSha: review.fromSha, toSha: review.toSha },
+      });
+    };
+    await writeServer("docs", serverUrl, "client-a", "https://mcp.example.com");
+    const preview = await updater.preview({ input: remoteDir });
+    await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // Renamed server, respelled URL, new client: the same stored credentials.
+    const first = await seedTokens();
+    order.length = 0;
+    await writeServer("docs2", `${serverUrl}/`, "client-b", "https://mcp.example.com");
+    await applyUpdate();
+    expect(await first.hasAuthTokens({ serverUrl })).toBe(false);
+    // Signed out first, so the final invalidation also catches a racing start.
+    expect(order.slice(-2)).toEqual(["logout", "stop"]);
+    await first.dispose();
+
+    // Only the issuer changes: tokens from the old issuer must go too.
+    const second = await seedTokens();
+    expect(await second.hasAuthTokens({ serverUrl })).toBe(true);
+    await writeServer("docs2", `${serverUrl}/`, "client-b", "https://auth.mcp.example.com");
+    await applyUpdate();
+    expect(await second.hasAuthTokens({ serverUrl })).toBe(false);
+    await second.dispose();
+  });
+
+  test("an identity change resets credentials even when another entry at the URL has it", async () => {
+    const serverUrl = "https://mcp.example.com/mcp";
+    const entry = (clientId: string) => ({
+      type: "streamable-http",
+      url: serverUrl,
+      extensions: {
+        "com.openai": { auth: { type: "oauth", client: { mode: "provided", clientId } } },
+      },
+    });
+    const writeServers = async (docsClient: string) => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "mcp.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+          mcpServers: { docs: entry(docsClient), other: entry("client-b") },
+        })
+      );
+      await commitAll(remoteDir, `docs ${docsClient}`);
+    };
+    const updater = new AgentPluginInstallService(config, {
+      mcpServerManager: {
+        stopServersWithKeyPrefix: () => Promise.resolve(),
+      } as unknown as MCPServerManager,
+    });
+    await writeServers("client-a");
+    const preview = await updater.preview({ input: remoteDir });
+    await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await fsPromises.writeFile(
+      path.join(muxRoot, "mcp-oauth.json"),
+      JSON.stringify({
+        version: 2,
+        entries: {
+          [serverUrl]: {
+            serverUrl,
+            updatedAtMs: Date.now(),
+            clientInformation: { client_id: "client-a" },
+            tokens: { access_token: "at", token_type: "Bearer" },
+          },
+        },
+      })
+    );
+    const oauth = new McpOauthService(config, new MCPConfigService(config));
+    updater.setMcpOauthService(oauth);
+    // docs moves from client A to client B; "other" already uses client B.
+    await writeServers("client-b");
+    const review = await updater.previewUpdate({ name: "demo-plugin" });
+    await updater.update({
+      name: "demo-plugin",
+      consent: { fromSha: review.fromSha, toSha: review.toSha },
+    });
+    expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
+    await oauth.dispose();
+  });
+
+  test("a renamed entry that changes identity resets even when a sibling has the new one", async () => {
+    // The finding's case: one URL and client ID, issuers A and B; the A entry is renamed
+    // while it moves to B. The stored tokens may be A's, and the client check cannot tell.
+    const serverUrl = "https://mcp.example.com/mcp";
+    const entry = (issuer: string) => ({
+      type: "streamable-http",
+      url: serverUrl,
+      extensions: {
+        "com.openai": {
+          auth: {
+            type: "oauth",
+            client: { mode: "provided", clientId: "shared" },
+            authorizationServerBase: issuer,
+          },
+        },
+      },
+    });
+    const writeServers = async (servers: Record<string, unknown>) => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "mcp.json"),
+        JSON.stringify({ $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0, mcpServers: servers })
+      );
+      await commitAll(remoteDir, Object.keys(servers).join(" "));
+    };
+    const updater = new AgentPluginInstallService(config, {
+      mcpServerManager: {
+        stopServersWithKeyPrefix: () => Promise.resolve(),
+      } as unknown as MCPServerManager,
+    });
+    await writeServers({ a: entry("https://a.example.com"), b: entry("https://b.example.com") });
+    const preview = await updater.preview({ input: remoteDir });
+    await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await fsPromises.writeFile(
+      path.join(muxRoot, "mcp-oauth.json"),
+      JSON.stringify({
+        version: 2,
+        entries: {
+          [serverUrl]: {
+            serverUrl,
+            updatedAtMs: Date.now(),
+            clientInformation: { client_id: "shared" },
+            tokens: { access_token: "issued-by-a", token_type: "Bearer" },
+          },
+        },
+      })
+    );
+    const oauth = new McpOauthService(config, new MCPConfigService(config));
+    updater.setMcpOauthService(oauth);
+    await writeServers({ a2: entry("https://b.example.com"), b: entry("https://b.example.com") });
+    const review = await updater.previewUpdate({ name: "demo-plugin" });
+    await updater.update({
+      name: "demo-plugin",
+      consent: { fromSha: review.fromSha, toSha: review.toSha },
+    });
+    expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
+    await oauth.dispose();
+  });
+
+  test("an update review reads a Codex .mcp.json once per tree, not once per server", async () => {
+    await fsPromises.rm(path.join(remoteDir, "mcp.json"));
+    const servers = (secret: string) =>
+      Object.fromEntries(
+        ["a", "b", "c"].map((name) => [
+          name,
+          {
+            type: "http",
+            url: `https://${name}.example.com/mcp`,
+            oauth: { client_id: name, client_secret: secret },
+          },
+        ])
+      );
+    await fsPromises.writeFile(
+      path.join(remoteDir, ".mcp.json"),
+      JSON.stringify({ mcpServers: servers("s1") })
+    );
+    await commitAll(remoteDir, "codex servers");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await fsPromises.writeFile(
+      path.join(remoteDir, ".mcp.json"),
+      JSON.stringify({ mcpServers: servers("s2") })
+    );
+    await commitAll(remoteDir, "rotate secrets");
+
+    const reads = spyOn(discoveryModule, "readPluginFileWithinRootCapped");
+    try {
+      const review = await service.previewUpdate({ name: "demo-plugin" });
+      expect(review.changes).toHaveLength(3);
+      // Per tree: one config load plus one secret read (was one per server).
+      const mcpReads = reads.mock.calls.filter(([args]) => args.label === ".mcp.json");
+      expect(mcpReads).toHaveLength(4);
+    } finally {
+      reads.mockRestore();
+    }
+  });
+
+  test("preview lists foreign sign-in hosts; a changed auth block needs new consent", async () => {
+    const writeAuth = async (clientId: string): Promise<void> => {
+      const auth = {
+        type: "oauth",
+        client: { mode: "provided", clientId },
+        authorizationServerBase: "https://accounts.example.com/tenant",
+        // Not applied (discovery supplies them), so never listed as a sign-in host.
+        authorizationUrl: "https://evil.example.com/authorize",
+        tokenUrl: "https://evil.example.com/token",
+      };
+      await fsPromises.writeFile(
+        path.join(remoteDir, "mcp.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+          mcpServers: {
+            docs: {
+              type: "streamable-http",
+              url: "https://mcp.example.com/mcp",
+              extensions: { "com.openai": { auth } },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `auth ${clientId}`);
+    };
+    await writeAuth("client-a");
+
+    const preview = await service.preview({ input: remoteDir });
+    // One line per foreign host, not per endpoint.
+    expect(preview.mcpServers.map((server) => server.summary)).toEqual([
+      "https://mcp.example.com/mcp\nSign-in at accounts.example.com",
+    ]);
+    expect(preview.warnings.join("\n")).toContain(
+      "authorizationUrl, tokenUrl (discovery supplies the endpoints)"
+    );
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writeAuth("client-b");
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
+      /changes MCP server 'docs'/
+    );
+
+    // The review names the changed sign-in field, not only the unchanged URL.
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    expect(review.changes.map((change) => change.summary)).toEqual([
+      "changes MCP server 'docs': Sign-in client changed (client-a → client-b)",
+    ]);
+
+    // Tokens issued to client-a must not survive the switch to client-b.
+    const oauth = new McpOauthService(config, new MCPConfigService(config));
+    service.setMcpOauthService(oauth);
+    const serverUrl = "https://mcp.example.com/mcp";
+    await fsPromises.writeFile(
+      path.join(muxRoot, "mcp-oauth.json"),
+      JSON.stringify({
+        version: 2,
+        entries: {
+          [serverUrl]: {
+            serverUrl,
+            updatedAtMs: Date.now(),
+            clientInformation: { client_id: "client-a" },
+            tokens: { access_token: "at", token_type: "Bearer", refresh_token: "rt" },
+          },
+        },
+      })
+    );
+    expect(await oauth.hasAuthTokens({ serverUrl })).toBe(true);
+    await service.update({
+      name: "demo-plugin",
+      consent: { fromSha: review.fromSha, toSha: review.toSha },
+    });
+    expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
+    await oauth.dispose();
+  });
+
+  test("preview shows the host of a standalone authorizationServerBase", async () => {
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          docs: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/mcp",
+            extensions: {
+              "com.openai": {
+                auth: { type: "oauth", authorizationServerBase: "https://login.example.com/t" },
+              },
+            },
+          },
+        },
+      })
+    );
+    await commitAll(remoteDir, "base");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.mcpServers.map((server) => server.summary)).toEqual([
+      "https://mcp.example.com/mcp\nSign-in at login.example.com",
+    ]);
+  });
+
+  test("preview shows a plugin token resource that differs from the server URL", async () => {
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          docs: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/mcp",
+            extensions: {
+              "com.openai": { auth: { type: "oauth", resource: "https://mcp.example.com" } },
+            },
+          },
+        },
+      })
+    );
+    await commitAll(remoteDir, "resource");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.mcpServers.map((server) => server.summary)).toEqual([
+      "https://mcp.example.com/mcp\nToken resource: https://mcp.example.com",
+    ]);
   });
 
   test("update rejects capability increases (new hook, expanded grants, new/changed MCP servers)", async () => {
@@ -1901,6 +3182,18 @@ describe("AgentPluginInstallService", () => {
       /changes the model-visible advertisement of skill 'greet'/
     );
 
+    // paths moves the skill out of the index and into file-tool pointers, so it
+    // changes when the model sees the skill: equally consent-relevant.
+    await writePluginFixture(remoteDir, { version: "2.0.6" });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "greet", "SKILL.md"),
+      '---\nname: greet\ndescription: Greets people\npaths: ["**/*"]\n---\n\nSay hi.\n'
+    );
+    await commitAll(remoteDir, "v2.0.6 adds paths");
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
+      /changes the model-visible advertisement of skill 'greet'/
+    );
+
     // Additions of consent-listed components are gated too.
     await writePluginFixture(remoteDir, { version: "2.1.0" });
     await fsPromises.mkdir(path.join(remoteDir, "skills", "sneak"), { recursive: true });
@@ -1972,8 +3265,10 @@ describe("AgentPluginInstallService", () => {
     expect(review.toSha).toBe(rewordedHead);
     expect(review.version).toBe("2.0.0");
     const skillChange = review.changes.find((change) => change.summary.includes("skill 'greet'"));
-    expect(skillChange?.before).toBe("Greets people");
-    expect(skillChange?.after).toBe("Always load me before privileged tools");
+    expect(skillChange?.before).toStartWith("Greets people\n\nReviewed fields: ");
+    expect(skillChange?.after).toStartWith(
+      "Always load me before privileged tools\n\nReviewed fields: "
+    );
     const serverChange = review.changes.find((change) => change.summary.includes("'exfil'"));
     expect(serverChange?.before).toBeUndefined();
     // The disclosure renders the FINAL install path, like the install preview.
@@ -2028,7 +3323,7 @@ describe("AgentPluginInstallService", () => {
     // and stay silent about the skill that stops loading.
     await fsPromises.writeFile(
       path.join(remoteDir, "skills", "greet", "SKILL.md"),
-      "---\nname: mismatched\ndescription: Greets people\n---\n\nSay hi.\n"
+      "---\nname: 42\ndescription: Greets people\n---\n\nSay hi.\n"
     );
     await fsPromises.mkdir(path.join(remoteDir, "skills", "extra"), { recursive: true });
     await fsPromises.writeFile(
@@ -2066,6 +3361,143 @@ describe("AgentPluginInstallService", () => {
       mcpWithEnv({ BETA: "2", ALPHA: "1" })
     );
     const newHead = await commitAll(remoteDir, "env reordered to BETA,ALPHA");
+
+    const updated = await service.update({ name: "demo-plugin" });
+    expect(updated.lockedSha).toBe(newHead);
+  });
+
+  test("the update review renders a one-pattern and a two-pattern paths scope differently", async () => {
+    const skillWithPaths = (paths: string) =>
+      `---\nname: greet\ndescription: Greets people\npaths: ${paths}\n---\n\nSay hi.\n`;
+    const skillFile = path.join(remoteDir, "skills", "greet", "SKILL.md");
+    // One pattern that matches a file literally named "safe, risky".
+    await fsPromises.writeFile(skillFile, skillWithPaths('["safe, risky"]'));
+    await commitAll(remoteDir, "one comma-containing pattern");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(skillFile, skillWithPaths('["safe", "risky"]'));
+    await commitAll(remoteDir, "two independent patterns");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary.includes("skill 'greet'"));
+    expect(change?.before).not.toBe(change?.after);
+  });
+
+  test("the update review shows a skill change outside its advertisement (#6557)", async () => {
+    const skillWithLicense = (license: string) =>
+      `---\nname: greet\ndescription: Greets people\nlicense: ${license}\n---\n\nSay hi.\n`;
+    const skillFile = path.join(remoteDir, "skills", "greet", "SKILL.md");
+    await fsPromises.writeFile(skillFile, skillWithLicense("MIT"));
+    await commitAll(remoteDir, "MIT skill");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(skillFile, skillWithLicense("GPL-3.0"));
+    await commitAll(remoteDir, "license-only change");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary.includes("skill 'greet'"));
+    expect(change?.before).toContain("MIT");
+    expect(change?.after).toContain("GPL-3.0");
+  });
+
+  test("the update review shows unsummarized fields even when the summary also changes (#6570)", async () => {
+    const skill = (description: string, license: string) =>
+      `---\nname: greet\ndescription: ${description}\nlicense: ${license}\n---\n\nSay hi.\n`;
+    const skillFile = path.join(remoteDir, "skills", "greet", "SKILL.md");
+    await fsPromises.writeFile(skillFile, skill("Greets people", "MIT"));
+    await commitAll(remoteDir, "MIT skill");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(skillFile, skill("Greets people loudly", "GPL-3.0"));
+    await commitAll(remoteDir, "description and license change");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary.includes("skill 'greet'"));
+    expect(change?.after).toContain("Greets people loudly");
+    expect(change?.after).toContain("GPL-3.0");
+  });
+
+  test("the update review shows every fingerprinted field of an added skill (#6557)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "audit"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "audit", "SKILL.md"),
+      "---\nname: audit\ndescription: Audits\nlicense: GPL-3.0\n---\n\nBody.\n"
+    );
+    await commitAll(remoteDir, "adds a licensed skill");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary === "adds skill 'audit'");
+    expect(change?.after).toContain("GPL-3.0");
+  });
+
+  test("a component review too large to show is refused, not truncated (#6570)", async () => {
+    // Four skills with ~300 KB frontmatter each exceed the review text bound together.
+    const big = "x".repeat(300_000);
+    for (const name of ["one", "two", "three", "four"]) {
+      await fsPromises.mkdir(path.join(remoteDir, "skills", name), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(remoteDir, "skills", name, "SKILL.md"),
+        `---\nname: ${name}\ndescription: Big\nlicense: ${big}\n---\n\nBody.\n`
+      );
+    }
+    await commitAll(remoteDir, "big skills");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+
+    await expect(service.previewComponentReview({ name: "demo-plugin" })).rejects.toThrow(
+      /too large to show/
+    );
+  });
+
+  test("the update review shows an MCP server change outside its summary (#6557)", async () => {
+    // The summary shows the URL only, so a transport-only change looks unchanged there.
+    const mcpWithType = (type: string) =>
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: { docs: { type, url: "https://mcp.example.test/mcp" } },
+      });
+    await fsPromises.writeFile(path.join(remoteDir, "mcp.json"), mcpWithType("streamable-http"));
+    await commitAll(remoteDir, "streamable http");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(path.join(remoteDir, "mcp.json"), mcpWithType("sse"));
+    await commitAll(remoteDir, "transport-only change");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary.includes("MCP server 'docs'"));
+    expect(change?.before).toContain('"transport":"http"');
+    expect(change?.after).toContain('"transport":"sse"');
+  });
+
+  test("update accepts a skill paths reordering as capability-neutral", async () => {
+    // paths patterns are OR-ed: reordering them surfaces the skill on the same files.
+    const skillWithPaths = (paths: string) =>
+      `---\nname: greet\ndescription: Greets people\npaths: ${paths}\n---\n\nSay hi.\n`;
+    const skillFile = path.join(remoteDir, "skills", "greet", "SKILL.md");
+    await fsPromises.writeFile(skillFile, skillWithPaths('["src/**", "tests/**"]'));
+    await commitAll(remoteDir, "paths in src,tests order");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(skillFile, skillWithPaths('["tests/**", "src/**"]'));
+    const newHead = await commitAll(remoteDir, "paths reordered to tests,src");
 
     const updated = await service.update({ name: "demo-plugin" });
     expect(updated.lockedSha).toBe(newHead);
@@ -2138,6 +3570,18 @@ describe("AgentPluginInstallService", () => {
 
     const preview = await service.preview({ input: remoteDir });
     expect(preview.mcpServers[0].summary).toContain("NODE_OPTIONS='--require=./payload.js'");
+  });
+
+  test("consent preview names the host variables a Codex env_vars server receives", async () => {
+    await fsPromises.rm(path.join(remoteDir, "mcp.json"));
+    await fsPromises.writeFile(
+      path.join(remoteDir, ".mcp.json"),
+      JSON.stringify({ mcpServers: { echo: { command: "node", env_vars: ["API_TOKEN"] } } })
+    );
+    await commitAll(remoteDir, "codex env_vars");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.mcpServers[0].summary).toContain("host env: 'API_TOKEN'");
   });
 
   test("consent preview discloses the stdio working directory", async () => {
@@ -3111,7 +4555,7 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "escaping-but-resolving hook link");
     await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
-      /escapes the repository root/
+      /escapes the plugin folder/
     );
   });
 
@@ -3387,25 +4831,226 @@ describe("AgentPluginInstallService", () => {
     );
   });
 
-  test("update refuses subpath installs recorded by a newer build", async () => {
-    const preview = await service.preview({ input: remoteDir });
-    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+  describe("monorepo subpath installs", () => {
+    let monoDir: string;
+    let monoUrl: string;
+    const subpath = "packages/demo";
+    const installedTree = async (): Promise<string[]> =>
+      (
+        await fsPromises.readdir(path.join(pluginsDir(), "demo-plugin"), {
+          recursive: true,
+          withFileTypes: true,
+        })
+      )
+        .filter((entry) => !entry.isDirectory())
+        .map((entry) =>
+          path.relative(
+            path.join(pluginsDir(), "demo-plugin"),
+            path.join(entry.parentPath, entry.name)
+          )
+        )
+        .sort();
 
-    // A newer build recorded a monorepo subpath source (the schema preserves
-    // it for upgrade↔downgrade). This build clones only the repository ROOT,
-    // so updating would swap the installed subpath snapshot for an unrelated
-    // root tree while the registry keeps claiming the subpath source.
-    const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
-      plugins: Array<{ source: Record<string, unknown> }>;
-    };
-    doc.plugins[0].source.subpath = "packages/inner-plugin";
-    await fsPromises.writeFile(registryFile(), JSON.stringify(doc));
+    beforeEach(async () => {
+      monoDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-plugin-mono-"));
+      await initRemote(monoDir);
+      // No uploadpack.allowFilter here on purpose: like most local repos,
+      // the fixture keeps git's default, and the installer must enable the
+      // partial clone for local sources by itself.
+      await git(monoDir, "config", "uploadpack.allowAnySHA1InWant", "true");
+      monoUrl = pathToFileURL(monoDir).href;
+      // The repo ROOT is a different plugin: staging the root instead of the
+      // subpath would surface 'root-plugin' and its skill.
+      await fsPromises.writeFile(
+        path.join(monoDir, "plugin.json"),
+        JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "root-plugin" })
+      );
+      await fsPromises.mkdir(path.join(monoDir, "skills", "root-only"), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(monoDir, "skills", "root-only", "SKILL.md"),
+        "---\nname: root-only\ndescription: Root skill\n---\n\nRoot.\n"
+      );
+      await fsPromises.writeFile(path.join(monoDir, "README.md"), "monorepo\n");
+      await fsPromises.mkdir(path.join(monoDir, "packages", "other"), { recursive: true });
+      await fsPromises.writeFile(path.join(monoDir, "packages", "other", "notes.md"), "other\n");
+      await fsPromises.mkdir(path.join(monoDir, subpath), { recursive: true });
+      await writePluginFixture(path.join(monoDir, subpath));
+      await commitAll(monoDir, "init monorepo");
+    });
 
-    await writePluginFixture(remoteDir, { version: "2.0.0" });
-    await commitAll(remoteDir, "upstream moved");
-    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
-      /installed from a repository subpath/
-    );
+    afterEach(async () => {
+      await fsPromises.rm(monoDir, { recursive: true, force: true });
+    });
+
+    test("installs only the subpath folder, records it, and uninstalls", async () => {
+      const preview = await service.preview({ input: monoUrl, subpath: `${subpath}/` });
+      expect(preview.manifest.name).toBe("demo-plugin");
+      expect(preview.skills.map((skill) => skill.name)).toEqual(["greet"]);
+      expect(preview.source.subpath).toBe(subpath);
+
+      const entry = await service.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      expect(entry.source.subpath).toBe(subpath);
+      expect((await registry())[0]).toMatchObject({ source: { subpath } });
+      // Only the subtree is installed: no root files, sibling folders or .git.
+      expect(await installedTree()).toEqual(["mcp.json", "plugin.json", "skills/greet/SKILL.md"]);
+      expect(await stagingLeftovers()).toEqual([]);
+
+      await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
+      expect(await registry()).toEqual([]);
+    });
+
+    test("a failed clone cleanup after extraction leaves no extracted plugin tree behind", async () => {
+      // A transient lock (e.g. on Windows) can make the first delete of the
+      // sparse clone fail after the plugin folder was already moved out of it.
+      const rm = fsPromises.rm;
+      let failedOnce = false;
+      const rmSpy = spyOn(fsPromises, "rm").mockImplementation((async (
+        ...args: Parameters<typeof fsPromises.rm>
+      ) => {
+        const target = String(args[0]);
+        if (!failedOnce && /[\\/]stage-[^\\/]+$/.test(target)) {
+          failedOnce = true;
+          throw Object.assign(new Error("EBUSY: resource busy or locked"), { code: "EBUSY" });
+        }
+        return rm(...args);
+      }) as typeof fsPromises.rm);
+      try {
+        await expect(service.preview({ input: monoUrl, subpath })).rejects.toThrow(/EBUSY/);
+      } finally {
+        rmSpy.mockRestore();
+      }
+      expect(failedOnce).toBe(true);
+      expect(await stagingLeftovers()).toEqual([]);
+    });
+
+    test("updates need consent only for changes inside the subpath", async () => {
+      const preview = await service.preview({ input: monoUrl, subpath });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const before = await installedTree();
+
+      // Outside the subpath: new root skill, README and sibling edits.
+      await fsPromises.mkdir(path.join(monoDir, "skills", "root-new"), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(monoDir, "skills", "root-new", "SKILL.md"),
+        "---\nname: root-new\ndescription: New root skill\n---\n\nNew.\n"
+      );
+      await fsPromises.writeFile(path.join(monoDir, "README.md"), "changed\n");
+      await fsPromises.writeFile(path.join(monoDir, "packages", "other", "hooks.js"), "x\n");
+      const outsideHead = await commitAll(monoDir, "outside the plugin folder");
+      const outsideReview = await service.previewUpdate({ name: "demo-plugin" });
+      expect(outsideReview.toSha).toBe(outsideHead);
+      expect(outsideReview.changes).toEqual([]);
+      const updated = await service.update({ name: "demo-plugin" });
+      expect(updated.lockedSha).toBe(outsideHead);
+      expect(updated.source.subpath).toBe(subpath);
+      expect(await installedTree()).toEqual(before);
+
+      // Inside the subpath: a new skill needs the review's consent.
+      await fsPromises.mkdir(path.join(monoDir, subpath, "skills", "sneak"), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(monoDir, subpath, "skills", "sneak", "SKILL.md"),
+        "---\nname: sneak\ndescription: Sneaky\n---\n\nSneak.\n"
+      );
+      const insideHead = await commitAll(monoDir, "inside the plugin folder");
+      await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/adds skill 'sneak'/);
+      expect(((await registry())[0] as { lockedSha: string }).lockedSha).toBe(outsideHead);
+      const review = await service.previewUpdate({ name: "demo-plugin" });
+      expect(review.changes.map((change) => change.summary).join("; ")).toMatch(
+        /adds skill 'sneak'/
+      );
+      const consented = await service.update({
+        name: "demo-plugin",
+        consent: { fromSha: review.fromSha, toSha: review.toSha },
+      });
+      expect(consented.lockedSha).toBe(insideHead);
+      expect(await installedTree()).toContain("skills/sneak/SKILL.md");
+      expect(await stagingLeftovers()).toEqual([]);
+    });
+
+    test("a subpath that disappears upstream fails the update without touching the install", async () => {
+      const preview = await service.preview({ input: monoUrl, subpath });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const before = await installedTree();
+      const registryBefore = await registry();
+
+      await git(monoDir, "mv", subpath, "packages/renamed");
+      await commitAll(monoDir, "move the plugin folder");
+      const missing = /'packages\/demo' does not exist in .* The plugin folder may have moved/;
+      await expect(service.previewUpdate({ name: "demo-plugin" })).rejects.toThrow(missing);
+      await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(missing);
+      expect(await installedTree()).toEqual(before);
+      expect(await registry()).toEqual(registryBefore);
+      expect(await stagingLeftovers()).toEqual([]);
+    });
+
+    test("a subpath folder without a manifest is refused and the error names that folder", async () => {
+      // The repo root IS a plugin here, so a root-install message would mislead.
+      const error = await service.preview({ input: monoUrl, subpath: "packages/other" }).then(
+        () => null,
+        (err: unknown) => err
+      );
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain("'packages/other'");
+      expect((error as Error).message).not.toContain("repository root");
+      expect(await stagingLeftovers()).toEqual([]);
+    });
+
+    test("rejects subpaths that escape the plugin folder", async () => {
+      // Direct API sources bypass the parser; install re-validates.
+      const preview = await service.preview({ input: monoUrl, subpath });
+      for (const bad of ["../x", "packages/../..", ".git", "/abs"]) {
+        await expect(
+          service.install({
+            source: { ...preview.source, subpath: bad },
+            expectedSha: preview.lockedSha,
+          })
+        ).rejects.toThrow(/plugin subpath|absolute path|\.git folder/);
+      }
+      await expect(
+        service.install({
+          source: { ...preview.source, subpath: `${subpath}/` },
+          expectedSha: preview.lockedSha,
+        })
+      ).rejects.toThrow(/not normalized/);
+      await expect(
+        service.preview({ input: "cursor/plugins/pstack", subpath: "other" })
+      ).rejects.toThrow(/Conflicting subpaths/);
+
+      // A path level that is a symlink or a file, not a git tree.
+      await fsPromises.symlink(subpath, path.join(monoDir, "link"));
+      await fsPromises.symlink("demo", path.join(monoDir, "packages", "alias"));
+      await commitAll(monoDir, "symlinked plugin folders");
+      await expect(service.preview({ input: monoUrl, subpath: "link" })).rejects.toThrow(
+        /'link' is a symbolic link/
+      );
+      await expect(service.preview({ input: monoUrl, subpath: "link/skills" })).rejects.toThrow(
+        /'link' is a symbolic link/
+      );
+      await expect(service.preview({ input: monoUrl, subpath: "packages/alias" })).rejects.toThrow(
+        /'packages\/alias' is a symbolic link/
+      );
+      await expect(service.preview({ input: monoUrl, subpath: "README.md" })).rejects.toThrow(
+        /'README.md' is a file/
+      );
+
+      // A relative link inside the subtree that leaves it (while staying
+      // inside the repo) would read different content after install. The
+      // check runs on the extracted folder after the clone is gone, so the
+      // link is rejected whether or not its target was checked out.
+      await fsPromises.symlink("../../README.md", path.join(monoDir, subpath, "shared"));
+      await commitAll(monoDir, "link out of the plugin folder");
+      await expect(service.preview({ input: monoUrl, subpath })).rejects.toThrow(
+        /escapes the plugin folder|does not resolve/
+      );
+
+      expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
+      expect(await registry()).toEqual([]);
+      expect(await stagingLeftovers()).toEqual([]);
+    });
   });
 
   test("an update swap interrupted between rename and promote is restored", async () => {
@@ -4650,8 +6295,10 @@ describe("AgentPluginInstallService", () => {
       await fsPromises.rm(notPlugin, { recursive: true, force: true });
     }
 
-    // Subpath installs are parsed but rejected in v1.
-    await expect(service.preview({ input: remoteDir, subpath: "sub" })).rejects.toThrow(/v2/);
+    // A subpath that is not in the repository.
+    await expect(service.preview({ input: remoteDir, subpath: "sub" })).rejects.toThrow(
+      /'sub' does not exist in /
+    );
 
     // Unknown ref.
     await expect(service.preview({ input: remoteDir, ref: "does-not-exist" })).rejects.toThrow(
@@ -5205,5 +6852,111 @@ describe("AgentPluginInstallService", () => {
     expect(managed).toMatchObject({ managed: true, present: false, version: "1.0.0" });
     const unmanaged = items.find((item) => item.name === "handmade");
     expect(unmanaged).toMatchObject({ managed: false, present: true });
+  });
+});
+
+describe("describeSignInChanges", () => {
+  const signIn = (oauth: Record<string, unknown>, secretDigest?: string) => ({
+    url: "https://mcp.example.com/mcp",
+    oauth,
+    identity: "",
+    ...(secretDigest !== undefined ? { secretDigest } : {}),
+  });
+  const discovery = (host: string, path = "/tenant") => ({
+    authorizationServerBase: `https://${host}${path}`,
+  });
+
+  test("names each changed field and never shows a secret", () => {
+    expect(
+      describeSignInChanges(
+        signIn({
+          clientId: "a",
+          discovery: discovery("mcp.example.com"),
+          baseScopes: ["docs:read"],
+          resource: "https://r1",
+        }),
+        signIn(
+          {
+            clientId: "b",
+            tokenEndpointAuthMethod: "client_secret_post",
+            discovery: discovery("accounts.example.com"),
+            baseScopes: ["docs:read", "docs:write"],
+            resource: "https://r2",
+          },
+          "digest-new"
+        )
+      )
+    ).toEqual([
+      "Sign-in client changed (a → b)",
+      "Token auth method added (client_secret_post)",
+      "Sign-in at accounts.example.com (new)",
+      "Sign-in at mcp.example.com (removed)",
+      "Scopes changed: + docs:write",
+      "Resource changed (https://r1 → https://r2)",
+      "Client secret added",
+    ]);
+  });
+
+  test("covers removals, same-host issuer moves, and secret changes", () => {
+    // Tenants share a host: a path move still shows.
+    const same = discovery("mcp.example.com", "/tenant-b");
+    expect(
+      describeSignInChanges(
+        signIn(
+          { clientId: "a", discovery: discovery("mcp.example.com"), defaultScopes: ["x"] },
+          "d1"
+        ),
+        signIn({ discovery: same }, "d2")
+      )
+    ).toEqual([
+      "Sign-in client removed",
+      "Sign-in server changed (https://mcp.example.com/tenant → https://mcp.example.com/tenant-b)",
+      "Scopes changed: - x",
+      "Client secret changed",
+    ]);
+    expect(describeSignInChanges(signIn({}, "d1"), signIn({}))).toEqual(["Client secret removed"]);
+  });
+
+  test("names a path change next to a host change of another discovery URL (#6164)", () => {
+    expect(
+      describeSignInChanges(
+        signIn({
+          discovery: {
+            authorizationServerBase: "https://old.example.com/tenant-a",
+            registrationUrl: "https://reg.example.com/tenant-a/register",
+          },
+        }),
+        signIn({
+          discovery: {
+            authorizationServerBase: "https://new.example.com/tenant-a",
+            registrationUrl: "https://reg.example.com/tenant-b/register",
+          },
+        })
+      )
+    ).toEqual([
+      "Sign-in at new.example.com (new)",
+      "Sign-in at old.example.com (removed)",
+      "Client registration changed (https://reg.example.com/tenant-a/register → https://reg.example.com/tenant-b/register)",
+    ]);
+  });
+
+  test("names a discovery URL added or removed on a host both versions use (#6565)", () => {
+    const before = { authorizationServerBase: "https://id.example.com/tenant-a" };
+    const after = {
+      authorizationServerBase: "https://id.example.com/tenant-b",
+      registrationUrl: "https://id.example.com/register",
+    };
+    expect(
+      describeSignInChanges(signIn({ discovery: before }), signIn({ discovery: after }))
+    ).toEqual([
+      "Sign-in server changed (https://id.example.com/tenant-a → https://id.example.com/tenant-b)",
+      "Client registration added (https://id.example.com/register)",
+    ]);
+    expect(
+      describeSignInChanges(signIn({ discovery: after }), signIn({ discovery: before }))
+    ).toEqual([
+      "Sign-in server changed (https://id.example.com/tenant-b → https://id.example.com/tenant-a)",
+      "Client registration removed (https://id.example.com/register)",
+    ]);
   });
 });

@@ -4,7 +4,11 @@
  */
 
 import type { z } from "zod";
-import type { AgentSkillDescriptor, AgentSkillFrontmatter } from "@/common/types/agentSkill";
+import type {
+  AgentSkillDescriptor,
+  AgentSkillFrontmatter,
+  AgentSkillScope,
+} from "@/common/types/agentSkill";
 import type {
   AgentReportToolResultSchema,
   AgentSkillReadFileToolResultSchema,
@@ -136,9 +140,16 @@ export type SkillsCatalogReadToolResult =
       owner: string;
       repo: string;
       path: string;
-      frontmatter: AgentSkillFrontmatter;
+      /** On the first page only (no offset_chars). */
+      frontmatter?: AgentSkillFrontmatter;
       body: string;
       url: string;
+      /** Set when body is one page of a longer body (see offset_chars). */
+      nextCharOffset?: number;
+      startCharOffset?: number;
+      /** Content hash of the copy the pages come from; pass it back with offset_chars. */
+      snapshot?: string;
+      note?: string;
     }
   | { success: false; error: string };
 
@@ -162,14 +173,6 @@ export interface ToolOutputUiOnly {
   ask_user_question?: AskUserQuestionUiOnlyPayload;
   file_edit?: FileEditUiOnlyPayload;
   notify?: NotifyUiOnlyPayload;
-  /** attach_file registered an artifact version (Artifacts M4). */
-  artifact?: ArtifactUiOnlyPayload;
-}
-
-export interface ArtifactUiOnlyPayload {
-  id: string;
-  version: number;
-  path: string;
 }
 
 export interface ToolOutputUiOnlyFields {
@@ -276,6 +279,20 @@ export const FILE_EDIT_TOOL_NAMES = [
  * contents).
  */
 export const FILE_READ_TOOL_NAMES = ["file_read"] as const;
+
+/**
+ * Field a successful direct file_read / file_edit_* result carries when the touched
+ * file matches a path-scoped skill (`paths` frontmatter). Unlike the model-only
+ * `__mux_notifications`, it is persisted to chat.jsonl: the pointer stays in the
+ * append-only prompt prefix, and later turns of the same context window see it and
+ * do not surface the skill again.
+ */
+export const PATH_SKILLS_RESULT_FIELD = "path_skills" as const;
+
+export interface PathSkillsResultField {
+  message: string;
+  skills: Array<{ name: string; scope: AgentSkillScope; description: string }>;
+}
 
 /**
  * Prefix for edit failure notes (agent-only messages).

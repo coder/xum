@@ -358,6 +358,85 @@ describeIntegration("Workspace init hook", () => {
   );
 
   test.concurrent(
+    "announces the workspace before the origin fetch and fetches in the background init",
+    async () => {
+      // On a remote server the origin fetch takes seconds; create() must not wait for it,
+      // or the browser sits on a locked composer until the network answers.
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
+      const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-test-origin-"));
+      const barePath = path.join(remoteDir, "origin.git");
+      const pusherPath = path.join(remoteDir, "pusher");
+      const fetchStarted = path.join(remoteDir, "fetch-started");
+      const fetchRelease = path.join(remoteDir, "fetch-release");
+      const uploadPack = path.join(remoteDir, "gated-upload-pack.sh");
+
+      try {
+        const trunk = (
+          await execAsync("git rev-parse --abbrev-ref HEAD", { cwd: tempGitRepo })
+        ).stdout.trim();
+        await execAsync(`git clone --quiet --bare "${tempGitRepo}" "${barePath}"`);
+        await execAsync(`git remote add origin "${barePath}" && git fetch --quiet origin`, {
+          cwd: tempGitRepo,
+        });
+        // origin gains a commit the project's origin/<trunk> ref has not seen yet.
+        await execAsync(`git clone --quiet "${barePath}" "${pusherPath}"`);
+        await execAsync(
+          'git config user.email "test@example.com" && git config user.name "Test User" && ' +
+            `git commit --allow-empty -qm "remote-only" && git push --quiet origin HEAD:${trunk}`,
+          { cwd: pusherPath }
+        );
+        const remoteHead = (
+          await execAsync(`git rev-parse ${trunk}`, { cwd: barePath })
+        ).stdout.trim();
+        await fs.writeFile(
+          uploadPack,
+          `#!/bin/sh\n: > "${fetchStarted}"\nwhile [ ! -e "${fetchRelease}" ]; do sleep 0.05; done\nexec git upload-pack "$@"\n`,
+          { mode: 0o755 }
+        );
+        await execAsync(`git config remote.origin.uploadpack "${uploadPack}"`, {
+          cwd: tempGitRepo,
+        });
+
+        const branchName = generateBranchName("announce-before-fetch");
+        // Resolves while the gated fetch is still held: nothing releases it until afterwards.
+        const createResult = await createWorkspace(env, tempGitRepo, branchName, trunk);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+
+        const initEvents = collectInitEvents(env, createResult.metadata.id, 20000);
+        const deadline = Date.now() + 10000;
+        const started = () =>
+          fs.access(fetchStarted).then(
+            () => true,
+            () => false
+          );
+        while (Date.now() < deadline && !(await started())) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        await fs.writeFile(fetchRelease, "");
+
+        const lines = (await initEvents).filter(isInitOutput).map((e) => e.line);
+        const fetchAt = lines.indexOf(`Fetching latest from origin/${trunk}...`);
+        expect(fetchAt).toBeGreaterThanOrEqual(0);
+        expect(lines.indexOf("Worktree created successfully")).toBeGreaterThan(fetchAt);
+        const workspacePath = createResult.metadata.namedWorkspacePath;
+        expect((await execAsync("git rev-parse HEAD", { cwd: workspacePath })).stdout.trim()).toBe(
+          remoteHead
+        );
+        await fs.access(path.join(workspacePath, "README.md"));
+      } finally {
+        await fs.writeFile(fetchRelease, "");
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+        await cleanupTempGitRepo(remoteDir);
+      }
+    },
+    30000
+  );
+
+  test.concurrent(
     "prunes committed plugin overrides after the deferred checkout and before the hook",
     async () => {
       // A repository that tracks .xum/mcp.local.jsonc materializes committed plugin enables

@@ -5,6 +5,9 @@ import * as nodePath from "node:path";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 
+import { registerCodexPluginHooks } from "@/node/services/agentPlugins/codexHookRunner";
+import { eventSpine } from "@/node/services/events/eventSpine";
+
 import { createKernelFileLoader } from "./kernelFileLoad";
 
 describe("createKernelFileLoader line counting", () => {
@@ -203,5 +206,170 @@ describe("createKernelFileLoader cancellation", () => {
 
     expect(seenStatSignals).toEqual([controller.signal]);
     expect(seenReadSignals).toEqual([controller.signal]);
+  });
+});
+
+describe("createKernelFileLoader Codex hook rewrites", () => {
+  it("runs an allowed rewrite with the rewritten path (Codex PRRT_kwDOPxxmWM6rRKxR)", async () => {
+    // A guard that redirects a read must not be bypassed: the loader passes file_read's schema,
+    // so the rewrite is checked and applied instead of the original path running.
+    using tmp = new DisposableTempDir("kernel-load-rewrite");
+    await fs.writeFile(nodePath.join(tmp.path, "secret.txt"), "secret\n", "utf8");
+    await fs.writeFile(nodePath.join(tmp.path, "safe.txt"), "safe\n", "utf8");
+    const unregister = registerCodexPluginHooks(eventSpine, {
+      workspaceId: "kernel-rewrite-ws",
+      pluginName: "guard",
+      order: 0,
+      hooks: [
+        {
+          key: "hooks/hooks.json#PreToolUse[0][0]",
+          hash: "h".repeat(64),
+          event: "PreToolUse",
+          matcher: "^file_read$",
+          handler: { type: "mcp_tool", server: "guard", tool: "check", input: {} },
+          status: "runnable",
+          source: "hooks/hooks.json",
+        },
+      ],
+      deps: {
+        isHookAllowed: () => Promise.resolve(true),
+        canCallPluginTool: () => true,
+        callPluginTool: () =>
+          Promise.resolve({
+            structuredContent: {
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                permissionDecision: "allow",
+                updatedInput: { path: "safe.txt" },
+              },
+            },
+          }),
+        notifyUser: () => undefined,
+      },
+    });
+    try {
+      const runtime = new LocalRuntime(tmp.path);
+      const load = createKernelFileLoader({
+        cwd: tmp.path,
+        runtime,
+        hooks: {
+          runtime,
+          cwd: tmp.path,
+          runtimeTempDir: tmp.path,
+          workspaceId: "kernel-rewrite-ws",
+        },
+      });
+      expect((await load({ path: "secret.txt" })).content).toBe("safe\n");
+    } finally {
+      unregister();
+    }
+  });
+
+  it("denies a rewrite that narrows the read to a range (Codex PRRT_kwDOPxxmWM6rb3ih)", async () => {
+    // mux.load reads whole files only: a range rewrite must refuse the load, never load the
+    // whole file the guard meant to narrow.
+    using tmp = new DisposableTempDir("kernel-load-range-rewrite");
+    await fs.writeFile(nodePath.join(tmp.path, "secret.txt"), "line1\nline2\nsecret\n", "utf8");
+    const unregister = registerCodexPluginHooks(eventSpine, {
+      workspaceId: "kernel-range-ws",
+      pluginName: "guard",
+      order: 0,
+      hooks: [
+        {
+          key: "hooks/hooks.json#PreToolUse[0][0]",
+          hash: "h".repeat(64),
+          event: "PreToolUse",
+          matcher: "^file_read$",
+          handler: { type: "mcp_tool", server: "guard", tool: "check", input: {} },
+          status: "runnable",
+          source: "hooks/hooks.json",
+        },
+      ],
+      deps: {
+        isHookAllowed: () => Promise.resolve(true),
+        canCallPluginTool: () => true,
+        callPluginTool: () =>
+          Promise.resolve({
+            structuredContent: {
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                permissionDecision: "allow",
+                updatedInput: { path: "secret.txt", offset: 1, limit: 1 },
+              },
+            },
+          }),
+        notifyUser: () => undefined,
+      },
+    });
+    try {
+      const runtime = new LocalRuntime(tmp.path);
+      const load = createKernelFileLoader({
+        cwd: tmp.path,
+        runtime,
+        hooks: { runtime, cwd: tmp.path, runtimeTempDir: tmp.path, workspaceId: "kernel-range-ws" },
+      });
+      const refused: unknown = await load({ path: "secret.txt" }).then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(refused).toBeInstanceOf(Error);
+      expect(String(refused)).toMatch(/does not match the tool's input/);
+    } finally {
+      unregister();
+    }
+  });
+});
+
+describe("createKernelFileLoader Codex PostToolUse block", () => {
+  it("a PostToolUse block refuses the load with the hook's feedback (Codex PRRT_kwDOPxxmWM6r6NnK)", async () => {
+    // Codex keeps a blocked nested call's original result from the caller: the loaded content
+    // must never reach the script, only the hook's feedback.
+    using tmp = new DisposableTempDir("kernel-load-post-block");
+    await fs.writeFile(nodePath.join(tmp.path, "secret.txt"), "SECRET=1\n", "utf8");
+    const unregister = registerCodexPluginHooks(eventSpine, {
+      workspaceId: "kernel-post-block-ws",
+      pluginName: "guard",
+      order: 0,
+      hooks: [
+        {
+          key: "hooks/hooks.json#PostToolUse[0][0]",
+          hash: "h".repeat(64),
+          event: "PostToolUse",
+          matcher: "^file_read$",
+          handler: { type: "mcp_tool", server: "guard", tool: "check", input: {} },
+          status: "runnable",
+          source: "hooks/hooks.json",
+        },
+      ],
+      deps: {
+        isHookAllowed: () => Promise.resolve(true),
+        canCallPluginTool: () => true,
+        callPluginTool: () =>
+          Promise.resolve({ structuredContent: { decision: "block", reason: "secrets stay out" } }),
+        notifyUser: () => undefined,
+      },
+    });
+    try {
+      const runtime = new LocalRuntime(tmp.path);
+      const load = createKernelFileLoader({
+        cwd: tmp.path,
+        runtime,
+        hooks: {
+          runtime,
+          cwd: tmp.path,
+          runtimeTempDir: tmp.path,
+          workspaceId: "kernel-post-block-ws",
+        },
+      });
+      const refused: unknown = await load({ path: "secret.txt" }).then(
+        (loaded) => loaded,
+        (error: unknown) => error
+      );
+      expect(refused).toBeInstanceOf(Error);
+      expect(String(refused)).toContain("[plugin:guard] secrets stay out");
+      expect(String(refused)).not.toContain("SECRET=1");
+    } finally {
+      unregister();
+    }
   });
 });

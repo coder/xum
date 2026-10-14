@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Loader2, Trash2 } from "lucide-react";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import { DevToolsRunCard } from "./DevToolsRunCard";
 import { useDevToolsSubscription } from "./useDevToolsSubscription";
 
@@ -9,23 +9,7 @@ interface DevToolsTabProps {
 }
 
 export function DevToolsTab(props: DevToolsTabProps) {
-  const { api } = useAPI();
   const { runs, stepsByRun, error } = useDevToolsSubscription(props.workspaceId);
-  const [clearing, setClearing] = useState(false);
-
-  const handleClear = () => {
-    if (!api || clearing) return;
-
-    setClearing(true);
-    void api.devtools
-      .clear({ workspaceId: props.workspaceId })
-      .catch((clearError: unknown) => {
-        console.warn("Failed to clear debug logs:", clearError);
-      })
-      .finally(() => {
-        setClearing(false);
-      });
-  };
 
   if (error) {
     return (
@@ -41,21 +25,7 @@ export function DevToolsTab(props: DevToolsTabProps) {
         <h3 className="text-foreground text-xs font-semibold tracking-wide uppercase">
           Debug Logs
         </h3>
-        {runs.length > 0 && (
-          <button
-            type="button"
-            onClick={handleClear}
-            disabled={clearing}
-            className="text-muted hover:text-foreground rounded p-1 transition-colors disabled:opacity-50"
-            aria-label="Clear debug logs"
-          >
-            {clearing ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Trash2 className="h-3.5 w-3.5" />
-            )}
-          </button>
-        )}
+        {runs.length > 0 && <ClearLogsButton workspaceId={props.workspaceId} />}
       </div>
 
       <div className="min-w-0 flex-1 overflow-y-auto p-2">
@@ -81,5 +51,41 @@ export function DevToolsTab(props: DevToolsTabProps) {
         )}
       </div>
     </div>
+  );
+}
+
+/** Clears the debug logs. It needs a live connection: while Xum reconnects it is disabled. */
+function ClearLogsButton(props: { workspaceId: string }) {
+  const api = useLiveAPI();
+  const [clearing, setClearing] = useState(false);
+
+  const handleClear = () => {
+    if (!api || clearing) return;
+
+    setClearing(true);
+    void api.devtools
+      .clear({ workspaceId: props.workspaceId })
+      .catch((clearError: unknown) => {
+        console.warn("Failed to clear debug logs:", clearError);
+      })
+      .finally(() => {
+        setClearing(false);
+      });
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={handleClear}
+      disabled={clearing || api == null}
+      className="text-muted hover:text-foreground rounded p-1 transition-colors disabled:opacity-50"
+      aria-label="Clear debug logs"
+    >
+      {clearing ? (
+        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      ) : (
+        <Trash2 className="h-3.5 w-3.5" />
+      )}
+    </button>
   );
 }

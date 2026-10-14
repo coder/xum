@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../tests/ui/dom";
 
 import {
+  TRANSCRIPT_MAX_MOUNTED_ROWS,
   TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
   TRANSCRIPT_REVEAL_CHUNK_ROWS,
   TRANSCRIPT_REVEAL_STEP_CHARS,
@@ -582,6 +583,172 @@ describe("useBoundedTranscriptReveal", () => {
       expect(mounted(result.current.fromIndex)).toBeLessThan(
         TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS
       );
+    });
+  });
+
+  // #4961 F20: an opt-in cap on mounted rows; reading back unmounts the newest rows.
+  describe("two-sided slice (maxMountedRows)", () => {
+    const LONG = TRANSCRIPT_MAX_MOUNTED_ROWS * 4;
+    const MAX = TRANSCRIPT_MAX_MOUNTED_ROWS;
+    const LATEST = { fromIndex: LONG - TRANSCRIPT_REVEAL_TAIL_ROWS, toIndex: LONG };
+    // Bundles of 10 rows: a slice edge must land on a multiple of 10 (or the transcript end).
+    const bundled = (index: number) => index % 10 === 0;
+
+    function renderSlice(maxMountedRows?: number, isSafeCut = bundled) {
+      const frames = manualFrames();
+      let props = { workspaceId: "ws", messages: rows(LONG), maxMountedRows, isSafeCut };
+      const renders: Array<{ from: number; to: number }> = [];
+      const view = renderHook(() => {
+        const reveal = useBoundedTranscriptReveal(props);
+        renders.push({ from: reveal.fromIndex, to: reveal.toIndex });
+        return reveal;
+      });
+      const reveal = () => view.result.current;
+      const runFrames = () => {
+        while (frames.hasPending()) act(() => frames.flush());
+      };
+      const setProps = (next: Partial<typeof props>) => {
+        props = { ...props, ...next };
+        view.rerender();
+      };
+      const readBack = () => {
+        runFrames();
+        for (let request = 0; request < 10 && reveal().fromIndex > LONG / 2; request += 1) {
+          act(() => reveal().revealMore());
+          runFrames();
+        }
+        expect(reveal().toIndex).toBeLessThan(LONG);
+      };
+      return { frames, reveal, renders, runFrames, setProps, readBack, props: () => props };
+    }
+
+    test("without maxMountedRows the slice always ends at the tail, as before", () => {
+      const { reveal, renders, runFrames, setProps } = renderSlice();
+      for (let request = 0; request < LONG / TRANSCRIPT_REVEAL_AUTO_MAX_ROWS; request += 1) {
+        act(() => reveal().revealMore());
+        runFrames();
+      }
+      act(() => reveal().revealNewer());
+      expect(reveal().fromIndex).toBe(0);
+      expect(renders.every((render) => render.to === LONG)).toBe(true);
+      // Enabling a cap restarts tail-first instead of keeping the oldest rows.
+      setProps({ maxMountedRows: MAX });
+      expect(reveal()).toMatchObject(LATEST);
+    });
+
+    test("older rows mount first, and the newest rows unmount in that same render", () => {
+      const { reveal, renders, readBack } = renderSlice(MAX);
+      readBack();
+      expect(reveal().fromIndex).toBeLessThan(LONG - MAX);
+      for (const render of renders) {
+        expect(render.to - render.from).toBeLessThanOrEqual(MAX);
+        expect(render.to === LONG || bundled(render.to)).toBe(true);
+      }
+    });
+
+    test("a detached slice keeps its rows across pages and appends; a deleted end row falls back", () => {
+      const { reveal, readBack, setProps, props } = renderSlice(MAX);
+      readBack();
+      const { fromIndex, toIndex } = reveal();
+      const ids = (from: number, to: number) => [from, to - 1].map((i) => props().messages[i].id);
+      const before = ids(fromIndex, toIndex);
+      setProps({ messages: [...rows(30, "old"), ...props().messages, ...rows(3, "new")] });
+      expect(ids(reveal().fromIndex, reveal().toIndex)).toEqual(before);
+      expect(reveal().toIndex).toBe(toIndex + 30);
+
+      // An edit deletes a run ending at the end row: the slice ends by the kept row above the run.
+      const run = (i: number) => i >= toIndex + 5 && i < toIndex + 30;
+      setProps({ messages: props().messages.filter((_, i) => !run(i)) });
+      // Kept row toIndex + 4; the slice ends at its bundle edge (toIndex + 0), never past it.
+      expect(reveal().toIndex).toBe(toIndex);
+      setProps({ messages: props().messages.filter((_, i) => i !== toIndex) }); // first unmounted row
+      expect(reveal().toIndex).toBe(toIndex);
+    });
+
+    test("revealNewer walks back to the tail; resetToLatest and a dropped cap reattach", () => {
+      const { frames, reveal, readBack, setProps } = renderSlice(MAX);
+      readBack();
+      for (let request = 0; request < 20 && reveal().toIndex < LONG; request += 1) {
+        const previousTo = reveal().toIndex;
+        act(() => reveal().revealNewer());
+        const advanced = reveal().toIndex - previousTo;
+        expect(advanced > 0 && advanced <= TRANSCRIPT_REVEAL_AUTO_MAX_ROWS).toBe(true);
+        expect(reveal().toIndex - reveal().fromIndex).toBeLessThanOrEqual(MAX);
+        // The start moved up; the automatic reveal must not walk it back down.
+        expect(frames.hasPending()).toBe(false);
+      }
+      expect(reveal().toIndex).toBe(LONG);
+
+      readBack();
+      act(() => reveal().resetToLatest());
+      expect(reveal()).toMatchObject(LATEST);
+      readBack();
+      setProps({ maxMountedRows: undefined });
+      expect(reveal()).toMatchObject(LATEST);
+    });
+
+    test("revealThrough a row beyond the cap centers the slice on it, without stepping", () => {
+      const { frames, reveal, runFrames, readBack } = renderSlice(MAX);
+      runFrames();
+      for (const target of [MAX + 300, LONG - MAX / 4]) {
+        if (target > LONG / 2) readBack();
+        act(() => reveal().revealThrough(target));
+        expect(reveal().toIndex).toBeGreaterThan(target);
+        expect(Math.abs(target - reveal().fromIndex - MAX / 2)).toBeLessThanOrEqual(10);
+        expect(frames.hasPending()).toBe(false);
+      }
+      act(() => reveal().revealThrough(LONG)); // A stale index past the end is a no-op.
+    });
+
+    test("bundles larger than the cap mount whole; centering and revealNewer still reach rows", () => {
+      const { reveal, runFrames } = renderSlice(MAX, (index) => index % 1500 === 0);
+      runFrames(); // The automatic reveal reaches a 1,500-row bundle: it mounts whole, alone.
+      expect(reveal()).toMatchObject({ fromIndex: 3000, toIndex: 4500 });
+      act(() => reveal().revealThrough(2000));
+      expect(reveal()).toMatchObject({ fromIndex: 1500, toIndex: 3000 });
+      act(() => reveal().revealNewer());
+      expect(reveal()).toMatchObject({ fromIndex: 3000, toIndex: 4500 });
+    });
+
+    test("a cap smaller than one budget plus a chunk, or fractional, is refused", () => {
+      for (const cap of [TRANSCRIPT_REVEAL_AUTO_MAX_ROWS, MAX + 0.5])
+        expect(() => renderSlice(cap)).toThrow();
+    });
+
+    // One reconciliation each (#6667 review deferral, F20 PR3a-1).
+    test("deleting the end rows on both sides of the edge falls back to the newest kept row", () => {
+      const { reveal, readBack, setProps, props } = renderSlice(MAX);
+      readBack();
+      const { toIndex } = reveal();
+      const keptId = props().messages[toIndex - 51].id;
+      setProps({
+        messages: props().messages.filter((_, i) => i < toIndex - 50 || i > toIndex),
+      });
+      expect(reveal().toIndex).toBe(toIndex - 50);
+      expect(props().messages[reveal().toIndex - 1].id).toBe(keptId);
+    });
+
+    test("rows replaced inside the slice stay mounted when the end row goes later", () => {
+      const { reveal, readBack, setProps, props } = renderSlice(MAX);
+      readBack();
+      const { toIndex } = reveal();
+      const replaced = props().messages.map((row, i) =>
+        i >= toIndex - 20 && i < toIndex ? { id: `${row.id}-v2` } : row
+      );
+      setProps({ messages: replaced });
+      setProps({ messages: props().messages.filter((_, i) => i !== toIndex) });
+      expect(reveal().toIndex).toBe(toIndex);
+      // Replace, append, then delete every older newer row at once: nothing the reader kept
+      // unmounts; the slice ends at the tail (the appended rows).
+      setProps({
+        messages: props().messages.map((row, i) => (i === toIndex - 1 ? { id: "v3" } : row)),
+      });
+      setProps({ messages: [...props().messages, ...rows(3, "new")] });
+      const gone = (i: number) =>
+        (i >= toIndex - 30 && i < toIndex - 10) || (i >= toIndex && i < LONG - 1);
+      setProps({ messages: props().messages.filter((_, i) => !gone(i)) });
+      expect(reveal().toIndex).toBe(props().messages.length);
+      expect(props().messages.findIndex((row) => row.id === "v3")).toBe(toIndex - 21);
     });
   });
 });

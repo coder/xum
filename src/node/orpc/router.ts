@@ -28,6 +28,7 @@ import {
   getWorkspaceMcpOverrides,
   getWorkspacePluginComposition,
   listWorkspaceMcpPrompts,
+  warmWorkspaceMcpServers,
   listWorkspacePluginSlashCommands,
   setWorkspaceMcpOverrides,
 } from "@/node/services/agentPlugins/workspacePluginOperations";
@@ -50,7 +51,20 @@ import {
   sendInteractionRoute,
   setStateRoute,
 } from "@/node/services/artifactInteractions";
-import { callMcpAppTool, getMcpAppView } from "@/node/services/mcpAppsOperations";
+import {
+  callMcpAppTool,
+  listMcpAppEntrypoints,
+  openMcpAppEntrypoint,
+  getMcpAppView,
+  getMcpAppViewRecords,
+  readMcpAppServerResource,
+  setMcpAppWidgetState,
+  updateMcpAppModelContext,
+  approveMcpAppViewDomains,
+  listMcpAppViewDomains,
+  readMcpAppViewDomains,
+  revokeMcpAppViewDomains,
+} from "@/node/services/mcpAppsOperations";
 import {
   listArtifactVersions,
   readArtifactVersion,
@@ -128,6 +142,7 @@ import { clearLogsForApi, getLogFilePath } from "@/node/services/log";
 import {
   attachTerminal,
   subscribeConfigChanges,
+  subscribeMcpAppEntrypointChanges,
   subscribeDevTools,
   subscribeReviewState,
   subscribeDrafts,
@@ -178,6 +193,12 @@ import { throwWorkflowOrpcError } from "./formatOrpcError";
 import { isDraftTooLargeError } from "@/common/utils/drafts";
 import { resolveDraftSends } from "@/node/services/draftSendResolution";
 import type { SendAcceptance } from "@/node/services/draftService";
+import {
+  boundMCPSettingsError,
+  mcpSettingsSnapshotForIpc,
+  MCP_SETTINGS_READ_TIMEOUT_MS,
+  type MCPSettingsReadSnapshot,
+} from "@/common/utils/mcpSettings";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 
 /**
@@ -204,6 +225,75 @@ async function passComputerUseRefusal<T>(request: Promise<T>): Promise<T> {
 }
 
 /** The draft merge's passive acceptance check (DraftService.update/beginSend). */
+/** Settings routes start the workspace's servers first, like MCP Apps views do. */
+async function runMcpSettingsRoute<T>(
+  context: ORPCContext,
+  workspaceId: string,
+  signal: AbortSignal | undefined,
+  run: () => Promise<T>
+): Promise<{ success: true; data: T } | { success: false; error: string }> {
+  try {
+    if (!context.mcpServerManager.hasWorkspaceRequestOptions(workspaceId))
+      await listWorkspaceMcpPrompts(context, workspaceId, signal);
+    return { success: true, data: await run() };
+  } catch (error) {
+    // Server error text is untrusted and unbounded: bound it before it crosses IPC.
+    return { success: false, error: boundMCPSettingsError(getErrorMessage(error)) };
+  }
+}
+
+type McpSettingsReadResult =
+  | { success: true; data: MCPSettingsReadSnapshot | { notConnected: true } | null }
+  | { success: false; error: string };
+
+const forIpc = (snapshot: MCPSettingsReadSnapshot | null) =>
+  snapshot === null ? null : mcpSettingsSnapshotForIpc(snapshot);
+
+/**
+ * `mcp.settings.read` for several servers in one call (concurrently). With `ifConnected`, a
+ * server the workspace does not run reads as `{ notConnected: true }`, and a running one is
+ * read with `noStart`: neither runMcpSettingsRoute's warm-up nor the manager's startup path
+ * runs, so the read never starts or restarts a server (an instance that closed meanwhile
+ * fails the read instead).
+ */
+async function readMcpSettingsRoute(
+  context: ORPCContext,
+  input: { workspaceId: string; serverNames: string[]; ifConnected?: boolean },
+  signal: AbortSignal | undefined
+): Promise<Record<string, McpSettingsReadResult>> {
+  const manager = context.mcpServerManager;
+  // Per server: a hung server times out with its own error and does not hold back the others.
+  const readTimeoutMs = MCP_SETTINGS_READ_TIMEOUT_MS;
+  const readOne = async (serverName: string): Promise<McpSettingsReadResult> => {
+    // A dialog reopened during a save must not show the values from before the save. The read
+    // gets the time the wait left, so the two share one deadline.
+    const timeoutMs = await manager.settingsSavesSettled(input.workspaceId, serverName, {
+      signal,
+      timeoutMs: readTimeoutMs,
+    });
+    if (input.ifConnected !== true)
+      return runMcpSettingsRoute(context, input.workspaceId, signal, async () =>
+        forIpc(await manager.readSettings(input.workspaceId, serverName, { signal, timeoutMs }))
+      );
+    if (!manager.isWorkspaceServerConnected(input.workspaceId, serverName))
+      return { success: true, data: { notConnected: true } };
+    try {
+      const data = await manager.readSettings(input.workspaceId, serverName, {
+        signal,
+        timeoutMs,
+        noStart: true,
+      });
+      return { success: true, data: forIpc(data) };
+    } catch (error) {
+      return { success: false, error: boundMCPSettingsError(getErrorMessage(error)) };
+    }
+  };
+  const entries = await Promise.all(
+    [...new Set(input.serverNames)].map(async (name) => [name, await readOne(name)] as const)
+  );
+  return Object.fromEntries(entries);
+}
+
 function sendAcceptanceOf(context: ORPCContext): SendAcceptance {
   return {
     acceptedSendIds: (workspaceId, sendIds) =>
@@ -1217,6 +1307,56 @@ export const router = (authToken?: string) => {
         }),
     },
     mcp: {
+      settings: {
+        read: t
+          .input(schemas.mcp.settings.read.input)
+          .output(schemas.mcp.settings.read.output)
+          .handler(({ context, input, signal }) => readMcpSettingsRoute(context, input, signal)),
+        update: t
+          .input(schemas.mcp.settings.update.input)
+          .output(schemas.mcp.settings.update.output)
+          .handler(({ context, input, signal }) =>
+            runMcpSettingsRoute(context, input.workspaceId, signal, async () =>
+              mcpSettingsSnapshotForIpc(
+                await context.mcpServerManager.saveSettings(
+                  input.workspaceId,
+                  input.serverName,
+                  input.set,
+                  input.instanceToken,
+                  { signal }
+                )
+              )
+            )
+          ),
+        runTool: t
+          .input(schemas.mcp.settings.runTool.input)
+          .output(schemas.mcp.settings.runTool.output)
+          .handler(({ context, input, signal }) =>
+            runMcpSettingsRoute(context, input.workspaceId, signal, () =>
+              context.mcpServerManager.runSettingsTool(
+                input.workspaceId,
+                input.serverName,
+                input.toolName,
+                input.instanceToken,
+                { confirmed: input.confirmed, signal }
+              )
+            )
+          ),
+        openApp: t
+          .input(schemas.mcp.settings.openApp.input)
+          .output(schemas.mcp.settings.openApp.output)
+          .handler(({ context, input, signal }) =>
+            runMcpSettingsRoute(context, input.workspaceId, signal, () =>
+              context.mcpServerManager.openSettingsApp(
+                input.workspaceId,
+                input.serverName,
+                input.toolName,
+                input.instanceToken,
+                { confirmed: input.confirmed, signal }
+              )
+            )
+          ),
+      },
       designStatus: t
         .input(schemas.mcp.designStatus.input)
         .output(schemas.mcp.designStatus.output)
@@ -1295,6 +1435,16 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.agentPluginInstallService.getComponentsResult(input)
         ),
+      getHooks: t
+        .input(schemas.agentPlugins.getHooks.input)
+        .output(schemas.agentPlugins.getHooks.output)
+        .handler(({ context, input }) => context.agentPluginInstallService.getHooksResult(input)),
+      setHookTrust: t
+        .input(schemas.agentPlugins.setHookTrust.input)
+        .output(schemas.agentPlugins.setHookTrust.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.setHookTrustResult(input)
+        ),
       setComponents: t
         .input(schemas.agentPlugins.setComponents.input)
         .output(schemas.agentPlugins.setComponents.output)
@@ -1327,6 +1477,18 @@ export const router = (authToken?: string) => {
             name: input.name,
             consent: input.consent ?? undefined,
           })
+        ),
+      previewComponentReview: t
+        .input(schemas.agentPlugins.previewComponentReview.input)
+        .output(schemas.agentPlugins.previewComponentReview.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.previewComponentReviewResult(input)
+        ),
+      confirmComponentReview: t
+        .input(schemas.agentPlugins.confirmComponentReview.input)
+        .output(schemas.agentPlugins.confirmComponentReview.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.confirmComponentReviewResult(input)
         ),
     },
     mcpOauth: {
@@ -1363,7 +1525,7 @@ export const router = (authToken?: string) => {
       getAuthStatus: t
         .input(schemas.mcpOauth.getAuthStatus.input)
         .output(schemas.mcpOauth.getAuthStatus.output)
-        .handler(({ context, input }) => context.mcpOauthService.getAuthStatus(input)),
+        .handler(({ context, input }) => context.mcpOauthService.getAuthStatusForApi(input)),
       logout: t
         .input(schemas.mcpOauth.logout.input)
         .output(schemas.mcpOauth.logout.output)
@@ -1693,10 +1855,64 @@ export const router = (authToken?: string) => {
             listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
           )
         ),
+      getViewRecords: t
+        .input(schemas.mcpApps.getViewRecords.input)
+        .output(schemas.mcpApps.getViewRecords.output)
+        .handler(({ context, input }) => getMcpAppViewRecords(context, input)),
       callTool: t
         .input(schemas.mcpApps.callTool.input)
         .output(schemas.mcpApps.callTool.output)
         .handler(({ context, input, signal }) => callMcpAppTool(context, input, signal)),
+      readResource: t
+        .input(schemas.mcpApps.readResource.input)
+        .output(schemas.mcpApps.readResource.output)
+        .handler(({ context, input, signal }) => readMcpAppServerResource(context, input, signal)),
+      updateModelContext: t
+        .input(schemas.mcpApps.updateModelContext.input)
+        .output(schemas.mcpApps.updateModelContext.output)
+        .handler(({ context, input }) => updateMcpAppModelContext(context, input)),
+      setWidgetState: t
+        .input(schemas.mcpApps.setWidgetState.input)
+        .output(schemas.mcpApps.setWidgetState.output)
+        .handler(({ context, input }) => setMcpAppWidgetState(context, input)),
+      approveViewDomains: t
+        .input(schemas.mcpApps.approveViewDomains.input)
+        .output(schemas.mcpApps.approveViewDomains.output)
+        .handler(({ context, input }) => approveMcpAppViewDomains(context, input)),
+      listViewDomains: t
+        .input(schemas.mcpApps.listViewDomains.input)
+        .output(schemas.mcpApps.listViewDomains.output)
+        .handler(({ context }) => listMcpAppViewDomains(context)),
+      readViewDomains: t
+        .input(schemas.mcpApps.readViewDomains.input)
+        .output(schemas.mcpApps.readViewDomains.output)
+        .handler(({ context }) => readMcpAppViewDomains(context)),
+      revokeViewDomains: t
+        .input(schemas.mcpApps.revokeViewDomains.input)
+        .output(schemas.mcpApps.revokeViewDomains.output)
+        .handler(({ context, input }) => revokeMcpAppViewDomains(context, input)),
+      listEntrypoints: t
+        .input(schemas.mcpApps.listEntrypoints.input)
+        .output(schemas.mcpApps.listEntrypoints.output)
+        .handler(({ context, input, signal }) =>
+          listMcpAppEntrypoints(context, input.workspaceId, signal, (workspaceId, warmSignal) =>
+            warmWorkspaceMcpServers(context, workspaceId, warmSignal)
+          )
+        ),
+      onEntrypointsChanged: t
+        .input(schemas.mcpApps.onEntrypointsChanged.input)
+        .output(schemas.mcpApps.onEntrypointsChanged.output)
+        .handler(({ context, input, signal }) =>
+          subscribeMcpAppEntrypointChanges(context, input.workspaceId, signal)
+        ),
+      openEntrypoint: t
+        .input(schemas.mcpApps.openEntrypoint.input)
+        .output(schemas.mcpApps.openEntrypoint.output)
+        .handler(({ context, input, signal }) =>
+          openMcpAppEntrypoint(context, input, signal, (workspaceId, warmSignal) =>
+            warmWorkspaceMcpServers(context, workspaceId, warmSignal)
+          )
+        ),
     },
     // Memory handlers run Effect generators via handlerGen (client aborts
     // interrupt the fiber); the wire contracts are unchanged.

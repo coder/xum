@@ -28,6 +28,7 @@ import {
   anthropicSupportsNativeXhigh,
   ANTHROPIC_THINKING_BUDGETS,
   GEMINI_THINKING_BUDGETS,
+  GEMINI_THINKING_LEVELS,
   getOpenAIReasoningEffort,
   isGpt6LunaModel,
   grokSupportsNativeXhigh,
@@ -185,6 +186,37 @@ type ProviderOptions =
   | { bedrock: BedrockProviderOptions }
   | Record<string, never>; // Empty object for unsupported providers
 
+// Simple direct providers have self-contained reasoning controls. Keep these
+// separate from the gateway/OpenAI branches so vendor-only settings cannot leak.
+const DIRECT_REASONING_BUILDERS: Record<
+  string,
+  ((model: string, thinking: ThinkingLevel) => ProviderOptions) | undefined
+> = {
+  meta: (_model, thinking) => ({
+    // Meta uses the OpenAI Responses wire format. Stateless encrypted replay
+    // preserves reasoning across agent tool turns under the existing SDK namespace.
+    openai: {
+      forceReasoning: true, // The OpenAI SDK does not recognize Meta's model IDs.
+      store: false,
+      include: ["reasoning.encrypted_content"],
+      reasoningEffort: thinking === "off" ? "low" : thinking,
+      reasoningSummary: "auto",
+    },
+  }),
+  moonshotai: (model): ProviderOptions => {
+    // Kimi K3 always reasons and supports only max; do not rely on the API default.
+    return isKimiK3Model(model) ? { moonshotai: { reasoningEffort: "max" } } : {};
+  },
+  zai: (model, thinking): ProviderOptions => {
+    if (!isGlm53Model(model)) return {};
+    const reasoningEffort: ZaiLanguageModelChatOptions["reasoningEffort"] =
+      thinking === "max" ? "max" : thinking === "high" || thinking === "xhigh" ? "high" : "low";
+    return {
+      zai: { thinking: { type: "enabled" }, reasoningEffort, toolStream: true },
+    };
+  },
+};
+
 /** The subset of @ai-sdk/amazon-bedrock options Xum sends. */
 interface BedrockProviderOptions {
   [key: string]: JSONValue | undefined;
@@ -266,6 +298,44 @@ export function isAnthropic1MEffectivelyEnabled(
   }
 
   return hasAnthropic1MIntentForModel(modelString, capabilityModel, muxProviderOptions);
+}
+
+/** The provider options with Anthropic 1M context turned on for `modelString`. */
+export function withAnthropic1MContextIntent(
+  modelString: string,
+  muxProviderOptions: MuxProviderOptions | undefined
+): MuxProviderOptions {
+  const existingModels = muxProviderOptions?.anthropic?.use1MContextModels ?? [];
+  return {
+    ...muxProviderOptions,
+    anthropic: {
+      ...muxProviderOptions?.anthropic,
+      use1MContext: true,
+      use1MContextModels: existingModels.includes(modelString)
+        ? existingModels
+        : [...existingModels, modelString],
+    },
+  };
+}
+
+/**
+ * True when 1M context is off for `modelString` and turning it on would take effect. This is
+ * the case in which AgentSession.resolveCompactionRetryPlan retries a compaction request with
+ * 1M context, so resolveCompactionInputBudgetTokens leaves its first attempt untrimmed.
+ */
+export function canSwitchToAnthropic1MContext(
+  modelString: string,
+  muxProviderOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined
+): boolean {
+  return (
+    !isAnthropic1MEffectivelyEnabled(modelString, muxProviderOptions, providersConfig) &&
+    isAnthropic1MEffectivelyEnabled(
+      modelString,
+      withAnthropic1MContextIntent(modelString, muxProviderOptions),
+      providersConfig
+    )
+  );
 }
 
 /**
@@ -394,7 +464,9 @@ export function buildProviderOptions(
   // SDK payload-family selection: passthrough gateways use origin payloads,
   // while transforming gateways use the route provider's payload schema.
   const formatProvider =
-    providerOptionsNamespaceKey === origin ? origin : (routeProvider ?? origin);
+    providerOptionsNamespaceKey === resolveProviderOptionsNamespaceKey(origin)
+      ? origin
+      : (routeProvider ?? origin);
 
   // Fast mode follows the actual route/wire, not capability aliases or thinking.
   // Ultrafast is additionally model-gated; unsupported models drop the tier.
@@ -700,7 +772,7 @@ export function buildProviderOptions(
   // Build Google-specific options
   if (formatProvider === "google") {
     const capBareModelName = capModelName.split("/").at(-1) ?? capModelName;
-    const usesGeminiThinkingLevelConfig = capBareModelName.includes("gemini-3");
+    const usesGeminiThinkingLevelConfig = /gemini-[34]/.test(capBareModelName);
     const isGeminiFlashThinkingModel = isGeminiFlashThinkingLevelModelName(capBareModelName);
     let thinkingConfig: GoogleGenerativeAIProviderOptions["thinkingConfig"];
 
@@ -720,8 +792,7 @@ export function buildProviderOptions(
       if (usesGeminiThinkingLevelConfig) {
         // Policy enforcement should clamp to valid Google levels before this adapter runs.
         // Avoid leaking xhigh/max to Google if a caller bypasses policy.
-        thinkingConfig.thinkingLevel =
-          effectiveThinking === "xhigh" || effectiveThinking === "max" ? "high" : effectiveThinking;
+        thinkingConfig.thinkingLevel = GEMINI_THINKING_LEVELS[effectiveThinking];
       } else {
         // Gemini 2.5 uses thinkingBudget
         const budget = GEMINI_THINKING_BUDGETS[effectiveThinking];
@@ -740,40 +811,13 @@ export function buildProviderOptions(
     return options;
   }
 
-  // Build Moonshot-specific options
-  if (formatProvider === "moonshotai") {
-    // Kimi K3 always reasons and supports only the max reasoning effort. Send it
-    // explicitly rather than relying on the API default.
-    if (isKimiK3Model(capabilityModel)) {
-      const options = {
-        moonshotai: { reasoningEffort: "max" },
-      } satisfies { moonshotai: MoonshotAIProviderOptions };
-      log.debug("buildProviderOptions: Returning Moonshot options", options);
-      return options;
-    }
-    return {};
-  }
-
-  // Build Z.ai-specific options
-  if (formatProvider === "zai") {
-    if (!isGlm53Model(capabilityModel)) {
-      return {};
-    }
-
-    const reasoningEffort: ZaiLanguageModelChatOptions["reasoningEffort"] =
-      effectiveThinking === "max"
-        ? "max"
-        : effectiveThinking === "high" || effectiveThinking === "xhigh"
-          ? "high"
-          : "low";
-    const options = {
-      zai: {
-        thinking: { type: "enabled" },
-        reasoningEffort,
-        toolStream: true,
-      },
-    } satisfies { zai: ZaiLanguageModelChatOptions };
-    log.debug("buildProviderOptions: Returning Z.ai options", options);
+  const directReasoningBuilder = DIRECT_REASONING_BUILDERS[formatProvider];
+  if (Object.hasOwn(DIRECT_REASONING_BUILDERS, formatProvider) && directReasoningBuilder) {
+    const options = directReasoningBuilder(capabilityModel, effectiveThinking);
+    log.debug("buildProviderOptions: Returning direct provider options", {
+      formatProvider,
+      options,
+    });
     return options;
   }
 

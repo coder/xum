@@ -1,6 +1,11 @@
 {
   "compilerOptions": {
     "target": "ES2020",
+    // Explicit because Bun ignores the target default: tsc and esbuild (Vite) already use assign
+    // semantics at ES2020, but Bun (bun test, bun build of the preload) used define semantics.
+    // Under define semantics, Bun's coverage marks never-run lines as hit in every file with an
+    // emitted class field, which hid real gaps in crap-lcov.
+    "useDefineForClassFields": false,
     "lib": ["ES2023", "DOM", "DOM.Iterable", "ES2022.Intl"],
     "module": "ESNext",
     "moduleResolution": "bundler",

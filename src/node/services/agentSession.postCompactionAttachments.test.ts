@@ -496,7 +496,6 @@ describe("AgentSession post-compaction attachments", () => {
       sessionDir,
       relPath: "chart.html",
       bytes: Buffer.from("<p>v1</p>"),
-      source: "publish",
       label: "chart",
     });
 

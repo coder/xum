@@ -4,11 +4,18 @@ import * as http from "http";
 import * as net from "net";
 import * as os from "os";
 import * as path from "path";
+import * as zlib from "zlib";
 import { WebSocket, WebSocketServer } from "ws";
 import { RPCLink as HTTPRPCLink } from "@orpc/client/fetch";
 import { createORPCClient } from "@orpc/client";
 import type { RouterClient } from "@orpc/server";
 import { createOrpcServer, DESKTOP_WS_PATH, ORPC_WS_PATH } from "./server";
+import {
+  FIRST_RUN_EARLY_SCRIPT,
+  FIRST_RUN_MODULES_ID,
+  FIRST_RUN_TEMPLATE_ID,
+  FIRST_RUN_VIEW_HTML,
+} from "./firstRunView";
 import { log } from "@/node/services/log";
 import type { ORPCContext } from "./context";
 import type { AppRouter } from "./router";
@@ -339,6 +346,32 @@ function rawRequest(
   });
 }
 
+interface RawBuffer {
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  body: Buffer;
+}
+
+// As rawRequest, but keeps the body as bytes so a compressed response can be decoded.
+function rawRequestBuffer(
+  baseUrl: string,
+  urlPath: string,
+  options: { headers?: Record<string, string> } = {}
+): Promise<RawBuffer> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(new URL(urlPath, baseUrl), { headers: options.headers }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      res.on("end", () =>
+        resolve({ status: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(chunks) })
+      );
+      res.on("error", reject);
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 function varyIncludesAcceptEncoding(headers: http.IncomingHttpHeaders): boolean {
   const vary = headers.vary;
   return (
@@ -445,7 +478,7 @@ describe("createOrpcServer hashed static asset compression", () => {
     }
   });
 
-  test("keeps existing headers for unhashed files and the SPA index", async () => {
+  test("keeps existing headers for unhashed files", async () => {
     const { server, close } = await createStaticTestServer({ files: staticFiles });
 
     try {
@@ -460,8 +493,6 @@ describe("createOrpcServer hashed static asset compression", () => {
           cacheControl: "public, max-age=0",
           body: staticFiles["terminal.html"],
         },
-        { urlPath: "/", cacheControl: "no-store", body: "<title>mux</title>" },
-        { urlPath: "/index.html", cacheControl: "no-store", body: "<title>mux</title>" },
       ];
 
       for (const testCase of cases) {
@@ -519,6 +550,170 @@ describe("createOrpcServer hashed static asset compression", () => {
       expect(identity.body).toBe(IDENTITY_BODY.slice(0, 4));
     } finally {
       await close();
+    }
+  });
+});
+
+// T3 Option C step 1: the SPA page is compressed per response (its HTML is rewritten per request) and
+// preloads the fonts its first view paints with, named by the built CSS. dist/index.html is untouched:
+// Electron loads it from file://.
+describe("createOrpcServer SPA fallback compression and font preloads", () => {
+  const css =
+    '@font-face{font-family:Geist;src:url(./Geist-Variable-C_ya05Eu.woff2)format("woff2")}' +
+    '@font-face{font-family:Nerd Font Symbols;src:url(./nerd-font-symbols-CoUzE12l.woff2)format("woff2")}' +
+    '@font-face{font-family:Geist Mono;src:url(./GeistMono-Variable-BJ0bRpLQ.woff2)format("woff2")}';
+  const indexHtml =
+    '<!doctype html><html><head><title>mux</title><link rel="stylesheet" crossorigin href="./API-CCITiHZd.css"></head><body><div>ok</div></body></html>';
+  const files = { "index.html": indexHtml, "API-CCITiHZd.css": css };
+
+  function decode(res: RawBuffer): string {
+    const encoding = res.headers["content-encoding"];
+    if (encoding === "br") return zlib.brotliDecompressSync(res.body).toString("utf-8");
+    if (encoding === "gzip") return zlib.gunzipSync(res.body).toString("utf-8");
+    expect(encoding).toBeUndefined();
+    return res.body.toString("utf-8");
+  }
+
+  test("negotiates br, gzip and identity with Vary, and keeps no-store", async () => {
+    const { server, close } = await createStaticTestServer({ files });
+    try {
+      const cases: Array<[string | undefined, string | undefined]> = [
+        ["br", "br"],
+        ["gzip", "gzip"],
+        [undefined, undefined],
+        ["identity", undefined],
+        // A browser lists gzip first: on equal q-values the server prefers brotli.
+        ["gzip, deflate, br, zstd", "br"],
+        ["br;q=0.5, gzip", "gzip"],
+      ];
+      for (const [acceptEncoding, expected] of cases) {
+        for (const urlPath of ["/", "/workspace/a1b2c3d4e5"]) {
+          const res = await rawRequestBuffer(server.baseUrl, urlPath, {
+            headers: acceptEncoding === undefined ? {} : { "Accept-Encoding": acceptEncoding },
+          });
+          const label = `${urlPath} ${acceptEncoding ?? "(none)"}`;
+          expect(res.status, label).toBe(200);
+          expect(res.headers["content-encoding"], label).toBe(expected);
+          expect(varyIncludesAcceptEncoding(res.headers), label).toBe(true);
+          expect(res.headers["cache-control"], label).toBe("no-store");
+          expect(decode(res), label).toContain("<title>mux</title>");
+        }
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("preloads only Geist in the response, on every route, never in dist/index.html", async () => {
+    const { server, tempDir, close } = await createStaticTestServer({ files });
+    try {
+      const preload = (file: string) =>
+        `<link rel="preload" as="font" type="font/woff2" crossorigin href="./${file}" />`;
+      const root = decode(await rawRequestBuffer(server.baseUrl, "/"));
+      const workspace = decode(await rawRequestBuffer(server.baseUrl, "/workspace/a1b2c3d4e5"));
+      for (const html of [root, workspace]) {
+        expect(html).toContain(preload("Geist-Variable-C_ya05Eu.woff2"));
+        expect(html.match(/rel="preload" as="font"/g)).toHaveLength(1);
+        // Not even on /workspace, where code shows: on a throttled phone the Geist Mono preload
+        // competed with the app JS and made the page's content 0.28 s later (page-timing, #6216).
+        expect(html).not.toContain("GeistMono-Variable");
+        // Not a first-view font, though it is a woff2 in the same CSS.
+        expect(html).not.toContain("nerd-font-symbols");
+        // After the injected <base>, so the relative font URLs resolve under a proxy base path.
+        expect(html.indexOf("<base ")).toBeLessThan(html.indexOf('rel="preload"'));
+      }
+      expect(await fs.readFile(path.join(tempDir, "index.html"), "utf-8")).toBe(indexHtml);
+    } finally {
+      await close();
+    }
+  });
+});
+
+// T3 C step 2 (plan section 5.6, PR 4b): only "/" gets the static first-run view and loads the app
+// JS after it paints. Catches the view on another route, a module tag left in <head>, a module
+// list after the early script (a paint-cache visit loads at once and needs it), an early script
+// after the stylesheet (it would wait for the CSS), a view on a page with no module script, and
+// a write to dist/index.html.
+describe("createOrpcServer static first-run view on /", () => {
+  const MODULES =
+    '<script type="module" crossorigin src="./main-AAAAAAAA.js"></script>\n    <link rel="modulepreload" crossorigin href="./API-BBBBBBBB.js">\n';
+  const indexHtml = `<!doctype html><html><head><title>mux</title>\n    ${MODULES}    <link rel="stylesheet" crossorigin href="./API-CCITiHZd.css"></head><body><div id="root"></div></body></html>`;
+  const decode = (res: RawBuffer) => {
+    const encoding = res.headers["content-encoding"];
+    if (encoding === "br") return zlib.brotliDecompressSync(res.body).toString("utf-8");
+    if (encoding === "gzip") return zlib.gunzipSync(res.body).toString("utf-8");
+    return res.body.toString("utf-8");
+  };
+  const at = (html: string, needle: string) => {
+    expect(countOccurrences(html, needle), needle).toBe(1);
+    return html.indexOf(needle);
+  };
+
+  test("serves / with the view's template, the module list and the early script, in order", async () => {
+    const { server, tempDir, close } = await createStaticTestServer({
+      files: { "index.html": indexHtml },
+    });
+    try {
+      for (const [urlPath, encoding] of [
+        ["/", "br"],
+        ["/", "gzip"],
+        ["/?token=t", "identity"],
+      ]) {
+        const res = await rawRequestBuffer(server.baseUrl, urlPath, {
+          headers: { "Accept-Encoding": encoding },
+        });
+        expect(res.headers["content-encoding"], urlPath).toBe(
+          encoding === "identity" ? undefined : encoding
+        );
+        const html = decode(res);
+        expect(html).not.toContain('<script type="module"');
+        expect(html).not.toContain('<link rel="modulepreload"');
+        const list = `<script type="application/json" id="${FIRST_RUN_MODULES_ID}">`;
+        const listJson = html.slice(
+          at(html, list) + list.length,
+          html.indexOf("</script>", at(html, list))
+        );
+        expect(JSON.parse(listJson)).toEqual({
+          script: "./main-AAAAAAAA.js",
+          preload: ["./API-BBBBBBBB.js"],
+        });
+        const order = [
+          at(html, "<base "),
+          at(html, list),
+          at(html, `<script>${FIRST_RUN_EARLY_SCRIPT}</script>`),
+          at(html, 'rel="stylesheet"'),
+          at(html, '<div id="root"></div>'),
+          at(html, `<template id="${FIRST_RUN_TEMPLATE_ID}">${FIRST_RUN_VIEW_HTML}</template>`),
+          at(html, "</body>"),
+        ];
+        expect(order, urlPath).toEqual([...order].sort((a, b) => a - b));
+      }
+      expect(await fs.readFile(path.join(tempDir, "index.html"), "utf-8")).toBe(indexHtml);
+    } finally {
+      await close();
+    }
+  });
+
+  test("leaves every other route, and a / without one module script, as before", async () => {
+    const noModules = indexHtml.replace(MODULES, "");
+    for (const [page, urlPaths] of [
+      [indexHtml, ["/workspace/a1b2c3d4e5", "/project?path=%2Ftmp%2Fp", "/index.html"]],
+      [noModules, ["/"]],
+    ] as const) {
+      const { server, close } = await createStaticTestServer({ files: { "index.html": page } });
+      try {
+        for (const urlPath of urlPaths) {
+          const html = decode(await rawRequestBuffer(server.baseUrl, urlPath));
+          // Without the base, redirect and proxy-template injections the page is dist's, byte for byte.
+          const stripped = html
+            .replace(/\n {4}<script>\(\(\)=>\{const pathname=[^\n]*<\/script>/, "")
+            .replace(/\n {4}<script>window\.__MUX_PROXY_URI_TEMPLATE__ = [^<]*<\/script>/, "")
+            .replace(/\n {4}<base href="[^"]*" \/>/, "");
+          expect(stripped, urlPath).toBe(page);
+        }
+      } finally {
+        await close();
+      }
     }
   });
 });

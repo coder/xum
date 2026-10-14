@@ -57,6 +57,25 @@ Higher-priority definitions **override** lower-priority ones with the same id.
 
 Definitions larger than 1 MB are rejected at parse time. Filenames that don't match the id schema are skipped with a warning.
 
+### Plugin agents in Claude Code or Cursor format
+
+[Agent plugins](/agents/agent-skills#agent-plugins) can ship `agents/*.md` files. A plugin agent that uses any Xum-only field (`base`, `tools` as an object, `subagent`, `ui`, `ai`, `prompt`, `disabled`) follows the Xum format below, unchanged.
+
+A plugin agent without any of those fields is read as a Claude Code or Cursor subagent. Both tools give such an agent every tool when it omits `tools`, so Xum maps it like this:
+
+| Plugin field                                                                                               | Xum meaning                                                                                                                  |
+| ---------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| (always)                                                                                                   | `base: exec`, `subagent.runnable: true`, `ui.hidden: true`, `prompt.append: false`                                           |
+| `name` omitted                                                                                             | The file name (agent id), as both tools do for plugin agents                                                                 |
+| `readonly: true` (Cursor)                                                                                  | `base: explore` instead (no file edits or task spawning; bash stays)                                                         |
+| `model`                                                                                                    | `ai.model` for an alias or a known Claude ID. Other values use the inherited model.                                          |
+| `effort` (Claude Code)                                                                                     | `ai.thinkingLevel`, when it is a valid thinking level                                                                        |
+| `is_background`, `background`                                                                              | Ignored. The `task` caller chooses `run_in_background`.                                                                      |
+| Other keys (`maxTurns`, `skills`, `memory`, `hooks`, `mcpServers`, `permissionMode`, `isolation`, `color`) | Ignored, as Xum ignores unknown keys. Claude Code also ignores `hooks`, `mcpServers` and `permissionMode` for plugin agents. |
+| `tools`, `disallowedTools` as a list                                                                       | Not supported yet. Xum skips the agent rather than grant every tool.                                                         |
+
+So `task({ agentId: "<file name>" })` spawns the agent with Exec's tools: it can run shell commands and edit files. The body replaces Exec's prompt. Xum still adds its sub-agent instructions (commit the work so the parent can apply the patch, and report back), because the parent depends on them. The agent does not appear in the agent picker. This mapping applies only to plugin agents. A project or global agent file in the same format keeps the Xum defaults (not runnable, no tools).
+
 ## File Format
 
 ### Frontmatter
@@ -167,6 +186,21 @@ These rules are applied last and cannot be overridden by frontmatter:
 | Plan agent editing files            | `file_edit_*` is restricted to the plan file path.                               |
 
 A chain is "plan-like" when the resolved tool policy enables `propose_plan`.
+
+### Task limits
+
+Two limits in **Settings → Agents → Task Settings** apply to every sub-agent task:
+
+| Setting                  | Default | Range | Effect                                                                    |
+| ------------------------ | ------- | ----- | ------------------------------------------------------------------------- |
+| Max Parallel Agent Tasks | 32      | 1–256 | Tasks over the limit wait in a queue and start when a running task stops. |
+| Max Task Nesting Depth   | 5       | 1–5   | A task at this depth cannot spawn children (see the table above).         |
+
+Depth counts from the workspace you chat in. That workspace has depth 0, its sub-agent has depth 1, and so on. With the default of 5, tasks can nest 5 levels below your workspace. Orchestration that nests a coordinator, workers, and their verifiers needs 4 levels, so the default leaves one level spare. A parent that waits in the foreground for its child does not count against the parallel limit.
+
+Each running task has its own workspace, model stream, and MCP servers. A higher parallel limit uses more memory and processes, and it sends more requests at the same time to your model provider, which can hit its rate limits.
+
+When you upgrade from a version with the earlier defaults (16 parallel tasks, depth 3), Xum changes a limit that still has its earlier default to the new default, one time. Xum cannot tell whether you chose 16 or 3 yourself, so it changes those values too. If you want the earlier value, set it again after the upgrade. Xum keeps it from then on. Xum keeps every other value that you set.
 
 ## Disabling and Extending Built-ins
 

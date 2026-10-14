@@ -76,6 +76,10 @@ export type ArtifactCapabilities = z.infer<typeof ArtifactCapabilitiesSchema>;
  * Artifact versions (M4). Each artifact (identified by its path relative to the artifacts dir)
  * keeps an append-only list of byte-exact copies in the workspace's host session dir, so old
  * versions stay viewable after the file changes, is deleted, or its container is gone.
+ *
+ * Only the artifact tool writes versions now ("publish"). "turn-end" and "attach_file" stay for
+ * indexes written by older builds: dropping them would make readArtifactIndex reject those
+ * indexes as corrupt and move their history aside.
  */
 export const ArtifactVersionSourceSchema = z.enum(["publish", "turn-end", "attach_file"]);
 export type ArtifactVersionSource = z.infer<typeof ArtifactVersionSourceSchema>;
@@ -87,7 +91,7 @@ export type ArtifactPin = z.infer<typeof ArtifactPinSchema>;
 export const ArtifactVersionSchema = z.object({
   /** 1-based, increasing per artifact. */
   version: z.number().int().positive(),
-  /** Title given at publish time; null for turn-end snapshots. */
+  /** Title given at publish time; null for turn-end snapshots of older builds. */
   label: z.string().nullable(),
   source: ArtifactVersionSourceSchema,
   createdAtMs: z.number(),

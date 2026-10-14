@@ -113,6 +113,30 @@ describe("TokenizerService", () => {
       }
     });
 
+    test("counts prompt-hook context as the provider request renders it", async () => {
+      // Codex P2 (PRRT_kwDOPxxmWM6rNI3g): the context is metadata in history, text in the request.
+      await seedHistory(
+        createMuxMessage("msg1", "user", "Hello", {
+          historySequence: 1,
+          pluginHookContext: [{ pluginId: "guard", text: "Ask first." }],
+        })
+      );
+      const statsSpy = spyOn(statsUtils, "calculateTokenStats").mockResolvedValue(mockResult);
+      try {
+        await service.calculateWorkspaceStats({ workspaceId: WS, model: "gpt-4" });
+        expect(tokenizedRows(statsSpy)).toEqual([
+          {
+            id: "msg1",
+            texts: [
+              'Hello\n<plugin-hook-context plugin="guard">\nAsk first.\n</plugin-hook-context>',
+            ],
+          },
+        ]);
+      } finally {
+        statsSpy.mockRestore();
+      }
+    });
+
     test("leaves plan-review records out of the counted context but not the cache identity", async () => {
       // A snapshot row carries the whole plan; it is persisted UI state, never sent to a model.
       const snapshot: PlanReviewRecord = {

@@ -3,7 +3,7 @@ import assert from "@/common/utils/assert";
 import { AlertTriangle, Check } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { flushUserPreferences } from "@/browser/stores/AppConfigStore";
 import { useHostTranscriptMutationCheck } from "@/browser/utils/transcriptBarrier";
@@ -234,7 +234,6 @@ export function AskUserQuestionToolCall(props: {
   toolCallId: string;
   workspaceId?: string;
 }): JSX.Element {
-  const { api } = useAPI();
   const isTranscriptMutationAllowed = useHostTranscriptMutationCheck();
 
   const argsAnswers = props.args.answers ?? {};
@@ -316,11 +315,13 @@ export function AskUserQuestionToolCall(props: {
   const autoRetryRollbackArmedRef = useRef(false);
   const autoRetryRollbackBaselineMessageCountRef = useRef<number | null>(null);
   const isMountedRef = useRef(true);
-  const apiRef = useRef(api);
+  // The rollback skips while offline, as it did when useAPI() went null in the gap.
+  const liveApi = useLiveAPI();
+  const apiRef = useRef(liveApi);
 
   useEffect(() => {
-    apiRef.current = api;
-  }, [api]);
+    apiRef.current = liveApi;
+  }, [liveApi]);
 
   const rollbackAutoRetryIfNeeded = useCallback(
     async (options?: { suppressErrors?: boolean }): Promise<void> => {
@@ -519,7 +520,7 @@ export function AskUserQuestionToolCall(props: {
         }
       }
 
-      assert(api, "API not connected");
+      assert(liveApi, "API not connected");
       assert(props.workspaceId, "workspaceId is required");
       workspaceId = props.workspaceId;
     } catch (error) {
@@ -569,7 +570,7 @@ export function AskUserQuestionToolCall(props: {
           ) {
             throw new Error(ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE);
           }
-          return api.workspace.sendMessage({
+          return liveApi.workspace.sendMessage({
             workspaceId,
             message,
             options: {
@@ -604,7 +605,7 @@ export function AskUserQuestionToolCall(props: {
       return;
     }
 
-    api.workspace
+    liveApi.workspace
       .answerAskUserQuestion({
         workspaceId,
         toolCallId: props.toolCallId,
@@ -633,7 +634,7 @@ export function AskUserQuestionToolCall(props: {
           );
         }
 
-        const enableResult = await api.workspace.setAutoRetryEnabled?.({
+        const enableResult = await liveApi.workspace.setAutoRetryEnabled?.({
           workspaceId,
           enabled: true,
           persist: false,
@@ -647,7 +648,7 @@ export function AskUserQuestionToolCall(props: {
           // Ask-user resume temporarily enables auto-retry for this attempt.
           // Roll back only after the resumed stream reaches a terminal outcome.
           if (!isMountedRef.current) {
-            await api.workspace.setAutoRetryEnabled?.({
+            await liveApi.workspace.setAutoRetryEnabled?.({
               workspaceId,
               enabled: false,
               persist: false,
@@ -660,7 +661,7 @@ export function AskUserQuestionToolCall(props: {
           }
         }
 
-        const resumeResult = await api.workspace.resumeStream({
+        const resumeResult = await liveApi.workspace.resumeStream({
           workspaceId,
           options: sendOptions,
         });

@@ -512,8 +512,12 @@ export const PlannedStagesPhone: AppStory = {
     await waitFor(() =>
       expect(canvas.getByRole("log", { name: "Conversation transcript" })).toBeVisible()
     );
-    const sidebar = canvasElement.querySelector('[aria-label="Workspace insights"]');
-    await expect(sidebar).toBeInTheDocument();
+    // The right sidebar is a lazy chunk (T3 #5971), so it can mount after the transcript.
+    const sidebar = await waitFor(() => {
+      const element = canvasElement.querySelector('[aria-label="Workspace insights"]');
+      if (element == null) throw new Error("right sidebar missing");
+      return element;
+    });
     // The real app hides this whole panel on phones. The test-runner does not
     // apply viewport globals, so only assert hidden at an actual phone width.
     if (window.innerWidth <= 390 || canvasElement.getBoundingClientRect().width <= 390) {

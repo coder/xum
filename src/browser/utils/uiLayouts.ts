@@ -1,3 +1,4 @@
+import { RIGHT_SIDEBAR_DEFAULT_COLLAPSED } from "@/constants/layout";
 import assert from "@/common/utils/assert";
 import {
   normalizeLayoutPresetsConfig,
@@ -92,7 +93,7 @@ export function resolveRightSidebarWidthPx(width: RightSidebarWidthPreset): numb
 }
 
 function readCurrentRightSidebarCollapsed(): boolean {
-  return readPersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+  return readPersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, RIGHT_SIDEBAR_DEFAULT_COLLAPSED);
 }
 
 function readCurrentRightSidebarWidthPx(): number {

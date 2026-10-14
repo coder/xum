@@ -9,7 +9,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import {
   CODER_CANONICAL_ROUTE_ORIGINS,
@@ -34,7 +34,9 @@ const DEFAULT_LABELS: Record<CoderCanonicalRouteOrigin, string> = {
  * instance that serves its native models when route priority picks Coder.
  */
 export function CoderCanonicalRoutes() {
-  const { api } = useAPI();
+  // The live client only: offline (the last client kept while reconnecting) a write would fail,
+  // and the optimistic route would look saved. Loads go through useProvidersConfig.
+  const api = useLiveAPI();
   const { config, refresh, updateOptimistically } = useProvidersConfig();
   const coder = config?.coder;
   const routes: CoderCanonicalRoutesMap = coder?.canonicalRoutes ?? {};

@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { KEYBINDS } from "@/browser/utils/ui/keybinds";
+import type { Keybind } from "@/common/types/keybind";
 import {
   ARTIFACT_ANNOTATION_CONTEXT_CHARS,
   ARTIFACT_ANNOTATION_QUOTE_MAX_CHARS,
@@ -14,15 +16,26 @@ import {
  * (experiment: "artifacts"). Security-owned contract:
  *
  * - Every message is an object `{ xumArtifact: 1, type, ... }`, validated with zod.
- * - Frame -> host (M3): `{ type: "key", key: "Escape" | "F", shiftKey }`, so Escape and
+ * - Frame -> host (M3): `{ type: "key", key: "Escape" | "F" | "C", shiftKey }`, so Escape and
  *   Shift+F can exit fullscreen while focus is inside the frame (the host never lets a frame
  *   message enter fullscreen: the artifact's script can post these without a key press).
+ *   "C" is the annotate shortcut (KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE), which a click into the
+ *   frame (focus then sits in it) made unreachable from the keyboard. It can turn annotate mode
+ *   on, so the host honours it only during a live user gesture in this frame
+ *   (hasLiveUserGesture, SandboxedArtifactFrame.tsx).
  * - Frame -> host (M5b): `{ type: "send", text, data? }` (window.xum.send) only fills the
  *   host-owned confirm strip, never sends by itself; `{ type: "setState", state }`
- *   (window.xum.setState) is persisted per artifact version. Text and JSON sizes are capped.
+ *   (window.xum.setState) is persisted per artifact, for all its versions. Text and JSON sizes
+ *   are capped.
  * - Frame -> host (M5b annotate): `{ type: "annotate", x, y, selector?, quote?, prefix?,
  *   suffix? }`, posted by the shim only while the host has annotate mode on; x/y are fractions of
  *   the frame size. The host also ignores it unless annotate mode is on.
+ * - Frame -> host (openWorkspace): `{ type: "openWorkspace", workspaceId }`
+ *   (window.xum.openWorkspace) asks the host to switch the app to that workspace. The host
+ *   honours it only for an interactive artifact (not pinned files or shelf copies), right after
+ *   the user clicked or typed inside this frame, and only for an active workspace
+ *   (SandboxedArtifactFrame.tsx). The frame never gets a reply, so no workspace list or title
+ *   reaches it.
  * - Host -> frame: `{ type: "theme", theme: "dark" | "light" }`, sent after load and on theme
  *   change; the artifact may read it, and the host never injects its own CSS.
  *   `{ type: "annotate", enabled }` switches the shim's click-to-pin capture on or off (clicks
@@ -46,11 +59,18 @@ export const ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND = 20;
 
 const bridgeEnvelope = { xumArtifact: z.literal(ARTIFACT_BRIDGE_VERSION) };
 
+/**
+ * Longest workspace ID the bridge accepts. New IDs are 10 hex characters, but legacy IDs are
+ * `<project>-<dir>` basenames with any characters, so there is no character set. The host's
+ * lookup in its active-workspace map is the real gate; this cap only keeps junk out before it.
+ */
+export const ARTIFACT_WORKSPACE_ID_MAX_CHARS = 1024;
+
 const ArtifactKeyMessageSchema = z
   .object({
     ...bridgeEnvelope,
     type: z.literal("key"),
-    key: z.enum(["Escape", "F"]),
+    key: z.enum(["Escape", "F", "C"]),
     shiftKey: z.boolean(),
   })
   .strict();
@@ -98,8 +118,17 @@ const ArtifactAnnotateMessageSchema = z
   })
   .strict();
 
+const ArtifactOpenWorkspaceMessageSchema = z
+  .object({
+    ...bridgeEnvelope,
+    type: z.literal("openWorkspace"),
+    workspaceId: z.string().min(1).max(ARTIFACT_WORKSPACE_ID_MAX_CHARS),
+  })
+  .strict();
+
 export const ArtifactFrameToHostMessageSchema = z.discriminatedUnion("type", [
   ArtifactKeyMessageSchema,
+  ArtifactOpenWorkspaceMessageSchema,
   ArtifactSendMessageSchema,
   ArtifactSetStateMessageSchema,
   ArtifactAnnotateMessageSchema,
@@ -205,8 +234,8 @@ export function postArtifactAnnotateMode(frameWindow: Window | null | undefined,
  * Source of the inline <script> injected as the frame's first script (inline, so the CSP's
  * 'unsafe-inline' allows it). It forwards Escape and Shift+F to the host and exposes a
  * read-only `window.xum.theme`, updated from theme messages, plus a `xumthemechange` event;
- * `window.xum.send` / `window.xum.setState`, and a read-only `window.xum.state` with a
- * `xumstatechange` event. It also mirrors the theme into `data-xum-theme` on the root element,
+ * `window.xum.send` / `window.xum.setState` / `window.xum.openWorkspace`, and a read-only
+ * `window.xum.state` with a `xumstatechange` event. It also mirrors the theme into `data-xum-theme` on the root element,
  * so plain CSS (the goal status board, which has no scripts) can follow the app theme instead
  * of the OS preference. While the host has annotate mode on, a capture-phase click listener
  * swallows clicks and reports the point (plus any selected text) instead.
@@ -229,6 +258,144 @@ export function postArtifactAnnotateMode(frameWindow: Window | null | undefined,
  * always flushes the latest value after the interval.
  */
 export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
+
+/**
+ * Frame script (a statement, run inside the bridge's IIFE and the MCP App preamble) that makes
+ * in-page links (`<a href="#section">`) jump within the artifact instead of navigating away.
+ *
+ * Why: a srcdoc frame resolves relative URLs against the parent page, so `#section` becomes
+ * `<app URL>#section`: a cross-document navigation to the Xum app, not a fragment jump. The
+ * navigation guard (frameNavigationGuard.tsx) then closes the artifact as "navigated away",
+ * and the desktop app refuses the navigation (subframeNavigation.ts). CSP `base-uri 'none'`
+ * rules out a `<base>` fix.
+ *
+ * So a plain left click on a link for this document (`href`, or SVG `xlink:href`, no `download`,
+ * no `target` other than `_self`) whose raw value starts with `#` is cancelled, and the script does the browser's fragment steps itself: the target is an id or
+ * an `<a name>`, raw first and then percent-decoded, else the top for `#` and `#top`. It is
+ * scrolled into view and focused, or, when it cannot take focus, given `tabindex="-1"` until it
+ * loses focus, so the next Tab continues after it. A native fragment navigation
+ * (`location.replace("about:srcdoc#x")`, `location.hash`, `<base href="about:srcdoc">`) would
+ * do this for free, but WebKit fires the iframe's `load` event for it, which the navigation
+ * guard must treat as leaving the document.
+ *
+ * It decides when the click reaches window in the bubble phase, after the artifact's element
+ * and document handlers, so one of those that calls preventDefault keeps the click. Window
+ * listeners the artifact adds itself run after this one, so they see the click already handled. The link is found through
+ * composedPath, so links in open shadow roots count too. Annotate mode stops the click in the
+ * capture phase first. Known limits (#6219), where the click still leaves the document as
+ * before: a handler that stops the click's propagation hides it from window, and a target
+ * inside a closed <details> is not revealed first.
+ *
+ * SECURITY AUDIT: it only cancels a navigation and scrolls or focuses inside the document; it
+ * never navigates, so both navigation guards stay as they are.
+ */
+export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
+    var XLINK = "http://www.w3.org/1999/xlink";
+    function fragmentOf(event) {
+      if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return null;
+      var path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
+      for (var i = 0; i < path.length; i++) {
+        var node = path[i];
+        if (!node || node.nodeType !== 1 || (node.localName !== "a" && node.localName !== "area")) continue;
+        // A download link, or one for another browsing context (target="_blank"), never navigated
+        // this document.
+        if (node.hasAttribute("download")) return null;
+        var linkTarget = node.getAttribute("target");
+        if (linkTarget !== null && linkTarget !== "" && linkTarget.toLowerCase() !== "_self") return null;
+        var href = node.getAttribute("href");
+        if (href === null) href = node.getAttributeNS(XLINK, "href");
+        if (href === null) return null;
+        href = href.trim();
+        return href.charAt(0) === "#" ? href.slice(1) : null;
+      }
+      return null;
+    }
+    // HTML's "find a potential indicated element": an id first, then an <a name>.
+    function findTarget(fragment) {
+      if (fragment === "") return null;
+      var element = document.getElementById(fragment);
+      if (element) return element;
+      var named = document.getElementsByName(fragment);
+      for (var i = 0; i < named.length; i++) if (named[i].localName === "a") return named[i];
+      return null;
+    }
+    function jump(raw) {
+      // Like URL percent-decoding: a "%" without two hex digits stays as it is.
+      var decoded = raw.replace(/(?:%[0-9A-Fa-f]{2})+/g, function (run) {
+        try { return decodeURIComponent(run); } catch (error) { return run; }
+      });
+      var target = findTarget(raw) || findTarget(decoded);
+      if (!target) {
+        if (raw !== "" && decoded.toLowerCase() !== "top") return;
+        // The top of the document: no focusing steps, so focus stays on the link (as in HTML).
+        window.scrollTo(0, 0);
+        return;
+      }
+      target.scrollIntoView();
+      target.focus({ preventScroll: true });
+      // tabIndex cannot tell (an <a> without href reports 0), so check whether focus moved.
+      if (document.activeElement !== target && !target.hasAttribute("tabindex")) {
+        target.setAttribute("tabindex", "-1");
+        target.focus({ preventScroll: true });
+        // Still unfocusable (disabled, inert): no blur will come to remove the attribute.
+        if (document.activeElement !== target) target.removeAttribute("tabindex");
+        // Only our own value: a focus handler (roving tabindex) may have set its own meanwhile.
+        else target.addEventListener("blur", function () {
+          if (target.getAttribute("tabindex") === "-1") target.removeAttribute("tabindex");
+        }, { once: true });
+      }
+    }
+    window.addEventListener("click", function (event) {
+      if (event.defaultPrevented) return;
+      var fragment = fragmentOf(event);
+      if (fragment === null) return;
+      event.preventDefault();
+      jump(fragment);
+    });
+  })();`;
+
+/**
+ * The annotate key the frame forwards, lowercased, from the keybind the panel and Settings use,
+ * so the three cannot drift. The shim checks only a key with no modifiers, so a keybind with
+ * modifiers or a `code` turns forwarding off (null) rather than forwarding the wrong key. Not
+ * an assert: this module loads with the app, and startup must never crash. The shim tests send
+ * the keybind's key, so such a change fails them.
+ */
+function plainSingleKey(keybind: Keybind): string | null {
+  const plain =
+    keybind.key.length === 1 &&
+    keybind.code == null &&
+    !keybind.ctrl &&
+    !keybind.shift &&
+    !keybind.alt &&
+    !keybind.meta;
+  return plain ? keybind.key.toLowerCase() : null;
+}
+const ANNOTATE_FRAME_KEY = plainSingleKey(KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE);
+
+/**
+ * The annotate key is forwarded (as "C") only once the key event has finished dispatching, so
+ * every handler in the artifact (window listeners registered after this one included) has run:
+ * an artifact that uses that key itself (a game, a keyboard widget) calls preventDefault or
+ * stopPropagation and keeps it.
+ * window.setTimeout reads the final defaultPrevented; it is not a timing guess. The exit keys
+ * keep their capture-phase listener.
+ */
+const ANNOTATE_KEY_LISTENER =
+  ANNOTATE_FRAME_KEY == null
+    ? ""
+    : `
+  window.addEventListener("keydown", function (event) {
+    // Auto-repeat would toggle the mode at the repeat rate and spend the frame's message budget,
+    // so a held key could drop its send/setState messages.
+    if (event.repeat || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    if (typeof event.key !== "string" || event.key.toLowerCase() !== ${JSON.stringify(ANNOTATE_FRAME_KEY)}) return;
+    if (isEditable(keyTarget(event))) return;
+    window.setTimeout(function () {
+      if (event.defaultPrevented) return;
+      host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: "C", shiftKey: false }, "*");
+    }, 0);
+  });`;
 
 export function buildArtifactBridgeScript(
   initialTheme: ArtifactTheme,
@@ -258,6 +425,10 @@ export function buildArtifactBridgeScript(
     var message = { xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "send", text: String(text) };
     if (data !== undefined) message.data = clone(data);
     host.postMessage(message, "*");
+  };
+  // openWorkspace() only asks; the host switches only after a user gesture in this frame.
+  api.openWorkspace = function (workspaceId) {
+    host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "openWorkspace", workspaceId: String(workspaceId) }, "*");
   };
   var stateFlushTimer = null;
   var lastStatePostAt = 0;
@@ -352,6 +523,11 @@ export function buildArtifactBridgeScript(
     }
     host.postMessage(message, "*");
   }, true);
+  // The innermost target: a key typed in an input inside an open shadow root reaches window
+  // retargeted to the shadow host, which is not editable.
+  function keyTarget(event) {
+    return typeof event.composedPath === "function" ? event.composedPath()[0] || event.target : event.target;
+  }
   function isEditable(target) {
     if (!target || target.nodeType !== 1) return false;
     var tag = target.tagName;
@@ -363,11 +539,13 @@ export function buildArtifactBridgeScript(
     // Escape is checked before the editable exclusion: keys inside the frame never reach the
     // host, so this is the only way to leave fullscreen while an artifact input has focus.
     if (event.key === "Escape") key = "Escape";
-    else if (isEditable(event.target)) return;
+    else if (isEditable(keyTarget(event))) return;
     else if (plain && event.shiftKey && (event.key === "F" || event.key === "f")) key = "F";
     if (key === null) return;
     host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: key, shiftKey: event.shiftKey }, "*");
   }, true);
+  ${ANNOTATE_KEY_LISTENER}
+  ${ARTIFACT_IN_PAGE_LINK_SCRIPT}
 })();`;
 }
 

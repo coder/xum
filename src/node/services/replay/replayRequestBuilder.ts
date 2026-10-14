@@ -83,10 +83,21 @@ export interface ReplayRequestInputs {
    */
   partialContinuation?: MuxMessage | null;
   /**
+   * MCP Apps model context message from the turn-envelope blob. Request-only
+   * (never in chat.jsonl); assemblePromptPayload inserts it where production does.
+   */
+  mcpAppModelContext?: MuxMessage | null;
+  /**
    * Native tool search: deferred tool names, whose replayed tool_catalog_search results
    * production rewrites into tool_reference blocks. Derived from the recorded wire tools.
    */
   deferLoadingToolNames?: ReadonlySet<string>;
+  /**
+   * The budget production trimmed a compaction request's history to, from the recorded
+   * DevTools run (DevToolsRun.compactionInputBudgetTokens). It depends on the 1M setting and
+   * the retry scale, which no durable log row carries.
+   */
+  compactionInputBudgetTokens?: number;
   workspaceId: string;
 }
 
@@ -227,6 +238,8 @@ export async function buildReplayRequest(inputs: ReplayRequestInputs): Promise<R
     anthropicCacheTtl: inputs.anthropicCacheTtl,
     workspaceId: inputs.workspaceId,
     deferLoadingToolNames: inputs.deferLoadingToolNames,
+    compactionInputBudgetTokens: inputs.compactionInputBudgetTokens,
+    requestContextMessage: inputs.mcpAppModelContext ?? undefined,
   });
 
   const { prompt } = await captureLanguageModelPrompt({

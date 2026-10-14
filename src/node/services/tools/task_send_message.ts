@@ -9,22 +9,24 @@ import type { AgentTreeTargetRelation } from "@/node/services/taskService";
 
 import { parseToolResult, requireTaskService, requireWorkspaceId } from "./toolUtils";
 
+const TARGET_RELATION_LABELS: Record<
+  AgentTreeTargetRelation,
+  ReturnType<typeof targetRelationLabel>
+> = {
+  target_descendant: "descendant",
+  target_ancestor: "ancestor",
+  peer: "sibling",
+  // Cross-tree targets still take the untrusted envelope path, exactly like siblings.
+  target_unrelated: "unrelated",
+  target_main_chat: "main_chat",
+  target_side_chat: "side_chat",
+};
+
 /** Routing relation → the target's relation to the sender, as shown in tool results. */
 function targetRelationLabel(
   relation: AgentTreeTargetRelation
-): "descendant" | "ancestor" | "sibling" | "unrelated" {
-  switch (relation) {
-    case "target_descendant":
-      return "descendant";
-    case "target_ancestor":
-      return "ancestor";
-    case "peer":
-      return "sibling";
-    case "target_unrelated":
-      // Cross-tree target (another root, or a live sub-agent of another tree); the untrusted
-      // envelope path applies, exactly like a sibling.
-      return "unrelated";
-  }
+): "descendant" | "ancestor" | "sibling" | "unrelated" | "main_chat" | "side_chat" {
+  return TARGET_RELATION_LABELS[relation];
 }
 
 export const createTaskSendMessageTool: ToolFactory = (config: ToolConfiguration) => {

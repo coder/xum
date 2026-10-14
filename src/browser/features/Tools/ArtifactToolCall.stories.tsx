@@ -7,7 +7,6 @@ import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import type { ArtifactKind } from "@/common/utils/artifactKind";
 import { ArtifactToolCall } from "./ArtifactToolCall";
-import { AttachFileToolCall } from "./AttachFileToolCall";
 
 const meta = {
   ...lightweightMeta,
@@ -60,7 +59,7 @@ function Section(props: { label: string; children: ReactNode }) {
   );
 }
 
-/** Every card state in one chat-width column: published kinds, a failed publish, attach_file. */
+/** Every card state in one chat-width column: published kinds and a failed publish. */
 function renderGallery() {
   getAppConfigStore().setClient(
     createMockORPCClient({ experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true } })
@@ -89,19 +88,6 @@ function renderGallery() {
             workspaceId={WORKSPACE_ID}
           />
         </Section>
-        <Section label="attach_file registered a version">
-          <AttachFileToolCall
-            toolName="attach_file"
-            args={{ path: "findings.md" }}
-            result={{
-              type: "content",
-              value: [{ type: "text", text: "[File shown to user: findings.md]" }],
-              ui_only: { artifact: { id: "id-findings.md", version: 2, path: "findings.md" } },
-            }}
-            status="completed"
-            workspaceId={WORKSPACE_ID}
-          />
-        </Section>
       </div>
     </div>
   );
@@ -109,7 +95,6 @@ function renderGallery() {
 
 async function waitForGallery(canvasElement: HTMLElement) {
   const canvas = within(canvasElement);
-  await canvas.findByRole("button", { name: /Open in Artifacts/ });
   const cards = await canvas.findAllByRole("button", { name: /in Artifacts$/ });
   await expect(cards).toHaveLength(CARDS.length);
 }

@@ -15,6 +15,7 @@ export type XumAgentsStorageContext =
  * Derive AGENTS storage context from tool configuration.
  */
 export function resolveXumAgentsStorageContext(config: ToolConfiguration): XumAgentsStorageContext {
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   const scope = config.xumScope!;
   if (scope.type === "global") {
     return { kind: "global-local", root: scope.xumHome };

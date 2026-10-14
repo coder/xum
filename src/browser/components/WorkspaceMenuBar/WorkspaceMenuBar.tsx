@@ -1,11 +1,20 @@
 import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { flushSync } from "react-dom";
-import { AppWindow, BarChart3, Bell, BellOff, Ellipsis, Info, Menu, Pencil } from "lucide-react";
+import {
+  AppWindow,
+  BarChart3,
+  Bell,
+  BellOff,
+  Ellipsis,
+  Info,
+  Menu,
+  PanelRightOpen,
+  Pencil,
+} from "lucide-react";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { cn } from "@/common/lib/utils";
-import { getErrorMessage } from "@/common/utils/errors";
-import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
+import { isWorkspacePinned } from "@/common/utils/pin";
 
 import { RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import {
@@ -14,7 +23,7 @@ import {
   useUserPreferences,
 } from "@/browser/stores/AppConfigStore";
 import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
-import { WorkspaceUnrelatedMessagingModal } from "../WorkspaceUnrelatedMessagingModal";
+import { WorkspaceUnrelatedMessagingDialog } from "../WorkspaceUnrelatedMessagingModal/WorkspaceUnrelatedMessagingDialog";
 import { WorkspaceMCPModal } from "../WorkspaceMCPModal/WorkspaceMCPModal";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
@@ -32,13 +41,7 @@ import {
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { Button } from "@/browser/components/Button/Button";
-import {
-  isDevcontainerRuntime,
-  isLocalProjectRuntime,
-  isWorktreeRuntime,
-  type RuntimeConfig,
-} from "@/common/types/runtime";
-import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
+import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
@@ -52,28 +55,36 @@ import { DebugLlmRequestModal } from "../DebugLlmRequestModal/DebugLlmRequestMod
 import { ConfirmationModal } from "../ConfirmationModal/ConfirmationModal";
 import { PopoverError } from "../PopoverError/PopoverError";
 import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
+import {
+  forkWorkspaceFromMenu,
+  getErrorAnchor,
+  requestGenerateWorkspaceTitle,
+  stopWorkspaceRuntime,
+} from "../WorkspaceActionsMenuContent/workspaceActionHandlers";
+import { useHeaderTitleEdit, WorkspaceHeaderTitle } from "./WorkspaceHeaderTitle";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
 import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
 import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 
 import { useWorkspaceActions, useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
-import { forkWorkspace } from "@/browser/utils/chatCommands";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
-import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
   NARROW_VIEWPORT_MAX_WIDTH_PX,
+  RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
   WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
 } from "@/constants/layout";
+import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
 import type { TabType } from "@/browser/types/rightSidebar";
-import { useAgentSkills } from "@/browser/stores/AgentSkillsStore";
+import { useAgentSkills, useAgentSkillsLoaded } from "@/browser/stores/AgentSkillsStore";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 
 interface WorkspaceMenuBarProps {
   workspaceId: string;
@@ -142,7 +153,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   onOpenSidebar,
   sidebarFullscreen = false,
 }) => {
-  const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { preflightArchiveWorkspace, archiveWorkspace, archivingWorkspaceIds, setWorkspacePinned } =
     useWorkspaceActions();
   const isArchiving = archivingWorkspaceIds.has(workspaceId);
@@ -154,7 +165,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const workspaceEntry = workspaceMetadata.get(workspaceId);
   // Heartbeats never fire for sub-agent workspaces.
   const canConfigureHeartbeat = workspaceEntry?.parentWorkspaceId == null;
-  const hasRepository = hasWorkspaceRepository(workspaceEntry);
   // The workspace's metadata.projectName is the parent project (since worktrees
   // are owned by the top-most parent). When the workspace is scoped to a
   // sub-project we surface the hierarchy as "parent / child" so the menu bar
@@ -187,17 +197,23 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   }
   const unrelatedMessagingModalOpen = unrelatedMessagingWorkspaceId === workspaceId;
   const skillList = useAgentSkills({ workspaceId, disableWorkspaceAgents: false });
+  const skillListLoaded = useAgentSkillsLoaded({ workspaceId, disableWorkspaceAgents: false });
   const moreActionsButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuBarRef = useRef<HTMLDivElement | null>(null);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const titleEdit = useHeaderTitleEdit(workspaceId, moreActionsButtonRef);
   const archiveError = usePopoverError();
   const forkError = usePopoverError();
   const stopRuntimeError = usePopoverError();
 
-  const [rightSidebarCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
-    // This state is toggled from RightSidebar, so we need cross-component updates.
-    listener: true,
-  });
+  const [rightSidebarCollapsed] = usePersistedState<boolean>(
+    RIGHT_SIDEBAR_COLLAPSED_KEY,
+    RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
+    {
+      // This state is toggled from RightSidebar, so we need cross-component updates.
+      listener: true,
+    }
+  );
 
   // Notification on response toggle (workspace-level) - defaults to disabled
   const notifyOnResponse =
@@ -389,9 +405,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     return () => window.removeEventListener("keydown", handler);
   }, [artifactsExperimentEnabled, isTimelineSidebarHidden, openSidebarTab]);
 
-  // "Open in Artifacts" on an MCP Apps tool card and openArtifact() (chat cards, file cards,
-  // Review, palette): while the sidebar is hidden, they show the Artifacts tab full-screen
-  // (RightSidebar handles the same events on wider layouts).
+  // openArtifact() (chat cards, file cards, Review, palette) and "Open in tab" on an MCP Apps
+  // tool card: while the sidebar is hidden, they show their tab full-screen (RightSidebar
+  // handles the same events on wider layouts).
   useEffect(() => {
     if (!artifactsExperimentEnabled) {
       return;
@@ -403,38 +419,25 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       }
       openSidebarTab("artifacts", activeElement());
     };
-    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
+    // "Open in tab" shows the view's own app tab full-screen: the tab RightSidebar opens or
+    // focuses on wider layouts, so the view still runs in one place.
+    const appViewHandler = (event: Event) => {
+      const detail = (event as CustomEvent<{ workspaceId: string; toolCallId: string }>).detail;
+      if (detail?.workspaceId !== workspaceId || !isTimelineSidebarHidden()) {
+        return;
+      }
+      openSidebarTab(appViewTabFor(detail.toolCallId), activeElement());
+    };
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
     window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
     return () => {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
       window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
     };
   }, [artifactsExperimentEnabled, isTimelineSidebarHidden, openSidebarTab, workspaceId]);
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
-  // Mirrors TaskService.isLocalUnrelatedMessagingEndpoint: unrelated delivery requires local or
-  // worktree runtimes on both endpoints, so remote/container workspaces get no consent switch —
-  // a grant there could never be honoured. The dialog itself stays reachable everywhere because
-  // its hold-until-turn-end preference also covers same-tree senders, which work on any runtime.
-  // An unset config resolves to the same canonical default the backend applies.
-  const unrelatedMessagingRuntime = runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
-  const unrelatedMessagingSupported =
-    isLocalProjectRuntime(unrelatedMessagingRuntime) ||
-    isWorktreeRuntime(unrelatedMessagingRuntime);
-
-  const getMoreMenuAnchor = useCallback(() => {
-    const rect = moreActionsButtonRef.current?.getBoundingClientRect();
-    if (!rect) {
-      return undefined;
-    }
-
-    return {
-      top: rect.top + window.scrollY,
-      left: rect.right + 10,
-    };
-  }, []);
-
   const handleOpenTouchFullscreenReview = useCallback(() => {
     window.dispatchEvent(
       createCustomEvent(CUSTOM_EVENTS.OPEN_TOUCH_REVIEW_IMMERSIVE, {
@@ -485,60 +488,18 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const handleArchiveChat = (anchorEl?: HTMLElement) =>
     archiveFlow.requestArchive(workspaceId, anchorEl);
 
-  const handleForkChat = useCallback(
-    async (anchorEl: HTMLElement) => {
-      if (!api) {
-        const rect = anchorEl.getBoundingClientRect();
-        forkError.showError(workspaceId, "Not connected to server", {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        });
-        return;
-      }
+  const handleForkWorkspace = async (anchorEl: HTMLElement) => {
+    const anchor = getErrorAnchor(anchorEl);
+    const error = await forkWorkspaceFromMenu(liveApi, workspaceId);
+    if (error) forkError.showError(workspaceId, error, anchor);
+  };
 
-      const rect = anchorEl.getBoundingClientRect();
-      const anchor = { top: rect.top + window.scrollY, left: rect.right + 10 };
-
-      try {
-        const result = await forkWorkspace({
-          client: api,
-          sourceWorkspaceId: workspaceId,
-        });
-        if (!result.success) {
-          forkError.showError(workspaceId, result.error ?? "Failed to fork chat", anchor);
-        }
-      } catch (error) {
-        const message = getErrorMessage(error);
-        forkError.showError(workspaceId, message, anchor);
-      }
-    },
-    [api, forkError, workspaceId]
-  );
-
-  const handleStopRuntime = useCallback(async () => {
-    if (!api) {
-      stopRuntimeError.showError(workspaceId, "Not connected to server", getMoreMenuAnchor());
-      return;
+  const handleStopRuntime = async () => {
+    const error = await stopWorkspaceRuntime(liveApi, runtimeStatusStore, workspaceId);
+    if (error) {
+      stopRuntimeError.showError(workspaceId, error, getErrorAnchor(moreActionsButtonRef.current));
     }
-
-    try {
-      const result = await api.workspace.stopRuntime({ workspaceId });
-      if (!result.success) {
-        stopRuntimeError.showError(
-          workspaceId,
-          result.error ?? "Failed to stop container",
-          getMoreMenuAnchor()
-        );
-        return;
-      }
-
-      // Clear the cached running state immediately so both menu entry points converge
-      // on a fresh backend read after the container stop succeeds.
-      runtimeStatusStore.invalidateWorkspace(workspaceId);
-    } catch (error) {
-      stopRuntimeError.showError(workspaceId, getErrorMessage(error), getMoreMenuAnchor());
-    }
-  }, [api, getMoreMenuAnchor, runtimeStatusStore, stopRuntimeError, workspaceId]);
+  };
 
   // Start workspace tutorial on first entry
   useEffect(() => {
@@ -630,6 +591,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // those controls and the MCP/editor/terminal buttons become unclickable.
   const isDesktop = isDesktopMode();
 
+  const workspaceIsPinned = workspaceEntry ? isWorkspacePinned(workspaceEntry) : false;
   // Mirror sidebar share/archive actions in the workspace menu bar for quick access.
   const moreActionsMenu = (
     <Popover open={moreMenuOpen} onOpenChange={setMoreMenuOpen}>
@@ -673,55 +635,41 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         onClick={(event: React.MouseEvent<HTMLDivElement>) => {
           event.stopPropagation();
         }}
+        onCloseAutoFocus={titleEdit.onMenuCloseAutoFocus}
       >
         {/* Keep MCP configuration in the more actions menu to keep the workspace menu bar lean. */}
         <WorkspaceActionsMenuContent
-          onConfigureMcp={() => setMcpModalOpen(true)}
-          onConfigureHeartbeat={canConfigureHeartbeat ? () => setHeartbeatModalOpen(true) : null}
-          onConfigureUnrelatedMessaging={() => setUnrelatedMessagingWorkspaceId(workspaceId)}
-          onOpenTouchFullscreenReview={
-            hasRepository && isTouchMobileScreen ? handleOpenTouchFullscreenReview : null
-          }
-          onEnterImmersiveReview={
-            hasRepository && !isTouchMobileScreen ? handleEnterImmersiveReview : null
-          }
-          onOpenSidebar={
-            timelineSidebarHidden && onOpenSidebar != null
-              ? () => onOpenSidebar(moreActionsButtonRef.current)
-              : null
-          }
-          onOpenTerminal={isPhoneHeader ? handleOpenTerminal : null}
-          onStopRuntime={isRuntimeRunning ? () => void handleStopRuntime() : null}
-          // Scratch chats have no repo: review events are ignored by
-          // RightSidebar and fork is unsupported on the backend, so hide
-          // both instead of offering dead menu items.
-          onForkChat={
-            hasRepository
-              ? (anchorEl) => {
-                  void handleForkChat(anchorEl);
-                }
-              : null
-          }
-          onTogglePinned={
-            workspaceEntry && isWorkspacePinnable(workspaceEntry)
-              ? () => {
-                  void setWorkspacePinned(workspaceId, !isWorkspacePinned(workspaceEntry));
-                }
-              : null
-          }
-          isPinned={workspaceEntry ? isWorkspacePinned(workspaceEntry) : false}
-          onArchiveChat={
-            workspaceEntry?.parentWorkspaceId != null
-              ? null
-              : (anchorEl) => {
-                  // handleArchiveChat runs preflight and opens a confirmation dialog
-                  // when streaming or untracked files are detected.
-                  void handleArchiveChat(anchorEl);
-                }
-          }
+          state={{
+            surface: "topbar",
+            workspace: workspaceEntry,
+            showsSubAgent: workspaceEntry?.parentWorkspaceId != null,
+            isRuntimeRunning,
+            isTouchMobileScreen,
+            isPhoneHeader,
+            isRightSidebarHidden: timelineSidebarHidden,
+          }}
+          actions={{
+            editTitle: titleEdit.start,
+            generateTitle: () => requestGenerateWorkspaceTitle(workspaceId),
+            configureMcp: () => setMcpModalOpen(true),
+            configureHeartbeat: () => setHeartbeatModalOpen(true),
+            configureMessaging: () => setUnrelatedMessagingWorkspaceId(workspaceId),
+            immersiveReview: handleEnterImmersiveReview,
+            touchFullscreenReview: handleOpenTouchFullscreenReview,
+            openSidebar:
+              onOpenSidebar != null ? () => onOpenSidebar(moreActionsButtonRef.current) : undefined,
+            openTerminal: handleOpenTerminal,
+            togglePinned: () => {
+              void setWorkspacePinned(workspaceId, !workspaceIsPinned);
+            },
+            fork: (anchorEl) => void handleForkWorkspace(anchorEl),
+            stopRuntime: () => void handleStopRuntime(),
+            // Runs preflight and opens a confirmation dialog when streaming or untracked files
+            // are detected.
+            archive: (anchorEl) => void handleArchiveChat(anchorEl),
+          }}
+          isPinned={workspaceIsPinned}
           onCloseMenu={() => setMoreMenuOpen(false)}
-          shortcutClassName="mobile-hide-shortcut-hints"
-          configureMcpTestId="workspace-mcp-button"
         />
       </PopoverContent>
     </Popover>
@@ -734,7 +682,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       className={cn(
         "bg-sidebar border-border-light flex items-center justify-between border-b px-2",
         isDesktop ? DESKTOP_TITLEBAR_HEIGHT_CLASS : "h-8",
-        rightSidebarCollapsed && "titlebar-safe-right-minus-sidebar titlebar-safe-right-gutter-2",
+        // A collapsed right sidebar floats below the header, so the header reaches the window's
+        // right edge and must clear the titlebar overlay controls itself.
+        rightSidebarCollapsed && "titlebar-safe-right titlebar-safe-right-gutter-2",
         // In desktop mode, make header draggable for window movement
         isDesktop && "titlebar-drag",
         // Keep header visible when iOS keyboard opens and causes scroll
@@ -768,9 +718,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             <TooltipContent>Open sidebar ({formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)})</TooltipContent>
           </Tooltip>
         )}
-        <span className="min-w-0 truncate text-sm" data-testid="workspace-title">
-          {workspaceTitle ?? workspaceName}
-        </span>
+        <WorkspaceHeaderTitle
+          workspaceId={workspaceId}
+          title={workspaceTitle ?? workspaceName}
+          edit={titleEdit}
+        />
         {/* Touch and keyboard users need a focusable control for workspace details. */}
         <Popover open={detailsPopoverOpen} onOpenChange={setDetailsPopoverOpen}>
           <Tooltip
@@ -916,7 +868,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                   href="https://mux.coder.com/config/notifications"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-accent hover:underline"
+                  className="text-accent-text hover:underline"
                 >
                   Learn more
                 </a>
@@ -926,10 +878,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         </Popover>
         <SkillIndicator
           loadedSkills={loadedSkills}
-          availableSkills={skillList.skills}
+          availableSkills={listInvocableSkills(skillList)}
           invalidSkills={skillList.invalidSkills}
+          skillWarnings={skillList.skillWarnings}
           unavailableSources={skillList.unavailableSources}
           skillLoadErrors={skillLoadErrors}
+          loading={!skillListLoaded}
         />
         {editorError && <span className="text-danger-soft text-xs">{editorError}</span>}
         <div className="max-[480px]:hidden">
@@ -1015,36 +969,48 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         )}
       </div>
       {!isPhoneHeader && moreActionsMenu}
+      {rightSidebarCollapsed && !isPhoneHeader && (
+        // Stands in for the collapsed sidebar's overview card where the card does not fit beside
+        // the transcript: globals.css shows exactly one of the two.
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() =>
+                window.dispatchEvent(
+                  createCustomEvent(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, { workspaceId })
+                )
+              }
+              aria-label="Expand right sidebar"
+              className={cn(
+                "right-sidebar-overview-expand text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0",
+                isDesktop && "titlebar-no-drag"
+              )}
+            >
+              <PanelRightOpen className="h-3.5 w-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" align="end">
+            Expand right sidebar
+          </TooltipContent>
+        </Tooltip>
+      )}
       <WorkspaceHeartbeatModal
         workspaceId={workspaceId}
         open={heartbeatModalOpen}
         onOpenChange={setHeartbeatModalOpen}
       />
-      <WorkspaceUnrelatedMessagingModal
+      <WorkspaceUnrelatedMessagingDialog
         // Remount per workspace: the keyed open state above only closes the dialog, while
         // the modal's own pending/error state and in-flight request id would otherwise
         // survive the switch and surface in the next workspace's dialog.
         key={workspaceId}
+        workspaceId={workspaceId}
+        runtimeConfig={runtimeConfig}
+        workspace={workspaceEntry}
         open={unrelatedMessagingModalOpen}
         onOpenChange={(open) => setUnrelatedMessagingWorkspaceId(open ? workspaceId : null)}
-        consentSupported={unrelatedMessagingSupported}
-        // Read straight from published metadata: the switch moves only after the backend
-        // commits and republishes, never on the local ack alone.
-        enabled={workspaceEntry?.unrelatedWorkspaceConsent != null}
-        onSetEnabled={(enabled) =>
-          api
-            ? api.workspace.setUnrelatedWorkspaceConsent({ workspaceId, enabled })
-            : Promise.resolve({ success: false as const, error: "Not connected to server" })
-        }
-        holdUntilTurnEnd={workspaceEntry?.agentMessageDispatchMode === "turn-end"}
-        onSetHoldUntilTurnEnd={(hold) =>
-          api
-            ? api.workspace.setAgentMessageDispatchMode({
-                workspaceId,
-                mode: hold ? "turn-end" : "tool-end",
-              })
-            : Promise.resolve({ success: false as const, error: "Not connected to server" })
-        }
       />
       <WorkspaceMCPModal
         workspaceId={workspaceId}
@@ -1066,12 +1032,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       />
       <PopoverError
         error={forkError.error}
-        prefix="Failed to fork chat"
+        prefix="Failed to fork workspace"
         onDismiss={forkError.clearError}
       />
       <PopoverError
         error={archiveError.error}
-        prefix="Failed to archive chat"
+        prefix="Failed to archive workspace"
         onDismiss={archiveError.clearError}
       />
     </div>

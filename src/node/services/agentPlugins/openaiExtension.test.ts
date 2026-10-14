@@ -1,0 +1,353 @@
+import { describe, expect, test } from "bun:test";
+
+import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import {
+  MAX_HOOK_POINTER_ENTRIES,
+  normalizeCodexManifest,
+  readOpenAIExtension,
+} from "./openaiExtension";
+
+const validInterface = { displayName: "Figma", shortDescription: "Design", developerName: "Figma" };
+
+describe("readOpenAIExtension", () => {
+  test("parses every supported field and normalizes package paths", () => {
+    const { extension, warnings } = readOpenAIExtension({
+      extensions: {
+        "com.openai": {
+          apps: "./.app.json",
+          hooks: ["./hooks/session.json", { hooks: {} }],
+          onboardingSkill: "./skills/setup/SKILL.md",
+        },
+      },
+    });
+
+    expect(warnings).toEqual([]);
+    expect(extension).toEqual({
+      apps: "./.app.json",
+      hooks: ["./hooks/session.json", { inline: { hooks: {} }, index: 1 }],
+      onboardingSkill: "./skills/setup/SKILL.md",
+    });
+  });
+
+  test("drops each invalid field with a warning and keeps the valid ones", () => {
+    const { extension, warnings } = readOpenAIExtension({
+      extensions: {
+        "com.openai": {
+          apps: "../outside.json",
+          hooks: ["/etc/hooks.json", "./hooks/ok.json"],
+          onboardingSkill: "./skills/setup/README.md",
+        },
+      },
+    });
+
+    expect(extension).toEqual({
+      hooks: ["./hooks/ok.json"],
+    });
+    expect(warnings).toHaveLength(3);
+    for (const field of ["apps", "hooks", "onboardingSkill"]) {
+      expect(warnings.some((warning) => warning.includes(field))).toBe(true);
+    }
+  });
+
+  test("validates the interface: bad URL, too-long text and an escaping image are dropped", () => {
+    const { extension, warnings } = readOpenAIExtension({
+      extensions: {
+        "com.openai": {
+          interface: {
+            ...validInterface,
+            longDescription: "x".repeat(4001),
+            websiteURL: "http://example.com",
+            privacyPolicyURL: "https://example.com/privacy",
+            brandColor: "#1ABCFE",
+            logo: "../outside.png",
+            composerIcon: "./assets/icon.png",
+            defaultPrompt: "Inspect a design",
+            capabilities: ["Read"],
+          },
+        },
+      },
+    });
+    expect(extension?.interface).toEqual({
+      ...validInterface,
+      privacyPolicyURL: "https://example.com/privacy",
+      brandColor: "#1ABCFE",
+      composerIcon: "./assets/icon.png",
+      defaultPrompt: ["Inspect a design"],
+      capabilities: ["Read"],
+    });
+    expect(warnings).toHaveLength(3);
+    for (const field of ["longDescription", "websiteURL", "logo"]) {
+      expect(warnings.some((warning) => warning.includes(`interface.${field}'`))).toBe(true);
+    }
+  });
+
+  test("required names up to OpenAI's package limits are kept; one more character drops the interface", () => {
+    const atLimits = {
+      displayName: "d".repeat(80),
+      shortDescription: "s".repeat(240),
+      developerName: "v".repeat(120),
+    };
+    const read = (iface: Record<string, unknown>) =>
+      readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
+    expect(read(atLimits)).toEqual({ extension: { interface: atLimits }, warnings: [] });
+    for (const [field, value] of Object.entries(atLimits)) {
+      const { extension, warnings } = read({ ...atLimits, [field]: `${value}x` });
+      expect(extension).toEqual({});
+      expect(warnings.some((warning) => warning.includes(`interface.${field}'`))).toBe(true);
+    }
+  });
+
+  test("control and direction characters: a required field drops the interface, an optional one is dropped", () => {
+    const read = (iface: Record<string, unknown>) =>
+      readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
+    // U+202E reverses the rest of the line: "Example\u202eelgooG" reads as "ExampleGoogle".
+    const spoofed = read({ ...validInterface, developerName: "Example\u202eelgooG" });
+    expect(spoofed.extension).toEqual({});
+    expect(spoofed.warnings.some((w) => w.includes("interface.developerName'"))).toBe(true);
+    // U+061C (ARABIC LETTER MARK) is a direction control too.
+    expect(read({ ...validInterface, developerName: "Example\u061cCo" }).extension).toEqual({});
+    for (const bad of [
+      "a\u0007b",
+      "a\u0085b",
+      "a\u2028b",
+      "a\u2066b",
+      "a\u200fb",
+      "two\nlines",
+      "  ",
+    ]) {
+      expect(read({ ...validInterface, displayName: bad }).extension).toEqual({});
+    }
+    // Optional: dropped alone, with a warning. longDescription may break lines with \n.
+    const optional = read({
+      ...validInterface,
+      category: "Design\u202a",
+      longDescription: "First line\nSecond line",
+    });
+    expect(optional.extension?.interface).toEqual({
+      ...validInterface,
+      longDescription: "First line\nSecond line",
+    });
+    expect(optional.warnings).toHaveLength(1);
+    expect(optional.warnings[0]).toContain("interface.category'");
+    // Capabilities and prompts are text too.
+    expect(read({ ...validInterface, capabilities: ["Read\u202e"] }).extension?.interface).toEqual(
+      validInterface
+    );
+  });
+
+  test("invisible format characters (\\p{Cf}) are refused like direction controls", () => {
+    const read = (iface: Record<string, unknown>) =>
+      readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
+    // ZERO WIDTH SPACE: "Fig\u200bma" looks like "Figma" in Settings.
+    for (const bad of ["Fig\u200bma", "Fig\u2064ma", "Fig\ufeffma", "Fig\u00adma", "Fig\u2060ma"]) {
+      expect(read({ ...validInterface, developerName: bad }).extension).toEqual({});
+    }
+    const optional = read({ ...validInterface, longDescription: "Line one\nLine\u200b two" });
+    expect(optional.extension?.interface).toEqual(validInterface);
+    expect(optional.warnings).toHaveLength(1);
+  });
+
+  test("joiners and emoji tag characters stay allowed; other format characters do not", () => {
+    const read = (iface: Record<string, unknown>) =>
+      readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
+    // ZWJ emoji sequence, a Persian name with ZWNJ, and a subdivision flag (tag characters).
+    const scotland = "\u{1f3f4}\u{e0067}\u{e0062}\u{e0073}\u{e0063}\u{e0074}\u{e007f}";
+    for (const good of [
+      "Dev \u{1f469}\u200d\u{1f4bb}",
+      "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645",
+      `Team ${scotland}`,
+      // An emoji with VS16, a keycap, and a Hindi conjunct broken with ZWNJ.
+      "Love \u2764\ufe0f",
+      "Room 1\ufe0f\u20e3",
+      "\u0915\u094d\u200c\u0937",
+    ]) {
+      const result = read({ ...validInterface, displayName: good, developerName: good });
+      expect(result.warnings).toEqual([]);
+      expect(result.extension?.interface?.displayName).toBe(good);
+    }
+    // Outside those sequences they are invisible spoofing tools (Codex PRRT_kwDOPxxmWM6sQExO).
+    for (const bad of [
+      "Fig\u200bma",
+      "Example\u202eelgooG",
+      "Fig\u200dma",
+      "Fig\u200cma",
+      "\u200c\u0645\u06cc",
+      "Fig\u{e0067}ma",
+      "\u{1f3f4}\u{e0067}\u{e0062}",
+      // Variation selectors outside an emoji or keycap, and ZWNJ in a script without shaping
+      // (Codex PRRT_kwDOPxxmWM6sQ79s, PRRT_kwDOPxxmWM6sQ79z).
+      "Fig\ufe0fma",
+      "Fig\u{e0100}ma",
+      "\u5f00\u53d1\u200c\u8005",
+      "\u0440\u0443\u200c\u0441",
+    ]) {
+      expect(read({ ...validInterface, developerName: bad }).extension).toEqual({});
+    }
+    for (const label of ["\u200d", "\ufe0f"]) {
+      const blank = read({ ...validInterface, capabilities: ["Search", label] });
+      expect(blank.extension?.interface).toEqual(validInterface);
+    }
+  });
+
+  test("joiner and tag exceptions need their exact context; Hangul fillers are refused (#6560)", () => {
+    const read = (iface: Record<string, unknown>) =>
+      readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
+    // A Devanagari half-form (ZWJ after a virama), and a mark after a Persian ZWNJ.
+    for (const text of ["\u0915\u094d\u200d\u0937", "\u0647\u200c\u0610\u0627"]) {
+      const good = read({ ...validInterface, displayName: text, developerName: text });
+      expect(good.warnings).toEqual([]);
+      expect(good.extension?.interface?.displayName).toBe(text);
+    }
+    for (const bad of [
+      // ZWJ without a virama shapes nothing, and a ZWJ across scripts is a spoof.
+      "\u0915\u200d\u0937",
+      "\u0627\u200d\u0915",
+      "\u0915\u094d\u200d\u0627",
+      // After the virama ZWJ must come a letter, not a digit or a vowel sign.
+      "\u0915\u094d\u200d\u0967",
+      "\u0915\u094d\u200d\u093e",
+      // A virama ZWJ needs a same-script letter before the virama too.
+      "\u094d\u200d\u0937",
+      "A\u094d\u200d\u0937",
+      // Only marks of a shaping script may sit after a ZWNJ (a Khmer vowel sign may not).
+      "\u0628\u200c\u17b6\u0628",
+      // ZWNJ between Arabic-Indic digits: digits are not letters.
+      "\u0661\u200c\u0662",
+      // A tag that is not a digit or lowercase letter, and a one-tag payload.
+      "\u{1f3f4}\u{e0021}\u{e0062}\u{e007f}",
+      "\u{1f3f4}\u{e0067}\u{e007f}",
+      // Hangul fillers are invisible letters.
+      "Fig\u3164ma",
+      "\u3164",
+      "Fig\uffa0ma",
+      "Fig\u115fma",
+      "Fig\u1160ma",
+    ]) {
+      expect(read({ ...validInterface, developerName: bad }).extension).toEqual({});
+    }
+  });
+
+  test("a long run of Arabic combining marks is checked in linear time (#6560)", () => {
+    // U+0610 is in an Arabic shaping script and is a mark. The old ZWNJ rule rescanned the rest of
+    // the string from each one: quadratic, about 50 ms per read on Bun and 200 ms on Node at the
+    // 4000-character longDescription cap. Twenty reads keep that far above the bound, and the
+    // linear rule far below it.
+    const marks = "\u0610".repeat(4000);
+    const extension = {
+      "com.openai": { interface: { ...validInterface, longDescription: marks } },
+    };
+    const started = performance.now();
+    for (let read = 0; read < 20; read++) {
+      expect(
+        readOpenAIExtension({ extensions: extension }).extension?.interface?.longDescription
+      ).toBe(marks);
+    }
+    expect(performance.now() - started).toBeLessThan(250);
+  });
+
+  test("a blank capability drops the capability list with a warning", () => {
+    const read = (capabilities: unknown) =>
+      readOpenAIExtension({
+        extensions: { "com.openai": { interface: { ...validInterface, capabilities } } },
+      });
+    for (const blank of ["", "   "]) {
+      const result = read(["Search", blank]);
+      expect(result.extension?.interface).toEqual(validInterface);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain("interface.capabilities'");
+    }
+    expect(read(["Search", "Read"]).extension?.interface?.capabilities).toEqual(["Search", "Read"]);
+  });
+
+  test("an interface without its required names is dropped as a whole", () => {
+    const { extension, warnings } = readOpenAIExtension({
+      extensions: { "com.openai": { interface: { displayName: "Only a name" } } },
+    });
+    expect(extension).toEqual({});
+    expect(warnings).toHaveLength(1);
+  });
+
+  test("reads at most the hook loader's entry cap and reports the rest once", () => {
+    const { extension, warnings } = readOpenAIExtension({
+      extensions: {
+        "com.openai": { hooks: [...Array<string>(100_000).fill("/bad"), "./hooks/late.json"] },
+      },
+    });
+
+    // The late valid entry is past the cap, so no entry is valid: the default file stays off.
+    expect(extension).toEqual({ hooks: [] });
+    expect(warnings).toHaveLength(MAX_HOOK_POINTER_ENTRIES + 1);
+    expect(warnings.filter((warning) => warning.includes("100001 entries"))).toHaveLength(1);
+  });
+
+  test("keeps review and publication as opaque objects; other shapes warn", () => {
+    const review = { tests: [{ prompt: "Hi" }] };
+    const kept = readOpenAIExtension({
+      extensions: { "com.openai": { review, publication: { countries: [] } } },
+    });
+    expect(kept).toEqual({ extension: { review, publication: { countries: [] } }, warnings: [] });
+
+    const dropped = readOpenAIExtension({
+      extensions: { "com.openai": { review: "yes", publication: [] } },
+    });
+    expect(dropped.extension).toEqual({});
+    expect(dropped.warnings).toHaveLength(2);
+  });
+
+  test("an absent namespace yields nothing; a non-object namespace warns", () => {
+    expect(readOpenAIExtension({})).toEqual({ extension: undefined, warnings: [] });
+    const result = readOpenAIExtension({ extensions: { "com.openai": "yes" } });
+    expect(result.extension).toBeUndefined();
+    expect(result.warnings).toHaveLength(1);
+  });
+});
+
+describe("normalizeCodexManifest", () => {
+  test("maps a skills path or every entry of a skills array", () => {
+    expect(normalizeCodexManifest({ name: "a", skills: ["./custom/"] }).manifest).toMatchObject({
+      contributes: { skills: ["./custom"] },
+    });
+    const { manifest } = normalizeCodexManifest({ name: "a", skills: ["./a/", "./b", "../x", 3] });
+    // Unsafe entries pass through so the validator reports each one.
+    expect(manifest).toMatchObject({ contributes: { skills: ["./a", "./b", "../x", 3] } });
+    expect(manifest).not.toHaveProperty("skills");
+    // One MCP file only: a one-entry mcpServers array maps, a longer one stays unknown.
+    expect(
+      normalizeCodexManifest({ name: "a", mcpServers: ["./.mcp.json"] }).manifest
+    ).toMatchObject({ contributes: { mcp: "./.mcp.json" } });
+    expect(
+      normalizeCodexManifest({ name: "a", mcpServers: ["./a.json", "./b.json"] }).manifest
+    ).toMatchObject({ mcpServers: ["./a.json", "./b.json"] });
+    // Another shape stays top-level, and the validator reports it as unknown.
+    expect(normalizeCodexManifest({ name: "a", skills: { a: 1 } }).manifest).toMatchObject({
+      skills: { a: 1 },
+    });
+  });
+
+  test("adds $schema and folds Codex top-level fields; inline extension values win", () => {
+    const { manifest, warnings } = normalizeCodexManifest({
+      name: "figma",
+      skills: "./skills/",
+      mcpServers: "./.mcp.json",
+      apps: "./.app.json",
+      hooks: "./legacy-hooks.json",
+      interface: validInterface,
+      extensions: { "com.openai": { hooks: "./hooks/hooks.json" } },
+    });
+
+    expect(manifest).toEqual({
+      $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+      name: "figma",
+      contributes: { skills: "./skills", mcp: "./.mcp.json" },
+      extensions: {
+        "com.openai": {
+          hooks: "./hooks/hooks.json",
+          apps: "./.app.json",
+          interface: validInterface,
+        },
+      },
+    });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("Top-level 'hooks' conflicts");
+  });
+});

@@ -5,15 +5,22 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
+import assert from "@/common/utils/assert";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
-import type { McpAppViewRef } from "./mcpAppViewsStore";
+import {
+  markMcpAppViewHosted,
+  setMcpAppViewFullscreenOnly,
+  useMcpAppViewFullscreenOnly,
+  useMcpAppViewReloadKey,
+  type McpAppViewRef,
+} from "./mcpAppViewsStore";
 
 // The card's display values: the aggregated tool name and the pre-sanitization arguments.
 const VIEW: McpAppViewRef = {
@@ -29,6 +36,23 @@ const VIEW: McpAppViewRef = {
 
 let invocation: McpAppView["invocation"] = null;
 let viewCsp: McpAppView["csp"] = {};
+let approvals: Array<{ serverName: string; origins: string[] }> = [];
+let approveFails: Error | null = null;
+let approvalProjectPath: string | null = "/repo";
+// When set, each approve call waits for the test to resolve it with the list it returns and the
+// backend commit revision of that list.
+let approveDeferred: Array<(approvedDomains: string[], revision: number) => void> | null = null;
+// When set, getView waits for this promise.
+let getViewGate: Promise<void> | null = null;
+// Backend commit revisions. Never reset: the approval store outlives a test and keeps the list
+// with the newest revision.
+let revision = Date.now() * 1000;
+// The view's stored widget state and its record binding (getView), and the writes it gets.
+let widgetState: unknown = null;
+let widgetStateBinding: string | null = null;
+let widgetStateWrites: Array<{ binding: string; state: unknown }> = [];
+// When set, setWidgetState answers only once it settles (a write in flight).
+let widgetStateWriteGate: Promise<void> | null = null;
 let toolCalls: Array<{
   serverName: string;
   toolName: string;
@@ -36,10 +60,11 @@ let toolCalls: Array<{
   consented: boolean;
 }> = [];
 
-function Wrapper(props: { children: ReactNode }) {
-  const api: TestApiOverrides<APIClient> = {
+function serverApi(): TestApiOverrides<APIClient> {
+  return {
     mcpApps: {
-      getView: () => {
+      getView: async () => {
+        await getViewGate;
         return Promise.resolve({
           success: true as const,
           data: {
@@ -49,8 +74,36 @@ function Wrapper(props: { children: ReactNode }) {
             resultAvailable: true,
             result: { content: [] },
             invocation,
+            approvalProjectPath,
+            widgetState,
+            widgetStateBinding,
+            // Read now, like the backend: newer than every list published so far.
+            approvedDomainsRevision: ++revision,
           },
         });
+      },
+      approveViewDomains: (input: { serverName: string; origins: string[] }) => {
+        approvals.push({ serverName: input.serverName, origins: input.origins });
+        if (approveFails) return Promise.reject(approveFails);
+        const deferred = approveDeferred;
+        if (deferred) {
+          return new Promise((resolve) =>
+            deferred.push((approvedDomains, committed) =>
+              resolve({ success: true as const, data: { approvedDomains, revision: committed } })
+            )
+          );
+        }
+        return Promise.resolve({
+          success: true as const,
+          data: { approvedDomains: input.origins, revision: ++revision },
+        });
+      },
+      setWidgetState: (input: { binding: string; state: unknown }) => {
+        widgetStateWrites.push({ binding: input.binding, state: input.state });
+        return (widgetStateWriteGate ?? Promise.resolve()).then(() => ({
+          success: true as const,
+          data: {},
+        }));
       },
       callTool: (input: {
         serverName: string;
@@ -73,20 +126,44 @@ function Wrapper(props: { children: ReactNode }) {
       },
     },
   };
+}
+
+function Wrapper(props: { children: ReactNode }) {
   return (
     <ThemeProvider forcedTheme="dark">
-      <APIProvider client={createTestApiClient(api)}>{props.children}</APIProvider>
+      <APIProvider client={createTestApiClient(serverApi())}>{props.children}</APIProvider>
     </ThemeProvider>
   );
 }
 
-/** Deliver a JSON-RPC message as if the view frame posted it. */
-function postFromView(frame: HTMLIFrameElement, data: unknown) {
+/** Post from the frame's window to the app window: what a page the view navigated to can do. */
+function postFromFrameWindow(frame: HTMLIFrameElement, data: unknown, ports: unknown[] = []) {
   const event = new window.Event("message");
   Object.defineProperty(event, "data", { value: data });
   Object.defineProperty(event, "source", { value: frame.contentWindow });
+  Object.defineProperty(event, "ports", { value: ports });
   act(() => {
     window.dispatchEvent(event);
+  });
+}
+
+/** A view document run from the frame's srcdoc (its real preamble), by frame. */
+interface BootedDocument {
+  /** The view's `window.parent`: the document's port to the host. */
+  parent: { postMessage: (message: unknown, targetOrigin: string) => void };
+  /** Gets every message the host sends the document. */
+  listeners: Array<(message: Posted) => void>;
+  /** Fire a window event (e.g. pagehide) in the document. */
+  dispatch: (type: string) => void;
+}
+const bootedDocuments = new WeakMap<HTMLIFrameElement, BootedDocument>();
+
+/** Deliver a JSON-RPC message as the view sends it: over its document's port. */
+function postFromView(frame: HTMLIFrameElement, data: unknown) {
+  const booted = bootedDocuments.get(frame);
+  assert(booted != null, "boot the view document first (bootDocument)");
+  act(() => {
+    booted.parent.postMessage(data, "*");
   });
 }
 
@@ -98,29 +175,100 @@ interface Posted {
   error?: { code: number };
 }
 
-/** Every message the host posted into the view. */
+/** The window.openai shim's seed in a view srcdoc (a JSON string the shim parses). */
+function openAiSeedOf(srcdoc: string | null): unknown {
+  const literal = /JSON\.parse\(("(?:[^"\\]|\\.)*")\)/.exec(srcdoc ?? "")?.[1];
+  assert(literal != null, "the srcdoc has no window.openai seed");
+  return JSON.parse(JSON.parse(literal) as string) as unknown;
+}
+
+/** Every message the host posted into the view document. */
 function capturePosted(frame: HTMLIFrameElement): Posted[] {
   const posted: Posted[] = [];
-  frame.contentWindow!.postMessage = ((message: Posted) => {
-    posted.push(message);
-  }) as Window["postMessage"];
+  bootedDocuments.get(frame)!.listeners.push((message) => posted.push(message));
   return posted;
 }
 
-/** Replies the host posted into the view, by request id. */
+/** Replies the host posted into the view document, by request id. */
 function captureReplies(frame: HTMLIFrameElement) {
   const replies = new Map<unknown, { result?: unknown; error?: { code: number } }>();
-  const target = frame.contentWindow!;
-  target.postMessage = ((message: { id?: unknown; result?: unknown; error?: { code: number } }) => {
+  bootedDocuments.get(frame)!.listeners.push((message) => {
     if (message.id !== undefined) replies.set(message.id, message);
-  }) as Window["postMessage"];
+  });
   return replies;
+}
+
+/** Messages posted to the frame's window itself, which a navigated page would receive. */
+function captureFrameWindowPosts(frame: HTMLIFrameElement): unknown[] {
+  const posts: unknown[] = [];
+  frame.contentWindow!.postMessage = ((message: unknown) => {
+    posts.push(message);
+  }) as Window["postMessage"];
+  return posts;
+}
+
+const tick = () => act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+
+/** Press the strip's Allow once its arming delay is over (confirmArming.ts). */
+async function pressAllow(button: HTMLElement) {
+  await waitFor(() => expect(button.hasAttribute("disabled")).toBe(false), {
+    timeout: CONFIRM_ARM_DELAY_MS * 4,
+  });
+  fireEvent.pointerDown(button);
+  fireEvent.click(button);
+}
+
+/**
+ * Run the view document's first script (the preamble) the way the frame's document would. It
+ * opens the document's channel: its open announcement reaches the app from the frame's window.
+ */
+function bootDocument(frame: HTMLIFrameElement): BootedDocument {
+  const doc = new window.DOMParser().parseFromString(frame.getAttribute("srcdoc")!, "text/html");
+  const preamble = doc.querySelector("script")?.textContent ?? "";
+  const handlers: Array<{ type: string; listener: () => void }> = [];
+  const listeners: BootedDocument["listeners"] = [];
+  const documentWindow: Record<string, unknown> = {
+    parent: {
+      postMessage: (data: unknown, _origin: string, ports: unknown[] = []) =>
+        postFromFrameWindow(frame, data, ports),
+    },
+    MessageEvent: class {
+      constructor(
+        readonly type: string,
+        readonly init: { data: Posted }
+      ) {}
+    },
+    dispatchEvent: (event: { init: { data: Posted } }) => {
+      for (const listener of listeners) listener(event.init.data);
+      return true;
+    },
+    addEventListener: (type: string, listener: () => void) => handlers.push({ type, listener }),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
+  (new Function("window", preamble) as (window: unknown) => void)(documentWindow);
+  const booted: BootedDocument = {
+    parent: documentWindow.parent as BootedDocument["parent"],
+    listeners,
+    dispatch: (type) => {
+      for (const entry of handlers) if (entry.type === type) entry.listener();
+    },
+  };
+  bootedDocuments.set(frame, booted);
+  return booted;
+}
+
+/** The mounted view frame, with its document booted (its channel is open). */
+async function findOpenFrame(view: { findByTestId: (id: string) => Promise<HTMLElement> }) {
+  const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+  bootDocument(frame);
+  return frame;
 }
 
 async function renderFrame() {
   const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
   const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
-  return { view, frame, posted: capturePosted(frame) };
+  const document = bootDocument(frame);
+  return { view, frame, posted: capturePosted(frame), document };
 }
 
 describe("McpAppFrame", () => {
@@ -131,6 +279,15 @@ describe("McpAppFrame", () => {
     window.localStorage.clear();
     invocation = null;
     viewCsp = {};
+    approvals = [];
+    approveFails = null;
+    approvalProjectPath = "/repo";
+    approveDeferred = null;
+    widgetState = null;
+    widgetStateBinding = null;
+    widgetStateWrites = [];
+    widgetStateWriteGate = null;
+    getViewGate = null;
     toolCalls = [];
     // Desktop mode by default: the preload bridge exists (isDesktopMode). Browser tests delete it.
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -142,11 +299,265 @@ describe("McpAppFrame", () => {
     cleanupDom = null;
   });
 
-  test("grants no CDN source until the saved preferences load", async () => {
-    getAppConfigStore().clearCachedState();
-    viewCsp = { resourceDomains: ["https://cdn.tailwindcss.com"] };
-    const { frame } = await renderFrame();
-    expect(frame.getAttribute("srcdoc")).not.toContain("https://cdn.tailwindcss.com");
+  // Offline, Allow waits for the next client instead of failing.
+  test.each([...GAP_MODES])(
+    "Allow is disabled while offline and the prompt stays (%s)",
+    async (mode) => {
+      invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+      viewCsp = { connectDomains: ["https://api.example.com"] };
+      const harness = createConnectionHarness(mode, serverApi);
+      const view = render(
+        <ThemeProvider forcedTheme="dark">
+          <harness.Wrapper>
+            <McpAppFrame workspaceId="ws" view={VIEW} />
+          </harness.Wrapper>
+        </ThemeProvider>
+      );
+      await view.findByTestId("mcp-app-frame");
+      const allow = () => view.getByRole("button", { name: "Allow" }) as HTMLButtonElement;
+      await waitFor(() => expect(allow().disabled).toBe(false), {
+        timeout: CONFIRM_ARM_DELAY_MS + 1000,
+      });
+
+      await harness.drop();
+      expect(allow().disabled).toBe(true);
+      harness.reconnect();
+      await waitFor(() => expect(allow().disabled).toBe(false));
+      await pressAllow(allow());
+      await waitFor(() =>
+        expect(approvals).toEqual([
+          { serverName: "charts-raw", origins: ["https://api.example.com"] },
+        ])
+      );
+    }
+  );
+
+  test("declared domains run under the base policy until the user allows them", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = {
+      connectDomains: ["https://api.example.com", "http://insecure.example.com"],
+      frameDomains: ["https://frame.example.com"],
+    };
+    const { view, frame } = await renderFrame();
+    expect(frame.getAttribute("srcdoc")).not.toContain("api.example.com");
+    expect(view.getByRole("alert").textContent).toContain(
+      "This view wants to reach: api.example.com"
+    );
+    // Not now keeps the base policy and hides the strip.
+    fireEvent.click(view.getByRole("button", { name: "Not now" }));
+    expect(view.queryByRole("alert")).toBeNull();
+    expect(approvals).toEqual([]);
+    cleanup();
+
+    const again = await renderFrame();
+    await pressAllow(again.view.getByRole("button", { name: "Allow" }));
+    // Approved for the record's raw server key, then the view reloads under the wider policy.
+    await waitFor(() =>
+      expect(approvals).toEqual([
+        { serverName: "charts-raw", origins: ["https://api.example.com"] },
+      ])
+    );
+    await waitFor(() => {
+      const csp = again.view.getByTestId("mcp-app-frame").getAttribute("srcdoc") ?? "";
+      expect(csp).toContain("connect-src https://api.example.com");
+      expect(csp).not.toContain("insecure.example.com");
+      expect(csp).toContain("frame-src 'none'");
+    });
+    expect(again.view.queryByText(/wants to reach/)).toBeNull();
+  });
+
+  test("the prompt names the project that keeps the approval", async () => {
+    // A task of a multi-project workspace stores approvals on its first project, not its own.
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    approvalProjectPath = "/work/alpha";
+    const { view } = await renderFrame();
+    expect(view.getByRole("alert").textContent).toContain("alpha");
+  });
+
+  test("an approval applies at once to every mounted view of the same server", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws" view={VIEW} />
+        <McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />
+      </>,
+      { wrapper: Wrapper }
+    );
+    await waitFor(() => expect(view.getAllByTestId("mcp-app-frame")).toHaveLength(2));
+    await pressAllow(view.getAllByRole("button", { name: "Allow" })[0]);
+    await waitFor(() => {
+      for (const frame of view.getAllByTestId("mcp-app-frame")) {
+        expect(frame.getAttribute("srcdoc")).toContain("connect-src https://api.example.com");
+      }
+    });
+    expect(view.queryAllByRole("button", { name: "Allow" })).toHaveLength(0);
+  });
+
+  test("an older approval response never replaces a newer one", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://a.example.com", "https://b.example.com"] };
+    const responders: Array<(approvedDomains: string[], revision: number) => void> = [];
+    approveDeferred = responders;
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws" view={VIEW} />
+        <McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />
+      </>,
+      { wrapper: Wrapper }
+    );
+    await waitFor(() => expect(view.getAllByRole("button", { name: "Allow" })).toHaveLength(2));
+    const [first, second] = view.getAllByRole("button", { name: "Allow" });
+    await pressAllow(first);
+    await pressAllow(second);
+    await waitFor(() => expect(responders).toHaveLength(2));
+    // The backend wrote both; the second request's (complete) answer arrives first.
+    const both = ["https://a.example.com", "https://b.example.com"];
+    const older = ++revision;
+    const newer = ++revision;
+    await act(async () => {
+      responders[1](both, newer);
+      await Promise.resolve();
+    });
+    await act(async () => {
+      responders[0](["https://a.example.com"], older);
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      for (const frame of view.getAllByTestId("mcp-app-frame")) {
+        expect(frame.getAttribute("srcdoc")).toContain("https://b.example.com");
+      }
+    });
+    expect(view.queryAllByRole("button", { name: "Allow" })).toHaveLength(0);
+  });
+
+  test("the list committed last wins, even when its request started first", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://a.example.com", "https://b.example.com"] };
+    const responders: Array<(approvedDomains: string[], revision: number) => void> = [];
+    approveDeferred = responders;
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws" view={VIEW} />
+        <McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />
+      </>,
+      { wrapper: Wrapper }
+    );
+    await waitFor(() => expect(view.getAllByRole("button", { name: "Allow" })).toHaveLength(2));
+    const [first, second] = view.getAllByRole("button", { name: "Allow" });
+    await pressAllow(first);
+    await pressAllow(second);
+    await waitFor(() => expect(responders).toHaveLength(2));
+    // The second request reached the config first and stored only its own origin. The first
+    // request committed after it, so its answer is the complete list.
+    await act(async () => {
+      responders[1](["https://b.example.com"], ++revision);
+      await Promise.resolve();
+    });
+    await act(async () => {
+      responders[0](["https://b.example.com", "https://a.example.com"], ++revision);
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      for (const frame of view.getAllByTestId("mcp-app-frame")) {
+        expect(frame.getAttribute("srcdoc")).toContain("https://a.example.com");
+        expect(frame.getAttribute("srcdoc")).toContain("https://b.example.com");
+      }
+    });
+    expect(view.queryAllByRole("button", { name: "Allow" })).toHaveLength(0);
+  });
+
+  test("a view without its result record names its blocked domains and offers no Allow", async () => {
+    invocation = null;
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    const { view, frame } = await renderFrame();
+    expect(view.getByText(/api\.example\.com/)).toBeTruthy();
+    expect(view.queryByRole("button", { name: "Allow" })).toBeNull();
+    expect(frame.getAttribute("srcdoc")).not.toContain("https://api.example.com");
+  });
+
+  test("a view whose server no project owns names its blocked domains and offers no Allow", async () => {
+    // A scratch chat, or a global server in a multi-project workspace: approving always fails.
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    approvalProjectPath = null;
+    const { view } = await renderFrame();
+    expect(view.getByText(/api\.example\.com/)).toBeTruthy();
+    expect(view.queryByRole("button", { name: "Allow" })).toBeNull();
+  });
+
+  test("a failed approval shows its error and keeps Allow for a retry", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    approveFails = new Error("config write failed");
+    const { view, frame } = await renderFrame();
+    await pressAllow(view.getByRole("button", { name: "Allow" }));
+    await view.findByText(/config write failed/);
+    expect(frame.getAttribute("srcdoc")).not.toContain("api.example.com");
+    // The failure was transient: Allow again succeeds.
+    approveFails = null;
+    await pressAllow(view.getByRole("button", { name: "Allow" }));
+    await waitFor(() =>
+      expect(view.getByTestId("mcp-app-frame").getAttribute("srcdoc")).toContain(
+        "connect-src https://api.example.com"
+      )
+    );
+    expect(approvals).toHaveLength(2);
+    expect(view.queryByText(/config write failed/)).toBeNull();
+  });
+
+  test("the strip is disabled while its approval runs", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    const responders: Array<(approvedDomains: string[], revision: number) => void> = [];
+    approveDeferred = responders;
+    const { view } = await renderFrame();
+    await pressAllow(view.getByRole("button", { name: "Allow" }));
+    await waitFor(() => expect(responders).toHaveLength(1));
+    const notNow = view.getByRole("button", { name: "Not now" }) as HTMLButtonElement;
+    expect(notNow.disabled).toBe(true);
+    expect((view.getByRole("button", { name: "Allow" }) as HTMLButtonElement).disabled).toBe(true);
+    // A Not now click while the call runs changes nothing: the user's Allow decides.
+    fireEvent.click(notNow);
+    expect(view.getByRole("alert").textContent).toContain("api.example.com");
+    await act(async () => {
+      responders[0](["https://api.example.com"], ++revision);
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(view.getByTestId("mcp-app-frame").getAttribute("srcdoc")).toContain(
+        "connect-src https://api.example.com"
+      )
+    );
+    expect(view.queryByRole("button", { name: "Not now" })).toBeNull();
+  });
+
+  test("widget state is stored for the view instance, and a remount starts with the latest", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    widgetState = { step: 2 };
+    widgetStateBinding = `record-${++revision}`;
+    let landWrite = () => undefined as void;
+    widgetStateWriteGate = new Promise<void>((resolve) => (landWrite = resolve));
+    const first = await renderFrame();
+    expect(openAiSeedOf(first.frame.getAttribute("srcdoc"))).toMatchObject({
+      widgetState: { step: 2 },
+    });
+    postFromView(first.frame, {
+      jsonrpc: "2.0",
+      method: "xum/widget-state",
+      params: { state: { step: 3 } },
+    });
+    await waitFor(() => expect(widgetStateWrites).toHaveLength(1));
+    // The card collapses while the write is in flight, and opens again before it lands. The
+    // record still holds step 2, but the new document starts with step 3.
+    first.view.unmount();
+    const second = await renderFrame();
+    expect(openAiSeedOf(second.frame.getAttribute("srcdoc"))).toMatchObject({
+      widgetState: { step: 3 },
+    });
+    landWrite();
+    expect(widgetStateWrites).toEqual([{ binding: widgetStateBinding, state: { step: 3 } }]);
   });
 
   test("the view is bound to the recorded tool call, not the card", async () => {
@@ -194,7 +605,7 @@ describe("McpAppFrame", () => {
         <McpAppFrame workspaceId="ws" view={{ ...VIEW, cancelled: true, failed }} />,
         { wrapper: Wrapper }
       );
-      const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+      const frame = await findOpenFrame(view);
       const posted = capturePosted(frame);
       postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
       await waitFor(() =>
@@ -221,6 +632,39 @@ describe("McpAppFrame", () => {
     const args = view.getByTestId("mcp-app-consent-args").textContent ?? "";
     expect(args).toContain("x".repeat(2000));
     expect(args).toContain('"city": "Berlin"');
+  });
+
+  test("the context consent strip shows the view's full context as plain text", async () => {
+    const { view, frame } = await renderFrame();
+    const text = `<b>bold</b> ${"y".repeat(2000)} END`;
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "ui/update-model-context",
+      params: { content: [{ type: "text", text }] },
+    });
+    await view.findByRole("alert");
+    const shown = view.getByTestId("mcp-app-consent-args");
+    expect(shown.textContent).toBe(text);
+    expect(shown.querySelector("b")).toBeNull();
+  });
+
+  test("a plugin server shows its server part, and its instance marker where consent is asked", async () => {
+    const key = "plugin:0123456789abcdef:tray";
+    const view = render(<McpAppFrame workspaceId="ws" view={{ ...VIEW, serverName: key }} />, {
+      wrapper: Wrapper,
+    });
+    const frame = await findOpenFrame(view);
+    expect(view.getByText("tray")).toBeTruthy();
+    expect(view.container.textContent).not.toContain("0123456789abcdef");
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "get_forecast", arguments: {} },
+    });
+    const strip = await view.findByRole("alert");
+    expect(strip.textContent).toContain("Allow get_forecast from tray (plugin 01234567)?");
   });
 
   test("consent prompts name the server by the card's sanitized key, not the raw key", async () => {
@@ -384,11 +828,20 @@ describe("McpAppFrame", () => {
       webkitRTCPeerConnection: class {},
       RTCDataChannel: class {},
       fetch: () => undefined,
+      // The preamble also installs the in-page link handler and opens the host channel.
+      addEventListener: () => undefined,
+      parent: { postMessage: () => undefined },
+      dispatchEvent: () => true,
     };
     // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
     const run = new Function("window", firstScript) as (window: unknown) => void;
     run(fakeWindow);
-    expect(Object.keys(fakeWindow)).toEqual(["fetch"]);
+    expect(Object.keys(fakeWindow)).toEqual([
+      "fetch",
+      "addEventListener",
+      "parent",
+      "dispatchEvent",
+    ]);
   });
 
   test("the view mounts in desktop and browser mode and is told which platform it is on", async () => {
@@ -427,10 +880,121 @@ describe("McpAppFrame", () => {
 
     // Reload brings back a fresh frame with a working host.
     fireEvent.click(view.getByRole("button", { name: "Reload" }));
-    const reloaded = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    const reloaded = await findOpenFrame(view);
     const replies = capturePosted(reloaded);
     postFromView(reloaded, { jsonrpc: "2.0", id: 10, method: "ping" });
     await waitFor(() => expect(replies.some((m) => m.id === 10)).toBe(true));
+  });
+
+  // #6187: in browser mode nothing blocks the navigation, and the next page keeps the frame's
+  // window. The host talks only over the view document's own port.
+  test("a page the view navigates to can neither reach the host nor get its replies", async () => {
+    delete window.api;
+    const { view, frame, posted } = await renderFrame();
+    const windowPosts = captureFrameWindowPosts(frame);
+    // A call that waits for consent: its reply goes out after the navigation.
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "tool" } });
+    const allow = await view.findByRole("button", { name: "Allow" });
+
+    // The next page posts from the frame's window, and even knowing the nonce cannot rebind.
+    const nonce = /nonce: "([0-9a-f]+)"/.exec(frame.getAttribute("srcdoc")!)![1];
+    const next = new MessageChannel();
+    const nextReceived: unknown[] = [];
+    next.port1.onmessage = (event) => nextReceived.push(event.data);
+    postFromFrameWindow(frame, { jsonrpc: "2.0", id: 2, method: "ui/initialize", params: {} });
+    postFromFrameWindow(frame, { xumMcpAppDocument: 1, type: "open", nonce }, [next.port2]);
+    next.port1.postMessage({ jsonrpc: "2.0", id: 3, method: "ping" });
+
+    await pressAllow(allow);
+    await waitFor(() => expect(posted.find((m) => m.id === 1)?.result).toBeDefined());
+    await tick();
+    expect(posted.some((m) => m.id === 2 || m.id === 3)).toBe(false);
+    expect(nextReceived).toEqual([]);
+    expect(windowPosts).toEqual([]);
+    next.port1.close();
+  });
+
+  test("an unloading view document closes the frame", async () => {
+    delete window.api;
+    const { view, document } = await renderFrame();
+    document.dispatch("pagehide");
+    expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+    expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+  });
+
+  // A burst over the rate limit must not hide the unload of a view that then redirects.
+  test("an unloading view document closes the frame even after a burst", async () => {
+    delete window.api;
+    const { view, frame, document } = await renderFrame();
+    for (let id = 100; id < 130; id++) postFromView(frame, { jsonrpc: "2.0", id, method: "ping" });
+    document.dispatch("pagehide");
+    expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+  });
+
+  // The HTML standard asks to close discarded ports: an unmounted view must not keep its port.
+  test("unmounting the view closes its document's port", async () => {
+    const close = spyOn(MessagePort.prototype, "close");
+    try {
+      const { view } = await renderFrame();
+      const before = close.mock.calls.length;
+      view.unmount();
+      await waitFor(() => expect(close.mock.calls.length).toBeGreaterThan(before));
+    } finally {
+      close.mockRestore();
+    }
+  });
+
+  test("a view that navigated away has its document's port closed", async () => {
+    delete window.api;
+    const close = spyOn(MessagePort.prototype, "close");
+    try {
+      const { view, document } = await renderFrame();
+      const before = close.mock.calls.length;
+      document.dispatch("pagehide");
+      expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+      await waitFor(() => expect(close.mock.calls.length).toBeGreaterThan(before));
+    } finally {
+      close.mockRestore();
+    }
+  });
+
+  test("the host answers nothing before the document opened its channel", async () => {
+    const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    const windowPosts = captureFrameWindowPosts(frame);
+    postFromFrameWindow(frame, { jsonrpc: "2.0", id: 1, method: "ping" });
+    await tick();
+    expect(windowPosts).toEqual([]);
+
+    bootDocument(frame);
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 2, method: "ping" });
+    await waitFor(() => expect(posted.map((m) => m.id)).toEqual([2]));
+  });
+
+  test("a document a new grant replaced neither closes nor silences the new one", async () => {
+    delete window.api;
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    const { view, frame, document: before } = await renderFrame();
+    const firstSrcDoc = frame.getAttribute("srcdoc");
+    const allow = view.getByRole("button", { name: "Allow" });
+    await waitFor(() => expect(allow.hasAttribute("disabled")).toBe(false), {
+      timeout: CONFIRM_ARM_DELAY_MS * 4,
+    });
+    // A burst over the rate limit right before the grant reloads the view.
+    for (let id = 100; id < 130; id++) postFromView(frame, { jsonrpc: "2.0", id, method: "ping" });
+    fireEvent.pointerDown(allow);
+    fireEvent.click(allow);
+    await waitFor(() => expect(frame.getAttribute("srcdoc")).not.toBe(firstSrcDoc));
+
+    // The frame loads the new document; the old one unloads after it was replaced.
+    bootDocument(frame);
+    const posted = capturePosted(frame);
+    before.dispatch("pagehide");
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ping" });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+    expect(view.queryByText(/This artifact navigated away/)).toBeNull();
   });
 });
 
@@ -442,6 +1006,7 @@ describe("McpAppFrame host strips", () => {
     window.localStorage.clear();
     invocation = null;
     viewCsp = {};
+    getViewGate = null;
     toolCalls = [];
     // Desktop mode: the preload bridge exists (isDesktopMode).
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -455,7 +1020,7 @@ describe("McpAppFrame host strips", () => {
 
   test("a shown consent strip is never replaced; a newer request is declined", async () => {
     const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
-    const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    const frame = await findOpenFrame(view);
     const replies = captureReplies(frame);
 
     postFromView(frame, {
@@ -498,7 +1063,7 @@ describe("McpAppFrame host strips", () => {
     window.addEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, onInsert);
     try {
       const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
-      const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+      const frame = await findOpenFrame(view);
       const replies = captureReplies(frame);
       const message = (id: number, text: string) =>
         postFromView(frame, {
@@ -525,6 +1090,367 @@ describe("McpAppFrame host strips", () => {
       expect(inserted).toEqual([{ text: "Explain this chart", mode: "append", workspaceId: "ws" }]);
     } finally {
       window.removeEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, onInsert);
+    }
+  });
+
+  test("the view document starts with the host context, fixed at mount", async () => {
+    const tree = <McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />;
+    const view = render(tree, { wrapper: Wrapper });
+    const frame = await view.findByTestId("mcp-app-frame");
+    const srcdoc = frame.getAttribute("srcdoc") ?? "";
+    expect(openAiSeedOf(srcdoc)).toMatchObject({ theme: "dark", displayMode: "inline" });
+    // A resize (or theme change) must not rebuild, and so reload, the view document.
+    Object.defineProperty(window, "innerHeight", { value: 333, configurable: true });
+    await act(async () => {
+      view.rerender(tree);
+      await Promise.resolve();
+    });
+    expect(view.getByTestId("mcp-app-frame").getAttribute("srcdoc")).toBe(srcdoc);
+  });
+
+  // The seed goes into the document when it is first built, not when the frame mounts.
+  test("a theme change while the view loads reaches the document's seed", async () => {
+    let release = () => undefined as void;
+    getViewGate = new Promise<void>((resolve) => (release = resolve));
+    const tree = (theme: "dark" | "light") => (
+      <ThemeProvider forcedTheme={theme}>
+        <APIProvider client={createTestApiClient(serverApi())}>
+          <McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />
+        </APIProvider>
+      </ThemeProvider>
+    );
+    const view = render(tree("dark"));
+    view.rerender(tree("light"));
+    await act(async () => {
+      release();
+      await Promise.resolve();
+    });
+    const frame = await view.findByTestId("mcp-app-frame");
+    expect(openAiSeedOf(frame.getAttribute("srcdoc"))).toMatchObject({ theme: "light" });
+    getViewGate = null;
+  });
+
+  // The container mounts only once getView answered, after the first render's effects ran.
+  test("the view container is observed for size changes once it mounts", async () => {
+    const observed: Element[] = [];
+    const original = globalThis.ResizeObserver;
+    // The component reads the global (the test DOM's window is a separate object).
+    globalThis.ResizeObserver = class {
+      observe(target: Element) {
+        observed.push(target);
+      }
+      unobserve = () => undefined;
+      disconnect = () => undefined;
+    } as unknown as typeof ResizeObserver;
+    try {
+      const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
+        wrapper: Wrapper,
+      });
+      const frame = await view.findByTestId("mcp-app-frame");
+      await waitFor(() => expect(observed.includes(frame.parentElement!)).toBe(true));
+    } finally {
+      globalThis.ResizeObserver = original;
+    }
+  });
+
+  test("a resize between the initialize reply and initialized still reaches the view", async () => {
+    Object.defineProperty(window, "innerHeight", { value: 800, configurable: true });
+    const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
+      wrapper: Wrapper,
+    });
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+    Object.defineProperty(window, "innerHeight", { value: 500, configurable: true });
+    act(() => {
+      window.dispatchEvent(new window.Event("resize"));
+    });
+    postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    await waitFor(() => {
+      const changed = posted.find((m) => m.method === "ui/notifications/host-context-changed");
+      const params = changed?.params as { containerDimensions?: { maxHeight?: number } };
+      expect(params?.containerDimensions?.maxHeight).toBe(400);
+    });
+    // The inline container's own cap follows the window too.
+    expect(frame.parentElement!.style.maxHeight).toBe("400px");
+  });
+
+  test("a resize tells the view its new maximum height", async () => {
+    Object.defineProperty(window, "innerHeight", { value: 800, configurable: true });
+    const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
+      wrapper: Wrapper,
+    });
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+
+    Object.defineProperty(window, "innerHeight", { value: 500, configurable: true });
+    act(() => {
+      window.dispatchEvent(new window.Event("resize"));
+    });
+    await waitFor(() => {
+      const changed = posted.find((m) => m.method === "ui/notifications/host-context-changed");
+      const params = changed?.params as { containerDimensions?: { maxHeight?: number } };
+      expect(params?.containerDimensions?.maxHeight).toBe(400);
+    });
+  });
+
+  // Other host-context reads (a display-mode request) do not post the dimensions: only what the
+  // view was actually sent counts as sent.
+  test("a display-mode request before the resize callback does not swallow the size update", async () => {
+    Object.defineProperty(window, "innerHeight", { value: 800, configurable: true });
+    const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
+      wrapper: Wrapper,
+    });
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+
+    Object.defineProperty(window, "innerHeight", { value: 500, configurable: true });
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "ui/request-display-mode",
+      params: { mode: "inline" },
+    });
+    await waitFor(() => expect(posted.some((m) => m.id === 2)).toBe(true));
+    act(() => {
+      window.dispatchEvent(new window.Event("resize"));
+    });
+    await waitFor(() => {
+      const changed = posted.find((m) => m.method === "ui/notifications/host-context-changed");
+      const params = changed?.params as { containerDimensions?: { maxHeight?: number } };
+      expect(params?.containerDimensions?.maxHeight).toBe(400);
+    });
+  });
+
+  // A view that declared only fullscreen is not hosted in its tool card: the card declines it
+  // (its notice replaces the frame), and no tab opens without the user.
+  test("a card instance marks a fullscreen-only view and opens no tab by itself", async () => {
+    const opened: string[] = [];
+    const onOpen = (e: Event) =>
+      opened.push((e as CustomEvent<{ toolCallId: string }>).detail.toolCallId);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
+    let isFullscreenOnly = () => false;
+    function FullscreenOnlyProbe() {
+      const marked = useMcpAppViewFullscreenOnly("ws-card-only", "call-1");
+      isFullscreenOnly = () => marked;
+      return null;
+    }
+    try {
+      const view = render(
+        <>
+          <McpAppFrame workspaceId="ws-card-only" view={VIEW} variant="inline" />
+          <FullscreenOnlyProbe />
+        </>,
+        { wrapper: Wrapper }
+      );
+      const frame = await findOpenFrame(view);
+      const posted = capturePosted(frame);
+      // A hybrid view: the window.openai shim's handshake comes first, with no list.
+      postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+      await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+      expect(isFullscreenOnly()).toBe(false);
+      // Then its own client declares fullscreen only.
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "ui/initialize",
+        params: { appCapabilities: { availableDisplayModes: ["fullscreen"] } },
+      });
+      await waitFor(() => expect(isFullscreenOnly()).toBe(true));
+      await tick();
+      expect(opened).toEqual([]);
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
+    }
+  });
+
+  // A view marked by an earlier mount, opened in its tab: the shim's list-less handshake comes
+  // first there. It must not clear the mark, or closing the tab would host the view inline.
+  test("a list-less handshake keeps an earlier mount's fullscreen-only mark", async () => {
+    setMcpAppViewFullscreenOnly("ws-kept", "call-1", true);
+    let isFullscreenOnly = () => false;
+    function FullscreenOnlyProbe() {
+      const marked = useMcpAppViewFullscreenOnly("ws-kept", "call-1");
+      isFullscreenOnly = () => marked;
+      return null;
+    }
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws-kept" view={VIEW} />
+        <FullscreenOnlyProbe />
+      </>,
+      { wrapper: Wrapper }
+    );
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+    expect(isFullscreenOnly()).toBe(true);
+  });
+
+  // E.g. "Open in tab" on a collapsed card: the view first initializes in its tab. Its card must
+  // not host it inline later either, until a newer document declares inline.
+  test("a tab instance marks a fullscreen-only view at once; a declaration with inline clears it", async () => {
+    let isFullscreenOnly = () => false;
+    function FullscreenOnlyProbe() {
+      const marked = useMcpAppViewFullscreenOnly("ws-tab-only", "call-1");
+      isFullscreenOnly = () => marked;
+      return null;
+    }
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws-tab-only" view={VIEW} />
+        <FullscreenOnlyProbe />
+      </>,
+      { wrapper: Wrapper }
+    );
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    const initialize = (id: number, modes: string[]) => {
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id,
+        method: "ui/initialize",
+        params: { appCapabilities: { availableDisplayModes: modes } },
+      });
+    };
+    initialize(1, ["fullscreen"]);
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+    expect(isFullscreenOnly()).toBe(true);
+    initialize(2, ["inline", "fullscreen"]);
+    await waitFor(() => expect(posted.some((m) => m.id === 2)).toBe(true));
+    expect(isFullscreenOnly()).toBe(false);
+  });
+
+  // The user can collapse the card during the teardown wait: the tab must not close then.
+  test("an inline move whose card is gone by the move keeps the view in its tab", async () => {
+    let closed = 0;
+    let reloads: number[] = [];
+    function ReloadProbe() {
+      reloads = [...reloads, useMcpAppViewReloadKey("ws", "call-1")];
+      return null;
+    }
+    const unmarkCard = markMcpAppViewHosted("ws", "call-1", "card");
+    let cardMarked = true;
+    try {
+      const view = render(
+        <>
+          <McpAppFrame workspaceId="ws" view={VIEW} onClose={() => closed++} />
+          <ReloadProbe />
+        </>,
+        { wrapper: Wrapper }
+      );
+      const frame = await findOpenFrame(view);
+      const posted = capturePosted(frame);
+      postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "ui/request-display-mode",
+        params: { mode: "inline" },
+      });
+      const teardown = await waitFor(() => {
+        const message = posted.find((m) => m.method === "ui/resource-teardown");
+        if (message === undefined) throw new Error("no teardown yet");
+        return message;
+      });
+      unmarkCard();
+      cardMarked = false;
+      const before = reloads.at(-1) ?? 0;
+      postFromView(frame, { jsonrpc: "2.0", id: teardown.id, result: {} });
+      // The torn-down view loads again in its tab instead.
+      await waitFor(() => expect(reloads.at(-1)).toBe(before + 1));
+      expect(closed).toBe(0);
+    } finally {
+      if (cardMarked) unmarkCard();
+    }
+  });
+
+  test("fullscreen from the card moves the view to its tab; inline from the tab closes it", async () => {
+    // Whether the requester already had its reply when the move (which unmounts it) ran.
+    const repliedAtMove: boolean[] = [];
+    let posted: Posted[] = [];
+    const opened: string[] = [];
+    const onOpen = (e: Event) => {
+      repliedAtMove.push(posted.some((m) => m.id === 2));
+      opened.push((e as CustomEvent<{ toolCallId: string }>).detail.toolCallId);
+    };
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
+    let closed = 0;
+    const onClose = () => {
+      repliedAtMove.push(posted.some((m) => m.id === 2));
+      closed++;
+    };
+    try {
+      const run = async (variant: "inline" | undefined, mode: string) => {
+        const view = render(
+          <McpAppFrame workspaceId="ws" view={VIEW} variant={variant} onClose={onClose} />,
+          { wrapper: Wrapper }
+        );
+        const frame = await findOpenFrame(view);
+        posted = capturePosted(frame);
+        postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+        await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+        postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+        postFromView(frame, {
+          jsonrpc: "2.0",
+          id: 2,
+          method: "ui/request-display-mode",
+          params: { mode },
+        });
+        await waitFor(() => expect(posted.some((m) => m.id === 2)).toBe(true));
+        // A move waits for the view to answer the teardown: its proof that the reply arrived.
+        const moves = opened.length + closed;
+        const teardown = posted.find((m) => m.method === "ui/resource-teardown");
+        if (teardown !== undefined) {
+          expect(opened.length + closed).toBe(moves);
+          postFromView(frame, { jsonrpc: "2.0", id: teardown.id, result: {} });
+          await waitFor(() => expect(opened.length + closed).toBe(moves + 1));
+        }
+        const initial = (
+          posted.find((m) => m.id === 1)?.result as {
+            hostContext: { displayMode: string; availableDisplayModes: string[] };
+          }
+        ).hostContext;
+        cleanup();
+        return { initial, reply: posted.find((m) => m.id === 2)?.result };
+      };
+      // The card instance is inline; fullscreen opens (or focuses) the view's tab.
+      const card = await run("inline", "fullscreen");
+      expect(card.initial).toMatchObject({
+        displayMode: "inline",
+        availableDisplayModes: ["inline", "fullscreen"],
+      });
+      expect(card.reply).toEqual({ mode: "fullscreen" });
+      expect(opened).toEqual(["call-1"]);
+      expect(closed).toBe(0);
+      // The tab instance is fullscreen. With no expanded card to return to, inline is declined.
+      const noCard = await run(undefined, "inline");
+      expect(noCard.initial.displayMode).toBe("fullscreen");
+      expect(noCard.reply).toEqual({ mode: "fullscreen" });
+      expect(closed).toBe(0);
+      // With an expanded card, inline closes the tab (the card takes the view back).
+      const unmarkCard = markMcpAppViewHosted("ws", "call-1", "card");
+      try {
+        const tab = await run(undefined, "inline");
+        expect(tab.reply).toEqual({ mode: "inline" });
+      } finally {
+        unmarkCard();
+      }
+      expect(closed).toBe(1);
+      expect(opened).toEqual(["call-1"]);
+      expect(repliedAtMove).toEqual([true, true]);
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
     }
   });
 });

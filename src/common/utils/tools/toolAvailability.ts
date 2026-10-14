@@ -71,6 +71,13 @@ export type SetGoalRefusalReason =
   | "non_goal_agent";
 
 const GOAL_TOOL_ACTIVE_STATUSES: ReadonlySet<GoalStatus> = new Set(["active", "budget_limited"]);
+// A paused goal can still be complete: the work may have finished (e.g. merged
+// elsewhere) while its loop was paused. Completing is terminal and never
+// re-arms continuations, so it needs no unpause first.
+const GOAL_TOOL_COMPLETABLE_STATUSES: ReadonlySet<GoalStatus> = new Set([
+  ...GOAL_TOOL_ACTIVE_STATUSES,
+  "paused",
+]);
 const GOAL_TOOL_REPLACEABLE_STATUSES: ReadonlySet<GoalStatus> = new Set([
   "active",
   "budget_limited",
@@ -108,15 +115,17 @@ export function getGoalToolAvailability(
   context: GoalToolAvailabilityContext
 ): GoalToolAvailability {
   const setGoal = getSetGoalRefusalReason(context) === null;
-  const hasActiveGoal =
-    context.goalStatus != null && GOAL_TOOL_ACTIVE_STATUSES.has(context.goalStatus);
+  const hasCompletableGoal =
+    context.goalStatus != null && GOAL_TOOL_COMPLETABLE_STATUSES.has(context.goalStatus);
   const hasGoalReadableForReplacement =
     setGoal && context.goalStatus != null && GOAL_TOOL_REPLACEABLE_STATUSES.has(context.goalStatus);
 
   return {
     setGoal,
-    getGoal: hasActiveGoal || hasGoalReadableForReplacement,
-    completeGoal: hasActiveGoal,
+    // get_goal follows complete_goal so a turn that may complete a paused goal
+    // can read its goalId (complete_goal's optimistic-concurrency token).
+    getGoal: hasCompletableGoal || hasGoalReadableForReplacement,
+    completeGoal: hasCompletableGoal,
   };
 }
 

@@ -37,6 +37,28 @@ interface ModelData {
 }
 
 export const modelsExtra: Record<string, ModelData> = {
+  // Muse Wonder preview: https://dev.meta.ai/docs/models and
+  // https://dev.meta.ai/docs/pricing-rate-limits.md (no long-context premium).
+  // models.dev supplies the practical output cap; reasoning stays private.
+  // Wonder Full is Muse Code-only and must not be advertised as an API model.
+  "meta/muse-wonder-1.0": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 131072,
+    input_cost_per_token: 0.000004,
+    cache_read_input_token_cost: 0.0000002,
+    output_cost_per_token: 0.00002,
+    litellm_provider: "meta",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_audio_input: true,
+    supports_video_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+    supported_endpoints: ["/v1/responses", "/v1/chat/completions", "/v1/messages"],
+  },
+
   // Grok 4.7 - Released September 21, 2026. xAI's frontier coding and knowledge-work
   // model. Identical rates and limits to Grok 4.6: $2/M input, $0.50/M cached input,
   // $6/M output, all doubled once a prompt reaches the 200K long-context threshold
@@ -216,10 +238,10 @@ export const modelsExtra: Record<string, ModelData> = {
   // Claude Opus 5.5 - Released September 22, 2026
   // Official pricing: $4/M input, $20/M output (20% below Opus 5), 5-minute cache
   // write $5/M (1.25x input), cache read $0.20/M (0.05x input). The 1-hour cache
-  // write tier ($8/M, 2x input) and fast mode ($8/$40) have no field/entry here,
-  // matching the Opus 5 treatment. Native 1M context, 128K max output, effort
-  // ladder low..max with native xhigh; thinking cannot be disabled (default
-  // effort medium). https://platform.claude.com/docs/en/models/opus-5-5/overview
+  // write tier ($8/M, 2x input) has no field (displayUsage derives it from input) and
+  // fast mode ($8/$40) has no entry, matching the Opus 5 treatment. Native 1M context,
+  // 128K max output, effort ladder low..max with native xhigh; thinking cannot be
+  // disabled (default effort medium). https://platform.claude.com/docs/en/models/opus-5-5/overview
   "claude-opus-5-5": {
     max_input_tokens: 1000000,
     max_output_tokens: 128000,
@@ -319,9 +341,11 @@ export const modelsExtra: Record<string, ModelData> = {
   },
 
   // Claude Sonnet 5.5 - Released September 28, 2026
-  // Official pricing, identical to Sonnet 5: $2/M input, $10/M output, 5-minute cache write
-  // $2.50/M (1.25x input), cache read $0.20/M (0.1x input). The 1-hour cache-write tier
-  // ($4/M, 2x input) has no field here, matching the other Claude entries. Native 1M context,
+  // Official pricing: $2/M input, $10/M output, 5-minute cache write $2.50/M (1.25x input),
+  // cache read $0.10/M (0.05x input, half of Sonnet 5's 0.1x per the prompt-caching pricing
+  // table). The 1-hour cache-write tier ($4/M, 2x input) has no field: displayUsage derives
+  // it from the input rate.
+  // https://platform.claude.com/docs/en/build-with-claude/prompt-caching#pricing Native 1M context,
   // 128K max output, effort low..max with native xhigh; thinking cannot be disabled.
   // https://platform.claude.com/docs/en/models/sonnet-5-5/overview
   "claude-sonnet-5-5": {
@@ -330,7 +354,7 @@ export const modelsExtra: Record<string, ModelData> = {
     input_cost_per_token: 0.000002, // $2 per million input tokens
     output_cost_per_token: 0.00001, // $10 per million output tokens
     cache_creation_input_token_cost: 0.0000025, // $2.50 per million tokens (1.25× input)
-    cache_read_input_token_cost: 0.0000002, // $0.20 per million tokens (0.1× input)
+    cache_read_input_token_cost: 0.0000001, // $0.10 per million tokens (0.05× input)
     litellm_provider: "anthropic",
     mode: "chat",
     supports_function_calling: true,
@@ -553,6 +577,31 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_response_schema: true,
   },
 
+  // Gemini 4 Argon - GA on the Gemini API on October 13, 2026. Stable `gemini-4-argon`
+  // model ID; input, thinking, and output share one 1,048,576-token window. A synchronous
+  // request caps output at 65,536 tokens: a larger max_output_tokens opts into long decode
+  // (CONTINUATION hops), which Xum does not drive, and streamManager sends this value as
+  // maxOutputTokens. We encode the introductory rates Google bills through November 30,
+  // 2026 ($2/M input, $10/M output, $0.10/M implicitly cached input) so displayed costs
+  // and goal budgets match real charges. TODO(2026-12-01): raise to the standard rates
+  // ($4/$20/$0.20). No >200K tier. Source: Gemini API model and pricing docs, 2026-10-14.
+  "gemini-4-argon": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 65536,
+    input_cost_per_token: 0.000002, // $2 per million input tokens (intro rate)
+    output_cost_per_token: 0.00001, // $10 per million output tokens, including thinking tokens (intro rate)
+    cache_read_input_token_cost: 0.0000001, // $0.10 per million cached input tokens (intro rate)
+    litellm_provider: "vertex_ai-language-models",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_audio_input: true,
+    supports_video_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
   // Gemini 3.8 Flash - GA on September 2, 2026. Stable `gemini-3.8-flash` model ID with
   // 1M context, 64K max output (DeepMind model card). Like 3.7 Flash, we encode the
   // introductory rates Google actually bills through December 31, 2026 ($0.75/M input,
@@ -602,8 +651,9 @@ export const modelsExtra: Record<string, ModelData> = {
   // Official tiered pricing, split at 100K prompt tokens (5x above):
   //   <=100K: $0.10/M input, $0.50/M output, 5-minute cache write $0.125/M, cache read $0.01/M
   //   >100K:  $0.50/M input, $2.50/M output, 5-minute cache write $0.625/M, cache read $0.05/M
-  // The 1-hour cache-write tier ($0.20/M, $1/M above 100K) has no field here, matching the
-  // other Claude entries. Native 1M context, 128K max output, adaptive thinking only.
+  // The 1-hour cache-write tier ($0.20/M, $1/M above 100K) has no field: displayUsage
+  // derives it as 2x the tier's input rate. Native 1M context, 128K max output, adaptive
+  // thinking only.
   // https://platform.claude.com/docs/en/models/haiku-5-5/overview
   "claude-haiku-5-5": {
     max_input_tokens: 1000000,

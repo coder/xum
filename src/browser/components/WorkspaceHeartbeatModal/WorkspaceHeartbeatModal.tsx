@@ -131,10 +131,21 @@ function getDraftMessageForSave(value: string): string {
   return normalizeDraftMessage(value) ?? "";
 }
 
+/** A save waits for loads (a reconnect's read too: it would overwrite offline changes). */
+function isSaveBlocked(state: {
+  isLoading: boolean;
+  isReloading: boolean;
+  isSaving: boolean;
+  hasValidationError: boolean;
+}): boolean {
+  return state.isLoading || state.isReloading || state.isSaving || state.hasValidationError;
+}
+
 export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
   const {
     settings,
     isLoading,
+    isReloading,
     isSaving,
     error,
     save,
@@ -239,7 +250,12 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
   const errorMessages = [validationError, error].filter(
     (message): message is string => message != null
   );
-  const hasBlockingError = isLoading || isSaving || validationError != null;
+  const hasBlockingError = isSaveBlocked({
+    isLoading,
+    isReloading,
+    isSaving,
+    hasValidationError: validationError != null,
+  });
 
   const handleIntervalBlur = () => {
     const parsedMinutes = parseIntervalMinutes(draftIntervalMinutes);

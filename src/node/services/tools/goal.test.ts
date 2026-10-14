@@ -732,8 +732,8 @@ describe("goal tools", () => {
   //
   // complete_goal is registered on every turn (#5247), so a call without an
   // active goal must come back as a typed result the model can act on, not an
-  // unknown tool or a confusing validation error. Covered below: no goal, a
-  // goal cleared mid-stream, and a paused goal. A forwarded `goalId` mismatch
+  // unknown tool or a confusing validation error. Covered below: no goal and a
+  // goal cleared mid-stream. A forwarded `goalId` mismatch
   // still surfaces as a typed `goal_conflict` from the service.
   // ---------------------------------------------------------------------------
   test.each([
@@ -743,13 +743,6 @@ describe("goal tools", () => {
       arrange: async () => {
         await setGoalOk(goalService, { workspaceId, objective: "Will be cleared" });
         await goalService.clearGoal(workspaceId);
-      },
-    },
-    {
-      label: "the goal is paused",
-      arrange: async () => {
-        await setGoalOk(goalService, { workspaceId, objective: "Will be paused" });
-        await setGoalOk(goalService, { workspaceId, status: "paused" });
       },
     },
   ])("complete_goal returns a typed no_active_goal result when $label", async ({ arrange }) => {
@@ -770,6 +763,34 @@ describe("goal tools", () => {
 
     expect(result).toMatchObject({ success: false, code: "no_active_goal" });
     expect(await goalService.getGoal(workspaceId)).toEqual(before);
+  });
+
+  // The work can finish while the goal loop is paused: complete_goal must not
+  // force a resume first.
+  test("complete_goal completes a paused goal", async () => {
+    const created = await setGoalOk(goalService, { workspaceId, objective: "Paused but done" });
+    await setGoalOk(goalService, { workspaceId, status: "paused" });
+    const tool = createCompleteGoalTool({
+      cwd: "/tmp",
+      runtimeTempDir: "/tmp",
+      runtime: inertRuntime,
+      workspaceId,
+      goalService,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!(
+        { summary: "Finished while paused.", goalId: created.goalId },
+        mockToolCallOptions
+      )
+    );
+
+    expect(result).toMatchObject({ goal: { goalId: created.goalId, status: "complete" } });
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({
+      status: "complete",
+      completionSummary: "Finished while paused.",
+    });
   });
 
   test("complete_goal surfaces goal_conflict when expected goalId is stale", async () => {
@@ -955,19 +976,16 @@ describe("goal tools", () => {
       expect(result).toEqual({ goal: null });
     });
 
-    test("get_goal hides a paused goal unless the turn may replace it with set_goal", async () => {
+    // A paused goal is completable on every turn, so every turn can read its goalId.
+    test("get_goal returns a paused goal even when the turn cannot replace it", async () => {
       const created = await setGoalOk(goalService, { workspaceId, objective: "Paused work" });
       await setGoalOk(goalService, { workspaceId, status: "paused" });
 
       const withoutSetGoal: unknown = await Promise.resolve(
         createGetGoalTool(toolConfig(SUB_AGENT_EXEC_CONTEXT)).execute!({}, mockToolCallOptions)
       );
-      const withSetGoal: unknown = await Promise.resolve(
-        createGetGoalTool(toolConfig(TOP_LEVEL_EXEC_CONTEXT)).execute!({}, mockToolCallOptions)
-      );
 
-      expect(withoutSetGoal).toEqual({ goal: null });
-      expect(withSetGoal).toMatchObject({ goal: { goalId: created.goalId, status: "paused" } });
+      expect(withoutSetGoal).toMatchObject({ goal: { goalId: created.goalId, status: "paused" } });
     });
 
     test("get_goal returns an active goal to sub-agents", async () => {

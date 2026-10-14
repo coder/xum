@@ -1,4 +1,5 @@
 import { tool } from "ai";
+import { pluginHookContextTexts } from "@/common/utils/messages/pluginHookContext";
 import type { z } from "zod";
 import assert from "@/common/utils/assert";
 import { isPlainObject } from "@/common/utils/isPlainObject";
@@ -91,7 +92,9 @@ function projectHistory(message: MuxMessage): { text: string; toolNames: Set<str
       return [JSON.stringify(sanitize(part, 0, "tool"))];
     })
     .join("\n");
-  return { text, toolNames };
+  // A user row's prompt-hook context reached the model inside that row, so search and read_item
+  // return it too (Codex PRRT_kwDOPxxmWM6reh6Z).
+  return { text: [text, ...pluginHookContextTexts(message)].join("\n"), toolNames };
 }
 
 /**
@@ -252,7 +255,8 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
       // and shift snippet offsets. Escape the query so matching stays literal.
       const search =
         args.action === "search"
-          ? new RegExp(args.query!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu")
+          ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+            new RegExp(args.query!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu")
           : null;
       const timeout = (): SessionHistoryResult => ({
         success: false,
@@ -274,7 +278,9 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           items: [],
           windows: [],
         };
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const items = result.items!;
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const windows = result.windows!;
         const warnings = new Set<Warning>();
         // Any scan of this attempt (caller authorization or target) that had to skip rows

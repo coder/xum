@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "b
 import { GlobalWindow } from "happy-dom";
 import type { ReactNode } from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 import * as ActualExperimentsModule from "@/browser/hooks/useExperiments";
 import * as ActualTelemetryModule from "@/browser/hooks/useTelemetry";
 import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
@@ -237,6 +238,66 @@ describe("PortableDesktopExperimentWarning", () => {
     view.rerender(<ExperimentsSection />);
 
     expect(view.getByLabelText("Toggle RLM Mode")).toBeTruthy();
+  });
+
+  // A reconnect checks the prerequisite again through the new client. The warning stays on
+  // screen while offline and until that check answers.
+  describe.each([...GAP_MODES])("across a reconnect (%s)", (mode) => {
+    test("keeps the missing-binary warning until the new check answers", async () => {
+      let nextStatus: Promise<{ available: false; reason: "binary_not_found" }> = Promise.resolve({
+        available: false,
+        reason: "binary_not_found",
+      });
+      const harness = createConnectionHarness(mode, (): TestApiOverrides<APIClient> => {
+        const status = nextStatus;
+        return { desktop: { getPrereqStatus: () => status } };
+      });
+      const view = render(
+        <harness.Wrapper>
+          <PortableDesktopExperimentWarning />
+        </harness.Wrapper>
+      );
+      await waitFor(() =>
+        expect(view.container.textContent).toContain("Portable Desktop is currently disabled")
+      );
+
+      nextStatus = new Promise(() => undefined);
+      await harness.drop();
+      expect(view.container.textContent).toContain("Portable Desktop is currently disabled");
+      harness.reconnect();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+      expect(view.container.textContent).toContain("Portable Desktop is currently disabled");
+    });
+
+    // Offline the kept warning's buttons could not reach the server: they must be disabled.
+    test("disables the warning's buttons while offline", async () => {
+      const harness = createConnectionHarness(
+        mode,
+        (): TestApiOverrides<APIClient> => ({
+          desktop: {
+            getPrereqStatus: () =>
+              Promise.resolve({ available: false as const, reason: "binary_not_found" as const }),
+          },
+        })
+      );
+      const view = render(
+        <harness.Wrapper>
+          <PortableDesktopExperimentWarning />
+        </harness.Wrapper>
+      );
+      const restart = (await view.findByRole("button", {
+        name: "Restart Xum",
+      })) as HTMLButtonElement;
+      const checkAgain = view.getByRole("button", { name: "Check again" }) as HTMLButtonElement;
+      await waitFor(() => expect(restart.disabled).toBe(false));
+
+      await harness.drop();
+      expect(view.container.textContent).toContain("Portable Desktop is currently disabled");
+      expect(restart.disabled).toBe(true);
+      expect(checkAgain.disabled).toBe(true);
+    });
   });
 
   test("loads prereq status on mount and shows the missing-binary warning when needed", async () => {

@@ -239,6 +239,11 @@ function normalizeArtifactsByChildTaskId(
         throw new Error(`Invalid subagent git patch artifact for task ${childTaskId}`);
       }
 
+      // The map key, not the entry's own childTaskId, names the patch folder
+      // (getSubagentGitPatchMboxPath), so it needs the same path check. A bad
+      // key skips only its own entry instead of failing every later write.
+      assertSafeSubagentGitPatchPathComponent(childTaskId, "childTaskId key");
+
       const normalizedArtifact =
         version === 1
           ? normalizeLegacyArtifact(artifact as LegacySubagentGitPatchArtifactV1)

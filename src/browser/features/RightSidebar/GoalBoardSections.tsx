@@ -27,7 +27,8 @@ import {
 } from "lucide-react";
 import { useRef, useState } from "react";
 
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI, type APIClient } from "@/browser/contexts/API";
+import { ConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useGoalDefaults } from "@/browser/utils/goals/useGoalDefaults";
 import { loadGoalDefaults, resolveGoalSetIntent } from "@/browser/utils/goals/resolveGoalSetIntent";
 import { cn } from "@/common/lib/utils";
@@ -57,6 +58,18 @@ import {
  * so clicking the row content doesn't fire a drag; `PointerSensor`'s
  * `distance: 6` activation keeps normal clicks intact.
  */
+/**
+ * The live client for a board change. While Xum reconnects the board stays on screen, so a click
+ * must not silently do nothing (or close an editor as if it saved): without a live client this
+ * throws, and each handler shows the error like any failed change.
+ */
+function liveClientFor(api: APIClient | null): APIClient {
+  if (api == null) {
+    throw new ConnectionLostError();
+  }
+  return api;
+}
+
 interface GoalBoardSectionsProps {
   workspaceId: string;
   board: GoalBoardSnapshot;
@@ -178,7 +191,7 @@ interface UpcomingSectionProps {
 }
 
 function UpcomingSection(props: UpcomingSectionProps) {
-  const { api } = useAPI();
+  const api = useLiveAPI();
   // Surfaces any backend rejection so users see why a click had no
   // effect. Cleared on next mutation. Backend errors arrive with the
   // server-side `error.message` intact via `ORPCError("BAD_REQUEST")`
@@ -199,14 +212,14 @@ function UpcomingSection(props: UpcomingSectionProps) {
 
   const handleDragEnd = async (event: DragEndEvent) => {
     const { active, over } = event;
-    if (!api || !over || active.id === over.id) return;
+    if (!over || active.id === over.id) return;
     const ids = props.entries.map((e) => e.goal.goalId);
     const fromIndex = ids.indexOf(String(active.id));
     const toIndex = ids.indexOf(String(over.id));
     if (fromIndex === -1 || toIndex === -1) return;
     const next = arrayMove(ids, fromIndex, toIndex);
     try {
-      await api.workspace.reorderUpcomingGoals({
+      await liveClientFor(api).workspace.reorderUpcomingGoals({
         workspaceId: props.workspaceId,
         upcomingIds: next,
       });
@@ -218,9 +231,11 @@ function UpcomingSection(props: UpcomingSectionProps) {
   };
 
   const promote = async (goalId: string) => {
-    if (!api) return;
     try {
-      await api.workspace.promoteUpcomingGoal({ workspaceId: props.workspaceId, goalId });
+      await liveClientFor(api).workspace.promoteUpcomingGoal({
+        workspaceId: props.workspaceId,
+        goalId,
+      });
       clearError();
       props.onMutated();
     } catch (caught) {
@@ -229,9 +244,8 @@ function UpcomingSection(props: UpcomingSectionProps) {
   };
 
   const archive = async (goalId: string) => {
-    if (!api) return;
     try {
-      await api.workspace.archiveGoal({ workspaceId: props.workspaceId, goalId });
+      await liveClientFor(api).workspace.archiveGoal({ workspaceId: props.workspaceId, goalId });
       clearError();
       props.onMutated();
     } catch (caught) {
@@ -240,9 +254,8 @@ function UpcomingSection(props: UpcomingSectionProps) {
   };
 
   const update = async (goalId: string, patch: UpcomingGoalPatch) => {
-    if (!api) return;
     try {
-      await api.workspace.updateUpcomingGoal({
+      await liveClientFor(api).workspace.updateUpcomingGoal({
         workspaceId: props.workspaceId,
         goalId,
         objective: patch.objective,
@@ -521,15 +534,14 @@ interface CompletedSectionProps {
 }
 
 function CompletedSection(props: CompletedSectionProps) {
-  const { api } = useAPI();
+  const api = useLiveAPI();
   const [error, setError] = useState<string | null>(null);
 
   if (props.entries.length === 0) return null;
 
   const archive = async (goalId: string) => {
-    if (!api) return;
     try {
-      await api.workspace.archiveGoal({ workspaceId: props.workspaceId, goalId });
+      await liveClientFor(api).workspace.archiveGoal({ workspaceId: props.workspaceId, goalId });
       setError(null);
       props.onMutated();
     } catch (caught) {
@@ -575,14 +587,16 @@ interface ArchivedSectionProps {
 }
 
 function ArchivedSection(props: ArchivedSectionProps) {
-  const { api } = useAPI();
+  const api = useLiveAPI();
   const [error, setError] = useState<string | null>(null);
   if (props.entries.length === 0) return null;
 
   const revive = async (goalId: string) => {
-    if (!api) return;
     try {
-      await api.workspace.reviveArchivedGoal({ workspaceId: props.workspaceId, goalId });
+      await liveClientFor(api).workspace.reviveArchivedGoal({
+        workspaceId: props.workspaceId,
+        goalId,
+      });
       setError(null);
       props.onMutated();
     } catch (caught) {
@@ -624,7 +638,7 @@ interface UpcomingAdderProps {
 }
 
 function UpcomingAdder(props: UpcomingAdderProps) {
-  const { api } = useAPI();
+  const api = useLiveAPI();
   const { defaults } = useGoalDefaults(props.workspaceId);
   const [isOpen, setIsOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -641,7 +655,6 @@ function UpcomingAdder(props: UpcomingAdderProps) {
   };
 
   const submit = async () => {
-    if (!api) return;
     const objective = (objectiveRef.current?.value ?? "").trim();
     if (objective.length === 0) {
       setError("Goal objective is required.");
@@ -678,18 +691,19 @@ function UpcomingAdder(props: UpcomingAdderProps) {
     setIsSubmitting(true);
     setError(null);
     try {
+      const client = liveClientFor(api);
       // Load effective defaults at submit time so a quick submit before
       // the hook fetch resolves still persists the current workspace/global
       // limits. Fall back to the hook snapshot if the network read fails.
       let effective = defaults;
       try {
-        effective = await loadGoalDefaults(api, props.workspaceId);
+        effective = await loadGoalDefaults(client, props.workspaceId);
       } catch {
         // Keep `effective` at the hook value (which is itself a
         // best-effort snapshot or the canonical default).
       }
       const resolved = resolveGoalSetIntent({ objective, budgetCents, turnCap }, effective);
-      await api.workspace.addUpcomingGoal({
+      await client.workspace.addUpcomingGoal({
         workspaceId: props.workspaceId,
         objective: resolved.objective,
         budgetCents: resolved.budgetCents,

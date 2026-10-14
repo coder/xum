@@ -163,6 +163,49 @@ describe("TimelinePanel", () => {
     ).not.toBeNull();
   });
 
+  test("renders a prompt-cache break's section, boundary and both block summaries", () => {
+    const cacheBreak = (
+      id: string,
+      seq: number,
+      promptCacheBreak: NonNullable<NonNullable<TimelineEvent["data"]>["promptCacheBreak"]>
+    ) =>
+      makeEvent(id, "cache.prefix_break", seq, {
+        data: { description: "Prompt cache prefix broke in messages at block 6", promptCacheBreak },
+      });
+    const view = renderTimeline({
+      events: [
+        cacheBreak("turn-break", 1, {
+          section: "messages",
+          boundary: "turn",
+          blockIndex: 6,
+          previousBlockCount: 7,
+          nextBlockCount: 7,
+          previous: { role: "user", type: "tool_result", length: 16_820, toolName: "read_file" },
+          next: { role: "user", type: "tool_result", length: 12_043, toolName: "read_file" },
+        }),
+        cacheBreak("step-break", 2, {
+          section: "system",
+          boundary: "step",
+          blockIndex: 2,
+          previousBlockCount: 13,
+          nextBlockCount: 2,
+          previous: { role: "system", type: "text", length: 512 },
+        }),
+      ],
+    });
+
+    const turnRow = view.container.querySelector('[data-timeline-event-id="turn-break"]');
+    expect(turnRow?.textContent).toContain("Prompt cache broke in messages");
+    expect(turnRow?.textContent).toContain("Turn boundary · 6 of 7 blocks matched");
+    expect(turnRow?.textContent).toContain("user · tool_result · read_file · 16,820 chars");
+    expect(turnRow?.textContent).toContain("user · tool_result · read_file · 12,043 chars");
+    const stepRow = view.container.querySelector('[data-timeline-event-id="step-break"]');
+    expect(stepRow?.textContent).toContain("Step boundary · 2 of 13 blocks matched");
+    // No tool name on a system block, and a shorter next request has no block to show.
+    expect(stepRow?.textContent).toContain("system · text · 512 chars");
+    expect(stepRow?.textContent).toContain("Request ended here");
+  });
+
   test("category filters narrow the feed and isolate agent events", () => {
     const events = [
       makeEvent("turn", "turn.user", 1),

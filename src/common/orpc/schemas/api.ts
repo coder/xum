@@ -76,6 +76,15 @@ import { ResultSchema } from "./result";
 import {
   McpAppToolCallRequestSchema,
   McpAppToolCallResultSchema,
+  McpAppApproveDomainsRequestSchema,
+  McpAppEntrypointSchema,
+  McpAppModelContextRequestSchema,
+  McpAppWidgetStateRequestSchema,
+  McpAppOpenEntrypointRequestSchema,
+  McpAppViewDomainsSchema,
+  McpAppResourceReadRequestSchema,
+  McpAppViewRecordsRequestSchema,
+  McpAppViewRecordsSchema,
   McpAppViewRequestSchema,
   McpAppViewSchema,
 } from "./mcpApps";
@@ -152,7 +161,11 @@ import {
   WorkspaceHeartbeatSettingsSchema,
 } from "./workspace";
 import { WorkspaceAgentAISettingsSchema, WorkspaceAISettingsSchema } from "./workspaceAiSettings";
-import { AgentSkillListResultSchema, AgentSkillPackageSchema, SkillNameSchema } from "./agentSkill";
+import {
+  AgentSkillListResultSchema,
+  AgentSkillPackageSchema,
+  SkillLookupNameSchema,
+} from "./agentSkill";
 import {
   AvailableWorkflowSchema,
   WorkflowRunIdSchema,
@@ -174,6 +187,12 @@ import {
   MCPRemoveGlobalParamsSchema,
   MCPRemoveParamsSchema,
   MCPServerMapSchema,
+  MCPSettingsReadInputSchema,
+  MCPSettingsReadSnapshotSchema,
+  MCPSettingsUpdateParamsSchema,
+  MCPSettingsRunToolParamsSchema,
+  MCPSettingsRunToolResultSchema,
+  MCPSettingsOpenAppResultSchema,
   MCPSetEnabledGlobalParamsSchema,
   MCPSetEnabledParamsSchema,
   MCPSetToolAllowlistGlobalParamsSchema,
@@ -190,6 +209,8 @@ import {
   AgentPluginInstallEntrySchema,
   AgentPluginInstallPreviewSchema,
   AgentPluginComponentsSchema,
+  AgentPluginComponentRefSchema,
+  AgentPluginHooksSchema,
   AgentPluginListItemSchema,
   AgentPluginUpdateCheckSchema,
   AgentPluginUpdateConsentSchema,
@@ -766,6 +787,8 @@ export const mcpOauth = {
         projectPath: z.string().optional(),
         serverName: z.string(),
         pendingServer: MCPOAuthPendingServerSchema.optional(),
+        // Caller-generated so Cancel can name the flow while the start runs (#6565).
+        flowId: z.string().optional(),
       })
       .strict(),
     output: ResultSchema(
@@ -796,6 +819,8 @@ export const mcpOauth = {
         projectPath: z.string().optional(),
         serverName: z.string(),
         pendingServer: MCPOAuthPendingServerSchema.optional(),
+        // Caller-generated so Cancel can name the flow while the start runs (#6565).
+        flowId: z.string().optional(),
       })
       .strict(),
     output: ResultSchema(
@@ -821,7 +846,8 @@ export const mcpOauth = {
     output: z.void(),
   },
   getAuthStatus: {
-    input: z.object({ serverUrl: z.string() }).strict(),
+    /** `serverName` applies that configured server's plugin client (see getAuthStatusForApi). */
+    input: z.object({ serverUrl: z.string(), serverName: z.string().optional() }).strict(),
     output: z.object({
       serverUrl: z.string().optional(),
       isLoggedIn: z.boolean(),
@@ -1002,6 +1028,7 @@ export const projects = {
           projectPath: z.string(),
           serverName: z.string(),
           pendingServer: MCPOAuthPendingServerSchema.optional(),
+          flowId: z.string().optional(),
         })
         .strict(),
       output: ResultSchema(
@@ -1032,6 +1059,7 @@ export const projects = {
           projectPath: z.string(),
           serverName: z.string(),
           pendingServer: MCPOAuthPendingServerSchema.optional(),
+          flowId: z.string().optional(),
         })
         .strict(),
       output: ResultSchema(
@@ -1127,6 +1155,40 @@ export const projects = {
  */
 export const mcp = {
   designStatus: { input: z.void(), output: ClaudeDesignStatusSchema },
+  /** OpenAI structured settings of one workspace server (`openai/settings`). */
+  settings: {
+    read: {
+      input: MCPSettingsReadInputSchema,
+      /**
+       * Per server name: null when the server has no `openai/settings` capability;
+       * `{ notConnected: true }` when `ifConnected` found it not running.
+       */
+      output: z.record(
+        z.string(),
+        ResultSchema(
+          z
+            .union([MCPSettingsReadSnapshotSchema, z.object({ notConnected: z.literal(true) })])
+            .nullable(),
+          z.string()
+        )
+      ),
+    },
+    update: {
+      input: MCPSettingsUpdateParamsSchema,
+      /** The snapshot the server shows after the update (its schema can change). */
+      output: ResultSchema(MCPSettingsReadSnapshotSchema, z.string()),
+    },
+    /** Run a layout tool action (a regular tool) and return its text result. */
+    runTool: {
+      input: MCPSettingsRunToolParamsSchema,
+      output: ResultSchema(MCPSettingsRunToolResultSchema, z.string()),
+    },
+    /** Open a layout tool action's MCP App: call the tool and store its view record. */
+    openApp: {
+      input: MCPSettingsRunToolParamsSchema,
+      output: ResultSchema(MCPSettingsOpenAppResultSchema, z.string()),
+    },
+  },
   configureDesign: {
     input: ClaudeDesignSettingsSchema.pick({ source: true, reuseEnabled: true }).partial({
       source: true,
@@ -1209,6 +1271,21 @@ export const agentPlugins = {
     input: z.object({ name: z.string() }),
     output: ResultSchema(AgentPluginComponentsSchema, z.string()),
   },
+  /** Codex-format hooks (hooks.json) of a managed plugin, with their trust review state. */
+  getHooks: {
+    input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginHooksSchema, z.string()),
+  },
+  /** Trust, turn off, or clear (null) one hook; refused when `hash` is no longer current. */
+  setHookTrust: {
+    input: z.object({
+      name: z.string(),
+      key: z.string(),
+      hash: z.string(),
+      state: z.enum(["trusted", "disabled"]).nullable(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   setComponents: {
     input: z.object({
       name: z.string(),
@@ -1263,6 +1340,26 @@ export const agentPlugins = {
       consent: AgentPluginUpdateConsentSchema.nullish(),
     }),
     output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
+  },
+  /**
+   * Component review of the installed tree (#6498): every imported skill or MCP server whose
+   * current fingerprint the user has not reviewed, in the update review shape (fromSha = toSha).
+   */
+  previewComponentReview: {
+    input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginUpdateReviewSchema, z.string()),
+  },
+  /** Record consent for the reviewed components that still match the installed tree. */
+  confirmComponentReview: {
+    input: z.object({
+      name: z.string(),
+      expectedLockedSha: z.string(),
+      reviewed: z.array(AgentPluginComponentRefSchema),
+    }),
+    output: ResultSchema(
+      z.object({ entry: AgentPluginInstallEntrySchema, cleanupWarning: z.string().optional() }),
+      z.string()
+    ),
   },
 };
 
@@ -1451,38 +1548,92 @@ export const artifacts = {
     }),
     output: ResultSchema(z.object({ id: z.string() }), z.string()),
   },
-  /** Persisted window.xum.state for an artifact version (null when none). */
+  /** Persisted window.xum.state of an artifact (null when none); one state for all versions. */
   getState: {
     input: z.object({
       workspaceId: z.string(),
       path: z.string(),
-      version: z.number().int().nonnegative().nullable(),
     }),
-    output: ResultSchema(z.object({ version: z.number(), state: z.unknown() }), z.string()),
+    output: ResultSchema(z.object({ state: z.unknown() }), z.string()),
   },
   setState: {
     input: z.object({
       workspaceId: z.string(),
       path: z.string(),
-      version: z.number().int().nonnegative().nullable(),
       state: z.unknown(),
     }),
-    output: ResultSchema(z.object({ version: z.number() }), z.string()),
+    output: ResultSchema(z.void(), z.string()),
   },
 };
 
 /**
  * MCP Apps views in the Artifacts tab (artifacts experiment): the view resource plus the
- * host-only tool result, and tools/call issued by a view.
+ * host-only tool result, and tools/call and resources/read issued by a view.
  */
 export const mcpApps = {
   getView: {
     input: McpAppViewRequestSchema,
     output: ResultSchema(McpAppViewSchema, z.string()),
   },
+  /** Views of tool calls by their result records alone (tabs restored after a restart). */
+  getViewRecords: {
+    input: McpAppViewRecordsRequestSchema,
+    output: ResultSchema(McpAppViewRecordsSchema, z.string()),
+  },
   callTool: {
     input: McpAppToolCallRequestSchema,
     output: ResultSchema(McpAppToolCallResultSchema, z.string()),
+  },
+  /** resources/read issued by a view; returns the server's raw ReadResourceResult. */
+  readResource: {
+    input: McpAppResourceReadRequestSchema,
+    output: ResultSchema(z.unknown(), z.string()),
+  },
+  approveViewDomains: {
+    input: McpAppApproveDomainsRequestSchema,
+    output: ResultSchema(
+      z.object({ approvedDomains: z.array(z.string()), revision: z.number() }),
+      z.string()
+    ),
+  },
+  listViewDomains: { input: z.void(), output: z.array(McpAppViewDomainsSchema) },
+  /**
+   * Every project's approvals with the revision of this read, newer than every list committed
+   * before it: the live follow of mounted views re-reads after each config change (#6181).
+   */
+  readViewDomains: {
+    input: z.void(),
+    output: z.object({ revision: z.number(), approvals: z.array(McpAppViewDomainsSchema) }),
+  },
+  /** Mounted views of the server in this renderer reload under the narrower policy. */
+  revokeViewDomains: {
+    input: McpAppViewDomainsSchema.pick({ projectPath: true, serverName: true }),
+    output: z.object({ revision: z.number() }),
+  },
+  /** ui/update-model-context of a view; used by the workspace's next requests. */
+  updateModelContext: {
+    input: McpAppModelContextRequestSchema,
+    output: ResultSchema(z.object({}), z.string()),
+  },
+  /** window.openai.setWidgetState of a view; kept in its result record (#6178). */
+  setWidgetState: {
+    input: McpAppWidgetStateRequestSchema,
+    output: ResultSchema(z.object({}), z.string()),
+  },
+  /** Entry points of the servers enabled in the workspace (starts them like prompt discovery). */
+  listEntrypoints: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: z.array(McpAppEntrypointSchema),
+  },
+  /** Ticks when a server of the workspace sends tools/list_changed: re-list entry points. */
+  onEntrypointsChanged: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: eventIterator(z.void()),
+  },
+  /** Call an entry point's tool with `{}` and store its view record (no chat row). */
+  openEntrypoint: {
+    input: McpAppOpenEntrypointRequestSchema,
+    output: ResultSchema(McpAppEntrypointSchema, z.string()),
   },
 };
 
@@ -2743,7 +2894,8 @@ export const agentSkills = {
     output: AgentSkillListResultSchema,
   },
   get: {
-    input: AgentDiscoveryInputSchema.and(z.object({ skillName: SkillNameSchema })),
+    // `<plugin>:<skill>` reaches a plugin skill shadowed by a higher-precedence one.
+    input: AgentDiscoveryInputSchema.and(z.object({ skillName: SkillLookupNameSchema })),
     output: AgentSkillPackageSchema,
   },
 };

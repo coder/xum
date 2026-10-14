@@ -3,9 +3,15 @@ import { tool } from "ai";
 import type { AgentSkillReadFileToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
-import { SkillNameSchema } from "@/common/orpc/schemas";
-import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
+import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
+import {
+  readAgentSkill,
+  type ResolvedAgentSkill,
+} from "@/node/services/agentSkills/agentSkillsService";
+import { pluginSiblingNoteFor } from "@/node/services/agentSkills/pluginSiblingNote";
+import type { InvocableSkill } from "@/common/types/agentSkill";
 import { readPluginFileWithinRootCapped } from "@/node/services/agentPlugins/discovery";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
@@ -45,29 +51,56 @@ function readContentWithFileReadLimits(input: {
   const startIdx = startLineNumber - 1;
   const endIdx = input.limit != null ? startIdx + input.limit : lines.length;
 
+  const page = numberPageLines(lines, startIdx, Math.min(endIdx, lines.length));
+  if ("error" in page) {
+    return { success: false, error: page.error };
+  }
+
+  return {
+    success: true,
+    file_size: input.fileSize,
+    modifiedTime: input.modifiedTime,
+    lines_read: page.numberedLines.length,
+    content: page.numberedLines.join("\n"),
+  };
+}
+
+/** Numbers lines[startIdx, endIdx) as `<n>\t<line>` rows within the page caps. */
+function numberPageLines(
+  lines: string[],
+  startIdx: number,
+  endIdx: number
+): { numberedLines: string[] } | { error: string } {
+  // The input schema only admits whole-number offset/limit; a fractional index
+  // would read `undefined` rows instead of failing.
+  assert(
+    Number.isInteger(startIdx) && Number.isInteger(endIdx),
+    `numberPageLines needs whole-number bounds (got ${startIdx}..${endIdx})`
+  );
   const numberedLines: string[] = [];
   let totalBytesAccumulated = 0;
-  const MAX_LINE_BYTES = 1024;
   const MAX_LINES = 1000;
   const MAX_TOTAL_BYTES = 16 * 1024; // 16KB
 
-  for (let i = startIdx; i < Math.min(endIdx, lines.length); i++) {
-    const line = lines[i];
+  // Unlike file_read, lines are never cut: skill markdown often keeps a whole
+  // paragraph on one line, and a silent per-line cut dropped instructions
+  // (agent_skill_read returns the SKILL.md body whole for the same reason).
+  // Only the page cap applies, and it fails loudly so the model pages instead.
+  for (let i = startIdx; i < endIdx; i++) {
     const lineNumber = i + 1;
-
-    let processedLine = line;
-    const lineBytes = Buffer.byteLength(line, "utf-8");
-    if (lineBytes > MAX_LINE_BYTES) {
-      processedLine = Buffer.from(line, "utf-8").subarray(0, MAX_LINE_BYTES).toString("utf-8");
-      processedLine += "... [truncated]";
-    }
-
-    const numberedLine = `${lineNumber}\t${processedLine}`;
+    const numberedLine = `${lineNumber}\t${lines[i]}`;
     const numberedLineBytes = Buffer.byteLength(numberedLine, "utf-8");
+
+    if (numberedLineBytes > MAX_TOTAL_BYTES) {
+      // Paging cannot shrink a single line, so name it (wherever it sits in the
+      // window) instead of asking for a smaller offset/limit window.
+      return {
+        error: `Line ${lineNumber} is ${numberedLineBytes} bytes, more than the ${MAX_TOTAL_BYTES}-byte output limit, so agent_skill_read_file cannot return it. Read the lines around it with offset and limit.`,
+      };
+    }
 
     if (totalBytesAccumulated + numberedLineBytes > MAX_TOTAL_BYTES) {
       return {
-        success: false,
         error: `Output would exceed ${MAX_TOTAL_BYTES} bytes. Please read less at a time using offset and limit parameters.`,
       };
     }
@@ -77,24 +110,33 @@ function readContentWithFileReadLimits(input: {
 
     if (numberedLines.length > MAX_LINES) {
       return {
-        success: false,
         error: `Output would exceed ${MAX_LINES} lines. Please read less at a time using offset and limit parameters.`,
       };
     }
   }
 
-  return {
-    success: true,
-    file_size: input.fileSize,
-    modifiedTime: input.modifiedTime,
-    lines_read: numberedLines.length,
-    content: numberedLines.join("\n"),
-  };
+  return { numberedLines };
+}
+
+/**
+ * Files of a plugin skill (playbooks, references) name sibling skills by bare
+ * name too, so they carry the plugin sibling note. It is a separate field so
+ * `content` line numbers stay exact.
+ */
+function withPluginSkillNote(
+  result: AgentSkillReadFileToolResult,
+  resolvedSkill: ResolvedAgentSkill,
+  availableSkills: readonly InvocableSkill[] | undefined
+): AgentSkillReadFileToolResult {
+  if (!result.success) return result;
+  const note = pluginSiblingNoteFor(resolvedSkill, availableSkills);
+  return note == null ? result : { ...result, pluginSkillNote: note };
 }
 
 /**
  * Agent Skill read_file tool factory.
- * Reads a file within a skill directory with the same output limits as file_read.
+ * Reads a file within a skill directory with file_read's paging and page caps,
+ * but without its per-line cut (see readContentWithFileReadLimits).
  */
 export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
@@ -119,11 +161,11 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
       });
 
       // Defensive: validate again even though inputSchema should guarantee shape.
-      const parsedName = SkillNameSchema.safeParse(name);
-      if (!parsedName.success) {
+      const lookup = parseSkillLookupName(name);
+      if (lookup == null) {
         return {
           success: false,
-          error: parsedName.error.message,
+          error: `Invalid skill name: ${name}`,
         };
       }
 
@@ -135,20 +177,16 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           };
         }
 
-        const resolvedSkill = await readAgentSkill(
-          skillCtx.runtime,
-          skillCtx.workspacePath,
-          parsedName.data,
-          {
-            roots: skillCtx.roots,
-            containment: skillCtx.containment,
-            includeClaudeSkills,
-          }
-        );
+        const resolvedSkill = await readAgentSkill(skillCtx.runtime, skillCtx.workspacePath, name, {
+          roots: skillCtx.roots,
+          containment: skillCtx.containment,
+          includeClaudeSkills,
+        });
 
         // Built-in skills are embedded in the app bundle (no filesystem access).
         if (resolvedSkill.package.scope === "built-in") {
-          const builtIn = readBuiltInSkillFile(parsedName.data, filePath);
+          assert(lookup.pluginName == null, "qualified skill lookups never resolve to built-ins");
+          const builtIn = readBuiltInSkillFile(lookup.skillName, filePath);
           return readContentWithFileReadLimits({
             fullContent: builtIn.content,
             fileSize: Buffer.byteLength(builtIn.content, "utf-8"),
@@ -274,13 +312,17 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           throw err;
         }
 
-        return readContentWithFileReadLimits({
-          fullContent,
-          fileSize: resultFileSize,
-          modifiedTime: resultModifiedTime,
-          offset,
-          limit,
-        });
+        return withPluginSkillNote(
+          readContentWithFileReadLimits({
+            fullContent,
+            fileSize: resultFileSize,
+            modifiedTime: resultModifiedTime,
+            offset,
+            limit,
+          }),
+          resolvedSkill,
+          config.availableSkills
+        );
       } catch (error) {
         return {
           success: false,

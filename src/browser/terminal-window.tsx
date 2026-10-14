@@ -64,6 +64,7 @@ if (!workspaceId || !sessionId) {
   // Don't use StrictMode for terminal windows to avoid double-mounting issues
   // StrictMode intentionally double-mounts components in dev, which causes
   // race conditions with WebSocket connections and terminal lifecycle
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   ReactDOM.createRoot(document.getElementById("root")!).render(
     <APIProvider>
       <TerminalRouterProvider popout>

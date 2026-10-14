@@ -40,6 +40,8 @@ test(
   async ({ app, screen, browser }) => {
     await browser.setViewport({ width: 1440, height: 900 });
     await openPlayground(app, screen, browser);
+    // This test exercises the expanded sidebar; fresh profiles start collapsed.
+    await screen.getByRole("button", /^Expand (right )?sidebar$/).tap();
     const collapse = screen
       .getByRole("complementary", "Workspace insights")
       .getByRole("button", "Collapse sidebar");

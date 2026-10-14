@@ -4,7 +4,11 @@ import { describe, it, expect, mock, spyOn } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
-import { COMPLETED_REPORT_REFETCH_NOTE } from "@/common/utils/tools/toolDefinitions";
+import { TOOL_TEXT_PAGE_MAX_CHARS } from "@/common/constants/toolLimits";
+import {
+  COMPLETED_REPORT_REFETCH_NOTE,
+  TOOL_DEFINITIONS,
+} from "@/common/utils/tools/toolDefinitions";
 import type { WorkflowRunRecord, WorkflowRunStatus } from "@/common/types/workflow";
 import { createTaskAwaitTool } from "./task_await";
 import { TestTempDir, createFakeWorkspaceTurnManager, createTestToolConfig } from "./testHelpers";
@@ -107,6 +111,12 @@ function createFakeTaskServices(
       waitForWorkspaceTurn,
     }),
   };
+}
+
+interface ReportPage {
+  reportMarkdown: string;
+  nextCharOffset?: number;
+  note?: string;
 }
 
 describe("task_await tool", () => {
@@ -744,6 +754,78 @@ describe("task_await tool", () => {
     );
   });
 
+  it("pages a long report and re-fetches the next page with offset_chars", async () => {
+    using tempDir = new TestTempDir("test-task-await-tool-report-pages");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    // An emoji (surrogate pair) straddles the page boundary: pages must not split it.
+    const report = `${"a".repeat(TOOL_TEXT_PAGE_MAX_CHARS - 1)}😀${"b".repeat(70_000)}`;
+    const taskServices = createFakeTaskServices({
+      listActiveDescendantAgentTaskIds: mock(() => ["t1"]),
+      isDescendantAgentTask: mock(() => Promise.resolve(true)),
+      getAgentTaskStatus: mock(() => "reported" as const),
+      waitForAgentReport: mock(() => Promise.resolve({ reportMarkdown: report })),
+    });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+
+    const pages: ReportPage[] = [];
+    let offset: number | null = null;
+    for (let call = 0; call < 5; call++) {
+      const result = (await Promise.resolve(
+        tool.execute!(
+          offset == null
+            ? { task_ids: ["t1"] }
+            : { task_ids: ["t1"], timeout_secs: 0, offset_chars: offset },
+          mockToolCallOptions
+        )
+      )) as { results: ReportPage[] };
+      const page = result.results[0];
+      expect(page.reportMarkdown.length).toBeLessThanOrEqual(TOOL_TEXT_PAGE_MAX_CHARS);
+      pages.push(page);
+      if (page.nextCharOffset == null) break;
+      expect(page.note).toContain(`offset_chars: ${page.nextCharOffset})`);
+      // The continuation names one ID, so it passes the single-report rule.
+      expect(page.note).toContain('task_await(task_ids: ["t1"], timeout_secs: 0');
+      offset = page.nextCharOffset;
+    }
+
+    expect(pages).toHaveLength(3);
+    expect(pages[0].reportMarkdown.endsWith("a")).toBe(true);
+    expect(pages.map((page) => page.reportMarkdown).join("")).toBe(report);
+    expect(pages[2].note).toBe(COMPLETED_REPORT_REFETCH_NOTE);
+  });
+
+  it("refuses offset_chars unless exactly one task ID is given", () => {
+    const schema = TOOL_DEFINITIONS.task_await.schema;
+    const issue = (args: Record<string, unknown>) => {
+      const parsed = schema.safeParse(args);
+      return parsed.success ? null : parsed.error.issues[0]?.message;
+    };
+    // Several IDs: the error names the exact single-ID call for each.
+    expect(issue({ task_ids: ["t1", "t2"], offset_chars: 50_000 })).toContain(
+      'task_await(task_ids: ["t1"], timeout_secs: 0, offset_chars: 50000) or task_await(task_ids: ["t2"]'
+    );
+    // No IDs awaits every task.
+    expect(issue({ offset_chars: 50_000 })).toContain("exactly one task ID");
+    // One ID (also when repeated), or offset 0, is fine.
+    expect(issue({ task_ids: ["t1"], offset_chars: 50_000 })).toBeNull();
+    expect(issue({ task_ids: ["t1", "t1"], offset_chars: 50_000 })).toBeNull();
+    expect(issue({ task_ids: ["t1", "t2"], offset_chars: 0 })).toBeNull();
+  });
+
+  it("refuses offset_chars for bash output and names the call that reads it", () => {
+    const schema = TOOL_DEFINITIONS.task_await.schema;
+    const issue = (args: Record<string, unknown>) => {
+      const parsed = schema.safeParse(args);
+      return parsed.success ? null : parsed.error.issues[0]?.message;
+    };
+    const readAgain = 'task_await(task_ids: ["bash:p1"], timeout_secs: 0) without offset_chars';
+    expect(issue({ task_ids: ["bash:p1"], offset_chars: 1000 })).toContain(readAgain);
+    // With other IDs too, the bash rule wins: the single-ID hint would name a refused call.
+    expect(issue({ task_ids: ["t1", "bash:p1"], offset_chars: 1000 })).toContain(readAgain);
+    expect(issue({ task_ids: ["bash:p1"], offset_chars: 0 })).toBeNull();
+    expect(issue({ task_ids: ["bash:p1"] })).toBeNull();
+  });
+
   it("propagates report-time AI settings into completed results", async () => {
     using tempDir = new TestTempDir("test-task-await-tool-report-settings");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
@@ -1264,6 +1346,74 @@ describe("task_await tool", () => {
       runUpdatedAt: "2026-01-01T00:00:05.000Z",
       settledAs: "delivered",
     });
+  });
+
+  it("returns a workflow's structuredOutput on the first report page only", async () => {
+    using tempDir = new TestTempDir("test-task-await-tool-workflow-pages");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const report = "r".repeat(TOOL_TEXT_PAGE_MAX_CHARS + 10);
+    const structuredOutput = { findings: "x".repeat(1_000) };
+    const completedRun = createWorkflowRun("completed", [
+      {
+        sequence: 1,
+        type: "result",
+        at: "2026-01-01T00:00:04.000Z",
+        result: { reportMarkdown: report, structuredOutput },
+      },
+    ]);
+    const tool = createTaskAwaitTool({
+      ...baseConfig,
+      ...createFakeTaskServices({}),
+      workflowService: {
+        getRun: mock(() => Promise.resolve(completedRun)),
+      } as unknown as TestWorkflowService,
+    });
+    const read = async (args: Record<string, unknown>) => {
+      const result = (await Promise.resolve(
+        tool.execute!({ task_ids: ["wfr_demo"], timeout_secs: 0, ...args }, mockToolCallOptions)
+      )) as { results: Array<ReportPage & { structuredOutput?: unknown }> };
+      return result.results[0];
+    };
+
+    const first = await read({});
+    expect(first.structuredOutput).toEqual(structuredOutput);
+    expect(first.nextCharOffset).toBe(TOOL_TEXT_PAGE_MAX_CHARS);
+    const second = await read({ offset_chars: first.nextCharOffset });
+    expect(second.reportMarkdown).toBe("r".repeat(10));
+    expect(second).not.toHaveProperty("structuredOutput");
+    // Rereading the first page with an explicit 0 still returns it.
+    expect((await read({ offset_chars: 0 })).structuredOutput).toEqual(structuredOutput);
+  });
+
+  it("drops structuredOutput from a later-page read of an empty report", async () => {
+    using tempDir = new TestTempDir("test-task-await-tool-empty-report-pages");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const structuredOutput = { findings: "x".repeat(60_000) };
+    const tool = createTaskAwaitTool({
+      ...baseConfig,
+      ...createFakeTaskServices({
+        listActiveDescendantAgentTaskIds: mock(() => ["t1"]),
+        isDescendantAgentTask: mock(() => Promise.resolve(true)),
+        getAgentTaskStatus: mock(() => "reported" as const),
+        waitForAgentReport: mock(() => Promise.resolve({ reportMarkdown: "", structuredOutput })),
+      }),
+    });
+    const read = async (offset: number) => {
+      const result = (await Promise.resolve(
+        tool.execute!(
+          { task_ids: ["t1"], timeout_secs: 0, offset_chars: offset },
+          mockToolCallOptions
+        )
+      )) as { results: Array<ReportPage & { structuredOutput?: unknown }> };
+      return result.results[0];
+    };
+
+    // An empty report reads back the same empty text at any offset: the requested offset,
+    // not the text, decides which read is the first page.
+    expect((await read(0)).structuredOutput).toEqual(structuredOutput);
+    const later = await read(TOOL_TEXT_PAGE_MAX_CHARS);
+    expect(later.reportMarkdown).toBe("");
+    expect(later).not.toHaveProperty("structuredOutput");
   });
 
   it("returns retry_from_checkpoint guidance for checkpoint-retryable failed workflow runs", async () => {

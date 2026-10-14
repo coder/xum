@@ -7,7 +7,12 @@ import type { FilePart, SendMessageOptions, WorkspaceChatMessage } from "@/commo
 import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
 import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
 import type { SendMessageError } from "@/common/types/errors";
-import type { ArtifactInteractionMetadata, MuxMessage } from "@/common/types/message";
+import {
+  getCompactionFollowUpContent,
+  type ArtifactInteractionMetadata,
+  type MuxMessage,
+  type MuxMessageMetadata,
+} from "@/common/types/message";
 import { ArtifactInteractionMetadataSchema } from "@/common/orpc/schemas/stream";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { TurnAcceptanceOrigin, TurnAdmissionToken } from "./taskWorkspaceSeam";
@@ -226,6 +231,8 @@ interface QueuedMessageInternalOptions {
   admissionStale?: () => boolean;
   /** See AgentSession SendMessageInternalOptions.skipOnSendCompaction (entries carrying it are sealed). */
   skipOnSendCompaction?: boolean;
+  /** See AgentSession SendMessageInternalOptions.skipPromptHooks (entries carrying it are sealed). */
+  skipPromptHooks?: boolean;
   /**
    * Task-attempt obligation for this send. The queue owns it from insertion (onEnqueued) until
    * the entry dispatches (the session reports admission) or is removed (disposed here). Entries
@@ -256,6 +263,29 @@ function clearCallbacksFor(entry: QueueEntry): QueueClearCallbacks {
       ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
       : {}),
   };
+}
+
+/**
+ * The texts a composer restore gets for an entry: the authored texts, except that a compaction
+ * entry's first text is its model-facing summarization prompt, so the user's command comes back
+ * instead. Texts queued behind it follow, so "/compact" plus a draft is re-sent as one /compact
+ * with that follow-up.
+ */
+function restoredTextsOf(entry: QueueEntry): readonly string[] {
+  return isCompactionMetadata(entry.muxMetadata)
+    ? [entry.muxMetadata.rawCommand, ...entry.authoredMessages.slice(1)]
+    : entry.authoredMessages;
+}
+
+/**
+ * A /compact's own follow-up: prepareCompactionMessage keeps its attachments and review notes
+ * only under `parsed.followUpContent` (rawCommand already holds its text), so a composer restore
+ * takes them from there (Codex PRRT_kwDOPxxmWM6r_ubq).
+ */
+function compactionFollowUpOf(entry: QueueEntry) {
+  return isCompactionMetadata(entry.muxMetadata)
+    ? getCompactionFollowUpContent(entry.muxMetadata as MuxMessageMetadata)
+    : undefined;
 }
 
 /**
@@ -336,6 +366,8 @@ interface QueueEntry {
   admissionStale?: () => boolean;
   /** Dispatch without on-send compaction (sealed; see QueuedMessageInternalOptions). */
   skipOnSendCompaction?: boolean;
+  /** Dispatch without the message.send prompt hooks (sealed; see QueuedMessageInternalOptions). */
+  skipPromptHooks?: boolean;
   /** Task-attempt obligation owned by this entry until dispatch or removal (sealed). */
   turnAdmission?: TurnAdmissionToken;
 }
@@ -434,6 +466,22 @@ export class MessageQueue {
    */
   private nextDispatchableEntry(): QueueEntry | undefined {
     return this.entries.find((entry) => entry.cancelSignal?.aborted !== true);
+  }
+
+  /**
+   * Whether any entry would still dispatch: a withdrawn entry drains as a no-op, and an entry
+   * whose admission (its own, its task attempt's or one add's compaction capture) went stale is
+   * refused at the drain (or kept as held input) without streaming.
+   */
+  hasDispatchableEntries(): boolean {
+    return this.entries.some(
+      (entry) =>
+        entry.cancelSignal?.aborted !== true &&
+        entry.admissionStale?.() !== true &&
+        entry.turnAdmission?.admissionStale() !== true &&
+        // dequeueNext folds each add's compaction staleness into the dispatched send's.
+        !entry.acceptanceOrigins.some((add) => add.compactionAdmissionStale?.() === true)
+    );
   }
 
   getNextDispatchableMode(): QueueDispatchMode | undefined {
@@ -721,6 +769,7 @@ export class MessageQueue {
     const entry = this.addInternal(message, options, internal, dedupeKey);
     if (entry != null && dedupeKey !== undefined) {
       entry.dedupeKeys.add(dedupeKey);
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       entry.acceptanceOrigins.at(-1)!.dedupeKey = dedupeKey;
     }
     return entry != null;
@@ -786,6 +835,8 @@ export class MessageQueue {
       internal?.admissionStale != null ||
       // The on-send compaction opt-out applies to exactly the guarded send that asked for it.
       internal?.skipOnSendCompaction === true ||
+      // A prompt-hook opt-out (a Stop continuation) must not lend itself to other input.
+      internal?.skipPromptHooks === true ||
       internal?.turnAdmission != null ||
       internal?.goalKind != null ||
       // Task-turn provenance classifies one dispatch; batching would lend it to other messages.
@@ -903,6 +954,9 @@ export class MessageQueue {
     if (internal?.skipOnSendCompaction === true) {
       entry.skipOnSendCompaction = true;
     }
+    if (internal?.skipPromptHooks === true) {
+      entry.skipPromptHooks = true;
+    }
     if (internal?.turnAdmission != null) {
       // Sealed entries are 1:1 with their token; a batched add can never reach a token-carrying
       // entry, so this is always the entry's own insertion.
@@ -1008,13 +1062,17 @@ export class MessageQueue {
   }
 
   private getFilePartsForEntries(entries: readonly QueueEntry[]): FilePart[] {
-    return entries.flatMap((entry) => entry.fileParts);
+    return entries.flatMap((entry) => [
+      ...(compactionFollowUpOf(entry)?.fileParts ?? []),
+      ...entry.fileParts,
+    ]);
   }
 
   private getReviewsForEntries(entries: readonly QueueEntry[]): ReviewNoteData[] | undefined {
-    const reviews = entries.flatMap((entry) =>
-      hasReviews(entry.muxMetadata) ? (entry.muxMetadata.reviews ?? []) : []
-    );
+    const reviews = entries.flatMap((entry) => [
+      ...(compactionFollowUpOf(entry)?.reviews ?? []),
+      ...(hasReviews(entry.muxMetadata) ? (entry.muxMetadata.reviews ?? []) : []),
+    ]);
     return reviews.length > 0 ? reviews : undefined;
   }
 
@@ -1102,9 +1160,10 @@ export class MessageQueue {
   }> {
     return this.restorableEntries(this.entries).map((entry) => {
       const reviews = this.getReviewsForEntries([entry]);
+      const fileParts = this.getFilePartsForEntries([entry]);
       return {
-        text: this.getDisplayTextForEntries([entry], (queued) => queued.authoredMessages),
-        ...(entry.fileParts.length > 0 ? { fileParts: entry.fileParts } : {}),
+        text: this.getDisplayTextForEntries([entry], restoredTextsOf),
+        ...(fileParts.length > 0 ? { fileParts } : {}),
         ...(reviews ? { reviews } : {}),
         sendIds: entry.sendIdentities.map(({ id }) => id),
       };
@@ -1145,7 +1204,7 @@ export class MessageQueue {
       ? {
           // Authored text, not the provider-facing message: reviews formatted into a message
           // come back as `reviews` below, so the composer would otherwise hold them twice.
-          text: this.getDisplayTextForEntries(restorable, (entry) => entry.authoredMessages),
+          text: this.getDisplayTextForEntries(restorable, restoredTextsOf),
           fileParts: this.getFilePartsForEntries(restorable),
           reviews: this.getReviewsForEntries(restorable),
         }
@@ -1372,7 +1431,7 @@ export class MessageQueue {
         // Kept so a re-send that is queued and refused again is held with the same display text.
         ...(authoredText !== entry.messages.join("\n") ? { authoredText } : {}),
       },
-      displayText: this.getDisplayTextForEntries([entry], (queued) => queued.authoredMessages),
+      displayText: this.getDisplayTextForEntries([entry], restoredTextsOf),
       attachmentCount: entry.fileParts.length,
       reviewCount,
       ...sendIdentitiesOf(entry),
@@ -1389,7 +1448,10 @@ export class MessageQueue {
     entryId?: string;
     message: string;
     options?: SendMessageOptions & { fileParts?: FilePart[] };
-    internal?: QueuedMessageInternalOptions;
+    internal?: QueuedMessageInternalOptions & {
+      /** See SendMessageInternalOptions.textBatchedBehindCompaction. */
+      textBatchedBehindCompaction?: string;
+    };
     /** Timestamp of the latest add batched into this entry (see QueueEntry.lastAddedAtMs). */
     enqueuedAtMs?: number;
   } {
@@ -1399,6 +1461,15 @@ export class MessageQueue {
     }
 
     const joinedMessages = entry.messages.join("\n");
+    // A compaction entry stays open, so sends added after it join its request. Its first message
+    // is the compaction request's own text (compaction always starts a new entry); the rest were
+    // sent separately and must still reach the message.send prompt hooks. An attachment-only add
+    // adds no message but is a send too: it reaches the hooks with empty text, like a direct
+    // attachment-only send (Codex PRRT_kwDOPxxmWM6rZqyv).
+    const textBatchedBehindCompaction =
+      isCompactionMetadata(entry.muxMetadata) && (entry.addCount > 1 || entry.messages.length > 1)
+        ? entry.messages.slice(1).join("\n")
+        : undefined;
     const options = entry.latestOptions
       ? (() => {
           const restOptions: SendMessageOptions = { ...entry.latestOptions };
@@ -1478,10 +1549,12 @@ export class MessageQueue {
       entry.cancelSignal != null ||
       admissionStale != null ||
       entry.skipOnSendCompaction === true ||
+      entry.skipPromptHooks === true ||
       entry.turnAdmission != null ||
       refreshCompactionAdmission != null ||
       readCompactionAdmission != null ||
       (entry.preTurnMessages?.length ?? 0) > 0 ||
+      textBatchedBehindCompaction != null ||
       entry.sendIdentities.length > 0;
     const internal = hasInternalOptions
       ? {
@@ -1503,9 +1576,11 @@ export class MessageQueue {
             : {}),
           ...(admissionStale != null ? { admissionStale } : {}),
           ...(entry.skipOnSendCompaction === true ? { skipOnSendCompaction: true } : {}),
+          ...(entry.skipPromptHooks === true ? { skipPromptHooks: true } : {}),
           ...(entry.turnAdmission != null ? { turnAdmission: entry.turnAdmission } : {}),
           ...(readCompactionAdmission != null ? { readCompactionAdmission } : {}),
           ...(refreshCompactionAdmission != null ? { refreshCompactionAdmission } : {}),
+          ...(textBatchedBehindCompaction != null ? { textBatchedBehindCompaction } : {}),
         }
       : undefined;
 

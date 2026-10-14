@@ -1,9 +1,17 @@
 import { useClaudeDesign } from "@/browser/hooks/useClaudeDesign";
+import { publishGlobalMcpEnablementChanged } from "@/browser/utils/workspaceMcpMutations";
+import {
+  McpAppViewDomainsLoadError,
+  McpAppViewDomainsSection,
+  unlistedMcpAppViewDomains,
+  useMcpAppViewDomains,
+} from "./McpAppViewDomains";
 import { getOwn } from "@/common/utils/getOwn";
 import { ClaudeDesignCard } from "./ClaudeDesignCard";
 import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useGlobalSecretKeys } from "./SecretsSection";
 import {
   Trash2,
   Play,
@@ -55,6 +63,7 @@ import {
 import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import { KebabMenu, type KebabMenuItem } from "@/browser/components/KebabMenu/KebabMenu";
 import { getErrorMessage } from "@/common/utils/errors";
+import { createOAuthFlowId } from "@/browser/utils/oauth/flowId";
 
 /** Expand/collapse header shared by the editable and read-only tool sections. */
 const ToolsDisclosureButton: React.FC<{
@@ -342,13 +351,14 @@ function getMCPOAuthLoginFlowMode(input: {
 }
 
 function useMCPOAuthLogin(input: {
-  api: ReturnType<typeof useAPI>["api"];
   isDesktop: boolean;
   serverName: string;
   pendingServer?: MCPOAuthPendingServerConfig;
   onSuccess?: () => void | Promise<void>;
 }) {
-  const { api, isDesktop, serverName, pendingServer, onSuccess } = input;
+  const { isDesktop, serverName, pendingServer, onSuccess } = input;
+  // The live client only: offline, startLogin shows its own "not connected" error.
+  const api = useLiveAPI();
   const loginAttemptRef = useRef(0);
   const [flowId, setFlowId] = useState<string | null>(null);
 
@@ -416,19 +426,25 @@ function useMCPOAuthLogin(input: {
         return;
       }
 
+      // Generated here and stored before the start RPC: the start can stall on discovery, and
+      // Cancel must reach the flow meanwhile (the backend refuses a flow cancelled while it
+      // was starting) (#6565).
+      const startFlowId = createOAuthFlowId();
+      setFlowId(startFlowId);
       setLoginStatus("starting");
 
       const startResult =
         loginFlowMode === "desktop"
-          ? await mcpOauthApi.startDesktopFlow({ serverName, pendingServer })
-          : await mcpOauthApi.startServerFlow({ serverName, pendingServer });
+          ? await mcpOauthApi.startDesktopFlow({ serverName, pendingServer, flowId: startFlowId })
+          : await mcpOauthApi.startServerFlow({ serverName, pendingServer, flowId: startFlowId });
 
       if (attempt !== loginAttemptRef.current) {
+        // A newer attempt replaced this one; Cancel is idempotent if it already ran.
         if (startResult.success) {
           if (loginFlowMode === "desktop") {
-            void mcpOauthApi.cancelDesktopFlow({ flowId: startResult.data.flowId });
+            void mcpOauthApi.cancelDesktopFlow({ flowId: startFlowId });
           } else {
-            void mcpOauthApi.cancelServerFlow({ flowId: startResult.data.flowId });
+            void mcpOauthApi.cancelServerFlow({ flowId: startFlowId });
           }
         }
         return;
@@ -618,9 +634,7 @@ const MCPOAuthRequiredCallout: React.FC<{
   disabledReason?: string;
   onLoginSuccess?: () => void | Promise<void>;
 }> = (props) => {
-  const { api } = useAPI();
   const login = useMCPOAuthLogin({
-    api,
     isDesktop: !!window.api,
     serverName: props.serverName,
     pendingServer: props.pendingServer,
@@ -659,7 +673,7 @@ const RemoteMCPOAuthSection: React.FC<{
     setAuthStatusError(null);
 
     try {
-      const status = await mcpOauthApi.getAuthStatus({ serverUrl: url });
+      const status = await mcpOauthApi.getAuthStatus({ serverUrl: url, serverName });
       setAuthStatus(status);
     } catch (err) {
       setAuthStatus(null);
@@ -667,14 +681,13 @@ const RemoteMCPOAuthSection: React.FC<{
     } finally {
       setAuthStatusLoading(false);
     }
-  }, [api, url]);
+  }, [api, url, serverName]);
 
   useEffect(() => {
     void refreshAuthStatus();
   }, [refreshAuthStatus, transport, url, oauthRefreshNonce]);
 
   const { loginStatus, loginError, loginInProgress, startLogin, cancelLogin } = useMCPOAuthLogin({
-    api,
     isDesktop,
     serverName,
     onSuccess: refreshAuthStatus,
@@ -835,8 +848,8 @@ function ToolSearchSetting() {
       description={
         <>
           Defer MCP tool definitions until the model discovers them with{" "}
-          <code className="text-accent">tool_catalog_search</code>. With Anthropic prompt caching,
-          uses Anthropic&apos;s native deferred loading, which keeps the cache intact.
+          <code className="text-accent-text">tool_catalog_search</code>. With Anthropic prompt
+          caching, uses Anthropic&apos;s native deferred loading, which keeps the cache intact.
         </>
       }
       ariaLabel="Toggle MCP tool search"
@@ -854,7 +867,8 @@ export const MCPSettingsSection: React.FC = () => {
   const { api } = useAPI();
   const [servers, setServers] = useState<Record<string, MCPServerInfo>>({});
   const [loading, setLoading] = useState(false);
-  const [globalSecretKeys, setGlobalSecretKeys] = useState<string[]>([]);
+  // Global secrets (used for {secret:"KEY"} header values).
+  const [globalSecretKeys] = useGlobalSecretKeys(api);
   const [error, setError] = useState<string | null>(null);
 
   // Test state with caching (global MCP config)
@@ -876,6 +890,7 @@ export const MCPSettingsSection: React.FC = () => {
     Record<string, { serverInfo: MCPServerIdentity; icon?: string }>
   >({});
   const [mcpOauthRefreshNonce, setMcpOauthRefreshNonce] = useState(0);
+  const viewDomains = useMcpAppViewDomains();
 
   interface EditableServer {
     name: string;
@@ -920,31 +935,6 @@ export const MCPSettingsSection: React.FC = () => {
     }
   }, [api]);
 
-  // Load global secrets (used for {secret:"KEY"} header values).
-  useEffect(() => {
-    if (!api) {
-      setGlobalSecretKeys([]);
-      return;
-    }
-
-    let cancelled = false;
-    (async () => {
-      try {
-        const secrets = await api.secrets.get({});
-        if (cancelled) return;
-        setGlobalSecretKeys(secrets.map((s) => s.key));
-      } catch (err) {
-        if (cancelled) return;
-        console.error("Failed to load global secrets:", err);
-        setGlobalSecretKeys([]);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api]);
-
   useEffect(() => {
     // A sibling can change reuse/server settings while the experiment stays enabled.
     const requests = refreshRequest.current;
@@ -968,6 +958,7 @@ export const MCPSettingsSection: React.FC = () => {
         if (!result.success) {
           setError(result.error ?? "Failed to remove MCP server");
         } else {
+          publishGlobalMcpEnablementChanged();
           clearTestResult(name);
           await refresh();
         }
@@ -1000,6 +991,8 @@ export const MCPSettingsSection: React.FC = () => {
             [name]: { ...prev[name], disabled: enabled },
           }));
           setError(result.error ?? "Failed to update server");
+        } else {
+          publishGlobalMcpEnablementChanged();
         }
       } catch (err) {
         // Revert on error
@@ -1097,6 +1090,7 @@ export const MCPSettingsSection: React.FC = () => {
         setError(result.error ?? "Failed to add MCP server");
         return;
       }
+      publishGlobalMcpEnablementChanged();
 
       setNewServer({ name: "", transport: "stdio", value: "", headersRows: [] });
       setNewTestResult(null);
@@ -1174,6 +1168,7 @@ export const MCPSettingsSection: React.FC = () => {
       if (!result.success) {
         setError(result.error ?? "Failed to update MCP server");
       } else {
+        publishGlobalMcpEnablementChanged();
         // Clear cached test result since config changed
         clearTestResult(editing.name);
         setEditing(null);
@@ -1229,7 +1224,6 @@ export const MCPSettingsSection: React.FC = () => {
       ? "OAuth login is only supported for remote (http/sse) MCP servers."
       : undefined;
   const newServerOauthLogin = useMCPOAuthLogin({
-    api,
     isDesktop: !!window.api,
     serverName: newServerName,
     pendingServer: newServerOauthPendingServer,
@@ -1323,9 +1317,9 @@ export const MCPSettingsSection: React.FC = () => {
       <div>
         <p className="text-content-secondary mb-4 text-xs">
           Configure global MCP servers. Global config lives in{" "}
-          <code className="text-accent">~/.xum/mcp.jsonc</code>, with optional repo overrides in{" "}
-          <code className="text-accent">./.xum/mcp.jsonc</code> and workspace overrides in{" "}
-          <code className="text-accent">.xum/mcp.local.jsonc</code>.
+          <code className="text-accent-text">~/.xum/mcp.jsonc</code>, with optional repo overrides
+          in <code className="text-accent-text">./.xum/mcp.jsonc</code> and workspace overrides in{" "}
+          <code className="text-accent-text">.xum/mcp.local.jsonc</code>.
         </p>
       </div>
 
@@ -1539,7 +1533,7 @@ export const MCPSettingsSection: React.FC = () => {
                                   size="icon"
                                   onClick={() => void handleTest(name)}
                                   disabled={isTesting}
-                                  className="text-muted hover:text-accent h-7 w-7"
+                                  className="text-muted hover:text-accent-text h-7 w-7"
                                   aria-label="Test connection"
                                 >
                                   {isTesting ? (
@@ -1562,7 +1556,7 @@ export const MCPSettingsSection: React.FC = () => {
                                       variant="ghost"
                                       size="icon"
                                       onClick={() => handleStartEdit(name, entry)}
-                                      className="text-muted hover:text-accent h-7 w-7"
+                                      className="text-muted hover:text-accent-text h-7 w-7"
                                       aria-label="Edit server"
                                     >
                                       <Pencil className="h-4 w-4" />
@@ -1657,15 +1651,28 @@ export const MCPSettingsSection: React.FC = () => {
                       )}
                     </div>
                   )}
+                  <McpAppViewDomainsSection
+                    entries={viewDomains.entries.filter((e) => e.serverName === name)}
+                    onRevoke={(e) => void viewDomains.revoke(e)}
+                    error={viewDomains.revokeError}
+                  />
                 </div>
               );
             })
           )}
         </div>
+        <McpAppViewDomainsSection
+          entries={unlistedMcpAppViewDomains(viewDomains.entries, servers)}
+          onRevoke={(e) => void viewDomains.revoke(e)}
+          showServer
+          error={viewDomains.revokeError}
+        />
+        <McpAppViewDomainsLoadError error={viewDomains.loadError} onRetry={viewDomains.retry} />
 
         {/* Add server form */}
         <details className="group mt-3">
-          <summary className="text-accent hover:text-accent/80 flex cursor-pointer list-none items-center gap-1 text-sm font-medium">
+          {/* Hover underlines instead of fading: 80% accent text fell below 4.5:1 on the dialog (#5946). */}
+          <summary className="text-accent-text flex cursor-pointer list-none items-center gap-1 text-sm font-medium hover:underline">
             <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" />
             Add server
           </summary>

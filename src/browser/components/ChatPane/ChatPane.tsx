@@ -87,7 +87,7 @@ import { useContextSwitchWarning } from "@/browser/hooks/useContextSwitchWarning
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
 import { CHAT_DOCK_GUTTER_CLASS } from "@/constants/layout";
 import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
@@ -355,6 +355,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const chatTranscriptFullWidth = useChatTranscriptFullWidth();
   const [transcriptDensity] = useTranscriptDensity();
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { workspaceMetadata } = useWorkspaceContext();
   const storeRaw = useWorkspaceStoreRaw();
   const aggregator = useWorkspaceAggregator(workspaceId);
@@ -739,9 +740,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
 
     const bashOutputGroup = bashOutputGroupInfos[targetIndex];
-    const bashGroupKey = bashOutputGroup
-      ? deferredMessages[bashOutputGroup.firstIndex]?.id
-      : undefined;
+    const bashGroupKey = bashOutputGroup?.groupKey;
     if (bashGroupKey && !expandedBashGroups.has(bashGroupKey)) {
       expandBashGroup(bashGroupKey);
       return;
@@ -1055,10 +1054,10 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   const handleQueuedDispatchModeChange = async (queueDispatchMode: QueueDispatchMode) => {
     clearQueuedActionError();
-    if (!api) {
+    if (!liveApi) {
       throw new Error("Workspace API is unavailable.");
     }
-    const result = await api.workspace.setQueuedMessageDispatchMode({
+    const result = await liveApi.workspace.setQueuedMessageDispatchMode({
       workspaceId,
       queueDispatchMode,
     });
@@ -1448,7 +1447,6 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     const rowProps = getTranscriptRowProps({
       derivations: transcriptRowDerivations,
       userMessageNavigationByHistoryId,
-      messages: deferredMessages,
       message,
       index,
     });
@@ -1553,7 +1551,12 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             // for visibility — using a container query rather than a viewport media
             // query means sidebars opening/closing correctly hide the TOC even when
             // the viewport width is unchanged. See `.plan-toc-aside` in globals.css.
-            className="@container/transcript flex h-full flex-col overflow-x-hidden overflow-y-auto px-[15px] pt-[15px] leading-[1.5] break-words whitespace-pre-wrap"
+            // `--chat-reserved-inline-end`: room a layout floats over the chat's right edge (the
+            // collapsed right sidebar's overview card, see globals.css). Padding by it centers the
+            // column, and the composer under it, in the space left of the overlay, so the column
+            // sits as far from the overlay as from the left edge. The transcript container query
+            // measures the content box, so the plan TOC sees the narrower gutters too.
+            className="@container/transcript flex h-full flex-col overflow-x-hidden overflow-y-auto pt-[15px] pr-[calc(15px+var(--chat-reserved-inline-end,0px))] pl-[15px] leading-[1.5] break-words whitespace-pre-wrap"
           >
             <div
               // While locked, opt the whole transcript subtree out of scroll
@@ -1573,7 +1576,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 // overlap content or get clipped by `overflow-x-hidden`.
                 // `w-full` is required in the centered mode because auto cross-axis
                 // margins disable flex-item stretch.
-                chatTranscriptFullWidth ? "w-full" : "plan-toc-aware max-w-4xl mx-auto w-full",
+                chatTranscriptFullWidth ? "w-full" : "plan-toc-aware max-w-chat mx-auto w-full",
                 // Push the dock to the bottom for short transcripts without reserving
                 // loading space: cached replay overlays the dock edge, not transcript rows.
                 "flex-1",
@@ -1662,7 +1665,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                   --composer-h channel to lag a frame behind and tear), while
                   `sticky` keeps the composer visually pinned over the transcript
                   when the user scrolls up. `mx-[-15px]` cancels the scrollport's
-                  horizontal padding so the dock stays full-bleed; `whitespace-normal
+                  gutter so the dock reaches the edges (short of any reserved overlay
+                  room on the right); `whitespace-normal
                   break-normal` reset the transcript text inheritance. clientHeight
                   of the scrollport never changes with dock height (send-flash
                   invariant). `bg-surface-primary` keeps transcript content from
@@ -1975,7 +1979,9 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   if (props.shouldShowPinnedTodoList) {
     addDecorationEntry({
       key: "pinned-todo-list",
-      node: <PinnedTodoList workspaceId={props.workspaceId} />,
+      // Keyed by workspace: ChatPane stays mounted across workspace switches, and the panel's
+      // scroll position (set to the current item on open) must not carry over to another chat.
+      node: <PinnedTodoList key={props.workspaceId} workspaceId={props.workspaceId} />,
     });
   }
   addDecorationEntry({

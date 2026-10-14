@@ -26,8 +26,21 @@ import {
   type PluginsSectionIntent,
 } from "@/browser/features/Settings/Sections/pluginsSectionIntents";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { MCP_APP_ENTRYPOINT_NOT_CONNECTED } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
 import { CommandIds } from "@/browser/utils/commandIds";
+import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
+import { withAppViewTab } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import type { OpenLocalServerResult, RemoteConnectionApi } from "@/common/types/remoteConnection";
+
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { RIGHT_SIDEBAR_COLLAPSED_KEY, getRightSidebarLayoutKey } from "@/common/constants/storage";
+import { focusInstructionsTab } from "@/browser/utils/instructionsTabFocus";
+import { readRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
+import {
+  getDefaultRightSidebarLayoutState,
+  getFocusedActiveTab,
+  selectOrAddTab,
+} from "@/browser/utils/rightSidebarLayout";
 
 const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
   const userProjects = new Map<string, ProjectConfig>();
@@ -1065,7 +1078,13 @@ test("goal palette commands match the Paused lifecycle state", () => {
     getVisibleGoalTitles({
       selectedWorkspaceState: makeWorkspaceState(makeGoalSnapshot("paused")),
     })
-  ).toEqual(["Goal: Clear", "Goal: Open panel", "Goal: Resume", "Goal: Set objective"]);
+  ).toEqual([
+    "Goal: Clear",
+    "Goal: Mark complete",
+    "Goal: Open panel",
+    "Goal: Resume",
+    "Goal: Set objective",
+  ]);
 });
 
 test("goal palette commands match the BudgetLimited lifecycle state", () => {
@@ -1995,6 +2014,31 @@ test("plugin component action only targets present managed installs without muta
   }
 });
 
+test("plugin hook review action opens the hooks panel of a present managed install", async () => {
+  const openSettings = mock(() => undefined);
+  const plugin = (name: string, present: boolean) => ({
+    name,
+    location: `/plugins/${name}`,
+    managed: true,
+    present,
+    skillCount: 0,
+    mcpServerCount: 0,
+  });
+  const api = createMockORPCClient({
+    agentPlugins: { items: [plugin("managed", true), plugin("missing", false)] },
+  });
+  const action = mk({ api, onOpenSettings: openSettings })
+    .flatMap((source) => source())
+    .find((action) => action.id === CommandIds.pluginsReviewHooks());
+  const field = action?.prompt?.fields[0];
+  if (field?.type !== "select" || !action?.prompt) throw new Error("Expected hook review picker");
+  expect((await field.getOptions({})).map((option) => option.id)).toEqual(["managed"]);
+  consumePendingPluginsSectionIntent();
+  await action.prompt.onSubmit({ pluginName: "managed" });
+  expect(consumePendingPluginsSectionIntent()).toEqual({ type: "review-hooks", name: "managed" });
+  expect(openSettings).toHaveBeenCalledWith("plugins");
+});
+
 describe("Open Server Window palette action", () => {
   const makeBridge = (result: OpenLocalServerResult) =>
     ({
@@ -2365,6 +2409,76 @@ describe("Right Sidebar: New Tab palette action", () => {
   });
 });
 
+describe("explicit sidebar navigation from a collapsed chat", () => {
+  test.each([null, true])("Instructions opens with collapse preference %s", async (collapsed) => {
+    await withTestWindow(() => {
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, collapsed);
+      focusInstructionsTab("w1");
+      expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
+      expect(getFocusedActiveTab(readRightSidebarLayout("w1"), "new")).toBe("instructions");
+    });
+  });
+
+  test.each([null, true])("Add Tool opens with collapse preference %s", async (collapsed) => {
+    await withTestWindow(async () => {
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, collapsed);
+      const action = getActions().find((entry) => entry.id === CommandIds.navRightSidebarAddTool());
+      await action!.prompt!.onSubmit({ tool: "review" });
+      expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
+      const layout = readRightSidebarLayout("w1");
+      expect(layout.root).toMatchObject({ tabs: ["review"], activeTab: "review" });
+    });
+  });
+
+  test.each(["horizontal", "vertical"] as const)(
+    "splitting %s reveals the panes",
+    async (direction) => {
+      await withTestWindow(async () => {
+        const id =
+          direction === "horizontal"
+            ? CommandIds.navRightSidebarSplitHorizontal()
+            : CommandIds.navRightSidebarSplitVertical();
+        await getActions()
+          .find((entry) => entry.id === id)!
+          .run();
+        expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
+        expect(readRightSidebarLayout("w1").root).toMatchObject({ type: "split", direction });
+      });
+    }
+  );
+
+  test.each(["focus", "add"])(
+    "%s terminal reveals an existing session, but does not create one",
+    async (actionType) => {
+      await withTestWindow(async () => {
+        const actions = getActions();
+        const run = async () => {
+          if (actionType === "focus") {
+            await actions
+              .find((entry) => entry.id === CommandIds.navRightSidebarFocusTerminal())!
+              .run();
+          } else {
+            await actions
+              .find((entry) => entry.id === CommandIds.navRightSidebarAddTool())!
+              .prompt!.onSubmit({ tool: "terminal" });
+          }
+        };
+        await run();
+        // With no session there is nothing to focus: leave the new chat collapsed.
+        expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(true);
+        const layout = selectOrAddTab(
+          getDefaultRightSidebarLayoutState("terminal:session-1"),
+          "costs"
+        );
+        updatePersistedState(getRightSidebarLayoutKey("w1"), layout);
+        await run();
+        expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
+        expect(getFocusedActiveTab(readRightSidebarLayout("w1"), "new")).toBe("terminal:session-1");
+      });
+    }
+  );
+});
+
 describe("Right Sidebar: Add Tool palette action (#5767)", () => {
   test("Stats also asks for the Stats dialog; other tools do not", async () => {
     await withTestWindow(async () => {
@@ -2384,6 +2498,370 @@ describe("Right Sidebar: Add Tool palette action (#5767)", () => {
         expect(requests).toEqual(["w1"]);
       } finally {
         window.removeEventListener(CUSTOM_EVENTS.OPEN_STATS_DIALOG, record);
+      }
+    });
+  });
+});
+
+test("app view entries tell several calls of one tool apart", () => {
+  const call = (toolCallId: string, args: unknown) => ({
+    type: "tool",
+    toolCallId,
+    toolName: "dice_show_dice_board",
+    args,
+    status: "completed",
+    mcpServer: {
+      connection: { key: "dice", transport: "stdio" },
+      identity: { name: "dice", version: "1.0.0" },
+      source: "connection",
+      app: { resourceUri: "ui://dice/board.html" },
+    },
+  });
+  const actions = getActions({
+    artifactsEnabled: true,
+    selectedWorkspaceState: {
+      messages: [call("a", { count: 2 }), call("b", { count: 4 }), call("c", { count: 4 })],
+    } as unknown as WorkspaceState,
+  });
+  const subtitles = ["a", "b", "c"].map(
+    (id) => actions.find((a) => a.id === CommandIds.navOpenAppView(id))?.subtitle
+  );
+  expect(subtitles.every((s) => s?.startsWith("dice"))).toBe(true);
+  expect(new Set(subtitles).size).toBe(3);
+});
+
+// The keyboard path to Reload: only a view with an open tab has one, and it focuses that tab.
+test("an app view with an open tab gets a Reload command that focuses its tab", () => {
+  const testWindow = new GlobalWindow();
+  const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
+  globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  globalThis.document = testWindow.document as unknown as Document;
+  try {
+    const call = (toolCallId: string) => ({
+      type: "tool",
+      toolCallId,
+      toolName: "dice_show_dice_board",
+      args: {},
+      status: "completed",
+      mcpServer: {
+        connection: { key: "dice", transport: "stdio" },
+        identity: { name: "dice", version: "1.0.0" },
+        source: "connection",
+        app: { resourceUri: "ui://dice/board.html" },
+      },
+    });
+    updateRightSidebarLayout("w1", (state) => withAppViewTab(state, "open"));
+    const actions = getActions({
+      artifactsEnabled: true,
+      selectedWorkspaceState: {
+        messages: [call("open"), call("closed")],
+      } as unknown as WorkspaceState,
+    });
+    expect(actions.some((a) => a.id === CommandIds.navReloadAppView("closed"))).toBe(false);
+    const reload = actions.find((a) => a.id === CommandIds.navReloadAppView("open"));
+    const focused: unknown[] = [];
+    testWindow.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, (event) =>
+      focused.push((event as unknown as CustomEvent).detail)
+    );
+    void reload?.run();
+    expect(focused).toEqual([{ workspaceId: "w1", toolCallId: "open" }]);
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+  }
+});
+
+test("a plugin view's palette entry shows its server part and keeps the full key searchable", () => {
+  const key = "plugin:0123456789abcdef:tray";
+  const actions = getActions({
+    artifactsEnabled: true,
+    selectedWorkspaceState: {
+      messages: [
+        {
+          type: "tool",
+          toolCallId: "p",
+          toolName: "tray_show",
+          args: {},
+          status: "completed",
+          mcpServer: {
+            connection: { key, transport: "stdio" },
+            identity: { name: "tray", version: "1.0.0" },
+            source: "connection",
+            app: { resourceUri: "ui://tray/view.html" },
+          },
+        },
+      ],
+    } as unknown as WorkspaceState,
+  });
+  const entry = actions.find((a) => a.id === CommandIds.navOpenAppView("p"));
+  expect(entry?.subtitle).toBe("tray");
+  expect(entry?.keywords).toContain(key);
+});
+
+test("two plugin installs with one server name keep their instance markers apart", () => {
+  const call = (toolCallId: string, key: string) => ({
+    type: "tool",
+    toolCallId,
+    toolName: "tray_show",
+    args: {},
+    status: "completed",
+    mcpServer: {
+      connection: { key, transport: "stdio" },
+      identity: { name: "tray", version: "1.0.0" },
+      source: "connection",
+      app: { resourceUri: "ui://tray/view.html" },
+    },
+  });
+  const actions = getActions({
+    artifactsEnabled: true,
+    selectedWorkspaceState: {
+      messages: [
+        call("i1", "plugin:0123456789abcdef:tray"),
+        call("i2", "plugin:fedcba9876543210:tray"),
+        call("own", "solo"),
+      ],
+    } as unknown as WorkspaceState,
+  });
+  const subtitle = (id: string) =>
+    actions.find((a) => a.id === CommandIds.navOpenAppView(id))?.subtitle;
+  expect([subtitle("i1"), subtitle("i2"), subtitle("own")]).toEqual([
+    "tray (plugin 01234567)",
+    "tray (plugin fedcba98)",
+    "solo",
+  ]);
+});
+
+test("an MCP App entry point's palette entry shows its server label and opens it once", async () => {
+  const entrypoint = {
+    serverName: "plugin:0123456789abcdef:tray",
+    serverLabel: "bits-and-bolts · tray",
+    toolName: "cad.tray",
+    title: "Parts Tray",
+    resourceUri: "ui://tray/view",
+    type: "global" as const,
+    viewKey: "entrypoint:plugin:0123456789abcdef:tray:cad.tray:global",
+  };
+  const opened: unknown[] = [];
+  const actions = getActions({
+    artifactsEnabled: true,
+    mcpAppEntrypoints: [entrypoint],
+    api: createTestApiClient({
+      mcpApps: {
+        openEntrypoint: (input: unknown) => {
+          opened.push(input);
+          return Promise.resolve({ success: true as const, data: entrypoint });
+        },
+      },
+    }),
+  });
+  const entry = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(entrypoint.viewKey));
+  // The label, never the internal plugin key; the key stays searchable.
+  expect([entry?.title, entry?.subtitle]).toEqual([
+    "Open Plugin View: Parts Tray",
+    entrypoint.serverLabel,
+  ]);
+  expect(entry?.keywords).toContain(entrypoint.serverName);
+  // Opening dispatches OPEN_MCP_APP_VIEW on window (the "Open in tab" path).
+  const testWindow = new GlobalWindow();
+  const originalWindow = globalThis.window;
+  globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  const shown: unknown[] = [];
+  testWindow.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, (event) =>
+    shown.push((event as unknown as CustomEvent<{ toolCallId: string }>).detail.toolCallId)
+  );
+  try {
+    await entry?.run();
+  } finally {
+    globalThis.window = originalWindow;
+    testWindow.close();
+  }
+  expect(shown).toEqual([entrypoint.viewKey]);
+  expect(opened).toMatchObject([
+    { serverName: entrypoint.serverName, toolName: "cad.tray", type: "global" },
+  ]);
+});
+
+test("a failed entry point open from the palette shows its error in a toast", async () => {
+  const entrypoint = {
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName: "cad.tray",
+    title: "Parts Tray",
+    resourceUri: "ui://tray/view",
+    type: "global" as const,
+    viewKey: "entrypoint:cad:cad.tray:global",
+  };
+  const actions = getActions({
+    artifactsEnabled: true,
+    mcpAppEntrypoints: [entrypoint],
+    api: createTestApiClient({
+      mcpApps: {
+        openEntrypoint: () =>
+          Promise.resolve({ success: false as const, error: "Too many entry point opens" }),
+      },
+    }),
+  });
+  const entry = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(entrypoint.viewKey));
+  await withTestWindow(async () => {
+    const events = collectCommandEvents();
+    try {
+      await entry?.run();
+      expect(events.receivedToasts).toEqual([
+        { type: "error", message: "Too many entry point opens" },
+      ]);
+    } finally {
+      events.dispose();
+    }
+  });
+});
+
+test("an entry point picked from the palette while disconnected says so in a toast", async () => {
+  const entrypoint = {
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName: "cad.tray",
+    title: "Parts Tray",
+    resourceUri: "ui://tray/view",
+    type: "global" as const,
+    viewKey: "entrypoint:cad:cad.tray:global",
+  };
+  const actions = getActions({
+    artifactsEnabled: true,
+    mcpAppEntrypoints: [entrypoint],
+    api: null,
+  });
+  const entry = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(entrypoint.viewKey));
+  await withTestWindow(async () => {
+    const events = collectCommandEvents();
+    try {
+      await entry?.run();
+      expect(events.receivedToasts).toEqual([
+        { type: "error", message: MCP_APP_ENTRYPOINT_NOT_CONNECTED },
+      ]);
+    } finally {
+      events.dispose();
+    }
+  });
+});
+
+// An open entry point's tab only gets focus from Open while its record is current, so a failed
+// load needs Reload from the keyboard too.
+test("an entry point with an open tab gets a Reload command that focuses its tab", async () => {
+  const entrypoint = (toolName: string) => ({
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName,
+    title: toolName,
+    resourceUri: "ui://cad/view",
+    type: "global" as const,
+    viewKey: `entrypoint:cad:${toolName}:global`,
+  });
+  const [open, closed] = [entrypoint("cad.open"), entrypoint("cad.closed")];
+  await withTestWindow(() => {
+    updateRightSidebarLayout("w1", (state) => withAppViewTab(state, open.viewKey));
+    const actions = getActions({ artifactsEnabled: true, mcpAppEntrypoints: [open, closed] });
+    expect(actions.some((a) => a.id === CommandIds.navReloadAppView(closed.viewKey))).toBe(false);
+    const reload = actions.find((a) => a.id === CommandIds.navReloadAppView(open.viewKey));
+    const focused: unknown[] = [];
+    const onFocus = (event: Event) => focused.push((event as CustomEvent).detail);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onFocus);
+    try {
+      void reload?.run();
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onFocus);
+    }
+    expect(focused).toEqual([{ workspaceId: "w1", toolCallId: open.viewKey }]);
+  });
+});
+
+test("a tool's global and thread entry points get palette commands that read differently", () => {
+  const entrypoint = (type: "global" | "thread") => ({
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName: "cad.board",
+    title: "Board",
+    resourceUri: "ui://cad/board",
+    type,
+    viewKey: `entrypoint:cad:cad.board:${type}`,
+  });
+  const entrypoints = [entrypoint("global"), entrypoint("thread")];
+  const actions = getActions({ artifactsEnabled: true, mcpAppEntrypoints: entrypoints });
+  const shown = entrypoints.map((e) => {
+    const action = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(e.viewKey));
+    return [action?.title, action?.subtitle].join(" ");
+  });
+  expect(shown[0]).not.toBe(shown[1]);
+});
+
+describe("Revoke MCP App View Domains…", () => {
+  const stored = [
+    { projectPath: "/repo/a", serverName: "charts", origins: ["https://api.example.com"] },
+  ];
+  // Shown whatever the artifacts experiment: Settings lists stored approvals either way.
+  const revokeAction = (api: APIClient, artifactsEnabled = false) =>
+    getActions({ api, artifactsEnabled }).find(
+      (action) => action.id === CommandIds.mcpAppsRevokeViewDomains()
+    );
+
+  test("lists the stored approvals and revokes the picked one", async () => {
+    const revoked: unknown[] = [];
+    const api = createTestApiClient({
+      mcpApps: {
+        listViewDomains: () => Promise.resolve(stored),
+        revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
+          revoked.push(input);
+          return Promise.resolve({ revision: 1 });
+        },
+      },
+    });
+    expect(revokeAction(api, true)?.title).toBe("Revoke MCP App View Domains…");
+    const action = revokeAction(api);
+    const field = action?.prompt?.fields[0];
+    if (field?.type !== "select" || !action?.prompt) throw new Error("Expected an approval picker");
+    const options = await field.getOptions({});
+    expect(options).toHaveLength(1);
+    expect(options[0].label).toContain("charts");
+    expect(options[0].label).toContain("api.example.com");
+    await withTestWindow(async () => {
+      const events = collectCommandEvents();
+      try {
+        await action.prompt!.onSubmit({ approval: options[0].id });
+        expect(events.receivedToasts.map((toast) => toast.type)).toEqual(["success"]);
+      } finally {
+        events.dispose();
+      }
+    });
+    expect(revoked).toEqual([{ projectPath: "/repo/a", serverName: "charts" }]);
+  });
+
+  test("a failed list rejects for the palette, and a failed revoke shows a toast", async () => {
+    const api = createTestApiClient({
+      mcpApps: {
+        listViewDomains: () => Promise.reject(new Error("backend busy")),
+        revokeViewDomains: () => Promise.reject(new Error("config write failed")),
+      },
+    });
+    const action = revokeAction(api);
+    const field = action?.prompt?.fields[0];
+    if (field?.type !== "select" || !action?.prompt) throw new Error("Expected an approval picker");
+    await withTestWindow(async () => {
+      const events = collectCommandEvents();
+      try {
+        // The open palette shows a rejected list (CommandPalette): a toast would sit under it.
+        let listError: unknown;
+        try {
+          await field.getOptions({});
+        } catch (error) {
+          listError = error;
+        }
+        expect(String(listError)).toContain("backend busy");
+        await action.prompt!.onSubmit({ approval: JSON.stringify(["/repo/a", "charts"]) });
+        const messages = events.receivedToasts.map((toast) => toast.message);
+        expect(messages).toHaveLength(1);
+        expect(messages[0]).toContain("config write failed");
+      } finally {
+        events.dispose();
       }
     });
   });

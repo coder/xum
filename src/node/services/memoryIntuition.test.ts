@@ -28,6 +28,7 @@ import { MemoryToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools/t
 import type { IntuitionReportToolArgs } from "@/common/types/tools";
 import { Config } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { registerCodexPluginHooks } from "./agentPlugins/codexHookRunner";
 import { eventSpine } from "./events/eventSpine";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 import { MemoryMetaService } from "./memoryMeta";
@@ -798,6 +799,70 @@ describe("runMemoryIntuition", () => {
       expect(requests).toHaveLength(2);
       expect(requests).toContainEqual({ command: "view", path: entry("a.md").path });
       expect(requests).toContainEqual({ command: "view", path: entry("b.md").path });
+      expect(reads.mock.calls.map((call) => call[1])).toEqual([entry("c.md").path]);
+    } finally {
+      unregister();
+    }
+  });
+
+  it("applies a Codex hook's allowed rewrite of a memory view (Codex PRRT_kwDOPxxmWM6rRKxR)", async () => {
+    // The direct pipeline call passes the memory tool's schema, so the rewrite is checked and
+    // applied: a guard that redirects a read must never run the original path instead.
+    using f = await fixture({ "a.md": "alpha", "c.md": "shared content" });
+    let modelStarted = false;
+    const reads = spyOn(f.memoryService, "readFileWithSha");
+    const unregister = registerCodexPluginHooks(eventSpine, {
+      workspaceId: f.ctx.workspaceId,
+      pluginName: "guard",
+      order: 0,
+      hooks: [
+        {
+          key: "hooks/hooks.json#PreToolUse[0][0]",
+          hash: "h".repeat(64),
+          event: "PreToolUse",
+          matcher: "^memory$",
+          handler: { type: "mcp_tool", server: "guard", tool: "check", input: {} },
+          status: "runnable",
+          source: "hooks/hooks.json",
+        },
+      ],
+      deps: {
+        isHookAllowed: () => Promise.resolve(true),
+        canCallPluginTool: () => true,
+        callPluginTool: () =>
+          Promise.resolve(
+            modelStarted
+              ? {
+                  structuredContent: {
+                    hookSpecificOutput: {
+                      hookEventName: "PreToolUse",
+                      permissionDecision: "allow",
+                      updatedInput: { command: "view", path: entry("c.md").path },
+                    },
+                  },
+                }
+              : { content: [] }
+          ),
+        notifyUser: () => undefined,
+      },
+    });
+    try {
+      await runMemoryIntuition({
+        ...f,
+        cue: "shared",
+        modelString: "mock:test",
+        resolveAgentBody: body,
+        createModel: () => {
+          modelStarted = true;
+          return Promise.resolve(pinned(scriptedModel([[read("a.md")], [report([])]])));
+        },
+        hooks: {
+          runtime: new LocalRuntime(f.root),
+          cwd: f.root,
+          runtimeTempDir: f.root,
+          workspaceId: f.ctx.workspaceId,
+        },
+      });
       expect(reads.mock.calls.map((call) => call[1])).toEqual([entry("c.md").path]);
     } finally {
       unregister();

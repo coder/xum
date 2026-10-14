@@ -1592,7 +1592,7 @@ export const ArchivingWorkspaceAlignment: AppStory = {
     const menuButton = within(row).getByLabelText("Workspace actions for Old experiment workspace");
     await userEvent.click(menuButton);
 
-    // Wait for the popover to open, then click "Archive chat"
+    // Wait for the popover to open, then click "Archive workspace"
     await waitFor(() => {
       const archiveButton = document.body.querySelector<HTMLElement>(
         "[data-radix-popper-content-wrapper] button"
@@ -1600,11 +1600,11 @@ export const ArchivingWorkspaceAlignment: AppStory = {
       if (!archiveButton) throw new Error("popover not open yet");
     });
 
-    // Find and click the Archive chat button in the popover
+    // Find and click the Archive workspace button in the popover
     const popoverContent = document.body.querySelector<HTMLElement>(
       "[data-radix-popper-content-wrapper]"
     )!;
-    const archiveButton = within(popoverContent).getByText("Archive chat").closest("button")!;
+    const archiveButton = within(popoverContent).getByText("Archive workspace").closest("button")!;
     await userEvent.click(archiveButton);
 
     // Wait for the "Archiving..." text to appear (confirms the transient state is active)

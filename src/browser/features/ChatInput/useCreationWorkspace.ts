@@ -9,6 +9,7 @@ import type {
   RuntimeAvailabilityStatus,
 } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
+import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
 import { handOffCreationAiSelection } from "@/browser/utils/aiSelectionIntent";
@@ -33,12 +34,13 @@ import type { SendMessageError } from "@/common/types/errors";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import type { WorkspaceCreatedOptions } from "@/browser/features/ChatInput/types";
+import { startBranchListLoad, type BranchLoadStatus } from "./branchListLoad";
 import type {
   ChatAttachment,
   PendingFileChatAttachment,
@@ -177,8 +179,8 @@ function estimateBase64DataUrlBytes(dataUrl: string): number | null {
 
 interface UseCreationWorkspaceReturn {
   branches: string[];
-  /** Whether listBranches has completed (to distinguish loading vs non-git repo) */
-  branchesLoaded: boolean;
+  /** Where listBranches stands: a failed list is not an empty (non-git) one (#6055). */
+  branchLoad: BranchLoadStatus;
   trunkBranch: string;
   setTrunkBranch: (branch: string) => void;
   /** Currently selected runtime (discriminated union: SSH has host, Docker has image) */
@@ -203,8 +205,6 @@ interface UseCreationWorkspaceReturn {
   ) => Promise<CreationSendResult>;
   /** Workspace name/title generation state and actions (for CreationControls) */
   nameState: WorkspaceNameState;
-  /** Reload branches (e.g., after git init) */
-  reloadBranches: () => Promise<void>;
   /** Runtime availability state for each mode (loading/failed/loaded) */
   runtimeAvailabilityState: RuntimeAvailabilityState;
   /** Trust confirmation dialog element — render in parent component tree */
@@ -218,6 +218,11 @@ export type RuntimeAvailabilityState =
   | { status: "loading" }
   | { status: "failed" }
   | { status: "loaded"; data: RuntimeAvailabilityMap };
+
+/** True for a real (non-blank) creation draft ID. */
+function isDraftId(draftId: string | null | undefined): draftId is string {
+  return typeof draftId === "string" && draftId.trim().length > 0;
+}
 
 function isWorkspaceDraftEmpty(workspaceId: string): boolean {
   const draft = getDraftStore().getView({ kind: "workspace", workspaceId });
@@ -287,10 +292,11 @@ export function useCreationWorkspace({
   // Keep router state fresh synchronously so auto-navigation checks don't lag behind route changes.
   latestRouteRef.current = { currentWorkspaceId, currentProjectId, pendingDraftId };
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { getProjectConfig, refreshProjects, loading: projectsLoading } = useProjectContext();
   const { config: providersConfig } = useProvidersConfig();
   const [branches, setBranches] = useState<string[]>([]);
-  const [branchesLoaded, setBranchesLoaded] = useState(false);
+  const [branchLoad, setBranchLoad] = useState<BranchLoadStatus>("loading");
   const [recommendedTrunk, setRecommendedTrunk] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [isSending, setIsSending] = useState(false);
@@ -312,7 +318,7 @@ export function useCreationWorkspace({
   // single auto-naming/manual-name state).
   const workspaceNameScopeId =
     projectPath.trim().length > 0
-      ? typeof draftId === "string" && draftId.trim().length > 0
+      ? isDraftId(draftId)
         ? getDraftScopeId(projectPath, draftId)
         : getPendingScopeId(projectPath)
       : null;
@@ -332,49 +338,39 @@ export function useCreationWorkspace({
   // Destructure name state functions for use in callbacks
   const { waitForGeneration } = workspaceNameState;
 
-  // Load branches - used on mount and after git init
-  // Returns a cleanup function to track mounted state
-  const loadBranches = useCallback(async () => {
-    if (kind === "scratch" || !projectPath.length || !api) return;
-    setBranchesLoaded(false);
-    try {
-      const result = await api.projects.listBranches({ projectPath });
-      setBranches(result.branches);
-      setRecommendedTrunk(result.recommendedTrunk);
-    } catch (err) {
-      console.error("Failed to load branches:", err);
-    } finally {
-      setBranchesLoaded(true);
-    }
-  }, [kind, projectPath, api]);
+  // The project whose runtimes are shown. Only a new project shows the runtimes as "loading"
+  // again: a new client (reconnect) reloads the same project behind the shown values.
+  const shownProjectPathRef = useRef<string | null>(null);
 
   // Load branches and runtime availability on mount with mounted guard
   useEffect(() => {
     if (kind === "scratch") {
-      setBranchesLoaded(true);
+      setBranchLoad("loaded");
       return;
     }
     if (!projectPath.length || !api) return;
     let mounted = true;
-    setBranchesLoaded(false);
-    setRuntimeAvailabilityState({ status: "loading" });
+    // Every load resets the branch load, a reload (reconnect) too: it is the send barrier for a
+    // trunk branch (#6033), and the branches can change while offline.
+    setBranchLoad("loading");
+    if (shownProjectPathRef.current !== projectPath) {
+      shownProjectPathRef.current = projectPath;
+      setRuntimeAvailabilityState({ status: "loading" });
+    }
     // Both requests run at once and settle independently. Send waits for the branch list (#6033),
     // so it must not also wait for the runtime probe (Docker, Podman, devcontainer CLI), which can
     // take several seconds after the branches are ready.
-    const loadBranches = async () => {
-      try {
-        const result = await api.projects.listBranches({ projectPath });
-        if (!mounted) return;
-        setBranches(result.branches);
-        setRecommendedTrunk(result.recommendedTrunk);
-      } catch (error) {
-        console.error("Failed to load branches:", error);
-      } finally {
-        if (mounted) {
-          setBranchesLoaded(true);
+    // A list that rejects or hangs reports "failed" (#6055); one that settles late still loads.
+    const cancelBranchLoad = startBranchListLoad(
+      () => api.projects.listBranches({ projectPath }),
+      (outcome) => {
+        if (outcome.status === "loaded") {
+          setBranches(outcome.branches);
+          setRecommendedTrunk(outcome.recommendedTrunk);
         }
+        setBranchLoad(outcome.status);
       }
-    };
+    );
     const loadRuntimeAvailability = async () => {
       try {
         const data = await api.projects.runtimeAvailability({ projectPath });
@@ -383,10 +379,10 @@ export function useCreationWorkspace({
         if (mounted) setRuntimeAvailabilityState({ status: "failed" });
       }
     };
-    void loadBranches();
     void loadRuntimeAvailability();
     return () => {
       mounted = false;
+      cancelBranchLoad();
     };
   }, [kind, projectPath, api]);
 
@@ -412,7 +408,7 @@ export function useCreationWorkspace({
       // File-only sends are valid; the attached-files notice or provider file
       // parts carry the content.
       const hasSendableAttachments = pendingFilesToStage.length > 0 || (fileParts?.length ?? 0) > 0;
-      if ((!messageText.trim() && !hasSendableAttachments) || isSending || !api) {
+      if ((!messageText.trim() && !hasSendableAttachments) || isSending || !liveApi) {
         return { success: false };
       }
 
@@ -569,8 +565,8 @@ export function useCreationWorkspace({
 
         const createResult =
           kind === "scratch"
-            ? await api.workspace.createScratch({ title: createTitle })
-            : await api.workspace.create({
+            ? await liveApi.workspace.createScratch({ title: createTitle })
+            : await liveApi.workspace.create({
                 projectPath,
                 branchName: identity.name,
                 trunkBranch: settings.trunkBranch,
@@ -598,7 +594,7 @@ export function useCreationWorkspace({
         // is portable across devices even before the first stream starts. Initial /goal commands do
         // not send a normal user message, so they await this write before setting the goal; that lets
         // the backend kickoff continuation use the same model/agent selected in creation.
-        const initialAiSettingsPersisted = api.workspace
+        const initialAiSettingsPersisted = liveApi.workspace
           .updateAgentAISettings({
             workspaceId: metadata.id,
             agentId: creationAgentId,
@@ -615,7 +611,7 @@ export function useCreationWorkspace({
           })
           .catch(() => null);
 
-        const isDraftScope = typeof draftId === "string" && draftId.trim().length > 0;
+        const isDraftScope = isDraftId(draftId);
         const clearPendingDraft = () => {
           // Once the workspace exists, drop the draft even if the initial send fails
           // so we don't keep a hidden placeholder in the sidebar.
@@ -707,7 +703,7 @@ export function useCreationWorkspace({
                 },
         });
 
-        if (typeof draftId === "string" && draftId.trim().length > 0 && promoteWorkspaceDraft) {
+        if (isDraftId(draftId) && promoteWorkspaceDraft) {
           // UI-only: show the created workspace in-place where the draft was rendered.
           promoteWorkspaceDraft(projectPath, draftId, metadata);
         }
@@ -743,7 +739,7 @@ export function useCreationWorkspace({
         // first send so the attached-files notice can reference real staged paths.
         const stagingOutcome =
           pendingFilesToStage.length > 0
-            ? await stagePendingFiles(api, metadata.id, pendingFilesToStage)
+            ? await stagePendingFiles(liveApi, metadata.id, pendingFilesToStage)
             : { staged: [], failures: [] };
         const stagingFailed = stagingOutcome.failures.length > 0;
 
@@ -775,7 +771,7 @@ export function useCreationWorkspace({
         if (initialSlashCommand) {
           await initialAiSettingsPersisted;
           const commandEnv: SlashCommandEnv = {
-            api,
+            api: liveApi,
             workspaceId: metadata.id,
             variant: "workspace",
             projectPath: metadata.projectPath,
@@ -884,7 +880,7 @@ export function useCreationWorkspace({
         // A transport-level rejection (e.g. oRPC disconnect) must flow through
         // the same failure branch as success:false: the outer catch would skip
         // the staged-draft transfer and the creation draft is already cleared.
-        const sendResult = await api.workspace
+        const sendResult = await liveApi.workspace
           .sendMessage({
             workspaceId: metadata.id,
             message: appendStagedAttachmentNotice(messageText, stagingOutcome.staged),
@@ -951,7 +947,7 @@ export function useCreationWorkspace({
     },
     [
       kind,
-      api,
+      liveApi,
       isSending,
       projectPath,
       projectScopeId,
@@ -989,11 +985,12 @@ export function useCreationWorkspace({
         cancelLabel: "Don't create",
         onConfirm: async () => {
           try {
-            if (!api) throw new Error("API not available");
-            await api.projects.setTrust({
+            if (!liveApi) throw new Error("API not available");
+            await liveApi.projects.setTrust({
               projectPath: trustPrompt.projectPath,
               trusted: true,
             });
+            publishProjectTrustChanged();
             // Trust persisted — resolve immediately. Refresh is best-effort
             // so a transient failure doesn't block workspace creation.
             trustPrompt.resolve(true);
@@ -1021,7 +1018,7 @@ export function useCreationWorkspace({
 
   return {
     branches,
-    branchesLoaded,
+    branchLoad,
     trunkBranch: settings.trunkBranch,
     setTrunkBranch,
     selectedRuntime: settings.selectedRuntime,
@@ -1035,8 +1032,6 @@ export function useCreationWorkspace({
     handleSend,
     // Workspace name/title state (for CreationControls)
     nameState: workspaceNameState,
-    // Reload branches (e.g., after git init)
-    reloadBranches: loadBranches,
     // Runtime availability state for each mode
     runtimeAvailabilityState,
     trustDialog,

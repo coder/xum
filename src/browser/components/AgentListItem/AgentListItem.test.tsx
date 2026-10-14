@@ -8,12 +8,7 @@ import { APIContext } from "@/browser/contexts/API";
 import * as RealProjectContextModule from "@/browser/contexts/ProjectContext";
 import type * as ReactDndModuleType from "react-dnd";
 import type * as ReactDndHtml5BackendModuleType from "react-dnd-html5-backend";
-import type * as ProjectContextModuleType from "@/browser/contexts/ProjectContext";
-import type * as WorkspaceTitleEditContextModuleType from "@/browser/contexts/WorkspaceTitleEditContext";
-import type * as ContextMenuPositionModuleType from "@/browser/hooks/useContextMenuPosition";
-import type * as WorkspaceFallbackModelModuleType from "@/browser/hooks/useWorkspaceFallbackModel";
 import type * as WorkspaceUnreadModule from "@/browser/hooks/useWorkspaceUnread";
-import type * as RuntimeStatusStoreModuleType from "@/browser/stores/RuntimeStatusStore";
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as TooltipModule from "../Tooltip/Tooltip";
 import * as WorkspaceStatusIndicatorModule from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
@@ -45,21 +40,32 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { WorkspaceSelection } from "./AgentListItem";
 import type { AgentListItem as AgentListItemComponent } from "./AgentListItem";
 
+// Snapshot the real exports at file scope, before any test mocks the modules. Do not load second
+// copies with require("...?real=1"): Bun's LCOV keeps only the last-loaded copy of a file, so a
+// later second copy replaces the coverage that the module's own tests recorded in the shard.
+const realProjectContext = { ...RealProjectContextModule };
+const realWorkspaceTitleEditContext = { ...RealWorkspaceTitleEditContextModule };
+const realContextMenuPosition = { ...RealContextMenuPositionModule };
+const realWorkspaceUnread = { ...RealWorkspaceUnreadModule };
+const realRuntimeStatusStore = { ...RealRuntimeStatusStoreModule };
+const realWorkspaceFallbackModel = { ...RealWorkspaceFallbackModelModule };
+const realWorkspaceStore = { ...RealWorkspaceStoreModule };
+
 // Restore the provider contexts after the suite; partial row stubs must not
 // replace the real contexts used by later full Settings renders.
 restoreModulesAfterSuite([
-  ["@/browser/contexts/ProjectContext", { ...RealProjectContextModule }],
+  ["@/browser/contexts/ProjectContext", realProjectContext],
   // installAgentListItemTestDoubles() re-registers these from beforeEach with overridden
   // exports, and `mock.restore()` does not undo mock.module, so the overrides otherwise leak
   // into every later test file (#4639).
   ["react-dnd", { ...RealReactDndModule }],
   ["react-dnd-html5-backend", { ...RealReactDndHtml5BackendModule }],
-  ["@/browser/contexts/WorkspaceTitleEditContext", { ...RealWorkspaceTitleEditContextModule }],
-  ["@/browser/hooks/useContextMenuPosition", { ...RealContextMenuPositionModule }],
-  ["@/browser/hooks/useWorkspaceUnread", { ...RealWorkspaceUnreadModule }],
-  ["@/browser/stores/RuntimeStatusStore", { ...RealRuntimeStatusStoreModule }],
-  ["@/browser/hooks/useWorkspaceFallbackModel", { ...RealWorkspaceFallbackModelModule }],
-  ["@/browser/stores/WorkspaceStore", { ...RealWorkspaceStoreModule }],
+  ["@/browser/contexts/WorkspaceTitleEditContext", realWorkspaceTitleEditContext],
+  ["@/browser/hooks/useContextMenuPosition", realContextMenuPosition],
+  ["@/browser/hooks/useWorkspaceUnread", realWorkspaceUnread],
+  ["@/browser/stores/RuntimeStatusStore", realRuntimeStatusStore],
+  ["@/browser/hooks/useWorkspaceFallbackModel", realWorkspaceFallbackModel],
+  ["@/browser/stores/WorkspaceStore", realWorkspaceStore],
 ]);
 
 let AgentListItem!: typeof AgentListItemComponent;
@@ -194,21 +200,14 @@ function installAgentListItemTestDoubles() {
   const actualReactDnd = require("react-dnd?real=1") as typeof ReactDndModuleType;
   const actualReactDndHtml5Backend =
     require("react-dnd-html5-backend?real=1") as typeof ReactDndHtml5BackendModuleType;
-  const actualProjectContext =
-    require("@/browser/contexts/ProjectContext?real=1") as typeof ProjectContextModuleType;
-  const actualWorkspaceTitleEditContext =
-    require("@/browser/contexts/WorkspaceTitleEditContext?real=1") as typeof WorkspaceTitleEditContextModuleType;
-  const actualContextMenuPosition =
-    require("@/browser/hooks/useContextMenuPosition?real=1") as typeof ContextMenuPositionModuleType;
-  const actualWorkspaceUnread =
-    require("@/browser/hooks/useWorkspaceUnread?real=1") as typeof WorkspaceUnreadModule;
-  const actualRuntimeStatusStore =
-    require("@/browser/stores/RuntimeStatusStore?real=1") as typeof RuntimeStatusStoreModuleType;
-  const actualWorkspaceFallbackModel =
-    require("@/browser/hooks/useWorkspaceFallbackModel?real=1") as typeof WorkspaceFallbackModelModuleType;
-  const actualWorkspaceStore =
-    require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
   /* eslint-enable @typescript-eslint/no-require-imports */
+  const actualProjectContext = realProjectContext;
+  const actualWorkspaceTitleEditContext = realWorkspaceTitleEditContext;
+  const actualContextMenuPosition = realContextMenuPosition;
+  const actualWorkspaceUnread = realWorkspaceUnread;
+  const actualRuntimeStatusStore = realRuntimeStatusStore;
+  const actualWorkspaceFallbackModel = realWorkspaceFallbackModel;
+  const actualWorkspaceStore = realWorkspaceStore;
 
   void mock.module("react-dnd", () => ({
     ...actualReactDnd,

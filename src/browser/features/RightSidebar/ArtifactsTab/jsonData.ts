@@ -31,6 +31,7 @@ export function countJsonNodes(value: JsonValue, cap: number): number {
   let count = 0;
   const stack: JsonValue[] = [value];
   while (stack.length > 0 && count <= cap) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const node = stack.pop()!;
     count += 1;
     if (node !== null && typeof node === "object") {

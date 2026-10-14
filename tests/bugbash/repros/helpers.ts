@@ -235,6 +235,17 @@ export async function openPlayground(
   await expect(screen.getByRole("button", "Notifications")).toBeVisible({
     timeout: 15_000,
   });
+  // The skills indicator renders only once the workspace's skills load. It sits right after the
+  // bell in the header's right-aligned group, so its late arrival moves the bell (and the other
+  // header buttons) left. A tap aimed at the old position then lands on the indicator, whose
+  // hover popover takes focus and closes the bell's popover (#6214). The seeded app has built-in
+  // skills, so the indicator always appears, and its label starts with "<n> of <total> skill(s)
+  // loaded". A contains match, because the label grows ", 1 invalid" and similar suffixes when a
+  // skill has an error. A DOM check, not toBeVisible: on a phone the header row scrolls sideways
+  // and can hold it out of view.
+  await expect(
+    browser.locator('[data-testid="workspace-menu-bar"] button[aria-label*=" skill"]')
+  ).toHaveCount(1, { timeout: 15_000 });
 }
 
 /**

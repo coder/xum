@@ -51,6 +51,6 @@ export function noActiveGoalRefusal(goalStatus: GoalStatus | null): GoalToolRefu
     success: false,
     code: "no_active_goal",
     goalStatus,
-    error: `There is no active goal to complete (current goal status: ${goalStatus ?? "none"}). complete_goal only completes active or budget-limited goals.`,
+    error: `There is no goal to complete (current goal status: ${goalStatus ?? "none"}). complete_goal only completes active, paused or budget-limited goals.`,
   };
 }

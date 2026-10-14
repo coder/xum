@@ -105,15 +105,6 @@ function isNotifyUiOnly(value: unknown): value is NotifyUiOnlyPayload {
   return true;
 }
 
-function isArtifactUiOnly(value: unknown): boolean {
-  return (
-    isRecord(value) &&
-    typeof value.id === "string" &&
-    typeof value.version === "number" &&
-    typeof value.path === "string"
-  );
-}
-
 function isUiOnlyRecord(value: unknown): value is ToolOutputUiOnly {
   if (!isRecord(value)) {
     return false;
@@ -130,10 +121,6 @@ function isUiOnlyRecord(value: unknown): value is ToolOutputUiOnly {
   }
 
   if ("notify" in record && !isNotifyUiOnly(record.notify)) {
-    return false;
-  }
-
-  if ("artifact" in record && !isArtifactUiOnly(record.artifact)) {
     return false;
   }
 

@@ -787,12 +787,14 @@ async function showSplashScreen() {
   // Wait for the window to actually be shown and rendered before continuing
   // This ensures the splash is visible before we block the event loop with heavy work
   await new Promise<void>((resolve) => {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     splashWindow!.once("show", () => {
       const loadTime = Date.now() - startTime;
       console.log(`[${timestamp()}] Splash screen shown (${loadTime}ms)`);
       // Let the first frame reach the screen before loadServices() blocks the main thread.
       setTimeout(resolve, SPLASH_FIRST_PAINT_WAIT_MS);
     });
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     splashWindow!.show();
   });
 
@@ -1335,6 +1337,7 @@ function createWindow() {
   });
 
   mainWindow.webContents.on("will-navigate", (event, url) => {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const currentOrigin = new URL(mainWindow!.webContents.getURL()).origin;
     const targetOrigin = new URL(url).origin;
     // Prevent navigation away from app origin, open externally instead.

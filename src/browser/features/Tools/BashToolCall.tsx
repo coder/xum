@@ -15,7 +15,12 @@ import {
   ErrorBox,
   ExitCodeBadge,
 } from "./Shared/ToolPrimitives";
-import { useToolExpansion, getStatusDisplay, type ToolStatus } from "./Shared/toolUtils";
+import {
+  useToolExpansion,
+  getStatusDisplay,
+  normalizeToolResultForRendering,
+  type ToolStatus,
+} from "./Shared/toolUtils";
 import { formatDuration } from "@/common/utils/formatDuration";
 import { cn } from "@/common/lib/utils";
 import { ElapsedTimeDisplay } from "./Shared/ElapsedTimeDisplay";
@@ -94,6 +99,18 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
 
   const liveOutputView = liveOutput ?? EMPTY_LIVE_OUTPUT;
   const combinedLiveOutput = liveOutputView.combined;
+
+  // A blocking tool_pre or plugin tool.execute.before hook returns `{ error }` without
+  // `success` (#6044): that shape is model-visible and replayed, so the card reads the reason
+  // from any non-empty `error` instead of requiring `success: false`. The shared normalizer
+  // unwraps the SDK JSON container (`{ type: "json", value }`); the object check keeps a
+  // primitive result (0, false) from throwing in the `in` check below.
+  const normalizedResult: unknown = normalizeToolResultForRendering(result);
+  const errorText: unknown =
+    typeof normalizedResult === "object" && normalizedResult !== null && "error" in normalizedResult
+      ? normalizedResult.error
+      : undefined;
+  const resultError = typeof errorText === "string" && errorText.length > 0 ? errorText : null;
 
   const isPending = status === "executing" || status === "pending";
   const backgroundProcessId =
@@ -297,10 +314,11 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
 
           {result && (
             <>
-              {result.success === false && result.error && (
+              {resultError !== null && (
                 <DetailSection>
                   <DetailLabel>Error</DetailLabel>
-                  <ErrorBox>{result.error}</ErrorBox>
+                  {/* Hook reasons can carry long unbroken paths: wrap them at phone width. */}
+                  <ErrorBox className="wrap-anywhere whitespace-pre-wrap">{resultError}</ErrorBox>
                 </DetailSection>
               )}
 

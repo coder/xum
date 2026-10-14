@@ -40,7 +40,7 @@ import { startProxy, UNREACHABLE } from "./proxy";
 import { Ledger, priced } from "./proxyPolicy";
 // prettier-ignore
 import { checkMountSource, containerEnv, exactStepRefusal, exploreRefusal, jobEnv, outputDir, plainFolders, stage } from "./inputs";
-import { type CleanupState, Refusal, Session, Stopped } from "./runner";
+import { type CleanupState, IMAGE, Refusal, Session, Stopped } from "./runner";
 import { DEFAULT_APP_MODEL } from "../aiMode";
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dir, "../../.."));
@@ -143,14 +143,22 @@ export const cannotReach = (job: ModelJob) =>
  * The text of a probe that the upstream answered 401 or 403: the key is rejected. No explorer
  * can work with it, and every later call would keep its full reservation, so both callers refuse.
  */
-export function keyRejected(job: ModelJob, status: number, records: object[]) {
+export function keyRejected(
+  job: ModelJob,
+  status: number,
+  records: object[],
+  probed?: { model: string; variable: string }
+) {
   // The upstream's own status from the call record too: a 401 with an HTML or empty body (a
   // gateway's) makes the probe's response unreadable, and probeApp then reports 502.
   const upstream = records.map((r) => (r as { status?: unknown }).status);
   const rejected = [status, ...upstream].find((s) => s === 401 || s === 403);
-  return rejected == null
-    ? undefined
-    : `ANTHROPIC_API_KEY rejected by ${new URL(job.upstream.baseUrl).host} (HTTP ${rejected}): check the key`;
+  if (rejected == null) return undefined;
+  const base = `ANTHROPIC_API_KEY rejected by ${new URL(job.upstream.baseUrl).host} (HTTP ${rejected}): check the key`;
+  // A 403 can also mean the key may not use the probed model (#6094 item 13).
+  return rejected === 403 && probed
+    ? `${base}, and its access to ${probed.model} (${probed.variable})`
+    : base;
 }
 /** Whether the proxy released a probe call because it could not connect (proxy.ts). */
 export const probeUnreachable = (records: object[]) =>
@@ -445,7 +453,15 @@ function checkJob(args: string[], o: LaunchOptions) {
   // First, before any docker command and before the container env exists.
   const ai = appAi(o.env, args[0] === "explore");
   const driven = mcpApps || selfCheck || args[0] === "explore" ? modelJob(o.env) : undefined;
-  return { dir, mcpApps, selfCheck, ai, driven };
+  // The stale-key local build: CI's bugbash-sandbox job sets BUGBASH_SANDBOX_BUILD_STALE=1, so a pull request that
+  // changes the image inputs can pass before main publishes its image. Only the self-check and
+  // exact-step repros may use a local build: they reach no real model. By the job kind, not by
+  // `driven`: the self-check counts as model-driven. Explore charters, the MCP Apps suite and
+  // checkDocker (the preflight of make bug-bash and make mcp-apps-e2e) keep the pinned digest.
+  // A positive check, not "none of the others": a job kind added later must not qualify by default.
+  const exactStep = exactStepRefusal(args, o.cwd, dir) == null;
+  const localBuild = o.env.BUGBASH_SANDBOX_BUILD_STALE === "1" && (selfCheck || exactStep);
+  return { dir, mcpApps, selfCheck, ai, driven, localBuild };
 }
 
 /** A job's checks and the Docker check, with no job: `--preflight` (Makefile, before the build). */
@@ -457,7 +473,7 @@ export async function preflight(args: string[], o: LaunchOptions): Promise<Clean
 /** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
 export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
   const log = o.log ?? logLine;
-  const { dir, mcpApps, selfCheck, ai, driven } = checkJob(args, o);
+  const { dir, mcpApps, selfCheck, ai, driven, localBuild } = checkJob(args, o);
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
@@ -521,7 +537,15 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
           ? `leftover: ${entry.id.slice(0, 12)} cannot be inspected (${entry.error})`
           : `leftover: ${entry.job.name} owner ${ownerState(entry.job.owner)} (make bug-bash-sandbox-recover)`
       );
-    const image = await session.ensureImage();
+    const image = await session.ensureImage({ localBuild });
+    // On stderr, not `log`: the self-check's log is not shown, and this must not be missed.
+    if (!image.startsWith(`${IMAGE}@`)) {
+      const warning =
+        `sandbox: LOCAL IMAGE ${image.slice(0, 19)}, built from this checkout, not the pinned ` +
+        `digest in image.json. Publish from main (workflow "Bug-bash sandbox image"), then ` +
+        `update tests/bugbash/sandbox/image.json.`;
+      console.error(o.env.GITHUB_ACTIONS === "true" ? `::warning::${warning}` : warning);
+    }
     // Another job's cleanup can remove the empty per-checkout folder between the two mkdirs.
     for (let attempt = 1; ; attempt++) {
       fs.mkdirSync(path.dirname(jobDir), { recursive: true, mode: 0o700 });
@@ -570,7 +594,10 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
         throw new Refusal(
           probeUnreachable(probe.records)
             ? `${cannotReach(driven)}: check the URL and the network`
-            : (keyRejected(driven, probe.status, probe.records) ??
+            : (keyRejected(driven, probe.status, probe.records, {
+                model: driven.model,
+                variable: "BUGBASH_MODEL",
+              }) ??
                 `the ${driven.model} probe failed (HTTP ${probe.status}): check ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL and BUGBASH_BUDGET_USD`)
         );
       log(`${name} probe: ${driven.model} answered`);
@@ -708,8 +735,15 @@ if (import.meta.main) {
         logLine(error.message);
         process.exit(error.reason === "SIGINT" ? 130 : 143);
       }
-      logLine(`refused: ${error instanceof Error ? error.message : String(error)}`);
-      process.exit(error instanceof Refusal ? 2 : 1);
+      const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof Refusal) {
+        logLine(`refused: ${message}`);
+        process.exit(2);
+      }
+      // An internal error exits 4, as run.ts maps it for a charter: e2e's own exit 1 means a
+      // failed test, so 1 must not also mean a launcher bug (#6094 item 17).
+      logLine(`error: ${message}`);
+      process.exit(4);
     }
   );
 }

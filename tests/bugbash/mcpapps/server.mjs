@@ -40,7 +40,7 @@ const TOOLS = [
     name: "show_dice_board",
     title: "Show dice board",
     description:
-      "Roll dice and show an interactive dice board to the user in the Artifacts tab. " +
+      "Roll dice and show an interactive dice board to the user. " +
       "Use when the user asks to roll dice or wants to try the MCP Apps prototype.",
     inputSchema: {
       type: "object",

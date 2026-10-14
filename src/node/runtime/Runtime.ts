@@ -56,6 +56,14 @@ export interface ExecOptions {
   /** Host-namespace paths to translate before exposing them as environment variables. */
   pathEnv?: Record<string, string>;
   /**
+   * Base environment taken from the Xum host process before `env` is applied.
+   * "inherit" (default) passes all of process.env; "minimal" passes only
+   * pickMinimalChildEnv's allowlist (#6509: managed plugin stdio MCP servers
+   * must not inherit the user's shell secrets). Only host-local runtimes read the
+   * host environment, so remote runtimes ignore this field.
+   */
+  hostEnv?: "inherit" | "minimal";
+  /**
    * Timeout in seconds.
    *
    * When provided, prevents zombie processes by ensuring spawned processes are killed.
@@ -121,13 +129,36 @@ export interface BackgroundHandle {
    * Read output from output.log at the given byte offset.
    * Returns the content read and the new offset (for incremental reads).
    * Works on both local and SSH runtimes by using runtime.exec() internally.
+   * With `maxBytes`, loads at most that many bytes (plus up to 3 to finish a UTF-8 character),
+   * so paging through a large log reads each byte from disk once. Such a bounded read also holds
+   * back an incomplete UTF-8 character at its end (a running process can write one in two
+   * writes), unless `final` says no more output can complete it (the drain after exit).
    */
-  readOutput(offset: number): Promise<{ content: string; newOffset: number }>;
+  readOutput(
+    offset: number,
+    maxBytes?: number,
+    options?: OutputReadOptions
+  ): Promise<BackgroundOutputRead>;
 
   /** Strict output probe used only by monitor polling. */
   readOutputForMonitor?(
     offset: number
   ): Promise<BackgroundMonitorProbeResult<{ content: string; newOffset: number }>>;
+}
+
+/** Options of BackgroundHandle.readOutput. */
+export interface OutputReadOptions {
+  /** No more output can come (the drain after exit): take an incomplete character too. */
+  final?: boolean;
+}
+
+/** One read of a background process's output.log. */
+export interface BackgroundOutputRead {
+  /** The bytes from the requested offset up to newOffset, decoded as UTF-8. */
+  content: string;
+  newOffset: number;
+  /** The file size the read saw: newOffset < fileSize when a bounded read left output unread. */
+  fileSize: number;
 }
 
 /**
@@ -230,8 +261,8 @@ export interface WorkspaceCreationParams {
   /** Whether the project is trusted — when false, git hooks are disabled */
   trusted?: boolean;
   /**
-   * Return once the checkout is reserved and leave populating its files to
-   * materializeWorkspace(), so that work streams to a workspace that is already announced.
+   * Return once the checkout is reserved and leave populating its files (and any origin fetch)
+   * to materializeWorkspace(), so that work streams to a workspace that is already announced.
    * Runtimes whose creation never populates files ignore this.
    */
   deferMaterialization?: boolean;
@@ -241,6 +272,23 @@ export interface WorkspaceCreationParams {
 export interface PendingMaterialization {
   /** The branch already existed and should fast-forward to origin/<trunkBranch> once checked out. */
   fastForwardFromOrigin: boolean;
+  /**
+   * Set when the reservation skipped the origin fetch so the workspace could be announced
+   * without waiting on the network: materializeWorkspace() fetches origin/<trunkBranch> before
+   * the checkout and then updates the branch.
+   */
+  deferredOriginSync?: {
+    /** The branch existed before this creation; it fast-forwards after the checkout. */
+    existingBranch: boolean;
+    /**
+     * Tip of the branch this creation made from the trunk. The branch moves to the fetched
+     * origin/<trunkBranch> only while it still points here. Absent when nothing may move it
+     * (an existing branch, or an explicit start point).
+     */
+    createdBranchTip?: string;
+    /** The created branch started from origin/<trunkBranch>, so its upstream is already set. */
+    createdFromOrigin: boolean;
+  };
 }
 
 /** Init params for materializeWorkspace(), plus how far a cancellation may reach. */

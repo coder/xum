@@ -340,6 +340,49 @@ describe("ArtifactViewer renderers", () => {
     await waitFor(() => expect(view.queryByRole("dialog") == null).toBe(true));
   });
 
+  test("C from inside the frame toggles annotate mode only during the user's gesture there", async () => {
+    let activation = { isActive: false };
+    Object.defineProperty(window.navigator, "userActivation", {
+      configurable: true,
+      get: () => activation,
+    });
+    try {
+      const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+      const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+      await view.findByRole("button", { name: "Annotate" });
+      const postC = () =>
+        act(() => {
+          const event = new window.Event("message");
+          Object.defineProperty(event, "data", {
+            value: { xumArtifact: 1, type: "key", key: "C", shiftKey: false },
+          });
+          Object.defineProperty(event, "source", { value: frame.contentWindow });
+          window.dispatchEvent(event);
+        });
+      const annotatePressed = () =>
+        view
+          .getByRole("button", { name: /^(Annotate|Stop annotating)$/ })
+          .getAttribute("aria-pressed");
+
+      // The artifact's script posting C by itself (no focus in the frame, no activation).
+      postC();
+      expect(annotatePressed()).toBe("false");
+      // Focus in the frame alone is not enough: it stays there long after the click.
+      act(() => frame.focus());
+      postC();
+      expect(annotatePressed()).toBe("false");
+
+      // The user's key press in the frame: focus there and activation live.
+      activation = { isActive: true };
+      postC();
+      expect(annotatePressed()).toBe("true");
+      postC();
+      expect(annotatePressed()).toBe("false");
+    } finally {
+      Reflect.deleteProperty(window.navigator, "userActivation");
+    }
+  });
+
   test("warns above HTML artifacts only when agent-browser is known to be missing", async () => {
     const warning = "Not checked by the agent: agent-browser is not available on this runtime.";
     for (const value of [true, null]) {

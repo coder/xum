@@ -295,6 +295,37 @@ function deletionCreatesRawReset(
   return createdReset();
 }
 
+/**
+ * #5886: the Anthropic thinking-replay receipt (MuxMetadata.anthropicThinkingReplay) must
+ * outlive a turn that produced no output, or the next turn replays the removed thinking and
+ * pays one more 400. Returns the stored row with only the partial's receipt added (its parts
+ * stay as they are, and an empty row never reaches the provider or shows as a reply), or
+ * undefined when there is nothing to add. A later strip of the same turn moves the receipt's
+ * point, so a changed point is copied too.
+ */
+function withPartialReplayReceipt(
+  existing: MuxMessage,
+  partial: MuxMessage
+): MuxMessage | undefined {
+  const receipt = partial.metadata;
+  if (receipt?.anthropicThinkingReplay !== "off") return undefined;
+  const stored = existing.metadata;
+  if (
+    stored?.anthropicThinkingReplay === "off" &&
+    stored.anthropicThinkingReplayFromStep === receipt.anthropicThinkingReplayFromStep
+  ) {
+    return undefined;
+  }
+  return {
+    ...existing,
+    metadata: {
+      ...stored,
+      anthropicThinkingReplay: "off",
+      anthropicThinkingReplayFromStep: receipt.anthropicThinkingReplayFromStep,
+    },
+  };
+}
+
 function stripContextUsage(message: MuxMessage): MuxMessage {
   if (!message.metadata) {
     return message;
@@ -1800,10 +1831,13 @@ export class HistoryService {
       try {
         // Preserve the existing recovery hashes and tombstone protocol, but leave no await
         // between the final ownership check and the complete destructive transaction.
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         renameSync(staged.get(markerPath)!, markerPath);
         renameSync(archivePath, `${archivePath}.truncate`);
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         if (archive !== null) renameSync(staged.get(archivePath)!, archivePath);
         if (chat === null) rmSync(chatPath, { force: true });
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         else renameSync(staged.get(chatPath)!, chatPath);
         committed = true;
       } catch (error) {
@@ -3595,25 +3629,19 @@ export class HistoryService {
         // write, before this partial was deleted, #5886).
         existingMessage.metadata?.anthropicThinkingReplay !== "off";
 
-      // #5886: the Anthropic thinking-repair receipt (MuxMetadata.anthropicThinkingReplay)
-      // must outlive a turn that produced no output, or the next turn replays the removed
-      // thinking and pays one more 400. Add only the receipt to the stored row: its parts
-      // stay as they are, and an empty row never reaches the provider or shows as a reply.
-      const keepsReplayReceipt =
-        !shouldCommit &&
-        partial.metadata?.anthropicThinkingReplay === "off" &&
-        existingMessage.metadata?.anthropicThinkingReplay !== "off";
+      // #5886: the receipt must outlive a turn that produced no output (see
+      // withPartialReplayReceipt).
+      const receiptRow = shouldCommit
+        ? undefined
+        : withPartialReplayReceipt(existingMessage, partial);
 
       if (shouldCommit) {
         const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, partial);
         if (!updateResult.success) {
           return updateResult;
         }
-      } else if (keepsReplayReceipt) {
-        const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, {
-          ...existingMessage,
-          metadata: { ...existingMessage.metadata, anthropicThinkingReplay: "off" },
-        });
+      } else if (receiptRow) {
+        const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, receiptRow);
         if (!updateResult.success) {
           return updateResult;
         }
@@ -4327,6 +4355,7 @@ export class HistoryService {
               "summary"
           )
             return Ok({ kind: "skipped" });
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           const trigger = messages.at(-1)!;
           if (
             new Set(messages.map((message) => message.id)).size !== messages.length ||
@@ -4393,12 +4422,15 @@ export class HistoryService {
             matches.length !== 1 ||
             !row ||
             !this.isCompactionReplacementRow(row) ||
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             !matchesTarget(row.message!)
           )
             return Ok({ kind: "skipped" });
           // Stamp the verified disk row so normalization never erases persisted fields.
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           messages = [row.message!];
         }
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const trigger = messages.at(-1)!;
         // Ordinary input records the rejection without gaining authority to replace a Stop.
         if (
@@ -4416,6 +4448,7 @@ export class HistoryService {
           return Ok(accepted);
         }
         if (replacementNonce !== null) {
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           if (!(await verifyIdentities!())) return Ok({ kind: "skipped" });
           if (verifyExistingWitness) {
             // A failed sidecar retirement must not make explicit Retry inert. Reuse the

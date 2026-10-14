@@ -147,6 +147,18 @@ describe("terminal budget rejection barriers", () => {
   });
 });
 
+describe("plugin-blocked queued sends", () => {
+  it("offers no Retry: the blocked message was never saved, so a resume replays the last turn", () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rNISc).
+    const messages = [
+      userMessage(),
+      assistantMessage(),
+      streamErrorMessage({ errorType: "plugin_blocked" }),
+    ];
+    expect(getInterruptionContext(messages).hasInterruptedStream).toBe(false);
+  });
+});
+
 describe("Token Budget warning rows", () => {
   const warning = userMessage({
     id: "warning-1",

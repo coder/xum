@@ -11,10 +11,12 @@ import {
   WEB_FETCH_TIMEOUT_SECS,
   WEB_FETCH_MAX_OUTPUT_BYTES,
   WEB_FETCH_MAX_HTML_BYTES,
+  WEB_FETCH_MAX_ADDRESS_ATTEMPTS,
 } from "@/common/constants/toolLimits";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
+import { assert } from "@/common/utils/assert";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
 import {
@@ -268,11 +270,10 @@ function probeCurlReportsProxyUsed(config: ToolConfiguration): Promise<boolean> 
 interface WebFetchTarget {
   url: URL;
   /**
-   * The address every request to this URL connects to: the first validated one, in
-   * resolver order, or the IP literal itself. Only one: no fallback to other addresses
-   * (follow-up), and never to curl's own DNS.
+   * The validated addresses this URL may connect to, in resolver order, or just the IP
+   * literal. Each request pins one of them; never curl's own DNS (#5966).
    */
-  address: string;
+  addresses: string[];
   /** False for IP-literal URLs, which curl connects to without resolving. */
   pinned: boolean;
 }
@@ -319,7 +320,7 @@ async function assertWebFetchTargetAllowed(
     if (isBlockedIpAddress(hostname)) {
       throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
     }
-    return { url: parsedUrl, address: hostname, pinned: false };
+    return { url: parsedUrl, addresses: [hostname], pinned: false };
   }
 
   const resolvedAddresses = await resolveHostnameInRuntime(
@@ -334,7 +335,8 @@ async function assertWebFetchTargetAllowed(
     }
   }
 
-  return { url: parsedUrl, address: resolvedAddresses[0], pinned: true };
+  assert(resolvedAddresses.length > 0, "web_fetch: resolver returned no addresses");
+  return { url: parsedUrl, addresses: resolvedAddresses, pinned: true };
 }
 
 /** Parse curl -i output into headers and body */
@@ -432,32 +434,107 @@ function buildCurlCommand(
   ].join(" ");
 }
 
+/** curl's route report: the address it connected to and whether a proxy was used. */
+interface CurlRoute {
+  remoteIp: string;
+  proxyUsed: boolean;
+}
+
+/** Remove curl's route line from stderr; `route` is null when it is missing or malformed. */
+function takeCurlRouteLine(stderr: string): { route: CurlRoute | null; stderr: string } {
+  const lines = stderr.split("\n");
+  const index = lines.findLastIndex((line) => line.startsWith(CURL_ROUTE_MARKER));
+  if (index === -1) return { route: null, stderr: stderr.trim() };
+  const fields = lines[index].slice(CURL_ROUTE_MARKER.length).split(";");
+  lines.splice(index, 1);
+  const [remoteIp, proxyUsed] = fields;
+  const wellFormed = fields.length === 2 && (proxyUsed === "0" || proxyUsed === "1");
+  return {
+    route: wellFormed ? { remoteIp, proxyUsed: proxyUsed === "1" } : null,
+    stderr: lines.join("\n").trim(),
+  };
+}
+
 /**
  * Remove curl's route line from stderr and check it. This is an invariant check, NOT the
  * SSRF defense: it runs after curl already connected, so it can only keep a wrong route's
  * response out of the result; pinning prevents the connection. It needs %{proxy_used}
  * (curl 8.7+) and checks direct connections only: through a proxy, %{remote_ip} is the
- * proxy. A missing or malformed route line with a response is treated as a wrong route.
+ * proxy. A missing or malformed route line with a response is treated as a wrong route,
+ * and so is a direct connection that produced a response but reports no address (#5990).
+ * An empty address with no response is curl failing before it connected: its own error
+ * is reported instead.
  */
 function checkCurlRoute(
   result: runtimeHelpers.ExecResult,
   expectedAddress: string
-): runtimeHelpers.ExecResult {
-  const lines = result.stderr.split("\n");
-  const index = lines.findLastIndex((line) => line.startsWith(CURL_ROUTE_MARKER));
-  const fields = index === -1 ? [] : lines[index].slice(CURL_ROUTE_MARKER.length).split(";");
-  if (index !== -1) lines.splice(index, 1);
-  const [remoteIp, proxyUsed] = fields;
-  const wellFormed = fields.length === 2 && (proxyUsed === "0" || proxyUsed === "1");
-  const wrongDirectRoute =
-    wellFormed &&
-    proxyUsed === "0" &&
-    remoteIp !== "" &&
-    normalizeHostname(remoteIp) !== normalizeHostname(expectedAddress);
-  if (wrongDirectRoute || (!wellFormed && result.stdout.length > 0)) {
+): { result: runtimeHelpers.ExecResult; route: CurlRoute | null } {
+  const { route, stderr } = takeCurlRouteLine(result.stderr);
+  const hasResponse = result.stdout.length > 0;
+  const wrongRoute =
+    route === null
+      ? hasResponse
+      : !route.proxyUsed &&
+        (route.remoteIp === ""
+          ? hasResponse
+          : normalizeHostname(route.remoteIp) !== normalizeHostname(expectedAddress));
+  if (wrongRoute) {
     throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
   }
-  return { ...result, stderr: lines.join("\n").trim() };
+  return { result: { ...result, stderr }, route };
+}
+
+/**
+ * #5977: whether the pinned address itself was unreachable. curl exits 7 also when a proxy
+ * refuses the tunnel or is down, but then it reports proxy_used=1. Only a direct attempt
+ * that got no response at all qualifies.
+ */
+function isPinnedAddressUnreachable(
+  result: runtimeHelpers.ExecResult,
+  route: CurlRoute | null
+): boolean {
+  return route?.proxyUsed === false && result.exitCode === 7 && result.stdout.length === 0;
+}
+
+/**
+ * One request for one target. A later validated address is tried only when the pinned one
+ * was unreachable (#5977): at most once each, at most WEB_FETCH_MAX_ADDRESS_ATTEMPTS in
+ * total, inside the same deadline, never unpinned.
+ * Without the route line (curl before 8.7) a refused CONNECT looks the same as a dead
+ * address, so that curl makes one attempt only.
+ */
+async function fetchTargetFromValidatedAddresses(
+  config: ToolConfiguration,
+  target: WebFetchTarget,
+  deadlineMs: number,
+  reportsProxyUsed: boolean,
+  abortSignal?: AbortSignal
+): Promise<runtimeHelpers.ExecResult> {
+  let result: runtimeHelpers.ExecResult | undefined;
+  for (const address of target.addresses.slice(0, WEB_FETCH_MAX_ADDRESS_ATTEMPTS)) {
+    const curlTimeoutSecs = getRemainingWebFetchTimeoutSecs(deadlineMs);
+    const connectTo = target.pinned ? buildConnectToPin(target.url, address) : null;
+    const raw = await runtimeHelpers.execBuffered(
+      config.runtime,
+      buildCurlCommand(target.url.toString(), curlTimeoutSecs, connectTo, reportsProxyUsed),
+      {
+        cwd: config.cwd,
+        abortSignal,
+        // Keep redirect hops inside the original fetch deadline instead of
+        // letting each curl invocation block for a fresh full timeout.
+        timeout: curlTimeoutSecs + WEB_FETCH_RUNTIME_TIMEOUT_GRACE_SECS,
+      }
+    );
+    if (!reportsProxyUsed) return raw;
+    const checked = checkCurlRoute(raw, address);
+    result = checked.result;
+    if (!isPinnedAddressUnreachable(result, checked.route) || abortSignal?.aborted) {
+      return result;
+    }
+    log.debug("web_fetch: pinned address unreachable, trying the next validated one");
+  }
+  assert(result, "web_fetch: a target always has at least one address");
+  return result;
 }
 
 async function executeWebFetchRequest(
@@ -472,20 +549,13 @@ async function executeWebFetchRequest(
 
   for (let redirectCount = 0; redirectCount <= WEB_FETCH_MAX_REDIRECTS; redirectCount++) {
     const currentUrl = target.url;
-    const curlTimeoutSecs = getRemainingWebFetchTimeoutSecs(deadlineMs);
-    const connectTo = target.pinned ? buildConnectToPin(currentUrl, target.address) : null;
-    const raw = await runtimeHelpers.execBuffered(
-      config.runtime,
-      buildCurlCommand(currentUrl.toString(), curlTimeoutSecs, connectTo, reportsProxyUsed),
-      {
-        cwd: config.cwd,
-        abortSignal,
-        // Keep redirect hops inside the original fetch deadline instead of
-        // letting each curl invocation block for a fresh full timeout.
-        timeout: curlTimeoutSecs + WEB_FETCH_RUNTIME_TIMEOUT_GRACE_SECS,
-      }
+    const result = await fetchTargetFromValidatedAddresses(
+      config,
+      target,
+      deadlineMs,
+      reportsProxyUsed,
+      abortSignal
     );
-    const result = reportsProxyUsed ? checkCurlRoute(raw, target.address) : raw;
 
     if (result.exitCode !== 0) {
       return { result, finalUrl: currentUrl.toString() };

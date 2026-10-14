@@ -1,3 +1,4 @@
+import assert from "@/common/utils/assert";
 import { tool } from "ai";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -17,6 +18,7 @@ import {
 } from "@/common/types/workflow";
 
 import { fromBashTaskId, isWorkflowRunTaskId, toBashTaskId } from "./taskId";
+import { pageTaskReportForResult } from "@/common/utils/tools/pageToolText";
 import { formatBashOutputReport } from "./bashTaskReport";
 import {
   dedupeStrings,
@@ -103,6 +105,41 @@ function buildTaskAwaitSequencingError(taskId: string, suggestedTaskIds: string[
       "Wait for the spawning tool result first, then call task_await in a later step. " +
       `Use one of these returned task IDs instead: ${suggestedTaskIds.join(", ")}.`,
   };
+}
+
+/**
+ * Page a completed report (sub-agent, workspace turn or workflow) to TOOL_TEXT_PAGE_MAX_CHARS.
+ * The report stays persisted, so task_await with timeout_secs 0 and offset_chars re-fetches the
+ * next page. Bash reports are not paged: their output is already capped per read, and an offset
+ * would skip output of an incremental read that no later read returns.
+ */
+function pageCompletedReport<T extends { status: string; taskId: string }>(
+  result: T,
+  offsetChars: number | null | undefined
+): T {
+  if (!isPageableReport(result)) return result;
+  const { text, ...paging } = pageTaskReportForResult(
+    result.taskId,
+    result.reportMarkdown,
+    offsetChars
+  );
+  const firstPage = (offsetChars ?? 0) === 0;
+  // A whole report read from the start keeps its result as is (including the re-fetch note).
+  if (firstPage && text === result.reportMarkdown) return result;
+  const page = { ...result, reportMarkdown: text, ...paging };
+  // structuredOutput has no size bound: only a read from offset 0 carries it, so reading a
+  // report page by page does not repeat it. Decided by the requested offset, not by the text:
+  // an empty report reads back the same empty text at any offset.
+  if (!firstPage) Reflect.deleteProperty(page, "structuredOutput");
+  return page;
+}
+
+/** A completed, non-bash result with a string report: the results report paging applies to. */
+function isPageableReport<T extends { status: string; taskId: string }>(
+  result: T
+): result is T & { reportMarkdown: string } {
+  if (result.status !== "completed" || fromBashTaskId(result.taskId) != null) return false;
+  return "reportMarkdown" in result && typeof result.reportMarkdown === "string";
 }
 
 function getWorkflowRunElapsedMs(run: WorkflowRunRecord): number | undefined {
@@ -929,6 +966,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         // bash getProcess/getOutput reads) run outside its internal try/catch and could reject.
         // Convert any stray rejection into an `error` result so the task still counts as settled —
         // otherwise the gate below could never reach `wantCount` or "all settled" and would stall.
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const promise = awaitOne(taskId, taskControllers.get(taskId)!.signal).catch(
           (error: unknown): Awaited<ReturnType<typeof awaitOne>> => ({
             status: "error",
@@ -981,7 +1019,11 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       // those to land so every awaited task has a result before assembling the ordered array.
       await Promise.all(taskPromises);
 
-      const results = uniqueTaskIds.map((taskId) => resultsByTaskId.get(taskId)!);
+      const results = uniqueTaskIds.map((taskId) => {
+        const result = resultsByTaskId.get(taskId);
+        assert(result != null, "every awaited task has a result once all promises settled");
+        return pageCompletedReport(result, args.offset_chars);
+      });
 
       return parseToolResult(TaskAwaitToolResultSchema, { results }, "task_await");
     },

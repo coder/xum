@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it, expect, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import {
+  formatKeybindForAria,
   isMac,
   matchesKeybind,
   matchesNewSidebarTabKeybind,
@@ -48,6 +49,42 @@ describe("NEW_SIDEBAR_TAB keybind", () => {
         createEvent({ ...chord, getModifierState: (key: string) => key === "AltGraph" })
       )
     ).toBe(false);
+  });
+});
+
+describe("workspace actions menu keybinds (#6328)", () => {
+  const keys = [
+    ["FORK_WORKSPACE", "KeyB", "\u222b"],
+    ["STOP_WORKSPACE_RUNTIME", "KeyX", "\u02db"],
+    ["MARK_WORKSPACE_UNREAD", "KeyM", "\u00c2"],
+    ["TOGGLE_COMPLETED_SUB_AGENTS", "KeyA", "\u00c5"],
+  ] as const;
+
+  test("macOS: Cmd+Option+Shift on the physical key, whatever character Option makes", () => {
+    globalThis.window = { api: { platform: "darwin" } } as unknown as Window & typeof globalThis;
+    for (const [id, code, optionCharacter] of keys) {
+      const chord = { key: optionCharacter, code, altKey: true, shiftKey: true };
+      expect(matchesKeybind(createEvent({ ...chord, metaKey: true }), KEYBINDS[id])).toBe(true);
+      // Option+Shift alone types that character; it must stay text, not a shortcut.
+      expect(matchesKeybind(createEvent(chord), KEYBINDS[id])).toBe(false);
+    }
+  });
+
+  test("Windows/Linux: Ctrl+Alt+Shift, and no chord another keybind uses", () => {
+    globalThis.window = { api: { platform: "linux" } } as unknown as Window & typeof globalThis;
+    for (const [id, code] of keys) {
+      const event = createEvent({
+        key: code.slice(3).toLowerCase(),
+        code,
+        ctrlKey: true,
+        altKey: true,
+        shiftKey: true,
+      });
+      const matching = (Object.keys(KEYBINDS) as Array<keyof typeof KEYBINDS>).filter((other) =>
+        matchesKeybind(event, KEYBINDS[other])
+      );
+      expect(matching).toEqual([id]);
+    }
   });
 });
 
@@ -176,6 +213,37 @@ describe("isKeybindDeprecated", () => {
 test("removed auto agent toggle keybind", () => {
   const removedKey = ["TOGGLE", "AUTO", "AGENT"].join("_");
   expect(KEYBINDS).not.toHaveProperty(removedKey);
+});
+
+describe("TOGGLE_MARKDOWN_PREVIEW keybind", () => {
+  test("uses Cmd+E on macOS so Ctrl+E keeps moving to the end of the line", () => {
+    globalThis.window = { api: { platform: "darwin" } } as unknown as Window & typeof globalThis;
+    expect(
+      matchesKeybind(createEvent({ key: "e", metaKey: true }), KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)
+    ).toBe(true);
+    expect(
+      matchesKeybind(createEvent({ key: "e", ctrlKey: true }), KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)
+    ).toBe(false);
+  });
+});
+
+describe("formatKeybindForAria", () => {
+  // aria-keyshortcuts must name the modifier the matcher accepts on each platform.
+  test("names Meta for a Ctrl keybind on macOS unless it keeps the Control key", () => {
+    globalThis.window = { api: { platform: "darwin" } } as unknown as Window & typeof globalThis;
+    expect(formatKeybindForAria(KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)).toBe("Meta+E");
+    expect(formatKeybindForAria(KEYBINDS.INTERRUPT_STREAM_VIM)).toBe("Control+C");
+    expect(formatKeybindForAria({ key: "k", ctrl: true, meta: true })).toBe("Control+Meta+K");
+  });
+
+  test("names Control elsewhere and keeps the formatKeybind order and key names", () => {
+    globalThis.window = { api: { platform: "linux" } } as unknown as Window & typeof globalThis;
+    expect(formatKeybindForAria(KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)).toBe("Control+E");
+    expect(formatKeybindForAria({ key: "Enter", ctrl: true, alt: true, shift: true })).toBe(
+      "Control+Alt+Shift+Enter"
+    );
+    expect(formatKeybindForAria({ key: " ", shift: true })).toBe("Shift+Space");
+  });
 });
 
 describe("SEND_MESSAGE_AFTER_TURN keybind (Ctrl/Cmd+Enter)", () => {

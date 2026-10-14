@@ -380,24 +380,17 @@ describe("createDisplayUsage", () => {
       expect(result!.output.cost_usd).toBeCloseTo(0.0225);
     });
 
-    test("preserves aggregate GPT-6.1 Sol totals during repricing and flags them as approximate", () => {
-      const aggregate = {
-        input: { tokens: 200000, cost_usd: 1 },
-        cached: { tokens: 100000, cost_usd: 0.05 },
-        cacheCreate: { tokens: 0, cost_usd: 0 },
-        output: { tokens: 1000, cost_usd: 0.03 },
-        reasoning: { tokens: 0, cost_usd: 0 },
-        model: "openai:gpt-6.1-sol",
-      };
+    test("keeps the recorded costs of a tiered aggregate without an unknown-pricing flag", () => {
+      const model = "anthropic:claude-haiku-5-5";
+      // Each request is under Haiku 5.5's 100K threshold; their sum is not.
+      const request = () =>
+        createDisplayUsage({ inputTokens: 80000, outputTokens: 500, totalTokens: 80500 }, model)!;
+      const aggregate = sumUsageHistory([request(), request()])!;
 
-      const result = recomputeUsageCosts(aggregate, "openai:gpt-6.1-sol", {
-        aggregatedUsage: true,
-      });
+      const result = recomputeUsageCosts(aggregate, model, { aggregatedUsage: true });
 
-      expect(result).toEqual({
-        ...aggregate,
-        hasUnknownCosts: true,
-      });
+      expect(result).toEqual(aggregate);
+      expect(result.hasUnknownCosts).toBeUndefined();
     });
 
     test("recomputes persisted GPT-6 Astra usage with the higher long-context tier", () => {
@@ -574,6 +567,129 @@ describe("createDisplayUsage", () => {
       expect(result).toBeDefined();
       expect(result!.cacheCreate.tokens).toBe(1500);
     });
+  });
+});
+
+describe("Anthropic 1h-TTL cache-write pricing", () => {
+  const CACHE_WRITE = 40_000;
+  // Raw Anthropic usage as the SDK surfaces it on providerMetadata.anthropic.usage.
+  const metadata = (split?: { fiveMinute: number; oneHour: number }) => ({
+    anthropic: {
+      cacheCreationInputTokens: CACHE_WRITE,
+      ...(split && {
+        usage: {
+          cache_creation: {
+            ephemeral_5m_input_tokens: split.fiveMinute,
+            ephemeral_1h_input_tokens: split.oneHour,
+          },
+        },
+      }),
+    },
+  });
+  const display = (
+    model: string,
+    meta: Record<string, unknown> | undefined,
+    inputTokens = CACHE_WRITE + 10_000
+  ) => {
+    const usage = createDisplayUsage({ inputTokens, outputTokens: 500 }, model, meta);
+    if (usage === undefined) throw new Error("expected display usage");
+    return usage;
+  };
+  const cacheWriteCost = (usage: ReturnType<typeof display>) => {
+    const cost = usage.cacheCreate.cost_usd;
+    if (cost === undefined) throw new Error("expected a priced cache write");
+    return cost;
+  };
+
+  test("prices a 1h write at 2x the response's own input rate, above the 5m rate", () => {
+    // Haiku 5.5 crosses its 100K tier, so the 1h rate must follow the tier's input rate.
+    for (const [model, inputTokens] of [
+      ["anthropic:claude-sonnet-5-5", undefined],
+      ["anthropic:claude-opus-4-8", undefined],
+      ["anthropic:claude-haiku-5-5", 150_000],
+    ] as const) {
+      const fiveMinute = display(model, metadata(), inputTokens);
+      const oneHour = display(
+        model,
+        metadata({ fiveMinute: 0, oneHour: CACHE_WRITE }),
+        inputTokens
+      );
+      const inputRate = (oneHour.input.cost_usd ?? NaN) / oneHour.input.tokens;
+      expect(oneHour.cacheCreate1hTokens).toBe(CACHE_WRITE);
+      expect(cacheWriteCost(oneHour) / CACHE_WRITE).toBeCloseTo(2 * inputRate, 15);
+      expect(cacheWriteCost(oneHour)).toBeGreaterThan(cacheWriteCost(fiveMinute));
+      expect(getTotalCost(oneHour)).toBeGreaterThan(getTotalCost(fiveMinute) ?? Infinity);
+    }
+  });
+
+  test("keeps the 5m price when no 1h split is reported", () => {
+    const model = "anthropic:claude-sonnet-5-5";
+    const noSplit = display(model, metadata());
+    const allFiveMinute = display(model, metadata({ fiveMinute: CACHE_WRITE, oneHour: 0 }));
+    expect(noSplit.cacheCreate1hTokens).toBeUndefined();
+    expect(allFiveMinute.cacheCreate1hTokens).toBeUndefined();
+    expect(cacheWriteCost(allFiveMinute)).toBe(cacheWriteCost(noSplit));
+    // A malformed persisted split self-heals to the 5m price instead of a negative count.
+    const malformed = display(model, {
+      anthropic: {
+        cacheCreationInputTokens: CACHE_WRITE,
+        usage: { cache_creation: { ephemeral_1h_input_tokens: -5 } },
+      },
+    });
+    expect(cacheWriteCost(malformed)).toBe(cacheWriteCost(noSplit));
+  });
+
+  test("prices each part of a mixed 5m/1h split at its own rate", () => {
+    const model = "anthropic:claude-sonnet-5-5";
+    const fiveMinuteRate = cacheWriteCost(display(model, metadata())) / CACHE_WRITE;
+    const oneHourRate =
+      cacheWriteCost(display(model, metadata({ fiveMinute: 0, oneHour: CACHE_WRITE }))) /
+      CACHE_WRITE;
+    const mixed = display(model, metadata({ fiveMinute: 30_000, oneHour: 10_000 }));
+    expect(mixed.cacheCreate1hTokens).toBe(10_000);
+    expect(cacheWriteCost(mixed)).toBeCloseTo(30_000 * fiveMinuteRate + 10_000 * oneHourRate, 12);
+  });
+
+  test("repricing and session aggregates keep the 1h premium", () => {
+    const model = "anthropic:claude-sonnet-5-5";
+    const mixed = display(model, metadata({ fiveMinute: 30_000, oneHour: 10_000 }));
+    const parsed = ChatUsageDisplaySchema.parse(mixed);
+    expect(getTotalCost(recomputeUsageCosts(parsed, model))).toBeCloseTo(
+      getTotalCost(mixed) ?? NaN,
+      12
+    );
+
+    const aggregate = sumUsageHistory([mixed, display(model, metadata())]);
+    if (aggregate === undefined) throw new Error("expected an aggregate");
+    expect(aggregate.cacheCreate1hTokens).toBe(10_000);
+    const repriced = recomputeUsageCosts(aggregate, model, { aggregatedUsage: true });
+    expect(getTotalCost(repriced)).toBeCloseTo(getTotalCost(aggregate) ?? NaN, 12);
+  });
+
+  test("repricing repairs a malformed 1h share instead of carrying it into later sums", () => {
+    const model = "anthropic:claude-sonnet-5-5";
+    const write = (tokens: number, oneHour: number) =>
+      display(model, {
+        anthropic: {
+          cacheCreationInputTokens: tokens,
+          usage: {
+            cache_creation: {
+              ephemeral_5m_input_tokens: tokens - oneHour,
+              ephemeral_1h_input_tokens: oneHour,
+            },
+          },
+        },
+      });
+    // A persisted row claims 100 1h tokens out of only 10 cache-write tokens.
+    const corrupt = { ...write(10, 10), cacheCreate1hTokens: 100 };
+    const repaired = recomputeUsageCosts(corrupt, model);
+    const later = sumUsageHistory([repaired, write(90, 0)]);
+    const expected = sumUsageHistory([write(10, 10), write(90, 0)]);
+    if (later === undefined || expected === undefined) throw new Error("expected aggregates");
+    expect(recomputeUsageCosts(later, model).cacheCreate.cost_usd).toBeCloseTo(
+      expected.cacheCreate.cost_usd ?? NaN,
+      12
+    );
   });
 });
 
@@ -760,12 +876,20 @@ describe("repricing keeps the billed service tier (#4787)", () => {
     expect(total(repriced)).toBeCloseTo(total(aggregate), 12);
   });
 
-  test("keeps the stored costs, marked approximate, of an aggregate that mixes tiers", () => {
+  test("keeps the recorded costs of an aggregate that mixes tiers", () => {
     const aggregate = sumUsageHistory([priced(MODEL, "priority"), priced(MODEL)]);
     if (aggregate === undefined) throw new Error("expected an aggregate");
-    expect(recomputeUsageCosts(aggregate, MODEL, { aggregatedUsage: true })).toEqual({
-      ...aggregate,
-      hasUnknownCosts: true,
-    });
+    expect(recomputeUsageCosts(aggregate, MODEL, { aggregatedUsage: true })).toEqual(aggregate);
+  });
+
+  test("an unpriced model's sum keeps its unknown-pricing flag through the schema", () => {
+    const unpriced = () =>
+      createDisplayUsage(
+        { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 },
+        "openai:some-unknown-model"
+      )!;
+    // Merging turns the unknown costs into numeric partial sums; only the flag remains.
+    const merged = ChatUsageDisplaySchema.parse(sumUsageHistory([unpriced(), unpriced()]));
+    expect(sumUsageHistory([merged])?.hasUnknownCosts).toBe(true);
   });
 });

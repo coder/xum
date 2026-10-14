@@ -1,10 +1,11 @@
 import "../../../../../tests/ui/dom";
 
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { ReactNode } from "react";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
@@ -222,5 +223,103 @@ describe("HeartbeatSection", () => {
         intervalMs: initialIntervalMs,
       });
     });
+  });
+});
+
+// happy-dom does not deliver React's synthetic onChange for controlled fields, so call the
+// field's React onChange prop directly (same workaround as InstructionsSection.test.tsx).
+function typeIntoTextarea(textarea: HTMLTextAreaElement, value: string) {
+  const reactPropsKey = Object.keys(textarea).find((key) => key.startsWith("__reactProps"));
+  const reactProps = (
+    reactPropsKey ? (textarea as unknown as Record<string, unknown>)[reactPropsKey] : null
+  ) as {
+    onChange?: (event: { target: { value: string } }) => void;
+  } | null;
+  const onChange = reactProps?.onChange;
+  if (!onChange) throw new Error("Expected the textarea to expose its onChange handler");
+  act(() => onChange({ target: { value } }));
+}
+
+// A reconnect reloads the config through the new client. A prompt the user typed and did not
+// save yet stays in the field (the reload must not overwrite it), and the field stays enabled.
+describe.each([...GAP_MODES])("HeartbeatSection across a reconnect (%s)", (mode) => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    mock.restore();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("keeps a typed, unsaved prompt when the reload answers", async () => {
+    mockApi = createMockAPI({ heartbeatDefaultPrompt: "Saved prompt" }).api;
+    const harness = createConnectionHarness(mode, () => mockApi);
+    const view = render(
+      <harness.Wrapper>
+        <TooltipProvider>
+          <ThemeProvider forcedTheme="dark">
+            <HeartbeatSection />
+          </ThemeProvider>
+        </TooltipProvider>
+      </harness.Wrapper>
+    );
+    const promptField = (await waitFor(() =>
+      view.getByLabelText("Default heartbeat prompt")
+    )) as HTMLTextAreaElement;
+    await waitFor(() => expect(promptField.value).toBe("Saved prompt"));
+
+    typeIntoTextarea(promptField, "Typed, not saved");
+    mockApi = createMockAPI({ heartbeatDefaultPrompt: "Prompt from the server" }).api;
+    await harness.drop();
+    harness.reconnect();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+
+    expect(promptField.value).toBe("Typed, not saved");
+    expect(promptField.disabled).toBe(false);
+  });
+
+  // A save that the drop cut off never reached the server. After the reconnect the field must
+  // show the saved value, not the unsaved one as if it were saved. Offline it is disabled.
+  test("shows the saved prompt after a save the drop cut off", async () => {
+    const first = createMockAPI({ heartbeatDefaultPrompt: "Saved prompt" });
+    first.api.config.updateHeartbeatDefaultPrompt = mock(() => new Promise<void>(() => undefined));
+    mockApi = first.api;
+    const harness = createConnectionHarness(mode, () => mockApi);
+    const view = render(
+      <harness.Wrapper>
+        <TooltipProvider>
+          <ThemeProvider forcedTheme="dark">
+            <HeartbeatSection />
+          </ThemeProvider>
+        </TooltipProvider>
+      </harness.Wrapper>
+    );
+    const promptField = (await waitFor(() =>
+      view.getByLabelText("Default heartbeat prompt")
+    )) as HTMLTextAreaElement;
+    await waitFor(() => expect(promptField.value).toBe("Saved prompt"));
+
+    typeIntoTextarea(promptField, "Cut off");
+    fireEvent.blur(promptField);
+    await waitFor(() => expect(first.api.config.updateHeartbeatDefaultPrompt).toHaveBeenCalled());
+
+    mockApi = createMockAPI({ heartbeatDefaultPrompt: "Saved prompt" }).api;
+    await harness.drop();
+    expect(promptField.disabled).toBe(true);
+    // A real reconnect takes at least a socket round trip: the cut-off save rejects before it.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    harness.reconnect();
+
+    await waitFor(() => expect(promptField.value).toBe("Saved prompt"));
+    expect(promptField.disabled).toBe(false);
   });
 });

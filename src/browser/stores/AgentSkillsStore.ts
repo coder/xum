@@ -3,7 +3,8 @@ import type { APIClient } from "@/browser/contexts/API";
 import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { RefreshController } from "@/browser/utils/RefreshController";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
-import type { AgentSkillListResult } from "@/common/types/agentSkill";
+import type { AgentSkillListResult, InvocableSkill } from "@/common/types/agentSkill";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 import { MapStore } from "./MapStore";
 
 /** The input of `agentSkills.list`: a workspace, or a project before its workspace exists. */
@@ -97,6 +98,14 @@ export class AgentSkillsStore {
     return this.versions.get(key, () => this.entries.get(key)?.result ?? EMPTY_RESULT);
   }
 
+  /**
+   * Whether this key's first answer has settled (also a failed one). Until then getResult is the
+   * empty default, which must not read as "no skills" (#6221).
+   */
+  hasResult(discovery: AgentSkillsDiscovery): boolean {
+    return this.entries.has(getDiscoveryKey(discovery));
+  }
+
   /** Refetch a list that missed a source or failed, also when it is still loading. */
   ensureFresh(discovery: AgentSkillsDiscovery): void {
     const key = getDiscoveryKey(discovery);
@@ -182,5 +191,22 @@ export function useAgentSkills(discovery: AgentSkillsDiscovery | null): AgentSki
   return useSyncExternalStore(
     (listener) => (discovery ? store.subscribe(discovery, listener) : () => undefined),
     () => (discovery ? store.getResult(discovery) : EMPTY_RESULT)
+  );
+}
+
+/**
+ * Skills for user invocation surfaces (slash menu, `$` suggestions, command
+ * palette): shadowed plugin skills join under `<plugin>:<skill>`.
+ */
+export function useInvocableSkills(discovery: AgentSkillsDiscovery | null): InvocableSkill[] {
+  return listInvocableSkills(useAgentSkills(discovery));
+}
+
+/** False while the first answer for `discovery` is pending (see AgentSkillsStore.hasResult). */
+export function useAgentSkillsLoaded(discovery: AgentSkillsDiscovery): boolean {
+  const store = getAgentSkillsStore();
+  return useSyncExternalStore(
+    (listener) => store.subscribe(discovery, listener),
+    () => store.hasResult(discovery)
   );
 }

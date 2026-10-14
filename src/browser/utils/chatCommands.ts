@@ -6,6 +6,7 @@
  * to ensure consistent behavior and avoid duplication.
  */
 
+import { isGoalLifecycleActive } from "@/common/types/goal";
 import type { RouterClient } from "@orpc/server";
 import type { AppRouter } from "@/node/orpc/router";
 import type {
@@ -1192,6 +1193,19 @@ function handleGoalCommand(
       }
 
       if (parsed.type === "goal-pause") {
+        // Same rule as the Goal tab and the palette: only a running goal pauses. The backend also
+        // lets the user move a completed goal to paused (a revive), which /goal pause must not do
+        // (bug bash: it reopened a completed goal and reported "Goal paused").
+        const currentGoal = await env.api.workspace.getGoal({ workspaceId: env.workspaceId });
+        if (currentGoal.goal?.status !== "active") {
+          return complete("restore", [
+            showToast({
+              id: Date.now().toString(),
+              type: "error",
+              message: "No running goal to pause.",
+            }),
+          ]);
+        }
         const result = await setGoalForCommand(env, { status: "paused" });
         if (!result.success) {
           return complete("restore", [showToast(createGoalSetErrorToast(result.error))]);
@@ -1222,6 +1236,18 @@ function handleGoalCommand(
 
       if (parsed.type === "goal-complete") {
         if (!parsed.summary) {
+          // The summary form lives in the Goal tab and only shows for a goal that can complete:
+          // without one, opening the tab would do nothing visible (bug bash).
+          const currentGoal = await env.api.workspace.getGoal({ workspaceId: env.workspaceId });
+          if (currentGoal.goal == null || !isGoalLifecycleActive(currentGoal.goal.status)) {
+            return complete("restore", [
+              showToast({
+                id: Date.now().toString(),
+                type: "error",
+                message: "No goal to complete.",
+              }),
+            ]);
+          }
           window.dispatchEvent?.(
             createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, {
               workspaceId: env.workspaceId,

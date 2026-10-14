@@ -21,7 +21,7 @@ import { collectAllTabsWithTabset, dockTabToEdge } from "@/browser/utils/rightSi
 import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import { makeSideChatTabType } from "@/browser/types/rightSidebar";
 
-import { getRightSidebarLayoutKey } from "@/common/constants/storage";
+import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import { updatePersistedState, readPersistedState } from "@/browser/hooks/usePersistedState";
 import { collectAllTabs, type RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { getRetryBarrierDerivation } from "@/browser/components/ChatPane/retryBarrierDerivation";
@@ -136,7 +136,9 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
   test("the launcher opens idle independent side chats without submitting the main draft or stopping its stream", async () => {
     const app = await createAppHarness({
       branchPrefix: "side-launcher",
-      beforeRender: (workspaceId) =>
+      beforeRender: (workspaceId) => {
+        // This test exercises the expanded launcher's panes, not the collapsed overview.
+        updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
         updatePersistedState(getRightSidebarLayoutKey(workspaceId), {
           version: 1,
           openTabsOnly: true,
@@ -152,7 +154,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
               { type: "tabset", id: "other-pane", tabs: ["costs"], activeTab: "costs" },
             ],
           },
-        }),
+        });
+      },
     });
     const service = app.env.services.toORPCContext().workspaceService;
     const send = jest.spyOn(service, "sendMessage");
@@ -232,7 +235,10 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
   }, 90_000);
 
   test("the launcher prevents duplicate requests and remains usable after creation fails", async () => {
-    const app = await createAppHarness({ branchPrefix: "side-launcher-retry" });
+    const app = await createAppHarness({
+      branchPrefix: "side-launcher-retry",
+      beforeRender: () => updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false),
+    });
     const service = app.env.services.toORPCContext().workspaceService;
     const create = jest.spyOn(service, "createSideChat");
     let rejectCreation!: (error: Error) => void;
@@ -385,10 +391,16 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       );
       expect(closeButton).not.toBeNull();
       fireEvent.click(closeButton!);
-      await waitFor(() => {
-        expect(getSidePane(app)).toBeNull();
-        expect(app.view.container.querySelector('button[aria-label="Close side chat"]')).toBeNull();
-      });
+      // The tab goes only after the backend removes the side chat (#6375).
+      await waitFor(
+        () => {
+          expect(getSidePane(app)).toBeNull();
+          expect(
+            app.view.container.querySelector('button[aria-label="Close side chat"]')
+          ).toBeNull();
+        },
+        { timeout: 10_000 }
+      );
       await waitFor(
         async () => {
           expect(await app.env.orpc.workspace.getInfo({ workspaceId: sideChatId })).toBeNull();
@@ -482,7 +494,10 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
     try {
       const mainPrompt = "[mock:long-stream] Continue working in the main chat";
       await app.chat.send(mainPrompt);
-      await waitFor(() => expect(isStreaming(app.workspaceId)).toBe(true));
+      // Every wait in this test names its budget: waitFor's 1 s default is too short for a stream
+      // to start, catch up or settle on a loaded runner (#6215). Same budgets as startStream and
+      // stopViaApi below.
+      await waitFor(() => expect(isStreaming(app.workspaceId)).toBe(true), { timeout: 30_000 });
       const parentPartial = await waitFor(
         async () => {
           const partial = await context.historyService.readPartial(app.workspaceId);
@@ -497,14 +512,21 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
 
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const childId = await waitForSideChatId(app);
-      await waitFor(() => expect(workspaceStore.isWorkspaceTranscriptCaughtUp(childId)).toBe(true));
+      await waitFor(
+        () => expect(workspaceStore.isWorkspaceTranscriptCaughtUp(childId)).toBe(true),
+        {
+          timeout: 10_000,
+        }
+      );
       // Join the actual recovery pass scheduled by onChat, not a grace-period sleep. A regression
       // that merely hides the banner still fails on a scheduled retry or automatic model send.
       await act(async () => {
         await service.getOrCreateSession(childId).ensureStartupAutoRetryCheck();
       });
       captureSideState();
-      await waitFor(() => expect(parentDeltas).toBeGreaterThan(deltasBeforeOpen));
+      await waitFor(() => expect(parentDeltas).toBeGreaterThan(deltasBeforeOpen), {
+        timeout: 10_000,
+      });
       expect(isStreaming(app.workspaceId)).toBe(true);
       expect(parentStops).toEqual([]);
       expect((await context.historyService.readPartial(app.workspaceId))?.id).toBe(
@@ -528,7 +550,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
         () => expect(getSidePane(app)?.textContent).toContain(`Mock response: ${question}`),
         { timeout: 30_000 }
       );
-      await waitFor(() => expect(isStreaming(childId)).toBe(false));
+      await waitFor(() => expect(isStreaming(childId)).toBe(false), { timeout: 10_000 });
       expect(sideStarts).toEqual([childId]);
       expect(
         modelCalls.mock.calls.filter(([options]) => options.workspaceId === childId)
@@ -633,21 +655,28 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const firstId = await waitForSideChatId(app);
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
-      const ids = await waitFor(async () => {
-        const sideChats = (await app.env.orpc.workspace.list()).filter(
-          (metadata) => metadata.sideChatParentWorkspaceId === app.workspaceId
-        );
-        expect(sideChats).toHaveLength(2);
-        return sideChats.map((metadata) => metadata.id);
-      });
+      // Creating the second side chat is backend work: give it the same budget as the first (#6375).
+      const ids = await waitFor(
+        async () => {
+          const sideChats = (await app.env.orpc.workspace.list()).filter(
+            (metadata) => metadata.sideChatParentWorkspaceId === app.workspaceId
+          );
+          expect(sideChats).toHaveLength(2);
+          return sideChats.map((metadata) => metadata.id);
+        },
+        { timeout: 10_000 }
+      );
       expect(ids).toContain(firstId);
-      await waitFor(() => {
-        for (const id of ids) {
-          expect(
-            app.view.container.querySelector(`[role="tab"][id$="-tab-side:${id}"]`)
-          ).not.toBeNull();
-        }
-      });
+      await waitFor(
+        () => {
+          for (const id of ids) {
+            expect(
+              app.view.container.querySelector(`[role="tab"][id$="-tab-side:${id}"]`)
+            ).not.toBeNull();
+          }
+        },
+        { timeout: 10_000 }
+      );
     } finally {
       await app.dispose();
     }
@@ -659,25 +688,34 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const firstId = await waitForSideChatId(app);
       const draft = "Unsent question in the first side chat";
-      await waitFor(() => expect(getSideComposer(app).value).toBe(""));
+      // Waits after backend work (creating, loading or removing a side chat) can take over the
+      // default one-second budget on a busy runner (#6375), so they get a budget. The draft
+      // store update below is local and keeps the default.
+      await waitFor(() => expect(getSideComposer(app).value).toBe(""), { timeout: 10_000 });
       act(() => getDraftStore().setText({ kind: "workspace", workspaceId: firstId }, draft));
       await waitFor(() => expect(getSideComposer(app).value).toBe(draft));
 
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
-      const secondId = await waitFor(async () => {
-        const sideChats = (await app.env.orpc.workspace.list()).filter(
-          (ws) => ws.sideChatParentWorkspaceId === app.workspaceId
-        );
-        expect(sideChats).toHaveLength(2);
-        return sideChats.find((ws) => ws.id !== firstId)!.id;
-      });
+      const secondId = await waitFor(
+        async () => {
+          const sideChats = (await app.env.orpc.workspace.list()).filter(
+            (ws) => ws.sideChatParentWorkspaceId === app.workspaceId
+          );
+          expect(sideChats).toHaveLength(2);
+          return sideChats.find((ws) => ws.id !== firstId)!.id;
+        },
+        { timeout: 10_000 }
+      );
       const sideTab = (id: string) =>
         app.view.container.querySelector<HTMLElement>(`[role="tab"][id$="-tab-side:${id}"]`);
-      await waitFor(() => {
-        expect(sideTab(firstId)).not.toBeNull();
-        expect(sideTab(secondId)?.getAttribute("aria-selected")).toBe("true");
-        expect(getSideComposer(app).value).toBe("");
-      });
+      await waitFor(
+        () => {
+          expect(sideTab(firstId)).not.toBeNull();
+          expect(sideTab(secondId)?.getAttribute("aria-selected")).toBe("true");
+          expect(getSideComposer(app).value).toBe("");
+        },
+        { timeout: 10_000 }
+      );
       const secondQuestion = "Question in the second side chat";
       await sendFrom(() => getSideComposer(app), secondId, secondQuestion);
       await waitFor(
@@ -686,18 +724,24 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       );
 
       fireEvent.click(sideTab(firstId)!);
-      await waitFor(() => expect(getSideComposer(app).value).toBe(draft));
+      await waitFor(() => expect(getSideComposer(app).value).toBe(draft), { timeout: 10_000 });
       expect(getSidePane(app)?.textContent).not.toContain(secondQuestion);
       fireEvent.click(sideTab(firstId)!.querySelector('button[aria-label="Close side chat"]')!);
-      await waitFor(async () => {
-        expect(sideTab(firstId)).toBeNull();
-        expect(sideTab(secondId)).not.toBeNull();
-        expect(await app.env.orpc.workspace.getInfo({ workspaceId: firstId })).toBeNull();
-        expect(await app.env.orpc.workspace.getInfo({ workspaceId: secondId })).not.toBeNull();
-      });
+      // The tab and the workspace go only after the backend removes the side chat, which took
+      // about 0.7 s on an idle host.
+      await waitFor(
+        async () => {
+          expect(sideTab(firstId)).toBeNull();
+          expect(sideTab(secondId)).not.toBeNull();
+          expect(await app.env.orpc.workspace.getInfo({ workspaceId: firstId })).toBeNull();
+          expect(await app.env.orpc.workspace.getInfo({ workspaceId: secondId })).not.toBeNull();
+        },
+        { timeout: 10_000 }
+      );
       fireEvent.click(sideTab(secondId)!);
-      await waitFor(() =>
-        expect(getSidePane(app)?.textContent).toContain(`Mock response: ${secondQuestion}`)
+      await waitFor(
+        () => expect(getSidePane(app)?.textContent).toContain(`Mock response: ${secondQuestion}`),
+        { timeout: 10_000 }
       );
     } finally {
       await app.dispose();

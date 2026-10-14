@@ -13,9 +13,11 @@ import {
 } from "@/browser/stories/storyPlayHelpers.js";
 import { expect, within, userEvent, waitFor } from "@storybook/test";
 import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
+import type { ThemeMode } from "@/browser/contexts/ThemeContext";
+import { textContrasts } from "@/browser/stories/helpers/contrast";
 
-// Tailwind's `max-w-4xl` in px, the cap the centered transcript and composer columns share.
-const CENTERED_COLUMN_MAX_WIDTH_PX = 896;
+// `max-w-chat` (--container-chat: 48rem) in px, the cap the centered transcript and composer columns share.
+const CENTERED_COLUMN_MAX_WIDTH_PX = 768;
 
 const meta = { ...appMeta, title: "App/Chat/Input" };
 export default meta;
@@ -384,6 +386,41 @@ export const QueuedFollowUp: AppStory = {
     });
   },
 };
+
+/**
+ * The tinted (`bg-muted/10`) action buttons on queued and held inputs reach WCAG AA (4.5:1).
+ * They used `--color-secondary`, which was 4.49:1 on the light dock (#6453).
+ */
+const queuedButtonContrastStory = (theme: ThemeMode): AppStory => ({
+  globals: { theme },
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: QueuedFollowUp.render,
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    const buttons = await waitFor(() => {
+      const status = [
+        ...storyRoot.querySelectorAll<HTMLElement>('[data-component="QueuedMessageStatus"]'),
+      ];
+      const sends = [
+        ...storyRoot.querySelectorAll<HTMLElement>('[data-component="HeldInputBanner"]'),
+      ].flatMap((banner) => within(banner).queryAllByRole("button", { name: /^Send/ }));
+      const found = [...status, ...sends];
+      // One queued status button and the three held inputs' Send buttons, at least.
+      if (found.length < 4) throw new Error(`expected 4+ action buttons, found ${found.length}`);
+      return found;
+    });
+    const failing = buttons
+      .flatMap((button) => textContrasts(button))
+      // Shortcut hints are their own `text-muted` chips, not the tinted button's label.
+      .filter((entry) => !entry.element.closest("kbd"))
+      .filter((entry) => entry.ratio < 4.5)
+      .map((entry) => `${entry.ratio.toFixed(2)}:1 "${entry.text}"`);
+    await expect(failing.join("\n")).toBe("");
+  },
+});
+
+export const QueuedButtonsContrastLight = queuedButtonContrastStory("light");
+export const QueuedButtonsContrastDark = queuedButtonContrastStory("dark");
 
 export const FocusedComposer: AppStory = {
   render: () => (
@@ -1065,7 +1102,7 @@ async function assertDockSurfacesMatchTranscript(
     const column = transcript.getBoundingClientRect();
     const available = scrollport.clientWidth;
     if (expectation === "full-width") {
-      // Docked surfaces used to hardcode the same 4xl cap the centered column uses, so below that
+      // Docked surfaces used to hardcode the same cap the centered column uses, so below that
       // width they line up regardless and the regression would pass unnoticed.
       if (column.width <= CENTERED_COLUMN_MAX_WIDTH_PX) {
         throw new Error(

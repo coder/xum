@@ -69,7 +69,7 @@ const TAB_CONFIG_DEF = {
     paletteKeywords: ["timeline", "events", "history", "activity"],
   },
   artifacts: {
-    description: "Files and app views to preview next to the chat",
+    description: "Files the agent created, to preview next to the chat",
     name: "Artifacts",
     contentClassName: "overflow-hidden p-0",
     featureFlag: EXPERIMENT_IDS.ARTIFACTS,

@@ -84,8 +84,8 @@ function setup(layout: RightSidebarLayoutState = LAYOUT, workspaceId = WORKSPACE
     ],
   });
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
-  // Collapsed on a wide layout earlier: opening the full-screen view expands it.
-  updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+  // Start without a preference: the default is collapsed, but the phone view must still open.
+  updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
   updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
   // The Browser tool polls for sessions; this story has none.
   client.browser = {
@@ -118,6 +118,15 @@ async function openSidebarFromMenu(canvasElement: HTMLElement) {
   await userEvent.click(await page.findByTestId("workspace-open-sidebar"));
 }
 
+/** The right sidebar is a lazy chunk (T3 #5971), so it mounts after the chat input. */
+async function findRightSidebar(canvasElement: HTMLElement): Promise<HTMLElement> {
+  return waitFor(() => {
+    const sidebar = canvasElement.querySelector<HTMLElement>('[aria-label="Workspace insights"]');
+    if (sidebar == null) throw new Error("right sidebar missing");
+    return sidebar;
+  });
+}
+
 export const FullScreenFromWorkspaceMenu: AppStory = {
   decorators: [PhoneFrameDecorator],
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
@@ -126,8 +135,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await waitForChatInputAutofocusDone(canvasElement);
     const canvas = within(canvasElement);
     const page = within(canvasElement.ownerDocument.body);
-    const sidebar = canvasElement.querySelector<HTMLElement>('[aria-label="Workspace insights"]');
-    if (sidebar == null) throw new Error("right sidebar missing");
+    const sidebar = await findRightSidebar(canvasElement);
     const moreButton = canvas.getByTestId("workspace-more-actions");
     const chatPane = canvas.getByRole("log", { name: "Conversation transcript" });
     await waitFor(() => expect(sidebar).not.toBeVisible());
@@ -141,6 +149,8 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
       "true"
     );
     await within(sidebar).findByText(RUN_NAME);
+    // The view closes from its header, so its strip has no collapse button.
+    await expect(within(sidebar).queryByRole("button", { name: "Collapse sidebar" })).toBeNull();
     // Everything behind the view is inert, not just the chat: the left sidebar and the footer
     // sit outside the chat pane.
     await expect(chatPane.closest("[inert]")).not.toBeNull();
@@ -241,6 +251,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
       await waitFor(() => expect(sidebar).not.toHaveClass("right-sidebar-fullscreen"));
       await expect(sidebar).toBeVisible();
       await expect(within(sidebar).queryByRole("button", { name: "Close sidebar" })).toBeNull();
+      await expect(within(sidebar).getByRole("button", { name: "Collapse sidebar" })).toBeVisible();
     }
   },
 };
@@ -274,8 +285,7 @@ export const SplitLayoutKeepsFocusedPane: AppStory = {
   render: () => <AppWithMocks setup={() => setup(SPLIT_LAYOUT, 'xum-legacy"quoted')} />,
   play: async ({ canvasElement }) => {
     await waitForChatInputAutofocusDone(canvasElement);
-    const sidebar = canvasElement.querySelector<HTMLElement>('[aria-label="Workspace insights"]');
-    if (sidebar == null) throw new Error("right sidebar missing");
+    const sidebar = await findRightSidebar(canvasElement);
     await openSidebarFromMenu(canvasElement);
     await waitFor(() => expect(sidebar).toBeVisible());
     const workflowsTab = within(sidebar).getByRole("tab", { name: /Workflows/ });
@@ -304,8 +314,7 @@ export const FullScreenSidebarOnPhone: AppStory = {
   },
   play: async ({ canvasElement }) => {
     await waitForChatInputAutofocusDone(canvasElement);
-    const sidebar = canvasElement.querySelector<HTMLElement>('[aria-label="Workspace insights"]');
-    if (sidebar == null) throw new Error("right sidebar missing");
+    const sidebar = await findRightSidebar(canvasElement);
     await openSidebarFromMenu(canvasElement);
     await waitFor(() => expect(sidebar).toBeVisible());
     await within(sidebar).findByText(RUN_NAME);

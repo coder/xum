@@ -941,6 +941,53 @@ describe("ProjectSidebar scratch chats", () => {
   });
 });
 
+describe("ProjectSidebar title keys", () => {
+  // setupProjectSidebarDom loads ProjectSidebar behind the shared test doubles.
+  beforeEach(() => setupProjectSidebarDom());
+
+  afterEach(cleanupProjectSidebarDom);
+
+  // The collapsed sidebar renders no rows, but Shift+F2 needs none (#6328).
+  test("Shift+F2 generates the selected workspace's title with the sidebar collapsed", async () => {
+    const workspace = createWorkspace("title-target");
+    mockWorkspaceActions({
+      selectedWorkspace: {
+        workspaceId: workspace.id,
+        projectPath: workspace.projectPath,
+        projectName: workspace.projectName,
+        namedWorkspacePath: workspace.namedWorkspacePath,
+      },
+    });
+    const regenerateTitle = mock((_input: { workspaceId: string }) =>
+      Promise.resolve({ success: true as const, data: { title: "Generated" } })
+    );
+    const api = { workspace: { regenerateTitle } } as unknown as NonNullable<
+      ReturnType<typeof APIModule.useAPI>["api"]
+    >;
+    spyOn(APIModule, "useAPI").mockImplementation(() => ({
+      api,
+      status: "connected",
+      error: null,
+      authenticate: () => undefined,
+      retry: () => undefined,
+    }));
+
+    render(
+      <ProjectSidebar
+        collapsed={true}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([[workspace.projectPath, [workspace]]])}
+        workspaceRecency={{ [workspace.id]: Date.now() }}
+      />
+    );
+    fireEvent.keyDown(window, { key: "F2", shiftKey: true });
+
+    await waitFor(() =>
+      expect(regenerateTitle).toHaveBeenCalledWith({ workspaceId: workspace.id })
+    );
+  });
+});
+
 describe("ProjectSidebar flat chat list", () => {
   beforeEach(() => {
     setupProjectSidebarDom();

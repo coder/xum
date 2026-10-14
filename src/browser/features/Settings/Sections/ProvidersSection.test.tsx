@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
-import type { APIClient } from "@/browser/contexts/API";
+import { APIContext, type APIClient } from "@/browser/contexts/API";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as ActualModelPreferenceRepairModule from "@/browser/utils/modelPreferenceRepair";
@@ -12,7 +12,6 @@ import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as SettingsContextModule from "@/browser/contexts/SettingsContext";
 import * as ActualWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
-import type * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import type {
   AddCustomProviderInput,
   ProviderConfigInfo,
@@ -83,10 +82,10 @@ restoreModulesAfterSuite([
   ["@/browser/contexts/WorkspaceContext", { ...ActualWorkspaceContextModule }],
 ]);
 
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualWorkspaceContext =
-  require("@/browser/contexts/WorkspaceContext?real=1") as typeof WorkspaceContextModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
+// Snapshot the real exports before the mock below. Do not load a second copy with
+// require("...?real=1"): Bun's LCOV keeps only the last-loaded copy of a file, so the copy would
+// replace WorkspaceContext.test.tsx's coverage of WorkspaceContext.tsx in the shard.
+const actualWorkspaceContext = { ...ActualWorkspaceContextModule };
 
 void mock.module("@/browser/contexts/WorkspaceContext", () => ({
   ...actualWorkspaceContext,
@@ -202,6 +201,30 @@ function renderProvidersSection() {
   );
 
   return { ...view, ...providerMocks, providersConfig };
+}
+
+/** As renderProvidersSection, while Xum reconnects with the last client kept (after the switch). */
+function renderProvidersSectionOffline() {
+  const providersConfig = createProvidersConfig();
+  providersConfigMock = providersConfig;
+  const client = setupSettingsStory({ providersConfig: {} });
+  const providerMocks = patchProviderMethods(client, providersConfig);
+  const offline = {
+    status: "reconnecting" as const,
+    api: client,
+    error: null,
+    attempt: 1,
+    authenticate: () => undefined,
+    retry: () => undefined,
+  };
+  const view = render(
+    <SettingsSectionStory setup={() => client}>
+      <APIContext.Provider value={offline}>
+        <ProvidersSection />
+      </APIContext.Provider>
+    </SettingsSectionStory>
+  );
+  return { ...view, ...providerMocks };
 }
 
 function getProviderCard(button: HTMLElement): HTMLElement {
@@ -427,6 +450,21 @@ describe("ProvidersSection", () => {
         "Provider added, but refreshing the provider list failed. It may appear after reopening settings."
       )
     ).toBeTruthy();
+  });
+
+  // Offline the kept client's write would fail, and the optimistic value would look saved: the
+  // provider toggle must be disabled and must not write.
+  test("disables the provider toggle and writes nothing while reconnecting", async () => {
+    const view = renderProvidersSectionOffline();
+    const openAiButton = await view.findByRole("button", { name: /^OpenAI\b/ });
+    fireEvent.click(openAiButton);
+
+    const toggle = within(getProviderCard(openAiButton)).getByRole("switch", {
+      name: "Toggle openai provider",
+    });
+    expect(toggle.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(toggle);
+    expect(view.setProviderConfig).not.toHaveBeenCalled();
   });
 
   test("shows and persists the OpenAI WebSocket transport toggle", async () => {

@@ -94,9 +94,12 @@ export async function runSelfCheck(
       // The fake upstream: no key or provider leaves this host.
       ANTHROPIC_API_KEY: "selfcheck-fake-key",
       ANTHROPIC_BASE_URL: `${upstream.baseUrl}/v1`,
-      BUGBASH_MODEL: "anthropic:claude-haiku-4-5",
+      BUGBASH_MODEL: "anthropic:claude-haiku-5-5",
       PATH: process.env.PATH,
       HOME: process.env.HOME,
+      // CI's opt-in to a local image on a stale key, and its warning annotation.
+      BUGBASH_SANDBOX_BUILD_STALE: process.env.BUGBASH_SANDBOX_BUILD_STALE,
+      GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
     };
     const stamp = `${Date.now()}-${process.pid}`;
     const job = async (extra: string[], name: string) => {
@@ -203,7 +206,10 @@ export async function runSelfCheck(
   return failed === 0 ? 0 : 1;
 }
 
-/** The target's exit code: runSelfCheck's, 130 or 143 on a stop, 2 on a refusal, else 1. */
+/**
+ * The target's exit code: runSelfCheck's, 130 or 143 on a stop, 2 on a refusal, else 4. An
+ * internal error exits 4, as in launch.ts: 1 means a failed check (#6094 item 17).
+ */
 export async function selfCheckExit(
   stop: AbortSignal,
   say: (line: string) => void,
@@ -213,8 +219,13 @@ export async function selfCheckExit(
     return await runSelfCheck(stop, say, launch);
   } catch (error) {
     if (error instanceof Stopped) return error.reason === "SIGINT" ? 130 : 143;
-    say(`self-check refused: ${error instanceof Error ? error.message : String(error)}`);
-    return error instanceof Refusal ? 2 : 1;
+    const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof Refusal) {
+      say(`self-check refused: ${message}`);
+      return 2;
+    }
+    say(`self-check error: ${message}`);
+    return 4;
   }
 }
 
@@ -226,8 +237,8 @@ if (import.meta.main) {
     (code) => process.exit(code),
     (error: unknown) => {
       // selfCheckExit maps every error to a code; this is only a last resort (fail closed).
-      console.error(`self-check failed: ${String(error)}`);
-      process.exit(1);
+      console.error(`self-check error: ${String(error)}`);
+      process.exit(4);
     }
   );
 }

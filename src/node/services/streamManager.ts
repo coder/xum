@@ -5,7 +5,6 @@ import {
   checkAssembledRequestBudgetForModel,
   createContextBudgetAnchor,
   estimateAnchoredRequestTokensForModel,
-  isExactAppend,
   type ContextBudgetAnchorRequest,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
@@ -68,6 +67,10 @@ import {
   type ReasoningProviderMetadata,
 } from "@/node/utils/messages/reasoningProviderOptions";
 import {
+  laterAnthropicThinkingReplayPoint,
+  type AnthropicThinkingReplayPoint,
+} from "@/node/utils/messages/anthropicThinkingReplay";
+import {
   ThinkingLevelSchema,
   coerceThinkingLevel,
   type ThinkingLevel,
@@ -104,7 +107,11 @@ import {
 } from "@/common/utils/tokens/usageHelpers";
 import { linkAbortSignal } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import { stripInternalToolResultFields } from "@/common/utils/tools/internalToolResultFields";
+import {
+  modelOnlyNotificationsField,
+  readModelOnlyToolNotifications,
+  stripInternalToolResultFields,
+} from "@/common/utils/tools/internalToolResultFields";
 import { summarizeInvalidToolInputErrors } from "@/node/utils/messages/summarizeInvalidToolInputErrors";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
@@ -299,8 +306,6 @@ export interface SettledStepBudget {
   nextRequestTokens?: number;
   /** The appended-message part of `nextRequestTokens`; absent when it was a full count. */
   nextRequestDeltaTokens?: number;
-  /** True only while every budget count since the turn's first step 0 was an exact append. */
-  exactAppendChain?: boolean;
   sessionHistoryAvailable: boolean;
   /** The step's request advertised `new_context`, so the final prompt can be acted on. */
   newContextAvailable: boolean;
@@ -410,8 +415,8 @@ function publishLiveRouting(streamInfo: WorkspaceStreamInfo): void {
 
 /**
  * Same-turn message transforms applied before every provider step: strip workflow run records
- * from same-turn tool results (history-level redaction in applyToolOutputRedaction can't see
- * these), neutralize protocol-envelope lookalikes in same-turn tool inputs/results
+ * and redact binary-like strings in same-turn tool results (history-level redaction in
+ * applyToolOutputRedaction can't see these), neutralize protocol-envelope lookalikes in same-turn tool inputs/results
  * (messagePipeline's neutralizer only sees persisted history), then extract supported
  * attachments out of tool-result JSON so providers don't treat them as text. Idempotent on an
  * already-transformed prefix. The settled-step budget floor reuses it so it measures exactly the
@@ -455,16 +460,17 @@ interface StepMessageTracker {
    * reuse the tracker, so their step 0 is not the turn's first request (#5279).
    */
   providerRequestPrepared?: boolean;
-  /** A full count after the turn's first request, or a thinking rebuild, ran (never reset). */
-  exactAppendChainBroken?: boolean;
   /** Present only when Auto set this turn's thinking level; shared across fallback hops. */
   autoThinkingEscalation?: AutoThinkingEscalationState;
   /**
-   * Set when an in-turn prefix change made prepareStep strip earlier Anthropic thinking.
-   * The finish-step handler then writes the replay receipt, so the next turn does not
-   * put the removed blocks back (preserved thinking).
+   * Set when an in-turn prefix change made prepareStep strip earlier Anthropic thinking: the
+   * SDK step number (of the current streamText call) whose request first sent the latest
+   * strip. The stream consumer turns it into the row's replay point once that step started,
+   * so the next turn neither puts the removed blocks back nor drops the ones kept after the
+   * strip (preserved thinking). prepareStep can run a step ahead of the consumer, hence a
+   * step number and not a flag. Cleared when a retry starts a new streamText call.
    */
-  anthropicThinkingStripped?: boolean;
+  anthropicThinkingStripStep?: number;
   /** True once this turn holds the Anthropic thinking-repair receipt (reads initialMetadata). */
   hasAnthropicReplayReceipt?: () => boolean;
 }
@@ -689,6 +695,19 @@ const OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN =
 // and the memory index live there). Routes without the drop_block control
 // (Coder gateway, custom providers) otherwise fail every retry identically.
 const ANTHROPIC_THINKING_SIGNATURE_INVALID_PATTERN = /Invalid `signature` in `thinking` block/;
+
+/**
+ * #5886: a same-turn rebuild reads history, which does not hold this turn's thinking-replay
+ * receipt yet. Keep the removed thinking out (all of it: the rebuild is a new prefix).
+ */
+function applyTurnReplayReceipt(
+  stepTracker: StepMessageTracker | undefined,
+  messages: ModelMessage[]
+): ModelMessage[] {
+  return stepTracker?.hasAnthropicReplayReceipt?.() === true
+    ? stripReasoningReplay(messages, "anthropic")
+    : messages;
+}
 
 /**
  * The provider's Retry-After in ms from a failed request's response headers, or null when it
@@ -986,6 +1005,9 @@ interface WorkspaceStreamInfo {
   currentStepStartIndex: number;
   // Exact SDK step starts; part shapes cannot distinguish consecutive tool-only steps.
   stepStartIndices: number[];
+  // Row step (index into stepStartIndices) of each SDK step the current streamText call
+  // started, by SDK step number. Maps stepTracker.anthropicThinkingStripStep to the row.
+  streamStepOrdinals: number[];
   historySequence: number;
   // Track accumulated parts for partial message (includes reasoning, text, and tools)
   parts: CompletedMessagePart[];
@@ -1110,7 +1132,10 @@ export interface ActiveStreamInfo {
   parts: CompletedMessagePart[];
   currentStepStartIndex: number;
   stepStartIndices: number[];
-  initialMetadata?: { systemMessageTokens?: number; anthropicThinkingReplay?: "off" };
+  initialMetadata?: Pick<
+    MuxMetadata,
+    "systemMessageTokens" | "anthropicThinkingReplay" | "anthropicThinkingReplayFromStep"
+  >;
   toolCompletionTimestamps: Map<string, number>;
   muxMetadata?: unknown;
 }
@@ -2189,15 +2214,19 @@ export class StreamManager {
 
   /**
    * #5887 containment: thinking that follows an Anthropic server tool in this row cannot
-   * replay as the API returned it (see anthropicServerToolCallIds). Write the same receipt
-   * as the signature repair, so later requests in the context segment send no thinking
-   * (removing every thinking block is valid; a gap or a put-back block is not). It rides
-   * on the partial write that stores this reasoning part (every reasoning append schedules
-   * one).
+   * replay as the API returned it (see anthropicServerToolCallIds). Write the receipt with
+   * the point at the row's end, so later requests in the context segment send no thinking
+   * up to and including this row (removing every thinking block is valid; a gap or a
+   * put-back block is not). Rows after it replay theirs. It wins over a step point and
+   * never moves back. It rides on the partial write that stores this reasoning part (every
+   * reasoning append schedules one).
    */
   private turnReplayOffAfterServerTool(streamInfo: WorkspaceStreamInfo): void {
     const serverToolIds = streamInfo.anthropicServerToolCallIds;
-    if (serverToolIds == null || streamInfo.initialMetadata?.anthropicThinkingReplay === "off") {
+    if (
+      serverToolIds == null ||
+      streamInfo.initialMetadata?.anthropicThinkingReplayFromStep === "end"
+    ) {
       return;
     }
     // Only Anthropic reasoning is bound to the native prefix: a refusal fallback to another
@@ -2214,7 +2243,60 @@ export class StreamManager {
       streamInfo.anthropicServerToolCallIds = undefined;
       return;
     }
-    streamInfo.initialMetadata = { ...streamInfo.initialMetadata, anthropicThinkingReplay: "off" };
+    this.moveAnthropicThinkingReplayPoint(streamInfo, "end");
+  }
+
+  /**
+   * Preserved thinking: once the step whose request stripped earlier Anthropic thinking
+   * (stepTracker.anthropicThinkingStripStep) has started, write the receipt with that step as
+   * the point, or the next turn replays the removed blocks and gets a 400. Persisted with the
+   * next partial write; a crash before it only costs one repair (fail-safe).
+   */
+  private async writeInTurnThinkingStripReceipt(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<void> {
+    const stripStep = streamInfo.stepTracker.anthropicThinkingStripStep;
+    // prepareStep may already have prepared a later step: wait until that step started.
+    if (stripStep == null || stripStep >= streamInfo.streamStepOrdinals.length) return;
+    streamInfo.stepTracker.anthropicThinkingStripStep = undefined;
+    if (
+      this.moveAnthropicThinkingReplayPoint(streamInfo, streamInfo.streamStepOrdinals[stripStep])
+    ) {
+      await this.schedulePartialWrite(workspaceId, streamInfo);
+    }
+  }
+
+  /**
+   * Write or move this row's thinking-replay receipt (MuxMetadata.anthropicThinkingReplay).
+   * A second strip in the same turn moves the point forward: it removed everything the
+   * earlier one did, and its later blocks are bound to the new prefix. initialMetadata feeds
+   * the partial, error partial and final row alike. Returns whether anything changed; the
+   * caller persists it.
+   */
+  private moveAnthropicThinkingReplayPoint(
+    streamInfo: WorkspaceStreamInfo,
+    point: AnthropicThinkingReplayPoint
+  ): boolean {
+    const current = streamInfo.initialMetadata;
+    const next = laterAnthropicThinkingReplayPoint(
+      current?.anthropicThinkingReplay === "off"
+        ? current.anthropicThinkingReplayFromStep
+        : undefined,
+      point
+    );
+    if (
+      current?.anthropicThinkingReplay === "off" &&
+      current.anthropicThinkingReplayFromStep === next
+    ) {
+      return false;
+    }
+    streamInfo.initialMetadata = {
+      ...current,
+      anthropicThinkingReplay: "off",
+      anthropicThinkingReplayFromStep: next,
+    };
+    return true;
   }
 
   private async cancelStreamSafely(
@@ -2394,6 +2476,11 @@ export class StreamManager {
         contextProviderMetadata,
         model: streamInfo.model,
         metadataModel: streamInfo.metadataModel,
+        // Same tool-model usage the committed partial gets below, so the renderer's
+        // per-turn cost views match history replay without a reload.
+        ...(streamInfo.toolModelUsages.length > 0
+          ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
+          : {}),
       },
       abortReason,
       abandonPartial,
@@ -2830,9 +2917,6 @@ export class StreamManager {
                 );
           const nextRequestTokens = nextRequest?.estimate;
           const nextRequestDeltaTokens = nextRequest?.delta;
-          if (nextRequestDeltaTokens == null && stepTracker) {
-            stepTracker.exactAppendChainBroken = true;
-          }
           const { decision, continuationEntryId } = await request.onStepSettled({
             model: request.modelString,
             usage: normalizeUsage(step.usage),
@@ -2841,8 +2925,6 @@ export class StreamManager {
             toolResultTokens,
             ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
             ...(nextRequestDeltaTokens != null ? { nextRequestDeltaTokens } : {}),
-            exactAppendChain:
-              nextRequestDeltaTokens != null && stepTracker?.exactAppendChainBroken !== true,
             sessionHistoryAvailable: request.tools?.session_history != null,
             newContextAvailable: request.tools?.new_context != null,
             newContextRequested: step.toolResults.some(
@@ -3038,6 +3120,8 @@ export class StreamManager {
 
     // Outgoing rows before this index predate the latest in-turn prefix change.
     let reasoningReplayBoundary = 0;
+    // The SDK step whose request first sent that boundary (stepTracker.anthropicThinkingStripStep).
+    let reasoningReplayBoundaryStep = 0;
     // XUM_DISABLE_AGENT_TOOLS=1 sends no tools at all (see isAgentToolsDisabled). Every chat
     // turn, sub-agent and workflow agent streams through here.
     const agentToolsDisabled = isAgentToolsDisabled();
@@ -3151,11 +3235,7 @@ export class StreamManager {
         const firstTurnRequest =
           stepTracker != null && stepNumber === 0 && !stepTracker.providerRequestPrepared;
         const thinkingOverride = this.applyPendingThinkingOverride(request, firstTurnRequest);
-        if (stepTracker) {
-          stepTracker.providerRequestPrepared = true;
-          // A thinking change rebuilds the request (mid-turn, or step 0's first-step rebuild).
-          if (thinkingOverride !== undefined) stepTracker.exactAppendChainBroken = true;
-        }
+        if (stepTracker) stepTracker.providerRequestPrepared = true;
         if (escalation && escalationState) {
           // The rebuild clamps to the model's ladder and reports a no-op as "not applicable";
           // only a level that actually changed is provenance, at the level it changed to (a
@@ -3196,12 +3276,12 @@ export class StreamManager {
               appliedLevel,
               thinkingOverride
             );
-            // #5886: the rebuild reads history, which does not hold this turn's
-            // thinking-repair receipt yet. Keep the removed thinking out.
-            const receiptApplied =
-              stepTracker?.hasAnthropicReplayReceipt?.() === true
-                ? stripReasoningReplay(rebuilt, "anthropic")
-                : rebuilt;
+            const receiptApplied = applyTurnReplayReceipt(stepTracker, rebuilt);
+            // A retry's step 0 can rebuild this row's earlier steps too: what it stripped
+            // is gone from here on, so the receipt's point moves to this step.
+            if (stepTracker && receiptApplied !== rebuilt) {
+              stepTracker.anthropicThinkingStripStep = stepNumber;
+            }
             // Same per-step transforms the construction-time messages receive.
             rebuiltFirstStepMessages = dedupeNativeToolReferences(
               await transformStepMessages(receiptApplied)
@@ -3239,6 +3319,7 @@ export class StreamManager {
           // Kept at the unstripped length: if stripping drops reasoning-only rows, the
           // boundary covers a few later rows too, which only strips more (fail safe).
           reasoningReplayBoundary = outgoing.length;
+          reasoningReplayBoundaryStep = stepNumber;
         }
         seenPrefixSwap = consumedSwap;
         previousToolSetKey = toolSetKey;
@@ -3267,8 +3348,10 @@ export class StreamManager {
           // (sanitizeReasoningReplayMetadata keeps no `bedrock` namespace), so the
           // stripped blocks cannot come back, and a receipt would strip later
           // Anthropic-route thinking in the same segment for nothing.
+          // The point is the step that first sent this boundary: its own thinking and later
+          // keep replaying. Steps after it re-strip the same rows and repeat the same value.
           if (stepTracker && isAnthropicMessagesModel(request.model)) {
-            stepTracker.anthropicThinkingStripped = true;
+            stepTracker.anthropicThinkingStripStep = reasoningReplayBoundaryStep;
           }
         }
         // Taken before this step records its own request; step zero has no settled step.
@@ -3291,15 +3374,6 @@ export class StreamManager {
         if (request.contextBudgetLimit != null) {
           const budgetOptions = { ...budgetRequest, modelContextLimit: request.contextBudgetLimit };
           const anchor = createContextBudgetAnchor(previousRequest, steps.at(-1));
-          // Any full count after the turn's first request breaks the chain; a fallback or retry
-          // hop's step 0 has no anchor.
-          if (
-            stepTracker &&
-            !firstTurnRequest &&
-            (anchor == null || !isExactAppend(budgetRequest, budgetOptions, anchor))
-          ) {
-            stepTracker.exactAppendChainBroken = true;
-          }
           const exceeded = await checkAssembledRequestBudgetForModel(
             budgetRequest,
             budgetOptions,
@@ -3452,6 +3526,7 @@ export class StreamManager {
       receivedTerminalEvent: false,
       currentStepStartIndex: 0,
       stepStartIndices: [0],
+      streamStepOrdinals: [],
       request,
       historySequence,
       parts: [], // Initialize empty parts array
@@ -3529,7 +3604,8 @@ export class StreamManager {
     toolCallId: string,
     toolName: string,
     output: unknown,
-    providerExecuted?: boolean
+    providerExecuted?: boolean,
+    modelOnlyNotifications?: string[]
   ): Promise<void> {
     // Find and update the existing tool part
     const existingPartIndex = streamInfo.parts.findIndex(
@@ -3549,6 +3625,7 @@ export class StreamManager {
           ...(mcpServer ? { mcpServer } : {}),
           state: "output-available" as const,
           output,
+          ...modelOnlyNotificationsField(modelOnlyNotifications),
         };
       }
     } else {
@@ -3562,6 +3639,7 @@ export class StreamManager {
         state: "output-available" as const,
         input: toolCall?.input ?? null,
         output,
+        ...modelOnlyNotificationsField(modelOnlyNotifications),
         ...(mcpServer ? { mcpServer } : {}),
         timestamp: nextPartTimestamp(streamInfo),
         ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
@@ -3606,7 +3684,8 @@ export class StreamManager {
     toolCallId: string,
     toolName: string,
     output: unknown,
-    providerExecuted?: boolean
+    providerExecuted?: boolean,
+    modelOnlyNotifications?: string[]
   ): Promise<void> {
     await this.completeToolCall(
       workspaceId,
@@ -3615,7 +3694,8 @@ export class StreamManager {
       toolCallId,
       toolName,
       output,
-      providerExecuted
+      providerExecuted,
+      modelOnlyNotifications
     );
     await this.checkSoftCancelStream(workspaceId, streamInfo);
   }
@@ -3785,6 +3865,7 @@ export class StreamManager {
         toolName: event.toolName,
         result: event.result ?? (event.error ? { error: event.error } : undefined),
         ...(mcpServer ? { mcpServer } : {}),
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         timestamp: event.endTime!,
         parentToolCallId: event.parentToolCallId,
       });
@@ -4222,17 +4303,14 @@ export class StreamManager {
       };
     }
 
+    const fallbackMessages = applyTurnReplayReceipt(streamInfo.stepTracker, prepared.data.messages);
     // Build the swapped request/stream into locals first so a failure here
     // leaves streamInfo unmodified (the terminal error then names the model
     // that actually refused, not a half-applied fallback).
     const nextRequest = this.buildStreamRequestConfig({
       model: prepared.data.model,
       modelString: prepared.data.modelString,
-      // #5886: prepare() rebuilds from history, which does not hold this turn's
-      // thinking-repair receipt yet. Keep the removed thinking out.
-      messages: streamInfo.stepTracker.hasAnthropicReplayReceipt?.()
-        ? stripReasoningReplay(prepared.data.messages, "anthropic")
-        : prepared.data.messages,
+      messages: fallbackMessages,
       system: prepared.data.system,
       tools: prepared.data.tools,
       providerOptions: prepared.data.providerOptions,
@@ -4371,6 +4449,11 @@ export class StreamManager {
       workspaceLog,
     });
     streamInfo.reasoningBackfillStartIndex = preserveParts ? streamInfo.parts.length : undefined;
+    // The receipt strip also removed this row's preserved thinking, so the receipt's point
+    // moves to the fallback's first step. It rides on the fallback's first partial write.
+    if (fallbackMessages !== prepared.data.messages) {
+      this.moveAnthropicThinkingReplayPoint(streamInfo, streamInfo.stepStartIndices.length - 1);
+    }
 
     streamInfo.model = prepared.data.modelString;
     streamInfo.metadataModel = this.resolveMetadataModel(
@@ -4551,6 +4634,8 @@ export class StreamManager {
             switch (part.type) {
               case "start-step": {
                 this.recordStepStart(streamInfo);
+                streamInfo.streamStepOrdinals.push(streamInfo.stepStartIndices.length - 1);
+                await this.writeInTurnThinkingStripReceipt(workspaceId, streamInfo);
                 break;
               }
 
@@ -4811,6 +4896,10 @@ export class StreamManager {
                 const strippedOutput = stripInternalToolResultFields(
                   stripEncryptedContent(toolResultPart.output)
                 );
+                // Kept beside the output, so the next turn's rebuild can resend them.
+                const modelOnlyNotifications = readModelOnlyToolNotifications(
+                  toolResultPart.output
+                );
 
                 // Tool call completed successfully
                 const toolCall = toolCalls.get(toolResultPart.toolCallId);
@@ -4839,7 +4928,8 @@ export class StreamManager {
                   toolResultPart.toolCallId,
                   toolResultPart.toolName,
                   strippedOutput,
-                  toolResultPart.providerExecuted
+                  toolResultPart.providerExecuted,
+                  modelOnlyNotifications
                 );
                 break;
               }
@@ -5031,21 +5121,6 @@ export class StreamManager {
                   } else {
                     workspaceLog.debug(message, fields);
                   }
-                }
-
-                // Preserved thinking: prepareStep stripped earlier Anthropic thinking after
-                // an in-turn prefix change. Write the same receipt as the signature repair,
-                // or the next turn replays the removed blocks and gets a 400. Persisted with
-                // the next partial write; a crash before it only costs one repair (fail-safe).
-                if (
-                  streamInfo.stepTracker.anthropicThinkingStripped === true &&
-                  streamInfo.initialMetadata?.anthropicThinkingReplay !== "off"
-                ) {
-                  streamInfo.initialMetadata = {
-                    ...streamInfo.initialMetadata,
-                    anthropicThinkingReplay: "off",
-                  };
-                  await this.schedulePartialWrite(workspaceId, streamInfo);
                 }
 
                 // Update cumulative totals for this stream.
@@ -5614,7 +5689,7 @@ export class StreamManager {
     // serialized prompt in their message (AI_TypeValidationError via the
     // cause walk); unbounded, that would be persisted to history metadata,
     // shipped over IPC, and rendered in the chat.
-    payload = { ...payload, error: clampErrorMessage(payload.error) };
+    payload = { ...payload, error: clampErrorMessage(payload.error), model: streamInfo.model };
     const refusalFinishReason =
       payload.errorType === "model_refusal"
         ? ([streamInfo.terminalFinishReason, streamInfo.terminalRawFinishReason].find(
@@ -5756,6 +5831,9 @@ export class StreamManager {
     options?: { preserveParts?: boolean; preserveUsage?: boolean; workspaceLog?: Logger }
   ): Promise<void> {
     streamInfo.stepTracker.pendingPrefixSwap = undefined;
+    // The next streamText call numbers its steps from 0 again.
+    streamInfo.stepTracker.anthropicThinkingStripStep = undefined;
+    streamInfo.streamStepOrdinals = [];
     const preserveParts = options?.preserveParts ?? false;
     const preserveUsage = options?.preserveUsage ?? false;
 
@@ -6009,14 +6087,12 @@ export class StreamManager {
     if (rejectedNamespace === "anthropic") {
       // Preserved thinking: once thinking is removed, putting it back invalidates every
       // later block, so the next turns must keep it out (messagePipeline reads this
-      // receipt). initialMetadata feeds the partial, error partial and final row alike
-      // (as the model-fallback record does). Persist before the retry request goes out so
-      // a crash mid-retry cannot forget the strip. A step-0 repair has no parts yet:
+      // receipt). The retry sends every earlier row and this row's earlier steps without
+      // thinking, so the point is the retried step (the reset above recorded its start):
+      // step 0 for a repair at the turn start. Persist before the retry request goes out
+      // so a crash mid-retry cannot forget the strip. A step-0 repair has no parts yet:
       // commitPartial keeps the receipt on the empty row (#5886).
-      streamInfo.initialMetadata = {
-        ...streamInfo.initialMetadata,
-        anthropicThinkingReplay: "off",
-      };
+      this.moveAnthropicThinkingReplayPoint(streamInfo, streamInfo.stepStartIndices.length - 1);
       await this.flushPartialWrite(workspaceId, streamInfo);
     }
 
@@ -6802,6 +6878,12 @@ export class StreamManager {
         streamInfo.state === StreamState.STARTING ||
         streamInfo.state === StreamState.STREAMING)
     ) {
+      const {
+        systemMessageTokens,
+        anthropicThinkingReplay,
+        anthropicThinkingReplayFromStep,
+        muxMetadata,
+      } = streamInfo.initialMetadata ?? {};
       return {
         messageId: streamInfo.messageId,
         model: streamInfo.model,
@@ -6811,15 +6893,16 @@ export class StreamManager {
         parts: streamInfo.parts,
         currentStepStartIndex: streamInfo.currentStepStartIndex,
         stepStartIndices: streamInfo.stepStartIndices.slice(),
+        // Continuous compaction reads the running turn's receipt from here (#5996).
         initialMetadata: {
-          systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens,
-          // Continuous compaction reads the running turn's receipt from here (#5996).
-          anthropicThinkingReplay: streamInfo.initialMetadata?.anthropicThinkingReplay,
+          systemMessageTokens,
+          anthropicThinkingReplay,
+          anthropicThinkingReplayFromStep,
         },
         // Correlation metadata for delegated work (e.g. workspace-turn
         // continuations); lets TaskService match a live continuation stream
         // to its still-open workspace-turn handle.
-        muxMetadata: streamInfo.initialMetadata?.muxMetadata,
+        muxMetadata,
       };
     }
 

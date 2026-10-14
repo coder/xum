@@ -317,10 +317,10 @@ export function GoalTab(props: GoalTabProps) {
   const canPause = canEdit && activeMode === "running";
   const canResume = canEdit && (activeMode === "paused" || lifecycle === "complete");
   // Mark-complete mirrors backend `validateStatusTransition` exactly:
-  // only `active` (running) and `budget_limited` are valid sources for
-  // the complete transition. Paused goals must be resumed first; this
+  // every lifecycle-active mode (running, paused, budget-limited) may
+  // complete. A paused goal's work can finish without a resume first; this
   // matches the slash command + palette gating.
-  const canComplete = canEdit && (activeMode === "running" || activeMode === "budget_limited");
+  const canComplete = canEdit && lifecycle === "active";
 
   const setStatus = async (
     status: Exclude<GoalStatus, "budget_limited">,

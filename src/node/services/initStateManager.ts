@@ -131,6 +131,9 @@ export class InitStateManager extends EventEmitter {
 
   constructor(private readonly config: Config) {
     super();
+    // No listener cap, for the same reason as AIService: each live AgentSession adds one
+    // listener per init event, so the count tracks live sessions, not a leak.
+    this.setMaxListeners(0);
     this.store = new EventStore(
       config,
       "init-status.json",
@@ -261,9 +264,12 @@ export class InitStateManager extends EventEmitter {
 
     this.initPromises.set(workspaceId, {
       promise,
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       resolve: resolve!,
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       reject: reject!,
       hookPhasePromise,
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       resolveHookPhase: resolveHookPhase!,
     });
 

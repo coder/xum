@@ -28,28 +28,39 @@ if ! [[ "$SHARD_INDEX" =~ ^[0-9]+$ && "$SHARD_TOTAL" =~ ^[0-9]+$ ]] \
   exit 2
 fi
 
+# Each isolated file writes its own LCOV report (see the isolated loop below), so the
+# CRAP gate scores its sources. A `no-coverage:` prefix marks a file that is isolated
+# because Bun coverage crashes or breaks it: that file runs without coverage. The
+# QuickJS group is marked as a whole, except WorkflowRunner.test.ts and
+# quickjsRuntime.test.ts, which pass under coverage: sandboxHostService and hookService
+# joined it as QuickJS-heavy suites, and router.test.ts has sat under its coverage
+# comment since the list began, with no other recorded reason.
 isolated_unit_tests=(
   # QuickJS-heavy tests can crash or lose runtime callbacks under Bun coverage
   # when sharing the monolithic process; keep them in fresh isolated processes.
+  # WorkflowRunner.test.ts passes under Bun 1.4.3 coverage in its own process, so it
+  # keeps coverage and the CRAP gate can score WorkflowRunner.ts.
   src/node/services/workflows/WorkflowRunner.test.ts
   # The evaluate() lifecycle suites run a QuickJS workflow per case (~40 runtimes);
   # the shared process segfaulted Bun twice on the same head with them included.
-  src/node/services/workflows/WorkflowRunner.evaluate.test.ts
-  src/node/services/workflows/WorkflowService.evaluate.test.ts
+  no-coverage:src/node/services/workflows/WorkflowRunner.evaluate.test.ts
+  no-coverage:src/node/services/workflows/WorkflowService.evaluate.test.ts
+  # Isolated like the QuickJS suites above, but with coverage: it passes under
+  # Bun 1.4.3 coverage, so the CRAP gate can score quickjsRuntime.ts.
   src/node/services/ptc/quickjsRuntime.test.ts
-  src/node/services/tools/code_execution.test.ts
+  no-coverage:src/node/services/tools/code_execution.test.ts
   # This suite also creates QuickJS runtimes. Shared coverage can trap during startup.
-  src/node/services/tools/code_execution.integration.test.ts
-  src/node/services/sandbox/sandboxHostService.test.ts
-  src/node/services/agentPlugins/hookService.test.ts
-  src/node/orpc/router.test.ts
+  no-coverage:src/node/services/tools/code_execution.integration.test.ts
+  no-coverage:src/node/services/sandbox/sandboxHostService.test.ts
+  no-coverage:src/node/services/agentPlugins/hookService.test.ts
+  no-coverage:src/node/orpc/router.test.ts
   # In the shared monolithic process on CI runners this file can enter an
   # infinite 'Maximum update depth exceeded' render loop (timing/coverage
   # sensitive; also seen on main and sibling branches) that spews ~1GB of
   # warnings until the 15-minute job timeout. Passes reliably in isolation
   # and could not be reproduced locally even with the exact CI file order,
   # bun version, and coverage flags.
-  src/browser/components/CommandPalette/CommandPalette.prompt.test.tsx
+  no-coverage:src/browser/components/CommandPalette/CommandPalette.prompt.test.tsx
   # Its tooltip test asserts Radix portal content, and Radix tooltip module
   # state binds to the first document that mounted a TooltipProvider in the
   # process — any earlier test file rendering a tooltip (raw happy-dom swap
@@ -71,7 +82,7 @@ isolated_unit_tests=(
   # coverage process Bun hit an allocator panic ("pas panic: deallocation did
   # fail", exit 133) as this file started on main run 35782976621, with zero
   # failing assertions; isolation gets it the signal-exit retry below.
-  src/node/services/mcpIconDecodeClient.test.ts
+  no-coverage:src/node/services/mcpIconDecodeClient.test.ts
   # Guards the DOM harness itself by deliberately poisoning process globals
   # (document/window set to undefined, a replaced baseline window), which would
   # perturb later suites in a shared process.
@@ -80,6 +91,17 @@ isolated_unit_tests=(
   # Jest skips it.
   ./tests/bunEachTableGc.test.ts
 )
+# Strip the marker so every later use of isolated_unit_tests sees plain paths, and
+# record it per index, so the coverage choice cannot drift from the list.
+isolated_coverage=()
+for i in "${!isolated_unit_tests[@]}"; do
+  if [[ "${isolated_unit_tests[$i]}" == no-coverage:* ]]; then
+    isolated_unit_tests[i]=${isolated_unit_tests[$i]#no-coverage:}
+    isolated_coverage[i]=0
+  else
+    isolated_coverage[i]=1
+  fi
+done
 
 # One process per file rather than one shared isolated process. Sharing it still
 # segfaults Bun on the runner (exit 132, "Bun has crashed", zero failing assertions)
@@ -153,12 +175,37 @@ bun_test_with_stall_watchdog() {
   return "$exit_code"
 }
 
+# Root of every LCOV report this lane writes. scripts/test-unit-ci.test.ts runs this
+# script from inside the tooling run, so it points the nested run elsewhere: a
+# nested run on the default root would delete the outer run's reports.
+UNIT_COVERAGE_DIR="${UNIT_COVERAGE_DIR:-coverage}"
+
+# Usage: bun_test_retrying_crashes <label> <coverage dir, or "" for none> <bun test args>...
+# With a coverage dir, each attempt writes <dir>/lcov.info. The last attempt runs
+# without coverage: a Bun crash under coverage must not fail a required job, and the
+# cost is only that run's missing report. Each attempt first removes the report of a
+# crashed earlier attempt, so a shard never uploads a partial one.
 bun_test_retrying_crashes() {
-  local label=$1 attempt exit_code
-  shift
+  local label=$1 coverage_dir=$2 attempt exit_code
+  local coverage_args=()
+  shift 2
   for attempt in 1 2 3; do
     exit_code=0
-    bun_test_with_stall_watchdog "$@" || exit_code=$?
+    coverage_args=()
+    if [[ -n "$coverage_dir" ]]; then
+      rm -f "$coverage_dir/lcov.info" "$coverage_dir/ran-without-coverage.txt"
+      if ((attempt < 3)); then
+        coverage_args=(--coverage --coverage-reporter=lcov "--coverage-dir=$coverage_dir")
+      else
+        echo "::warning::bun crashed twice under coverage on $label; the last attempt runs without coverage"
+        # Quality / CRAP reads this marker (scripts/crap/ci.ts, RAN_WITHOUT_COVERAGE):
+        # the shard's coverage is incomplete, so coverage-based findings only warn.
+        mkdir -p "$coverage_dir"
+        printf '%s\n' "$label" >"$coverage_dir/ran-without-coverage.txt"
+      fi
+    fi
+    # The ${a[@]+...} form expands an empty array under `set -u` on Bash 3.2 (macOS).
+    bun_test_with_stall_watchdog ${coverage_args[@]+"${coverage_args[@]}"} "$@" || exit_code=$?
     if [[ "$exit_code" -eq 0 ]]; then
       return 0
     fi
@@ -172,7 +219,9 @@ bun_test_retrying_crashes() {
 for i in "${!isolated_unit_tests[@]}"; do
   [[ -z "$mode" ]] || break
   ((i % SHARD_TOTAL == SHARD_INDEX - 1)) || continue
-  bun_test_retrying_crashes "${isolated_unit_tests[$i]}" "${isolated_unit_tests[$i]}"
+  coverage_dir=""
+  ((isolated_coverage[i] == 0)) || coverage_dir="$UNIT_COVERAGE_DIR/isolated/$i"
+  bun_test_retrying_crashes "${isolated_unit_tests[$i]}" "$coverage_dir" "${isolated_unit_tests[$i]}"
 done
 
 # Derive the exclusions from isolated_unit_tests so the two lists cannot
@@ -189,7 +238,8 @@ done
 # policy tests, the VS Code extension's pure helpers (incl. the webview oRPC allowlist
 # guard) and tooling tests under scripts/. check-startup-imports.test.ts and
 # check-test-seam-comments.test.ts are excluded because their static-check make
-# targets run them right before the guard itself; orpcConnection.integration.test.ts
+# targets run them right before the guard itself; crap/check.test.ts and
+# crap/agentGate.test.ts need uv (make test-crap-scripts runs them); orpcConnection.integration.test.ts
 # needs a live xum server (see scripts/check-test-routing.sh for every file run
 # outside this lane).
 #
@@ -207,11 +257,13 @@ done < <(
   find "${tooling_roots[@]}" -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) \
     ! -path ./scripts/check-startup-imports.test.ts \
     ! -path ./scripts/check-test-seam-comments.test.ts \
+    ! -path ./scripts/crap/check.test.ts \
+    ! -path ./scripts/crap/agentGate.test.ts \
     ! -path ./vscode/src/api/orpcConnection.integration.test.ts \
     "${find_excludes[@]}" | LC_ALL=C sort
 )
 if [[ -z "$mode" ]] && ((SHARD_INDEX == 1 && ${#tooling_files[@]} > 0)); then
-  bun_test_retrying_crashes "tooling tests" "${tooling_files[@]}"
+  bun_test_retrying_crashes "tooling tests" "$UNIT_COVERAGE_DIR/tooling" "${tooling_files[@]}"
 fi
 
 # Deterministic, size-balanced split: largest files first, each assigned to the
@@ -254,5 +306,4 @@ echo "Unit shard ${SHARD_INDEX}/${SHARD_TOTAL}: ${#unit_files[@]} shared-process
 if ((${#unit_files[@]} == 0)); then
   exit 0
 fi
-bun_test_retrying_crashes "unit shard ${SHARD_INDEX}/${SHARD_TOTAL}" \
-  --coverage --coverage-reporter=lcov "${unit_files[@]}"
+bun_test_retrying_crashes "unit shard ${SHARD_INDEX}/${SHARD_TOTAL}" "$UNIT_COVERAGE_DIR" "${unit_files[@]}"

@@ -9,7 +9,7 @@ import { PROXY_PATH, startProxy, type CallRecord } from "./proxy";
 import { Ledger, MAX_BODY_BYTES, usageCost } from "./proxyPolicy";
 
 const KEY = "sk-host-secret-key-for-the-proxy-test";
-const MODEL = "claude-haiku-4-5";
+const MODEL = "claude-haiku-5-5";
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
@@ -345,12 +345,16 @@ test("close() rejects when a call cost more than its bound, so the job fails", a
 
 test("refuses a fifth concurrent call, and a call that does not fit the budget, before the upstream", async () => {
   const { socketPath, fake, proxy } = await setup();
-  const stalled = Array.from({ length: 4 }, () => send(socketPath, body("[fake:stall]")));
+  // Settled at once: close() resets these calls, and the rejection can come before close()
+  // returns. A rejection with no handler yet failed the test as an unhandled error (#6340).
+  const stalled = Promise.allSettled(
+    Array.from({ length: 4 }, () => send(socketPath, body("[fake:stall]")))
+  );
   while (fake.requests.length < 4) await new Promise((wake) => setTimeout(wake, 5));
   expect((await send(socketPath, body("hi"))).status).toBe(429);
   expect(proxy.stats()).toMatchObject({ inFlight: 4, refused: 1 });
   await proxy.close();
-  await Promise.allSettled(stalled);
+  await stalled;
   expect(fake.requests).toHaveLength(4);
 
   const poor = await setup({ capUsd: 0.001 });
@@ -364,7 +368,10 @@ test("close() settles at once with calls stuck at every stage, and keeps their r
   // Upstream silent before its headers, a stream that never ends, and a client that never
   // reads a big answer (the proxy waits on drain). Plus a connection that never sends headers.
   const stream = { stream: true };
-  const stuck = ["[fake:stall]", "[fake:hang]"].map((text) => send(socketPath, body(text, stream)));
+  // Settled at once, as in the test above: close() resets them before it returns (#6340).
+  const stuck = ["[fake:stall]", "[fake:hang]"].map((text) =>
+    send(socketPath, body(text, stream)).catch(() => undefined)
+  );
   const unread = new Promise<void>((resolve) => {
     const req = http.request(
       { socketPath, method: "POST", path: PROXY_PATH, headers: HEADERS },

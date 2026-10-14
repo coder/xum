@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
@@ -14,9 +14,12 @@ import {
   type AgentPluginInstallEntry,
 } from "@/common/config/schemas/agentPluginInstalls";
 import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
+import { getOwn } from "@/common/utils/getOwn";
 import type {
   AgentPluginInstallPreview,
   AgentPluginComponents,
+  AgentPluginHooks,
+  AgentPluginInterfaceSummary,
   AgentPluginListItem,
   AgentPluginManifestSummary,
   AgentPluginPreviewHook,
@@ -24,6 +27,7 @@ import type {
   AgentPluginPreviewSkill,
   AgentPluginUpdateCheck,
   AgentPluginCapabilityChange,
+  AgentPluginComponentRef,
   AgentPluginUpdateConsent,
   AgentPluginUpdateReview,
 } from "@/common/orpc/schemas/agentPlugins";
@@ -39,9 +43,19 @@ import {
   resolveSkillAdvertise,
   resolveSkillWhenToUse,
 } from "@/common/orpc/schemas/agentSkill";
-import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
+import { resolveSkillPaths } from "@/common/utils/skills/skillPaths";
+import {
+  parseSkillMarkdown,
+  skillConsentFrontmatter,
+} from "@/node/services/agentSkills/parseSkillMarkdown";
 import { log } from "@/node/services/log";
-import type { MCPServerInfo } from "@/common/types/mcp";
+import type { MCPServerInfo, MCPServerOAuthConfig, MCPStdioServerInfo } from "@/common/types/mcp";
+import type { McpOauthService } from "@/node/services/mcpOauthService";
+import {
+  pluginClientSecretFor,
+  readPluginClientSecrets,
+  type PluginClientSecret,
+} from "./openaiMcpAuth";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
@@ -49,32 +63,52 @@ import {
   type WorkspaceMcpOverridesService,
 } from "@/node/services/workspaceMcpOverridesService";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
-import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
+  CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+  readPluginFileWithinRootCapped,
   discoverAgentPluginAt,
   discoverAgentPlugins,
+  ensurePluginPathContained,
   journalDerivedDiscoveryGate,
+  PLUGIN_MANIFEST_RELATIVE_PATH,
+  PluginGitPathError,
   setAgentPluginDiscoveryGate,
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "./discovery";
+import { checkLogoImage } from "./imageHeader";
+import {
+  consentForSelection,
+  countUnreviewed,
+  isComponentConsented,
+  recordReviewedComponents,
+  serverConsentDetail,
+  serverConsentFingerprint,
+  skillConsentDetail,
+  skillConsentFingerprint,
+  type ComponentConsent,
+} from "./componentConsent";
+import type { OpenAIPluginInterface } from "./openaiExtension";
 import {
   acquirePluginMutationLock,
   bumpContainerMutationEpoch,
   MUTATION_LOCK_FILE,
+  containerHasPendingSignOuts,
   isJournalName,
   JOURNAL_PREFIXES,
   MUTATION_EPOCH_FILE,
+  PENDING_SIGN_OUTS_FILE_NAME,
   PROMOTION_JOURNAL_PREFIX,
   STAGING_DIR_NAME,
   UNINSTALL_JOURNAL_PREFIX,
   UPDATE_JOURNAL_PREFIX,
 } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
-import type { AgentPluginManifest } from "./manifest";
+import { isPlainObject, type AgentPluginManifest } from "./manifest";
 import { hashPluginTree } from "./treeHash";
 import {
   buildPluginServerKey,
@@ -83,9 +117,18 @@ import {
   isCanonicalPluginServerKeyPrefix,
   loadPluginMcpServers,
 } from "./mcpConfig";
+import { loadPluginCodexHooks } from "./codexHooks";
+import {
+  readPluginHookTrust,
+  removePluginHookTrust,
+  reviewStateOf,
+  setPluginHookTrust,
+  type PluginHookTrustState,
+} from "./pluginHookTrust";
 import {
   assertNoAgentPluginUrlCredentials,
   isFullCommitSha,
+  normalizeAgentPluginSubpath,
   parseAgentPluginSourceInput,
 } from "./sourceInput";
 
@@ -156,8 +199,30 @@ const MUTATION_LOCK_ACQUIRE_TIMEOUT_MS = 10 * 60 * 1000;
 /** Bound discovery/settings waits on startup crash-recovery I/O. */
 const JOURNAL_RECONCILIATION_TIMEOUT_MS = 30_000;
 
+/**
+ * How long the discovery gate waits before it retries a pending sign-out pass that left the
+ * record (a failed logout, a corrupt record). Every agent request runs the gate, so without it
+ * an offline server is signed out, and a warning logged, once per request (#6627).
+ */
+const PENDING_SIGN_OUT_RETRY_MS = 30_000;
+
 const LS_REMOTE_TIMEOUT_MS = 30_000;
 const CLONE_TIMEOUT_MS = 120_000;
+
+/** Waits for the startup sign-out pass at most timeoutMs, then lets discovery go on. */
+async function waitForPendingSignOuts(
+  pass: Promise<void>,
+  timeoutMs = JOURNAL_RECONCILIATION_TIMEOUT_MS
+): Promise<void> {
+  const settled = await raceWithAbortAndTimeout(pass, { timeoutMs });
+  if (settled.kind === "timeout") log.warn("Pending plugin sign-outs timed out", { timeoutMs });
+}
+
+function componentsChangedError(): Error {
+  return new Error(
+    "Installed plugin files changed during component review. Refresh the component inventory."
+  );
+}
 
 /** Deterministic JSON with recursively sorted object keys (fingerprinting). */
 function stableStringify(value: unknown): string {
@@ -175,9 +240,216 @@ function stableStringify(value: unknown): string {
 
 /** Preview skill row plus the extra model-visible fields (see collectSkills). */
 type CollectedPluginSkill = AgentPluginPreviewSkill & {
+  /** Load-time consent fingerprint (componentConsent.ts): root-relative dir + frontmatter. */
+  consentFingerprint: string;
+  /** The fingerprinted fields as text (componentConsent.ts skillConsentDetail), built on demand. */
+  consentDetail: () => string;
   whenToUse?: string;
   advertise?: boolean;
+  paths?: string[];
 };
+
+/**
+ * EVERY model-visible advertisement field of a plugin skill: description, whenToUse
+ * (both interpolate into the agent_skill_read tool description on each request),
+ * advertise (a flip from hidden to visible surfaces a previously invisible skill), and
+ * paths (which files surface it). Changing any of them is re-consent territory, same as
+ * adding a skill. The fingerprint stays JSON (field boundaries are unambiguous); the
+ * display rendering is NOT used for comparison because a multi-line description could
+ * imitate it.
+ */
+/**
+ * The raw registry consent with this build's kinds replaced. A newer build may store more kinds,
+ * and a save on this build must keep them (downgrade round-trip).
+ */
+function mergeRawConsent(raw: unknown, consent: ComponentConsent): Record<string, unknown> {
+  return { ...(isPlainObject(raw) ? raw : {}), ...consent };
+}
+
+function skillChangeSummary(current: SurfaceSkill, staged: SurfaceSkill, name: string): string {
+  return current.fingerprint !== staged.fingerprint
+    ? `changes the model-visible advertisement of skill '${name}'`
+    : `changes the definition of skill '${name}'`;
+}
+
+/** Both consent views of one skill (componentConsent.ts). */
+function skillConsentFields(args: Parameters<typeof skillConsentFingerprint>[0]): {
+  consentFingerprint: string;
+  consentDetail: () => string;
+} {
+  return {
+    consentFingerprint: skillConsentFingerprint(args),
+    consentDetail: () => skillConsentDetail(args),
+  };
+}
+
+/**
+ * The review text of a skill or server: its usual summary plus every fingerprinted field. The
+ * review records the fingerprint, which covers fields the summary omits (a header, an OAuth scope,
+ * a frontmatter key), so the user must see all of them to approve what is recorded.
+ */
+function reviewText(item: { display: string; consentDetail: () => string }): string {
+  return `${item.display}\n\nReviewed fields: ${item.consentDetail()}`;
+}
+
+/**
+ * Upper bound on the text of one review. Frontmatter fields have no size limit, so a crafted
+ * package could make a review too large to send and render. Over the bound, Xum refuses the review
+ * (fails closed) instead of truncating text the user would approve.
+ */
+const MAX_REVIEW_TEXT_CHARS = 1_000_000;
+
+function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void {
+  const size = changes.reduce(
+    (total, change) =>
+      total + change.summary.length + (change.before?.length ?? 0) + (change.after?.length ?? 0),
+    0
+  );
+  if (size > MAX_REVIEW_TEXT_CHARS) {
+    throw new Error(
+      "This plugin's review is too large to show, so Xum cannot apply it. Reinstall the plugin or contact its publisher."
+    );
+  }
+}
+
+/** List row field: managed rows count imported components that need a review (#6498). */
+function reviewRequiredField(
+  entry: AgentPluginInstallEntry | undefined,
+  fingerprints: ComponentConsent
+): { reviewRequiredCount?: number } {
+  if (entry === undefined) return {};
+  return {
+    reviewRequiredCount: countUnreviewed({
+      current: fingerprints,
+      selection: entry.importedComponents,
+      consent: entry.componentConsent,
+    }),
+  };
+}
+
+/** Consent after a confirmed review: only the shown refs that still match get records. */
+function consentAfterReview(
+  entry: AgentPluginInstallEntry,
+  changes: readonly AgentPluginCapabilityChange[],
+  consent: { reviewed?: readonly AgentPluginComponentRef[] } | undefined
+): ComponentConsent {
+  return recordReviewedComponents({
+    previous: entry.componentConsent,
+    current: changes.flatMap((change) => (change.component ? [change.component] : [])),
+    reviewed: consent?.reviewed ?? [],
+  });
+}
+
+/**
+ * Component review rows: imported skills and MCP servers whose current consent fingerprint has
+ * no matching record. `before` says whether the user ever reviewed the component on this install.
+ */
+function unreviewedRows(
+  entry: AgentPluginInstallEntry,
+  surface: { skills: Map<string, SurfaceSkill>; servers: Map<string, SurfaceServer> }
+): AgentPluginCapabilityChange[] {
+  return [
+    ...[...surface.skills].flatMap(([name, item]) => unreviewedRow(entry, "skills", name, item)),
+    ...[...surface.servers].flatMap(([name, item]) =>
+      unreviewedRow(entry, "mcpServers", name, item)
+    ),
+  ];
+}
+
+const COMPONENT_LABELS: Record<keyof ComponentConsent, string> = {
+  skills: "Skill",
+  mcpServers: "MCP server",
+};
+
+function reviewedBefore(
+  consent: ComponentConsent | undefined,
+  kind: keyof ComponentConsent,
+  name: string
+): string {
+  return consent !== undefined && getOwn(consent[kind], name) !== undefined
+    ? "Changed since you reviewed it"
+    : "Not reviewed on this install";
+}
+
+function unreviewedRow(
+  entry: AgentPluginInstallEntry,
+  kind: "skills" | "mcpServers",
+  name: string,
+  item: SurfaceSkill | SurfaceServer
+): AgentPluginCapabilityChange[] {
+  const imported = entry.importedComponents?.[kind].includes(name) ?? true;
+  const fingerprint = item.consentFingerprint;
+  if (!imported || isComponentConsented(entry.componentConsent, kind, name, fingerprint)) return [];
+  return [
+    {
+      summary: `${COMPONENT_LABELS[kind]} '${name}' needs review`,
+      before: reviewedBefore(entry.componentConsent, kind, name),
+      after: reviewText(item),
+      component: { kind, name, fingerprint },
+    },
+  ];
+}
+
+/** Every component of an inventory: what a legacy import-all entry (no selection) imports. */
+function fullSelection(
+  inventory: Pick<AgentPluginComponents, "skills" | "mcpServers">
+): AgentPluginImportedComponents {
+  return {
+    skills: inventory.skills.map((skill) => skill.name),
+    mcpServers: inventory.mcpServers.map((server) => server.serverName),
+  };
+}
+
+/** The consent preview showed every component of the pinned SHA (#6498). */
+function consentAtInstall(
+  importedComponents: AgentPluginImportedComponents | undefined,
+  inventory: Pick<AgentPluginComponents, "skills" | "mcpServers"> & {
+    fingerprints: ComponentConsent;
+  }
+): ComponentConsent {
+  return consentForSelection({
+    selection: importedComponents ?? fullSelection(inventory),
+    shown: inventory.fingerprints,
+  });
+}
+
+function omitConsentFingerprint(
+  skill: CollectedPluginSkill
+): Omit<CollectedPluginSkill, "consentFingerprint" | "consentDetail"> {
+  const { consentFingerprint, consentDetail: _consentDetail, ...rest } = skill;
+  assert(consentFingerprint.length > 0, "collected skills carry a consent fingerprint");
+  return rest;
+}
+
+function describeSkillAdvertisement(skill: CollectedPluginSkill): {
+  fingerprint: string;
+  display: string;
+} {
+  return {
+    fingerprint: JSON.stringify({
+      description: skill.description ?? null,
+      whenToUse: skill.whenToUse ?? null,
+      advertise: skill.advertise ?? null,
+      // Only path-scoped skills carry the key, so fingerprints of existing
+      // skills stay byte-identical (no spurious re-consent on update). Patterns
+      // are OR-ed, so order is irrelevant: sort a copy so a reorder needs no consent.
+      ...(skill.paths !== undefined ? { paths: [...skill.paths].sort() } : {}),
+    }),
+    display: formatSkillAdvertisementDisplay(skill),
+  };
+}
+
+/** The advertisement as the model sees it, shown in the update review. */
+function formatSkillAdvertisementDisplay(skill: CollectedPluginSkill): string {
+  return [
+    skill.description ?? "(no description)",
+    ...(skill.whenToUse !== undefined ? [`When to use: ${skill.whenToUse}`] : []),
+    ...(skill.advertise === false ? ["(not advertised to the model)"] : []),
+    // Declared scope only: this text makes no claim about how the scope is enforced.
+    // JSON quoting keeps entries unambiguous: ["a, b"] and ["a", "b"] render differently.
+    ...(skill.paths !== undefined ? [`Declared paths: ${JSON.stringify(skill.paths)}`] : []),
+  ].join("\n");
+}
 
 /** Result of resolving a user-supplied ref against the remote. */
 interface ResolvedRemoteRef {
@@ -349,6 +621,94 @@ async function runGit(
   return run();
 }
 
+/**
+ * Extra `git clone` flags for a monorepo subpath install: a partial clone
+ * (no blobs up front) with no initial checkout. `--sparse` would check out
+ * the repository-root files first, and those count toward the clone quota,
+ * so a small plugin in a monorepo with large root files could not install.
+ * cloneRef checks out after narrowToSubpath has set the sparse pattern.
+ */
+function sparseCloneFlags(subpath: string | undefined, url: string): string[] {
+  // --no-local: for a plain local-path source, git's local-clone shortcut
+  // ignores --depth and --filter and copies the whole repository history.
+  return subpath === undefined
+    ? []
+    : ["--filter=blob:none", "--no-checkout", "--no-local", ...localUploadPackFlags(url)];
+}
+
+/** `git fetch` counterpart of sparseCloneFlags (the sparse checkout is set before checkout). */
+function partialFetchFlags(subpath: string | undefined, url: string): string[] {
+  return subpath === undefined ? [] : ["--filter=blob:none", ...localUploadPackFlags(url)];
+}
+
+/**
+ * For a local source (absolute path or file://), git runs the source's
+ * upload-pack on this machine, and that upload-pack ignores --filter unless
+ * the SOURCE repository sets uploadpack.allowFilter (off by default). Every
+ * blob of the commit would then land in the clone and count toward its quota.
+ * Enabling it on the command line needs no change to the user's repository.
+ * Remote transports keep their server's own setting.
+ */
+function localUploadPackFlags(url: string): string[] {
+  const isLocal = url.startsWith("file://") || path.isAbsolute(url);
+  return isLocal ? ["--upload-pack", "git -c uploadpack.allowFilter=true upload-pack"] : [];
+}
+
+/** Git tree-entry modes that are not folders, for the subpath error. Other modes are files. */
+const NON_FOLDER_GIT_MODE_KINDS: Readonly<Record<string, string>> = {
+  "120000": "a symbolic link",
+  "160000": "a git submodule",
+};
+
+/** Mode of the entry named exactly `name` in `git ls-tree -z` output, if any. */
+function lsTreeEntryMode(output: string, name: string): string | undefined {
+  for (const record of output.split("\0")) {
+    const match = /^(\d{6}) \S+ [0-9a-f]+\t([\s\S]*)$/.exec(record);
+    if (match !== null && match[2] === name) {
+      return match[1];
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Subpath for preview(): from the shorthand or the separate API argument
+ * (normalized), refusing two different ones (mirrors the ref conflict).
+ */
+function resolvePreviewSubpath(
+  parsedSubpath: string | undefined,
+  rawExplicit: string | undefined
+): string | undefined {
+  const explicit = rawExplicit?.trim() ? normalizeAgentPluginSubpath(rawExplicit) : undefined;
+  if (explicit !== undefined && parsedSubpath !== undefined && parsedSubpath !== explicit) {
+    throw new Error(
+      `Conflicting subpaths: '${parsedSubpath}' in the source and '${explicit}' in the subpath field.`
+    );
+  }
+  return parsedSubpath ?? explicit;
+}
+
+/** Throws unless `subpath` is absent or already in normalizeAgentPluginSubpath form. */
+function assertNormalizedSubpath(subpath: string | undefined): void {
+  if (subpath !== undefined && normalizeAgentPluginSubpath(subpath) !== subpath) {
+    throw new Error(`The plugin subpath '${subpath}' is not normalized. Run the preview again.`);
+  }
+}
+
+/** A plugin subpath that is missing or not a real folder at the staged commit (shown unwrapped). */
+class AgentPluginSubpathError extends Error {}
+
+function subpathNotAFolder(
+  subpath: string,
+  url: string,
+  prefix: string,
+  kind: string
+): AgentPluginSubpathError {
+  return new AgentPluginSubpathError(
+    `'${subpath}' is not a folder in ${url} ('${prefix}' is ${kind}). Subpath installs need a real folder.`
+  );
+}
+
 /** Max simultaneous `git ls-remote` processes during an update check. */
 const UPDATE_CHECK_CONCURRENCY = 4;
 
@@ -397,12 +757,369 @@ async function pathExists(candidate: string): Promise<boolean> {
   }
 }
 
+/** Consent-preview details of a stdio launch beyond its argv: cwd, env and host env. */
+function stdioLaunchDetails(
+  info: MCPStdioServerInfo,
+  rewrite: (value: string) => string,
+  finalTargetPath: string
+): string[] {
+  // Env VALUES are execution-relevant (e.g. NODE_OPTIONS=--require=…
+  // auto-loads code the argv never shows), so consent must disclose the
+  // full assignment, quoted like the argv so boundaries are unambiguous.
+  const envAssignments = Object.entries(info.env ?? {})
+    .filter(([key]) => key !== "PLUGIN_ROOT" && key !== "PLUGIN_DATA")
+    .map(([key, value]) => `${key}=${shellQuote(rewrite(value))}`);
+  const details: string[] = [];
+  // cwd is execution-relevant too: prepareStdioLaunch passes it to the
+  // runtime, so `node server.js` resolves scripts/configs relative to
+  // it — including from WRITABLE persistent plugin data — and the argv
+  // alone would imply a different resolution (capabilitySurface treats
+  // cwd as consent-relevant for the same reason). The loader defaults
+  // cwd to the plugin root; only a DEVIATION from the reviewed tree
+  // root needs calling out.
+  if (info.cwd !== undefined && rewrite(info.cwd) !== finalTargetPath) {
+    details.push(`cwd: ${shellQuote(rewrite(info.cwd))}`);
+  }
+  if (envAssignments.length > 0) {
+    details.push(`env: ${envAssignments.join(" ")}`);
+  }
+  // Codex `env_vars`: the server receives these host values (often credentials). Only the
+  // names are shown, never the values.
+  if (info.forwardEnv !== undefined) {
+    details.push(`host env: ${info.forwardEnv.map(shellQuote).join(" ")}`);
+  }
+  return details;
+}
+
+/** Preview warning for a skill whose SKILL.md `name` is only a display name. */
+function displayNameWarnings(
+  label: string,
+  dirName: string,
+  displayName: string | undefined
+): string[] {
+  if (displayName === undefined) return [];
+  return [
+    `${label}/${dirName}: SKILL.md name '${displayName}' is not the directory name; it loads as '${dirName}'`,
+  ];
+}
+
 function shortenHome(absPath: string): string {
   const home = os.homedir();
   if (absPath === home) {
     return "~";
   }
   return absPath.startsWith(home + path.sep) ? `~${absPath.slice(home.length)}` : absPath;
+}
+
+/** Remote-server sign-in as the update review compares it. */
+interface SurfaceSignIn {
+  url: string;
+  oauth?: MCPServerOAuthConfig;
+  /** sha256 of the plugin client secret: compared, never shown. */
+  secretDigest?: string;
+  /** Tokens belong to this: client, endpoints, resource and scopes. */
+  identity: string;
+}
+
+interface SurfaceSkill {
+  fingerprint: string;
+  consentFingerprint: string;
+  display: string;
+  /** Every fingerprinted field as text, built on demand for a review row (see reviewText). */
+  consentDetail: () => string;
+}
+
+interface SurfaceServer {
+  /** Update diff: the consent fingerprint plus the client-secret digest (#6498 review S2). */
+  fingerprint: string;
+  /** Load-time consent fingerprint (componentConsent.ts). */
+  consentFingerprint: string;
+  display: string;
+  /** Every fingerprinted field as text, built on demand for a review row (see reviewText). */
+  consentDetail: () => string;
+  signIn?: SurfaceSignIn;
+}
+
+/** Per-scan memo: each `.mcp.json` is read and parsed once for all its servers. */
+type SecretReader = (
+  source: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>,
+  clientId: string
+) => Promise<string | undefined>;
+
+function createSecretReader(): SecretReader {
+  const files = new Map<string, Promise<Map<string, PluginClientSecret>>>();
+  return (source, clientId) => {
+    let secrets = files.get(source.mcpConfigPath);
+    if (secrets === undefined) {
+      secrets = readPluginClientSecrets(source).catch(() => new Map<string, PluginClientSecret>());
+      files.set(source.mcpConfigPath, secrets);
+    }
+    // Only the secret of the client this scan captured (#6297).
+    return secrets.then((map) => pluginClientSecretFor(map, source.serverName, clientId));
+  };
+}
+
+/**
+ * Throws on a corrupt record or one of another version. SECURITY: it may name sign-outs that never ran, so it keeps the
+ * discovery fence until the user repairs or deletes it. Reading it as "nothing pending" would
+ * admit the plugin with its old sign-in's tokens.
+ */
+function parsePendingSignOuts(raw: string, file: string): string[] {
+  let record: unknown;
+  try {
+    record = JSON.parse(raw);
+  } catch {
+    record = undefined;
+  }
+  // Another version's record is kept as it is: an upgrade can still finish it.
+  const fields =
+    typeof record === "object" && record !== null ? (record as Record<string, unknown>) : {};
+  const value = fields.version === 1 ? fields.urls : undefined;
+  if (!Array.isArray(value) || !value.every((url) => typeof url === "string"))
+    throw new Error(
+      `The pending plugin sign-out record (${shortenHome(file)}) is corrupt or from another Xum version. Sign out of the plugin MCP servers in Settings, then delete the file.`
+    );
+  return value;
+}
+
+async function readSignIn(
+  url: string,
+  oauth: MCPServerOAuthConfig | undefined,
+  readSecret: SecretReader
+): Promise<SurfaceSignIn> {
+  const secret =
+    oauth?.clientSecretSource !== undefined && oauth.clientId !== undefined
+      ? await readSecret(oauth.clientSecretSource, oauth.clientId)
+      : undefined;
+  return {
+    url,
+    ...(oauth !== undefined ? { oauth: { ...oauth, clientSecretSource: undefined } } : {}),
+    ...(secret !== undefined
+      ? { secretDigest: createHash("sha256").update(secret).digest("hex") }
+      : {}),
+    identity: stableStringify({
+      clientId: oauth?.clientId ?? null,
+      // Tokens were issued by this authorization server (discovery is pointed at it).
+      issuer: oauth?.discovery?.authorizationServerBase ?? null,
+      registrationUrl: oauth?.discovery?.registrationUrl ?? null,
+      resource: oauth?.resource ?? null,
+      baseScopes: oauth?.baseScopes ?? null,
+      defaultScopes: oauth?.defaultScopes ?? null,
+    }),
+  };
+}
+
+type SignInDiscovery = MCPServerOAuthConfig["discovery"];
+
+function discoveryHosts(discovery: SignInDiscovery): Set<string> {
+  return new Set(
+    [discovery?.authorizationServerBase, discovery?.registrationUrl]
+      .filter((url) => url !== undefined)
+      .map((url) => new URL(url).host)
+  );
+}
+
+/**
+ * The line for one discovery URL whose host the host lines do not name: `changed (x → y)` for a
+ * move on its host, `added`/`removed` for a URL on a host that both versions use (#6565).
+ */
+function discoveryFieldLine(
+  name: string,
+  key: "authorizationServerBase" | "registrationUrl",
+  [a, b]: [SignInDiscovery, SignInDiscovery],
+  hosts: [Set<string>, Set<string>]
+): string[] {
+  const [x, y] = [a?.[key], b?.[key]];
+  if (x === y) return [];
+  if (x === undefined || y === undefined) return addedOrRemovedLine(name, x, y, hosts);
+  return new URL(x).host === new URL(y).host ? [`${name} changed (${x} → ${y})`] : [];
+}
+
+/** See discoveryFieldLine: exactly one of `x` (before) and `y` (after) is defined. */
+function addedOrRemovedLine(
+  name: string,
+  x: string | undefined,
+  y: string | undefined,
+  [oldHosts, newHosts]: [Set<string>, Set<string>]
+): string[] {
+  const url = x ?? y;
+  if (url === undefined) return [];
+  // The other version must use this host; otherwise its host line names the change.
+  const otherHosts = x === undefined ? oldHosts : newHosts;
+  if (!otherHosts.has(new URL(url).host)) return [];
+  return [`${name} ${x === undefined ? "added" : "removed"} (${url})`];
+}
+
+/**
+ * Review lines for the sign-in discovery URLs: one per added or removed host, and one per URL
+ * that changed on a host both versions use. Tenants share a host (`/tenant-a` → `/tenant-b`), so
+ * a path move gets its own line, also when another discovery URL changed host (#6164).
+ */
+function describeDiscoveryChanges(a: SignInDiscovery, b: SignInDiscovery): string[] {
+  const hosts: [Set<string>, Set<string>] = [discoveryHosts(a), discoveryHosts(b)];
+  const [oldHosts, newHosts] = hosts;
+  const lines = [
+    ...[...newHosts]
+      .filter((host) => !oldHosts.has(host))
+      .map((host) => `Sign-in at ${host} (new)`),
+    ...[...oldHosts]
+      .filter((host) => !newHosts.has(host))
+      .map((host) => `Sign-in at ${host} (removed)`),
+    ...discoveryFieldLine("Sign-in server", "authorizationServerBase", [a, b], hosts),
+    ...discoveryFieldLine("Client registration", "registrationUrl", [a, b], hosts),
+  ];
+  if (lines.length === 0 && stableStringify(a ?? null) !== stableStringify(b ?? null))
+    lines.push("Sign-in server changed");
+  return lines;
+}
+
+/** One review line per changed sign-in field. Secrets are named, never shown. */
+export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSignIn): string[] {
+  const lines: string[] = [];
+  const a = before?.oauth;
+  const b = after?.oauth;
+  const changed = (name: string, x?: string, y?: string): void => {
+    if (x === y) return;
+    lines.push(
+      y === undefined
+        ? `${name} removed`
+        : x === undefined
+          ? `${name} added (${y})`
+          : `${name} changed (${x} → ${y})`
+    );
+  };
+  changed("Sign-in client", a?.clientId, b?.clientId);
+  changed("Token auth method", a?.tokenEndpointAuthMethod, b?.tokenEndpointAuthMethod);
+  lines.push(...describeDiscoveryChanges(a?.discovery, b?.discovery));
+  const scopes = (oauth?: MCPServerOAuthConfig): string[] => [
+    ...(oauth?.baseScopes ?? []),
+    ...(oauth?.defaultScopes ?? []),
+  ];
+  // Sets: scope lists are plugin-controlled and can be long.
+  const [oldScopes, newScopes] = [new Set(scopes(a)), new Set(scopes(b))];
+  const added = [...newScopes].filter((scope) => !oldScopes.has(scope));
+  const removed = [...oldScopes].filter((scope) => !newScopes.has(scope));
+  if (added.length + removed.length > 0)
+    lines.push(
+      `Scopes changed: ${[...added.map((x) => `+ ${x}`), ...removed.map((x) => `- ${x}`)].join(" ")}`
+    );
+  else if (
+    stableStringify([a?.baseScopes ?? null, a?.defaultScopes ?? null]) !==
+    stableStringify([b?.baseScopes ?? null, b?.defaultScopes ?? null])
+  )
+    lines.push("Scopes changed");
+  changed("Resource", a?.resource, b?.resource);
+  const [oldSecret, newSecret] = [before?.secretDigest, after?.secretDigest];
+  if (oldSecret !== newSecret)
+    lines.push(
+      oldSecret === undefined
+        ? "Client secret added"
+        : newSecret === undefined
+          ? "Client secret removed"
+          : "Client secret changed"
+    );
+  return lines;
+}
+
+const LOGO_MAX_BYTES = 512 * 1024;
+// No SVG: a data-URL <img> cannot run script, but raster-only keeps the
+// renderer away from markup altogether. No GIF: OpenAI does not list it, and it
+// animates (no unrequested UI animation); animated PNG/WebP are refused by header.
+const LOGO_MIME_BY_EXTENSION: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+};
+
+/**
+ * One manifest image as a data URL, or undefined (with a warning) when it is
+ * missing, not a raster type, or refused by the reader or the header check.
+ * SECURITY AUDIT: the image crosses to the renderer only as a data URL read
+ * through the contained, capped reader (a symlink out of the plugin root fails
+ * there); never a file path.
+ */
+async function readLogoDataUrl(
+  rootPath: string,
+  logoPath: string | undefined,
+  label: string,
+  warnings: string[]
+): Promise<string | undefined> {
+  if (logoPath === undefined) return undefined;
+  const mime = getOwn(LOGO_MIME_BY_EXTENSION, path.extname(logoPath).toLowerCase());
+  if (mime === undefined) {
+    warnings.push(`${label} '${logoPath}' must be a PNG, JPEG or WebP image; ignoring`);
+    return undefined;
+  }
+  try {
+    // The contained reader also refuses a link into the staged clone's .git
+    // (ensurePluginPathContained, #6161), so no separate check is needed here.
+    const { bytes } = await readPluginFileWithinRootCapped({
+      filePath: path.join(rootPath, logoPath),
+      pluginRoot: rootPath,
+      maxBytes: LOGO_MAX_BYTES,
+      label,
+    });
+    // SECURITY AUDIT: bounded decoded size (a tiny compressed file can decode to
+    // hundreds of MB in the renderer) and no animation, from the header alone.
+    const refusal = checkLogoImage(bytes, mime);
+    if (refusal !== null) throw new Error(refusal);
+    return `data:${mime};base64,${bytes.toString("base64")}`;
+  } catch (error) {
+    warnings.push(`${label} '${logoPath}' cannot be shown: ${getErrorMessage(error)}`);
+    return undefined;
+  }
+}
+
+/**
+ * The light and dark image paths. OpenAI defines each dark field as the
+ * variant of its own light field (`logoDark` of `logo`, `composerIconDark` of
+ * `composerIcon`), so the dark path comes from the same family as the light
+ * one: a dark composer icon must not replace the listing logo in dark themes.
+ * Only with no light image at all does either dark field stand in.
+ */
+function logoPaths(info: OpenAIPluginInterface): { light?: string; dark?: string } {
+  if (info.logo !== undefined) return { light: info.logo, dark: info.logoDark };
+  if (info.composerIcon !== undefined) {
+    return { light: info.composerIcon, dark: info.composerIconDark };
+  }
+  return { dark: info.logoDark ?? info.composerIconDark };
+}
+
+/**
+ * UI projection of the OpenAI `interface`. The renderer picks the logo by
+ * theme (`logoDark`/`composerIconDark` are OpenAI's dark-theme variants) and
+ * falls back to the other one when a read fails. Budget: at most two
+ * LOGO_MAX_BYTES images per plugin (about 1.4 MiB as base64). list() is a local
+ * IPC call that Settings makes on open, the installed plugin count is the
+ * user's, and nothing here reaches model context, so no shared cap is needed.
+ */
+async function interfaceSummary(
+  plugin: Pick<AgentPluginInfo, "rootPath" | "openai">,
+  warnings: string[]
+): Promise<AgentPluginInterfaceSummary | undefined> {
+  const info = plugin.openai?.interface;
+  if (info === undefined) return undefined;
+  const paths = logoPaths(info);
+  const logoDataUrl = await readLogoDataUrl(plugin.rootPath, paths.light, "Plugin logo", warnings);
+  const logoDarkDataUrl = await readLogoDataUrl(
+    plugin.rootPath,
+    paths.dark,
+    "Plugin dark logo",
+    warnings
+  );
+  return {
+    displayName: info.displayName,
+    developerName: info.developerName,
+    shortDescription: info.shortDescription,
+    ...(info.capabilities !== undefined ? { capabilities: info.capabilities } : {}),
+    ...(info.websiteURL !== undefined ? { websiteURL: info.websiteURL } : {}),
+    ...(info.privacyPolicyURL !== undefined ? { privacyPolicyURL: info.privacyPolicyURL } : {}),
+    ...(info.termsOfServiceURL !== undefined ? { termsOfServiceURL: info.termsOfServiceURL } : {}),
+    ...(info.supportURL !== undefined ? { supportURL: info.supportURL } : {}),
+    ...(logoDataUrl !== undefined ? { logoDataUrl } : {}),
+    ...(logoDarkDataUrl !== undefined ? { logoDarkDataUrl } : {}),
+  };
 }
 
 function manifestSummary(manifest: AgentPluginManifest): AgentPluginManifestSummary {
@@ -418,6 +1135,7 @@ function manifestSummary(manifest: AgentPluginManifest): AgentPluginManifestSumm
 }
 
 export class AgentPluginInstallService {
+  private mcpOauthService: Pick<McpOauthService, "logout" | "credentialKey"> | undefined;
   private readonly containerDir: string;
   private readonly stagingRoot: string;
   private readonly registryFile: string;
@@ -454,6 +1172,8 @@ export class AgentPluginInstallService {
       mcpConfigService?: Pick<MCPConfigService, "pruneEnabledPluginServers">;
       /** Used to prune plugin server keys from per-workspace overrides on uninstall. */
       workspaceMcpOverridesService?: WorkspaceMcpOverridesService;
+      /** Signs out plugin servers whose sign-in identity an update changes. */
+      mcpOauthService?: Pick<McpOauthService, "logout" | "credentialKey">;
       /** Test override for the staged-clone checkout quota. */
       stagingQuota?: { maxBytes: number; maxFiles: number };
       /** Test override for the recovery wait bound. */
@@ -461,6 +1181,7 @@ export class AgentPluginInstallService {
     }
   ) {
     assert(path.isAbsolute(config.rootDir), "AgentPluginInstallService: rootDir must be absolute");
+    this.mcpOauthService = deps.mcpOauthService;
     this.containerDir = path.join(config.rootDir, "plugins");
     this.stagingRoot = path.join(config.rootDir, STAGING_DIR_NAME);
     this.registryFile = path.join(config.rootDir, PLUGIN_REGISTRY_FILE_NAME);
@@ -481,7 +1202,11 @@ export class AgentPluginInstallService {
       // journal bracket: recovery consumes journals, and reading them first
       // would suppress the very scan whose recovery just succeeded.
       const unhealthySuppression = (await this.reconciliationState) ? [] : [this.containerDir];
+      // The startup pass (setMcpOauthService) is awaited, so the first request sees the plugins.
+      await this.pendingSignOutReady;
       const bracket = await journalDerivedDiscoveryGate(containerPaths);
+      // The bracket keeps the container closed while a sign-out is pending; start finishing it.
+      this.startPendingSignOutPass({ retryNow: false });
       return {
         suppressed: [...new Set([...bracket.suppressed, ...unhealthySuppression])],
         confirm: async () => {
@@ -509,10 +1234,22 @@ export class AgentPluginInstallService {
    * left unconsumed (failed restore/quarantine, unidentified target tree) —
    * both mean the managed container may hold unreconciled state.
    */
+  /**
+   * Crash recovery, then starts the pending sign-outs. Pending sign-outs do not make recovery
+   * unhealthy: every discovery gate checks the record itself (containerHasPendingSignOuts).
+   */
+  private async recover(): Promise<boolean> {
+    const allConsumed = await this.reconcileJournals();
+    // Started, not awaited: a slow or failed sign-out must not latch journal health (a
+    // timed-out recovery stores false until the next section open). The record is its own fence.
+    this.startPendingSignOutPass({ retryNow: true });
+    return allConsumed;
+  }
+
   private async attemptReconcileJournals(context: string): Promise<boolean> {
     let work = this.reconciliationWork;
     if (work === undefined) {
-      const started = this.reconcileJournals().then(
+      const started = this.recover().then(
         (allConsumed) => {
           if (!allConsumed) {
             log.warn(`Plugin journal reconciliation left unresolved journals (${context})`);
@@ -1010,7 +1747,7 @@ export class AgentPluginInstallService {
             resolvedTarget === rootReal || resolvedTarget.startsWith(rootReal + path.sep);
           if (!path.isAbsolute(rawTarget) && !withinStagedRoot) {
             throw new Error(
-              `The repository ships a relative symbolic link that escapes the repository root (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`
+              `The repository ships a relative symbolic link that escapes the plugin folder (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`
             );
           }
           if (
@@ -1032,38 +1769,33 @@ export class AgentPluginInstallService {
     }
   }
 
-  /** Shallow-clone `resolved` into a fresh staging dir; returns { dir, sha } with sha = HEAD. */
+  /**
+   * Shallow-clone `resolved` into a fresh staging dir; returns { dir, sha }
+   * with sha = HEAD. With `subpath`, the clone is partial + sparse and the
+   * returned dir is ONLY that folder (see extractSubpath).
+   */
   private async cloneResolved(
     url: string,
-    resolved: ResolvedRemoteRef
+    resolved: ResolvedRemoteRef,
+    subpath?: string
   ): Promise<{ dir: string; sha: string }> {
     const dir = await this.createStagingDir();
     try {
       if (resolved.refType === "commit") {
-        await this.fetchExactSha(url, resolved.sha, dir);
+        await this.fetchExactSha(url, resolved.sha, dir, subpath);
       } else {
-        await runGit(
-          [
-            "clone",
-            "--depth",
-            "1",
-            "--single-branch",
-            "--branch",
-            resolved.ref,
-            "-c",
-            "advice.detachedHead=false",
-            url,
-            dir,
-          ],
-          { diskQuota: this.cloneDiskQuota(dir) }
-        );
+        await this.cloneRef(url, resolved.ref, dir, subpath);
       }
       const sha = (await runGit(["-C", dir, "rev-parse", "HEAD"])).trim();
       assert(isFullCommitSha(sha), "cloneResolved: rev-parse HEAD must be a full SHA");
-      await this.assertStagedTreeWithinQuota(dir);
-      return { dir, sha };
+      return { dir: await this.stagedPluginRoot(dir, subpath, url, sha), sha };
     } catch (error) {
       await this.removeDir(dir);
+      // A missing or non-folder subpath is a clear user-facing error of its
+      // own, not a git failure: keep it out of the "Failed to clone" wrapping.
+      if (error instanceof AgentPluginSubpathError) {
+        throw error;
+      }
       throw new Error(`Failed to clone ${url}: ${getErrorMessage(error)}`);
     }
   }
@@ -1072,14 +1804,21 @@ export class AgentPluginInstallService {
    * Clone exactly `sha` (what the user consented to). Prefers a direct SHA
    * fetch (GitHub allows it); falls back to cloning the tracking ref and
    * verifying HEAD still matches, so a remote that moved between preview and
-   * install fails loudly instead of installing unreviewed content.
+   * install fails loudly instead of installing unreviewed content. A
+   * `source.subpath` stages only that folder (see extractSubpath).
    */
   private async cloneExactSha(source: AgentPluginGitSource, sha: string): Promise<string> {
+    const subpath = source.subpath;
     const dir = await this.createStagingDir();
     try {
       try {
-        await this.fetchExactSha(source.url, sha, dir);
-      } catch {
+        await this.fetchExactSha(source.url, sha, dir, subpath);
+      } catch (error) {
+        // The commit WAS fetched; its tree just lacks the folder. The
+        // tracking-ref clone below would only reach the same verdict.
+        if (error instanceof AgentPluginSubpathError) {
+          throw error;
+        }
         if (source.refType === "commit") {
           throw new Error(`Could not fetch commit ${sha} from ${source.url}.`);
         }
@@ -1088,21 +1827,7 @@ export class AgentPluginInstallService {
         await this.removeDir(dir);
         await fsPromises.mkdir(dir, { recursive: true });
         this.activeStagingPaths.add(dir);
-        await runGit(
-          [
-            "clone",
-            "--depth",
-            "1",
-            "--single-branch",
-            "--branch",
-            source.ref,
-            "-c",
-            "advice.detachedHead=false",
-            source.url,
-            dir,
-          ],
-          { diskQuota: this.cloneDiskQuota(dir) }
-        );
+        await this.cloneRef(source.url, source.ref, dir, subpath);
       }
       const head = (await runGit(["-C", dir, "rev-parse", "HEAD"])).trim();
       if (head !== sha) {
@@ -1110,23 +1835,197 @@ export class AgentPluginInstallService {
           `The remote moved since the preview (expected ${sha.slice(0, 12)}, got ${head.slice(0, 12)}). Run the preview again.`
         );
       }
-      await this.assertStagedTreeWithinQuota(dir);
-      return dir;
+      return await this.stagedPluginRoot(dir, subpath, source.url, sha);
     } catch (error) {
       await this.removeDir(dir);
       throw error instanceof Error ? error : new Error(getErrorMessage(error));
     }
   }
 
-  private async fetchExactSha(url: string, sha: string, dir: string): Promise<void> {
+  /**
+   * The staged plugin root of a verified clone: the whole checkout for a
+   * root install, or only `subpath` (see extractSubpath). Both run the
+   * staged-tree quota and symlink checks on the tree that gets installed.
+   */
+  private async stagedPluginRoot(
+    dir: string,
+    subpath: string | undefined,
+    url: string,
+    sha: string
+  ): Promise<string> {
+    if (subpath === undefined) {
+      await this.assertStagedTreeWithinQuota(dir);
+      return dir;
+    }
+    return this.extractSubpath(dir, subpath, url, sha);
+  }
+
+  /**
+   * Shallow-clone branch or tag `ref`. With `subpath`, the clone is partial
+   * and sparse and gets narrowed to the folder; callers still verify HEAD
+   * against the SHA they expect before using the tree.
+   */
+  private async cloneRef(url: string, ref: string, dir: string, subpath?: string): Promise<void> {
+    await runGit(
+      [
+        "clone",
+        "--depth",
+        "1",
+        "--single-branch",
+        ...sparseCloneFlags(subpath, url),
+        "--branch",
+        ref,
+        "-c",
+        "advice.detachedHead=false",
+        url,
+        dir,
+      ],
+      { diskQuota: this.cloneDiskQuota(dir) }
+    );
+    await this.narrowToSubpath(dir, "HEAD", subpath, url);
+    if (subpath !== undefined) {
+      // The clone ran with --no-checkout: materialize only the sparse folder.
+      await runGit(["-C", dir, "checkout", "--quiet", "HEAD"], {
+        diskQuota: this.cloneDiskQuota(dir),
+      });
+    }
+  }
+
+  private async fetchExactSha(
+    url: string,
+    sha: string,
+    dir: string,
+    subpath?: string
+  ): Promise<void> {
     const diskQuota = this.cloneDiskQuota(dir);
     await runGit(["init", "--quiet", dir]);
     await runGit(["-C", dir, "remote", "add", "origin", url]);
-    await runGit(["-C", dir, "fetch", "--depth", "1", "origin", sha], { diskQuota });
+    // `init` + `fetch --filter` configures the promisor remote on its own, so
+    // the sparse checkout below can lazy-fetch just the subpath's blobs.
+    await runGit(
+      ["-C", dir, "fetch", "--depth", "1", ...partialFetchFlags(subpath, url), "origin", sha],
+      { diskQuota }
+    );
+    // Must precede the checkout: a full checkout would materialize (and
+    // lazy-fetch) the whole monorepo before narrowing.
+    await this.narrowToSubpath(dir, "FETCH_HEAD", subpath, url);
     await runGit(
       ["-C", dir, "-c", "advice.detachedHead=false", "checkout", "--quiet", "FETCH_HEAD"],
       { diskQuota }
     );
+  }
+
+  /**
+   * Check that every level of `subpath` is a real folder in `rev`, then
+   * narrow the staging clone's sparse checkout to exactly that folder.
+   *
+   * SECURITY: each level must be a git tree object (mode 040000), checked
+   * BEFORE any subpath blob is fetched. `ls-tree` compares exact names, which
+   * also defeats case-insensitive filesystem matches (`Pstack` vs `pstack`).
+   * Registry entries and direct API sources never passed the parser, so the
+   * subpath is re-validated here.
+   */
+  private async narrowToSubpath(
+    dir: string,
+    rev: "HEAD" | "FETCH_HEAD",
+    subpath: string | undefined,
+    url: string
+  ): Promise<void> {
+    if (subpath === undefined) {
+      return;
+    }
+    assertNormalizedSubpath(subpath);
+    const sha = (await runGit(["-C", dir, "rev-parse", rev])).trim();
+    const segments = subpath.split("/");
+    for (let depth = 1; depth <= segments.length; depth++) {
+      const prefix = segments.slice(0, depth).join("/");
+      // -z: NUL-terminated, unquoted names. --literal-pathspecs: no `:(magic)`.
+      const output = await runGit([
+        "--literal-pathspecs",
+        "-C",
+        dir,
+        "ls-tree",
+        "-z",
+        rev,
+        "--",
+        prefix,
+      ]);
+      const mode = lsTreeEntryMode(output, prefix);
+      if (mode === undefined) {
+        throw new AgentPluginSubpathError(
+          `'${subpath}' does not exist in ${url} at ${sha.slice(0, 12)}. The plugin folder may have moved or been removed upstream.`
+        );
+      }
+      if (mode !== "040000") {
+        throw subpathNotAFolder(subpath, url, prefix, NON_FOLDER_GIT_MODE_KINDS[mode] ?? "a file");
+      }
+    }
+    // Non-cone pattern `/<subpath>/`: cone mode would also check out every
+    // file at the repository root and in each parent folder, and those count
+    // toward the clone quota. The pattern is literal: normalization rejects
+    // every gitignore special (`* ? [ ] \ ! #`, outer whitespace).
+    await runGit(["-C", dir, "sparse-checkout", "set", "--no-cone", "--", `/${subpath}/`], {
+      diskQuota: this.cloneDiskQuota(dir),
+    });
+  }
+
+  /**
+   * Turn a sparse monorepo clone into a staged plugin root that holds ONLY
+   * `subpath` (already checked by narrowToSubpath). Every later step
+   * (validation, consent preview, update capability diff, promote,
+   * receipts) treats the staged dir as the plugin root, so consent and
+   * update reviews cover exactly this folder: upstream commits that only
+   * touch files outside it stage an identical tree and need no consent.
+   *
+   * The lstat walk on the checkout is a second guard behind the git tree
+   * check. The quota/symlink walk runs on the EXTRACTED dir after the clone
+   * is gone, so a relative link that escapes the subtree (even if it stays
+   * inside the repo) is rejected like a link escaping the repo root.
+   * Always consumes `cloneDir`: it is removed on every path.
+   */
+  private async extractSubpath(
+    cloneDir: string,
+    subpath: string,
+    url: string,
+    sha: string
+  ): Promise<string> {
+    const pluginDir = `${cloneDir}-plugin`;
+    try {
+      const segments = subpath.split("/");
+      for (let depth = 1; depth <= segments.length; depth++) {
+        const prefix = segments.slice(0, depth).join("/");
+        const stat = await fsPromises.lstat(path.join(cloneDir, prefix)).catch(() => undefined);
+        if (stat === undefined) {
+          throw new AgentPluginSubpathError(
+            `'${subpath}' was not checked out from ${url} at ${sha.slice(0, 12)}. Try again.`
+          );
+        }
+        if (!stat.isDirectory()) {
+          throw subpathNotAFolder(
+            subpath,
+            url,
+            prefix,
+            stat.isSymbolicLink() ? "a symbolic link" : "a file"
+          );
+        }
+      }
+      await this.renameIntoStaging(path.join(cloneDir, subpath), pluginDir);
+    } catch (error) {
+      await this.removeDir(cloneDir);
+      throw error;
+    }
+    try {
+      // The clone goes first: the symlink check must not resolve into it.
+      await this.removeDir(cloneDir);
+      await this.assertStagedTreeWithinQuota(pluginDir);
+      return pluginDir;
+    } catch (error) {
+      // The caller only knows cloneDir, so pluginDir must not outlive this
+      // failure. If even its removal fails (e.g. a Windows file lock), drop
+      // the in-process claim so stale-staging reclamation can reap it later.
+      await this.removeDir(pluginDir).catch(() => this.activeStagingPaths.delete(pluginDir));
+      throw error;
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -1138,22 +2037,31 @@ export class AgentPluginInstallService {
    * a staged clone. Throws user-facing errors for non-plugins, including a
    * clear message for Claude Code plugin/marketplace repos (explicit non-goal).
    */
-  private async validateStagedClone(stagedDir: string): Promise<{
+  private async validateStagedClone(
+    stagedDir: string,
+    subpath?: string
+  ): Promise<{
     plugin: AgentPluginInfo;
     warnings: string[];
   }> {
-    const hasManifest = await pathExists(path.join(stagedDir, "plugin.json"));
+    // Discovery reads `.codex-plugin/plugin.json` when the root manifest is
+    // absent; both live in the staged tree the consent receipt hashes.
+    const hasManifest =
+      (await pathExists(path.join(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH))) ||
+      (await pathExists(path.join(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH)));
     if (!hasManifest) {
       if (
         (await pathExists(path.join(stagedDir, ".claude-plugin", "plugin.json"))) ||
         (await pathExists(path.join(stagedDir, ".claude-plugin", "marketplace.json")))
       ) {
         throw new Error(
-          "This repository is a Claude Code plugin or marketplace (found .claude-plugin/). Mux implements the vendor-neutral Agent Plugins 1.0.0 format and cannot install Claude Code collections."
+          "This repository is a Claude Code plugin or marketplace (found .claude-plugin/). Mux implements the vendor-neutral Agent Plugins 1.0.0 format and cannot install Claude Code collections. If an Agent Plugin lives in one of its folders, install it as owner/repo/path/to/plugin."
         );
       }
       throw new Error(
-        "No plugin.json found at the repository root. The repo is not an Agent Plugin — if the plugin lives in a subdirectory, monorepo subpath installs land in v2."
+        subpath === undefined
+          ? "No plugin.json (or .codex-plugin/plugin.json) found at the repository root. The repo is not an Agent Plugin — if the plugin lives in a subdirectory, install it as owner/repo/path/to/plugin."
+          : `No plugin.json (or .codex-plugin/plugin.json) found in '${subpath}'. The folder is not an Agent Plugin.`
       );
     }
 
@@ -1238,34 +2146,24 @@ export class AgentPluginInstallService {
     warnings: string[]
   ): Promise<{
     hook: AgentPluginPreviewHook | undefined;
-    /** serverName → { fingerprint (compared), display (shown in the update review) }. */
-    servers: Map<string, { fingerprint: string; display: string }>;
-    /** skillName → { fingerprint (compared), display (the advertisement as the model sees it) }. */
-    skills: Map<string, { fingerprint: string; display: string }>;
+    /** serverName → { fingerprint (compared), display (shown in the update review), remote sign-in }. */
+    servers: Map<string, SurfaceServer>;
+    /**
+     * skillName → { fingerprint (the advertisement), consentFingerprint (path + frontmatter,
+     * compared), display (the advertisement as the model sees it) }.
+     */
+    skills: Map<string, SurfaceSkill>;
     agents: Map<string, string>;
     components: Set<string>;
   }> {
     const hook = this.collectHook(plugin);
-    const skills = new Map<string, { fingerprint: string; display: string }>();
-    for (const skill of await this.collectSkills(plugin, warnings)) {
-      // EVERY model-visible advertisement field: description, whenToUse
-      // (both interpolate into the agent_skill_read tool description on each
-      // request), and advertise (a flip from hidden to visible surfaces a
-      // previously invisible skill). Changing any of them is re-consent
-      // territory, same as adding a skill. The fingerprint stays JSON (field
-      // boundaries are unambiguous); the display rendering is NOT used for
-      // comparison because a multi-line description could imitate it.
+    const readSecret = createSecretReader();
+    const skills = new Map<string, SurfaceSkill>();
+    for (const skill of await this.collectSkillsFromRoots(plugin, warnings)) {
       skills.set(skill.name, {
-        fingerprint: JSON.stringify({
-          description: skill.description ?? null,
-          whenToUse: skill.whenToUse ?? null,
-          advertise: skill.advertise ?? null,
-        }),
-        display: [
-          skill.description ?? "(no description)",
-          ...(skill.whenToUse !== undefined ? [`When to use: ${skill.whenToUse}`] : []),
-          ...(skill.advertise === false ? ["(not advertised to the model)"] : []),
-        ].join("\n"),
+        ...describeSkillAdvertisement(skill),
+        consentFingerprint: skill.consentFingerprint,
+        consentDetail: skill.consentDetail,
       });
     }
     const agents = new Map<string, string>();
@@ -1278,37 +2176,38 @@ export class AgentPluginInstallService {
         (command) => `slash command /${command.name}`
       ),
     ]);
-    const servers = new Map<string, { fingerprint: string; display: string }>();
+    const servers = new Map<string, SurfaceServer>();
     if (plugin.mcpConfigPath !== undefined) {
       const { servers: infos, diagnostics } = await loadPluginMcpServers(plugin, {
         xumHome: this.config.rootDir,
         instanceId,
       });
       warnings.push(...diagnostics.map((d) => d.message));
-      const normalize = (value: string): string => value.split(plugin.rootPath).join("<plugin>");
       const rewrite = (value: string): string => value.split(plugin.rootPath).join(finalTargetPath);
+      // A staged update review normalizes the final path too (see collectMcpServers).
+      const paths = {
+        rootPaths: [plugin.rootPath, finalTargetPath],
+        dataPaths: [getPluginDataPath(this.config.rootDir, instanceId)],
+      };
       for (const info of Object.values(infos)) {
         assert(info.plugin !== undefined, "plugin server info must carry provenance");
-        const fingerprint =
+        const signIn =
           info.transport === "stdio"
-            ? JSON.stringify({
-                transport: "stdio",
-                argv: [info.command, ...(info.args ?? [])].map(normalize),
-                // Sorted: env is an unordered map, so a mere property
-                // reordering upstream must not read as a capability change.
-                env: Object.fromEntries(
-                  Object.entries(info.env ?? {})
-                    .map(([key, value]): [string, string] => [key, normalize(value)])
-                    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-                ),
-                // cwd changes relative module/config resolution (e.g. plugin
-                // root → writable PLUGIN_DATA), so it is consent-relevant.
-                ...(info.cwd !== undefined ? { cwd: normalize(info.cwd) } : {}),
-              })
-            : JSON.stringify({ transport: info.transport, url: info.url });
+            ? undefined
+            : await readSignIn(info.url, info.oauth, readSecret);
+        // The whole normalized server (componentConsent.ts) so a parser widening shows here too,
+        // plus the secret digest so a secret-only change still needs review.
+        const consentFingerprint = serverConsentFingerprint(info, paths);
+        const fingerprint = JSON.stringify({
+          consentFingerprint,
+          secretDigest: signIn?.secretDigest ?? null,
+        });
         servers.set(info.plugin.serverName, {
           fingerprint,
+          consentFingerprint,
+          consentDetail: () => serverConsentDetail(info, paths),
           display: this.describeMcpServer(info, rewrite, finalTargetPath).summary,
+          ...(signIn !== undefined ? { signIn } : {}),
         });
       }
     }
@@ -1333,7 +2232,9 @@ export class AgentPluginInstallService {
     name: string,
     installedPath: string,
     stagedPlugin: AgentPluginInfo,
-    stagedWarnings: string[]
+    stagedWarnings: string[],
+    /** Receives server URLs whose sign-in identity changes (stored tokens must go). */
+    signInResets?: string[]
   ): Promise<AgentPluginCapabilityChange[]> {
     const instanceId = this.instanceIdFor(name);
     const { plugin: currentPlugin } = await discoverAgentPluginAt({
@@ -1388,28 +2289,78 @@ export class AgentPluginInstallService {
     }
     for (const [serverName, server] of staged.servers) {
       const currentServer = current?.servers.get(serverName);
+      const component = {
+        kind: "mcpServers" as const,
+        name: serverName,
+        fingerprint: server.consentFingerprint,
+      };
       if (currentServer === undefined) {
-        changes.push({ summary: `adds MCP server '${serverName}'`, after: server.display });
-      } else if (currentServer.fingerprint !== server.fingerprint) {
         changes.push({
-          summary: `changes MCP server '${serverName}'`,
-          before: currentServer.display,
-          after: server.display,
+          summary: `adds MCP server '${serverName}'`,
+          after: reviewText(server),
+          component,
+        });
+      } else if (currentServer.fingerprint !== server.fingerprint) {
+        const authLines = describeSignInChanges(currentServer.signIn, server.signIn);
+        changes.push({
+          summary: [`changes MCP server '${serverName}'`, ...authLines].join(": "),
+          before: reviewText(currentServer),
+          after: reviewText(server),
+          component,
         });
       }
+    }
+    // Stored credentials are keyed by the normalized server URL, not the
+    // server name: match sign-ins by that key, so a renamed server or a
+    // respelled URL (`/mcp` vs `/mcp/`) with a new identity still resets.
+    const credentialKey = (url: string): string | null =>
+      this.mcpOauthService?.credentialKey(url) ?? null;
+    // Compare each entry with its own previous identity (same name, same key): when two
+    // servers share a URL, another entry already using the new identity must not mask the
+    // change. A renamed (or added) entry has no previous self, and the stored credentials
+    // cannot be traced to one entry: reset whenever any identity at the key differs. A
+    // needless sign-out is acceptable; stale credentials offered under a new identity are not.
+    const currentIdentities = new Map<string, Set<string>>();
+    const currentEntryIdentity = new Map<string, string>();
+    for (const [serverName, server] of current?.servers ?? []) {
+      const key = server.signIn && credentialKey(server.signIn.url);
+      if (!key || !server.signIn) continue;
+      const identities = currentIdentities.get(key) ?? new Set<string>();
+      identities.add(server.signIn.identity);
+      currentIdentities.set(key, identities);
+      currentEntryIdentity.set(`${serverName}\0${key}`, server.signIn.identity);
+    }
+    for (const [serverName, server] of staged.servers) {
+      const key = server.signIn && credentialKey(server.signIn.url);
+      if (!key || !server.signIn) continue;
+      const previous = currentEntryIdentity.get(`${serverName}\0${key}`);
+      const identity = server.signIn.identity;
+      const changed =
+        previous !== undefined
+          ? previous !== identity
+          : [...(currentIdentities.get(key) ?? [])].some((other) => other !== identity);
+      if (changed) signInResets?.push(server.signIn.url);
     }
     // Skill advertisements interpolate into the model-visible skill index on
     // every request, so a new skill — or a reworded description — can inject
     // instructions without the user ever invoking it. Gate both.
     for (const [skillName, skill] of staged.skills) {
       const currentSkill = current?.skills.get(skillName);
+      const component = {
+        kind: "skills" as const,
+        name: skillName,
+        fingerprint: skill.consentFingerprint,
+      };
       if (currentSkill === undefined) {
-        changes.push({ summary: `adds skill '${skillName}'`, after: skill.display });
-      } else if (currentSkill.fingerprint !== skill.fingerprint) {
+        changes.push({ summary: `adds skill '${skillName}'`, after: reviewText(skill), component });
+      } else if (currentSkill.consentFingerprint !== skill.consentFingerprint) {
+        // The skill's location and whole frontmatter count (#6498), so a moved skill or a new
+        // frontmatter field shows here. The summary names an advertisement change when there is one.
         changes.push({
-          summary: `changes the model-visible advertisement of skill '${skillName}'`,
-          before: currentSkill.display,
-          after: skill.display,
+          summary: skillChangeSummary(currentSkill, skill, skillName),
+          before: reviewText(currentSkill),
+          after: reviewText(skill),
+          component,
         });
       }
     }
@@ -1436,6 +2387,7 @@ export class AgentPluginInstallService {
         changes.push({ summary: `adds ${component}` });
       }
     }
+    assertReviewFits(changes);
     return changes;
   }
 
@@ -1521,7 +2473,11 @@ export class AgentPluginInstallService {
         const content = await fsPromises.readFile(filePath, "utf8");
         // Throws on malformed frontmatter or oversized content — exactly the
         // definitions runtime discovery would skip.
-        frontmatter = parseAgentDefinitionMarkdown({ content, byteSize: stat.size }).frontmatter;
+        frontmatter = parseAgentDefinitionMarkdown({
+          content,
+          byteSize: stat.size,
+          plugin: { agentId: agentIdParse.data },
+        }).frontmatter;
       } catch {
         continue;
       }
@@ -1547,14 +2503,34 @@ export class AgentPluginInstallService {
    * advertise gates that visibility entirely, so the update capability
    * fingerprint must cover them (the oRPC preview schema strips the extras).
    */
-  private async collectSkills(
-    plugin: Pick<AgentPluginInfo, "rootPath" | "skillsDir">,
+  private async collectSkillsFromRoots(
+    plugin: Pick<AgentPluginInfo, "rootPath" | "skillsDirs">,
     warnings: string[]
   ): Promise<CollectedPluginSkill[]> {
-    const skillsDir = plugin.skillsDir;
-    if (skillsDir === undefined) {
-      return [];
+    const skills: CollectedPluginSkill[] = [];
+    for (const skillsDir of plugin.skillsDirs ?? []) {
+      for (const skill of await this.collectSkills(plugin.rootPath, skillsDir, warnings)) {
+        // Runtime discovery keeps the first skill of a name (roots in declared order), so the
+        // preview must not promise the later one (#6121).
+        if (skills.some((earlier) => earlier.name === skill.name)) {
+          warnings.push(
+            `${path.relative(plugin.rootPath, skillsDir)}/${skill.name}: an earlier skills root has a skill with this name; it will not load`
+          );
+          continue;
+        }
+        skills.push(skill);
+      }
     }
+    return skills;
+  }
+
+  /** One skills root of collectSkillsFromRoots. Warnings name the root by its plugin-relative path. */
+  private async collectSkills(
+    pluginRoot: string,
+    skillsDir: string,
+    warnings: string[]
+  ): Promise<CollectedPluginSkill[]> {
+    const label = path.relative(pluginRoot, skillsDir);
     const skills: CollectedPluginSkill[] = [];
     let entries: string[] = [];
     try {
@@ -1578,12 +2554,14 @@ export class AgentPluginInstallService {
         // allowMissing (matching runtime assertSkillDirValid): resolve through
         // the symlinked dir even when SKILL.md is absent, so an escaping
         // symlink fails containment instead of hiding behind ENOENT.
-        containedSkillPath = await ensurePathContained(plugin.rootPath, skillPath, {
+        containedSkillPath = await ensurePluginPathContained(pluginRoot, skillPath, {
           allowMissing: true,
         });
       } catch (error) {
         if (!hasErrorCode(error, "ENOENT")) {
-          warnings.push(`skills/${dirName}: resolves outside the plugin root; it will not load`);
+          warnings.push(
+            `${label}/${dirName}: ${error instanceof PluginGitPathError ? "resolves into the plugin's .git directory" : "resolves outside the plugin root"}; it will not load`
+          );
         }
         // ENOENT (unresolvable path) → not a skill dir; skip silently.
         continue;
@@ -1603,7 +2581,7 @@ export class AgentPluginInstallService {
       // never-loading skill as a capability addition.
       const dirNameParsed = SkillNameSchema.safeParse(dirName);
       if (!dirNameParsed.success) {
-        warnings.push(`skills/${dirName}: invalid skill directory name; it will not load`);
+        warnings.push(`${label}/${dirName}: invalid skill directory name; it will not load`);
         continue;
       }
       // Size-check BEFORE reading (mirroring runtime discovery): the parse
@@ -1611,7 +2589,7 @@ export class AgentPluginInstallService {
       // identical guard in collectAgentFiles.
       if (stat.size > MAX_FILE_SIZE) {
         warnings.push(
-          `skills/${dirName}: SKILL.md is too large (${stat.size} bytes; max ${MAX_FILE_SIZE}); it will not load`
+          `${label}/${dirName}: SKILL.md is too large (${stat.size} bytes; max ${MAX_FILE_SIZE}); it will not load`
         );
         continue;
       }
@@ -1621,9 +2599,16 @@ export class AgentPluginInstallService {
           content,
           byteSize: stat.size,
           directoryName: dirNameParsed.data,
+          // Mirror runtime discovery: a display name loads under the dir name.
+          allowDisplayName: true,
         });
+        warnings.push(...displayNameWarnings(label, dirName, parsed.displayName));
         skills.push({
           name: parsed.frontmatter.name,
+          ...skillConsentFields({
+            relativeDir: path.relative(pluginRoot, path.join(skillsDir, dirName)),
+            frontmatter: skillConsentFrontmatter(parsed),
+          }),
           ...(parsed.frontmatter.description !== undefined
             ? { description: parsed.frontmatter.description }
             : {}),
@@ -1634,9 +2619,11 @@ export class AgentPluginInstallService {
           // the same helpers the runtime uses.
           whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
           advertise: resolveSkillAdvertise(parsed.frontmatter),
+          // paths moves the skill from the static index to file-tool pointers.
+          paths: resolveSkillPaths(parsed.frontmatter),
         });
       } catch (error) {
-        warnings.push(`skills/${dirName}: ${getErrorMessage(error)}`);
+        warnings.push(`${label}/${dirName}: ${getErrorMessage(error)}`);
       }
     }
     return skills;
@@ -1653,9 +2640,9 @@ export class AgentPluginInstallService {
     finalTargetPath: string,
     instanceId: string,
     warnings: string[]
-  ): Promise<AgentPluginPreviewMcpServer[]> {
+  ): Promise<{ previews: AgentPluginPreviewMcpServer[]; fingerprints: Record<string, string> }> {
     if (plugin.mcpConfigPath === undefined) {
-      return [];
+      return { previews: [], fingerprints: {} };
     }
     const { servers, diagnostics } = await loadPluginMcpServers(plugin, {
       xumHome: this.config.rootDir,
@@ -1664,11 +2651,24 @@ export class AgentPluginInstallService {
     warnings.push(...diagnostics.map((d) => d.message));
 
     const rewrite = (value: string): string => value.split(plugin.rootPath).join(finalTargetPath);
-
-    const result: AgentPluginPreviewMcpServer[] = Object.values(servers).map((info) =>
-      this.describeMcpServer(info, rewrite, finalTargetPath)
-    );
-    return result.sort((a, b) => a.serverName.localeCompare(b.serverName));
+    // A staged review must also normalize the final path: a manifest can name it literally.
+    const paths = {
+      rootPaths: [plugin.rootPath, finalTargetPath],
+      dataPaths: [getPluginDataPath(this.config.rootDir, instanceId)],
+    };
+    const entries = Object.values(servers).map((info) => {
+      const preview = this.describeMcpServer(info, rewrite, finalTargetPath);
+      return [preview, serverConsentFingerprint(info, paths)] as const;
+    });
+    return {
+      previews: entries
+        .map(([preview]) => preview)
+        .sort((a, b) => a.serverName.localeCompare(b.serverName)),
+      // From entries, never by assignment: a server named `__proto__` must stay an own key.
+      fingerprints: Object.fromEntries(
+        entries.map(([preview, fingerprint]) => [preview.serverName, fingerprint])
+      ),
+    };
   }
 
   /**
@@ -1683,10 +2683,29 @@ export class AgentPluginInstallService {
   ): AgentPluginPreviewMcpServer {
     assert(info.plugin !== undefined, "plugin server info must carry provenance");
     if (info.transport !== "stdio") {
+      // SECURITY AUDIT: the user consents to the server URL, so each auth host
+      // that differs from its host gets its own line. Exact host comparison:
+      // no public-suffix list exists here to make parent-domain matching safe.
+      const serverHost = new URL(info.url).host;
+      const discovery = info.oauth?.discovery;
+      const authHosts = new Set(
+        [discovery?.authorizationServerBase, discovery?.registrationUrl]
+          .filter((url) => url !== undefined)
+          .map((url) => new URL(url).host)
+          .filter((host) => host !== serverHost)
+      );
       return {
         serverName: info.plugin.serverName,
         transport: info.transport === "http" ? "http" : "sse",
-        summary: info.url,
+        summary: [
+          info.url,
+          ...[...authHosts].map((host) => `Sign-in at ${host}`),
+          // The token audience, when the plugin narrows or widens it.
+          ...(info.oauth?.resource !== undefined &&
+          new URL(info.oauth.resource).href !== new URL(info.url).href
+            ? [`Token resource: ${info.oauth.resource}`]
+            : []),
+        ].join("\n"),
       };
     }
     // Mirror the runtime's rendering (MCPServerManager shell-quotes every
@@ -1697,26 +2716,7 @@ export class AgentPluginInstallService {
       info.args !== undefined
         ? [info.command, ...info.args].map(rewrite).map(shellQuote).join(" ")
         : rewrite(info.command);
-    // Env VALUES are execution-relevant (e.g. NODE_OPTIONS=--require=…
-    // auto-loads code the argv never shows), so consent must disclose the
-    // full assignment, quoted like the argv so boundaries are unambiguous.
-    const envAssignments = Object.entries(info.env ?? {})
-      .filter(([key]) => key !== "PLUGIN_ROOT" && key !== "PLUGIN_DATA")
-      .map(([key, value]) => `${key}=${shellQuote(rewrite(value))}`);
-    const details: string[] = [];
-    // cwd is execution-relevant too: prepareStdioLaunch passes it to the
-    // runtime, so `node server.js` resolves scripts/configs relative to
-    // it — including from WRITABLE persistent plugin data — and the argv
-    // alone would imply a different resolution (capabilitySurface treats
-    // cwd as consent-relevant for the same reason). The loader defaults
-    // cwd to the plugin root; only a DEVIATION from the reviewed tree
-    // root needs calling out.
-    if (info.cwd !== undefined && rewrite(info.cwd) !== finalTargetPath) {
-      details.push(`cwd: ${shellQuote(rewrite(info.cwd))}`);
-    }
-    if (envAssignments.length > 0) {
-      details.push(`env: ${envAssignments.join(" ")}`);
-    }
+    const details = stdioLaunchDetails(info, rewrite, finalTargetPath);
     return {
       serverName: info.plugin.serverName,
       transport: "stdio",
@@ -1749,6 +2749,14 @@ export class AgentPluginInstallService {
     return this.captureResult(() => this.install(args));
   }
 
+  getHooksResult(args: { name: string }) {
+    return this.captureResult(() => this.getHooks(args));
+  }
+
+  setHookTrustResult(args: Parameters<AgentPluginInstallService["setHookTrust"]>[0]) {
+    return this.captureResult(() => this.setHookTrust(args));
+  }
+
   getComponentsResult(args: { name: string }) {
     return this.captureResult(() => this.getComponents(args));
   }
@@ -1778,6 +2786,18 @@ export class AgentPluginInstallService {
     return this.captureResult(() => this.previewUpdate(args));
   }
 
+  previewComponentReviewResult(
+    args: Parameters<AgentPluginInstallService["previewComponentReview"]>[0]
+  ) {
+    return this.captureResult(() => this.previewComponentReview(args));
+  }
+
+  confirmComponentReviewResult(
+    args: Parameters<AgentPluginInstallService["confirmComponentReview"]>[0]
+  ) {
+    return this.captureResult(() => this.confirmComponentReview(args));
+  }
+
   async preview(args: {
     input: string;
     ref?: string | undefined;
@@ -1791,29 +2811,26 @@ export class AgentPluginInstallService {
       );
     }
     const ref = parsed.ref ?? (explicitRef.length > 0 ? explicitRef : undefined);
-    const subpath = parsed.subpath ?? (args.subpath?.trim() ? args.subpath.trim() : undefined);
-    if (subpath !== undefined) {
-      // Approved v1 scope: the descriptor grammar knows subpaths, installs don't.
-      throw new Error(
-        "Monorepo subpath installs land in v2. Point at a repo whose root is the plugin."
-      );
-    }
+    const subpath = resolvePreviewSubpath(parsed.subpath, args.subpath);
 
     const resolved = await this.resolveRemoteRef(parsed.url, ref);
-    const { dir: stagedDir, sha } = await this.cloneResolved(parsed.url, resolved);
+    const { dir: stagedDir, sha } = await this.cloneResolved(parsed.url, resolved, subpath);
     try {
-      const { plugin, warnings } = await this.validateStagedClone(stagedDir);
+      const { plugin, warnings } = await this.validateStagedClone(stagedDir, subpath);
       const targetPath = this.targetPathFor(plugin.name);
       await this.assertNoCollision(plugin.name);
 
-      const skills = await this.collectSkills(plugin, warnings);
-      const mcpServers = await this.collectMcpServers(
+      const skills = await this.collectSkillsFromRoots(plugin, warnings);
+      const { previews: mcpServers } = await this.collectMcpServers(
         plugin,
         targetPath,
         this.instanceIdFor(plugin.name),
         warnings
       );
       const hook = this.collectHook(plugin);
+      const codexHooks = await loadPluginCodexHooks(plugin);
+      warnings.push(...codexHooks.warnings);
+      const openaiInterface = await interfaceSummary(plugin, warnings);
       const agents = (await this.collectAgentFiles(plugin.agentsDir)).map((agent) => agent.name);
       const workflows = await this.collectComponentFiles(plugin.workflowsDir, ".js");
       const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
@@ -1832,14 +2849,20 @@ export class AgentPluginInstallService {
         url: parsed.url,
         ref: resolved.ref,
         refType: resolved.refType,
+        ...(subpath !== undefined ? { subpath } : {}),
       };
       return {
         source,
         lockedSha: sha,
-        manifest: manifestSummary(plugin.manifest),
-        skills,
+        manifest: {
+          ...manifestSummary(plugin.manifest),
+          ...(openaiInterface !== undefined ? { interface: openaiInterface } : {}),
+        },
+        // Fingerprints stay in the backend: the preview shows what the components do.
+        skills: skills.map((skill) => omitConsentFingerprint(skill)),
         mcpServers,
         ...(hook !== undefined ? { hook } : {}),
+        codexHooks: codexHooks.hooks,
         agents,
         workflows,
         slashCommands,
@@ -1881,22 +2904,22 @@ export class AgentPluginInstallService {
     // parser, and this URL is persisted to plugins.json and rendered in
     // Settings.
     assertNoAgentPluginUrlCredentials(args.source.url);
-    if (args.source.subpath !== undefined) {
-      throw new Error("Monorepo subpath installs land in v2.");
-    }
+    // Same reasoning for the subpath: it is persisted and decides which
+    // folder becomes the plugin root, so a direct API source must already be
+    // in the normalized form preview() returns.
+    assertNormalizedSubpath(args.source.subpath);
 
     return this.runExclusive(async () => {
       const stagedDir = await this.cloneExactSha(args.source, args.expectedSha);
       try {
-        const { plugin } = await this.validateStagedClone(stagedDir);
+        const { plugin } = await this.validateStagedClone(stagedDir, args.source.subpath);
         const name = plugin.name;
+        const inventory = await this.collectComponents(plugin, this.targetPathFor(name));
         const importedComponents =
           args.importedComponents === undefined
             ? undefined
-            : this.validateComponentImports(
-                args.importedComponents,
-                await this.collectComponents(plugin)
-              );
+            : this.validateComponentImports(args.importedComponents, inventory);
+        const componentConsent = consentAtInstall(importedComponents, inventory);
         await this.assertNoCollision(name);
         await this.assertNoPendingOverridePrune(name);
         await this.assertNoResidualInstanceState(name);
@@ -1947,6 +2970,7 @@ export class AgentPluginInstallService {
           lockedSha: args.expectedSha,
           installedAt: new Date().toISOString(),
           ...(importedComponents !== undefined ? { importedComponents } : {}),
+          componentConsent,
           manifest: {
             ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
             ...(plugin.manifest.description !== undefined
@@ -2619,13 +3643,20 @@ export class AgentPluginInstallService {
   }
 
   /** Full inventory deliberately ignores saved imports: package update consent stays unchanged. */
-  private async collectComponents(plugin: AgentPluginInfo) {
+  /**
+   * `finalTargetPath` is where the plugin is (or will be) installed. A staged clone passes it so
+   * PLUGIN_DATA and the consent fingerprints match what the installed tree loads.
+   */
+  private async collectComponents(
+    plugin: AgentPluginInfo,
+    finalTargetPath = path.join(plugin.containerPath, plugin.dirName)
+  ) {
     const warnings: string[] = [];
-    const skills = await this.collectSkills(plugin, warnings);
-    const mcpServers = await this.collectMcpServers(
+    const skills = await this.collectSkillsFromRoots(plugin, warnings);
+    const { previews: mcpServers, fingerprints } = await this.collectMcpServers(
       { ...plugin, importedComponents: undefined },
-      path.join(plugin.containerPath, plugin.dirName),
-      computePluginInstanceId(path.join(plugin.containerPath, plugin.dirName)),
+      finalTargetPath,
+      computePluginInstanceId(finalTargetPath),
       warnings
     );
     return {
@@ -2634,6 +3665,11 @@ export class AgentPluginInstallService {
         ...(description !== undefined ? { description } : {}),
       })),
       mcpServers,
+      /** What this review showed, as consent fingerprints (#6498). Never sent to the renderer. */
+      fingerprints: {
+        skills: Object.fromEntries(skills.map((skill) => [skill.name, skill.consentFingerprint])),
+        mcpServers: fingerprints,
+      } satisfies ComponentConsent,
     };
   }
 
@@ -2658,7 +3694,7 @@ export class AgentPluginInstallService {
 
   private async readInstalledComponents(
     entry: AgentPluginInstallEntry
-  ): Promise<AgentPluginComponents> {
+  ): Promise<AgentPluginComponents & { fingerprints: ComponentConsent }> {
     const pluginDir = this.targetPathFor(entry.name);
     // Pin reads to one tree even if the installed symlink changes A → B → A
     // between the receipt hashes. Only keys/data paths retain the logical identity.
@@ -2690,21 +3726,118 @@ export class AgentPluginInstallService {
     };
   }
 
+  /**
+   * The managed plugin's Codex-format hooks (hooks.json) with their trust review state. Read
+   * fresh on each call: the review must show what would run now.
+   */
+  async getHooks(args: { name: string }): Promise<AgentPluginHooks> {
+    // The hook load and the trust read are two reads: an update from another process between
+    // them could show the old hook as trusted. Bracket both with discovery's journal/epoch gate,
+    // as getComponents does (Codex PRRT_kwDOPxxmWM6rb4Tz).
+    const { hooks, warnings, trust } = await this.readInsideDiscoveryGate(
+      "Plugin files changed during hook review. Refresh the hook review.",
+      async () => ({
+        ...(await this.loadManagedPluginHooks(args.name)),
+        trust: await readPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name)),
+      })
+    );
+    return {
+      hooks: hooks.map((hook) => ({ ...hook, review: reviewStateOf(trust, hook) })),
+      warnings,
+    };
+  }
+
+  /**
+   * Trust or turn off one hook definition (or clear the decision with `state: null`). The caller
+   * passes the hash it reviewed: if the hook changed since, nothing is recorded, so a trust can
+   * never apply to a definition the user did not see.
+   */
+  async setHookTrust(args: {
+    name: string;
+    key: string;
+    hash: string;
+    state: PluginHookTrustState | null;
+  }): Promise<void> {
+    // Under the plugin mutation lock: an overlapping uninstall (in any process) must not delete
+    // the trust file between this check and the write, which would recreate it.
+    return this.runExclusive(async () => {
+      const { hooks } = await this.loadManagedPluginHooks(args.name);
+      const hook = hooks.find((candidate) => candidate.key === args.key);
+      if (hook?.hash !== args.hash) {
+        throw new Error("This hook changed since you reviewed it. Review it again.");
+      }
+      if (args.state === "trusted" && hook.status !== "runnable") {
+        throw new Error("Xum does not run this hook, so it cannot be trusted.");
+      }
+      await setPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name), args);
+    });
+  }
+
+  /**
+   * `name`'s registry row. Strict only for this row: one unparseable row of another plugin (after
+   * a downgrade) must not fail hook review and trust for every plugin (Codex
+   * PRRT_kwDOPxxmWM6rb4T6). A duplicate or unreadable row for this name still fails.
+   */
+  private async findOwnRegistryEntry(name: string): Promise<AgentPluginInstallEntry> {
+    const { rawEntries } = await this.readRegistryDocument("strict");
+    const rows = rawEntries.filter((raw) => this.rawEntryName(raw) === name);
+    if (rows.length > 1) {
+      throw new Error(
+        `The plugin registry (${shortenHome(this.registryFile)}) contains duplicate entries for '${name}'. Repair the file, then retry.`
+      );
+    }
+    const [entry] = this.parseRegistryEntries(rows, "strict");
+    if (rows.length === 1 && entry === undefined) {
+      throw new Error(
+        `The plugin registry entry for '${name}' cannot be read by this version of Xum (written by a newer version, or corrupted).`
+      );
+    }
+    if (entry === undefined) throw new Error(`No managed plugin named '${name}'.`);
+    return entry;
+  }
+
+  /** Run `read` inside discovery's journal/epoch bracket; an overlapping installer move throws. */
+  private async readInsideDiscoveryGate<T>(changedMessage: string, read: () => Promise<T>) {
+    const gate = await journalDerivedDiscoveryGate([this.containerDir]);
+    if (gate.suppressed.length > 0) throw new Error(changedMessage);
+    const value = await read();
+    if ((await gate.confirm()).length > 0) throw new Error(changedMessage);
+    return value;
+  }
+
+  private async loadManagedPluginHooks(name: string) {
+    await this.findOwnRegistryEntry(name);
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: this.targetPathFor(name),
+      scope: "global",
+    });
+    if (plugin === null) throw new Error(`Plugin '${name}' is not readable.`);
+    return loadPluginCodexHooks(plugin);
+  }
+
   async getComponents(args: { name: string }): Promise<AgentPluginComponents> {
     // Inventory must not hold the writer lock over full-tree hashes and deny
     // live MCP admission. Reuse discovery's journal/epoch bracket to reject
     // overlapping installer moves, including a complete rollback or reinstall.
     const gate = await journalDerivedDiscoveryGate([this.containerDir]);
-    const changed = () =>
-      new Error(
-        "Installed plugin files changed during component review. Refresh the component inventory."
-      );
-    if (gate.suppressed.length > 0) throw changed();
+    if (gate.suppressed.length > 0) throw await this.closedComponentReviewError();
     const entry = (await this.readRegistry("strict")).find((entry) => entry.name === args.name);
     if (entry === undefined) throw new Error(`No managed plugin named '${args.name}'.`);
-    const inventory = await this.readInstalledComponents(entry);
-    if ((await gate.confirm()).length > 0) throw changed();
+    const { fingerprints, ...inventory } = await this.readInstalledComponents(entry);
+    assert(fingerprints !== undefined, "installed inventory carries consent fingerprints");
+    if ((await gate.confirm()).length > 0) throw componentsChangedError();
     return inventory;
+  }
+
+  /**
+   * Why the bracket closed a component review. A pending sign-out also closes it, but then no
+   * file changed, and a refresh fails the same way until the sign-out finishes (#6627).
+   */
+  private async closedComponentReviewError(): Promise<Error> {
+    if (!(await this.hasPendingSignOuts())) return componentsChangedError();
+    return new Error(
+      "A plugin MCP sign-out from an update has not finished yet. Plugin components are unavailable until Xum finishes it; check the log for the reason."
+    );
   }
 
   async setComponents(args: {
@@ -2744,12 +3877,15 @@ export class AgentPluginInstallService {
       }
       const importedComponents = this.validateComponentImports(args.importedComponents, inventory);
       // An unchanged legacy import-all selection must keep following future package inventory.
-      const previous = entry.importedComponents ?? {
-        skills: inventory.skills.map((skill) => skill.name),
-        mcpServers: inventory.mcpServers.map((server) => server.serverName),
-      };
+      const previous = entry.importedComponents ?? fullSelection(inventory);
       if (selectionKey(importedComponents) === selectionKey(previous))
         return { data: entry, changed: false };
+      // Only newly added components were shown for consent (#6498 review B1).
+      const componentConsent = consentForSelection({
+        selection: importedComponents,
+        shown: inventory.fingerprints,
+        previous: { selection: previous, consent: entry.componentConsent },
+      });
       await this.writeRegistry(
         envelope,
         rawEntries.map((raw) => {
@@ -2761,10 +3897,11 @@ export class AgentPluginInstallService {
               ...(record.importedComponents as Record<string, unknown>),
               ...importedComponents,
             },
+            componentConsent: mergeRawConsent(record.componentConsent, componentConsent),
           };
         })
       );
-      return { data: { ...entry, importedComponents }, changed: true };
+      return { data: { ...entry, importedComponents, componentConsent }, changed: true };
     });
     if (!changed) return { data };
     // Persist first and release the mutation lock: reconciliation rediscovers current policy.
@@ -2779,7 +3916,179 @@ export class AgentPluginInstallService {
     }
   }
 
+  private get pendingSignOutsFile(): string {
+    return path.join(this.config.rootDir, PENDING_SIGN_OUTS_FILE_NAME);
+  }
+
+  private async readPendingSignOuts(): Promise<string[]> {
+    try {
+      const file = this.pendingSignOutsFile;
+      return parsePendingSignOuts(await fsPromises.readFile(file, "utf-8"), file);
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return [];
+      throw error;
+    }
+  }
+
+  private async writePendingSignOuts(urls: string[]): Promise<void> {
+    if (urls.length === 0) {
+      await fsPromises.rm(this.pendingSignOutsFile, { force: true });
+      return;
+    }
+    await writeFileAtomic(this.pendingSignOutsFile, JSON.stringify({ version: 1, urls }), "utf-8");
+  }
+
+  /**
+   * Adds `urls` to the pending sign-outs and returns the ones this call added. Callers hold the
+   * plugin mutation lock. Throws when the write fails: nothing changed yet, and an unrecorded
+   * sign-out would be lost on a crash.
+   */
+  private async recordPendingSignOuts(urls: string[]): Promise<string[]> {
+    if (urls.length === 0) return [];
+    const pending = await this.readPendingSignOuts();
+    const added = urls.filter((url) => !pending.includes(url));
+    if (added.length > 0) await this.writePendingSignOuts([...pending, ...added]);
+    return added;
+  }
+
+  /**
+   * Removes `urls` from the pending sign-outs: they finished, or the update rolled back before
+   * the new tree was live. Best effort: a leftover URL only signs the server out once more.
+   */
+  private async forgetPendingSignOuts(urls: readonly string[]): Promise<void> {
+    if (urls.length === 0) return;
+    try {
+      const pending = await this.readPendingSignOuts();
+      await this.writePendingSignOuts(pending.filter((url) => !urls.includes(url)));
+    } catch (error) {
+      log.warn("Could not update the pending plugin sign-outs", { error: getErrorMessage(error) });
+    }
+  }
+
+  /** Signs out `urls` after an update; the ones that failed stay pending. */
+  private async signOutAndSettle(name: string, urls: string[]): Promise<void> {
+    const done: string[] = [];
+    for (const serverUrl of urls) {
+      if (await this.signOutPluginServer(name, serverUrl)) done.push(serverUrl);
+    }
+    await this.forgetPendingSignOuts(done);
+  }
+
+  private async signOutPluginServer(name: string, serverUrl: string): Promise<boolean> {
+    const result = await this.mcpOauthService?.logout({ serverUrl });
+    if (result?.success === true) return true;
+    log.warn("Could not sign out a plugin MCP server after its sign-in changed", {
+      plugin: name,
+      error: result?.error ?? "sign-in service unavailable",
+    });
+    return false;
+  }
+
+  /**
+   * Finishes the sign-outs that an update recorded but could not complete (#6122). Runs with
+   * crash recovery and from the discovery gate. Without the sign-in service it does nothing.
+   */
+  /** True when it tried, and sign-outs are left. */
+  private async completePendingSignOuts(): Promise<boolean> {
+    const oauth = this.mcpOauthService;
+    if (oauth === undefined || !(await this.hasPendingSignOuts())) return false;
+    return this.runExclusive(async () => {
+      const left: string[] = [];
+      for (const serverUrl of await this.readPendingSignOuts()) {
+        if (!(await oauth.logout({ serverUrl })).success) left.push(serverUrl);
+      }
+      await this.writePendingSignOuts(left);
+      return left.length > 0;
+    });
+  }
+
+  private hasPendingSignOuts(): Promise<boolean> {
+    return containerHasPendingSignOuts(this.containerDir);
+  }
+
+  /**
+   * Starts a pass that finishes the pending sign-outs, when none runs. The discovery gate never
+   * waits for it: it takes the plugin mutation lock, which an update holds while it stops MCP
+   * servers. The journal bracket keeps the container closed meanwhile.
+   *
+   * The slot is set before any await, so callers that overlap share one pass (#6627). The gate
+   * passes `retryNow: false`: after a pass that left the record it waits
+   * PENDING_SIGN_OUT_RETRY_MS. Startup and section open pass `retryNow: true`: they retry at
+   * once, and when a pass already runs they get one more pass after it, because the running
+   * pass can have read the record before the user's retry.
+   */
+  private startPendingSignOutPass(options: { retryNow: boolean }): void {
+    if (this.signOutPassRunning(options.retryNow) || this.signOutRetryWaits(options.retryNow))
+      return;
+    const pass: Promise<void> = this.runPendingSignOutPass().finally(() =>
+      this.endPendingSignOutPass(pass)
+    );
+    this.pendingSignOutPass = pass;
+  }
+
+  /** True when a pass runs. A `retryNow` caller then asks for one more pass after it. */
+  private signOutPassRunning(retryNow: boolean): boolean {
+    if (this.pendingSignOutPass === undefined) return false;
+    if (retryNow) this.pendingSignOutRerun = true;
+    return true;
+  }
+
+  /** True while the gate's wait after a pass that left the record runs. */
+  private signOutRetryWaits(retryNow: boolean): boolean {
+    return !retryNow && Date.now() < this.pendingSignOutRetryAtMs;
+  }
+
+  /** Resolves once no pass runs, the passes that `retryNow` callers asked for included. */
+  private async settledSignOutPasses(): Promise<void> {
+    // endPendingSignOutPass starts a requested pass before the settled one resolves.
+    while (this.pendingSignOutPass !== undefined) await this.pendingSignOutPass;
+  }
+
+  /** Clears the slot of a settled pass, and starts the pass a `retryNow` caller asked for. */
+  private endPendingSignOutPass(pass: Promise<void>): void {
+    if (this.pendingSignOutPass !== pass) return;
+    this.pendingSignOutPass = undefined;
+    if (!this.pendingSignOutRerun) return;
+    this.pendingSignOutRerun = false;
+    this.startPendingSignOutPass({ retryNow: true });
+  }
+
+  /** One pass: finishes the record, and schedules the next gate retry when it is left. */
+  private async runPendingSignOutPass(): Promise<void> {
+    // A pass before the sign-in service is wired tries nothing, so it sets no wait.
+    const left = await this.completePendingSignOuts().catch((error: unknown) => {
+      // An unreadable record stays: it keeps discovery closed until the user deletes it.
+      log.warn("Could not finish pending plugin sign-outs", { error: getErrorMessage(error) });
+      return true;
+    });
+    this.pendingSignOutRetryAtMs = left ? Date.now() + PENDING_SIGN_OUT_RETRY_MS : 0;
+  }
+
+  private pendingSignOutPass: Promise<void> | undefined;
+  /** See startPendingSignOutPass. */
+  private pendingSignOutRetryAtMs = 0;
+  /** See signOutPassRunning. */
+  private pendingSignOutRerun = false;
+
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */
+  /** The OAuth service is built in a later DI layer than this service. */
+  setMcpOauthService(service: Pick<McpOauthService, "logout" | "credentialKey">): void {
+    this.mcpOauthService = service;
+    // The startup pass ran without this service: finish pending sign-outs now, before the
+    // first agent request scans the container.
+    // Bounded like journal recovery: a hung logout (stalled store I/O) must not hang every
+    // discovery request. On timeout discovery goes on, and the journal bracket keeps the
+    // container closed while the sign-out is still pending.
+    this.startPendingSignOutPass({ retryNow: true });
+    this.pendingSignOutReady = waitForPendingSignOuts(
+      this.settledSignOutPasses(),
+      this.deps.reconciliationTimeoutMs
+    );
+  }
+
+  /** Started by setMcpOauthService. */
+  private pendingSignOutReady: Promise<void> = Promise.resolve();
+
   async list(): Promise<AgentPluginListItem[]> {
     // Section open re-runs crash recovery (the startup pass may have failed
     // or predates recent journals) BEFORE discovery scans the container, so
@@ -2789,6 +4098,7 @@ export class AgentPluginInstallService {
     // wait on this fresh attempt (reconcileJournals serializes internally via
     // runExclusive); a success here re-opens a previously suppressed
     // container.
+    await this.pendingSignOutReady;
     await this.reconciliationState;
     this.reconciliationState = this.attemptReconcileJournals("section open");
     await this.reconciliationState;
@@ -2831,6 +4141,8 @@ export class AgentPluginInstallService {
           ? `plugin.json names itself '${plugin.name}' — the installed name '${entry.name}' stays authoritative.`
           : undefined;
       const description = manifestNameDrift ?? plugin.manifest.description;
+      // The install preview already disclosed logo problems; the row only shows what loads.
+      const openaiInterface = await interfaceSummary(plugin, []);
       items.push({
         name: entry?.name ?? plugin.name,
         managed: entry !== undefined,
@@ -2838,6 +4150,7 @@ export class AgentPluginInstallService {
         location: shortenHome(path.join(plugin.containerPath, plugin.dirName)),
         ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
         ...(description !== undefined ? { description } : {}),
+        ...(openaiInterface !== undefined ? { interface: openaiInterface } : {}),
         ...(entry !== undefined
           ? {
               source: entry.source,
@@ -2857,6 +4170,7 @@ export class AgentPluginInstallService {
         importedMcpServerCount: inventory.mcpServers.filter(
           (server) => selection === undefined || selection.mcpServers.includes(server.serverName)
         ).length,
+        ...reviewRequiredField(entry, inventory.fingerprints),
       });
     }
 
@@ -3065,6 +4379,9 @@ export class AgentPluginInstallService {
         delete commitEnvelope.pendingOverridePrunes;
       }
       try {
+        // Before the commit, so a failure leaves trust cleared (fail closed) rather than kept
+        // for a later install under this name.
+        await removePluginHookTrust(this.config.rootDir, this.instanceIdFor(entry.name));
         await this.writeRegistry(
           commitEnvelope,
           rawRegistry.filter((rawEntry) => this.rawEntryName(rawEntry) !== entry.name)
@@ -3731,6 +5048,10 @@ export class AgentPluginInstallService {
           return { name: entry.name, status: "pinned" };
         }
         try {
+          // Commit-level comparison, also for subpath installs: a monorepo
+          // commit outside the subpath still reads as "update available",
+          // but applying it needs no consent (the staged folder is identical,
+          // so the capability diff is empty).
           // Pass the stored kind: a remote ADDING a same-name branch must
           // not make a still-tracked tag read as "now a branch".
           const resolved = await this.resolveRemoteRef(
@@ -3786,16 +5107,6 @@ export class AgentPluginInstallService {
         `'${entry.name}' is pinned to commit ${entry.lockedSha.slice(0, 12)}; uninstall and reinstall to change it.`
       );
     }
-    if (entry.source.subpath !== undefined) {
-      // The registry schema deliberately preserves subpath entries written
-      // by newer builds (upgrade↔downgrade), but this build clones and
-      // validates only the repository ROOT: updating would swap the
-      // installed subpath snapshot for an unrelated root tree while the
-      // registry keeps claiming the subpath source.
-      throw new Error(
-        `'${entry.name}' was installed from a repository subpath by a newer version of Mux; update it with that version.`
-      );
-    }
     // A retained journal means a previous swap's recovery is unfinished
     // (e.g. the target was occupied by an unidentifiable tree). Refuse
     // BEFORE cloning and comparing capabilities: a new journal would
@@ -3842,9 +5153,11 @@ export class AgentPluginInstallService {
     entry: AgentPluginInstallEntry,
     sha: string
   ): Promise<{ stagedDir: string; plugin: AgentPluginInfo; warnings: string[] }> {
+    // A subpath install tracks the same folder at the new commit; a folder
+    // that disappeared upstream fails here, before any swap.
     const stagedDir = await this.cloneExactSha(entry.source, sha);
     try {
-      const { plugin, warnings } = await this.validateStagedClone(stagedDir);
+      const { plugin, warnings } = await this.validateStagedClone(stagedDir, entry.source.subpath);
       if (plugin.name !== entry.name) {
         // Container-entry names are identity (instanceId, PLUGIN_DATA,
         // workspace overrides hash the path) — never rename on update.
@@ -3865,6 +5178,90 @@ export class AgentPluginInstallService {
    * collectCapabilityChanges). Writes nothing; the UI shows the result and,
    * on confirmation, calls update() with a consent naming these exact SHAs.
    */
+  /**
+   * The imported components of the installed tree whose current fingerprint the user has not
+   * reviewed (#6498), in the update review shape so Settings reuses the update review panel.
+   */
+  async previewComponentReview(args: { name: string }): Promise<AgentPluginUpdateReview> {
+    const entry = (await this.readRegistry("strict")).find((entry) => entry.name === args.name);
+    if (entry === undefined) throw new Error(`No managed plugin named '${args.name}'.`);
+    const { changes, warnings } = await this.unreviewedComponents(entry);
+    return {
+      name: entry.name,
+      fromSha: entry.lockedSha,
+      toSha: entry.lockedSha,
+      changes,
+      warnings,
+    };
+  }
+
+  /**
+   * Record consent for the reviewed components that still match the installed tree. A component
+   * that changed after the review keeps needing review, so consent never covers unseen content.
+   */
+  async confirmComponentReview(args: {
+    name: string;
+    expectedLockedSha: string;
+    reviewed: AgentPluginComponentRef[];
+  }): Promise<{ entry: AgentPluginInstallEntry; cleanupWarning?: string }> {
+    const data = await this.runExclusive(async () => {
+      const { envelope, rawEntries } = await this.readRegistryDocument("strict");
+      const entry = this.parseRegistryEntries(rawEntries, "strict").find(
+        (entry) => entry.name === args.name
+      );
+      if (entry === undefined) throw new Error(`No readable managed plugin named '${args.name}'.`);
+      if (entry.lockedSha !== args.expectedLockedSha)
+        throw new Error("Plugin changed since the review. Review it again.");
+      const { changes } = await this.unreviewedComponents(entry);
+      const componentConsent = consentAfterReview(entry, changes, { reviewed: args.reviewed });
+      await this.writeRegistry(
+        envelope,
+        rawEntries.map((raw) =>
+          this.rawEntryName(raw) === entry.name
+            ? {
+                ...(raw as Record<string, unknown>),
+                componentConsent: mergeRawConsent(
+                  (raw as Record<string, unknown>).componentConsent,
+                  componentConsent
+                ),
+              }
+            : raw
+        )
+      );
+      return { ...entry, componentConsent };
+    });
+    // Newly consented servers can start: reconcile after the lock, like setComponents. The
+    // consent is committed, so a reconcile failure is a warning, not a failed review.
+    try {
+      await this.deps.mcpServerManager?.reconcilePluginComponents();
+      return { entry: data };
+    } catch (error) {
+      const cleanupWarning = `Review saved, but MCP servers need a restart to apply it: ${getErrorMessage(error)}`;
+      log.warn(cleanupWarning, { name: args.name });
+      return { entry: data, cleanupWarning };
+    }
+  }
+
+  /** Review rows for imported components without a matching consent record. */
+  private async unreviewedComponents(
+    entry: AgentPluginInstallEntry
+  ): Promise<{ changes: AgentPluginCapabilityChange[]; warnings: string[] }> {
+    const targetPath = this.targetPathFor(entry.name);
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: targetPath, scope: "global" });
+    if (plugin === null || plugin.name !== entry.name)
+      throw new Error(`Installed plugin '${entry.name}' is missing or invalid.`);
+    const warnings: string[] = [];
+    const surface = await this.capabilitySurface(
+      plugin,
+      this.instanceIdFor(entry.name),
+      targetPath,
+      warnings
+    );
+    const changes = unreviewedRows(entry, surface);
+    assertReviewFits(changes);
+    return { changes, warnings };
+  }
+
   async previewUpdate(args: { name: string }): Promise<AgentPluginUpdateReview> {
     return this.runExclusive(async () => {
       const { entry, resolved } = await this.resolveUpdateTarget(args.name);
@@ -3935,6 +5332,9 @@ export class AgentPluginInstallService {
       }
 
       const { stagedDir, plugin } = await this.stageUpdate(entry, targetSha);
+      // Sign-outs this update recorded, and whether its tree went live (see the catch below).
+      let recordedSignOuts: string[] = [];
+      let promoted = false;
       try {
         const targetPath = this.targetPathFor(entry.name);
         // Security: an update must not silently expand what the plugin can
@@ -3943,12 +5343,26 @@ export class AgentPluginInstallService {
         // capability surface against the installed tree; changes need a
         // consent from previewUpdate naming this exact (from, to) pair,
         // which the user gave after seeing every change.
-        const changes = await this.collectCapabilityChanges(entry.name, targetPath, plugin, []);
+        const signInResets: string[] = [];
+        const changes = await this.collectCapabilityChanges(
+          entry.name,
+          targetPath,
+          plugin,
+          [],
+          signInResets
+        );
+        // Only changes the user saw at these fingerprints get consent records (#6498).
+        const componentConsent = consentAfterReview(entry, changes, args.consent);
         if (changes.length > 0 && args.consent === undefined) {
           throw new Error(
             `The update to '${entry.name}' ${changes.map((change) => change.summary).join("; ")}. Updates cannot expand a plugin's capabilities without review — open Settings → Plugins and review the update to confirm it.`
           );
         }
+
+        // Record the sign-outs before anything changes: a crash, or a store write that fails
+        // after the swap, leaves them for the next start (#6122).
+        const resets = [...new Set(signInResets)];
+        recordedSignOuts = await this.recordPendingSignOuts(resets);
 
         await this.removeDir(path.join(stagedDir, ".git"));
 
@@ -4013,6 +5427,7 @@ export class AgentPluginInstallService {
           }
           throw error;
         }
+        promoted = true;
         // The new tree is live. Consume the JOURNAL before the marker, and
         // ENFORCE that ordering: a markerless target with the journal still
         // present is exactly the state recovery must treat as an unidentified
@@ -4082,6 +5497,7 @@ export class AgentPluginInstallService {
           ...entry,
           lockedSha: targetSha,
           updatedAt: new Date().toISOString(),
+          componentConsent,
           manifest: {
             ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
             ...(plugin.manifest.description !== undefined
@@ -4125,6 +5541,7 @@ export class AgentPluginInstallService {
                 lockedSha: updated.lockedSha,
                 updatedAt: updated.updatedAt,
                 manifest: { ...preservedManifest, ...updated.manifest },
+                componentConsent: mergeRawConsent(rawRecord.componentConsent, componentConsent),
               };
             })
           );
@@ -4138,6 +5555,12 @@ export class AgentPluginInstallService {
           // replaced tree. Servers restart on next use; default-disabled
           // state and workspace overrides are untouched (identity is the
           // lexical path).
+          // The new tree is in place: tokens issued to the old sign-in
+          // identity (client, endpoints, issuer, resource, scopes) must not be
+          // refreshed with the new client. Signed out, the server asks again.
+          // Runs BEFORE the final stop, so a startup that raced the sign-out
+          // is invalidated too, and a failing stop cannot skip it.
+          await this.signOutAndSettle(entry.name, resets);
           await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
         }
 
@@ -4145,6 +5568,11 @@ export class AgentPluginInstallService {
           `Updated agent plugin '${entry.name}' ${entry.lockedSha.slice(0, 12)} → ${targetSha.slice(0, 12)}`
         );
         return updated;
+      } catch (error) {
+        // Failed before the new tree went live: the old sign-in still applies, so the recorded
+        // sign-outs must not run at the next start.
+        if (!promoted) await this.forgetPendingSignOuts(recordedSignOuts);
+        throw error;
       } finally {
         await this.removeDir(stagedDir);
       }

@@ -467,6 +467,7 @@ async function discardInactiveCache(cachePath: string): Promise<void> {
     await discardBackupCache(cachePath);
   } finally {
     cacheReapClaims.delete(cacheName);
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     releaseClaim!();
   }
 }

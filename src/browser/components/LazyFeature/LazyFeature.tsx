@@ -8,6 +8,11 @@ interface LazyFeatureProps {
   name: string;
   /** Shown while the feature's chunk loads. Reserve the feature's box to avoid layout shift. */
   fallback?: ReactNode;
+  /**
+   * Wraps the loading and the failure fallback. For a page-level boundary: the loaded page holds
+   * the one `main` landmark, so these states must hold it too (#6017, #6025).
+   */
+  frame?: (state: ReactNode, kind: "loading" | "failed") => ReactNode;
   children: ReactNode;
 }
 
@@ -33,9 +38,13 @@ function ReloadFallback(props: { name: string }) {
  * Electron loads chunks from its installed files, so it is not expected to hit this.
  */
 export function LazyFeature(props: LazyFeatureProps) {
+  const frame = props.frame ?? ((state: ReactNode) => state);
   return (
-    <ErrorBoundary workspaceInfo={props.name} fallback={<ReloadFallback name={props.name} />}>
-      <Suspense fallback={props.fallback ?? null}>{props.children}</Suspense>
+    <ErrorBoundary
+      workspaceInfo={props.name}
+      fallback={frame(<ReloadFallback name={props.name} />, "failed")}
+    >
+      <Suspense fallback={frame(props.fallback ?? null, "loading")}>{props.children}</Suspense>
     </ErrorBoundary>
   );
 }

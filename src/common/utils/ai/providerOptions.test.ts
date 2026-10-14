@@ -37,6 +37,47 @@ void mock.module("@/node/services/log", () => ({
   },
 }));
 
+describe("Meta Responses options", () => {
+  test.each(["off", "low", "medium", "high", "xhigh", "max"] as const)(
+    "preserves the supported effort for %s without leaking OpenAI-only controls",
+    (thinking) => {
+      const options = buildProviderOptions(
+        "meta:muse-wonder-1.0",
+        thinking,
+        undefined,
+        undefined,
+        { openai: { serviceTier: "priority", store: true, wireFormat: "chatCompletions" } },
+        "workspace-id"
+      );
+      expect(options).toEqual({
+        openai: {
+          forceReasoning: true,
+          store: false,
+          include: ["reasoning.encrypted_content"],
+          reasoningEffort: thinking === "off" ? "low" : thinking,
+          reasoningSummary: "auto",
+        },
+      });
+    }
+  );
+
+  test("uses gateway options rather than direct Meta options when routed through OpenRouter", () => {
+    const options = buildProviderOptions(
+      "meta:muse-wonder-1.0",
+      "high",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "openrouter"
+    );
+    expect(options).toHaveProperty("openrouter.reasoning.effort", "high");
+    expect(options).not.toHaveProperty("openai");
+  });
+});
+
 function createMockProvidersConfig(mappings: Record<string, string>): ProvidersConfigMap {
   const config: ProvidersConfigMap = {};
 
@@ -62,6 +103,12 @@ function createMockProvidersConfig(mappings: Record<string, string>): ProvidersC
 }
 
 describe("resolveProviderOptionsNamespaceKey", () => {
+  test("maps direct Meta extras to OpenAI while preserving transforming gateway namespaces", () => {
+    expect(resolveProviderOptionsNamespaceKey("meta")).toBe("openai");
+    expect(resolveProviderOptionsNamespaceKey("meta", "meta")).toBe("openai");
+    expect(resolveProviderOptionsNamespaceKey("meta", "openrouter")).toBe("openrouter");
+  });
+
   test("returns the canonical provider for direct routing", () => {
     expect(resolveProviderOptionsNamespaceKey("openai")).toBe("openai");
   });

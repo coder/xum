@@ -657,6 +657,26 @@ describe("TOOL_DEFINITIONS", () => {
     expect(parsed.success).toBe(false);
   });
 
+  it("accepts <plugin>:<skill> on the skill read tools but keeps writes bare", () => {
+    // Tool tests call execute() directly, so only this schema check sees what the model may send.
+    expect(TOOL_DEFINITIONS.agent_skill_read.schema.safeParse({ name: "pstack:tdd" }).success).toBe(
+      true
+    );
+    expect(
+      TOOL_DEFINITIONS.agent_skill_read_file.schema.safeParse({
+        name: "pstack:tdd",
+        filePath: "SKILL.md",
+      }).success
+    ).toBe(true);
+    expect(
+      TOOL_DEFINITIONS.agent_skill_write.schema.safeParse({
+        name: "pstack:tdd",
+        filePath: "SKILL.md",
+        content: "x",
+      }).success
+    ).toBe(false);
+  });
+
   it("always includes global skill management tools", () => {
     const tools = getAvailableTools("openai:gpt-4o");
 
@@ -854,7 +874,7 @@ describe("TOOL_DEFINITIONS", () => {
     expect(enabledTools).toContain("workflow_resume");
   });
 
-  it("gates native Google tools to Gemini 3 models", () => {
+  it("gates native Google tools to Gemini 3 models and Gemini 4 Argon", () => {
     expect(getAvailableTools("google:gemini-2.5-pro")).not.toContain("google_search");
     expect(getAvailableTools("google:gemini-2.5-pro")).not.toContain("url_context");
     expect(getAvailableTools("google:gemini-4-pro")).not.toContain("google_search");
@@ -864,6 +884,7 @@ describe("TOOL_DEFINITIONS", () => {
       "google:gemini-3.1-pro-preview",
       "google:gemini-3.5-flash",
       "google:models/gemini-3.5-flash",
+      "google:gemini-4-argon",
     ]) {
       const tools = getAvailableTools(modelString);
       expect(tools).toContain("google_search");

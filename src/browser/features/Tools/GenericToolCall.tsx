@@ -27,11 +27,15 @@ import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
+  markMcpAppViewHosted,
   mcpAppViewRefFor,
-  openMcpAppView,
+  openMcpAppViewTab,
+  useMcpAppViewFullscreenOnly,
   type McpAppViewRef,
 } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
 import { McpAppFrame } from "@/browser/features/RightSidebar/ArtifactsTab/McpAppFrame";
+import { useMcpAppViewInTab } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
+import { AppViewInTabNotice } from "@/browser/features/RightSidebar/AppViewTab/AppViewTab";
 
 interface GenericToolCallProps {
   toolName: string;
@@ -58,31 +62,41 @@ function useMcpAppViewsSupported(): boolean {
 }
 
 /**
- * Tools that declare a ui:// view get an action that opens it in the Artifacts tab. Own
- * component so plain rows keep their exact previous render tree.
+ * Tools that declare a ui:// view get an action that opens it in its own right-sidebar tab (or
+ * focuses that tab). Own component so plain rows keep their exact previous render tree.
  */
 const OpenMcpAppViewButton: React.FC<{ workspaceId: string; view: McpAppViewRef }> = (props) => {
   if (!useMcpAppViewsSupported()) return null;
   // Narrow cards (phones, a narrow chat) show the icon only, so the action never pushes the
   // header past the card's right edge.
   return (
-    <TooltipIfPresent tooltip="Open in Artifacts">
+    <TooltipIfPresent tooltip="Open in tab">
       <button
         type="button"
-        aria-label="Open in Artifacts"
+        aria-label="Open in tab"
         onClick={(e) => {
           // The header toggles expansion; this action must not.
           e.stopPropagation();
-          openMcpAppView(props.workspaceId, props.view);
+          openMcpAppViewTab(props.workspaceId, props.view);
         }}
         className="text-muted hover:text-foreground focus-visible:ring-accent ml-auto inline-flex shrink-0 items-center gap-1 rounded text-[11px] focus-visible:ring-1"
       >
         <AppWindow className="h-3 w-3" />
-        <span className="hidden @[32rem]:inline">Open in Artifacts</span>
+        <span className="hidden @[32rem]:inline">Open in tab</span>
       </button>
     </TooltipIfPresent>
   );
 };
+
+/**
+ * Whether the card shows the "Open in tab" placeholder instead of a frame: while the view's tab
+ * has it, or always once the view turned out to be fullscreen only.
+ */
+function useMcpAppViewHostedElsewhere(workspaceId: string, toolCallId: string): boolean {
+  const inTab = useMcpAppViewInTab(workspaceId, toolCallId, ["tab"]);
+  const fullscreenOnly = useMcpAppViewFullscreenOnly(workspaceId, toolCallId);
+  return inTab || fullscreenOnly;
+}
 
 /**
  * Expanded body of a call with an app view: the view itself (the spec's inline display mode),
@@ -97,10 +111,25 @@ const McpAppToolDetails: React.FC<{
 }> = (props) => {
   // A failed call's error is in the raw output: show it without a click.
   const [showRaw, setShowRaw] = React.useState(props.view.failed);
-  if (!useMcpAppViewsSupported()) return <ToolDetails>{props.raw}</ToolDetails>;
+  const elsewhere = useMcpAppViewHostedElsewhere(props.workspaceId, props.view.toolCallId);
+  const supported = useMcpAppViewsSupported();
+  const { workspaceId, view } = props;
+  // An expanded card is where the view goes back to on inline (ui/request-display-mode).
+  React.useEffect(() => {
+    if (!supported) return;
+    return markMcpAppViewHosted(workspaceId, view.toolCallId, "card");
+  }, [supported, workspaceId, view.toolCallId]);
+  if (!supported) return <ToolDetails>{props.raw}</ToolDetails>;
   return (
     <ToolDetails>
-      <McpAppFrame workspaceId={props.workspaceId} view={props.view} variant="inline" />
+      {elsewhere ? (
+        // One live instance per view: while its tab has it, the card shows this
+        // instead of a second frame. Closing the tab brings the view back here, unless the
+        // view declared fullscreen only: it is never hosted inline, so the card keeps this.
+        <AppViewInTabNotice workspaceId={props.workspaceId} view={props.view} />
+      ) : (
+        <McpAppFrame workspaceId={props.workspaceId} view={props.view} variant="inline" />
+      )}
       <button
         type="button"
         aria-expanded={showRaw}

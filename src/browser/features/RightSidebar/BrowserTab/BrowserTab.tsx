@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent }
 import { Check, ChevronDown, Globe2, Loader2, Play, TriangleAlert } from "lucide-react";
 import { useAPI } from "@/browser/contexts/API";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { getBrowserSelectedSessionKey } from "@/common/constants/storage";
 import { cn } from "@/common/lib/utils";
@@ -29,7 +30,7 @@ interface BrowserTabProps {
 const STATUS_BADGES: Record<BrowserSessionStatus, { label: string; className: string }> = {
   starting: {
     label: "Connecting",
-    className: "border-accent/30 bg-accent/10 text-accent",
+    className: "border-accent/30 bg-accent/10 text-accent-text",
   },
   live: {
     label: "Live",
@@ -51,11 +52,11 @@ const DISCOVERY_BADGES: Record<
 > = {
   attachable: {
     label: "Ready",
-    className: "border-accent/30 bg-accent/10 text-accent",
+    className: "border-accent/30 bg-accent/10 text-accent-text",
   },
   missing_stream: {
     label: "Activating",
-    className: "border-accent/30 bg-accent/10 text-accent",
+    className: "border-accent/30 bg-accent/10 text-accent-text",
   },
 };
 
@@ -119,6 +120,10 @@ export function chooseExplicitOtherSession(
 
 function matchesBrowserPageTabRef(tab: BrowserPageTab, tabRef: string | null): boolean {
   return tabRef != null && tab.tabId === tabRef;
+}
+
+function errorMessageOr(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
 }
 
 function areBrowserPageTabsEqual(first: BrowserPageTab[], second: BrowserPageTab[]): boolean {
@@ -186,9 +191,8 @@ export function BrowserTab(props: BrowserTabProps) {
 
   useEffect(() => {
     if (api == null) {
+      // Keep the discovered sessions through a reconnect: the new client re-lists them.
       setDiscoveryError("Browser API client is unavailable.");
-      setDiscoveredSessions([]);
-      setOtherDiscoveredSessions([]);
       return;
     }
 
@@ -216,15 +220,14 @@ export function BrowserTab(props: BrowserTabProps) {
           chooseSelectedSession(currentSessionName, result.sessions)
         );
       } catch (error) {
-        if (cancelled) {
+        // A lost connection is not a discovery failure; the next client re-lists the sessions.
+        if (cancelled || isConnectionLostError(error)) {
           return;
         }
 
         // Preserve the last known discovery result so transient refresh failures do not
         // tear down an otherwise healthy browser bridge.
-        setDiscoveryError(
-          error instanceof Error ? error.message : "Failed to discover browser sessions."
-        );
+        setDiscoveryError(errorMessageOr(error, "Failed to discover browser sessions."));
       } finally {
         discoveryRefreshInFlightRef.current = false;
       }
@@ -243,11 +246,22 @@ export function BrowserTab(props: BrowserTabProps) {
   }, [api, props.workspaceId, setSelectedCurrentSessionName]);
 
   useEffect(() => {
-    if (
-      api == null ||
-      selectedSessionName == null ||
-      selectedDiscoveredSessionStatus !== "attachable"
-    ) {
+    // Another session never shows the previous session's tabs, even without a client: picking a
+    // kept discovered session while Xum reconnects clears the strip at once.
+    if (pageTabsSessionNameRef.current !== selectedSessionName) {
+      pageTabsSessionNameRef.current = selectedSessionName;
+      setPageTabs((currentTabs) => (currentTabs.length === 0 ? currentTabs : []));
+      setPageTabsError(null);
+      pendingTabIdRef.current = null;
+      setPendingTabId(null);
+    }
+    // Without a client (a reconnect), keep the tab strip of the selected session as it is: the
+    // new client re-lists its tabs.
+    if (api == null) {
+      tabRefreshInFlightSessionNameRef.current = null;
+      return;
+    }
+    if (selectedSessionName == null || selectedDiscoveredSessionStatus !== "attachable") {
       tabRefreshInFlightSessionNameRef.current = null;
       pageTabsSessionNameRef.current = null;
       setPageTabs((currentTabs) => (currentTabs.length === 0 ? currentTabs : []));
@@ -258,13 +272,6 @@ export function BrowserTab(props: BrowserTabProps) {
     }
 
     let cancelled = false;
-    if (pageTabsSessionNameRef.current !== selectedSessionName) {
-      pageTabsSessionNameRef.current = selectedSessionName;
-      setPageTabs((currentTabs) => (currentTabs.length === 0 ? currentTabs : []));
-      setPageTabsError(null);
-      pendingTabIdRef.current = null;
-      setPendingTabId(null);
-    }
 
     const refreshTabs = async (): Promise<void> => {
       if (tabRefreshInFlightSessionNameRef.current === selectedSessionName) {
@@ -298,14 +305,12 @@ export function BrowserTab(props: BrowserTabProps) {
         );
         setPageTabsError(null);
       } catch (error) {
-        if (cancelled) {
+        if (cancelled || isConnectionLostError(error)) {
           return;
         }
 
         setPageTabsError(
-          error instanceof Error
-            ? error.message
-            : `Failed to list browser tabs for session "${selectedSessionName}".`
+          errorMessageOr(error, `Failed to list browser tabs for session "${selectedSessionName}".`)
         );
       } finally {
         if (tabRefreshInFlightSessionNameRef.current === selectedSessionName) {
@@ -695,7 +700,7 @@ function BrowserPageTabStripButton(props: {
       <span
         className={cn(
           "flex h-4.5 w-4.5 shrink-0 items-center justify-center rounded",
-          props.tab.active ? "bg-accent/15 text-accent" : "bg-background-tertiary text-muted"
+          props.tab.active ? "bg-accent/15 text-accent-text" : "bg-background-tertiary text-muted"
         )}
       >
         {isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : <Globe2 className="h-3 w-3" />}
@@ -882,7 +887,7 @@ function BrowserSessionPickerOption(props: {
         )}
       </span>
       {props.session.status === "missing_stream" && (
-        <span className="text-accent mt-0.5 shrink-0 text-[10px]">Activating</span>
+        <span className="text-accent-text mt-0.5 shrink-0 text-[10px]">Activating</span>
       )}
     </button>
   );
@@ -942,7 +947,7 @@ function BrowserViewerState(props: {
     <div className="flex h-full items-center justify-center p-6">
       <div className="flex max-w-sm flex-col items-center gap-3 text-center">
         <div className="bg-accent/10 flex h-12 w-12 items-center justify-center rounded-full">
-          <Play className="text-accent h-6 w-6" />
+          <Play className="text-accent-text h-6 w-6" />
         </div>
         <div className="space-y-1">
           <h4 className="text-foreground text-sm font-medium">{content.title}</h4>

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUpRight, BookOpen } from "lucide-react";
 
 import { ChatInputDecoration } from "@/browser/components/ChatPane/ChatInputDecoration";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import {
   type AdditionalSystemContextSnapshot,
   getAdditionalSystemContextFocusGeneration,
@@ -14,6 +14,7 @@ import {
   useAdditionalSystemContextSnapshot,
 } from "@/browser/utils/additionalSystemContextStore";
 import { focusInstructionsTab } from "@/browser/utils/instructionsTabFocus";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -40,6 +41,11 @@ interface ScratchpadState {
   content: string;
   enabled: boolean;
   loading: boolean;
+  /**
+   * Editing is off while the text loads, and while there is no live connection to save to (the
+   * editor keeps showing the text).
+   */
+  disabled: boolean;
   /** True once the save has been in flight longer than the indicator delay. */
   savingVisible: boolean;
   error: string | null;
@@ -47,15 +53,78 @@ interface ScratchpadState {
   setEnabled: (enabled: boolean) => void;
 }
 
-export function useChatInstructions(workspaceId: string): ScratchpadState {
+/**
+ * Loads the workspace's instructions into the store; returns whether the first load is pending.
+ *
+ * A re-run for the shown workspace (a new API client after a reconnect) keeps the editor as it
+ * is: it does not flash "Loading…" or take focus from the textarea. A local edit the backend has
+ * not settled (`dirtyRef`) is not replaced by the load.
+ */
+function useChatInstructionsLoad(
+  workspaceId: string,
+  dirtyRef: { current: boolean },
+  setError: (error: string | null) => void
+): boolean {
   const { api } = useAPI();
-  const snapshot = useAdditionalSystemContextSnapshot(workspaceId);
   const [loading, setLoading] = useState(true);
+  // The workspace whose instructions the editor shows (loaded, or failed to load).
+  const loadedWorkspaceIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (loadedWorkspaceIdRef.current !== workspaceId) {
+      loadedWorkspaceIdRef.current = null;
+      dirtyRef.current = false;
+      setLoading(true);
+    }
+    setError(null);
+
+    if (!api) return;
+
+    const loadVersion = getAdditionalSystemContextVersion(workspaceId);
+    // Set by the cleanup, which also runs on unmount.
+    let cancelled = false;
+    api.workspace
+      .getAdditionalSystemContext({ workspaceId })
+      .then((result) => {
+        if (cancelled) return;
+        if (!dirtyRef.current && getAdditionalSystemContextVersion(workspaceId) === loadVersion) {
+          updateAdditionalSystemContextSnapshot(workspaceId, {
+            content: result.content,
+            enabled: result.enabled,
+          });
+        }
+        setLoading(false);
+        loadedWorkspaceIdRef.current = workspaceId;
+      })
+      .catch((err) => {
+        // A lost connection is not a load error: keep the editor as it is for the next client.
+        if (cancelled || isConnectionLostError(err)) return;
+        setError(getErrorMessage(err));
+        setLoading(false);
+        loadedWorkspaceIdRef.current = workspaceId;
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [api, workspaceId, dirtyRef, setError]);
+
+  return loading;
+}
+
+export function useChatInstructions(workspaceId: string): ScratchpadState {
+  // Saves need a live connection. While Xum reconnects the editor keeps showing the text but is
+  // read-only, so no edit waits for a later client.
+  const liveApi = useLiveAPI();
+  const snapshot = useAdditionalSystemContextSnapshot(workspaceId);
   const [savingVisible, setSavingVisible] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // An edit the backend has not settled yet: a load must not replace it. A failed save settles
+  // it too, so a later reload shows what the backend stored.
   const dirtyRef = useRef(false);
   const mountedRef = useRef(true);
   const savingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const loading = useChatInstructionsLoad(workspaceId, dirtyRef, setError);
 
   const clearSavingTimer = () => {
     if (savingTimerRef.current != null) {
@@ -72,45 +141,17 @@ export function useChatInstructions(workspaceId: string): ScratchpadState {
     };
   }, []);
 
+  // Another workspace starts without the previous one's "Saving…".
   useEffect(() => {
-    dirtyRef.current = false;
-    setLoading(true);
     setSavingVisible(false);
     clearSavingTimer();
-    setError(null);
-
-    if (!api) return;
-
-    const loadVersion = getAdditionalSystemContextVersion(workspaceId);
-    let cancelled = false;
-    api.workspace
-      .getAdditionalSystemContext({ workspaceId })
-      .then((result) => {
-        if (cancelled || !mountedRef.current) return;
-        if (!dirtyRef.current && getAdditionalSystemContextVersion(workspaceId) === loadVersion) {
-          updateAdditionalSystemContextSnapshot(workspaceId, {
-            content: result.content,
-            enabled: result.enabled,
-          });
-        }
-        setLoading(false);
-      })
-      .catch((err) => {
-        if (cancelled || !mountedRef.current) return;
-        setError(getErrorMessage(err));
-        setLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api, workspaceId]);
+  }, [workspaceId]);
 
   const queue = useCallback(
     (next: AdditionalSystemContextSnapshot) => {
+      if (!liveApi) return;
       dirtyRef.current = true;
       updateAdditionalSystemContextSnapshot(workspaceId, next);
-      if (!api) return;
       setError(null);
       // Only show the "Saving…" message if the save takes more than a beat —
       // sub-second writes shouldn't flicker the UI on every keystroke.
@@ -119,19 +160,20 @@ export function useChatInstructions(workspaceId: string): ScratchpadState {
         if (mountedRef.current) setSavingVisible(true);
         savingTimerRef.current = null;
       }, SAVING_INDICATOR_DELAY_MS);
-      queueAdditionalSystemContextSave(api, workspaceId, next, {
+      queueAdditionalSystemContextSave(liveApi, workspaceId, next, {
         onError: (err) => {
           if (!mountedRef.current) return;
           setError(getErrorMessage(err));
         },
         onIdle: () => {
+          dirtyRef.current = false;
           if (!mountedRef.current) return;
           clearSavingTimer();
           setSavingVisible(false);
         },
       });
     },
-    [api, workspaceId]
+    [liveApi, workspaceId]
   );
 
   const setContent = useCallback(
@@ -152,6 +194,7 @@ export function useChatInstructions(workspaceId: string): ScratchpadState {
     content: snapshot.content,
     enabled: snapshot.enabled,
     loading,
+    disabled: loading || liveApi == null,
     savingVisible,
     error,
     setContent,
@@ -229,7 +272,7 @@ export function ChatInstructionsEditor(props: ChatInstructionsEditorProps) {
           props.textareaClassName
         )}
         aria-label={`${CHAT_INSTRUCTIONS_LABEL} editor`}
-        disabled={state.loading}
+        disabled={state.disabled}
       />
       <div className="text-muted flex min-h-4 items-center justify-between gap-2 text-[10px]">
         <label className="flex cursor-pointer items-center gap-1.5 select-none">
@@ -237,7 +280,7 @@ export function ChatInstructionsEditor(props: ChatInstructionsEditorProps) {
             type="checkbox"
             className="accent-[var(--color-accent)]"
             checked={state.enabled}
-            disabled={state.loading}
+            disabled={state.disabled}
             onChange={(event) => state.setEnabled(event.currentTarget.checked)}
             aria-label="Enable Chat Instructions"
           />

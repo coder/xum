@@ -21,6 +21,7 @@ import { ChatHarness } from "../harness";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getAgentsInitNudgeKey, getDraftScopeId } from "@/common/constants/storage";
+import { BRANCH_LIST_TIMEOUT_MS } from "@/browser/features/ChatInput/branchListLoad";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -145,6 +146,20 @@ async function openCreationViewWhileBranchesLoad(
   );
 }
 
+const BRANCH_LIST_FAILED = "Could not load branches";
+
+function runInitButtonNow(container: HTMLElement): HTMLButtonElement | null {
+  return container.querySelector<HTMLButtonElement>('[data-testid="agents-init-run"]');
+}
+
+function workspaceTypeLabel(container: HTMLElement): string {
+  return (
+    container.querySelector(
+      '[data-component="RuntimeTypeGroup"] button[aria-label="Workspace type"]'
+    )?.textContent ?? ""
+  );
+}
+
 async function openCreationViewWithHeldBranches(options?: {
   showAgentsInitBanner?: boolean;
   apiClient?: ReturnType<typeof getSharedEnv>["orpc"];
@@ -208,45 +223,96 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
     }
   }, 90_000);
 
-  // The ProjectPage "Run /init" banner sends through the composer's send() once. While the branch
-  // list loads that send is refused like any other: /init stays in the composer and is sent only
-  // when the user presses Send. Nothing sends later on its own (tracked as a follow-up).
-  test("Run /init clicked while the branches load sends nothing until the user presses Send", async () => {
-    const availability = holdRuntimeAvailability(getSharedEnv().orpc);
-    const { view, cleanupDom, chat, held, create } = await openCreationViewWithHeldBranches({
+  // #6038: the ProjectPage "Run /init" banner sends through the composer's send() once, so it stays
+  // off while the composer cannot send (the branch list loads). Once on, a click sends at once.
+  test("Run /init is off while the branches load, then a click sends /init at once", async () => {
+    const { view, cleanupDom, held, create } = await openCreationViewWithHeldBranches({
       showAgentsInitBanner: true,
-      apiClient: availability.client,
     });
     try {
-      fireEvent.click(await runInitButton(view.container));
-      await chat.expectInputValue("/init");
+      const runInit = await runInitButton(view.container);
+      expect(runInit.disabled).toBe(true);
+      fireEvent.click(runInit);
       expect(create).not.toHaveBeenCalled();
 
-      // Neither request completing sends on its own: branches first, then the runtime probe.
       held.release();
-      await waitFor(() => expect(sendButton(view.container).disabled).toBe(false), {
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(false), {
         timeout: 10_000,
       });
-      availability.release();
-      await availability.allAnswered();
-      // A negative check needs a settle window: give React a few frames to commit the probe result.
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      expect(create).not.toHaveBeenCalled();
-      await chat.expectInputValue("/init");
-
-      // An explicit Send submits /init once.
-      fireEvent.click(sendButton(view.container));
+      fireEvent.click(runInitButtonNow(view.container)!);
       await waitFor(() => expect(create).toHaveBeenCalledTimes(1), { timeout: 30_000 });
       const trunkBranch = create.mock.calls[0]?.[2];
       expect(typeof trunkBranch === "string" && trunkBranch.length > 0).toBe(true);
     } finally {
-      availability.release();
       held.release();
       held.spy.mockRestore();
       create.mockRestore();
       await cleanupView(view, cleanupDom);
     }
   }, 90_000);
+
+  // #6055: a failed branch list is not an empty one. It must not make the git project look like a
+  // non-git one, which silently switched the runtime to Local and created a Local workspace.
+  test("a failed branch list says so and keeps a worktree send off, with no switch to Local", async () => {
+    const env = getSharedEnv();
+    const cleanupDom = setupTestDom();
+    const view = renderApp({ apiClient: env.orpc });
+    const projectPath = await addProjectViaUI(view, getSharedRepoPath());
+    const reject = jest
+      .spyOn(env.services.projectService, "listBranches")
+      .mockRejectedValue(new Error("git for-each-ref failed"));
+    const create = jest.spyOn(env.services.workspaceService, "create");
+    try {
+      await openCreationViewWhileBranchesLoad(view, projectPath);
+      await waitFor(() => expect(reject).toHaveBeenCalled(), { timeout: 10_000 });
+      const draftId = await waitForLatestDraftId(projectPath);
+      const scope: DraftScope = { kind: "creation", projectPath, draftId };
+      const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), scope);
+      await chat.typeWithoutSending("hello after a failed branch list");
+
+      await waitFor(() => expect(view.container.textContent ?? "").toContain(BRANCH_LIST_FAILED), {
+        timeout: 10_000,
+      });
+      expect(sendButton(view.container).disabled).toBe(true);
+      fireEvent.click(sendButton(view.container));
+      const textarea = view.container.querySelector<HTMLTextAreaElement>(
+        'textarea[aria-label="Message"]'
+      )!;
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      // A negative check needs a settle window: give a send a chance to reach the backend.
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect(create).not.toHaveBeenCalled();
+      expect(workspaceTypeLabel(view.container)).toContain("Worktree");
+    } finally {
+      reject.mockRestore();
+      create.mockRestore();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  // The same failure with a list that never settles: the view gives up after the bound.
+  test(
+    "a branch list that hangs past the bound says so",
+    async () => {
+      const { view, cleanupDom, held, create } = await openCreationViewWithHeldBranches();
+      try {
+        await waitFor(
+          () => expect(view.container.textContent ?? "").toContain(BRANCH_LIST_FAILED),
+          {
+            timeout: BRANCH_LIST_TIMEOUT_MS + 10_000,
+          }
+        );
+        expect(sendButton(view.container).disabled).toBe(true);
+        expect(create).not.toHaveBeenCalled();
+      } finally {
+        held.release();
+        held.spy.mockRestore();
+        create.mockRestore();
+        await cleanupView(view, cleanupDom);
+      }
+    },
+    BRANCH_LIST_TIMEOUT_MS + 60_000
+  );
 
   test("Run /init clicked after the branches load sends /init at once", async () => {
     const { view, cleanupDom, held, create } = await openCreationViewWithHeldBranches({
@@ -313,6 +379,98 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
       await waitFor(() => expect(create).toHaveBeenCalled(), { timeout: 30_000 });
       expect(held.spy.mock.results.length).toBeGreaterThan(0);
     } finally {
+      held.release();
+      held.spy.mockRestore();
+      create.mockRestore();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  // #6423: "Run /init" sends through the creation composer once, so it stays off whenever that
+  // composer's Send is off, not only while the branch list loads.
+  test("Run /init is off while the Coder presets load", async () => {
+    const env = getSharedEnv();
+    const coder = env.services.coderService;
+    let releasePresets: () => void = () => undefined;
+    const presetsHeld = new Promise<void>((resolve) => {
+      releasePresets = resolve;
+    });
+    const spies = [
+      jest
+        .spyOn(coder, "getCoderInfo")
+        .mockResolvedValue({ state: "available", version: "2.30.0" }),
+      jest.spyOn(coder, "listTemplates").mockResolvedValue({
+        ok: true,
+        templates: [{ name: "dev", displayName: "Dev", organizationName: "default" }],
+      }),
+      jest.spyOn(coder, "listWorkspaces").mockResolvedValue({ ok: true, workspaces: [] }),
+    ];
+    const presets = jest.spyOn(coder, "listPresets").mockImplementation(async () => {
+      await presetsHeld;
+      return { ok: true, presets: [] };
+    });
+    const { view, cleanupDom, held, create } = await openCreationViewWithHeldBranches({
+      showAgentsInitBanner: true,
+    });
+    try {
+      held.release();
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(false), {
+        timeout: 10_000,
+      });
+      await selectRuntime(view.container, "Coder");
+      await waitFor(() => expect(presets).toHaveBeenCalled(), { timeout: 10_000 });
+      // The composer reports from an effect, and the page renders the banner after it.
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(true), {
+        timeout: 5_000,
+      });
+
+      releasePresets();
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(false), {
+        timeout: 10_000,
+      });
+      expect(create).not.toHaveBeenCalled();
+    } finally {
+      releasePresets();
+      for (const spy of [...spies, presets]) spy.mockRestore();
+      held.release();
+      held.spy.mockRestore();
+      create.mockRestore();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  test("Run /init is off while a send is in flight", async () => {
+    const env = getSharedEnv();
+    const opened = await openCreationViewWithHeldBranches({ showAgentsInitBanner: true });
+    const { view, cleanupDom, chat, held } = opened;
+    // Replace the helper's call-through spy with one that holds the creation send.
+    opened.create.mockRestore();
+    const workspaceService = env.services.workspaceService;
+    const realCreate = workspaceService.create.bind(workspaceService);
+    let releaseCreate: () => void = () => undefined;
+    const createHeld = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    const create = jest
+      .spyOn(workspaceService, "create")
+      .mockImplementation(async (...args: Parameters<typeof workspaceService.create>) => {
+        await createHeld;
+        return realCreate(...args);
+      });
+    try {
+      held.release();
+      await chat.typeWithoutSending("hello while Run /init waits");
+      await waitFor(() => expect(sendButton(view.container).disabled).toBe(false), {
+        timeout: 10_000,
+      });
+      expect(runInitButtonNow(view.container)?.disabled).toBe(false);
+      fireEvent.click(sendButton(view.container));
+      await waitFor(() => expect(create).toHaveBeenCalledTimes(1), { timeout: 30_000 });
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(true), {
+        timeout: 5_000,
+      });
+    } finally {
+      releaseCreate();
       held.release();
       held.spy.mockRestore();
       create.mockRestore();

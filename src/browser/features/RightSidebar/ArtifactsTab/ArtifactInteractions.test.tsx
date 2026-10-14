@@ -3,16 +3,25 @@ import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import type { WorkspaceSelection } from "@/browser/components/AgentListItem/AgentListItem";
+import {
+  WorkspaceContext,
+  type WorkspaceContext as WorkspaceContextValue,
+} from "@/browser/contexts/WorkspaceContext";
+import { createWorkspace } from "@/browser/stories/mocks/workspaces";
+import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { ArtifactsPanel } from "./ArtifactsPanel";
+import { openArtifact } from "./openArtifact";
 import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 import { useArtifactInteractions, type ArtifactInteractionTarget } from "./useArtifactInteractions";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
+import { ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND } from "./artifactBridge";
 
 const HTML: ArtifactReadResult = {
   status: "ok",
@@ -24,15 +33,19 @@ const HTML: ArtifactReadResult = {
   content: "<button>Ship</button>",
 };
 
+/** A pinned checkout file (read-only: no send, setState or openWorkspace). */
+const PINNED: ArtifactReadResult = { ...HTML, path: "docs/pinned.html" };
+let pinnedHtml = false;
+
 let sends: Array<{ path: string; text: string; data?: unknown; version: number | null }> = [];
 let savedStates: unknown[] = [];
 interface SetStateResult {
   success: true;
-  data: { version: number };
+  data: undefined;
 }
 let setStateImpl: (state: unknown) => Promise<SetStateResult> = (state) => {
   savedStates.push(state);
-  return Promise.resolve({ success: true as const, data: { version: 0 } });
+  return Promise.resolve({ success: true as const, data: undefined });
 };
 let persistedState: unknown = { step: 1 };
 /** When set, getState waits for this promise (state still loading). */
@@ -60,7 +73,16 @@ function Wrapper(props: { children: ReactNode }) {
           data: { artifactId: "id", path: input.path, pin: null, versions: [] },
         }),
       listPinned: () =>
-        Promise.resolve({ success: true as const, data: { available: true as const, files: [] } }),
+        Promise.resolve({
+          success: true as const,
+          data: {
+            available: true as const,
+            files: pinnedHtml
+              ? [{ path: PINNED.path, kind: PINNED.kind, size: PINNED.size, modifiedMs: 1 }]
+              : [],
+          },
+        }),
+      readPinned: () => Promise.resolve({ success: true as const, data: PINNED }),
       capabilities: () => Promise.resolve({ agentBrowserAvailable: true }),
       listShelf: () =>
         Promise.resolve({
@@ -69,7 +91,7 @@ function Wrapper(props: { children: ReactNode }) {
         }),
       getState: async () => {
         await stateGate;
-        return { success: true as const, data: { version: 0, state: persistedState } };
+        return { success: true as const, data: { state: persistedState } };
       },
       setState: (input: { state: unknown }) => setStateImpl(input.state),
       sendInteraction: (input: {
@@ -86,9 +108,12 @@ function Wrapper(props: { children: ReactNode }) {
       },
     },
   };
+  // One client per mount, like the app's: a new client on every render would make the hook
+  // refetch the state on any rerender and hide a missing refetch.
+  const [client] = useState(() => createTestApiClient(api));
   return (
     <ThemeProvider forcedTheme="dark">
-      <APIProvider client={createTestApiClient(api)}>{props.children}</APIProvider>
+      <APIProvider client={client}>{props.children}</APIProvider>
     </ThemeProvider>
   );
 }
@@ -132,7 +157,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     savedStates = [];
     setStateImpl = (state) => {
       savedStates.push(state);
-      return Promise.resolve({ success: true as const, data: { version: 0 } });
+      return Promise.resolve({ success: true as const, data: undefined });
     };
     persistedState = { step: 1 };
     stateGate = null;
@@ -320,7 +345,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect(JSON.parse(JSON.parse(embedded ?? '"null"') as string)).toEqual(persistedState);
   });
 
-  test("setState from the frame is persisted for the displayed version", async () => {
+  test("setState from the frame is persisted for the artifact", async () => {
     const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
     postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
@@ -383,6 +408,69 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect(sends[0]).toMatchObject({ text: "Held" });
   });
 
+  test("a new version waits for the tab's pending write, then loads the saved state", async () => {
+    // The state is per artifact, so v2 must start with what the user picked on v1. The rebuild
+    // reads the server only after this tab's write has landed, so it never gets a pre-write state.
+    let settleWrite: () => void = () => undefined;
+    setStateImpl = (state) =>
+      new Promise<SetStateResult>((resolve) => {
+        settleWrite = () => {
+          persistedState = state;
+          resolve({ success: true as const, data: undefined });
+        };
+      });
+    const live = (latestVersion: number) => ({ path: HTML.path, version: null, latestVersion });
+    const view = render(<InteractionsHarness target={live(1)} />, { wrapper: Wrapper });
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 1 }));
+    act(() => hookHandlers?.setState?.({ step: 4 }));
+    view.rerender(<InteractionsHarness target={live(2)} />);
+    await act(() => Promise.resolve());
+    // Still waiting: the frame is not rebuilt with a state the write may change.
+    expect(hookHandlers?.initialState).toBeUndefined();
+    await act(async () => {
+      settleWrite();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 4 }));
+  });
+
+  test("Reload hands the remounted frame the newest state", async () => {
+    // Bug bash: Reload remounts the viewer but not this hook, so the frame got the last load's
+    // state and lost the picks made since.
+    const shown = (reloadTick: number) => ({
+      path: HTML.path,
+      version: 2,
+      latestVersion: 2,
+      reloadTick,
+    });
+    const view = render(<InteractionsHarness target={shown(0)} />, { wrapper: Wrapper });
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 1 }));
+    act(() => hookHandlers?.setState?.({ step: 5 }));
+    await waitFor(() => expect(savedStates).toEqual([{ step: 5 }]));
+    persistedState = { step: 5 };
+    view.rerender(<InteractionsHarness target={shown(1)} />);
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 5 }));
+  });
+
+  test("once its write settles, a rebuild takes the server's state, not the tab's", async () => {
+    // The tab's own state overrides a server read only while its write is queued or in flight:
+    // afterwards another window's newer save (or a failed write) must not be hidden.
+    const shown = (reloadTick: number) => ({
+      path: HTML.path,
+      version: 2,
+      latestVersion: 2,
+      reloadTick,
+    });
+    const view = render(<InteractionsHarness target={shown(0)} />, { wrapper: Wrapper });
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 1 }));
+    act(() => hookHandlers?.setState?.({ step: 5 }));
+    await waitFor(() => expect(savedStates).toEqual([{ step: 5 }]));
+    await act(() => Promise.resolve());
+    persistedState = { step: 9 };
+    view.rerender(<InteractionsHarness target={shown(1)} />);
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 9 }));
+  });
+
   test("concurrent setState writes run one at a time and the last state wins", async () => {
     // A server that persists each write when its request settles: overlapping requests that
     // settle out of order would leave an older state on disk.
@@ -395,7 +483,7 @@ describe("artifact interactions in the Artifacts panel", () => {
           state,
           settle: () => {
             persisted = state;
-            resolve({ success: true as const, data: { version: 0 } });
+            resolve({ success: true as const, data: undefined });
           },
         };
         inFlight.push(request);
@@ -419,5 +507,140 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect(inFlight).toEqual([]);
     expect(persisted).toEqual({ step: 3 });
     expect(maxInFlight).toBe(1);
+  });
+});
+
+describe("window.xum.openWorkspace", () => {
+  let cleanupDom: (() => void) | null = null;
+  let opened: string[] = [];
+  let activation = { isActive: true };
+  const active = createWorkspace({ id: "a1b2c3d4e5", name: "fix-bug", projectName: "xum" });
+  const turnTarget = {
+    ...createWorkspace({ id: "b2c3d4e5f6", name: "side-task", projectName: "xum" }),
+    tags: { [WORKSPACE_TURN_TASK_TAGS.handle]: "wst_side_task" },
+  };
+  const archived = {
+    ...createWorkspace({ id: "0f0f0f0f0f", name: "old", projectName: "xum" }),
+    archivedAt: "2026-01-01T00:00:00.000Z",
+  };
+  const open = (workspaceId: unknown) => ({ xumArtifact: 1, type: "openWorkspace", workspaceId });
+
+  function WorkspaceWrapper(props: { children: ReactNode }) {
+    const value = {
+      workspaceMetadata: new Map([
+        [active.id, active],
+        [turnTarget.id, turnTarget],
+        [archived.id, archived],
+      ]),
+      loading: false,
+      loaded: true,
+      loadError: null,
+      setSelectedWorkspace: (selection: WorkspaceSelection | null) => {
+        if (selection != null) opened.push(selection.workspaceId);
+      },
+    } as unknown as WorkspaceContextValue;
+    return (
+      <Wrapper>
+        <WorkspaceContext.Provider value={value}>{props.children}</WorkspaceContext.Provider>
+      </Wrapper>
+    );
+  }
+
+  /** The panel with the user's click inside the frame: focus on the iframe, activation live. */
+  async function renderClickedFrame() {
+    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: WorkspaceWrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    act(() => frame.focus());
+    expect(document.activeElement).toBe(frame);
+    return { view, frame };
+  }
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    window.localStorage.clear();
+    opened = [];
+    activation = { isActive: true };
+    pinnedHtml = false;
+    Object.defineProperty(window.navigator, "userActivation", {
+      configurable: true,
+      get: () => activation,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("a click in the frame opens an active workspace through the app's navigation", async () => {
+    const { view, frame } = await renderClickedFrame();
+    postFromFrame(frame, open(active.id));
+    expect(opened).toEqual([active.id]);
+    expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
+  });
+
+  test("a workspace-turn task handle opens the workspace it created", async () => {
+    const { frame } = await renderClickedFrame();
+    postFromFrame(frame, open("wst_side_task"));
+    expect(opened).toEqual([turnTarget.id]);
+  });
+
+  test("an unknown or archived ID does not switch and shows a host notice", async () => {
+    const { view, frame } = await renderClickedFrame();
+    postFromFrame(frame, open("ffffffffff"));
+    expect(opened).toEqual([]);
+    expect(view.getByTestId("artifact-open-workspace-notice")).toBeTruthy();
+    postFromFrame(frame, open(archived.id));
+    expect(opened).toEqual([]);
+    // A later valid open clears the notice.
+    postFromFrame(frame, open(active.id));
+    expect(opened).toEqual([active.id]);
+    expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
+  });
+
+  test("without a user gesture in the frame nothing happens, not even a notice", async () => {
+    const { view, frame } = await renderClickedFrame();
+    // A script-only call: no live user activation.
+    activation = { isActive: false };
+    postFromFrame(frame, open(active.id));
+    postFromFrame(frame, open("ffffffffff"));
+    // Activation from typing elsewhere in the app: focus is not in the frame.
+    activation = { isActive: true };
+    act(() => view.getByTestId("artifacts-panel").focus());
+    postFromFrame(frame, open(active.id));
+    postFromFrame(frame, open("ffffffffff"));
+    expect(opened).toEqual([]);
+    expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
+  });
+
+  test("a pinned file stays read-only: it cannot switch workspaces", async () => {
+    pinnedHtml = true;
+    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: WorkspaceWrapper });
+    await view.findByTestId("artifact-frame");
+    act(() => openArtifact({ workspaceId: "ws-i", path: PINNED.path, pinned: true }));
+    await waitFor(() =>
+      expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain(PINNED.path)
+    );
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    await waitFor(() => expect(frame.title).toBe(PINNED.path));
+    act(() => frame.focus());
+    postFromFrame(frame, open(active.id));
+    postFromFrame(frame, open("ffffffffff"));
+    expect(opened).toEqual([]);
+    expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
+  });
+
+  test("invalid shapes, other windows and messages over the rate limit never switch", async () => {
+    const { view, frame } = await renderClickedFrame();
+    postFromFrame(frame, open(42));
+    postFromFrame(frame, { ...open(active.id), title: "x" });
+    act(() => {
+      window.dispatchEvent(messageEvent(open(active.id), window));
+    });
+    for (let i = 0; i < ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND; i++) postFromFrame(frame, "junk");
+    postFromFrame(frame, open(active.id));
+    expect(opened).toEqual([]);
+    expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
   });
 });

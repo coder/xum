@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
@@ -18,6 +19,8 @@ interface UseWorkspaceHeartbeatParams {
 export interface UseWorkspaceHeartbeatResult {
   settings: HeartbeatFormSettings;
   isLoading: boolean;
+  /** Shown settings wait for the current client's read (after a reconnect, or offline). */
+  isReloading: boolean;
   isSaving: boolean;
   error: string | null;
   save: (next: HeartbeatFormSettings) => Promise<boolean>;
@@ -68,6 +71,20 @@ function normalizeHeartbeatSettings(
   };
 }
 
+/** The global heartbeat defaults the form shows as placeholders; undefined without a config. */
+function getGlobalHeartbeatDefaults(
+  config: { heartbeatDefaultPrompt?: string; heartbeatDefaultIntervalMs?: number } | null
+): {
+  prompt: string | undefined;
+  intervalMs: number | undefined;
+} {
+  if (config == null) return { prompt: undefined, intervalMs: undefined };
+  return {
+    prompt: config.heartbeatDefaultPrompt?.trim() ?? undefined,
+    intervalMs: config.heartbeatDefaultIntervalMs ?? HEARTBEAT_DEFAULT_INTERVAL_MS,
+  };
+}
+
 function getHeartbeatErrorMessage(error: unknown, fallbackMessage: string): string {
   if (error instanceof Error && error.message) {
     return error.message;
@@ -86,6 +103,9 @@ export function useWorkspaceHeartbeat(
     getDefaultHeartbeatSettings()
   );
   const [isLoading, setIsLoading] = useState(true);
+  // The client whose read answered. A reconnect keeps the form on screen, but a save waits for
+  // the new client's read: the form would overwrite changes made on the server while offline.
+  const [readClient, setReadClient] = useState<typeof api>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [globalDefaultPrompt, setGlobalDefaultPrompt] = useState<string | undefined>(undefined);
@@ -97,14 +117,21 @@ export function useWorkspaceHeartbeat(
   const currentWorkspaceIdRef = useRef<string | null>(workspaceId);
   currentWorkspaceIdRef.current = workspaceId;
   const latestSaveRequestIdRef = useRef(0);
+  // The workspace whose settings are shown (undefined before the first load effect).
+  const shownWorkspaceIdRef = useRef<string | null | undefined>(undefined);
 
   useEffect(() => {
-    setSettings(getDefaultHeartbeatSettings());
-    setIsLoading(true);
-    setIsSaving(false);
-    setError(null);
-    setGlobalDefaultPrompt(undefined);
-    setGlobalDefaultIntervalMs(undefined);
+    // Only another workspace resets the form to "loading": a new client (reconnect) reloads the
+    // same workspace behind the shown settings.
+    if (shownWorkspaceIdRef.current !== workspaceId) {
+      shownWorkspaceIdRef.current = workspaceId;
+      setSettings(getDefaultHeartbeatSettings());
+      setIsLoading(true);
+      setIsSaving(false);
+      setError(null);
+      setGlobalDefaultPrompt(undefined);
+      setGlobalDefaultIntervalMs(undefined);
+    }
 
     if (!workspaceId) {
       setIsLoading(false);
@@ -125,15 +152,17 @@ export function useWorkspaceHeartbeat(
         if (currentWorkspaceIdRef.current !== workspaceId) return;
 
         setSettings(normalizeHeartbeatSettings(heartbeat));
-        setGlobalDefaultPrompt(config?.heartbeatDefaultPrompt?.trim() ?? undefined);
-        setGlobalDefaultIntervalMs(
-          config ? (config.heartbeatDefaultIntervalMs ?? HEARTBEAT_DEFAULT_INTERVAL_MS) : undefined
-        );
+        const globalDefaults = getGlobalHeartbeatDefaults(config);
+        setGlobalDefaultPrompt(globalDefaults.prompt);
+        setGlobalDefaultIntervalMs(globalDefaults.intervalMs);
         setError(null);
         setIsLoading(false);
+        // The client is a callable proxy: pass it through an updater, never as the state.
+        setReadClient(() => api);
       })
       .catch((loadError) => {
-        if (cancelled) return;
+        // A lost connection is no load failure: keep the shown settings for the reconnect.
+        if (cancelled || isConnectionLostError(loadError)) return;
         if (currentWorkspaceIdRef.current !== workspaceId) return;
 
         setGlobalDefaultPrompt(undefined);
@@ -141,6 +170,7 @@ export function useWorkspaceHeartbeat(
           getHeartbeatErrorMessage(loadError, "Failed to load workspace heartbeat settings")
         );
         setIsLoading(false);
+        setReadClient(() => api);
       });
 
     return () => {
@@ -225,6 +255,7 @@ export function useWorkspaceHeartbeat(
   return {
     settings,
     isLoading,
+    isReloading: !isLoading && workspaceId != null && readClient !== api,
     isSaving,
     error,
     save,

@@ -10,6 +10,7 @@ import type {
   Experimental_EvaluationModelV4CallOptions,
 } from "@ai-sdk/provider";
 import type { EvaluationQuestions } from "@/common/types/evaluation";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import {
   EvaluationError,
   classifyEvaluationError,
@@ -202,6 +203,49 @@ describe("EvaluationService.evaluate", () => {
     // Negative/fractional counts are dropped; the well-formed allowlisted key survives.
     expect(result.usageProviderMetadata).toEqual({ xai: { costInUsdTicks: 7 } });
     expect(JSON.stringify(result)).not.toContain("NaN");
+  });
+
+  it("prices Anthropic 1h cache writes from the raw response usage at the 1h rate", async () => {
+    const evaluateWithSplit = async (fiveMinute: number, oneHour: number) => {
+      const { model } = mockModel(() =>
+        Promise.resolve({
+          answers: VALID_ANSWERS,
+          usage: { inputTokens: 5_000, outputTokens: 10 },
+          // AI SDK 7 Anthropic metadata: the write total and split live only in raw usage.
+          providerMetadata: {
+            anthropic: {
+              usage: {
+                cache_creation_input_tokens: fiveMinute + oneHour,
+                cache_creation: {
+                  ephemeral_5m_input_tokens: fiveMinute,
+                  ephemeral_1h_input_tokens: oneHour,
+                },
+              },
+            },
+          },
+          warnings: [],
+        })
+      );
+      const result = await Effect.runPromise(service.evaluate(call(model, QUESTIONS)));
+      const metadata = result.usageProviderMetadata as Record<string, unknown>;
+      const usage = createDisplayUsage(
+        { inputTokens: 5_000, outputTokens: 10 },
+        "anthropic:claude-sonnet-5-5",
+        metadata
+      );
+      return { usage, metadata };
+    };
+    const fiveMinute = await evaluateWithSplit(4_000, 0);
+    const oneHour = await evaluateWithSplit(0, 4_000);
+    expect(fiveMinute.usage?.cacheCreate.tokens).toBe(4_000);
+    expect(oneHour.usage?.cacheCreate.tokens).toBe(4_000);
+    expect(oneHour.usage?.cacheCreate.cost_usd).toBeGreaterThan(
+      fiveMinute.usage?.cacheCreate.cost_usd ?? Infinity
+    );
+    // Only counts are projected, never the raw usage object.
+    expect(oneHour.metadata).toEqual({
+      anthropic: { cacheCreationInputTokens: 4_000, cacheCreation1hInputTokens: 4_000 },
+    });
   });
 
   it("bounds the provider-reported response model id", async () => {

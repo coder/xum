@@ -99,6 +99,12 @@ export async function createAppHarness(options?: {
 
     await setupWorkspaceView(view, metadata, workspaceId);
     await waitForWorkspaceChatToRender(view.container);
+    // Return only once workspace init has ended. Many backend calls (agents.list, sends,
+    // executeBash) wait for init, so before this a test's first such call could take longer than
+    // waitFor's 1 s default and flake under load (#6143, #6169). The app has already rendered
+    // while init ran, as it does for a user. waitForInit never throws, and with no init hook in
+    // the temp repo init ends once the checkout is ready.
+    await env.services.initStateManager.waitForInit(workspaceId);
 
     const chat = new ChatHarness(view.container, workspaceId);
 

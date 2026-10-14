@@ -295,6 +295,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         resolvePromise = resolve;
       });
       // TypeScript doesn't understand the Promise executor runs synchronously
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const safeResolve = resolvePromise!;
       generationPromiseRef.current = { promise, resolve: safeResolve, requestId };
 

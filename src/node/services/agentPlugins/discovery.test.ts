@@ -7,10 +7,13 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   computeAgentPluginContainers,
   discoverAgentPlugins,
+  ensurePluginPathContained,
   journalDerivedDiscoveryGate,
+  readPluginFileWithinRootCapped,
   setAgentPluginDiscoveryGate,
 } from "./discovery";
 import { bumpContainerMutationEpoch, MUTATION_EPOCH_FILE, STAGING_DIR_NAME } from "./journals";
+import { resolvePluginHookGrants } from "./hookSandbox";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { createTestPluginInstallEntry } from "./testFixtures";
 
@@ -85,7 +88,7 @@ describe("discoverAgentPlugins", () => {
     expect(plugin.name).toBe("hello-plugin");
     expect(plugin.scope).toBe("global");
     expect(plugin.rootPath).toBe(await fs.realpath(path.join(container, "hello-plugin")));
-    expect(plugin.skillsDir).toBe(path.join(plugin.rootPath, "skills"));
+    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
     expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, "mcp.json"));
     expect(result.diagnostics).toEqual([]);
   });
@@ -166,6 +169,8 @@ describe("discoverAgentPlugins", () => {
       ];
       const manifestPath = await fs.realpath(path.join(owner, "managed", "plugin.json"));
       const reads = spyOn(fs, "readFile");
+      // Manifests are read through an opened handle (readPluginFileWithinRootCapped).
+      const opens = spyOn(fs, "open");
       try {
         const { plugins } = await discoverAgentPlugins(containers);
         expect(plugins).toHaveLength(2);
@@ -182,9 +187,10 @@ describe("discoverAgentPlugins", () => {
         });
         expect(plugins[0].rootPath).toBe(plugins[1].rootPath);
         expect(reads.mock.calls.filter(([file]) => file === registryPath)).toHaveLength(1);
-        expect(reads.mock.calls.filter(([file]) => file === manifestPath)).toHaveLength(1);
+        expect(opens.mock.calls.filter(([file]) => file === manifestPath)).toHaveLength(1);
       } finally {
         reads.mockRestore();
+        opens.mockRestore();
       }
       await fs.writeFile(registryPath, "{");
       const corrupt = await discoverAgentPlugins(containers);
@@ -933,9 +939,39 @@ describe("discoverAgentPlugins", () => {
 
     expect(result.plugins).toHaveLength(1);
     const plugin = result.plugins[0];
-    expect(plugin.skillsDir).toBe(path.join(plugin.rootPath, "lib", "skills"));
+    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "lib", "skills")]);
     expect(plugin.workflowsDir).toBe(path.join(plugin.rootPath, "scripts"));
     expect(plugin.agentsDir).toBeUndefined();
+  });
+
+  test("a Codex skills array resolves every contained root; a missing or escaping one is skipped", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "multi");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    for (const dir of ["core", "extra", "skills"]) {
+      await fs.mkdir(path.join(pluginDir, dir), { recursive: true });
+    }
+    await fs.symlink(tmp.path, path.join(pluginDir, "outside"));
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({
+        name: "multi",
+        skills: ["./core/", "./missing", "./outside", "./extra", "./core"],
+      }),
+      "utf8"
+    );
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const plugin = result.plugins[0];
+    // Declared roots replace the default skills/ (as in Codex), in declared order.
+    expect(plugin.skillsDirs).toEqual([
+      path.join(plugin.rootPath, "core"),
+      path.join(plugin.rootPath, "extra"),
+    ]);
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics[0].message).toContain("outside/ resolves outside the plugin root");
   });
 
   test("discovers a manifest-only plugin without components", async () => {
@@ -946,7 +982,7 @@ describe("discoverAgentPlugins", () => {
     const result = await discoverAgentPlugins([{ path: container, scope: "project" }]);
 
     expect(result.plugins).toHaveLength(1);
-    expect(result.plugins[0].skillsDir).toBeUndefined();
+    expect(result.plugins[0].skillsDirs).toBeUndefined();
     expect(result.plugins[0].mcpConfigPath).toBeUndefined();
     expect(result.diagnostics).toEqual([]);
   });
@@ -964,6 +1000,288 @@ describe("discoverAgentPlugins", () => {
 
     expect(result.plugins.map((p) => p.name)).toEqual(["real-plugin"]);
     expect(result.diagnostics).toEqual([]);
+  });
+
+  test("discovers a Codex package with only .codex-plugin/plugin.json and .mcp.json", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "figma");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    await fs.mkdir(path.join(pluginDir, "skills"), { recursive: true });
+    await fs.writeFile(path.join(pluginDir, ".mcp.json"), "{}", "utf8");
+    // Shape copied from openai/plugins: no $schema, OpenAI fields at the top level.
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({
+        name: "figma",
+        skills: "./skills/",
+        apps: "./.app.json",
+        hooks: "./hooks.json",
+        interface: { displayName: "Figma", shortDescription: "Design", developerName: "Figma" },
+      }),
+      "utf8"
+    );
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.diagnostics).toEqual([]);
+    expect(result.plugins).toHaveLength(1);
+    const plugin = result.plugins[0];
+    expect(plugin.name).toBe("figma");
+    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
+    expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, ".mcp.json"));
+    // Parsed and exposed only: no hook component resolves from the legacy key.
+    expect(plugin.hooksPath).toBeUndefined();
+    expect(plugin.openai).toEqual({
+      apps: "./.app.json",
+      hooks: ["./hooks.json"],
+      interface: { displayName: "Figma", shortDescription: "Design", developerName: "Figma" },
+    });
+  });
+
+  test("a .codex-plugin manifest linked into .git is refused (#6161)", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "leaky");
+    await fs.mkdir(path.join(pluginDir, ".git"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".git", "manifest.json"),
+      JSON.stringify({ name: "leaky", description: "SECRET-from-git" }),
+      "utf8"
+    );
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"));
+    await fs.symlink("../.git/manifest.json", path.join(pluginDir, ".codex-plugin", "plugin.json"));
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toEqual([]);
+    expect(result.diagnostics.map((d) => d.message).join("\n")).toContain(".git directory");
+    expect(JSON.stringify(result)).not.toContain("SECRET-from-git");
+  });
+
+  test("a Codex-fallback package gets no Xum hooks, agents, workflows, slash commands or grants", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "hostile");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    for (const dir of ["skills", "agents", "workflows", "hooks"]) {
+      await fs.mkdir(path.join(pluginDir, dir), { recursive: true });
+    }
+    await fs.writeFile(path.join(pluginDir, "hooks.js"), "export default {};", "utf8");
+    await fs.writeFile(path.join(pluginDir, "hooks", "alt.js"), "export default {};", "utf8");
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({
+        name: "hostile",
+        skills: ["./skills/"],
+        extensions: { mux: { hooks: { tools: ["bash"] } } },
+        contributes: {
+          hooks: "hooks/alt.js",
+          slashCommands: [{ name: "x", expansion: "y" }],
+        },
+      }),
+      "utf8"
+    );
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toHaveLength(1);
+    const plugin = result.plugins[0];
+    expect(plugin.codexFallback).toBe(true);
+    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
+    expect(plugin.hooksPath).toBeUndefined();
+    expect(plugin.agentsDir).toBeUndefined();
+    expect(plugin.workflowsDir).toBeUndefined();
+    expect(plugin.manifest.contributes?.slashCommands).toBeUndefined();
+    expect(resolvePluginHookGrants(plugin.manifest).bridgeTools.allow).toEqual([]);
+    expect(result.diagnostics.map((d) => d.message)).toEqual([
+      "'contributes' is not supported in .codex-plugin/plugin.json; ignoring",
+      "'extensions.mux' is not supported in .codex-plugin/plugin.json; ignoring",
+    ]);
+  });
+
+  test("a root plugin.json without com.openai takes it from the .codex-plugin overlay", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "overlay");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    const overlay = { name: "other-name", apps: "./.app.json", hooks: "./hooks.js" };
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify(overlay),
+      "utf8"
+    );
+    await fs.writeFile(path.join(pluginDir, "hooks.js"), "export default {};", "utf8");
+
+    const first = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+    // Root identity and components stay canonical; only com.openai comes from the overlay.
+    expect(first.plugins[0]).toMatchObject({
+      name: "overlay",
+      openai: { apps: "./.app.json", hooks: ["./hooks.js"] },
+      hooksPath: path.join(first.plugins[0].rootPath, "hooks.js"),
+    });
+
+    // An inline root com.openai object replaces the overlay entirely.
+    await writePlugin(container, "overlay", {
+      manifest: {
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "overlay",
+        extensions: { "com.openai": { onboardingSkill: "./skills/a/SKILL.md" } },
+      },
+    });
+    const second = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+    expect(second.plugins[0].openai).toEqual({ onboardingSkill: "./skills/a/SKILL.md" });
+  });
+
+  test("the overlay's interface, review and publication metadata reach the typed view", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "overlay-meta");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    // OpenAI's Codex layout: `interface` at the top level, review and publication under
+    // extensions.com.openai (https://developers.openai.com/plugins/deploy/submission).
+    const review = { tests: [{ prompt: "Open my file" }] };
+    const publication = { countries: ["US"], release_notes: "First release" };
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({
+        name: "overlay-meta",
+        interface: { displayName: "Meta", shortDescription: "Docs", developerName: "Acme" },
+        extensions: { "com.openai": { review, publication } },
+      }),
+      "utf8"
+    );
+
+    const { plugins, diagnostics } = await discoverAgentPlugins([
+      { path: container, scope: "global" },
+    ]);
+
+    expect(diagnostics).toEqual([]);
+    expect(plugins[0].openai).toEqual({
+      interface: { displayName: "Meta", shortDescription: "Docs", developerName: "Acme" },
+      review,
+      publication,
+    });
+  });
+
+  test("a manifest swapped for an outside link after its size check is not read", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await fs.realpath(await writePlugin(container, "swapped"));
+    const outside = path.join(tmp.path, "outside.json");
+    await fs.writeFile(
+      outside,
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "outside-name" }),
+      "utf8"
+    );
+    const manifestPath = path.join(pluginDir, "plugin.json");
+    // A local process replaces the manifest between discovery's size check and its read.
+    const realStat = fs.stat;
+    let swapped = false;
+    const stats = spyOn(fs, "stat").mockImplementation((async (
+      ...args: Parameters<typeof fs.stat>
+    ) => {
+      const result = await realStat(...args);
+      if (!swapped && args[0] === manifestPath) {
+        swapped = true;
+        await fs.rm(manifestPath);
+        await fs.symlink(outside, manifestPath);
+      }
+      return result;
+    }) as typeof fs.stat);
+    try {
+      const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+      expect(swapped).toBe(true);
+      expect(result.plugins).toEqual([]);
+      expect(result.diagnostics).toHaveLength(1);
+      expect(result.diagnostics[0]).toMatchObject({ path: manifestPath, severity: "error" });
+    } finally {
+      stats.mockRestore();
+    }
+  });
+
+  test("root plugin.json and mcp.json win over the Codex fallbacks", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "root-plugin", { mcpJson: "{}" });
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({ name: "codex-name" }),
+      "utf8"
+    );
+    await fs.writeFile(path.join(pluginDir, ".mcp.json"), "{}", "utf8");
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins.map((p) => p.name)).toEqual(["root-plugin"]);
+    expect(result.plugins[0].mcpConfigPath).toBe(path.join(result.plugins[0].rootPath, "mcp.json"));
+  });
+
+  test("a symlinked .mcp.json keeps the Codex dialect; a root mcp.json does not", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const linked = await writePlugin(container, "linked");
+    await fs.mkdir(path.join(linked, "config"));
+    await fs.writeFile(path.join(linked, "config", "server.json"), "{}", "utf8");
+    await fs.symlink("config/server.json", path.join(linked, ".mcp.json"));
+    await writePlugin(container, "portable", { mcpJson: "{}" });
+
+    const { plugins } = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const byName = new Map(plugins.map((p) => [p.name, p]));
+    expect(byName.get("linked")?.mcpConfigPath).toBe(
+      path.join(byName.get("linked")!.rootPath, "config", "server.json")
+    );
+    expect(byName.get("linked")?.mcpConfigDialect).toBe("codex");
+    expect(byName.get("portable")?.mcpConfigDialect).toBeUndefined();
+  });
+
+  test("falls back to .mcp.json for a root-manifest plugin without mcp.json", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "dot-mcp");
+    await fs.writeFile(path.join(pluginDir, ".mcp.json"), "{}", "utf8");
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins[0].mcpConfigPath).toBe(
+      path.join(result.plugins[0].rootPath, ".mcp.json")
+    );
+  });
+
+  test("refuses a .codex-plugin/plugin.json symlink that escapes the plugin root", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const outside = path.join(tmp.path, "outside.json");
+    await fs.writeFile(outside, JSON.stringify({ name: "escaper" }), "utf8");
+    const codexDir = path.join(container, "escaper", ".codex-plugin");
+    await fs.mkdir(codexDir, { recursive: true });
+    await fs.symlink(outside, path.join(codexDir, "plugin.json"));
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toEqual([]);
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics[0].message).toContain("outside the plugin root");
+  });
+
+  test("invalid com.openai fields are dropped with warnings, never fatal", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    await writePlugin(container, "bad-openai", {
+      manifest: {
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "bad-openai",
+        extensions: { "com.openai": { apps: "../escape.json", onboardingSkill: 3 } },
+      },
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins.map((p) => p.name)).toEqual(["bad-openai"]);
+    expect(result.plugins[0].openai).toEqual({});
+    expect(result.diagnostics.map((d) => d.severity)).toEqual(["warning", "warning"]);
   });
 
   test("a broken sibling plugin never affects a valid one", async () => {
@@ -1049,7 +1367,7 @@ describe("discoverAgentPlugins", () => {
     const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
 
     expect(result.plugins).toHaveLength(1);
-    expect(result.plugins[0].skillsDir).toBeUndefined();
+    expect(result.plugins[0].skillsDirs).toBeUndefined();
     // MCP component is unaffected (§6.2 narrowest-scope invalidation).
     expect(result.plugins[0].mcpConfigPath).toBeDefined();
     expect(result.diagnostics).toHaveLength(1);
@@ -1066,7 +1384,7 @@ describe("discoverAgentPlugins", () => {
 
     expect(result.plugins).toHaveLength(1);
     expect(result.plugins[0].mcpConfigPath).toBeUndefined();
-    expect(result.plugins[0].skillsDir).toBeDefined();
+    expect(result.plugins[0].skillsDirs).toBeDefined();
     expect(result.diagnostics).toHaveLength(1);
     expect(result.diagnostics[0].message).toContain("mcp.json");
   });
@@ -1080,7 +1398,7 @@ describe("discoverAgentPlugins", () => {
     const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
 
     expect(result.plugins).toHaveLength(1);
-    expect(result.plugins[0].skillsDir).toBeUndefined();
+    expect(result.plugins[0].skillsDirs).toBeUndefined();
     expect(result.plugins[0].mcpConfigPath).toBeDefined();
   });
 
@@ -1341,5 +1659,40 @@ describe("computeAgentPluginContainers", () => {
       projectTrusted: false,
     });
     expect(containers.some((c) => c.path === path.join("/home/u/.mux", "plugins"))).toBe(true);
+  });
+});
+
+describe("plugin .git containment (#6161)", () => {
+  test("the contained reader refuses a link into .git; .gitignore-like names still read", async () => {
+    using tmp = new DisposableTempDir("plugin-git-link");
+    const root = await fs.realpath(tmp.path);
+    await fs.mkdir(path.join(root, ".git"));
+    await fs.writeFile(path.join(root, ".git", "config"), "url = https://user:SECRET@host\n");
+    await fs.symlink(".git/config", path.join(root, "hooks.js"));
+    await fs.symlink(".git", path.join(root, "linked-git"));
+    await fs.writeFile(path.join(root, ".gitignore"), "dist\n");
+    await fs.mkdir(path.join(root, ".github"));
+    await fs.writeFile(path.join(root, ".github", "notes.md"), "ok\n");
+    const read = (relative: string) =>
+      readPluginFileWithinRootCapped({
+        filePath: path.join(root, relative),
+        pluginRoot: root,
+        maxBytes: 1024,
+        label: "hooks.js",
+      });
+    for (const relative of ["hooks.js", ".git/config", "linked-git/config", ".GIT/config"]) {
+      const error: unknown = await read(relative).catch((caught: unknown) => caught);
+      // ".GIT" exists only on case-insensitive filesystems; elsewhere it is missing.
+      if (relative === ".GIT/config" && error instanceof Error && error.message.includes("ENOENT"))
+        continue;
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toContain(".git directory");
+      expect(String(error)).not.toContain("SECRET");
+    }
+    expect((await read(".gitignore")).content).toBe("dist\n");
+    expect((await read(".github/notes.md")).content).toBe("ok\n");
+    expect(await ensurePluginPathContained(root, path.join(root, ".gitignore"))).toBe(
+      path.join(root, ".gitignore")
+    );
   });
 });

@@ -38,8 +38,11 @@ const SINGLE_HEADERS = new Set(
 /**
  * Nano-dollars per token at list price, checked 2026-10-10 against
  * https://platform.claude.com/docs/en/about-claude/pricing: Opus 5.5 $4 / $20 per million
- * (cache read $0.20), Sonnet 5.5 $2 / $10 ($0.10), Haiku 4.5 $1 / $5 ($0.10). A cache write costs
- * 2x input (the 1-hour rate, the higher one). The vision docs
+ * (cache read $0.20), Sonnet 5.5 $2 / $10 ($0.10). Haiku 5.5 (checked 2026-10-13) is priced by
+ * prompt length: $0.10 / $0.50 ($0.01) up to 100,000 prompt tokens and $0.50 / $2.50 ($0.05)
+ * above. checkRequest admits prompts up to 200k tokens, so the table holds the higher tier: a
+ * bound must not undercount, and the ledger then overcounts a short prompt.
+ * A cache write costs 2x input (the 1-hour rate, the higher one). The vision docs
  * (https://platform.claude.com/docs/en/build-with-claude/vision) cap one image at 4,784 visual
  * tokens on the high-resolution tier (Opus 4.7 and later) and 1,568 on other models, after
  * scaling it down. The bound uses 4,784 for every model, so it holds in either tier.
@@ -47,7 +50,7 @@ const SINGLE_HEADERS = new Set(
 const PRICES = new Map([
   ["claude-opus-5-5", { input: 4000, output: 20_000, cacheRead: 200 }],
   ["claude-sonnet-5-5", { input: 2000, output: 10_000, cacheRead: 100 }],
-  ["claude-haiku-4-5", { input: 1000, output: 5000, cacheRead: 100 }],
+  ["claude-haiku-5-5", { input: 500, output: 2500, cacheRead: 50 }],
 ]);
 const VISUAL_TOKENS = 4784;
 

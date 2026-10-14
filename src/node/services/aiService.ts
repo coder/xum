@@ -1,6 +1,18 @@
 import { createAssistantMessageId } from "@/node/services/utils/messageIds";
-import { eventSpine, type RequestAssemblySnapshot } from "./events/eventSpine";
+import {
+  eventSpine,
+  type RequestAssemblySnapshot,
+  type TurnStopContext,
+} from "./events/eventSpine";
+import { codexPluginHookService } from "./agentPlugins/codexHookService";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
+import {
+  runMessageSendHooks,
+  runTurnStopHooks,
+  type MessageSendHookInput,
+  type MessageSendHookOutcome,
+  type TurnStopHookOutcome,
+} from "./agentPlugins/promptHooks";
 import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
@@ -159,9 +171,13 @@ export class AIService extends EventEmitter {
     )
   ) {
     super();
-    // Increase max listeners to accommodate multiple concurrent workspace listeners
-    // Each workspace subscribes to stream events, and we expect >10 concurrent workspaces
-    this.setMaxListeners(50);
+    // No listener cap: every live AgentSession adds one listener per forwarded event, and a
+    // session lives from first use of its workspace until archive, removal or shutdown, so the
+    // count tracks how many workspaces this process has touched. Any fixed cap is a false
+    // MaxListenersExceededWarning for a user with many workspaces or sub-agents. A leak (a
+    // disposed session that keeps its listeners) is caught by
+    // workspaceService.sessionListeners.test.ts instead.
+    this.setMaxListeners(0);
     this.workspaceMcpOverridesService =
       workspaceMcpOverridesService ?? new WorkspaceMcpOverridesService(config);
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
@@ -494,8 +510,88 @@ export class AIService extends EventEmitter {
       metadata: metadata.data,
       hostCheckoutRoot: runtimeContext.data.hostCheckoutRoot,
       journal: this.durableEventJournalFor(workspaceId),
+      mcpServerManager: this.turnRequestBuilderBindings.mcpServerManager,
     });
     return Ok(eventSpine.captureRequestAssembly(workspaceId));
+  }
+
+  /**
+   * Load the workspace's lazy hooks, then report whether any message.send hook applies to it.
+   * The accepted-send check reads this: before the load, a first send after a restart saw no
+   * hook and skipped the check, so a retry could run a stateful hook twice (Codex
+   * PRRT_kwDOPxxmWM6rSBny). Another workspace's hooks do not count (PRRT_kwDOPxxmWM6rQd90).
+   */
+  async prepareMessageSendHooks(workspaceId: string): Promise<boolean> {
+    await this.loadRequestHooksForPrompt(workspaceId);
+    return eventSpine.hasMiddlewareFor("message.send", workspaceId);
+  }
+
+  /**
+   * Run the message.send prompt-hook chain for one new message (fail-open). Loads the
+   * workspace's lazy hooks first (the same setup as request building), so the first send after a
+   * restart sees them too.
+   */
+  async runMessageSendHooks(
+    workspaceId: string,
+    input: MessageSendHookInput,
+    cancelSignal?: AbortSignal,
+    /** prepareMessageSendHooks already ran the lazy load for this send. */
+    hooksLoaded = false
+  ): Promise<MessageSendHookOutcome> {
+    if (!hooksLoaded) await this.loadRequestHooksForPrompt(workspaceId);
+    // Codex UserPromptSubmit hooks call their plugin's MCP server, which the turn only starts
+    // after this chain: start it first (the turn's own startup, bounded), or the first prompt
+    // after a restart misses the hooks. A canceled send ends this wait and its hook calls (see
+    // MessageSendContext.signal).
+    await codexPluginHookService.prepareForPromptHooks(
+      workspaceId,
+      (signal) => this.turnRequestBuilder.startWorkspaceMcpServers(workspaceId, signal),
+      cancelSignal
+    );
+    // After the setup above, so the check sees the hooks it loaded.
+    const cwd = eventSpine.hasMiddlewareFor("message.send", workspaceId)
+      ? await this.resolvePromptHookCwd(workspaceId)
+      : undefined;
+    return runMessageSendHooks(eventSpine, workspaceId, { ...input, cwd, signal: cancelSignal });
+  }
+
+  /** Run the turn.stop prompt-hook chain for one finished turn (fail-open). */
+  async runTurnStopHooks(
+    workspaceId: string,
+    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "model">
+  ): Promise<TurnStopHookOutcome> {
+    const cwd = eventSpine.hasMiddlewareFor("turn.stop", workspaceId)
+      ? await this.resolvePromptHookCwd(workspaceId)
+      : undefined;
+    return runTurnStopHooks(eventSpine, workspaceId, { ...input, cwd });
+  }
+
+  /** The lazy hook setup of request building, fail-soft: the hooks already loaded still run. */
+  private async loadRequestHooksForPrompt(workspaceId: string): Promise<void> {
+    const snapshot = await this.captureRequestAssemblySnapshot(workspaceId).catch(
+      (error: unknown) => {
+        log.warn("Prompt hooks: hook setup failed; running the hooks already loaded", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+        return null;
+      }
+    );
+    if (snapshot?.success === false) {
+      log.debug("Prompt hooks: hook setup skipped", { workspaceId, error: snapshot.error });
+    }
+  }
+
+  /** The workspace path prompt hooks see as `cwd` (the tools' cwd); undefined when unreadable. */
+  private async resolvePromptHookCwd(workspaceId: string): Promise<string | undefined> {
+    try {
+      const metadata = await this.getWorkspaceMetadata(workspaceId);
+      if (!metadata.success) return undefined;
+      const context = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
+      return context.success ? context.data.workspacePath : undefined;
+    } catch {
+      return undefined; // fail open: the hook runs without cwd
+    }
   }
 
   releaseMockStreamStartGate(workspaceId: string): void {

@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useRef, useState } from "react";
+import React, { useEffect, useCallback, useRef, useState } from "react";
 import { useRouter } from "./contexts/RouterContext";
 import { useLocation } from "react-router-dom";
 import "./styles/globals.css";
@@ -8,9 +8,13 @@ import type { WorkspaceSelection } from "./components/ProjectSidebar/ProjectSide
 import { LeftSidebar } from "./components/LeftSidebar/LeftSidebar";
 import { ProjectCreateModal } from "./components/ProjectCreateModal/ProjectCreateModal";
 import { MultiProjectWorkspaceCreateModal } from "./components/MultiProjectWorkspaceCreateModal/MultiProjectWorkspaceCreateModal";
-import { AIView } from "./components/AIView/AIView";
+import type * as AIViewModule from "./components/AIView/AIView";
 import { ErrorBoundary } from "./components/ErrorBoundary/ErrorBoundary";
-import { usePersistedState, updatePersistedState } from "./hooks/usePersistedState";
+import {
+  readPersistedState,
+  usePersistedState,
+  updatePersistedState,
+} from "./hooks/usePersistedState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
 import { useComputerUse } from "./hooks/useComputerUse";
 import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
@@ -57,6 +61,10 @@ import {
 } from "@/constants/layout";
 import { XUM_PRODUCT_SLUG } from "@/common/constants/product";
 import { buildCoreSources, type BuildSourcesParams } from "./utils/commands/sources";
+import {
+  useLoadMcpAppEntrypoints,
+  useMcpAppEntrypoints,
+} from "./features/RightSidebar/AppViewTab/mcpAppEntrypoints";
 
 import {
   getTopLevelProjectEntries,
@@ -74,6 +82,7 @@ import {
   getProjectScopeId,
   getWorkspaceLastReadKey,
   EXPANDED_PROJECTS_KEY,
+  LAST_VISITED_ROUTE_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
   LEFT_SIDEBAR_WIDTH_KEY,
 } from "@/common/constants/storage";
@@ -83,17 +92,15 @@ import type { UpdateChannel } from "@/common/types/project";
 import { useTelemetry } from "./hooks/useTelemetry";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useStartWorkspaceCreation } from "./hooks/useStartWorkspaceCreation";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
 import { getAutoRouting, getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 
-import { ScratchPage } from "@/browser/components/ScratchPage/ScratchPage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isLocalProjectRuntime, isWorktreeRuntime } from "@/common/types/runtime";
 import type { WorkspaceCreatedOptions } from "@/browser/features/ChatInput/types";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
-import { ProjectPage } from "@/browser/components/ProjectPage/ProjectPage";
 
 import { SettingsProvider, useSettings } from "./contexts/SettingsContext";
 import { AboutDialogProvider, useAboutDialog } from "./contexts/AboutDialogContext";
@@ -127,13 +134,93 @@ import { createProjectRefs } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import { prependInitialAppProxyBasePath } from "@/browser/utils/frontendBasePath";
+import {
+  prependInitialAppProxyBasePath,
+  stripInitialAppProxyBasePathFromPathname,
+} from "@/browser/utils/frontendBasePath";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
 import { WorkspaceActiveGoalsWarningToast } from "@/browser/components/ActiveGoalsWarningToast/ActiveGoalsWarningToast";
 import { LoadingScreen } from "@/browser/components/LoadingScreen/LoadingScreen";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { markAppShellReady } from "@/browser/utils/perf/appShellReady";
 import { Err, Ok } from "@/common/types/result";
+
+// T3 #5971 (route split): each page is its own chunk. The workspace page's ErrorBoundary sits inside
+// its chunk, so a failed chunk load reaches PageArea's LazyFeature (Reload, which can recover).
+let aiViewChunk: Promise<typeof AIViewModule> | undefined;
+export const loadAIView = () => (aiViewChunk ??= import("./components/AIView/AIView"));
+const AIView = React.lazy(async () => {
+  const { AIView: View } = await loadAIView();
+  return {
+    default: (props: React.ComponentProps<typeof View> & { errorScope: string }) => (
+      <ErrorBoundary workspaceInfo={props.errorScope}>
+        <View {...props} />
+      </ErrorBoundary>
+    ),
+  };
+});
+const ProjectPage = React.lazy(async () => ({
+  default: (await import("@/browser/components/ProjectPage/ProjectPage")).ProjectPage,
+}));
+const ScratchPage = React.lazy(async () => ({
+  default: (await import("@/browser/components/ScratchPage/ScratchPage")).ScratchPage,
+}));
+// AppLoader renders App only after the workspace metadata loads, so on a workspace route start the
+// page chunk now, while the entry still boots. A dynamic import: `/` (first run) loads nothing more.
+const startupRoute =
+  window.location.protocol === "file:"
+    ? readPersistedState<string | null>(LAST_VISITED_ROUTE_KEY, null)
+    : stripInitialAppProxyBasePathFromPathname(window.location.pathname);
+// `typeof`: a corrupted or legacy persisted route can parse to a non-string (RouterContext checks it
+// the same way), and this runs during module evaluation, where a throw would stop the app.
+if (typeof startupRoute === "string" && startupRoute.startsWith("/workspace/")) {
+  loadAIView().catch(() => undefined); // React.lazy reports it
+}
+
+/**
+ * The app shell's ref: marks the shell ready, then (#6255) on desktop starts the workspace page chunk
+ * once the renderer is idle. Desktop often starts off a workspace route, and its first workspace
+ * click then waited for the chunk (+50-100 ms in the nightly workspace-open scenarios). Not in the
+ * browser: there it would add page-code evaluation to the first-run page's Lighthouse window. A
+ * module function, so React calls it only on attach and detach (see markAppShellReady).
+ */
+export function appShellRef(element: HTMLElement | null): void {
+  markAppShellReady(element);
+  if (element == null || window.location.protocol !== "file:") return;
+  if (typeof requestIdleCallback !== "function") return;
+  requestIdleCallback(
+    () => {
+      loadAIView().catch(() => undefined); // React.lazy reports it
+    },
+    { timeout: 2_000 } // load it even if the renderer stays busy
+  );
+}
+
+/**
+ * The page column. While a page chunk loads or after it fails, it holds the page's one `main`.
+ * `pageKey` names the kind of page: a new kind gets a fresh boundary, so a page that failed to load
+ * or render does not keep its failure state over the next page.
+ */
+function PageArea(props: { pageKey: string; children: React.ReactNode }) {
+  const frame = (state: React.ReactNode) => (
+    <main className="mobile-layout flex min-w-0 flex-1 items-center justify-center overflow-hidden">
+      {state}
+    </main>
+  );
+  return (
+    <div className="mobile-layout flex flex-1 overflow-hidden">
+      <LazyFeature
+        key={props.pageKey}
+        name="Page"
+        frame={frame}
+        fallback={<LoadingScreen statusText="Opening page..." />}
+      >
+        {props.children}
+      </LazyFeature>
+    </div>
+  );
+}
 
 function RootRouteShell(props: {
   leftSidebarCollapsed: boolean;
@@ -205,10 +292,17 @@ function AppInner() {
   const { layoutPresets, applySlotToWorkspace, saveCurrentWorkspaceToSlot } = useUILayouts();
   const { getMinOverride: getMinThinkingOverride } = useMinThinkingLevels();
   const { api, status, error, authenticate, retry } = useAPI();
+  // Handlers and command sources see null offline, even while useAPI() keeps the last client.
+  const liveApi = useLiveAPI();
+  // Read after a confirmation dialog: the connection can drop while it is open.
+  const liveApiRef = useRef(liveApi);
+  useEffect(() => {
+    liveApiRef.current = liveApi;
+  }, [liveApi]);
   const [supportedUpdateChannels, setSupportedUpdateChannels] = useState<UpdateChannel[]>([]);
 
   useEffect(() => {
-    setSupportedUpdateChannels([]);
+    // No reset here: a reconnect (new client) keeps the listed channels until the reload answers.
     if (!api) return;
 
     let active = true;
@@ -247,6 +341,9 @@ function AppInner() {
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  // MCP App entry points open as app tabs, so the Artifacts experiment gates them too.
+  useLoadMcpAppEntrypoints(selectedWorkspace?.workspaceId ?? null, artifactsEnabled);
+  const mcpAppEntrypoints = useMcpAppEntrypoints(selectedWorkspace?.workspaceId ?? "");
   const sessionTapesEnabled = useExperimentValue(EXPERIMENT_IDS.SESSION_TAPES);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const perfFlightRecorderEnabled = useExperimentValue(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER);
@@ -618,7 +715,8 @@ function AppInner() {
   const togglePremiumServiceTier = useCallback(
     async (targetServiceTier: PremiumServiceTier) => {
       const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
-      if (!api || !scopeId || providersConfig == null || fastModeToggleInFlightRef.current) return;
+      if (!liveApi || !scopeId || providersConfig == null || fastModeToggleInFlightRef.current)
+        return;
 
       // Creation composers use the same project-scoped model preference as their selector,
       // so the global shortcut remains available before the first workspace exists.
@@ -664,11 +762,11 @@ function AppInner() {
         if (provider === "openai") {
           const current =
             getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier;
-          setWorkspaceServiceTier(api, scopeId, toggleServiceTier(current, targetServiceTier));
+          setWorkspaceServiceTier(liveApi, scopeId, toggleServiceTier(current, targetServiceTier));
           return;
         }
         const patch = await applyFastModeToggle(
-          api.providers,
+          liveApi.providers,
           provider,
           providersConfig[provider],
           targetServiceTier
@@ -685,7 +783,7 @@ function AppInner() {
       }
     },
     [
-      api,
+      liveApi,
       creationScopeId,
       getModelForWorkspace,
       getRouteForModel,
@@ -730,14 +828,14 @@ function AppInner() {
         projectPaths.length >= 2,
         "createMultiProjectWorkspace requires at least two projects"
       );
-      if (!api) {
+      if (!liveApi) {
         throw new Error("Not connected to server");
       }
 
       const [primaryProjectPath] = projectPaths;
       assert(primaryProjectPath, "createMultiProjectWorkspace requires a primary project");
 
-      const branchResult = await api.projects.listBranches({ projectPath: primaryProjectPath });
+      const branchResult = await liveApi.projects.listBranches({ projectPath: primaryProjectPath });
       const candidateBranches = branchResult.branches.filter(
         (branch): branch is string => typeof branch === "string"
       );
@@ -758,7 +856,7 @@ function AppInner() {
       // Multi-project container names must stay unique and path-separator-free.
       const projects = createProjectRefs(projectPaths);
 
-      const metadata = await api.workspace.createMultiProject({
+      const metadata = await liveApi.workspace.createMultiProject({
         projects,
         branchName: `multi-${Date.now().toString(36)}`,
         trunkBranch,
@@ -783,7 +881,7 @@ function AppInner() {
       setSelectedWorkspace(toWorkspaceSelection(metadata));
       setMultiProjectWorkspaceModalOpen(false);
     },
-    [api, setSelectedWorkspace, setWorkspaceMetadata, telemetry, workspaceStore]
+    [liveApi, setSelectedWorkspace, setWorkspaceMetadata, telemetry, workspaceStore]
   );
 
   const archiveMergedWorkspacesInProjectFromPalette = useCallback(
@@ -791,7 +889,7 @@ function AppInner() {
       const trimmedProjectPath = projectPath.trim();
       if (!trimmedProjectPath) return;
 
-      if (!api) {
+      if (!liveApi) {
         if (typeof window !== "undefined") {
           window.alert("Cannot archive merged workspaces: API not connected");
         }
@@ -799,7 +897,7 @@ function AppInner() {
       }
 
       try {
-        const result = await api.workspace.archiveMergedInProject({
+        const result = await liveApi.workspace.archiveMergedInProject({
           projectPath: trimmedProjectPath,
         });
 
@@ -836,15 +934,15 @@ function AppInner() {
         }
       }
     },
-    [api]
+    [liveApi]
   );
 
   const getBranchesForProject = useCallback(
     async (projectPath: string): Promise<BranchListResult> => {
-      if (!api) {
+      if (!liveApi) {
         return { branches: [], recommendedTrunk: null };
       }
-      const branchResult = await api.projects.listBranches({ projectPath });
+      const branchResult = await liveApi.projects.listBranches({ projectPath });
       const sanitizedBranches = branchResult.branches.filter(
         (branch): branch is string => typeof branch === "string"
       );
@@ -859,7 +957,7 @@ function AppInner() {
         recommendedTrunk: recommended,
       };
     },
-    [api]
+    [liveApi]
   );
 
   const selectWorkspaceFromPalette = useCallback(
@@ -887,7 +985,7 @@ function AppInner() {
   );
   const removeSubagentFromPalette = async (workspaceId: string, title: string) => {
     const notice = await confirmAndRemoveSubagent({
-      api,
+      getApi: () => liveApiRef.current,
       confirm: confirmDialog,
       removeSubagent,
       workspaceId,
@@ -990,6 +1088,7 @@ function AppInner() {
     onStartMultiProjectWorkspaceCreation: openNewMultiProjectWorkspaceFromPalette,
     multiProjectWorkspacesEnabled,
     artifactsEnabled,
+    mcpAppEntrypoints,
     perfFlightRecorderEnabled,
     sessionTapesEnabled,
     onArchiveMergedWorkspacesInProject: archiveMergedWorkspacesInProjectFromPalette,
@@ -1031,7 +1130,7 @@ function AppInner() {
       }
     },
     onClearTimingStats: (workspaceId: string) => workspaceStore.clearTimingStats(workspaceId),
-    api,
+    api: liveApi,
     confirmDialog,
   };
 
@@ -1436,7 +1535,7 @@ function AppInner() {
     <>
       <div
         className="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]"
-        ref={markAppShellReady}
+        ref={appShellRef}
       >
         <LeftSidebar
           collapsed={sidebarCollapsed}
@@ -1450,7 +1549,17 @@ function AppInner() {
         <div className="mobile-main-content flex min-w-0 flex-1 flex-col overflow-hidden">
           <WindowsToolchainBanner />
           <RosettaBanner />
-          <div className="mobile-layout flex flex-1 overflow-hidden">
+          <PageArea
+            pageKey={
+              selectedWorkspace || currentWorkspaceId
+                ? "workspace"
+                : creationProjectPath === SCRATCH_PROJECT_CONFIG_KEY
+                  ? "scratch"
+                  : creationProjectPath
+                    ? "project"
+                    : "root"
+            }
+          >
             {/* Settings and analytics are modals over whatever page they were opened from, so the
                 page stays mounted underneath them. */}
             {selectedWorkspace ? (
@@ -1473,22 +1582,19 @@ function AppInner() {
                 const workspacePath =
                   currentMetadata.namedWorkspacePath ?? selectedWorkspace.namedWorkspacePath ?? "";
                 return (
-                  <ErrorBoundary
-                    workspaceInfo={`${selectedWorkspace.projectName}/${workspaceName}`}
-                  >
-                    <AIView
-                      workspaceId={selectedWorkspace.workspaceId}
-                      projectPath={selectedWorkspace.projectPath}
-                      projectName={selectedWorkspace.projectName}
-                      leftSidebarCollapsed={sidebarCollapsed}
-                      onToggleLeftSidebarCollapsed={handleToggleSidebar}
-                      workspaceName={workspaceName}
-                      namedWorkspacePath={workspacePath}
-                      runtimeConfig={currentMetadata.runtimeConfig}
-                      incompatibleRuntime={currentMetadata.incompatibleRuntime}
-                      isInitializing={currentMetadata.isInitializing === true}
-                    />
-                  </ErrorBoundary>
+                  <AIView
+                    errorScope={`${selectedWorkspace.projectName}/${workspaceName}`}
+                    workspaceId={selectedWorkspace.workspaceId}
+                    projectPath={selectedWorkspace.projectPath}
+                    projectName={selectedWorkspace.projectName}
+                    leftSidebarCollapsed={sidebarCollapsed}
+                    onToggleLeftSidebarCollapsed={handleToggleSidebar}
+                    workspaceName={workspaceName}
+                    namedWorkspacePath={workspacePath}
+                    runtimeConfig={currentMetadata.runtimeConfig}
+                    incompatibleRuntime={currentMetadata.incompatibleRuntime}
+                    isInitializing={currentMetadata.isInitializing === true}
+                  />
                 );
               })()
             ) : currentWorkspaceId ? (
@@ -1543,7 +1649,7 @@ function AppInner() {
                 onToggleLeftSidebarCollapsed={handleToggleSidebar}
               />
             )}
-          </div>
+          </PageArea>
         </div>
         <WorkspaceActiveGoalsWarningToast />
         <CommandPalette getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })} />

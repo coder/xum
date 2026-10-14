@@ -16,6 +16,7 @@ import {
   createMuxMessage,
   type CompactionFollowUpRequest,
   type MuxMessage,
+  type MuxMetadata,
 } from "@/common/types/message";
 import { selectRollingCut, type RollingCut } from "@/common/utils/compaction/rollingCut";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
@@ -45,7 +46,10 @@ interface StreamSnapshot {
   stepStartIndices: readonly number[];
   currentStepStartIndex: number;
   // The live turn's Anthropic thinking-repair receipt can exist only in memory (#5996).
-  initialMetadata?: { anthropicThinkingReplay?: "off" };
+  initialMetadata?: Pick<
+    MuxMetadata,
+    "anthropicThinkingReplay" | "anthropicThinkingReplayFromStep"
+  >;
 }
 interface Dependencies {
   workspaceId: string;
@@ -339,7 +343,11 @@ export class ContinuousCompactor {
           ...rows[index].metadata,
           stepStartPartIndices: [...live.stepStartIndices],
           ...(live.initialMetadata?.anthropicThinkingReplay === "off"
-            ? { anthropicThinkingReplay: "off" as const }
+            ? {
+                anthropicThinkingReplay: "off" as const,
+                anthropicThinkingReplayFromStep:
+                  live.initialMetadata.anthropicThinkingReplayFromStep,
+              }
             : {}),
         },
       };

@@ -1,7 +1,7 @@
 import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, render, waitFor } from "@testing-library/react";
 
 import { installDom } from "../../../../tests/ui/dom";
 import { MarkdownRenderer } from "./MarkdownRenderer";
@@ -78,6 +78,20 @@ describe("UserMessageContent raw HTML", () => {
     expect(view.container.querySelector('[data-streamdown="strong"]')?.textContent).toBe("bold");
     expect(view.container.querySelector("a")?.getAttribute("href")).toBe("https://example.com/");
     expect(view.container.querySelector("li")?.textContent).toBe("item");
+  });
+
+  // File previews block image URLs (MarkdownFilePreview.test.tsx); user bubbles share the
+  // raw-HTML-as-text pipeline but must keep loading them.
+  test("an image URL typed by the user still loads", async () => {
+    const view = render(
+      <UserMessageContent content={"![shot](https://example.com/shot.png)"} variant="sent" />
+    );
+
+    await waitFor(() =>
+      expect(view.container.querySelector("img")?.getAttribute("src")).toBe(
+        "https://example.com/shot.png"
+      )
+    );
   });
 
   test("assistant markdown still renders allowed HTML", () => {

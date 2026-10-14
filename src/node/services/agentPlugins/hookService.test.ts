@@ -47,6 +47,7 @@ import {
 } from "./hookService";
 import { bumpContainerMutationEpoch, STAGING_DIR_NAME } from "./journals";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import { buildPluginServerKey, resolvePluginInstanceId } from "./mcpConfig";
 
 const WORKSPACE_ID = "plugin-hooks-test";
 
@@ -490,6 +491,8 @@ describe("AgentPluginHookService", () => {
         expect(ensure).toHaveBeenCalledTimes(1);
         expect(ensure.mock.calls[0][0]).toMatchObject({
           projectRoot: h.config.rootDir,
+          // Project plugin instance IDs hash the project key, not the checkout.
+          projectKey: h.config.rootDir,
           projectTrusted: false,
         });
         if (mode !== "enabled") {
@@ -595,7 +598,7 @@ describe("AgentPluginHookService", () => {
         ).success
       ).toBe(true);
       expect(ensure).toHaveBeenCalledTimes(1);
-      expect(injected).toEqual(["base\n\nmodelString,workspaceId"]);
+      expect(injected).toEqual(["base\n\nmodelString,settings,workspaceId"]);
     } finally {
       ensure.mockRestore();
       await h.session.dispose();
@@ -631,6 +634,201 @@ describe("AgentPluginHookService", () => {
       expect(ctx.systemMessage).toBe("base");
     }
   );
+
+  test("hooks get their own plugin's MCP server settings", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "cad-hooks",
+      `({ "request.assemble": (input) => ({ context: "Units: " + input.settings.cad.units }) })`
+    );
+    const prefixes: string[] = [];
+    harness.service.setSettingsProvider((workspaceId, prefix) => {
+      expect(workspaceId).toBe(WORKSPACE_ID);
+      prefixes.push(prefix);
+      return Promise.resolve({ cad: { units: "mm" } });
+    });
+    await harness.ensure();
+    const ctx: RequestAssembleContext = {
+      workspaceId: WORKSPACE_ID,
+      modelString: "model",
+      systemMessage: "base",
+      tools: {},
+    };
+    await harness.spine.run("request.assemble", ctx);
+    expect(ctx.systemMessage).toBe("base\n\nUnits: mm");
+    // The same instance ID as the plugin's MCP server keys.
+    const instanceId = resolvePluginInstanceId(
+      { scope: "global", containerPath: harness.container, dirName: "cad-hooks" },
+      {}
+    );
+    expect(prefixes).toEqual([buildPluginServerKey(instanceId, "")]);
+  });
+
+  test("one dispatch starts every plugin's settings read before it waits on the first", async () => {
+    // #6186: the spine runs plugin middleware serially, so serial reads add one timeout each.
+    const harness = await createHarness();
+    for (const name of ["first-plugin", "second-plugin"]) {
+      await writeHookPlugin(
+        harness.container,
+        name,
+        `({ "request.assemble": (input) => ({ context: input.settings.s.v }) })`
+      );
+    }
+    const prefixes: string[] = [];
+    const firstReached = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    harness.service.setSettingsProvider(async (_workspaceId, prefix) => {
+      prefixes.push(prefix);
+      firstReached.resolve();
+      await gate.promise;
+      return { s: { v: prefix } };
+    });
+    await harness.ensure();
+    const ctx: RequestAssembleContext = {
+      workspaceId: WORKSPACE_ID,
+      modelString: "model",
+      systemMessage: "base",
+      tools: {},
+    };
+    const running = harness.spine.run("request.assemble", ctx);
+    await firstReached.promise;
+    const startedBeforeFirstSettled = new Set(prefixes).size;
+    gate.resolve();
+    await running;
+    expect(startedBeforeFirstSettled).toBe(2);
+    // Each hook still gets only its own plugin's settings.
+    const contributed = ctx.systemMessage.split("\n\n").slice(1);
+    expect(new Set(contributed)).toEqual(new Set(prefixes));
+    expect(contributed).toHaveLength(2);
+  });
+
+  test("a tool call prefetches settings only for sibling plugins that grant the tool", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "reads-files",
+      `({ "tool.execute.before": () => ({}) })`,
+      { tools: ["file_read"] }
+    );
+    await writeHookPlugin(
+      harness.container,
+      "runs-bash",
+      `({ "tool.execute.before": () => ({}) })`,
+      { tools: ["bash"] }
+    );
+    const prefixes: string[] = [];
+    harness.service.setSettingsProvider((_workspaceId, prefix) => {
+      prefixes.push(prefix);
+      return Promise.resolve({});
+    });
+    await harness.ensure();
+    await runTool(harness.spine, makeToolCtx("file_read", { path: "/repo/a.txt" }));
+    // Only the plugin that can run on file_read has its settings read.
+    expect(new Set(prefixes).size).toBe(1);
+  });
+
+  test("hook settings above the size cap are omitted with a flag", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "big-settings",
+      `({ "request.assemble": (input) => ({ context: Object.keys(input.settings).length + ":" + input.settingsOmitted }) })`
+    );
+    let value = "x";
+    harness.service.setSettingsProvider(() => Promise.resolve({ cad: { notes: value } }));
+    await harness.ensure();
+    const assemble = async () => {
+      const ctx: RequestAssembleContext = {
+        workspaceId: WORKSPACE_ID,
+        modelString: "model",
+        systemMessage: "base",
+        tools: {},
+      };
+      await harness.spine.run("request.assemble", ctx);
+      return ctx.systemMessage;
+    };
+    expect(await assemble()).toBe("base\n\n1:undefined");
+    // About what four servers at the per-server limits can send.
+    value = "x".repeat(400 * 1024);
+    expect(await assemble()).toBe("base\n\n0:true");
+    // The cap counts UTF-8 bytes of the settings JSON, `{"cad":{"notes":"…"}}` (20 bytes around
+    // the value): exactly at the cap passes, one byte over is omitted.
+    const cap = 64 * 1024;
+    value = "x".repeat(cap - 20);
+    expect(await assemble()).toBe("base\n\n1:undefined");
+    value = "x".repeat(cap - 19);
+    expect(await assemble()).toBe("base\n\n0:true");
+    // Non-ASCII text: fewer UTF-16 units than the cap, but more bytes.
+    value = "é".repeat((cap - 20) / 2 + 1);
+    expect(await assemble()).toBe("base\n\n0:true");
+  });
+
+  test.each(["dispose", "epoch"] as const)(
+    "a %s that lands while a hook reads its settings stops the call",
+    async (mode) => {
+      // Salvaged from #6040: the settings read must come before the revocation checks.
+      const harness = await createHarness();
+      await writeHookPlugin(
+        harness.container,
+        "revoked-mid-read",
+        `({ "tool.execute.before": () => ({ deny: "removed hook ran" }) })`,
+        { tools: ["file_read"] }
+      );
+      const gate = Promise.withResolvers<void>();
+      const reached = Promise.withResolvers<void>();
+      harness.service.setSettingsProvider(async () => {
+        reached.resolve();
+        await gate.promise;
+        return {};
+      });
+      await harness.ensure();
+      const mountSpy = spyOn(harness.sandboxHost, "withPersistentMount");
+      try {
+        const ctx = makeToolCtx("file_read", { path: "/repo/a.txt" });
+        const running = runTool(harness.spine, ctx);
+        await reached.promise;
+        if (mode === "dispose") await harness.service.disposeWorkspace(WORKSPACE_ID);
+        else {
+          const stagingRoot = path.join(harness.tmp.path, STAGING_DIR_NAME);
+          await fs.mkdir(stagingRoot, { recursive: true });
+          await bumpContainerMutationEpoch(stagingRoot);
+        }
+        gate.resolve();
+        await running;
+        expect(ctx.executed).toBe(true);
+        expect(ctx.blocked).toBeUndefined();
+        expect(mountSpy).not.toHaveBeenCalled();
+      } finally {
+        gate.resolve();
+        mountSpy.mockRestore();
+      }
+    }
+  );
+
+  test("a plugin revoked (epoch bump, e.g. another backend's update) before the hook call never has its settings server contacted", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "revoked-before-read",
+      `({ "tool.execute.before": () => ({ deny: "removed hook ran" }) })`,
+      { tools: ["file_read"] }
+    );
+    let settingsReads = 0;
+    harness.service.setSettingsProvider(() => {
+      settingsReads++;
+      return Promise.resolve({});
+    });
+    await harness.ensure();
+    // The middleware stays registered (no local teardown yet); only the epoch moved.
+    const ctx = makeToolCtx("file_read", { path: "/repo/a.txt" });
+    const stagingRoot = path.join(harness.tmp.path, STAGING_DIR_NAME);
+    await fs.mkdir(stagingRoot, { recursive: true });
+    await bumpContainerMutationEpoch(stagingRoot);
+    await runTool(harness.spine, ctx);
+    expect(ctx.blocked).toBeUndefined();
+    expect(settingsReads).toBe(0);
+  });
 
   test("an admitted context snapshot reacquires a dropped sandbox instead of retaining its runtime", async () => {
     const harness = await createHarness();

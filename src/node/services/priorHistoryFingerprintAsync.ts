@@ -1,4 +1,5 @@
 import {
+  comparePriorHistoryOrder,
   FNV_OFFSET_BASIS,
   MISSING_TIMESTAMP,
   updateFnv1a,
@@ -12,8 +13,11 @@ interface PriorHistoryRow {
 }
 
 function comparePriorHistoryRows(left: PriorHistoryRow, right: PriorHistoryRow): number {
-  return (
-    left.historySequence - right.historySequence || left.message.id.localeCompare(right.message.id)
+  return comparePriorHistoryOrder(
+    left.historySequence,
+    left.message.id,
+    right.historySequence,
+    right.message.id
   );
 }
 
@@ -23,10 +27,8 @@ function comparePriorHistoryRows(left: PriorHistoryRow, right: PriorHistoryRow):
  * epoch), stalling heartbeats, IPC and other workspaces' replays (#4655). This version:
  * - yields to the event loop while collecting and while hashing rows;
  * - skips the sort when rows are already in comparator order (the normal case), because sorting
- *   1.24M entries is itself a long block. Array.prototype.sort is stable, so skipping is exact for
- *   a consistent comparator. A non-finite sequence (persisted metadata is not schema-checked, so
- *   NaN, Infinity or a string can appear) turns the subtraction into NaN, which `||` sends to the
- *   id tiebreak, so the comparator is inconsistent: such histories always sort, like the reference;
+ *   1.24M entries is itself a long block. Array.prototype.sort is stable and the comparator is a
+ *   total order (comparePriorHistoryOrder), so skipping is exact;
  * - hashes each row's pieces in order instead of one concatenated string (FNV-1a streams UTF-16
  *   code units, so the hash is identical), so it never holds every row's serialized parts at once.
  *
@@ -52,11 +54,7 @@ export async function computePriorHistoryFingerprintAsync(
       continue;
     }
     const row = { historySequence, message };
-    // Number.isFinite does not coerce, so it also rejects a persisted string sequence.
-    if (
-      !Number.isFinite(historySequence) ||
-      (rows.length > 0 && !(comparePriorHistoryRows(rows[rows.length - 1], row) <= 0))
-    ) {
+    if (rows.length > 0 && comparePriorHistoryRows(rows[rows.length - 1], row) > 0) {
       inComparatorOrder = false;
     }
     rows.push(row);

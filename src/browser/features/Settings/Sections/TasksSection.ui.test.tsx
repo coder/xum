@@ -1,10 +1,12 @@
 // Real Radix exports must initialize after the DOM, even when this suite runs first.
 import { installDom } from "../../../../../tests/ui/dom";
 import type React from "react";
-import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as tooltipModule from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
+import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import {
   createTestApiClient,
   createTestConfig,
@@ -987,5 +989,142 @@ describe("TasksSection Auto routing defaults", () => {
       expect(payload.agentAiDefaults.plan).toBeUndefined();
       expect(payload.agentAiDefaults.mystery).toEqual({ modelString: "openai:gpt-6-luna" });
     });
+  });
+});
+
+// A reconnect reloads the config and the agents through the new client. The agent list stays on
+// screen ("Loading agents…" is for another project only), and a value the user changed but the
+// debounced autosave has not sent yet is kept and saved, not replaced by the reload.
+describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => {
+  let restoreDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    restoreDom = installDom();
+    experimentsEnabledByDefault = false;
+    experimentValues = {};
+    selectedWorkspaceMock = { projectPath: "/proj", workspaceId: "ws-1" };
+  });
+
+  afterEach(() => {
+    cleanup();
+    apiMock = null;
+    selectedWorkspaceMock = null;
+    restoreDom?.();
+    restoreDom = null;
+  });
+
+  function connect(maxParallelAgentTasks: number, agents: Promise<AgentDefinitionDescriptor[]>) {
+    const saveConfig = mock((_payload: { taskSettings: { maxParallelAgentTasks: number } }) =>
+      Promise.resolve(undefined)
+    );
+    apiMock = {
+      config: {
+        getConfig: mock(() =>
+          Promise.resolve(
+            createTestConfig({
+              taskSettings: { ...DEFAULT_TASK_SETTINGS, maxParallelAgentTasks },
+            })
+          )
+        ),
+        saveConfig,
+      },
+      agents: { list: mock(() => agents) },
+    };
+    return saveConfig;
+  }
+
+  function maxParallelInput(view: ReturnType<typeof render>): HTMLInputElement {
+    const row = view.getByText("Max Parallel Agent Tasks").closest(".justify-between");
+    const input = row?.querySelector("input");
+    if (!(input instanceof window.HTMLInputElement)) throw new Error("No max-parallel input");
+    return input;
+  }
+
+  test("keeps the agent list while the reload is pending", async () => {
+    connect(3, Promise.resolve(FALLBACK_AGENTS));
+    const harness = createConnectionHarness(mode, () => apiMock ?? {});
+    const view = render(
+      <harness.Wrapper>
+        <TasksSection />
+      </harness.Wrapper>
+    );
+    await waitFor(() => expect(view.queryByText("Loading agents…")).toBeNull());
+
+    connect(3, new Promise(() => undefined));
+    await harness.drop();
+    harness.reconnect();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(view.queryByText("Loading agents…")).toBeNull();
+  });
+
+  test("keeps and saves a change the reload would overwrite", async () => {
+    connect(3, Promise.resolve(FALLBACK_AGENTS));
+    const harness = createConnectionHarness(mode, () => apiMock ?? {});
+    const view = render(
+      <harness.Wrapper>
+        <TasksSection />
+      </harness.Wrapper>
+    );
+    await waitFor(() => expect(maxParallelInput(view).value).toBe("3"));
+
+    // The change, then the reconnect, before the debounced autosave fires.
+    const input = maxParallelInput(view);
+    const reactPropsKey = Object.keys(input).find((key) => key.startsWith("__reactProps"));
+    const onChange = (
+      reactPropsKey ? (input as unknown as Record<string, unknown>)[reactPropsKey] : null
+    ) as { onChange?: (event: { target: { value: string } }) => void } | null;
+    if (!onChange?.onChange) throw new Error("Expected the input to expose its onChange handler");
+    const change = onChange.onChange;
+    act(() => change({ target: { value: "7" } }));
+    const saveConfig = connect(5, Promise.resolve(FALLBACK_AGENTS));
+    await harness.drop();
+    harness.reconnect();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+
+    expect(maxParallelInput(view).value).toBe("7");
+    await waitFor(() => expect(saveConfig).toHaveBeenCalled(), { timeout: 2_000 });
+    expect(saveConfig.mock.calls.at(-1)?.[0].taskSettings.maxParallelAgentTasks).toBe(7);
+  });
+
+  // Offline an edit would live only in this section's state, and leaving the section before the
+  // reconnect would lose it: the controls must be disabled until a live client is back.
+  test("disables the controls while offline", async () => {
+    connect(3, Promise.resolve(FALLBACK_AGENTS));
+    const harness = createConnectionHarness(mode, () => apiMock ?? {});
+    const view = render(
+      <harness.Wrapper>
+        <TasksSection />
+      </harness.Wrapper>
+    );
+    await waitFor(() => expect(maxParallelInput(view).value).toBe("3"));
+    // happy-dom does not apply a disabled <fieldset> to `:disabled`: read the fieldset (browsers
+    // disable every control inside it).
+    const isDisabled = (input: HTMLInputElement) =>
+      input.disabled || input.closest("fieldset")?.disabled === true;
+    expect(isDisabled(maxParallelInput(view))).toBe(false);
+
+    await harness.drop();
+    await waitFor(() => expect(isDisabled(maxParallelInput(view))).toBe(true));
+    // The kept value stays on screen.
+    expect(maxParallelInput(view).value).toBe("3");
+
+    // Until the reload answers the controls stay disabled: an edit then would be replaced by it.
+    let answer: (() => void) | null = null;
+    const answered = new Promise<void>((resolve) => (answer = resolve));
+    connect(3, Promise.resolve(FALLBACK_AGENTS));
+    const config = apiMock?.config.getConfig;
+    if (!apiMock || !config) throw new Error("connect() sets the client");
+    apiMock.config.getConfig = mock(() => answered.then(() => config() as unknown));
+    harness.reconnect();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(isDisabled(maxParallelInput(view))).toBe(true);
+    act(() => answer?.());
+    await waitFor(() => expect(isDisabled(maxParallelInput(view))).toBe(false));
   });
 });

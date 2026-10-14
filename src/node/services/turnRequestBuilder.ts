@@ -9,8 +9,11 @@ import type { OnStepSettled } from "./streamManager";
 import { measureAssembledRequestBudgetForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
+import { measureCompactionInputTokens } from "./compactionInputSizing";
 import {
   anthropicBetweenToolsRouteAvailable,
+  canSwitchToAnthropic1MContext,
   isAnthropic1MEffectivelyEnabled,
 } from "@/common/utils/ai/providerOptions";
 import * as path from "path";
@@ -76,9 +79,11 @@ import { isRlmModeEnabled } from "@/node/services/branchSummary";
 import type { ProviderService } from "@/node/services/providerService";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { type DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import { formatMcpAppModelContextSection } from "@/node/services/mcpAppResultStore";
 import type { InitStateManager } from "./initStateManager";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
+import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
 import type { StreamManager } from "./streamManager";
 import {
   type ModelFallbackOptions,
@@ -193,6 +198,10 @@ import {
   WORKFLOW_RESULT_METADATA_TYPE,
 } from "@/common/utils/workflowRunMessages";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import {
+  createPathSkillActivation,
+  loadedSnapshotSkillNames,
+} from "@/node/services/agentSkills/pathSkillActivation";
 import { eventSpine, type RequestAssembleContext } from "@/node/services/events/eventSpine";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
@@ -364,6 +373,17 @@ export interface StreamMessageOptions {
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**
+   * Compaction requests only: the share of the compaction input budget to trim to (default 1).
+   * AgentSession passes 0.5 for the one retry after the request hit context_exceeded.
+   */
+  compactionInputBudgetScale?: number;
+  /**
+   * Compaction requests only: AgentSession still holds the one context_exceeded retry of this
+   * request (resolveCompactionRetryPlan). Without it, a model that could switch to 1M context is
+   * trimmed on this attempt too, since nothing would retry it at 1M.
+   */
+  compactionContextRetryAvailable?: boolean;
+  /**
    * Model floor already resolved by AgentSession (config.json
    * minThinkingLevelByModel → resolveMinimumThinkingLevel). Passed down so
    * mid-turn overrides clamp against the same floor as the send-time level;
@@ -453,6 +473,88 @@ function pinCoderInstanceRawProvidersConfig(
       additionalProviders: [{ name: instance.name, type: instance.type }],
     },
   };
+}
+
+/**
+ * The estimated token budget a compaction request's history must fit (trimCompactionInput):
+ * SUMMARIZER_INPUT_FRACTION of the model's effective window, the share continuous compaction's
+ * summarizer uses, so the system prompt and the summary fit beside it. Per attempt, because a
+ * fallback model has its own window. Undefined, so nothing is trimmed, when the window is
+ * unknown, or when the model can still switch to 1M context and a retry is left
+ * (`contextRetryAvailable`): its context_exceeded retry does that and trims to the 1M window,
+ * which keeps more history than a trim to 200k would.
+ */
+export function resolveCompactionInputBudgetTokens(
+  modelString: string,
+  providerOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  scale = 1,
+  contextRetryAvailable = true
+): number | undefined {
+  assert(scale > 0 && scale <= 1, "compaction input budget scale must be in (0, 1]");
+  if (retriesAt1MContext(modelString, providerOptions, providersConfig, contextRetryAvailable)) {
+    return undefined;
+  }
+  const limit = getEffectiveContextLimit(
+    modelString,
+    isAnthropic1MEffectivelyEnabled(modelString, providerOptions, providersConfig),
+    providersConfig,
+    { openaiWireFormat: providerOptions?.openai?.wireFormat }
+  );
+  return limit == null ? undefined : Math.floor(limit * SUMMARIZER_INPUT_FRACTION * scale);
+}
+
+/** The context_exceeded retry will switch this model to 1M context (see above). */
+function retriesAt1MContext(
+  modelString: string,
+  providerOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  contextRetryAvailable: boolean
+): boolean {
+  return (
+    contextRetryAvailable &&
+    canSwitchToAnthropic1MContext(modelString, providerOptions, providersConfig)
+  );
+}
+
+/**
+ * assemblePromptPayload's compaction budget option: set for compaction requests only. A retry
+ * (scale set) on a model whose window is unknown has no window to derive a budget from; it
+ * trims to `scale` of the history's own estimate instead, so it does not resend the history
+ * that just hit context_exceeded unchanged.
+ */
+async function compactionInputBudgetOption(
+  isCompactionRequest: boolean,
+  model: {
+    modelString: string;
+    providerOptions: MuxProviderOptions | undefined;
+    providersConfig: ProvidersConfigMap | null | undefined;
+  },
+  history: MuxMessage[],
+  scale: number | undefined,
+  contextRetryAvailable: boolean
+): Promise<{ compactionInputBudgetTokens?: number }> {
+  if (!isCompactionRequest) return {};
+  const budget =
+    resolveCompactionInputBudgetTokens(
+      model.modelString,
+      model.providerOptions,
+      model.providersConfig,
+      scale,
+      contextRetryAvailable
+    ) ?? (scale == null ? undefined : await retryBudgetFromHistory(history, model, scale));
+  return budget == null ? {} : { compactionInputBudgetTokens: budget };
+}
+
+/** `scale` of the history's model-aware size: the same measure the trim then fits to it. */
+async function retryBudgetFromHistory(
+  history: MuxMessage[],
+  model: { modelString: string },
+  scale: number
+): Promise<number | undefined> {
+  const size = await measureCompactionInputTokens(history, model.modelString);
+  const budget = Math.floor(size * scale);
+  return budget > 0 ? budget : undefined;
 }
 
 /**
@@ -590,7 +692,7 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   desktopSessionManager?: DesktopSessionManager;
   computerUseService?: ComputerUseService;
   /** Routes AI calls from bash commands through Xum so their spend is accounted. */
-  bashAiProxy?: Pick<BashAiProxyService, "envFor">;
+  bashAiProxy?: Pick<BashAiProxyService, "envFor" | "noteBlocked">;
 }
 
 /**
@@ -733,6 +835,58 @@ export class TurnRequestBuilder {
       modelString: canonical,
       coderDerived: false,
     };
+  }
+
+  /**
+   * Start this workspace's MCP servers exactly as a send's request build does (same inputs to
+   * MCPServerManager.getToolsForWorkspace), so the same servers start and no others. Codex plugin
+   * hooks on UserPromptSubmit run before request building and need their plugin's server, which
+   * after a restart is not running yet. Returns false when the workspace is not ready for MCP
+   * (init failed, unsanitized checkout, runtime not ready, no MCP manager) or is a side chat.
+   */
+  async startWorkspaceMcpServers(workspaceId: string, signal: AbortSignal): Promise<boolean> {
+    const mcpServerManager = this.dependencies.bindings.mcpServerManager;
+    if (mcpServerManager === undefined) return false;
+    const metadataResult = await this.dependencies.getWorkspaceMetadata(workspaceId);
+    if (!metadataResult.success) return false;
+    const metadata = metadataResult.data;
+    // Like request building: a side chat never starts MCP servers (its local-read-only ceiling),
+    // so its prompt hooks fail open instead of reaching a possibly mutating MCP tool.
+    if (sideChatCapabilityGrants(metadata) != null) return false;
+    const runtimeContext = this.dependencies.createWorkspaceRuntimeContext(workspaceId, metadata);
+    if (!runtimeContext.success) return false;
+    const { runtime, workspacePath, hostCheckoutRoot } = runtimeContext.data;
+    await this.dependencies.initStateManager.waitForInit(workspaceId, signal);
+    if (this.dependencies.initStateManager.getUnsanitizedCheckoutError(workspaceId)) return false;
+    const ready = await runtime.ensureReady({ signal });
+    if (!ready.ready || signal.aborted) return false;
+    const readStartedAt = Date.now();
+    const read = await this.dependencies.workspaceMcpOverridesService
+      .getOverridesForWorkspace(workspaceId, { timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS, signal })
+      .catch(() => ({ overrides: undefined, authoritative: false }));
+    const projectSecrets = isMultiProject(metadata)
+      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
+      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
+    await mcpServerManager.getToolsForWorkspace(
+      {
+        workspaceId,
+        projectPath: metadata.projectPath,
+        runtime,
+        workspacePath,
+        trusted: isWorkspaceProjectTrusted(this.dependencies.config, metadata),
+        overrides: read.overrides,
+        overridesAuthoritative: read.authoritative,
+        ...(read.authoritative
+          ? {}
+          : { overridesReadDeadlineAt: readStartedAt + MCP_OVERRIDES_READ_TIMEOUT_MS }),
+        projectSecrets: await secretsToRecord(projectSecrets),
+        agentPlugins: hostCheckoutRoot
+          ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
+          : null,
+      },
+      { signal }
+    );
+    return true;
   }
 
   prepareModelAttempt(options: PrepareModelAttemptOptions): PreparedModelAttempt {
@@ -950,6 +1104,43 @@ export class TurnRequestBuilder {
     return { type: "finished", result: Err({ type: errorType, message: errorMessage }) };
   }
 
+  /**
+   * AI calls from bash commands bypass the chat stream. Point their SDKs at the local proxy so
+   * the spend lands in this workspace's ledger (Costs tab and Analytics). envFor() skips any
+   * provider that project secrets configure: secrets override xumEnv in the bash tool, and a
+   * proxy URL must never pair with a real key.
+   * Best effort: a proxy problem leaves bash without the pair and never fails the turn.
+   * Untrusted projects and the project-automation kill switch blank provider keys in bash
+   * (gitNoRepoAutomationEnv), so repo code there must not spend through the proxy either.
+   * Add nothing rather than a proxy URL whose key the bash tool then blanks.
+   */
+  private async bashAiProxyEnv(
+    workspaceId: string,
+    runtimeType: ReturnType<typeof getRuntimeType>,
+    secretKeys: readonly string[],
+    sharedExecutionTrusted: boolean
+  ): Promise<Record<string, string> | undefined> {
+    const bashAiProxy = this.dependencies.bindings.bashAiProxy;
+    if (!bashAiProxy) return undefined;
+    if (!sharedExecutionTrusted) {
+      // Say why bash gets no proxy variables, so a user who turned the switch on can find out.
+      bashAiProxy.noteBlocked(
+        workspaceId,
+        projectAutomationDisabled() ? "kill_switch" : "untrusted"
+      );
+      return undefined;
+    }
+    try {
+      return await bashAiProxy.envFor(workspaceId, runtimeType, secretKeys);
+    } catch (error) {
+      log.warn("[bash-ai-proxy] env setup failed; bash AI calls stay uncounted", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return undefined;
+    }
+  }
+
   private async prepareOrThrow(
     opts: StreamMessageOptions,
     context: TurnRequestBuildContext
@@ -1003,6 +1194,8 @@ export class TurnRequestBuilder {
       contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
       openaiTruncationModeOverride,
+      compactionInputBudgetScale,
+      compactionContextRetryAvailable,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
     } = opts;
@@ -1138,6 +1331,12 @@ export class TurnRequestBuilder {
             : {}),
       };
     };
+    // One scope per built turn: every model this turn creates (fallback hops included) shares it,
+    // so the prefix detector can tell a turn-boundary break from a mid-turn one.
+    const promptCacheScope = this.dependencies.providerModelFactory.createPromptCacheTurnScope(
+      workspaceId,
+      this.dependencies.bindings.timelineService ?? NOOP_TIMELINE_RECORDER
+    );
     const prepareModelSeed = async (options: {
       rawModelString: string;
       requestedThinkingLevel: ThinkingLevel | undefined;
@@ -1190,6 +1389,7 @@ export class TurnRequestBuilder {
           workspaceId,
           providersConfig: providersConfigSnapshot,
           getServiceTierOverride: () => activeTurnThinkingOverride?.serviceTier ?? userServiceTier,
+          promptCacheScope,
         }
       );
       if (options.recordTiming) {
@@ -1616,6 +1816,11 @@ export class TurnRequestBuilder {
       effectiveAgentId === "compact" ||
       muxMetadata?.type === "compaction-request" ||
       latestUserMessage?.metadata?.muxMetadata?.type === "compaction-request";
+    // Before any request is sent: compaction prompts never extend the chat's prefix, and
+    // the baseline must clear even when the compaction model is not on an Anthropic route.
+    if (isCompactionRequest) promptCacheScope.markCompaction();
+    // The context the request is built from: a cleared or replaced history starts a new baseline.
+    promptCacheScope.setContextEpoch(providerRequestMessages[0]?.id);
     const tokenBudgetEnabled =
       !isCompactionRequest &&
       sessionHistoryEnabled &&
@@ -1706,6 +1911,7 @@ export class TurnRequestBuilder {
         metadata,
         hostCheckoutRoot,
         journal: this.dependencies.durableEventJournalFor(workspaceId),
+        mcpServerManager: this.dependencies.bindings.mcpServerManager,
       });
     }
 
@@ -2103,31 +2309,15 @@ export class TurnRequestBuilder {
       scratchDir,
     });
     const projectSecretsRecord = await secretsToRecord(projectSecrets);
-    // AI calls from bash commands bypass the chat stream. Point their SDKs at the local proxy so
-    // the spend lands in this workspace's ledger (Costs tab and Analytics). envFor() skips any
-    // provider that project secrets configure: secrets override xumEnv in the bash tool, and a
-    // proxy URL must never pair with a real key.
-    // Best effort: a proxy problem leaves bash without the pair and never fails the turn.
-    // Untrusted projects and the project-automation kill switch blank provider keys in bash
-    // (gitNoRepoAutomationEnv), so repo code there must not spend through the proxy either.
-    // Add nothing rather than a proxy URL whose key the bash tool then blanks.
-    if (sharedExecutionTrusted) {
-      try {
-        Object.assign(
-          xumEnv,
-          await this.dependencies.bindings.bashAiProxy?.envFor(
-            workspaceId,
-            runtimeType,
-            Object.keys(projectSecretsRecord)
-          )
-        );
-      } catch (error) {
-        log.warn("[bash-ai-proxy] env setup failed; bash AI calls stay uncounted", {
-          workspaceId,
-          error: getErrorMessage(error),
-        });
-      }
-    }
+    Object.assign(
+      xumEnv,
+      await this.bashAiProxyEnv(
+        workspaceId,
+        runtimeType,
+        Object.keys(projectSecretsRecord),
+        sharedExecutionTrusted
+      )
+    );
     const getWorkflowProjectTrusted = () =>
       isWorkspaceProjectTrusted(this.dependencies.config, metadata);
 
@@ -2165,6 +2355,7 @@ export class TurnRequestBuilder {
                 : undefined,
             taskAdapterFactory: (runId, workflowName) =>
               createProductionWorkflowTaskAdapter({
+                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
                 taskService: this.dependencies.bindings.taskService!,
                 parentWorkspaceId: workspaceId,
                 workflowRunId: runId,
@@ -2316,9 +2507,15 @@ export class TurnRequestBuilder {
       }
       return created.data;
     };
+    // Codex hook fields: one turn ID for every tool call of this turn (its assistant message).
+    // One object for every attempt: each attempt sets the model it streams with, so a refusal
+    // fallback's tool calls, and the host-side hook config built once below (kernel file loads),
+    // report the fallback model (Codex PRRT_kwDOPxxmWM6sXvVm).
+    const hookTurn = { turnId: assistantMessageId, model: modelString };
     // Hoisted so refusal fallback can rebuild tools without changing their context.
     const toolsForModelConfig: ToolConfiguration = {
       cwd: workspacePath,
+      hookTurn,
       runtime,
       projects: getProjects(metadata),
       secrets: projectSecretsRecord,
@@ -2483,15 +2680,13 @@ export class TurnRequestBuilder {
       onConfigChanged: () => this.dependencies.providerService.notifyConfigChanged(),
       taskService: this.dependencies.bindings.taskService,
       workspaceTurnManager: this.dependencies.bindings.workspaceTurnManager,
-      // models_list: same pipeline as the composer picker, read from live backend
-      // state on every call (the tool object outlives config edits). Models are
+      // Read live backend state on every call (the tool object outlives config edits). Models are
       // resolved on the Xum host, so this is the source even for SSH workspaces.
       listAvailableModels: () => {
         const appConfig = this.dependencies.config.loadConfigOrDefault();
         return listAvailableModels(
           {
             providersConfig: this.dependencies.providerService.getConfig(),
-            hiddenModels: appConfig.hiddenModels ?? [],
             routePriority: appConfig.routePriority ?? [...DEFAULT_ROUTE_PRIORITY],
             routeOverrides: appConfig.routeOverrides ?? {},
           },
@@ -2519,6 +2714,17 @@ export class TurnRequestBuilder {
       // Dynamic context for tool descriptions (moved from system prompt for better model attention)
       availableSubagents: agentDefinitions,
       availableSkills,
+      // Built once per turn (refusal-fallback rebuilds reuse this config) from the
+      // context window, so path-scoped skills surface once per window.
+      pathSkillActivation: createPathSkillActivation({
+        skills: availableSkills,
+        messages: activeContextMessages,
+        // The first request after compaction re-injects loaded skills from this
+        // attachment, outside history: those skills need no pointer either.
+        loadedSkillNames: loadedSnapshotSkillNames(postCompactionAttachments),
+        cwd: workspacePath,
+        runtime,
+      }),
       mcpPromptRuntime,
       // Session-segment memory index advertised in the memory tool
       // description (same disclosure mechanic as skills).
@@ -2546,6 +2752,50 @@ export class TurnRequestBuilder {
         failedNames: mcpStats?.failedServerNames.join(", "),
       });
     }
+    // SECURITY AUDIT: MCP Apps model context (ui/update-model-context) is view output, i.e.
+    // untrusted text from an MCP server, sent to the model. It is a request-only user-role row
+    // placed right before the newest user row (assemblePromptPayload). At the provider,
+    // mergeConsecutiveUserMessages joins the two, so the newest user message starts with the
+    // labeled <mcp-app-context> block and the user's text follows it. Never the system prompt:
+    // unlike plugin request.assemble text, no user reviewed it, so it must not outrank tool
+    // results, and a view update must not change the cached system prefix. It is never written
+    // to chat.jsonl. It goes in only (1) for servers this turn actually enabled (the validated
+    // inventory above; none when the serve failed closed), (2) attributed to the server and view
+    // named by the view's result record, inside the block, whose text cannot close a <view> or
+    // the block, so nothing after the host's own closing tag can pose as the user's text, and
+    // (3) after a durable hook-context row, so "model-visible => logged" holds.
+    // Each view's latest update replaces its previous one in the store, so only the last update
+    // before this request is sent. It is kept for later turns too, not cleared on use: the spec
+    // says "This context will be used in future turns" (MCP Apps 2026-01-26).
+    let mcpAppContextMessage: MuxMessage | undefined;
+    if (!isSideChat && mcpServers !== undefined && this.dependencies.bindings.mcpServerManager) {
+      const enabledServers = new Set(
+        Object.entries(mcpServers)
+          .filter(([, info]) => !info.disabled)
+          .map(([name]) => name)
+      );
+      try {
+        const section = formatMcpAppModelContextSection(
+          await this.dependencies.bindings.mcpServerManager.getMcpAppModelContexts(workspaceId),
+          enabledServers
+        );
+        if (section !== undefined) {
+          await this.dependencies
+            .durableEventJournalFor(workspaceId)
+            .publishWithBlob(section, (blobHash) => ({
+              workspaceId,
+              kind: "hook-context",
+              data: { hookId: "mcp-apps:model-context", placement: "user-context", blobHash },
+            }));
+          mcpAppContextMessage = createMuxMessage("mcp-app-context", "user", section, {
+            synthetic: true,
+          });
+        }
+      } catch (error) {
+        // Self-healing: an unreadable store or journal drops the context, never the turn.
+        workspaceLog.warn("Dropping MCP Apps model context from the request", { error });
+      }
+    }
 
     type ModelSeed = typeof modelResult.data;
     const prepareModelRequest = async (options: {
@@ -2560,6 +2810,7 @@ export class TurnRequestBuilder {
       cleanupModelOnError?: boolean;
     }) => {
       const { seed } = options;
+      hookTurn.model = seed.rawModelString;
       try {
         const attemptProviderRequestMessages =
           options.providerRequestMessages ??
@@ -2574,6 +2825,7 @@ export class TurnRequestBuilder {
           seed.toolsModelString,
           {
             ...toolsForModelConfig,
+            hookTurn: { ...hookTurn },
             capabilityModelString: seed.capabilityModelString,
             // Per attempt: a fallback model that calls set_goal must price and
             // kick off the goal on itself, not on the primary it replaced.
@@ -2849,18 +3101,24 @@ export class TurnRequestBuilder {
         const firstStepToolNames = new Set(
           forcedFirstStepToolNames?.length ? forcedFirstStepToolNames : toolNamesForSentinel
         );
+        // Recorded in the DevTools run so the replay verifier trims the same way.
+        const compactionInputBudget = await compactionInputBudgetOption(
+          isCompactionRequest,
+          {
+            modelString: seed.rawModelString,
+            providerOptions: effectiveMuxProviderOptions,
+            providersConfig: seed.providersConfig,
+          },
+          attemptProviderRequestMessages,
+          compactionInputBudgetScale,
+          compactionContextRetryAvailable === true
+        );
         // Shared by the initial build and thinking rebuilds so their assembly
-        // inputs cannot drift apart mid-turn. `measureOnly` assembles a candidate history and
-        // returns its estimate without throwing: it runs after `request.assemble`, so no hook,
-        // tool-search seeding or skill step reruns. Turn-start stage decisions (#5286) count a
-        // candidate message list here.
-        const assemblePayloadForThinkingLevel = (
-          level: ThinkingLevel,
-          measureOnly?: { history: MuxMessage[] }
-        ) =>
+        // inputs cannot drift apart mid-turn.
+        const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
           assembleBudgetCheckedPromptPayload(
             {
-              history: measureOnly?.history ?? options.sourceMessages,
+              history: options.sourceMessages,
               systemMessage: attemptSystem,
               volatileSystemSuffixLength: attemptVolatileSystemSuffixLength,
               tools: attemptTools,
@@ -2878,6 +3136,8 @@ export class TurnRequestBuilder {
               anthropicCacheTtl: effectiveAnthropicCacheTtl,
               workspaceId,
               tagHistoryItemIds: tokenBudgetEnabled,
+              ...compactionInputBudget,
+              requestContextMessage: mcpAppContextMessage,
             },
             {
               enabled: tokenBudgetEnabled,
@@ -2886,7 +3146,6 @@ export class TurnRequestBuilder {
               activeTools: forcedFirstStepToolNames?.length
                 ? forcedFirstStepToolNames
                 : (computeLoadedToolNames(toolSearchRuntime?.state) ?? [...firstStepToolNames]),
-              measureOnly: measureOnly != null,
             }
           );
         const prepareMessagesForProviderStartedAt = Date.now();
@@ -2921,6 +3180,7 @@ export class TurnRequestBuilder {
             planFilePath,
             postCompactionAttachments,
             partialContinuationMessage: options.partialContinuationMessage,
+            mcpAppModelContextMessage: mcpAppContextMessage,
           });
         };
         const rebuildMessagesForThinkingLevel = async (level: ThinkingLevel) => {
@@ -2944,8 +3204,7 @@ export class TurnRequestBuilder {
           engineSystem: attemptPayload.system,
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
           contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
-          measureMessages: (history: MuxMessage[]) =>
-            assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel, { history }),
+          ...compactionInputBudget,
           systemMessageTokens: attemptSystemTokens,
           tools: attemptTools,
           engineTools: attemptPayload.tools ?? attemptTools,
@@ -3234,6 +3493,11 @@ export class TurnRequestBuilder {
       const toolsForStream = primaryRequest.engineTools;
 
       const devToolsService = this.dependencies.devToolsService;
+      // Queues this turn's run metadata with a request's compaction budget: the primary's
+      // below, each refusal fallback's own one (another window) in modelFallback.prepare, so
+      // replay rebuilds the request each run sent.
+      let queueRunMetadata: (compactionInputBudgetTokens: number | undefined) => void = () =>
+        undefined;
       const canQueueDevToolsRunMetadata =
         devToolsService?.enabled === true &&
         typeof modelResult.data.model !== "string" &&
@@ -3245,7 +3509,8 @@ export class TurnRequestBuilder {
         // when middleware is guaranteed to run (LanguageModelV3).
         pendingRunMetadataId = String(streamToken);
         context.startupState.pendingRunMetadataId = pendingRunMetadataId;
-        devToolsService.setPendingRunMetadata(workspaceId, pendingRunMetadataId, {
+        const metadataId = pendingRunMetadataId;
+        const runMetadata = {
           toolPolicy:
             effectiveToolPolicy != null && effectiveToolPolicy.length > 0
               ? effectiveToolPolicy
@@ -3253,7 +3518,18 @@ export class TurnRequestBuilder {
           // Join key for the replay verifier: re-anchors this recorded run to
           // its turn-envelope row and assistant message (see DevToolsRun).
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
-        });
+          // Same epoch as the runtime prefix monitor: the replay audit resets its baseline on change.
+          ...(promptCacheScope.contextEpoch != null
+            ? { contextEpoch: promptCacheScope.contextEpoch }
+            : {}),
+        };
+        queueRunMetadata = (compactionInputBudgetTokens) =>
+          devToolsService.setPendingRunMetadata(workspaceId, metadataId, {
+            ...runMetadata,
+            // Undefined unless this is a budgeted compaction request (JSON drops the key).
+            compactionInputBudgetTokens,
+          });
+        queueRunMetadata(primaryRequest.compactionInputBudgetTokens);
         this.dependencies.trackPendingDevToolsRunMetadata(
           assistantMessageId,
           workspaceId,
@@ -3325,6 +3601,8 @@ export class TurnRequestBuilder {
                 }
                 let nextHeaders = nextRequest.headers;
                 if (pendingRunMetadataId != null) {
+                  // The fallback's run is created after this, under the same metadata ID.
+                  queueRunMetadata(nextRequest.compactionInputBudgetTokens);
                   nextHeaders = {
                     ...nextHeaders,
                     [DEVTOOLS_RUN_METADATA_ID_HEADER]: pendingRunMetadataId,

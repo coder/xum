@@ -128,8 +128,10 @@ export function getDefaultAgentDefinitionsRoots(
       runtime.normalizePath(relativePath, workspacePath)
     ),
     globalRoot: GLOBAL_AGENTS_ROOT,
-    // Agent Plugins discovery is host-filesystem-only (v1), so remote runtimes
-    // never get plugin containers (mirrors agentSkillsService).
+    // Agent Plugins discovery reads the host filesystem only. Remote runtimes
+    // (SSH/Docker) get the GLOBAL host plugin containers (read through a host
+    // LocalRuntime) but no project plugin containers, because a remote
+    // checkout is not on the host filesystem (mirrors agentSkillsService).
     ...(!(runtime instanceof RemoteRuntime)
       ? {
           projectPluginRoots: [
@@ -140,7 +142,10 @@ export function getDefaultAgentDefinitionsRoots(
           ],
           globalPluginRoots: [`${runtime.getXumHome()}/plugins`, UNIVERSAL_AGENT_PLUGINS_CONTAINER],
         }
-      : {}),
+      : {
+          // Tilde form: the host LocalRuntime maps ~/.xum to the host Xum home.
+          globalPluginRoots: ["~/.xum/plugins", UNIVERSAL_AGENT_PLUGINS_CONTAINER],
+        }),
   };
 }
 
@@ -328,6 +333,14 @@ function getAgentIdFromFilename(filename: string): AgentId | null {
   return idParsed.data;
 }
 
+/** Plugin agents parse with the Claude Code / Cursor format mapping (pluginAgentFormat.ts). */
+function parseSource(
+  pluginRoot: string | undefined,
+  agentId: AgentId
+): { plugin?: { agentId: string } } {
+  return pluginRoot != null ? { plugin: { agentId } } : {};
+}
+
 async function readAgentDescriptorFromFile(
   runtime: Runtime,
   filePath: string,
@@ -391,7 +404,11 @@ async function readAgentDescriptorFromFile(
   }
 
   try {
-    const parsed = parseAgentDefinitionMarkdown({ content, byteSize });
+    const parsed = parseAgentDefinitionMarkdown({
+      content,
+      byteSize,
+      ...parseSource(pluginRoot, agentId),
+    });
 
     const { selectable } = resolveAgentVisibility(parsed.frontmatter.ui);
 
@@ -733,7 +750,11 @@ async function loadAgentDefinition(
         content = await readFileString(candidate.runtime, filePath, abortSignal);
         byteSize = stat.size;
       }
-      const parsed = parseAgentDefinitionMarkdown({ content, byteSize });
+      const parsed = parseAgentDefinitionMarkdown({
+        content,
+        byteSize,
+        ...parseSource(candidate.pluginRoot, agentId),
+      });
 
       const pkg: AgentDefinitionPackage = {
         id: agentId,
@@ -1085,6 +1106,7 @@ export async function resolveAgentDiscoveryContext(
       metadata,
     };
   }
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   const projectPath = input.projectPath!;
   return {
     runtime: createRuntime({ type: "local", srcBaseDir: context.config.srcDir }, { projectPath }),

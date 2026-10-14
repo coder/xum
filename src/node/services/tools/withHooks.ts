@@ -19,9 +19,13 @@
  */
 
 import assert from "node:assert";
+import { randomUUID } from "node:crypto";
 import type { Tool } from "ai";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
+import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
+import { readMcpToolOrigin } from "@/node/services/agentPlugins/codexToolNames";
+import { unsanitizedTool } from "@/common/utils/tools/schemaSanitizer";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { WithHookOutput, MayHaveHookOutput } from "@/common/types/tools";
 import {
@@ -34,6 +38,7 @@ import {
 } from "@/node/services/hooks";
 import {
   eventSpine,
+  type HookTurn,
   type ToolExecuteContext,
   type WaterfallNext,
 } from "@/node/services/events/eventSpine";
@@ -50,6 +55,8 @@ export interface HookConfig {
   workspaceId: string;
   /** Additional environment variables to pass to hooks */
   env?: Record<string, string>;
+  /** See ToolExecutionHost.turn. */
+  turn?: HookTurn;
 }
 
 /**
@@ -78,6 +85,7 @@ export function deriveToolHookConfig(config: ToolConfiguration): HookConfig | nu
       ...(config.xumEnv ?? {}),
       ...(config.secrets ?? {}),
     },
+    turn: config.hookTurn,
   };
 }
 
@@ -124,17 +132,19 @@ export function withHooks<TParameters, TResult>(
   const wrappedToolRecord = wrappedTool as any as Record<string, unknown>;
 
   wrappedToolRecord.execute = async (args: TParameters, options: unknown) => {
-    // Extract abort signal from tool options (if present)
-    const abortSignal =
-      options && typeof options === "object" && "abortSignal" in options
-        ? (options as { abortSignal?: AbortSignal }).abortSignal
-        : undefined;
+    // The abort signal and the call ID from the AI SDK's tool options, when present.
+    const abortSignal = readToolOption(options, "abortSignal") as AbortSignal | undefined;
+    const toolCallId = readToolOption(options, "toolCallId");
 
     const outcome = await runThroughToolHookPipeline({
       toolName,
       args,
       config,
       abortSignal,
+      ...(typeof toolCallId === "string" ? { toolCallId } : {}),
+      // The full schema: OpenAI requests carry a sanitized copy that drops constraints.
+      inputJsonSchema: () => extractToolJsonSchema(unsanitizedTool(tool)),
+      mcpOrigin: readMcpToolOrigin(tool),
       execute: (currentArgs) =>
         Promise.resolve(executeFn.call(tool, currentArgs, options) as TResult | Promise<TResult>),
     });
@@ -143,6 +153,17 @@ export function withHooks<TParameters, TResult>(
   };
 
   return wrappedTool;
+}
+
+function readToolOption(options: unknown, key: "abortSignal" | "toolCallId"): unknown {
+  return options !== null && typeof options === "object" && key in options
+    ? (options as Record<string, unknown>)[key]
+    : undefined;
+}
+
+/** A host-side call (mux.load, intuition) has no SDK call ID: its Pre and Post hooks share one. */
+function hookCallId(toolCallId: string | undefined): string {
+  return toolCallId ?? `xum-hook-call-${randomUUID()}`;
 }
 
 /** Outcome of one hook-gated execution (see runThroughToolHookPipeline). */
@@ -164,6 +185,12 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
   args: TArgs;
   config: HookConfig;
   abortSignal?: AbortSignal;
+  /** See ToolExecuteContext.toolCallId; generated when absent. */
+  toolCallId?: string;
+  /** See ToolExecuteContext.inputJsonSchema. */
+  inputJsonSchema?: () => unknown;
+  /** See ToolExecuteContext.mcpOrigin. */
+  mcpOrigin?: { serverName: string; toolName: string };
   execute: (args: TArgs) => Promise<TResult>;
 }): Promise<ToolHookPipelineOutcome<TResult>> {
   const { toolName, config } = input;
@@ -171,15 +198,13 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
 
   const ctx: ToolExecuteContext = {
     toolName,
+    toolCallId: hookCallId(input.toolCallId),
     args: input.args,
-    host: {
-      runtime: config.runtime,
-      runtimeTempDir: config.runtimeTempDir,
-      cwd: config.cwd,
-      workspaceId: config.workspaceId,
-      env: config.env,
-    },
+    // HookConfig holds exactly the host fields.
+    host: { ...config },
     abortSignal: input.abortSignal,
+    ...(input.inputJsonSchema != null ? { inputJsonSchema: input.inputJsonSchema } : {}),
+    ...(input.mcpOrigin != null ? { mcpOrigin: input.mcpOrigin } : {}),
     executed: false,
   };
 
@@ -197,6 +222,11 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
     ctx.executed,
     `tool.execute middleware for ${toolName} neither executed nor blocked the tool`
   );
+  // A post hook blocked the output: the result is its feedback (what the model sees, unchanged
+  // for an ordinary tool call), and a nested caller must not use the output it captured.
+  if (ctx.postBlocked) {
+    return { blocked: true, result: ctx.result };
+  }
   return { blocked: false, result: ctx.result as TResult };
 }
 

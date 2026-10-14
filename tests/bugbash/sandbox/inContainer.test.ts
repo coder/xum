@@ -34,7 +34,9 @@ async function fakeRoot(over: { init?: string; devices?: string[]; socket?: bool
   fs.writeFileSync(path.join(root, "repo/.sandbox-nonce"), "nonce-1");
   fs.mkdirSync(path.dirname(path.join(root, PROXY_SOCKET)), { recursive: true });
   if (over.socket !== false) {
-    const server = net.createServer((socket) => socket.end("proxy says hi"));
+    // resume(): an unread socket never sees the peer's FIN, so server.close() would wait for
+    // it forever (Node, and Bun since 1.4; Bun 1.3.12 closed it anyway).
+    const server = net.createServer((socket) => socket.resume().end("proxy says hi"));
     await new Promise<void>((resolve) => server.listen(path.join(root, PROXY_SOCKET), resolve));
     cleanups.push(() => new Promise((done) => server.close(done)));
   }
@@ -154,13 +156,13 @@ test("B3: a resolved real app AI in the sandbox talks to the proxy, never with a
   const env = {
     ...SANDBOX_ENV,
     BUGBASH_AI_RESOLVED: "real",
-    BUGBASH_APP_MODEL: "anthropic:claude-haiku-4-5",
+    BUGBASH_APP_MODEL: "anthropic:claude-haiku-5-5",
     ANTHROPIC_API_KEY: "sk-must-not-be-used",
   };
   expect(await resolveAiMode(env, root)).toMatchObject({
     mode: "real",
     provider: "anthropic",
-    model: "anthropic:claude-haiku-4-5",
+    model: "anthropic:claude-haiku-5-5",
     apiKey: "bugbash-sandbox-placeholder",
     baseUrl: "http://127.0.0.1:4141/anthropic/v1",
   });

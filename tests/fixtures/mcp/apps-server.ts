@@ -7,7 +7,12 @@ import { createInterface } from "node:readline";
  * - show_chart: model + app visible, view ui://chart/view, returns structuredContent.
  * - refresh_chart: app-only (hidden from the model), callable from the view.
  * - legacy_view: deprecated flat `_meta["ui/resourceUri"]`.
+ * Entry points (`_meta["openai/ui"].entrypoints`): show_chart global (title over annotations), refresh_chart
+ * thread + file (app-only; annotations.title with bidi/control characters the host strips), legacy_view
+ * global (a title that cleans to nothing: name).
  * - capabilities_probe: echoes the client's initialize capabilities (gating tests).
+ * With APPS_FIXTURE_LIST_CHANGED=1, refresh_chart also adds a parts_library entry point tool
+ * and sends notifications/tools/list_changed.
  * Extra resources exercise the host's resources/read validation.
  */
 const VIEW_URI = "ui://chart/view";
@@ -102,6 +107,27 @@ function chartResult(title: string, values: number[]) {
   };
 }
 
+/**
+ * APPS_FIXTURE_BAD_ENTRYPOINT_NAMES=1: also list app-only entry point tools whose names do not fit
+ * the host's route contract (empty, 300 characters), as a misbehaving server might.
+ */
+function badEntrypointTools() {
+  if (process.env.APPS_FIXTURE_BAD_ENTRYPOINT_NAMES !== "1") return [];
+  return ["", "x".repeat(300)].map((name) => ({
+    name,
+    // Titled, so only the name (not an empty title) decides.
+    title: "Misnamed view",
+    inputSchema: { type: "object", properties: {} },
+    _meta: {
+      ui: { resourceUri: VIEW_URI, visibility: ["app"] },
+      "openai/ui": { entrypoints: [{ type: "global" }] },
+    },
+  }));
+}
+
+/** Set once refresh_chart changed the catalog (APPS_FIXTURE_LIST_CHANGED). */
+let catalogChanged = false;
+
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 lines.on("line", (line) => {
   const request = JSON.parse(line) as {
@@ -131,20 +157,51 @@ lines.on("line", (line) => {
           {
             name: "show_chart",
             title: "Show chart",
+            // Loses to `title` (the spec's order: title, then annotations.title, then name).
+            annotations: { title: "Chart (annotation)" },
             inputSchema: { type: "object", properties: { title: { type: "string" } } },
-            _meta: { ui: { resourceUri: VIEW_URI, visibility: ["model", "app"] } },
+            _meta: {
+              ui: { resourceUri: VIEW_URI, visibility: ["model", "app"] },
+              "openai/ui": { entrypoints: [{ type: "global" }] },
+            },
           },
           {
             name: "refresh_chart",
+            // RLO, BEL and a whitespace run: the host shows "Refresh chart".
+            annotations: { title: "Refresh\u202e\u0007  chart" },
             inputSchema: { type: "object", properties: {} },
-            _meta: { ui: { resourceUri: VIEW_URI, visibility: ["app"] } },
+            _meta: {
+              ui: { resourceUri: VIEW_URI, visibility: ["app"] },
+              "openai/ui": {
+                entrypoints: [{ type: "thread" }, { type: "file", extensions: [".csv"] }],
+              },
+            },
           },
           {
             name: "legacy_view",
+            // Only bidi and control characters: the host falls back to the tool name.
+            title: "\u202e\u0007",
             inputSchema: { type: "object", properties: {} },
-            _meta: { "ui/resourceUri": "ui://chart/legacy" },
+            _meta: {
+              "ui/resourceUri": "ui://chart/legacy",
+              "openai/ui": { entrypoints: [{ type: "global" }] },
+            },
           },
           { name: "capabilities_probe", inputSchema: { type: "object", properties: {} } },
+          ...badEntrypointTools(),
+          ...(catalogChanged
+            ? [
+                {
+                  name: "parts_library",
+                  title: "Parts library",
+                  inputSchema: { type: "object", properties: {} },
+                  _meta: {
+                    ui: { resourceUri: VIEW_URI, visibility: ["app"] },
+                    "openai/ui": { entrypoints: [{ type: "global" }] },
+                  },
+                },
+              ]
+            : []),
         ],
       };
       break;
@@ -158,6 +215,12 @@ lines.on("line", (line) => {
       } else if (name === "refresh_chart") {
         refreshCount += 1;
         result = chartResult(`Refreshed ${refreshCount}`, [90, 30, 60, 20]);
+        if (process.env.APPS_FIXTURE_LIST_CHANGED === "1") {
+          catalogChanged = true;
+          process.stdout.write(
+            JSON.stringify({ jsonrpc: "2.0", method: "notifications/tools/list_changed" }) + "\n"
+          );
+        }
       } else if (name === "legacy_view") {
         result = { content: [{ type: "text", text: "legacy" }] };
       } else if (name === "capabilities_probe") {

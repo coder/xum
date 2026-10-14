@@ -7,7 +7,7 @@ import { cn } from "@/common/lib/utils";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { ArtifactShelfScope, ArtifactVersion } from "@/common/orpc/schemas/artifacts";
 
-/** Label for a stored version: its publish title, or a plain name for turn-end snapshots. */
+/** Label for a stored version: its publish title, or a plain name for older turn-end snapshots. */
 function versionLabel(version: ArtifactVersion): string {
   if (version.label != null && version.label.length > 0) return version.label;
   return version.source === "turn-end" ? "Turn snapshot" : "Untitled";

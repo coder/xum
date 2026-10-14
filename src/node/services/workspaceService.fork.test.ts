@@ -3,7 +3,7 @@ import { generateForkBranchName, generateForkTitle } from "./workspaceService";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
-import { Err, Ok } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
@@ -50,6 +50,35 @@ describe("WorkspaceService fork", () => {
 
   afterEach(async () => {
     await cleanupHistory();
+  });
+
+  test("a fork in flight refuses the pre-interruption archive hold on its source", async () => {
+    // Park the fork at its first await: its admission is counted in the synchronous entry block.
+    let releaseMetadata: (result: Result<WorkspaceMetadata, string>) => void = () => undefined;
+    const metadata = new Promise<Result<WorkspaceMetadata, string>>((resolve) => {
+      releaseMetadata = resolve;
+    });
+    const workspaceService = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService: createMockAIService({ getWorkspaceMetadata: mock(() => metadata) }),
+    });
+    const holdOptions = { queuedDelegatedTurnCount: 0, expectedDelegatedTurnCorrelations: [] };
+    const acquireHold = () =>
+      workspaceService.acquirePreInterruptionArchiveHold("fork-source", holdOptions);
+
+    const idle = acquireHold();
+    expect(idle.success).toBe(true);
+    if (idle.success) idle.data[Symbol.dispose]();
+
+    const forking = workspaceService.fork("fork-source");
+    expect(acquireHold().success).toBe(false);
+
+    releaseMetadata(Err("source is gone"));
+    expect((await forking).success).toBe(false);
+    const afterFork = acquireHold();
+    expect(afterFork.success).toBe(true);
+    if (afterFork.success) afterFork.data[Symbol.dispose]();
   });
 
   test("cleans up init state when orchestrateFork rejects", async () => {
@@ -551,7 +580,13 @@ describe("WorkspaceService fork", () => {
       createMuxMessage("assistant-1", "assistant", "Hello", {
         model: "claude-sonnet-4-20250514",
         usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        timestamp: 7_000,
       })
+    );
+    // An idle compaction keeps an older recency timestamp, so the newest row is not the last.
+    await historyService.appendToHistory(
+      sourceWorkspaceId,
+      createMuxMessage("summary-1", "assistant", "Summary", { timestamp: 3_000 })
     );
 
     // Review notes/read state live in the session dir and must follow the fork.
@@ -635,8 +670,10 @@ describe("WorkspaceService fork", () => {
       }
       expect(result.data.metadata.forkFamilyBaseName).toBeUndefined();
 
+      // Empty ledger whose fork marker is the newest copied row, not the reset time: a
+      // first turn in the reset's millisecond is still the fork's own.
       const forkedUsage = await sessionUsageService.getSessionUsage(newWorkspaceId);
-      expect(forkedUsage).toEqual({ byModel: {}, version: 1 });
+      expect(forkedUsage).toEqual({ byModel: {}, version: 1, forkedAt: 7_000 });
 
       const forkedMessages: string[] = [];
       const historyResult = await historyService.iterateFullHistory(

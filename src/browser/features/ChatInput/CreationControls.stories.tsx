@@ -117,7 +117,7 @@ const DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS: Omit<
   "selectedRuntime" | "onSelectedRuntimeChange" | "runtimeAvailabilityState"
 > = {
   branches: ["main", "develop"],
-  branchesLoaded: true,
+  branchLoad: "loaded",
   trunkBranch: "main",
   onTrunkBranchChange: fn(),
   coderConfigFallback: {},
@@ -330,7 +330,7 @@ const BASE_CREATION_NAME_STATE: WorkspaceNameState = {
 
 const CREATION_ERROR_BASE_CONTROLS_PROPS = {
   branches: ["main"],
-  branchesLoaded: true,
+  branchLoad: "loaded",
   trunkBranch: "main",
   onTrunkBranchChange: fn(),
   selectedRuntime: { mode: RUNTIME_MODE.WORKTREE },

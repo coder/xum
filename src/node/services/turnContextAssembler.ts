@@ -22,12 +22,16 @@ import {
 import type { Instructions, ModelMessage, SystemModelMessage, Tool } from "ai";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
+import type { CountCompactionRowTokens } from "@/common/utils/messages/compactionRowSizing";
+import { trimCompactionInput } from "@/common/utils/messages/trimCompactionInput";
+import { createCompactionRowCounter, projectCompactionInput } from "./compactionInputSizing";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { InvocableSkill } from "@/common/types/agentSkill";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 import type { InstructionSources } from "@/common/types/instructions";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -78,6 +82,7 @@ import {
   type AnthropicCacheTtl,
 } from "@/common/utils/ai/cacheStrategy";
 import { prepareMessagesForProvider } from "./messagePipeline";
+import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
 const keepContextRow = (message: MuxMessage) =>
   !isModelHiddenMessage(message) && !message.metadata?.contextBudgetRejected;
@@ -197,6 +202,44 @@ export interface AssemblePromptPayloadOptions {
   workspaceId: string;
   /** Token budget: end each persisted user row with its session_history item ID. */
   tagHistoryItemIds?: boolean;
+  /**
+   * Compaction requests only: the estimated token budget their history must fit
+   * (trimCompactionInput). Absent for every other request, which is never trimmed.
+   */
+  compactionInputBudgetTokens?: number;
+  /**
+   * Request-only user-role context (MCP Apps model context), never persisted. It goes before the
+   * newest user row (insertRequestContextMessage has the trailing-partial rule), or last when
+   * the request ends without one, so the cached prefix (system prompt and earlier turns) is
+   * unchanged when it changes. The provider
+   * transform (mergeConsecutiveUserMessages) merges it into the start of that user message.
+   */
+  requestContextMessage?: MuxMessage;
+}
+
+/**
+ * `history` with `context` before its trailing user message, or appended without one. When the
+ * history ends in a partial assistant (an interrupted turn, or the refusal fallback continuing
+ * the refused output), `context` goes before the user request that partial answers: placed
+ * after the partial, it would read as a new context-only user turn, and the model would answer
+ * it instead of continuing the partial. Runs before addInterruptedSentinel, so the partial
+ * still gets its continuation sentinel.
+ */
+export function insertRequestContextMessage(
+  history: MuxMessage[],
+  context: MuxMessage | undefined
+): MuxMessage[] {
+  if (context === undefined) return history;
+  assert(context.role === "user", "request context must be a user-role message");
+  const last = history.at(-1);
+  let index = history.length;
+  if (last?.role === "user") {
+    index = history.length - 1;
+  } else if (last?.role === "assistant" && last.metadata?.partial === true) {
+    const request = history.findLastIndex((message) => message.role === "user");
+    index = request === -1 ? history.length - 1 : request;
+  }
+  return [...history.slice(0, index), context, ...history.slice(index)];
 }
 
 /**
@@ -219,8 +262,8 @@ function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
       return message;
     }
     const tag = `[id: ${getHistoryItemId(message)}]`;
-    // Append inside the last text part: mergeConsecutiveUserMessages keeps one text part per
-    // message, so a separate tag part is dropped when this row merges with a neighbour.
+    // Append inside the last text part: mergeConsecutiveUserMessages keeps each row's parts in
+    // order, so the tag stays at the end of this row's text.
     const lastText = message.parts.findLastIndex((part) => part.type === "text");
     return {
       ...message,
@@ -236,6 +279,43 @@ function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
   });
 }
 
+/**
+ * A compaction request's history fitted to its budget; any other request unchanged. The trim
+ * sizes and edits the redacted projection the provider receives (projectCompactionInput),
+ * counting rows with the model's tokenizer. A history that fits keeps its original rows, so
+ * the request stays byte-identical.
+ */
+async function trimToCompactionInputBudget(
+  messages: MuxMessage[],
+  budgetTokens: number | undefined,
+  modelString: string,
+  requestContextMessage: MuxMessage | undefined
+): Promise<MuxMessage[]> {
+  if (budgetTokens == null) return messages;
+  const countRow = createCompactionRowCounter(modelString);
+  const sized = projectCompactionInput(messages);
+  const trim = await trimCompactionInput(
+    sized,
+    await historyShareOfBudget(budgetTokens, requestContextMessage, countRow),
+    countRow
+  );
+  return trim.messages === sized ? messages : trim.messages;
+}
+
+/**
+ * The request-only context (MCP Apps) is inserted after the trim but sent with the history, so
+ * it takes its share of the budget first. At least 1 token is left: the trim then cuts all it
+ * can, and the context_exceeded retry decides the rest.
+ */
+async function historyShareOfBudget(
+  budgetTokens: number,
+  requestContextMessage: MuxMessage | undefined,
+  countRow: CountCompactionRowTokens
+): Promise<number> {
+  const contextTokens = requestContextMessage ? await countRow(requestContextMessage) : 0;
+  return Math.max(1, budgetTokens - contextTokens);
+}
+
 export async function assemblePromptPayload(
   options: AssemblePromptPayloadOptions
 ): Promise<PromptPayload> {
@@ -244,11 +324,29 @@ export async function assemblePromptPayload(
     options.providerForMessages,
     options.effectiveThinkingLevel
   );
+  // Prompt-hook context renders BEFORE the compaction trim: the trim counts each row's parts, not
+  // its metadata, so unrendered context (up to PLUGIN_HOOK_CONTEXT_MAX_CHARS per user row) would
+  // pass the budget and then grow the request past it in messagePipeline. Rendered rows drop
+  // the metadata, so messagePipeline's own pass renders nothing twice. It also renders before the
+  // token-budget [id: ...] tag, which must stay last.
+  const renderHookContextFirst =
+    options.compactionInputBudgetTokens != null || options.tagHistoryItemIds === true;
+  const providerRequestMessages = await trimToCompactionInputBudget(
+    renderHookContextFirst
+      ? renderPluginHookContextForProvider(prepared.providerRequestMessages)
+      : prepared.providerRequestMessages,
+    options.compactionInputBudgetTokens,
+    options.modelString,
+    options.requestContextMessage
+  );
   let messages = await prepareMessagesForProvider({
     messagesWithSentinel: addInterruptedSentinel(
-      options.tagHistoryItemIds === true
-        ? tagUserRowsWithHistoryItemIds(prepared.providerRequestMessages)
-        : prepared.providerRequestMessages
+      insertRequestContextMessage(
+        options.tagHistoryItemIds === true
+          ? tagUserRowsWithHistoryItemIds(providerRequestMessages)
+          : providerRequestMessages,
+        options.requestContextMessage
+      )
     ),
     replayReceiptMessages: prepared.activeContextMessages,
     effectiveAgentId: options.effectiveAgentId,
@@ -312,7 +410,7 @@ export async function assemblePromptPayload(
   }
 
   return {
-    providerRequestMessages: prepared.providerRequestMessages,
+    providerRequestMessages,
     messages,
     system,
     tools: options.tools
@@ -597,7 +695,7 @@ export interface StreamSystemContextResult {
   /** Available subagent definitions for tool descriptions (undefined for subagent workspaces). */
   agentDefinitions: Awaited<ReturnType<typeof discoverAgentDefinitions>> | undefined;
   /** Available skills for tool descriptions. */
-  availableSkills: AgentSkillDescriptor[] | undefined;
+  availableSkills: InvocableSkill[] | undefined;
   /** Exact ancestor plan files surfaced in the prompt and forwarded through tool configuration. */
   ancestorPlanFilePaths: string[];
   /** Instruction snapshot used for the prompt; reuse it for tool-scoped instructions. */
@@ -994,7 +1092,11 @@ export async function buildStreamSystemContext(
       // Used only for the project-runtime default-roots fallback (skillCtx.roots undefined).
       includeClaudeSkills: opts.claudeSkillsCompatEnabled,
     })
-      .then(requireReachableSkills)
+      .then((discovery) => {
+        requireReachableSkills(discovery);
+        // Shadowed plugin skills join the index under `<plugin>:<skill>`.
+        return listInvocableSkills(discovery);
+      })
       .catch((error: unknown) => {
         // An unreachable host must fail the turn, not silently drop the skills index (#4438).
         if (isRuntimeTransportError(error)) throw error;

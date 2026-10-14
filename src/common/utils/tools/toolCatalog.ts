@@ -606,6 +606,7 @@ export function rebuildToolSearchState(
   state.allToolNames = prepared.state.allToolNames;
   state.native = prepared.state.native;
   state.activatedToolNames = new Set(
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     [...state.activatedToolNames].filter((name) => prepared.state!.deferredToolNames.has(name))
   );
   return { tools: prepared.tools };

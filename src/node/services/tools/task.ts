@@ -20,6 +20,7 @@ import { log } from "@/node/services/log";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 
 import { buildTaskGroupLaunches } from "@/common/utils/tools/taskGroups";
+import { pageTaskReportForResult } from "@/common/utils/tools/pageToolText";
 import {
   emitChatEventBestEffort,
   parseToolResult,
@@ -235,9 +236,14 @@ function toAggregatePendingStatus(
 }
 
 function serializeCompletedReport(report: CompletedTaskInfo) {
+  // A foreground result holds the first page of a long report, like task_await does; the
+  // note names the task_await call that reads the next page.
+  const page = pageTaskReportForResult(report.taskId, report.reportMarkdown, undefined);
   return {
     taskId: report.taskId,
-    reportMarkdown: report.reportMarkdown,
+    reportMarkdown: page.text,
+    nextCharOffset: page.nextCharOffset,
+    note: page.note,
     structuredOutput: report.structuredOutput,
     title: report.title,
     agentId: report.agentId,
@@ -245,6 +251,21 @@ function serializeCompletedReport(report: CompletedTaskInfo) {
     modelString: report.modelString,
     thinkingLevel: report.thinkingLevel,
     desktopOwnerWorkspaceId: report.desktopOwnerWorkspaceId,
+  };
+}
+
+/** The first page of a foreground workspace turn's report, plus any supersede note. */
+function pageWorkspaceTurnReport(
+  taskId: string,
+  reportMarkdown: string,
+  supersedeNote: string | undefined
+): { reportMarkdown: string; nextCharOffset?: number; note?: string } {
+  const page = pageTaskReportForResult(taskId, reportMarkdown, undefined);
+  const notes = [supersedeNote, page.note].filter((note) => note != null);
+  return {
+    reportMarkdown: page.text,
+    nextCharOffset: page.nextCharOffset,
+    ...(notes.length > 0 ? { note: notes.join(" ") } : {}),
   };
 }
 
@@ -328,6 +349,8 @@ function buildCompletedTaskResult(params: {
       status: "completed",
       taskId: report.taskId,
       reportMarkdown: report.reportMarkdown,
+      nextCharOffset: report.nextCharOffset,
+      note: report.note,
       structuredOutput: report.structuredOutput,
       title: report.title,
       agentId: report.agentId,
@@ -511,11 +534,14 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               taskId: created.data.taskId,
               workspaceId: report.workspaceId ?? created.data.workspaceId,
               handleKind: "workspace_turn" as const,
-              reportMarkdown: report.reportMarkdown,
               title: report.title,
               messageId: report.messageId,
               finalMessageRef: report.finalMessageRef,
-              ...(completedSupersedeNote != null ? { note: completedSupersedeNote } : {}),
+              ...pageWorkspaceTurnReport(
+                created.data.taskId,
+                report.reportMarkdown,
+                completedSupersedeNote
+              ),
             },
             "task"
           );

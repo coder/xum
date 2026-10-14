@@ -893,6 +893,7 @@ export class CompactionPendingState {
               observedState &&
               (await this.consumeUnderLock(view, observation.pending, observedState))
             ) {
+              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
               const expected = this.receipts.get(observation.pending)!;
               raw =
                 identity(observedState) === expected.identity
@@ -932,6 +933,7 @@ export class CompactionPendingState {
                 throw new Error("Pending retirement changed");
             } catch (error) {
               // Empty only an exact retired head; a retired fallback cannot erase active B.
+              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
               const expected = this.receipts.get(receipt)!;
               if (
                 identity(state) !== expected.identity ||

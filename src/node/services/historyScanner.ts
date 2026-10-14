@@ -997,6 +997,7 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
     } else {
       const archive = await locate("archive", skip - chat.boundaryCount);
       if (archive.kind === "start" || (clampToOldest && archive.oldestBoundary !== null)) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const location = archive.kind === "start" ? archive : archive.oldestBoundary!;
         boundary = location.boundary;
         boundaryPublicationId = location.boundaryPublicationId;
@@ -1517,7 +1518,8 @@ export async function scanHistoryFilesBounded(
       assert(length >= 0 && result.bytesRead + length <= maxBytes);
       const buffer = Buffer.alloc(length);
       const bytesRead = handles.has(artifact)
-        ? (await handles.get(artifact)!.read(buffer, 0, length, start)).bytesRead
+        ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+          (await handles.get(artifact)!.read(buffer, 0, length, start)).bytesRead
         : 0;
       result.bytesRead += bytesRead;
       options.abortSignal?.throwIfAborted();
@@ -1561,7 +1563,9 @@ export async function scanHistoryFilesBounded(
       ? structuredClone(options.cursor)
       : {
           provenanceEpoch,
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           snapshots: { chat: initialChat!, archive: await snapshot("archive") },
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           validatedChatSnapshot: initialChat!,
           phase: "floor",
           recentFirst: options.recentFirst === true,
@@ -1822,7 +1826,9 @@ export async function scanHistoryFilesBounded(
     // boundary row (or the floor), retaining only locations. Returns false when
     // the page budget ran out.
     const probePage = async (): Promise<boolean> => {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const probe = state.probe!;
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const floor = state.floor!;
       assert(probe && floor, "newest-first probe requires floor and probe state");
       const lower = probe.artifact === floor.artifact ? floor.byteOffset : 0;
@@ -1878,7 +1884,9 @@ export async function scanHistoryFilesBounded(
     // Reverse delivery of one discovered span, from its end (state position) down
     // to its boundary row, crossing the chat -> archive seam when the span does.
     const deliverPage = async (): Promise<boolean> => {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const span = state.span!;
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const floor = state.floor!;
       assert(span && floor, "newest-first delivery requires span and floor state");
       const artifact = state.artifact;
@@ -1967,6 +1975,7 @@ export async function scanHistoryFilesBounded(
             // Keep the legacy cursor field, but sequence coverage is not replay proof.
             const sequence = message?.metadata?.historySequence;
             if (artifact === "archive" && Number.isSafeInteger(sequence))
+              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
               state.archiveWatermark = Math.max(state.archiveWatermark, sequence!);
             if (isManualHistoryReset(message, possibleReset)) {
               // Corrupt reset rows are privacy floors even when they parse or
@@ -1984,6 +1993,7 @@ export async function scanHistoryFilesBounded(
           assert(raw, "readable browse rows retain their bounded raw bytes");
           const sequence = message.metadata?.historySequence;
           const anchorSequence =
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             Number.isSafeInteger(sequence) && sequence! >= 0 ? sequence! : null;
           // Repaired/imported rows may reuse archived sequences with different
           // identities or payloads. Retain possible replays without exact proof.

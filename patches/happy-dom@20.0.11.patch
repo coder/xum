@@ -1,0 +1,35 @@
+diff --git a/lib/mutation-observer/MutationObserverListener.js b/lib/mutation-observer/MutationObserverListener.js
+index 3a68b9a76db624429603fb6847a7130769323773..3080ee9339022ef7f8a655f646575ea04202fc15 100644
+--- a/lib/mutation-observer/MutationObserverListener.js
++++ b/lib/mutation-observer/MutationObserverListener.js
+@@ -11,6 +11,9 @@ export default class MutationObserverListener {
+     #records = [];
+     #destroyed = false;
+     #timeout = null;
++    // Strong reference: Node only holds this callback through the WeakRef below, so a GC would
++    // otherwise drop it and the observer would stop reporting. happy-dom 21.0.1 holds it the same way.
++    #listenerCallback;
+     /**
+      * Constructor.
+      *
+@@ -24,9 +27,10 @@ export default class MutationObserverListener {
+     constructor(init) {
+         this.options = init.options;
+         this.target = init.target;
++        this.#listenerCallback = (record) => this.report(record);
+         this.mutationListener = {
+             options: init.options,
+-            callback: new WeakRef((record) => this.report(record))
++            callback: new WeakRef(this.#listenerCallback)
+         };
+         this.#window = init.window;
+         this.#observer = init.observer;
+@@ -89,6 +93,7 @@ export default class MutationObserverListener {
+         this.#callback = null;
+         this.#timeout = null;
+         this.#records = null;
++        this.#listenerCallback = null;
+     }
+ }
+ //# sourceMappingURL=MutationObserverListener.js.map
+\ No newline at end of file

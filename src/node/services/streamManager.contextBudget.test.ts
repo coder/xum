@@ -865,9 +865,8 @@ describe("settled context hard ceiling", () => {
   }, 20000);
 });
 
-// #5286: turn-start stage decisions (PR1b/PR2) reuse the settled step's appended-message delta only
-// while every budget count of the turn was an exact append; any full count or rebuild must say so.
-describe("exact-append chain (#5286)", () => {
+// The settled step reports the appended-message delta of its anchored next-request estimate.
+describe("settled next-request delta", () => {
   const usage = {
     inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
     outputTokens: { total: 10, text: 10, reasoning: 0 },
@@ -893,20 +892,15 @@ describe("exact-append chain (#5286)", () => {
     });
   };
 
-  async function runTurn(mode: "exact" | "thinking" | "fallback"): Promise<SettledStepBudget[]> {
+  async function runTurn(mode: "exact" | "fallback"): Promise<SettledStepBudget[]> {
     const h = await createTestHistoryService();
     const workspaceId = `exact-append-${mode}`;
     const messageId = `assistant-${mode}`;
     const settled: SettledStepBudget[] = [];
-    const thinkingOverrideState: { pending?: "high" } = {};
     const tools = {
       read: tool({
         inputSchema: z.object({}),
-        execute: () => {
-          // A thinking change written while the first tool runs is consumed by the next step.
-          if (mode === "thinking" && settled.length === 0) thinkingOverrideState.pending = "high";
-          return "part text line ".repeat(50);
-        },
+        execute: () => "part text line ".repeat(50),
       }),
     };
     const refusal: LanguageModelV3StreamPart[] = [
@@ -939,15 +933,6 @@ describe("exact-append chain (#5286)", () => {
         providedRuntimeTempDir: runtimeDir,
         tools,
         contextBudgetLimit: 100_000,
-        ...(mode === "thinking"
-          ? {
-              thinkingOverrideState,
-              rebuildProviderOptionsForThinkingLevel: () => ({
-                providerOptions: {},
-                effectiveLevel: "high" as const,
-              }),
-            }
-          : {}),
         ...(mode === "fallback"
           ? {
               modelFallback: {
@@ -982,30 +967,19 @@ describe("exact-append chain (#5286)", () => {
     }
   }
 
-  test("a turn of exact appends reports the chain and the counted delta on every step", async () => {
+  test("a turn of exact appends reports the counted delta on every step", async () => {
     const settled = await runTurn("exact");
     expect(settled).toHaveLength(2);
     for (const step of settled) {
-      expect(step.exactAppendChain).toBe(true);
       expect(step.nextRequestDeltaTokens).toBeDefined();
       expect(step.usage!.inputTokens! + step.nextRequestDeltaTokens!).toBe(step.nextRequestTokens!);
     }
   });
 
-  test("a mid-turn thinking rebuild breaks the chain for later steps", async () => {
-    const settled = await runTurn("thinking");
-    expect(settled).toHaveLength(2);
-    expect(settled[0].exactAppendChain).toBe(true);
-    // Its own settle estimate was still an exact append; the rebuilt request broke the chain.
-    expect(settled[1].nextRequestDeltaTokens).toBeDefined();
-    expect(settled[1].exactAppendChain).toBe(false);
-  });
-
-  test("a fallback hop's full step-0 count breaks the chain", async () => {
+  test("a fallback hop's settled step reports the counted delta", async () => {
     const settled = await runTurn("fallback");
     expect(settled).toHaveLength(1);
     expect(settled[0].model).toBe("openai:gpt-4o-mini");
     expect(settled[0].nextRequestDeltaTokens).toBeDefined();
-    expect(settled[0].exactAppendChain).toBe(false);
   });
 });

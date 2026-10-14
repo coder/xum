@@ -140,7 +140,6 @@ const DESKTOP_ONLY_CLASSES = new Set([
   "titlebar-safe-right",
   "titlebar-safe-right-gutter-2",
   "titlebar-safe-right-gutter-3",
-  "titlebar-safe-right-minus-sidebar",
   "titlebar-safe-right-capped",
   // Mobile app shell: these rules live in the desktop shell's (max-width: 768px) and
   // (pointer: coarse) media blocks (sidebar overlay, sticky header). The webview has no app shell
@@ -158,6 +157,10 @@ const DESKTOP_ONLY_CLASSES = new Set([
   // which the webview never applies.
   "right-sidebar-fullscreen",
   "right-sidebar-fullscreen-header",
+  // The collapsed right sidebar's overview card and its header stand-in: both query the desktop
+  // workspace shell's width, and the webview renders neither the shell nor the right sidebar.
+  "right-sidebar-overview-card",
+  "right-sidebar-overview-expand",
   // Project sidebar only: the webview shows one workspace and no project sidebar.
   "react-colorful",
   "section-color-picker",

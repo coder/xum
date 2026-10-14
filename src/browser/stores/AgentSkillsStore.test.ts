@@ -49,6 +49,22 @@ const skillNames = (store: AgentSkillsStore) =>
   store.getResult(DISCOVERY).skills.map((descriptor) => descriptor.name);
 
 describe("AgentSkillsStore", () => {
+  test("hasResult is false until the first answer settles, also when that answer fails (#6221)", async () => {
+    const empty = track(createStore([listResult([])]));
+    empty.store.subscribe(DISCOVERY, () => undefined);
+    // Before the answer, the empty default list must not read as "no skills".
+    expect(empty.store.hasResult(DISCOVERY)).toBe(false);
+    await settle();
+    expect(empty.store.hasResult(DISCOVERY)).toBe(true);
+
+    const failed = track(createStore([new Error("offline")]));
+    failed.store.subscribe(DISCOVERY, () => undefined);
+    expect(failed.store.hasResult(DISCOVERY)).toBe(false);
+    await settle();
+    // A failed first fetch settles too: callers stop waiting and show what they have.
+    expect(failed.store.hasResult(DISCOVERY)).toBe(true);
+  });
+
   test("subscribers of one key share one fetch, also across a resubscribe", async () => {
     const { store, list } = track(createStore([listResult(["review"])]));
 

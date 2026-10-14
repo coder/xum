@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { sliceMessagesFromLatestCompactionBoundary } from "@/common/utils/messages/compactionBoundary";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectsConfig } from "@/common/types/project";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
@@ -474,6 +474,79 @@ describe("assemblePromptPayload", () => {
       ...overrides,
     });
 
+  test("puts request context at the start of the newest user message, or last without one", async () => {
+    const context = createMuxMessage("ctx", "user", "VIEW-CONTEXT");
+    const turns = [
+      createMuxMessage("u1", "user", "FIRST"),
+      createMuxMessage("a1", "assistant", "ANSWER"),
+    ];
+    const order = async (history: typeof turns) => {
+      const payload = await assemble({ history, requestContextMessage: context });
+      // Request-only: never part of the rows the request was built from.
+      expect(payload.providerRequestMessages.some((m) => m.id === "ctx")).toBe(false);
+      const wire = JSON.stringify(payload.messages);
+      return ["FIRST", "ANSWER", "VIEW-CONTEXT", "NEWEST"]
+        .filter((text) => wire.includes(text))
+        .sort((a, b) => wire.indexOf(a) - wire.indexOf(b));
+    };
+    expect(await order([...turns, createMuxMessage("u2", "user", "NEWEST")])).toEqual([
+      "FIRST",
+      "ANSWER",
+      "VIEW-CONTEXT",
+      "NEWEST",
+    ]);
+    // At the provider the two user rows are one message (mergeConsecutiveUserMessages): the
+    // context block first, then the user's text.
+    const merged = await assemble({
+      history: [...turns, createMuxMessage("u2", "user", "NEWEST")],
+      requestContextMessage: context,
+    });
+    expect(merged.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(JSON.stringify(merged.messages[2])).toContain("VIEW-CONTEXT\\nNEWEST");
+    expect(await order(turns)).toEqual(["FIRST", "ANSWER", "VIEW-CONTEXT"]);
+    const plain = await assemble({ history: turns });
+    const withContext = await assemble({ history: turns, requestContextMessage: context });
+    expect(withContext.system).toEqual(plain.system);
+  });
+
+  test("request context keeps every part of the user message it merges into", async () => {
+    const context = createMuxMessage("ctx", "user", "VIEW-CONTEXT");
+    const svg = `data:image/svg+xml;base64,${Buffer.from("<svg><text>SVG-BODY</text></svg>").toString("base64")}`;
+    const history = [
+      createMuxMessage("u1", "user", "NEWEST", undefined, [
+        { type: "file", mediaType: "image/svg+xml", url: svg, filename: "chart.svg" },
+      ]),
+    ];
+    const payload = await assemble({ history, requestContextMessage: context });
+    expect(payload.messages.map((m) => m.role)).toEqual(["user"]);
+    const wire = JSON.stringify(payload.messages);
+    // The SVG reaches the provider as text, after the context and the user's own text.
+    expect(wire).toContain("SVG-BODY");
+    expect(wire.indexOf("VIEW-CONTEXT")).toBeLessThan(wire.indexOf("NEWEST"));
+    expect(wire.indexOf("NEWEST")).toBeLessThan(wire.indexOf("SVG-BODY"));
+  });
+
+  test("puts request context before the request a trailing partial assistant continues", async () => {
+    const context = createMuxMessage("ctx", "user", "VIEW-CONTEXT");
+    // The refusal fallback (and an interrupted turn) ends the history in the partial reply.
+    const history = [
+      createMuxMessage("u1", "user", "FIRST"),
+      createMuxMessage("a1", "assistant", "ANSWER"),
+      createMuxMessage("u2", "user", "NEWEST"),
+      createMuxMessage("a2", "assistant", "PARTIAL", { partial: true }),
+    ];
+    const payload = await assemble({ history, requestContextMessage: context });
+    const wire = JSON.stringify(payload.messages);
+    const order = ["FIRST", "ANSWER", "VIEW-CONTEXT", "NEWEST", "PARTIAL"]
+      .filter((text) => wire.includes(text))
+      .sort((a, b) => wire.indexOf(a) - wire.indexOf(b));
+    expect(order).toEqual(["FIRST", "ANSWER", "VIEW-CONTEXT", "NEWEST", "PARTIAL"]);
+    // Nothing but the continuation sentinel follows the partial reply.
+    const afterPartial = wire.slice(wire.indexOf("PARTIAL"));
+    expect(afterPartial).not.toContain("VIEW-CONTEXT");
+    expect(afterPartial).toContain("[CONTINUE]");
+  });
+
   test("replays tool_catalog_search results as tool references only for deferred tools", async () => {
     const history = [
       createMuxMessage("user", "user", "find it"),
@@ -683,6 +756,32 @@ describe("assemblePromptPayload", () => {
     expect(JSON.stringify(longPayload.messages.slice(0, shortPayload.messages.length))).toBe(
       JSON.stringify(shortPayload.messages)
     );
+  });
+
+  test("a hooked row keeps its hook context and still ends with its ID tag, merged or not", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rNI3m): the tag must stay last on a row with hook context.
+    const hooked = createMuxMessage("hooked", "user", "fix the bug", {
+      historySequence: 7,
+      pluginHookContext: [{ pluginId: "guard", text: "Ask first." }],
+    });
+    const next = createMuxMessage("next", "user", "now lint", { historySequence: 8 });
+    const block = '<plugin-hook-context plugin="guard">\nAsk first.\n</plugin-hook-context>';
+    const userText = async (history: MuxMessage[]) => {
+      const payload = await assemble({ history, tagHistoryItemIds: true });
+      return payload.messages
+        .filter((message) => message.role === "user")
+        .map((message) =>
+          typeof message.content === "string"
+            ? message.content
+            : message.content.map((part) => (part.type === "text" ? part.text : "")).join("|")
+        );
+    };
+
+    expect(await userText([hooked])).toEqual([`fix the bug\n${block}\n[id: 7]`]);
+    // Merging keeps one text part per message, so the context must live inside it.
+    expect(await userText([hooked, next])).toEqual([
+      `fix the bug\n${block}\n[id: 7]\nnow lint\n[id: 8]`,
+    ]);
   });
 
   test("token budget tags survive user-row merging but skip rows session_history hides", async () => {
@@ -1031,6 +1130,53 @@ describe("buildStreamSystemContext", () => {
       isSubagentWorkspace: false,
     }).catch((error: unknown) => error);
     expect(outcome).toMatchObject({ type: "network" });
+  });
+
+  test("lists a plugin skill shadowed by a global skill under <plugin>:<skill> in the skills index", async () => {
+    // Plugin skill namespaces: the model index must offer `pstack:tdd`, or the model
+    // never learns the shadowed plugin skill exists.
+    using tempRoot = new DisposableTempDir("stream-system-context-plugin-skill-namespace");
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "xum-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    const writeSkill = async (skillsRoot: string, description: string) => {
+      await fs.mkdir(path.join(skillsRoot, "tdd"), { recursive: true });
+      await fs.writeFile(
+        path.join(skillsRoot, "tdd", "SKILL.md"),
+        `---\nname: tdd\ndescription: ${description}\n---\nBody\n`
+      );
+    };
+    await writeSkill(path.join(xumHome, "skills"), "global tdd");
+    const pluginDir = path.join(xumHome, "plugins", "pstack");
+    await writeSkill(path.join(pluginDir, "skills"), "pstack tdd");
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "pstack",
+      })
+    );
+
+    const metadata = createWorkspaceMetadata({
+      id: "plugin-skill-namespace-ws",
+      name: "plugin-skill-namespace-workspace",
+      projectName: "project",
+      projectPath,
+    });
+    const { availableSkills } = await buildSystemContextForTest({
+      runtime: new TestRuntime(projectPath, xumHome),
+      metadata,
+      workspacePath: projectPath,
+      cfg: createProjectsConfig({
+        projectPath,
+        workspaces: [{ id: metadata.id, name: metadata.name }],
+      }),
+      isSubagentWorkspace: false,
+    });
+
+    const byName = new Map(availableSkills?.map((skill) => [skill.name, skill.description]));
+    expect(byName.get("tdd")).toBe("global tdd");
+    expect(byName.get("pstack:tdd")).toBe("pstack tdd");
   });
 
   test("reads instruction files while agent discovery is still in flight", async () => {

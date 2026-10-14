@@ -42,7 +42,7 @@ import {
   isEditableElement,
   KEYBINDS,
 } from "@/browser/utils/ui/keybinds";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import {
   CUSTOM_EVENTS,
   getStorageChangeEvent,
@@ -82,6 +82,7 @@ import {
   type PinnedDropEdge,
   type PinnedMoveDirection,
 } from "@/browser/utils/ui/pinnedReorder";
+import { isWorkspaceRowRendered } from "@/browser/utils/ui/workspaceDomNav";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { SidebarCollapseButton } from "../SidebarCollapseButton/SidebarCollapseButton";
 import { ConfirmationModal } from "../ConfirmationModal/ConfirmationModal";
@@ -108,6 +109,7 @@ import { TitleEditProvider, useTitleEdit } from "@/browser/contexts/WorkspaceTit
 import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { useWorkspaceActionKeybinds } from "./useWorkspaceActionKeybinds";
 import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
 import {
   PositionedMenu,
@@ -131,7 +133,11 @@ import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { formatWorkspaceRemoveWarnings } from "@/browser/utils/workspace";
-import { forkWorkspace } from "@/browser/utils/chatCommands";
+import {
+  forkWorkspaceFromMenu,
+  getErrorAnchor,
+  stopWorkspaceRuntime,
+} from "@/browser/components/WorkspaceActionsMenuContent/workspaceActionHandlers";
 import { PopoverError } from "../PopoverError/PopoverError";
 import { SectionHeader } from "../SectionHeader/SectionHeader";
 import { WorkspaceSectionDropZone } from "../WorkspaceSectionDropZone/WorkspaceSectionDropZone";
@@ -648,35 +654,37 @@ const ProjectDragLayer: React.FC = () => {
 /**
  * Handles F2 (edit title) and Shift+F2 (generate new title) keybinds.
  * Rendered inside TitleEditProvider so it can access useTitleEdit().
+ * Both keys also work with the sidebar collapsed (#6328): Shift+F2 needs no row, and F2 leaves a
+ * workspace whose row is not rendered to the workspace header (WorkspaceMenuBar).
  */
 function SidebarTitleEditKeybinds(props: {
   selectedWorkspace: WorkspaceSelection | undefined;
   sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>;
-  collapsed: boolean;
 }) {
   const { requestEdit, wrapGenerateTitle } = useTitleEdit();
-  const { api } = useAPI();
+  const liveApi = useLiveAPI();
 
   const regenerateTitleForWorkspace = useCallback(
     (workspaceId: string) => {
       wrapGenerateTitle(workspaceId, () => {
-        if (!api) {
+        if (!liveApi) {
           return Promise.resolve({ success: false, error: "Not connected to server" });
         }
-        return api.workspace.regenerateTitle({ workspaceId });
+        return liveApi.workspace.regenerateTitle({ workspaceId });
       });
     },
-    [wrapGenerateTitle, api]
+    [wrapGenerateTitle, liveApi]
   );
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (props.collapsed) return;
       if (!props.selectedWorkspace) return;
       if (isEditableElement(e.target)) return;
       const wsId = props.selectedWorkspace.workspaceId;
 
       if (matchesKeybind(e, KEYBINDS.EDIT_WORKSPACE_TITLE)) {
+        // No row to edit in: the workspace header takes the key.
+        if (!isWorkspaceRowRendered(wsId)) return;
         e.preventDefault();
         const meta = props.sortedWorkspacesByProject
           .get(props.selectedWorkspace.projectPath)
@@ -691,7 +699,6 @@ function SidebarTitleEditKeybinds(props: {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
-    props.collapsed,
     props.selectedWorkspace,
     props.sortedWorkspacesByProject,
     requestEdit,
@@ -760,7 +767,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   useWorkspaceAttentionSubscription(sortedWorkspacesByProject, workspaceStore);
   const runtimeStatusStore = useRuntimeStatusStoreRaw();
   const { navigateToProject, isAnalyticsOpen } = useRouter();
-  const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { confirm: confirmDialog } = useConfirmDialog();
   const settings = useSettings();
   // The settings and analytics modals cover the chat without changing the route's workspace;
@@ -1092,74 +1099,29 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const handleForkWorkspace = useCallback(
     async (workspaceId: string, buttonElement?: HTMLElement) => {
-      if (!api) {
-        workspaceForkError.showError(workspaceId, "Not connected to server");
-        return;
-      }
-
-      let anchor: { top: number; left: number } | undefined;
-      if (buttonElement) {
-        const rect = buttonElement.getBoundingClientRect();
-        anchor = {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        };
-      }
-
-      try {
-        const result = await forkWorkspace({
-          client: api,
-          sourceWorkspaceId: workspaceId,
-        });
-        if (result.success) {
-          return;
-        }
-        workspaceForkError.showError(workspaceId, result.error ?? "Failed to fork chat", anchor);
-      } catch (error) {
-        // IPC/transport failures throw instead of returning { success: false }
-        const message = getErrorMessage(error);
-        workspaceForkError.showError(workspaceId, message, anchor);
-      }
+      const anchor = getErrorAnchor(buttonElement);
+      const error = await forkWorkspaceFromMenu(liveApi, workspaceId);
+      if (error) workspaceForkError.showError(workspaceId, error, anchor);
     },
-    [api, workspaceForkError]
+    [liveApi, workspaceForkError]
   );
 
   const handleStopRuntime = useCallback(
     async (workspaceId: string, buttonElement?: HTMLElement) => {
-      let anchor: { top: number; left: number } | undefined;
-      if (buttonElement) {
-        const rect = buttonElement.getBoundingClientRect();
-        anchor = {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        };
-      }
-
-      if (!api) {
-        workspaceStopRuntimeError.showError(workspaceId, "Not connected to server", anchor);
-        return;
-      }
-
-      try {
-        const result = await api.workspace.stopRuntime({ workspaceId });
-        if (!result.success) {
-          workspaceStopRuntimeError.showError(
-            workspaceId,
-            result.error ?? "Failed to stop container",
-            anchor
-          );
-          return;
-        }
-
-        // A successful stop should hide the running indicator and menu action without
-        // forcing rows to own their own optimistic runtime state.
-        runtimeStatusStore.invalidateWorkspace(workspaceId);
-      } catch (error) {
-        workspaceStopRuntimeError.showError(workspaceId, getErrorMessage(error), anchor);
-      }
+      const anchor = getErrorAnchor(buttonElement);
+      const error = await stopWorkspaceRuntime(liveApi, runtimeStatusStore, workspaceId);
+      if (error) workspaceStopRuntimeError.showError(workspaceId, error, anchor);
     },
-    [api, runtimeStatusStore, workspaceStopRuntimeError]
+    [liveApi, runtimeStatusStore, workspaceStopRuntimeError]
   );
+
+  useWorkspaceActionKeybinds({
+    selectedWorkspaceId: visibleSelectedWorkspaceId,
+    getWorkspaceMetadata: (workspaceId) => workspaceStore.getWorkspaceMetadata(workspaceId),
+    runtimeStatusStore,
+    onForkWorkspace: (workspaceId) => void handleForkWorkspace(workspaceId),
+    onStopRuntime: (workspaceId) => void handleStopRuntime(workspaceId),
+  });
 
   const hasActiveStream = useCallback(
     (workspaceId: string) => {
@@ -2579,7 +2541,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       <SidebarTitleEditKeybinds
         selectedWorkspace={selectedWorkspace ?? undefined}
         sortedWorkspacesByProject={sortedWorkspacesByProject}
-        collapsed={collapsed}
       />
       {/* Outside the collapsed-only UI: the watchers live exactly as long as the visibility map
           they fill, so a collapsed sidebar or section never leaves a stale value in it. */}
@@ -3677,7 +3638,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           <SidebarCollapseButton
             collapsed={collapsed}
             onToggle={onToggleCollapsed}
-            side="left"
             shortcut={formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)}
           />
           <PositionedMenu
@@ -3798,7 +3758,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           />
           <PopoverError
             error={workspaceArchiveError.error}
-            prefix="Failed to archive chat"
+            prefix="Failed to archive workspace"
             onDismiss={workspaceArchiveError.clearError}
           />
           <PopoverError
@@ -3808,7 +3768,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           />
           <PopoverError
             error={workspaceForkError.error}
-            prefix="Failed to fork chat"
+            prefix="Failed to fork workspace"
             onDismiss={workspaceForkError.clearError}
           />
           <PopoverError

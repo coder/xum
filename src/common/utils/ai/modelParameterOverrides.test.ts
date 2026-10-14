@@ -466,7 +466,7 @@ describe("resolveModelParameterOverrides", () => {
     });
   });
 
-  it("strips deprecated sampling parameters for Gemini 3.8 Flash", () => {
+  it("strips deprecated sampling parameters for Gemini 3.8 Flash and Gemini 4 Argon", () => {
     const providersConfig = withGoogleModelParameters({
       "*": {
         max_output_tokens: 32768,
@@ -476,17 +476,15 @@ describe("resolveModelParameterOverrides", () => {
       },
     });
 
-    const result = resolveModelParameterOverrides(
-      providersConfig,
-      "google",
-      "google:gemini-3.8-flash"
-    );
+    for (const model of ["google:gemini-3.8-flash", "google:gemini-4-argon"]) {
+      const result = resolveModelParameterOverrides(providersConfig, "google", model);
 
-    expect(result).toEqual({
-      standard: {
-        maxOutputTokens: 32768,
-      },
-    });
+      expect(result).toEqual({
+        standard: {
+          maxOutputTokens: 32768,
+        },
+      });
+    }
   });
 
   it("strips deprecated sampling parameters for Gemini 3.5 Flash-Lite", () => {

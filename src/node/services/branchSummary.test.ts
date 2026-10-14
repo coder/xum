@@ -202,6 +202,19 @@ describe("buildAbandonedBranchTranscript", () => {
     expect(buildAbandonedBranchTranscript(visible)).toContain(feedbackText);
   });
 
+  test("a user row's prompt-hook context is in the transcript, as in its token estimate", () => {
+    // Codex PRRT_kwDOPxxmWM6rPqxL: the estimate counts the provider-visible text.
+    const message: MuxMessage = {
+      id: "u1",
+      role: "user",
+      parts: [{ type: "text", text: "fix the tests" }],
+      metadata: { timestamp: 1, pluginHookContext: [{ pluginId: "guard", text: "Repro first." }] },
+    };
+    const transcript = buildAbandonedBranchTranscript([message]);
+    expect(transcript).toContain("fix the tests");
+    expect(transcript).toContain("Repro first.");
+  });
+
   test("keeps text and tool markers, strips reasoning parts", () => {
     const message: MuxMessage = {
       id: "a1",
