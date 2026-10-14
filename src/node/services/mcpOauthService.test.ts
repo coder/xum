@@ -1592,6 +1592,52 @@ describe("McpOauthService OAuth flows", () => {
     }
   );
 
+  // Parallel requests that all get a 401 run several auth() calls on one provider. Each call
+  // passes its own context object, so a later call's read must not rebind an earlier refresh.
+  test("an older overlapping refresh is dropped after a newer call read the replacing grant (#6537)", async () => {
+    const serverUrl = "https://example.com/mcp";
+    const oauth: MCPServerOAuthConfig = { clientId: "c", baseScopes: ["read"] };
+    await fs.writeFile(
+      getStoreFilePath(xumHome),
+      JSON.stringify({
+        version: 2,
+        entries: {
+          [serverUrl]: {
+            serverUrl,
+            updatedAtMs: Date.now(),
+            clientInformation: { client_id: "c" },
+            tokens: { access_token: "at-1", token_type: "Bearer", scope: "read" },
+          },
+        },
+      })
+    );
+    const provider = await service.getAuthProviderForServer({ serverUrl });
+    if (provider === undefined) throw new Error("expected a provider");
+    const [a, b, c] = [{ ...authCtx }, { ...authCtx }, { ...authCtx }];
+    // A and B read grant 1; B's rotating refresh stores grant 2 with a wider scope.
+    for (const ctx of [a, b]) {
+      await provider.clientInformation(ctx);
+      await provider.tokens(ctx);
+    }
+    await provider.saveTokens(
+      { access_token: "at-2", token_type: "Bearer", scope: "read write" } as never,
+      b
+    );
+    // C reads grant 2, then A's answer for grant 1 lands without scope.
+    await provider.clientInformation(c);
+    await provider.tokens(c);
+    await provider.saveTokens({ access_token: "at-1b", token_type: "Bearer" } as never, a);
+    const stored = JSON.parse(await fs.readFile(getStoreFilePath(xumHome), "utf-8")) as {
+      entries: Record<string, { tokens?: { access_token: string; scope?: string } }>;
+    };
+    // A's answer is dropped: it never gets grant 2's scope.
+    expect(stored.entries[serverUrl].tokens).toMatchObject({
+      access_token: "at-2",
+      scope: "read write",
+    });
+    expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+  });
+
   test("a grant without scope records the requested scope, and a refresh keeps it (#6141)", async () => {
     await withAuthServer(async (base) => {
       // withAuthServer's token endpoint omits scope.
