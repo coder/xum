@@ -191,9 +191,7 @@ async function runToolHooks(
   const view = codexToolView(ctx.toolName, ctx.mcpOrigin);
   const toolEvent = () => ({
     tool_name: view.codexName ?? ctx.toolName,
-    tool_input: isPlainObject(ctx.args)
-      ? { ...ctx.args, ...view.toCodexFields(ctx.args) }
-      : ctx.args,
+    tool_input: view.toCodexInput(ctx.args),
   });
   for (const hook of pre.filter((candidate) => matches(candidate, ctx.toolName, view))) {
     const output = await invoke(
@@ -227,34 +225,87 @@ async function runToolHooks(
     return;
   }
   await next();
-  if (ctx.executed) {
-    for (const hook of post.filter((candidate) => matches(candidate, ctx.toolName, view))) {
-      const output = await invoke(
-        hook,
-        { ...toolEvent(), tool_response: ctx.result },
-        "PostToolUse",
-        registration,
-        parsePostToolUseOutput,
-        call
-      );
-      if (output === null) continue;
-      if (output.additionalContext !== undefined) notes.push(output.additionalContext);
-      // Codex: block or continue: false replaces the tool result with the hook's feedback.
-      // The context gathered so far still reaches the model (Codex adds it next to the feedback).
-      const feedback = output.blockReason ?? output.stopFeedback;
-      if (feedback !== undefined) {
-        ctx.result = { error: `[plugin:${registration.pluginName}] ${feedback}` };
-        // A nested caller (mux.load) holds the original output outside ctx.result: it must not
-        // hand it on (Codex PRRT_kwDOPxxmWM6r6NnK). That holds for continue: false too, though
-        // Codex keeps it apart from a block: the hook replaced the output the model sees, so a
-        // nested call must not return it either (Codex security review PRRT_kwDOPxxmWM6sQaTG).
-        ctx.postBlocked = true;
-        break;
-      }
-    }
+  // A later middleware (another plugin, the shell pre-hook) blocked the call: the context of
+  // these hooks still reaches the model, as Codex records it before the block (Codex
+  // PRRT_kwDOPxxmWM6rPqkW).
+  if (!ctx.executed && ctx.blocked !== undefined && notes.length > 0) {
+    ctx.blocked = { result: annotate(ctx.blocked.result, notes, registration) };
+    return;
   }
+  if (ctx.executed) await runPostToolHooks(ctx, post, view, toolEvent, notes, registration, call);
   // Model-visible tool context rides on the tool result (logged in chat.jsonl with it).
   if (notes.length > 0 && ctx.executed) ctx.result = annotate(ctx.result, notes, registration);
+}
+
+/**
+ * Codex runs every matched PostToolUse hook on the same response, then joins: any block replaces
+ * the result with every blocker's feedback (post_tool_use.rs, Codex PRRT_kwDOPxxmWM6sGB7x).
+ * Context goes to `notes`.
+ */
+async function runPostToolHooks(
+  ctx: ToolExecuteContext,
+  post: PluginHookDefinition[],
+  view: CodexToolView,
+  toolEvent: () => Record<string, unknown>,
+  notes: string[],
+  registration: CodexHookRegistration,
+  call: { cwd?: string; abortSignal?: AbortSignal }
+): Promise<void> {
+  // Codex's response shape for an aliased built-in (Bash: the output text).
+  const response = view.toCodexResponse(toolResponseOf(ctx));
+  const feedback: string[] = [];
+  for (const hook of post.filter((candidate) => matches(candidate, ctx.toolName, view))) {
+    const output = await invoke(
+      hook,
+      { ...toolEvent(), tool_response: response },
+      "PostToolUse",
+      registration,
+      parsePostToolUseOutput,
+      call
+    );
+    if (output === null) continue;
+    if (output.additionalContext !== undefined) notes.push(output.additionalContext);
+    const hookFeedback = output.blockReason ?? output.stopFeedback;
+    if (hookFeedback !== undefined) feedback.push(hookFeedback);
+  }
+  if (feedback.length > 0) replaceWithFeedback(ctx, feedback, registration);
+}
+
+/**
+ * The tool's own result, as the innermost plugin's PostToolUse saw it. Each plugin is its own
+ * middleware, and an inner plugin's block replaces ctx.result before an outer plugin's hooks
+ * run: every plugin's hooks must still see the same response, as in Codex (Codex
+ * PRRT_kwDOPxxmWM6sX3yK). Keyed by the call's context, so it lives as long as the call.
+ */
+const originalResults = new WeakMap<ToolExecuteContext, unknown>();
+
+function toolResponseOf(ctx: ToolExecuteContext): unknown {
+  if (!originalResults.has(ctx)) originalResults.set(ctx, ctx.result);
+  return originalResults.get(ctx);
+}
+
+/** Replace the tool result with the PostToolUse blockers' feedback (Codex `decision: "block"`). */
+function replaceWithFeedback(
+  ctx: ToolExecuteContext,
+  feedback: string[],
+  registration: CodexHookRegistration
+): void {
+  // Codex: block or continue: false replaces the tool result with the hooks' feedback. The
+  // context gathered so far still reaches the model (Codex adds it next to the feedback).
+  const error = joinCapped(feedback, registration, "\n\n");
+  // Each plugin is its own middleware: an inner plugin that blocked already replaced the result.
+  // Its feedback and context stay, and this plugin's feedback is added (Codex
+  // PRRT_kwDOPxxmWM6sXQ2G).
+  const previous = ctx.postBlocked === true && isPlainObject(ctx.result) ? ctx.result : undefined;
+  ctx.result =
+    previous !== undefined && typeof previous.error === "string"
+      ? { ...previous, error: capText(`${previous.error}\n\n${error}`) }
+      : { error };
+  // A nested caller (mux.load) holds the original output outside ctx.result: it must not hand it
+  // on (Codex PRRT_kwDOPxxmWM6r6NnK). That holds for continue: false too, though Codex keeps it
+  // apart from a block: the hook replaced the output the model sees, so a nested call must not
+  // return it either (Codex security review PRRT_kwDOPxxmWM6sQaTG).
+  ctx.postBlocked = true;
 }
 
 function applyUpdatedInput(
@@ -265,7 +316,7 @@ function applyUpdatedInput(
   hook: PluginHookDefinition
 ): void {
   // A Codex-shaped rewrite (Bash `command`) maps back to Xum's names before the schema check.
-  const updated = view.fromCodexInput(updatedInput);
+  const updated = view.fromCodexInput(updatedInput, ctx.args);
   const schema = ctx.inputJsonSchema?.();
   if (schema === undefined) {
     // No schema to check the rewrite against (a caller that omitted it): deny. Running the
@@ -447,26 +498,72 @@ function lookup(root: unknown, dottedPath: string): unknown {
   return value;
 }
 
+/**
+ * The joined context of one plugin's hooks on one call. Each note is already capped; the join is
+ * capped too, so many hooks cannot add more than this to one result (Codex spills oversized
+ * context to a file; Xum cuts it, PRRT_kwDOPxxmWM6rPqkc).
+ */
+const HOOK_CONTEXT_MAX_CHARS = 32 * 1024;
+const HOOK_CONTEXT_CUT_MARKER = "\n[plugin hook context cut]";
+
+/**
+ * One plugin's texts, labeled and joined, cut at HOOK_CONTEXT_MAX_CHARS. Used for context and for
+ * PostToolUse feedback: both reach the model, and up to MAX_PLUGIN_HOOKS hooks can add to them
+ * (Codex PRRT_kwDOPxxmWM6sWuO7).
+ */
+function joinCapped(texts: string[], registration: CodexHookRegistration, separator: string) {
+  return capText(
+    texts.map((text) => `[plugin:${registration.pluginName}] ${text}`).join(separator)
+  );
+}
+
+/** The cap of joinCapped, for text that several plugins joined (Codex PRRT_kwDOPxxmWM6sX3yS). */
+function capText(text: string): string {
+  return text.length > HOOK_CONTEXT_MAX_CHARS
+    ? text.slice(0, HOOK_CONTEXT_MAX_CHARS) + HOOK_CONTEXT_CUT_MARKER
+    : text;
+}
+
+function joinNotes(notes: string[], registration: CodexHookRegistration): string {
+  return joinCapped(notes, registration, "\n");
+}
+
 function annotate(result: unknown, notes: string[], registration: CodexHookRegistration): unknown {
-  if (result === null || typeof result !== "object" || Symbol.asyncIterator in result)
-    return result;
-  const note = notes.map((text) => `[plugin:${registration.pluginName}] ${text}`).join("\n");
+  const note = joinNotes(notes, registration);
+  // A streaming result stays as it is (it cannot carry a field).
+  if (isAsyncIterable(result)) return result;
+  // A primitive, null or an array cannot take a field without changing its shape: wrap it, as
+  // the shell tool hooks do (withHooks.ts, Codex PRRT_kwDOPxxmWM6rRKxT, PRRT_kwDOPxxmWM6rgsaI).
+  if (result === null || typeof result !== "object" || Array.isArray(result)) {
+    return { result, hook_output: note };
+  }
   const existing = (result as { hook_output?: unknown }).hook_output;
-  // MCP tools convert their result for the model from `content` (raw MCP) or `value` (Xum's
-  // { type: "content" } shape) only (mcpToModelOutput), so the note must ride there as text too.
-  const record = result as Record<string, unknown>;
-  const part = { type: "text", text: note };
-  const contentParts: Record<string, unknown[]> = Array.isArray(record.content)
-    ? { content: [...(record.content as unknown[]), part] }
-    : record.type === "content" && Array.isArray(record.value)
-      ? { value: [...(record.value as unknown[]), part] }
-      : {};
   return {
     ...result,
-    ...contentParts,
+    ...contentPartsWithNote(result as Record<string, unknown>, note),
     hook_output:
       typeof existing === "string" && existing.length > 0 ? `${existing}\n${note}` : note,
   };
+}
+
+/**
+ * MCP tools convert their result for the model from `content` (raw MCP) or `value` (Xum's
+ * { type: "content" } shape) only (mcpToModelOutput), so the note must ride there as text too.
+ */
+function contentPartsWithNote(
+  record: Record<string, unknown>,
+  note: string
+): Record<string, unknown[]> {
+  const part = { type: "text", text: note };
+  if (Array.isArray(record.content)) return { content: [...(record.content as unknown[]), part] };
+  if (record.type === "content" && Array.isArray(record.value)) {
+    return { value: [...(record.value as unknown[]), part] };
+  }
+  return {};
+}
+
+function isAsyncIterable(value: unknown): boolean {
+  return typeof value === "object" && value !== null && Symbol.asyncIterator in value;
 }
 
 function warn(registration: CodexHookRegistration, hook: PluginHookDefinition, message: string) {

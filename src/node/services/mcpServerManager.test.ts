@@ -1,5 +1,9 @@
 import { log } from "@/node/services/log";
-import type { MCPSettingValue } from "@/common/utils/mcpSettings";
+import {
+  MAX_MCP_SETTINGS_TOOL_RESULT,
+  type MCPSettingValue,
+  type MCPSettingsToolAction,
+} from "@/common/utils/mcpSettings";
 import {
   afterEach,
   beforeEach,
@@ -887,6 +891,273 @@ describe("MCPServerManager", () => {
     expect(manager.getCachedSettings("settings-ws", "cad")).toEqual(values);
   });
 
+  test("settings tool actions: listed, allowed tools only; a tool that can write needs a confirmation", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-actions") });
+    const actions: Record<string, MCPSettingsToolAction> = {
+      library: { title: "Part library", readOnly: true, opensApp: false },
+      reset: { title: "Reset parts", readOnly: false, opensApp: false },
+      viewer: { title: "Viewer", readOnly: true, opensApp: true },
+      hidden: { title: "Hidden", readOnly: true, opensApp: false },
+    };
+    const runs: Array<{ name: string; meta: unknown }> = [];
+    let bigResult = false;
+    servers.serve("settings-actions", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [
+                {
+                  kind: "group",
+                  title: "Parts",
+                  items: ["library", "reset", "viewer", "hidden", "missing"].map((tool) => ({
+                    kind: "tool",
+                    tool,
+                  })),
+                },
+              ],
+            },
+          }),
+        settingsToolAction: (name) => (Object.hasOwn(actions, name) ? actions[name] : undefined),
+        callSettingsActionTool: (name, meta) => {
+          runs.push({ name, meta });
+          if (bigResult)
+            return Promise.resolve({
+              content: Array.from({ length: 1000 }, () => ({
+                type: "text" as const,
+                text: "x".repeat(10_000),
+              })),
+            });
+          return Promise.resolve({
+            content: [
+              { type: "text" as const, text: "3 libraries" },
+              { type: "image" as const, data: "", mimeType: "image/png" },
+              { type: "text" as const, text: "synced" },
+            ],
+            ...(name === "reset" ? { isError: true } : {}),
+          });
+        },
+      },
+    });
+    const workspaceId = "settings-actions-ws";
+    await manager.getToolsForWorkspace(
+      workspaceRequest(workspaceId, {
+        // The tool allowlist excludes "hidden": settings must not run it either.
+        overrides: { toolAllowlist: { cad: ["draw", "library", "reset", "viewer"] } },
+        overridesAuthoritative: true,
+      })
+    );
+
+    const snapshot = await manager.readSettings(workspaceId, "cad");
+    if (snapshot === null) throw new Error("expected settings");
+    expect(snapshot.layout[0]?.items).toEqual([
+      { kind: "tool", tool: "library", action: actions.library },
+      { kind: "tool", tool: "reset", action: actions.reset },
+      // An MCP App tool without MCP Apps support: no action (never run without its view).
+      { kind: "tool", tool: "viewer" },
+      { kind: "tool", tool: "hidden" },
+      { kind: "tool", tool: "missing" },
+    ]);
+
+    const run = (tool: string, confirmed = false, token = snapshot.instanceToken) =>
+      manager
+        .runSettingsTool(workspaceId, "cad", tool, token, { confirmed })
+        .catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+    // A read-only tool runs at once; only the text parts of its result come back.
+    expect(await run("library")).toEqual({ text: "3 libraries\nsynced", isError: false });
+    // Refused before anything reaches the server.
+    expect(await run("reset")).toContain("confirmation");
+    expect(await run("viewer", true)).toContain("no tool");
+    expect(await run("hidden", true)).toContain("no tool");
+    expect(await run("missing", true)).toContain("no tool");
+    expect(await run("library", true, "stale-token")).toContain("restarted or replaced");
+    expect(runs).toEqual([{ name: "library", meta: { "xum/workspaceId": workspaceId } }]);
+    // Confirmed, it runs; a tool error reaches the dialog as an error result.
+    expect(await run("reset", true)).toEqual({ text: "3 libraries\nsynced", isError: true });
+    expect(runs.map((entry) => entry.name)).toEqual(["library", "reset"]);
+    // A huge result is cut to the bound (with a mark), not joined whole first.
+    bigResult = true;
+    const big = await run("library");
+    if (typeof big === "string") throw new Error(big);
+    expect(big.text).toHaveLength(MAX_MCP_SETTINGS_TOOL_RESULT + 1);
+    expect(big.text.endsWith("…")).toBe(true);
+  });
+
+  test("settings tool actions follow tools/list_changed: the read and the run refresh the catalog", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-actions-live") });
+    let listed = new Set(["old"]);
+    let listing = new Set(["old"]);
+    servers.serve("settings-actions-live", {
+      era: "modern",
+      // A refresh (tools/list) picks up what the server lists now.
+      listTools: () => {
+        listed = new Set(listing);
+        return Promise.resolve({ draw: testTool() });
+      },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [
+                {
+                  kind: "group",
+                  title: "Parts",
+                  items: [
+                    { kind: "tool", tool: "old" },
+                    { kind: "tool", tool: "new" },
+                  ],
+                },
+              ],
+            },
+          }),
+        settingsToolAction: (name) =>
+          listed.has(name) ? { title: name, readOnly: true, opensApp: false } : undefined,
+        callSettingsActionTool: () => Promise.resolve({ content: [] }),
+      },
+    });
+    const workspaceId = "settings-actions-live-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const first = await manager.readSettings(workspaceId, "cad");
+    if (first === null) throw new Error("expected settings");
+    // The server replaces "old" with "new" (tools/list_changed).
+    listing = new Set(["new"]);
+    const run = (tool: string) =>
+      manager
+        .runSettingsTool(workspaceId, "cad", tool, first.instanceToken, { confirmed: false })
+        .then(() => "ran")
+        .catch((error: unknown) => String(error));
+    expect(await run("old")).toContain("no tool");
+    const second = await manager.readSettings(workspaceId, "cad");
+    expect(second?.layout[0]?.items).toEqual([
+      { kind: "tool", tool: "old" },
+      { kind: "tool", tool: "new", action: { title: "new", readOnly: true, opensApp: false } },
+    ]);
+    expect(await run("new")).toBe("ran");
+  });
+
+  test("settings tool actions fail closed when the catalog refresh stalls or fails", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-actions-stall") });
+    // "reset" was read-only; the server makes it writable and then lists slowly or fails.
+    const readOnly = true;
+    let listing: "ok" | "stall" | "fail" = "ok";
+    const runs: string[] = [];
+    servers.serve("settings-actions-stall", {
+      era: "modern",
+      listTools: () => {
+        if (listing === "stall") return new Promise<never>(() => undefined);
+        if (listing === "fail") return Promise.reject(new Error("tools/list failed"));
+        return Promise.resolve({ draw: testTool() });
+      },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [{ kind: "group", title: "Parts", items: [{ kind: "tool", tool: "reset" }] }],
+            },
+          }),
+        // The held catalog keeps the old flag until a listing completes.
+        settingsToolAction: (name) =>
+          name === "reset" ? { title: "Reset", readOnly, opensApp: false } : undefined,
+        callSettingsActionTool: (name) => {
+          runs.push(name);
+          return Promise.resolve({ content: [] });
+        },
+      },
+    });
+    const workspaceId = "settings-actions-stall-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const snapshot = await manager.readSettings(workspaceId, "cad");
+    if (snapshot === null) throw new Error("expected settings");
+    const run = () =>
+      manager
+        .runSettingsTool(workspaceId, "cad", "reset", snapshot.instanceToken, { confirmed: false })
+        .then(() => "ran")
+        .catch((error: unknown) => String(error));
+    // The tool became writable, but the listing that would say so fails, or stalls past the
+    // deadline: the stale read-only flag must not let it run without a confirmation.
+    listing = "fail";
+    expect(await run()).toContain("Could not refresh cad's tools; try again");
+    expect(runs).toEqual([]);
+    // A completed refresh runs the action (still read-only here) as before.
+    listing = "ok";
+    expect(await run()).toBe("ran");
+    expect(runs).toEqual(["reset"]);
+    // Last: a stalled listing stays in flight (later refreshes join it until it settles).
+    listing = "stall";
+    expect(await run()).toContain("Could not refresh cad's tools; try again");
+    expect(runs).toEqual(["reset"]);
+  }, 10_000);
+
+  test("settings tool actions re-list a legacy catalog before a dispatch (no MCP Apps)", async () => {
+    // A legacy-era server and no MCP Apps: nothing else re-lists its tools after
+    // tools/list_changed. "reset" was read-only and the server made it writable.
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-actions-legacy") });
+    let listedReadOnly = true;
+    let serverReadOnly = true;
+    let relistFails = false;
+    const runs: string[] = [];
+    servers.serve("settings-actions-legacy", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [{ kind: "group", title: "Parts", items: [{ kind: "tool", tool: "reset" }] }],
+            },
+          }),
+        settingsToolAction: (name) =>
+          name === "reset"
+            ? { title: "Reset", readOnly: listedReadOnly, opensApp: false }
+            : undefined,
+        relistTools: () => {
+          if (relistFails) return Promise.reject(new Error("tools/list failed"));
+          listedReadOnly = serverReadOnly;
+          return Promise.resolve();
+        },
+        callSettingsActionTool: (name) => {
+          runs.push(name);
+          return Promise.resolve({ content: [] });
+        },
+      },
+    });
+    const workspaceId = "settings-actions-legacy-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const snapshot = await manager.readSettings(workspaceId, "cad");
+    if (snapshot === null) throw new Error("expected settings");
+    const run = (confirmed: boolean) =>
+      manager
+        .runSettingsTool(workspaceId, "cad", "reset", snapshot.instanceToken, { confirmed })
+        .then(() => "ran")
+        .catch((error: unknown) => String(error));
+    serverReadOnly = false;
+    // The dispatch re-lists first, so the stale read-only flag cannot skip the confirmation.
+    expect(await run(false)).toContain("runs only after a confirmation");
+    expect(runs).toEqual([]);
+    // A failed re-list refuses the dispatch instead of using the held catalog.
+    relistFails = true;
+    expect(await run(true)).toContain("Could not refresh cad's tools; try again");
+    relistFails = false;
+    expect(await run(true)).toBe("ran");
+    expect(runs).toEqual(["reset"]);
+  });
+
   test("settings: a server counts as connected only once the workspace started it", async () => {
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-connected") });
     servers.serve("settings-connected", { tools: { draw: testTool() } });
@@ -1132,6 +1403,192 @@ describe("MCPServerManager", () => {
     expect(manager.getCachedSettings("hooks-race-ws", "plugin:abc:saved")).toEqual({ units: "in" });
   });
 
+  describe("settings for plugin hooks: revalidation (#6186)", () => {
+    // One plugin "abc" with servers a and b; each read waits for the test to settle it.
+    async function setup(workspaceId: string) {
+      const tmp = new DisposableTempDir(`mcp-hook-settings-${workspaceId}`);
+      const pluginServer = (command: string, serverName: string) => ({
+        ...stdioConfig(command),
+        env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: path.join(tmp.path, "data") },
+        plugin: {
+          pluginName: "cad",
+          serverName,
+          sourceScope: "global" as const,
+          sourceLocation: "x",
+        },
+      });
+      const all = {
+        "plugin:abc:a": pluginServer(`${workspaceId}-a`, "a"),
+        "plugin:abc:b": pluginServer(`${workspaceId}-b`, "b"),
+      };
+      configService.listServers.mockResolvedValue(all);
+      const schema = { type: "object", properties: { units: { type: "string", title: "Units" } } };
+      const result = (units: string): mcpSdk.MCPRawCallToolResult => ({
+        content: [],
+        structuredContent: { schema, values: { units } },
+      });
+      const reads: Array<{
+        server: string;
+        timeoutMs: number | undefined;
+        settle: (units: string | null) => void;
+      }> = [];
+      // While set, reads answer at once with these units.
+      let immediateUnits: string | undefined = "mm";
+      const settingsServer = (server: string) => ({
+        tools: { draw: testTool() },
+        settings: {
+          settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+          callSettingsTool: (
+            name: string,
+            args: Record<string, unknown>,
+            _meta: Record<string, unknown>,
+            options?: { timeoutMs?: number }
+          ) => {
+            if (name === "s.update") {
+              const set = args.set as { units: string };
+              return Promise.resolve(result(set.units));
+            }
+            if (immediateUnits !== undefined) return Promise.resolve(result(immediateUnits));
+            return new Promise<mcpSdk.MCPRawCallToolResult>((resolve, reject) =>
+              reads.push({
+                server,
+                timeoutMs: options?.timeoutMs,
+                // null: the read fails (a server error or a timeout).
+                settle: (units) =>
+                  units === null ? reject(new Error("server down")) : resolve(result(units)),
+              })
+            );
+          },
+        },
+      });
+      servers.serve(`${workspaceId}-a`, settingsServer("a"));
+      servers.serve(`${workspaceId}-b`, settingsServer("b"));
+      await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+      // Fill a's cache through the dialog read path.
+      await manager.readSettings(workspaceId, "plugin:abc:a");
+      immediateUnits = undefined;
+      return { tmp, all, reads };
+    }
+
+    test("a server that a pending override change disables gets no settings", async () => {
+      const t = await setup("hooks-repair-ws");
+      using _tmp = t.tmp;
+      // Hold the enablement repair of the publication below.
+      const repairGate = Promise.withResolvers<void>();
+      configService.listServers.mockImplementationOnce(async () => {
+        await repairGate.promise;
+        return t.all;
+      });
+      const publication = manager.applyWorkspaceOverrides("hooks-repair-ws", {
+        disabledServers: ["plugin:abc:a", "plugin:abc:b"],
+      });
+      // a is cached and b is not: neither may reach a hook while the repair runs.
+      const hookSettings = manager.getSettingsForPluginHooks(
+        "hooks-repair-ws",
+        "plugin:abc:",
+        1000
+      );
+      repairGate.resolve();
+      await publication;
+      const started = t.reads.map((read) => read.server);
+      t.reads.splice(0).forEach((read) => read.settle("cm"));
+      expect(await hookSettings).toEqual({});
+      // The disabled server b is not even read.
+      expect(started).toEqual([]);
+    });
+
+    test("a stuck repair costs one hook timeout, then later hooks fail closed at once", async () => {
+      const t = await setup("hooks-stuck-ws");
+      using _tmp = t.tmp;
+      const repairGate = Promise.withResolvers<void>();
+      configService.listServers.mockImplementationOnce(async () => {
+        await repairGate.promise;
+        return t.all;
+      });
+      const publication = manager.applyWorkspaceOverrides("hooks-stuck-ws", {});
+      try {
+        expect(
+          await manager.getSettingsForPluginHooks("hooks-stuck-ws", "plugin:abc:", 10)
+        ).toEqual({});
+        // A later plugin of the same dispatch must not wait on the stuck repair again: with this
+        // timeout, a second wait would outlast the test.
+        expect(
+          await manager.getSettingsForPluginHooks("hooks-stuck-ws", "plugin:abc:", 60_000)
+        ).toEqual({});
+      } finally {
+        repairGate.resolve();
+        await publication;
+      }
+    });
+
+    test("after a repair wait a hook gets cached values only; the next hook reads the misses", async () => {
+      const t = await setup("hooks-budget-ws");
+      using _tmp = t.tmp;
+      const repairGate = Promise.withResolvers<void>();
+      configService.listServers.mockImplementationOnce(async () => {
+        await repairGate.promise;
+        return t.all;
+      });
+      const publication = manager.applyWorkspaceOverrides("hooks-budget-ws", {});
+      const hookSettings = manager.getSettingsForPluginHooks(
+        "hooks-budget-ws",
+        "plugin:abc:",
+        1000
+      );
+      repairGate.resolve();
+      await publication;
+      // The wait spent this hook's budget: b is not read with what is left.
+      expect(await hookSettings).toEqual({ a: { units: "mm" }, b: {} });
+      expect(t.reads).toEqual([]);
+      const next = manager.getSettingsForPluginHooks("hooks-budget-ws", "plugin:abc:", 1000);
+      expect(t.reads.map((read) => [read.server, read.timeoutMs])).toEqual([["b", 1000]]);
+      t.reads.splice(0).forEach((read) => read.settle("cm"));
+      expect(await next).toEqual({ a: { units: "mm" }, b: { units: "cm" } });
+    });
+
+    test("a cached server disabled while a sibling's read is in flight is left out", async () => {
+      const t = await setup("hooks-sibling-ws");
+      using _tmp = t.tmp;
+      const hookSettings = manager.getSettingsForPluginHooks(
+        "hooks-sibling-ws",
+        "plugin:abc:",
+        1000
+      );
+      expect(t.reads.map((read) => read.server)).toEqual(["b"]);
+      await manager.applyWorkspaceOverrides("hooks-sibling-ws", {
+        disabledServers: ["plugin:abc:a"],
+      });
+      t.reads.splice(0).forEach((read) => read.settle("cm"));
+      expect(await hookSettings).toEqual({ b: { units: "cm" } });
+    });
+
+    test("a failed hook read returns the values a save cached meanwhile", async () => {
+      const t = await setup("hooks-failsave-ws");
+      using _tmp = t.tmp;
+      const hookSettings = manager.getSettingsForPluginHooks(
+        "hooks-failsave-ws",
+        "plugin:abc:",
+        1000
+      );
+      expect(t.reads.map((read) => read.server)).toEqual(["b"]);
+      // The dialog reads b (its read gives the save b's instance token), then saves.
+      const dialogRead = manager.readSettings("hooks-failsave-ws", "plugin:abc:b");
+      await waitFor(() => t.reads.length === 2);
+      t.reads.pop()?.settle("mm");
+      const prior = await dialogRead;
+      if (prior === null) throw new Error("expected settings");
+      await manager.updateSettings(
+        "hooks-failsave-ws",
+        "plugin:abc:b",
+        { units: "in" },
+        prior,
+        prior.instanceToken
+      );
+      t.reads.splice(0).forEach((read) => read.settle(null));
+      expect(await hookSettings).toEqual({ a: { units: "mm" }, b: { units: "in" } });
+    });
+  });
+
   test("settings: a noStart read never starts or restarts the server", async () => {
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-nostart") });
     servers.serve("settings-nostart", {
@@ -1253,8 +1710,9 @@ describe("MCPServerManager", () => {
     expect(after.instanceToken).toBe(before.instanceToken);
   });
 
-  test("settings: a save read from a replaced server instance saves only when the schema is unchanged", async () => {
+  test("settings: a save or tool action read from a replaced instance proceeds only when the schema is unchanged", async () => {
     const updates: string[] = [];
+    const runs: string[] = [];
     const settingsServer = (id: string, title: string) => ({
       tools: { draw: testTool() },
       settings: {
@@ -1266,8 +1724,17 @@ describe("MCPServerManager", () => {
             structuredContent: {
               schema: { type: "object", properties: { units: { type: "string", title } } },
               values: { units: "in" },
+              // A tool action: the read adds its `action`, and the save's check must hash the
+              // same enriched layout it remembered.
+              layout: [{ kind: "group", title: "Parts", items: [{ kind: "tool", tool: "lib" }] }],
             },
           });
+        },
+        settingsToolAction: (tool: string) =>
+          tool === "lib" ? { title: "Library", readOnly: true, opensApp: false } : undefined,
+        callSettingsActionTool: () => {
+          runs.push(id);
+          return Promise.resolve({ content: [] });
         },
       },
     });
@@ -1286,17 +1753,32 @@ describe("MCPServerManager", () => {
         .then(() => "saved")
         .catch((error: unknown) => String(error));
 
-    // The dialog stays open while the server restarts with the same schema: the save lands.
+    const run = () =>
+      manager
+        .runSettingsTool("settings-token-ws", "cad", "lib", read.instanceToken, {
+          confirmed: false,
+        })
+        .then(() => "ran")
+        .catch((error: unknown) => String(error));
+
+    // The dialog stays open while the server restarts with the same schema. A tool action is
+    // refused until a read saw the new instance (no schema to compare yet).
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-token-v1b") });
     await manager.getToolsForWorkspace(request);
+    expect(await run()).toContain("Reopen");
+    // The save lands (its fresh read sees the new instance), and so does the action after it.
     expect(await save()).toBe("saved");
     expect(updates).toEqual(["v1b"]);
+    expect(await run()).toBe("ran");
+    expect(runs).toEqual(["v1b"]);
 
     // A replacement with another schema is refused: the dialog validated against the old one.
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-token-v2") });
     await manager.getToolsForWorkspace(request);
     expect(await save()).toContain("Reopen");
     expect(updates).toEqual(["v1b"]);
+    expect(await run()).toContain("Reopen");
+    expect(runs).toEqual(["v1b"]);
   });
 
   test("settings: a token read from one server never passes the schema check of another", async () => {
@@ -1558,6 +2040,100 @@ describe("MCPServerManager", () => {
       );
     expect(refused).toBeInstanceOf(Error);
     expect(reads).toEqual(["apps-read ui://x/a"]);
+  });
+
+  test("settings app actions: an MCP App tool opens with {} into a view record; the run path refuses it", async () => {
+    using tmp = new DisposableTempDir("mcp-settings-apps");
+    const store = new McpAppResultStore((id) => path.join(tmp.path, id));
+    let appsEnabled = true;
+    manager.setMcpApps({ isEnabled: () => appsEnabled, store });
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-apps") });
+    const actions: Record<string, MCPSettingsToolAction> = {
+      payment: { title: "Payment method", readOnly: false, opensApp: true },
+      library: { title: "Part library", readOnly: true, opensApp: false },
+    };
+    const calls: string[] = [];
+    servers.serve("settings-apps", {
+      tools: { draw: testTool() },
+      apps: {
+        hasTool: () => true,
+        toolUi: (name: string) =>
+          name === "payment" ? { resourceUri: "ui://cad/payment", visibility: ["app"] } : undefined,
+        appEntrypoints: () => [],
+        callToolForApp: () => Promise.reject(new Error("an app open sends the settings _meta")),
+      },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [
+                { kind: "group", title: "Billing", items: [{ kind: "tool", tool: "payment" }] },
+              ],
+            },
+          }),
+        settingsToolAction: (name) => (Object.hasOwn(actions, name) ? actions[name] : undefined),
+        // The app open calls through the settings path: `{}` and the workspace `_meta`.
+        callSettingsActionTool: (name, meta) => {
+          calls.push(`${name} ${JSON.stringify(meta)}`);
+          return Promise.resolve({ content: [{ type: "text" as const, text: "form" }] });
+        },
+      },
+    });
+    const workspaceId = "settings-apps-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const snapshot = await manager.readSettings(workspaceId, "cad");
+    if (snapshot === null) throw new Error("expected settings");
+    const open = (tool: string, confirmed: boolean) =>
+      manager
+        .openSettingsApp(workspaceId, "cad", tool, snapshot.instanceToken, { confirmed })
+        .catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+
+    // Each path takes only its own kind of tool; a tool that can write needs a confirmation.
+    expect(await open("library", true)).toContain("has no MCP App");
+    expect(await open("payment", false)).toContain("confirmation");
+    const runRefusal = await manager
+      .runSettingsTool(workspaceId, "cad", "payment", snapshot.instanceToken, { confirmed: true })
+      .catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+    expect(runRefusal).toContain("opens an MCP App");
+    expect(calls).toEqual([]);
+
+    expect(await open("payment", true)).toEqual({
+      viewKey: "settings:cad:payment",
+      serverName: "cad",
+      serverLabel: "cad",
+      toolName: "payment",
+      title: "Payment method",
+      resourceUri: "ui://cad/payment",
+    });
+    expect(calls).toEqual([`payment {"xum/workspaceId":"${workspaceId}"}`]);
+    // A result Xum cannot store fails the open: the stable key still holds the previous
+    // open's result, which the view must not get.
+    const recordSpy = spyOn(store, "record").mockResolvedValueOnce(false);
+    expect(await open("payment", true)).toContain("could not keep");
+    recordSpy.mockRestore();
+    // getMcpAppView mounts the modal's view from this record; it is never a tool call's view.
+    // With the experiment switched off, nothing opens: the open is refused (the server restarts
+    // without MCP Apps), and a fresh read gives the app tool no action.
+    appsEnabled = false;
+    expect(await open("payment", true)).toContain("Reopen");
+    expect(calls).toHaveLength(2);
+    const reread = await manager.readSettings(workspaceId, "cad");
+    expect(snapshot.layout[0]?.items).toEqual([
+      { kind: "tool", tool: "payment", action: actions.payment },
+    ]);
+    expect(reread?.layout[0]?.items).toEqual([{ kind: "tool", tool: "payment" }]);
+    expect(await store.get(workspaceId, "settings:cad:payment")).toMatchObject({
+      serverName: "cad",
+      toolName: "payment",
+      resourceUri: "ui://cad/payment",
+      arguments: {},
+      result: { content: [{ type: "text", text: "form" }] },
+      entrypoint: true,
+    });
   });
 
   test("entry points: listed per enabled server, opened with {} on their own server only", async () => {

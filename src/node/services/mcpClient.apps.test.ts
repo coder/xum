@@ -79,6 +79,8 @@ describe("MCP Apps client gating", () => {
     // Hidden tools stay known for view calls.
     expect(client.hasTool("refresh_chart")).toBe(true);
     expect(client.toolUi("refresh_chart")?.visibility).toEqual(["app"]);
+    // A settings layout action on an app tool opens the app; it is not run as a regular tool.
+    expect(client.settingsToolAction("show_chart")?.opensApp).toBe(true);
   });
 });
 

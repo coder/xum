@@ -63,6 +63,7 @@ import {
 import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import { KebabMenu, type KebabMenuItem } from "@/browser/components/KebabMenu/KebabMenu";
 import { getErrorMessage } from "@/common/utils/errors";
+import { createOAuthFlowId } from "@/browser/utils/oauth/flowId";
 
 /** Expand/collapse header shared by the editable and read-only tool sections. */
 const ToolsDisclosureButton: React.FC<{
@@ -425,19 +426,25 @@ function useMCPOAuthLogin(input: {
         return;
       }
 
+      // Generated here and stored before the start RPC: the start can stall on discovery, and
+      // Cancel must reach the flow meanwhile (the backend refuses a flow cancelled while it
+      // was starting) (#6565).
+      const startFlowId = createOAuthFlowId();
+      setFlowId(startFlowId);
       setLoginStatus("starting");
 
       const startResult =
         loginFlowMode === "desktop"
-          ? await mcpOauthApi.startDesktopFlow({ serverName, pendingServer })
-          : await mcpOauthApi.startServerFlow({ serverName, pendingServer });
+          ? await mcpOauthApi.startDesktopFlow({ serverName, pendingServer, flowId: startFlowId })
+          : await mcpOauthApi.startServerFlow({ serverName, pendingServer, flowId: startFlowId });
 
       if (attempt !== loginAttemptRef.current) {
+        // A newer attempt replaced this one; Cancel is idempotent if it already ran.
         if (startResult.success) {
           if (loginFlowMode === "desktop") {
-            void mcpOauthApi.cancelDesktopFlow({ flowId: startResult.data.flowId });
+            void mcpOauthApi.cancelDesktopFlow({ flowId: startFlowId });
           } else {
-            void mcpOauthApi.cancelServerFlow({ flowId: startResult.data.flowId });
+            void mcpOauthApi.cancelServerFlow({ flowId: startFlowId });
           }
         }
         return;

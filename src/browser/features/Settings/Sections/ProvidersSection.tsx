@@ -84,6 +84,7 @@ import {
 import type { AddCustomProviderInput, ProviderConfigInfo } from "@/common/orpc/types";
 import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/providersConfig";
 import type { Result } from "@/common/types/result";
+import { createOAuthFlowId } from "@/browser/utils/oauth/flowId";
 import {
   CODER_CANONICAL_ROUTE_ORIGINS,
   CODER_OAUTH_SERVER_START_PATH,
@@ -135,18 +136,6 @@ interface OAuthMessage {
 function getServerAuthToken(): string | null {
   const urlToken = new URLSearchParams(window.location.search).get("token")?.trim();
   return urlToken?.length ? urlToken : getStoredAuthToken();
-}
-
-/**
- * Flow ID for a Coder login. It doubles as the OAuth `state` (CSRF token), so
- * it must be unguessable: derived from getRandomValues, which — unlike
- * Crypto.randomUUID — is available outside secure contexts too (Xum's browser
- * UI can be served from a plain-HTTP remote origin, where randomUUID is
- * undefined and would throw before the login even started).
- */
-function createCoderLoginFlowId(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 /**
@@ -1294,7 +1283,7 @@ export function ProvidersSection() {
     // startDesktopFlow can stall on backend network calls, and Cancel must be
     // able to reach the attempt (the backend pre-cancels IDs it hasn't
     // registered yet) instead of abandoning only the frontend state.
-    const flowId = createCoderLoginFlowId();
+    const flowId = createOAuthFlowId();
     setCoderFlowId(flowId);
 
     try {
