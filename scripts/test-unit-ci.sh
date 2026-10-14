@@ -31,9 +31,10 @@ fi
 # Each isolated file writes its own LCOV report (see the isolated loop below), so the
 # CRAP gate scores its sources. A `no-coverage:` prefix marks a file that is isolated
 # because Bun coverage crashes or breaks it: that file runs without coverage. The
-# QuickJS group is marked as a whole: sandboxHostService and hookService joined it as
-# QuickJS-heavy suites, and router.test.ts has sat under its coverage comment since the
-# list began, with no other recorded reason.
+# QuickJS group is marked as a whole, except quickjsRuntime.test.ts, which passes under
+# coverage: sandboxHostService and hookService joined it as QuickJS-heavy suites, and
+# router.test.ts has sat under its coverage comment since the list began, with no other
+# recorded reason.
 isolated_unit_tests=(
   # QuickJS-heavy tests can crash or lose runtime callbacks under Bun coverage
   # when sharing the monolithic process; keep them in fresh isolated processes.
