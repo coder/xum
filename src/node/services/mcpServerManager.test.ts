@@ -1283,6 +1283,41 @@ describe("MCPServerManager", () => {
     expect(updates).toEqual(["v1b"]);
   });
 
+  test("settings: a token read from one server never passes the schema check of another", async () => {
+    const updates: string[] = [];
+    const settingsServer = (id: string) => ({
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: (name: string) => {
+          if (name === "s.update") updates.push(id);
+          // The same schema on both servers: only the server key tells them apart.
+          return Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: { units: { type: "string", title: "Units" } } },
+              values: { units: "in" },
+            },
+          });
+        },
+      },
+    });
+    configService.listServers.mockResolvedValue({
+      a: stdioConfig("settings-cross-a"),
+      b: stdioConfig("settings-cross-b"),
+    });
+    servers.serve("settings-cross-a", settingsServer("a"));
+    servers.serve("settings-cross-b", settingsServer("b"));
+    await manager.getToolsForWorkspace(workspaceRequest("settings-cross-ws"));
+    const readA = await manager.readSettings("settings-cross-ws", "a");
+    if (readA === null) throw new Error("expected settings");
+    const refused = await manager
+      .saveSettings("settings-cross-ws", "b", { units: "mm" }, readA.instanceToken)
+      .catch((error: unknown) => String(error));
+    expect(refused).toContain("Reopen");
+    expect(updates).toEqual([]);
+  });
+
   test("settings: a server replaced between the save's fresh read and its update is refused", async () => {
     const updates: string[] = [];
     const settingsServer = (id: string) => ({
@@ -1363,8 +1398,11 @@ describe("MCPServerManager", () => {
     expect((await manager.readSettings("settings-reopen-ws", "cad"))?.values).toEqual({
       units: "in",
     });
-    // A stalled save holds a read no longer than the read's deadline or abort.
-    await manager.settingsSavesSettled("settings-reopen-ws", "cad", { timeoutMs: 1 });
+    // A stalled save holds a read no longer than the read's deadline or abort, and the read
+    // gets only the time left (at least 1 ms).
+    expect(await manager.settingsSavesSettled("settings-reopen-ws", "cad", { timeoutMs: 1 })).toBe(
+      1
+    );
     const aborted = new AbortController();
     const abortedWait = manager.settingsSavesSettled("settings-reopen-ws", "cad", {
       signal: aborted.signal,
@@ -1384,8 +1422,10 @@ describe("MCPServerManager", () => {
     expect((await manager.readSettings("settings-reopen-ws", "cad"))?.values).toEqual({
       units: "mm",
     });
-    // No save in flight: nothing to wait for.
-    await manager.settingsSavesSettled("settings-reopen-ws", "cad", { timeoutMs: 60_000 });
+    // No save in flight: nothing to wait for, and the whole deadline is left.
+    expect(
+      await manager.settingsSavesSettled("settings-reopen-ws", "cad", { timeoutMs: 60_000 })
+    ).toBe(60_000);
   });
 
   test("settings: a replaced server instance does not keep the old instance's cached values", async () => {
