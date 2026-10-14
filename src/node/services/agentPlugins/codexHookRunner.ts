@@ -26,6 +26,14 @@ import { log } from "@/node/services/log";
 import { compileHookMatcher, type PluginHookDefinition } from "./codexHooks";
 import { isPlainObject } from "./manifest";
 import { codexToolView, type CodexToolView } from "./codexToolNames";
+import {
+  parsePostToolUseOutput,
+  parsePreToolUseOutput,
+  parseStopOutput,
+  parseUserPromptSubmitOutput,
+  type HookEventName,
+  type PreToolUseOutput,
+} from "./codexHookOutput";
 
 /** Xum's limits for one hook call, in seconds (Codex's default is 600). */
 export const HOOK_DEFAULT_TIMEOUT_SECONDS = 10;
@@ -34,8 +42,6 @@ export const HOOK_MAX_TIMEOUT_SECONDS = 30;
 const CODEX_HOOK_ORDER_BASE = -1_000_000;
 /** Expanded `input` larger than this (as JSON) is not sent (PreToolUse then denies the call). */
 const HOOK_INPUT_MAX_CHARS = 64 * 1024;
-/** Hook text that reaches the model or the user is cut to this length. */
-const HOOK_TEXT_MAX_CHARS = 16 * 1024;
 
 export interface CodexHookRunnerDeps {
   /** Per-call gate: plugin still installed, project trusted, this exact hash still trusted. */
@@ -67,19 +73,6 @@ export interface CodexHookRegistration {
   order: number;
   hooks: PluginHookDefinition[];
   deps: CodexHookRunnerDeps;
-}
-
-/** The fields Xum reads from a hook's output (Codex common + hook-specific fields). */
-interface HookOutput {
-  continue?: boolean;
-  stopReason?: string;
-  systemMessage?: string;
-  decision?: string;
-  reason?: string;
-  permissionDecision?: string;
-  permissionDecisionReason?: string;
-  updatedInput?: unknown;
-  additionalContext?: string;
 }
 
 /** Register one plugin's runnable hooks on the spine. Returns the unregister function. */
@@ -125,27 +118,14 @@ export function registerCodexPluginHooks(
               { prompt: ctx.text },
               "UserPromptSubmit",
               registration,
+              parseUserPromptSubmitOutput,
               { cwd: ctx.cwd }
             );
             if (output === null) continue;
-            // Codex: a block without a non-empty reason is an invalid result and fails open
-            // (its context is dropped too); continue: false blocks on its own.
-            if (
-              output.decision === "block" &&
-              output.reason === undefined &&
-              output.continue !== false
-            ) {
-              warn(
-                registration,
-                hook,
-                "returned decision block without a reason; ignoring its output"
-              );
-              continue;
-            }
-            if (output.decision === "block" || output.continue === false) {
+            if (output.stopped === true || output.blockReason !== undefined) {
               ctx.blocked = {
                 pluginName: registration.pluginName,
-                reason: output.reason ?? output.stopReason ?? "Blocked by a plugin hook.",
+                reason: output.blockReason ?? "Blocked by a plugin hook.",
               };
               return;
             }
@@ -176,13 +156,13 @@ export function registerCodexPluginHooks(
               },
               "Stop",
               registration,
+              parseStopOutput,
               { cwd: ctx.cwd }
             );
             if (output === null) continue;
-            if (output.continue === false) ctx.halted = { pluginName: registration.pluginName };
-            else if (output.decision === "block" && output.reason !== undefined) {
-              ctx.continueReasons.push(output.reason);
-            }
+            if (output.halt !== undefined) ctx.halted = { pluginName: registration.pluginName };
+            else if (output.continueWith !== undefined)
+              ctx.continueReasons.push(output.continueWith);
           }
         },
         scope
@@ -201,6 +181,12 @@ async function runToolHooks(
 ): Promise<void> {
   const notes: string[] = [];
   const call = { cwd: ctx.host.cwd, abortSignal: ctx.abortSignal };
+  const preCall = {
+    ...call,
+    inputTooLarge: {
+      denyReason: `the call is too large for the hook to check (its input is over ${HOOK_INPUT_MAX_CHARS} characters)`,
+    } satisfies PreToolUseOutput,
+  };
   // Codex names and fields (Bash, mcp__<server>__<tool>, tool_input.command), so a Codex
   // hooks.json works without edits. Xum's own names and fields stay available too.
   const view = codexToolView(ctx.toolName, ctx.mcpOrigin);
@@ -211,33 +197,27 @@ async function runToolHooks(
       : ctx.args,
   });
   for (const hook of pre.filter((candidate) => matches(candidate, ctx.toolName, view))) {
-    const output = await invoke(hook, toolEvent(), "PreToolUse", registration, call);
+    const output = await invoke(
+      hook,
+      toolEvent(),
+      "PreToolUse",
+      registration,
+      parsePreToolUseOutput,
+      preCall
+    );
     if (ctx.abortSignal?.aborted) break;
     if (output === null) continue;
-    // Codex: PreToolUse does not support continue: false, stopReason or "ask"; such a run fails
-    // (open). `continue: true` is the schema default, so Codex accepts it (output_parser.rs
-    // rejects only false): a serializer that writes the default must not void a deny.
-    if (
-      output.continue === false ||
-      output.stopReason !== undefined ||
-      output.permissionDecision === "ask"
-    ) {
-      warn(registration, hook, "returned fields PreToolUse does not support; ignoring its output");
-      continue;
-    }
-    if (output.permissionDecision === "deny" || output.decision === "block") {
-      const reason =
-        output.permissionDecisionReason ?? output.reason ?? "No reason given by the hook.";
+    if (output.denyReason !== undefined) {
       // Codex keeps the context of a blocking PreToolUse, and of the hooks before it.
       if (output.additionalContext !== undefined) notes.push(output.additionalContext);
       const result = {
-        error: `Tool call blocked by plugin '${registration.pluginName}' hook: ${reason}`,
+        error: `Tool call blocked by plugin '${registration.pluginName}' hook: ${output.denyReason}`,
       };
       ctx.blocked = { result: notes.length > 0 ? annotate(result, notes, registration) : result };
       return;
     }
     if (output.updatedInput !== undefined) {
-      applyUpdatedInput(ctx, output, view, registration, hook);
+      applyUpdatedInput(ctx, output.updatedInput, view, registration, hook);
       if (ctx.blocked) return;
     }
     if (output.additionalContext !== undefined) notes.push(output.additionalContext);
@@ -255,18 +235,21 @@ async function runToolHooks(
         { ...toolEvent(), tool_response: ctx.result },
         "PostToolUse",
         registration,
+        parsePostToolUseOutput,
         call
       );
       if (output === null) continue;
       if (output.additionalContext !== undefined) notes.push(output.additionalContext);
-      // Codex: block (or continue: false) replaces the tool result with the hook's feedback.
+      // Codex: block or continue: false replaces the tool result with the hook's feedback.
       // The context gathered so far still reaches the model (Codex adds it next to the feedback).
-      if (output.decision === "block" || output.continue === false) {
-        const feedback = output.reason ?? output.stopReason ?? "Stopped by a plugin hook.";
+      const feedback = output.blockReason ?? output.stopFeedback;
+      if (feedback !== undefined) {
         ctx.result = { error: `[plugin:${registration.pluginName}] ${feedback}` };
-        // A nested caller (mux.load) holds the original output outside ctx.result: it must not
-        // hand it on (Codex PRRT_kwDOPxxmWM6r6NnK).
-        ctx.postBlocked = true;
+        // Only a block fails the call for a nested caller (mux.load), which holds the original
+        // output outside ctx.result and must not hand it on (Codex PRRT_kwDOPxxmWM6r6NnK).
+        // continue: false is not a block in Codex (post_tool_use.rs keeps it apart from
+        // should_block), so the nested call still succeeds (PRRT_kwDOPxxmWM6sDjM-).
+        if (output.blockReason !== undefined) ctx.postBlocked = true;
         break;
       }
     }
@@ -277,17 +260,13 @@ async function runToolHooks(
 
 function applyUpdatedInput(
   ctx: ToolExecuteContext,
-  output: HookOutput,
+  updatedInput: unknown,
   view: CodexToolView,
   registration: CodexHookRegistration,
   hook: PluginHookDefinition
 ): void {
-  if (output.permissionDecision !== "allow") {
-    warn(registration, hook, "returned updatedInput without permissionDecision allow; ignoring it");
-    return;
-  }
   // A Codex-shaped rewrite (Bash `command`) maps back to Xum's names before the schema check.
-  const updated = view.fromCodexInput(output.updatedInput);
+  const updated = view.fromCodexInput(updatedInput);
   const schema = ctx.inputJsonSchema?.();
   if (schema === undefined) {
     // No schema to check the rewrite against (a caller that omitted it): deny. Running the
@@ -348,14 +327,19 @@ function matches(hook: PluginHookDefinition, toolName: string, view: CodexToolVi
   return matcher.test(toolName) || (view.codexName !== undefined && matcher.test(view.codexName));
 }
 
-async function invoke(
+async function invoke<T extends { systemMessage?: string; invalid?: string }>(
   hook: PluginHookDefinition,
   eventFields: Record<string, unknown>,
-  eventName: string,
+  eventName: HookEventName,
   registration: CodexHookRegistration,
-  /** Tool calls: the session cwd (a Codex common field) and the tool's abort signal. */
-  call: { cwd?: string; abortSignal?: AbortSignal } = {}
-): Promise<HookOutput | null> {
+  /** Reads the MCP result with the event's Codex rules (codexHookOutput.ts); throws if malformed. */
+  parse: (result: unknown) => T | null,
+  /**
+   * Tool calls: the session cwd (a Codex common field) and the tool's abort signal. PreToolUse
+   * also passes the decision for an input too large to send.
+   */
+  call: { cwd?: string; abortSignal?: AbortSignal; inputTooLarge?: T } = {}
+): Promise<T | null> {
   const handler = hook.handler;
   if (handler.type !== "mcp_tool") return null;
   if (call.abortSignal?.aborted) return null;
@@ -395,15 +379,12 @@ async function invoke(
       // (a Bash script) are model-controlled and could be padded past the limit on purpose.
       // Only a hook that could run denies (Codex PRRT_kwDOPxxmWM6rPrku): with its server or tool
       // off, it fails open like any unavailable hook.
-      const couldRun =
-        eventName === "PreToolUse" &&
-        registration.deps.canCallPluginTool({ server: handler.server, tool: handler.tool });
-      return couldRun
-        ? {
-            permissionDecision: "deny",
-            permissionDecisionReason: `the call is too large for the hook to check (its input is over ${HOOK_INPUT_MAX_CHARS} characters)`,
-          }
-        : null;
+      if (call.inputTooLarge === undefined) return null;
+      const couldRun = registration.deps.canCallPluginTool({
+        server: handler.server,
+        tool: handler.tool,
+      });
+      return couldRun ? call.inputTooLarge : null;
     }
     const result = await Promise.race([
       registration.deps.callPluginTool({
@@ -414,15 +395,26 @@ async function invoke(
       }),
       ended,
     ]);
-    const output = parseHookOutput(result, eventName);
-    if (output?.systemMessage !== undefined) registration.deps.notifyUser(output.systemMessage);
-    return output;
+    return applyOutput(parse(result), registration, hook);
   } catch (error) {
     warn(registration, hook, `failed (${getErrorMessage(error)}); continuing without it`);
     return null;
   } finally {
     clearTimeout(timer);
   }
+}
+
+function applyOutput<T extends { systemMessage?: string; invalid?: string }>(
+  output: T | null,
+  registration: CodexHookRegistration,
+  hook: PluginHookDefinition
+): T | null {
+  if (output === null) return null;
+  // Codex shows systemMessage even when the rest of the output breaks a rule.
+  if (output.systemMessage !== undefined) registration.deps.notifyUser(output.systemMessage);
+  if (output.invalid === undefined) return output;
+  warn(registration, hook, `${output.invalid}; ignoring its output`);
+  return null;
 }
 
 /**
@@ -457,89 +449,6 @@ function lookup(root: unknown, dottedPath: string): unknown {
     value = (value as Record<string, unknown>)[segment];
   }
   return value;
-}
-
-/**
- * The hook's output from an MCP call result: every text content block, joined with newlines and
- * read as JSON, as Codex does (hook_mcp_executor.rs). Codex ignores `structuredContent`; Xum
- * reads it only when the result has no text. Plain text counts only for UserPromptSubmit (Codex
- * adds it as context). An `isError` result is a failure.
- */
-export function parseHookOutput(result: unknown, eventName: string): HookOutput | null {
-  const plainTextIsContext = eventName === "UserPromptSubmit";
-  if (!isPlainObject(result)) throw new Error("the MCP result is not an object");
-  if (result.isError === true) throw new Error("the MCP tool returned an error");
-  const content: unknown[] = Array.isArray(result.content) ? result.content : [];
-  const joined = content
-    .flatMap((part) =>
-      isPlainObject(part) && part.type === "text" && typeof part.text === "string"
-        ? [part.text]
-        : []
-    )
-    .join("\n")
-    .trim();
-  let raw: unknown = result.structuredContent;
-  if (joined.length > 0) {
-    try {
-      raw = JSON.parse(joined);
-    } catch {
-      return plainTextIsContext ? { additionalContext: cut(joined) } : null;
-    }
-  }
-  if (!isPlainObject(raw)) return null;
-  // Codex's schema requires hookSpecificOutput.hookEventName to name this event; an output
-  // tagged for another event (or untagged) is malformed and fails open. Codex reads JSON null on
-  // every optional field as absent (serde `Option`), so each check below treats null as omitted:
-  // a serializer that writes null defaults (`"hookSpecificOutput": null`) must not void a block.
-  if (
-    raw.hookSpecificOutput != null &&
-    !(isPlainObject(raw.hookSpecificOutput) && raw.hookSpecificOutput.hookEventName === eventName)
-  ) {
-    throw new Error(`hookSpecificOutput is not tagged hookEventName "${eventName}"`);
-  }
-  const specific = isPlainObject(raw.hookSpecificOutput) ? raw.hookSpecificOutput : {};
-  // Codex's schemas allow only these exact values; anything else (" deny ", "Block") is malformed
-  // and fails open instead of becoming a policy action.
-  const oneOf = (value: unknown, allowed: string[]) =>
-    value == null || (typeof value === "string" && allowed.includes(value));
-  if (!oneOf(raw.decision, eventName === "PreToolUse" ? ["approve", "block"] : ["block"])) {
-    throw new Error(`invalid decision ${JSON.stringify(raw.decision)}`);
-  }
-  if (!oneOf(specific.permissionDecision, ["allow", "deny", "ask"])) {
-    throw new Error(`invalid permissionDecision ${JSON.stringify(specific.permissionDecision)}`);
-  }
-  // Codex's schemas type every field; a wrong type anywhere ("continue": "false") makes the whole
-  // output malformed, so it fails open instead of honoring the other fields.
-  const typed = (record: Record<string, unknown>, fields: string[], type: string) => {
-    for (const field of fields) {
-      if (record[field] != null && typeof record[field] !== type) {
-        throw new Error(`${field} is not a ${type}`);
-      }
-    }
-  };
-  typed(raw, ["continue", "suppressOutput"], "boolean");
-  typed(raw, ["stopReason", "systemMessage", "reason"], "string");
-  typed(specific, ["permissionDecisionReason", "additionalContext"], "string");
-  const text = (value: unknown) =>
-    typeof value === "string" && value.trim() ? cut(value) : undefined;
-  const output: HookOutput = {
-    ...(typeof raw.continue === "boolean" ? { continue: raw.continue } : {}),
-    stopReason: text(raw.stopReason),
-    systemMessage: text(raw.systemMessage),
-    decision: text(raw.decision),
-    reason: text(raw.reason),
-    permissionDecision: text(specific.permissionDecision),
-    permissionDecisionReason: text(specific.permissionDecisionReason),
-    ...(specific.updatedInput != null ? { updatedInput: specific.updatedInput } : {}),
-    additionalContext: text(specific.additionalContext),
-  };
-  return Object.fromEntries(
-    Object.entries(output).filter(([, value]) => value !== undefined)
-  ) as HookOutput;
-}
-
-function cut(text: string): string {
-  return text.trim().slice(0, HOOK_TEXT_MAX_CHARS);
 }
 
 function annotate(result: unknown, notes: string[], registration: CodexHookRegistration): unknown {
