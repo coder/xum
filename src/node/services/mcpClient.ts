@@ -12,6 +12,7 @@ import {
   advertisedMCPSettingsToolNames,
   parseMCPSettingsCapability,
   type MCPSettingsCapability,
+  type MCPSettingsToolAction,
 } from "@/common/utils/mcpSettings";
 import {
   isModelVisibleTool,
@@ -194,6 +195,17 @@ export interface MCPClientHandle {
     meta: Record<string, unknown>,
     options?: { signal?: AbortSignal; timeoutMs?: number }
   ): Promise<MCPRawCallToolResult>;
+  /**
+   * A tool of the latest tools() listing as a settings layout tool action (hidden tools
+   * included, settings tools excluded). Undefined when the listing has no such tool.
+   */
+  settingsToolAction(name: string): MCPSettingsToolAction | undefined;
+  /** tools/call for a settings layout tool action, with the spec's `{}` arguments. */
+  callSettingsActionTool(
+    name: string,
+    meta: Record<string, unknown>,
+    options?: { signal?: AbortSignal }
+  ): Promise<MCPRawCallToolResult>;
   close(): Promise<void>;
 }
 
@@ -349,6 +361,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
   // Every tool of the latest listing (hidden ones included) -> its `_meta.ui`, if any.
   let listedTools = new Map<string, MCPToolUi | undefined>();
   let listedEntrypoints: readonly MCPAppEntrypointTool[] = [];
+  let listedSettingsActions = new Map<string, MCPSettingsToolAction>();
 
   if (config.onUncaughtError) {
     const onUncaughtError = config.onUncaughtError;
@@ -374,12 +387,26 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       const tools: Record<string, Tool> = {};
       const listed = new Map<string, MCPToolUi | undefined>();
       const entrypoints: MCPAppEntrypointTool[] = [];
+      const settingsActions = new Map<string, MCPSettingsToolAction>();
       for (const definition of listResult.tools) {
         // Settings tools are host-only: left out of the listing too, so an MCP App view
         // cannot call them through callToolForApp (hasTool is false for them).
         if (settingsTools.has(definition.name)) continue;
         const ui = mcpApps ? parseMCPToolUiMeta(definition._meta) : undefined;
         listed.set(definition.name, ui);
+        // The settings spec's display name order; the same cleaning as entry point titles.
+        const actionTitle = mcpAppEntrypointTitle(
+          [definition.title, definition.annotations?.title],
+          definition.name
+        );
+        if (actionTitle !== undefined)
+          settingsActions.set(definition.name, {
+            title: actionTitle,
+            readOnly: definition.annotations?.readOnlyHint === true,
+            // Without MCP Apps (the connection did not announce the extension), `ui` is
+            // undefined: the host cannot tell an app tool apart, and it runs as a regular tool.
+            opensApp: ui?.resourceUri !== undefined,
+          });
         // Read before the visibility filter below: entry points ignore visibility.
         if (ui?.resourceUri !== undefined) {
           const { types, skippedFile } = parseMCPAppEntrypoints(definition._meta);
@@ -447,6 +474,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       }
       listedTools = listed;
       listedEntrypoints = entrypoints;
+      listedSettingsActions = settingsActions;
       return tools;
     },
     prompts: (options) => listServerPrompts(client, options?.signal),
@@ -498,6 +526,17 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         { name, arguments: args, _meta: meta },
         {
           timeout: options?.timeoutMs ?? APP_TOOL_CALL_TIMEOUT_MS,
+          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+        }
+      );
+    },
+    settingsToolAction: (name) => listedSettingsActions.get(name),
+    callSettingsActionTool: (name, meta, options) => {
+      assert(listedSettingsActions.has(name), "callSettingsActionTool only calls listed tools");
+      return client.callTool(
+        { name, arguments: {}, _meta: meta },
+        {
+          timeout: APP_TOOL_CALL_TIMEOUT_MS,
           ...(options?.signal !== undefined ? { signal: options.signal } : {}),
         }
       );

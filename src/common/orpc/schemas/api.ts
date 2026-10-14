@@ -189,6 +189,8 @@ import {
   MCPSettingsReadInputSchema,
   MCPSettingsReadSnapshotSchema,
   MCPSettingsUpdateParamsSchema,
+  MCPSettingsRunToolParamsSchema,
+  MCPSettingsRunToolResultSchema,
   MCPSetEnabledGlobalParamsSchema,
   MCPSetEnabledParamsSchema,
   MCPSetToolAllowlistGlobalParamsSchema,
@@ -1166,6 +1168,11 @@ export const mcp = {
       input: MCPSettingsUpdateParamsSchema,
       /** The snapshot the server shows after the update (its schema can change). */
       output: ResultSchema(MCPSettingsReadSnapshotSchema, z.string()),
+    },
+    /** Run a layout tool action (a regular tool) and return its text result. */
+    runTool: {
+      input: MCPSettingsRunToolParamsSchema,
+      output: ResultSchema(MCPSettingsRunToolResultSchema, z.string()),
     },
   },
   configureDesign: {

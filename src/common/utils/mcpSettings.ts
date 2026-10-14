@@ -13,6 +13,7 @@ import type {
   MCPSettingsGroupSchema,
   MCPSettingsLayoutItemSchema,
   MCPSettingsSnapshotSchema,
+  MCPSettingsToolActionSchema,
   MCPSettingValueSchema,
 } from "@/common/orpc/schemas/mcp";
 
@@ -32,6 +33,10 @@ export type MCPSettingSchema = z.infer<typeof MCPSettingSchemaSchema>;
 export type MCPSettingsLayoutItem = z.infer<typeof MCPSettingsLayoutItemSchema>;
 export type MCPSettingsGroup = z.infer<typeof MCPSettingsGroupSchema>;
 export type MCPSettingsSnapshot = z.infer<typeof MCPSettingsSnapshotSchema>;
+export type MCPSettingsToolAction = z.infer<typeof MCPSettingsToolActionSchema>;
+
+/** Longest tool action result text sent to the renderer (UTF-16 units). */
+export const MAX_MCP_SETTINGS_TOOL_RESULT = 4096;
 
 const MAX_TEXT = 1024;
 const MAX_VALUE_LENGTH = 4096;
@@ -60,8 +65,17 @@ export const MCP_SETTINGS_READ_TIMEOUT_MS = 10_000;
  * on a code point. Server error text is untrusted and otherwise unbounded.
  */
 export function boundMCPSettingsError(message: string): string {
-  if (message.length <= MAX_TEXT) return message;
-  const cut = message.slice(0, MAX_TEXT);
+  return boundText(message, MAX_TEXT);
+}
+
+/** A tool action's result text as sent to the renderer: MAX_MCP_SETTINGS_TOOL_RESULT at most. */
+export function boundMCPSettingsToolResult(text: string): string {
+  return boundText(text, MAX_MCP_SETTINGS_TOOL_RESULT);
+}
+
+function boundText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
   return `${/[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut}…`;
 }
 

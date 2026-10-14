@@ -1319,6 +1319,20 @@ export const router = (authToken?: string) => {
               )
             )
           ),
+        runTool: t
+          .input(schemas.mcp.settings.runTool.input)
+          .output(schemas.mcp.settings.runTool.output)
+          .handler(({ context, input, signal }) =>
+            runMcpSettingsRoute(context, input.workspaceId, signal, () =>
+              context.mcpServerManager.runSettingsTool(
+                input.workspaceId,
+                input.serverName,
+                input.toolName,
+                input.instanceToken,
+                { confirmed: input.confirmed, signal }
+              )
+            )
+          ),
       },
       designStatus: t
         .input(schemas.mcp.designStatus.input)

@@ -27,15 +27,18 @@ import {
   type MCPClientHandle,
   type MCPGetPromptResult,
   type MCPPrompt,
+  type MCPRawCallToolResult,
 } from "@/node/services/mcpClient";
 import {
   MCP_SETTINGS_WORKSPACE_META_KEY,
+  boundMCPSettingsToolResult,
   filterMCPSettingValues,
   parseMCPSettingsReadResult,
   validateMCPSettingValue,
   type MCPSettingValue,
   type MCPSettingsReadSnapshot,
   type MCPSettingsSnapshot,
+  type MCPSettingsToolAction,
 } from "@/common/utils/mcpSettings";
 import type {
   McpAppModelContext,
@@ -1395,7 +1398,10 @@ interface MCPServerInstance {
     "toolUi" | "hasTool" | "callToolForApp" | "readResource" | "appEntrypoints"
   >;
   /** OpenAI structured settings (`openai/settings`); its tools are hidden from the model. */
-  settings?: Pick<MCPClientHandle, "settingsCapability" | "callSettingsTool">;
+  settings?: Pick<
+    MCPClientHandle,
+    "settingsCapability" | "callSettingsTool" | "settingsToolAction" | "callSettingsActionTool"
+  >;
   /** True once the underlying MCP client/transport has been closed. */
   isClosed: boolean;
   /**
@@ -5042,7 +5048,82 @@ export class MCPServerManager {
       log.warn(`[MCP] Settings of '${serverName}': ${warning}`, { workspaceId });
     assert(source !== undefined, "a settings snapshot comes from a server instance");
     this.cacheSettings(source.instance, workspaceId, source.requestId, snapshot.values);
-    return { ...snapshot, instanceToken: this.settingsInstanceToken(source.instance) };
+    const { instance } = source;
+    const layout = snapshot.layout.map((group) => ({
+      ...group,
+      items: group.items.map((item) => {
+        if (item.kind !== "tool") return item;
+        const action = this.settingsToolAction(instance, workspaceId, serverName, item.tool);
+        return action === undefined ? item : { ...item, action };
+      }),
+    }));
+    return { ...snapshot, layout, instanceToken: this.settingsInstanceToken(instance) };
+  }
+
+  /** A layout tool item's action: a tool the server lists and the tool allowlist allows. */
+  private settingsToolAction(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    toolName: string
+  ): MCPSettingsToolAction | undefined {
+    const action = instance.settings?.settingsToolAction(toolName);
+    const allowlist = this.appToolAllowlist(workspaceId, serverName);
+    return allowlist === null || allowlist.has(toolName) ? action : undefined;
+  }
+
+  /**
+   * Run a settings layout tool action: the spec calls the same-server tool with `{}` and shows
+   * the text of its result. Refused when the server instance is not the one the dialog read,
+   * when the tool has no action (see settingsToolAction) or opens an MCP App, and when a tool
+   * without `readOnlyHint: true` runs without the user's confirmation.
+   */
+  async runSettingsTool(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    instanceToken: string,
+    options: { confirmed: boolean; signal?: AbortSignal }
+  ): Promise<{ text: string; isError: boolean }> {
+    // One-shot dispatch, like callMcpAppTool: an epoch retry must not run the tool twice.
+    let dispatched: Promise<MCPRawCallToolResult> | null = null;
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP settings tool '${serverName}/${toolName}'`,
+      (instance) => {
+        if (dispatched !== null) return dispatched;
+        if (this.settingsInstanceToken(instance) !== instanceToken)
+          return Promise.reject(staleSettingsInstanceError(serverName));
+        const action = this.settingsToolAction(instance, workspaceId, serverName, toolName);
+        if (instance.settings === undefined || action === undefined)
+          return Promise.reject(new Error(`'${serverName}' has no tool named '${toolName}'`));
+        if (action.opensApp)
+          return Promise.reject(new Error(`'${action.title}' opens an MCP App: not supported yet`));
+        if (!action.readOnly && !options.confirmed)
+          return Promise.reject(new Error(`'${action.title}' runs only after a confirmation`));
+        log.info("[MCP] Settings tool action", { workspaceId, serverName, toolName });
+        dispatched = instance.settings.callSettingsActionTool(
+          toolName,
+          { [MCP_SETTINGS_WORKSPACE_META_KEY]: workspaceId },
+          options
+        );
+        return dispatched;
+      },
+      (result) => {
+        const parts: unknown[] = Array.isArray(result.content) ? result.content : [];
+        const text = parts
+          .map((part) =>
+            part !== null && typeof part === "object" && Reflect.get(part, "type") === "text"
+              ? String(Reflect.get(part, "text"))
+              : ""
+          )
+          .filter((part) => part.length > 0)
+          .join("\n");
+        return { text: boundMCPSettingsToolResult(text), isError: result.isError === true };
+      },
+      options
+    );
   }
 
   /**

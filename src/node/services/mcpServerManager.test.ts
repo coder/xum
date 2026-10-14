@@ -1,5 +1,5 @@
 import { log } from "@/node/services/log";
-import type { MCPSettingValue } from "@/common/utils/mcpSettings";
+import type { MCPSettingValue, MCPSettingsToolAction } from "@/common/utils/mcpSettings";
 import {
   afterEach,
   beforeEach,
@@ -863,6 +863,88 @@ describe("MCPServerManager", () => {
       },
     ]);
     expect(manager.getCachedSettings("settings-ws", "cad")).toEqual(values);
+  });
+
+  test("settings tool actions: listed, allowed tools only; a tool that can write needs a confirmation", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-actions") });
+    const actions: Record<string, MCPSettingsToolAction> = {
+      library: { title: "Part library", readOnly: true, opensApp: false },
+      reset: { title: "Reset parts", readOnly: false, opensApp: false },
+      viewer: { title: "Viewer", readOnly: true, opensApp: true },
+      hidden: { title: "Hidden", readOnly: true, opensApp: false },
+    };
+    const runs: Array<{ name: string; meta: unknown }> = [];
+    servers.serve("settings-actions", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [
+                {
+                  kind: "group",
+                  title: "Parts",
+                  items: ["library", "reset", "viewer", "hidden", "missing"].map((tool) => ({
+                    kind: "tool",
+                    tool,
+                  })),
+                },
+              ],
+            },
+          }),
+        settingsToolAction: (name) => (Object.hasOwn(actions, name) ? actions[name] : undefined),
+        callSettingsActionTool: (name, meta) => {
+          runs.push({ name, meta });
+          return Promise.resolve({
+            content: [
+              { type: "text" as const, text: "3 libraries" },
+              { type: "image" as const, data: "", mimeType: "image/png" },
+              { type: "text" as const, text: "synced" },
+            ],
+            ...(name === "reset" ? { isError: true } : {}),
+          });
+        },
+      },
+    });
+    const workspaceId = "settings-actions-ws";
+    await manager.getToolsForWorkspace(
+      workspaceRequest(workspaceId, {
+        // The tool allowlist excludes "hidden": settings must not run it either.
+        overrides: { toolAllowlist: { cad: ["draw", "library", "reset", "viewer"] } },
+        overridesAuthoritative: true,
+      })
+    );
+
+    const snapshot = await manager.readSettings(workspaceId, "cad");
+    if (snapshot === null) throw new Error("expected settings");
+    expect(snapshot.layout[0]?.items).toEqual([
+      { kind: "tool", tool: "library", action: actions.library },
+      { kind: "tool", tool: "reset", action: actions.reset },
+      { kind: "tool", tool: "viewer", action: actions.viewer },
+      { kind: "tool", tool: "hidden" },
+      { kind: "tool", tool: "missing" },
+    ]);
+
+    const run = (tool: string, confirmed = false, token = snapshot.instanceToken) =>
+      manager
+        .runSettingsTool(workspaceId, "cad", tool, token, { confirmed })
+        .catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+    // A read-only tool runs at once; only the text parts of its result come back.
+    expect(await run("library")).toEqual({ text: "3 libraries\nsynced", isError: false });
+    // Refused before anything reaches the server.
+    expect(await run("reset")).toContain("confirmation");
+    expect(await run("viewer", true)).toContain("MCP App");
+    expect(await run("hidden", true)).toContain("no tool");
+    expect(await run("missing", true)).toContain("no tool");
+    expect(await run("library", true, "stale-token")).toContain("restarted or replaced");
+    expect(runs).toEqual([{ name: "library", meta: { "xum/workspaceId": workspaceId } }]);
+    // Confirmed, it runs; a tool error reaches the dialog as an error result.
+    expect(await run("reset", true)).toEqual({ text: "3 libraries\nsynced", isError: true });
+    expect(runs.map((entry) => entry.name)).toEqual(["library", "reset"]);
   });
 
   test("settings: a server counts as connected only once the workspace started it", async () => {

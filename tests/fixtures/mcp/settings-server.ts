@@ -3,7 +3,7 @@ import { createInterface } from "node:readline";
 /**
  * Legacy-protocol (2025-11-25) MCP stdio server advertising OpenAI structured
  * settings (`openai/settings`), for mcpClient tests. Raw JSON-RPC like
- * apps-server.ts. `settings.update` echoes the arguments and `_meta` it got.
+ * apps-server.ts. Every tools/call echoes the arguments and `_meta` it got.
  */
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 lines.on("line", (line) => {
@@ -33,7 +33,20 @@ lines.on("line", (line) => {
       };
       break;
     case "tools/list":
-      result = { tools: [tool("settings.read"), tool("settings.update"), tool("echo")] };
+      result = {
+        tools: [
+          tool("settings.read"),
+          tool("settings.update"),
+          // Settings tool actions: display name order `title`, `annotations.title`, `name`.
+          {
+            ...tool("library"),
+            title: "Part library",
+            annotations: { title: "Ignored", readOnlyHint: true },
+          },
+          { ...tool("reset"), annotations: { title: "Reset parts" } },
+          tool("echo"),
+        ],
+      };
       break;
     case "tools/call":
       result = {
