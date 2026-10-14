@@ -14,6 +14,8 @@ interface CreationDraftMoveSource {
   sendInFlight: boolean;
   processingAttachmentCount: number;
   payloadsLoaded: boolean;
+  /** Voice input is requesting the microphone, recording, or transcribing. */
+  voiceInputActive: boolean;
 }
 
 /**
@@ -27,15 +29,17 @@ export function useCreationDraftMove(source: CreationDraftMoveSource) {
   const [moving, setMoving] = useState(false);
   // The move waits for whatever is still on its way into the draft: the drafts themselves
   // (composers may render before they load, and an unloaded draft would move as an empty one),
-  // a send in flight takes it, a file being read is added to the draft it was attached to, and
-  // loading attachments would reach the moved copy only once loaded (lost if the user moved it
-  // on meanwhile).
+  // a send in flight takes it, a file being read or a voice transcript is added to the draft it
+  // was meant for (and a microphone grant after the move would start a recording no one sees),
+  // and loading attachments would reach the moved copy only once loaded (lost if the user moved
+  // it on meanwhile).
   const blocked =
     !hydrated ||
     source.sendInFlight ||
     source.processingAttachmentCount > 0 ||
-    !source.payloadsLoaded;
-  // Read when the move is done waiting: a send or a file read may have begun meanwhile, or the
+    !source.payloadsLoaded ||
+    source.voiceInputActive;
+  // Read when the move is done waiting: a send, a file read or voice input may have begun, or the
   // user left the draft (its composer is keyed by project and draft), and a move then would open
   // the destination in place of the page they went to.
   const blockedRef = useRef(blocked);

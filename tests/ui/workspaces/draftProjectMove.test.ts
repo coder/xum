@@ -226,6 +226,48 @@ async function startHeldAgentMove(
   await waitFor(() => expect(projectSelector(container)?.disabled).toBe(true), WAIT);
 }
 
+/** The app's API client, reporting an OpenAI key, which voice input needs to transcribe. */
+function withTranscription(orpc: OrpcClient): OrpcClient {
+  const providers = new Proxy(orpc.providers, {
+    get(target, key, receiver) {
+      if (key !== "getConfig") return Reflect.get(target, key, receiver) as unknown;
+      return async (...args: Parameters<typeof target.getConfig>) => {
+        const config = await target.getConfig(...args);
+        return { ...config, openai: { ...config.openai, apiKeySet: true, isEnabled: true } };
+      };
+    },
+  });
+  return new Proxy(orpc, {
+    get(target, key, receiver) {
+      return key === "providers" ? providers : (Reflect.get(target, key, receiver) as unknown);
+    },
+  });
+}
+
+/**
+ * Lets the composer offer voice input, with a microphone request that waits for `microphone`.
+ * Install after setupTestDom, which replaces the navigator. Returns the restore function.
+ */
+function installVoiceCapture(microphone: Promise<MediaStream>): () => void {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "MediaRecorder");
+  Object.defineProperty(globalThis, "MediaRecorder", {
+    configurable: true,
+    value: class {
+      static isTypeSupported(): boolean {
+        return true;
+      }
+    },
+  });
+  Object.defineProperty(globalThis.navigator, "mediaDevices", {
+    configurable: true,
+    value: { getUserMedia: () => microphone },
+  });
+  return () => {
+    if (original) Object.defineProperty(globalThis, "MediaRecorder", original);
+    else Reflect.deleteProperty(globalThis, "MediaRecorder");
+  };
+}
+
 async function writeAgent(projectPath: string, agentId: string): Promise<string> {
   const file = path.join(projectPath, ".xum", "agents", `${agentId}.md`);
   await fs.mkdir(path.dirname(file), { recursive: true });
@@ -559,6 +601,38 @@ describeIntegration("Creation project selector moves the draft", () => {
       releasePayloads();
       getSpy.mockRestore();
       await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  test("the project selector is disabled while voice input is active", async () => {
+    let denyMicrophone: () => void = () => undefined;
+    const microphone = new Promise<MediaStream>((_resolve, reject) => {
+      denyMicrophone = () => reject(new Error("NotAllowedError"));
+    });
+    const { view, cleanupDom, a } = await openTwoProjects(withTranscription(getSharedEnv().orpc));
+    const { container } = view;
+    const restoreVoice = installVoiceCapture(microphone);
+    try {
+      await openProjectCreationView(view, a);
+      const voiceButton = await waitFor(() => {
+        const button = container.querySelector<HTMLButtonElement>(
+          'button[aria-label="Voice input"]'
+        );
+        if (!button || button.disabled) throw new Error("Voice input not offered");
+        return button;
+      }, WAIT);
+      expect(projectSelector(container)?.disabled).toBe(false);
+
+      // Voice input waits for the microphone, and then records and transcribes: the transcript
+      // is added through this composer, which a move unmounts.
+      fireEvent.click(voiceButton);
+
+      await waitFor(() => expect(projectSelector(container)?.disabled).toBe(true), WAIT);
+      denyMicrophone();
+      await waitFor(() => expect(projectSelector(container)?.disabled).toBe(false), WAIT);
+    } finally {
+      await cleanupView(view, cleanupDom);
+      restoreVoice();
     }
   }, 90_000);
 

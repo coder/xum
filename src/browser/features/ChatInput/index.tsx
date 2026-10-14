@@ -905,6 +905,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     sendInFlight: isSendInFlight,
     processingAttachmentCount,
     payloadsLoaded: draft.payloadsLoaded,
+    voiceInputActive: voiceInput.state !== "idle",
   });
 
   const creationRuntimeError =
