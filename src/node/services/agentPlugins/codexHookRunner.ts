@@ -113,7 +113,7 @@ export function registerCodexPluginHooks(
           for (const hook of prompt) {
             const output = await invoke(
               hook,
-              { ...promptEventFields(undefined, ctx.model), prompt: ctx.text },
+              { ...promptEventFields(), prompt: ctx.text },
               "UserPromptSubmit",
               registration,
               parseUserPromptSubmitOutput,
@@ -261,15 +261,15 @@ async function runToolHooks(
 /**
  * Codex's common fields for UserPromptSubmit and Stop (hooks/src/events/user_prompt_submit.rs,
  * stop.rs; Codex PRRT_kwDOPxxmWM6rN7nt). Stop's `turn_id` is the finished turn's assistant
- * message ID. A prompt hook runs before that ID exists, so UserPromptSubmit has no `turn_id`.
+ * message ID, and its `model` the one the turn streamed with. UserPromptSubmit has neither yet:
+ * its hooks run before the turn ID exists and before auto routing and fallback pick the model, so
+ * any value there could be wrong, and a guard must not act on a wrong model (Codex
+ * PRRT_kwDOPxxmWM6sZTZ2, PRRT_kwDOPxxmWM6sZTZ9; tracked on #6166).
  * `permission_mode` is always "bypassPermissions": Xum asks no tool approval, and Codex sends
  * that value for the same policy (it never sends "plan"). `transcript_path` is null: chat.jsonl
  * is not a Codex transcript, and Codex allows null.
  */
-function promptEventFields(
-  turnId: string | undefined,
-  model: string | undefined
-): Record<string, unknown> {
+function promptEventFields(turnId?: string, model?: string): Record<string, unknown> {
   return {
     ...(turnId !== undefined ? { turn_id: turnId } : {}),
     ...(model !== undefined ? { model } : {}),

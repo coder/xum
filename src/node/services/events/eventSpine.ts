@@ -143,11 +143,6 @@ export interface MessageSendContext {
   /** The workspace path (Codex common field `cwd`), when Xum could resolve it. */
   readonly cwd?: string;
   /**
-   * The model the send asks for (Codex common field `model`). Auto routing and fallback run
-   * after the hooks, so the turn can stream with another model.
-   */
-  readonly model?: string;
-  /**
    * The send's cancel signal. A withdrawn send ends its pending hook calls instead of waiting for
    * the hook timeout (Codex PRRT_kwDOPxxmWM6rkl9A). The hooks run before any history write, so a
    * send whose signal fired is always cancelled after them, and an ended hook cannot let it

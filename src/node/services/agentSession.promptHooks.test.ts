@@ -42,13 +42,11 @@ type Decide = (ctx: MessageSendContext) => void;
 /** A session plus a fake prompt-hook consumer that records each call and applies `decide`. */
 async function setup(decide: Decide) {
   const calls: Array<Pick<MessageSendContext, "text" | "origin">> = [];
-  const models: Array<string | undefined> = [];
   unregisters.push(
     eventSpine.useBefore(
       "message.send",
       (ctx) => {
         calls.push({ text: ctx.text, origin: ctx.origin });
-        models.push(ctx.model);
         decide(ctx);
       },
       { workspaceId }
@@ -62,7 +60,7 @@ async function setup(decide: Decide) {
     streamed.push(request);
     return baseStream(request);
   });
-  return { h, calls, models, streamed };
+  return { h, calls, streamed };
 }
 
 async function userRows(h: AgentSessionHarness): Promise<MuxMessage[]> {
@@ -465,7 +463,7 @@ describe("message.send outcomes", () => {
   });
 
   test("each send kind reaches the hook with its origin", async () => {
-    const { h, calls, models } = await setup(blockAll);
+    const { h, calls } = await setup(blockAll);
     const send = (internal?: Parameters<typeof h.session.sendMessage>[2]) =>
       h.session.sendMessage("probe", options, internal);
 
@@ -481,8 +479,6 @@ describe("message.send outcomes", () => {
     await send({ acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true });
 
     expect(calls.map((call) => call.origin)).toEqual(["user", "task", "task", "goal", "system"]);
-    // Codex `model` (PRRT_kwDOPxxmWM6rN7nt): the model the send asks for.
-    expect(new Set(models)).toEqual(new Set([options.model]));
   });
 });
 

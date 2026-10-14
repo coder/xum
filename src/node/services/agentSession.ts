@@ -1338,11 +1338,6 @@ interface PreparationAttempt {
   sendIdentities?: readonly SendIdentity[];
 }
 
-/** The model a send asks for; auto routing and fallback can change it later. */
-function requestedModelOf(options: SendMessageOptions | undefined): string | undefined {
-  return options?.model;
-}
-
 export class AgentSession {
   private readonly replayPublication = new AsyncLocalStorage<{
     listener: (event: AgentSessionChatEvent) => void;
@@ -4671,9 +4666,7 @@ export class AgentSession {
      * readSendHooksPresent's result: false skips the chain, true skips its reload (Codex
      * PRRT_kwDOPxxmWM6sVlZG: a broken hooks.js must not cost its evaluation timeout twice).
      */
-    hooksPresent: boolean | undefined,
-    /** The send's options: the hooks see its requested model (MessageSendContext.model). */
-    options: SendMessageOptions | undefined
+    hooksPresent?: boolean
   ): Promise<
     MessageSendHookOutcome & {
       /** The hooks checked the request's follow-up; its outcome travels with the follow-up. */
@@ -4698,7 +4691,6 @@ export class AgentSession {
           text,
           origin: resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin),
           canBlock,
-          model: requestedModelOf(options),
         },
         internal?.cancelSignal,
         hooksPresent === true
@@ -5067,8 +5059,7 @@ export class AgentSession {
       internal,
       attempt.acceptanceOrigin,
       // The load above ran once for this send: the chain does not repeat it.
-      sendHooksPresent,
-      options
+      sendHooksPresent
     );
     if (await cancelBeforeAcceptance()) {
       return Ok(undefined);

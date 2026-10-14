@@ -618,12 +618,7 @@ describe("UserPromptSubmit and Stop", () => {
       () => null
     );
 
-    await runMessageSendHooks(spine, workspaceId, {
-      text: "fix",
-      origin: "user",
-      canBlock: true,
-      model: "openai:gpt-4o",
-    });
+    await runMessageSendHooks(spine, workspaceId, { text: "fix", origin: "user", canBlock: true });
     await runTurnStopHooks(spine, workspaceId, {
       messageId: "assistant-1",
       lastAssistantMessage: "done",
@@ -632,8 +627,9 @@ describe("UserPromptSubmit and Stop", () => {
     });
 
     expect(calls).toEqual([
-      // A prompt hook runs before the turn has an ID: `${turn_id}` expands to null.
-      { turn: null, model: "openai:gpt-4o", mode: "bypassPermissions" },
+      // A prompt hook runs before the turn has an ID and before routing picks its model:
+      // both expand to null rather than to a value that could be wrong.
+      { turn: null, model: null, mode: "bypassPermissions" },
       { turn: "assistant-1", model: "openai:gpt-4o", mode: "bypassPermissions" },
     ]);
   });

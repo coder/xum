@@ -40,8 +40,6 @@ export interface MessageSendHookInput {
    * later hook still sees the send, independent of plugin order.
    */
   canBlock: boolean;
-  /** See MessageSendContext.model. */
-  model?: string;
 }
 
 export async function runMessageSendHooks(
@@ -55,7 +53,6 @@ export async function runMessageSendHooks(
     origin: input.origin,
     text: input.text,
     ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
-    model: input.model,
     signal: input.signal,
     additionalContext: [],
   };
