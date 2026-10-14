@@ -2086,6 +2086,79 @@ describe("AgentPluginInstallService", () => {
     expect(JSON.stringify(failed)).not.toContain(Buffer.from("outside-secret").toString("base64"));
   });
 
+  test("a sign-out the update could not finish is recorded and finished at the next start (#6122)", async () => {
+    const mcpStub = { stopServersWithKeyPrefix: () => Promise.resolve() };
+    const serverUrl = "https://mcp.example.com/mcp";
+    const writeServer = async (clientId: string) => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "mcp.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+          mcpServers: {
+            docs: {
+              type: "streamable-http",
+              url: serverUrl,
+              extensions: {
+                "com.openai": { auth: { type: "oauth", client: { mode: "provided", clientId } } },
+              },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `docs ${clientId}`);
+    };
+    const pendingSignOuts = async (): Promise<unknown> => {
+      const registry = JSON.parse(
+        await fsPromises.readFile(path.join(muxRoot, "plugins.json"), "utf-8")
+      ) as { plugins: Array<Record<string, unknown>> };
+      return registry.plugins.find((plugin) => plugin.name === "demo-plugin")?.pendingSignOuts;
+    };
+    await fsPromises.writeFile(
+      path.join(muxRoot, "mcp-oauth.json"),
+      JSON.stringify({
+        version: 2,
+        entries: {
+          [serverUrl]: {
+            serverUrl,
+            updatedAtMs: Date.now(),
+            clientInformation: { client_id: "client-a" },
+            tokens: { access_token: "at", token_type: "Bearer" },
+          },
+        },
+      })
+    );
+    const updater = new AgentPluginInstallService(config, {
+      mcpServerManager: mcpStub as unknown as MCPServerManager,
+    });
+    await writeServer("client-a");
+    const preview = await updater.preview({ input: remoteDir });
+    await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+    // The store write of the post-update sign-out fails.
+    const failing = new McpOauthService(config, new MCPConfigService(config));
+    spyOn(failing, "logout").mockResolvedValue({ success: false, error: "disk full" });
+    updater.setMcpOauthService(failing);
+    await writeServer("client-b");
+    const review = await updater.previewUpdate({ name: "demo-plugin" });
+    await updater.update({
+      name: "demo-plugin",
+      consent: { fromSha: review.fromSha, toSha: review.toSha },
+    });
+    expect(await pendingSignOuts()).toEqual([serverUrl]);
+    expect(await failing.hasAuthTokens({ serverUrl })).toBe(true);
+    await failing.dispose();
+
+    // The next start: the sign-in service is wired after the install service.
+    const restarted = new AgentPluginInstallService(config, {
+      mcpServerManager: mcpStub as unknown as MCPServerManager,
+    });
+    const oauth = new McpOauthService(config, new MCPConfigService(config));
+    restarted.setMcpOauthService(oauth);
+    await restarted.list();
+    expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
+    expect(await pendingSignOuts()).toBeUndefined();
+    await oauth.dispose();
+  });
+
   test("an update signs out by credential key (rename, respelled URL, issuer) before the final stop", async () => {
     const order: string[] = [];
     const mcpStub = {

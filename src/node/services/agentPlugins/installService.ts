@@ -505,6 +505,19 @@ function createSecretReader(): SecretReader {
   };
 }
 
+/** The credential URLs an update still has to sign out (raw registry field, #6122). */
+function readPendingSignOuts(rawEntry: unknown): string[] {
+  if (typeof rawEntry !== "object" || rawEntry === null) return [];
+  const value = (rawEntry as { pendingSignOuts?: unknown }).pendingSignOuts;
+  return Array.isArray(value) ? value.filter((url): url is string => typeof url === "string") : [];
+}
+
+/** The raw entry with these pending sign-outs (the field is dropped when none are left). */
+function withPendingSignOuts(rawEntry: unknown, urls: string[]): unknown {
+  const { pendingSignOuts: _previous, ...rest } = rawEntry as Record<string, unknown>;
+  return urls.length > 0 ? { ...rest, pendingSignOuts: urls } : rest;
+}
+
 async function readSignIn(
   url: string,
   oauth: MCPServerOAuthConfig | undefined,
@@ -802,13 +815,19 @@ export class AgentPluginInstallService {
    * left unconsumed (failed restore/quarantine, unidentified target tree) —
    * both mean the managed container may hold unreconciled state.
    */
+  /** Crash recovery, then the pending sign-outs (they may need a restored tree's registry). */
+  private async recover(): Promise<boolean> {
+    const allConsumed = await this.reconcileJournals();
+    return (await this.completePendingSignOuts()) && allConsumed;
+  }
+
   private async attemptReconcileJournals(context: string): Promise<boolean> {
     let work = this.reconciliationWork;
     if (work === undefined) {
-      const started = this.reconcileJournals().then(
+      const started = this.recover().then(
         (allConsumed) => {
           if (!allConsumed) {
-            log.warn(`Plugin journal reconciliation left unresolved journals (${context})`);
+            log.warn(`Plugin recovery left unresolved journals or sign-outs (${context})`);
           }
           return allConsumed;
         },
@@ -3214,8 +3233,106 @@ export class AgentPluginInstallService {
 
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */
   /** The OAuth service is built in a later DI layer than this service. */
+  /**
+   * Adds `urls` to the entry's pending sign-outs on disk and returns the raw registry with them,
+   * so the update's own registry write keeps them. Throws when the write fails: nothing changed
+   * yet, and an unrecorded sign-out would be lost on a crash.
+   */
+  private async recordPendingSignOuts(
+    envelope: Record<string, unknown>,
+    rawRegistry: unknown[],
+    name: string,
+    urls: string[]
+  ): Promise<unknown[]> {
+    if (urls.length === 0) return rawRegistry;
+    const next = rawRegistry.map((rawEntry) =>
+      this.rawEntryName(rawEntry) === name
+        ? withPendingSignOuts(rawEntry, [...new Set([...readPendingSignOuts(rawEntry), ...urls])])
+        : rawEntry
+    );
+    await this.writeRegistry(envelope, next);
+    return next;
+  }
+
+  /**
+   * Signs out `urls`, then removes the ones that succeeded from the entry's pending sign-outs.
+   * The failed ones stay for the next start (completePendingSignOuts). The registry update is
+   * best effort: a leftover entry only signs the server out once more.
+   */
+  private async signOutAndSettle(name: string, urls: string[]): Promise<void> {
+    if (urls.length === 0) return;
+    const done = new Set<string>();
+    for (const serverUrl of urls) {
+      if (await this.signOutPluginServer(name, serverUrl)) done.add(serverUrl);
+    }
+    try {
+      const { envelope, rawEntries } = await this.readRegistryDocument("strict");
+      await this.writeRegistry(
+        envelope,
+        rawEntries.map((rawEntry) =>
+          this.rawEntryName(rawEntry) === name
+            ? withPendingSignOuts(
+                rawEntry,
+                readPendingSignOuts(rawEntry).filter((url) => !done.has(url))
+              )
+            : rawEntry
+        )
+      );
+    } catch (error) {
+      log.warn("Could not clear finished plugin sign-outs", {
+        plugin: name,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  private async signOutPluginServer(name: string, serverUrl: string): Promise<boolean> {
+    const result = await this.mcpOauthService?.logout({ serverUrl });
+    if (result?.success === true) return true;
+    log.warn("Could not sign out a plugin MCP server after its sign-in changed", {
+      plugin: name,
+      error: result?.error ?? "sign-in service unavailable",
+    });
+    return false;
+  }
+
+  /**
+   * Finishes the sign-outs that an update recorded but could not complete (#6122). It runs
+   * with crash recovery, so the discovery gate keeps the managed container closed until every
+   * pending sign-out is done: a plugin server never connects with its old sign-in's tokens.
+   * Without the sign-in service yet it fails closed; setMcpOauthService runs it again.
+   */
+  private async completePendingSignOuts(): Promise<boolean> {
+    const { rawEntries } = await this.readRegistryDocument("lenient");
+    if (!rawEntries.some((rawEntry) => readPendingSignOuts(rawEntry).length > 0)) return true;
+    const oauth = this.mcpOauthService;
+    if (oauth === undefined) return false;
+    return this.runExclusive(async () => {
+      const { envelope, rawEntries: current } = await this.readRegistryDocument("strict");
+      let allDone = true;
+      const next: unknown[] = [];
+      for (const rawEntry of current) {
+        const left: string[] = [];
+        for (const serverUrl of readPendingSignOuts(rawEntry)) {
+          if (!(await oauth.logout({ serverUrl })).success) left.push(serverUrl);
+        }
+        allDone &&= left.length === 0;
+        next.push(
+          readPendingSignOuts(rawEntry).length > 0 ? withPendingSignOuts(rawEntry, left) : rawEntry
+        );
+      }
+      await this.writeRegistry(envelope, next);
+      return allDone;
+    });
+  }
+
   setMcpOauthService(service: Pick<McpOauthService, "logout" | "credentialKey">): void {
     this.mcpOauthService = service;
+    // Pending sign-outs wait for this service: finish them before discovery opens (#6122).
+    const previous = this.reconciliationState;
+    this.reconciliationState = previous.then(() =>
+      this.attemptReconcileJournals("sign-in service ready")
+    );
   }
 
   async list(): Promise<AgentPluginListItem[]> {
@@ -4401,6 +4518,16 @@ export class AgentPluginInstallService {
           );
         }
 
+        // Record the sign-outs before anything changes: a crash, or a store write that fails
+        // after the swap, leaves them for the next start (#6122).
+        const resets = [...new Set(signInResets)];
+        const registryForUpdate = await this.recordPendingSignOuts(
+          envelope,
+          rawRegistry,
+          entry.name,
+          resets
+        );
+
         await this.removeDir(path.join(stagedDir, ".git"));
 
         const serverKeyPrefix = buildPluginServerKey(this.instanceIdFor(entry.name), "");
@@ -4552,7 +4679,7 @@ export class AgentPluginInstallService {
         try {
           await this.writeRegistry(
             envelope,
-            rawRegistry.map((rawEntry) => {
+            registryForUpdate.map((rawEntry) => {
               if (this.rawEntryName(rawEntry) !== entry.name) {
                 return rawEntry;
               }
@@ -4594,14 +4721,7 @@ export class AgentPluginInstallService {
           // refreshed with the new client. Signed out, the server asks again.
           // Runs BEFORE the final stop, so a startup that raced the sign-out
           // is invalidated too, and a failing stop cannot skip it.
-          for (const serverUrl of new Set(signInResets)) {
-            const result = await this.mcpOauthService?.logout({ serverUrl });
-            if (result?.success === false)
-              log.warn("Could not sign out a plugin MCP server after its sign-in changed", {
-                plugin: entry.name,
-                error: result.error,
-              });
-          }
+          await this.signOutAndSettle(entry.name, resets);
           await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
         }
 
