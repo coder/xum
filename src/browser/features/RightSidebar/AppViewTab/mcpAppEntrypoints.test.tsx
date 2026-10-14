@@ -4,7 +4,11 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider } from "@/browser/contexts/API";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { useWorkspaceStoreRaw, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
+import {
+  useWorkspaceStoreRaw,
+  type WorkspaceState,
+  type WorkspaceStore,
+} from "@/browser/stores/WorkspaceStore";
 import { createTestApiClient } from "@/browser/testUtils";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import {
@@ -37,8 +41,7 @@ function entrypoint(title: string): McpAppEntrypoint {
 }
 
 /** Every workspace's transcript is loaded and empty, so only entry points can name a view. */
-function loadedTranscripts(): () => void {
-  const store = useWorkspaceStoreRaw();
+function loadedTranscripts(store: WorkspaceStore): () => void {
   const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(() => true);
   const state = spyOn(store, "getWorkspaceState").mockImplementation(
     () =>
@@ -253,7 +256,7 @@ describe("MCP App entry points", () => {
     const wrapper = (props: { children: React.ReactNode }) => (
       <APIProvider client={client}>{props.children}</APIProvider>
     );
-    const restore = loadedTranscripts();
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
     try {
       const { result } = renderHook(
         () => {
@@ -298,7 +301,7 @@ describe("MCP App entry points", () => {
     const wrapper = (props: { children: React.ReactNode }) => (
       <APIProvider client={client}>{props.children}</APIProvider>
     );
-    const restore = loadedTranscripts();
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
     try {
       const viewKey = entrypoint("Library").viewKey;
       const { result } = renderHook(
@@ -339,7 +342,7 @@ describe("MCP App entry points", () => {
     const wrapper = (props: { children: React.ReactNode }) => (
       <APIProvider client={client}>{props.children}</APIProvider>
     );
-    const restore = loadedTranscripts();
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
     try {
       const { result } = renderHook(
         () => {
@@ -369,7 +372,7 @@ describe("MCP App entry points", () => {
     const wrapper = (props: { children: React.ReactNode }) => (
       <APIProvider client={client}>{props.children}</APIProvider>
     );
-    const restore = loadedTranscripts();
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
     try {
       const { result } = renderHook(
         () => {
@@ -396,7 +399,7 @@ describe("MCP App entry points", () => {
     const client = createTestApiClient({
       mcpApps: { listEntrypoints: () => Promise.resolve([plugin]) },
     });
-    const restore = loadedTranscripts();
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
     function Tab() {
       useLoadMcpAppEntrypoints("ws-label", true);
       return (
