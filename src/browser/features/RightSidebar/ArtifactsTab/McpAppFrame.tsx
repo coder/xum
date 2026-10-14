@@ -25,6 +25,11 @@ import {
 } from "./mcpAppDocumentChannel";
 import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
 import {
+  mcpAppWidgetStateSeed,
+  mcpAppWidgetStateTarget,
+  saveMcpAppWidgetState,
+} from "./mcpAppWidgetState";
+import {
   createMcpAppHost,
   type McpAppConsentRequest,
   type McpAppHost,
@@ -447,7 +452,12 @@ export function McpAppFrame(props: {
   const guard = useFrameNavigationGuard(documentKey);
   const { navigatedRef, leave: leaveDocument } = guard;
   const viewDocument = useMcpAppViewDocument(documentKey, guard.frameKey);
-  const srcDoc = buildMcpAppViewSrcDoc(current, grant, viewDocument, openAiSeed);
+  // The document starts with this view instance's last widget state (mcpAppWidgetState.ts).
+  const widgetStateTarget = mcpAppWidgetStateTarget(workspaceId, toolCallId, current?.view);
+  const srcDoc = buildMcpAppViewSrcDoc(current, grant, viewDocument, {
+    ...openAiSeed,
+    widgetState: mcpAppWidgetStateSeed(viewDocument, widgetStateTarget),
+  });
 
   // Values the long-lived host reads at message time.
   const latest = useRef({ theme, view, result: current?.view ?? null, onClose: props.onClose });
@@ -521,6 +531,13 @@ export function McpAppFrame(props: {
         return result.data;
       },
       // Bound like callTool: the backend attributes the context to the view's result record.
+      // Through the latest client and loaded view; the write outlives this frame.
+      saveWidgetState: (state) =>
+        saveMcpAppWidgetState(
+          apiRef.current,
+          mcpAppWidgetStateTarget(workspaceId, toolCallId, latest.current.result),
+          state
+        ),
       updateModelContext: async (text) => {
         const client = apiRef.current;
         if (client == null) throw new Error("Xum is reconnecting. Try again once it is back.");

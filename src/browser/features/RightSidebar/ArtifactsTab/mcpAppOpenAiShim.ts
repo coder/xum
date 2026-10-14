@@ -26,8 +26,9 @@
  * Each lifecycle message is cached as a copy, so a widget that mutates its globals does not
  * change what its client is replayed. The shim leaves teardown replies to that client.
  * Members without a standard equivalent warn once; their Promises reject and nothing throws.
- * setWidgetState updates window.openai.widgetState in this page only: the state
- * lasts as long as the frame (a collapsed card or a move to the tab starts with null). Optional
+ * setWidgetState updates window.openai.widgetState at once and sends the state to the host
+ * (xum/widget-state), which stores it in the view's result record. The next document of the same
+ * view instance (a remount, a move to the tab, an app restart) starts with it (#6178). Optional
  * extensions Xum lacks (uploadFile, selectFiles, getFileDownloadUrl, requestCheckout,
  * requestModal, setOpenInAppUrl) are absent, so `if (window.openai?.selectFiles)` takes the
  * view's fallback.
@@ -45,6 +46,12 @@ export interface McpAppOpenAiSeed {
   platform: string;
   /** The inline cap; null in a panel, whose frame is as tall as its container. */
   maxHeight: number | null;
+  /**
+   * The state this view instance last stored with setWidgetState (mcpAppWidgetState.ts), or
+   * null. The only seed value that comes from the view: it is the view's own data, read back by
+   * the same instance.
+   */
+  widgetState?: unknown;
 }
 
 export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
@@ -58,6 +65,7 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
     locale: seed.locale,
     platform: seed.platform,
     ...(seed.maxHeight != null ? { containerDimensions: { maxHeight: seed.maxHeight } } : {}),
+    widgetState: seed.widgetState,
   })
     .replace(/</g, "\\u003c")
     .replace(/\u2028/g, "\\u2028")
@@ -101,8 +109,11 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
     toolResponseMetadata: null,
     widgetState: null
   };
-  var seeded = fromHostContext(${seedJson});
+  var seedValues = ${seedJson};
+  var seeded = fromHostContext(seedValues);
   for (var seedKey in seeded) globals[seedKey] = seeded[seedKey];
+  // JSON drops an undefined seed: the Apps SDK's "no state" is null.
+  globals.widgetState = seedValues.widgetState === undefined ? null : seedValues.widgetState;
   setLang(globals.locale);
 
   function post(message) {
@@ -283,7 +294,10 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
       request("ui/open-link", { url: String((args && args.href) || "") }).catch(function () {});
     },
     setWidgetState: function (state) {
-      setGlobals({ widgetState: state === undefined ? null : state });
+      var value = state === undefined ? null : state;
+      setGlobals({ widgetState: value });
+      // Sent at once, not buffered: a collapse right after this call must not drop it.
+      post({ jsonrpc: "2.0", method: "xum/widget-state", params: { state: value } });
       return Promise.resolve();
     }
   };

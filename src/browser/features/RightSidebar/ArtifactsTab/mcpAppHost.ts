@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   MCP_APP_MODEL_CONTEXT_MAX_BYTES,
+  MCP_APP_WIDGET_STATE_MAX_BYTES,
   MCP_APP_READ_URI_MAX_CHARS,
   MCP_APP_TOOL_CALL_WINDOW_MS,
   MCP_APP_TOOL_CALLS_PER_WINDOW,
@@ -64,6 +65,16 @@ const SizeChangedParams = z.object({
   height: z.number().finite().optional(),
 });
 const LogParams = z.object({ level: z.string().max(32).optional(), data: z.unknown().optional() });
+/** xum/widget-state: JSON of at most MCP_APP_WIDGET_STATE_MAX_BYTES (the backend's cap too). */
+const WidgetStateParams = z.object({
+  state: z
+    .unknown()
+    .refine(
+      (state) =>
+        new TextEncoder().encode(JSON.stringify(state ?? null)).length <=
+        MCP_APP_WIDGET_STATE_MAX_BYTES
+    ),
+});
 const ToolCallParams = z.object({
   name: z.string().min(1).max(256),
   arguments: z.record(z.string(), z.unknown()).optional(),
@@ -186,6 +197,11 @@ export interface McpAppHostOptions {
   /** Store the view's model context; it replaces the previous one ("" clears it). */
   updateModelContext: (text: string) => Promise<void>;
   /**
+   * Keep the view's window.openai widget state (xum/widget-state, sent by mcpAppOpenAiShim.ts)
+   * for the next document of the same view instance. Called in arrival order.
+   */
+  saveWidgetState: (state: unknown) => void;
+  /**
    * Prepare a switch to a mode from availableDisplayModes other than the current one: returns
    * the move, or null when the host cannot show the view in that mode now (the mode stays).
    * A move unmounts this instance, so the host runs it only once the view has its reply.
@@ -197,6 +213,25 @@ export interface McpAppHostOptions {
   onSizeChanged: (size: { width?: number; height?: number }) => void;
   onInitialized: () => void;
   log: (message: string, data?: unknown) => void;
+}
+
+/** notifications/message from the view, into the host's debug log. */
+function logViewMessage(params: unknown, options: Pick<McpAppHostOptions, "log">): void {
+  const parsed = LogParams.safeParse(params);
+  if (parsed.success) options.log(`view log (${parsed.data.level ?? "info"})`, parsed.data.data);
+}
+
+/**
+ * xum/widget-state from the window.openai shim: only the view's own state for its own next
+ * document, so no consent, but capped like the backend.
+ */
+function handleWidgetState(
+  params: unknown,
+  options: Pick<McpAppHostOptions, "saveWidgetState" | "log">
+): void {
+  const parsed = WidgetStateParams.safeParse(params);
+  if (parsed.success) options.saveWidgetState(parsed.data.state);
+  else options.log("dropped widget state over the size limit");
 }
 
 export function clampMcpAppHeight(height: number): number {
@@ -470,12 +505,12 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         });
         return;
       }
-      case "notifications/message": {
-        const parsed = LogParams.safeParse(params);
-        if (parsed.success)
-          options.log(`view log (${parsed.data.level ?? "info"})`, parsed.data.data);
+      case "xum/widget-state":
+        handleWidgetState(params, options);
         return;
-      }
+      case "notifications/message":
+        logViewMessage(params, options);
+        return;
       default:
         // Unknown notifications have no reply channel; drop them.
         return;

@@ -39,6 +39,12 @@ let approveDeferred: Array<(approvedDomains: string[], revision: number) => void
 // Backend commit revisions. Never reset: the approval store outlives a test and keeps the list
 // with the newest revision.
 let revision = Date.now() * 1000;
+// The view's stored widget state and its record binding (getView), and the writes it gets.
+let widgetState: unknown = null;
+let widgetStateBinding: number | null = null;
+let widgetStateWrites: Array<{ binding: number; state: unknown }> = [];
+// When set, setWidgetState answers only once it settles (a write in flight).
+let widgetStateWriteGate: Promise<void> | null = null;
 let toolCalls: Array<{
   serverName: string;
   toolName: string;
@@ -60,6 +66,8 @@ function serverApi(): TestApiOverrides<APIClient> {
             result: { content: [] },
             invocation,
             approvalProjectPath,
+            widgetState,
+            widgetStateBinding,
             // Read now, like the backend: newer than every list published so far.
             approvedDomainsRevision: ++revision,
           },
@@ -80,6 +88,13 @@ function serverApi(): TestApiOverrides<APIClient> {
           success: true as const,
           data: { approvedDomains: input.origins, revision: ++revision },
         });
+      },
+      setWidgetState: (input: { binding: number; state: unknown }) => {
+        widgetStateWrites.push({ binding: input.binding, state: input.state });
+        return (widgetStateWriteGate ?? Promise.resolve()).then(() => ({
+          success: true as const,
+          data: {},
+        }));
       },
       callTool: (input: {
         serverName: string;
@@ -252,6 +267,10 @@ describe("McpAppFrame", () => {
     approveFails = null;
     approvalProjectPath = "/repo";
     approveDeferred = null;
+    widgetState = null;
+    widgetStateBinding = null;
+    widgetStateWrites = [];
+    widgetStateWriteGate = null;
     toolCalls = [];
     // Desktop mode by default: the preload bridge exists (isDesktopMode). Browser tests delete it.
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -495,6 +514,29 @@ describe("McpAppFrame", () => {
       )
     );
     expect(view.queryByRole("button", { name: "Not now" })).toBeNull();
+  });
+
+  test("widget state is stored for the view instance, and a remount starts with the latest", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    widgetState = { step: 2 };
+    widgetStateBinding = ++revision;
+    let landWrite = () => undefined as void;
+    widgetStateWriteGate = new Promise<void>((resolve) => (landWrite = resolve));
+    const first = await renderFrame();
+    expect(first.frame.getAttribute("srcdoc")).toContain('"widgetState":{"step":2}');
+    postFromView(first.frame, {
+      jsonrpc: "2.0",
+      method: "xum/widget-state",
+      params: { state: { step: 3 } },
+    });
+    await waitFor(() => expect(widgetStateWrites).toHaveLength(1));
+    // The card collapses while the write is in flight, and opens again before it lands. The
+    // record still holds step 2, but the new document starts with step 3.
+    first.view.unmount();
+    const second = await renderFrame();
+    expect(second.frame.getAttribute("srcdoc")).toContain('"widgetState":{"step":3}');
+    landWrite();
+    expect(widgetStateWrites).toEqual([{ binding: widgetStateBinding, state: { step: 3 } }]);
   });
 
   test("the view is bound to the recorded tool call, not the card", async () => {

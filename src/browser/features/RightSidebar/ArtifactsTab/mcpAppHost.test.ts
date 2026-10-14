@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
-import { MCP_APP_MODEL_CONTEXT_MAX_BYTES } from "@/common/utils/mcpApps";
+import {
+  MCP_APP_MODEL_CONTEXT_MAX_BYTES,
+  MCP_APP_WIDGET_STATE_MAX_BYTES,
+} from "@/common/utils/mcpApps";
 import { passesFrameGate } from "./artifactBridge";
 import {
   createMcpAppHost,
@@ -23,6 +26,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
   const composer: string[] = [];
   const opened: string[] = [];
   const sizes: Array<{ width?: number; height?: number }> = [];
+  const widgetStates: unknown[] = [];
   let initialized = 0;
   const host = createMcpAppHost({
     serverName: "charts",
@@ -56,6 +60,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
       modelContexts.push(text);
       return Promise.resolve();
     },
+    saveWidgetState: (state) => widgetStates.push(state),
     setDisplayMode: (mode) => {
       modeRequests.push(mode);
       return () => {
@@ -102,6 +107,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
     composer,
     opened,
     sizes,
+    widgetStates,
     request,
     reply,
     initialized: () => initialized,
@@ -280,6 +286,16 @@ describe("MCP Apps host router", () => {
     expect(teardown.method).toBe("ui/resource-teardown");
     await t.host.handleMessage({ jsonrpc: "2.0", id: teardown.id, result: {} });
     await done;
+  });
+
+  test("widget state is saved in order, and a state over the cap is dropped", async () => {
+    const t = setup();
+    const send = (state: unknown) =>
+      t.host.handleMessage({ jsonrpc: "2.0", method: "xum/widget-state", params: { state } });
+    await send({ n: 1 });
+    await send({ text: "x".repeat(MCP_APP_WIDGET_STATE_MAX_BYTES) });
+    await send(null);
+    expect(t.widgetStates).toEqual([{ n: 1 }, null]);
   });
 
   test("resources/read goes to the view's own server and returns its result", async () => {

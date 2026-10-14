@@ -91,6 +91,7 @@ async function runView(
   const consents: McpAppConsentRequest[] = [];
   const composer: string[] = [];
   const calls: Array<{ toolName: string; args: unknown }> = [];
+  const savedStates: unknown[] = [];
   // The view document's channel (mcpAppDocumentChannel.ts), as McpAppFrame binds it.
   const channel = createMcpAppDocumentChannel("00");
   channel.setReceiver({
@@ -126,6 +127,7 @@ async function runView(
     },
     readResource: () => Promise.reject(new Error("unused")),
     updateModelContext: () => Promise.resolve(),
+    saveWidgetState: (state) => savedStates.push(state),
     setDisplayMode: () => null,
     requestConsent: (request) => {
       consents.push(request);
@@ -149,7 +151,7 @@ async function runView(
     )
   );
   await settle();
-  return { win, host, posted, consents, composer, calls, warnings };
+  return { win, host, posted, consents, composer, calls, warnings, savedStates };
 }
 
 const COLLECT_EVENTS = `window.events = [];
@@ -240,6 +242,24 @@ describe("window.openai shim", () => {
     // Xum does not use the URL, so the member is absent and the widget keeps its own link.
     expect((t.win as unknown as { openInApp: unknown }).openInApp).toBe("own link");
     expect(t.warnings).toHaveLength(1);
+  });
+
+  test("widget state starts from the stored state, and each setWidgetState is saved", async () => {
+    const t = await runView(
+      `window.atLoad = window.openai.widgetState;
+      window.openai.setWidgetState({ step: 3 });
+      window.openai.setWidgetState({ step: 4 });
+      window.done = true;`,
+      // A value with "</script>" cannot end the shim's script element.
+      { seed: { ...SEED, widgetState: { step: 2, note: "</script>" } } }
+    );
+    expect(t.win.done).toBe(true);
+    expect((t.win as unknown as { atLoad: unknown }).atLoad).toEqual({
+      step: 2,
+      note: "</script>",
+    });
+    // In order, each as the host got it.
+    expect(t.savedStates).toEqual([{ step: 3 }, { step: 4 }]);
   });
 
   test("host context is in the globals before any view script reads them", async () => {
