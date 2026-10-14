@@ -52,8 +52,9 @@ const McpAppResultRecordSchema = z.object({
    */
   instanceId: z.string().min(1).optional(),
   /**
-   * Written by an entry point open (MCPServerManager.openMcpAppEntrypoint), never by a tool
-   * call. A restored tab whose entry point is gone is then unavailable, not a tool call's view.
+   * Written by an entry point open (MCPServerManager.openMcpAppEntrypoint) or a settings app
+   * open (openSettingsApp), never by a tool call. A restored tab whose entry point is gone is
+   * then unavailable, not a tool call's view.
    */
   entrypoint: z.literal(true).optional(),
   /**
@@ -166,10 +167,11 @@ export class McpAppResultStore {
   }
 
   /** Record a tool result. Never throws: a failed write only means the view opens without it. */
+  /** Resolves true once the record is stored (a failure is logged, never thrown). */
   async record(
     workspaceId: string,
     input: Omit<McpAppResultRecord, "version" | "createdAt" | "instanceId">
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       let record: McpAppResultRecord = {
         version: 1,
@@ -181,17 +183,19 @@ export class McpAppResultStore {
       if (Buffer.byteLength(serialized, "utf8") > MCP_APP_RESULT_MAX_BYTES) {
         record = { ...record, result: null };
         serialized = JSON.stringify(record);
-        if (Buffer.byteLength(serialized, "utf8") > MCP_APP_RESULT_MAX_BYTES) return;
+        if (Buffer.byteLength(serialized, "utf8") > MCP_APP_RESULT_MAX_BYTES) return false;
       }
       const dir = this.dirFor(workspaceId);
-      if (!(await this.writeRecord(workspaceId, dir, record.toolCallId, serialized))) return;
+      if (!(await this.writeRecord(workspaceId, dir, record.toolCallId, serialized))) return false;
       // Publish to memory only once the record is durable: a failed write must not leave a
       // record that opens now but vanishes on restart. Before prune, so a prune failure does
       // not hide a record that is already on disk.
       this.remember(workspaceId, record);
       await this.prune(dir);
+      return true;
     } catch (error) {
       log.debug("[MCP Apps] Failed to record tool result", { workspaceId, error });
+      return false;
     }
   }
 

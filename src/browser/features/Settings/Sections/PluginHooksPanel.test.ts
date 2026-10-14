@@ -22,7 +22,7 @@ describe("describePluginHookHandler", () => {
     expect(describePluginHookHandler({ ...handler, timeoutSeconds: 5 })).toContain("timeout 5s");
   });
 
-  test("an omitted timeout reads as the runner default, not a number", () => {
+  test("an omitted timeout reads as the runner default, apart from a declared one", () => {
     const handler = { type: "mcp_tool" as const, server: "s", tool: "t", input: {} };
     const summary = describePluginHookHandler(handler);
     expect(summary).not.toContain("undefined");

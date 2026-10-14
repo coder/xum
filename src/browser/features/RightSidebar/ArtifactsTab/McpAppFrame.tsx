@@ -127,13 +127,18 @@ function consentText(request: McpAppConsentRequest): [string, string, string] {
   }
 }
 
-function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
+/** The server as the user sees it: a plugin server's "<plugin> · <server>" label, when known. */
+function viewServerLabel(view: McpAppViewRef): string {
+  return view.serverLabel ?? mcpServerDisplayName(view.serverName);
+}
+
+function McpAppViewHeader(props: { serverName: string; serverLabel: string; onClose: () => void }) {
   return (
     <div className="border-border-light flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-[11px]">
       <span className="text-muted min-w-0 flex-1 truncate">
         App view from{" "}
         <TooltipIfPresent tooltip={props.serverName}>
-          <span className="text-foreground">{mcpServerDisplayName(props.serverName)}</span>
+          <span className="text-foreground">{props.serverLabel}</span>
         </TooltipIfPresent>
       </span>
       <TooltipIfPresent tooltip="Close view">
@@ -384,6 +389,20 @@ function DomainsPromptText(props: { origins: readonly string[]; projectPath: str
   );
 }
 
+/** Hands a frame's close sequence to its host (McpAppFrame `closeRef`) while it is mounted. */
+function useExposedClose(
+  closeRef: { current: (() => void) | null } | undefined,
+  close: () => void
+): void {
+  useEffect(() => {
+    if (closeRef === undefined) return;
+    closeRef.current = close;
+    return () => {
+      closeRef.current = null;
+    };
+  });
+}
+
 /**
  * Close the channel of a document that left the frame: a new one replaced it, it navigated away
  * (the frame is removed until Reload, which loads a new document), or the view unmounted. The
@@ -433,6 +452,11 @@ export function McpAppFrame(props: {
   variant?: McpAppFrameVariant;
   /** Panel only: closes the panel's host (its app tab). */
   onClose?: () => void;
+  /**
+   * Panel only: receives the frame's close sequence (the view's teardown, then onClose), so a
+   * host's own dismissal (a modal's Escape or outside click) closes the view the same way.
+   */
+  closeRef?: { current: (() => void) | null };
 }) {
   const inline = props.variant === "inline";
   const { api } = useAPI();
@@ -739,12 +763,24 @@ export function McpAppFrame(props: {
     await hostRef.current?.teardown("closed");
     props.onClose?.();
   };
+  useExposedClose(props.closeRef, () => void close());
 
   const header = inline ? null : (
-    <McpAppViewHeader serverName={serverName} onClose={() => void close()} />
+    <McpAppViewHeader
+      serverName={serverName}
+      serverLabel={viewServerLabel(view)}
+      onClose={() => void close()}
+    />
   );
 
-  if (current == null) return <Notice>Loading…</Notice>;
+  // A panel keeps its Close header while it loads: a hung load must stay closable.
+  if (current == null)
+    return (
+      <div className="flex min-h-0 flex-col">
+        {header}
+        <Notice>Loading…</Notice>
+      </div>
+    );
   if (current.view == null || srcDoc == null || grant == null) {
     return (
       <div className="flex min-h-0 flex-col">

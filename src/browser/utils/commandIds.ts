@@ -120,6 +120,7 @@ export const CommandIds = {
   mcpAppsRevokeViewDomains: () => "mcp-apps:revoke-view-domains" as const,
   pluginsManageComponents: () => "plugins:manage-components" as const,
   pluginsReviewHooks: () => "plugins:review-hooks" as const,
+  pluginsReviewComponents: () => "plugins:review-components" as const,
   pluginsUninstall: () => "plugins:uninstall" as const,
   pluginsCheckUpdates: () => "plugins:check-updates" as const,
   pluginsUpdateAll: () => "plugins:update-all" as const,

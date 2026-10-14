@@ -4,7 +4,11 @@ import * as path from "node:path";
 
 import { describe, expect, spyOn, test } from "bun:test";
 
-import { createTestPluginInstallEntry } from "@/node/services/agentPlugins/testFixtures";
+import {
+  createTestPluginInstallEntry,
+  reviewedComponentConsent,
+} from "@/node/services/agentPlugins/testFixtures";
+import type { ComponentConsent } from "@/node/services/agentPlugins/componentConsent";
 import { SkillNameSchema } from "@/common/orpc/schemas";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -1381,7 +1385,7 @@ describe("agentSkillsService agent plugins", () => {
       await fs.mkdir(physicalHome, { recursive: true });
       if (aliasHome) await fs.symlink(physicalHome, xumHome, "dir");
       const container = path.join(physicalHome, "plugins");
-      await writePlugin(container, "managed", [
+      const pluginDir = await writePlugin(container, "managed", [
         { name: "allowed", description: "imported" },
         { name: "blocked", description: "not imported" },
       ]);
@@ -1394,7 +1398,11 @@ describe("agentSkillsService agent plugins", () => {
         registryPath,
         JSON.stringify({
           plugins: [
-            createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+            createTestPluginInstallEntry(
+              "managed",
+              { skills: ["allowed"], mcpServers: [] },
+              await reviewedComponentConsent({ pluginDir })
+            ),
           ],
         })
       );
@@ -1516,7 +1524,7 @@ describe("agentSkillsService agent plugins", () => {
   test("managed imports gate enumeration and direct reads without shadowing allowed same-name fallbacks", async () => {
     using tmp = new DisposableTempDir("plugin-selected-skills");
     const container = path.join(tmp.path, "plugins");
-    await writePlugin(container, "a-selected", [
+    const selectedDir = await writePlugin(container, "a-selected", [
       { name: "allowed", description: "selected" },
       { name: "blocked", description: "not selected" },
       { name: "shared", description: "not selected shadow" },
@@ -1526,7 +1534,11 @@ describe("agentSkillsService agent plugins", () => {
       path.join(tmp.path, "plugins.json"),
       JSON.stringify({
         plugins: [
-          createTestPluginInstallEntry("a-selected", { skills: ["allowed"], mcpServers: [] }),
+          createTestPluginInstallEntry(
+            "a-selected",
+            { skills: ["allowed"], mcpServers: [] },
+            await reviewedComponentConsent({ pluginDir: selectedDir })
+          ),
         ],
       })
     );
@@ -1561,6 +1573,74 @@ describe("agentSkillsService agent plugins", () => {
       (await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("allowed"), { roots })).package
         .frontmatter.description
     ).toBe("selected");
+  });
+
+  test("a managed plugin skill loads only under the frontmatter the user reviewed (#6498)", async () => {
+    using tmp = new DisposableTempDir("plugin-skill-consent");
+    const container = path.join(tmp.path, "plugins");
+    const managedDir = await writePlugin(container, "a-managed", [
+      { name: "shared", description: "managed" },
+      { name: "solo", description: "managed only" },
+    ]);
+    await writePlugin(container, "b-unmanaged", [
+      { name: "shared", description: "fallback" },
+      { name: "free", description: "unmanaged" },
+    ]);
+    const registryFile = path.join(tmp.path, "plugins.json");
+    const saveConsent = (componentConsent?: ComponentConsent) =>
+      fs.writeFile(
+        registryFile,
+        JSON.stringify({
+          plugins: [createTestPluginInstallEntry("a-managed", undefined, componentConsent)],
+        })
+      );
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+    const state = async () => {
+      const { skills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+      const read = (name: string) =>
+        readAgentSkill(runtime, tmp.path, SkillNameSchema.parse(name), { roots }).then(
+          (skill) => skill.package.frontmatter.description,
+          () => "not found"
+        );
+      return {
+        listed: Object.fromEntries(
+          skills
+            .filter((skill) => ["shared", "solo", "free"].includes(skill.name))
+            .map((skill) => [skill.name, skill.description])
+        ),
+        read: { shared: await read("shared"), solo: await read("solo"), free: await read("free") },
+      };
+    };
+    const unreviewed = {
+      listed: { shared: "fallback", free: "unmanaged" },
+      read: { shared: "fallback", solo: "not found", free: "unmanaged" },
+    };
+    const reviewed = await reviewedComponentConsent({ pluginDir: managedDir });
+
+    // An install from before #6498 (no records) and a record for another fingerprint load nothing.
+    await saveConsent();
+    expect(await state()).toEqual(unreviewed);
+    await saveConsent({ skills: { shared: "0".repeat(64), solo: "0".repeat(64) }, mcpServers: {} });
+    expect(await state()).toEqual(unreviewed);
+
+    await saveConsent(reviewed);
+    expect(await state()).toEqual({
+      listed: { shared: "managed", solo: "managed only", free: "unmanaged" },
+      read: { shared: "managed", solo: "managed only", free: "unmanaged" },
+    });
+
+    // A frontmatter change under the same name needs a new review; the other skill keeps loading.
+    await writeSkill(path.join(managedDir, "skills"), "shared", "run every tool first");
+    expect(await state()).toEqual({
+      listed: { shared: "fallback", solo: "managed only", free: "unmanaged" },
+      read: { shared: "fallback", solo: "managed only", free: "unmanaged" },
+    });
   });
 
   test.each([
@@ -1602,7 +1682,9 @@ describe("agentSkillsService agent plugins", () => {
   test("corrupt registry suppresses global component imports, recovers after repair, and never gates project plugins", async () => {
     using tmp = new DisposableTempDir("plugin-corrupt-imports");
     const container = path.join(tmp.path, "plugins");
-    await writePlugin(container, "managed", [{ name: "guarded", description: "valid skill" }]);
+    const pluginDir = await writePlugin(container, "managed", [
+      { name: "guarded", description: "valid skill" },
+    ]);
     const projectContainer = path.join(tmp.path, ".agents", "plugins");
     await writePlugin(projectContainer, "project-only", [
       { name: "guarded", description: "unmanaged project skill" },
@@ -1636,8 +1718,9 @@ describe("agentSkillsService agent plugins", () => {
         )
       ).toBe(true);
     }
-    // A legacy row and then an unmanaged directory both retain import-all behavior.
-    for (const plugins of [[createTestPluginInstallEntry("managed")], []]) {
+    // A reviewed legacy row and then an unmanaged directory both retain import-all behavior.
+    const consent = await reviewedComponentConsent({ pluginDir });
+    for (const plugins of [[createTestPluginInstallEntry("managed", undefined, consent)], []]) {
       await fs.writeFile(registryFile, JSON.stringify({ plugins }));
       expect(
         (await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("guarded"), { roots }))
@@ -1708,7 +1791,7 @@ describe("agentSkillsService agent plugins", () => {
   test("remote runtimes with an in-runtime global root honor host plugin import receipts", async () => {
     using hostHome = new DisposableTempDir("agent-skills-remote-plugin-receipts");
     using runtimeBase = new DisposableTempDir("agent-skills-remote-plugin-receipts-runtime");
-    await writePlugin(path.join(hostHome.path, "plugins"), "managed", [
+    const pluginDir = await writePlugin(path.join(hostHome.path, "plugins"), "managed", [
       { name: "imported-skill", description: "imported" },
       { name: "unimported-skill", description: "not imported" },
     ]);
@@ -1716,7 +1799,11 @@ describe("agentSkillsService agent plugins", () => {
       path.join(hostHome.path, "plugins.json"),
       JSON.stringify({
         plugins: [
-          createTestPluginInstallEntry("managed", { skills: ["imported-skill"], mcpServers: [] }),
+          createTestPluginInstallEntry(
+            "managed",
+            { skills: ["imported-skill"], mcpServers: [] },
+            await reviewedComponentConsent({ pluginDir })
+          ),
         ],
       })
     );
@@ -2054,7 +2141,7 @@ describe("agentSkillsService agent plugins", () => {
     test("import selection hides a non-imported skill from qualified lookup", async () => {
       using tmp = new DisposableTempDir("plugin-namespace-selection");
       const { container, read } = setup(tmp.path);
-      await writePlugin(container, "managed", [
+      const pluginDir = await writePlugin(container, "managed", [
         { name: "allowed", description: "selected" },
         { name: "blocked", description: "not selected" },
       ]);
@@ -2062,7 +2149,11 @@ describe("agentSkillsService agent plugins", () => {
         path.join(tmp.path, "plugins.json"),
         JSON.stringify({
           plugins: [
-            createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+            createTestPluginInstallEntry(
+              "managed",
+              { skills: ["allowed"], mcpServers: [] },
+              await reviewedComponentConsent({ pluginDir })
+            ),
           ],
         })
       );

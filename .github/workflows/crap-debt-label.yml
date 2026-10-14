@@ -30,9 +30,10 @@ jobs:
       github.event.label.name == 'crap-debt' &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    # Covers waiting for a pr.yml run still in progress (its jobs time out
-    # within 20 minutes after they start).
-    timeout-minutes: 45
+    # Covers waiting for a pr.yml run still in progress: Quality / CRAP waits
+    # for the test jobs (20-minute timeout), then has its own 25 minutes, plus
+    # the changes job, queue time and the 30-second watch interval.
+    timeout-minutes: 60
     permissions:
       actions: write
     steps:
