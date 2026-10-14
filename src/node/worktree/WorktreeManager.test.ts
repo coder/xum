@@ -1687,74 +1687,106 @@ describe("WorktreeManager.createWorkspace", () => {
     }
   }, 20_000);
 
-  for (const existing of [false, true]) {
-    it(`moves a deferred ${existing ? "existing" : "new"} branch to the freshly fetched origin trunk when the local origin ref is stale`, async () => {
+  /** Gives the fixture an origin that has a commit its local origin/main ref has not seen. */
+  function addOriginAheadOfLocalRef(
+    fixture: { rootDir: string; projectPath: string },
+    opts: { fetchOnce: boolean }
+  ) {
+    const remotePath = path.join(fixture.rootDir, "remote");
+    execFileSync("git", ["clone", "--quiet", fixture.projectPath, remotePath], { stdio: "ignore" });
+    execFileSync("git", ["remote", "add", "origin", remotePath], {
+      cwd: fixture.projectPath,
+      stdio: "ignore",
+    });
+    if (opts.fetchOnce) {
+      execFileSync("git", ["fetch", "--quiet", "origin"], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+    }
+    execSync(
+      'git config user.email "test@example.com" && git config user.name "test" && ' +
+        'git config commit.gpgsign false && git commit --allow-empty -m "remote-only"',
+      { cwd: remotePath, stdio: "ignore" }
+    );
+    const staleHead = gitRevParseHead(fixture.projectPath);
+    const remoteHead = gitRevParseHead(remotePath);
+    expect(remoteHead).not.toBe(staleHead);
+    return { staleHead, remoteHead };
+  }
+
+  const staleOriginCases = [
+    { title: "a deferred new branch", existing: false, originRef: "stale" },
+    { title: "a deferred existing branch", existing: true, originRef: "stale" },
+    // The reservation falls back to local main, so the sync must also set the upstream.
+    { title: "a deferred new branch", existing: false, originRef: "missing" },
+    // Old Git cannot defer, so the eager checkout runs the same sync first.
+    {
+      title: "a new branch whose deferral fell back to eager on old Git",
+      existing: false,
+      originRef: "stale",
+      legacyGit: true,
+    },
+  ] as const;
+
+  for (const testCase of staleOriginCases) {
+    it(`moves ${testCase.title} to the freshly fetched origin trunk when the local origin ref is ${testCase.originRef}`, async () => {
       const branchName = "feature-stale-origin";
       const fixture = await createWorktreeManagerFixture({
-        existingBranchName: existing ? branchName : undefined,
+        existingBranchName: testCase.existing ? branchName : undefined,
       });
+      const realExec = disposableExec.execFileAsync;
+      const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
+        (file, args, options) => {
+          const proc = realExec(file, args, options);
+          if ("legacyGit" in testCase && file === "git" && args[0] === "--version") {
+            Object.defineProperty(proc, "result", {
+              value: proc.result.then((output) => ({ ...output, stdout: "git version 2.35.7\n" })),
+            });
+          }
+          return proc;
+        }
+      );
       try {
-        const remotePath = path.join(fixture.rootDir, "remote");
-        execFileSync("git", ["clone", "--quiet", fixture.projectPath, remotePath], {
-          stdio: "ignore",
+        const { staleHead, remoteHead } = addOriginAheadOfLocalRef(fixture, {
+          fetchOnce: testCase.originRef === "stale",
         });
-        execFileSync("git", ["remote", "add", "origin", remotePath], {
-          cwd: fixture.projectPath,
-          stdio: "ignore",
-        });
-        execFileSync("git", ["fetch", "--quiet", "origin"], {
-          cwd: fixture.projectPath,
-          stdio: "ignore",
-        });
-        // origin moves on after the last fetch, so the local origin/main ref is stale.
-        execSync(
-          'git config user.email "test@example.com" && git config user.name "test" && ' +
-            'git config commit.gpgsign false && git commit --allow-empty -m "remote-only"',
-          { cwd: remotePath, stdio: "ignore" }
-        );
-        const staleHead = gitRevParseHead(fixture.projectPath);
-        const remoteHead = gitRevParseHead(remotePath);
-        expect(remoteHead).not.toBe(staleHead);
-
         const steps: string[] = [];
         const initLogger = {
           ...fixture.initLogger,
           logStep: (message: string) => steps.push(message),
         };
-        const result = await fixture.manager.createWorkspace({
+        const params = {
           projectPath: fixture.projectPath,
           branchName,
           trunkBranch: "main",
           trusted: true,
           initLogger,
-          deferMaterialization: true,
-        });
-        if (!result.success || !result.workspacePath || !result.pendingMaterialization) {
-          throw new Error("Expected a deferred reservation");
-        }
-        expect(steps).not.toContain("Fetching latest from origin/main...");
-        expect(
-          execFileSync("git", ["rev-parse", branchName], { cwd: fixture.projectPath })
-            .toString()
-            .trim()
-        ).toBe(staleHead);
-
-        await fixture.manager.materializeWorkspace(
-          {
-            projectPath: fixture.projectPath,
-            workspacePath: result.workspacePath,
-            branchName,
-            trunkBranch: "main",
-            trusted: true,
-            initLogger,
-          },
-          result.pendingMaterialization
+        };
+        const result = await withUniquePath(fixture.rootDir, () =>
+          fixture.manager.createWorkspace({ ...params, deferMaterialization: true })
         );
+        if (!result.success || !result.workspacePath) throw new Error("Expected a workspace");
+        if ("legacyGit" in testCase) {
+          expect(result.pendingMaterialization).toBeUndefined();
+        } else {
+          if (!result.pendingMaterialization) throw new Error("Expected a deferred reservation");
+          expect(steps).not.toContain("Fetching latest from origin/main...");
+          expect(
+            execFileSync("git", ["rev-parse", branchName], { cwd: fixture.projectPath })
+              .toString()
+              .trim()
+          ).toBe(staleHead);
+          await fixture.manager.materializeWorkspace(
+            { ...params, workspacePath: result.workspacePath },
+            result.pendingMaterialization
+          );
+        }
         expect(gitRevParseHead(result.workspacePath)).toBe(remoteHead);
         expect(
           execFileSync("git", ["status", "--porcelain"], { cwd: result.workspacePath }).toString()
         ).toBe("");
-        if (!existing) {
+        if (!testCase.existing) {
           expect(
             execFileSync("git", ["config", `branch.${branchName}.merge`], {
               cwd: fixture.projectPath,
@@ -1764,10 +1796,52 @@ describe("WorktreeManager.createWorkspace", () => {
           ).toBe("refs/heads/main");
         }
       } finally {
+        execSpy.mockRestore();
         await fixture.cleanup();
       }
     }, 20_000);
   }
+
+  it("leaves a deferred new branch that moved after the reservation instead of resetting it to origin", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      addOriginAheadOfLocalRef(fixture, { fetchOnce: true });
+      const stderr: string[] = [];
+      const params = {
+        projectPath: fixture.projectPath,
+        branchName: "feature-moved-after-reservation",
+        trunkBranch: "main",
+        trusted: true,
+        initLogger: { ...fixture.initLogger, logStderr: (line: string) => stderr.push(line) },
+      };
+      const result = await fixture.manager.createWorkspace({
+        ...params,
+        deferMaterialization: true,
+      });
+      if (!result.success || !result.workspacePath || !result.pendingMaterialization) {
+        throw new Error("Expected a deferred reservation");
+      }
+      const movedTip = execFileSync(
+        "git",
+        ["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "moved by someone else"],
+        { cwd: fixture.projectPath }
+      )
+        .toString()
+        .trim();
+      execFileSync("git", ["update-ref", `refs/heads/${params.branchName}`, movedTip], {
+        cwd: fixture.projectPath,
+      });
+
+      await fixture.manager.materializeWorkspace(
+        { ...params, workspacePath: result.workspacePath },
+        result.pendingMaterialization
+      );
+      expect(gitRevParseHead(result.workspacePath)).toBe(movedTip);
+      expect(stderr.some((line) => line.includes("Could not move"))).toBe(true);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
 
   for (const removal of [false, true]) {
     it(`${removal ? "cancels a removal" : "checks out the reserved base for an archive"} during the deferred origin fetch`, async () => {
