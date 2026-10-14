@@ -30,6 +30,7 @@ import {
   markMcpAppViewHosted,
   mcpAppViewRefFor,
   openMcpAppViewTab,
+  useMcpAppViewFullscreenOnly,
   type McpAppViewRef,
 } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
 import { McpAppFrame } from "@/browser/features/RightSidebar/ArtifactsTab/McpAppFrame";
@@ -101,6 +102,7 @@ const McpAppToolDetails: React.FC<{
   // A failed call's error is in the raw output: show it without a click.
   const [showRaw, setShowRaw] = React.useState(props.view.failed);
   const inTab = useMcpAppViewInTab(props.workspaceId, props.view.toolCallId, ["tab"]);
+  const fullscreenOnly = useMcpAppViewFullscreenOnly(props.workspaceId, props.view.toolCallId);
   const supported = useMcpAppViewsSupported();
   const { workspaceId, view } = props;
   // An expanded card is where the view goes back to on inline (ui/request-display-mode).
@@ -111,9 +113,10 @@ const McpAppToolDetails: React.FC<{
   if (!supported) return <ToolDetails>{props.raw}</ToolDetails>;
   return (
     <ToolDetails>
-      {inTab ? (
+      {inTab || fullscreenOnly ? (
         // One live instance per view: while its tab has it, the card shows this
-        // instead of a second frame. Closing the tab brings the view back here.
+        // instead of a second frame. Closing the tab brings the view back here, unless the
+        // view declared fullscreen only: it is never hosted inline, so the card keeps this.
         <AppViewInTabNotice workspaceId={props.workspaceId} view={props.view} />
       ) : (
         <McpAppFrame workspaceId={props.workspaceId} view={props.view} variant="inline" />

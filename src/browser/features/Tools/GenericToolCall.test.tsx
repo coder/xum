@@ -8,7 +8,10 @@ import {
 import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import { removeTabEverywhere } from "@/browser/utils/rightSidebarLayout";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
-import { isMcpAppViewHosted } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
+import {
+  isMcpAppViewHosted,
+  markMcpAppViewFullscreenOnly,
+} from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
 import { installDom } from "../../../../tests/ui/dom";
 import { APIContext, APIProvider } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
@@ -112,7 +115,11 @@ describe("GenericToolCall MCP Apps view", () => {
     app: { resourceUri: "ui://dice/board.html" },
   };
 
-  function renderAppCall(status: ToolStatus, mcpServer: MCPToolCallDisplay = appSnapshot) {
+  function renderAppCall(
+    status: ToolStatus,
+    mcpServer: MCPToolCallDisplay = appSnapshot,
+    workspaceId = "ws-app-card"
+  ) {
     const client = createTestApiClient({
       mcpApps: {
         getView: () => {
@@ -140,7 +147,7 @@ describe("GenericToolCall MCP Apps view", () => {
             result={{ content: [{ type: "text", text: "Rolled 4d6" }] }}
             status={status}
             mcpServer={mcpServer}
-            workspaceId="ws-app-card"
+            workspaceId={workspaceId}
             toolCallId="call-1"
           />
         </APIProvider>
@@ -188,6 +195,25 @@ describe("GenericToolCall MCP Apps view", () => {
     );
     await view.findByTestId("mcp-app-frame");
     expect(getViewCalls).toBe(2);
+  });
+
+  // Found when the view first initialized in its card and moved to its tab (McpAppFrame).
+  test("a fullscreen-only view's card keeps the placeholder after its tab closes", async () => {
+    const workspaceId = "ws-app-card-fullscreen-only";
+    const view = renderAppCall("completed", appSnapshot, workspaceId);
+    await view.findByTestId("mcp-app-frame");
+    act(() => {
+      markMcpAppViewFullscreenOnly(workspaceId, "call-1");
+      updateRightSidebarLayout(workspaceId, (s) => withAppViewTab(s, "call-1"));
+    });
+    await waitFor(() => expect(view.queryByTestId("mcp-app-frame")).toBeNull());
+    act(() =>
+      updateRightSidebarLayout(workspaceId, (s) => removeTabEverywhere(s, appViewTabFor("call-1")))
+    );
+    // No frame comes back, which would move the view to a tab again.
+    expect(view.getByRole("button", { name: "Go to tab" })).toBeTruthy();
+    expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+    expect(getViewCalls).toBe(1);
   });
 
   test("an expanded card is an inline target for its view, also while the tab has it", async () => {

@@ -189,8 +189,10 @@ export interface McpAppHostOptions {
    * Prepare a switch to a mode from availableDisplayModes other than the current one: returns
    * the move, or null when the host cannot show the view in that mode now (the mode stays).
    * A move unmounts this instance, so the host runs it only once the view has its reply.
+   * `cause` is "declared" when the view's declared modes exclude the current one (a
+   * fullscreen-only view in its tool card), "request" for ui/request-display-mode.
    */
-  setDisplayMode: (mode: McpAppDisplayMode) => (() => void) | null;
+  setDisplayMode: (mode: McpAppDisplayMode, cause: "request" | "declared") => (() => void) | null;
   requestConsent: (request: McpAppConsentRequest) => Promise<boolean>;
   insertIntoComposer: (text: string) => void;
   openExternalLink: (url: string) => void;
@@ -227,7 +229,7 @@ function startDisplayMode(input: {
 }) {
   const move =
     input.pending === undefined && isFullscreenOnly(input.declared, input.context)
-      ? input.setDisplayMode("fullscreen")
+      ? input.setDisplayMode("fullscreen", "declared")
       : null;
   const pending = move != null ? "fullscreen" : input.pending;
   return { move, pending, displayMode: pending ?? input.viewMode(input.context.displayMode) };
@@ -445,7 +447,7 @@ export function createMcpAppHost(options: McpAppHostOptions) {
           requested !== undefined &&
           requested !== current &&
           (viewDisplayModes?.includes(requested) ?? true)
-            ? options.setDisplayMode(requested)
+            ? options.setDisplayMode(requested, "request")
             : null;
         const mode = move != null && requested !== undefined ? requested : current;
         respond(id, { mode });

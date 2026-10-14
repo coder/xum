@@ -32,6 +32,7 @@ import {
 } from "./mcpAppHost";
 import {
   isMcpAppViewHosted,
+  markMcpAppViewFullscreenOnly,
   openMcpAppViewTab,
   reloadMcpAppView,
   type McpAppViewRef,
@@ -642,11 +643,14 @@ export function McpAppFrame(props: {
       // Inline only while the card is expanded in the loaded transcript: a collapsed (or
       // unloaded) card mounts no inline instance, so closing the tab would lose the view.
       // The host runs the move later; skip it once this instance is gone (closed meanwhile).
-      setDisplayMode: (mode) => {
+      setDisplayMode: (mode, cause) => {
         if (mode === "inline" && !isMcpAppViewHosted(workspaceId, toolCallId, "card")) return null;
         return () => {
           if (hostRef.current !== host) return;
           if (mode === "fullscreen") {
+            // A fullscreen-only view: its card stops mounting it, so closing its tab does not
+            // move it back to the tab again while the card is expanded.
+            if (cause === "declared") markMcpAppViewFullscreenOnly(workspaceId, toolCallId);
             openMcpAppViewTab(workspaceId, latest.current.view);
             return;
           }

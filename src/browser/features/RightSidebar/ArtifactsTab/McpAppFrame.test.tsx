@@ -16,6 +16,7 @@ import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
 import {
   markMcpAppViewHosted,
+  useMcpAppViewFullscreenOnly,
   useMcpAppViewReloadKey,
   type McpAppViewRef,
 } from "./mcpAppViewsStore";
@@ -1149,10 +1150,20 @@ describe("McpAppFrame host strips", () => {
     const onOpen = (e: Event) =>
       opened.push((e as CustomEvent<{ toolCallId: string }>).detail.toolCallId);
     window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
+    let isFullscreenOnly = () => false;
+    function FullscreenOnlyProbe() {
+      const marked = useMcpAppViewFullscreenOnly("ws-fullscreen-only", "call-1");
+      isFullscreenOnly = () => marked;
+      return null;
+    }
     try {
-      const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
-        wrapper: Wrapper,
-      });
+      const view = render(
+        <>
+          <McpAppFrame workspaceId="ws-fullscreen-only" view={VIEW} variant="inline" />
+          <FullscreenOnlyProbe />
+        </>,
+        { wrapper: Wrapper }
+      );
       const frame = await findOpenFrame(view);
       const posted = capturePosted(frame);
       postFromView(frame, {
@@ -1173,8 +1184,11 @@ describe("McpAppFrame host strips", () => {
         return message;
       });
       expect(opened).toEqual([]);
+      expect(isFullscreenOnly()).toBe(false);
       postFromView(frame, { jsonrpc: "2.0", id: teardown.id, result: {} });
       await waitFor(() => expect(opened).toEqual(["call-1"]));
+      // Its card stops hosting it, so closing the tab does not send it back to a tab.
+      expect(isFullscreenOnly()).toBe(true);
     } finally {
       window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
     }
