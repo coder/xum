@@ -4,6 +4,7 @@ import {
   addTabToFocusedTabset,
   collectAllTabs,
   parseRightSidebarLayoutState,
+  readRequestedRightSidebarTab,
   selectOrAddTab,
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
@@ -45,7 +46,8 @@ export function withAppViewTab(
  */
 export function saveAppViewTab(workspaceId: string, toolCallId: string): void {
   updatePersistedState<unknown>(getRightSidebarLayoutKey(workspaceId), (raw: unknown) => {
-    const layout = parseRightSidebarLayoutState(raw);
+    // The fallback RightSidebar uses: a workspace without a saved layout starts the same way.
+    const layout = parseRightSidebarLayoutState(raw, readRequestedRightSidebarTab());
     const tab = appViewTabFor(toolCallId);
     return collectAllTabs(layout.root).includes(tab)
       ? raw

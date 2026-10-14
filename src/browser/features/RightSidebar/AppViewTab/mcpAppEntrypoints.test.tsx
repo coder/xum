@@ -24,7 +24,7 @@ import {
   publishProjectTrustChanged,
   publishWorkspaceMcpOverridesSaved,
 } from "@/browser/utils/workspaceMcpMutations";
-import { getRightSidebarLayoutKey } from "@/common/constants/storage";
+import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_TAB_KEY } from "@/common/constants/storage";
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 import { appViewTabFor } from "./appViewTabs";
 import { useLoadMcpAppEntrypoints, useMcpAppEntrypoints } from "./mcpAppEntrypoints";
@@ -593,6 +593,28 @@ describe("MCP App entry points", () => {
     expect(opens).toBe(1);
   });
 
+  test("a saved palette tab keeps the tool a new layout starts with", async () => {
+    // No saved layout yet; the user asked new layouts to start on Costs (RightSidebar reads
+    // RIGHT_SIDEBAR_TAB_KEY for its default layout).
+    const target = entrypoint("Library");
+    const client = createTestApiClient({
+      mcpApps: {
+        openEntrypoint: () => Promise.resolve({ success: true as const, data: target }),
+      },
+    });
+    updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "costs");
+    try {
+      expect(await openMcpAppEntrypoint(client, "ws-unsaved", target)).toBeNull();
+      const layout = parseRightSidebarLayoutState(
+        readPersistedState<unknown>(getRightSidebarLayoutKey("ws-unsaved"), null)
+      );
+      expect(collectAllTabs(layout.root)).toEqual(["costs", appViewTabFor(target.viewKey)]);
+      expect(getFocusedActiveTab(layout, "review")).toBe("costs");
+    } finally {
+      updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
+    }
+  });
+
   test("a rerun of an entry point whose tab is mounted reloads its frame", async () => {
     const target = entrypoint("Library");
     let stored: string[] = [target.viewKey];
@@ -652,6 +674,9 @@ describe("MCP App entry points", () => {
         await openMcpAppEntrypoint(client, "ws-rerun", target, () => undefined);
       });
       await waitFor(() => expect(loads).toBe(2));
+      // Exactly one reload: waitFor alone would also pass on the way to a third load.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(loads).toBe(2);
     } finally {
       restore();
     }

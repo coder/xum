@@ -419,6 +419,9 @@ export function focusMcpAppViewTab(workspaceId: string, toolCallId: string) {
  * frame's key, so a bump remounts the frame and it loads the view again (McpAppFrame loads a
  * view once per tool call). Used after an entry point ran again for a tab that is open.
  */
+// Never pruned on purpose: an entry holds one number, and only a user's pick that ran an entry
+// point again adds one, so the map stays small for a session. Dropping an entry
+// when its tab closes would also be safe (a missing count reads as 0), but it needs no hook.
 const reloadCounts = new Map<string, number>();
 
 /** Remount every frame that shows the view, so it loads the view again. */

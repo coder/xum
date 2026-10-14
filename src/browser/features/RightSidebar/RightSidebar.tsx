@@ -2,7 +2,6 @@ import React from "react";
 import { X } from "lucide-react";
 import {
   RIGHT_SIDEBAR_COLLAPSED_KEY,
-  RIGHT_SIDEBAR_TAB_KEY,
   getReviewImmersiveKey,
   TERMINAL_TITLES_MAX_CHARS,
   getRightSidebarLayoutKey,
@@ -80,7 +79,6 @@ import { shouldAutoActivateWorkflowsTab } from "@/browser/features/RightSidebar/
 import {
   NEW_TAB,
   isNewTab,
-  isTabType,
   isTerminalTab,
   getAppViewTabKey,
   getSideChatTabWorkspaceId,
@@ -105,6 +103,7 @@ import {
   moveTabToTabset,
   openToolFromNewTab,
   parseRightSidebarLayoutState,
+  readRequestedRightSidebarTab,
   removeTabEverywhere,
   reorderTabInTabset,
   selectTabByIndex,
@@ -1257,15 +1256,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     });
   };
 
-  // A tool explicitly requested for new layouts (RIGHT_SIDEBAR_TAB_KEY). Without one, a
-  // workspace starts with just the New tab, which guides the user to the tools.
+  // A tool explicitly requested for new layouts (readRequestedRightSidebarTab).
   // Not gated on canReviewDiffs: that is false until workspace metadata loads, and a "review"
   // request dropped then would persist a New-tab-only layout. Without a repository, `layout`
   // below hides Review anyway (an emptied layout shows the New tab).
-  const initialActiveTab = React.useMemo<TabType | undefined>(() => {
-    const raw = readPersistedState<string | null>(RIGHT_SIDEBAR_TAB_KEY, null);
-    return isTabType(raw) ? raw : undefined;
-  }, []);
+  const initialActiveTab = React.useMemo<TabType | undefined>(readRequestedRightSidebarTab, []);
 
   const defaultLayout = React.useMemo(
     () => getDefaultRightSidebarLayoutState(initialActiveTab),
