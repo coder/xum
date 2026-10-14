@@ -8,6 +8,8 @@ import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
  *
  * Captured from the live page at 412 px (61 elements), then edited:
  * - The app shell's <main> is a <div>. The boot loader's <main> in #root stays the only landmark.
+ * - The shell's root is `h-full`: outside #root, which globals.css sizes to the viewport, its
+ *   nested `h-full` would resolve against an auto height and collapse to the content height.
  * - Radix runtime artifacts are gone: focus guards, generated ids, aria-hidden, tabindex,
  *   pointer-events. The disabled attributes are gone too: the live buttons are enabled, and
  *   `disabled:opacity-50` made the copy look disabled.
@@ -21,7 +23,7 @@ import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
  * insertAdjacentHTML.
  */
 export const FIRST_RUN_VIEW_HTML = `<div id="${FIRST_RUN_VIEW_ID}" inert style="position:fixed;inset:0;overflow:hidden">
-  <div>
+  <div class="h-full">
     <div class="bg-surface-primary h-full">
       <div class="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
         <div class="mobile-main-content flex min-w-0 flex-1 flex-col overflow-hidden">
