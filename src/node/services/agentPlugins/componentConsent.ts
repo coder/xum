@@ -122,13 +122,25 @@ export function serverConsentFingerprint(info: MCPServerInfo, paths: ConsentPath
   });
 }
 
-/** Fingerprint of one skill: where it lives in the plugin and its whole `SKILL.md`. */
-export function skillConsentFingerprint(args: { relativeDir: string; content: string }): string {
+/**
+ * Fingerprint of one skill: where it lives in the plugin (the #6494 `extra/foo` vs `skills/foo`
+ * case) and its whole parsed frontmatter, so a new frontmatter field fails closed. The body is
+ * not covered: no review shows it, and the update review has always treated a body edit as
+ * capability-neutral. `paths` patterns are OR-ed, so their order does not count.
+ */
+export function skillConsentFingerprint(args: {
+  relativeDir: string;
+  frontmatter: Readonly<Record<string, unknown>>;
+}): string {
+  const { paths } = args.frontmatter;
   return digest({
     scheme: CONSENT_SCHEME,
     kind: "skill",
     dir: args.relativeDir.replaceAll("\\", "/"),
-    content: args.content,
+    frontmatter: {
+      ...args.frontmatter,
+      ...(Array.isArray(paths) ? { paths: [...(paths as unknown[])].map(String).sort() } : {}),
+    },
   });
 }
 

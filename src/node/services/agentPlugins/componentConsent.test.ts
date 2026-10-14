@@ -85,14 +85,23 @@ describe("serverConsentFingerprint", () => {
 });
 
 describe("skillConsentFingerprint", () => {
-  test("covers the root-relative directory and the whole SKILL.md text", () => {
-    const content = "---\nname: foo\ndescription: d\n---\nBody\n";
-    const fp = skillConsentFingerprint({ relativeDir: "skills/foo", content });
-    expect(skillConsentFingerprint({ relativeDir: "skills\\foo", content })).toBe(fp);
-    expect(skillConsentFingerprint({ relativeDir: "extra/foo", content })).not.toBe(fp);
+  test("covers the root-relative directory and every frontmatter field, not path order", () => {
+    const frontmatter = { name: "foo", description: "d", paths: ["src/**", "tests/**"] };
+    const fp = skillConsentFingerprint({ relativeDir: "skills/foo", frontmatter });
+    expect(skillConsentFingerprint({ relativeDir: "skills\\foo", frontmatter })).toBe(fp);
     expect(
-      skillConsentFingerprint({ relativeDir: "skills/foo", content: `${content}More\n` })
-    ).not.toBe(fp);
+      skillConsentFingerprint({
+        relativeDir: "skills/foo",
+        frontmatter: { ...frontmatter, paths: ["tests/**", "src/**"] },
+      })
+    ).toBe(fp);
+    const changed = [
+      { relativeDir: "extra/foo", frontmatter },
+      { relativeDir: "skills/foo", frontmatter: { ...frontmatter, description: "other" } },
+      // A field no review shows today still counts, so a new field fails closed.
+      { relativeDir: "skills/foo", frontmatter: { ...frontmatter, metadata: { a: "b" } } },
+    ];
+    for (const input of changed) expect(skillConsentFingerprint(input)).not.toBe(fp);
   });
 });
 

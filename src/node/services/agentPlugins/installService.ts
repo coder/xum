@@ -206,7 +206,7 @@ function stableStringify(value: unknown): string {
 
 /** Preview skill row plus the extra model-visible fields (see collectSkills). */
 type CollectedPluginSkill = AgentPluginPreviewSkill & {
-  /** Load-time consent fingerprint (componentConsent.ts): root-relative dir + whole SKILL.md. */
+  /** Load-time consent fingerprint (componentConsent.ts): root-relative dir + frontmatter. */
   consentFingerprint: string;
   whenToUse?: string;
   advertise?: boolean;
@@ -2012,7 +2012,7 @@ export class AgentPluginInstallService {
           name: parsed.frontmatter.name,
           consentFingerprint: skillConsentFingerprint({
             relativeDir: path.relative(pluginRoot, path.join(skillsDir, dirName)),
-            content,
+            frontmatter: parsed.frontmatter,
           }),
           ...(parsed.frontmatter.description !== undefined
             ? { description: parsed.frontmatter.description }

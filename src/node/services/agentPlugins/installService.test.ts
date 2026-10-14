@@ -1466,11 +1466,10 @@ describe("AgentPluginInstallService", () => {
       expectedSha: preview.lockedSha,
       importedComponents: { skills: ["greet"], mcpServers: [] },
     });
-    const content = await fsPromises.readFile(
-      path.join(pluginsDir(), "demo-plugin", "skills", "greet", "SKILL.md"),
-      "utf8"
-    );
-    const greet = skillConsentFingerprint({ relativeDir: "skills/greet", content });
+    const greet = skillConsentFingerprint({
+      relativeDir: "skills/greet",
+      frontmatter: { name: "greet", description: "Greets people" },
+    });
     expect(installed.componentConsent).toEqual({ skills: { greet }, mcpServers: {} });
     expect((await service.list())[0]).toMatchObject({ importedSkillCount: 1 });
     const stored = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
