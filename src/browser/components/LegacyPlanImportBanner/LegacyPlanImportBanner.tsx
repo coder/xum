@@ -117,7 +117,7 @@ export const LegacyPlanImportNotice: React.FC<LegacyPlanImportNoticeProps> = (pr
                 type="button"
                 disabled={importing}
                 onClick={() => void importPlan()}
-                className="text-secondary bg-muted/10 hover:bg-hover hover:text-foreground flex h-6 items-center gap-1 rounded-md px-2 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                className="text-foreground bg-muted/10 hover:bg-hover flex h-6 items-center gap-1 rounded-md px-2 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {importing ? (
                   <Loader2 className="size-3 animate-spin" />

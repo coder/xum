@@ -25,6 +25,11 @@ import {
   type MCPToolUi,
 } from "@/common/utils/mcpApps";
 import { log } from "@/node/services/log";
+import {
+  MCP_APP_CATALOG_CHANGE_MIN_INTERVAL_MS,
+  MCP_APP_CATALOG_RELIST_MAX_RETRIES,
+} from "@/constants/mcp";
+import { coalesceCatalogChanges } from "./mcpCatalogChanges";
 
 /**
  * MCP client adapter over the official TypeScript SDK v2
@@ -109,6 +114,12 @@ export interface MCPClientConfig {
    * visibility lacks "model" out of tools(). When false the client behaves exactly as before.
    */
   mcpApps?: boolean;
+  /**
+   * Called when the server sends notifications/tools/list_changed (MCP App entry points follow
+   * the catalog). A plain handler: it opens no `subscriptions/listen` stream, so it hears what
+   * the server sends unasked. The SDK still evicts its cached tools/list either way.
+   */
+  onToolsListChanged?: () => void;
 }
 
 export type MCPPrompt = Awaited<ReturnType<Client["listPrompts"]>>["prompts"][number];
@@ -301,6 +312,26 @@ function mcpToModelOutput({
   return { type: "content", value: convertedContent };
 }
 
+/** List a connected server's prompts; a server without the prompts capability has none. */
+async function listServerPrompts(
+  client: Client,
+  signal: AbortSignal | undefined
+): Promise<MCPPrompt[]> {
+  // The SDK also returns [] for such a server, but prints a console.debug line
+  // on each call. Xum lists prompts often (composer, tool descriptions), so that
+  // line flooded the server log.
+  if (!client.getServerCapabilities()?.prompts) return [];
+  // Cursorless listPrompts() aggregates pages up to ClientOptions.listMaxPages
+  // and forwards these options to each request; the integration test covers
+  // page two.
+  const result = await client.listPrompts(undefined, {
+    timeout: PROMPT_LIST_TIMEOUT_MS,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  assert(Array.isArray(result.prompts), "MCP prompts/list result must carry a prompts array");
+  return result.prompts;
+}
+
 /**
  * Connect to an MCP server and return a handle for tools and prompts.
  *
@@ -310,6 +341,28 @@ function mcpToModelOutput({
  * to a pre-2026 client — on anything but definitive modern evidence. A
  * `prior` verdict skips the probe entirely.
  */
+/**
+ * Hand the server's tools/list_changed notifications to `onChanged` (MCPClientConfig), after a
+ * re-list: a legacy-era instance has no other catalog refresh, so its entry points and app tool
+ * checks would keep the startup listing. Coalesced (coalesceCatalogChanges), so a flood costs
+ * at most one tools/list per interval. Returns the stop for the client's close.
+ */
+function reportToolsListChanged(
+  client: Client,
+  relist: () => Promise<unknown>,
+  onChanged: (() => void) | undefined
+): () => void {
+  if (onChanged === undefined) return () => undefined;
+  const changes = coalesceCatalogChanges({
+    relist,
+    report: onChanged,
+    minIntervalMs: MCP_APP_CATALOG_CHANGE_MIN_INTERVAL_MS,
+    maxRetries: MCP_APP_CATALOG_RELIST_MAX_RETRIES,
+  });
+  client.setNotificationHandler("notifications/tools/list_changed", () => changes.notify());
+  return changes.dispose;
+}
+
 export async function createMCPClient(config: MCPClientConfig): Promise<MCPClientHandle> {
   const mcpApps = config.mcpApps === true;
   const client = new Client(CLIENT_INFO, {
@@ -334,6 +387,14 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     const onUncaughtError = config.onUncaughtError;
     client.onerror = (error) => onUncaughtError(error);
   }
+  // Set once the handle exists. A notification before then needs no re-list: the first tools()
+  // call lists the current catalog.
+  let relist: () => Promise<unknown> = () => Promise.resolve();
+  const stopCatalogChanges = reportToolsListChanged(
+    client,
+    () => relist(),
+    config.onToolsListChanged
+  );
 
   const transport = isHttpTransportConfig(config.transport)
     ? createHttpTransport(config.transport)
@@ -346,7 +407,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
   // Every advertised name, even from a half-malformed capability: hiding stays on.
   const settingsTools = new Set(advertisedMCPSettingsToolNames(client.getServerCapabilities()));
 
-  return {
+  const handle: MCPClientHandle = {
     tools: async () => {
       const listResult = await client.listTools();
       assert(Array.isArray(listResult.tools), "MCP tools/list result must carry a tools array");
@@ -429,17 +490,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       listedEntrypoints = entrypoints;
       return tools;
     },
-    prompts: async (options) => {
-      // Cursorless listPrompts() aggregates pages up to ClientOptions.listMaxPages
-      // and forwards these options to each request; the integration test covers
-      // page two.
-      const result = await client.listPrompts(undefined, {
-        timeout: PROMPT_LIST_TIMEOUT_MS,
-        ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-      });
-      assert(Array.isArray(result.prompts), "MCP prompts/list result must carry a prompts array");
-      return result.prompts;
-    },
+    prompts: (options) => listServerPrompts(client, options?.signal),
     getPrompt: (name, args, options) =>
       client.getPrompt(
         { name, arguments: args },
@@ -492,6 +543,11 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         }
       );
     },
-    close: () => client.close(),
+    close: () => {
+      stopCatalogChanges();
+      return client.close();
+    },
   };
+  relist = () => handle.tools();
+  return handle;
 }

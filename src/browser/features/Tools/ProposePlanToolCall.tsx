@@ -909,7 +909,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         <ClipboardList aria-hidden="true" className="h-4 w-4" />
         <div className="text-plan-mode font-mono text-[13px] font-semibold">{planTitle}</div>
         {annotateMode && (
-          <div className="bg-accent/10 text-accent rounded px-1.5 py-0.5 font-mono text-[10px] font-medium">
+          <div className="bg-accent/10 text-accent-text rounded px-1.5 py-0.5 font-mono text-[10px] font-medium">
             Annotating
           </div>
         )}

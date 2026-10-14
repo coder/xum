@@ -119,6 +119,8 @@ export const AgentPluginInterfaceSummarySchema = z.object({
   supportURL: z.string().optional(),
   /** `data:image/...;base64,` read through the contained capped reader; never a path. */
   logoDataUrl: z.string().optional(),
+  /** Dark-theme variant (OpenAI `logoDark`/`composerIconDark`), read the same way. */
+  logoDarkDataUrl: z.string().optional(),
 });
 export type AgentPluginInterfaceSummary = z.infer<typeof AgentPluginInterfaceSummarySchema>;
 

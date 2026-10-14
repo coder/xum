@@ -11,6 +11,19 @@ import { codexPluginHookService } from "./codexHookService";
 import { agentPluginHookService } from "./hookService";
 import { resolveAgentPluginsMcpContext } from "./mcpConfig";
 
+/**
+ * The per-call trust gate of Codex hooks. It re-reads the workspace's projects too: `metadata` is
+ * the send's snapshot, and a project added mid-turn must count from the next hook call (Codex
+ * PRRT_kwDOPxxmWM6sGAw0). A workspace that is gone runs no hook.
+ */
+function isWorkspaceTrustedNow(config: Config, metadata: WorkspaceMetadata): boolean {
+  const current = config.findWorkspace(metadata.id);
+  if (current === null) return false;
+  const live =
+    current.projects !== undefined ? { ...metadata, projects: current.projects } : metadata;
+  return isWorkspaceTrustedForSharedExecution(live, config.loadConfigOrDefault().projects);
+}
+
 /** Shared lazy hook setup for ordinary request building and rollover admission. No model/tools. */
 export async function prepareWorkspaceRequestHooks(args: {
   config: Config;
@@ -41,8 +54,7 @@ export async function prepareWorkspaceRequestHooks(args: {
       // A function, not a value: the gate re-reads trust before every hook call. Every project of
       // the workspace must be trusted: hooks run MCP tools in the runtime they all share, the
       // rule for the repo's own tool hooks too (Codex PRRT_kwDOPxxmWM6r_vUC).
-      isProjectTrusted: () =>
-        isWorkspaceTrustedForSharedExecution(metadata, config.loadConfigOrDefault().projects),
+      isProjectTrusted: () => isWorkspaceTrustedNow(config, metadata),
       mcp: args.mcpServerManager,
       notifyUser: (pluginName, message) =>
         eventSpine.emit("plugin.hook.notice", { workspaceId: metadata.id, pluginName, message }),

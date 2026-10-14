@@ -2,14 +2,17 @@
 import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { McpAppFrame } from "@/browser/features/RightSidebar/ArtifactsTab/McpAppFrame";
+import { CONFIRM_ARM_DELAY_MS } from "@/browser/features/RightSidebar/ArtifactsTab/confirmArming";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import type { McpAppViewDomains } from "@/common/orpc/schemas/mcpApps";
+import { revokeMcpAppViewDomains } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore";
 import {
+  McpAppViewDomainsLoadError,
   McpAppViewDomainsSection,
   unlistedMcpAppViewDomains,
   useMcpAppViewDomains,
@@ -27,8 +30,16 @@ const VIEW = {
   failed: false,
 };
 
+const OTHER_ORIGIN = "https://other.example.com";
 let stored: McpAppViewDomains[] = [];
+// Backend commit revisions. Never reset: the approval store outlives a test and keeps the list
+// with the newest revision.
+let revision = Date.now() * 1000;
+// When set, approve calls wait until the test resolves them with a list and its revision.
+let approveDeferred: Array<(approvedDomains: string[], revision: number) => void> = [];
 let revokeFails: Error | null = null;
+// When set, the next listViewDomains call fails with it.
+let listFails: Error | null = null;
 let revoked: Array<{ projectPath: string; serverName: string }> = [];
 
 function api(): APIClient {
@@ -39,23 +50,35 @@ function api(): APIClient {
           success: true as const,
           data: {
             html: "<p>view</p>",
-            csp: { connectDomains: [API_ORIGIN] },
+            csp: { connectDomains: [API_ORIGIN, OTHER_ORIGIN] },
             prefersBorder: null,
             resultAvailable: true,
             result: { content: [] },
             invocation: { serverName: "charts", toolName: "show_chart", arguments: {} },
             approvedDomains: [API_ORIGIN],
             approvalProjectPath: "/repo",
+            // Read now, like the backend: newer than every list published so far.
+            approvedDomainsRevision: ++revision,
           },
         }),
-      listViewDomains: () => Promise.resolve(stored),
+      listViewDomains: () => {
+        const failure = listFails;
+        listFails = null;
+        return failure ? Promise.reject(failure) : Promise.resolve(stored);
+      },
+      approveViewDomains: () =>
+        new Promise((resolve) =>
+          approveDeferred.push((approvedDomains, committed) =>
+            resolve({ success: true as const, data: { approvedDomains, revision: committed } })
+          )
+        ),
       revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
         if (revokeFails) return Promise.reject(revokeFails);
         revoked.push(input);
         stored = stored.filter(
           (e) => e.projectPath !== input.projectPath || e.serverName !== input.serverName
         );
-        return Promise.resolve();
+        return Promise.resolve({ revision: ++revision });
       },
     },
   };
@@ -66,11 +89,14 @@ function api(): APIClient {
 function Approvals() {
   const viewDomains = useMcpAppViewDomains();
   return (
-    <McpAppViewDomainsSection
-      entries={viewDomains.entries}
-      onRevoke={(entry) => void viewDomains.revoke(entry)}
-      error={viewDomains.revokeError}
-    />
+    <>
+      <McpAppViewDomainsSection
+        entries={viewDomains.entries}
+        onRevoke={(entry) => void viewDomains.revoke(entry)}
+        error={viewDomains.revokeError}
+      />
+      <McpAppViewDomainsLoadError error={viewDomains.loadError} onRetry={viewDomains.retry} />
+    </>
   );
 }
 
@@ -92,7 +118,9 @@ describe("MCP Apps allowed view domains", () => {
     cleanupDom = installDom();
     stored = [{ projectPath: "/repo", serverName: "charts", origins: [API_ORIGIN] }];
     revokeFails = null;
+    listFails = null;
     revoked = [];
+    approveDeferred = [];
   });
   afterEach(() => {
     cleanup();
@@ -112,7 +140,37 @@ describe("MCP Apps allowed view domains", () => {
     await waitFor(async () => expect(await frameCsp(view)).not.toContain(API_ORIGIN));
     // The view asks again.
     expect(view.getByRole("button", { name: "Allow" })).toBeTruthy();
+    expect(view.getByRole("alert").textContent).toContain("api.example.com");
     expect(revoked).toEqual([{ projectPath: "/repo", serverName: "charts" }]);
+  });
+
+  test("an approval committed after a revoke still applies to the mounted view", async () => {
+    const view = renderWith(
+      <>
+        <McpAppFrame workspaceId="ws" view={VIEW} />
+        <Approvals />
+      </>
+    );
+    // The view asks for the origin that is not approved yet; the user allows it.
+    const allow = await view.findByRole("button", { name: "Allow" });
+    await waitFor(() => expect(allow.hasAttribute("disabled")).toBe(false), {
+      timeout: CONFIRM_ARM_DELAY_MS * 4,
+    });
+    fireEvent.pointerDown(allow);
+    fireEvent.click(allow);
+    await waitFor(() => expect(approveDeferred).toHaveLength(1));
+    // A revoke commits while the approval waits. The approval commits after it (a newer
+    // revision), so the stored list holds only the newly allowed origin.
+    fireEvent.click(await view.findByRole("button", { name: "Revoke" }));
+    await waitFor(async () => expect(await frameCsp(view)).not.toContain(API_ORIGIN));
+    await act(async () => {
+      approveDeferred[0]([OTHER_ORIGIN], ++revision);
+      await Promise.resolve();
+    });
+    await waitFor(async () =>
+      expect(await frameCsp(view)).toContain(`connect-src ${OTHER_ORIGIN}`)
+    );
+    expect(await frameCsp(view)).not.toContain(API_ORIGIN);
   });
 
   test("a failed revoke shows its error next to the entry and keeps it", async () => {
@@ -121,6 +179,33 @@ describe("MCP Apps allowed view domains", () => {
     fireEvent.click(await view.findByRole("button", { name: "Revoke" }));
     await view.findByText(/Could not revoke: config write failed/);
     expect(view.getByText(/api\.example\.com/)).toBeTruthy();
+  });
+
+  test("a failed load shows its error with a retry instead of an empty list", async () => {
+    listFails = new Error("backend busy");
+    const view = renderWith(<Approvals />);
+    await view.findByText(/Could not load allowed view domains: backend busy/);
+    fireEvent.click(view.getByRole("button", { name: "Retry" }));
+    await view.findByText(/api\.example\.com/);
+    expect(view.queryByText(/Could not load/)).toBeNull();
+  });
+
+  test("a revoke from outside Settings (the command palette) refreshes the list", async () => {
+    const client = api();
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <APIProvider client={client}>
+          <Approvals />
+        </APIProvider>
+      </ThemeProvider>
+    );
+    await view.findByText(/api\.example\.com/);
+    await act(async () => {
+      expect(
+        await revokeMcpAppViewDomains(client, { projectPath: "/repo", serverName: "charts" })
+      ).toBeNull();
+    });
+    await waitFor(() => expect(view.queryByText(/api\.example\.com/)).toBeNull());
   });
 
   test("a malformed stored origin renders as text instead of crashing Settings", async () => {

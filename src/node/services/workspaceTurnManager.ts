@@ -10,7 +10,7 @@ import {
 import assert from "node:assert/strict";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
-import { type Config } from "@/node/config";
+import { type Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { StreamManager } from "@/node/services/streamManager";
 import {
@@ -210,6 +210,12 @@ interface ResolvedWorkspaceLifecycleTarget {
   taskTitle?: string;
   workspaceId: string;
   metadata: WorkspaceMetadata | null;
+}
+
+type ExecutionMirror = Pick<WorkspaceConfigEntry, "taskExecutionId" | "taskExecutionStatus">;
+
+function sameExecutionMirror(a: ExecutionMirror, b: ExecutionMirror): boolean {
+  return a.taskExecutionId === b.taskExecutionId && a.taskExecutionStatus === b.taskExecutionStatus;
 }
 
 function parseTerminalSubagentExecutionVersion(content: string): string | null {
@@ -6062,15 +6068,7 @@ export class WorkspaceTurnManager {
             continue;
           }
         } else {
-          await this.taskHost.editWorkspaceEntry(
-            task.id,
-            (workspace) => {
-              workspace.taskExecutionId = normalized.handleId;
-              workspace.taskExecutionStatus = normalized.status;
-            },
-            { allowMissing: true }
-          );
-          await this.taskHost.emitWorkspaceMetadata(task.id);
+          await this.persistRecoveredTerminalExecutionMirror(task.id, task, normalized);
         }
         if (isActiveWorkspaceTurnTaskStatus(normalized.status)) {
           this.activeWorkspaceTurnHandleByWorkspaceId.set(task.id, {
@@ -6092,6 +6090,43 @@ export class WorkspaceTurnManager {
         });
       }
     }
+  }
+
+  /**
+   * Startup reconciliation's write for a terminal handle: a compare-and-set against the mirror
+   * the startup snapshot read. With many tasks the pass outlives the startup step bound, so it
+   * overlaps early clients: a parent can reawaken the child after the snapshot was read, and that
+   * reawakening's mirror (new handle, `running`) must win. Rewriting the stale terminal pointer
+   * over it made the live child read as idle-after-report, so its own task and workflow_run
+   * spawns were refused with "cannot spawn new tasks after agent_report".
+   */
+  private async persistRecoveredTerminalExecutionMirror(
+    workspaceId: string,
+    snapshot: ExecutionMirror,
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<void> {
+    assert(
+      !isActiveWorkspaceTurnTaskStatus(record.status),
+      "persistRecoveredTerminalExecutionMirror: record must be terminal"
+    );
+    const target: ExecutionMirror = {
+      taskExecutionId: record.handleId,
+      taskExecutionStatus: record.status,
+    };
+    // The snapshot already holds this outcome, so the compare-and-set below could only leave the
+    // row as it is. Skip the edit: each one rewrites the whole config file, and a large config has
+    // hundreds of settled mirrors (#6511).
+    if (sameExecutionMirror(snapshot, target)) return;
+    await this.taskHost.editWorkspaceEntry(
+      workspaceId,
+      (workspace) => {
+        if (!sameExecutionMirror(workspace, snapshot)) return;
+        workspace.taskExecutionId = target.taskExecutionId;
+        workspace.taskExecutionStatus = target.taskExecutionStatus;
+      },
+      { allowMissing: true }
+    );
+    await this.taskHost.emitWorkspaceMetadata(workspaceId);
   }
 
   /**

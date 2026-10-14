@@ -21,6 +21,9 @@
  *
  * The flexoki-light workspace story and the code stories' branch name check flexoki-light's
  * muted and secondary token, and the Models story checks light `--color-muted-light` (#5984).
+ *
+ * The accent-link stories check markdown links and the selected Settings section in all four
+ * themes, which use the text-only accent token (#5946 dark, #6449 light).
  */
 
 import { expect, userEvent, waitFor, within } from "@storybook/test";
@@ -686,3 +689,48 @@ const darkSecondaryStory = (theme: ThemeMode): AppStory => ({
 
 export const SecondaryTextDark = darkSecondaryStory("dark");
 export const SecondaryTextFlexokiDark = darkSecondaryStory("flexoki-dark");
+
+// ─── Accent text (#5946 dark, #6449 light) ───────────────────────────────────────────────────
+
+/** An assistant answer with markdown links on the main surface, then Settings. */
+function setupAccentLinkWorkspace() {
+  return setupSimpleChatStory({
+    workspaceId: "ws-dark-accent",
+    workspaceName: "feature/dark-accent",
+    projectName: "my-app",
+    messages: [
+      createUserMessage("u1", "Where is the setup guide?", {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP - 60_000,
+      }),
+      createAssistantMessage(
+        "a1",
+        "See the [setup guide](https://example.com/setup) and the [release notes](https://example.com/notes).",
+        { historySequence: 2, timestamp: STABLE_TIMESTAMP }
+      ),
+    ],
+  });
+}
+
+const accentLinkStory = (theme: ThemeMode): AppStory => ({
+  globals: { theme },
+  parameters: lightContract,
+  render: () => <AppWithMocks setup={setupAccentLinkWorkspace} />,
+  play: async ({ canvasElement }) => {
+    const links = await findTexts("markdown link", 2, () => [
+      ...canvasElement.querySelectorAll<HTMLElement>(".markdown-content a"),
+    ]);
+    // The selected Settings section is accent text on an accent tint: the lowest-contrast place
+    // it renders (light: 3.46:1 before #6449, flexoki-dark: 3.87:1 before #5946).
+    const dialog = await openSettingsDialog(canvasElement);
+    const section = await findTexts("selected Settings section", 1, () => [
+      within(dialog).getByRole("button", { name: "General" }),
+    ]);
+    await expectReadable([...links, ...section]);
+  },
+});
+
+export const AccentLinksLight = accentLinkStory("light");
+export const AccentLinksFlexokiLight = accentLinkStory("flexoki-light");
+export const AccentLinksDark = accentLinkStory("dark");
+export const AccentLinksFlexokiDark = accentLinkStory("flexoki-dark");

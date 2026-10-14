@@ -255,7 +255,7 @@ function ChangeList(props: {
         <ul className="mt-2 space-y-1.5">
           {props.changes.map((change) => (
             <li key={`${change.status}:${change.path}`} className="flex min-w-0 gap-2 text-xs">
-              <span className="text-accent w-5 shrink-0 font-mono">{change.status}</span>
+              <span className="text-accent-text w-5 shrink-0 font-mono">{change.status}</span>
               <span className="text-muted min-w-0 break-all">{change.path}</span>
             </li>
           ))}

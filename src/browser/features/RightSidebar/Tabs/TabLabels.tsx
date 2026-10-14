@@ -248,7 +248,7 @@ export const WorkflowsTabLabel: React.FC<WorkflowsTabLabelProps> = ({ workspaceI
       Workflows
       {activeCount > 0 && (
         <span
-          className="text-accent inline-flex items-center gap-1 text-[10px] tabular-nums"
+          className="text-accent-text inline-flex items-center gap-1 text-[10px] tabular-nums"
           aria-label={`${activeCount} running workflow${activeCount === 1 ? "" : "s"}`}
         >
           <span className="bg-accent inline-block h-[6px] w-[6px] animate-pulse rounded-full motion-reduce:animate-none" />

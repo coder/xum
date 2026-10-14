@@ -285,7 +285,11 @@ jobs:
         continue-on-error: true
         with:
           name: crap-lcov-unit-${{ matrix.shard }}
-          path: coverage/**/lcov.info
+          # ran-without-coverage.txt marks a run that fell back to no coverage
+          # (scripts/test-unit-ci.sh); Quality / CRAP then only warns on coverage.
+          path: |
+            coverage/**/lcov.info
+            coverage/**/ran-without-coverage.txt
           if-no-files-found: ignore
           retention-days: 3
       - uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
@@ -383,16 +387,30 @@ jobs:
 
   crap:
     name: Quality / CRAP
-    # Informational: not in Required, and scripts/crap/ci.ts always exits 0. A
-    # skipped or failed test shard leaves no report, which the summary shows as
-    # partial coverage.
+    # The repo variable CRAP_MODE picks the mode. Unset or anything but "block"
+    # is warn mode: informational, scripts/crap/ci.ts exits 0 and Required
+    # ignores this job. With "block", ci.ts exits 1 on remaining violations and
+    # Required fails with it; a skipped run (merge_group, push) counts as a pass.
+    # A skipped or failed test shard leaves no report: the summary shows partial
+    # coverage and coverage-based findings only warn. A tool error never
+    # blocks: every step is soft and time-boxed (the step timeouts sum to less
+    # than the job's), and only the Verdict step fails the job, when the
+    # finished report has violations in block mode.
+    # ROLLBACK: set the CRAP_MODE repo variable back to "warn" (Settings ->
+    # Secrets and variables -> Actions -> Variables). No code change.
     needs: [changes, test-unit, test-integration]
     if: ${{ !cancelled() && github.event_name == 'pull_request' }}
-    continue-on-error: true
-    timeout-minutes: 10
+    continue-on-error: ${{ vars.CRAP_MODE != 'block' }}
+    timeout-minutes: 20
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Read the PR's current labels (CRAP report step).
+      pull-requests: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        continue-on-error: true
+        timeout-minutes: 3
         with:
           persist-credentials: false
       # Compare against the merge commit's first parent: the base GitHub built
@@ -404,31 +422,70 @@ jobs:
       # escape hatch (trailers are for the local hook).
       - name: Fetch the merge base
         id: base
+        continue-on-error: true
+        timeout-minutes: 2
         run: |
           set -euo pipefail
           sha=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)
           git fetch --no-tags --depth=1 origin "$sha"
           echo "sha=$sha" >>"$GITHUB_OUTPUT"
+      # Setup failures must not block: without bun the report step skips, and
+      # without uv check.ts reports a tool error.
       - uses: oven-sh/setup-bun@b7a1c7ccf290d58743029c4f6903da283811b979 # v2.1.0
+        continue-on-error: true
+        timeout-minutes: 2
         with:
           bun-version: 1.4.3
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        continue-on-error: true
+        timeout-minutes: 2
         with:
           enable-cache: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         continue-on-error: true
+        timeout-minutes: 3
         with:
           pattern: crap-lcov-*
           path: coverage-shards
+      # ci.ts writes verdict=violations only for a finished report with
+      # violations in block mode. A crash or a timeout here leaves no verdict.
       - name: CRAP report
+        id: report
+        continue-on-error: true
+        timeout-minutes: 6
         env:
           BASE_REF: ${{ steps.base.outputs.sha }}
           LCOV_DIR: coverage-shards
           # Shard counts of the test-unit and test-integration matrices above.
           EXPECTED_UNIT: "6"
           EXPECTED_INTEGRATION: "3"
-          CRAP_DEBT_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'crap-debt') }}
-        run: bun scripts/crap/ci.ts
+          # Integration shards skip their tests without backend or browser changes.
+          INTEGRATION_RAN: ${{ needs.changes.outputs.backend == 'true' || needs.changes.outputs.browser == 'true' }}
+          CRAP_MODE: ${{ vars.CRAP_MODE }}
+          # A re-run reuses the original event payload, so read the label live:
+          # crap-debt-label.yml re-runs this job when crap-debt is added or
+          # removed. If the API call fails, fall back to the payload's labels.
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_DEBT_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'crap-debt') }}
+        run: |
+          if ! command -v bun >/dev/null; then
+            echo "::warning title=CRAP::bun setup failed, so no CRAP report"
+            exit 0
+          fi
+          CRAP_DEBT_LABEL=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq 'any(.labels[]; .name == "crap-debt")') ||
+            CRAP_DEBT_LABEL=$EVENT_DEBT_LABEL
+          export CRAP_DEBT_LABEL
+          bun scripts/crap/ci.ts
+      - name: Verdict
+        if: ${{ always() }}
+        env:
+          VERDICT: ${{ steps.report.outputs.verdict }}
+        run: |
+          if [[ "$VERDICT" == "violations" ]]; then
+            echo "❌ CRAP violations (block mode): see the CRAP report step"
+            exit 1
+          fi
 
   test-storybook:
     name: Test / Storybook
@@ -544,8 +601,15 @@ jobs:
     name: Test / Bug-bash sandbox
     needs: [changes]
     if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
-    timeout-minutes: 30
+    # 45, not 30: a stale image key adds a local image build of up to 25 minutes (below).
+    timeout-minutes: 45
     runs-on: ${{ needs.changes.outputs.linux-runner }}
+    # Stale-key local build: only main publishes the image, so a PR that changes its inputs (Dockerfile, build.sh,
+    # playwright-core) has a stale image.json. With this opt-in the launcher then builds the image
+    # locally with build.sh, for these two jobs only, and prints a warning. Model-driven runs
+    # (make bug-bash, make mcp-apps-e2e) ignore it and keep the pinned digest.
+    env:
+      BUGBASH_SANDBOX_BUILD_STALE: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -866,19 +930,32 @@ jobs:
       - build-windows
       - build-vscode
       - codex-comments
+      # Counts only in CRAP block mode (vars.CRAP_MODE == 'block'); see the crap job.
+      - crap
     runs-on: ubuntu-latest
     # superseded: read this workflow's runs/jobs and check out the decision script.
     permissions:
       actions: read
       contents: read
     steps:
+      # The job results Required judges. In CRAP warn mode (vars.CRAP_MODE is
+      # not "block") Quality / CRAP never decides Required, so its result is
+      # dropped here, and every later step reads this list.
+      - id: results
+        env:
+          CRAP_MODE: ${{ vars.CRAP_MODE }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          # shellcheck disable=SC2016 # $mode is a jq variable, not a shell one.
+          filter='to_entries[] | select(.key != "crap" or $mode == "block") | .value.result'
+          echo "list=$(jq -r --arg mode "$CRAP_MODE" "$filter" <<<"$NEEDS_JSON" | paste -sd ' ' -)" >>"$GITHUB_OUTPUT"
       # A cancelled duplicate run must not leave a red Required when another run for
       # this PR will publish one (#4547). The script stands down only with proof and
       # fails closed otherwise; see its header for the rules.
       - if: >-
           github.event_name == 'pull_request' &&
-          contains(join(needs.*.result, ' '), 'cancelled') &&
-          !contains(join(needs.*.result, ' '), 'failure')
+          contains(steps.results.outputs.list, 'cancelled') &&
+          !contains(steps.results.outputs.list, 'failure')
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
@@ -887,8 +964,8 @@ jobs:
       - id: superseded
         if: >-
           github.event_name == 'pull_request' &&
-          contains(join(needs.*.result, ' '), 'cancelled') &&
-          !contains(join(needs.*.result, ' '), 'failure')
+          contains(steps.results.outputs.list, 'cancelled') &&
+          !contains(steps.results.outputs.list, 'failure')
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -899,7 +976,7 @@ jobs:
             echo "value=true" >>"$GITHUB_OUTPUT"
           fi
       - env:
-          RESULTS: ${{ join(needs.*.result, ' ') }}
+          RESULTS: ${{ steps.results.outputs.list }}
           SUPERSEDED: ${{ steps.superseded.outputs.value }}
         run: |
           echo "Job results: $RESULTS"

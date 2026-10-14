@@ -735,3 +735,69 @@ export const HooksReviewTruncatedInputPhoneViewport: Story = {
     }
   },
 };
+
+/** 48x48 dark disc: the light-theme logo, unreadable on a dark background. */
+const DARK_DISC_LOGO =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAh0lEQVR42u3ZwQ3AIAwEQcpASv91XkqIFLA5m31sAfNC+Macz6jcAADAD6CP7ABa7BhAm0sFKKhwgJIKASi5rQAdagtAh7sbIJN+AWTWXQCZBgBABkDmAQAAAACAWAAvMQAA/Mg8AOU/9dyFXADlT4stjrstzustBo42E1OLka/NzMpSD6ByL24kjnoh5of0AAAAAElFTkSuQmCC";
+/** 48x48 light disc: the dark-theme variant (OpenAI `logoDark`). */
+const LIGHT_DISC_LOGO =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAhklEQVR42u3ZsRHAIAwEQfqvF8fvEjxjkHiJC66AjRj0Y85nVG4AAOAH0Ed2AC12DKDNpQIUVDhASYUAlNxWgA61BaDD3Q2QSb8AMusugEwDACADIPMAAAAAAEAsgJcYAAB+ZB6A8p967kIugPKnxRbH3Rbn9RYDR5uJqcXI12ZmZakHULkXyaGx0xu95bMAAAAASUVORK5CYII=";
+
+/** Two rows: one with both logos, one with only the light logo (its dark read failed). */
+const THEMED_LOGO_ITEMS: AgentPluginListItem[] = [
+  {
+    ...MANAGED_ITEM,
+    interface: {
+      ...OPENAI_INTERFACE,
+      logoDataUrl: DARK_DISC_LOGO,
+      logoDarkDataUrl: LIGHT_DISC_LOGO,
+    },
+  },
+  {
+    ...UNMANAGED_ITEM,
+    interface: { ...OPENAI_INTERFACE, displayName: "Light only", logoDataUrl: DARK_DISC_LOGO },
+  },
+];
+
+const ThemedLogoStory: FC = () => (
+  <PluginsSectionStoryShell options={{ agentPlugins: { items: THEMED_LOGO_ITEMS } }}>
+    <PluginsSettingsSection />
+  </PluginsSectionStoryShell>
+);
+
+/** The logo `src` of each interface row, in list order. */
+async function themedLogoSources(canvasElement: HTMLElement): Promise<Array<string | null>> {
+  const canvas = within(canvasElement);
+  await canvas.findByText("Light only");
+  return Array.from(
+    canvasElement.querySelectorAll("[data-testid='plugin-interface']"),
+    (details) => details.querySelector("img")?.getAttribute("src") ?? null
+  );
+}
+
+/** Dark theme: the dark variant shows; a row without one keeps its light logo. */
+export const ThemedLogoDark: Story = {
+  globals: { theme: "dark" },
+  // Behavioral contract only: the Pixel budget has no headroom (see HooksReview).
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <ThemedLogoStory />,
+  play: async ({ canvasElement }) => {
+    const sources = await themedLogoSources(canvasElement);
+    if (sources[0] !== LIGHT_DISC_LOGO) throw new Error("Dark theme must show the dark logo");
+    if (sources[1] !== DARK_DISC_LOGO)
+      throw new Error("A missing dark logo falls back to the light one");
+  },
+};
+
+/** Light theme: every row shows its light logo. */
+export const ThemedLogoLight: Story = {
+  globals: { theme: "light" },
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <ThemedLogoStory />,
+  play: async ({ canvasElement }) => {
+    const sources = await themedLogoSources(canvasElement);
+    if (sources.some((source) => source !== DARK_DISC_LOGO)) {
+      throw new Error("Light theme must show the light logo");
+    }
+  },
+};

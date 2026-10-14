@@ -12,6 +12,8 @@ import {
   XCircle,
 } from "lucide-react";
 import { useAPI } from "@/browser/contexts/API";
+import { useTheme } from "@/browser/contexts/ThemeContext";
+import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { Button } from "@/browser/components/Button/Button";
 import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { cn } from "@/common/lib/utils";
@@ -70,7 +72,7 @@ const Badge: React.FC<{
       "rounded px-1.5 py-0.5 text-[10px] font-medium",
       props.wrap === true ? "max-w-full wrap-anywhere" : "whitespace-nowrap",
       props.tone === "muted" && "bg-foreground/10 text-muted",
-      props.tone === "accent" && "bg-accent/15 text-accent",
+      props.tone === "accent" && "bg-accent/15 text-accent-text",
       props.tone === "warning" && "bg-warning/15 text-warning",
       props.tone === "error" && "bg-destructive/15 text-destructive"
     )}
@@ -78,6 +80,23 @@ const Badge: React.FC<{
     {props.children}
   </span>
 );
+
+/**
+ * The interface logo for the current theme. A light logo can vanish on a dark
+ * background (#6124), so dark themes use OpenAI's dark variant. Each theme
+ * falls back to the other image when its own is missing or failed to read:
+ * some logo beats none, as before.
+ */
+const PluginLogo: React.FC<{
+  info: Pick<AgentPluginInterfaceSummary, "logoDataUrl" | "logoDarkDataUrl">;
+}> = (props) => {
+  const isLight = isLightThemeMode(useTheme().theme);
+  const logo = isLight
+    ? (props.info.logoDataUrl ?? props.info.logoDarkDataUrl)
+    : (props.info.logoDarkDataUrl ?? props.info.logoDataUrl);
+  if (logo?.startsWith("data:image/") !== true) return null;
+  return <img src={logo} alt="" className="size-8 shrink-0 rounded" />;
+};
 
 /**
  * OpenAI `interface` metadata. Every manifest string renders as React text
@@ -95,9 +114,7 @@ const PluginInterfaceDetails: React.FC<{ info: AgentPluginInterfaceSummary }> = 
   const httpsLinks = links.filter((link) => link.url?.startsWith("https://") === true);
   return (
     <div className="mt-1 flex min-w-0 items-start gap-2" data-testid="plugin-interface">
-      {props.info.logoDataUrl?.startsWith("data:image/") && (
-        <img src={props.info.logoDataUrl} alt="" className="size-8 shrink-0 rounded" />
-      )}
+      <PluginLogo info={props.info} />
       <div className="min-w-0 space-y-0.5">
         <p className="text-foreground text-xs break-words">
           <span className="font-medium">{props.info.displayName}</span>
@@ -405,7 +422,7 @@ const ManageComponentsPanel: React.FC<{
         </p>
       )}
       {saved && (
-        <p role="status" className="text-accent text-xs">
+        <p role="status" className="text-accent-text text-xs">
           Component selection saved.
         </p>
       )}
@@ -618,7 +635,7 @@ const AddPluginPanel: React.FC<{
                 phone widths. */}
             <p className="text-muted text-[11px] break-all">
               {preview.source.url} @ {preview.source.ref} →{" "}
-              <code className="text-accent">{preview.targetPath}</code>
+              <code className="text-accent-text">{preview.targetPath}</code>
               {preview.manifest.authorName ? ` · by ${preview.manifest.authorName}` : ""}
               {preview.manifest.license ? ` · ${preview.manifest.license}` : ""}
             </p>
@@ -1135,7 +1152,7 @@ export const PluginsSettingsSection: React.FC = () => {
         <p className="text-muted mb-4 text-xs">
           Install Agent Plugins from git repositories into{" "}
           {containerLocation !== null ? (
-            <code className="text-accent">{containerLocation}</code>
+            <code className="text-accent-text">{containerLocation}</code>
           ) : (
             "the managed plugins directory"
           )}
@@ -1186,7 +1203,7 @@ export const PluginsSettingsSection: React.FC = () => {
         )}
 
         {installSucceeded && (
-          <p role="status" className="text-accent mb-3 text-xs">
+          <p role="status" className="text-accent-text mb-3 text-xs">
             Plugin installed.
           </p>
         )}

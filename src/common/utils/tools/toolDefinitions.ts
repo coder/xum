@@ -47,7 +47,11 @@ import {
 import { ArtifactKindSchema } from "@/common/orpc/schemas/artifacts";
 import { z } from "zod";
 import { AgentIdSchema } from "@/common/schemas/ids";
-import { AgentSkillPackageSchema, SkillNameSchema } from "@/common/orpc/schemas/agentSkill";
+import {
+  AgentSkillPackageSchema,
+  SkillLookupNameSchema,
+  SkillNameSchema,
+} from "@/common/orpc/schemas/agentSkill";
 import {
   BestOfGroupSchema,
   WorkspaceHeartbeatSettingsSchema,
@@ -1758,6 +1762,10 @@ export const AgentReportToolResultSchema = z.discriminatedUnion("success", [
 ]);
 const FILE_TOOL_PATH = z.string().describe("File path (absolute or workspace-relative)");
 const SKILL_NAME_PARAM = SkillNameSchema.describe("Skill directory name");
+// Read tools only: writes and deletes keep the bare SKILL_NAME_PARAM.
+const SKILL_LOOKUP_NAME_PARAM = SkillLookupNameSchema.describe(
+  "Skill name, or <plugin>:<skill> for a plugin's skill"
+);
 const FILE_LINE_RANGE_FIELDS = {
   offset: z.number().int().positive().nullish().describe("1-based start line (default 1)"),
   limit: z.number().int().positive().nullish().describe("Max lines from offset (default all)"),
@@ -2801,7 +2809,7 @@ export const TOOL_DEFINITIONS = {
       "Load a skill's SKILL.md (frontmatter + body) by name; read its other files with agent_skill_read_file. skillDir in the result is the skill's absolute directory where bash runs (relative paths in the skill resolve against it); if absent, skillDirUnavailable says why.",
     schema: z
       .object({
-        name: SKILL_NAME_PARAM,
+        name: SKILL_LOOKUP_NAME_PARAM,
       })
       .strict(),
   },
@@ -2810,7 +2818,7 @@ export const TOOL_DEFINITIONS = {
     description: "Read a file in a skill directory, like file_read.",
     schema: z
       .object({
-        name: SKILL_NAME_PARAM,
+        name: SKILL_LOOKUP_NAME_PARAM,
         filePath: z
           .string()
           .min(1)

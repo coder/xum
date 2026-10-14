@@ -240,6 +240,10 @@
     --color-accent-button-hover: var(--color-accent-dark);
     --color-accent-darker: hsl(202 100% 23%); /* #094771 - even darker accent */
     --color-accent-light: hsl(198 100% 65%); /* #4db8ff - lighter accent */
+    /* Accent as a text color (links, accent labels). --color-accent stays the button fill and focus
+       ring: white text on it needs that darker blue. This one reaches WCAG AA (4.5:1) on every dark
+       surface, down to the modal background #2e2e2e (4.51:1); #0070cc was 3.36:1 on dialogs (#5946). */
+    --color-accent-text: #1a98ff;
     --color-accent-foreground: hsl(0 0% 100%); /* readable text/icons on accent surfaces */
 
     --color-success: hsl(122 39% 49%); /* #4caf50 - success green */
