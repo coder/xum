@@ -79,6 +79,7 @@ import {
   McpAppApproveDomainsRequestSchema,
   McpAppEntrypointSchema,
   McpAppModelContextRequestSchema,
+  McpAppWidgetStateRequestSchema,
   McpAppOpenEntrypointRequestSchema,
   McpAppViewDomainsSchema,
   McpAppResourceReadRequestSchema,
@@ -1564,6 +1565,11 @@ export const mcpApps = {
   /** ui/update-model-context of a view; used by the workspace's next requests. */
   updateModelContext: {
     input: McpAppModelContextRequestSchema,
+    output: ResultSchema(z.object({}), z.string()),
+  },
+  /** window.openai.setWidgetState of a view; kept in its result record (#6178). */
+  setWidgetState: {
+    input: McpAppWidgetStateRequestSchema,
     output: ResultSchema(z.object({}), z.string()),
   },
   /** Entry points of the servers enabled in the workspace (starts them like prompt discovery). */

@@ -19,6 +19,7 @@ import {
   type McpAppsContext,
   readMcpAppServerResource,
   revokeMcpAppViewDomains,
+  setMcpAppWidgetState,
   updateMcpAppModelContext,
 } from "./mcpAppsOperations";
 
@@ -125,6 +126,46 @@ describe("getMcpAppView", () => {
     if (!result.success) throw new Error(result.error);
     expect(result.data.invocation).toBeNull();
     expect(result.data.resultAvailable).toBe(false);
+  });
+});
+
+describe("MCP App widget state", () => {
+  test("a view reads back the state its own record holds, with the record's binding", async () => {
+    const { ctx } = context({ ...RECORD, widgetState: { step: 2 } });
+    const result = await getMcpAppView(ctx, request(), undefined, noWarm);
+    if (!result.success) throw new Error(result.error);
+    expect(result.data.widgetState).toEqual({ step: 2 });
+    expect(result.data.widgetStateBinding).toBe(RECORD.createdAt);
+    // Without a record there is no instance to keep state for.
+    const none = await getMcpAppView(context(null).ctx, request(), undefined, noWarm);
+    expect(none.success && [none.data.widgetState, none.data.widgetStateBinding]).toEqual([
+      null,
+      null,
+    ]);
+  });
+
+  test("a write goes to the record's store binding; another server is refused", async () => {
+    const writes: unknown[] = [];
+    const { ctx } = context(RECORD);
+    (ctx.mcpServerManager as unknown as Record<string, unknown>).setMcpAppWidgetState = (
+      ...args: unknown[]
+    ) => {
+      writes.push(args);
+      return Promise.resolve();
+    };
+    const write = { workspaceId: "ws", toolCallId: "call-1", binding: 1, state: { a: 1 } };
+    expect(await setMcpAppWidgetState(ctx, { ...write, serverName: "charts" })).toEqual({
+      success: true,
+      data: {},
+    });
+    expect(writes).toEqual([["ws", "call-1", 1, { a: 1 }]]);
+    expect((await setMcpAppWidgetState(ctx, { ...write, serverName: "other" })).success).toBe(
+      false
+    );
+    expect(
+      (await setMcpAppWidgetState(context(null).ctx, { ...write, serverName: "charts" })).success
+    ).toBe(false);
+    expect(writes).toHaveLength(1);
   });
 });
 

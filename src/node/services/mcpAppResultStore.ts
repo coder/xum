@@ -3,7 +3,11 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
 import assert from "@/common/utils/assert";
-import { isMcpAppResourceUri, MCP_APP_MODEL_CONTEXT_MAX_BYTES } from "@/common/utils/mcpApps";
+import {
+  isMcpAppResourceUri,
+  MCP_APP_MODEL_CONTEXT_MAX_BYTES,
+  MCP_APP_WIDGET_STATE_MAX_BYTES,
+} from "@/common/utils/mcpApps";
 import { log } from "@/node/services/log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
@@ -52,6 +56,13 @@ const McpAppResultRecordSchema = z.object({
    * (#6181). Absent on a completed call and on records written before this field.
    */
   outcome: z.enum(["failed", "interrupted"]).optional(),
+  /**
+   * The view's window.openai widget state (setWidgetState), JSON of at most
+   * MCP_APP_WIDGET_STATE_MAX_BYTES. Kept in the record so it belongs to this one view instance:
+   * a new record under a reused tool call ID starts without it, and pruning the record or
+   * removing the workspace removes it (#6178).
+   */
+  widgetState: z.unknown().optional(),
 });
 export type McpAppResultRecord = z.infer<typeof McpAppResultRecordSchema>;
 
@@ -175,22 +186,73 @@ export class McpAppResultStore {
     });
   }
 
-  async get(workspaceId: string, toolCallId: string): Promise<McpAppResultRecord | null> {
-    const cached = this.memory.get(`${workspaceId}\0${toolCallId}`);
-    if (cached) return cached;
+  /**
+   * Store the widget state of the view of record `toolCallId` written at `recordCreatedAt`; null
+   * clears it. Throws when that record is gone (pruned, removed, or replaced by a new record under
+   * a reused tool call ID), so a late write of an old view never reaches the new one, and when the
+   * state is over MCP_APP_WIDGET_STATE_MAX_BYTES.
+   *
+   * The read-modify-write holds the session dir's target lock, like writeRecord, so a new record
+   * for the same ID and this write cannot interleave, and a removed workspace is refused. It reads
+   * the record from disk inside the lock: another backend may have replaced it.
+   */
+  async setWidgetState(
+    workspaceId: string,
+    toolCallId: string,
+    recordCreatedAt: number,
+    state: unknown
+  ): Promise<void> {
+    const stateJson = state === null ? null : JSON.stringify(state);
+    if (stateJson === undefined) throw new Error("The widget state is not JSON");
+    if (stateJson !== null && Buffer.byteLength(stateJson, "utf8") > MCP_APP_WIDGET_STATE_MAX_BYTES)
+      throw new Error("The widget state is too large");
+    const dir = this.dirFor(workspaceId);
+    const filePath = path.join(dir, fileNameFor(toolCallId));
+    const updated = await withTargetMutationLock(this.rootDir, path.dirname(dir), async () => {
+      if (this.rootDir !== null && (await isWorkspaceRemovalTombstoned(this.rootDir, workspaceId)))
+        throw new Error(`Widget state refused: workspace ${workspaceId} was removed`);
+      const record = await this.readRecord(filePath, toolCallId);
+      if (record?.createdAt !== recordCreatedAt) {
+        throw new Error("Widget state refused: the view's result record is gone");
+      }
+      const { widgetState: _previous, ...rest } = record;
+      // Parsed back from its JSON, so memory holds exactly what the file holds.
+      const next: McpAppResultRecord =
+        stateJson === null ? rest : { ...rest, widgetState: JSON.parse(stateJson) as unknown };
+      await writeFileAtomic(filePath, JSON.stringify(next));
+      return next;
+    });
+    this.remember(workspaceId, updated);
+  }
+
+  /** A record file, or null when it is missing, corrupt or another tool call's. */
+  private async readRecord(
+    filePath: string,
+    toolCallId: string
+  ): Promise<McpAppResultRecord | null> {
     try {
-      const raw = await fs.readFile(
-        path.join(this.dirFor(workspaceId), fileNameFor(toolCallId)),
-        "utf8"
+      const parsed = McpAppResultRecordSchema.safeParse(
+        JSON.parse(await fs.readFile(filePath, "utf8"))
       );
-      const parsed = McpAppResultRecordSchema.safeParse(JSON.parse(raw));
-      // A corrupt or foreign record reads as missing (self-healing), never as an error.
-      if (!parsed.success || parsed.data.toolCallId !== toolCallId) return null;
-      this.remember(workspaceId, parsed.data);
-      return parsed.data;
+      return parsed.success && parsed.data.toolCallId === toolCallId ? parsed.data : null;
     } catch {
       return null;
     }
+  }
+
+  async get(workspaceId: string, toolCallId: string): Promise<McpAppResultRecord | null> {
+    const cached = this.memory.get(`${workspaceId}\0${toolCallId}`);
+    if (cached) return cached;
+    let filePath: string;
+    try {
+      filePath = path.join(this.dirFor(workspaceId), fileNameFor(toolCallId));
+    } catch {
+      return null;
+    }
+    // A corrupt or foreign record reads as missing (self-healing), never as an error.
+    const record = await this.readRecord(filePath, toolCallId);
+    if (record) this.remember(workspaceId, record);
+    return record;
   }
 
   /**

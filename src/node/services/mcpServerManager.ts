@@ -5177,6 +5177,17 @@ export class MCPServerManager {
     });
   }
 
+  /** window.openai widget state of the view of a result record; see McpAppResultStore. */
+  async setMcpAppWidgetState(
+    workspaceId: string,
+    toolCallId: string,
+    binding: number,
+    state: unknown
+  ): Promise<void> {
+    assert(this.mcpApps, "MCP Apps support is not configured");
+    await this.mcpApps.store.setWidgetState(workspaceId, toolCallId, binding, state);
+  }
+
   /** The views' latest model context, newest first; none while MCP Apps is off. */
   async getMcpAppModelContexts(workspaceId: string): Promise<readonly McpAppModelContext[]> {
     if (this.mcpApps?.isEnabled() !== true) return [];

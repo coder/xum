@@ -58,6 +58,7 @@ import {
   getMcpAppView,
   getMcpAppViewRecords,
   readMcpAppServerResource,
+  setMcpAppWidgetState,
   updateMcpAppModelContext,
   approveMcpAppViewDomains,
   listMcpAppViewDomains,
@@ -1822,6 +1823,10 @@ export const router = (authToken?: string) => {
         .input(schemas.mcpApps.updateModelContext.input)
         .output(schemas.mcpApps.updateModelContext.output)
         .handler(({ context, input }) => updateMcpAppModelContext(context, input)),
+      setWidgetState: t
+        .input(schemas.mcpApps.setWidgetState.input)
+        .output(schemas.mcpApps.setWidgetState.output)
+        .handler(({ context, input }) => setMcpAppWidgetState(context, input)),
       approveViewDomains: t
         .input(schemas.mcpApps.approveViewDomains.input)
         .output(schemas.mcpApps.approveViewDomains.output)

@@ -3,7 +3,10 @@ import { createHash } from "node:crypto";
 import fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { MCP_APP_MODEL_CONTEXT_MAX_BYTES } from "@/common/utils/mcpApps";
+import {
+  MCP_APP_MODEL_CONTEXT_MAX_BYTES,
+  MCP_APP_WIDGET_STATE_MAX_BYTES,
+} from "@/common/utils/mcpApps";
 import {
   formatMcpAppModelContextSection,
   MCP_APP_MODEL_CONTEXT_FILE,
@@ -306,5 +309,81 @@ describe("McpAppResultStore model context", () => {
       const texts = (await store.getModelContexts("ws")).map((v) => v.text).sort();
       expect(texts).toEqual(["from first", "from second"]);
     }
+  });
+});
+
+describe("McpAppResultStore widget state", () => {
+  /** Whether a write was refused (threw). */
+  const refused = async (write: Promise<void>) => {
+    try {
+      await write;
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  const sessionDirIn = (tmp: DisposableTempDir) => (id: string) => path.join(tmp.path, id);
+
+  test("a view's state is kept with its record and survives a restart", async () => {
+    using tmp = new DisposableTempDir("mcp-app-widget-state");
+    const store = new McpAppResultStore(sessionDirIn(tmp));
+    await store.record("ws", entry("c1"));
+    const record = await store.get("ws", "c1");
+    if (!record) throw new Error("expected the record");
+    await store.setWidgetState("ws", "c1", record.createdAt, { step: 2 });
+    expect((await store.get("ws", "c1"))?.widgetState).toEqual({ step: 2 });
+    // A new store reads the state from disk, like a restarted backend.
+    expect((await new McpAppResultStore(sessionDirIn(tmp)).get("ws", "c1"))?.widgetState).toEqual({
+      step: 2,
+    });
+    // null clears it.
+    await store.setWidgetState("ws", "c1", record.createdAt, null);
+    expect((await store.get("ws", "c1"))?.widgetState).toBeUndefined();
+  });
+
+  test("a new record under a reused tool call ID neither sees nor accepts the old state", async () => {
+    using tmp = new DisposableTempDir("mcp-app-widget-state");
+    const store = new McpAppResultStore(sessionDirIn(tmp));
+    await store.record("ws", entry("c1"));
+    const first = await store.get("ws", "c1");
+    if (!first) throw new Error("expected the record");
+    await store.setWidgetState("ws", "c1", first.createdAt, { secret: true });
+    await Bun.sleep(2);
+    // A later stream reuses the ID for another server's view.
+    await store.record("ws", { ...entry("c1"), serverName: "other" });
+    const second = await new McpAppResultStore(sessionDirIn(tmp)).get("ws", "c1");
+    expect(second?.widgetState).toBeUndefined();
+    // A late write from the old view is refused: its record is gone.
+    expect(await refused(store.setWidgetState("ws", "c1", first.createdAt, { secret: true }))).toBe(
+      true
+    );
+    expect((await store.get("ws", "c1"))?.widgetState).toBeUndefined();
+  });
+
+  test("refuses state over the cap, and a missing record", async () => {
+    using tmp = new DisposableTempDir("mcp-app-widget-state");
+    const store = new McpAppResultStore(sessionDirIn(tmp));
+    await store.record("ws", entry("c1"));
+    const record = await store.get("ws", "c1");
+    if (!record) throw new Error("expected the record");
+    const big = { text: "x".repeat(MCP_APP_WIDGET_STATE_MAX_BYTES) };
+    expect(await refused(store.setWidgetState("ws", "c1", record.createdAt, big))).toBe(true);
+    expect(await refused(store.setWidgetState("ws", "missing", record.createdAt, {}))).toBe(true);
+    expect((await store.get("ws", "c1"))?.widgetState).toBeUndefined();
+  });
+
+  test("pruning the record removes its state", async () => {
+    using tmp = new DisposableTempDir("mcp-app-widget-state");
+    const store = new McpAppResultStore(sessionDirIn(tmp));
+    await store.record("ws", entry("old"));
+    const old = await store.get("ws", "old");
+    if (!old) throw new Error("expected the record");
+    await store.setWidgetState("ws", "old", old.createdAt, { kept: false });
+    const dir = path.join(tmp.path, "ws", MCP_APP_RESULT_DIR);
+    // Make the record the oldest file, then push it past the cap.
+    for (const name of await fs.readdir(dir)) await fs.utimes(path.join(dir, name), 1, 1);
+    for (let i = 0; i < MCP_APP_RESULT_MAX_PER_WORKSPACE; i++)
+      await store.record("ws", entry(`n${i}`));
+    expect(await new McpAppResultStore(sessionDirIn(tmp)).get("ws", "old")).toBeNull();
   });
 });

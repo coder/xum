@@ -12,6 +12,7 @@ import type {
   McpAppEntrypoint,
   McpAppOpenEntrypointRequestSchema,
   McpAppModelContextRequestSchema,
+  McpAppWidgetStateRequestSchema,
   McpAppResourceReadRequestSchema,
   McpAppToolCallRequestSchema,
   McpAppToolCallResult,
@@ -198,6 +199,8 @@ export async function getMcpAppView(
         approvedDomainsRevision: committedViewDomainsRevision,
         approvedDomains: approvedDomainsIn(context, approvalProjectPath, boundServerName),
         approvalProjectPath,
+        widgetState: record?.widgetState ?? null,
+        widgetStateBinding: record?.createdAt ?? null,
         invocation:
           record !== null
             ? {
@@ -372,6 +375,39 @@ export async function updateMcpAppModelContext(
   }
   try {
     await context.mcpServerManager.setMcpAppModelContext(input.workspaceId, record, input.text);
+    return { success: true, data: {} };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+/**
+ * window.openai.setWidgetState of a view. Like updateMcpAppModelContext, the view's result record
+ * binds the server, and the store refuses a write whose binding is not the current record's.
+ */
+export async function setMcpAppWidgetState(
+  context: McpAppsContext,
+  input: z.infer<typeof McpAppWidgetStateRequestSchema>
+): Promise<Result<Record<string, never>, string>> {
+  assertMcpAppsEnabled(context);
+  const record = await context.mcpServerManager.getMcpAppResult(
+    input.workspaceId,
+    input.toolCallId
+  );
+  if (
+    record === null ||
+    (input.serverName !== record.serverName &&
+      input.serverName !== displayConnectionKey(record.serverName))
+  ) {
+    return { success: false, error: "This view cannot store widget state" };
+  }
+  try {
+    await context.mcpServerManager.setMcpAppWidgetState(
+      input.workspaceId,
+      input.toolCallId,
+      input.binding,
+      input.state
+    );
     return { success: true, data: {} };
   } catch (error) {
     return { success: false, error: getErrorMessage(error) };
