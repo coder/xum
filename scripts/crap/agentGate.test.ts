@@ -324,6 +324,11 @@ test("the project hooks run the user's own hooks and pass their exit codes throu
   writeFileSync(join(marked, ".xum.legacy-fallback"), ".cmux\n");
   userHook(join(marked, ".cmux"), "tool_pre", 6);
   expect(runHook(pre, "ls", { HOME: marked, XUM_ROOT: "" }).status).toBe(6);
+  // Xum ignores a symlinked marker, so the hook does too.
+  rmSync(join(marked, ".xum.legacy-fallback"));
+  writeFileSync(join(dir, "marker"), ".cmux\n");
+  symlinkSync(join(dir, "marker"), join(marked, ".xum.legacy-fallback"));
+  expect(runHook(pre, "ls", { HOME: marked, XUM_ROOT: "" })).toEqual({ status: 0, out: "" });
 
   // XUM_ROOT moves the user's home, and a home that is the project's own .xum
   // does not run the project hook again.

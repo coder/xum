@@ -41,7 +41,8 @@ xum_home() {
       fi
     done
   fi
-  if [[ -f "$canonical.legacy-fallback" ]]; then
+  # Like Xum's marker reader, ignore a marker that is a symlink.
+  if [[ -f "$canonical.legacy-fallback" && ! -L "$canonical.legacy-fallback" ]]; then
     marker=$(<"$canonical.legacy-fallback")
     marker=${marker//[[:space:]]/}
     if [[ ("$marker" == ".mux$suffix" || ("$marker" == ".cmux" && -z "$suffix")) && -d "$HOME/$marker" ]]; then
