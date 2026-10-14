@@ -194,13 +194,6 @@ export function getDisplayTitleFromPersistedState(state: unknown): string {
 }
 
 /**
- * Hook for managing workspace name generation with debouncing.
- *
- * Automatically generates names as the user types their message,
- * but allows manual override. If the user clears the manual name,
- * auto-generation resumes.
- */
-/**
  * A request that settles after unmount must not write its scope's state: a draft moved to another
  * project migrates that state away, and the write would leave a name behind there.
  */
@@ -218,6 +211,13 @@ function storeGeneratedIdentity(
   }));
 }
 
+/**
+ * Hook for managing workspace name generation with debouncing.
+ *
+ * Automatically generates names as the user types their message,
+ * but allows manual override. If the user clears the manual name,
+ * auto-generation resumes.
+ */
 export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspaceNameReturn {
   const { message, debounceMs = 500, userModel, scopeId } = options;
   const { api } = useAPI();
