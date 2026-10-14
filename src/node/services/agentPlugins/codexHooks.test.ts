@@ -487,6 +487,9 @@ describe("loadPluginCodexHooks", () => {
               hooks: [
                 { ...scan, timeout: 1.5 },
                 { ...scan, timeout: 2 },
+                // Every u64 value parses in Codex, also above 2^53; 2^64 does not.
+                { ...scan, timeout: 1e19 },
+                { ...scan, timeout: 2 ** 64 },
               ],
             },
           ],
@@ -496,8 +499,11 @@ describe("loadPluginCodexHooks", () => {
 
     const { hooks, warnings } = await loadPluginCodexHooks(plugin);
 
-    expect(hooks.map((hook) => hook.key)).toEqual(["hooks/hooks.json#Stop[0][1]"]);
-    expect(warnings).toHaveLength(1);
+    expect(hooks.map((hook) => hook.key)).toEqual([
+      "hooks/hooks.json#Stop[0][1]",
+      "hooks/hooks.json#Stop[0][2]",
+    ]);
+    expect(warnings).toHaveLength(2);
   });
 
   test("a handler whose input holds a non-finite number is dropped with a warning", async () => {

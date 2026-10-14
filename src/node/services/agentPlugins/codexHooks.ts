@@ -56,6 +56,8 @@ const MATCHERLESS_CODEX_HOOK_EVENTS = new Set(["UserPromptSubmit", "Stop", "Inte
 
 const DEFAULT_HOOKS_FILE = "hooks/hooks.json";
 const MAX_HOOKS_FILE_BYTES = 256 * 1024;
+/** Codex reads `timeout` as a u64 (whole seconds); the runner caps it at 30 s anyway. */
+const U64_LIMIT = 2 ** 64;
 /**
  * Bounds for one plugin. Install Preview loads the hooks of an untrusted repository, and a
  * 256 KiB manifest can repeat one path tens of thousands of times: without them one Preview
@@ -304,6 +306,10 @@ function readGroupMatcher(
   return null;
 }
 
+function isU64(value: unknown): boolean {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value < U64_LIMIT;
+}
+
 function parseHandler(
   raw: unknown,
   where: string,
@@ -335,10 +341,7 @@ function parseHandler(
       // second instead of dropping the hook. Codex drops the whole file on a parse error; Xum
       // drops only this handler, as for every invalid field. Integer also excludes `1e400`
       // (Infinity), which JSON and the review RPC cannot carry.
-      if (
-        timeout != null &&
-        !(typeof timeout === "number" && Number.isSafeInteger(timeout) && timeout >= 0)
-      ) {
+      if (timeout != null && !isU64(timeout)) {
         invalid = "timeout";
         break;
       }
