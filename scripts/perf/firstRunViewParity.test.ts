@@ -12,7 +12,7 @@ test("the test page gets the constant once, outside #root", async () => {
   window.document.write(withFirstRunView(served, FIRST_RUN_VIEW_HTML));
   const views = window.document.querySelectorAll(`#${FIRST_RUN_VIEW_ID}`);
   expect(views).toHaveLength(1);
-  expect(views[0].closest("#root")).toBeNull();
+  expect(views[0].closest("#root") === null).toBe(true); // a compact failure, not an element dump
   expect(window.document.getElementById("root")?.textContent).toBe("Loading");
   expect(() => withFirstRunView("<html><body>", FIRST_RUN_VIEW_HTML)).toThrow("</body>");
   await window.happyDOM.close();
