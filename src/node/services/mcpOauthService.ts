@@ -326,17 +326,21 @@ function grantCoversBaseScopes(
   scope: string | undefined,
   config: MCPServerOAuthConfig | undefined
 ): boolean {
-  if (!config?.baseScopes?.length) return true;
-  const granted = new Set(scope?.split(" ").filter(Boolean));
-  return config.baseScopes.every((scope) => granted.has(scope));
+  return missingBaseScopes(scope, config).length === 0;
 }
 
-/** The scope a token write stores: its own, or for a refresh without one, the stored grant's. */
-function refreshedScope(
-  input: { tokens: MCPOAuthTokens; keepStoredScope?: boolean },
-  stored: MCPOAuthTokens | undefined
-): string | undefined {
-  return input.tokens.scope ?? (input.keepStoredScope === true ? stored?.scope : undefined);
+/** Scope strings are space-separated sets (RFC 6749 §3.3); a configured entry can hold several. */
+function scopeSet(scopes: readonly string[]): Set<string> {
+  return new Set(scopes.flatMap((scope) => scope.split(/\s+/)).filter(Boolean));
+}
+
+/** The plugin's base scopes that `scope` (a granted scope string) does not hold. */
+function missingBaseScopes(
+  scope: string | undefined,
+  config: MCPServerOAuthConfig | undefined
+): string[] {
+  const granted = scopeSet(scope !== undefined ? [scope] : []);
+  return [...scopeSet(config?.baseScopes ?? [])].filter((base) => !granted.has(base));
 }
 
 /**
@@ -350,10 +354,8 @@ function checkedGrantScope(
   flow: Pick<OAuthFlowBase, "scope" | "plugin">
 ): string | undefined {
   const scope = granted ?? flow.scope;
-  const config = flow.plugin?.config;
-  if (grantCoversBaseScopes(scope, config)) return scope;
-  const grantedSet = new Set(scope?.split(" ") ?? []);
-  const missing = (config?.baseScopes ?? []).filter((base) => !grantedSet.has(base));
+  const missing = missingBaseScopes(scope, flow.plugin?.config);
+  if (missing.length === 0) return scope;
   // The scope names come from the consented plugin config, not from the server.
   throw new Error(`The authorization server did not grant required scopes: ${missing.join(" ")}`);
 }
@@ -1794,6 +1796,15 @@ export class McpOauthService {
     };
   }
 
+  /** The stored tokens when they may serve this server (storedClientMatches). */
+  private async readMatchingTokens(
+    serverUrl: string,
+    oauth: MCPServerOAuthConfig | undefined
+  ): Promise<MCPOAuthTokens | undefined> {
+    const creds = await this.getValidStoredCredentials({ serverUrl });
+    return storedClientMatches(creds, oauth) ? creds?.tokens : undefined;
+  }
+
   private createBackgroundProvider(input: {
     serverUrl: string;
     serverName?: string;
@@ -1802,6 +1813,8 @@ export class McpOauthService {
     let discoveryState: OAuthDiscoveryState | undefined;
     // The client a refresh runs with: its tokens are saved only while that client is stored.
     let refreshedWithClientId: string | undefined;
+    // The scope of the token the refresh read (see saveTokens scopeIfOmitted).
+    let refreshedTokenScope: string | undefined;
     // The stored client record the refresh read; the SDK's back-stamp may replace only it.
     // The SDK reads the client before every write; undefined means nothing was read yet.
     let readClient: StoredClientIdentity | undefined;
@@ -1809,10 +1822,9 @@ export class McpOauthService {
 
     return {
       tokens: async () => {
-        const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
-        if (!storedClientMatches(creds, input.oauth)) return undefined;
-        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-        return creds?.tokens as unknown as MCPOAuthTokens | undefined;
+        const tokens = await this.readMatchingTokens(input.serverUrl, input.oauth);
+        refreshedTokenScope = tokens?.scope;
+        return tokens;
       },
       saveTokens: async (tokens) => {
         await this.saveTokens({
@@ -1821,7 +1833,7 @@ export class McpOauthService {
           tokens: tokens as unknown as MCPOAuthTokens,
           legacyBinding: deriveAuthorizationServerBinding(discoveryState),
           clientId: refreshedWithClientId ?? input.oauth?.clientId,
-          keepStoredScope: true,
+          scopeIfOmitted: refreshedTokenScope,
         });
       },
       saveDiscoveryState: (state) => {
@@ -2172,8 +2184,11 @@ export class McpOauthService {
     flowGeneration?: number;
     /** The client the tokens were issued to (the flow's or the refresh's). */
     clientId?: string;
-    /** A refresh: a response without scope keeps the stored grant's scope (RFC 6749 §6). */
-    keepStoredScope?: boolean;
+    /**
+     * Stored when the response has no scope: a refresh keeps the scope of the token it
+     * refreshed (RFC 6749 §6), read with that token, never a newer grant's.
+     */
+    scopeIfOmitted?: string;
   }): Promise<void> {
     const saved = await this.storeLock.withLock(this.storeFilePath, async () => {
       if (this.isStaleFlowSave(input.serverUrl, input.flowGeneration)) return false;
@@ -2202,7 +2217,7 @@ export class McpOauthService {
         creds.clientInformation = undefined;
       }
 
-      const scope = refreshedScope(input, serverMatches ? creds.tokens : undefined);
+      const scope = input.tokens.scope ?? input.scopeIfOmitted;
       creds.serverUrl = input.serverUrl;
       creds.tokens = {
         ...input.tokens,
