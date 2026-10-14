@@ -140,20 +140,32 @@ export type McpAppDocumentGate = (data: unknown, fromFrame: boolean) => McpAppDo
  * so its message no longer comes from the frame's window. A leave can only close the bridge,
  * and only a holder of the nonce can send it.
  */
+/** What one message is for the gate of the document with `nonce`. */
+function documentEvent(
+  data: unknown,
+  nonce: string,
+  fromFrame: boolean
+): "message" | "open" | "leave" | "ignore" {
+  if (typeof data !== "object" || data === null || !(MCP_APP_DOCUMENT_MARKER in data)) {
+    return "message";
+  }
+  const announcement = data as { type?: unknown; nonce?: unknown };
+  if (announcement.nonce !== nonce) return "ignore";
+  if (announcement.type === "leave") return "leave";
+  return announcement.type === "open" && fromFrame ? "open" : "ignore";
+}
+
 export function createMcpAppDocumentGate(nonce: string): McpAppDocumentGate {
   let state: "waiting" | "open" | "left" = "waiting";
   return (data, fromFrame) => {
-    if (typeof data === "object" && data !== null && MCP_APP_DOCUMENT_MARKER in data) {
-      const announcement = data as { type?: unknown; nonce?: unknown };
-      if (announcement.nonce !== nonce || state === "left") return "drop";
-      if (announcement.type === "leave") {
-        state = "left";
-        return "left";
-      }
-      if (announcement.type === "open" && fromFrame && state === "waiting") state = "open";
-      return "drop";
+    const event = documentEvent(data, nonce, fromFrame);
+    if (state === "left") return "drop";
+    if (event === "leave") {
+      state = "left";
+      return "left";
     }
-    return fromFrame && state === "open" ? "deliver" : "drop";
+    if (event === "open" && state === "waiting") state = "open";
+    return event === "message" && fromFrame && state === "open" ? "deliver" : "drop";
   };
 }
 
