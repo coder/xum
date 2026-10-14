@@ -210,41 +210,6 @@ export function declaresFullscreenOnly(declared: readonly string[] | undefined):
   return declared !== undefined && declared.includes("fullscreen") && !declared.includes("inline");
 }
 
-/** Whether a view hosted inline declared fullscreen but not inline (and the host offers it). */
-function isFullscreenOnly(
-  declared: readonly string[] | undefined,
-  context: Pick<McpAppHostContext, "displayMode" | "availableDisplayModes">
-): boolean {
-  if (context.displayMode !== "inline" || !declaresFullscreenOnly(declared)) return false;
-  return context.availableDisplayModes.includes("fullscreen");
-}
-
-/**
- * The mode a view starts in (its ui/initialize reply). A view that declared fullscreen but not
- * inline is not hosted inline: its instance in a tool card moves to fullscreen (its tab), and it
- * is told that mode from the start. `move` is that accepted move, null for none.
- */
-function startDisplayMode(input: {
-  declared: readonly string[] | undefined;
-  context: McpAppHostContext;
-  pending: McpAppDisplayMode | undefined;
-  /** A start move a repeated initialize must keep (it has not run yet). */
-  previousMove: (() => void) | null;
-  setDisplayMode: McpAppHostOptions["setDisplayMode"];
-  viewMode: (mode: McpAppDisplayMode) => McpAppDisplayMode;
-}) {
-  const move =
-    input.pending === undefined && isFullscreenOnly(input.declared, input.context)
-      ? input.setDisplayMode("fullscreen")
-      : null;
-  const pending = move != null ? "fullscreen" : input.pending;
-  return {
-    move: move ?? input.previousMove,
-    pending,
-    displayMode: pending ?? input.viewMode(input.context.displayMode),
-  };
-}
-
 /**
  * The view's declared display modes after a ui/initialize, told to the frame. A later initialize
  * without a list (the window.openai shim's, mcpAppOpenAiShim.ts) keeps the view's own
@@ -261,16 +226,6 @@ function declaredDisplayModes(
     previous;
   options.onViewDisplayModes?.(modes);
   return modes;
-}
-
-/** As for an accepted request: the view gets its teardown before the move replaces it. */
-async function runMoveAfterTeardown(
-  move: (() => void) | null,
-  teardown: (reason: string) => Promise<void>
-): Promise<void> {
-  if (move == null) return;
-  await teardown("display-mode");
-  move();
 }
 
 export function createMcpAppHost(options: McpAppHostOptions) {
@@ -300,13 +255,6 @@ export function createMcpAppHost(options: McpAppHostOptions) {
    * every later request is answered with it: that is where the view ends up.
    */
   let pendingDisplayMode: McpAppDisplayMode | undefined;
-  /**
-   * The move of a view that cannot stay in its mode (a fullscreen-only view in its tool card),
-   * accepted at ui/initialize. It runs at the next initialized: the host must not send requests
-   * (its teardown) before that. A hybrid view's own client can initialize after the
-   * window.openai shim's handshake (mcpAppOpenAiShim.ts), so that later initialized runs it too.
-   */
-  let startMove: (() => void) | null = null;
 
   /**
    * The mode the view is told. "The host MUST NOT switch the View to a display mode that does
@@ -358,17 +306,7 @@ export function createMcpAppHost(options: McpAppHostOptions) {
       case "ui/initialize": {
         viewDisplayModes = declaredDisplayModes(params, viewDisplayModes, options);
         const context = options.getHostContext();
-        const start = startDisplayMode({
-          declared: viewDisplayModes,
-          context,
-          pending: pendingDisplayMode,
-          previousMove: startMove,
-          setDisplayMode: options.setDisplayMode,
-          viewMode,
-        });
-        pendingDisplayMode = start.pending;
-        startMove = start.move;
-        const hostContext = { ...context, displayMode: start.displayMode };
+        const hostContext = { ...context, displayMode: viewMode(context.displayMode) };
         notifiedDisplayMode = hostContext.displayMode;
         respond(id, {
           protocolVersion: MCP_APP_PROTOCOL_VERSION,
@@ -534,18 +472,13 @@ export function createMcpAppHost(options: McpAppHostOptions) {
     }
   }
 
-  async function handleNotification(method: string, params: unknown) {
+  function handleNotification(method: string, params: unknown) {
     switch (method) {
-      case "ui/notifications/initialized": {
-        if (!initialized) {
-          initialized = true;
-          options.onInitialized();
-        }
-        const move = startMove;
-        startMove = null;
-        await runMoveAfterTeardown(move, teardown);
+      case "ui/notifications/initialized":
+        if (initialized) return;
+        initialized = true;
+        options.onInitialized();
         return;
-      }
       case "ui/notifications/size-changed": {
         const parsed = SizeChangedParams.safeParse(params);
         if (!parsed.success) return;
@@ -587,7 +520,8 @@ export function createMcpAppHost(options: McpAppHostOptions) {
       }
       const notification = JsonRpcNotificationSchema.safeParse(data);
       if (notification.success) {
-        return handleNotification(notification.data.method, notification.data.params);
+        handleNotification(notification.data.method, notification.data.params);
+        return Promise.resolve();
       }
       // Malformed: answer only when there is an id to answer.
       const id = IdSchema.safeParse((data as { id?: unknown } | null)?.id);
