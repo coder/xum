@@ -2086,6 +2086,250 @@ describe("AgentPluginInstallService", () => {
     expect(JSON.stringify(failed)).not.toContain(Buffer.from("outside-secret").toString("base64"));
   });
 
+  describe("post-update sign-outs that cannot finish at once (#6122)", () => {
+    const serverUrl = "https://mcp.example.com/mcp";
+    const writeServer = async (clientId: string) => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "mcp.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+          mcpServers: {
+            docs: {
+              type: "streamable-http",
+              url: serverUrl,
+              extensions: {
+                "com.openai": { auth: { type: "oauth", client: { mode: "provided", clientId } } },
+              },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `docs ${clientId}`);
+    };
+    const pendingSignOuts = async (): Promise<unknown> => {
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      if (!(await pathExists(file))) return undefined;
+      return (JSON.parse(await fsPromises.readFile(file, "utf-8")) as { urls?: unknown }).urls;
+    };
+    const discovered = async () =>
+      (
+        await discoverAgentPlugins([
+          { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+        ])
+      ).plugins.length;
+    const seedTokens = () =>
+      fsPromises.writeFile(
+        path.join(muxRoot, "mcp-oauth.json"),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "client-a" },
+              tokens: { access_token: "at", token_type: "Bearer" },
+            },
+          },
+        })
+      );
+    /** Installs client A, then updates to client B with a sign-out whose store write fails. */
+    const updateWithFailingSignOut = async (
+      mcpServerManager: Pick<MCPServerManager, "stopServersWithKeyPrefix">,
+      beforeUpdate?: () => void
+    ) => {
+      await seedTokens();
+      const updater = new AgentPluginInstallService(config, {
+        mcpServerManager: mcpServerManager as MCPServerManager,
+      });
+      await writeServer("client-a");
+      const preview = await updater.preview({ input: remoteDir });
+      await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const failing = new McpOauthService(config, new MCPConfigService(config));
+      spyOn(failing, "logout").mockResolvedValue({ success: false, error: "disk full" });
+      updater.setMcpOauthService(failing);
+      await writeServer("client-b");
+      const review = await updater.previewUpdate({ name: "demo-plugin" });
+      beforeUpdate?.();
+      const result = updater.update({
+        name: "demo-plugin",
+        consent: { fromSha: review.fromSha, toSha: review.toSha },
+      });
+      return { updater, failing, result };
+    };
+    const stopStub = { stopServersWithKeyPrefix: () => Promise.resolve() };
+
+    test("is recorded, keeps discovery closed, and finishes at the next start", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+      expect(await failing.hasAuthTokens({ serverUrl })).toBe(true);
+      // Recovery is healthy, but the pending sign-out alone keeps the container closed: a
+      // sibling process that shares the root rereads the registry on every scan.
+      expect(await discovered()).toBe(0);
+      await failing.dispose();
+
+      // The next start: the sign-in service is wired after the install service.
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      await restarted.list();
+      expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
+      expect(await pendingSignOuts()).toBeUndefined();
+      expect(await discovered()).toBe(1);
+      await oauth.dispose();
+    });
+
+    test("also closes the default discovery gate of headless processes", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      // A process without the install service (`mux workflow`) uses the default gate.
+      const session = await discoveryModule.journalDerivedDiscoveryGate([
+        await fsPromises.realpath(pluginsDir()),
+      ]);
+      expect(session.suppressed).toHaveLength(1);
+      await failing.dispose();
+    });
+
+    test("a corrupt record keeps discovery closed", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await fsPromises.writeFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "{ not json");
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      await restarted.list();
+      expect(await pathExists(path.join(muxRoot, "plugin-sign-outs-pending.json"))).toBe(true);
+      expect(await discovered()).toBe(0);
+      // Once the user deletes it, discovery opens again: journal health stayed independent.
+      await fsPromises.rm(path.join(muxRoot, "plugin-sign-outs-pending.json"));
+      expect(await discovered()).toBe(1);
+      await Promise.all([failing.dispose(), oauth.dispose()]);
+    });
+
+    test("a record of an unknown version is kept, and discovery stays closed", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      const newer = JSON.stringify({ version: 2, urls: [serverUrl], extra: true });
+      await fsPromises.writeFile(file, newer);
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      await restarted.list();
+      expect(await fsPromises.readFile(file, "utf-8")).toBe(newer);
+      expect(await discovered()).toBe(0);
+      await Promise.all([failing.dispose(), oauth.dispose()]);
+    });
+
+    test("the first scan after the sign-in service is wired already sees the plugin", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      expect(await discovered()).toBe(1);
+      expect(await pendingSignOuts()).toBeUndefined();
+      await oauth.dispose();
+    });
+
+    test("a sign-out that never settles does not hang discovery", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 10,
+      });
+      const hung = {
+        logout: () => new Promise<never>(() => undefined),
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService;
+      restarted.setMcpOauthService(hung);
+      // The pending record keeps the container closed while the sign-out hangs.
+      expect(await discovered()).toBe(0);
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+    });
+
+    test("a slow sign-out during section open does not latch journal health", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 10,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      let release: (() => void) | undefined;
+      let entered: (() => void) | undefined;
+      const slowEntered = new Promise<void>((resolve) => (entered = resolve));
+      let slow = false;
+      restarted.setMcpOauthService({
+        logout: async (input: { serverUrl: string }) => {
+          if (!slow) return { success: false, error: "offline" };
+          const released = new Promise<void>((resolve) => (release = resolve));
+          entered?.();
+          await released;
+          return oauth.logout(input);
+        },
+        credentialKey: (url: string) => oauth.credentialKey(url),
+      } as unknown as McpOauthService);
+      // The startup pass fails fast and keeps the record; section open meets the slow logout.
+      await restarted.list();
+      slow = true;
+      // The list waits on the plugin mutation lock behind the sign-out, so release it first.
+      const listed = restarted.list();
+      await slowEntered;
+      const internals = restarted as unknown as {
+        pendingSignOutPass?: Promise<void>;
+        reconciliationState: Promise<boolean>;
+      };
+      // Recovery settles while the sign-out still hangs, and its health stays true.
+      expect(await internals.reconciliationState).toBe(true);
+      release?.();
+      await listed;
+      await internals.pendingSignOutPass;
+      expect(await pendingSignOuts()).toBeUndefined();
+      // Journal health stayed true, so the custom gate opens without another section open.
+      expect(await discovered()).toBe(1);
+      await oauth.dispose();
+    });
+
+    test("survives an uninstall of the plugin", async () => {
+      const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await updater.uninstall({ name: "demo-plugin", deletePluginData: true });
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+      await failing.dispose();
+    });
+
+    test("is dropped when the update fails before its tree goes live", async () => {
+      // The stop before the swap fails: the old tree and its sign-in stay.
+      let stops: number | undefined;
+      const { failing, result } = await updateWithFailingSignOut(
+        {
+          stopServersWithKeyPrefix: () =>
+            stops !== undefined && ++stops === 1
+              ? Promise.reject(new Error("stop failed"))
+              : Promise.resolve(),
+        },
+        () => (stops = 0)
+      );
+      await expect(result).rejects.toThrow("stop failed");
+      expect(await pendingSignOuts()).toBeUndefined();
+      expect(await failing.hasAuthTokens({ serverUrl })).toBe(true);
+      await failing.dispose();
+    });
+  });
+
   test("an update signs out by credential key (rename, respelled URL, issuer) before the final stop", async () => {
     const order: string[] = [];
     const mcpStub = {
