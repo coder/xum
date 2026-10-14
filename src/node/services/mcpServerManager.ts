@@ -5307,6 +5307,7 @@ export class MCPServerManager {
             resourceUri: tool.resourceUri,
             arguments: {},
             result,
+            entrypoint: true,
           });
           return {
             serverName,

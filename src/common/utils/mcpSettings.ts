@@ -298,3 +298,31 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
   const droppedSettingCount = declared - Object.keys(properties).length;
   return { properties, values, layout, warnings, droppedSettingCount };
 }
+
+/**
+ * The snapshot as the renderer may receive it. The IPC schema's records (Zod) drop a
+ * "__proto__" key, which would hide such a setting without counting it. So it is dropped
+ * here, counted as a setting Xum cannot show. Hooks still get its value (they skip IPC).
+ */
+export function mcpSettingsSnapshotForIpc(snapshot: MCPSettingsSnapshot): MCPSettingsSnapshot {
+  const reserved = "__proto__";
+  if (!Object.hasOwn(snapshot.properties, reserved)) return snapshot;
+  const properties = { ...snapshot.properties };
+  const values = { ...snapshot.values };
+  delete properties[reserved];
+  delete values[reserved];
+  const layout = snapshot.layout
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => item.kind !== "property" || item.property !== reserved),
+    }))
+    .filter((group) => group.items.length > 0);
+  return {
+    ...snapshot,
+    properties,
+    values,
+    layout,
+    warnings: [...snapshot.warnings, `Setting '${reserved}' cannot be shown; ignoring it`],
+    droppedSettingCount: snapshot.droppedSettingCount + 1,
+  };
+}

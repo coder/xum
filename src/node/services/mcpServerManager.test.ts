@@ -1375,6 +1375,8 @@ describe("MCPServerManager", () => {
       resourceUri: "ui://x/view",
       arguments: {},
       result: { content: [{ type: "text", text: "apps-entry" }] },
+      // Marks the record as an entry point's (tool call IDs come from outside).
+      entrypoint: true,
     });
 
     // Another server's tool, or a type the tool does not declare, is refused before any call.

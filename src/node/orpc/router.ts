@@ -193,6 +193,7 @@ import { resolveDraftSends } from "@/node/services/draftSendResolution";
 import type { SendAcceptance } from "@/node/services/draftService";
 import {
   boundMCPSettingsError,
+  mcpSettingsSnapshotForIpc,
   MCP_SETTINGS_READ_TIMEOUT_MS,
   type MCPSettingsSnapshot,
 } from "@/common/utils/mcpSettings";
@@ -250,6 +251,9 @@ type McpSettingsReadResult =
  * runs, so the read never starts or restarts a server (an instance that closed meanwhile
  * fails the read instead).
  */
+const forIpc = (snapshot: MCPSettingsSnapshot | null) =>
+  snapshot === null ? null : mcpSettingsSnapshotForIpc(snapshot);
+
 async function readMcpSettingsRoute(
   context: ORPCContext,
   input: { workspaceId: string; serverNames: string[]; ifConnected?: boolean },
@@ -260,8 +264,8 @@ async function readMcpSettingsRoute(
   const timeoutMs = MCP_SETTINGS_READ_TIMEOUT_MS;
   const readOne = async (serverName: string): Promise<McpSettingsReadResult> => {
     if (input.ifConnected !== true)
-      return runMcpSettingsRoute(context, input.workspaceId, signal, () =>
-        manager.readSettings(input.workspaceId, serverName, { signal, timeoutMs })
+      return runMcpSettingsRoute(context, input.workspaceId, signal, async () =>
+        forIpc(await manager.readSettings(input.workspaceId, serverName, { signal, timeoutMs }))
       );
     if (!manager.isWorkspaceServerConnected(input.workspaceId, serverName))
       return { success: true, data: { notConnected: true } };
@@ -271,7 +275,7 @@ async function readMcpSettingsRoute(
         timeoutMs,
         noStart: true,
       });
-      return { success: true, data };
+      return { success: true, data: forIpc(data) };
     } catch (error) {
       return { success: false, error: boundMCPSettingsError(getErrorMessage(error)) };
     }
