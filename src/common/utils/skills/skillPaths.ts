@@ -81,6 +81,12 @@ const SKILL_PATH_SHAPE_RULES: ReadonlyArray<(pattern: string) => string | undefi
     p.split("/").some((segment) => segment === "." || segment === "..")
       ? `pattern '${p}' must not contain '.' or '..' segments`
       : undefined,
+  // Normalized tool paths never contain '//' or a trailing '/', so an empty segment
+  // could never match either.
+  (p) =>
+    p.split("/").includes("")
+      ? `pattern '${p}' must not contain empty path segments ('//' or a trailing '/')`
+      : undefined,
 ];
 
 function validateSkillPathShape(pattern: string): string | undefined {

@@ -47,6 +47,8 @@ describe("normalizeSkillPaths", () => {
     ["absolute windows", ["C:/src/*.ts"], "C:/src/*.ts"],
     ["parent segment", ["src/../../*.ts"], ".."],
     ["interior current-dir segment", ["src/./**/*.ts"], "'.'"],
+    ["empty interior segment", ["src//**/*.ts"], "empty"],
+    ["trailing slash", ["src/"], "empty"],
     ["negated pattern", ["src/**/*.ts", "!src/**/*.test.ts"], "!src/**/*.test.ts"],
     ["backslash separator", ["src\\**\\*.ts"], "use '/'"],
   ])("rejects %s with an error naming the problem", (_label, raw, fragment) => {

@@ -229,7 +229,8 @@ function formatSkillAdvertisementDisplay(skill: CollectedPluginSkill): string {
     ...(skill.whenToUse !== undefined ? [`When to use: ${skill.whenToUse}`] : []),
     ...(skill.advertise === false ? ["(not advertised to the model)"] : []),
     // Declared scope only: this text makes no claim about how the scope is enforced.
-    ...(skill.paths !== undefined ? [`Declared paths: ${skill.paths.join(", ")}`] : []),
+    // JSON quoting keeps entries unambiguous: ["a, b"] and ["a", "b"] render differently.
+    ...(skill.paths !== undefined ? [`Declared paths: ${JSON.stringify(skill.paths)}`] : []),
   ].join("\n");
 }
 

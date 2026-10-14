@@ -2661,6 +2661,25 @@ describe("AgentPluginInstallService", () => {
     expect(updated.lockedSha).toBe(newHead);
   });
 
+  test("the update review renders a one-pattern and a two-pattern paths scope differently", async () => {
+    const skillWithPaths = (paths: string) =>
+      `---\nname: greet\ndescription: Greets people\npaths: ${paths}\n---\n\nSay hi.\n`;
+    const skillFile = path.join(remoteDir, "skills", "greet", "SKILL.md");
+    // One pattern that matches a file literally named "safe, risky".
+    await fsPromises.writeFile(skillFile, skillWithPaths('["safe, risky"]'));
+    await commitAll(remoteDir, "one comma-containing pattern");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(skillFile, skillWithPaths('["safe", "risky"]'));
+    await commitAll(remoteDir, "two independent patterns");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary.includes("skill 'greet'"));
+    expect(change?.before).not.toBe(change?.after);
+  });
+
   test("update accepts a skill paths reordering as capability-neutral", async () => {
     // paths patterns are OR-ed: reordering them surfaces the skill on the same files.
     const skillWithPaths = (paths: string) =>
