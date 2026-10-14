@@ -34,6 +34,7 @@ import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcp
 import {
   newestMcpAppViewDomains,
   publishMcpAppViewDomains,
+  useFollowMcpAppViewDomains,
   useMcpAppViewDomains,
 } from "./mcpAppViewDomainsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
@@ -468,6 +469,8 @@ export function McpAppFrame(props: {
   const approvalProjectPath = current?.view?.approvalProjectPath ?? null;
   // An approval or revoke of this server committed after this view's read applies here too.
   const published = useMcpAppViewDomains(approvalProjectPath, boundServerName);
+  // A Revoke in another window or Xum process narrows this view while it stays mounted.
+  useFollowMcpAppViewDomains(approvalProjectPath, boundServerName);
   const approved = newestMcpAppViewDomains(published, current?.view);
   const grant = current?.view ? grantMcpAppCsp(current.view.csp, approved) : null;
   // Only a view with a result record can be approved (the record binds its server), and only

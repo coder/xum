@@ -94,14 +94,22 @@ async function approvalProjectPathOf(
  * An approve or revoke takes the next revision inside its config edit: edits run one at a time
  * (Config.editConfig), so revisions follow commit order. Once the write landed, the revision
  * counts as committed. A read takes the committed revision before it reads the config, so the
- * list it reads is at least that new. A later live follow can publish its reads the same way.
+ * list it reads is at least that new.
+ *
+ * Edits by another process take no revision. The live follow (readMcpAppViewDomains) reaches
+ * them: the renderer re-reads after each config change, and each such read takes a new
+ * revision of its own.
  *
  * Process memory only. The counter starts at the boot time in microseconds, so revisions after a
  * backend restart stay above those a renderer still holds from before it (unless the clock went
- * back). Edits by another process are not counted: they reach a view when it next mounts.
+ * back).
  */
 let assignedViewDomainsRevision = Date.now() * 1000;
 let committedViewDomainsRevision = assignedViewDomainsRevision;
+
+/** Approval-list edits of this backend that have not committed yet, and who waits for none. */
+let viewDomainsEditsInFlight = 0;
+let viewDomainsEditsDrained: Array<() => void> = [];
 
 /** Runs one approval-list edit and returns the revision of its commit. */
 async function editViewDomains(
@@ -109,12 +117,26 @@ async function editViewDomains(
   edit: (config: ProjectsConfig) => ProjectsConfig
 ): Promise<number> {
   let revision = 0;
-  await context.config.editConfig((config) => {
-    revision = ++assignedViewDomainsRevision;
-    return edit(config);
-  });
-  committedViewDomainsRevision = Math.max(committedViewDomainsRevision, revision);
+  viewDomainsEditsInFlight++;
+  try {
+    await context.config.editConfig((config) => {
+      revision = ++assignedViewDomainsRevision;
+      return edit(config);
+    });
+    committedViewDomainsRevision = Math.max(committedViewDomainsRevision, revision);
+  } finally {
+    endViewDomainsEdit();
+  }
   return revision;
+}
+
+/** One edit left the flight: when it was the last, wake the reads that wait for none. */
+function endViewDomainsEdit(): void {
+  viewDomainsEditsInFlight--;
+  if (viewDomainsEditsInFlight > 0) return;
+  const waiters = viewDomainsEditsDrained;
+  viewDomainsEditsDrained = [];
+  for (const resolve of waiters) resolve();
 }
 
 /** Origins the user allowed `serverName`'s views to reach in `projectPath`. */
@@ -449,6 +471,23 @@ export function listMcpAppViewDomains(context: McpAppsContext): McpAppViewDomain
       origins,
     }))
   );
+}
+
+/**
+ * Every project's approvals with a new revision of their own (the live follow, #6181). The read
+ * waits until no edit of this backend is in flight: an edit that took its revision but has not
+ * committed could otherwise be read as missing, and this newer read would then outrank its
+ * result. The revision, the commit mark and the read then happen in one synchronous step.
+ */
+export async function readMcpAppViewDomains(
+  context: McpAppsContext
+): Promise<{ revision: number; approvals: McpAppViewDomains[] }> {
+  while (viewDomainsEditsInFlight > 0) {
+    await new Promise<void>((resolve) => viewDomainsEditsDrained.push(resolve));
+  }
+  const revision = ++assignedViewDomainsRevision;
+  committedViewDomainsRevision = Math.max(committedViewDomainsRevision, revision);
+  return { revision, approvals: listMcpAppViewDomains(context) };
 }
 
 export async function revokeMcpAppViewDomains(
