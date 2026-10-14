@@ -18,8 +18,9 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { chromium, type Page } from "playwright";
+import { chromium, type Browser, type Page } from "playwright";
 import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
 import { FIRST_RUN_VIEW_HTML } from "@/node/orpc/firstRunView";
 
@@ -76,7 +77,6 @@ async function startServer(tree: string, root: string, logFile: string) {
       .then((r) => r.ok)
       .catch(() => false);
   for (let i = 0; i < 120 && !(await up()); i++) await new Promise((r) => setTimeout(r, 500));
-  if (!(await up())) throw new Error(`the server did not start, see ${logFile}`);
   const stop = async () => {
     if (server.exitCode === null && server.signalCode === null) {
       process.kill(-server.pid!, "SIGTERM");
@@ -84,6 +84,10 @@ async function startServer(tree: string, root: string, logFile: string) {
     }
     fs.closeSync(log);
   };
+  if (!(await up())) {
+    await stop();
+    throw new Error(`the server did not start, see ${logFile}`);
+  }
   return { origin, stop };
 }
 
@@ -116,17 +120,20 @@ async function main(): Promise<number> {
   const out = path.resolve(a.out ?? fs.mkdtempSync(path.join(os.tmpdir(), "parity-out-")));
   fs.mkdirSync(out, { recursive: true });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "parity-root-"));
-  const server = await startServer(path.resolve(a.tree), root, path.join(out, "server.log"));
-  // A route-fulfilled document has no local address space, so Local Network Access would block the
-  // app's WebSocket to 127.0.0.1. pageTiming.ts navigates without fulfill and needs no such flag.
-  const browser = await chromium.launch({
-    executablePath: a.chrome,
-    headless: true,
-    args: ["--disable-features=LocalNetworkAccessChecks"],
-  });
+  let server: Awaited<ReturnType<typeof startServer>> | undefined;
+  let browser: Browser | undefined;
   const results = [];
   let injected = false;
   try {
+    server = await startServer(path.resolve(a.tree), root, path.join(out, "server.log"));
+    const { origin } = server;
+    // A route-fulfilled document has no local address space, so Local Network Access would block the
+    // app's WebSocket to 127.0.0.1. pageTiming.ts navigates without fulfill and needs no such flag.
+    browser = await chromium.launch({
+      executablePath: a.chrome,
+      headless: true,
+      args: ["--disable-features=LocalNetworkAccessChecks"],
+    });
     for (const size of WIDTHS) {
       for (const theme of THEMES) {
         const name = `${size.width}-${theme}`;
@@ -138,7 +145,7 @@ async function main(): Promise<number> {
         const page = await context.newPage();
         let release!: () => void;
         const held = new Promise<void>((resolve) => (release = resolve));
-        await page.route(`${server.origin}/`, async (route) => {
+        await page.route(`${origin}/`, async (route) => {
           const response = await route.fetch();
           const html = await response.text();
           injected ||= !html.includes(`id="${FIRST_RUN_VIEW_ID}"`);
@@ -151,14 +158,18 @@ async function main(): Promise<number> {
           await held;
           await route.continue();
         });
-        await page.goto(`${server.origin}/`, { waitUntil: "commit" });
-        // Measure the painted static view: stylesheets applied, then the fonts that layout asked for.
+        await page.goto(`${origin}/`, { waitUntil: "commit" });
+        // Measure the painted static view: stylesheets applied (a stylesheet that never loads is an
+        // invalid run after 60 s), then the fonts that layout asked for.
+        const sheets = "link[rel=stylesheet]";
+        await page.waitForFunction(
+          (selector) =>
+            [...document.querySelectorAll<HTMLLinkElement>(selector)].every((l) => l.sheet),
+          sheets,
+          { timeout: 60_000 }
+        );
         // (No named inner functions: tsx's keepNames would wrap them in __name, which the page lacks.)
         await page.evaluate(async () => {
-          const sheets = "link[rel=stylesheet]";
-          while (![...document.querySelectorAll<HTMLLinkElement>(sheets)].every((l) => l.sheet)) {
-            await new Promise((resolve) => requestAnimationFrame(resolve));
-          }
           void document.body.offsetHeight; // layout now, so the fonts it needs start loading
           await document.fonts.ready;
           for (let i = 0; i < 2; i++)
@@ -190,8 +201,8 @@ async function main(): Promise<number> {
       }
     }
   } finally {
-    await browser.close();
-    await server.stop();
+    await browser?.close();
+    await server?.stop();
     fs.rmSync(root, { recursive: true, force: true });
   }
   const report = { tree: path.resolve(a.tree), injected, results };
@@ -200,7 +211,7 @@ async function main(): Promise<number> {
   return results.every((r) => r.failures.length === 0) ? 0 : 1;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === new URL(import.meta.url).pathname) {
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().then(
     (code) => process.exit(code),
     (error: unknown) => {
