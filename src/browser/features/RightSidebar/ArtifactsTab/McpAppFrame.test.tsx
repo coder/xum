@@ -771,6 +771,28 @@ describe("McpAppFrame", () => {
     expect(view.queryByTestId("mcp-app-frame")).toBeNull();
   });
 
+  // A burst over the rate limit must not hide the unload of a view that then redirects.
+  test("an unloading view document closes the frame even after a burst", async () => {
+    delete window.api;
+    const { view, frame, document } = await renderFrame();
+    for (let id = 100; id < 130; id++) postFromView(frame, { jsonrpc: "2.0", id, method: "ping" });
+    document.dispatch("pagehide");
+    expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+  });
+
+  // The HTML standard asks to close discarded ports: an unmounted view must not keep its port.
+  test("unmounting the view closes its document's port", async () => {
+    const close = spyOn(MessagePort.prototype, "close");
+    try {
+      const { view } = await renderFrame();
+      const before = close.mock.calls.length;
+      view.unmount();
+      await waitFor(() => expect(close.mock.calls.length).toBeGreaterThan(before));
+    } finally {
+      close.mockRestore();
+    }
+  });
+
   test("the host answers nothing before the document opened its channel", async () => {
     const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
     const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;

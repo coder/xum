@@ -517,15 +517,21 @@ export function McpAppFrame(props: {
     // The host lives as long as the document; `grant` is derived from the same inputs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [srcDoc, workspaceId, serverName, boundServerName, guard.navigated, navigatedRef]);
-  // Close the channel of the document a new one replaced. A setup, not a cleanup: StrictMode
-  // replays effects (setup, cleanup, setup), and a cleanup would close the live channel. Setups
-  // run after every cleanup of the commit, so the old host's teardown still went out on it. An
-  // unmounted frame's channel has no receiver left and is dropped with the component.
-  const previousDocument = useRef(viewDocument);
+  // Close the channel of a document that left the frame: a new one replaced it, or the view
+  // unmounted (the HTML standard asks to close discarded ports). StrictMode replays effects
+  // (setup, cleanup, setup) synchronously, so the cleanup closes only in a microtask, and only
+  // if no setup took the same document back by then. The host's own cleanup runs before it, so
+  // its teardown still went out on the channel.
+  const mountedDocument = useRef<typeof viewDocument>(null);
   useLayoutEffect(() => {
-    const previous = previousDocument.current;
-    previousDocument.current = viewDocument;
-    if (previous != null && previous !== viewDocument) previous.channel.close();
+    if (viewDocument == null) return;
+    mountedDocument.current = viewDocument;
+    return () => {
+      mountedDocument.current = null;
+      queueMicrotask(() => {
+        if (mountedDocument.current !== viewDocument) viewDocument.channel.close();
+      });
+    };
   }, [viewDocument]);
 
   // Keep the view's theme current without reloading it.
