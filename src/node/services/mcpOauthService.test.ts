@@ -1301,6 +1301,67 @@ describe("McpOauthService OAuth flows", () => {
     });
   });
 
+  test("a background back-stamp of the old issuer's client never replaces a newer issuer's sign-in (#6297)", async () => {
+    await withAuthServer(async (base) => {
+      const port = new URL(base).port;
+      const serverUrl = `${base}/mcp`;
+      const issuerA = `http://127.0.0.1:${port}`;
+      const configA: MCPServerOAuthConfig = {
+        clientId: "shared",
+        discovery: { authorizationServerBase: issuerA },
+      };
+      const configB: MCPServerOAuthConfig = {
+        clientId: "shared",
+        discovery: { authorizationServerBase: `http://localhost:${port}` },
+      };
+      // Pre-upgrade credentials: a legacy binding to issuer A, no SEP-2352 stamp.
+      const legacy = { authorization_server: issuerA, token_endpoint: `${issuerA}/token` };
+      await fs.writeFile(
+        getStoreFilePath(xumHome),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "shared", ...legacy },
+              tokens: { access_token: "at-a", token_type: "Bearer", ...legacy },
+            },
+          },
+        })
+      );
+      // Issuer A's refresh reads the unstamped client...
+      const providerA = await service.getAuthProviderForServer({ serverUrl, oauth: configA });
+      if (providerA === undefined) throw new Error("expected a provider");
+      expect((await providerA.clientInformation())?.client_id).toBe("shared");
+      // ...while a sign-in for issuer B completes.
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: { transport: "http", url: serverUrl, disabled: true, oauth: configB },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "docs",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      const signedIn = await service.handleServerCallbackAndExchange({
+        state: start.data.flowId,
+        code: "code",
+        iss: null,
+        error: null,
+      });
+      expect(signedIn.success).toBe(true);
+      // Then the SDK back-stamps A's client and saves A's refreshed tokens.
+      await providerA.saveClientInformation?.({ client_id: "shared", issuer: issuerA } as never);
+      await providerA.saveTokens({
+        access_token: "at-a-new",
+        token_type: "Bearer",
+        issuer: issuerA,
+      } as never);
+      expect(await service.hasAuthTokens({ serverUrl, oauth: configB })).toBe(true);
+    });
+  });
+
   test("interleaved sign-ins of two clients at one URL never store client B with token A", async () => {
     await withAuthServer(async (base) => {
       const serverUrl = `${base}/mcp`;

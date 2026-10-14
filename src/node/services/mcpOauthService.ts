@@ -365,6 +365,26 @@ function tokenWriteConflict(
     : "of another issuer than the stored client's";
 }
 
+/** The identity of a stored client record: its ID and SEP-2352 issuer stamp (null: none). */
+type StoredClientIdentity = { client_id: string; issuer?: string } | null;
+
+function storedClientIdentity(stored: MCPOAuthClientInformation | undefined): StoredClientIdentity {
+  return stored ? { client_id: stored.client_id, issuer: stored.issuer } : null;
+}
+
+/**
+ * Whether the stored client is no longer the one a background refresh read. The SDK back-stamps
+ * an unstamped client with the refresh's issuer; a sign-in for another issuer with the same
+ * client ID can replace the record in between, and the back-stamp must not undo it (#6297).
+ */
+function storedClientReplaced(
+  stored: MCPOAuthClientInformation | undefined,
+  expected: StoredClientIdentity | undefined
+): boolean {
+  if (expected === undefined) return false;
+  return stored?.client_id !== expected?.client_id || stored?.issuer !== expected?.issuer;
+}
+
 /**
  * An interactive sign-in whose credentials were dropped must fail: the SDK's auth() would
  * otherwise return AUTHORIZED and the callback page would say "Login complete" with nothing
@@ -1739,6 +1759,9 @@ export class McpOauthService {
     let discoveryState: OAuthDiscoveryState | undefined;
     // The client a refresh runs with: its tokens are saved only while that client is stored.
     let refreshedWithClientId: string | undefined;
+    // The stored client record the refresh read; the SDK's back-stamp may replace only it.
+    // The SDK reads the client before every write; undefined means nothing was read yet.
+    let readClient: StoredClientIdentity | undefined;
     const pluginState = pluginDiscoveryState(input.oauth);
 
     return {
@@ -1802,6 +1825,7 @@ export class McpOauthService {
           ? creds?.clientInformation
           : undefined;
         refreshedWithClientId = stored?.client_id;
+        readClient = storedClientIdentity(stored);
         // Token refresh re-reads a plugin secret from its consented file.
         const plugin = stored && pluginClient(input.oauth, await readClientSecret(input.oauth));
         return stored && { ...stored, ...plugin };
@@ -1819,6 +1843,7 @@ export class McpOauthService {
             input.oauth
           ),
           legacyBinding: deriveAuthorizationServerBinding(discoveryState),
+          expectedStoredClient: readClient,
         });
       },
     };
@@ -2139,15 +2164,35 @@ export class McpOauthService {
     rejectDroppedFlowSave(saved, input.flowGeneration);
   }
 
+  /** A stale flow's write, or a refresh's back-stamp of a client another sign-in replaced. */
+  private dropsClientWrite(
+    store: McpOauthStoreFile,
+    input: {
+      serverUrl: string;
+      flowGeneration?: number;
+      expectedStoredClient?: StoredClientIdentity;
+    }
+  ): boolean {
+    if (this.isStaleFlowSave(input.serverUrl, input.flowGeneration)) return true;
+    const stored = store.entries[input.serverUrl]?.clientInformation;
+    if (!storedClientReplaced(stored, input.expectedStoredClient)) return false;
+    log.info("[MCP OAuth] Dropping a refresh's client write: another sign-in replaced it", {
+      serverUrl: input.serverUrl,
+    });
+    return true;
+  }
+
   private async saveClientInformation(input: {
     serverUrl: string;
     clientInformation: MCPOAuthClientInformation;
     legacyBinding?: AuthorizationServerBinding;
     flowGeneration?: number;
+    /** A background refresh's read client: the write is dropped once another replaced it. */
+    expectedStoredClient?: StoredClientIdentity;
   }): Promise<void> {
     const saved = await this.storeLock.withLock(this.storeFilePath, async () => {
-      if (this.isStaleFlowSave(input.serverUrl, input.flowGeneration)) return false;
       const store = await this.ensureStoreLoadedLocked();
+      if (this.dropsClientWrite(store, input)) return false;
       const creds = (store.entries[input.serverUrl] ??= {
         serverUrl: input.serverUrl,
         updatedAtMs: Date.now(),
