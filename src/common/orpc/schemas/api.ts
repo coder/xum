@@ -1563,6 +1563,11 @@ export const mcpApps = {
     input: z.object({ workspaceId: z.string().min(1) }),
     output: z.array(McpAppEntrypointSchema),
   },
+  /** Ticks when a server of the workspace sends tools/list_changed: re-list entry points. */
+  onEntrypointsChanged: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: eventIterator(z.void()),
+  },
   /** Call an entry point's tool with `{}` and store its view record (no chat row). */
   openEntrypoint: {
     input: McpAppOpenEntrypointRequestSchema,

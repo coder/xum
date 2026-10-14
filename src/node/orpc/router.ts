@@ -139,6 +139,7 @@ import { clearLogsForApi, getLogFilePath } from "@/node/services/log";
 import {
   attachTerminal,
   subscribeConfigChanges,
+  subscribeMcpAppEntrypointChanges,
   subscribeDevTools,
   subscribeReviewState,
   subscribeDrafts,
@@ -1841,6 +1842,12 @@ export const router = (authToken?: string) => {
           listMcpAppEntrypoints(context, input.workspaceId, signal, (workspaceId, warmSignal) =>
             listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
           )
+        ),
+      onEntrypointsChanged: t
+        .input(schemas.mcpApps.onEntrypointsChanged.input)
+        .output(schemas.mcpApps.onEntrypointsChanged.output)
+        .handler(({ context, input, signal }) =>
+          subscribeMcpAppEntrypointChanges(context, input.workspaceId, signal)
         ),
       openEntrypoint: t
         .input(schemas.mcpApps.openEntrypoint.input)

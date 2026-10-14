@@ -109,6 +109,12 @@ export interface MCPClientConfig {
    * visibility lacks "model" out of tools(). When false the client behaves exactly as before.
    */
   mcpApps?: boolean;
+  /**
+   * Called when the server sends notifications/tools/list_changed (MCP App entry points follow
+   * the catalog). A plain handler: it opens no `subscriptions/listen` stream, so it hears what
+   * the server sends unasked. The SDK still evicts its cached tools/list either way.
+   */
+  onToolsListChanged?: () => void;
 }
 
 export type MCPPrompt = Awaited<ReturnType<Client["listPrompts"]>>["prompts"][number];
@@ -333,6 +339,10 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
   if (config.onUncaughtError) {
     const onUncaughtError = config.onUncaughtError;
     client.onerror = (error) => onUncaughtError(error);
+  }
+  if (config.onToolsListChanged) {
+    const onToolsListChanged = config.onToolsListChanged;
+    client.setNotificationHandler("notifications/tools/list_changed", () => onToolsListChanged());
   }
 
   const transport = isHttpTransportConfig(config.transport)

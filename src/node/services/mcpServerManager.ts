@@ -5319,6 +5319,30 @@ export class MCPServerManager {
       : displayConnectionKey(serverName);
   }
 
+  private readonly appCatalogListeners = new Set<(workspaceId: string) => void>();
+
+  /**
+   * Calls `listener` with the workspace of an MCP Apps server that sent tools/list_changed: its
+   * entry points can have changed (mcpApps.onEntrypointsChanged). Returns the unsubscribe.
+   */
+  onMcpAppCatalogChanged(listener: (workspaceId: string) => void): () => void {
+    this.appCatalogListeners.add(listener);
+    return () => this.appCatalogListeners.delete(listener);
+  }
+
+  /** The client option that reports a connection's tools/list_changed (MCP Apps only). */
+  private appCatalogChangeOption(
+    appResultStore: McpAppResultStore | null,
+    workspaceId: string | undefined
+  ): { onToolsListChanged?: () => void } {
+    if (appResultStore === null || workspaceId === undefined) return {};
+    return {
+      onToolsListChanged: () => {
+        for (const listener of [...this.appCatalogListeners]) listener(workspaceId);
+      },
+    };
+  }
+
   /** Effective tool allowlist of a server for MCP Apps calls (read at dispatch). */
   private appToolAllowlist(workspaceId: string, serverName: string): Set<string> | null {
     return effectiveToolAllowlist(
@@ -7293,6 +7317,7 @@ export class MCPServerManager {
             transport,
             ...(prior !== undefined ? { prior } : {}),
             mcpApps: appResultStore !== null,
+            ...this.appCatalogChangeOption(appResultStore, workspaceId),
           });
         } catch (error) {
           // The connect failure may have been the negotiation probe killing a
@@ -7485,6 +7510,7 @@ export class MCPServerManager {
             onUncaughtError,
             ...(prior !== undefined ? { prior } : {}),
             mcpApps: appResultStore !== null,
+            ...this.appCatalogChangeOption(appResultStore, workspaceId),
           }),
         signal,
         { workspaceId, releaseAfterMs: MCP_LAUNCH_INITIATION_FENCE_MS }
@@ -7503,6 +7529,7 @@ export class MCPServerManager {
             onUncaughtError,
             ...(prior !== undefined ? { prior } : {}),
             mcpApps: appResultStore !== null,
+            ...this.appCatalogChangeOption(appResultStore, workspaceId),
           }),
         signal,
         { workspaceId, releaseAfterMs: MCP_LAUNCH_INITIATION_FENCE_MS }

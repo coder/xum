@@ -82,6 +82,26 @@ describe("MCP Apps client gating", () => {
   });
 });
 
+describe("MCP Apps tools/list_changed", () => {
+  test("the client reports a server's tools/list_changed", async () => {
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [fixture],
+      stderr: "pipe",
+      env: fixtureEnv({ APPS_FIXTURE_LIST_CHANGED: "1" }),
+    });
+    const changed = Promise.withResolvers<void>();
+    const client = await createMCPClient({
+      transport,
+      mcpApps: true,
+      onToolsListChanged: () => changed.resolve(),
+    });
+    clients.push(client);
+    await client.callToolForApp("refresh_chart", {});
+    await changed.promise;
+  });
+});
+
 describe("MCP App entry points", () => {
   test("skips entry points whose tool names the routes refuse (empty, over-long)", async () => {
     // One bad name in the list would fail the listEntrypoints output schema for every server.

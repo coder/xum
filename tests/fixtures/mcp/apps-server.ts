@@ -11,6 +11,7 @@ import { createInterface } from "node:readline";
  * thread + file (app-only; annotations.title with bidi/control characters the host strips), legacy_view
  * global (a title that cleans to nothing: name).
  * - capabilities_probe: echoes the client's initialize capabilities (gating tests).
+ * With APPS_FIXTURE_LIST_CHANGED=1, refresh_chart also sends notifications/tools/list_changed.
  * Extra resources exercise the host's resources/read validation.
  */
 const VIEW_URI = "ui://chart/view";
@@ -197,6 +198,11 @@ lines.on("line", (line) => {
       } else if (name === "refresh_chart") {
         refreshCount += 1;
         result = chartResult(`Refreshed ${refreshCount}`, [90, 30, 60, 20]);
+        if (process.env.APPS_FIXTURE_LIST_CHANGED === "1") {
+          process.stdout.write(
+            JSON.stringify({ jsonrpc: "2.0", method: "notifications/tools/list_changed" }) + "\n"
+          );
+        }
       } else if (name === "legacy_view") {
         result = { content: [{ type: "text", text: "legacy" }] };
       } else if (name === "capabilities_probe") {

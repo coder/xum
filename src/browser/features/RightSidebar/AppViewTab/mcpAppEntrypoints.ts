@@ -174,11 +174,37 @@ export function useLoadMcpAppEntrypoints(workspaceId: string | null, enabled: bo
     [workspaceId]
   );
 
+  // A server's tools/list_changed can add, remove or rebind entry points: re-list. The stream
+  // dies with its socket. A reconnect brings a new `api`, which opens it again.
+  useEffect(() => {
+    if (api == null || workspaceId == null || !enabled) return;
+    return followCatalogChanges(api, workspaceId, () => setMutationTick((tick) => tick + 1));
+  }, [api, workspaceId, enabled]);
+
   // Syncs an external store with the backend (not derived React state).
   useEffect(() => {
     if (workspaceId == null) return;
     return loadMcpAppEntrypoints(api, workspaceId, enabled);
   }, [api, workspaceId, enabled, mutationTick]);
+}
+
+/** Call `onChange` per tools/list_changed tick of the workspace; returns the stop. */
+function followCatalogChanges(api: APIClient, workspaceId: string, onChange: () => void) {
+  const controller = new AbortController();
+  const follow = async () => {
+    const stream = await api.mcpApps.onEntrypointsChanged(
+      { workspaceId },
+      { signal: controller.signal }
+    );
+    for await (const _tick of stream) {
+      if (controller.signal.aborted) break;
+      onChange();
+    }
+  };
+  // A lost connection or an older backend ends the stream: plugin, MCP and trust changes still
+  // re-list, and an open still refreshes the catalog first.
+  follow().catch(() => undefined);
+  return () => controller.abort();
 }
 
 /** One listing into the store; returns its cancel (which also ends the pending state). */

@@ -1538,6 +1538,30 @@ describe("MCPServerManager", () => {
     expect(await open("apps", "board")).toBe(true);
   });
 
+  test("a server's tools/list_changed reaches the MCP Apps catalog listeners", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-list-changed");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-list-changed") });
+    servers.serve("apps-list-changed", { tools: { show: testTool() } });
+    const request = workspaceRequest("apps-list-changed");
+    await manager.getToolsForWorkspace(request);
+    const changed: string[] = [];
+    const unsubscribe = manager.onMcpAppCatalogChanged((workspaceId) => changed.push(workspaceId));
+
+    // The server announces a changed tool catalog on its connection.
+    const [config] = (mcpSdk.createMCPClient as unknown as ReturnType<typeof mock>).mock.calls.at(
+      -1
+    ) as [mcpSdk.MCPClientConfig];
+    config.onToolsListChanged?.();
+    unsubscribe();
+    config.onToolsListChanged?.();
+
+    expect(changed).toEqual([request.workspaceId]);
+  });
+
   test("listing entry points refreshes the tool catalog first (tools/list_changed)", async () => {
     using tmp = new DisposableTempDir("mcp-apps-entry-refresh");
     manager.setMcpApps({
