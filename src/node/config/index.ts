@@ -1558,7 +1558,7 @@ function configFileWatchDirs(configFile: string): Map<string, Set<string>> {
       continue;
     }
     const entry = path.join(resolved, name);
-    const stat = lstatOrNull(entry);
+    const stat = walkableEntryStat(entry, pending.length > 0);
     if (stat === null) {
       watch(resolved, name);
       return dirs;
@@ -1579,12 +1579,20 @@ function configFileWatchDirs(configFile: string): Map<string, Set<string>> {
   return dirs;
 }
 
-function lstatOrNull(entry: string): fs.Stats | null {
+/**
+ * The entry's stat when the walk can go on through it, else null. With entries left, a file
+ * in a folder's place counts as missing: a watch on the file would follow its inode, and the
+ * folder that replaces it would go unseen.
+ */
+function walkableEntryStat(entry: string, entriesLeft: boolean): fs.Stats | null {
+  let stat: fs.Stats;
   try {
-    return fs.lstatSync(entry);
+    stat = fs.lstatSync(entry);
   } catch {
     return null;
   }
+  const walkable = !entriesLeft || stat.isDirectory() || stat.isSymbolicLink();
+  return walkable ? stat : null;
 }
 
 /** Where a path walk goes on from a symlink: the dir its text starts from, and its entries. */
@@ -1787,11 +1795,14 @@ export class Config {
   }
 
   private startConfigFileWatchers(dirs = configFileWatchDirs(this.configFile)): void {
-    this.watchedConfigFileDirsKey = configFileWatchDirsKey(dirs);
+    let complete = true;
     for (const [dir, fileNames] of dirs) {
       const watcher = this.watchConfigDir(dir, fileNames);
       if (watcher) this.configFileWatchers.push(watcher);
+      else complete = false;
     }
+    // A dir whose watch failed to start is retried by the next relink check (the next event).
+    this.watchedConfigFileDirsKey = complete ? configFileWatchDirsKey(dirs) : null;
   }
 
   /** A config.json event: re-resolve a replaced symlink first, so the watch follows it. */
@@ -1804,9 +1815,13 @@ export class Config {
   private followConfigFileRelinks(): void {
     // A relink that lands while the watches are reinstalled can reach no watch, so resolve
     // again until the watched dirs match the links.
+    // A watch that failed to start gets one retry per check, not one per loop pass.
+    let tried: string | null = null;
     for (let reinstalls = 0; reinstalls < CONFIG_FILE_WATCH_MAX_REINSTALLS; reinstalls += 1) {
       const dirs = configFileWatchDirs(this.configFile);
-      if (configFileWatchDirsKey(dirs) === this.watchedConfigFileDirsKey) return;
+      const key = configFileWatchDirsKey(dirs);
+      if (key === this.watchedConfigFileDirsKey || key === tried) return;
+      tried = key;
       // Keep the notified stamp: the new target's bytes still count as a change.
       this.closeConfigFileWatcher();
       this.startConfigFileWatchers(dirs);
@@ -1890,6 +1905,8 @@ export class Config {
 
   private deferredChangeNotificationDepth = 0;
   private changeNotificationPending = false;
+  /** A foreign edit's notification deferred by a batch: its flush keeps the listener guard. */
+  private foreignChangeNotificationPending = false;
 
   /** Flush config changes once after the outermost operation, including partial failures. */
   async withDeferredChangeNotifications<T>(operation: () => Promise<T>): Promise<T> {
@@ -1898,11 +1915,21 @@ export class Config {
       return await operation();
     } finally {
       this.deferredChangeNotificationDepth -= 1;
-      if (this.deferredChangeNotificationDepth === 0 && this.changeNotificationPending) {
-        this.changeNotificationPending = false;
-        this.notifyConfigChanged();
-      }
+      if (this.deferredChangeNotificationDepth === 0) this.flushDeferredChangeNotification();
     }
+  }
+
+  /**
+   * A batch with an own edit notifies as an own save does. A batch with only foreign edits
+   * keeps the listener guard of notifyConfigChangedByAnotherProcess.
+   */
+  private flushDeferredChangeNotification(): void {
+    const own = this.changeNotificationPending;
+    const foreign = this.foreignChangeNotificationPending;
+    this.changeNotificationPending = false;
+    this.foreignChangeNotificationPending = false;
+    if (own) this.notifyConfigChanged();
+    else if (foreign) this.notifyConfigChangedByAnotherProcess();
   }
 
   private notifyConfigChanged(): void {
@@ -1921,7 +1948,7 @@ export class Config {
    */
   private notifyConfigChangedByAnotherProcess(): void {
     if (this.deferredChangeNotificationDepth > 0) {
-      this.notifyConfigChanged();
+      this.foreignChangeNotificationPending = true;
       return;
     }
     for (const listener of this.emitter.listeners("configChanged")) {
