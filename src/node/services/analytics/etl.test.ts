@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -9,6 +9,7 @@ import {
   appendEvents,
   CHAT_FILE_NAME,
   clearWorkspaceAnalyticsState,
+  computePricingFingerprint,
   CURRENT_ETL_SEMANTICS_VERSION,
   deleteCorruptAnalyticsRows,
   getCurrentPricingFingerprint,
@@ -28,7 +29,9 @@ import {
   CREATE_INGEST_META_TABLE_SQL,
   CREATE_WATERMARK_TABLE_SQL,
 } from "./schemaSql";
-import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { createDisplayUsage, PRICING_LOGIC_VERSION } from "@/common/utils/tokens/displayUsage";
+import modelsData from "@/common/utils/tokens/models.json";
+import { modelsExtra } from "@/common/utils/tokens/models-extra";
 
 const SUBAGENT_TRANSCRIPTS_DIR_NAME = "subagent-transcripts";
 
@@ -1967,6 +1970,19 @@ describe("headless usage ingestion", () => {
 });
 
 describe("pricing fingerprint", () => {
+  test("changes with the pricing logic version, so older analytics DBs reprice", () => {
+    // What builds before the pricing logic version stored: the price tables alone.
+    const tablesOnly = createHash("sha256")
+      .update(JSON.stringify(modelsExtra))
+      .update(JSON.stringify(modelsData))
+      .digest("hex");
+
+    expect(getCurrentPricingFingerprint()).not.toBe(tablesOnly);
+    expect(getCurrentPricingFingerprint()).not.toBe(
+      computePricingFingerprint(PRICING_LOGIC_VERSION - 1)
+    );
+  });
+
   test("round-trips through ingest_meta and starts unset", async () => {
     const conn = await createTestConn();
 

@@ -28,6 +28,14 @@ import {
 } from "./usageHelpers";
 
 /**
+ * Version of the rules that price recorded usage, apart from the price tables. The analytics
+ * DB hashes it into its pricing fingerprint, so a bump reprices every stored row on upgrade.
+ * Bump it when a change prices already recorded usage differently.
+ * 2: long-context tiers per request; legacy turns' tier and 1h writes from the last step.
+ */
+export const PRICING_LOGIC_VERSION = 2;
+
+/**
  * Anthropic bills 1-hour-TTL cache writes at 2x base input (5-minute writes use the
  * model's `cache_creation_input_token_cost`, 1.25x). The catalog has no 1h field, so
  * the rate derives from the input rate of the same context tier and service tier.

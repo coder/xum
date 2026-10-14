@@ -10,6 +10,7 @@ import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   createDisplayUsage,
+  PRICING_LOGIC_VERSION,
   readTurnSteps,
   type TurnSteps,
 } from "@/common/utils/tokens/displayUsage";
@@ -1921,19 +1922,25 @@ const PRICING_FINGERPRINT_META_KEY = "pricing_fingerprint";
 let cachedPricingFingerprint: string | undefined;
 
 /**
- * Fingerprint of the bundled pricing tables. Event costs are computed at
- * ingest time from these tables, so a fingerprint change means previously
- * ingested rows may carry stale costs (typically $0 for models that were
- * unknown at ingest time) and need a full rebuild to reprice.
- *
- * Cached per process: the tables are compiled into the bundle and cannot
- * change while the worker is running.
+ * Fingerprint of the bundled pricing tables and pricing rules. Event costs are
+ * computed at ingest time, so a fingerprint change means previously ingested
+ * rows may carry stale costs (typically $0 for models that were unknown at
+ * ingest time, or costs from older rules) and need a full rebuild to reprice.
  */
-export function getCurrentPricingFingerprint(): string {
-  cachedPricingFingerprint ??= createHash("sha256")
+export function computePricingFingerprint(pricingLogicVersion: number): string {
+  return createHash("sha256")
     .update(JSON.stringify(modelsExtra))
     .update(JSON.stringify(modelsData))
+    .update(`pricing-logic-v${pricingLogicVersion}`)
     .digest("hex");
+}
+
+/**
+ * Cached per process: the tables and rules are compiled into the bundle and
+ * cannot change while the worker is running.
+ */
+export function getCurrentPricingFingerprint(): string {
+  cachedPricingFingerprint ??= computePricingFingerprint(PRICING_LOGIC_VERSION);
   return cachedPricingFingerprint;
 }
 
