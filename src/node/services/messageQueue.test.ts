@@ -782,6 +782,46 @@ describe("MessageQueue", () => {
       expect(queue.getVisibleQueueDispatchMode()).toBe("turn-end");
     });
 
+    it.each(["admission", "task", "compaction"] as const)(
+      "uses the first surviving entry's mode after %s admission goes stale",
+      (gate) => {
+        const stale = { admission: false, task: false, compaction: false };
+        queue.add(
+          "automatic guidance",
+          { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+          {
+            synthetic: true,
+            sealed: true,
+            admissionStale: () => stale.admission,
+            turnAdmission: {
+              admissionStale: () => stale.task,
+              onEnqueued: () => undefined,
+              onAdmitted: () => undefined,
+              onDisposed: () => undefined,
+            },
+            compactionAdmissionStale: () => stale.compaction,
+          }
+        );
+        expect(queue.hasDispatchableEntries()).toBe(true);
+        expect(queue.getNextDispatchableMode()).toBe("tool-end");
+
+        stale[gate] = true;
+        expect(queue.hasDispatchableEntries()).toBe(false);
+        expect(queue.getNextDispatchableMode()).toBeUndefined();
+        // Refusal/cancellation callbacks still belong to the normal FIFO drain.
+        expect(queue.isEmpty()).toBe(false);
+
+        queue.add("held user input", {
+          model: "gpt-4",
+          agentId: "exec",
+          queueDispatchMode: "turn-end",
+        });
+        expect(queue.hasDispatchableEntries()).toBe(true);
+        expect(queue.getNextDispatchableMode()).toBe("turn-end");
+        expect(queue.getNextQueueCutCandidate()?.dispatchMode).toBe("turn-end");
+      }
+    );
+
     it("should reset mode to tool-end when cleared", () => {
       queue.add("Follow up", {
         model: "gpt-4",

@@ -1392,43 +1392,49 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("withdrawn input does not background a subsequent Bash registration", async () => {
-    using tempDir = new TestTempDir("withdrawn-queued-bash");
-    const manager = new BackgroundProcessManager(tempDir.path);
-    const workspaceId = "queue-dispatch-withdrawn-bash";
-    const { session, cleanup, aiEmitter } = await createAgentSessionHarness({
-      workspaceId,
-      backgroundProcessManager: manager,
-    });
-    try {
-      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
-      const controller = new AbortController();
-      session.queueMessage(
-        "follow up",
-        { model: TEST_MODEL, agentId: "exec" },
-        {
-          ...peerTriggerInternal("agent-msg:sender:withdrawn-bash"),
-          cancelSignal: controller.signal,
-        }
-      );
-      controller.abort();
-      expect(session.hasQueuedMessages()).toBe(false);
-      expect(manager.hasQueuedMessage(workspaceId)).toBe(false);
-      const background = mock(() => undefined);
-      const foreground = manager.registerForegroundProcess(
+  test.each(["aborted", "admission-stale"] as const)(
+    "%s input does not background a subsequent Bash registration",
+    async (withdrawal) => {
+      using tempDir = new TestTempDir("withdrawn-queued-bash");
+      const manager = new BackgroundProcessManager(tempDir.path);
+      const workspaceId = "queue-dispatch-withdrawn-bash";
+      const { session, cleanup, aiEmitter } = await createAgentSessionHarness({
         workspaceId,
-        "bash-late",
-        "test",
-        "test",
-        background
-      );
-      expect(background).not.toHaveBeenCalled();
-      foreground.unregister();
-    } finally {
-      await session.dispose();
-      await cleanup();
+        backgroundProcessManager: manager,
+      });
+      try {
+        aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+        const controller = new AbortController();
+        let stale = false;
+        session.queueMessage(
+          "follow up",
+          { model: TEST_MODEL, agentId: "exec" },
+          {
+            ...peerTriggerInternal("agent-msg:sender:withdrawn-bash"),
+            cancelSignal: controller.signal,
+            admissionStale: () => stale,
+          }
+        );
+        if (withdrawal === "aborted") controller.abort();
+        else stale = true;
+        expect(session.hasQueuedMessages()).toBe(false);
+        expect(manager.hasQueuedMessage(workspaceId)).toBe(false);
+        const background = mock(() => undefined);
+        const foreground = manager.registerForegroundProcess(
+          workspaceId,
+          "bash-late",
+          "test",
+          "test",
+          background
+        );
+        expect(background).not.toHaveBeenCalled();
+        foreground.unregister();
+      } finally {
+        await session.dispose();
+        await cleanup();
+      }
     }
-  });
+  );
 
   test("held user input blocks agent Bash backgrounding until Send now", async () => {
     using tempDir = new TestTempDir("held-queued-bash");

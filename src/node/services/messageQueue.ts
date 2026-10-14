@@ -372,6 +372,17 @@ interface QueueEntry {
   turnAdmission?: TurnAdmissionToken;
 }
 
+/** Stale/withdrawn entries drain as no-ops or held input; they must not cut tools or background Bash. */
+function isEntryDispatchable(entry: QueueEntry): boolean {
+  return (
+    entry.cancelSignal?.aborted !== true &&
+    entry.admissionStale?.() !== true &&
+    entry.turnAdmission?.admissionStale() !== true &&
+    // dequeueNext folds each add's compaction staleness into the dispatched send's.
+    !entry.acceptanceOrigins.some((add) => add.compactionAdmissionStale?.() === true)
+  );
+}
+
 /**
  * FIFO queue of messages sent during active streaming.
  *
@@ -460,28 +471,12 @@ export class MessageQueue {
     return entries.some((entry) => entry.dispatchMode === "tool-end") ? "tool-end" : "turn-end";
   }
 
-  /**
-   * The first entry whose cancel signal has not fired. Aborted entries still drain FIFO (as no-ops that fire
-   * onCanceled), but they are not pending work or continuations of a turn.
-   */
   private nextDispatchableEntry(): QueueEntry | undefined {
-    return this.entries.find((entry) => entry.cancelSignal?.aborted !== true);
+    return this.entries.find(isEntryDispatchable);
   }
 
-  /**
-   * Whether any entry would still dispatch: a withdrawn entry drains as a no-op, and an entry
-   * whose admission (its own, its task attempt's or one add's compaction capture) went stale is
-   * refused at the drain (or kept as held input) without streaming.
-   */
   hasDispatchableEntries(): boolean {
-    return this.entries.some(
-      (entry) =>
-        entry.cancelSignal?.aborted !== true &&
-        entry.admissionStale?.() !== true &&
-        entry.turnAdmission?.admissionStale() !== true &&
-        // dequeueNext folds each add's compaction staleness into the dispatched send's.
-        !entry.acceptanceOrigins.some((add) => add.compactionAdmissionStale?.() === true)
-    );
+    return this.entries.some(isEntryDispatchable);
   }
 
   getNextDispatchableMode(): QueueDispatchMode | undefined {
