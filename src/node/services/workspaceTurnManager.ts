@@ -6103,6 +6103,15 @@ export class WorkspaceTurnManager {
       !isActiveWorkspaceTurnTaskStatus(record.status),
       "persistRecoveredTerminalExecutionMirror: record must be terminal"
     );
+    // The snapshot already holds this outcome, so the compare-and-set below could only leave the
+    // row as it is. Skip the edit: each one rewrites the whole config file, and a large config has
+    // hundreds of settled mirrors (#6511).
+    if (
+      snapshot.taskExecutionId === record.handleId &&
+      snapshot.taskExecutionStatus === record.status
+    ) {
+      return;
+    }
     await this.taskHost.editWorkspaceEntry(
       workspaceId,
       (workspace) => {

@@ -196,6 +196,59 @@ describe("WorkspaceTurnManager", () => {
     expect(await ownerInput()).toBe("clicked");
   });
 
+  // Startup reconciliation used to rewrite every terminal mirror with its own config edit, even when
+  // the mirror already named its newest handle and status: on a large config that pass alone ran
+  // for minutes (#6511). Only a mirror that changes is written.
+  test("startup writes only the terminal execution mirrors that change", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    const child = (id: string, taskExecutionId: string) =>
+      projectWorkspace(projectPath, id, id, {
+        parentWorkspaceId: parentId,
+        agentId: "explore",
+        taskStatus: "reported",
+        runtimeConfig: { type: "local" },
+        taskExecutionId,
+        taskExecutionStatus: "completed",
+      });
+    await config.editConfig((cfg) => {
+      cfg.projects
+        .get(projectPath)!
+        .workspaces.push(child("settled", "wst_settled"), child("superseded", "wst_old"));
+      return cfg;
+    });
+    const { taskService } = createWorkspaceTurnManagerHarness(config);
+    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
+      .taskHandleStore;
+    await taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, "settled", "wst_settled", "completed")
+    );
+    await taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, "superseded", "wst_old", "completed")
+    );
+    await taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, "superseded", "wst_new", "interrupted", {
+        updatedAt: "2026-06-19T00:00:02.000Z",
+      })
+    );
+
+    const edits = spyOn(config, "editConfig");
+    try {
+      await taskService.reconcileAgentTaskExecutionIds();
+      expect(edits).toHaveBeenCalledTimes(1);
+    } finally {
+      edits.mockRestore();
+    }
+    expect(findWorkspaceInConfig(config, "settled")).toMatchObject({
+      taskExecutionId: "wst_settled",
+      taskExecutionStatus: "completed",
+    });
+    expect(findWorkspaceInConfig(config, "superseded")).toMatchObject({
+      taskExecutionId: "wst_new",
+      taskExecutionStatus: "interrupted",
+    });
+  });
+
   test("shared desktop active mirror refuses a missing target or competing child", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
