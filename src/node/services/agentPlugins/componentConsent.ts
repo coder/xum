@@ -214,3 +214,53 @@ export function consentForSelection(args: {
     );
   return { skills: records("skills"), mcpServers: records("mcpServers") };
 }
+
+export interface ComponentRef {
+  kind: keyof ComponentConsent;
+  name: string;
+  fingerprint: string;
+}
+
+/**
+ * Consent records after a confirmed review. A component gets a record only when it is in both
+ * lists with the same fingerprint: `current` (what the backend recomputed under the lock) and
+ * `reviewed` (what the renderer showed). A component that changed after the review keeps its old
+ * record, so it still needs a review (#6498 review S1). Every other record is kept.
+ */
+export function recordReviewedComponents(args: {
+  previous: ComponentConsent | undefined;
+  current: readonly ComponentRef[];
+  reviewed: readonly ComponentRef[];
+}): ComponentConsent {
+  const next: ComponentConsent = {
+    skills: { ...args.previous?.skills },
+    mcpServers: { ...args.previous?.mcpServers },
+  };
+  for (const ref of args.current) {
+    const shown = args.reviewed.some(
+      (other) =>
+        other.kind === ref.kind && other.name === ref.name && other.fingerprint === ref.fingerprint
+    );
+    if (shown) next[ref.kind][ref.name] = ref.fingerprint;
+  }
+  return next;
+}
+
+/**
+ * Imported components without a consent record for their current fingerprint. `selection` absent
+ * means a legacy import-all entry. A selected name the tree no longer has does not count.
+ */
+export function countUnreviewed(args: {
+  current: ComponentConsent;
+  selection: ComponentSelection | undefined;
+  consent: ComponentConsent | undefined;
+}): number {
+  let count = 0;
+  for (const kind of ["skills", "mcpServers"] as const) {
+    for (const [name, fingerprint] of Object.entries(args.current[kind])) {
+      const imported = args.selection === undefined || args.selection[kind].includes(name);
+      if (imported && !isComponentConsented(args.consent, kind, name, fingerprint)) count++;
+    }
+  }
+  return count;
+}

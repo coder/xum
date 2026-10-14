@@ -4,6 +4,7 @@ import type { MCPHttpServerInfo, MCPStdioServerInfo } from "@/common/types/mcp";
 import {
   consentForSelection,
   isComponentConsented,
+  recordReviewedComponents,
   serverConsentFingerprint,
   skillConsentFingerprint,
 } from "./componentConsent";
@@ -164,5 +165,26 @@ describe("consentForSelection", () => {
       previous: { selection: { skills: ["a", "b"], mcpServers: ["s"] }, consent: undefined },
     });
     expect(consent).toEqual({ skills: {}, mcpServers: {} });
+  });
+});
+
+describe("recordReviewedComponents", () => {
+  test("records only components shown at the fingerprint the backend still sees", () => {
+    const next = recordReviewedComponents({
+      previous: { skills: { a: "a1", kept: "k1" }, mcpServers: {} },
+      current: [
+        { kind: "skills", name: "a", fingerprint: "a2" },
+        { kind: "mcpServers", name: "s", fingerprint: "s3" },
+        { kind: "skills", name: "late", fingerprint: "l2" },
+      ],
+      reviewed: [
+        { kind: "skills", name: "a", fingerprint: "a2" },
+        // Shown at s2, but the server changed again before confirm.
+        { kind: "mcpServers", name: "s", fingerprint: "s2" },
+        // Shown under the other kind.
+        { kind: "mcpServers", name: "late", fingerprint: "l2" },
+      ],
+    });
+    expect(next).toEqual({ skills: { a: "a2", kept: "k1" }, mcpServers: {} });
   });
 });

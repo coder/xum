@@ -1442,6 +1442,18 @@ export const router = (authToken?: string) => {
             consent: input.consent ?? undefined,
           })
         ),
+      previewComponentReview: t
+        .input(schemas.agentPlugins.previewComponentReview.input)
+        .output(schemas.agentPlugins.previewComponentReview.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.previewComponentReviewResult(input)
+        ),
+      confirmComponentReview: t
+        .input(schemas.agentPlugins.confirmComponentReview.input)
+        .output(schemas.agentPlugins.confirmComponentReview.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.confirmComponentReviewResult(input)
+        ),
     },
     mcpOauth: {
       startDesktopFlow: t

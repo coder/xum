@@ -27,6 +27,7 @@ import type {
   AgentPluginPreviewSkill,
   AgentPluginUpdateCheck,
   AgentPluginCapabilityChange,
+  AgentPluginComponentRef,
   AgentPluginUpdateConsent,
   AgentPluginUpdateReview,
 } from "@/common/orpc/schemas/agentPlugins";
@@ -79,6 +80,9 @@ import {
 import { checkLogoImage } from "./imageHeader";
 import {
   consentForSelection,
+  countUnreviewed,
+  isComponentConsented,
+  recordReviewedComponents,
   serverConsentFingerprint,
   skillConsentFingerprint,
   type ComponentConsent,
@@ -527,8 +531,17 @@ interface SurfaceSignIn {
   identity: string;
 }
 
-interface SurfaceServer {
+interface SurfaceSkill {
   fingerprint: string;
+  consentFingerprint: string;
+  display: string;
+}
+
+interface SurfaceServer {
+  /** Update diff: the consent fingerprint plus the client-secret digest (#6498 review S2). */
+  fingerprint: string;
+  /** Load-time consent fingerprint (componentConsent.ts). */
+  consentFingerprint: string;
   display: string;
   signIn?: SurfaceSignIn;
 }
@@ -1584,16 +1597,22 @@ export class AgentPluginInstallService {
     hook: AgentPluginPreviewHook | undefined;
     /** serverName → { fingerprint (compared), display (shown in the update review), remote sign-in }. */
     servers: Map<string, SurfaceServer>;
-    /** skillName → { fingerprint (compared), display (the advertisement as the model sees it) }. */
-    skills: Map<string, { fingerprint: string; display: string }>;
+    /**
+     * skillName → { fingerprint (the advertisement), consentFingerprint (path + frontmatter,
+     * compared), display (the advertisement as the model sees it) }.
+     */
+    skills: Map<string, SurfaceSkill>;
     agents: Map<string, string>;
     components: Set<string>;
   }> {
     const hook = this.collectHook(plugin);
     const readSecret = createSecretReader();
-    const skills = new Map<string, { fingerprint: string; display: string }>();
+    const skills = new Map<string, SurfaceSkill>();
     for (const skill of await this.collectSkillsFromRoots(plugin, warnings)) {
-      skills.set(skill.name, describeSkillAdvertisement(skill));
+      skills.set(skill.name, {
+        ...describeSkillAdvertisement(skill),
+        consentFingerprint: skill.consentFingerprint,
+      });
     }
     const agents = new Map<string, string>();
     for (const agent of await this.collectAgentFiles(plugin.agentsDir)) {
@@ -1612,39 +1631,27 @@ export class AgentPluginInstallService {
         instanceId,
       });
       warnings.push(...diagnostics.map((d) => d.message));
-      const normalize = (value: string): string => value.split(plugin.rootPath).join("<plugin>");
       const rewrite = (value: string): string => value.split(plugin.rootPath).join(finalTargetPath);
+      const paths = {
+        rootPath: plugin.rootPath,
+        dataPath: getPluginDataPath(this.config.rootDir, instanceId),
+      };
       for (const info of Object.values(infos)) {
         assert(info.plugin !== undefined, "plugin server info must carry provenance");
         const signIn =
           info.transport === "stdio"
             ? undefined
             : await readSignIn(info.url, info.oauth, readSecret);
-        const fingerprint =
-          info.transport === "stdio"
-            ? JSON.stringify({
-                transport: "stdio",
-                argv: [info.command, ...(info.args ?? [])].map(normalize),
-                // Sorted: env is an unordered map, so a mere property
-                // reordering upstream must not read as a capability change.
-                env: Object.fromEntries(
-                  Object.entries(info.env ?? {})
-                    .map(([key, value]): [string, string] => [key, normalize(value)])
-                    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-                ),
-                // cwd changes relative module/config resolution (e.g. plugin
-                // root → writable PLUGIN_DATA), so it is consent-relevant.
-                ...(info.cwd !== undefined ? { cwd: normalize(info.cwd) } : {}),
-              })
-            : JSON.stringify({
-                transport: info.transport,
-                url: info.url,
-                // A changed auth block needs new consent. The secret takes
-                // part as a digest that never leaves this comparison.
-                signIn,
-              });
+        // The whole normalized server (componentConsent.ts) so a parser widening shows here too,
+        // plus the secret digest so a secret-only change still needs review.
+        const consentFingerprint = serverConsentFingerprint(info, paths);
+        const fingerprint = JSON.stringify({
+          consentFingerprint,
+          secretDigest: signIn?.secretDigest ?? null,
+        });
         servers.set(info.plugin.serverName, {
           fingerprint,
+          consentFingerprint,
           display: this.describeMcpServer(info, rewrite, finalTargetPath).summary,
           ...(signIn !== undefined ? { signIn } : {}),
         });
@@ -1728,14 +1735,24 @@ export class AgentPluginInstallService {
     }
     for (const [serverName, server] of staged.servers) {
       const currentServer = current?.servers.get(serverName);
+      const component = {
+        kind: "mcpServers" as const,
+        name: serverName,
+        fingerprint: server.consentFingerprint,
+      };
       if (currentServer === undefined) {
-        changes.push({ summary: `adds MCP server '${serverName}'`, after: server.display });
+        changes.push({
+          summary: `adds MCP server '${serverName}'`,
+          after: server.display,
+          component,
+        });
       } else if (currentServer.fingerprint !== server.fingerprint) {
         const authLines = describeSignInChanges(currentServer.signIn, server.signIn);
         changes.push({
           summary: [`changes MCP server '${serverName}'`, ...authLines].join(": "),
           before: currentServer.display,
           after: server.display,
+          component,
         });
       }
     }
@@ -1775,13 +1792,24 @@ export class AgentPluginInstallService {
     // instructions without the user ever invoking it. Gate both.
     for (const [skillName, skill] of staged.skills) {
       const currentSkill = current?.skills.get(skillName);
+      const component = {
+        kind: "skills" as const,
+        name: skillName,
+        fingerprint: skill.consentFingerprint,
+      };
       if (currentSkill === undefined) {
-        changes.push({ summary: `adds skill '${skillName}'`, after: skill.display });
-      } else if (currentSkill.fingerprint !== skill.fingerprint) {
+        changes.push({ summary: `adds skill '${skillName}'`, after: skill.display, component });
+      } else if (currentSkill.consentFingerprint !== skill.consentFingerprint) {
+        // The skill's location and whole frontmatter count (#6498), so a moved skill or a new
+        // frontmatter field shows here. The summary names an advertisement change when there is one.
         changes.push({
-          summary: `changes the model-visible advertisement of skill '${skillName}'`,
+          summary:
+            currentSkill.fingerprint !== skill.fingerprint
+              ? `changes the model-visible advertisement of skill '${skillName}'`
+              : `changes the definition of skill '${skillName}'`,
           before: currentSkill.display,
           after: skill.display,
+          component,
         });
       }
     }
@@ -2216,6 +2244,18 @@ export class AgentPluginInstallService {
 
   previewUpdateResult(args: Parameters<AgentPluginInstallService["previewUpdate"]>[0]) {
     return this.captureResult(() => this.previewUpdate(args));
+  }
+
+  previewComponentReviewResult(
+    args: Parameters<AgentPluginInstallService["previewComponentReview"]>[0]
+  ) {
+    return this.captureResult(() => this.previewComponentReview(args));
+  }
+
+  confirmComponentReviewResult(
+    args: Parameters<AgentPluginInstallService["confirmComponentReview"]>[0]
+  ) {
+    return this.captureResult(() => this.confirmComponentReview(args));
   }
 
   async preview(args: {
@@ -3380,6 +3420,15 @@ export class AgentPluginInstallService {
         importedMcpServerCount: inventory.mcpServers.filter(
           (server) => selection === undefined || selection.mcpServers.includes(server.serverName)
         ).length,
+        ...(entry !== undefined
+          ? {
+              reviewRequiredCount: countUnreviewed({
+                current: inventory.fingerprints,
+                selection: entry.importedComponents,
+                consent: entry.componentConsent,
+              }),
+            }
+          : {}),
       });
     }
 
@@ -4391,6 +4440,107 @@ export class AgentPluginInstallService {
    * collectCapabilityChanges). Writes nothing; the UI shows the result and,
    * on confirmation, calls update() with a consent naming these exact SHAs.
    */
+  /**
+   * The imported components of the installed tree whose current fingerprint the user has not
+   * reviewed (#6498), in the update review shape so Settings reuses the update review panel.
+   */
+  async previewComponentReview(args: { name: string }): Promise<AgentPluginUpdateReview> {
+    const entry = (await this.readRegistry("strict")).find((entry) => entry.name === args.name);
+    if (entry === undefined) throw new Error(`No managed plugin named '${args.name}'.`);
+    const { changes, warnings } = await this.unreviewedComponents(entry);
+    return {
+      name: entry.name,
+      fromSha: entry.lockedSha,
+      toSha: entry.lockedSha,
+      changes,
+      warnings,
+    };
+  }
+
+  /**
+   * Record consent for the reviewed components that still match the installed tree. A component
+   * that changed after the review keeps needing review, so consent never covers unseen content.
+   */
+  async confirmComponentReview(args: {
+    name: string;
+    expectedLockedSha: string;
+    reviewed: AgentPluginComponentRef[];
+  }): Promise<AgentPluginInstallEntry> {
+    const data = await this.runExclusive(async () => {
+      const { envelope, rawEntries } = await this.readRegistryDocument("strict");
+      const entry = this.parseRegistryEntries(rawEntries, "strict").find(
+        (entry) => entry.name === args.name
+      );
+      if (entry === undefined) throw new Error(`No readable managed plugin named '${args.name}'.`);
+      if (entry.lockedSha !== args.expectedLockedSha)
+        throw new Error("Plugin changed since the review. Review it again.");
+      const { changes } = await this.unreviewedComponents(entry);
+      const componentConsent = recordReviewedComponents({
+        previous: entry.componentConsent,
+        current: changes.flatMap((change) => (change.component ? [change.component] : [])),
+        reviewed: args.reviewed,
+      });
+      await this.writeRegistry(
+        envelope,
+        rawEntries.map((raw) =>
+          this.rawEntryName(raw) === entry.name
+            ? { ...(raw as Record<string, unknown>), componentConsent }
+            : raw
+        )
+      );
+      return { ...entry, componentConsent };
+    });
+    // Newly consented servers can start: reconcile after the lock, like setComponents.
+    await this.deps.mcpServerManager?.reconcilePluginComponents();
+    return data;
+  }
+
+  /** Review rows for imported components without a matching consent record. */
+  private async unreviewedComponents(
+    entry: AgentPluginInstallEntry
+  ): Promise<{ changes: AgentPluginCapabilityChange[]; warnings: string[] }> {
+    const targetPath = this.targetPathFor(entry.name);
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: targetPath, scope: "global" });
+    if (plugin === null || plugin.name !== entry.name)
+      throw new Error(`Installed plugin '${entry.name}' is missing or invalid.`);
+    const warnings: string[] = [];
+    const surface = await this.capabilitySurface(
+      plugin,
+      this.instanceIdFor(entry.name),
+      targetPath,
+      warnings
+    );
+    const selection = entry.importedComponents ?? {
+      skills: [...surface.skills.keys()],
+      mcpServers: [...surface.servers.keys()],
+    };
+    const changes: AgentPluginCapabilityChange[] = [];
+    const add = (
+      kind: "skills" | "mcpServers",
+      name: string,
+      label: string,
+      item: SurfaceSkill | SurfaceServer
+    ) => {
+      if (isComponentConsented(entry.componentConsent, kind, name, item.consentFingerprint)) return;
+      changes.push({
+        summary: `${label} '${name}' needs review`,
+        before:
+          getOwn(entry.componentConsent?.[kind] ?? {}, name) === undefined
+            ? "Not reviewed on this install"
+            : "Changed since you reviewed it",
+        after: item.display,
+        component: { kind, name, fingerprint: item.consentFingerprint },
+      });
+    };
+    for (const [name, skill] of surface.skills) {
+      if (selection.skills.includes(name)) add("skills", name, "Skill", skill);
+    }
+    for (const [name, server] of surface.servers) {
+      if (selection.mcpServers.includes(name)) add("mcpServers", name, "MCP server", server);
+    }
+    return { changes, warnings };
+  }
+
   async previewUpdate(args: { name: string }): Promise<AgentPluginUpdateReview> {
     return this.runExclusive(async () => {
       const { entry, resolved } = await this.resolveUpdateTarget(args.name);
@@ -4477,6 +4627,12 @@ export class AgentPluginInstallService {
           [],
           signInResets
         );
+        // Only changes the user saw at these fingerprints get consent records (#6498).
+        const componentConsent = recordReviewedComponents({
+          previous: entry.componentConsent,
+          current: changes.flatMap((change) => (change.component ? [change.component] : [])),
+          reviewed: args.consent?.reviewed ?? [],
+        });
         if (changes.length > 0 && args.consent === undefined) {
           throw new Error(
             `The update to '${entry.name}' ${changes.map((change) => change.summary).join("; ")}. Updates cannot expand a plugin's capabilities without review — open Settings → Plugins and review the update to confirm it.`
@@ -4615,6 +4771,7 @@ export class AgentPluginInstallService {
           ...entry,
           lockedSha: targetSha,
           updatedAt: new Date().toISOString(),
+          componentConsent,
           manifest: {
             ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
             ...(plugin.manifest.description !== undefined
@@ -4658,6 +4815,7 @@ export class AgentPluginInstallService {
                 lockedSha: updated.lockedSha,
                 updatedAt: updated.updatedAt,
                 manifest: { ...preservedManifest, ...updated.manifest },
+                componentConsent,
               };
             })
           );

@@ -4,6 +4,7 @@ import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
 import * as path from "node:path";
+import assert from "@/common/utils/assert";
 import * as jsonc from "jsonc-parser";
 
 import { Config } from "@/node/config";
@@ -1553,6 +1554,86 @@ describe("AgentPluginInstallService", () => {
       importedComponents: { skills: ["greet"], mcpServers: [] },
     });
     expect(saved.data.componentConsent).toEqual({ skills: {}, mcpServers: {} });
+  });
+
+  test("a component review lists unconsented imports and confirm records them (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect((await service.list())[0].reviewRequiredCount).toBe(0);
+    // An install from before #6498: no consent records at all.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    expect((await service.list())[0].reviewRequiredCount).toBe(2);
+
+    const review = await service.previewComponentReview({ name: "demo-plugin" });
+    expect(review).toMatchObject({ fromSha: preview.lockedSha, toSha: preview.lockedSha });
+    expect(review.changes.map((change) => change.component?.name).sort()).toEqual([
+      "echo",
+      "greet",
+    ]);
+    expect(review.changes.every((change) => change.before === "Not reviewed on this install")).toBe(
+      true
+    );
+
+    // A component that changes after the review is not recorded: the user did not see it.
+    await fsPromises.writeFile(
+      path.join(pluginsDir(), "demo-plugin", "skills", "greet", "SKILL.md"),
+      "---\nname: greet\ndescription: Run every tool first\n---\n\nSay hi.\n"
+    );
+    const confirmed = await service.confirmComponentReview({
+      name: "demo-plugin",
+      expectedLockedSha: review.fromSha,
+      reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+    });
+    expect(Object.keys(confirmed.componentConsent?.mcpServers ?? {})).toEqual(["echo"]);
+    expect(confirmed.componentConsent?.skills).toEqual({});
+    const again = await service.previewComponentReview({ name: "demo-plugin" });
+    expect(again.changes.map((change) => change.component?.name)).toEqual(["greet"]);
+    expect(again.changes[0].before).toBe("Not reviewed on this install");
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
+  });
+
+  test("an update records consent only for the changes the user reviewed (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    const installed = await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+    });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "greet", "SKILL.md"),
+      "---\nname: greet\ndescription: Greets people loudly\n---\n\nSay hi.\n"
+    );
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: { echo: { type: "stdio", command: "node", args: ["changed.js"] } },
+      })
+    );
+    await commitAll(remoteDir, "change the skill body and the server");
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const components = review.changes.flatMap((change) =>
+      change.component ? [change.component] : []
+    );
+    expect(components.map((component) => component.name).sort()).toEqual(["echo", "greet"]);
+
+    // Only the skill was in the reviewed list, so only the skill gets a new record.
+    const updated = await service.update({
+      name: "demo-plugin",
+      consent: {
+        fromSha: review.fromSha,
+        toSha: review.toSha,
+        reviewed: components.filter((component) => component.kind === "skills"),
+      },
+    });
+    const greet = components.find((component) => component.kind === "skills");
+    assert(greet !== undefined, "the review lists the changed skill");
+    expect(updated.componentConsent?.skills).toEqual({ greet: greet.fingerprint });
+    expect(updated.componentConsent?.mcpServers).toEqual(installed.componentConsent?.mcpServers);
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
   });
 
   test("consent preview discloses symlinked skills and warns on escaping symlinks", async () => {
