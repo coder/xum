@@ -517,5 +517,22 @@ describe("AskUserQuestionToolCall", () => {
       expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
       expect(view.getByText(/no longer in the agent/)).toBeTruthy();
     });
+
+    test("rechecks the agent's context right before sending", async () => {
+      const view = renderAsyncQuestion();
+      fireEvent.click(view.getByText("First"));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+      // A compaction lands after the click but before dispatch (while preferences flush): the
+      // rendered card is still open, so only a dispatch-time re-read can catch it.
+      currentWorkspaceState = {
+        ...currentWorkspaceState,
+        messages: [{ type: "tool", toolCallId: "ask-async" }, { type: "compaction-boundary" }],
+      };
+
+      await waitFor(() =>
+        expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull()
+      );
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
   });
 });

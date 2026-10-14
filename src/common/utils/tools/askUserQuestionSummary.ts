@@ -10,6 +10,34 @@ export const ASK_USER_QUESTION_ASYNC_SUMMARY =
   "continue working with your best judgment and state the assumptions you make. If the user " +
   "answers, the answers arrive later as a user message; adjust your work to them then.";
 
+/**
+ * Refusal for answering a question that is not blocking on an answer: an Exec question seen
+ * before its immediate result arrived, or one already completed without answers.
+ */
+export const ASK_USER_QUESTION_NOT_WAITING_MESSAGE =
+  "This question is not waiting for an answer here. Try again in a moment.";
+
+/** Refusal for a non-blocking answer whose question was dropped from the agent's context. */
+export const ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE =
+  "These questions are no longer in the agent's context.";
+
+/**
+ * True when a context boundary (compaction, Start Here, reset) follows the question's tool row.
+ * Answers name questions and options by number only, so they mean nothing to the model then.
+ */
+export function hasAskUserQuestionLeftContext(
+  transcript: ReadonlyArray<{ type: string; toolCallId?: string }>,
+  toolCallId: string
+): boolean {
+  const ownRowIndex = transcript.findIndex(
+    (message) => message.type === "tool" && message.toolCallId === toolCallId
+  );
+  return (
+    ownRowIndex !== -1 &&
+    transcript.slice(ownRowIndex + 1).some((message) => message.type === "compaction-boundary")
+  );
+}
+
 /** One question's answer as picked on the card: 1-based option numbers plus the user's own text. */
 export interface AskUserQuestionSelection {
   optionNumbers: number[];

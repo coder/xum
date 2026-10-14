@@ -38,7 +38,9 @@ import type {
 } from "@/common/types/tools";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 import {
+  ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE,
   buildAskUserQuestionAnswerMessage,
+  hasAskUserQuestionLeftContext,
   isAsyncAskUserQuestionOutput,
 } from "@/common/utils/tools/askUserQuestionSummary";
 import type { DisplayedUserMessage } from "@/common/types/message";
@@ -293,15 +295,10 @@ export function AskUserQuestionToolCall(props: {
             message.askUserQuestionAnswer?.toolCallId === props.toolCallId
         )?.askUserQuestionAnswer?.answers ?? sentAnswers)
     : null;
-  // The answer names questions and options by number only, so it means nothing to the model once
-  // a compaction, Start Here or reset dropped this tool call from its context.
-  const ownRowIndex = transcript.findIndex(
-    (message) => message.type === "tool" && message.toolCallId === props.toolCallId
-  );
+  // Answers name questions and options by number only, so a question that a compaction, Start
+  // Here or reset dropped from the agent's context closes unanswered.
   const leftAgentContext =
-    isAsyncQuestion &&
-    ownRowIndex !== -1 &&
-    transcript.slice(ownRowIndex + 1).some((message) => message.type === "compaction-boundary");
+    isAsyncQuestion && hasAskUserQuestionLeftContext(transcript, props.toolCallId);
   const isAnswering =
     props.status === "executing" ||
     (isAsyncQuestion && deliveredAnswers == null && !leftAgentContext);
@@ -561,6 +558,16 @@ export function AskUserQuestionToolCall(props: {
           // a stale copy of a question that was edited away or moved behind a boundary.
           if (!isTranscriptMutationAllowed(workspaceId)) {
             throw new Error(TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
+          }
+          // The render-time check above is a snapshot: a boundary may have landed while the
+          // preferences flushed, so re-read the latest transcript before sending.
+          if (
+            hasAskUserQuestionLeftContext(
+              workspaceStore.getWorkspaceState(workspaceId).messages,
+              props.toolCallId
+            )
+          ) {
+            throw new Error(ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE);
           }
           return api.workspace.sendMessage({
             workspaceId,
@@ -974,7 +981,7 @@ export function AskUserQuestionToolCall(props: {
               <div className="flex flex-col gap-2">
                 {leftAgentContext && successResult == null && (
                   <div className="text-muted text-[11px] italic">
-                    Not answered. These questions are no longer in the agent&apos;s context.
+                    Not answered. {ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE}
                   </div>
                 )}
                 {successResult && (

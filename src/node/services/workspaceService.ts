@@ -267,7 +267,11 @@ import type {
   WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
 import { isDynamicToolPart } from "@/common/types/toolParts";
-import { buildAskUserQuestionSummary } from "@/common/utils/tools/askUserQuestionSummary";
+import {
+  ASK_USER_QUESTION_NOT_WAITING_MESSAGE,
+  buildAskUserQuestionSummary,
+  isAsyncAskUserQuestionOutput,
+} from "@/common/utils/tools/askUserQuestionSummary";
 import {
   AskUserQuestionToolArgsSchema,
   AskUserQuestionToolResultSchema,
@@ -17389,6 +17393,14 @@ export class WorkspaceService
       //
       // In that case we persist the tool result into partial.json or chat.jsonl,
       // then emit a synthetic tool-call-end so the renderer updates immediately.
+      //
+      // A live stream owns its partial (it rewrites it from memory), so an unregistered question
+      // while streaming is not a restart leftover: it is a non-blocking (Exec) question whose
+      // immediate result has not reached the renderer yet. Finalizing it here would lose the
+      // answer, so refuse; once the result lands the card answers it with a chat message.
+      if (this.aiService.isStreaming(workspaceId)) {
+        return Err(ASK_USER_QUESTION_NOT_WAITING_MESSAGE);
+      }
       try {
         // Helper: update a message in-place if it contains this ask_user_question tool call.
         const tryFinalizeMessage = (
@@ -17407,6 +17419,13 @@ export class WorkspaceService
 
             if (part.toolName !== "ask_user_question") {
               errorMessage = `toolCallId=${toolCallId} is toolName=${part.toolName}, expected ask_user_question`;
+              return part;
+            }
+
+            // A non-blocking question completed without answers; its answers are a chat message,
+            // so this path must not report them as delivered.
+            if (part.state === "output-available" && isAsyncAskUserQuestionOutput(part.output)) {
+              errorMessage = ASK_USER_QUESTION_NOT_WAITING_MESSAGE;
               return part;
             }
 
