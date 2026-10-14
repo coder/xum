@@ -11,6 +11,7 @@ import {
   resolveSkillUserInvocable,
   resolveSkillWhenToUse,
 } from "@/common/orpc/schemas";
+import { resolveSkillPaths } from "@/common/utils/skills/skillPaths";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { AgentSkillListToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -138,6 +139,7 @@ async function readSkillDescriptor(
       userInvocable: resolveSkillUserInvocable(parsed.frontmatter),
       argumentHint: parsed.frontmatter["argument-hint"],
       whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
+      paths: resolveSkillPaths(parsed.frontmatter),
     });
 
     if (!descriptorResult.success) {
