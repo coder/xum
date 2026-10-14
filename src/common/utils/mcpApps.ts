@@ -192,6 +192,13 @@ export function mcpAppEntrypointTitle(
 }
 
 /**
+ * Shortest time between two MCP App catalog-change ticks of one workspace. Each tick re-lists
+ * every MCP App server of the workspace, so a server that floods tools/list_changed must not
+ * drive a refresh loop. A burst yields one tick at once and one trailing tick.
+ */
+export const MCP_APP_CATALOG_CHANGE_MIN_INTERVAL_MS = 5_000;
+
+/**
  * The result-store key of an opened entry point (one view record per server, tool and type).
  * Names are encoded: server keys contain colons (`plugin:<hex>:<server>`), and a raw join would
  * give `a` + `b:c` and `a:b` + `c` the same key.
