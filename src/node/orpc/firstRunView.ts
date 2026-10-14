@@ -29,8 +29,9 @@ import { VERSION } from "@/version";
  *   (`z-[1500]`), or the iOS standalone `.ios-status-bar-band` (1001) would paint over the copy.
  * - The left sidebar and the shell header come from the live 1200 px first paint (owner decision
  *   10-14), with runtime attributes and Radix ScrollArea pieces gone. Both sidebar states are here:
- *   the <style> shows the one App.tsx starts with (collapsed at `innerWidth <= 768`) or the saved
- *   one the early script sets in `data-sidebar`. A saved custom width is not copied (leftover).
+ *   the <style> shows the one App.tsx starts with (collapsed at or below
+ *   `NARROW_VIEWPORT_MAX_WIDTH_PX`) or the saved one the early script sets in `data-sidebar`. A
+ *   saved custom width is not copied (leftover).
  * - The logo's fill follows `data-theme` (set before the app by index.html), as ProjectSidebar picks
  *   its dark or light logo from the theme.
  * - The live wizard focuses its first button and shows a focus ring. The inert copy has none.
