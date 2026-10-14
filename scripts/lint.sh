@@ -45,20 +45,10 @@ fi
 
 OXLINT_CONFIG=.oxlintrc.json
 
-# The config is generated and gitignored, so it cannot drift from eslint.config.mjs.
-ensure_oxlint_config() {
-  local input
-  for input in eslint.config.mjs eslint-local-rules.mjs scripts/gen-oxlintrc.mjs node_modules/.installed; do
-    if [ ! -f "$OXLINT_CONFIG" ] || [ "$input" -nt "$OXLINT_CONFIG" ]; then
-      echo "Generating $OXLINT_CONFIG from eslint.config.mjs..."
-      node scripts/gen-oxlintrc.mjs "$OXLINT_CONFIG"
-      return
-    fi
-  done
-}
-
 run_oxlint() {
-  ensure_oxlint_config
+  # The config is generated and gitignored, so it cannot drift from eslint.config.mjs. It lists
+  # every lint file, so it is regenerated when its inputs or the set of lint files change.
+  node scripts/gen-oxlintrc.mjs --if-stale "$OXLINT_CONFIG"
   # A separate assignment so set -e stops on a listing error.
   local listing
   listing="$(node "$SCRIPT_DIR/lib/lint_targets.js" --oxlint-args)"
