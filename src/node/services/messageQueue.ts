@@ -468,6 +468,11 @@ export class MessageQueue {
     return this.entries.find((entry) => entry.cancelSignal?.aborted !== true);
   }
 
+  /** Whether any entry would still dispatch (a withdrawn entry drains as a no-op). */
+  hasDispatchableEntries(): boolean {
+    return this.nextDispatchableEntry() !== undefined;
+  }
+
   getNextDispatchableMode(): QueueDispatchMode | undefined {
     return this.nextDispatchableEntry()?.dispatchMode;
   }
