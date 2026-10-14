@@ -306,6 +306,7 @@ import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibil
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import type { StartupRecoveryState } from "@/node/services/startupRecovery";
 import { judgeLifecycleMarkerOwner } from "@/node/services/lifecycleMarkerOwners";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
@@ -1223,6 +1224,29 @@ function isStartupRedriveCandidate(
     isActiveStartupTask(task, inUseElsewhere) &&
     !isWorkspaceArchived(task.archivedAt, task.unarchivedAt)
   );
+}
+
+/**
+ * A legacy task row (no taskStatus) has no durable evidence that it was running: startup recovery
+ * sends it the restart nudge only for an interrupted history tail.
+ */
+function lacksLegacyRestartEvidence(
+  task: AgentTaskWorkspaceEntry,
+  state: StartupRecoveryState | undefined
+): boolean {
+  return task.taskStatus == null && state !== "interrupted";
+}
+
+/**
+ * A legacy task row that startup recovery has no work for: no restart evidence, no pending
+ * guidance, and an `idle` probe, which proves no compaction follow-up is pending either.
+ */
+function isIdleLegacyStartupTask(
+  task: AgentTaskWorkspaceEntry,
+  state: StartupRecoveryState | undefined,
+  pendingGuidanceCount: number
+): boolean {
+  return state === "idle" && pendingGuidanceCount === 0 && lacksLegacyRestartEvidence(task, state);
 }
 
 function isWorkspaceBusyIdleOnlySend(error: unknown): boolean {
@@ -5911,6 +5935,9 @@ export class TaskService implements AgentTaskIntegration {
         skippedRunningDueToActiveDescendants += 1;
         continue;
       }
+      // Decided before the attempt rotation below: that rotation writes the whole config file,
+      // and a large config with many legacy rows outlived the startup step bound (#6511).
+      if (isIdleLegacyStartupTask(task, states.get(task.id), pendingGuidance.length)) continue;
 
       // Admission classification: startup re-drive (compaction follow-up, guidance replay or the
       // restart nudge) = new UNOWNED attempt; rotate + mark once before the first send, guarded
@@ -5988,7 +6015,7 @@ export class TaskService implements AgentTaskIntegration {
       }
 
       // Legacy tasks lack active-status evidence. Durable compaction/guidance above still wins.
-      if (task.taskStatus == null && states.get(task.id) !== "interrupted") continue;
+      if (lacksLegacyRestartEvidence(task, states.get(task.id))) continue;
       const isPlanLike = await this.isPlanLikeTaskWorkspace({
         projectPath: task.projectPath,
         workspace: task,

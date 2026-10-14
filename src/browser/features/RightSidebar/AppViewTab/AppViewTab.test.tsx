@@ -15,6 +15,47 @@ import { useWorkspaceStoreRaw, type WorkspaceState } from "@/browser/stores/Work
 import { createTestApiClient } from "@/browser/testUtils";
 import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTab";
 
+/**
+ * Run the view document's preamble (its first script) as the frame's document would: it opens
+ * the document's channel to the host (mcpAppDocumentChannel.ts), whose open announcement comes
+ * from the frame's window. Returns the view's `window.parent`, which posts over that channel.
+ * `onMessage` gets every message the host sends the document.
+ */
+function bootViewDocument(
+  frame: HTMLIFrameElement,
+  onMessage: (message: { method?: string; params?: unknown }) => void
+): { postMessage: (message: unknown, targetOrigin: string) => void } {
+  const doc = new window.DOMParser().parseFromString(frame.getAttribute("srcdoc")!, "text/html");
+  const preamble = doc.querySelector("script")?.textContent ?? "";
+  const documentWindow: Record<string, unknown> = {
+    parent: {
+      postMessage: (data: unknown, _origin: string, ports: unknown[] = []) => {
+        const event = new window.Event("message");
+        Object.defineProperty(event, "data", { value: data });
+        Object.defineProperty(event, "source", { value: frame.contentWindow });
+        Object.defineProperty(event, "ports", { value: ports });
+        act(() => {
+          window.dispatchEvent(event);
+        });
+      },
+    },
+    MessageEvent: class {
+      constructor(
+        readonly type: string,
+        readonly init: { data: { method?: string; params?: unknown } }
+      ) {}
+    },
+    dispatchEvent: (event: { init: { data: { method?: string; params?: unknown } } }) => {
+      onMessage(event.init.data);
+      return true;
+    },
+    addEventListener: () => undefined,
+  };
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
+  (new Function("window", preamble) as (window: unknown) => void)(documentWindow);
+  return documentWindow.parent as { postMessage: (message: unknown, targetOrigin: string) => void };
+}
+
 describe("AppViewTabPanel", () => {
   let cleanupDom: (() => void) | null = null;
   beforeEach(() => {
@@ -206,16 +247,9 @@ describe("AppViewTabPanel", () => {
         );
         const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
         const posted: Array<{ method?: string; params?: unknown }> = [];
-        frame.contentWindow!.postMessage = ((message: { method?: string; params?: unknown }) => {
-          posted.push(message);
-        }) as Window["postMessage"];
-        const event = new window.Event("message");
-        Object.defineProperty(event, "data", {
-          value: { jsonrpc: "2.0", method: "ui/notifications/initialized" },
-        });
-        Object.defineProperty(event, "source", { value: frame.contentWindow });
+        const viewWindow = bootViewDocument(frame, (message) => posted.push(message));
         act(() => {
-          window.dispatchEvent(event);
+          viewWindow.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" }, "*");
         });
         await waitFor(() =>
           expect(

@@ -1263,6 +1263,22 @@ function checkCompactionFollowUpStillPending(
     : "consumed";
 }
 
+/** Messages the startup recovery probe reads from the end of history. */
+const STARTUP_TAIL_MESSAGE_COUNT = 20;
+
+/**
+ * Whether the startup follow-up dispatch (dispatchPendingFollowUpOnce without a targeted summary)
+ * can still act on this history tail. Conservative: it answers true whenever the tail cannot
+ * decide (only hidden rows, or a preserved tail copy whose epoch boundary may be further back).
+ */
+function mayEndInPendingCompactionFollowUp(tail: readonly MuxMessage[]): boolean {
+  const last = tail.findLast((message) => !isModelHiddenMessage(message));
+  if (last === undefined) return tail.length >= STARTUP_TAIL_MESSAGE_COUNT;
+  if (last.metadata?.rlmPreservedTailCopy === true) return true;
+  const metadata = last.metadata?.muxMetadata;
+  return isCompactionSummaryMetadata(metadata) && metadata.pendingFollowUp != null;
+}
+
 function pendingCompactionSummary(message: MuxMessage): CompactionCancellationSummary | undefined {
   const metadata = message.metadata?.muxMetadata;
   return message.role === "assistant" &&
@@ -3346,6 +3362,14 @@ export class AgentSession {
     return retryRequest;
   }
 
+  private classifyStartupTail(
+    partial: MuxMessage | null,
+    history: MuxMessage[]
+  ): "interrupted" | "follow-up" | "idle" {
+    if (this.hasInterruptedStartupTail(partial, history)) return "interrupted";
+    return mayEndInPendingCompactionFollowUp(history) ? "follow-up" : "idle";
+  }
+
   private hasInterruptedStartupTail(partial: MuxMessage | null, history: MuxMessage[]): boolean {
     if (this.isPendingAskUserQuestion(partial)) return false;
     if (partial?.role === "assistant" && !this.isFinishedStartupPartial(partial, history)) {
@@ -3587,7 +3611,9 @@ export class AgentSession {
         this.historyService
           .readPartial(this.workspaceId, { throwOnError: strictPartial })
           .catch(() => undefined),
-        this.historyService.getLastMessages(this.workspaceId, 20).catch(() => null),
+        this.historyService
+          .getLastMessages(this.workspaceId, STARTUP_TAIL_MESSAGE_COUNT)
+          .catch(() => null),
       ])
     );
   }
@@ -3625,7 +3651,7 @@ export class AgentSession {
       this.isPendingAskUserQuestion(this.getLastNonSystemHistoryMessage(history.data))
     )
       return "question";
-    return this.hasInterruptedStartupTail(partial, history.data) ? "interrupted" : "idle";
+    return this.classifyStartupTail(partial, history.data);
   }
 
   ensureStartupAutoRetryCheck(): Promise<void> {
@@ -12355,6 +12381,8 @@ export class AgentSession {
         return false;
       }
     } else {
+      // Keep mayEndInPendingCompactionFollowUp a superset of what this branch dispatches: startup
+      // recovery skips a legacy task whose probe is `idle` without calling this dispatch (#6511).
       // Read the last message from history — only need 1 message, avoid full-file read.
       // Startup recovery must retry on transient read failures, so bubble errors.
       const historyResult = await this.historyService.getLastMessages(this.workspaceId, 1);
