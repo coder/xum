@@ -78,6 +78,22 @@ test("reports rules that only one of the two configs enables", async () => {
   });
 });
 
+test("compares full option lists, counting ESLint's default options as set", async () => {
+  expect(
+    await mismatches(
+      [
+        {
+          files: ["src/**/*.ts"],
+          rules: { "no-empty": ["error", { allowEmptyCatch: true }], "no-cond-assign": "error" },
+        },
+      ],
+      // ESLint resolves no-cond-assign to ["error", "except-parens"], its default.
+      { rules: { "no-empty": "error", "no-cond-assign": "error" } },
+      ["src/a.ts"]
+    )
+  ).toEqual({ "no-empty: options differ from ESLint's no-empty": ["src/a.ts"] });
+});
+
 test("ignores rules oxlint cannot run: type-aware ones and the listed gaps", async () => {
   expect(
     await mismatches(

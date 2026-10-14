@@ -4,7 +4,7 @@
 // `make lint` runs oxlint with the committed .oxlintrc.json, and CI runs both linters. The two
 // configs are maintained side by side until ESLint is removed. For every file ESLint lints, this
 // resolves ESLint's effective config and replays oxlint's (top-level rules, then each matching
-// override in order), and fails on any rule oxlint supports whose severity or options differ.
+// override in order), and fails on any rule oxlint supports whose severity or options (after ESLint's defaults) differ.
 // Fix a failure by editing .oxlintrc.json, or list the rule in INTENTIONAL_GAPS with a reason.
 //
 // Usage: node scripts/check-oxlint-config.mjs
@@ -38,24 +38,52 @@ function parseRuleValue(value) {
   return { severity: SEVERITIES[severity] ?? String(severity), options };
 }
 
-/** True when every key and array item in `expected` appears in `actual` with the same value. */
-function isSubset(expected, actual) {
-  if (Array.isArray(expected)) {
-    return (
-      Array.isArray(actual) &&
-      expected.length === actual.length &&
-      expected.every((item, index) => isSubset(item, actual[index]))
-    );
+const isPlainObject = (value) =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
+function mergeObjects(defaults, overrides) {
+  const merged = { ...defaults };
+  for (const [key, value] of Object.entries(overrides)) {
+    merged[key] =
+      isPlainObject(value) && isPlainObject(defaults[key])
+        ? mergeObjects(defaults[key], value)
+        : value;
   }
-  if (expected !== null && typeof expected === "object") {
-    return (
-      actual !== null &&
-      typeof actual === "object" &&
-      Object.entries(expected).every(([key, value]) => isSubset(value, actual[key]))
-    );
-  }
-  return expected === actual;
+  return merged;
 }
+
+/**
+ * Applies a rule's `meta.defaultOptions` the way ESLint does when it resolves a config, so that
+ * oxlint's options compare against ESLint's in full: ESLint's effective config already contains
+ * the defaults, and oxlint's config leaves them out.
+ */
+function withDefaultOptions(defaults = [], options) {
+  const merged = defaults.map((value, index) => {
+    if (index >= options.length) return value;
+    return isPlainObject(value) && isPlainObject(options[index])
+      ? mergeObjects(value, options[index])
+      : options[index];
+  });
+  return [...merged, ...options.slice(defaults.length)];
+}
+
+function ruleMeta(eslintConfig, eslintName) {
+  const slash = eslintName.lastIndexOf("/");
+  const plugin = slash === -1 ? "@" : eslintName.slice(0, slash);
+  return eslintConfig.plugins?.[plugin]?.rules?.[eslintName.slice(slash + 1)]?.meta;
+}
+
+const sortKeys = (value) =>
+  Array.isArray(value)
+    ? value.map(sortKeys)
+    : isPlainObject(value)
+      ? Object.fromEntries(
+          Object.keys(value)
+            .sort()
+            .map((key) => [key, sortKeys(value[key])])
+        )
+      : value;
+const sameOptions = (a, b) => JSON.stringify(sortKeys(a)) === JSON.stringify(sortKeys(b));
 
 /** The oxlint names an ESLint rule can have: plugin renames plus TypeScript extension rules. */
 function oxlintNamesFor(eslintName) {
@@ -71,8 +99,15 @@ function oxlintNamesFor(eslintName) {
 /** Rules oxlint can run with this config: native non-type-aware rules plus its JS plugins' rules. */
 function supportedRules(root, oxlintConfig) {
   const oxlint = path.join(path.dirname(require.resolve("oxlint/package.json")), "bin", "oxlint");
+  // Run the bin script through Node: Windows cannot execute its shebang directly. Under Bun
+  // (bun test), its piped output can come back truncated, so use Node from PATH there.
+  const node = process.versions.bun === undefined ? process.execPath : "node";
   const native = JSON.parse(
-    execFileSync(oxlint, ["--rules", "--format", "json"], { cwd: root, encoding: "utf8" })
+    execFileSync(node, [oxlint, "--rules", "--format", "json"], {
+      cwd: root,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    })
   );
   const names = new Set();
   for (const rule of native) {
@@ -133,7 +168,11 @@ function eslintRulesByOxlintName(eslintConfig, supported) {
       if (!supported.has(name)) continue;
       const current = byName.get(name);
       if (current === undefined || (current.severity === "off" && parsed.severity !== "off")) {
-        byName.set(name, { ...parsed, eslintName });
+        byName.set(name, {
+          ...parsed,
+          eslintName,
+          defaultOptions: ruleMeta(eslintConfig, eslintName)?.defaultOptions,
+        });
       }
       break;
     }
@@ -179,7 +218,7 @@ export async function findMismatches({
         report(`${name}: ESLint ${want.severity}, oxlint ${got.severity}`, file);
       } else if (
         got.severity !== "off" &&
-        !isSubset(got.options, want.options.slice(0, got.options.length))
+        !sameOptions(withDefaultOptions(want.defaultOptions, got.options), want.options)
       ) {
         report(`${name}: options differ from ESLint's ${want.eslintName}`, file);
       }
