@@ -2,6 +2,7 @@ import { PLUGIN_SIBLING_NOTE_MAX_SKILLS } from "@/common/constants/toolLimits";
 import type { InvocableSkill, SkillName } from "@/common/types/agentSkill";
 import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
 import assert from "@/common/utils/assert";
+import type { ResolvedAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
 
 /**
  * Plugin skills refer to sibling skills by bare name (pstack's poteto-mode says
@@ -44,6 +45,19 @@ export function formatPluginSiblingNote(args: {
     `When this skill refers to one of these skills, read the plugin's own skill by its qualified name: ` +
     `${mappings.join(", ")}${overflow}.`
   );
+}
+
+/** The note for a resolved skill: null for non-plugin skills. */
+export function pluginSiblingNoteFor(
+  resolved: Pick<ResolvedAgentSkill, "package" | "pluginName">,
+  skills: readonly InvocableSkill[] | undefined
+): string | null {
+  if (resolved.pluginName == null) return null;
+  return formatPluginSiblingNote({
+    pluginName: resolved.pluginName,
+    skillName: resolved.package.directoryName,
+    skills: skills ?? [],
+  });
 }
 
 /**

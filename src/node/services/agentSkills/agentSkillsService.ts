@@ -928,14 +928,26 @@ export interface ResolvedAgentSkill {
   pluginName?: string;
 }
 
+type PluginProvenance = Pick<ResolvedAgentSkill, "pluginRoot" | "pluginName">;
+
+/** A scan candidate's plugin provenance, without undefined keys. */
+function pluginProvenance(
+  candidate: Pick<AgentSkillScanCandidate, "pluginRoot" | "pluginName">
+): PluginProvenance {
+  return {
+    ...(candidate.pluginRoot != null ? { pluginRoot: candidate.pluginRoot } : {}),
+    ...(candidate.pluginName != null ? { pluginName: candidate.pluginName } : {}),
+  };
+}
+
 async function readAgentSkillFromDir(
   runtime: Runtime,
   skillDir: string,
   directoryName: SkillName,
   scope: AgentSkillScope,
-  pluginRoot?: string,
-  pluginName?: string
+  plugin: PluginProvenance
 ): Promise<ResolvedAgentSkill> {
+  const pluginRoot = plugin.pluginRoot;
   const skillFilePath = runtime.normalizePath("SKILL.md", skillDir);
 
   let content: string;
@@ -990,8 +1002,7 @@ async function readAgentSkillFromDir(
     package: validated.data,
     skillDir,
     sourceRuntime: runtime,
-    ...(pluginRoot != null ? { pluginRoot } : {}),
-    ...(pluginName != null ? { pluginName } : {}),
+    ...plugin,
   };
 }
 
@@ -1091,8 +1102,7 @@ export async function readAgentSkill(
         skillDir,
         name,
         candidate.scope,
-        candidate.pluginRoot,
-        candidate.pluginName
+        pluginProvenance(candidate)
       );
     } catch (error) {
       // An unreadable skill (transport, permission) must not let a lower-scope

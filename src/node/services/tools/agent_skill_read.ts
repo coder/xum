@@ -18,7 +18,7 @@ import {
   substituteSkillDirectoryPlaceholders,
 } from "@/node/services/agentSkills/skillDirectory";
 import {
-  formatPluginSiblingNote,
+  pluginSiblingNoteFor,
   prependPluginSiblingNote,
 } from "@/node/services/agentSkills/pluginSiblingNote";
 
@@ -83,7 +83,7 @@ function buildSkillReadDescription(config: ToolConfiguration): string {
 function buildSkillReadSuccess(
   resolved: ResolvedAgentSkill,
   workspaceRuntime: Runtime,
-  availableSkills: readonly InvocableSkill[]
+  availableSkills: readonly InvocableSkill[] | undefined
 ): AgentSkillReadToolResult {
   const dir = resolveSkillDirectory(resolved, workspaceRuntime);
   const location = dir.available
@@ -91,14 +91,7 @@ function buildSkillReadSuccess(
     : { skillDirUnavailable: dir.reason };
   // A plugin skill's bare references to its siblings must reach the plugin's
   // own skills, not higher-precedence skills with the same name.
-  const siblingNote =
-    resolved.pluginName != null
-      ? formatPluginSiblingNote({
-          pluginName: resolved.pluginName,
-          skillName: resolved.package.directoryName,
-          skills: availableSkills,
-        })
-      : null;
+  const siblingNote = pluginSiblingNoteFor(resolved, availableSkills);
   return {
     success: true,
     skill: {
@@ -155,7 +148,7 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
         // Judged against config.runtime: that is where the model's bash runs.
         // availableSkills is this turn's invocable list from the same skill
         // storage context, so the sibling note costs no extra discovery.
-        return buildSkillReadSuccess(resolved, config.runtime, config.availableSkills ?? []);
+        return buildSkillReadSuccess(resolved, config.runtime, config.availableSkills);
       } catch (error) {
         return {
           success: false,

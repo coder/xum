@@ -317,9 +317,10 @@ import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import {
   discoverAgentSkills,
   readAgentSkill,
+  type ResolvedAgentSkill,
 } from "@/node/services/agentSkills/agentSkillsService";
 import {
-  formatPluginSiblingNote,
+  pluginSiblingNoteFor,
   prependPluginSiblingNote,
 } from "@/node/services/agentSkills/pluginSiblingNote";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
@@ -395,6 +396,38 @@ type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPo
 // Wake continuations must retain their delegated turn correlation through candidate preparation.
 // An explicit correlation (a workspace-turn-task row, or a wake row that reactivated an inactive
 // sub-agent under a fresh continuation) wins; a plain wake inherits the still-open turn from history.
+/** The skill-storage context a snapshot's readAgentSkill call used. */
+interface SkillLookupContext {
+  runtime: Runtime;
+  workspacePath: string;
+  options: Parameters<typeof readAgentSkill>[3];
+}
+
+/**
+ * The plugin sibling note for skill snapshots. Discovery runs at most once per
+ * materialization, with the first plugin skill's lookup context (the same
+ * precedence its readAgentSkill call used), and never for non-plugin skills.
+ */
+function createPluginSiblingNoteResolver(
+  workspaceId: string
+): (resolved: ResolvedAgentSkill, context: SkillLookupContext) => Promise<string | null> {
+  let invocableSkills: Promise<readonly InvocableSkill[]> | undefined;
+  return async (resolved, context) => {
+    if (resolved.pluginName == null) return null;
+    invocableSkills ??= discoverAgentSkills(context.runtime, context.workspacePath, context.options)
+      .then(listInvocableSkills)
+      .catch((error: unknown) => {
+        // The note is advisory: never fail the send because of it.
+        log.warn("Failed to discover agent skills for the plugin sibling note", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+        return [];
+      });
+    return pluginSiblingNoteFor(resolved, await invocableSkills);
+  };
+}
+
 function resolveStreamMuxMetadata(
   options: MuxMessageMetadata | undefined,
   retry: MuxMessageMetadata | undefined,
@@ -13554,9 +13587,7 @@ export class AgentSession {
       }
     }
 
-    // Invocable skills for the plugin sibling note, discovered at most once per
-    // materialization and only when the first plugin skill is seen.
-    let invocableSkills: Promise<readonly InvocableSkill[]> | undefined;
+    const resolvePluginSiblingNote = createPluginSiblingNoteResolver(this.workspaceId);
     const snapshotMessages: MuxMessage[] = [];
     for (const ref of refs) {
       // A lookup name: bare, or `<plugin>:<skill>` for a plugin skill. The ref's
@@ -13572,11 +13603,7 @@ export class AgentSession {
       let resolved: Awaited<ReturnType<typeof readAgentSkill>>;
       // The context readAgentSkill used, so the sibling note discovers skills
       // with the same precedence.
-      let lookupContext: {
-        runtime: Runtime;
-        workspacePath: string;
-        options: Parameters<typeof readAgentSkill>[3];
-      };
+      let lookupContext: SkillLookupContext;
       try {
         // claude-skills-compat experiment: resolve slash-invoked skills with the same
         // roots as discovery. The gate is an optional AgentSessionAIService capability.
@@ -13677,29 +13704,7 @@ export class AgentSession {
       // before hashing so the snapshot hash covers the note.
       // Plugin skills name sibling skills by bare name; map the shadowed ones to
       // their qualified names. The off-host note stays the very first line.
-      let siblingNote: string | null = null;
-      if (resolved.pluginName != null) {
-        const context = lookupContext;
-        invocableSkills ??= discoverAgentSkills(
-          context.runtime,
-          context.workspacePath,
-          context.options
-        )
-          .then(listInvocableSkills)
-          .catch((error: unknown) => {
-            // The note is advisory: never fail the send because of it.
-            log.warn("Failed to discover agent skills for the plugin sibling note", {
-              workspaceId: this.workspaceId,
-              error: getErrorMessage(error),
-            });
-            return [];
-          });
-        siblingNote = formatPluginSiblingNote({
-          pluginName: resolved.pluginName,
-          skillName: skill.directoryName,
-          skills: await invocableSkills,
-        });
-      }
+      const siblingNote = await resolvePluginSiblingNote(resolved, lookupContext);
       const body = prependSkillDirectoryOffHostNote(
         prependPluginSiblingNote(injectedBody, siblingNote),
         skillDirectory
