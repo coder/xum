@@ -2027,6 +2027,35 @@ describe("CompactionHandler", () => {
       expect(copies.some((copy) => copy.metadata?.muxMetadata?.type === "plan-review")).toBe(false);
     });
 
+    it("keeps a tail user row's prompt-hook context on its copy", async () => {
+      // Codex PRRT_kwDOPxxmWM6rPqxI: the copy is what later requests send, and the context
+      // renders from its metadata.
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+      });
+      const pluginHookContext = [{ pluginId: "guard", text: "Ask for a repro first." }];
+      await seedHistory(
+        createMuxMessage("u0", "user", "old head question"),
+        createMuxMessage("a0", "assistant", "old head answer"),
+        createMuxMessage("u1", "user", "tail question", { pluginHookContext }),
+        createMuxMessage("a1", "assistant", "tail answer"),
+        createStampedCompactionRequest("compact-req", 2)
+      );
+
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
+
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      const userCopy = epochResult.data.find(
+        (row) => row.metadata?.rlmPreservedTailCopy === true && row.role === "user"
+      );
+      expect(userCopy?.metadata?.pluginHookContext).toEqual(pluginHookContext);
+    });
+
     it("rewrites MCP snapshot invoking IDs to the copy IDs of LATER tail rows", async () => {
       // MCP snapshot rows precede the user row they expand, so the invoking
       // row's copy ID must be preassigned before any copy is built — a

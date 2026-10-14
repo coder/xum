@@ -219,6 +219,39 @@ interface CompactionHandlerOptions {
  * - Appending compacted summaries as durable history boundaries
  * - Preserving cumulative usage across compactions
  */
+/**
+ * The metadata a tail copy keeps verbatim, when set (see buildPreservedTailCopy for the fields it
+ * must never copy):
+ * - `partial` keeps interrupted-tool sentinels applying.
+ * - `muxMetadata` drives provider-side filtering (workflow display rows).
+ * - `pluginHookContext`: request building renders a user row's prompt-hook context from its
+ *   metadata, so the copy that replaces it must carry it (Codex PRRT_kwDOPxxmWM6rPqxI).
+ */
+type RowMetadata = NonNullable<MuxMessage["metadata"]>;
+
+const TAIL_COPY_METADATA_KEYS = [
+  "timestamp",
+  "model",
+  "thinkingLevel",
+  "agentId",
+  "stepStartPartIndices",
+  "partial",
+  "muxMetadata",
+  "kind",
+  "fileAtMentionSnapshot",
+  "agentSkillSnapshot",
+  "pluginHookContext",
+] as const satisfies ReadonlyArray<keyof RowMetadata>;
+
+function pickTailCopyMetadata(source: RowMetadata | undefined): Partial<RowMetadata> {
+  if (source === undefined) return {};
+  return Object.fromEntries(
+    TAIL_COPY_METADATA_KEYS.flatMap((key) =>
+      source[key] !== undefined ? [[key, source[key]]] : []
+    )
+  ) as Partial<RowMetadata>;
+}
+
 export class CompactionHandler {
   private readonly workspaceId: string;
   private readonly historyService: HistoryService;
@@ -1294,25 +1327,7 @@ export class CompactionHandler {
       metadata: {
         synthetic: true,
         rlmPreservedTailCopy: true,
-        ...(source?.timestamp !== undefined ? { timestamp: source.timestamp } : {}),
-        ...(source?.model !== undefined ? { model: source.model } : {}),
-        ...(source?.thinkingLevel !== undefined ? { thinkingLevel: source.thinkingLevel } : {}),
-        ...(source?.agentId !== undefined ? { agentId: source.agentId } : {}),
-        ...(source?.stepStartPartIndices !== undefined
-          ? { stepStartPartIndices: source.stepStartPartIndices }
-          : {}),
-        // Preserve partial so interrupted-tool sentinels keep applying.
-        ...(source?.partial !== undefined ? { partial: source.partial } : {}),
-        // muxMetadata drives provider-side filtering (workflow display rows),
-        // so it must ride along verbatim.
-        ...(source?.muxMetadata !== undefined ? { muxMetadata: source.muxMetadata } : {}),
-        ...(source?.kind !== undefined ? { kind: source.kind } : {}),
-        ...(source?.fileAtMentionSnapshot !== undefined
-          ? { fileAtMentionSnapshot: source.fileAtMentionSnapshot }
-          : {}),
-        ...(source?.agentSkillSnapshot !== undefined
-          ? { agentSkillSnapshot: source.agentSkillSnapshot }
-          : {}),
+        ...pickTailCopyMetadata(source),
         ...(mcpPromptSnapshot !== undefined ? { mcpPromptSnapshot } : {}),
       },
     });

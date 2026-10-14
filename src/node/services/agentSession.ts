@@ -132,6 +132,7 @@ import { synthesizeSilentContinuationSummary } from "@/constants/goalPrompts";
 import type { SendMessageError } from "@/common/types/errors";
 import { ChatMuxMessageSchema, SendMessageOptionsSchema } from "@/common/orpc/schemas";
 import { AutoModelRoutingRecordSchema } from "@/common/orpc/schemas/message";
+import { readPersistedPluginHookContext } from "@/common/utils/messages/pluginHookContext";
 import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import {
   normalizePersistedAgentCandidate,
@@ -548,16 +549,9 @@ function resolveMessageSendOrigin(
 
 /** Raw JSON boundary for a persisted follow-up's hook context: malformed entries are dropped. */
 function coercePluginHookContext(value: unknown): PluginHookContextEntry[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const entries = value.filter(
-    (entry: unknown): entry is PluginHookContextEntry =>
-      typeof entry === "object" &&
-      entry !== null &&
-      "pluginId" in entry &&
-      typeof entry.pluginId === "string" &&
-      "text" in entry &&
-      typeof entry.text === "string"
-  );
+  // The same read as every persisted row: valid entries only, cut at the per-message cap
+  // (Codex PRRT_kwDOPxxmWM6rPrJe).
+  const entries = readPersistedPluginHookContext(value);
   return entries.length > 0 ? entries : undefined;
 }
 
