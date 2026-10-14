@@ -31,15 +31,14 @@ import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registr
 
 const TRUST_DIR = "plugin-hook-trust";
 
+const TrustEntrySchema = z.object({ hash: z.string(), state: z.enum(["trusted", "disabled"]) });
+/** Entries are checked one by one (readTrustFile), so one malformed entry drops only itself. */
 const TrustRecordSchema = z.object({
   version: z.literal(1),
   installedAt: z.string(),
-  hooks: z.record(
-    z.string(),
-    z.object({ hash: z.string(), state: z.enum(["trusted", "disabled"]) })
-  ),
+  hooks: z.record(z.string(), z.unknown()),
 });
-export type PluginHookTrustRecord = z.infer<typeof TrustRecordSchema>["hooks"];
+export type PluginHookTrustRecord = Record<string, z.infer<typeof TrustEntrySchema>>;
 export type PluginHookTrustState = PluginHookTrustRecord[string]["state"];
 
 export function getPluginHookTrustPath(xumHome: string, instanceId: string): string {
@@ -99,10 +98,29 @@ async function readTrustFile(
   }
   const parsed = TrustRecordSchema.safeParse(json);
   // Trust recorded for an earlier install under this name never carries over.
-  if (parsed.success) return parsed.data.installedAt === installedAt ? parsed.data.hooks : {};
+  if (parsed.success) {
+    return parsed.data.installedAt === installedAt ? validEntries(parsed.data.hooks, file) : {};
+  }
   if (isNewerVersionFor(json, installedAt)) return "newer-version";
   log.warn("Plugin hook trust file is malformed; trusting no hooks", { file });
   return {};
+}
+
+/**
+ * The well-formed entries. A malformed one is dropped alone: if it voided the whole file, the next
+ * rewrite would drop every valid decision (self-healing, see AGENTS.md).
+ */
+function validEntries(hooks: Record<string, unknown>, file: string): PluginHookTrustRecord {
+  const valid: PluginHookTrustRecord = {};
+  let dropped = 0;
+  for (const [key, value] of Object.entries(hooks)) {
+    const entry = TrustEntrySchema.safeParse(value);
+    if (entry.success) valid[key] = entry.data;
+    else dropped++;
+  }
+  if (dropped > 0)
+    log.warn("Plugin hook trust file has malformed entries; skipping them", { file, dropped });
+  return valid;
 }
 
 /** The file's text, or undefined (logged) when it is missing, unreadable or not bounded. */
@@ -115,12 +133,18 @@ async function readBoundedTrustFile(file: string): Promise<string | undefined> {
       fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0)
     );
     const stat = await handle.stat();
-    // The size from fstat can grow before the read: read at most one byte past the limit, so the
-    // limit holds while reading too (Codex PRRT_kwDOPxxmWM6rPrVQ).
-    const buffer = Buffer.alloc(MAX_TRUST_FILE_BYTES + 1);
-    const bytesRead = stat.isFile() ? await readUntilFull(handle, buffer) : Infinity;
-    if (bytesRead > MAX_TRUST_FILE_BYTES) {
+    if (!stat.isFile() || stat.size > MAX_TRUST_FILE_BYTES) {
       log.warn("Plugin hook trust file is not a bounded regular file; trusting no hooks", { file });
+      return undefined;
+    }
+    // Sized to the file (runners read it on every hook call), plus one byte: the file can grow
+    // after fstat, and a full buffer means it did. That read is refused, so the limit holds while
+    // reading too (Codex PRRT_kwDOPxxmWM6rPrVQ). Xum's own writes rename a new file into place,
+    // which never changes the open file.
+    const buffer = Buffer.alloc(stat.size + 1);
+    const bytesRead = await readUntilFull(handle, buffer);
+    if (bytesRead > stat.size) {
+      log.warn("Plugin hook trust file grew while it was read; trusting no hooks", { file });
       return undefined;
     }
     return buffer.toString("utf8", 0, bytesRead);
@@ -237,7 +261,13 @@ async function ensureTrustRoot(xumHome: string): Promise<void> {
 async function removeWrongKindRoot(xumHome: string): Promise<void> {
   const root = path.join(xumHome, TRUST_DIR);
   const existing = await fs.lstat(root).catch(() => null);
-  if (existing !== null && !existing.isDirectory()) await fs.rm(root, { force: true });
+  if (existing === null || existing.isDirectory()) return;
+  // A symlink set up on purpose is not followed either: trust writes must stay inside Xum home.
+  // Its target is kept, but every trust decision in it stops applying, so say so in the log.
+  if (existing.isSymbolicLink()) {
+    log.warn("Plugin hook trust store is a symlink; replacing it with a directory", { root });
+  }
+  await fs.rm(root, { force: true });
 }
 
 /** Uninstall: a later install under the same name must not inherit trust. */

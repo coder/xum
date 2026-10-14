@@ -14,6 +14,7 @@ import { AgentPluginInstallService } from "./installService";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { computePluginInstanceId } from "./mcpConfig";
 import { getPluginHookTrustPath } from "./pluginHookTrust";
+import { PLUGIN_REGISTRY_FILE_NAME } from "./registry";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   using proc = execFileAsync("git", [`-C`, cwd, ...args]);
@@ -218,6 +219,54 @@ describe("AgentPluginInstallService hook trust", () => {
     expect(await fsPromises.readFile(trustFile(), "utf8")).toBe(newer);
   });
 
+  /** The registry's installedAt for the installed plugin (the trust file's install binding). */
+  const installedAt = async (): Promise<string> => {
+    const registry = JSON.parse(
+      await fsPromises.readFile(path.join(xumRoot, PLUGIN_REGISTRY_FILE_NAME), "utf8")
+    ) as { plugins: Array<{ installedAt: string }> };
+    return registry.plugins[0].installedAt;
+  };
+
+  test("a newer-format record for this install is kept, not rewritten", async () => {
+    await install();
+    const [hook] = (await service.getHooks({ name: "guard" })).hooks;
+    const newer = JSON.stringify({ version: 2, installedAt: await installedAt(), hooks: {} });
+    await fsPromises.mkdir(path.dirname(trustFile()), { recursive: true });
+    await fsPromises.writeFile(trustFile(), newer);
+
+    await expect(
+      service.setHookTrust({ name: "guard", key: hook.key, hash: hook.hash, state: "trusted" })
+    ).rejects.toThrow("newer Xum version");
+    expect(await fsPromises.readFile(trustFile(), "utf8")).toBe(newer);
+  });
+
+  test("one malformed trust entry drops only itself, also on the next rewrite", async () => {
+    await install();
+    const [hook, stopHook] = (await service.getHooks({ name: "guard" })).hooks;
+    await fsPromises.mkdir(path.dirname(trustFile()), { recursive: true });
+    await fsPromises.writeFile(
+      trustFile(),
+      JSON.stringify({
+        version: 1,
+        installedAt: await installedAt(),
+        hooks: {
+          [hook.key]: { hash: hook.hash, state: "trusted" },
+          other: { hash: 1, state: "trusted" },
+        },
+      })
+    );
+    expect((await service.getHooks({ name: "guard" })).hooks[0]?.review).toBe("trusted");
+
+    // A decision for another hook rewrites the file: the valid decision survives it.
+    await service.setHookTrust({
+      name: "guard",
+      key: stopHook.key,
+      hash: stopHook.hash,
+      state: "disabled",
+    });
+    expect((await service.getHooks({ name: "guard" })).hooks[0]?.review).toBe("trusted");
+  });
+
   test("a malformed trust entry (a directory) does not block a trust decision", async () => {
     await install();
     const [hook] = (await service.getHooks({ name: "guard" })).hooks;
@@ -254,6 +303,17 @@ describe("AgentPluginInstallService hook trust", () => {
     await fsPromises.mkdir(path.dirname(trustFile()), { recursive: true });
     // 1e400 parses to Infinity.
     await fsPromises.writeFile(trustFile(), '{ "version": 1e400, "hooks": {} }');
+
+    expect(await trustFirstHook()).toBe("trusted");
+  });
+
+  test("a fractional trust version is malformed, not a newer format", async () => {
+    await install();
+    await fsPromises.mkdir(path.dirname(trustFile()), { recursive: true });
+    await fsPromises.writeFile(
+      trustFile(),
+      JSON.stringify({ version: 1.5, installedAt: await installedAt(), hooks: {} })
+    );
 
     expect(await trustFirstHook()).toBe("trusted");
   });
@@ -300,7 +360,12 @@ describe("AgentPluginInstallService hook trust", () => {
     if (process.platform === "win32" || process.getuid?.() === 0) return;
     await install();
     await fsPromises.mkdir(path.dirname(trustFile()), { recursive: true });
-    await fsPromises.writeFile(trustFile(), "{}", { mode: 0o000 });
+    const [hook] = (await service.getHooks({ name: "guard" })).hooks;
+    // A valid record that cannot be read: it trusts nothing until the repair.
+    const record = { version: 1, installedAt: await installedAt(), hooks: {} as object };
+    record.hooks = { [hook.key]: { hash: hook.hash, state: "trusted" } };
+    await fsPromises.writeFile(trustFile(), JSON.stringify(record), { mode: 0o000 });
+    expect((await service.getHooks({ name: "guard" })).hooks[0]?.review).toBe("new");
 
     expect(await trustFirstHook()).toBe("trusted");
     expect((await fsPromises.stat(trustFile())).mode & 0o777).toBe(0o600);
