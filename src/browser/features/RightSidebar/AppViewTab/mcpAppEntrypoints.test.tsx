@@ -529,25 +529,26 @@ describe("MCP App entry points", () => {
       restore();
     }
   });
+
   test("re-lists when a server announces a changed tool catalog", async () => {
     let title = "Library";
     const ticks: Array<() => void> = [];
     const client = createTestApiClient({
       mcpApps: {
         listEntrypoints: () => Promise.resolve([entrypoint(title)]),
-        onEntrypointsChanged: async function* (
-          _input: unknown,
-          options?: { signal?: AbortSignal }
-        ) {
-          for (;;) {
-            const tick = Promise.withResolvers<void>();
-            ticks.push(tick.resolve);
-            options?.signal?.addEventListener("abort", () => tick.resolve(), { once: true });
-            await tick.promise;
-            if (options?.signal?.aborted === true) return;
-            yield undefined;
-          }
-        },
+        onEntrypointsChanged: (_input: unknown, options?: { signal?: AbortSignal }) =>
+          Promise.resolve(
+            (async function* () {
+              for (;;) {
+                const tick = Promise.withResolvers<void>();
+                ticks.push(tick.resolve);
+                options?.signal?.addEventListener("abort", () => tick.resolve(), { once: true });
+                await tick.promise;
+                if (options?.signal?.aborted === true) return;
+                yield undefined;
+              }
+            })()
+          ),
       },
     });
     const wrapper = (props: { children: React.ReactNode }) => (
