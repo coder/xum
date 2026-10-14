@@ -248,6 +248,28 @@ jobs:
         env:
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_TOTAL: ${{ strategy.job-total }}
+      # The runner's curl is older than 8.7, so the run above covers only web_fetch's
+      # single-attempt path. Run the real-curl pinning tests once more with a pinned static
+      # curl 8.7+ (curl.se lists stunnel/static-curl), so CI also checks the address
+      # fallback and its no-retry cases (#6414). The env var fails the file if that curl is
+      # not the one on PATH.
+      - name: web_fetch pinning tests with curl 8.7+
+        if: matrix.shard == 1 && github.event.inputs.test_filter == ''
+        env:
+          STATIC_CURL_VERSION: 8.22.0
+          STATIC_CURL_SHA256: dfb02460ba2abe513087538f12a3cf79b74b64a5ea3787ce8ac0cdb11251f884
+          XUM_WEB_FETCH_REQUIRE_CURL_FALLBACK: "1"
+        run: |
+          dir="$RUNNER_TEMP/static-curl"
+          mkdir -p "$dir"
+          archive="$dir/curl.tar.xz"
+          curl -fsSL --retry 3 -o "$archive" \
+            "https://github.com/stunnel/static-curl/releases/download/${STATIC_CURL_VERSION}/curl-linux-x86_64-musl-${STATIC_CURL_VERSION}.tar.xz"
+          echo "${STATIC_CURL_SHA256}  ${archive}" | sha256sum -c -
+          tar -xJf "$archive" -C "$dir" curl
+          PATH="$dir:$PATH"
+          curl -q --version
+          bun test src/node/services/tools/web_fetch.pinning.test.ts
       # A shard writes one report per process: coverage/lcov.info for the shared
       # process, plus coverage/isolated/<n>/ and coverage/tooling/ (see
       # scripts/test-unit-ci.sh). Upload them all.

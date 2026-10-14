@@ -35,6 +35,7 @@ import {
   resolveSkillUserInvocable,
   resolveSkillWhenToUse,
 } from "@/common/orpc/schemas";
+import { resolveSkillPaths } from "@/common/utils/skills/skillPaths";
 import type {
   AgentSkillDescriptor,
   AgentSkillIssue,
@@ -686,6 +687,7 @@ async function readSkillDescriptorFromDir(
       userInvocable: resolveSkillUserInvocable(parsed.frontmatter),
       argumentHint: parsed.frontmatter["argument-hint"],
       whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
+      paths: resolveSkillPaths(parsed.frontmatter),
       ...(options?.pluginName !== undefined ? { pluginName: options.pluginName } : {}),
     };
 

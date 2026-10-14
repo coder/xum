@@ -430,6 +430,39 @@ describe("agent_skill_read", () => {
     expect(withoutLine).not.toContain("When to use:");
   });
 
+  it("leaves path-scoped skills out of the index but still reads them by name", async () => {
+    const lines = skillIndexLines([
+      { name: "ts-rules", description: "TS rules", scope: "project", paths: ["**/*.ts"] },
+      { name: "general", description: "General", scope: "project" },
+    ]);
+    expect(lines.some((line) => line.startsWith("- general:"))).toBe(true);
+    expect(lines.some((line) => line.includes("ts-rules"))).toBe(false);
+
+    using tempDir = new TestTempDir("test-agent-skill-read-path-scoped");
+    const skillDir = path.join(tempDir.path, ".mux", "skills", "ts-rules");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      '---\nname: ts-rules\ndescription: TS rules\npaths: ["**/*.ts"]\n---\nBody\n',
+      "utf-8"
+    );
+    const tool = createAgentSkillReadTool(
+      createTestToolConfig(tempDir.path, {
+        workspaceId: "regular-workspace",
+        xumScope: {
+          type: "project",
+          xumHome: tempDir.path,
+          projectRoot: tempDir.path,
+          projectStorageAuthority: "host-local",
+        },
+      })
+    );
+    const parsed = AgentSkillReadToolResultSchema.parse(
+      await Promise.resolve(tool.execute!({ name: "ts-rules" }, mockToolCallOptions))
+    );
+    expect(parsed.success).toBe(true);
+  });
+
   it("keeps each index description on one line within the length cap", () => {
     const lines = skillIndexLines([
       {
