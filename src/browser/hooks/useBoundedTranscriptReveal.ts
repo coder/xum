@@ -91,8 +91,11 @@ interface RevealState {
   /** First unmounted newer row while detached, anchored by id like the start; null ⇒ the tail. */
   endMessageId: string | null;
   endIndexHint: number;
-  /** The rows `endIndexHint` indexes, for the fallback when the end row is gone. */
-  endRows: readonly RevealRow[];
+  /**
+   * Ids of the rows `endIndexHint` indexes, for the fallback when the end row is gone; [] at the
+   * tail. Ids only, so a detached slice never keeps an obsolete transcript reachable (#6669).
+   */
+  endRows: readonly string[];
 }
 
 /**
@@ -145,13 +148,13 @@ function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCu
  */
 function endAtNearestUnmountedRow(
   rows: readonly RevealRow[],
-  endRows: readonly RevealRow[],
+  endRows: readonly string[],
   hint: number,
   isSafeCut: IsSafeCut
 ): number {
   const indexById = new Map(rows.map((row, index) => [row.id, index]));
   for (let newer = hint + 1; newer < endRows.length; newer += 1) {
-    const index = indexById.get(endRows[newer].id);
+    const index = indexById.get(endRows[newer]);
     if (index !== undefined) return nearestSafeCutAtOrBefore(index, rows.length, isSafeCut);
   }
   return rows.length;
@@ -184,9 +187,9 @@ function resolveSliceEnd(
 function withSliceEnd(state: RevealState, messages: readonly RevealRow[], to: number): RevealState {
   const endMessageId = to < messages.length ? messages[to].id : null;
   const endIndexHint = endMessageId === null ? 0 : to;
-  return state.endMessageId === endMessageId && state.endIndexHint === endIndexHint
-    ? state
-    : { ...state, endMessageId, endIndexHint, endRows: messages };
+  if (state.endMessageId === endMessageId && state.endIndexHint === endIndexHint) return state;
+  const endRows = endMessageId === null ? [] : messages.map((row) => row.id);
+  return { ...state, endMessageId, endIndexHint, endRows };
 }
 
 interface RevealSnapshot {
@@ -255,6 +258,48 @@ function revealThroughState(
   if (index >= snapshot.fromIndex || previous.generation !== snapshot.generation) return previous;
   const targetMessageId = snapshot.messages[index].id;
   return previous.targetMessageId === targetMessageId ? previous : { ...previous, targetMessageId };
+}
+
+/**
+ * Whether the automatic reveal must stop counting: always while detached (`toIndex < length`), so
+ * deletions in the unmounted newer rows cannot resume it; attached, main's mounted-rows budget.
+ */
+function isBudgetSpent(
+  state: RevealState,
+  slice: Pick<RevealSnapshot, "messages" | "fromIndex" | "toIndex">
+): boolean {
+  const length = slice.messages.length;
+  return slice.toIndex < length || length - slice.fromIndex >= state.autoRowLimit;
+}
+
+/** Load older with a cap in force: walk to the row one budget older (revealThrough's rule). */
+function moreTargetState(
+  previous: RevealState,
+  snapshot: RevealSnapshot,
+  isSafeCut: IsSafeCut
+): RevealState {
+  if (previous.generation !== snapshot.generation || snapshot.fromIndex === 0) return previous;
+  const length = snapshot.messages.length;
+  const cut = nearestSafeCutAtOrBefore(
+    snapshot.fromIndex - TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
+    length,
+    isSafeCut
+  );
+  return { ...previous, targetMessageId: snapshot.messages[cut].id };
+}
+
+/**
+ * Where a detached slice starts once its start row is gone (#6669 round 7): as many rows before
+ * the end as were mounted, so every surviving mounted row stays mounted even when the deleted run
+ * put the old start index past the new length. Rows deleted below it mount instead, never more.
+ */
+function detachedStartFallback(
+  state: RevealState,
+  messages: readonly RevealRow[],
+  isSafeCut: IsSafeCut
+): number {
+  const mountedBefore = state.endIndexHint - state.anchorIndexHint;
+  return storedSliceEnd(state, messages, isSafeCut) - mountedBefore;
 }
 
 /** Largest safe cut at or before `index`, clamped to [0, length]; 0 is always safe. */
@@ -425,7 +470,11 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       setState(current);
     }
     fromIndex = nearestSafeCutAtOrBefore(
-      anchorIndex === -1 ? current.anchorIndexHint : anchorIndex,
+      anchorIndex !== -1
+        ? anchorIndex
+        : current.endMessageId === null
+          ? current.anchorIndexHint
+          : detachedStartFallback(current, args.messages, args.isSafeCut),
       length,
       args.isSafeCut
     );
@@ -459,11 +508,10 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       setState(current);
     }
   }
-  const mountedRows = length - fromIndex;
   const isRevealPaused =
     current.anchorMessageId !== null &&
     current.targetMessageId === null &&
-    mountedRows >= current.autoRowLimit;
+    isBudgetSpent(current, { messages: args.messages, fromIndex, toIndex });
 
   // The scheduled step reads the latest COMMITTED inputs when it runs, not what it captured
   // when scheduled: grouping can change while a frame is pending. Published from a layout
@@ -505,8 +553,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
           return previous;
         }
         // A frame that slipped past cancellation must not step a reveal that paused meanwhile.
-        const snapshotMountedRows = snapshot.messages.length - snapshot.fromIndex;
-        if (previous.targetMessageId === null && snapshotMountedRows >= previous.autoRowLimit) {
+        if (previous.targetMessageId === null && isBudgetSpent(previous, snapshot)) {
           return previous;
         }
         const cut = nextStepCut(
@@ -525,7 +572,14 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   // the rows and boundary it just rendered.
   const revealMore = () => {
     const snapshot = latest.current;
-    const limit = snapshot.messages.length - snapshot.fromIndex + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS;
+    const length = snapshot.messages.length;
+    const limit = length - snapshot.fromIndex + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS;
+    if (max !== undefined && (snapshot.toIndex < length || limit > max)) {
+      // Detached, or about to be: the walk ends at a target row instead of a count, so no
+      // deletion elsewhere can lengthen it (F20 PR3a-2). A vanished target ends it early.
+      setState((previous) => moreTargetState(previous, snapshot, args.isSafeCut));
+      return;
+    }
     setState((previous) =>
       previous.generation !== snapshot.generation || previous.autoRowLimit >= limit
         ? previous

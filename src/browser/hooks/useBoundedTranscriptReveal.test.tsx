@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { installDom } from "../../../tests/ui/dom";
 
+import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
+
 import {
   TRANSCRIPT_MAX_MOUNTED_ROWS,
   TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
@@ -10,6 +12,7 @@ import {
   TRANSCRIPT_REVEAL_STEP_CHARS,
   TRANSCRIPT_REVEAL_TAIL_ROWS,
 } from "@/common/constants/ui";
+import { createMuxMessage } from "@/common/types/message";
 
 import {
   transcriptRevealFrameScheduler,
@@ -594,9 +597,9 @@ describe("useBoundedTranscriptReveal", () => {
     // Bundles of 10 rows: a slice edge must land on a multiple of 10 (or the transcript end).
     const bundled = (index: number) => index % 10 === 0;
 
-    function renderSlice(maxMountedRows?: number, isSafeCut = bundled) {
+    function renderSlice(maxMountedRows?: number, isSafeCut = bundled, messages = rows(LONG)) {
       const frames = manualFrames();
-      let props = { workspaceId: "ws", messages: rows(LONG), maxMountedRows, isSafeCut };
+      let props = { workspaceId: "ws", messages, maxMountedRows, isSafeCut };
       const renders: Array<{ from: number; to: number }> = [];
       const view = renderHook(() => {
         const reveal = useBoundedTranscriptReveal(props);
@@ -749,6 +752,144 @@ describe("useBoundedTranscriptReveal", () => {
       setProps({ messages: props().messages.filter((_, i) => !gone(i)) });
       expect(reveal().toIndex).toBe(props().messages.length);
       expect(props().messages.findIndex((row) => row.id === "v3")).toBe(toIndex - 21);
+    });
+
+    test("every Load older press mounts at least one budget, also across the cap", () => {
+      const { reveal, runFrames } = renderSlice(MAX);
+      runFrames();
+      for (let press = 0; press < 4; press += 1) {
+        const from = reveal().fromIndex;
+        act(() => reveal().revealMore());
+        runFrames();
+        const mounted = from - reveal().fromIndex;
+        expect(mounted).toBeGreaterThanOrEqual(TRANSCRIPT_REVEAL_AUTO_MAX_ROWS);
+        expect(mounted).toBeLessThan(
+          TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS
+        );
+      }
+      expect(reveal().toIndex).toBeLessThan(LONG);
+    });
+
+    // F20 PR3a-2: each edit is ONE update through the real aggregator's delete, reconcile or
+    // page path. Row i has historySequence SEQ + i (one displayed row per user message). Every
+    // cut is safe: the index-based `bundled` would move bundle edges when rows above them go.
+    describe("detached budget on real aggregator updates", () => {
+      const SEQ = 1000;
+      function renderOnAggregator(maxMountedRows: number) {
+        const aggregator = new StreamingMessageAggregator(new Date().toISOString(), "ws");
+        const message = (id: string, sequence: number) =>
+          createMuxMessage(id, "user", id, { historySequence: sequence, timestamp: sequence });
+        const history = (from: number, to: number, prefix = "m") =>
+          Array.from({ length: to - from }, (_, i) =>
+            message(`${prefix}-${from + i}`, SEQ + from + i)
+          );
+        aggregator.loadHistoricalMessages(history(0, LONG));
+        const slice = renderSlice(maxMountedRows, alwaysSafe, aggregator.getDisplayedMessages());
+        const update = (edit: () => void) => {
+          edit();
+          slice.setProps({ messages: aggregator.getDisplayedMessages() });
+        };
+        const deleteRows = (keep: (i: number) => boolean) =>
+          update(() =>
+            aggregator.handleDeleteMessage({
+              type: "delete",
+              historySequences: Array.from({ length: LONG }, (_, i) => i)
+                .filter((i) => !keep(i))
+                .map((i) => SEQ + i),
+            })
+          );
+        const mountedIds = () =>
+          slice
+            .props()
+            .messages.slice(slice.reveal().fromIndex, slice.reveal().toIndex)
+            .map((r) => r.id);
+        return { ...slice, aggregator, message, history, update, deleteRows, mountedIds };
+      }
+
+      test("a delete, reconcile or page in the unmounted newer rows keeps the slice paused", () => {
+        const edits: Array<(s: ReturnType<typeof renderOnAggregator>, to: number) => void> = [
+          (s, to) => s.deleteRows((i) => i < to + 5 || i >= to + 105),
+          (s, to) =>
+            s.update(() =>
+              s.aggregator.reconcileSinceReplay({
+                requestedAnchorSequence: SEQ + to + 5,
+                messages: s.history(to + 105, LONG),
+                hasActiveStream: false,
+              })
+            ),
+          (s) =>
+            s.update(() =>
+              s.aggregator.loadHistoricalMessages(
+                Array.from({ length: 200 }, (_, i) => s.message(`old-${i}`, i)),
+                false,
+                { mode: "append" }
+              )
+            ),
+        ];
+        // Read back by presses, or centered by a navigation (its budget is the whole suffix).
+        const setups = [
+          (s: ReturnType<typeof renderOnAggregator>) => s.readBack(),
+          (s: ReturnType<typeof renderOnAggregator>) =>
+            act(() => s.reveal().revealThrough(LONG / 2)),
+        ];
+        for (const [edit, setup] of edits.flatMap((e) => setups.map((u) => [e, u] as const))) {
+          const slice = renderOnAggregator(MAX);
+          setup(slice);
+          const before = slice.mountedIds();
+          expect(slice.reveal().isRevealPaused).toBe(true);
+          edit(slice, slice.reveal().toIndex);
+          expect(slice.frames.hasPending()).toBe(false);
+          expect(slice.reveal().isRevealPaused).toBe(true);
+          expect(slice.mountedIds()).toEqual(before);
+          cleanup();
+        }
+      });
+
+      // #6669 round 7: the old anchor index ends up at or past the new length.
+      test("deleting the start anchor and every older row keeps the survivors mounted", () => {
+        const slice = renderOnAggregator(MAX);
+        slice.readBack();
+        const { fromIndex, toIndex } = slice.reveal();
+        const survivors = slice.mountedIds().slice(1);
+        // Also drop unmounted newer rows (the newest 3 survive) so the old start is past the end.
+        const newer = Math.max(0, LONG - 2 * fromIndex);
+        slice.deleteRows((i) => i > fromIndex && !(i >= toIndex + 10 && i < toIndex + 10 + newer));
+        expect(fromIndex).toBeGreaterThanOrEqual(slice.props().messages.length);
+        expect(slice.mountedIds().slice(-survivors.length)).toEqual(survivors);
+        expect(slice.reveal().toIndex - slice.reveal().fromIndex).toBeLessThanOrEqual(MAX);
+        expect(slice.frames.hasPending()).toBe(false);
+      });
+
+      test("attached, the same update behaves as on main", () => {
+        const slice = renderOnAggregator(MAX);
+        slice.runFrames();
+        const { fromIndex } = slice.reveal();
+        expect(slice.reveal()).toMatchObject({ isRevealPaused: true, toIndex: LONG });
+        slice.renders.length = 0;
+        slice.deleteRows((i) => i > fromIndex);
+        slice.runFrames();
+        // Captured on main 34c70e3de7: the old start is past the end, so no row shows, then the
+        // automatic reveal mounts the survivors chunk by chunk without a press.
+        const main = [519, 459, 399, 339, 279, 219, 159, 99, 39, 0];
+        expect(slice.renders).toEqual(main.map((from) => ({ from, to: 519 })));
+      });
+
+      test("a vanished navigation target pauses, and the start still re-anchors that render", () => {
+        const slice = renderOnAggregator(MAX);
+        slice.readBack();
+        act(() => slice.reveal().revealMore());
+        act(() => slice.frames.flush()); // One chunk of the walk to the target.
+        expect(slice.reveal().isRevealPaused).toBe(false);
+        const { fromIndex, toIndex } = slice.reveal();
+        const survivors = slice.mountedIds().slice(1);
+        // One update deletes the target row (one budget older) and the current start row.
+        const target = fromIndex - TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS;
+        slice.deleteRows((i) => i !== fromIndex && !(i >= target - 10 && i <= target));
+        expect(slice.reveal().isRevealPaused).toBe(true);
+        expect(slice.frames.hasPending()).toBe(false);
+        expect(slice.mountedIds().slice(-survivors.length)).toEqual(survivors);
+        expect(slice.reveal().toIndex).toBe(toIndex - 12);
+      });
     });
   });
 });
