@@ -2507,11 +2507,15 @@ export class TurnRequestBuilder {
       }
       return created.data;
     };
+    // Codex hook fields: one turn ID for every tool call of this turn (its assistant message).
+    // One object for every attempt: each attempt sets the model it streams with, so a refusal
+    // fallback's tool calls, and the host-side hook config built once below (kernel file loads),
+    // report the fallback model (Codex PRRT_kwDOPxxmWM6sXvVm).
+    const hookTurn = { turnId: assistantMessageId, model: modelString };
     // Hoisted so refusal fallback can rebuild tools without changing their context.
     const toolsForModelConfig: ToolConfiguration = {
       cwd: workspacePath,
-      // Codex hook fields: one turn ID for every tool call of this turn (its assistant message).
-      hookTurn: { turnId: assistantMessageId, model: modelString },
+      hookTurn,
       runtime,
       projects: getProjects(metadata),
       secrets: projectSecretsRecord,
@@ -2808,6 +2812,7 @@ export class TurnRequestBuilder {
       cleanupModelOnError?: boolean;
     }) => {
       const { seed } = options;
+      hookTurn.model = seed.rawModelString;
       try {
         const attemptProviderRequestMessages =
           options.providerRequestMessages ??
@@ -2822,6 +2827,7 @@ export class TurnRequestBuilder {
           seed.toolsModelString,
           {
             ...toolsForModelConfig,
+            hookTurn: { ...hookTurn },
             capabilityModelString: seed.capabilityModelString,
             // Per attempt: a fallback model that calls set_goal must price and
             // kick off the goal on itself, not on the primary it replaced.
