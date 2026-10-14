@@ -1014,6 +1014,37 @@ describe("agentSkillsService", () => {
     ).toContain("must match directory name");
   });
 
+  test("discoverAgentSkills reports invalid paths globs and keeps valid path-scoped skills", async () => {
+    using project = new DisposableTempDir("agent-skills-paths");
+    using global = new DisposableTempDir("agent-skills-paths-global");
+    const projectSkillsRoot = path.join(project.path, ".mux", "skills");
+
+    for (const [name, pathsYaml] of [
+      ["ts-rules", 'paths: "src/**/*.ts, *.{ts,tsx}"'],
+      ["bad-glob", 'paths: ["src/[abc"]'],
+    ] as const) {
+      await fs.mkdir(path.join(projectSkillsRoot, name), { recursive: true });
+      await fs.writeFile(
+        path.join(projectSkillsRoot, name, "SKILL.md"),
+        `---\nname: ${name}\ndescription: d\n${pathsYaml}\n---\nBody\n`,
+        "utf-8"
+      );
+    }
+
+    const diagnostics = await discoverAgentSkills(new LocalRuntime(project.path), project.path, {
+      roots: { projectRoot: projectSkillsRoot, globalRoot: global.path },
+    });
+
+    expect(diagnostics.skills.find((s) => s.name === "ts-rules")?.paths).toEqual([
+      "src/**/*.ts",
+      "*.{ts,tsx}",
+    ]);
+    expect(diagnostics.skills.some((s) => s.name === "bad-glob")).toBe(false);
+    const issue = diagnostics.invalidSkills.find((i) => i.directoryName === "bad-glob");
+    expect(issue?.message).toContain("paths");
+    expect(issue?.message).toContain("src/[abc");
+  });
+
   test("discovers symlinked skill directories", async () => {
     using project = new DisposableTempDir("agent-skills-symlink");
     using skillSource = new DisposableTempDir("agent-skills-source");
@@ -1599,13 +1630,80 @@ describe("agentSkillsService agent plugins", () => {
     expect(roots.globalPluginRoots).toEqual(["~/.xum/plugins", "~/.agents/plugins"]);
   });
 
-  test("getDefaultAgentSkillsRoots never includes plugin containers for remote runtimes", () => {
-    using project = new DisposableTempDir("agent-skills-plugin-remote");
-    const runtime = new RemotePathMappedRuntime(project.path, "/remote/workspace");
+  async function withHostXumHome<T>(xumHome: string, run: () => Promise<T>): Promise<T> {
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = xumHome;
+    try {
+      return await run();
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  }
 
-    const roots = getDefaultAgentSkillsRoots(runtime, "/remote/workspace");
-    expect(roots.projectPluginRoots).toBeUndefined();
-    expect(roots.globalPluginRoots).toBeUndefined();
+  test("remote runtimes discover global host plugin skills but not project plugins in the checkout", async () => {
+    using hostHome = new DisposableTempDir("agent-skills-remote-plugin-host-home");
+    using checkout = new DisposableTempDir("agent-skills-remote-plugin-checkout");
+    await writePlugin(path.join(hostHome.path, "plugins"), "host-plugin", [
+      { name: "host-plugin-skill", description: "from host plugin" },
+    ]);
+    await writePlugin(path.join(checkout.path, ".xum", "plugins"), "checkout-plugin", [
+      { name: "checkout-plugin-skill", description: "from checkout plugin" },
+    ]);
+    // Identity mapping: the checkout path also exists on the host, so a regression
+    // that scans project plugin containers with the host runtime would find it.
+    const runtime = new RemotePathMappedRuntime(checkout.path, checkout.path);
+
+    await withHostXumHome(hostHome.path, async () => {
+      const { skills } = await discoverAgentSkills(runtime, checkout.path);
+      expect(skills.find((skill) => skill.name === "host-plugin-skill")).toMatchObject({
+        scope: "global",
+        pluginName: "host-plugin",
+        description: "from host plugin",
+      });
+      expect(skills.some((skill) => skill.name === "checkout-plugin-skill")).toBe(false);
+
+      const resolved = await readAgentSkill(
+        runtime,
+        checkout.path,
+        SkillNameSchema.parse("host-plugin-skill")
+      );
+      expect(resolved.package.scope).toBe("global");
+      expect(resolved.package.frontmatter.description).toBe("from host plugin");
+      await expect(
+        readAgentSkill(runtime, checkout.path, SkillNameSchema.parse("checkout-plugin-skill"))
+      ).rejects.toThrow("not found");
+    });
+  });
+
+  test("remote runtimes with an in-runtime global root honor host plugin import receipts", async () => {
+    using hostHome = new DisposableTempDir("agent-skills-remote-plugin-receipts");
+    using runtimeBase = new DisposableTempDir("agent-skills-remote-plugin-receipts-runtime");
+    await writePlugin(path.join(hostHome.path, "plugins"), "managed", [
+      { name: "imported-skill", description: "imported" },
+      { name: "unimported-skill", description: "not imported" },
+    ]);
+    await fs.writeFile(
+      path.join(hostHome.path, "plugins.json"),
+      JSON.stringify({
+        plugins: [
+          createTestPluginInstallEntry("managed", { skills: ["imported-skill"], mcpServers: [] }),
+        ],
+      })
+    );
+    // Docker-style: the global skill root is a container path (/var/mux/skills),
+    // which must not be used to locate the host plugin registry.
+    const runtime = new RemotePathMappedRuntime(runtimeBase.path, "/var", { xumHome: "/var/mux" });
+    const workspacePath = "/var/workspace";
+
+    await withHostXumHome(hostHome.path, async () => {
+      const { skills } = await discoverAgentSkills(runtime, workspacePath);
+      expect(skills.find((skill) => skill.name === "imported-skill")?.pluginName).toBe("managed");
+      expect(skills.some((skill) => skill.name === "unimported-skill")).toBe(false);
+      await expect(
+        readAgentSkill(runtime, workspacePath, SkillNameSchema.parse("unimported-skill"))
+      ).rejects.toThrow("not found");
+    });
   });
 
   test("default discovery (no containment options) rejects project plugins symlinked outside the checkout", async () => {

@@ -31,14 +31,16 @@ fi
 # Each isolated file writes its own LCOV report (see the isolated loop below), so the
 # CRAP gate scores its sources. A `no-coverage:` prefix marks a file that is isolated
 # because Bun coverage crashes or breaks it: that file runs without coverage. The
-# QuickJS group is marked as a whole, except quickjsRuntime.test.ts, which passes under
-# coverage: sandboxHostService and hookService joined it as QuickJS-heavy suites, and
-# router.test.ts has sat under its coverage comment since the list began, with no other
-# recorded reason.
+# QuickJS group is marked as a whole, except WorkflowRunner.test.ts and
+# quickjsRuntime.test.ts, which pass under coverage: sandboxHostService and hookService
+# joined it as QuickJS-heavy suites, and router.test.ts has sat under its coverage
+# comment since the list began, with no other recorded reason.
 isolated_unit_tests=(
   # QuickJS-heavy tests can crash or lose runtime callbacks under Bun coverage
   # when sharing the monolithic process; keep them in fresh isolated processes.
-  no-coverage:src/node/services/workflows/WorkflowRunner.test.ts
+  # WorkflowRunner.test.ts passes under Bun 1.4.3 coverage in its own process, so it
+  # keeps coverage and the CRAP gate can score WorkflowRunner.ts.
+  src/node/services/workflows/WorkflowRunner.test.ts
   # The evaluate() lifecycle suites run a QuickJS workflow per case (~40 runtimes);
   # the shared process segfaulted Bun twice on the same head with them included.
   no-coverage:src/node/services/workflows/WorkflowRunner.evaluate.test.ts

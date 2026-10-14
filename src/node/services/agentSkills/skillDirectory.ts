@@ -48,8 +48,9 @@ function execsOnHost(runtime: Runtime): boolean {
  * - Read on the host while bash runs elsewhere (host-fallback global skills on
  *   SSH, every devcontainer read): none. A devcontainer sees the
  *   checkout under a different path, so a host path would mislead the model.
- *   Plugin discovery is host-only, so remote runtimes never see plugin skills;
- *   in local/worktree workspaces plugin skills pass the host check.
+ *   Plugin discovery is host-only: remote runtimes see only global host plugin
+ *   skills, which fail this check; in local/worktree workspaces plugin skills
+ *   pass the host check.
  */
 export function resolveSkillDirectory(
   resolved: ResolvedAgentSkill,
@@ -80,6 +81,20 @@ export function resolveSkillDirectory(
     skillDir: forBash(resolved.skillDir),
     ...(resolved.pluginRoot != null ? { pluginRoot: forBash(resolved.pluginRoot) } : {}),
   };
+}
+
+/**
+ * Prepend the off-host note to a user-invoked (slash/inline) skill snapshot body
+ * whose files are on the Xum host while bash runs elsewhere. agent_skill_read reports the
+ * same reason as skillDirUnavailable, but a snapshot reaches the model without
+ * any tool result, so without this note the model would run a bundled script
+ * by a path that does not exist where bash runs. Built-in and other-checkout
+ * skills get no note: they are not a host-versus-runtime problem.
+ */
+export function prependSkillDirectoryOffHostNote(body: string, dir: SkillDirectory): string {
+  // First, not last: snapshot bodies are cut at MAX_AGENT_SKILL_SNAPSHOT_CHARS,
+  // and a trailing note would be lost from a long skill.
+  return !dir.available && dir.reason === OFF_HOST_REASON ? `${OFF_HOST_REASON}\n\n${body}` : body;
 }
 
 /** Why bash on `workspaceRuntime` cannot use the skill's path, or null when it can. */

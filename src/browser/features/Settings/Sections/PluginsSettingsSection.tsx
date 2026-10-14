@@ -12,6 +12,8 @@ import {
   XCircle,
 } from "lucide-react";
 import { useAPI } from "@/browser/contexts/API";
+import { useTheme } from "@/browser/contexts/ThemeContext";
+import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { Button } from "@/browser/components/Button/Button";
 import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { cn } from "@/common/lib/utils";
@@ -80,6 +82,23 @@ const Badge: React.FC<{
 );
 
 /**
+ * The interface logo for the current theme. A light logo can vanish on a dark
+ * background (#6124), so dark themes use OpenAI's dark variant. Each theme
+ * falls back to the other image when its own is missing or failed to read:
+ * some logo beats none, as before.
+ */
+const PluginLogo: React.FC<{
+  info: Pick<AgentPluginInterfaceSummary, "logoDataUrl" | "logoDarkDataUrl">;
+}> = (props) => {
+  const isLight = isLightThemeMode(useTheme().theme);
+  const logo = isLight
+    ? (props.info.logoDataUrl ?? props.info.logoDarkDataUrl)
+    : (props.info.logoDarkDataUrl ?? props.info.logoDataUrl);
+  if (logo?.startsWith("data:image/") !== true) return null;
+  return <img src={logo} alt="" className="size-8 shrink-0 rounded" />;
+};
+
+/**
  * OpenAI `interface` metadata. Every manifest string renders as React text
  * (escaped, no HTML or markdown). The logo is a backend-read data URL, links
  * are https only and open externally (the desktop main process routes
@@ -95,9 +114,7 @@ const PluginInterfaceDetails: React.FC<{ info: AgentPluginInterfaceSummary }> = 
   const httpsLinks = links.filter((link) => link.url?.startsWith("https://") === true);
   return (
     <div className="mt-1 flex min-w-0 items-start gap-2" data-testid="plugin-interface">
-      {props.info.logoDataUrl?.startsWith("data:image/") && (
-        <img src={props.info.logoDataUrl} alt="" className="size-8 shrink-0 rounded" />
-      )}
+      <PluginLogo info={props.info} />
       <div className="min-w-0 space-y-0.5">
         <p className="text-foreground text-xs break-words">
           <span className="font-medium">{props.info.displayName}</span>

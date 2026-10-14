@@ -117,6 +117,24 @@ function syntheticToolCallId(toolName: string): string {
 }
 
 /**
+ * Marks the execute options of a tool call bridged from a code_execution guest.
+ * Bridged calls usually carry the runtime's nested-record callId, which looks like any
+ * other toolCallId, so callers that must tell them apart check this key instead. An
+ * own symbol key survives the `{ ...options }` copies wrappers make on the way to the
+ * tool (withExecutionScope), and `Symbol.for` survives duplicated module instances.
+ */
+const PTC_BRIDGED_EXECUTION = Symbol.for("xum.ptc.bridgedExecution");
+
+/** True for a tool execution bridged from a code_execution guest (not a direct model call). */
+export function isPtcBridgedExecution(options: unknown): boolean {
+  return (
+    typeof options === "object" &&
+    options !== null &&
+    (options as Record<symbol, unknown>)[PTC_BRIDGED_EXECUTION] === true
+  );
+}
+
+/**
  * Hard cap on a xum.load vars key. Keys are variable names; load records are
  * exempt from kernel record compaction (their summaries are bounded by
  * construction), so an unbounded key (e.g. `key: vars.large`) would ride the
@@ -330,13 +348,15 @@ export class ToolBridge {
 
         // Execute tool with full options (toolCallId and messages are required by type
         // but not used by most tools; messages stay synthetic for sandbox context)
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-        const result: unknown = await boundTool.execute!(validatedArgs, {
+        const executeOptions = {
           abortSignal,
           toolCallId: bridgedToolCallId,
           messages: [],
           context: undefined,
-        });
+          [PTC_BRIDGED_EXECUTION]: true,
+        };
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+        const result: unknown = await boundTool.execute!(validatedArgs, executeOptions);
 
         // Ensure result is JSON-serializable
         return this.stripAttachmentParts(runtime, this.serializeResult(result));

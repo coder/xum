@@ -211,7 +211,10 @@ async function resolveSkillWorkflowScript(
  * Discover plugins eligible to provide `plugin://` workflow scripts. Project
  * containers apply only for trusted projects (running project plugin code is
  * running repo-controlled code); global containers always apply. Plugin
- * discovery is host-filesystem-only, so remote runtimes resolve none.
+ * discovery is host-filesystem-only: remote runtimes (SSH/Docker) get only the
+ * global host containers from the default roots, which is intended. Their
+ * scripts are read on the host and the conductor runs in Xum, so they work the
+ * same as in local workspaces.
  */
 export async function discoverWorkflowPlugins(input: {
   runtime: Runtime;
