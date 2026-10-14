@@ -880,7 +880,10 @@ describe("McpOauthService OAuth flows", () => {
       await requested;
       await service.logout({ serverUrl: `${base}/mcp` });
       releaseToken();
-      await exchange;
+      // The callback reports a cancelled sign-in, never "Login complete" (#6297).
+      const result = await exchange;
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("Sign-in cancelled");
       // No tokens at all (hasAuthTokens would also need the deleted client record).
       expect((await service.getAuthStatus({ serverUrl: `${base}/mcp` })).isLoggedIn).toBe(false);
       // A flow started after the sign-out saves again.
@@ -1257,6 +1260,47 @@ describe("McpOauthService OAuth flows", () => {
     });
   });
 
+  test("a late token from a flow pinned to another issuer never replaces the current issuer's tokens (#6297)", async () => {
+    await withAuthServer(async (base) => {
+      const port = new URL(base).port;
+      const serverUrl = `${base}/mcp`;
+      // The same server and client ID under two issuers (another origin, same listener).
+      const configA: MCPServerOAuthConfig = {
+        clientId: "shared",
+        discovery: { authorizationServerBase: `http://127.0.0.1:${port}` },
+      };
+      const configB: MCPServerOAuthConfig = {
+        clientId: "shared",
+        discovery: { authorizationServerBase: `http://localhost:${port}` },
+      };
+      const listServers = spyOn(mcpConfigService, "listServers");
+      const startWith = async (oauth: MCPServerOAuthConfig) => {
+        listServers.mockResolvedValue({
+          docs: { transport: "http", url: serverUrl, disabled: true, oauth },
+        });
+        const start = await service.startServerFlow({
+          projectPath,
+          serverName: "docs",
+          redirectUri: "https://x/cb",
+        });
+        if (!start.success) throw new Error(start.error);
+        return start.data.flowId;
+      };
+      const exchange = (state: string) =>
+        service.handleServerCallbackAndExchange({ state, code: "code", iss: null, error: null });
+      const flowA = await startWith(configA);
+      const flowB = await startWith(configB);
+      expect((await exchange(flowB)).success).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl, oauth: configB })).toBe(true);
+      // Flow A's token lands last: it is dropped and reported, and B stays signed in.
+      const resultA = await exchange(flowA);
+      expect(resultA.success).toBe(false);
+      if (!resultA.success) expect(resultA.error).toContain("Sign-in cancelled");
+      expect(await service.hasAuthTokens({ serverUrl, oauth: configB })).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl, oauth: configA })).toBe(false);
+    });
+  });
+
   test("interleaved sign-ins of two clients at one URL never store client B with token A", async () => {
     await withAuthServer(async (base) => {
       const serverUrl = `${base}/mcp`;
@@ -1321,12 +1365,14 @@ describe("McpOauthService OAuth flows", () => {
       // Flow A saves client A, flow B then saves client B, then A's code exchange lands.
       const flowA = await startFor("a", "client-a");
       const flowB = await startFor("b", "client-b");
-      await service.handleServerCallbackAndExchange({
+      const resultA = await service.handleServerCallbackAndExchange({
         state: flowA,
         code: "code-a",
         iss: null,
         error: null,
       });
+      expect(resultA.success).toBe(false);
+      if (!resultA.success) expect(resultA.error).toContain("Sign-in cancelled");
       const store = JSON.parse(await fs.readFile(getStoreFilePath(xumHome), "utf-8")) as {
         entries: Record<string, { clientInformation?: { client_id: string }; tokens?: unknown }>;
       };
