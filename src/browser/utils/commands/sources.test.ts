@@ -2644,7 +2644,8 @@ describe("Revoke MCP App View Domains…", () => {
   const stored = [
     { projectPath: "/repo/a", serverName: "charts", origins: ["https://api.example.com"] },
   ];
-  const revokeAction = (api: APIClient, artifactsEnabled = true) =>
+  // Shown whatever the artifacts experiment: Settings lists stored approvals either way.
+  const revokeAction = (api: APIClient, artifactsEnabled = false) =>
     getActions({ api, artifactsEnabled }).find(
       (action) => action.id === CommandIds.mcpAppsRevokeViewDomains()
     );
@@ -2660,7 +2661,7 @@ describe("Revoke MCP App View Domains…", () => {
         },
       },
     });
-    expect(revokeAction(api, false)).toBeUndefined();
+    expect(revokeAction(api, true)?.title).toBe("Revoke MCP App View Domains…");
     const action = revokeAction(api);
     const field = action?.prompt?.fields[0];
     if (field?.type !== "select" || !action?.prompt) throw new Error("Expected an approval picker");
@@ -2680,7 +2681,7 @@ describe("Revoke MCP App View Domains…", () => {
     expect(revoked).toEqual([{ projectPath: "/repo/a", serverName: "charts" }]);
   });
 
-  test("a failed revoke or list shows its error in a toast", async () => {
+  test("a failed list rejects for the palette, and a failed revoke shows a toast", async () => {
     const api = createTestApiClient({
       mcpApps: {
         listViewDomains: () => Promise.reject(new Error("backend busy")),
@@ -2693,12 +2694,12 @@ describe("Revoke MCP App View Domains…", () => {
     await withTestWindow(async () => {
       const events = collectCommandEvents();
       try {
-        expect(await field.getOptions({})).toEqual([]);
+        // The open palette shows a rejected list (CommandPalette): a toast would sit under it.
+        await expect(Promise.resolve(field.getOptions({}))).rejects.toThrow("backend busy");
         await action.prompt!.onSubmit({ approval: JSON.stringify(["/repo/a", "charts"]) });
         const messages = events.receivedToasts.map((toast) => toast.message);
-        expect(messages).toHaveLength(2);
-        expect(messages[0]).toContain("backend busy");
-        expect(messages[1]).toContain("config write failed");
+        expect(messages).toHaveLength(1);
+        expect(messages[0]).toContain("config write failed");
       } finally {
         events.dispose();
       }

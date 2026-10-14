@@ -68,7 +68,11 @@ export function useMcpAppViewDomains() {
 export function McpAppViewDomainsLoadError(props: { error: string | null; onRetry: () => void }) {
   if (props.error == null) return null;
   return (
-    <div className="border-border-medium flex min-w-0 items-center gap-2 border-t px-3 py-2 text-xs">
+    // An alert, so a screen reader announces a failure that appears after the section rendered.
+    <div
+      role="alert"
+      className="border-border-medium flex min-w-0 items-center gap-2 border-t px-3 py-2 text-xs"
+    >
       <div className="text-danger min-w-0 flex-1 break-words">
         Could not load allowed view domains: {props.error}
       </div>

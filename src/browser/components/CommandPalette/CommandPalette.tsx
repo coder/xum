@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { getErrorMessage } from "@/common/utils/errors";
 import { Command } from "cmdk";
 import { useCommandRegistry } from "@/browser/contexts/CommandRegistryContext";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
@@ -347,6 +348,9 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
     Array<{ id: string; label: string; keywords?: string[] }>
   >([]);
   const [isLoadingOptions, setIsLoadingOptions] = useState(false);
+  // Why the current select prompt has no options: shown in the open palette, where a toast would
+  // render under the overlay.
+  const [optionsError, setOptionsError] = useState<string | null>(null);
 
   const currentField: PromptField | null = activePrompt
     ? (activePrompt.fields[activePrompt.idx] ?? null)
@@ -410,6 +414,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
       }
 
       setIsLoadingOptions(true);
+      setOptionsError(null);
       try {
         const rawOptions = await Promise.resolve(
           currentField.getOptions(activePrompt?.values ?? {})
@@ -426,6 +431,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
         if (!cancelled) {
           console.error("Failed to resolve prompt select options", error);
           setSelectOptions([]);
+          setOptionsError(getErrorMessage(error));
         }
       } finally {
         if (!cancelled) {
@@ -476,7 +482,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
       } else if (selectOptions.length > 0) {
         emptyText = "No results";
       } else {
-        emptyText = "No options";
+        emptyText = optionsError != null ? `Could not load options: ${optionsError}` : "No options";
       }
     } else {
       const typed = query.trim();
