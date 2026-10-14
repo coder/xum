@@ -4,11 +4,12 @@
  * Real Config, real git worktrees and init hook (an isolated GIT_CONFIG_GLOBAL); the naming model
  * is the only fake.
  */
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, jest, mock, spyOn, test } from "bun:test";
 import { execFileSync } from "child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { WORKSPACE_NAME_GENERATION_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { NameGenerationError } from "@/common/types/errors";
 import type { WorkspaceService } from "./workspaceService";
@@ -53,11 +54,15 @@ async function initRepo(repoPath: string): Promise<void> {
   git(repoPath, "commit", "-m", "init");
 }
 
+// Bun implements advanceTimersByTime, but its jest typings omit it.
+const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
+
+/** Polls with setImmediate, which Bun's fake timers leave real. */
 async function until(condition: () => boolean | Promise<boolean>): Promise<void> {
   const deadline = Date.now() + 10_000;
   while (!(await condition())) {
     if (Date.now() > deadline) throw new Error("condition not reached");
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => setImmediate(resolve));
   }
 }
 
@@ -146,6 +151,8 @@ describe("create() with nameGeneration", () => {
       () => false
     );
   const waitForNamingStep = (id: string) => until(() => initLines(id).includes("Naming branch..."));
+  /** The abort signal create() handed the naming model. */
+  const namingSignal = () => generateIdentity.mock.calls[0]?.[5];
 
   function sendFirstMessage(workspaceId: string) {
     const session = service.getOrCreateSession(workspaceId);
@@ -205,6 +212,45 @@ describe("create() with nameGeneration", () => {
     expect(branchExists(projectPath, created.name)).toBe(true);
   }, 30_000);
 
+  test("a naming timeout stops the request and keeps the branch, and the init runs", async () => {
+    generateIdentity.mockImplementation(() => new Promise<IdentityResult>(() => undefined));
+
+    fakeTimers.useFakeTimers();
+    let created: Awaited<ReturnType<typeof createNamed>>;
+    try {
+      created = await createNamed();
+      await waitForNamingStep(created.id);
+      await until(() => generateIdentity.mock.calls.length === 1);
+      fakeTimers.advanceTimersByTime(WORKSPACE_NAME_GENERATION_TIMEOUT_MS);
+    } finally {
+      fakeTimers.useRealTimers();
+    }
+    await harness.initStateManager.waitForInit(created.id);
+
+    expect(namingSignal()?.aborted).toBe(true);
+    expect(await readObserved(created.path)).toBe(`${created.name} ${created.name}`);
+    expect(entry(created.id)?.pendingAutoTitle).toBe(true);
+  }, 30_000);
+
+  test("a creation that fails after naming started stops the naming request", async () => {
+    generateIdentity.mockImplementation(() => new Promise<IdentityResult>(() => undefined));
+
+    const result = await service.create(
+      projectPath,
+      undefined,
+      "no-such-trunk",
+      undefined,
+      { type: "worktree", srcBaseDir },
+      undefined,
+      undefined,
+      undefined,
+      { nameGeneration: NAME_REQUEST }
+    );
+    expect(result.success).toBe(false);
+    await until(() => generateIdentity.mock.calls.length === 1);
+    expect(namingSignal()?.aborted).toBe(true);
+  }, 30_000);
+
   test("a title the user sets while naming runs is kept", async () => {
     const naming = createDeferred<IdentityResult>();
     generateIdentity.mockImplementation(() => naming.promise);
@@ -225,8 +271,11 @@ describe("create() with nameGeneration", () => {
 
     const created = await createNamed();
     await waitForNamingStep(created.id);
+    const removeStartedAt = Date.now();
     const removed = await service.remove(created.id, true);
     expect(removed.success).toBe(true);
+    // Removal awaits the init; without the abort it would wait out the naming deadline.
+    expect(Date.now() - removeStartedAt).toBeLessThan(WORKSPACE_NAME_GENERATION_TIMEOUT_MS);
 
     expect(branchExists(projectPath, created.name)).toBe(false);
     expect(branchExists(projectPath, "sidebar-k3m9")).toBe(false);
@@ -241,6 +290,7 @@ describe("create() with nameGeneration", () => {
     await waitForNamingStep(created.id);
     const archived = await service.archive(created.id);
     expect(archived.success).toBe(true);
+    expect(namingSignal()?.aborted).toBe(true);
 
     // A name arriving after the archive applies nothing; the next message titles it instead.
     naming.resolve(GENERATED);

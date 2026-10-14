@@ -161,6 +161,23 @@ describe("generateWorkspaceIdentity candidate settings", () => {
     });
   });
 
+  test("the request carries the caller's abort signal", async () => {
+    // Creation naming stops a timed-out or orphaned request through this signal.
+    const streamTextSpy = spyOn(aiSdk, "streamText").mockReturnValue(proposeNameStream);
+    const controller = new AbortController();
+
+    await generateWorkspaceIdentity(
+      "Add setting",
+      [{ model: "anthropic:claude-haiku-4-5" }],
+      createTitleAIService(createTitleModel()),
+      undefined,
+      undefined,
+      controller.signal
+    );
+
+    expect(streamTextSpy.mock.calls[0]?.[0].abortSignal).toBe(controller.signal);
+  });
+
   test("clamps the configured thinking level to the model's policy", async () => {
     const aiService = createTitleAIService(createTitleModel());
     const streamTextSpy = spyOn(aiSdk, "streamText").mockReturnValue(proposeNameStream);
