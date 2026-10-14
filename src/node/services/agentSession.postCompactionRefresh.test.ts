@@ -212,7 +212,7 @@ describe("AgentSession post-compaction refresh trigger", () => {
       aiService,
       initStateManager: new InitStateManager(config),
       backgroundProcessManager: {
-        setMessageQueued: mock(() => undefined),
+        getForegroundToolCallIds: mock(() => []),
         cleanup: mock(() => Promise.resolve()),
       } as unknown as BackgroundProcessManager,
       onPostCompactionStateChange,

@@ -2549,6 +2549,7 @@ export class TurnRequestBuilder {
       xaiNativeToolsEnabled: routeProvider === "xai",
       xaiSearchParameters: effectiveMuxProviderOptions.xai?.searchParameters,
       backgroundProcessManager: this.dependencies.backgroundProcessManager,
+      hasQueuedMessages,
       // Plan agent configuration for plan file access.
       // - read: plan file is readable in all agents (useful context)
       // - write: allowed in all agents; plan agents still lock other edits to the exact plan path

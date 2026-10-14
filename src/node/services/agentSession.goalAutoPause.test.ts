@@ -106,7 +106,7 @@ async function createSessionHarness(
   }) as unknown as InitStateManager;
   const backgroundProcessManager = {
     cleanup: mock((_workspaceId: string) => Promise.resolve()),
-    setMessageQueued: mock((_workspaceId: string, _queued: (() => boolean) | null) => undefined),
+    getForegroundToolCallIds: mock(() => []),
   } as unknown as BackgroundProcessManager;
 
   const aiService = createAiService(workspaceId, () => session.closingSignal);

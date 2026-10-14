@@ -3693,7 +3693,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           cleanup: mock(() => Promise.resolve()),
           hasRunningBackgroundProcesses: mock(() => false),
           hasOrphanedRunningBackgroundProcesses: mock(() => Promise.resolve(false)),
-          setMessageQueued: mock(() => undefined),
+          getForegroundToolCallIds: mock(() => []),
         }) as unknown as BackgroundProcessManager;
         const initStateManager = {
           on: mock(() => undefined),

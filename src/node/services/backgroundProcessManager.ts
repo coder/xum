@@ -727,7 +727,7 @@ interface OutputWaitOptions {
   filterExclude: boolean;
   timeoutMs: number;
   abortSignal: AbortSignal | undefined;
-  workspaceId: string | undefined;
+  hasQueuedMessages: ((dispatchMode?: "tool-end" | "turn-end") => boolean) | undefined;
 }
 
 /** Read the next bytes of output.log into the window. Returns false when there were none. */
@@ -1079,8 +1079,6 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   // Tracks foreground processes (started via runtime.exec) that can be backgrounded
   // Key is toolCallId to support multiple parallel foreground processes per workspace
   private foregroundProcesses = new Map<string, ForegroundProcess>();
-  // Tracks workspaces with queued messages (for bash_output to return early)
-  private queuedMessageReaders = new Map<string, () => boolean>();
 
   // Once set, stopMonitor() suppresses "monitor:stopped" so the persisted armed-monitor
   // registry survives shutdown and the next startup can notify owners their monitors
@@ -1093,31 +1091,6 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // Raise the default listener cap to avoid noisy MaxListenersExceededWarning.
     this.setMaxListeners(50);
     this.bgOutputDir = bgOutputDir;
-  }
-
-  /** Publish the live queue reader, or null while dispatch is suppressed/the queue is empty. */
-  setMessageQueued(workspaceId: string, isQueued: (() => boolean) | null): void {
-    if (isQueued) {
-      this.queuedMessageReaders.set(workspaceId, isQueued);
-    } else {
-      this.queuedMessageReaders.delete(workspaceId);
-    }
-    this.backgroundQueuedProcesses(workspaceId);
-  }
-
-  hasQueuedMessage(workspaceId: string): boolean {
-    // Cancellation and admission probes can withdraw input without another queue notification.
-    return this.queuedMessageReaders.get(workspaceId)?.() ?? false;
-  }
-
-  private backgroundQueuedProcesses(workspaceId: string): void {
-    // User and agent input share this backend path, even without a mounted chat.
-    // The live reader preserves turn-end holds and never revives withdrawn input.
-    if (this.hasQueuedMessage(workspaceId)) {
-      this.getForegroundToolCallIds(workspaceId).forEach((toolCallId) =>
-        this.sendToBackground(toolCallId)
-      );
-    }
   }
 
   /** Emit a change event for a workspace */
@@ -2564,8 +2537,6 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       `Registered foreground process for workspace ${workspaceId}, toolCallId ${toolCallId}`
     );
     this.emitChange(workspaceId);
-    // Input may have queued while Bash was preparing, before this registration existed.
-    this.backgroundQueuedProcesses(workspaceId);
 
     return {
       unregister: () => {
@@ -2924,8 +2895,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * @param filterExclude When true, invert filter to exclude matching lines instead of keeping them
    * @param timeout Seconds to wait for output if none available (default 0 = non-blocking)
    * @param abortSignal Optional signal to abort waiting early (e.g., when stream is cancelled)
-   * @param workspaceId Optional workspace ID to check for queued messages (return early to process them)
+   * @param workspaceId Optional caller workspace ID for output-consumption attribution
    * @param noteToolName Optional tool name to use in polling guidance notes
+   * @param hasQueuedMessages Live caller queue decision; returning true interrupts only this wait
    */
   async getOutput(
     processId: string,
@@ -2934,7 +2906,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     timeout?: number,
     abortSignal?: AbortSignal,
     workspaceId?: string,
-    noteToolName?: string
+    noteToolName?: string,
+    hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean
   ): Promise<
     | {
         success: true;
@@ -3011,7 +2984,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       filterExclude: filterExclude === true,
       timeoutMs: timeoutSecs * 1000,
       abortSignal,
-      workspaceId,
+      hasQueuedMessages,
     });
     if (window == null) {
       return {
@@ -3168,7 +3141,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   /** True when the user sent a message or the caller stopped waiting. */
   private isWaitInterrupted(options: OutputWaitOptions): boolean {
     if (options.abortSignal?.aborted === true) return true;
-    return options.workspaceId ? this.hasQueuedMessage(options.workspaceId) : false;
+    return options.hasQueuedMessages?.("tool-end") === true;
   }
 
   /**

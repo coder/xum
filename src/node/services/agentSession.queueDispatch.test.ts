@@ -1263,14 +1263,8 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
   test("withdrawn tool-end entry neither soft-stops nor hides a later entry's mode", async () => {
     const workspaceId = "queue-dispatch-withdrawn-head";
-    const queuedSignals: boolean[] = [];
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
       workspaceId,
-      backgroundProcessManagerOverrides: {
-        setMessageQueued: mock((_workspaceId: string, queued: (() => boolean) | null) => {
-          queuedSignals.push(queued?.() ?? false);
-        }),
-      },
     });
     const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
 
@@ -1307,7 +1301,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
       });
       expect(session.hasQueuedMessages("tool-end")).toBe(false);
       expect(session.hasQueuedMessages("turn-end")).toBe(true);
-      expect(queuedSignals).toEqual([true, false]);
     } finally {
       stopStream.mockRestore();
       await session.dispose();
@@ -1373,16 +1366,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
         sender === "agent" ? peerTriggerInternal("agent-msg:sender:bash") : undefined
       );
       expect(background).toHaveBeenCalledTimes(mode === "tool-end" ? 1 : 0);
-      const lateBackground = mock(() => undefined);
-      const late = manager.registerForegroundProcess(
-        workspaceId,
-        "bash-late",
-        "test",
-        "test",
-        lateBackground
-      );
-      expect(lateBackground).toHaveBeenCalledTimes(mode === "tool-end" ? 1 : 0);
-      late.unregister();
       expect(otherBackground).not.toHaveBeenCalled();
     } finally {
       foreground.unregister();
@@ -1391,50 +1374,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
       await cleanup();
     }
   });
-
-  test.each(["aborted", "admission-stale"] as const)(
-    "%s input does not background a subsequent Bash registration",
-    async (withdrawal) => {
-      using tempDir = new TestTempDir("withdrawn-queued-bash");
-      const manager = new BackgroundProcessManager(tempDir.path);
-      const workspaceId = "queue-dispatch-withdrawn-bash";
-      const { session, cleanup, aiEmitter } = await createAgentSessionHarness({
-        workspaceId,
-        backgroundProcessManager: manager,
-      });
-      try {
-        aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
-        const controller = new AbortController();
-        let stale = false;
-        session.queueMessage(
-          "follow up",
-          { model: TEST_MODEL, agentId: "exec" },
-          {
-            ...peerTriggerInternal("agent-msg:sender:withdrawn-bash"),
-            cancelSignal: controller.signal,
-            admissionStale: () => stale,
-          }
-        );
-        if (withdrawal === "aborted") controller.abort();
-        else stale = true;
-        expect(session.hasQueuedMessages()).toBe(false);
-        expect(manager.hasQueuedMessage(workspaceId)).toBe(false);
-        const background = mock(() => undefined);
-        const foreground = manager.registerForegroundProcess(
-          workspaceId,
-          "bash-late",
-          "test",
-          "test",
-          background
-        );
-        expect(background).not.toHaveBeenCalled();
-        foreground.unregister();
-      } finally {
-        await session.dispose();
-        await cleanup();
-      }
-    }
-  );
 
   test("held user input blocks agent Bash backgrounding until Send now", async () => {
     using tempDir = new TestTempDir("held-queued-bash");
@@ -1476,14 +1415,8 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
   test("a synthetic turn-end entry never cuts a tool boundary and drains at stream-end", async () => {
     const workspaceId = "queue-dispatch-synthetic-turn-end";
-    const queuedSignals: boolean[] = [];
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
       workspaceId,
-      backgroundProcessManagerOverrides: {
-        setMessageQueued: mock((_workspaceId: string, queued: (() => boolean) | null) => {
-          queuedSignals.push(queued?.() ?? false);
-        }),
-      },
     });
     const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
     const sendQueuedMessages = spyOn(session, "sendQueuedMessages").mockImplementation(
@@ -1504,7 +1437,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(session.getQueuedInputStopCause()).toBeUndefined();
       expect(session.hasQueuedMessages("tool-end")).toBe(false);
       // bash_output early-return signal stays off for turn-end entries.
-      expect(queuedSignals).toEqual([false]);
 
       // Provider-executed and local tool results both pass without a soft stop.
       aiEmitter.emit("tool-call-end", {
@@ -1546,14 +1478,8 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
   test("a synthetic tool-end entry cuts the next tool boundary and dispatches after the abort", async () => {
     const workspaceId = "queue-dispatch-synthetic-tool-end";
-    const queuedSignals: boolean[] = [];
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
       workspaceId,
-      backgroundProcessManagerOverrides: {
-        setMessageQueued: mock((_workspaceId: string, queued: (() => boolean) | null) => {
-          queuedSignals.push(queued?.() ?? false);
-        }),
-      },
     });
     const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
     const sendQueuedMessages = spyOn(session, "sendQueuedMessages").mockImplementation(
@@ -1571,7 +1497,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(session.hasQueuedMessages("tool-end")).toBe(true);
       // Local tool boundaries stop through the queued-input cause (StreamManager stopWhen).
       expect(session.getQueuedInputStopCause()).toMatchObject({ kind: "queued-input" });
-      expect(queuedSignals).toEqual([true]);
 
       // Provider-executed boundaries soft-stop the stream and dispatch once it aborts.
       aiEmitter.emit("tool-call-end", {
@@ -1806,13 +1731,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
   test("updates visible queued dispatch mode without dequeuing content", async () => {
     const workspaceId = "queue-dispatch-mode-update";
-    const setMessageQueued = mock(
-      (_workspaceId: string, _queued: (() => boolean) | null) => undefined
-    );
     const { session, cleanup, events } = await createAgentSessionHarness({
       workspaceId,
       captureEvents: true,
-      backgroundProcessManagerOverrides: { setMessageQueued },
     });
 
     try {
@@ -1833,7 +1754,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         queuedMessages: ["my queued follow-up"],
         queueDispatchMode: "tool-end",
       });
-      expect(setMessageQueued.mock.calls.at(-1)?.[1]?.()).toBe(true);
+      expect(session.hasQueuedMessages("tool-end")).toBe(true);
       expect(session.hasQueuedMessages()).toBe(true);
 
       expect(session.setQueuedMessageDispatchMode("turn-end")).toBe(true);
@@ -1842,7 +1763,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         queuedMessages: ["my queued follow-up"],
         queueDispatchMode: "turn-end",
       });
-      expect(setMessageQueued.mock.calls.at(-1)?.[1]?.()).toBe(false);
+      expect(session.hasQueuedMessages("tool-end")).toBe(false);
       expect(session.hasQueuedMessages()).toBe(true);
     } finally {
       await session.dispose();

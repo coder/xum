@@ -1122,6 +1122,11 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
         });
       }
 
+      const sendToBackground = () => {
+        backgroundedRef.current = true;
+        // Both explicit backgrounding and queued input unblock the same foreground wait.
+        if (backgroundResolve) backgroundResolve();
+      };
       // Register foreground process for "send to background" feature
       // Only if manager is available (AI tool calls, not IPC)
       const fgRegistration =
@@ -1131,13 +1136,21 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
               toolCallId,
               script,
               safeDisplayName,
-              () => {
-                backgroundedRef.current = true;
-                // Resolve the background promise to unblock the wait
-                if (backgroundResolve) backgroundResolve();
-              }
+              sendToBackground
             )
           : null;
+      const backgroundForQueuedMessage = () => {
+        if (
+          fgRegistration &&
+          !foregroundCompleted &&
+          !backgroundedRef.current &&
+          config.hasQueuedMessages?.("tool-end") === true
+        ) {
+          sendToBackground();
+        }
+      };
+      // Input can arrive during Bash preparation, before a foreground registration exists.
+      backgroundForQueuedMessage();
 
       // Execute using runtime interface (works for both local and SSH)
       const scriptWithClosedStdin = `exec </dev/null
@@ -1242,6 +1255,9 @@ ${scriptWithEnv}`;
       };
 
       const flushLiveOutput = (): void => {
+        // Admission probes have no change event. Reuse this wait's existing cadence rather
+        // than cache a decision that cancellation/withdrawal can invalidate between enqueues.
+        backgroundForQueuedMessage();
         if (liveOutputStopped) return;
 
         const flush = (isError: boolean, buffer: string): void => {
@@ -1279,7 +1295,7 @@ ${scriptWithEnv}`;
         liveStderrBuffer = "";
       };
 
-      if (config.emitChatEvent && config.workspaceId && toolCallId) {
+      if (config.hasQueuedMessages || (config.emitChatEvent && config.workspaceId && toolCallId)) {
         liveOutputTimer = setInterval(flushLiveOutput, LIVE_FLUSH_INTERVAL_MS);
       }
 

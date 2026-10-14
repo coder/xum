@@ -81,7 +81,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       getMonitorWakeDeliveryState: mock(() => Promise.resolve(undefined)),
       acknowledgeMonitorWake: mock(() => undefined),
       dropRetiredMonitor: mock(() => undefined),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     }) as unknown as BackgroundProcessManager;
     const aiService = createMockAIService({ isStreaming: mock(() => false) });
     const extensionMetadata = new ExtensionMetadataService(
@@ -2371,7 +2371,7 @@ describe("tree Stop and descendant bash monitor attention", () => {
       ),
       acknowledgeMonitorWake: mock(() => undefined),
       dropRetiredMonitor: mock(() => undefined),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     }) as unknown as BackgroundProcessManager;
     let childStreaming = true;
     // When set, the cascade's stream stop of the child waits for it (holding the child's latch).
