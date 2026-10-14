@@ -17,6 +17,7 @@ import {
   isModelVisibleTool,
   MCP_APP_MIME_TYPE,
   MCP_APPS_EXTENSION_ID,
+  mcpAppEntrypointTitle,
   parseMCPAppEntrypoints,
   parseMCPToolUiMeta,
   type MCPAppEntrypointType,
@@ -366,13 +367,14 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
               tool: definition.name,
             });
           }
-          if (types.length > 0) {
+          const title = mcpAppEntrypointTitle(
+            [definition.title, definition.annotations?.title],
+            definition.name
+          );
+          if (types.length > 0 && title !== undefined) {
             entrypoints.push({
               toolName: definition.name,
-              title:
-                [definition.title, definition.annotations?.title].find(
-                  (title) => typeof title === "string" && title.trim().length > 0
-                ) ?? definition.name,
+              title,
               resourceUri: ui.resourceUri,
               types,
             });

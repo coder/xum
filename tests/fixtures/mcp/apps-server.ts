@@ -8,7 +8,8 @@ import { createInterface } from "node:readline";
  * - refresh_chart: app-only (hidden from the model), callable from the view.
  * - legacy_view: deprecated flat `_meta["ui/resourceUri"]`.
  * Entry points (`_meta["openai/ui"].entrypoints`): show_chart global (title over annotations), refresh_chart
- * thread + file (app-only; annotations.title), legacy_view global (no title: name).
+ * thread + file (app-only; annotations.title with bidi/control characters the host strips), legacy_view
+ * global (a title that cleans to nothing: name).
  * - capabilities_probe: echoes the client's initialize capabilities (gating tests).
  * Extra resources exercise the host's resources/read validation.
  */
@@ -143,7 +144,8 @@ lines.on("line", (line) => {
           },
           {
             name: "refresh_chart",
-            annotations: { title: "Refresh chart" },
+            // RLO, BEL and a whitespace run: the host shows "Refresh chart".
+            annotations: { title: "Refresh\u202e\u0007  chart" },
             inputSchema: { type: "object", properties: {} },
             _meta: {
               ui: { resourceUri: VIEW_URI, visibility: ["app"] },
@@ -154,6 +156,8 @@ lines.on("line", (line) => {
           },
           {
             name: "legacy_view",
+            // Only bidi and control characters: the host falls back to the tool name.
+            title: "\u202e\u0007",
             inputSchema: { type: "object", properties: {} },
             _meta: {
               "ui/resourceUri": "ui://chart/legacy",
