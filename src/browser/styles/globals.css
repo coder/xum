@@ -208,7 +208,9 @@
 
   /* Darkened to reach WCAG AA (4.5:1) on #fff, #f5f5f5 and #f8fafc (#5950, #5951). */
   --color-muted: hsl(210 14% 44%);
-  --color-muted-light: hsl(210 20% 60%);
+  /* Same as --color-muted: hsl(210 20% 60%) was 2.7:1 on the sidebar, and a passing value of
+     its own would be darker than --color-muted (#5984). */
+  --color-muted-light: var(--color-muted);
   --color-muted-dark: hsl(210 12% 42%);
   --color-placeholder: hsl(210 16% 52%);
   --color-subtle: hsl(210 20% 64%);
@@ -370,8 +372,8 @@
   --color-content-secondary: #575653;
   --color-content-tertiary: #6f6e69;
   --color-content-disabled: #b7b5ac;
-  --color-muted-foreground: #6f6e69;
-  --color-secondary: #6f6e69;
+  --color-muted-foreground: #575653;
+  --color-secondary: #575653;
   --color-surface-primary: #fffcf0;
   --color-surface-secondary: #f8f5e8;
   --color-content-destructive: #af3029;
@@ -459,9 +461,12 @@
   --color-input-border: #205ea6;
   --color-input-border-focus: color-mix(in srgb, var(--color-input-border), white 30%);
 
-  --color-muted: #6f6e69;
-  --color-muted-light: #6f6e69;
-  --color-muted-dark: #6f6e69;
+  /* Flexoki base-700: WCAG AA (4.5:1) on the sidebar (#f2f0e5, 6.42:1) and on hover
+     (#e6e4d9, 5.75:1). base-600 was 4.47:1 on the sidebar (#5984). The muted, muted-light,
+     muted-dark, muted-foreground and secondary text tokens share it. */
+  --color-muted: #575653;
+  --color-muted-light: #575653;
+  --color-muted-dark: #575653;
   --color-placeholder: #6f6e69;
   --color-subtle: #6f6e69;
   --color-dim: #6f6e69;
