@@ -252,7 +252,33 @@ describe("MCP Apps failed tool calls", () => {
       resourceUri: "ui://chart/view",
       arguments: { title: "Q3" },
       result: null,
+      outcome: "interrupted",
     });
+  });
+
+  test("a call that throws records a failed outcome", async () => {
+    using tempDir = new DisposableTempDir("mcp-apps-results");
+    const client = await connect(true);
+    const store = new McpAppResultStore((workspaceId) => path.join(tempDir.path, workspaceId));
+    const scope = { workspaceId: "ws1", messageId: "m1", token: "t1" };
+    const raw = await client.tools();
+    // Same tool object, so its view declaration stays attached (getMCPToolUi).
+    raw.show_chart.execute = () => Promise.reject(new Error("server crashed"));
+    const tools = withExecutionScope(
+      wrapMCPTools(raw, { appResults: { serverName: "apps", store } }),
+      scope
+    );
+    let threw = false;
+    try {
+      await tools.show_chart.execute!(
+        { title: "Q3" },
+        { toolCallId: "call-3", messages: [], context: undefined }
+      );
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+    expect(await store.get("ws1", "call-3")).toMatchObject({ result: null, outcome: "failed" });
   });
 });
 

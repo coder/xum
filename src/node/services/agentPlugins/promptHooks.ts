@@ -45,7 +45,7 @@ export interface MessageSendHookInput {
 export async function runMessageSendHooks(
   spine: EventSpine,
   workspaceId: string,
-  input: MessageSendHookInput & { cwd?: string }
+  input: MessageSendHookInput & { cwd?: string; signal?: AbortSignal }
 ): Promise<MessageSendHookOutcome> {
   if (!spine.hasMiddleware("message.send")) return { kind: "none" };
   const base = {
@@ -53,6 +53,7 @@ export async function runMessageSendHooks(
     origin: input.origin,
     text: input.text,
     ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+    signal: input.signal,
     additionalContext: [],
   };
   const ctx: MessageSendContext = input.canBlock

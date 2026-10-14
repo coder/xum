@@ -389,6 +389,10 @@ export const MCPSettingsSnapshotSchema = z.object({
   /** Schema properties dropped (unsupported schema, no valid value, or over a budget); the UI notes them. */
   droppedSettingCount: z.number().int().nonnegative(),
 });
+/** A snapshot plus its server instance's token (MCPSettingsReadSnapshot). */
+export const MCPSettingsReadSnapshotSchema = MCPSettingsSnapshotSchema.extend({
+  instanceToken: z.string(),
+});
 export const MCPSettingsReadParamsSchema = z.object({
   workspaceId: z.string(),
   serverName: z.string(),
@@ -407,4 +411,6 @@ export const MCPSettingsReadInputSchema = z.object({
 export const MCPSettingsUpdateParamsSchema = MCPSettingsReadParamsSchema.extend({
   /** Changed values only. */
   set: z.record(z.string(), MCPSettingValueSchema),
+  /** The read's instanceToken: a replaced or restarted server refuses the update. */
+  instanceToken: z.string(),
 });

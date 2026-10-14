@@ -63,9 +63,18 @@ function webpVp8l(width: number, height: number): Buffer {
 describe("checkLogoImage", () => {
   test("accepts PNG, JPEG and WebP within the limits", () => {
     expect(checkLogoImage(png(512, 512), "image/png")).toBeNull();
-    expect(checkLogoImage(jpeg(4096, 3906), "image/jpeg")).toBeNull();
+    expect(checkLogoImage(jpeg(3906, 3906), "image/jpeg")).toBeNull();
     expect(checkLogoImage(webpVp8x(256, 256, 0), "image/webp")).toBeNull();
-    expect(checkLogoImage(webpVp8l(64, 32), "image/webp")).toBeNull();
+    expect(checkLogoImage(webpVp8l(48, 48), "image/webp")).toBeNull();
+  });
+
+  test("refuses a logo that is not square or is smaller than 48×48", () => {
+    // OpenAI: "Icons and logos must be square and at least 48 by 48 pixels."
+    expect(checkLogoImage(png(256, 64), "image/png")).toContain("256×64");
+    expect(checkLogoImage(webpVp8l(64, 32), "image/webp")).not.toBeNull();
+    expect(checkLogoImage(jpeg(48, 49), "image/jpeg")).not.toBeNull();
+    expect(checkLogoImage(png(1, 1), "image/png")).toContain("1×1");
+    expect(checkLogoImage(png(47, 47), "image/png")).not.toBeNull();
   });
 
   test("refuses a decoded size over 4096 per side or 16 M pixels", () => {

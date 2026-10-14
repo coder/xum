@@ -1,4 +1,5 @@
 import { log } from "@/node/services/log";
+import type { MCPSettingValue } from "@/common/utils/mcpSettings";
 import {
   afterEach,
   beforeEach,
@@ -1179,6 +1180,84 @@ describe("MCPServerManager", () => {
     releaseRead?.();
     await slowRead;
     expect(manager.getCachedSettings("settings-latest-ws", "cad")).toEqual(values);
+  });
+
+  test("settings: a save returns the schema the server shows after the update", async () => {
+    // The server shows "Snap to grid" only once the grid is on.
+    let stored: Record<string, MCPSettingValue> = { grid: false };
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-fresh") });
+    servers.serve("settings-fresh", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: (name, args) => {
+          if (name === "s.update") stored = { ...stored, ...(args.set as typeof stored) };
+          const snap =
+            stored.grid === true ? { snap: { type: "boolean", title: "Snap to grid" } } : {};
+          return Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: {
+                type: "object",
+                properties: { grid: { type: "boolean", title: "Grid" }, ...snap },
+              },
+              values: { snap: false, ...stored },
+            },
+          });
+        },
+      },
+    });
+    await manager.getToolsForWorkspace(workspaceRequest("settings-fresh-ws"));
+    const before = await manager.readSettings("settings-fresh-ws", "cad");
+    if (before === null) throw new Error("expected settings");
+    expect(Object.keys(before.properties)).toEqual(["grid"]);
+
+    const after = await manager.saveSettings(
+      "settings-fresh-ws",
+      "cad",
+      { grid: true },
+      before.instanceToken
+    );
+    expect(Object.keys(after.properties)).toEqual(["grid", "snap"]);
+    expect(after.values).toEqual({ grid: true, snap: false });
+    expect(after.instanceToken).toBe(before.instanceToken);
+  });
+
+  test("settings: a save read from a replaced server instance is refused", async () => {
+    const updates: string[] = [];
+    const settingsServer = (id: string) => ({
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: (name: string) => {
+          if (name === "s.update") updates.push(id);
+          return Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: { units: { type: "string", title: "Units" } } },
+              values: { units: "in" },
+            },
+          });
+        },
+      },
+    });
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-token-v1") });
+    servers.serve("settings-token-v1", settingsServer("v1"));
+    servers.serve("settings-token-v2", settingsServer("v2"));
+    const request = workspaceRequest("settings-token-ws");
+    await manager.getToolsForWorkspace(request);
+    const read = await manager.readSettings("settings-token-ws", "cad");
+    if (read === null) throw new Error("expected settings");
+
+    // The dialog stays open while the server's configuration is replaced.
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-token-v2") });
+    await manager.getToolsForWorkspace(request);
+    const refused = await manager
+      .saveSettings("settings-token-ws", "cad", { units: "mm" }, read.instanceToken)
+      .catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(Error);
+    expect(String(refused)).toContain("Reopen");
+    expect(updates).toEqual([]);
   });
 
   test("settings: a replaced server instance does not keep the old instance's cached values", async () => {

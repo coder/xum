@@ -8,7 +8,7 @@ import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useAPI } from "@/browser/contexts/API";
 import { cn } from "@/common/lib/utils";
 import type { MCPServerIdentity, MCPServerInfo, WorkspaceMCPOverrides } from "@/common/types/mcp";
-import type { MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
+import type { MCPSettingsReadSnapshot } from "@/common/utils/mcpSettings";
 import {
   Dialog,
   DialogContent,
@@ -372,10 +372,10 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   const beginSettingsSave = (serverName: string) => {
     setSavingSettings((prev) => countSettingsSave(prev, serverName, 1));
     const request = settingsRequests.take(settingsRequests.current(), serverName);
-    return (values: MCPSettingsSnapshot["values"] | null) => {
+    return (snapshot: MCPSettingsReadSnapshot | null) => {
       setSavingSettings((prev) => countSettingsSave(prev, serverName, -1));
-      if (values !== null && request.isLatest())
-        setServerSettings((prev) => applySavedSettings(prev, serverName, values));
+      if (snapshot !== null && request.isLatest())
+        setServerSettings((prev) => applySavedSettings(prev, serverName, request.id, snapshot));
     };
   };
 

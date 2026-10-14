@@ -194,7 +194,7 @@ import {
   boundMCPSettingsError,
   mcpSettingsSnapshotForIpc,
   MCP_SETTINGS_READ_TIMEOUT_MS,
-  type MCPSettingsSnapshot,
+  type MCPSettingsReadSnapshot,
 } from "@/common/utils/mcpSettings";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 
@@ -240,7 +240,7 @@ async function runMcpSettingsRoute<T>(
 }
 
 type McpSettingsReadResult =
-  | { success: true; data: MCPSettingsSnapshot | { notConnected: true } | null }
+  | { success: true; data: MCPSettingsReadSnapshot | { notConnected: true } | null }
   | { success: false; error: string };
 
 /**
@@ -250,7 +250,7 @@ type McpSettingsReadResult =
  * runs, so the read never starts or restarts a server (an instance that closed meanwhile
  * fails the read instead).
  */
-const forIpc = (snapshot: MCPSettingsSnapshot | null) =>
+const forIpc = (snapshot: MCPSettingsReadSnapshot | null) =>
   snapshot === null ? null : mcpSettingsSnapshotForIpc(snapshot);
 
 async function readMcpSettingsRoute(
@@ -1307,22 +1307,17 @@ export const router = (authToken?: string) => {
           .input(schemas.mcp.settings.update.input)
           .output(schemas.mcp.settings.update.output)
           .handler(({ context, input, signal }) =>
-            // Validate against a fresh read: the renderer's schema can be stale.
-            runMcpSettingsRoute(context, input.workspaceId, signal, async () => {
-              const snapshot = await context.mcpServerManager.readSettings(
-                input.workspaceId,
-                input.serverName,
-                { signal }
-              );
-              if (snapshot === null)
-                throw new Error(`MCP server '${input.serverName}' has no settings`);
-              return context.mcpServerManager.updateSettings(
-                input.workspaceId,
-                input.serverName,
-                input.set,
-                snapshot
-              );
-            })
+            runMcpSettingsRoute(context, input.workspaceId, signal, async () =>
+              mcpSettingsSnapshotForIpc(
+                await context.mcpServerManager.saveSettings(
+                  input.workspaceId,
+                  input.serverName,
+                  input.set,
+                  input.instanceToken,
+                  { signal }
+                )
+              )
+            )
           ),
       },
       designStatus: t

@@ -142,6 +142,13 @@ export interface MessageSendContext {
   readonly text: string;
   /** The workspace path (Codex common field `cwd`), when Xum could resolve it. */
   readonly cwd?: string;
+  /**
+   * The send's cancel signal. A withdrawn send ends its pending hook calls instead of waiting for
+   * the hook timeout (Codex PRRT_kwDOPxxmWM6rkl9A). The hooks run before any history write, so a
+   * send whose signal fired is always cancelled after them, and an ended hook cannot let it
+   * through.
+   */
+  readonly signal?: AbortSignal;
   /** Appended by middleware, in chain order; saved on the user row (pluginHookContext). */
   readonly additionalContext: Array<{ pluginId: string; text: string }>;
   /** Set to refuse the send. useBefore skips the rest of the chain (first block wins). */
@@ -217,6 +224,26 @@ const ISOLATED_CONSUMERS = {
 } satisfies Partial<{ [K in keyof WaterfallPointMap]: (ctx: WaterfallPointMap[K]) => () => void }>;
 
 /** Duck-check for contexts that support blocking (tool.execute, message.send). */
+/** Per isolated point: snapshot what a consumer may change, and return its undo. */
+const ISOLATED_CONSUMERS = {
+  "message.send": (ctx: MessageSendContext) => {
+    const { blocked } = ctx;
+    const contextLength = ctx.additionalContext.length;
+    return () => {
+      ctx.blocked = blocked;
+      ctx.additionalContext.length = contextLength;
+    };
+  },
+  "turn.stop": (ctx: TurnStopContext) => {
+    const { halted } = ctx;
+    const reasons = ctx.continueReasons.length;
+    return () => {
+      ctx.halted = halted;
+      ctx.continueReasons.length = reasons;
+    };
+  },
+} satisfies Partial<{ [K in keyof WaterfallPointMap]: (ctx: WaterfallPointMap[K]) => () => void }>;
+
 function isBlocked(ctx: unknown): boolean {
   return (
     typeof ctx === "object" &&

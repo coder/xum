@@ -7,7 +7,7 @@ import type {
   DraftUpdateInput,
   DraftWriteOutput,
 } from "@/common/orpc/schemas/drafts";
-import { removeSentText } from "@/common/utils/composerDraftText";
+import { takeSentText } from "@/common/utils/composerDraftText";
 import { draftScopeKey, summarizeDraft, toDraftAttachmentMetadata } from "@/common/utils/drafts";
 
 interface StoredDraft {
@@ -81,11 +81,12 @@ export function createMockDraftsApi() {
     // Idempotent sends: story sends are accepted at once, so nothing is retained.
     beginSend: (input: DraftBeginSendInput) => {
       const current = drafts.get(draftScopeKey(input.scope));
+      const visible = input.text ?? current?.text ?? "";
       const taken = new Set(input.pendingSend.attachmentIds);
       return Promise.resolve(
         write({
           scope: input.scope,
-          text: removeSentText(input.text ?? current?.text ?? "", input.pendingSend.text),
+          text: takeSentText(visible, input.pendingSend.text, visible === input.typedAfterSendText),
           attachments: (current?.attachments ?? []).filter(({ id }) => !taken.has(id)),
         })
       );
