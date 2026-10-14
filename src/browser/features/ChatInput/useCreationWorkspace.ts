@@ -185,6 +185,8 @@ interface UseCreationWorkspaceReturn {
   setTrunkBranch: (branch: string) => void;
   /** Currently selected runtime (discriminated union: SSH has host, Docker has image) */
   selectedRuntime: ParsedRuntime;
+  /** The runtime the user picked, which moving the draft to another project carries. */
+  explicitRuntimePick: ParsedRuntime | null;
   /** Fallback Coder config used when re-selecting Coder runtime. */
   coderConfigFallback: CoderWorkspaceConfig;
   /** Fallback SSH host used when leaving the Coder runtime. */
@@ -309,11 +311,6 @@ export function useCreationWorkspace({
   const [runtimeAvailabilityState, setRuntimeAvailabilityState] =
     useState<RuntimeAvailabilityState>({ status: "loading" });
 
-  // Centralized draft workspace settings with automatic persistence
-  const { settings, coderConfigFallback, sshHostFallback, setSelectedRuntime, setTrunkBranch } =
-    useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk);
-  const creationAgentId = resolveCreationAgentId(settings.agentId, agentBaseById);
-
   // Persist draft workspace name generation state per draft (so multiple drafts don't share a
   // single auto-naming/manual-name state).
   const workspaceNameScopeId =
@@ -322,6 +319,17 @@ export function useCreationWorkspace({
         ? getDraftScopeId(projectPath, draftId)
         : getPendingScopeId(projectPath)
       : null;
+
+  // Centralized draft workspace settings with automatic persistence
+  const {
+    settings,
+    explicitRuntimePick,
+    coderConfigFallback,
+    sshHostFallback,
+    setSelectedRuntime,
+    setTrunkBranch,
+  } = useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk, workspaceNameScopeId);
+  const creationAgentId = resolveCreationAgentId(settings.agentId, agentBaseById);
 
   // Project scope ID for reading send options at send time
   const projectScopeId = getProjectScopeId(projectPath);
@@ -1022,6 +1030,7 @@ export function useCreationWorkspace({
     trunkBranch: settings.trunkBranch,
     setTrunkBranch,
     selectedRuntime: settings.selectedRuntime,
+    explicitRuntimePick,
     coderConfigFallback,
     sshHostFallback,
     defaultRuntimeMode: settings.defaultRuntimeMode,

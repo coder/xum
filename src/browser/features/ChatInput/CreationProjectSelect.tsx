@@ -15,6 +15,8 @@ interface CreationProjectSelectProps {
   selected: string;
   userProjects: Map<string, ProjectConfig>;
   onChange: (scope: string) => void;
+  /** While a creation send is in flight the draft cannot move. */
+  disabled?: boolean;
 }
 
 function formatScopeLabel(scope: string, userProjects: Map<string, ProjectConfig>): string {
@@ -46,7 +48,7 @@ export function CreationProjectSelect(props: CreationProjectSelectProps) {
     );
   }
   return (
-    <RadixSelect value={props.selected} onValueChange={props.onChange}>
+    <RadixSelect value={props.selected} onValueChange={props.onChange} disabled={props.disabled}>
       <Tooltip>
         <TooltipTrigger asChild>
           <SelectTrigger

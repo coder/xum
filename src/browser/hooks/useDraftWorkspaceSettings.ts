@@ -13,6 +13,10 @@ import {
 } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import {
+  clearCreationRuntimeHandOff,
+  peekCreationRuntimeHandOff,
+} from "@/browser/utils/creationDraftCarry";
+import {
   readOptionField,
   readSshOptionDefaults,
   type RuntimeOptionDefaults,
@@ -208,9 +212,13 @@ const buildRuntimeFromChoice = (choice: RuntimeChoice): ParsedRuntime => {
 export function useDraftWorkspaceSettings(
   projectPath: string,
   branches: string[],
-  recommendedTrunk: string | null
+  recommendedTrunk: string | null,
+  /** The draft's storage scope: a moved draft's runtime pick is handed off under it. */
+  draftScopeId: string | null = null
 ): {
   settings: DraftWorkspaceSettings;
+  /** The runtime the user picked in this composer, or null while it follows the defaults. */
+  explicitRuntimePick: ParsedRuntime | null;
   /** Restores prior Coder selections when re-entering Coder mode. */
   coderConfigFallback: CoderWorkspaceConfig;
   /** Preserves the last SSH host when leaving Coder so the input stays populated. */
@@ -403,7 +411,19 @@ export function useDraftWorkspaceSettings(
 
   // Currently selected runtime for this session. Until the user or a Settings change picks
   // one it follows the defaults (derived below), so options that load after mount apply.
-  const [runtimePick, setSelectedRuntimeState] = useState<ParsedRuntime | null>(null);
+  // `explicit` marks a user pick (not a Settings default change), the only kind a moved draft
+  // carries to another project.
+  const [runtimePick, setSelectedRuntimeState] = useState<{
+    runtime: ParsedRuntime;
+    explicit: boolean;
+  } | null>(() => {
+    const handedOff = peekCreationRuntimeHandOff(draftScopeId);
+    return handedOff != null ? { runtime: handedOff, explicit: true } : null;
+  });
+  // Cleared after mount, not in the initializer: StrictMode runs initializers twice.
+  useEffect(() => {
+    if (draftScopeId != null) clearCreationRuntimeHandOff(draftScopeId);
+  }, [draftScopeId]);
 
   // Project changes remount ChatInput (key includes projectPath), so this effect only handles
   // live Settings updates to the default runtime while staying on the same project.
@@ -414,16 +434,17 @@ export function useDraftWorkspaceSettings(
     }
 
     appliedDefaultRuntimeChoiceRef.current = settingsDefaultRuntime;
-    setSelectedRuntimeState(
-      buildRuntimeForMode(
+    setSelectedRuntimeState({
+      runtime: buildRuntimeForMode(
         defaultRuntimeMode,
         { host: defaultSshHost, coder: defaultSshCoder },
         defaultDockerImage,
         lastShareCredentials,
         defaultDevcontainerConfigPath,
         lastDevcontainerShareCredentials
-      )
-    );
+      ),
+      explicit: false,
+    });
   }, [
     settingsDefaultRuntime,
     defaultRuntimeMode,
@@ -448,7 +469,7 @@ export function useDraftWorkspaceSettings(
     defaultDevcontainerConfigPath,
     lastDevcontainerShareCredentials
   );
-  const selectedRuntime = runtimePick ?? defaultRuntime;
+  const selectedRuntime = runtimePick?.runtime ?? defaultRuntime;
 
   const lastSshHost = lastSsh.host;
   const lastSshCoder = lastSsh.coder;
@@ -466,7 +487,7 @@ export function useDraftWorkspaceSettings(
       devcontainerShareCredentials: lastDevcontainerShareCredentials,
     });
 
-    setSelectedRuntimeState(mergedRuntime);
+    setSelectedRuntimeState({ runtime: mergedRuntime, explicit: true });
 
     // Persist host/image/coder so they're remembered when switching modes.
     // Avoid wiping the remembered value when the UI switches modes with an empty field.
@@ -513,6 +534,7 @@ export function useDraftWorkspaceSettings(
       defaultRuntimeMode: defaultRuntimeChoice,
       trunkBranch,
     },
+    explicitRuntimePick: runtimePick?.explicit === true ? runtimePick.runtime : null,
     coderConfigFallback,
     sshHostFallback,
     setSelectedRuntime,

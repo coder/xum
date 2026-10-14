@@ -14,7 +14,7 @@ import { useLocation } from "react-router-dom";
 import type { FrontendWorkspaceMetadata, WorkspaceRemoveResult } from "@/common/types/workspace";
 import type { ArchivePreflightResult, ArchiveWorkspaceResult } from "@/common/orpc/schemas/api";
 import type { WorkspaceSelection } from "@/browser/components/ProjectSidebar/ProjectSidebar";
-import type { RuntimeConfig } from "@/common/types/runtime";
+import type { ParsedRuntime, RuntimeConfig } from "@/common/types/runtime";
 import type { DeepLinkPayload } from "@/common/types/deepLink";
 import {
   getDraftScopeId,
@@ -50,13 +50,18 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { collectOrphanedWorkspaceStorage } from "@/browser/utils/workspaceStorageGc";
 import { collectOrphanedCreationDraftStorage } from "@/browser/utils/creationDraftStorageGc";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
-import type { WorkspaceCreationScope } from "@/common/utils/subProjects";
+import {
+  resolveWorkspaceCreationScope,
+  type WorkspaceCreationScope,
+} from "@/common/utils/subProjects";
+import { carryCreationAiSettings, handOffCreationRuntime } from "@/browser/utils/creationDraftCarry";
 import {
   defaultCreationDraftScope,
   getDraftStore,
   useCreationDraftsByProject,
   useDraftStoreReady,
   type CreationDraftsByProject,
+  type DraftStoreScope,
   type WorkspaceDraft,
 } from "@/browser/stores/DraftStore";
 import { createDraftId } from "@/common/utils/drafts";
@@ -257,16 +262,42 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
     subProjectPath?: string,
     options?: { replace?: boolean }
   ) => void;
-  updateWorkspaceDraftSubProject: (
-    projectPath: string,
-    draftId: string,
-    subProjectPath: string | null
-  ) => void;
+  /**
+   * Move the creation draft being edited (text, attachments, workspace name, AI settings, and a
+   * runtime the user picked) to another project, sub-project, or Scratch, and open it there.
+   */
+  moveWorkspaceDraft: (move: WorkspaceDraftMove) => void;
   openWorkspaceDraft: (projectPath: string, draftId: string) => void;
   deleteWorkspaceDraft: (projectPath: string, draftId: string) => void;
 
   // Helpers
   getWorkspaceInfo: (workspaceId: string) => Promise<FrontendWorkspaceMetadata | null>;
+}
+
+export interface WorkspaceDraftMove {
+  /** The source's owning project. */
+  projectPath: string;
+  /** The source's listed draft, or null for the project's default creation draft. */
+  draftId: string | null;
+  /** The project selector's value: a project, a sub-project, or SCRATCH_PROJECT_CONFIG_KEY. */
+  destination: string;
+  /** Carried only between projects (Scratch has no runtime). */
+  runtimePick: ParsedRuntime | null;
+}
+
+/**
+ * Moves a creation draft's text and attachments (the DraftStore deletes the source once the
+ * destination is saved) and its workspace name state to a listed draft.
+ */
+function moveCreationDraftBody(
+  from: { scope: DraftStoreScope; storageScopeId: string },
+  to: { projectPath: string; draftId: string }
+): void {
+  // Never rejects.
+  getDraftStore()
+    .moveDraft(from.scope, { kind: "creation", projectPath: to.projectPath, draftId: to.draftId })
+    .catch(() => undefined);
+  migrateWorkspaceStorage(from.storageScopeId, getDraftScopeId(to.projectPath, to.draftId));
 }
 
 const WorkspaceActionsContext = createContext<
@@ -430,6 +461,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     hasAnyProject,
     refreshProjects,
     loading: projectsLoading,
+    userProjects,
   } = useProjectContext();
   // Get router navigation functions and current route state
   const {
@@ -1637,32 +1669,6 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     },
     [navigateToProject]
   );
-  // Persist sub-project selection + URL updates so draft sub-project switches stick across navigation.
-  const updateWorkspaceDraftSubProject = useCallback(
-    (projectPath: string, draftId: string, subProjectPath: string | null) => {
-      if (projectPath.trim().length === 0) return;
-      if (draftId.trim().length === 0) return;
-
-      const normalizedSubProjectPath =
-        typeof subProjectPath === "string" && subProjectPath.trim().length > 0
-          ? subProjectPath
-          : null;
-
-      const existing = (getDraftStore().getCreationDraftsByProject()[projectPath] ?? []).find(
-        (draft) => draft.draftId === draftId
-      );
-      if (existing && existing.subProjectPath !== normalizedSubProjectPath) {
-        getDraftStore().putCreationDraft(projectPath, {
-          ...existing,
-          subProjectPath: normalizedSubProjectPath,
-        });
-      }
-
-      navigateToProject(projectPath, draftId);
-    },
-    [navigateToProject]
-  );
-
   const createWorkspaceDraft = useCallback(
     (projectPath: string, subProjectPath?: string, options?: { replace?: boolean }) => {
       // Read the store directly to get the freshest value, avoiding stale closure issues.
@@ -1703,15 +1709,13 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       // into the first draft scope so it stays accessible.
       // The default creation composer's draft (no draft id) moves into the first listed one.
       if (existingDrafts.length === 0) {
-        const pendingScopeId = getPendingScopeId(projectPath);
         const defaultScope = defaultCreationDraftScope(projectPath);
         const pending = getDraftStore().getView(defaultScope);
         if (pending.text.trim().length > 0 || pending.attachmentCount > 0) {
-          // Never rejects; the default draft is deleted only once the new one is saved.
-          getDraftStore()
-            .moveDraft(defaultScope, { kind: "creation", projectPath, draftId })
-            .catch(() => undefined);
-          migrateWorkspaceStorage(pendingScopeId, getDraftScopeId(projectPath, draftId));
+          moveCreationDraftBody(
+            { scope: defaultScope, storageScopeId: getPendingScopeId(projectPath) },
+            { projectPath, draftId }
+          );
         }
       }
       getDraftStore().putCreationDraft(projectPath, draft);
@@ -1843,6 +1847,73 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     [setWorkspaceDraftPromotionsByProject]
   );
 
+  const moveWorkspaceDraft = useCallback(
+    (move: WorkspaceDraftMove) => {
+      const source = move.projectPath;
+      const dest = resolveWorkspaceCreationScope(move.destination, userProjects);
+      const listed =
+        move.draftId != null
+          ? (getDraftStore().getCreationDraftsByProject()[source] ?? []).find(
+              (draft) => draft.draftId === move.draftId
+            )
+          : undefined;
+
+      // A sub-project switch inside the owning project keeps the same draft: the composer is
+      // keyed by the owner and draft, so it stays mounted with everything it shows.
+      if (move.draftId != null && dest.projectPath === source) {
+        if (listed?.subProjectPath !== dest.subProjectPath) {
+          getDraftStore().putCreationDraft(source, {
+            draftId: move.draftId,
+            subProjectPath: dest.subProjectPath,
+            createdAt: listed?.createdAt ?? Date.now(),
+          });
+        }
+        navigateToProject(source, move.draftId, { replace: true });
+        return;
+      }
+
+      const draftId = createDraftId();
+      getDraftStore().putCreationDraft(dest.projectPath, {
+        draftId,
+        subProjectPath: dest.subProjectPath,
+        createdAt: listed?.createdAt ?? Date.now(),
+      });
+      const sourceScope: DraftStoreScope =
+        move.draftId != null
+          ? { kind: "creation", projectPath: source, draftId: move.draftId }
+          : defaultCreationDraftScope(source);
+      const sourceView = getDraftStore().getView(sourceScope);
+      moveCreationDraftBody(
+        {
+          scope: sourceScope,
+          storageScopeId:
+            move.draftId != null
+              ? getDraftScopeId(source, move.draftId)
+              : getPendingScopeId(source),
+        },
+        { projectPath: dest.projectPath, draftId }
+      );
+      // moveDraft leaves an empty source alone, but its list entry must not stay behind.
+      if (
+        move.draftId != null &&
+        sourceView.text.length === 0 &&
+        sourceView.attachmentCount === 0
+      ) {
+        deleteWorkspaceDraft(source, move.draftId);
+      }
+      carryCreationAiSettings(source, dest.projectPath);
+      if (
+        move.runtimePick != null &&
+        source !== SCRATCH_PROJECT_CONFIG_KEY &&
+        dest.projectPath !== SCRATCH_PROJECT_CONFIG_KEY
+      ) {
+        handOffCreationRuntime(getDraftScopeId(dest.projectPath, draftId), move.runtimePick);
+      }
+      navigateToProject(dest.projectPath, draftId, { replace: true });
+    },
+    [userProjects, navigateToProject, deleteWorkspaceDraft]
+  );
+
   // Split into two context values so metadata-Map churn doesn't re-render
   // components that only need actions/selection/drafts.
   const metadataValue = useMemo<WorkspaceMetadataContextValue>(
@@ -1874,7 +1945,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       workspaceDraftPromotionsByProject,
       promoteWorkspaceDraft,
       createWorkspaceDraft,
-      updateWorkspaceDraftSubProject,
+      moveWorkspaceDraft,
       openWorkspaceDraft,
       deleteWorkspaceDraft,
       getWorkspaceInfo,
@@ -1902,7 +1973,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       workspaceDraftPromotionsByProject,
       promoteWorkspaceDraft,
       createWorkspaceDraft,
-      updateWorkspaceDraftSubProject,
+      moveWorkspaceDraft,
       openWorkspaceDraft,
       deleteWorkspaceDraft,
       getWorkspaceInfo,
