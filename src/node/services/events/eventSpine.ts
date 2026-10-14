@@ -200,17 +200,17 @@ interface Registration {
 }
 
 /**
- * Per isolated point: snapshot what a consumer may change, and return its undo. The arrays are
- * copied whole: a consumer can also remove or change earlier entries before it throws, and an
- * undo by length alone would then leave holes for the later readers.
+ * Per isolated point: snapshot what a consumer may change, and return its undo. The arrays and
+ * their entries are copied: a consumer can also remove earlier entries or change them in place
+ * before it throws, and an undo by length alone would then leave holes for the later readers.
  */
 const ISOLATED_CONSUMERS = {
   "message.send": (ctx: MessageSendContext) => {
     const { blocked } = ctx;
-    const context = [...ctx.additionalContext];
+    const context = ctx.additionalContext.map((entry) => ({ ...entry }));
     return () => {
       ctx.blocked = blocked;
-      ctx.additionalContext.splice(0, ctx.additionalContext.length, ...context);
+      restoreArray(ctx.additionalContext, context);
     };
   },
   "turn.stop": (ctx: TurnStopContext) => {
@@ -218,10 +218,22 @@ const ISOLATED_CONSUMERS = {
     const reasons = [...ctx.continueReasons];
     return () => {
       ctx.halted = halted;
-      ctx.continueReasons.splice(0, ctx.continueReasons.length, ...reasons);
+      restoreArray(ctx.continueReasons, reasons);
     };
   },
 } satisfies Partial<{ [K in keyof WaterfallPointMap]: (ctx: WaterfallPointMap[K]) => () => void }>;
+
+/**
+ * Put `snapshot` back into `target` in place (the context holds the array). Index assignment,
+ * not `splice(0, n, ...snapshot)`: spreading a large array into call arguments can throw a
+ * RangeError in the very catch path that runs this.
+ */
+function restoreArray<T>(target: T[], snapshot: readonly T[]): void {
+  target.length = snapshot.length;
+  snapshot.forEach((item, index) => {
+    target[index] = item;
+  });
+}
 
 /** Duck-check for contexts that support blocking (tool.execute, message.send). */
 function isBlocked(ctx: unknown): boolean {
