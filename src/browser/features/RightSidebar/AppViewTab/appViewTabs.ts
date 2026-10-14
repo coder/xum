@@ -44,7 +44,7 @@ export function withAppViewTab(
  * Works whether or not the workspace's sidebar is mounted (it follows the saved layout).
  */
 export function saveAppViewTab(workspaceId: string, toolCallId: string): void {
-  updatePersistedState<unknown>(getRightSidebarLayoutKey(workspaceId), (raw) => {
+  updatePersistedState<unknown>(getRightSidebarLayoutKey(workspaceId), (raw: unknown) => {
     const layout = parseRightSidebarLayoutState(raw);
     const tab = appViewTabFor(toolCallId);
     return collectAllTabs(layout.root).includes(tab)
