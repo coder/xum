@@ -1139,6 +1139,37 @@ describe("McpAppFrame host strips", () => {
     });
   });
 
+  // Other host-context reads (a display-mode request) do not post the dimensions: only what the
+  // view was actually sent counts as sent.
+  test("a display-mode request before the resize callback does not swallow the size update", async () => {
+    Object.defineProperty(window, "innerHeight", { value: 800, configurable: true });
+    const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
+      wrapper: Wrapper,
+    });
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+
+    Object.defineProperty(window, "innerHeight", { value: 500, configurable: true });
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "ui/request-display-mode",
+      params: { mode: "inline" },
+    });
+    await waitFor(() => expect(posted.some((m) => m.id === 2)).toBe(true));
+    act(() => {
+      window.dispatchEvent(new window.Event("resize"));
+    });
+    await waitFor(() => {
+      const changed = posted.find((m) => m.method === "ui/notifications/host-context-changed");
+      const params = changed?.params as { containerDimensions?: { maxHeight?: number } };
+      expect(params?.containerDimensions?.maxHeight).toBe(400);
+    });
+  });
+
   test("fullscreen from the card moves the view to its tab; inline from the tab closes it", async () => {
     // Whether the requester already had its reply when the move (which unmounts it) ran.
     const repliedAtMove: boolean[] = [];
