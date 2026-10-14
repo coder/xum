@@ -316,10 +316,22 @@ function mcpToModelOutput({
  * to a pre-2026 client — on anything but definitive modern evidence. A
  * `prior` verdict skips the probe entirely.
  */
-/** Hand the server's tools/list_changed notifications to `onChanged` (MCPClientConfig). */
-function reportToolsListChanged(client: Client, onChanged: (() => void) | undefined): void {
+/**
+ * Hand the server's tools/list_changed notifications to `onChanged` (MCPClientConfig), after a
+ * re-list: a legacy-era instance has no other catalog refresh, so its entry points and app tool
+ * checks would keep the startup listing. A failed re-list still reports the change.
+ */
+function reportToolsListChanged(
+  client: Client,
+  relist: () => Promise<unknown>,
+  onChanged: (() => void) | undefined
+): void {
   if (onChanged === undefined) return;
-  client.setNotificationHandler("notifications/tools/list_changed", () => onChanged());
+  client.setNotificationHandler("notifications/tools/list_changed", () =>
+    relist()
+      .catch(() => undefined)
+      .finally(onChanged)
+  );
 }
 
 export async function createMCPClient(config: MCPClientConfig): Promise<MCPClientHandle> {
@@ -346,7 +358,10 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     const onUncaughtError = config.onUncaughtError;
     client.onerror = (error) => onUncaughtError(error);
   }
-  reportToolsListChanged(client, config.onToolsListChanged);
+  // Set once the handle exists. A notification before then needs no re-list: the first tools()
+  // call lists the current catalog.
+  let relist: () => Promise<unknown> = () => Promise.resolve();
+  reportToolsListChanged(client, () => relist(), config.onToolsListChanged);
 
   const transport = isHttpTransportConfig(config.transport)
     ? createHttpTransport(config.transport)
@@ -359,7 +374,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
   // Every advertised name, even from a half-malformed capability: hiding stays on.
   const settingsTools = new Set(advertisedMCPSettingsToolNames(client.getServerCapabilities()));
 
-  return {
+  const handle: MCPClientHandle = {
     tools: async () => {
       const listResult = await client.listTools();
       assert(Array.isArray(listResult.tools), "MCP tools/list result must carry a tools array");
@@ -507,4 +522,6 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     },
     close: () => client.close(),
   };
+  relist = () => handle.tools();
+  return handle;
 }

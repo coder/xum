@@ -83,7 +83,7 @@ describe("MCP Apps client gating", () => {
 });
 
 describe("MCP Apps tools/list_changed", () => {
-  test("the client reports a server's tools/list_changed", async () => {
+  test("the client re-lists a server's tools on tools/list_changed, then reports it", async () => {
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [fixture],
@@ -97,8 +97,13 @@ describe("MCP Apps tools/list_changed", () => {
       onToolsListChanged: () => changed.resolve(),
     });
     clients.push(client);
+    await client.tools();
+    expect(client.appEntrypoints().map((tool) => tool.toolName)).not.toContain("parts_library");
+    // The server adds an entry point tool and announces it (a legacy-era server: the manager
+    // has no other refresh for its catalog).
     await client.callToolForApp("refresh_chart", {});
     await changed.promise;
+    expect(client.appEntrypoints().map((tool) => tool.toolName)).toContain("parts_library");
   });
 });
 

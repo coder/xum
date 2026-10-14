@@ -11,7 +11,8 @@ import { createInterface } from "node:readline";
  * thread + file (app-only; annotations.title with bidi/control characters the host strips), legacy_view
  * global (a title that cleans to nothing: name).
  * - capabilities_probe: echoes the client's initialize capabilities (gating tests).
- * With APPS_FIXTURE_LIST_CHANGED=1, refresh_chart also sends notifications/tools/list_changed.
+ * With APPS_FIXTURE_LIST_CHANGED=1, refresh_chart also adds a parts_library entry point tool
+ * and sends notifications/tools/list_changed.
  * Extra resources exercise the host's resources/read validation.
  */
 const VIEW_URI = "ui://chart/view";
@@ -124,6 +125,9 @@ function badEntrypointTools() {
   }));
 }
 
+/** Set once refresh_chart changed the catalog (APPS_FIXTURE_LIST_CHANGED). */
+let catalogChanged = false;
+
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 lines.on("line", (line) => {
   const request = JSON.parse(line) as {
@@ -185,6 +189,19 @@ lines.on("line", (line) => {
           },
           { name: "capabilities_probe", inputSchema: { type: "object", properties: {} } },
           ...badEntrypointTools(),
+          ...(catalogChanged
+            ? [
+                {
+                  name: "parts_library",
+                  title: "Parts library",
+                  inputSchema: { type: "object", properties: {} },
+                  _meta: {
+                    ui: { resourceUri: VIEW_URI, visibility: ["app"] },
+                    "openai/ui": { entrypoints: [{ type: "global" }] },
+                  },
+                },
+              ]
+            : []),
         ],
       };
       break;
@@ -199,6 +216,7 @@ lines.on("line", (line) => {
         refreshCount += 1;
         result = chartResult(`Refreshed ${refreshCount}`, [90, 30, 60, 20]);
         if (process.env.APPS_FIXTURE_LIST_CHANGED === "1") {
+          catalogChanged = true;
           process.stdout.write(
             JSON.stringify({ jsonrpc: "2.0", method: "notifications/tools/list_changed" }) + "\n"
           );
