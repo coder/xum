@@ -148,21 +148,26 @@ describe("LocalBaseRuntime.exec PATH handling", () => {
       process.env.MUX_VENDORED_BIN_DIR = vendoredBinDir;
       process.env.AGENT_BROWSER_SESSION = "mux-leaked-session";
 
-      const stream = await runtime.exec(
-        'printf "%s\\n" "${AGENT_BROWSER_SESSION-unset}" && mux-path-probe',
-        {
-          cwd: os.tmpdir(),
-          timeout: 5,
-          env: { PATH: `${vendoredBinDir}:${tempBinDir}:/usr/bin:/bin` },
-        }
-      );
-      const [stdout, exitCode] = await Promise.all([
-        readStreamAsString(stream.stdout),
-        stream.exitCode,
-      ]);
+      // #6509: the minimal host env drops the vendored-bin pointer, but PATH
+      // sanitization must still see it.
+      for (const hostEnv of ["inherit", "minimal"] as const) {
+        const stream = await runtime.exec(
+          'printf "%s\\n" "${AGENT_BROWSER_SESSION-unset}" && mux-path-probe',
+          {
+            cwd: os.tmpdir(),
+            timeout: 5,
+            env: { PATH: `${vendoredBinDir}:${tempBinDir}:/usr/bin:/bin` },
+            hostEnv,
+          }
+        );
+        const [stdout, exitCode] = await Promise.all([
+          readStreamAsString(stream.stdout),
+          stream.exitCode,
+        ]);
 
-      expect(exitCode).toBe(0);
-      expect(stdout.trim()).toBe("unset\ncaller-path");
+        expect(exitCode).toBe(0);
+        expect(stdout.trim()).toBe("unset\ncaller-path");
+      }
     } finally {
       if (originalVendoredBinDir == null) {
         delete process.env.MUX_VENDORED_BIN_DIR;
@@ -176,6 +181,45 @@ describe("LocalBaseRuntime.exec PATH handling", () => {
       }
       await fs.rm(tempBinDir, { recursive: true, force: true });
       await fs.rm(vendoredBinDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("LocalBaseRuntime.exec hostEnv", () => {
+  // #6509: plugin stdio MCP servers must not inherit the user's shell secrets.
+  async function runEnvProbe(hostEnv: "inherit" | "minimal" | undefined) {
+    const runtime = new TestLocalRuntime();
+    const stream = await runtime.exec(
+      'printf "%s|%s|%s" "${XUM_TEST_HOST_SECRET-unset}" "${XUM_TEST_DECLARED-unset}" "${HOME-unset}"',
+      {
+        cwd: os.tmpdir(),
+        timeout: 5,
+        env: { XUM_TEST_DECLARED: "declared" },
+        ...(hostEnv !== undefined ? { hostEnv } : {}),
+      }
+    );
+    await stream.stdin.close();
+    const [stdout, exitCode] = await Promise.all([
+      readStreamAsString(stream.stdout),
+      stream.exitCode,
+    ]);
+    expect(exitCode).toBe(0);
+    return stdout;
+  }
+
+  it("keeps only allowlisted host variables plus the declared env for minimal", async () => {
+    const original = process.env.XUM_TEST_HOST_SECRET;
+    process.env.XUM_TEST_HOST_SECRET = "leaked";
+    try {
+      expect(await runEnvProbe("minimal")).toBe(`unset|declared|${process.env.HOME ?? "unset"}`);
+      // Default exec (user MCP servers, the bash tool) still inherits the host env.
+      expect(await runEnvProbe(undefined)).toBe(`leaked|declared|${process.env.HOME ?? "unset"}`);
+    } finally {
+      if (original === undefined) {
+        delete process.env.XUM_TEST_HOST_SECRET;
+      } else {
+        process.env.XUM_TEST_HOST_SECRET = original;
+      }
     }
   });
 });

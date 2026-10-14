@@ -52,7 +52,7 @@ import { MCPConfigService } from "./mcpConfigService";
 import { Config } from "@/node/config";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 import type { TelemetryService } from "./telemetryService";
-import type { Runtime } from "@/node/runtime/Runtime";
+import type { ExecOptions, Runtime } from "@/node/runtime/Runtime";
 import * as crossProcessLock from "@/node/utils/main/crossProcessLock";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
@@ -1028,6 +1028,63 @@ describe("MCPServerManager", () => {
     expect(await run("new")).toBe("ran");
   });
 
+  test("settings tool actions fail closed when the catalog refresh stalls or fails", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-actions-stall") });
+    // "reset" was read-only; the server makes it writable and then lists slowly or fails.
+    const readOnly = true;
+    let listing: "ok" | "stall" | "fail" = "ok";
+    const runs: string[] = [];
+    servers.serve("settings-actions-stall", {
+      era: "modern",
+      listTools: () => {
+        if (listing === "stall") return new Promise<never>(() => undefined);
+        if (listing === "fail") return Promise.reject(new Error("tools/list failed"));
+        return Promise.resolve({ draw: testTool() });
+      },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [{ kind: "group", title: "Parts", items: [{ kind: "tool", tool: "reset" }] }],
+            },
+          }),
+        // The held catalog keeps the old flag until a listing completes.
+        settingsToolAction: (name) =>
+          name === "reset" ? { title: "Reset", readOnly, opensApp: false } : undefined,
+        callSettingsActionTool: (name) => {
+          runs.push(name);
+          return Promise.resolve({ content: [] });
+        },
+      },
+    });
+    const workspaceId = "settings-actions-stall-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const snapshot = await manager.readSettings(workspaceId, "cad");
+    if (snapshot === null) throw new Error("expected settings");
+    const run = () =>
+      manager
+        .runSettingsTool(workspaceId, "cad", "reset", snapshot.instanceToken, { confirmed: false })
+        .then(() => "ran")
+        .catch((error: unknown) => String(error));
+    // The tool became writable, but the listing that would say so fails, or stalls past the
+    // deadline: the stale read-only flag must not let it run without a confirmation.
+    listing = "fail";
+    expect(await run()).toContain("Could not refresh cad's tools; try again");
+    expect(runs).toEqual([]);
+    // A completed refresh runs the action (still read-only here) as before.
+    listing = "ok";
+    expect(await run()).toBe("ran");
+    expect(runs).toEqual(["reset"]);
+    // Last: a stalled listing stays in flight (later refreshes join it until it settles).
+    listing = "stall";
+    expect(await run()).toContain("Could not refresh cad's tools; try again");
+    expect(runs).toEqual(["reset"]);
+  }, 10_000);
+
   test("settings: a server counts as connected only once the workspace started it", async () => {
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-connected") });
     servers.serve("settings-connected", { tools: { draw: testTool() } });
@@ -1465,6 +1522,41 @@ describe("MCPServerManager", () => {
     expect(runs).toEqual(["v1b"]);
   });
 
+  test("settings: a token read from one server never passes the schema check of another", async () => {
+    const updates: string[] = [];
+    const settingsServer = (id: string) => ({
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: (name: string) => {
+          if (name === "s.update") updates.push(id);
+          // The same schema on both servers: only the server key tells them apart.
+          return Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: { units: { type: "string", title: "Units" } } },
+              values: { units: "in" },
+            },
+          });
+        },
+      },
+    });
+    configService.listServers.mockResolvedValue({
+      a: stdioConfig("settings-cross-a"),
+      b: stdioConfig("settings-cross-b"),
+    });
+    servers.serve("settings-cross-a", settingsServer("a"));
+    servers.serve("settings-cross-b", settingsServer("b"));
+    await manager.getToolsForWorkspace(workspaceRequest("settings-cross-ws"));
+    const readA = await manager.readSettings("settings-cross-ws", "a");
+    if (readA === null) throw new Error("expected settings");
+    const refused = await manager
+      .saveSettings("settings-cross-ws", "b", { units: "mm" }, readA.instanceToken)
+      .catch((error: unknown) => String(error));
+    expect(refused).toContain("Reopen");
+    expect(updates).toEqual([]);
+  });
+
   test("settings: a server replaced between the save's fresh read and its update is refused", async () => {
     const updates: string[] = [];
     const settingsServer = (id: string) => ({
@@ -1545,8 +1637,11 @@ describe("MCPServerManager", () => {
     expect((await manager.readSettings("settings-reopen-ws", "cad"))?.values).toEqual({
       units: "in",
     });
-    // A stalled save holds a read no longer than the read's deadline or abort.
-    await manager.settingsSavesSettled("settings-reopen-ws", "cad", { timeoutMs: 1 });
+    // A stalled save holds a read no longer than the read's deadline or abort, and the read
+    // gets only the time left (at least 1 ms).
+    expect(await manager.settingsSavesSettled("settings-reopen-ws", "cad", { timeoutMs: 1 })).toBe(
+      1
+    );
     const aborted = new AbortController();
     const abortedWait = manager.settingsSavesSettled("settings-reopen-ws", "cad", {
       signal: aborted.signal,
@@ -1566,8 +1661,10 @@ describe("MCPServerManager", () => {
     expect((await manager.readSettings("settings-reopen-ws", "cad"))?.values).toEqual({
       units: "mm",
     });
-    // No save in flight: nothing to wait for.
-    await manager.settingsSavesSettled("settings-reopen-ws", "cad", { timeoutMs: 60_000 });
+    // No save in flight: nothing to wait for, and the whole deadline is left.
+    expect(
+      await manager.settingsSavesSettled("settings-reopen-ws", "cad", { timeoutMs: 60_000 })
+    ).toBe(60_000);
   });
 
   test("settings: a replaced server instance does not keep the old instance's cached values", async () => {
@@ -4702,6 +4799,44 @@ describe("MCPServerManager", () => {
     expect(lockHeld).toBe(false);
   });
 
+  test("starts plugin stdio servers with the minimal host environment (#6509)", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-host-env");
+    configService.listServers = mock(() =>
+      Promise.resolve({
+        user: stdioConfig("user-cmd"),
+        "plugin:instance:srv": {
+          ...stdioConfig("plugin-cmd"),
+          env: { PLUGIN_DATA: path.join(tmp.path, "data") },
+          plugin: {
+            pluginName: "demo",
+            serverName: "srv",
+            sourceScope: "global",
+            sourceLocation: "plugins/demo",
+          },
+        },
+      })
+    );
+    servers.serve("user-cmd", { tools: { ping: testTool() } });
+    servers.serve("plugin-cmd", { tools: { pong: testTool() } });
+    const hostEnvByCommand = new Map<string, unknown>();
+    const runtime = {
+      exec: (...args: Parameters<typeof servers.exec>) => {
+        hostEnvByCommand.set(args[0], args[1].hostEnv);
+        return servers.exec(...args);
+      },
+    } as unknown as Runtime;
+
+    const started = await manager.getToolsForWorkspace(
+      workspaceRequest("ws-plugin-host-env", { runtime })
+    );
+
+    expect(Object.keys(started.tools)).toHaveLength(2);
+    expect(Object.fromEntries(hostEnvByCommand)).toEqual({
+      "user-cmd": "inherit",
+      "plugin-cmd": "minimal",
+    });
+  });
+
   /**
    * Instrument a component fixture's invalidation with the override writer's
    * lock and report whether each lock is held, then serve it from a manager
@@ -7589,6 +7724,41 @@ describe("MCPServerManager", () => {
       expect(text.error.length).toBeLessThanOrEqual(300);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  test("named Test connection launches a plugin stdio server with the minimal host environment (#6509)", async () => {
+    using tmp = new DisposableTempDir("mcp-named-test-host-env");
+    configService.listServers = mock(() =>
+      Promise.resolve({
+        "plugin:instance:srv": {
+          ...stdioConfig("plugin-cmd"),
+          env: { PLUGIN_DATA: path.join(tmp.path, "data") },
+          plugin: {
+            pluginName: "demo",
+            serverName: "srv",
+            sourceScope: "global",
+            sourceLocation: "plugins/demo",
+          },
+        },
+        user: stdioConfig("user-cmd"),
+      })
+    );
+    const exec = mock((_command: string, _options: ExecOptions) =>
+      Promise.reject(new Error("launch reached"))
+    );
+    const runtime = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      exec,
+    } as unknown as Runtime);
+    try {
+      await manager.test({ projectPath: tmp.path, name: "plugin:instance:srv" });
+      await manager.test({ projectPath: tmp.path, name: "user" });
+      expect(exec.mock.calls.map(([command, options]) => [command, options.hostEnv])).toEqual([
+        ["plugin-cmd", "minimal"],
+        ["user-cmd", "inherit"],
+      ]);
+    } finally {
+      runtime.mockRestore();
     }
   });
 
@@ -10575,7 +10745,7 @@ describe("prepareStdioLaunch", () => {
       command: "bunx -y some-server",
       disabled: false,
     });
-    expect(launch).toEqual({ command: "bunx -y some-server" });
+    expect(launch).toEqual({ command: "bunx -y some-server", hostEnv: "inherit" });
   });
 
   test("argv mode quotes command and each arg against shell injection", async () => {
@@ -10612,6 +10782,8 @@ describe("prepareStdioLaunch", () => {
     expect((await fs.stat(dataPath)).isDirectory()).toBe(true);
     expect(launch.cwd).toBe(tmp.path);
     expect(launch.env?.PLUGIN_DATA).toBe(dataPath);
+    // #6509: plugin servers start without the full host environment.
+    expect(launch.hostEnv).toBe("minimal");
     // Plugin-root cwd is shipped plugin content: never created by launch.
     expect(await fs.readdir(tmp.path)).toEqual(["plugin-data"]);
   });

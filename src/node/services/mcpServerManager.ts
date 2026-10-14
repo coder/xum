@@ -81,7 +81,7 @@ import * as crypto from "crypto";
 import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { shellQuote } from "@/common/utils/shell";
 import { requiredPropertyNames, schemaAcceptsNull } from "@/common/utils/tools/schemaSanitizer";
-import type { ExecStream, Runtime } from "@/node/runtime/Runtime";
+import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
@@ -922,6 +922,13 @@ interface StdioLaunch {
   command: string;
   cwd?: string;
   env?: Record<string, string>;
+  /**
+   * #6509: a plugin server gets only the minimal host environment plus its
+   * declared env, so the user's shell secrets are not passed to it. Not a sandbox:
+   * the server runs as the same OS user (see docs/config/mcp-servers.mdx). User-configured
+   * servers keep the full environment.
+   */
+  hostEnv: NonNullable<ExecOptions["hostEnv"]>;
 }
 
 /**
@@ -992,7 +999,9 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
   const command =
     info.args !== undefined ? [info.command, ...info.args].map(shellQuote).join(" ") : info.command;
 
+  let hostEnv: StdioLaunch["hostEnv"] = "inherit";
   if (info.plugin !== undefined) {
+    hostEnv = "minimal";
     const dataPath = info.env?.PLUGIN_DATA;
     assert(
       dataPath !== undefined && path.isAbsolute(dataPath),
@@ -1020,6 +1029,7 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
     command,
     ...(info.cwd !== undefined ? { cwd: info.cwd } : {}),
     ...(info.env !== undefined ? { env: info.env } : {}),
+    hostEnv,
   };
 }
 
@@ -1030,7 +1040,7 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
  */
 async function runServerTest(
   server:
-    | { transport: "stdio"; command: string; cwd?: string; env?: Record<string, string> }
+    | ({ transport: "stdio" } & StdioLaunch)
     | {
         transport: "http" | "sse" | "auto";
         url: string;
@@ -1082,6 +1092,7 @@ async function runServerTest(
           const execStream = await runtime.exec(server.command, {
             cwd: server.cwd ?? projectPath,
             ...(server.env !== undefined ? { env: server.env } : {}),
+            hostEnv: server.hostEnv,
             timeout: TEST_TIMEOUT_MS / 1000,
           });
 
@@ -1714,7 +1725,7 @@ export class MCPServerManager {
     { started: number; applied: number }
   >();
   /** Dedupes send-path background tool refreshes per instance; see refreshInstanceToolsInBackground. */
-  private readonly toolRefreshesInFlight = new WeakMap<MCPServerInstance, Promise<void>>();
+  private readonly toolRefreshesInFlight = new WeakMap<MCPServerInstance, Promise<boolean>>();
   /**
    * Prompt catalogs of idle-stopped servers, by workspace, with the start
    * config they were fetched under. The restart seeds each restarted
@@ -2565,19 +2576,22 @@ export class MCPServerManager {
 
   /**
    * One deduped tools/list refresh of a modern-era instance; never rejects (a failed refresh
-   * keeps the cached tools). Legacy instances have no refresh and resolve at once.
+   * keeps the cached tools). Resolves false when the refresh failed. Legacy instances have no
+   * refresh and resolve true at once (tools/list_changed re-lists them).
    */
-  private refreshInstanceTools(instance: MCPServerInstance): Promise<void> {
+  private refreshInstanceTools(instance: MCPServerInstance): Promise<boolean> {
     const inFlight = this.toolRefreshesInFlight.get(instance);
     if (inFlight !== undefined) return inFlight;
-    if (instance.isClosed || !instance.refreshTools) return Promise.resolve();
+    if (instance.isClosed || !instance.refreshTools) return Promise.resolve(true);
     const refresh = instance
       .refreshTools()
+      .then(() => true)
       .catch((error: unknown) => {
         log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
           name: instance.name,
           error: getErrorMessage(error),
         });
+        return false;
       })
       .finally(() => {
         if (this.toolRefreshesInFlight.get(instance) === refresh) {
@@ -5163,7 +5177,7 @@ export class MCPServerManager {
     };
     // The hash covers what this read returns (its layout carries the tool actions), the same
     // object a save's fresh read is compared with (runSettingsSave).
-    this.rememberSettingsSchema(instanceToken, read);
+    this.rememberSettingsSchema(workspaceId, serverName, instanceToken, read);
     return { ...read, instanceToken };
   }
 
@@ -5213,15 +5227,25 @@ export class MCPServerManager {
     return this.mcpApps?.isEnabled() === true && instance.apps !== undefined;
   }
 
-  /** Refresh the running instance's catalog before a settings action dispatch (bounded). */
+  /**
+   * Refresh the running instance's catalog before a settings action dispatch (bounded). Fails
+   * closed: when the refresh times out or fails, the held catalog can be stale (a tool that
+   * became writable still reads as read-only and would run without the user's confirmation),
+   * so the dispatch is refused instead of falling back to it.
+   */
   private async refreshSettingsActionCatalog(
     workspaceId: string,
     serverName: string,
     signal: AbortSignal | undefined
   ): Promise<void> {
     const instance = this.workspaceServers.get(workspaceId)?.instances.get(serverName);
-    if (instance !== undefined && !instance.isClosed)
-      await this.refreshAppCatalogs([{ instance }], signal);
+    if (instance === undefined || instance.isClosed) return;
+    const refreshed = await raceWithAbortAndTimeout(this.refreshInstanceTools(instance), {
+      ...(signal !== undefined ? { signal } : {}),
+      timeoutMs: MCP_APP_CATALOG_REFRESH_TIMEOUT_MS,
+    });
+    if (refreshed.kind !== "ok" || !refreshed.value)
+      throw new Error(`Could not refresh ${serverName}'s tools; try again`);
   }
 
   /**
@@ -5278,7 +5302,8 @@ export class MCPServerManager {
     toolName: string,
     request: { instanceToken: string; confirmed: boolean; opensApp: boolean }
   ): Error | null {
-    if (!this.isSettingsTokenAccepted(this.settingsInstanceToken(instance), request.instanceToken))
+    const currentToken = this.settingsInstanceToken(instance);
+    if (!this.isSettingsTokenAccepted(workspaceId, serverName, currentToken, request.instanceToken))
       return staleSettingsInstanceError(serverName);
     const action = this.settingsToolAction(instance, workspaceId, serverName, toolName);
     if (action === undefined) return new Error(`'${serverName}' has no tool named '${toolName}'`);
@@ -5382,7 +5407,9 @@ export class MCPServerManager {
 
   /**
    * Resolves once this server's saves in flight settled. The dialog's reads wait for it: a
-   * dialog reopened during a save must not show the values from before the save.
+   * dialog reopened during a save must not show the values from before the save. Resolves to
+   * the part of `timeoutMs` left (at least 1 ms), so the read that follows shares one deadline
+   * with the wait instead of starting a second full one.
    */
   async settingsSavesSettled(
     workspaceId: string,
@@ -5392,44 +5419,59 @@ export class MCPServerManager {
      * not hold the dialog's bulk read. Past either, the read goes ahead without waiting.
      */
     options: { signal?: AbortSignal; timeoutMs: number }
-  ): Promise<void> {
+  ): Promise<number> {
     const saves = this.pendingSettingsSaves.get(settingsSaveKey(workspaceId, serverName));
-    if (saves === undefined) return;
-    const stop = AbortSignal.any([
+    if (saves === undefined) return options.timeoutMs;
+    const started = Date.now();
+    // A failed save is the save's own error; a read only waits for it.
+    await raceUntilAborted(Promise.allSettled([...saves]), [
       AbortSignal.timeout(options.timeoutMs),
       ...(options.signal !== undefined ? [options.signal] : []),
     ]);
-    const stopped = new Promise<void>((resolve) => {
-      if (stop.aborted) resolve();
-      stop.addEventListener("abort", () => resolve(), { once: true });
-    });
-    // A failed save is the save's own error; a read only waits for it.
-    await Promise.race([Promise.allSettled([...saves]), stopped]);
+    return Math.max(1, options.timeoutMs - (Date.now() - started));
   }
 
   /**
-   * The schema each recent instance token was read with, as a hash: a save whose token names a
-   * restarted instance (idle stop, crash restart) still lands when the new instance shows the
-   * same schema. Bounded: the oldest token is forgotten first, and its save is refused.
+   * The schema each recent instance token was read with, as a hash, per workspace and server: a
+   * save whose token names a restarted instance (idle stop, crash restart) still lands when the
+   * new instance shows the same schema. Keyed by server too, so a token read from one server
+   * never passes the check of a save to another. Bounded: the oldest entry is forgotten first,
+   * and its save is refused.
    */
   private readonly settingsSchemaHashes = new Map<string, string>();
 
   /**
-   * Whether a request that names `requestToken` (the dialog's read) may act on the instance with
-   * `currentToken`: the same instance, or a restarted one (idle stop, crash restart) whose last
-   * read showed the same schema. Saves (runSettingsSave, right after a fresh read) and tool
-   * actions (settingsToolRefusal, against the instance's last read) share this rule. An instance
-   * no read has seen yet has no hash and is refused.
+   * Whether a request that names `requestToken` (the dialog's read) may act on this workspace
+   * and server's instance with `currentToken`: the same instance, or a restarted one (idle stop,
+   * crash restart) whose last read showed the same schema. Saves (runSettingsSave, right after a
+   * fresh read) and tool actions (settingsToolRefusal, against the instance's last read) share
+   * this rule. An instance no read has seen yet has no hash and is refused. Both lookups use the
+   * workspace and server, so a token read from another server never matches.
    */
-  private isSettingsTokenAccepted(currentToken: string, requestToken: string): boolean {
+  private isSettingsTokenAccepted(
+    workspaceId: string,
+    serverName: string,
+    currentToken: string,
+    requestToken: string
+  ): boolean {
     if (currentToken === requestToken) return true;
-    const current = this.settingsSchemaHashes.get(currentToken);
-    return current !== undefined && current === this.settingsSchemaHashes.get(requestToken);
+    const hashOf = (token: string) =>
+      this.settingsSchemaHashes.get(settingsSchemaKey(workspaceId, serverName, token));
+    const current = hashOf(currentToken);
+    return current !== undefined && current === hashOf(requestToken);
   }
 
-  private rememberSettingsSchema(instanceToken: string, snapshot: MCPSettingsSnapshot): void {
-    this.settingsSchemaHashes.delete(instanceToken);
-    this.settingsSchemaHashes.set(instanceToken, settingsSchemaHash(snapshot));
+  private rememberSettingsSchema(
+    workspaceId: string,
+    serverName: string,
+    instanceToken: string,
+    snapshot: MCPSettingsSnapshot
+  ): void {
+    const key = settingsSchemaKey(workspaceId, serverName, instanceToken);
+    // Each read overwrites its token's hash: the latest schema of an instance is the one a save
+    // validated against (the dialog shows that read).
+    this.settingsSchemaHashes.delete(key);
+    this.settingsSchemaHashes.set(key, settingsSchemaHash(snapshot));
     if (this.settingsSchemaHashes.size > MAX_REMEMBERED_SETTINGS_SCHEMAS) {
       const oldest = this.settingsSchemaHashes.keys().next().value;
       if (oldest !== undefined) this.settingsSchemaHashes.delete(oldest);
@@ -5474,7 +5516,7 @@ export class MCPServerManager {
     if (prior === null) throw new Error(`MCP server '${serverName}' has no settings`);
     // Another instance (restarted or replaced since the dialog read): the save still lands when
     // it shows the schema the dialog validated against, else the user must reopen.
-    if (!this.isSettingsTokenAccepted(prior.instanceToken, instanceToken))
+    if (!this.isSettingsTokenAccepted(workspaceId, serverName, prior.instanceToken, instanceToken))
       throw staleSettingsInstanceError(serverName);
     const values = await this.updateSettings(
       workspaceId,
@@ -6554,7 +6596,7 @@ export class MCPServerManager {
 
     if (command?.trim()) {
       return runServerTest(
-        { transport: "stdio", command },
+        { transport: "stdio", command, hostEnv: "inherit" },
         projectPath,
         "command",
         trimmedName ?? "command"
@@ -7670,6 +7712,7 @@ export class MCPServerManager {
             runtime.exec(launch.command, {
               cwd: launch.cwd ?? workspacePath,
               ...(launch.env !== undefined ? { env: launch.env } : {}),
+              hostEnv: launch.hostEnv,
               timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
               abortSignal: AbortSignal.any([launchSignal, processAbort.signal]),
             }),
@@ -8305,14 +8348,35 @@ function settingsToolResultText(result: MCPRawCallToolResult): { text: string; i
   return { text: boundMCPSettingsToolResult(text), isError: result.isError === true };
 }
 
-/** Instance tokens whose settings schema saveSettings remembers (see settingsSchemaHashes). */
+/** Instance tokens whose settings schema is remembered (settingsSchemaHashes). */
 const MAX_REMEMBERED_SETTINGS_SCHEMAS = 256;
 
 function settingsSaveKey(workspaceId: string, serverName: string): string {
   return `${workspaceId}\0${serverName}`;
 }
 
-/** What a save validates against: the schema and its layout, never the values. */
+/** Wait for `work` or the first abort of `signals`, then drop the abort listener. */
+async function raceUntilAborted(work: Promise<unknown>, signals: AbortSignal[]): Promise<void> {
+  const stop = AbortSignal.any(signals);
+  const onStop = Promise.withResolvers<void>();
+  const resolve = () => onStop.resolve();
+  if (stop.aborted) resolve();
+  stop.addEventListener("abort", resolve, { once: true });
+  try {
+    await Promise.race([work, onStop.promise]);
+  } finally {
+    stop.removeEventListener("abort", resolve);
+  }
+}
+
+function settingsSchemaKey(workspaceId: string, serverName: string, token: string): string {
+  return `${settingsSaveKey(workspaceId, serverName)}\0${token}`;
+}
+
+/**
+ * What a save or a tool action checks a restarted instance against (isSettingsTokenAccepted):
+ * the schema and its layout, tool actions included, never the values.
+ */
 function settingsSchemaHash(snapshot: Pick<MCPSettingsSnapshot, "properties" | "layout">): string {
   return crypto
     .createHash("sha256")
