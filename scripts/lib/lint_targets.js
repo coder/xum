@@ -1,6 +1,9 @@
 "use strict";
 
-// Chooses what `make lint` checks: only the files this branch changed, or everything.
+// Chooses what the linters check. For oxlint, which checks the whole repo in seconds:
+// `--oxlint-args` prints its arguments, one per line, and listLintFiles() feeds
+// scripts/check-oxlint-config.mjs. Otherwise, chooses what type-aware ESLint checks: only the files
+// this branch changed, or everything.
 //
 // A cold type-aware ESLint run over the whole repo peaks at ~7.6 GiB and takes minutes, and every
 // new worktree starts without an ESLint cache. Several agents doing that at once OOM-killed shared
@@ -9,9 +12,11 @@
 // change in one file can surface type-aware findings in files the branch did not touch.
 
 const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
 
 // Must match ESLINT_PATTERNS in scripts/lint.sh: files outside them have no type-aware parser
-// setup, so ESLint fails on them instead of skipping them.
+// setup, so ESLint fails on them instead of skipping them. oxlint checks the same files.
 const LINT_FILE_PATTERNS = [
   /^src\/.+\.tsx?$/,
   /^tests\/.+\.tsx?$/,
@@ -24,6 +29,7 @@ const LINT_FILE_PATTERNS = [
 // trustworthy: the lint config and its inputs, dependencies, and the compiler settings.
 const FULL_LINT_TRIGGERS = [
   /^eslint\.config\.mjs$/,
+  /^eslint-local-rules\.mjs$/,
   /^package\.json$/,
   /^bun\.lock$/,
   /^tsconfig[^/]*\.json$/,
@@ -100,6 +106,54 @@ function listChangedFiles(cwd, base) {
 }
 
 /**
+ * oxlint walks these directories itself: a list of every file would exceed the Windows
+ * command-line limit (~32K characters). Every file that LINT_FILE_PATTERNS matches is inside one.
+ */
+const OXLINT_ROOTS = ["src", "tests", "scripts/lib"];
+// The extensions oxlint lints when it walks a directory.
+const OXLINT_FILE_EXTENSIONS = /\.(?:[cm]?[jt]sx?|vue|svelte|astro)$/;
+
+function listFiles(cwd, args) {
+  return (
+    git(["ls-files", "-z", ...args, "--", ...OXLINT_ROOTS], cwd)
+      .split("\0")
+      .filter((file) => file !== "")
+      // ESLint never lints node_modules.
+      .filter((file) => !file.split("/").includes("node_modules"))
+      // --cached still lists a tracked file that was deleted from the working tree.
+      .filter((file) => fs.existsSync(path.join(cwd, file)))
+  );
+}
+
+const isLintFile = (file) => LINT_FILE_PATTERNS.some((re) => re.test(file));
+const sorted = (files) => [...new Set(files)].sort();
+
+/**
+ * Every file ESLint lints: tracked or not, and gitignored or not, because ESLint does not read
+ * .gitignore (generated files such as src/version.ts are linted too). Sorted.
+ */
+function listLintFiles(cwd) {
+  return sorted(listFiles(cwd, ["--cached", "--others"]).filter(isLintFile));
+}
+
+/**
+ * oxlint's arguments for checking exactly the files ESLint lints: OXLINT_ROOTS, ignore patterns
+ * for the other files the walk would find there (e.g. tests/__mocks__/*.js), and the gitignored
+ * lint files, which the walk skips.
+ */
+function oxlintArgs(cwd) {
+  const others = listFiles(cwd, ["--cached", "--others", "--exclude-standard"]).filter(
+    (file) => OXLINT_FILE_EXTENSIONS.test(file) && !isLintFile(file)
+  );
+  const ignored = listFiles(cwd, ["--cached", "--others", "--ignored", "--exclude-standard"]);
+  return [
+    ...sorted(others).flatMap((file) => ["--ignore-pattern", file]),
+    ...OXLINT_ROOTS,
+    ...sorted(ignored.filter(isLintFile)),
+  ];
+}
+
+/**
  * Prints the selection for scripts/lint.sh. The first line is `full <reason>` or
  * `files <base>`; for `files`, one path per following line.
  */
@@ -116,11 +170,23 @@ function main(cwd = process.cwd(), env = process.env) {
   return [`files ${base}`, ...selection.files].join("\n") + "\n";
 }
 
-module.exports = { LINT_FILE_PATTERNS, FULL_LINT_TRIGGERS, selectLintTargets, resolveBase, main };
+module.exports = {
+  LINT_FILE_PATTERNS,
+  FULL_LINT_TRIGGERS,
+  selectLintTargets,
+  resolveBase,
+  listLintFiles,
+  oxlintArgs,
+  main,
+};
 
 if (require.main === module) {
   try {
-    process.stdout.write(main());
+    if (process.argv.includes("--oxlint-args")) {
+      process.stdout.write(oxlintArgs(process.cwd()).join("\n") + "\n");
+    } else {
+      process.stdout.write(main());
+    }
   } catch (error) {
     process.stderr.write(
       `lint_targets: ${error instanceof Error ? error.message : String(error)}\n`

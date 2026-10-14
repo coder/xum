@@ -330,6 +330,17 @@ function grantCoversBaseScopes(
   return missingBaseScopes(scope, config).length === 0;
 }
 
+/**
+ * The base-scope check of stored tokens: Xum's recorded request when there is one (the plugin's
+ * own scope names, #6564), else the granted scope (tokens stored before the record existed).
+ */
+function tokensCoverBaseScopes(
+  tokens: MCPOAuthTokens | undefined,
+  config: MCPServerOAuthConfig | undefined
+): boolean {
+  return grantCoversBaseScopes(tokens?.requested_scope ?? tokens?.scope, config);
+}
+
 /** Scope strings are space-separated sets (RFC 6749 §3.3); a configured entry can hold several. */
 function scopeSet(scopes: readonly string[]): Set<string> {
   return new Set(scopes.flatMap((scope) => scope.split(/\s+/)).filter(Boolean));
@@ -345,20 +356,50 @@ function missingBaseScopes(
 }
 
 /**
- * The scope an interactive grant stores. A grant without scope is the requested scope (RFC 6749
- * §5.1): record it, so the base-scope check can read it later. Tokens without a base scope
- * would read as signed out (storedClientMatches): fail the sign-in with the reason instead of
- * reporting "Login complete" (#6141).
+ * The scope fields an interactive grant stores. A grant without scope is the requested scope
+ * (RFC 6749 §5.1). The request is recorded too: the base-scope check compares it, not the
+ * granted names, because some servers rename granted scopes (#6564).
+ *
+ * A grant that only names requested scopes and lacks a base scope is a narrower grant: the
+ * sign-in fails, because those tokens cannot serve the plugin (#6141). A grant that names a
+ * scope outside the request is renamed (Entra permissions for `.default`, Google URL forms of
+ * short names): Xum cannot tell which requested scope it covers, so it keeps it and logs both.
  */
-function checkedGrantScope(
+function grantScopeFields(
   granted: string | undefined,
   flow: Pick<OAuthFlowBase, "scope" | "plugin">
-): string | undefined {
+): { scope?: string; requested_scope?: string } {
   const scope = granted ?? flow.scope;
-  const missing = missingBaseScopes(scope, flow.plugin?.config);
-  if (missing.length === 0) return scope;
-  // The scope names come from the consented plugin config, not from the server.
-  throw new Error(`The authorization server did not grant required scopes: ${missing.join(" ")}`);
+  if (missingBaseScopes(scope, flow.plugin?.config).length > 0)
+    refuseNarrowerGrant(scope, flow.scope);
+  return {
+    ...(scope !== undefined ? { scope } : {}),
+    ...(flow.scope !== undefined ? { requested_scope: flow.scope } : {}),
+  };
+}
+
+/** Throws for a narrower grant (only requested names); logs a renamed one (see grantScopeFields). */
+function refuseNarrowerGrant(granted: string | undefined, requested: string | undefined): void {
+  const requestedNames = scopeSet(requested !== undefined ? [requested] : []);
+  const grantedNames = scopeSet(granted !== undefined ? [granted] : []);
+  if (![...grantedNames].some((name) => !requestedNames.has(name)))
+    throw new Error(
+      `The authorization server granted less than the plugin requires: requested "${requested ?? ""}", granted "${granted ?? ""}"`
+    );
+  log.warn("[MCP OAuth] The granted scope does not name every requested base scope", {
+    requested,
+    granted,
+  });
+}
+
+/**
+ * SDK tokens from a token response. `requested_scope` is Xum's own record of the request, so a
+ * server-supplied field of that name is dropped: it must not decide the base-scope check.
+ */
+function serverTokens(tokens: Parameters<OAuthClientProvider["saveTokens"]>[0]): MCPOAuthTokens {
+  const copy: MCPOAuthTokens = { ...tokens };
+  delete copy.requested_scope;
+  return copy;
 }
 
 /**
@@ -385,7 +426,7 @@ function storedClientMatches(
   stored: MCPOAuthStoredCredentials | null | undefined,
   config: MCPServerOAuthConfig | undefined
 ): boolean {
-  return storedClientUsable(stored, config) && grantCoversBaseScopes(stored?.tokens?.scope, config);
+  return storedClientUsable(stored, config) && tokensCoverBaseScopes(stored?.tokens, config);
 }
 
 /**
@@ -479,9 +520,20 @@ function clientConflict(
 /** A refresh response without scope keeps the refreshed grant's scope (RFC 6749 §6). */
 function refreshedScope(input: { tokens: MCPOAuthTokens; refreshedFrom?: MCPOAuthTokens }): {
   scope?: string;
+  requested_scope?: string;
 } {
-  const scope = input.tokens.scope ?? input.refreshedFrom?.scope;
-  return scope !== undefined ? { scope } : {};
+  return { ...scopeFields(input.refreshedFrom), ...scopeFields(input.tokens) };
+}
+
+/** The defined scope fields of `tokens` (MCPOAuthTokens.scope and requested_scope). */
+function scopeFields(tokens: MCPOAuthTokens | undefined): {
+  scope?: string;
+  requested_scope?: string;
+} {
+  return {
+    ...(tokens?.scope !== undefined ? { scope: tokens.scope } : {}),
+    ...(tokens?.requested_scope !== undefined ? { requested_scope: tokens.requested_scope } : {}),
+  };
 }
 
 /** The same stored grant: the SDK's issuer back-stamp keeps both tokens. */
@@ -828,6 +880,13 @@ function deriveAuthorizationServerBinding(
   };
 }
 
+/** MCPOAuthTokens.requested_scope. */
+function parseRequestedScope(value: Record<string, unknown>): { requested_scope?: string } {
+  return typeof value.requested_scope === "string"
+    ? { requested_scope: value.requested_scope }
+    : {};
+}
+
 /** The provided-client mark (MCPOAuthClientInformation.provided_by_plugin). */
 function parseProvidedMark(value: Record<string, unknown>): { provided_by_plugin?: true } {
   return value.provided_by_plugin === true ? { provided_by_plugin: true } : {};
@@ -911,6 +970,7 @@ function parseStoredCredentials(value: unknown): MCPOAuthStoredCredentials | nul
         token_type: typeof tokensRaw.token_type === "string" ? tokensRaw.token_type : "",
         expires_in: typeof tokensRaw.expires_in === "number" ? tokensRaw.expires_in : undefined,
         scope: typeof tokensRaw.scope === "string" ? tokensRaw.scope : undefined,
+        ...parseRequestedScope(tokensRaw),
         refresh_token:
           typeof tokensRaw.refresh_token === "string" ? tokensRaw.refresh_token : undefined,
         ...parseAuthorizationServerBinding(tokensRaw),
@@ -1780,11 +1840,10 @@ export class McpOauthService {
     return {
       tokens: () => Promise.resolve(undefined),
       saveTokens: async (tokens) => {
-        const scope = checkedGrantScope(tokens.scope, flow);
+        const scopes = grantScopeFields(tokens.scope, flow);
         await this.saveTokens({
           serverUrl: flow.serverUrlForStoreKey,
-          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-          tokens: { ...tokens, scope } as unknown as MCPOAuthTokens,
+          tokens: { ...serverTokens(tokens), ...scopes },
           legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
           flowGeneration: flow.signOutGeneration,
           clientId: flow.clientInformation?.client_id ?? flow.plugin?.config.clientId,
@@ -1898,8 +1957,7 @@ export class McpOauthService {
       saveTokens: async (tokens) => {
         await this.saveTokens({
           serverUrl: input.serverUrl,
-          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-          tokens: tokens as unknown as MCPOAuthTokens,
+          tokens: serverTokens(tokens),
           legacyBinding: deriveAuthorizationServerBinding(discoveryState),
           clientId: refreshedWithClientId ?? input.oauth?.clientId,
           refreshedFrom,
