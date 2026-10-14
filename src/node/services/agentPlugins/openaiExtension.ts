@@ -60,6 +60,13 @@ export interface OpenAIPluginExtension {
   /** Relative path to a packaged skill's SKILL.md. */
   onboardingSkill?: string;
   interface?: OpenAIPluginInterface;
+  /**
+   * Directory submission metadata, kept opaque: nothing in Xum reads it. Kept in the typed view
+   * so an overlay's values are not lost when the root manifest has no `com.openai`
+   * (Codex PRRT_kwDOPxxmWM6rvwzT, #6297).
+   */
+  review?: Record<string, unknown>;
+  publication?: Record<string, unknown>;
 }
 
 const FIELD = `extensions["${OPENAI_EXTENSION_NAMESPACE}"]`;
@@ -199,8 +206,26 @@ export function normalizeOpenAIRelativePath(value: unknown): string | undefined 
   return segments.every((segment) => segment === ".") ? undefined : trimmed;
 }
 
+/**
+ * Hook pointer entries read per plugin. Install Preview reads an untrusted repository, and a
+ * 256 KiB manifest can hold ~100k entries: discovery would emit one diagnostic per invalid entry,
+ * and the hook loader would reread a repeated file each time (#6297).
+ */
+export const MAX_HOOK_POINTER_ENTRIES = 32;
+
+/** The first MAX_HOOK_POINTER_ENTRIES entries; one warning reports the rest. */
+function capHookEntries(raw: unknown, warnings: string[]): unknown[] {
+  const all: unknown[] = Array.isArray(raw) ? raw : [raw];
+  if (all.length > MAX_HOOK_POINTER_ENTRIES) {
+    warnings.push(
+      `'${FIELD}.hooks' has ${all.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
+    );
+  }
+  return all.slice(0, MAX_HOOK_POINTER_ENTRIES);
+}
+
 function readHooks(raw: unknown, warnings: string[]): OpenAIPluginHooksEntry[] {
-  const entries: unknown[] = Array.isArray(raw) ? raw : [raw];
+  const entries = capHookEntries(raw, warnings);
   const hooks: OpenAIPluginHooksEntry[] = [];
   for (const entry of entries) {
     if (isPlainObject(entry)) {
@@ -250,7 +275,22 @@ export function readOpenAIExtension(manifest: Pick<AgentPluginManifest, "extensi
     const parsed = readInterface(raw.interface, warnings);
     if (parsed !== undefined) extension.interface = parsed;
   }
+  readSubmissionMetadata(raw, extension, warnings);
   return { extension, warnings };
+}
+
+/** Copy `review` and `publication` as opaque objects; any other shape warns. */
+function readSubmissionMetadata(
+  raw: Record<string, unknown>,
+  extension: OpenAIPluginExtension,
+  warnings: string[]
+): void {
+  for (const key of ["review", "publication"] as const) {
+    const value = raw[key];
+    if (value === undefined) continue;
+    if (isPlainObject(value)) extension[key] = value;
+    else warnings.push(`'${FIELD}.${key}' must be an object; ignoring`);
+  }
 }
 
 /** Codex top-level fields that move into `extensions["com.openai"]`. */

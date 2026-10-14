@@ -1993,6 +1993,69 @@ describe("AgentPluginInstallService", () => {
     );
   });
 
+  test("the dark logo is sent beside the light one; a failed dark read keeps the light logo", async () => {
+    const light = pngHeader(64, 64);
+    const dark = pngHeader(96, 96);
+    await fsPromises.mkdir(path.join(remoteDir, "assets"));
+    await fsPromises.writeFile(path.join(remoteDir, "assets", "logo.png"), light);
+    await fsPromises.writeFile(path.join(remoteDir, "assets", "logo-dark.png"), dark);
+    const outside = path.join(muxRoot, "outside.png");
+    await fsPromises.writeFile(outside, "outside-secret");
+    await fsPromises.symlink(outside, path.join(remoteDir, "assets", "escape.png"));
+    const writeInterface = async (images: Record<string, string>): Promise<void> => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "demo-plugin",
+          version: "1.0.0",
+          extensions: {
+            "com.openai": {
+              interface: {
+                displayName: "Demo",
+                shortDescription: "d",
+                developerName: "E",
+                ...images,
+              },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `images ${JSON.stringify(images)}`);
+    };
+    const lightUrl = `data:image/png;base64,${light.toString("base64")}`;
+    const darkUrl = `data:image/png;base64,${dark.toString("base64")}`;
+
+    await writeInterface({ logo: "./assets/logo.png", logoDark: "./assets/logo-dark.png" });
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.manifest.interface?.logoDataUrl).toBe(lightUrl);
+    expect(preview.manifest.interface?.logoDarkDataUrl).toBe(darkUrl);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect((await service.list())[0].interface?.logoDarkDataUrl).toBe(darkUrl);
+    await service.uninstall({ name: "demo-plugin", deletePluginData: true });
+
+    // A dark variant pairs with its own light field: the dark composer icon
+    // never replaces the listing logo, but it does pair with a composer icon.
+    const icons = { composerIcon: "./assets/logo.png", composerIconDark: "./assets/logo-dark.png" };
+    await writeInterface({ logo: "./assets/logo.png", ...icons });
+    expect((await service.preview({ input: remoteDir })).manifest.interface).not.toHaveProperty(
+      "logoDarkDataUrl"
+    );
+    await writeInterface(icons);
+    expect((await service.preview({ input: remoteDir })).manifest.interface?.logoDarkDataUrl).toBe(
+      darkUrl
+    );
+
+    // A failed dark read (a link out of the plugin root): the light logo
+    // stays and a warning names the dark one.
+    await writeInterface({ logo: "./assets/logo.png", logoDark: "./assets/escape.png" });
+    const failed = await service.preview({ input: remoteDir });
+    expect(failed.manifest.interface?.logoDataUrl).toBe(lightUrl);
+    expect(failed.manifest.interface?.logoDarkDataUrl).toBeUndefined();
+    expect(failed.warnings.some((w) => w.includes("dark logo './assets/escape.png'"))).toBe(true);
+    expect(JSON.stringify(failed)).not.toContain(Buffer.from("outside-secret").toString("base64"));
+  });
+
   test("an update signs out by credential key (rename, respelled URL, issuer) before the final stop", async () => {
     const order: string[] = [];
     const mcpStub = {
@@ -2479,6 +2542,18 @@ describe("AgentPluginInstallService", () => {
       /changes the model-visible advertisement of skill 'greet'/
     );
 
+    // paths moves the skill out of the index and into file-tool pointers, so it
+    // changes when the model sees the skill: equally consent-relevant.
+    await writePluginFixture(remoteDir, { version: "2.0.6" });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "greet", "SKILL.md"),
+      '---\nname: greet\ndescription: Greets people\npaths: ["**/*"]\n---\n\nSay hi.\n'
+    );
+    await commitAll(remoteDir, "v2.0.6 adds paths");
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
+      /changes the model-visible advertisement of skill 'greet'/
+    );
+
     // Additions of consent-listed components are gated too.
     await writePluginFixture(remoteDir, { version: "2.1.0" });
     await fsPromises.mkdir(path.join(remoteDir, "skills", "sneak"), { recursive: true });
@@ -2644,6 +2719,43 @@ describe("AgentPluginInstallService", () => {
       mcpWithEnv({ BETA: "2", ALPHA: "1" })
     );
     const newHead = await commitAll(remoteDir, "env reordered to BETA,ALPHA");
+
+    const updated = await service.update({ name: "demo-plugin" });
+    expect(updated.lockedSha).toBe(newHead);
+  });
+
+  test("the update review renders a one-pattern and a two-pattern paths scope differently", async () => {
+    const skillWithPaths = (paths: string) =>
+      `---\nname: greet\ndescription: Greets people\npaths: ${paths}\n---\n\nSay hi.\n`;
+    const skillFile = path.join(remoteDir, "skills", "greet", "SKILL.md");
+    // One pattern that matches a file literally named "safe, risky".
+    await fsPromises.writeFile(skillFile, skillWithPaths('["safe, risky"]'));
+    await commitAll(remoteDir, "one comma-containing pattern");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(skillFile, skillWithPaths('["safe", "risky"]'));
+    await commitAll(remoteDir, "two independent patterns");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary.includes("skill 'greet'"));
+    expect(change?.before).not.toBe(change?.after);
+  });
+
+  test("update accepts a skill paths reordering as capability-neutral", async () => {
+    // paths patterns are OR-ed: reordering them surfaces the skill on the same files.
+    const skillWithPaths = (paths: string) =>
+      `---\nname: greet\ndescription: Greets people\npaths: ${paths}\n---\n\nSay hi.\n`;
+    const skillFile = path.join(remoteDir, "skills", "greet", "SKILL.md");
+    await fsPromises.writeFile(skillFile, skillWithPaths('["src/**", "tests/**"]'));
+    await commitAll(remoteDir, "paths in src,tests order");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(skillFile, skillWithPaths('["tests/**", "src/**"]'));
+    const newHead = await commitAll(remoteDir, "paths reordered to tests,src");
 
     const updated = await service.update({ name: "demo-plugin" });
     expect(updated.lockedSha).toBe(newHead);

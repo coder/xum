@@ -235,7 +235,7 @@ def function_percent(reports: list[dict[int, int]], start: int, end: int, is_cod
 
 # Bun bug: an inlined `const` zeroes the lines above an uncalled user.
 #
-# REMOVAL TRIGGER: oven-sh/bun issue TBD ("bun test --coverage: an uncalled
+# REMOVAL TRIGGER: oven-sh/bun#45218 ("bun test --coverage: an uncalled
 # function that uses an inlined `const` zeroes every line from that const down
 # to the function"). Seen on Bun 1.2.15 through 1.4.3, not on Node. When a
 # Bun release fixes it and the repo's Bun pin (package.json packageManager)
@@ -309,27 +309,32 @@ def inlined_literal(node):
     return None
 
 
-def runs_whenever_called(body, declaration) -> bool:
-    """Whether nothing in `body` before `declaration` can skip it: no return, throw or call.
+def runs_whenever_called(body, target, is_safe) -> bool:
+    """Whether nothing in `body` before the declarator `target` can skip it: no return, throw or call.
 
-    Every earlier statement must declare plain names (a destructuring pattern
-    can throw) with literal values (inlined_literal) or none, so the
-    declaration runs whenever the function does.
+    Every earlier statement, and every earlier declarator of target's own
+    statement (`const x = mayThrow(), K = 2`), must declare a plain name (a
+    destructuring pattern can throw) with a value that `is_safe` accepts or
+    none, so the target runs whenever the function does.
     """
 
     for statement in body.named_children:
-        if statement.start_byte >= declaration.start_byte:
+        if statement.start_byte >= target.start_byte:
             return True
         if statement.type == "comment":
             continue
         if statement.type != "lexical_declaration":
             return False
         for declarator in statement.named_children:
+            if declarator.start_byte >= target.start_byte:
+                return True
+            if declarator.type == "comment":
+                continue
             name = declarator.child_by_field_name("name")
             value = declarator.child_by_field_name("value")
             if name is None or name.type != "identifier":
                 return False
-            if value is not None and inlined_literal(value) is None:
+            if value is not None and not is_safe(value):
                 return False
     return True
 
@@ -348,6 +353,33 @@ def literal_const_scopes(root) -> dict[str, list[tuple[int, object]]]:
     """
 
     consts: dict[str, list[tuple[int, object]]] = {}
+
+    def literal_lines(value) -> list[int]:
+        literal = inlined_literal(value)
+        if literal is not None:
+            return [literal.start_point[0] + 1]
+        if value.type != "identifier":
+            return []
+        return [
+            line
+            for line, target in consts.get(value.text.decode("utf-8"), [])
+            if target.start_byte <= value.start_byte < target.end_byte
+        ]
+
+    def is_safe_in(body):
+        # A literal, or an alias of a literal const declared earlier in this
+        # same body. A const of an outer scope can be shadowed by a later local
+        # declaration, whose temporal dead zone makes the read throw; a second
+        # const of the same name in one body is a syntax error.
+        def is_safe(value) -> bool:
+            if inlined_literal(value) is not None:
+                return True
+            declarations = consts.get(value.text.decode("utf-8"), []) if value.type == "identifier" else []
+            same = (body.start_byte, body.end_byte)
+            return any((scope.start_byte, scope.end_byte) == same for _, scope in declarations)
+
+        return is_safe
+
     # descendants() walks in source order, so an alias sees its target.
     for node in descendants(root):
         if node.type != "lexical_declaration" or node.child_count == 0 or node.children[0].type != "const":
@@ -360,25 +392,14 @@ def literal_const_scopes(root) -> dict[str, list[tuple[int, object]]]:
         )
         if scope is None or not (scope.type == "program" or is_function_body):
             continue
-        if is_function_body and not runs_whenever_called(scope, node):
-            continue
         for declarator in node.named_children:
             name = declarator.child_by_field_name("name")
             value = declarator.child_by_field_name("value")
             if name is None or value is None or name.type != "identifier":
                 continue
-            literal = inlined_literal(value)
-            if literal is not None:
-                lines = [literal.start_point[0] + 1]
-            elif value.type == "identifier":
-                lines = [
-                    line
-                    for line, target in consts.get(value.text.decode("utf-8"), [])
-                    if target.start_byte <= value.start_byte < target.end_byte
-                ]
-            else:
-                lines = []
-            for line in lines:
+            if is_function_body and not runs_whenever_called(scope, declarator, is_safe_in(scope)):
+                continue
+            for line in literal_lines(value):
                 consts.setdefault(name.text.decode("utf-8"), []).append((line, scope))
     return consts
 

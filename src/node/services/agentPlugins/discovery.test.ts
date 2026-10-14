@@ -169,6 +169,8 @@ describe("discoverAgentPlugins", () => {
       ];
       const manifestPath = await fs.realpath(path.join(owner, "managed", "plugin.json"));
       const reads = spyOn(fs, "readFile");
+      // Manifests are read through an opened handle (readPluginFileWithinRootCapped).
+      const opens = spyOn(fs, "open");
       try {
         const { plugins } = await discoverAgentPlugins(containers);
         expect(plugins).toHaveLength(2);
@@ -185,9 +187,10 @@ describe("discoverAgentPlugins", () => {
         });
         expect(plugins[0].rootPath).toBe(plugins[1].rootPath);
         expect(reads.mock.calls.filter(([file]) => file === registryPath)).toHaveLength(1);
-        expect(reads.mock.calls.filter(([file]) => file === manifestPath)).toHaveLength(1);
+        expect(opens.mock.calls.filter(([file]) => file === manifestPath)).toHaveLength(1);
       } finally {
         reads.mockRestore();
+        opens.mockRestore();
       }
       await fs.writeFile(registryPath, "{");
       const corrupt = await discoverAgentPlugins(containers);
@@ -1098,6 +1101,73 @@ describe("discoverAgentPlugins", () => {
     });
     const second = await discoverAgentPlugins([{ path: container, scope: "global" }]);
     expect(second.plugins[0].openai).toEqual({ onboardingSkill: "./skills/a/SKILL.md" });
+  });
+
+  test("the overlay's interface, review and publication metadata reach the typed view", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "overlay-meta");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    // OpenAI's Codex layout: `interface` at the top level, review and publication under
+    // extensions.com.openai (https://developers.openai.com/plugins/deploy/submission).
+    const review = { tests: [{ prompt: "Open my file" }] };
+    const publication = { countries: ["US"], release_notes: "First release" };
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({
+        name: "overlay-meta",
+        interface: { displayName: "Meta", shortDescription: "Docs", developerName: "Acme" },
+        extensions: { "com.openai": { review, publication } },
+      }),
+      "utf8"
+    );
+
+    const { plugins, diagnostics } = await discoverAgentPlugins([
+      { path: container, scope: "global" },
+    ]);
+
+    expect(diagnostics).toEqual([]);
+    expect(plugins[0].openai).toEqual({
+      interface: { displayName: "Meta", shortDescription: "Docs", developerName: "Acme" },
+      review,
+      publication,
+    });
+  });
+
+  test("a manifest swapped for an outside link after its size check is not read", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await fs.realpath(await writePlugin(container, "swapped"));
+    const outside = path.join(tmp.path, "outside.json");
+    await fs.writeFile(
+      outside,
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "outside-name" }),
+      "utf8"
+    );
+    const manifestPath = path.join(pluginDir, "plugin.json");
+    // A local process replaces the manifest between discovery's size check and its read.
+    const realStat = fs.stat;
+    let swapped = false;
+    const stats = spyOn(fs, "stat").mockImplementation((async (
+      ...args: Parameters<typeof fs.stat>
+    ) => {
+      const result = await realStat(...args);
+      if (!swapped && args[0] === manifestPath) {
+        swapped = true;
+        await fs.rm(manifestPath);
+        await fs.symlink(outside, manifestPath);
+      }
+      return result;
+    }) as typeof fs.stat);
+    try {
+      const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+      expect(swapped).toBe(true);
+      expect(result.plugins).toEqual([]);
+      expect(result.diagnostics).toHaveLength(1);
+      expect(result.diagnostics[0]).toMatchObject({ path: manifestPath, severity: "error" });
+    } finally {
+      stats.mockRestore();
+    }
   });
 
   test("root plugin.json and mcp.json win over the Codex fallbacks", async () => {

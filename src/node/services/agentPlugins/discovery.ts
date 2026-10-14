@@ -401,7 +401,16 @@ async function readManifestCandidate(
     };
   }
   try {
-    return { status: "ok", raw: JSON.parse(await fsPromises.readFile(manifestReal, "utf8")) };
+    // The checks above only classify the candidate. The bytes come from one handle that is
+    // identity-checked, contained and capped, so a local replacement after the size check
+    // cannot redirect or grow the read (Codex PRRT_kwDOPxxmWM6rvwzc, #6297).
+    const { content } = await readPluginFileWithinRootCapped({
+      filePath: manifestReal,
+      pluginRoot: rootReal,
+      maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
+      label: relative,
+    });
+    return { status: "ok", raw: JSON.parse(content) };
   } catch (error) {
     return { status: "invalid", message: `Failed to read ${relative}: ${getErrorMessage(error)}` };
   }
