@@ -247,6 +247,8 @@ interface Entry {
 const FLUSH_DEBOUNCE_MS = 300;
 /** Retries of a creation draft move whose source another window changed meanwhile. */
 const MOVE_CHANGED_RETRIES = 3;
+/** Retries of a failed creation draft move: one whose reply was lost may have moved the draft. */
+const MOVE_FAILURE_RETRIES = 2;
 const RETRY_BASE_MS = 250;
 const RETRY_MAX_MS = 5_000;
 const EMPTY_VIEW: DraftView = {
@@ -270,6 +272,52 @@ function retryDelayMs(attempt: number): number {
 
 type CreationScope = Extract<DraftScope, { kind: "creation" }>;
 type MovedReply = Extract<DraftMoveCreationOutput, { result: "moved" }>;
+
+/** The source's local edit counters right after the flush whose content a move sent. */
+interface MoveSourceMark {
+  entry: Entry | undefined;
+  text: number;
+  attachments: number;
+  name: number;
+  queued: number;
+}
+
+function markMoveSource(entry: Entry | undefined): MoveSourceMark {
+  if (!entry) return { entry, text: 0, attachments: 0, name: 0, queued: 0 };
+  return {
+    entry,
+    text: entry.textVersion,
+    attachments: entry.attachmentsVersion,
+    name: entry.nameVersion,
+    queued: entry.queuedAttachmentUpdates.length,
+  };
+}
+
+/** Whether the source got a local edit after the move's flush: the moved body lacks it. */
+function isEditedSince(entry: Entry | undefined, mark: MoveSourceMark): boolean {
+  if (!entry) return false;
+  if (entry !== mark.entry)
+    return hasUnsavedEdit(entry) || entry.queuedAttachmentUpdates.length > 0;
+  return (
+    entry.textVersion !== mark.text ||
+    entry.attachmentsVersion !== mark.attachments ||
+    entry.nameVersion !== mark.name ||
+    entry.queuedAttachmentUpdates.length !== mark.queued
+  );
+}
+
+/** Why a move that answered "changed" ends without moving, or null to retry it. */
+function moveStopReason(present: boolean, hadContent: boolean, attempt: number): string | null {
+  // Another window moved or deleted the draft shown here: moving what is left would add an empty
+  // draft.
+  if (!present && hadContent) return "The creation draft was moved or deleted elsewhere";
+  if (attempt >= MOVE_CHANGED_RETRIES) return "The creation draft kept changing during its move";
+  return null;
+}
+
+function hasContent(view: DraftView): boolean {
+  return view.text.length > 0 || view.attachmentCount > 0 || view.nameState !== null;
+}
 
 export function draftStoreScopeKey(scope: DraftStoreScope): string {
   return scope.kind === "pending" ? `pending:${scope.projectPath}` : draftScopeKey(scope);
@@ -639,14 +687,6 @@ export class DraftStore {
   private serverListRevision = Number.NEGATIVE_INFINITY;
   private readonly pendingListPuts = new Map<string, PendingListPut>();
   /**
-   * Creation draft moves waiting for their reply, by destination key: the destination's row is
-   * shown and the source's hidden, and the destination sends nothing (see moveCreationDraft).
-   */
-  private readonly pendingMoves = new Map<
-    string,
-    { row: DraftListEntry; sourceKey: string; settled: Promise<void> }
-  >();
-  /**
    * The legacy localStorage list, shown (where the backend list lacks an entry) until its import
    * is reflected, or for the whole session when the import failed (the next start retries).
    */
@@ -838,7 +878,6 @@ export class DraftStore {
       if (!merged.has(key)) merged.set(key, entry);
     }
     for (const [key, { entry }] of this.pendingListPuts) merged.set(key, entry);
-    this.overlayPendingMoves(merged);
     for (const key of this.pendingDeletes.keys()) merged.delete(key);
     const byProject: CreationDraftsByProject = {};
     for (const { projectPath, ...draft } of merged.values()) {
@@ -846,14 +885,6 @@ export class DraftStore {
     }
     this.creationDrafts = byProject;
     for (const listener of this.listListeners) listener();
-  }
-
-  /** A pending move shows its destination's row in place of its source's. */
-  private overlayPendingMoves(merged: Map<string, DraftListEntry>): void {
-    for (const [key, move] of this.pendingMoves) {
-      merged.delete(move.sourceKey);
-      merged.set(key, move.row);
-    }
   }
 
   /** Drop a creation draft from the local list (the backend delete delists it too). */
@@ -1039,10 +1070,6 @@ export class DraftStore {
    * Resolves at once when they are loaded; a send awaits this so it never goes out without them.
    */
   ensurePayloads(scope: DraftStoreScope): Promise<void> {
-    // A move's destination: the backend holds its payloads only once the move is done (a move
-    // that failed and dropped the entry leaves nothing to load).
-    const move = this.pendingMoves.get(draftStoreScopeKey(scope));
-    if (move) return move.settled.then(() => this.ensurePayloads(scope));
     const key = draftStoreScopeKey(scope);
     const entry = this.entries.get(key);
     if (!entry || entry.payloadsLoaded || entry.scope.kind === "pending") return Promise.resolve();
@@ -1596,124 +1623,103 @@ export class DraftStore {
   /**
    * Move a creation draft (the project's default draft or a listed one) to the new listed draft
    * `to` in one backend step (drafts.moveCreation: body, name and row together, then the source
-   * goes). The destination shows the source's content and row at once and sends nothing until the
-   * reply; edits made there meanwhile are saved after it. Never rejects and never loses content:
-   * after a failure an edited destination stays a draft of its own next to the source; otherwise
-   * the destination goes and the source shows again. Resolves whether the draft moved.
+   * goes). Nothing changes here before the backend moved it: then the destination shows the moved
+   * content and row, and the source goes. Never rejects; after a failure nothing changed. Resolves
+   * whether the draft moved.
    */
   async moveCreationDraft(from: DraftStoreScope, to: DraftListEntry): Promise<boolean> {
     // The pending scope (no project yet) is memory-only: nothing to move on the backend.
     if (from.kind !== "creation") return false;
-    const destScope: CreationScope = {
-      kind: "creation",
-      projectPath: to.projectPath,
-      draftId: to.draftId,
-    };
-    const destKey = draftScopeKey(destScope);
-    const dest = this.seedMovedDraft(this.entries.get(draftScopeKey(from)), destScope);
-    let settle: () => void = () => undefined;
-    const settled = new Promise<void>((resolve) => {
-      settle = resolve;
-    });
-    this.pendingMoves.set(destKey, { row: to, sourceKey: draftScopeKey(from), settled });
-    this.recomputeList();
-    try {
-      const reply = await this.sendMove(from, to, destScope);
-      this.pendingMoves.delete(destKey);
-      this.applyMoved(from, dest, to, reply);
-      return true;
-    } catch (error) {
-      console.warn("Failed to move the creation draft; keeping the source draft:", error);
-      this.pendingMoves.delete(destKey);
-      this.keepAfterFailedMove(dest, to);
-      return false;
-    } finally {
-      settle();
-    }
+    const sourceRow = this.getCreationDraftsByProject()[from.projectPath]?.find(
+      ({ draftId }) => draftId === from.draftId
+    );
+    const sent = await this.sendMoveWithRetries(from, to, hasContent(this.getView(from)));
+    if (sent === null) return false;
+    this.applyMoved(from, to, sent, sourceRow);
+    return true;
   }
 
-  /** The destination shows the source's content, as the backend will hold it after the move. */
-  private seedMovedDraft(source: Entry | undefined, to: CreationScope): Entry {
-    const dest = this.getOrCreateEntry(to);
-    if (source) {
-      dest.text = source.text;
-      dest.attachments = source.attachments;
-      dest.attachmentCount = source.attachmentCount;
-      dest.payloadsLoaded = source.payloadsLoaded;
-      dest.nameState = source.nameState;
-      this.recompute(dest);
+  /** The move, again after a failure: a lost reply's retry answers "moved" (the move is idempotent). */
+  private async sendMoveWithRetries(
+    from: CreationScope,
+    to: DraftListEntry,
+    hadContent: boolean
+  ): Promise<{ reply: MovedReply; mark: MoveSourceMark } | null> {
+    for (let failures = 0; ; failures++) {
+      try {
+        return await this.sendMove(from, to, hadContent);
+      } catch (error) {
+        if (failures >= MOVE_FAILURE_RETRIES) {
+          console.warn("Failed to move the creation draft; keeping the source draft:", error);
+          return null;
+        }
+        console.warn("Failed to move the creation draft; retrying:", error);
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs(failures)));
+      }
     }
-    return dest;
   }
 
   /** The move request, retried while another window's edit keeps changing the source. */
   private async sendMove(
     from: CreationScope,
     to: DraftListEntry,
-    destScope: CreationScope
-  ): Promise<MovedReply> {
+    hadContent: boolean
+  ): Promise<{ reply: MovedReply; mark: MoveSourceMark } | null> {
     let newer = Number.NEGATIVE_INFINITY;
     for (let attempt = 0; ; attempt++) {
       // The source's unsaved edits first: the backend moves what it stores.
       await this.flush(from);
+      const mark = markMoveSource(this.entries.get(draftScopeKey(from)));
       const client = this.writableClient();
-      const known = Math.max(this.entries.get(draftScopeKey(from))?.revision ?? newer, newer);
+      const known = Math.max(mark.entry?.revision ?? newer, newer);
       const reply = await client.drafts.moveCreation({
         source: from,
         sourceRevision: Number.isFinite(known) ? known : null,
-        dest: destScope,
+        dest: { kind: "creation", projectPath: to.projectPath, draftId: to.draftId },
         subProjectPath: to.subProjectPath,
         createdAt: to.createdAt,
       });
       this.assertCurrentClient(client);
-      if (reply.result === "moved") return reply;
-      if (attempt >= MOVE_CHANGED_RETRIES) throw new Error("the source draft kept changing");
+      if (reply.result === "moved") return { reply, mark };
+      const stop = moveStopReason(reply.present, hadContent, attempt);
+      if (stop !== null) {
+        console.warn(`${stop}; keeping the source draft`);
+        return null;
+      }
       newer = reply.revision;
     }
   }
 
   private applyMoved(
     from: CreationScope,
-    dest: Entry,
     to: DraftListEntry,
-    reply: MovedReply
+    sent: { reply: MovedReply; mark: MoveSourceMark },
+    sourceRow: WorkspaceDraft | undefined
   ): void {
     const sourceKey = draftScopeKey(from);
-    this.dropEntry(sourceKey);
-    this.dropListEntry(sourceKey);
+    if (isEditedSince(this.entries.get(sourceKey), sent.mark)) {
+      // An edit made after the flush (e.g. a file read the source composer began) is not in the
+      // moved body: the source stays, and saves it again.
+      if (sourceRow) this.putCreationDraft(from.projectPath, sourceRow);
+    } else {
+      this.dropEntry(sourceKey);
+      this.dropListEntry(sourceKey);
+    }
+    const dest: CreationScope = {
+      kind: "creation",
+      projectPath: to.projectPath,
+      draftId: to.draftId,
+    };
     // Shown until the backend list reflects the move, as a confirmed put.
-    const destKey = draftStoreScopeKey(dest.scope);
-    this.pendingListPuts.set(destKey, {
+    this.pendingListPuts.set(draftScopeKey(dest), {
       entry: to,
       attempt: 0,
-      confirmedRevision: reply.listRevision,
+      confirmedRevision: sent.reply.listRevision,
       sending: null,
     });
     this.settleList();
-    // The moved content (another window's edits included), under edits made here meanwhile,
-    // which are saved now.
-    this.applyWriteReply(dest, reply.dest, ALL_FIELDS);
-  }
-
-  private keepAfterFailedMove(dest: Entry, to: DraftListEntry): void {
-    const key = draftStoreScopeKey(dest.scope);
-    const current = this.entries.get(key) === dest;
-    if (!current || !hasUnsavedEdit(dest)) {
-      if (current) this.dropEntry(key);
-      this.recomputeList();
-      return;
-    }
-    // Edited meanwhile: a draft of its own. Its seeded fields were never saved, so write them all
-    // (the attachments only with their payloads; without them they stay in the source).
-    dest.textVersion++;
-    dest.nameVersion++;
-    if (dest.payloadsLoaded) dest.attachmentsVersion++;
-    this.putCreationDraft(to.projectPath, {
-      draftId: to.draftId,
-      subProjectPath: to.subProjectPath,
-      createdAt: to.createdAt,
-    });
-    this.scheduleFlush(dest);
+    // The moved content, another window's edits included (pushes may have created the entry).
+    this.applyWriteReply(this.getOrCreateEntry(dest), sent.reply.dest, ALL_FIELDS);
   }
 
   /** Drop local state of a removed workspace (its session dir, and draft, are gone). */
@@ -2352,8 +2358,6 @@ export class DraftStore {
     const scope = entry.scope;
     if (scope.kind === "pending") return;
     const key = draftScopeKey(scope);
-    // A move's destination: the move writes it; edits made meanwhile are saved after its reply.
-    if (this.pendingMoves.has(key)) return;
     for (
       let wrote = dueFields(entry);
       wrote !== null && this.entries.get(key) === entry;

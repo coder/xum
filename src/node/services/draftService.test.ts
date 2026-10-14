@@ -1244,12 +1244,65 @@ describe("DraftService moveCreation", () => {
     expect(await service.moveCreation(input)).toEqual({
       result: "changed",
       revision: newer.revision,
+      present: true,
     });
     expect((await service.get(source)).text).toBe("first and more");
     expect((await service.get(dest)).text).toBe("");
     expect((await service.getList()).entries).toEqual([]);
     // A source the client never saw stored has changed too.
     expect((await service.moveCreation({ ...input, sourceRevision: null })).result).toBe("changed");
+  });
+
+  it("answers changed and writes nothing when the source was deleted since the given revision", async () => {
+    using tempDir = new TestTempDir("drafts-move-deleted");
+    const { projectPath, otherProject, service } = await createMoveHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    const seen = await service.update({ scope: source, text: "taken elsewhere" });
+    // Another window deletes it (or moves it away) meanwhile.
+    const deleted = await service.delete(source);
+    const dest = { kind: "creation" as const, projectPath: otherProject, draftId: "dst" };
+
+    expect(
+      await service.moveCreation({
+        source,
+        sourceRevision: seen.revision,
+        dest,
+        subProjectPath: null,
+        createdAt: 1,
+      })
+    ).toEqual({ result: "changed", revision: deleted.revision, present: false });
+    expect((await service.get(dest)).text).toBe("");
+    expect((await service.getList()).entries).toEqual([]);
+  });
+
+  it("refuses a move when a newer version wrote the list, and keeps the source", async () => {
+    using tempDir = new TestTempDir("drafts-move-newer-list");
+    const { config, projectPath, otherProject, service } = await createMoveHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    const written = await service.update({ scope: source, text: "keep me" });
+    const listFile = path.join(config.rootDir, "drafts", "list.json");
+    const row = { projectPath, draftId: "src", subProjectPath: null, createdAt: 1 };
+    const content = JSON.stringify({ version: 2, entries: [row] });
+    await fs.writeFile(listFile, content);
+    const dest = { kind: "creation" as const, projectPath: otherProject, draftId: "dst" };
+
+    let refused: unknown;
+    await service
+      .moveCreation({
+        source,
+        sourceRevision: written.revision,
+        dest,
+        subProjectPath: null,
+        createdAt: 1,
+      })
+      .catch((error: unknown) => (refused = error));
+
+    expect(refused).toBeInstanceOf(Error);
+    const restarted = new DraftService(config);
+    expect((await restarted.get(source)).text).toBe("keep me");
+    expect((await restarted.get(dest)).text).toBe("");
+    expect(await fs.readFile(listFile, "utf-8")).toBe(content);
   });
 
   it("answers moved to a retry after a lost reply", async () => {

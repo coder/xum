@@ -81,6 +81,8 @@ function createClient(service: DraftService) {
     updates: 0,
     listPuts: 0,
     failMoves: 0,
+    /** Moves whose reply is lost after the backend ran them. */
+    loseMoveReplies: 0,
     /** Held before the backend runs a move. */
     moveGate: null as Promise<void> | null,
   };
@@ -125,7 +127,12 @@ function createClient(service: DraftService) {
         control.failMoves--;
         throw new Error("move failed");
       }
-      return service.moveCreation(input);
+      const reply = await service.moveCreation(input);
+      if (control.loseMoveReplies > 0) {
+        control.loseMoveReplies--;
+        throw new Error("move reply lost");
+      }
+      return reply;
     },
     putListEntry: async (entry: Parameters<DraftService["putListEntry"]>[0]) => {
       control.listPuts++;
@@ -1121,7 +1128,7 @@ describe("DraftStore", () => {
     expect(store.getView(defaultScope).nameState?.manualName).toBe("default-name");
   });
 
-  test("moves the default draft in one step and shows the destination at once", async () => {
+  test("moves the default draft in one step and shows the destination once it moved", async () => {
     using tempDir = new TestTempDir("draft-store-move-creation");
     const { projectPath, service, client, control } = await createHarness(tempDir);
     const source: DraftScope = {
@@ -1137,8 +1144,19 @@ describe("DraftStore", () => {
     const row = { projectPath, draftId: "first-listed", subProjectPath: null, createdAt: 5 };
     const dest: DraftScope = { kind: "creation", projectPath, draftId: "first-listed" };
     const updatesBefore = control.updates;
+    let release: () => void = () => undefined;
+    control.moveGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
 
     const moved = store.moveCreationDraft(source, row);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Nothing moves before the backend did.
+    expect(store.getView(dest).text).toBe("");
+    expect(store.getView(source).text).toBe("typed before reload");
+    release();
+    expect(await moved).toBe(true);
+
     expect(store.getView(dest)).toMatchObject({
       text: "typed before reload",
       attachmentCount: 1,
@@ -1147,8 +1165,8 @@ describe("DraftStore", () => {
     expect(store.getCreationDraftsByProject()[projectPath]).toEqual([
       { draftId: "first-listed", subProjectPath: null, createdAt: 5 },
     ]);
-    expect(await moved).toBe(true);
-
+    await store.ensurePayloads(dest);
+    expect(store.getAttachments(dest)).toEqual([image]);
     expect(await service.get(dest)).toMatchObject({
       text: "typed before reload",
       attachments: [image],
@@ -1159,69 +1177,6 @@ describe("DraftStore", () => {
     // No separate body write or list put: the move did both.
     expect(control.updates).toBe(updatesBefore);
     expect(control.listPuts).toBe(0);
-  });
-
-  test("a destination's payload load before the move's reply waits for the move", async () => {
-    using tempDir = new TestTempDir("draft-store-move-payloads");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
-    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
-    await service.update({ scope: source, text: "with an image", attachments: [image] });
-    // A reload: the source's attachment payloads have not loaded.
-    const store = createStore(client);
-    await store.whenReady();
-    let release: () => void = () => undefined;
-    control.moveGate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
-
-    const moved = store.moveCreationDraft(source, {
-      projectPath,
-      draftId: "dst",
-      subProjectPath: null,
-      createdAt: 1,
-    });
-    // The destination's composer loads its payloads while the backend has no destination yet.
-    const loaded = store.ensurePayloads(dest);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    release();
-    await moved;
-    await loaded;
-
-    expect(store.getView(dest)).toMatchObject({ attachmentCount: 1, payloadsLoaded: true });
-    expect(store.getAttachments(dest)).toEqual([image]);
-  });
-
-  test("holds a destination edit until the move's reply and saves it after", async () => {
-    using tempDir = new TestTempDir("draft-store-move-hold");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
-    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
-    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
-    await service.update({ scope: source, text: "draft" });
-    const store = createStore(client);
-    await store.whenReady();
-    let release: () => void = () => undefined;
-    control.moveGate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const row = { projectPath, draftId: "dst", subProjectPath: null, createdAt: 1 };
-    const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
-
-    const moved = store.moveCreationDraft(source, row);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    store.setText(dest, "draft, edited");
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    expect(control.updates).toBe(0);
-    // The source's row is hidden while the move runs.
-    expect(store.getCreationDraftsByProject()[projectPath]?.map(({ draftId }) => draftId)).toEqual([
-      "dst",
-    ]);
-    release();
-    await moved;
-    await store.flush(dest);
-
-    expect((await service.get(dest)).text).toBe("draft, edited");
-    expect(store.getView(dest).text).toBe("draft, edited");
   });
 
   test("moves another window's edit made during the move", async () => {
@@ -1259,19 +1214,49 @@ describe("DraftStore", () => {
     expect((await service.get(source)).text).toBe("");
   });
 
-  test("a failed move keeps an edited destination as its own draft, and the source", async () => {
-    using tempDir = new TestTempDir("draft-store-move-fail-edited");
+  test("a move whose reply was lost after the backend moved the draft still shows it moved", async () => {
+    using tempDir = new TestTempDir("draft-store-move-lost-reply");
     const { projectPath, service, client, control } = await createHarness(tempDir);
     const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
     await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
     await service.update({ scope: source, text: "draft", nameState: NAME_STATE });
     const store = createStore(client);
     await store.whenReady();
+    control.loseMoveReplies = 1;
+    const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
+
+    expect(
+      await store.moveCreationDraft(source, {
+        projectPath,
+        draftId: "dst",
+        subProjectPath: null,
+        createdAt: 1,
+      })
+    ).toBe(true);
+
+    expect(store.getView(dest)).toMatchObject({ text: "draft", nameState: NAME_STATE });
+    expect(store.getView(source).text).toBe("");
+    expect(store.getCreationDraftsByProject()[projectPath]?.map(({ draftId }) => draftId)).toEqual([
+      "dst",
+    ]);
+    // The next edit adds to the moved text instead of replacing it.
+    store.setText(dest, "draft, edited");
+    await store.flush(dest);
+    expect((await service.get(dest)).text).toBe("draft, edited");
+  });
+
+  test("a source edit made after the move's flush is saved, not dropped", async () => {
+    using tempDir = new TestTempDir("draft-store-move-late-edit");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    await service.update({ scope: source, text: "draft" });
+    const store = createStore(client);
+    await store.whenReady();
     let release: () => void = () => undefined;
     control.moveGate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    control.failMoves = 1;
     const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
 
     const moved = store.moveCreationDraft(source, {
@@ -1281,18 +1266,62 @@ describe("DraftStore", () => {
       createdAt: 2,
     });
     await new Promise((resolve) => setTimeout(resolve, 20));
-    store.setText(dest, "draft, edited");
+    // E.g. a file read the source composer began before the move ends now.
+    store.setAttachments(source, [image]);
     release();
-    expect(await moved).toBe(false);
-    await store.flush(dest);
-    await waitFor(async () => (await service.getList()).entries.length === 2);
+    expect(await moved).toBe(true);
+    await store.flush(source);
 
-    expect(await service.get(dest)).toMatchObject({ text: "draft, edited", nameState: NAME_STATE });
-    expect((await service.get(source)).text).toBe("draft");
-    expect(store.getView(source).text).toBe("draft");
+    expect((await service.get(dest)).text).toBe("draft");
+    expect((await service.get(source)).attachments).toEqual([image]);
+    expect(store.getAttachments(source)).toEqual([image]);
+    await waitFor(async () => (await service.getList()).entries.length === 2);
   });
 
-  test("a failed move without edits drops the destination and shows the source again", async () => {
+  test("a move whose source another move took ends without an empty draft", async () => {
+    using tempDir = new TestTempDir("draft-store-move-taken");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = {
+      kind: "creation",
+      projectPath,
+      draftId: DEFAULT_CREATION_DRAFT_ID,
+    };
+    await service.update({ scope: source, text: "promoted twice" });
+    const store = createStore(client);
+    const other = createStore(client);
+    await store.whenReady();
+    await other.whenReady();
+    let release: () => void = () => undefined;
+    control.moveGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    // Two windows promote the same default draft at once.
+    const first = store.moveCreationDraft(source, {
+      projectPath,
+      draftId: "first",
+      subProjectPath: null,
+      createdAt: 1,
+    });
+    const second = other.moveCreationDraft(source, {
+      projectPath,
+      draftId: "second",
+      subProjectPath: null,
+      createdAt: 1,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    control.moveGate = null;
+    release();
+
+    expect([await first, await second].sort()).toEqual([false, true]);
+    const entries = (await service.getList()).entries;
+    expect(entries).toHaveLength(1);
+    expect(
+      (await service.get({ kind: "creation", projectPath, draftId: entries[0].draftId })).text
+    ).toBe("promoted twice");
+  });
+
+  test("a failed move leaves the source as it was and creates nothing", async () => {
     using tempDir = new TestTempDir("draft-store-move-fail");
     const { projectPath, service, client, control } = await createHarness(tempDir);
     const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
@@ -1300,7 +1329,7 @@ describe("DraftStore", () => {
     await service.update({ scope: source, text: "draft" });
     const store = createStore(client);
     await store.whenReady();
-    control.failMoves = 1;
+    control.failMoves = 100;
     const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
 
     expect(
