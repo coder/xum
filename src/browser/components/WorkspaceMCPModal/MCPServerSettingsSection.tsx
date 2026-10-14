@@ -26,6 +26,8 @@ interface MCPServerSettingsSectionProps {
    * keeps Refresh Tools disabled until the save ends.
    */
   beginSave: () => (snapshot: MCPSettingsReadSnapshot | null) => void;
+  /** A tool action run starts (Refresh Tools waits for it); the returned callback ends it. */
+  beginToolRun: () => () => void;
   /**
    * Refresh Tools runs for this server. Its settings read would take a newer request ID than
    * a save started now, and the save's result would be dropped, so Save waits for it.
@@ -55,6 +57,8 @@ export const MCPServerSettingsSection = React.forwardRef<
   // Number inputs keep their raw text so a half-typed "1." is not rewritten.
   const [numberText, setNumberText] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
+  // Tool action runs in flight: Save waits for them, and they wait for a save (see below).
+  const [runningTools, setRunningTools] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const { properties } = props.snapshot;
@@ -66,6 +70,7 @@ export const MCPServerSettingsSection = React.forwardRef<
     Object.keys(changed).length > 0 &&
     Object.keys(errors).length === 0 &&
     !saving &&
+    runningTools === 0 &&
     !props.refreshing;
   // The dialog's Save does not send settings, so it must not close over a pending edit.
   useImperativeHandle(ref, () => ({ hasUnsavedChanges: () => Object.keys(changed).length > 0 }));
@@ -197,6 +202,17 @@ export const MCPServerSettingsSection = React.forwardRef<
                   serverName={props.serverName}
                   instanceToken={props.snapshot.instanceToken}
                   item={item}
+                  // A save or refresh replaces the snapshot and remounts this section: a run
+                  // started meanwhile would lose its result.
+                  disabled={saving || props.refreshing}
+                  beginRun={() => {
+                    setRunningTools((count) => count + 1);
+                    const end = props.beginToolRun();
+                    return () => {
+                      setRunningTools((count) => count - 1);
+                      end();
+                    };
+                  }}
                 />
               );
             const schema = getOwn(properties, item.property);

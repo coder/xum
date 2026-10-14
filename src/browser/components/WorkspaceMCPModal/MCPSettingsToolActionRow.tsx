@@ -13,6 +13,10 @@ interface MCPSettingsToolActionRowProps {
   /** The settings read's instanceToken: the tool must belong to the instance the user saw. */
   instanceToken: string;
   item: Extract<MCPSettingsLayoutItem, { kind: "tool" }>;
+  /** A save or refresh of the section is in flight. */
+  disabled: boolean;
+  /** The run starts; the returned callback ends it (the section and dialog wait for it). */
+  beginRun: () => () => void;
 }
 
 /**
@@ -62,7 +66,7 @@ function RunnableToolRow(props: MCPSettingsToolActionRowProps & { action: MCPSet
           variant="outline"
           className="shrink-0"
           onClick={() => void run()}
-          disabled={running}
+          disabled={running || props.disabled}
           aria-label={`Run ${label}`}
         >
           {running && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
@@ -107,6 +111,7 @@ function useToolActionRun(
     if (!confirmed) return;
     setRunning(true);
     setResult(null);
+    const endRun = props.beginRun();
     try {
       const response = await api.mcp.settings.runTool({
         workspaceId: props.workspaceId,
@@ -120,6 +125,7 @@ function useToolActionRun(
       setResult({ text: getErrorMessage(caught), isError: true });
     } finally {
       setRunning(false);
+      endRun();
     }
   };
   return { running, result, run };

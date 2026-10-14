@@ -379,6 +379,16 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
     };
   };
 
+  /**
+   * A settings tool action of `serverName` starts; the returned callback settles it. It counts
+   * like a save, so Refresh Tools waits: a refresh remounts the section, which would drop the
+   * run's result while the tool still runs (the user could run a writing tool twice).
+   */
+  const beginSettingsToolRun = (serverName: string) => {
+    setSavingSettings((prev) => countSettingsSave(prev, serverName, 1));
+    return () => setSavingSettings((prev) => countSettingsSave(prev, serverName, -1));
+  };
+
   // Save overrides
   const handleSave = useCallback(async () => {
     if (!api || overridesRevision === null) return;
@@ -611,6 +621,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                             serverName={name}
                             snapshot={entry.snapshot}
                             beginSave={() => beginSettingsSave(name)}
+                            beginToolRun={() => beginSettingsToolRun(name)}
                             refreshing={isLoadingTools === true}
                           />
                         </div>

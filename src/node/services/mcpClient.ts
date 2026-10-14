@@ -263,9 +263,9 @@ function addSettingsToolAction(
   actions.set(definition.name, {
     title,
     readOnly: definition.annotations?.readOnlyHint === true,
-    // Without MCP Apps (the connection did not announce the extension), `ui` is undefined:
-    // the host cannot tell an app tool apart, and it runs as a regular tool.
-    opensApp: ui?.resourceUri !== undefined,
+    // Parsed even without MCP Apps (where `ui` is undefined): an app tool must not run as a
+    // regular tool without its view (the manager gives it no action then).
+    opensApp: (ui ?? parseMCPToolUiMeta(definition._meta))?.resourceUri !== undefined,
   });
 }
 

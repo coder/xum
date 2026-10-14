@@ -924,7 +924,8 @@ describe("MCPServerManager", () => {
     expect(snapshot.layout[0]?.items).toEqual([
       { kind: "tool", tool: "library", action: actions.library },
       { kind: "tool", tool: "reset", action: actions.reset },
-      { kind: "tool", tool: "viewer", action: actions.viewer },
+      // An MCP App tool without MCP Apps support: no action (never run without its view).
+      { kind: "tool", tool: "viewer" },
       { kind: "tool", tool: "hidden" },
       { kind: "tool", tool: "missing" },
     ]);
@@ -937,7 +938,7 @@ describe("MCPServerManager", () => {
     expect(await run("library")).toEqual({ text: "3 libraries\nsynced", isError: false });
     // Refused before anything reaches the server.
     expect(await run("reset")).toContain("confirmation");
-    expect(await run("viewer", true)).toContain("MCP App");
+    expect(await run("viewer", true)).toContain("no tool");
     expect(await run("hidden", true)).toContain("no tool");
     expect(await run("missing", true)).toContain("no tool");
     expect(await run("library", true, "stale-token")).toContain("restarted or replaced");
@@ -945,6 +946,62 @@ describe("MCPServerManager", () => {
     // Confirmed, it runs; a tool error reaches the dialog as an error result.
     expect(await run("reset", true)).toEqual({ text: "3 libraries\nsynced", isError: true });
     expect(runs.map((entry) => entry.name)).toEqual(["library", "reset"]);
+  });
+
+  test("settings tool actions follow tools/list_changed: the read and the run refresh the catalog", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-actions-live") });
+    let listed = new Set(["old"]);
+    let listing = new Set(["old"]);
+    servers.serve("settings-actions-live", {
+      era: "modern",
+      // A refresh (tools/list) picks up what the server lists now.
+      listTools: () => {
+        listed = new Set(listing);
+        return Promise.resolve({ draw: testTool() });
+      },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [
+                {
+                  kind: "group",
+                  title: "Parts",
+                  items: [
+                    { kind: "tool", tool: "old" },
+                    { kind: "tool", tool: "new" },
+                  ],
+                },
+              ],
+            },
+          }),
+        settingsToolAction: (name) =>
+          listed.has(name) ? { title: name, readOnly: true, opensApp: false } : undefined,
+        callSettingsActionTool: () => Promise.resolve({ content: [] }),
+      },
+    });
+    const workspaceId = "settings-actions-live-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const first = await manager.readSettings(workspaceId, "cad");
+    if (first === null) throw new Error("expected settings");
+    // The server replaces "old" with "new" (tools/list_changed).
+    listing = new Set(["new"]);
+    const run = (tool: string) =>
+      manager
+        .runSettingsTool(workspaceId, "cad", tool, first.instanceToken, { confirmed: false })
+        .then(() => "ran")
+        .catch((error: unknown) => String(error));
+    expect(await run("old")).toContain("no tool");
+    const second = await manager.readSettings(workspaceId, "cad");
+    expect(second?.layout[0]?.items).toEqual([
+      { kind: "tool", tool: "old" },
+      { kind: "tool", tool: "new", action: { title: "new", readOnly: true, opensApp: false } },
+    ]);
+    expect(await run("new")).toBe("ran");
   });
 
   test("settings: a server counts as connected only once the workspace started it", async () => {

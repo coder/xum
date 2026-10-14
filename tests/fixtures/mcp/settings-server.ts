@@ -44,6 +44,8 @@ lines.on("line", (line) => {
             annotations: { title: "Ignored", readOnlyHint: true },
           },
           { ...tool("reset"), annotations: { title: "Reset parts" } },
+          // An MCP App tool: an app action even on a connection without MCP Apps.
+          { ...tool("viewer"), _meta: { ui: { resourceUri: "ui://cad/viewer" } } },
           tool("echo"),
         ],
       };

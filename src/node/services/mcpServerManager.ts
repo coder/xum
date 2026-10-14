@@ -5052,18 +5052,31 @@ export class MCPServerManager {
     const { instance } = source;
     return {
       ...snapshot,
-      layout: this.withSettingsToolActions(instance, workspaceId, serverName, snapshot.layout),
+      layout: await this.withSettingsToolActions(
+        instance,
+        workspaceId,
+        serverName,
+        snapshot.layout,
+        options?.signal
+      ),
       instanceToken: this.settingsInstanceToken(instance),
     };
   }
 
-  /** The layout with each tool item's action (see settingsToolAction). */
-  private withSettingsToolActions(
+  /**
+   * The layout with each tool item's action (see settingsToolAction). The catalog is refreshed
+   * first (bounded, as for MCP App entry points): after tools/list_changed the held catalog
+   * would show a new tool as unavailable and keep a removed one runnable.
+   */
+  private async withSettingsToolActions(
     instance: MCPServerInstance,
     workspaceId: string,
     serverName: string,
-    layout: MCPSettingsGroup[]
-  ): MCPSettingsGroup[] {
+    layout: MCPSettingsGroup[],
+    signal: AbortSignal | undefined
+  ): Promise<MCPSettingsGroup[]> {
+    if (layout.some((group) => group.items.some((item) => item.kind === "tool")))
+      await this.refreshAppCatalogs([{ instance }], signal);
     return layout.map((group) => ({
       ...group,
       items: group.items.map((item) => {
@@ -5074,7 +5087,11 @@ export class MCPServerManager {
     }));
   }
 
-  /** A layout tool item's action: a tool the server lists and the tool allowlist allows. */
+  /**
+   * A layout tool item's action: a tool the server lists and the tool allowlist allows. An MCP
+   * App tool needs MCP Apps (the artifacts experiment and an apps connection): without them it
+   * has no action, so it is never run as a regular tool without its view.
+   */
   private settingsToolAction(
     instance: MCPServerInstance,
     workspaceId: string,
@@ -5083,7 +5100,20 @@ export class MCPServerManager {
   ): MCPSettingsToolAction | undefined {
     const action = instance.settings?.settingsToolAction(toolName);
     const allowlist = this.appToolAllowlist(workspaceId, serverName);
-    return allowlist === null || allowlist.has(toolName) ? action : undefined;
+    if (allowlist !== null && !allowlist.has(toolName)) return undefined;
+    const appsUsable = this.mcpApps?.isEnabled() === true && instance.apps !== undefined;
+    return action?.opensApp === true && !appsUsable ? undefined : action;
+  }
+
+  /** Refresh the running instance's catalog before a settings action dispatch (bounded). */
+  private async refreshSettingsActionCatalog(
+    workspaceId: string,
+    serverName: string,
+    signal: AbortSignal | undefined
+  ): Promise<void> {
+    const instance = this.workspaceServers.get(workspaceId)?.instances.get(serverName);
+    if (instance !== undefined && !instance.isClosed)
+      await this.refreshAppCatalogs([{ instance }], signal);
   }
 
   /**
@@ -5099,6 +5129,8 @@ export class MCPServerManager {
     instanceToken: string,
     options: { confirmed: boolean; signal?: AbortSignal }
   ): Promise<{ text: string; isError: boolean }> {
+    // A tool that tools/list_changed removed since the dialog read is refused.
+    await this.refreshSettingsActionCatalog(workspaceId, serverName, options.signal);
     // One-shot dispatch, like callMcpAppTool: an epoch retry must not run the tool twice.
     let dispatched: Promise<MCPRawCallToolResult> | null = null;
     return this.invokeServerOperation(

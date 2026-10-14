@@ -19,7 +19,7 @@ test("settings tools are hidden from the model and called with the host's _meta"
     updateTool: "settings.update",
   });
   // The model sees only ordinary tools: it cannot change the user's settings.
-  expect(Object.keys(await client.tools())).toEqual(["library", "reset", "echo"]);
+  expect(Object.keys(await client.tools())).toEqual(["library", "reset", "viewer", "echo"]);
   // Nor can an MCP App view: app calls go only to listed tools.
   expect(client.hasTool("echo")).toBe(true);
   expect(client.hasTool("settings.update")).toBe(false);
@@ -48,7 +48,13 @@ test("a half-malformed capability still hides its valid tool from the model and 
     }),
   });
   expect(client.settingsCapability()).toBeUndefined();
-  expect(Object.keys(await client.tools())).toEqual(["settings.read", "library", "reset", "echo"]);
+  expect(Object.keys(await client.tools())).toEqual([
+    "settings.read",
+    "library",
+    "reset",
+    "viewer",
+    "echo",
+  ]);
   expect(client.hasTool("settings.update")).toBe(false);
 });
 
@@ -74,6 +80,7 @@ test("settings tool actions: the spec's display name order, readOnlyHint, and {}
     readOnly: false,
     opensApp: false,
   });
+  expect(client.settingsToolAction("viewer")?.opensApp).toBe(true);
   // The settings tools themselves are no actions.
   expect(client.settingsToolAction("settings.update")).toBeUndefined();
 

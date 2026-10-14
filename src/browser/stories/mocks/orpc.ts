@@ -350,6 +350,8 @@ export interface MockORPCClientOptions {
   mcpSettingsFirstReadGate?: { promise: Promise<void> };
   /** Records every settings tool action run; each one returns "<tool> finished". */
   mcpSettingsToolRuns?: Array<{ toolName: string; confirmed: boolean }>;
+  /** When set, the first settings tool run waits for this promise (a run held in flight). */
+  mcpSettingsToolRunGate?: { promise: Promise<void> };
   /** When set, mcp.test waits for this promise (stories hold a Fetch Tools in flight). */
   mcpTestGate?: { promise: Promise<void> };
   /** Session icon registry for mcp.icon - maps iconRef to a PNG data URL (unknown refs resolve null) */
@@ -502,6 +504,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpSettingsAfterUpdate,
     mcpSettingsFirstReadGate,
     mcpSettingsToolRuns,
+    mcpSettingsToolRunGate,
     mcpTestGate,
     mcpIcons = new Map<string, string>(),
     mcpOauthAuthStatus = new Map<string, MCPOAuthAuthStatus>(),
@@ -1441,12 +1444,14 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             },
           };
         },
-        runTool: (input: { toolName: string; confirmed: boolean }) => {
+        runTool: async (input: { toolName: string; confirmed: boolean }) => {
+          const gated = mcpSettingsToolRuns?.length === 0 ? mcpSettingsToolRunGate : undefined;
           mcpSettingsToolRuns?.push({ toolName: input.toolName, confirmed: input.confirmed });
-          return Promise.resolve({
+          await gated?.promise;
+          return {
             success: true,
             data: { text: `${input.toolName} finished`, isError: false },
-          });
+          };
         },
       },
       list: (input?: { projectPath?: string }) => {

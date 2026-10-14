@@ -74,6 +74,7 @@ interface WorkspaceMCPStoryOptions {
   settingsFirstReadGate?: { promise: Promise<void> };
   settingsAfterSave?: Record<string, MCPSettingsSnapshot>;
   settingsToolRuns?: Array<{ toolName: string; confirmed: boolean }>;
+  settingsToolRunGate?: { promise: Promise<void> };
   testGate?: { promise: Promise<void> };
 }
 
@@ -154,6 +155,7 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
     mcpSettingsFirstReadGate: options.settingsFirstReadGate,
     mcpSettingsAfterUpdate: new Map(Object.entries(options.settingsAfterSave ?? {})),
     mcpSettingsToolRuns: options.settingsToolRuns,
+    mcpSettingsToolRunGate: options.settingsToolRunGate,
     mcpTestGate: options.testGate,
   });
 }
@@ -697,6 +699,7 @@ export const WorkspaceMCPServerSettingsNarrow: Story = {
 // variant, so they skip Pixel to stay within the snapshot budget.
 /** The latest WorkspaceMCPServerSettingsToolActions render's runs (its play reads them). */
 let toolActionRuns: Array<{ toolName: string; confirmed: boolean }> = [];
+let toolActionGate = Promise.withResolvers<void>();
 /**
  * Layout tool actions: a read-only tool runs at once and shows its text; a tool that can write
  * asks first (Cancel runs nothing); an MCP App tool and an unavailable tool stay disabled.
@@ -706,7 +709,12 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
   render: () => {
     const runs: Array<{ toolName: string; confirmed: boolean }> = [];
     toolActionRuns = runs;
-    return renderWorkspaceMCPModal({ ...settingsStoryOptions(), settingsToolRuns: runs });
+    toolActionGate = Promise.withResolvers<void>();
+    return renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settingsToolRuns: runs,
+      settingsToolRunGate: toolActionGate,
+    });
   },
   play: async ({ canvasElement }) => {
     const dialog = await findWorkspaceMCPDialog(canvasElement);
@@ -714,7 +722,17 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
     const page = within(canvasElement.ownerDocument.body);
     // The spec's display name (the tool's title), not the raw tool name.
     await userEvent.click(await section.findByRole("button", { name: "Run Part library" }));
+    // While it runs, Refresh Tools and the other runs wait: a refresh remounts the section and
+    // would drop the result.
+    await waitFor(() => expect(toolActionRuns).toHaveLength(1));
+    await expect(
+      within(dialog).getByRole("button", { name: /(Fetch|Refresh) Tools/ })
+    ).toBeDisabled();
+    toolActionGate.resolve();
     await expect(section.findByText("cad.library finished")).resolves.toBeInTheDocument();
+    await waitFor(() =>
+      expect(within(dialog).getByRole("button", { name: /(Fetch|Refresh) Tools/ })).toBeEnabled()
+    );
     await expect(toolActionRuns).toEqual([{ toolName: "cad.library", confirmed: false }]);
 
     await userEvent.click(section.getByRole("button", { name: "Run Reset parts" }));
