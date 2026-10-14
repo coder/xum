@@ -830,6 +830,20 @@ describe("Codex output rules (output_parser.rs)", () => {
 
     const blocked = setup([hook("PostToolUse")], () => json({ decision: "block", reason: "No." }));
     expect((await runTool(blocked.spine, "bash", {})).postBlocked).toBe(true);
+
+    // continue: false is checked before invalid fields: it still stops, with `reason` as the
+    // feedback, but the invalid output's context is dropped (Codex post_tool_use.rs).
+    const invalidStop = setup([hook("PostToolUse")], () =>
+      json({
+        continue: false,
+        reason: "Why.",
+        suppressOutput: true,
+        hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: "Dropped." },
+      })
+    );
+    expect((await runTool(invalidStop.spine, "bash", {})).result).toEqual({
+      error: "[plugin:guard] Why.",
+    });
   });
 
   test("UserPromptSubmit: continue: false shows stopReason over reason", async () => {

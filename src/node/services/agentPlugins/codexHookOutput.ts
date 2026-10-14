@@ -103,7 +103,7 @@ export function parsePreToolUseOutput(result: unknown): PreToolUseOutput | null 
       : hasSpecificDecision(specific)
         ? preSpecificDecision(specific)
         : preLegacyDecision(raw);
-  return withContext(raw, decision, specific);
+  return withContext(raw, decision, specific, !("invalid" in decision));
 }
 
 function hasSpecificDecision(specific: Record<string, unknown>): boolean {
@@ -148,27 +148,43 @@ export function parsePostToolUseOutput(result: unknown): PostToolUseOutput | nul
   const wire = readWire(result, "PostToolUse");
   if (wire === null) return null;
   const { raw, specific } = wire;
-  return withContext(raw, postDecision(raw, specific), specific);
+  const invalid =
+    unsupportedUniversal(raw, "PostToolUse", { allowContinueFalse: true }) ??
+    (specific.updatedMCPToolOutput != null
+      ? "returned unsupported updatedMCPToolOutput"
+      : undefined) ??
+    invalidBlock(raw);
+  // Codex checks continue: false before any invalid field, so it stops even then; an invalid
+  // output only loses its context (post_tool_use.rs).
+  const decision: Decision<PostToolUseOutput> =
+    raw.continue === false
+      ? { stopFeedback: stopFeedback(raw) }
+      : invalid !== undefined
+        ? { invalid }
+        : blockReasonOf(raw);
+  return withContext(raw, decision, specific, invalid === undefined);
 }
 
-function postDecision(
-  raw: Record<string, unknown>,
-  specific: Record<string, unknown>
-): Decision<PostToolUseOutput> {
-  const universal = unsupportedUniversal(raw, "PostToolUse", { allowContinueFalse: true });
-  if (universal !== undefined) return { invalid: universal };
-  if (specific.updatedMCPToolOutput != null) {
-    return { invalid: "returned unsupported updatedMCPToolOutput" };
+/** continue: false feeds the model `reason`, else `stopReason` (Codex post_tool_use.rs). */
+function stopFeedback(raw: Record<string, unknown>): string {
+  const feedback = trimmed(stringField(raw, "reason")) ?? trimmed(stringField(raw, "stopReason"));
+  return feedback ?? "PostToolUse hook stopped execution";
+}
+
+/** Codex: a block needs a non-empty reason, and a continuing hook's reason needs a block. */
+function invalidBlock(raw: Record<string, unknown>): string | undefined {
+  const block = enumField(raw, "decision", ["block"]) === "block";
+  if (block && trimmed(stringField(raw, "reason")) === undefined) {
+    return "returned a block without a non-empty reason";
   }
-  // Codex checks continue: false first; the other rules apply only to a continuing hook.
-  if (raw.continue === false) {
-    const feedback = trimmed(stringField(raw, "reason")) ?? trimmed(stringField(raw, "stopReason"));
-    return { stopFeedback: feedback ?? "PostToolUse hook stopped execution" };
+  if (!block && raw.continue !== false && raw.reason != null) {
+    return "returned reason without decision";
   }
-  if (enumField(raw, "decision", ["block"]) === "block") {
-    return requireReason(stringField(raw, "reason"), (blockReason) => ({ blockReason }));
-  }
-  return raw.reason != null ? { invalid: "returned reason without decision" } : {};
+  return undefined;
+}
+
+function blockReasonOf(raw: Record<string, unknown>): { blockReason?: string } {
+  return raw.decision === "block" ? { blockReason: trimmed(stringField(raw, "reason")) } : {};
 }
 
 export function parseUserPromptSubmitOutput(result: unknown): UserPromptSubmitOutput | null {
@@ -183,17 +199,22 @@ export function parseUserPromptSubmitOutput(result: unknown): UserPromptSubmitOu
   const wire = readWire(result, "UserPromptSubmit", text);
   if (wire === null) return null;
   const { raw, specific } = wire;
-  return withContext(raw, promptDecision(raw), specific);
+  // Codex drops the context only for a block without a reason, also when continue: false stops.
+  const blockWithoutReason =
+    enumField(raw, "decision", ["block"]) === "block" &&
+    trimmed(stringField(raw, "reason")) === undefined;
+  return withContext(raw, promptDecision(raw), specific, !blockWithoutReason);
 }
 
 function promptDecision(raw: Record<string, unknown>): Decision<UserPromptSubmitOutput> {
-  const block = enumField(raw, "decision", ["block"]) === "block";
   if (raw.continue === false) {
-    // Codex shows stopReason for a stopped prompt (PRRT_kwDOPxxmWM6rb29w).
+    // Codex stops the prompt and keeps `stopReason` (user_prompt_submit.rs). Showing `reason`
+    // when there is no stopReason is a Xum display choice (PRRT_kwDOPxxmWM6rb29w).
     const why = trimmed(stringField(raw, "stopReason")) ?? trimmed(stringField(raw, "reason"));
     return why !== undefined ? { stopped: true, blockReason: why } : { stopped: true };
   }
-  return block ? requireReason(stringField(raw, "reason"), (blockReason) => ({ blockReason })) : {};
+  const invalid = invalidBlock(raw);
+  return invalid !== undefined ? { invalid } : blockReasonOf(raw);
 }
 
 export function parseStopOutput(result: unknown): StopOutput | null {
@@ -227,14 +248,14 @@ function requireReason<T>(
     : build(text);
 }
 
-/** systemMessage always; additionalContext only when the output is valid (Codex). */
+/** systemMessage always; additionalContext only when Codex keeps it (`keepContext`). */
 function withContext<T extends Common & { additionalContext?: string }>(
   raw: Record<string, unknown>,
   decision: Decision<T>,
-  specific: Record<string, unknown>
+  specific: Record<string, unknown>,
+  keepContext: boolean
 ): T {
-  const context =
-    "invalid" in decision ? undefined : trimmed(stringField(specific, "additionalContext"));
+  const context = keepContext ? trimmed(stringField(specific, "additionalContext")) : undefined;
   return compact({ ...common(raw), ...decision, additionalContext: context } as T);
 }
 
