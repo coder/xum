@@ -106,20 +106,35 @@ export function parsePreToolUseOutput(result: unknown): PreToolUseOutput | null 
   // output; Xum still honors its deny (see NO_REASON) and voids the rest: a rewrite, the context
   // (PRRT_kwDOPxxmWM6sSNEa).
   const unsupported = unknown ?? unsupportedPreToolUseField(raw);
-  // A voided rewrite falls back to a legacy block next to it: the hook refused the original call
-  // and allowed only its rewritten form (Codex PRRT_kwDOPxxmWM6sT8v7).
   const decision: Decision<PreToolUseOutput> =
     unsupported === undefined || "denyReason" in chosen
       ? chosen
-      : "denyReason" in legacy
-        ? legacy
-        : { invalid: unsupported };
+      : voidedDecision(chosen, legacy, unsupported);
   return withContext(
     raw,
     decision,
     specific,
     unsupported === undefined && !("invalid" in decision)
   );
+}
+
+/**
+ * The decision when an unsupported or unknown field voids the output. A legacy block next to it
+ * still holds (Codex PRRT_kwDOPxxmWM6sT8v7). A voided rewrite denies the call: the hook allowed
+ * only its rewritten form, so running the original would bypass it, as for a rewrite that fails
+ * the tool's schema (codexHookRunner.ts). Codex runs the original here: this is a Xum-stricter
+ * rule (#6166).
+ */
+function voidedDecision(
+  chosen: Decision<PreToolUseOutput>,
+  legacy: Decision<PreToolUseOutput>,
+  unsupported: string
+): Decision<PreToolUseOutput> {
+  if ("denyReason" in legacy) return legacy;
+  if ("updatedInput" in chosen) {
+    return { denyReason: `the hook ${unsupported}, which voids its rewrite of this call` };
+  }
+  return { invalid: unsupported };
 }
 
 function unsupportedPreToolUseField(raw: Record<string, unknown>): string | undefined {
