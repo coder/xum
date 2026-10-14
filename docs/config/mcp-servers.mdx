@@ -65,6 +65,8 @@ MCP servers declared in an [Agent Plugin's](https://agent-plugins.org) `mcp.json
 
 Stdio plugin servers launch with the spec's `PLUGIN_ROOT` and `PLUGIN_DATA` environment variables; per-plugin data directories live under `~/.xum/plugin-data/`.
 
+Stdio plugin servers do not inherit your full shell environment, so a plugin cannot read tokens such as `GITHUB_TOKEN` that you exported for other tools. A plugin server receives only basic variables (`PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `TERM`, temp and time-zone variables, their Windows equivalents, and CA bundle paths such as `NODE_EXTRA_CA_CERTS`), plus the `env` its MCP configuration declares. Proxy variables such as `HTTPS_PROXY` are not passed. Servers you configure yourself keep the full environment.
+
 **Settings → Plugins** installs plugins from git into `~/.xum/plugins` (paste a git URL or `owner/repo[@ref]`); the exact location derives from the active Xum home (a legacy `~/.mux` home keeps working) and is shown in the section. Before anything is written, a consent preview lists the plugin's manifest, every skill, and every MCP server command line. Installs are pinned to the resolved commit; update checks compare the tracked branch or tag against the pinned commit and never auto-apply. Applying an update replaces the plugin directory wholesale — local edits to a managed plugin directory are discarded — and restarts that plugin's running MCP servers. Uninstalling removes the directory, the registry entry, and the plugin's global enablement and per-workspace server overrides, but keeps `~/.xum/plugin-data/` unless you opt in to deleting it.
 
 ## Tool search

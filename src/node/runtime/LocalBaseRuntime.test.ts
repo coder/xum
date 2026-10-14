@@ -180,6 +180,45 @@ describe("LocalBaseRuntime.exec PATH handling", () => {
   });
 });
 
+describe("LocalBaseRuntime.exec hostEnv", () => {
+  // #6509: plugin stdio MCP servers must not read the user's shell secrets.
+  async function runEnvProbe(hostEnv: "inherit" | "minimal" | undefined) {
+    const runtime = new TestLocalRuntime();
+    const stream = await runtime.exec(
+      'printf "%s|%s|%s" "${XUM_TEST_HOST_SECRET-unset}" "${XUM_TEST_DECLARED-unset}" "${HOME-unset}"',
+      {
+        cwd: os.tmpdir(),
+        timeout: 5,
+        env: { XUM_TEST_DECLARED: "declared" },
+        ...(hostEnv !== undefined ? { hostEnv } : {}),
+      }
+    );
+    await stream.stdin.close();
+    const [stdout, exitCode] = await Promise.all([
+      readStreamAsString(stream.stdout),
+      stream.exitCode,
+    ]);
+    expect(exitCode).toBe(0);
+    return stdout;
+  }
+
+  it("keeps only allowlisted host variables plus the declared env for minimal", async () => {
+    const original = process.env.XUM_TEST_HOST_SECRET;
+    process.env.XUM_TEST_HOST_SECRET = "leaked";
+    try {
+      expect(await runEnvProbe("minimal")).toBe(`unset|declared|${process.env.HOME ?? "unset"}`);
+      // Default exec (user MCP servers, the bash tool) still inherits the host env.
+      expect(await runEnvProbe(undefined)).toBe(`leaked|declared|${process.env.HOME ?? "unset"}`);
+    } finally {
+      if (original === undefined) {
+        delete process.env.XUM_TEST_HOST_SECRET;
+      } else {
+        process.env.XUM_TEST_HOST_SECRET = original;
+      }
+    }
+  });
+});
+
 describe("LocalBaseRuntime.exec timeout", () => {
   it("should resolve exitCode with EXIT_CODE_TIMEOUT when command exceeds timeout", async () => {
     const runtime = new TestLocalRuntime();

@@ -72,7 +72,7 @@ import assert from "@/common/utils/assert";
 import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { shellQuote } from "@/common/utils/shell";
 import { requiredPropertyNames, schemaAcceptsNull } from "@/common/utils/tools/schemaSanitizer";
-import type { ExecStream, Runtime } from "@/node/runtime/Runtime";
+import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
@@ -900,6 +900,12 @@ interface StdioLaunch {
   command: string;
   cwd?: string;
   env?: Record<string, string>;
+  /**
+   * #6509: a plugin server gets only the minimal host environment plus its
+   * declared env, so it cannot read the user's shell secrets. User-configured
+   * servers keep the full environment.
+   */
+  hostEnv: NonNullable<ExecOptions["hostEnv"]>;
 }
 
 /**
@@ -970,7 +976,9 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
   const command =
     info.args !== undefined ? [info.command, ...info.args].map(shellQuote).join(" ") : info.command;
 
+  let hostEnv: StdioLaunch["hostEnv"] = "inherit";
   if (info.plugin !== undefined) {
+    hostEnv = "minimal";
     const dataPath = info.env?.PLUGIN_DATA;
     assert(
       dataPath !== undefined && path.isAbsolute(dataPath),
@@ -998,6 +1006,7 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
     command,
     ...(info.cwd !== undefined ? { cwd: info.cwd } : {}),
     ...(info.env !== undefined ? { env: info.env } : {}),
+    hostEnv,
   };
 }
 
@@ -1008,7 +1017,7 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
  */
 async function runServerTest(
   server:
-    | { transport: "stdio"; command: string; cwd?: string; env?: Record<string, string> }
+    | ({ transport: "stdio" } & StdioLaunch)
     | {
         transport: "http" | "sse" | "auto";
         url: string;
@@ -1060,6 +1069,7 @@ async function runServerTest(
           const execStream = await runtime.exec(server.command, {
             cwd: server.cwd ?? projectPath,
             ...(server.env !== undefined ? { env: server.env } : {}),
+            hostEnv: server.hostEnv,
             timeout: TEST_TIMEOUT_MS / 1000,
           });
 
@@ -6044,7 +6054,7 @@ export class MCPServerManager {
 
     if (command?.trim()) {
       return runServerTest(
-        { transport: "stdio", command },
+        { transport: "stdio", command, hostEnv: "inherit" },
         projectPath,
         "command",
         trimmedName ?? "command"
@@ -7160,6 +7170,7 @@ export class MCPServerManager {
             runtime.exec(launch.command, {
               cwd: launch.cwd ?? workspacePath,
               ...(launch.env !== undefined ? { env: launch.env } : {}),
+              hostEnv: launch.hostEnv,
               timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
               abortSignal: AbortSignal.any([launchSignal, processAbort.signal]),
             }),

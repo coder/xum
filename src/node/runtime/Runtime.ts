@@ -56,6 +56,14 @@ export interface ExecOptions {
   /** Host-namespace paths to translate before exposing them as environment variables. */
   pathEnv?: Record<string, string>;
   /**
+   * Base environment taken from the Xum host process before `env` is applied.
+   * "inherit" (default) passes all of process.env; "minimal" passes only
+   * pickMinimalChildEnv's allowlist (#6509: managed plugin stdio MCP servers
+   * must not read the user's shell secrets). Only host-local runtimes read the
+   * host environment, so remote runtimes ignore this field.
+   */
+  hostEnv?: "inherit" | "minimal";
+  /**
    * Timeout in seconds.
    *
    * When provided, prevents zombie processes by ensuring spawned processes are killed.
