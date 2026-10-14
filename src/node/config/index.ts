@@ -1545,25 +1545,48 @@ export class Config {
    */
   private notifiedConfigFileStamp = "missing";
 
+  /** The resolved config.json path the target-dir watch follows (see startConfigFileWatchers). */
+  private watchedConfigFileTarget: string | null = null;
+
   private ensureConfigFileWatcher(): void {
     if (this.configFileWatchers.length > 0) return;
     // The baseline comes before the watch: a rewrite between the two then reads as a new
     // stamp in the check below instead of being adopted silently.
     const baseline = this.configFileStamp();
+    try {
+      // Another backend can create the root with its first save; a watch needs it to exist.
+      ensurePrivateDirSync(this.rootDir);
+    } catch (error) {
+      log.debug("Config dir not created for the config file watcher", { error });
+    }
+    this.startConfigFileWatchers();
+    // Without a watch, writeConfigFileTracked retries after this process's next save.
+    if (this.configFileWatchers.length === 0) return;
+    this.notifiedConfigFileStamp = baseline;
+    this.handleConfigFileEvent();
+  }
+
+  private startConfigFileWatchers(): void {
     // Watch directories, not the file: atomic saves rename a temp file over config.json, and
     // a file watch follows the old inode. writeFileAtomic renames over a symlink's target, so
     // a symlinked config.json also needs its target's directory.
-    const targets = new Map([[this.rootDir, path.basename(this.configFile)]]);
     const realFile = this.realConfigFilePath();
+    this.watchedConfigFileTarget = realFile;
+    const targets = new Map([[this.rootDir, path.basename(this.configFile)]]);
     targets.set(path.dirname(realFile), path.basename(realFile));
     for (const [dir, fileName] of targets) {
       const watcher = this.watchConfigDir(dir, fileName);
       if (watcher) this.configFileWatchers.push(watcher);
     }
-    // The config dir does not exist before the first save, so no watch starts. Listeners
-    // read config when they subscribe, and writeConfigFileTracked retries the watch.
-    if (this.configFileWatchers.length === 0) return;
-    this.notifiedConfigFileStamp = baseline;
+  }
+
+  /** A config.json event: re-resolve a replaced symlink first, so the watch follows it. */
+  private handleConfigFileEventWithRelink(): void {
+    if (this.realConfigFilePath() !== this.watchedConfigFileTarget) {
+      // Keep the notified stamp: the new target's bytes still count as a change below.
+      this.closeConfigFileWatcher();
+      this.startConfigFileWatchers();
+    }
     this.handleConfigFileEvent();
   }
 
@@ -1581,7 +1604,7 @@ export class Config {
       watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
         // Some platforms omit the filename; treat that as a possible config.json change.
         if (filename != null && filename !== fileName) return;
-        this.handleConfigFileEvent();
+        this.handleConfigFileEventWithRelink();
       });
     } catch (error) {
       log.debug("Config file watcher not started", { dir, error });

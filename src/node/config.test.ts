@@ -1887,6 +1887,45 @@ describe("Config", () => {
       }
     });
 
+    it("follows a config.json symlink that is pointed at another directory", async () => {
+      const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-a-"));
+      const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-b-"));
+      try {
+        const link = path.join(tempDir, "config.json");
+        fs.writeFileSync(path.join(dirA, "config.json"), JSON.stringify({ projects: [] }));
+        fs.writeFileSync(
+          path.join(dirB, "config.json"),
+          JSON.stringify({ projects: [], updateChannel: "npm" })
+        );
+        fs.symlinkSync(path.join(dirA, "config.json"), link);
+        // One subscription for the whole test: a fresh one would start a fresh watch.
+        let notified = Promise.withResolvers<void>();
+        const unsubscribe = config.onConfigChanged(() => notified.resolve());
+        // Replace the link atomically, as a dotfiles manager does.
+        fs.symlinkSync(path.join(dirB, "config.json"), `${link}.tmp`);
+        fs.renameSync(`${link}.tmp`, link);
+        await notified.promise;
+        notified = Promise.withResolvers<void>();
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(dirA, { recursive: true, force: true });
+        fs.rmSync(dirB, { recursive: true, force: true });
+      }
+    });
+
+    it("notifies when another process creates the config dir with its first save", async () => {
+      const rootDir = path.join(tempDir, "fresh-root");
+      const fresh = new Config(rootDir);
+      const next = nextNotification(fresh);
+      await new Config(rootDir).setUpdateChannel("nightly");
+      await next.promise;
+      next.unsubscribe();
+      expect(fresh.getUpdateChannel()).toBe("nightly");
+    });
+
     it("notifies for a rewrite that lands while the watch starts", async () => {
       await config.setUpdateChannel("npm");
       const realWatch = fs.watch;
