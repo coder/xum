@@ -2595,8 +2595,7 @@ export class MCPServerManager {
       const prompts = saved.prompts.get(serverName);
       if (prompts !== undefined && instance.prompts.length === 0) {
         instance.prompts = prompts;
-        // A restored catalog is a stale value, not a missing one: serve it while revalidating.
-        this.promptListSettledInstances.add(instance);
+        this.markRestoredCatalogListed(instance);
       }
     }
   }
@@ -2650,6 +2649,14 @@ export class MCPServerManager {
     if (signal?.aborted !== true) this.promptListSettledInstances.add(instance);
   }
 
+  /**
+   * A restored catalog is a stale value, not a missing one: serve it while revalidating. An
+   * empty one can come from a server that was never listed (warmed, then stopped idle).
+   */
+  private markRestoredCatalogListed(instance: MCPServerInstance): void {
+    if (instance.prompts.length > 0) this.promptListSettledInstances.add(instance);
+  }
+
   /** Whether a served instance of the workspace never settled a prompts/list. */
   private hasUnlistedPromptInstances(workspaceId: string): boolean {
     const entry = this.workspaceServers.get(workspaceId);
@@ -2678,12 +2685,15 @@ export class MCPServerManager {
   ): Promise<boolean> {
     // The serve's own background refresh can settle before this check runs.
     if (!unlistedAtServe && !this.hasUnlistedPromptInstances(workspaceId)) return false;
-    const entry = this.workspaceServers.get(workspaceId);
-    if (entry === undefined) return false;
-    // Share the serve's background refresh (deduped per entry) with every concurrent send.
-    if (this.hasUnlistedPromptInstances(workspaceId))
+    // Share the entry's deduped background refresh with every concurrent send. A refresh that
+    // was already in flight covers only the instances it started with, so a second round lists
+    // an instance added since then.
+    for (let round = 0; round < 2 && this.hasUnlistedPromptInstances(workspaceId); round++) {
+      const entry = this.workspaceServers.get(workspaceId);
+      if (entry === undefined) break;
       this.refreshInstancePromptsInBackground(entry);
-    await entry.promptRefreshInFlight;
+      await entry.promptRefreshInFlight;
+    }
     return true;
   }
 
