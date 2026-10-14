@@ -825,6 +825,55 @@ describe("McpOauthService OAuth flows", () => {
     });
   });
 
+  // A sign-in's deadline and Cancel must cover authorization-server discovery: a stalled
+  // metadata request must not keep the start pending (and the desktop listener bound) (#6164).
+  test.each([
+    ["plugin registrationUrl discovery", true],
+    ["SDK discovery", false],
+  ])("a sign-in settled during stalled %s returns at once", async (_label, withRegistrationUrl) => {
+    let stalled!: () => void;
+    const discoveryStalled = new Promise<void>((resolve) => (stalled = resolve));
+    const server = createServer((req, res) => {
+      const pathname = (req.url ?? "/").split("?")[0];
+      if (pathname.startsWith("/.well-known/oauth-authorization-server")) {
+        stalled(); // Never answers until the client gives up.
+        req.on("close", () => res.destroy());
+        return;
+      }
+      res.statusCode = pathname === "/mcp" ? 401 : 404;
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Failed to bind");
+      const base = `http://127.0.0.1:${address.port}`;
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: {
+          transport: "http",
+          url: `${base}/mcp`,
+          disabled: true,
+          oauth: {
+            clientId: "c",
+            ...(withRegistrationUrl
+              ? {
+                  discovery: { authorizationServerBase: base, registrationUrl: `${base}/register` },
+                }
+              : {}),
+          },
+        },
+      });
+      const starting = service.startDesktopFlow({ projectPath, serverName: "docs" });
+      await discoveryStalled;
+      // The update-time sign-out settles every flow of this server (the deadline does the same).
+      await service.logout({ serverUrl: `${base}/mcp` });
+      expect(await starting).toEqual({ success: false, error: "Signed out" });
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   test("a token exchange in flight when the user signs out saves nothing", async () => {
     let tokenRequested!: () => void;
     const requested = new Promise<void>((resolve) => (tokenRequested = resolve));
@@ -1185,7 +1234,7 @@ describe("McpOauthService OAuth flows", () => {
       expect(await usable(pinned("https://b.example.com"))).toBe(false);
     });
 
-    test("a sign-in whose probe spans a sign-out writes credentials the new issuer never uses", async () => {
+    test("a sign-in whose probe spans a sign-out ends with it and writes nothing", async () => {
       let probing!: () => void;
       const probed = new Promise<void>((resolve) => (probing = resolve));
       let releaseProbe!: () => void;
@@ -1237,20 +1286,11 @@ describe("McpOauthService OAuth flows", () => {
         // The update's sign-out lands while the flow is still probing.
         await service.logout({ serverUrl: url });
         releaseProbe();
-        const start = await starting;
-        if (!start.success) throw new Error(start.error);
-        await service.handleServerCallbackAndExchange({
-          state: start.data.flowId,
-          code: "the-code",
-          iss: null,
-          error: null,
-        });
-        // The old-identity flow did write; only the issuer it carries keeps it from serving B.
+        // The flow is registered before its probe, so the sign-out ends it (#6164): the
+        // old-identity flow never reaches the token endpoint.
+        expect(await starting).toEqual({ success: false, error: "Signed out" });
         expect(
           await service.getAuthProviderForServer({ serverUrl: url, oauth: configA })
-        ).toBeDefined();
-        expect(
-          await service.getAuthProviderForServer({ serverUrl: url, oauth: configB })
         ).toBeUndefined();
         expect(await service.hasAuthTokens({ serverUrl: url, oauth: configB })).toBe(false);
       } finally {
