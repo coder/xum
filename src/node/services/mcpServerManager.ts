@@ -902,7 +902,8 @@ interface StdioLaunch {
   env?: Record<string, string>;
   /**
    * #6509: a plugin server gets only the minimal host environment plus its
-   * declared env, so it cannot read the user's shell secrets. User-configured
+   * declared env, so the user's shell secrets are not passed to it. Not a sandbox:
+   * the server runs as the same OS user (see docs/config/mcp-servers.mdx). User-configured
    * servers keep the full environment.
    */
   hostEnv: NonNullable<ExecOptions["hostEnv"]>;

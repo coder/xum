@@ -186,7 +186,7 @@ describe("LocalBaseRuntime.exec PATH handling", () => {
 });
 
 describe("LocalBaseRuntime.exec hostEnv", () => {
-  // #6509: plugin stdio MCP servers must not read the user's shell secrets.
+  // #6509: plugin stdio MCP servers must not inherit the user's shell secrets.
   async function runEnvProbe(hostEnv: "inherit" | "minimal" | undefined) {
     const runtime = new TestLocalRuntime();
     const stream = await runtime.exec(

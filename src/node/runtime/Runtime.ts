@@ -59,7 +59,7 @@ export interface ExecOptions {
    * Base environment taken from the Xum host process before `env` is applied.
    * "inherit" (default) passes all of process.env; "minimal" passes only
    * pickMinimalChildEnv's allowlist (#6509: managed plugin stdio MCP servers
-   * must not read the user's shell secrets). Only host-local runtimes read the
+   * must not inherit the user's shell secrets). Only host-local runtimes read the
    * host environment, so remote runtimes ignore this field.
    */
   hostEnv?: "inherit" | "minimal";
