@@ -99,7 +99,8 @@ export const AgentPluginInstallEntrySchema = z.object({
    * its current fingerprint matches, so a newer build that parses more of the package cannot load
    * a changed component under an approved name. Top-level, not under importedComponents: older
    * builds spread importedComponents on save and would keep a nested record stale. Absent on
-   * older installs, which then need a review (no backfill).
+   * older installs, which then need a review (no backfill). `z.record` drops a `__proto__` key on
+   * parse, so a component with that name never has consent: it fails closed.
    */
   componentConsent: z
     .object({
