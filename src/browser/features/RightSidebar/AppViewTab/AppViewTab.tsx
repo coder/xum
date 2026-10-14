@@ -58,7 +58,7 @@ export function AppViewTabLabel(props: { workspaceId: string; toolCallId: string
       ? ""
       : index >= 0
         ? appViewServerNames(views)[index]
-        : mcpServerDisplayName(ref.serverName);
+        : (ref.serverLabel ?? mcpServerDisplayName(ref.serverName));
   return (
     <span className="inline-flex min-w-0 items-center gap-1">
       <AppWindow className="h-3 w-3 shrink-0" />
@@ -75,7 +75,7 @@ export function AppViewTabTooltip(props: { workspaceId: string; toolCallId: stri
   const ref = typeof view === "object" ? view : null;
   return ref == null ? null : (
     <span className="wrap-anywhere">
-      {ref.label} · {ref.serverName}
+      {ref.label} · {ref.serverLabel ?? ref.serverName}
     </span>
   );
 }
