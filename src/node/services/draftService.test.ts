@@ -1118,6 +1118,43 @@ describe("DraftService workspace name state", () => {
     });
   });
 
+  it("answers a partial legacy import with the merged draft it stored", async () => {
+    using tempDir = new TestTempDir("drafts-name-import-merged");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const bodyKept: DraftScope = { kind: "creation", projectPath, draftId: "body-kept" };
+    const nameKept: DraftScope = { kind: "creation", projectPath, draftId: "name-kept" };
+    await service.update({ scope: bodyKept, text: "newer backend text" });
+    await service.update({ scope: nameKept, nameState });
+
+    // A client applies the reply as the draft at its revision (a later same-revision change
+    // event is dropped as stale), so the reply must hold what was stored, not the legacy input.
+    const nameImport = await service.importLegacy({
+      scope: bodyKept,
+      text: "stale legacy text",
+      nameState,
+    });
+    expect(nameImport).toMatchObject({
+      result: "applied",
+      text: "newer backend text",
+      attachments: [],
+      nameState,
+    });
+    const other = { ...nameState, manualName: "legacy-name", autoGenerate: false };
+    const bodyImport = await service.importLegacy({
+      scope: nameKept,
+      text: "legacy text",
+      attachments: [image],
+      nameState: other,
+    });
+    expect(bodyImport).toMatchObject({
+      result: "applied",
+      text: "legacy text",
+      attachments: [{ id: image.id, mediaType: image.mediaType }],
+      nameState,
+    });
+    expect(nameImport.revision).toBe((await service.get(bodyKept)).revision);
+  });
 });
 
 describe("DraftService workspace name state size", () => {

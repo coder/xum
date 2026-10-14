@@ -658,10 +658,10 @@ export class DraftService extends EventEmitter {
       if (!(await this.hasOwner(scope))) {
         return { result: "orphaned", revision: this.getRevision(key) };
       }
-      if (isStoredDraftEmpty(stored)) {
-        return { result: "applied", revision: this.getRevision(key) };
-      }
-      return { result: "applied", revision: await this.persist(scope, filePath, stored) };
+      const revision = isStoredDraftEmpty(stored)
+        ? this.getRevision(key)
+        : await this.persist(scope, filePath, stored);
+      return { result: "applied", ...writeOutput(scope, stored, revision) };
     });
   }
 
