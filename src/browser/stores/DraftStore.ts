@@ -831,8 +831,7 @@ export class DraftStore {
       if (!merged.has(key)) merged.set(key, entry);
     }
     for (const [key, { entry }] of this.pendingListPuts) merged.set(key, entry);
-    for (const key of this.pendingDeletes.keys()) merged.delete(key);
-    for (const key of this.waitingDeletes) merged.delete(key);
+    for (const key of [...this.pendingDeletes.keys(), ...this.waitingDeletes]) merged.delete(key);
     const byProject: CreationDraftsByProject = {};
     for (const { projectPath, ...draft } of merged.values()) {
       (byProject[projectPath] ??= []).push(draft);
@@ -2120,22 +2119,33 @@ export class DraftStore {
         removeKeys();
       } catch (error) {
         console.warn("Failed to import a legacy draft; will retry on next start:", error);
-        // The backend could not be consulted, so this bypasses the non-clobber rule on purpose:
-        // if the snapshot has no draft for the scope, show the legacy one and let the normal write
-        // path save it. Otherwise the composer starts empty, the user types, and the next import
-        // answers "present" and drops the legacy keys: a guaranteed loss. The keys stay until a
-        // later import confirms.
-        const existing = this.entries.get(draftStoreScopeKey(scope));
-        if (!existing || (existing.text.length === 0 && existing.attachmentCount === 0)) {
-          this.setText(scope, text);
-          this.setAttachments(scope, attachments);
-        }
-        if (nameState !== null && this.getView(scope).nameState === null) {
-          this.setNameState(scope, nameState);
-        }
+        this.showUnimportedLegacyDraft(scope, text, attachments, nameState);
       }
     }
     await this.migrateLegacyNameStates(client, pendingNameKeys);
+  }
+
+  /**
+   * A legacy draft whose import failed. The backend could not be consulted, so this bypasses the
+   * non-clobber rule on purpose: if the snapshot has no draft for the scope, show the legacy one
+   * and let the normal write path save it. Otherwise the composer starts empty, the user types,
+   * and the next import answers "present" and drops the legacy keys: a guaranteed loss. The keys
+   * stay until a later import confirms.
+   */
+  private showUnimportedLegacyDraft(
+    scope: DraftScope,
+    text: string,
+    attachments: DraftAttachment[],
+    nameState: WorkspaceNamePersistedState | null
+  ): void {
+    const existing = this.entries.get(draftStoreScopeKey(scope));
+    if (!existing || (existing.text.length === 0 && existing.attachmentCount === 0)) {
+      this.setText(scope, text);
+      this.setAttachments(scope, attachments);
+    }
+    if (nameState !== null && this.getView(scope).nameState === null) {
+      this.setNameState(scope, nameState);
+    }
   }
 
   /**
