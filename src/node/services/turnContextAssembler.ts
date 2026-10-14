@@ -262,8 +262,8 @@ function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
       return message;
     }
     const tag = `[id: ${getHistoryItemId(message)}]`;
-    // Append inside the last text part: mergeConsecutiveUserMessages joins the text parts of
-    // merged rows into one, so the tag stays at the end of this row's text.
+    // Append inside the last text part: mergeConsecutiveUserMessages keeps each row's parts in
+    // order, so the tag stays at the end of this row's text.
     const lastText = message.parts.findLastIndex((part) => part.type === "text");
     return {
       ...message,

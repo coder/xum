@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
@@ -12,6 +12,7 @@ import {
   runPostHook,
 } from "./hooks";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { log } from "@/node/services/log";
 import { ExecPathMappingRuntime } from "./testExecPathMappingRuntime";
 
 describe("hooks", () => {
@@ -343,6 +344,73 @@ describe("hooks", () => {
 
       expect(result.success).toBe(true);
       expect(result.exitCode).toBe(0);
+    });
+
+    test("a post-hook skipped because its tool call was aborted is not logged as an error", async () => {
+      const hookPath = path.join(tempDir, ".xum", "tool_post");
+      await fs.mkdir(path.dirname(hookPath), { recursive: true });
+      await fs.writeFile(hookPath, "#!/bin/bash\nexit 0");
+      await fs.chmod(hookPath, 0o755);
+      const context = {
+        tool: "test_tool",
+        toolInput: "{}",
+        workspaceId: "test-workspace",
+        projectDir: tempDir,
+        abortSignal: AbortSignal.abort(),
+      };
+      const logError = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        // Cancelled tool call (user interrupt, memory intuition deadline): skipped hook.
+        const aborted = await runPostHook(runtime, hookPath, context, { success: true });
+        expect(aborted.success).toBe(false);
+        expect(logError).not.toHaveBeenCalled();
+
+        // Any other failure to run the hook is still an error.
+        const failing = Object.create(runtime) as LocalRuntime;
+        failing.exec = () => Promise.reject(new Error("spawn failed"));
+        const failed = await runPostHook(
+          failing,
+          hookPath,
+          { ...context, abortSignal: undefined },
+          { success: true }
+        );
+        expect(failed.output).toContain("spawn failed");
+        expect(logError).toHaveBeenCalledTimes(1);
+      } finally {
+        logError.mockRestore();
+      }
+    });
+
+    test("pre- and post-hooks still run when a tool value contains NUL bytes", async () => {
+      const writeHook = async (name: string) => {
+        const hookPath = path.join(tempDir, ".xum", name);
+        await fs.mkdir(path.dirname(hookPath), { recursive: true });
+        await fs.writeFile(
+          hookPath,
+          '#!/bin/bash\necho "ok=$XUM_TOOL_INPUT_OK nul=${XUM_TOOL_INPUT_NUL-unset}"'
+        );
+        await fs.chmod(hookPath, 0o755);
+        return hookPath;
+      };
+      // Binary bash output (or file content) can carry NUL; spawn rejects such env values.
+      const toolInputValue = { nul: "a\0b", ok: "x" };
+      const context = {
+        tool: "bash",
+        toolInput: JSON.stringify(toolInputValue),
+        toolInputValue,
+        workspaceId: "test-workspace",
+        projectDir: tempDir,
+      };
+
+      const pre = await runPreHook(runtime, await writeHook("tool_pre"), context);
+      expect(pre.allowed).toBe(true);
+      expect(pre.output).toBe("ok=x nul=unset");
+
+      const post = await runPostHook(runtime, await writeHook("tool_post"), context, {
+        output: "binary\0output",
+      });
+      expect(post.success).toBe(true);
+      expect(post.output).toBe("ok=x nul=unset");
     });
 
     test("receives MUX_TOOL_RESULT env var", async () => {

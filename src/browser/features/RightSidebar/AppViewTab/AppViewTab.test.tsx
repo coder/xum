@@ -2,7 +2,7 @@
 import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import {
   appViewDetails,
@@ -136,6 +136,94 @@ describe("AppViewTabPanel", () => {
       await waitFor(() =>
         expect(opened).toEqual([{ serverName: "dice", resourceUri: "ui://dice/board.html" }])
       );
+    } finally {
+      registered.mockRestore();
+      state.mockRestore();
+    }
+  });
+
+  test("a restored tab of a failed or interrupted call outside the transcript gets tool-cancelled", async () => {
+    // Restored after a restart, before the last compaction boundary: only the result record
+    // knows how the call ended.
+    const store = useWorkspaceStoreRaw();
+    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(
+      (id) => id === "ws-ended"
+    );
+    const state = spyOn(store, "getWorkspaceState").mockImplementation(
+      () =>
+        ({
+          messages: [],
+          loading: false,
+          isHydratingTranscript: false,
+        }) as unknown as WorkspaceState
+    );
+    const client = createTestApiClient({
+      mcpApps: {
+        getViewRecords: (input: { toolCallIds: string[] }) =>
+          Promise.resolve({
+            success: true as const,
+            data: input.toolCallIds.map((toolCallId) => ({
+              toolCallId,
+              view: {
+                serverName: "dice",
+                toolName: "dice_show_dice_board",
+                resourceUri: "ui://dice/board.html",
+                arguments: {},
+                outcome:
+                  toolCallId === "call-failed" ? ("failed" as const) : ("interrupted" as const),
+              },
+            })),
+          }),
+        getView: () =>
+          Promise.resolve({
+            success: true as const,
+            data: {
+              html: "<p>view</p>",
+              csp: {},
+              prefersBorder: null,
+              resultAvailable: false,
+              result: null,
+              invocation: null,
+            },
+          }),
+      },
+    });
+    try {
+      for (const [toolCallId, reason] of [
+        ["call-failed", "failed"],
+        ["call-interrupted", "interrupted"],
+      ] as const) {
+        const view = render(
+          <ThemeProvider forcedTheme="dark">
+            <APIProvider client={client}>
+              <AppViewTabPanel
+                workspaceId="ws-ended"
+                toolCallId={toolCallId}
+                onClose={() => undefined}
+              />
+            </APIProvider>
+          </ThemeProvider>
+        );
+        const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+        const posted: Array<{ method?: string; params?: unknown }> = [];
+        frame.contentWindow!.postMessage = ((message: { method?: string; params?: unknown }) => {
+          posted.push(message);
+        }) as Window["postMessage"];
+        const event = new window.Event("message");
+        Object.defineProperty(event, "data", {
+          value: { jsonrpc: "2.0", method: "ui/notifications/initialized" },
+        });
+        Object.defineProperty(event, "source", { value: frame.contentWindow });
+        act(() => {
+          window.dispatchEvent(event);
+        });
+        await waitFor(() =>
+          expect(
+            posted.find((m) => m.method === "ui/notifications/tool-cancelled")?.params
+          ).toEqual({ reason })
+        );
+        view.unmount();
+      }
     } finally {
       registered.mockRestore();
       state.mockRestore();

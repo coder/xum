@@ -14,6 +14,7 @@ import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { textContrast } from "@/browser/stories/helpers/contrast";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import type { MCPServerInfo } from "@/common/types/mcp";
@@ -60,6 +61,7 @@ interface MCPSectionStoryOptions {
   secrets?: Secret[];
   preCacheTools?: boolean;
   experiments?: Partial<Record<ExperimentId, boolean>>;
+  mcpAppViewDomainsListError?: string;
 }
 
 function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): APIClient {
@@ -99,6 +101,7 @@ function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): API
     mcpTestResults,
     mcpOauthAuthStatus: options.mcpOauthAuthStatus,
     experiments: options.experiments,
+    mcpAppViewDomainsListError: options.mcpAppViewDomainsListError,
   });
 }
 
@@ -689,6 +692,32 @@ export const ClaudeDesignPhone: Story = {
     const card = within(context.canvasElement).getByRole("region", { name: "Claude Design" });
     await expect(card.getBoundingClientRect().width).toBeLessThanOrEqual(375);
     await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth);
+  },
+};
+
+// A failed load of the MCP App view-domain approvals shows its error with a Retry instead of an
+// empty list (#6181). Phone width: the error wraps and Retry stays on screen.
+export const ViewDomainsLoadErrorPhone: Story = {
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+  // The test-runner ignores viewport globals; the wrapper enforces the width there too.
+  render: () => (
+    <div style={{ width: 375, maxWidth: "100%" }}>
+      <MCPSettingsSectionStoryShell
+        setup={() =>
+          setupMCPSettingsSectionStory({ mcpAppViewDomainsListError: "The backend is busy" })
+        }
+      >
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const error = await canvas.findByText(/Could not load allowed view domains: The backend/);
+    const row = error.parentElement!;
+    await expect(within(row).getByRole("button", { name: "Retry" })).toBeVisible();
+    await expect(row.getBoundingClientRect().right).toBeLessThanOrEqual(375);
   },
 };
 

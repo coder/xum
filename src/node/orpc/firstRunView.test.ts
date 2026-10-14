@@ -5,9 +5,19 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
-import { AUTH_TOKEN_KEY, ONBOARDING_VIEWED_KEY } from "@/common/constants/storage";
+import {
+  AUTH_TOKEN_KEY,
+  LEFT_SIDEBAR_COLLAPSED_KEY,
+  ONBOARDING_VIEWED_KEY,
+} from "@/common/constants/storage";
+import { VERSION } from "@/version";
 import { FIRST_RUN_MODULES_ID } from "../../../scripts/perf/firstLoadJs";
-import { FIRST_RUN_EARLY_SCRIPT, FIRST_RUN_TEMPLATE_ID, FIRST_RUN_VIEW_HTML } from "./firstRunView";
+import {
+  FIRST_RUN_EARLY_SCRIPT,
+  FIRST_RUN_TEMPLATE_ID,
+  FIRST_RUN_VIEW_HTML,
+  firstRunViewHtml,
+} from "./firstRunView";
 
 interface Call {
   url: string;
@@ -26,6 +36,7 @@ afterEach(async () => {
 /** Runs the script on a served "/" (the module list, then the template), with fakes for its inputs. */
 function run(
   o: {
+    sidebar?: string;
     url?: string;
     viewed?: boolean;
     token?: string;
@@ -45,6 +56,7 @@ function run(
   doc.body.innerHTML = `<div id="root"></div><template id="${FIRST_RUN_TEMPLATE_ID}">${FIRST_RUN_VIEW_HTML}</template>`;
   if (o.viewed) window.localStorage.setItem(ONBOARDING_VIEWED_KEY, "true");
   if (o.token) window.localStorage.setItem(AUTH_TOKEN_KEY, o.token);
+  if (o.sidebar) window.localStorage.setItem(LEFT_SIDEBAR_COLLAPSED_KEY, o.sidebar);
   let visibility = o.hidden ? "hidden" : "visible";
   let readyState = o.loading ? "loading" : "complete";
   Object.defineProperty(doc, "visibilityState", { get: () => visibility, configurable: true });
@@ -211,6 +223,20 @@ describe("the early script", () => {
     error.mockRestore();
   });
 
+  // Option A (owner decision 10-14): the view takes the app's saved sidebar choice, a JSON boolean.
+  // Catches a missing copy, swapped states, and a copy of a value the app would not read (also an
+  // object-key lookup, which finds "toString" on the prototype).
+  test.each([
+    ["true", "collapsed"],
+    ["false", "expanded"],
+    ["1", undefined],
+    ["toString", undefined],
+  ])("marks the view with a saved sidebar value of %s", async (saved, state) => {
+    const page = run({ sidebar: saved });
+    await page.answer([], {});
+    expect(page.view()?.dataset.sidebar).toBe(state);
+  });
+
   // Catches a script that runs on a slashless URL, which the redirect script navigates away from.
   test("does nothing on a slashless URL", () => {
     const page = run({ url: "http://127.0.0.1/xum" });
@@ -219,3 +245,16 @@ describe("the early script", () => {
 });
 
 type Page = ReturnType<typeof run>;
+
+// Catches a hard-coded version in the static title bar, and one inserted without HTML escaping.
+test("the static title bar shows the build's version, escaped", () => {
+  const version = (html: string) => {
+    const window = new GlobalWindow();
+    window.document.body.innerHTML = html;
+    const text = window.document.querySelector("[data-pre-version]")?.textContent;
+    void window.happyDOM.close();
+    return text;
+  };
+  expect(version(FIRST_RUN_VIEW_HTML)).toBe(VERSION.git_describe);
+  expect(version(firstRunViewHtml("v1 <b>&"))).toBe("v1 <b>&");
+});
