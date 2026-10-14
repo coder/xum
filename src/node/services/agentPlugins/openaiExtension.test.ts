@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
-import { normalizeCodexManifest, readOpenAIExtension } from "./openaiExtension";
+import {
+  MAX_HOOK_POINTER_ENTRIES,
+  normalizeCodexManifest,
+  readOpenAIExtension,
+} from "./openaiExtension";
 
 const validInterface = { displayName: "Figma", shortDescription: "Design", developerName: "Figma" };
 
@@ -137,6 +141,33 @@ describe("readOpenAIExtension", () => {
     });
     expect(extension).toEqual({});
     expect(warnings).toHaveLength(1);
+  });
+
+  test("reads at most the hook loader's entry cap and reports the rest once", () => {
+    const { extension, warnings } = readOpenAIExtension({
+      extensions: {
+        "com.openai": { hooks: [...Array(100_000).fill("/bad"), "./hooks/late.json"] },
+      },
+    });
+
+    // The late valid entry is past the cap, so no entry is valid: the default file stays off.
+    expect(extension).toEqual({ hooks: [] });
+    expect(warnings).toHaveLength(MAX_HOOK_POINTER_ENTRIES + 1);
+    expect(warnings.at(-1)).toContain("100001 entries");
+  });
+
+  test("keeps review and publication as opaque objects; other shapes warn", () => {
+    const review = { tests: [{ prompt: "Hi" }] };
+    const kept = readOpenAIExtension({
+      extensions: { "com.openai": { review, publication: { countries: [] } } },
+    });
+    expect(kept).toEqual({ extension: { review, publication: { countries: [] } }, warnings: [] });
+
+    const dropped = readOpenAIExtension({
+      extensions: { "com.openai": { review: "yes", publication: [] } },
+    });
+    expect(dropped.extension).toEqual({});
+    expect(dropped.warnings).toHaveLength(2);
   });
 
   test("an absent namespace yields nothing; a non-object namespace warns", () => {

@@ -60,6 +60,13 @@ export interface OpenAIPluginExtension {
   /** Relative path to a packaged skill's SKILL.md. */
   onboardingSkill?: string;
   interface?: OpenAIPluginInterface;
+  /**
+   * Directory submission metadata, kept opaque: nothing in Xum reads it. Kept in the typed view
+   * so an overlay's values are not lost when the root manifest has no `com.openai`
+   * (Codex PRRT_kwDOPxxmWM6rvwzT, #6297).
+   */
+  review?: Record<string, unknown>;
+  publication?: Record<string, unknown>;
 }
 
 const FIELD = `extensions["${OPENAI_EXTENSION_NAMESPACE}"]`;
@@ -199,8 +206,16 @@ export function normalizeOpenAIRelativePath(value: unknown): string | undefined 
   return segments.every((segment) => segment === ".") ? undefined : trimmed;
 }
 
+/**
+ * Hook pointer entries read per plugin. Install Preview reads an untrusted repository, and a
+ * 256 KiB manifest can hold ~100k entries: discovery would emit one diagnostic per invalid entry,
+ * and the hook loader would reread a repeated file each time (#6297).
+ */
+export const MAX_HOOK_POINTER_ENTRIES = 32;
+
 function readHooks(raw: unknown, warnings: string[]): OpenAIPluginHooksEntry[] {
-  const entries: unknown[] = Array.isArray(raw) ? raw : [raw];
+  const all: unknown[] = Array.isArray(raw) ? raw : [raw];
+  const entries = all.slice(0, MAX_HOOK_POINTER_ENTRIES);
   const hooks: OpenAIPluginHooksEntry[] = [];
   for (const entry of entries) {
     if (isPlainObject(entry)) {
@@ -215,6 +230,11 @@ function readHooks(raw: unknown, warnings: string[]): OpenAIPluginHooksEntry[] {
       continue;
     }
     hooks.push(relative);
+  }
+  if (all.length > entries.length) {
+    warnings.push(
+      `'${FIELD}.hooks' has ${all.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
+    );
   }
   return hooks;
 }
@@ -249,6 +269,12 @@ export function readOpenAIExtension(manifest: Pick<AgentPluginManifest, "extensi
   if (raw.interface !== undefined) {
     const parsed = readInterface(raw.interface, warnings);
     if (parsed !== undefined) extension.interface = parsed;
+  }
+  for (const key of ["review", "publication"] as const) {
+    const value = raw[key];
+    if (value === undefined) continue;
+    if (isPlainObject(value)) extension[key] = value;
+    else warnings.push(`'${FIELD}.${key}' must be an object; ignoring`);
   }
   return { extension, warnings };
 }
