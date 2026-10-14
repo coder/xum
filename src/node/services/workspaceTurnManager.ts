@@ -10,7 +10,7 @@ import {
 import assert from "node:assert/strict";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
-import { type Config } from "@/node/config";
+import { type Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { StreamManager } from "@/node/services/streamManager";
 import {
@@ -6062,15 +6062,7 @@ export class WorkspaceTurnManager {
             continue;
           }
         } else {
-          await this.taskHost.editWorkspaceEntry(
-            task.id,
-            (workspace) => {
-              workspace.taskExecutionId = normalized.handleId;
-              workspace.taskExecutionStatus = normalized.status;
-            },
-            { allowMissing: true }
-          );
-          await this.taskHost.emitWorkspaceMetadata(task.id);
+          await this.persistRecoveredTerminalExecutionMirror(task.id, task, normalized);
         }
         if (isActiveWorkspaceTurnTaskStatus(normalized.status)) {
           this.activeWorkspaceTurnHandleByWorkspaceId.set(task.id, {
@@ -6092,6 +6084,40 @@ export class WorkspaceTurnManager {
         });
       }
     }
+  }
+
+  /**
+   * Startup reconciliation's write for a terminal handle: a compare-and-set against the mirror
+   * the startup snapshot read. With many tasks the pass outlives the startup step bound, so it
+   * overlaps early clients: a parent can reawaken the child after the snapshot was read, and that
+   * reawakening's mirror (new handle, `running`) must win. Rewriting the stale terminal pointer
+   * over it made the live child read as idle-after-report, so its own task and workflow_run
+   * spawns were refused with "cannot spawn new tasks after agent_report".
+   */
+  private async persistRecoveredTerminalExecutionMirror(
+    workspaceId: string,
+    snapshot: Pick<WorkspaceConfigEntry, "taskExecutionId" | "taskExecutionStatus">,
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<void> {
+    assert(
+      !isActiveWorkspaceTurnTaskStatus(record.status),
+      "persistRecoveredTerminalExecutionMirror: record must be terminal"
+    );
+    await this.taskHost.editWorkspaceEntry(
+      workspaceId,
+      (workspace) => {
+        if (
+          workspace.taskExecutionId !== snapshot.taskExecutionId ||
+          workspace.taskExecutionStatus !== snapshot.taskExecutionStatus
+        ) {
+          return;
+        }
+        workspace.taskExecutionId = record.handleId;
+        workspace.taskExecutionStatus = record.status;
+      },
+      { allowMissing: true }
+    );
+    await this.taskHost.emitWorkspaceMetadata(workspaceId);
   }
 
   /**

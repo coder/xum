@@ -16488,7 +16488,7 @@ export class TaskService implements AgentTaskIntegration {
 
   listAgentTaskExecutionEntries(
     config: ReturnType<Config["loadConfigOrDefault"]>
-  ): Array<{ id?: string; taskExecutionId?: string }> {
+  ): Array<Pick<WorkspaceConfigEntry, "id" | "taskExecutionId" | "taskExecutionStatus">> {
     return this.listAgentTaskWorkspaces(config);
   }
 
