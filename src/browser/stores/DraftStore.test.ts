@@ -925,6 +925,42 @@ describe("DraftStore", () => {
     expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
   });
 
+  // #6438, review round 3: the store stays hydrated across the switch, so an edit can be saved
+  // to the new backend before its snapshot arrives. That reply was then compared with the old
+  // backend's view, lost to it, and the old text came back.
+  test("an edit saved to a new backend before its snapshot keeps the typed text", async () => {
+    using tempDir = new TestTempDir("draft-store-new-backend-early-write");
+    const { config, client } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "text on the old backend");
+    await store.flush(WS_SCOPE);
+
+    const realNow = Date.now;
+    Date.now = () => realNow() - 3_600_000;
+    let service: DraftService;
+    try {
+      service = new DraftService(config);
+    } finally {
+      Date.now = realNow;
+    }
+    const next = createClient(service);
+    // The new backend's snapshot is slow: the edit below is saved before it arrives.
+    let releaseSnapshot: () => void = () => undefined;
+    next.control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(next.client);
+
+    store.setText(WS_SCOPE, "typed after the switch");
+    await store.flush(WS_SCOPE);
+    expect(next.control.updates).toBe(1);
+    expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
+    releaseSnapshot();
+    await waitFor(() => store.getText(WS_SCOPE) === "typed after the switch" && store.isHydrated());
+    expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
+  });
+
   // #6438, the same switch with a write in flight: the old backend's late reply confirmed the
   // edit, so it was never written to the new backend (lost on reload), and its view (the old
   // backend's higher revision) again outranked every later reply of the new one.

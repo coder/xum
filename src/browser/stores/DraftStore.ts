@@ -1643,15 +1643,11 @@ export class DraftStore {
       seen.add(draftStoreScopeKey(summary.scope));
       // Each subscription restarts the revision sequence, so a restarted backend is never ignored.
       entry.revision = summary.revision;
-      // The view of the backend before goes with it: a new backend can number its revisions lower
-      // (another process, its clock behind), and that view would outrank all of its replies (#6438).
-      entry.serverView = null;
       this.applyServerState(entry, summary.text, summary.attachments, summary.pendingSends ?? []);
     }
     for (const [key, entry] of this.entries) {
       if (entry.scope.kind !== "pending" && !seen.has(key)) {
         entry.revision = Number.NEGATIVE_INFINITY;
-        entry.serverView = null;
         this.applyServerState(entry, "", [], []);
       }
     }
@@ -1683,6 +1679,7 @@ export class DraftStore {
     const controller = new AbortController();
     this.subscription = controller;
     const { signal } = controller;
+    this.forgetServerViews();
     if (!this.ready && !this.readyTimer) {
       // Startup must never hang on drafts (a subscription that never yields, a stuck legacy
       // import): let composers render after a bound. Writes still wait for hydration, and a late
@@ -1759,6 +1756,20 @@ export class DraftStore {
       }
     };
     run().catch((error: unknown) => console.error("Draft subscription failed:", error));
+  }
+
+  /**
+   * A subscription may reach another backend process (a new client, or a restarted backend),
+   * which numbers its revisions anew, possibly lower (its clock behind). The views and revisions
+   * of the backend before would outrank all of its replies and pushes, and put old text back
+   * over typing (#6438). Forgotten here, before any write can reach the new backend: the store
+   * stays hydrated meanwhile, so an edit may be saved there before its snapshot arrives.
+   */
+  private forgetServerViews(): void {
+    for (const entry of this.entries.values()) {
+      entry.serverView = null;
+      entry.revision = Number.NEGATIVE_INFINITY;
+    }
   }
 
   private stopSubscription(): void {
