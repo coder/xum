@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
 import { installDom } from "../../../../tests/ui/dom";
@@ -18,7 +18,11 @@ import type { ArtifactEntry } from "@/common/orpc/schemas/artifacts";
 import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/workspace";
 import type { GoalSnapshot } from "@/common/types/goal";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
-import type { WorkspaceSidebarState, WorkspaceUsageState } from "@/browser/stores/WorkspaceStore";
+import type {
+  WorkspaceSidebarState,
+  WorkspaceState,
+  WorkspaceUsageState,
+} from "@/browser/stores/WorkspaceStore";
 import type { TabType } from "@/browser/types/rightSidebar";
 import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as RealGitStatusStoreModule from "@/browser/stores/GitStatusStore";
@@ -43,8 +47,11 @@ void mock.module("@/browser/stores/GitStatusStore", () => ({
 }));
 
 import { OVERVIEW_MAX_LIST_ROWS, RightSidebarOverview } from "./RightSidebarOverview";
-import { openMcpAppViewTab, type McpAppViewRef } from "./ArtifactsTab/mcpAppViewsStore";
-import { appViewTabFor } from "./AppViewTab/appViewTabs";
+import {
+  getMcpAppViews,
+  openMcpAppViewTab,
+  type McpAppViewRef,
+} from "./ArtifactsTab/mcpAppViewsStore";
 
 const WORKSPACE_ID = "ws-main";
 
@@ -94,6 +101,19 @@ function usage(tokens: number, costUsd: number): ChatUsageDisplay {
 
 function artifact(path: string, modifiedMs: number): ArtifactEntry {
   return { path, kind: "markdown", size: 10, modifiedMs };
+}
+
+/** An API whose Artifacts listing is empty: the Outputs section shows app views only. */
+function emptyArtifactsClient() {
+  return createTestApiClient({
+    artifacts: {
+      list: () =>
+        Promise.resolve({
+          success: true as const,
+          data: { available: true as const, dir: "/a", entries: [], truncated: false },
+        }),
+    },
+  });
 }
 
 function renderOverview(
@@ -460,9 +480,93 @@ describe("RightSidebarOverview", () => {
         "1 more",
       ])
     );
-    // An app view opens in its own app tab: the Artifacts tab lists only files.
-    fireEvent.click(section.getByRole("button", { name: /Roll dice/ }));
-    expect(opened).toEqual([appViewTabFor("call-new")]);
+    // An app view opens in its own app tab (the Artifacts tab lists only files), through the
+    // view store like its tool card does.
+    const focused: unknown[] = [];
+    const onFocus = (event: Event) => focused.push((event as CustomEvent).detail);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onFocus);
+    try {
+      fireEvent.click(section.getByRole("button", { name: /Roll dice/ }));
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onFocus);
+    }
+    expect(focused).toEqual([{ workspaceId: appsWorkspace, toolCallId: "call-new" }]);
+    expect(opened).toEqual([]);
+  });
+
+  // A view from the transcript only: after compaction drops its call, the tab still needs the
+  // ref, as when the tool card or the palette opened it.
+  test("an app row keeps its view's ref when it opens the view", async () => {
+    const appsWorkspace = "ws-apps-transcript";
+    const store = RealWorkspaceStoreModule.useWorkspaceStoreRaw();
+    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(
+      (id) => id === appsWorkspace
+    );
+    const state = spyOn(store, "getWorkspaceState").mockImplementation(
+      () =>
+        ({
+          messages: [
+            {
+              type: "tool",
+              toolCallId: "call-transcript",
+              toolName: "dice_roll",
+              args: {},
+              status: "completed",
+              mcpServer: {
+                connection: { key: "dice", transport: "stdio" },
+                identity: { name: "dice", version: "1.0.0" },
+                source: "connection",
+                app: { resourceUri: "ui://dice/roll" },
+              },
+            },
+          ],
+          loading: false,
+          isHydratingTranscript: false,
+        }) as unknown as WorkspaceState
+    );
+    try {
+      const { view } = renderOverview([workspace({ id: appsWorkspace })], {
+        artifactsEnabled: true,
+        client: emptyArtifactsClient(),
+        workspaceId: appsWorkspace,
+      });
+      const section = within(await view.findByRole("region", { name: "Outputs" }));
+      expect(getMcpAppViews(appsWorkspace)).toEqual([]);
+      fireEvent.click(section.getByRole("button", { name: /dice_roll/ }));
+      expect(getMcpAppViews(appsWorkspace).map((v) => v.toolCallId)).toEqual(["call-transcript"]);
+    } finally {
+      registered.mockRestore();
+      state.mockRestore();
+    }
+  });
+
+  // The Artifacts tab lists only files, so More cannot lead there for hidden app views.
+  test("More lists the hidden app views in the card", async () => {
+    const appsWorkspace = "ws-apps-more";
+    for (const id of ["v1", "v2", "v3", "v4"]) {
+      openMcpAppViewTab(appsWorkspace, {
+        toolCallId: id,
+        serverName: "dice",
+        resourceUri: "ui://dice/roll",
+        toolName: "roll",
+        label: `Roll ${id}`,
+        arguments: {},
+        cancelled: false,
+        failed: false,
+      });
+    }
+    const { view, opened } = renderOverview([workspace({ id: appsWorkspace })], {
+      artifactsEnabled: true,
+      client: emptyArtifactsClient(),
+      workspaceId: appsWorkspace,
+    });
+    const section = within(await view.findByRole("region", { name: "Outputs" }));
+    const rows = () => section.getAllByRole("button").map((row) => row.textContent);
+    await waitFor(() => expect(rows()).toEqual(["Roll v4", "Roll v3", "Roll v2", "1 more"]));
+    fireEvent.click(section.getByRole("button", { name: "1 more" }));
+    expect(rows()).toEqual(["Roll v4", "Roll v3", "Roll v2", "Roll v1"]);
+    expect(opened).toEqual([]);
+    expect(document.activeElement?.textContent).toBe("Roll v1");
   });
 
   test("tells repeated MCP app calls apart and marks failed ones", async () => {

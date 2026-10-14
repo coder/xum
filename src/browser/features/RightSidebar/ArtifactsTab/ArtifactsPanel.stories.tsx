@@ -1161,6 +1161,60 @@ export const McpAppViewPhone: Story = {
   play: ({ canvasElement }) => playMcpAppView(canvasElement),
 };
 
+// A tab whose view failed to load offers Reload. The mock has no view for the call at first (the
+// load fails); the play adds it and presses Reload, which remounts the frame.
+const RELOAD_TOOL_CALL_ID = "call-weather-reload";
+const reloadViews: Record<string, McpAppView> = {};
+function renderMcpAppViewReload() {
+  delete reloadViews[RELOAD_TOOL_CALL_ID];
+  openMcpAppViewTab(WORKSPACE_ID, {
+    toolCallId: RELOAD_TOOL_CALL_ID,
+    serverName: "weather",
+    resourceUri: "ui://weather/view.html",
+    toolName: "show_weather",
+    label: "Show weather",
+    arguments: { city: "Berlin" },
+    cancelled: false,
+    failed: false,
+  });
+  return (
+    <APIProvider client={createMockORPCClient({ mcpApps: { views: reloadViews } })}>
+      {/* Pinned to a phone's sidebar width: the test runner plays at desktop size. */}
+      <div data-testid="phone-width" className="bg-sidebar h-screen" style={{ width: 358 }}>
+        <AppViewTabPanel
+          workspaceId={WORKSPACE_ID}
+          toolCallId={RELOAD_TOOL_CALL_ID}
+          onClose={() => undefined}
+        />
+      </div>
+    </APIProvider>
+  );
+}
+/** Failed load, then Reload: Play only (the stack adds no Pixel snapshots, shared cap). */
+export const McpAppViewReloadPhone: Story = {
+  ...PHONE,
+  render: () => renderMcpAppViewReload(),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText(/No view for call-weather-reload/);
+    const reload = canvas.getByRole("button", { name: "Reload" });
+    // The button stays inside the narrow tab.
+    const tab = canvas.getByTestId("phone-width").getBoundingClientRect();
+    await expect(reload.getBoundingClientRect().right).toBeLessThanOrEqual(tab.right);
+    reloadViews[RELOAD_TOOL_CALL_ID] = {
+      html: "<p>Berlin</p>",
+      csp: {},
+      prefersBorder: null,
+      resultAvailable: true,
+      result: { content: [{ type: "text", text: "Berlin: 18°C" }] },
+      approvalProjectPath: "/repo",
+      invocation: null,
+    };
+    await userEvent.click(reload);
+    await canvas.findByTestId("mcp-app-frame");
+  },
+};
+
 // A view that declares https domains asks once per server; until then it runs on the base policy.
 const DOMAINS_CSP = {
   connectDomains: ["https://api.example.com"],

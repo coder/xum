@@ -41,8 +41,7 @@ import { isAbortError } from "@/browser/utils/isAbortError";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { makeSideChatTabType, type TabType } from "@/browser/types/rightSidebar";
 import { openArtifact } from "./ArtifactsTab/openArtifact";
-import { appViewDetails, useMcpAppViews } from "./ArtifactsTab/mcpAppViewsStore";
-import { appViewTabFor } from "./AppViewTab/appViewTabs";
+import { appViewDetails, openMcpAppViewTab, useMcpAppViews } from "./ArtifactsTab/mcpAppViewsStore";
 import { TAB_ICONS } from "./Tabs/tabIcons";
 
 /**
@@ -379,6 +378,16 @@ const OverviewStats: React.FC<{ workspaceId: string; onOpen: () => void }> = (pr
 };
 
 /**
+ * App view rows of the Outputs list: all once More revealed them, otherwise at least one when
+ * there are any, so files never push the newest app result out.
+ */
+function overviewAppRows(appViews: number, files: number, revealed: boolean): number {
+  if (revealed) return appViews;
+  if (appViews === 0) return 0;
+  return Math.min(appViews, Math.max(1, OVERVIEW_MAX_LIST_ROWS - files));
+}
+
+/**
  * The Artifacts tab's newest files and app views. Listed once when the card shows, then again
  * after the agent's file edits; the card is a glance, so it skips the tab's polling.
  */
@@ -388,6 +397,9 @@ const OverviewOutputs: React.FC<{
 }> = (props) => {
   const api = useOptionalAPI()?.api ?? null;
   const appViews = useMcpAppViews(props.workspaceId);
+  // The Artifacts tab lists only files, so More reveals hidden app views here (like side chats):
+  // the number of app rows shown before, null until then.
+  const [revealedFrom, setRevealedFrom] = React.useState<number | null>(null);
   const [files, setFiles] = React.useState<readonly ArtifactEntry[]>([]);
   // The backend capped its walk (entry limit, depth, unreadable folders): more files exist than
   // `files` holds, so the "more" row cannot give an exact count.
@@ -430,16 +442,15 @@ const OverviewOutputs: React.FC<{
   // app result is never pushed out by files, each kind keeps at least one of the capped rows
   // when it has any. A file opens in the Artifacts tab; an app view in its own app tab (Artifacts
   // lists only files). Either tab gets focus (the activated row unmounts as the sidebar expands).
-  const appRows =
-    appViews.length === 0
-      ? 0
-      : Math.min(appViews.length, Math.max(1, OVERVIEW_MAX_LIST_ROWS - files.length));
-  const fileRows = Math.min(files.length, OVERVIEW_MAX_LIST_ROWS - appRows);
+  const appRows = overviewAppRows(appViews.length, files.length, revealedFrom != null);
+  const fileRows = Math.min(files.length, Math.max(0, OVERVIEW_MAX_LIST_ROWS - appRows));
+  const hiddenAppViews = appViews.length - appRows;
   const shown: Array<{
     key: string;
     Icon: LucideIcon;
     label: string;
     sub?: string | null;
+    focusOnMount?: boolean;
     open: () => void;
   }> = [
     ...files.slice(0, fileRows).map((file) => {
@@ -461,7 +472,11 @@ const OverviewOutputs: React.FC<{
       Icon: TAB_ICONS.artifacts,
       label: view.label,
       sub: details[index] || null,
-      open: () => props.onOpenTab(appViewTabFor(view.toolCallId)),
+      // The first row the More row revealed takes focus, as for side chats.
+      focusOnMount: index === revealedFrom,
+      // Through the view store, like the tool card and the palette: it keeps the view's ref, so
+      // the tab still resolves after compaction drops the call from the loaded transcript.
+      open: () => openMcpAppViewTab(props.workspaceId, view),
     })),
   ];
   // A truncated walk can end before reaching any file (only a too-deep or unreadable folder), yet
@@ -476,13 +491,16 @@ const OverviewOutputs: React.FC<{
           Icon={output.Icon}
           label={output.label}
           sub={output.sub}
+          focusOnMount={output.focusOnMount}
           onClick={output.open}
         />
       ))}
       <MoreRow
         count={files.length + appViews.length - shown.length}
         atLeast={filesTruncated}
-        onClick={() => props.onOpenTab("artifacts")}
+        onClick={() =>
+          hiddenAppViews > 0 ? setRevealedFrom(appRows) : props.onOpenTab("artifacts")
+        }
       />
     </OverviewSection>
   );

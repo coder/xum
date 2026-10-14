@@ -28,6 +28,8 @@ import {
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { MCP_APP_ENTRYPOINT_NOT_CONNECTED } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
 import { CommandIds } from "@/browser/utils/commandIds";
+import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
+import { withAppViewTab } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import type { OpenLocalServerResult, RemoteConnectionApi } from "@/common/types/remoteConnection";
 
 const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
@@ -2446,6 +2448,48 @@ test("app view entries tell several calls of one tool apart", () => {
   );
   expect(subtitles.every((s) => s?.startsWith("dice"))).toBe(true);
   expect(new Set(subtitles).size).toBe(3);
+});
+
+// The keyboard path to Reload: only a view with an open tab has one, and it focuses that tab.
+test("an app view with an open tab gets a Reload command that focuses its tab", () => {
+  const testWindow = new GlobalWindow();
+  const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
+  globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  globalThis.document = testWindow.document as unknown as Document;
+  try {
+    const call = (toolCallId: string) => ({
+      type: "tool",
+      toolCallId,
+      toolName: "dice_show_dice_board",
+      args: {},
+      status: "completed",
+      mcpServer: {
+        connection: { key: "dice", transport: "stdio" },
+        identity: { name: "dice", version: "1.0.0" },
+        source: "connection",
+        app: { resourceUri: "ui://dice/board.html" },
+      },
+    });
+    updateRightSidebarLayout("w1", (state) => withAppViewTab(state, "open"));
+    const actions = getActions({
+      artifactsEnabled: true,
+      selectedWorkspaceState: {
+        messages: [call("open"), call("closed")],
+      } as unknown as WorkspaceState,
+    });
+    expect(actions.some((a) => a.id === CommandIds.navReloadAppView("closed"))).toBe(false);
+    const reload = actions.find((a) => a.id === CommandIds.navReloadAppView("open"));
+    const focused: unknown[] = [];
+    testWindow.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, (event) =>
+      focused.push((event as unknown as CustomEvent).detail)
+    );
+    void reload?.run();
+    expect(focused).toEqual([{ workspaceId: "w1", toolCallId: "open" }]);
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+  }
 });
 
 test("a plugin view's palette entry shows its server part and keeps the full key searchable", () => {

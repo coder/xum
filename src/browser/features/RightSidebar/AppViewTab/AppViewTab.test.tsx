@@ -142,6 +142,57 @@ describe("AppViewTabPanel", () => {
     }
   });
 
+  test("a tab whose view failed to load offers Reload, which loads it again", async () => {
+    let calls = 0;
+    const client = createTestApiClient({
+      mcpApps: {
+        getView: () => {
+          calls += 1;
+          return Promise.resolve(
+            calls === 1
+              ? { success: false as const, error: "server not connected" }
+              : {
+                  success: true as const,
+                  data: {
+                    html: "<p>view</p>",
+                    csp: {},
+                    prefersBorder: null,
+                    resultAvailable: true,
+                    result: { content: [] },
+                    invocation: null,
+                  },
+                }
+          );
+        },
+      },
+    });
+    openMcpAppViewTab("ws-retry", {
+      toolCallId: "call-retry",
+      serverName: "dice",
+      resourceUri: "ui://dice/board.html",
+      toolName: "show",
+      label: "Board",
+      arguments: {},
+      cancelled: false,
+      failed: false,
+    });
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <APIProvider client={client}>
+          <AppViewTabPanel
+            workspaceId="ws-retry"
+            toolCallId="call-retry"
+            onClose={() => undefined}
+          />
+        </APIProvider>
+      </ThemeProvider>
+    );
+    expect(await view.findByText(/server not connected/)).toBeTruthy();
+    fireEvent.click(view.getByRole("button", { name: "Reload" }));
+    await view.findByTestId("mcp-app-frame");
+    expect(calls).toBe(2);
+  });
+
   test("tabs of two plugin installs with one server name show their instance markers", () => {
     for (const [id, key] of [
       ["m1", "plugin:0123456789abcdef:tray"],
@@ -367,6 +418,24 @@ describe("app view details", () => {
       registered.mockRestore();
       state.mockRestore();
     }
+  });
+
+  // A narrow tab cuts the label's detail off, so the tooltip carries it too.
+  test("the tooltip of one of several calls of a tool names that call's detail", () => {
+    for (const [id, args] of [
+      ["t-old", { count: 4 }],
+      ["t-new", { count: 6 }],
+    ] as const) {
+      openMcpAppViewTab("ws-tooltip", view(id, args));
+    }
+    const tooltip = (toolCallId: string) =>
+      render(
+        <APIProvider client={createTestApiClient({})}>
+          <AppViewTabTooltip workspaceId="ws-tooltip" toolCallId={toolCallId} />
+        </APIProvider>
+      ).container.textContent;
+    expect(tooltip("t-old")).toBe("Board · dice · count: 4");
+    expect(tooltip("t-new")).toBe("Board · dice · count: 6");
   });
 
   test("numbers repeats of the same call, oldest first", () => {
