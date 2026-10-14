@@ -28,6 +28,7 @@ import {
   createMcpAppHost,
   declaresFullscreenOnly,
   type McpAppConsentRequest,
+  type McpAppDisplayMode,
   type McpAppHost,
   type McpAppHostContext,
 } from "./mcpAppHost";
@@ -368,6 +369,27 @@ function useContainerDimensionsUpdates(hostRef: { current: McpAppHost | null }, 
   };
 }
 
+/**
+ * Runs an accepted display-mode move of a view (setDisplayMode): fullscreen opens or focuses
+ * its tab, any other mode (inline) closes the tab so its expanded card takes the view back.
+ */
+function moveViewTo(
+  mode: McpAppDisplayMode,
+  input: { workspaceId: string; view: McpAppViewRef; onClose?: () => void }
+) {
+  if (mode === "fullscreen") {
+    openMcpAppViewTab(input.workspaceId, input.view);
+    return;
+  }
+  // The user collapsed the card during the teardown wait: closing the tab would leave the view
+  // without a frame. It stays in its tab and loads again (it was torn down).
+  if (!isMcpAppViewHosted(input.workspaceId, input.view.toolCallId, "card")) {
+    reloadMcpAppView(input.workspaceId, input.view.toolCallId);
+    return;
+  }
+  input.onClose?.();
+}
+
 /** The domain prompt's text: the origins, and the project that keeps the approval. */
 function DomainsPromptText(props: { origins: readonly string[]; projectPath: string | null }) {
   return (
@@ -663,17 +685,11 @@ export function McpAppFrame(props: {
         if (mode === "inline" && !isMcpAppViewHosted(workspaceId, toolCallId, "card")) return null;
         return () => {
           if (hostRef.current !== host) return;
-          if (mode === "fullscreen") {
-            openMcpAppViewTab(workspaceId, latest.current.view);
-            return;
-          }
-          // The user collapsed the card during the teardown wait: closing the tab would leave the
-          // view without a frame. It stays in its tab and loads again (it was torn down).
-          if (!isMcpAppViewHosted(workspaceId, toolCallId, "card")) {
-            reloadMcpAppView(workspaceId, toolCallId);
-            return;
-          }
-          latest.current.onClose?.();
+          moveViewTo(mode, {
+            workspaceId,
+            view: latest.current.view,
+            onClose: latest.current.onClose,
+          });
         };
       },
       log: (message, data) =>
