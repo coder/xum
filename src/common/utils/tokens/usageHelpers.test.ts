@@ -414,27 +414,30 @@ describe("Anthropic 1h-TTL cache-write share", () => {
 
 describe("accumulateStepsProviderMetadata", () => {
   test("returns undefined for streams that never reported metadata", () => {
-    expect(accumulateStepsProviderMetadata([])).toBeUndefined();
-    expect(accumulateStepsProviderMetadata([{}, {}])).toBeUndefined();
+    expect(accumulateStepsProviderMetadata([], undefined)).toBeUndefined();
+    expect(accumulateStepsProviderMetadata([{}, {}], undefined)).toBeUndefined();
   });
 
   test("sums cache-write tokens across steps (last-step metadata alone would drop them)", () => {
-    const result = accumulateStepsProviderMetadata([
-      { providerMetadata: { anthropic: { cacheCreationInputTokens: 1000 } } },
-      { providerMetadata: { anthropic: { cacheCreationInputTokens: 500 } } },
-      // Final step reads from cache only — its own metadata reports 0 writes.
-      { providerMetadata: { anthropic: { cacheCreationInputTokens: 0 } } },
-    ]);
+    const result = accumulateStepsProviderMetadata(
+      [
+        { providerMetadata: { anthropic: { cacheCreationInputTokens: 1000 } } },
+        { providerMetadata: { anthropic: { cacheCreationInputTokens: 500 } } },
+        // Final step reads from cache only — its own metadata reports 0 writes.
+        { providerMetadata: { anthropic: { cacheCreationInputTokens: 0 } } },
+      ],
+      undefined
+    );
     expect(
       (result?.anthropic as { cacheCreationInputTokens: number }).cacheCreationInputTokens
     ).toBe(1500);
   });
 
   test("keeps earlier metadata when a later step reports none", () => {
-    const result = accumulateStepsProviderMetadata([
-      { providerMetadata: { anthropic: { cacheCreationInputTokens: 300 } } },
-      {},
-    ]);
+    const result = accumulateStepsProviderMetadata(
+      [{ providerMetadata: { anthropic: { cacheCreationInputTokens: 300 } } }, {}],
+      undefined
+    );
     expect(
       (result?.anthropic as { cacheCreationInputTokens: number }).cacheCreationInputTokens
     ).toBe(300);

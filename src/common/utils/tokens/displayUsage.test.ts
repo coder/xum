@@ -1,6 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import { createDisplayUsage, recomputeUsageCosts } from "./displayUsage";
-import { getTotalCost, sumUsageHistory } from "./usageAggregator";
+import { getTotalCost, sumUsageHistory, type ChatUsageDisplay } from "./usageAggregator";
+import { accumulateStepsProviderMetadata, addUsage } from "./usageHelpers";
 import { ChatUsageDisplaySchema } from "@/common/orpc/schemas/chatStats";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
@@ -382,9 +383,15 @@ describe("createDisplayUsage", () => {
 
     test("keeps the recorded costs of a tiered aggregate without an unknown-pricing flag", () => {
       const model = "anthropic:claude-haiku-5-5";
-      // Each request is under Haiku 5.5's 100K threshold; their sum is not.
-      const request = () =>
-        createDisplayUsage({ inputTokens: 80000, outputTokens: 500, totalTokens: 80500 }, model)!;
+      // Each request is under Haiku 5.5's 100K threshold; their sum is not. Rows recorded
+      // before per-request long-context shares carry none.
+      const request = () => {
+        const { longContextTokens: _share, ...usage } = createDisplayUsage(
+          { inputTokens: 80000, outputTokens: 500, totalTokens: 80500 },
+          model
+        )!;
+        return usage;
+      };
       const aggregate = sumUsageHistory([request(), request()])!;
 
       const result = recomputeUsageCosts(aggregate, model, { aggregatedUsage: true });
@@ -567,6 +574,138 @@ describe("createDisplayUsage", () => {
       expect(result).toBeDefined();
       expect(result!.cacheCreate.tokens).toBe(1500);
     });
+  });
+});
+
+describe("long-context tiers chosen per request", () => {
+  // Haiku 5.5 bills a whole request at 5x once its prompt passes 100K tokens.
+  const MODEL = "anthropic:claude-haiku-5-5";
+  interface Step {
+    usage: LanguageModelV2Usage;
+    providerMetadata?: Record<string, unknown>;
+  }
+  const step = (usage: Partial<LanguageModelV2Usage>, cacheWrite1h = 0): Step => ({
+    usage: { inputTokens: 0, outputTokens: 500, totalTokens: 0, ...usage },
+    ...(cacheWrite1h > 0 && {
+      providerMetadata: {
+        anthropic: {
+          cacheCreationInputTokens: cacheWrite1h,
+          usage: {
+            cache_creation: {
+              ephemeral_5m_input_tokens: 0,
+              ephemeral_1h_input_tokens: cacheWrite1h,
+            },
+          },
+        },
+      },
+    }),
+  });
+  const turnUsage = (steps: Step[]): LanguageModelV2Usage =>
+    steps.reduce<LanguageModelV2Usage | undefined>((sum, s) => addUsage(sum, s.usage), undefined)!;
+  /** A turn as the stream end records it: summed usage plus the steps' summed metadata. */
+  const priceTurn = (steps: Step[]): ChatUsageDisplay =>
+    createDisplayUsage(turnUsage(steps), MODEL, accumulateStepsProviderMetadata(steps, MODEL))!;
+  /** What the provider bills: each step priced as its own request. */
+  const priceRequests = (steps: Step[]): ChatUsageDisplay =>
+    sumUsageHistory(steps.map((s) => createDisplayUsage(s.usage, MODEL, s.providerMetadata)!))!;
+  const totalCost = (usage: ChatUsageDisplay) => getTotalCost(usage) ?? NaN;
+
+  test("steps each under the threshold price at base rates although their sum is over", () => {
+    const steps = [step({ inputTokens: 80_000 }), step({ inputTokens: 90_000 })];
+    const summedPrompt = createDisplayUsage(turnUsage(steps), MODEL)!;
+    expect(summedPrompt.input.tokens).toBeGreaterThan(100_000);
+
+    const turn = priceTurn(steps);
+
+    expect(totalCost(turn)).toBeCloseTo(totalCost(priceRequests(steps)), 12);
+    expect(totalCost(turn) * 4).toBeLessThan(totalCost(summedPrompt));
+  });
+
+  test("one step over the threshold prices only that step at the long-context rate", () => {
+    const steps = [
+      step({ inputTokens: 60_000 }),
+      step(
+        {
+          inputTokens: 130_000,
+          cachedInputTokens: 100_000,
+          outputTokens: 800,
+          reasoningTokens: 300,
+        },
+        20_000
+      ),
+      step({ inputTokens: 70_000, cachedInputTokens: 50_000 }),
+    ];
+    const turn = priceTurn(steps);
+    const requests = priceRequests(steps);
+    const cost = (usage: ChatUsageDisplay, key: "input" | "cached" | "cacheCreate") =>
+      usage[key].cost_usd ?? NaN;
+    const outputCost = (usage: ChatUsageDisplay) =>
+      (usage.output.cost_usd ?? NaN) + (usage.reasoning.cost_usd ?? NaN);
+
+    for (const key of ["input", "cached", "cacheCreate"] as const) {
+      expect(cost(turn, key)).toBeCloseTo(cost(requests, key), 12);
+    }
+    expect(outputCost(turn)).toBeCloseTo(outputCost(requests), 12);
+    expect(totalCost(turn)).toBeCloseTo(totalCost(requests), 12);
+    // Without per-step shares the summed prompt would bill the whole turn at the long rate.
+    const summedPrompt = createDisplayUsage(
+      turnUsage(steps),
+      MODEL,
+      accumulateStepsProviderMetadata(steps, undefined)
+    )!;
+    expect(totalCost(turn)).toBeLessThan(totalCost(summedPrompt));
+  });
+
+  test("an aggregate of per-request shares reprices exactly after a price-table change", () => {
+    const turns = [
+      priceTurn([step({ inputTokens: 60_000 }), step({ inputTokens: 130_000 })]),
+      priceTurn([step({ inputTokens: 90_000 })]),
+    ];
+    // Persisted through the session-usage schema, then left with costs from an older table.
+    const aggregate = ChatUsageDisplaySchema.parse(sumUsageHistory(turns));
+    const stale: ChatUsageDisplay = {
+      ...aggregate,
+      input: { tokens: aggregate.input.tokens, cost_usd: 0 },
+      cached: { tokens: aggregate.cached.tokens, cost_usd: 0 },
+      cacheCreate: { tokens: aggregate.cacheCreate.tokens, cost_usd: 0 },
+      output: { tokens: aggregate.output.tokens, cost_usd: 0 },
+      reasoning: { tokens: aggregate.reasoning.tokens, cost_usd: 0 },
+    };
+
+    const repriced = recomputeUsageCosts(stale, MODEL, { aggregatedUsage: true });
+
+    expect(totalCost(repriced)).toBeCloseTo(totalCost(turns[0]) + totalCost(turns[1]), 12);
+  });
+
+  test("an aggregate keeps its recorded costs once one summed entry lacks a share", () => {
+    const { longContextTokens: _share, ...legacy } = priceTurn([
+      step({ inputTokens: 60_000 }),
+      step({ inputTokens: 130_000 }),
+    ]);
+    const aggregate = sumUsageHistory([priceTurn([step({ inputTokens: 90_000 })]), legacy])!;
+
+    expect(aggregate.longContextTokens).toBeUndefined();
+    expect(recomputeUsageCosts(aggregate, MODEL, { aggregatedUsage: true })).toEqual(aggregate);
+  });
+
+  test("a malformed persisted share prices no more than every token at the long rate", () => {
+    const allLong = priceTurn([step({ inputTokens: 130_000, cachedInputTokens: 30_000 })]);
+    const huge = 1e12;
+    const corrupt: ChatUsageDisplay = {
+      ...allLong,
+      longContextTokens: {
+        input: huge,
+        cached: huge,
+        cacheCreate: huge,
+        cacheCreate1h: huge,
+        output: huge,
+      },
+    };
+
+    const repaired = recomputeUsageCosts(corrupt, MODEL);
+
+    expect(totalCost(repaired)).toBeCloseTo(totalCost(allLong), 12);
+    expect(repaired.longContextTokens).toEqual(allLong.longContextTokens);
   });
 });
 

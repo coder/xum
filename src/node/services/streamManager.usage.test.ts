@@ -6,6 +6,9 @@ import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { StreamAbortEventSchema } from "@/common/orpc/schemas/stream";
 import { Err, Ok } from "@/common/types/result";
+import type { MuxMessage } from "@/common/types/message";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import { StreamManager, type TurnEngineEvent, type TurnExecutionOptions } from "./streamManager";
 import { SessionUsageService } from "./sessionUsageService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -95,6 +98,25 @@ async function readSidecarRecords(
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
+// Haiku 5.5 bills a whole request at its long-context rate once the prompt passes 100K tokens.
+const LONG_CONTEXT_MODEL = "anthropic:claude-haiku-5-5";
+// Under the threshold alone; the turn's summed prompt is over it.
+const SHORT_STEP_USAGE = { inputTokens: 80_000, outputTokens: 400, totalTokens: 80_400 };
+const LONG_STEP_USAGE = { inputTokens: 120_000, outputTokens: 600, totalTokens: 120_600 };
+
+/** The persisted turn's cost minus the provider's bill: each step priced as its own request. */
+function costAboveRequestPrices(message: MuxMessage, steps: Array<Record<string, number>>) {
+  const turn = createDisplayUsage(
+    message.metadata?.usage,
+    LONG_CONTEXT_MODEL,
+    message.metadata?.providerMetadata
+  );
+  const requests = sumUsageHistory(
+    steps.map((usage) => createDisplayUsage(usage, LONG_CONTEXT_MODEL)!)
+  );
+  return (getTotalCost(turn) ?? NaN) - (getTotalCost(requests) ?? NaN);
+}
+
 /** The turn's only sidecar row: a duplicate write would double-count the spend. */
 async function readSingleSidecarRecord(
   sessionsDir: string,
@@ -157,6 +179,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
     historySequence?: number;
     chunks: ScriptedChunk[];
     usage?: Record<string, number>;
+    steps?: ScriptedAttempt["steps"];
     streamManager?: StreamManager;
     events?: TurnEngineEvent[];
     options?: Partial<TurnExecutionOptions>;
@@ -172,6 +195,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
           {
             chunks: params.chunks,
             usage: params.usage ?? { inputTokens: 4, outputTokens: 6, totalTokens: 10 },
+            steps: params.steps,
           },
           ...(params.fallbackAttempts ?? []),
         ]),
@@ -247,6 +271,20 @@ describe("StreamManager - TTFT metadata persistence", () => {
 
     expect(updatedMessage.metadata?.model).toBe("openai:my-gpt4");
     expect(updatedMessage.metadata?.metadataModel).toBe("openai:gpt-4");
+  });
+
+  test("a completed turn prices each step at its own context tier", async () => {
+    const steps = [SHORT_STEP_USAGE, LONG_STEP_USAGE];
+    const message = await completeTurnAndReadMessage({
+      workspaceId: "long-context-completed-workspace",
+      messageId: "long-context-completed-message",
+      chunks: [...steps.map((usage) => finishStep(usage)), text("done"), STOP_FINISH],
+      usage: { inputTokens: 200_000, outputTokens: 1_000, totalTokens: 201_000 },
+      steps: steps.map((usage) => ({ usage })),
+      options: { modelString: LONG_CONTEXT_MODEL },
+    });
+
+    expect(costAboveRequestPrices(message, steps)).toBeCloseTo(0, 12);
   });
 
   test("emits and persists routeProvider from initial stream metadata", async () => {
@@ -570,6 +608,24 @@ describe("StreamManager - aborted stream usage persistence", () => {
       anthropic: { cacheCreationInputTokens: 42 },
     });
     expect(partial?.metadata?.contextUsage).toMatchObject(ABORT_STEP_USAGE);
+  });
+
+  test("an aborted turn prices each finished step at its own context tier", async () => {
+    const workspaceId = "long-context-abort-workspace";
+    const messageId = "long-context-abort-message";
+    const steps = [SHORT_STEP_USAGE, LONG_STEP_USAGE];
+    const { streamManager, completion } = await startHeldTurnForTests({
+      workspaceId,
+      messageId,
+      chunks: [partialText, ...steps.map((usage) => finishStep(usage))],
+      options: { modelString: LONG_CONTEXT_MODEL },
+    });
+
+    await streamManager.stopStream(workspaceId, { abortReason: "user" });
+    expect((await completion).status).toBe("aborted");
+
+    const partial = await readHistoryMessage(historyService, workspaceId, messageId);
+    expect(costAboveRequestPrices(partial, steps)).toBeCloseTo(0, 12);
   });
 
   test("emits the effective fallback model and its pinned pricing identity with aborted usage", async () => {

@@ -86,14 +86,15 @@ export async function appendPartialAssistantForTests(
 export function createStreamResultForTests(
   fullStream: AsyncGenerator<unknown, void, unknown>,
   usage: unknown = TEST_USAGE,
-  providerMetadata: unknown = undefined
+  providerMetadata: unknown = undefined,
+  steps: unknown[] = []
 ): Record<string, unknown> {
   return {
     fullStream,
     totalUsage: Promise.resolve(usage),
     usage: Promise.resolve(usage),
     providerMetadata: Promise.resolve(providerMetadata),
-    steps: Promise.resolve([]),
+    steps: Promise.resolve(steps),
   };
 }
 
@@ -162,6 +163,8 @@ export interface ScriptedAttempt {
   /** streamResult usage/totalUsage for the attempt; omitted means TEST_USAGE. */
   usage?: Record<string, number>;
   providerMetadata?: Record<string, unknown>;
+  /** streamResult steps (each step's usage and provider metadata); omitted means none. */
+  steps?: Array<{ usage: Record<string, number>; providerMetadata?: Record<string, unknown> }>;
   /** Keep the stream open after the chunks until the turn's abort signal fires. */
   holdUntilAbort?: boolean;
 }
@@ -199,7 +202,8 @@ export function scriptedStreamText(attempts: Array<ScriptedAttempt | Error>) {
         }
       })(),
       attempt.usage,
-      attempt.providerMetadata
+      attempt.providerMetadata,
+      attempt.steps
     );
   });
 }

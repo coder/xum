@@ -7,8 +7,22 @@
 
 import { getModelStats, type ModelStats } from "./modelStats";
 import { readReportedServiceTier, withServiceTierPricing } from "./serviceTierPricing";
-import type { ChatUsageDisplay } from "./usageAggregator";
-import { getAnthropicCacheWrite1hTokens, type AiSdkUsageLike } from "./usageHelpers";
+import {
+  clampLongContextTokens,
+  getCacheCreate1hTokens,
+  getLongContextTokens,
+  NO_LONG_CONTEXT_TOKENS,
+  type ChatUsageDisplay,
+  type LongContextTokens,
+} from "./usageAggregator";
+import {
+  getPromptTokens,
+  readLongContextTokens,
+  readUsageTokens,
+  toLongContextTokens,
+  type AiSdkUsageLike,
+  type UsageTokens,
+} from "./usageHelpers";
 
 /**
  * Anthropic bills 1-hour-TTL cache writes at 2x base input (5-minute writes use the
@@ -17,16 +31,6 @@ import { getAnthropicCacheWrite1hTokens, type AiSdkUsageLike } from "./usageHelp
  * https://platform.claude.com/docs/en/build-with-claude/prompt-caching#pricing
  */
 const CACHE_WRITE_1H_INPUT_MULTIPLIER = 2;
-
-interface UsageCostInputs {
-  inputTokens: number;
-  cachedTokens: number;
-  cacheCreateTokens: number;
-  /** Share of cacheCreateTokens written at the 1h TTL (0 when unreported). */
-  cacheCreate1hTokens: number;
-  outputTokens: number;
-  reasoningTokens: number;
-}
 
 interface RecomputeUsageCostsOptions {
   aggregatedUsage?: boolean;
@@ -40,21 +44,32 @@ interface UsageCosts {
   reasoningCost: number;
 }
 
-function selectCostRate(
-  modelStats: ModelStats,
-  promptContextTokens: number,
-  baseRate: number,
-  highContextRate?: number
-): number {
-  if (
-    highContextRate != null &&
-    modelStats.tiered_pricing_threshold_tokens != null &&
-    promptContextTokens > modelStats.tiered_pricing_threshold_tokens
-  ) {
-    return highContextRate;
-  }
+interface TierRates {
+  input: number;
+  cached: number;
+  cacheCreate: number;
+  output: number;
+}
 
-  return baseRate;
+function tierRates(modelStats: ModelStats, longContext: boolean): TierRates {
+  // A token class without a long-context rate keeps its base rate in both tiers.
+  const rate = (baseRate: number, longRate: number | undefined) =>
+    longContext ? (longRate ?? baseRate) : baseRate;
+  return {
+    input: rate(modelStats.input_cost_per_token, modelStats.input_cost_per_token_above_200k_tokens),
+    cached: rate(
+      modelStats.cache_read_input_token_cost ?? 0,
+      modelStats.cache_read_input_token_cost_above_200k_tokens
+    ),
+    cacheCreate: rate(
+      modelStats.cache_creation_input_token_cost ?? 0,
+      modelStats.cache_creation_input_token_cost_above_200k_tokens
+    ),
+    output: rate(
+      modelStats.output_cost_per_token,
+      modelStats.output_cost_per_token_above_200k_tokens
+    ),
+  };
 }
 
 function hasTieredPricing(modelStats: ModelStats): boolean {
@@ -66,43 +81,61 @@ function hasTieredPricing(modelStats: ModelStats): boolean {
   );
 }
 
-function calculateUsageCosts(modelStats: ModelStats, usage: UsageCostInputs): UsageCosts {
-  // Long-context providers price the entire prompt tier (input/cache reads/cache writes)
-  // based on prompt size, then reuse that same tier for output/reasoning charges.
-  const promptContextTokens = usage.inputTokens + usage.cachedTokens + usage.cacheCreateTokens;
-  const inputRate = selectCostRate(
-    modelStats,
-    promptContextTokens,
-    modelStats.input_cost_per_token,
-    modelStats.input_cost_per_token_above_200k_tokens
-  );
-  const cachedRate = selectCostRate(
-    modelStats,
-    promptContextTokens,
-    modelStats.cache_read_input_token_cost ?? 0,
-    modelStats.cache_read_input_token_cost_above_200k_tokens
-  );
-  const cacheCreateRate = selectCostRate(
-    modelStats,
-    promptContextTokens,
-    modelStats.cache_creation_input_token_cost ?? 0,
-    modelStats.cache_creation_input_token_cost_above_200k_tokens
-  );
-  const outputRate = selectCostRate(
-    modelStats,
-    promptContextTokens,
-    modelStats.output_cost_per_token,
-    modelStats.output_cost_per_token_above_200k_tokens
-  );
+/**
+ * The share of `tokens` to price at long-context rates; undefined for models without tiered
+ * pricing. Providers choose the tier per request from its prompt size and apply it to the
+ * whole request (input, cache reads and writes, output). `recorded` is the per-request share
+ * summed over the usage's requests; without it the usage prices as one request.
+ */
+function resolveLongContextTokens(
+  modelStats: ModelStats,
+  tokens: UsageTokens,
+  recorded: LongContextTokens | undefined
+): LongContextTokens | undefined {
+  const threshold = modelStats.tiered_pricing_threshold_tokens;
+  if (threshold === undefined) return undefined;
+  const totals = toLongContextTokens(tokens);
+  if (recorded !== undefined) return clampLongContextTokens(recorded, totals);
+  return getPromptTokens(tokens) > threshold ? totals : NO_LONG_CONTEXT_TOKENS;
+}
 
+/** Prices `longContext` (within `tokens`) at long-context rates and the rest at base rates. */
+function calculateUsageCosts(
+  modelStats: ModelStats,
+  tokens: UsageTokens,
+  longContext: LongContextTokens | undefined
+): UsageCosts {
+  const long = longContext ?? NO_LONG_CONTEXT_TOKENS;
+  const baseRates = tierRates(modelStats, false);
+  const longRates = tierRates(modelStats, true);
+  const cost = (total: number, longShare: number, baseRate: number, longRate: number) =>
+    (total - longShare) * baseRate + longShare * longRate;
+  // The long share counts output and reasoning together; split it in their proportion.
+  const totalOutput = tokens.output + tokens.reasoning;
+  const longOutput = totalOutput > 0 ? (long.output * tokens.output) / totalOutput : 0;
   return {
-    inputCost: usage.inputTokens * inputRate,
-    cachedCost: usage.cachedTokens * cachedRate,
+    inputCost: cost(tokens.input, long.input, baseRates.input, longRates.input),
+    cachedCost: cost(tokens.cached, long.cached, baseRates.cached, longRates.cached),
     cacheCreateCost:
-      (usage.cacheCreateTokens - usage.cacheCreate1hTokens) * cacheCreateRate +
-      usage.cacheCreate1hTokens * inputRate * CACHE_WRITE_1H_INPUT_MULTIPLIER,
-    outputCost: usage.outputTokens * outputRate,
-    reasoningCost: usage.reasoningTokens * outputRate,
+      cost(
+        tokens.cacheCreate - tokens.cacheCreate1h,
+        long.cacheCreate - long.cacheCreate1h,
+        baseRates.cacheCreate,
+        longRates.cacheCreate
+      ) +
+      cost(
+        tokens.cacheCreate1h,
+        long.cacheCreate1h,
+        baseRates.input * CACHE_WRITE_1H_INPUT_MULTIPLIER,
+        longRates.input * CACHE_WRITE_1H_INPUT_MULTIPLIER
+      ),
+    outputCost: cost(tokens.output, longOutput, baseRates.output, longRates.output),
+    reasoningCost: cost(
+      tokens.reasoning,
+      long.output - longOutput,
+      baseRates.output,
+      longRates.output
+    ),
   };
 }
 
@@ -120,45 +153,7 @@ export function createDisplayUsage(
 ): ChatUsageDisplay | undefined {
   if (!usage) return undefined;
 
-  // AI SDK v6 unified semantics: ALL providers now report inputTokens INCLUSIVE
-  // of cached tokens. Previously Anthropic excluded cached tokens from inputTokens
-  // but v6 changed this to match OpenAI/Google (inputTokens = total input including
-  // cache_read + cache_write). We always subtract both cachedInputTokens and
-  // cacheCreateTokens to get the true non-cached input count.
-  // Self-healing: mux persists the flat v6 shape, but fall back to AI SDK 7's
-  // nested token details in case an un-normalized usage object slips through.
-  const cachedTokens = usage.cachedInputTokens ?? usage.inputTokenDetails?.cacheReadTokens ?? 0;
-  const rawInputTokens = usage.inputTokens ?? 0;
-
-  // Extract cache creation tokens from provider metadata (Anthropic-specific;
-  // AI SDK 7 reports them on usage.inputTokenDetails instead).
-  // Needed before computing inputTokens since we subtract it from the total.
-  const cacheCreateTokens =
-    (providerMetadata?.anthropic as { cacheCreationInputTokens?: number } | undefined)
-      ?.cacheCreationInputTokens ??
-    usage.inputTokenDetails?.cacheWriteTokens ??
-    0;
-
-  // Subtract both cache-read and cache-create tokens to isolate non-cached input.
-  // Math.max guards against pre-v6 historical data where inputTokens already excluded
-  // cache tokens (subtraction would go negative).
-  const inputTokens = Math.max(0, rawInputTokens - cachedTokens - cacheCreateTokens);
-  const cacheCreate1hTokens = getAnthropicCacheWrite1hTokens(providerMetadata, cacheCreateTokens);
-
-  // Extract reasoning tokens with fallback to provider metadata (OpenAI-specific)
-  const reasoningTokens =
-    usage.reasoningTokens ??
-    usage.outputTokenDetails?.reasoningTokens ??
-    (providerMetadata?.openai as { reasoningTokens?: number } | undefined)?.reasoningTokens ??
-    0;
-
-  // Calculate output tokens excluding reasoning. Inclusive semantics guarantees
-  // outputTokens >= reasoningTokens, so a smaller outputTokens means the row was
-  // persisted with reasoning-exclusive output (historical Gemini-via-gateway data);
-  // use it directly instead of clamping to 0.
-  const rawOutputTokens = usage.outputTokens ?? 0;
-  const outputWithoutReasoning =
-    rawOutputTokens >= reasoningTokens ? rawOutputTokens - reasoningTokens : rawOutputTokens;
+  const tokens = readUsageTokens(usage, providerMetadata);
 
   // Get model stats for cost calculation, at the service tier the provider
   // reported it billed (#4352); no reported tier keeps the base rates.
@@ -179,16 +174,15 @@ export function createDisplayUsage(
   let cacheCreateCost: number | undefined;
   let outputCost: number | undefined;
   let reasoningCost: number | undefined;
+  let longContextTokens: LongContextTokens | undefined;
 
   if (modelStats) {
-    const costs = calculateUsageCosts(modelStats, {
-      inputTokens,
-      cachedTokens,
-      cacheCreateTokens,
-      cacheCreate1hTokens,
-      outputTokens: outputWithoutReasoning,
-      reasoningTokens,
-    });
+    longContextTokens = resolveLongContextTokens(
+      modelStats,
+      tokens,
+      readLongContextTokens(providerMetadata)
+    );
+    const costs = calculateUsageCosts(modelStats, tokens, longContextTokens);
     inputCost = costs.inputCost;
     cachedCost = costs.cachedCost;
     cacheCreateCost = costs.cacheCreateCost;
@@ -230,25 +224,26 @@ export function createDisplayUsage(
     // Persisted so a later repricing uses the same tier (#4787).
     ...(serviceTier !== undefined && serviceTier !== "standard" ? { serviceTier } : {}),
     // Persisted so a later repricing keeps the 1h-TTL write premium.
-    ...(cacheCreate1hTokens > 0 ? { cacheCreate1hTokens } : {}),
+    ...(tokens.cacheCreate1h > 0 ? { cacheCreate1hTokens: tokens.cacheCreate1h } : {}),
+    ...(longContextTokens !== undefined ? { longContextTokens } : {}),
     input: {
-      tokens: inputTokens,
+      tokens: tokens.input,
       cost_usd: inputCost,
     },
     cached: {
-      tokens: cachedTokens,
+      tokens: tokens.cached,
       cost_usd: cachedCost,
     },
     cacheCreate: {
-      tokens: cacheCreateTokens,
+      tokens: tokens.cacheCreate,
       cost_usd: cacheCreateCost,
     },
     output: {
-      tokens: outputWithoutReasoning,
+      tokens: tokens.output,
       cost_usd: outputCost,
     },
     reasoning: {
-      tokens: reasoningTokens,
+      tokens: tokens.reasoning,
       cost_usd: reasoningCost,
     },
     model, // Include model for display purposes
@@ -262,7 +257,8 @@ export function createDisplayUsage(
  * persisted session cost aggregates without discarding the raw token counts.
  *
  * Pass `{ aggregatedUsage: true }` for buckets like session `byModel` totals that may span
- * many requests. Tiered pricing is non-linear, so those aggregates keep their recorded costs.
+ * many requests. Tiered pricing is non-linear, so those aggregates keep their recorded costs
+ * unless they carry their per-request long-context share.
  */
 export function recomputeUsageCosts(
   usage: ChatUsageDisplay,
@@ -271,16 +267,21 @@ export function recomputeUsageCosts(
 ): ChatUsageDisplay {
   const modelStats = getModelStats(metadataModel);
   const serviceTier = usage.serviceTier;
-  // Self-healing: clamp a malformed persisted 1h share into [0, cacheCreate tokens] and
-  // persist the clamped value, so a bad share cannot leak into later aggregates.
-  const rawCacheCreate1hTokens = usage.cacheCreate1hTokens;
-  const cacheCreate1hTokens =
-    rawCacheCreate1hTokens !== undefined && Number.isFinite(rawCacheCreate1hTokens)
-      ? Math.min(usage.cacheCreate.tokens, Math.max(0, rawCacheCreate1hTokens))
-      : 0;
+  // Self-healing: clamp malformed persisted 1h and long-context shares into the usage's
+  // tokens and persist the clamped values, so a bad share cannot leak into later aggregates.
+  const tokens: UsageTokens = {
+    input: usage.input.tokens,
+    cached: usage.cached.tokens,
+    cacheCreate: usage.cacheCreate.tokens,
+    cacheCreate1h: getCacheCreate1hTokens(usage),
+    output: usage.output.tokens,
+    reasoning: usage.reasoning.tokens,
+  };
+  const longContextTokens = getLongContextTokens(usage);
   const carriedFields = {
     ...(serviceTier !== undefined ? { serviceTier } : {}),
-    ...(cacheCreate1hTokens > 0 ? { cacheCreate1hTokens } : {}),
+    ...(tokens.cacheCreate1h > 0 ? { cacheCreate1hTokens: tokens.cacheCreate1h } : {}),
+    ...(longContextTokens !== undefined ? { longContextTokens } : {}),
   };
 
   if (!modelStats) {
@@ -298,13 +299,16 @@ export function recomputeUsageCosts(
   }
 
   // A sum cannot be split back into per-request tiers: neither service tiers (#4787) nor
-  // context-window tiers, where pricing the summed prompt would bill every request at the
-  // long-context rate. Each request was priced at its own tiers when recorded, so keep those
-  // costs. They are known, not "unknown": that warning is reserved for unpriced models, and
-  // flagging tiered sums showed it for every session that used Haiku 5.5.
+  // context-window tiers without the recorded long-context share, where pricing the summed
+  // prompt would bill every request at the long-context rate. Each request was priced at its
+  // own tiers when recorded, so keep those costs. They are known, not "unknown": that warning
+  // is reserved for unpriced models, and flagging tiered sums showed it for every session that
+  // used Haiku 5.5.
   if (
     serviceTier === "mixed" ||
-    (options?.aggregatedUsage === true && hasTieredPricing(modelStats))
+    (options?.aggregatedUsage === true &&
+      hasTieredPricing(modelStats) &&
+      longContextTokens === undefined)
   ) {
     // Keep the stored costs, but replace the 1h share with its clamped value, so a malformed
     // share cannot leak into later aggregates.
@@ -319,14 +323,11 @@ export function recomputeUsageCosts(
     serviceTier !== undefined
       ? withServiceTierPricing(modelStats, metadataModel, serviceTier)
       : modelStats;
-  const costs = calculateUsageCosts(pricedStats, {
-    inputTokens: usage.input.tokens,
-    cachedTokens: usage.cached.tokens,
-    cacheCreateTokens: usage.cacheCreate.tokens,
-    cacheCreate1hTokens,
-    outputTokens: usage.output.tokens,
-    reasoningTokens: usage.reasoning.tokens,
-  });
+  const costs = calculateUsageCosts(
+    pricedStats,
+    tokens,
+    resolveLongContextTokens(pricedStats, tokens, longContextTokens)
+  );
 
   return {
     input: {

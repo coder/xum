@@ -98,6 +98,7 @@ function createRecoveryHarness() {
   let attempts: Attempt[] = [];
   let calls: StreamTextOptions[] = [];
   let streamUsage: unknown = TEST_USAGE;
+  let streamSteps: unknown[] = [];
   let workspaceId = "";
   let stops: Array<Promise<unknown>> = [];
   const context: AttemptContext = {
@@ -122,6 +123,7 @@ function createRecoveryHarness() {
         ...createStreamResultForTests(attempt(options, context)),
         usage: Promise.resolve(streamUsage),
         totalUsage: Promise.resolve(streamUsage),
+        steps: Promise.resolve(streamSteps),
       };
     }),
   });
@@ -137,6 +139,8 @@ function createRecoveryHarness() {
     initialMetadata?: Partial<MuxMetadata>;
     /** SDK-reported total usage for every attempt of this turn. */
     streamUsage?: unknown;
+    /** SDK-reported steps for every attempt of this turn; omitted means none. */
+    streamSteps?: unknown[];
     requestOptions?: Partial<TurnExecutionOptions>;
   }) {
     const historySequence = input.historySequence ?? 1;
@@ -146,6 +150,7 @@ function createRecoveryHarness() {
     calls = [];
     stops = [];
     streamUsage = "streamUsage" in input ? input.streamUsage : TEST_USAGE;
+    streamSteps = input.streamSteps ?? [];
     await appendPartialAssistantForTests(input.workspaceId, messageId, historySequence);
     const result = await streamManager.startStream(
       testStartOptions({
@@ -266,13 +271,18 @@ describe("StreamManager - previousResponseId recovery", () => {
     const { calls, messageId } = await harness.run({
       workspaceId,
       providerOptions: { openai: { previousResponseId: "resp_abc123" } },
-      // The SDK total covers only the restarted stream, not the completed first step.
+      // The SDK total and steps cover only the restarted stream, not the completed first step.
       streamUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      streamSteps: [{ usage: { inputTokens: 4, outputTokens: 5, totalTokens: 9 } }],
       attempts: [
         async function* (options) {
           yield { type: "start-step" };
           yield { type: "text-delta", text: "step one" };
-          yield { type: "finish-step", usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } };
+          yield {
+            type: "finish-step",
+            usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+            providerMetadata: { anthropic: { cacheCreationInputTokens: 30 } },
+          };
           await prepareStepForTests(options, stepMessages, 1);
           yield {
             type: "error",
@@ -297,11 +307,15 @@ describe("StreamManager - previousResponseId recovery", () => {
     expect(harness.errors()).toEqual([]);
     const [streamEnd] = harness.streamEnds();
     expect(partTexts(streamEnd)).toEqual(["step one", "step two"]);
-    // Step-boundary retries report the per-step accumulation, not the restarted SDK total.
+    // Step-boundary retries report the per-step accumulation, not the restarted SDK total,
+    // and keep the first step's cache writes in the provider metadata priced with it.
     expect(streamEnd?.metadata.usage).toMatchObject({
       inputTokens: 5,
       outputTokens: 7,
       totalTokens: 12,
+    });
+    expect(streamEnd?.metadata.providerMetadata).toMatchObject({
+      anthropic: { cacheCreationInputTokens: 30 },
     });
     // The retried step reuses its start index instead of recording a duplicate.
     expect(await committedStepStarts(workspaceId, messageId)).toEqual([0, 1]);
