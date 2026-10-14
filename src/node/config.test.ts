@@ -684,6 +684,32 @@ describe("Config", () => {
       }
     });
 
+    it("saves two edits in a row without an outside write", async () => {
+      // The second edit reads the bytes the first one renamed into place, so its own check holds.
+      await config.setUpdateChannel("nightly");
+      await config.setUpdateChannel("npm");
+      expect(new Config(tempDir).getUpdateChannel()).toBe("npm");
+    });
+
+    it("saves a retry on the same Config after a refusal, and memory matches disk", async () => {
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        const error = await editWithOutsideWrite((file) => fs.writeFileSync(file, outside));
+        expect(String(error)).toContain("config.json changed on disk");
+      } finally {
+        errorSpy.mockRestore();
+      }
+      // No restart: the retry reads the outside bytes fresh and saves on top of them.
+      await config.setUpdateChannel("nightly");
+      const saved = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        updateChannel?: string;
+        note?: string;
+      };
+      expect(saved.updateChannel).toBe("nightly");
+      expect(config.getUpdateChannel()).toBe("nightly");
+      expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+    });
+
     it("saves an edit that reads the outside bytes first", async () => {
       fs.writeFileSync(path.join(tempDir, "config.json"), outside);
       await config.setUpdateChannel("nightly");
