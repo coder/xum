@@ -32,6 +32,104 @@ function findLatestAnswerRow(
   return undefined;
 }
 
+interface AnsweredQuestions {
+  questions: AskUserQuestionQuestion[];
+  answers: Record<string, string>;
+}
+
+interface NonBlockingQuestionState {
+  /** The questions still take answers. */
+  isOpen: boolean;
+  /** The answers to show, or null while nothing was answered. */
+  answered: AnsweredQuestions | null;
+  /** Unanswered, and a context boundary dropped the question from the agent's context. */
+  closedUnanswered: boolean;
+}
+
+const NOT_NON_BLOCKING: NonBlockingQuestionState = {
+  isOpen: false,
+  answered: null,
+  closedUnanswered: false,
+};
+
+/**
+ * Where a non-blocking question stands. A durable answer row wins over this card's own accepted
+ * send (another client may have sent a correction); answers name questions and options by
+ * number only, so a question that a compaction, Start Here or reset dropped from the agent's
+ * context closes unanswered.
+ */
+export function getNonBlockingQuestionState(args: {
+  enabled: boolean;
+  toolCallId: string;
+  questions: AskUserQuestionQuestion[];
+  transcript: readonly DisplayedMessage[] | undefined;
+  sentAnswers: Record<string, string> | null;
+}): NonBlockingQuestionState {
+  if (!args.enabled) {
+    return NOT_NON_BLOCKING;
+  }
+  const transcript = args.transcript ?? [];
+  const answers = findLatestAnswerRow(transcript, args.toolCallId) ?? args.sentAnswers;
+  if (answers != null) {
+    return {
+      isOpen: false,
+      answered: { questions: args.questions, answers },
+      closedUnanswered: false,
+    };
+  }
+  const leftAgentContext = hasAskUserQuestionLeftContext(transcript, args.toolCallId);
+  return { isOpen: !leftAgentContext, answered: null, closedUnanswered: leftAgentContext };
+}
+
+/**
+ * Dispatches one answer message, behind the composer's barriers. Resolves with an error message,
+ * or null once the backend accepted the send.
+ */
+async function dispatchAnswerMessage(args: {
+  api: NonNullable<ReturnType<typeof useLiveAPI>>;
+  workspaceId: string;
+  toolCallId: string;
+  message: string;
+  sendId: string;
+  answers: Record<string, string>;
+  isTranscriptMutationAllowed: (workspaceId: string) => boolean;
+  readTranscript: (workspaceId: string) => readonly DisplayedMessage[];
+}): Promise<string | null> {
+  try {
+    // Same barrier as the composer: the backend reads send preferences from config.json.
+    await flushUserPreferences();
+    // The composer's dispatch-time barrier: while the transcript replays, this card may be a
+    // stale copy of a question that was edited away or moved behind a boundary.
+    if (!args.isTranscriptMutationAllowed(args.workspaceId)) {
+      return TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE;
+    }
+    // The render-time state is a snapshot: a boundary may have landed while the preferences
+    // flushed, so re-read the latest transcript before sending.
+    if (hasAskUserQuestionLeftContext(args.readTranscript(args.workspaceId), args.toolCallId)) {
+      return ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE;
+    }
+    const result = await args.api.workspace.sendMessage({
+      workspaceId: args.workspaceId,
+      message: args.message,
+      options: {
+        ...getSendOptionsFromStorage(args.workspaceId),
+        sendId: args.sendId,
+        muxMetadata: {
+          type: "normal",
+          askUserQuestionAnswer: { toolCallId: args.toolCallId, answers: args.answers },
+        },
+      },
+    });
+    if (!result.success) {
+      const formatted = formatSendMessageError(result.error);
+      return [formatted.message, formatted.resolutionHint].filter(Boolean).join(" ");
+    }
+    return null;
+  } catch (error) {
+    return getErrorMessage(error);
+  }
+}
+
 /**
  * Codex-style (non-blocking) ask_user_question answers: the tool already returned, so the card
  * sends its answers as ordinary user input, exactly like a composer message. The default queue
@@ -43,13 +141,7 @@ export function useNonBlockingQuestionAnswers(props: {
   toolCallId: string;
   questions: AskUserQuestionQuestion[];
   transcript: readonly DisplayedMessage[] | undefined;
-}): {
-  /** The questions still take answers. */
-  isOpen: boolean;
-  /** The answers to show, or null while nothing was answered. */
-  answered: { questions: AskUserQuestionQuestion[]; answers: Record<string, string> } | null;
-  /** Unanswered, and a context boundary dropped the question from the agent's context. */
-  closedUnanswered: boolean;
+}): NonBlockingQuestionState & {
   /** Sends the answers; resolves with an error message, or null once the send was accepted. */
   send: (
     selections: AskUserQuestionSelection[],
@@ -69,71 +161,42 @@ export function useNonBlockingQuestionAnswers(props: {
   // second row for an id a row already carries).
   const pendingSendRef = useRef<{ message: string; sendId: string } | null>(null);
 
-  // A durable row wins over this card's local send (another client may have sent a correction).
-  const transcript = props.transcript ?? [];
-  const deliveredAnswers = props.enabled
-    ? (findLatestAnswerRow(transcript, props.toolCallId) ?? sentAnswers)
-    : null;
-  // Answers name questions and options by number only, so a question that a compaction, Start
-  // Here or reset dropped from the agent's context closes unanswered.
-  const leftAgentContext =
-    props.enabled && hasAskUserQuestionLeftContext(transcript, props.toolCallId);
-
   const send = async (
     selections: AskUserQuestionSelection[],
     answers: Record<string, string>
   ): Promise<string | null> => {
-    const workspaceId = props.workspaceId;
-    try {
-      if (!liveApi || !workspaceId) {
-        return "API not connected";
-      }
-      const message = buildAskUserQuestionAnswerMessage(props.toolCallId, selections);
-      const pendingSend = pendingSendRef.current;
-      const sendId = pendingSend?.message === message ? pendingSend.sendId : createSendId();
-      pendingSendRef.current = { message, sendId };
-      // Same barrier as the composer: the backend reads send preferences from config.json.
-      await flushUserPreferences();
-      // The composer's dispatch-time barrier: while the transcript replays, this card may be a
-      // stale copy of a question that was edited away or moved behind a boundary.
-      if (!isTranscriptMutationAllowed(workspaceId)) {
-        return TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE;
-      }
-      // The render-time check is a snapshot: a boundary may have landed while the preferences
-      // flushed, so re-read the latest transcript before sending.
-      const latest = workspaceStore.getWorkspaceState(workspaceId).messages;
-      if (hasAskUserQuestionLeftContext(latest, props.toolCallId)) {
-        return ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE;
-      }
-      const result = await liveApi.workspace.sendMessage({
-        workspaceId,
-        message,
-        options: {
-          ...getSendOptionsFromStorage(workspaceId),
-          sendId,
-          muxMetadata: {
-            type: "normal",
-            askUserQuestionAnswer: { toolCallId: props.toolCallId, answers },
-          },
-        },
-      });
-      if (!result.success) {
-        const formatted = formatSendMessageError(result.error);
-        return [formatted.message, formatted.resolutionHint].filter(Boolean).join(" ");
-      }
+    if (!liveApi || !props.workspaceId) {
+      return "API not connected";
+    }
+    const message = buildAskUserQuestionAnswerMessage(props.toolCallId, selections);
+    const pendingSend = pendingSendRef.current;
+    const sendId = pendingSend?.message === message ? pendingSend.sendId : createSendId();
+    pendingSendRef.current = { message, sendId };
+    const error = await dispatchAnswerMessage({
+      api: liveApi,
+      workspaceId: props.workspaceId,
+      toolCallId: props.toolCallId,
+      message,
+      sendId,
+      answers,
+      isTranscriptMutationAllowed,
+      readTranscript: (workspaceId) => workspaceStore.getWorkspaceState(workspaceId).messages,
+    });
+    if (error == null) {
       pendingSendRef.current = null;
       setSentAnswers(answers);
-      return null;
-    } catch (error) {
-      return getErrorMessage(error);
     }
+    return error;
   };
 
   return {
-    isOpen: props.enabled && deliveredAnswers == null && !leftAgentContext,
-    answered:
-      deliveredAnswers == null ? null : { questions: props.questions, answers: deliveredAnswers },
-    closedUnanswered: leftAgentContext && deliveredAnswers == null,
+    ...getNonBlockingQuestionState({
+      enabled: props.enabled,
+      toolCallId: props.toolCallId,
+      questions: props.questions,
+      transcript: props.transcript,
+      sentAnswers,
+    }),
     send,
   };
 }
