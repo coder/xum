@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { Children, isValidElement, Suspense, useEffect } from "react";
 import { liveClientOf, useOptionalAPI } from "@/browser/contexts/API";
+import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
 import { Button } from "../Button/Button";
 import { ErrorBoundary } from "../ErrorBoundary/ErrorBoundary";
 
@@ -29,16 +30,35 @@ function ReloadFallback(props: { name: string }) {
 }
 
 /**
- * The child component types that rendered in this page. A rendered lazy type has its chunk, so it
+ * The lazy child types that rendered in this page. A rendered lazy type has its chunk, so it
  * needs no server to render again (#6380).
  */
 const renderedTypes = new WeakSet<object>();
 
-/** The component types of the direct child elements (host elements have string types). */
-function childTypes(children: ReactNode): object[] {
-  return Children.toArray(children).flatMap((child) =>
-    isValidElement(child) && typeof child.type !== "string" ? [child.type] : []
-  );
+// React tags a React.lazy type with this symbol (react-is checks the same one).
+const REACT_LAZY_TYPE = Symbol.for("react.lazy");
+
+/** The React.lazy types of the direct child elements: only those load a chunk when they render. */
+function lazyChildTypes(children: ReactNode): object[] {
+  return Children.toArray(children).flatMap((child) => {
+    const type: unknown = isValidElement(child) ? child.type : null;
+    const isLazy =
+      typeof type === "object" &&
+      type !== null &&
+      "$$typeof" in type &&
+      type.$$typeof === REACT_LAZY_TYPE;
+    return isLazy ? [type] : [];
+  });
+}
+
+/**
+ * True when the chunks come from the API server, so an API outage is a chunk outage too. With a
+ * split origin (VITE_BACKEND_URL) the page's own origin serves them, and Electron (`file:`) loads
+ * them from its installed files.
+ */
+function chunksNeedApiServer(): boolean {
+  if (window.location.protocol === "file:") return false;
+  return new URL(getBrowserBackendBaseUrl()).origin === window.location.origin;
 }
 
 /** Records the types once they commit: Suspense commits its children only after they load. */
@@ -50,13 +70,13 @@ function MarkRendered(props: { types: object[] }) {
 }
 
 /**
- * Renders the children, or `loading` while Xum reconnects if one of their types never rendered
+ * Renders the children, or `loading` while Xum reconnects if one of their lazy types never rendered
  * (see LazyFeature). No APIProvider (isolated renders) counts as online.
  */
 function OfflineGate(props: { loading: ReactNode; children: ReactNode }) {
   const api = useOptionalAPI();
-  const online = api == null || liveClientOf(api) != null;
-  const types = childTypes(props.children);
+  const online = api == null || liveClientOf(api) != null || !chunksNeedApiServer();
+  const types = lazyChildTypes(props.children);
   if (!online && !types.every((type) => renderedTypes.has(type))) return props.loading;
   return (
     <>

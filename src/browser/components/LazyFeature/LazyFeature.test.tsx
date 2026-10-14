@@ -146,5 +146,40 @@ describe("LazyFeature", () => {
       expect(again.queryByTestId("lazy-content")).not.toBeNull();
       expect(again.queryByTestId("pending")).toBeNull();
     });
+
+    // Only a lazy child needs a chunk: a synchronous page (the root route) renders offline.
+    test("a synchronous child renders while offline", async () => {
+      const harness = createConnectionHarness(mode, () => ({}));
+      await harness.drop();
+      const Plain = () => <div data-testid="plain-content" />;
+      const view = render(
+        <LazyFeature name="Page" fallback={<div data-testid="pending" />}>
+          <Plain />
+        </LazyFeature>,
+        { wrapper: harness.Wrapper }
+      );
+      expect(view.queryByTestId("plain-content")).not.toBeNull();
+    });
+
+    // With VITE_BACKEND_URL, the chunks come from the page's origin, not from the API server.
+    test("a split-origin API outage does not hold a feature back", async () => {
+      const previous = process.env.VITE_BACKEND_URL;
+      process.env.VITE_BACKEND_URL = "http://api.example.test";
+      try {
+        const harness = createConnectionHarness(mode, () => ({}));
+        await harness.drop();
+        const lazy = deferredLazy();
+        render(
+          <LazyFeature name="Feature">
+            <lazy.Component />
+          </LazyFeature>,
+          { wrapper: harness.Wrapper }
+        );
+        expect(lazy.loads.count).toBe(1);
+      } finally {
+        if (previous === undefined) delete process.env.VITE_BACKEND_URL;
+        else process.env.VITE_BACKEND_URL = previous;
+      }
+    });
   });
 });
