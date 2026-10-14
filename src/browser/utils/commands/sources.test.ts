@@ -2639,3 +2639,69 @@ test("a tool's global and thread entry points get palette commands that read dif
   });
   expect(shown[0]).not.toBe(shown[1]);
 });
+
+describe("Revoke MCP App View Domains…", () => {
+  const stored = [
+    { projectPath: "/repo/a", serverName: "charts", origins: ["https://api.example.com"] },
+  ];
+  const revokeAction = (api: APIClient, artifactsEnabled = true) =>
+    getActions({ api, artifactsEnabled }).find(
+      (action) => action.id === CommandIds.mcpAppsRevokeViewDomains()
+    );
+
+  test("lists the stored approvals and revokes the picked one", async () => {
+    const revoked: unknown[] = [];
+    const api = createTestApiClient({
+      mcpApps: {
+        listViewDomains: () => Promise.resolve(stored),
+        revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
+          revoked.push(input);
+          return Promise.resolve({ revision: 1 });
+        },
+      },
+    });
+    expect(revokeAction(api, false)).toBeUndefined();
+    const action = revokeAction(api);
+    const field = action?.prompt?.fields[0];
+    if (field?.type !== "select" || !action?.prompt) throw new Error("Expected an approval picker");
+    const options = await field.getOptions({});
+    expect(options).toHaveLength(1);
+    expect(options[0].label).toContain("charts");
+    expect(options[0].label).toContain("api.example.com");
+    await withTestWindow(async () => {
+      const events = collectCommandEvents();
+      try {
+        await action.prompt!.onSubmit({ approval: options[0].id });
+        expect(events.receivedToasts.map((toast) => toast.type)).toEqual(["success"]);
+      } finally {
+        events.dispose();
+      }
+    });
+    expect(revoked).toEqual([{ projectPath: "/repo/a", serverName: "charts" }]);
+  });
+
+  test("a failed revoke or list shows its error in a toast", async () => {
+    const api = createTestApiClient({
+      mcpApps: {
+        listViewDomains: () => Promise.reject(new Error("backend busy")),
+        revokeViewDomains: () => Promise.reject(new Error("config write failed")),
+      },
+    });
+    const action = revokeAction(api);
+    const field = action?.prompt?.fields[0];
+    if (field?.type !== "select" || !action?.prompt) throw new Error("Expected an approval picker");
+    await withTestWindow(async () => {
+      const events = collectCommandEvents();
+      try {
+        expect(await field.getOptions({})).toEqual([]);
+        await action.prompt!.onSubmit({ approval: JSON.stringify(["/repo/a", "charts"]) });
+        const messages = events.receivedToasts.map((toast) => toast.message);
+        expect(messages).toHaveLength(2);
+        expect(messages[0]).toContain("backend busy");
+        expect(messages[1]).toContain("config write failed");
+      } finally {
+        events.dispose();
+      }
+    });
+  });
+});

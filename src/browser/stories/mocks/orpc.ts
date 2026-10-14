@@ -244,6 +244,8 @@ export interface MockORPCClientOptions {
     states?: Record<string, unknown>;
   };
   /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
+  /** When set, mcpApps.listViewDomains fails with this error (Settings' load error). */
+  mcpAppViewDomainsListError?: string;
   mcpApps?: {
     views: Record<string, McpAppView>;
     callTool?: (input: { toolName: string; consented: boolean }) => McpAppToolCallResult;
@@ -2482,7 +2484,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           data: { approvedDomains: entry.origins, revision: ++mockViewDomainsRevision },
         });
       },
-      listViewDomains: () => Promise.resolve([...mockViewDomains.values()]),
+      listViewDomains: () =>
+        options.mcpAppViewDomainsListError != null
+          ? Promise.reject(new Error(options.mcpAppViewDomainsListError))
+          : Promise.resolve([...mockViewDomains.values()]),
       revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
         mockViewDomains.delete(JSON.stringify([input.projectPath, input.serverName]));
         return Promise.resolve({ revision: ++mockViewDomainsRevision });

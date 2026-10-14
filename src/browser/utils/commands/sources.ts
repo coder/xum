@@ -54,6 +54,7 @@ import {
 } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
 import { mcpAppEntrypointDescription } from "@/browser/features/RightSidebar/AppViewTab/mcpAppEntrypoints";
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
+import { revokeMcpAppViewDomains } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore";
 
 /**
  * One palette action per MCP App entry point: opens its app tab (calling the tool with {}) or
@@ -78,6 +79,67 @@ function entrypointActions(
       if (error !== null) showCommandFeedbackToast({ type: "error", message: error });
     },
   }));
+}
+
+/**
+ * "Revoke MCP App View Domains…": the keyboard path to Revoke under "Allowed view domains" in
+ * Settings (#6181). Picks one stored approval (server and project) and revokes it. The palette
+ * has closed by the time the call settles, so the outcome shows as a toast.
+ */
+function revokeViewDomainsActions(
+  api: APIClient | null,
+  artifactsEnabled: boolean | undefined,
+  settings: string
+): CommandAction[] {
+  if (artifactsEnabled !== true) return [];
+  return [
+    {
+      id: CommandIds.mcpAppsRevokeViewDomains(),
+      title: "Revoke MCP App View Domains…",
+      subtitle: "Stop a server's views from reaching the domains you allowed",
+      section: settings,
+      keywords: ["mcp", "app", "view", "domains", "csp", "allowed", "revoke", "network"],
+      run: () => undefined,
+      prompt: {
+        title: "Revoke MCP App View Domains",
+        fields: [
+          {
+            type: "select",
+            name: "approval",
+            label: "Allowed view domains",
+            placeholder: "Choose a server and project…",
+            getOptions: async () => {
+              try {
+                const approvals = api ? await api.mcpApps.listViewDomains() : [];
+                return approvals.map((approval) => ({
+                  id: JSON.stringify([approval.projectPath, approval.serverName]),
+                  label: `${approval.serverName} in ${approval.projectPath}: ${approval.origins.join(", ")}`,
+                  keywords: [approval.serverName, approval.projectPath, ...approval.origins],
+                }));
+              } catch (error) {
+                showCommandFeedbackToast({
+                  type: "error",
+                  message: `Could not load allowed view domains: ${getErrorMessage(error)}`,
+                });
+                return [];
+              }
+            },
+          },
+        ],
+        onSubmit: async (values) => {
+          const [projectPath, serverName] = JSON.parse(values.approval) as [string, string];
+          const error = api
+            ? await revokeMcpAppViewDomains(api, { projectPath, serverName })
+            : MCP_APP_ENTRYPOINT_NOT_CONNECTED;
+          showCommandFeedbackToast(
+            error == null
+              ? { type: "success", message: `Revoked the view domains of ${serverName}` }
+              : { type: "error", message: `Could not revoke: ${error}` }
+          );
+        },
+      },
+    },
+  ];
 }
 
 /**
@@ -2220,6 +2282,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       },
     },
   ]);
+
+  // MCP App view-domain approvals (artifacts experiment): the palette path to Settings' Revoke.
+  actions.push(() => revokeViewDomainsActions(p.api, p.artifactsEnabled, section.settings));
 
   // Settings
   if (p.onOpenSettings) {
