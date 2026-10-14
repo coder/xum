@@ -74,7 +74,7 @@ import * as crypto from "crypto";
 import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { shellQuote } from "@/common/utils/shell";
 import { requiredPropertyNames, schemaAcceptsNull } from "@/common/utils/tools/schemaSanitizer";
-import type { ExecStream, Runtime } from "@/node/runtime/Runtime";
+import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
@@ -915,6 +915,13 @@ interface StdioLaunch {
   command: string;
   cwd?: string;
   env?: Record<string, string>;
+  /**
+   * #6509: a plugin server gets only the minimal host environment plus its
+   * declared env, so the user's shell secrets are not passed to it. Not a sandbox:
+   * the server runs as the same OS user (see docs/config/mcp-servers.mdx). User-configured
+   * servers keep the full environment.
+   */
+  hostEnv: NonNullable<ExecOptions["hostEnv"]>;
 }
 
 /**
@@ -985,7 +992,9 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
   const command =
     info.args !== undefined ? [info.command, ...info.args].map(shellQuote).join(" ") : info.command;
 
+  let hostEnv: StdioLaunch["hostEnv"] = "inherit";
   if (info.plugin !== undefined) {
+    hostEnv = "minimal";
     const dataPath = info.env?.PLUGIN_DATA;
     assert(
       dataPath !== undefined && path.isAbsolute(dataPath),
@@ -1013,6 +1022,7 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
     command,
     ...(info.cwd !== undefined ? { cwd: info.cwd } : {}),
     ...(info.env !== undefined ? { env: info.env } : {}),
+    hostEnv,
   };
 }
 
@@ -1023,7 +1033,7 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
  */
 async function runServerTest(
   server:
-    | { transport: "stdio"; command: string; cwd?: string; env?: Record<string, string> }
+    | ({ transport: "stdio" } & StdioLaunch)
     | {
         transport: "http" | "sse" | "auto";
         url: string;
@@ -1075,6 +1085,7 @@ async function runServerTest(
           const execStream = await runtime.exec(server.command, {
             cwd: server.cwd ?? projectPath,
             ...(server.env !== undefined ? { env: server.env } : {}),
+            hostEnv: server.hostEnv,
             timeout: TEST_TIMEOUT_MS / 1000,
           });
 
@@ -1863,7 +1874,7 @@ export class MCPServerManager {
     } catch (error) {
       log.debug("MCP component policy unavailable", { error });
     }
-    return { registryPath: this.componentPolicy?.registryPath ?? "", imports: null };
+    return { registryPath: this.componentPolicy?.registryPath ?? "", imports: null, consent: null };
   }
 
   private async withPluginAdmissionFence<T>(
@@ -4926,7 +4937,7 @@ export class MCPServerManager {
    * workspace whose config key starts with `keyPrefix` (one plugin instance)
    * and that has `openai/settings`, keyed by the plugin's own server name.
    * Uses the cache; an empty cache is read once with a short timeout (all
-   * misses concurrently), and a failed read yields `{}` for that server.
+   * misses concurrently), and a failed read yields the current cache or `{}`.
    * Never starts servers and never throws: hooks must not stall or break the turn.
    */
   async getSettingsForPluginHooks(
@@ -4936,42 +4947,107 @@ export class MCPServerManager {
   ): Promise<Record<string, Record<string, MCPSettingValue>>> {
     // Null prototype: a plugin server named "__proto__" stays an own key (JSON keeps it).
     const settings = Object.create(null) as Record<string, Record<string, MCPSettingValue>>;
+    // Only awaits when a repair is pending: without one, the reads start synchronously.
+    const pendingRepair = this.pendingEnablementRepairs.get(workspaceId);
+    if (pendingRepair !== undefined && !(await this.awaitRepairForHooks(pendingRepair, timeoutMs)))
+      return settings;
+    // After a repair wait, cached values only (#6186): the wait already spent the hook's budget,
+    // and a read given only the rest could time out and stay memoized as failed for the instance.
+    // The next hook call reads the misses with the full timeout.
+    const mayRead = pendingRepair === undefined;
     const entry = this.workspaceServers.get(workspaceId);
     if (entry === undefined) return settings;
-    const misses: Array<Promise<void>> = [];
+    const sources: Array<{
+      name: string;
+      instance: MCPServerInstance;
+      pluginServerName: string;
+      read?: Promise<Record<string, MCPSettingValue> | undefined>;
+    }> = [];
     for (const [name, instance] of entry.instances) {
-      const pluginServerName = entry.enabledServers[name]?.plugin?.serverName;
-      if (
-        !name.startsWith(keyPrefix) ||
-        pluginServerName === undefined ||
-        !entry.enabledServerNames.has(name) ||
-        instance.isClosed ||
-        instance.settings?.settingsCapability() === undefined
-      )
-        continue;
+      const pluginServerName = name.startsWith(keyPrefix)
+        ? this.hookSettingsServerName(workspaceId, name, instance)
+        : undefined;
+      if (pluginServerName === undefined) continue;
       const cached = this.settingsCache.get(instance)?.get(workspaceId);
-      if (cached !== undefined) {
-        settings[pluginServerName] = cached;
-        continue;
-      }
-      misses.push(
-        this.readSettingsForHooks(instance, workspaceId, timeoutMs).then((values) => {
-          // Recheck after the await: a server disabled, removed or replaced meanwhile must not
-          // hand its settings to the hook.
-          const current = this.workspaceServers.get(workspaceId);
-          if (
-            current?.instances.get(name) !== instance ||
-            !current.enabledServerNames.has(name) ||
-            instance.isClosed
-          )
-            return;
-          settings[pluginServerName] = values ?? {};
-        })
-      );
+      sources.push({
+        name,
+        instance,
+        pluginServerName,
+        ...(cached === undefined && mayRead
+          ? { read: this.readSettingsForHooks(instance, workspaceId, timeoutMs) }
+          : {}),
+      });
     }
     // Concurrently: misses on several servers share one timeout window instead of adding up.
-    await Promise.all(misses);
+    const reads = await Promise.all(
+      sources.map((source) => source.read ?? Promise.resolve(undefined))
+    );
+    sources.forEach((source, index) => {
+      // Recheck every collected server, cached ones too (#6186): a server disabled, removed or
+      // replaced during any read must not hand its settings to the hook.
+      if (!this.isHookSettingsSourceCurrent(workspaceId, source.name, source.instance)) return;
+      // The cache first: a save that settled during a failed or older read holds newer values.
+      settings[source.pluginServerName] =
+        this.settingsCache.get(source.instance)?.get(workspaceId) ?? reads[index] ?? {};
+    });
     return settings;
+  }
+
+  /** Enablement repairs a hook already waited on until its timeout (see awaitRepairForHooks). */
+  private readonly hookTimedOutRepairs = new WeakSet<Promise<void>>();
+
+  /**
+   * An override change waiting for repairEnablement can disable a server the entry still lists
+   * as enabled (#6186). Waits for it, bounded by the hook timeout. False when it did not settle
+   * in time: the hook then gets no settings (fail closed). A repair that already outlasted one
+   * hook's wait is not waited on again, so serial plugin hooks of one dispatch (or later ones)
+   * do not add one timeout each.
+   */
+  private async awaitRepairForHooks(repair: Promise<void>, timeoutMs: number): Promise<boolean> {
+    if (this.hookTimedOutRepairs.has(repair)) return false;
+    if ((await raceWithAbortAndTimeout(repair, { timeoutMs })).kind === "ok") return true;
+    this.hookTimedOutRepairs.add(repair);
+    return false;
+  }
+
+  /**
+   * The plugin's own name for server `name` when `instance` can give a hook settings now: a
+   * plugin server that is current (isHookSettingsSourceCurrent) and has `openai/settings`.
+   */
+  private hookSettingsServerName(
+    workspaceId: string,
+    name: string,
+    instance: MCPServerInstance
+  ): string | undefined {
+    const pluginServerName =
+      this.workspaceServers.get(workspaceId)?.enabledServers[name]?.plugin?.serverName;
+    if (
+      pluginServerName === undefined ||
+      !this.isHookSettingsSourceCurrent(workspaceId, name, instance) ||
+      instance.settings?.settingsCapability() === undefined
+    )
+      return undefined;
+    return pluginServerName;
+  }
+
+  /**
+   * Whether `instance` may give its settings to a hook now: still this workspace's running
+   * instance for `name` and enabled, with no override invalidation or enablement repair pending
+   * (as canCallToolForPluginHook: hooks fail closed instead of re-deriving enablement).
+   */
+  private isHookSettingsSourceCurrent(
+    workspaceId: string,
+    name: string,
+    instance: MCPServerInstance
+  ): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    return (
+      entry?.instances.get(name) === instance &&
+      entry.enabledServerNames.has(name) &&
+      !instance.isClosed &&
+      !this.overridesInvalidationGenerations.has(workspaceId) &&
+      !this.pendingEnablementRepairs.has(workspaceId)
+    );
   }
 
   private readSettingsForHooks(
@@ -4998,7 +5074,7 @@ export class MCPServerManager {
           return this.settingsCache.get(instance)?.get(workspaceId) ?? parsed.values;
         } catch (error) {
           log.warn(
-            `[MCP] Settings read for plugin hooks failed for '${instance.name}'; passing {}`,
+            `[MCP] Settings read for plugin hooks failed for '${instance.name}'; passing the cached values or {}`,
             {
               workspaceId,
               error: getErrorMessage(error),
@@ -5140,7 +5216,7 @@ export class MCPServerManager {
     assert(source !== undefined, "a settings snapshot comes from a server instance");
     this.cacheSettings(source.instance, workspaceId, source.requestId, snapshot.values);
     const instanceToken = this.settingsInstanceToken(source.instance);
-    this.rememberSettingsSchema(instanceToken, snapshot);
+    this.rememberSettingsSchema(workspaceId, serverName, instanceToken, snapshot);
     return { ...snapshot, instanceToken };
   }
 
@@ -5149,7 +5225,9 @@ export class MCPServerManager {
 
   /**
    * Resolves once this server's saves in flight settled. The dialog's reads wait for it: a
-   * dialog reopened during a save must not show the values from before the save.
+   * dialog reopened during a save must not show the values from before the save. Resolves to
+   * the part of `timeoutMs` left (at least 1 ms), so the read that follows shares one deadline
+   * with the wait instead of starting a second full one.
    */
   async settingsSavesSettled(
     workspaceId: string,
@@ -5159,31 +5237,38 @@ export class MCPServerManager {
      * not hold the dialog's bulk read. Past either, the read goes ahead without waiting.
      */
     options: { signal?: AbortSignal; timeoutMs: number }
-  ): Promise<void> {
+  ): Promise<number> {
     const saves = this.pendingSettingsSaves.get(settingsSaveKey(workspaceId, serverName));
-    if (saves === undefined) return;
-    const stop = AbortSignal.any([
+    if (saves === undefined) return options.timeoutMs;
+    const started = Date.now();
+    // A failed save is the save's own error; a read only waits for it.
+    await raceUntilAborted(Promise.allSettled([...saves]), [
       AbortSignal.timeout(options.timeoutMs),
       ...(options.signal !== undefined ? [options.signal] : []),
     ]);
-    const stopped = new Promise<void>((resolve) => {
-      if (stop.aborted) resolve();
-      stop.addEventListener("abort", () => resolve(), { once: true });
-    });
-    // A failed save is the save's own error; a read only waits for it.
-    await Promise.race([Promise.allSettled([...saves]), stopped]);
+    return Math.max(1, options.timeoutMs - (Date.now() - started));
   }
 
   /**
-   * The schema each recent instance token was read with, as a hash: a save whose token names a
-   * restarted instance (idle stop, crash restart) still lands when the new instance shows the
-   * same schema. Bounded: the oldest token is forgotten first, and its save is refused.
+   * The schema each recent instance token was read with, as a hash, per workspace and server: a
+   * save whose token names a restarted instance (idle stop, crash restart) still lands when the
+   * new instance shows the same schema. Keyed by server too, so a token read from one server
+   * never passes the check of a save to another. Bounded: the oldest entry is forgotten first,
+   * and its save is refused.
    */
   private readonly settingsSchemaHashes = new Map<string, string>();
 
-  private rememberSettingsSchema(instanceToken: string, snapshot: MCPSettingsSnapshot): void {
-    this.settingsSchemaHashes.delete(instanceToken);
-    this.settingsSchemaHashes.set(instanceToken, settingsSchemaHash(snapshot));
+  private rememberSettingsSchema(
+    workspaceId: string,
+    serverName: string,
+    instanceToken: string,
+    snapshot: MCPSettingsSnapshot
+  ): void {
+    const key = settingsSchemaKey(workspaceId, serverName, instanceToken);
+    // Each read overwrites its token's hash: the latest schema of an instance is the one a save
+    // validated against (the dialog shows that read).
+    this.settingsSchemaHashes.delete(key);
+    this.settingsSchemaHashes.set(key, settingsSchemaHash(snapshot));
     if (this.settingsSchemaHashes.size > MAX_REMEMBERED_SETTINGS_SCHEMAS) {
       const oldest = this.settingsSchemaHashes.keys().next().value;
       if (oldest !== undefined) this.settingsSchemaHashes.delete(oldest);
@@ -5230,7 +5315,8 @@ export class MCPServerManager {
     // it shows the schema the dialog validated against, else the user must reopen.
     if (
       prior.instanceToken !== instanceToken &&
-      this.settingsSchemaHashes.get(instanceToken) !== settingsSchemaHash(prior)
+      this.settingsSchemaHashes.get(settingsSchemaKey(workspaceId, serverName, instanceToken)) !==
+        settingsSchemaHash(prior)
     )
       throw staleSettingsInstanceError(serverName);
     const values = await this.updateSettings(
@@ -6310,7 +6396,7 @@ export class MCPServerManager {
 
     if (command?.trim()) {
       return runServerTest(
-        { transport: "stdio", command },
+        { transport: "stdio", command, hostEnv: "inherit" },
         projectPath,
         "command",
         trimmedName ?? "command"
@@ -7426,6 +7512,7 @@ export class MCPServerManager {
             runtime.exec(launch.command, {
               cwd: launch.cwd ?? workspacePath,
               ...(launch.env !== undefined ? { env: launch.env } : {}),
+              hostEnv: launch.hostEnv,
               timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
               abortSignal: AbortSignal.any([launchSignal, processAbort.signal]),
             }),
@@ -8040,6 +8127,24 @@ const MAX_REMEMBERED_SETTINGS_SCHEMAS = 256;
 
 function settingsSaveKey(workspaceId: string, serverName: string): string {
   return `${workspaceId}\0${serverName}`;
+}
+
+/** Wait for `work` or the first abort of `signals`, then drop the abort listener. */
+async function raceUntilAborted(work: Promise<unknown>, signals: AbortSignal[]): Promise<void> {
+  const stop = AbortSignal.any(signals);
+  const onStop = Promise.withResolvers<void>();
+  const resolve = () => onStop.resolve();
+  if (stop.aborted) resolve();
+  stop.addEventListener("abort", resolve, { once: true });
+  try {
+    await Promise.race([work, onStop.promise]);
+  } finally {
+    stop.removeEventListener("abort", resolve);
+  }
+}
+
+function settingsSchemaKey(workspaceId: string, serverName: string, token: string): string {
+  return `${settingsSaveKey(workspaceId, serverName)}\0${token}`;
 }
 
 /** What a save validates against: the schema and its layout, never the values. */

@@ -393,15 +393,17 @@ jobs:
     # Required fails with it; a skipped run (merge_group, push) counts as a pass.
     # A skipped or failed test shard leaves no report: the summary shows partial
     # coverage and coverage-based findings only warn. A tool error never
-    # blocks: every step is soft and time-boxed (the step timeouts sum to less
-    # than the job's), and only the Verdict step fails the job, when the
-    # finished report has violations in block mode.
+    # blocks: every step is soft and time-boxed (the step timeouts sum to 18
+    # minutes, 7 below the job's, which also covers job setup and post
+    # steps), and only the Verdict step fails the job, when the finished
+    # report has violations in block mode. 394 runs (2026-10-13/14) took 28s at
+    # most, the CRAP report step 9s at most.
     # ROLLBACK: set the CRAP_MODE repo variable back to "warn" (Settings ->
     # Secrets and variables -> Actions -> Variables). No code change.
     needs: [changes, test-unit, test-integration]
     if: ${{ !cancelled() && github.event_name == 'pull_request' }}
     continue-on-error: ${{ vars.CRAP_MODE != 'block' }}
-    timeout-minutes: 20
+    timeout-minutes: 25
     runs-on: ubuntu-latest
     permissions:
       contents: read

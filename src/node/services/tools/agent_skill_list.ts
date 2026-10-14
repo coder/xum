@@ -20,6 +20,11 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry";
 import { discoverAgentPlugins } from "@/node/services/agentPlugins/discovery";
 import {
+  isPluginSkillConsented,
+  pluginSkillConsentGate,
+  type PluginSkillConsentGate,
+} from "@/node/services/agentPlugins/componentConsent";
+import {
   discoverAgentSkills,
   requireReachableSkills,
   getDefaultAgentSkillsRoots,
@@ -52,22 +57,13 @@ async function listSkillDirectories(skillsRoot: string): Promise<string[]> {
   }
 }
 
-async function readSkillDescriptor(
-  skillsRoot: string,
-  directoryNameRaw: string,
+/** Read `skillDir`'s SKILL.md when it is a contained regular file of allowed size; else log and null. */
+async function readContainedSkillFile(
+  skillDir: string,
+  directoryName: string,
   scope: "global" | "project",
   containmentRoot: string
-): Promise<AgentSkillDescriptor | null> {
-  const parsedDirectoryName = SkillNameSchema.safeParse(directoryNameRaw);
-  if (!parsedDirectoryName.success) {
-    log.warn(
-      `Skipping invalid ${scope} skill directory name '${directoryNameRaw}' in ${skillsRoot}`
-    );
-    return null;
-  }
-
-  const directoryName = parsedDirectoryName.data;
-  const skillDir = path.join(skillsRoot, directoryName);
+): Promise<{ content: string; byteSize: number } | null> {
   const skillFilePath = path.join(skillDir, "SKILL.md");
 
   // SECURITY: validate that BOTH the skill directory and SKILL.md canonical
@@ -114,22 +110,46 @@ async function readSkillDescriptor(
     return null;
   }
 
-  let content: string;
   try {
-    content = await fsPromises.readFile(containedPath, "utf-8");
+    return { content: await fsPromises.readFile(containedPath, "utf-8"), byteSize: stat.size };
   } catch (error) {
     log.warn(
       `Skipping ${scope} skill '${directoryName}' because SKILL.md could not be read: ${getErrorMessage(error)}`
     );
     return null;
   }
+}
+
+async function readSkillDescriptor(
+  skillsRoot: string,
+  directoryNameRaw: string,
+  scope: "global" | "project",
+  containmentRoot: string,
+  skillConsent?: PluginSkillConsentGate
+): Promise<AgentSkillDescriptor | null> {
+  const parsedDirectoryName = SkillNameSchema.safeParse(directoryNameRaw);
+  if (!parsedDirectoryName.success) {
+    log.warn(
+      `Skipping invalid ${scope} skill directory name '${directoryNameRaw}' in ${skillsRoot}`
+    );
+    return null;
+  }
+
+  const directoryName = parsedDirectoryName.data;
+  const skillDir = path.join(skillsRoot, directoryName);
+  const file = await readContainedSkillFile(skillDir, directoryName, scope, containmentRoot);
+  if (file === null) return null;
 
   try {
     const parsed = parseSkillMarkdown({
-      content,
-      byteSize: stat.size,
+      content: file.content,
+      byteSize: file.byteSize,
       directoryName,
     });
+    if (!isPluginSkillConsented(skillConsent, skillDir, parsed.frontmatter)) {
+      log.warn(`Skipping ${scope} plugin skill '${directoryName}': not reviewed on this install`);
+      return null;
+    }
 
     const descriptorResult = AgentSkillDescriptorSchema.safeParse({
       name: parsed.frontmatter.name,
@@ -232,6 +252,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           containmentRoot: string;
           scope: "global" | "project";
           importedSkills?: readonly string[];
+          skillConsent?: PluginSkillConsentGate;
         }> = [
           {
             skillsRoot: path.join(xumScope.xumHome, "skills"),
@@ -319,13 +340,14 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               containmentRoot: plugin.rootPath,
               scope: plugin.scope,
               importedSkills,
+              skillConsent: pluginSkillConsentGate(plugin),
             }))
           );
         }
 
         const skills: AgentSkillDescriptor[] = [];
         const seenByScope = new Set<string>();
-        for (const { skillsRoot, containmentRoot, scope, importedSkills } of roots) {
+        for (const { skillsRoot, containmentRoot, scope, importedSkills, skillConsent } of roots) {
           let skillsRootReal: string;
           try {
             skillsRootReal = await fsPromises.realpath(skillsRoot);
@@ -357,7 +379,8 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               skillsRootReal,
               directoryName,
               scope,
-              containmentRoot
+              containmentRoot,
+              skillConsent
             );
             if (!descriptor) {
               continue;
