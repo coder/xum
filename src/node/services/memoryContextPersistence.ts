@@ -136,17 +136,23 @@ export class MemoryContextStore {
     };
   }
 
-  async save(windowKey: string, contexts: ReadonlyMap<string, CachedMemoryContext>): Promise<void> {
+  /** Returns true only when the file now holds these contexts. */
+  async save(
+    windowKey: string,
+    contexts: ReadonlyMap<string, CachedMemoryContext>
+  ): Promise<boolean> {
     assert(windowKey.length > 0, "MemoryContextStore.save requires a window key");
     const generation = this.generation;
     // Copy now: the caller keeps mutating the map after this returns.
     const entries = [...contexts];
-    await this.enqueue("write", async () => {
+    const written = await this.enqueue("write", async () => {
       // A window boundary that ran while this write waited owns the file now.
-      if (generation !== this.generation) return;
+      if (generation !== this.generation) return false;
       await fs.mkdir(path.dirname(this.filePath), { recursive: true });
       await writeFileAtomic(this.filePath, JSON.stringify(toFile(windowKey, entries)));
+      return true;
     });
+    return written === true;
   }
 
   /** A window boundary: the saved context must not reach the next window. */

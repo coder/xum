@@ -407,6 +407,41 @@ describe("AgentSession memory context", () => {
     }
   });
 
+  test("retries a failed save on the next cache hit", async () => {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    let version = 0;
+    const buildMemorySessionContext = mock(() => {
+      version++;
+      return Promise.resolve<MemorySessionContext>({
+        indexEntries: [],
+        hotMemoriesBlock: `<hot_memories>v${version}</hot_memories>`,
+      });
+    });
+    // A directory at the file's path makes the first write fail.
+    const filePath = path.join(config.sessionsDir, WORKSPACE_ID, MEMORY_CONTEXT_FILE_NAME);
+    await fs.mkdir(filePath, { recursive: true });
+    const before = await createSession({ historyService, config, buildMemorySessionContext });
+    try {
+      await resolveInWindow(before, "test-model");
+      await fs.rm(filePath, { recursive: true });
+      await resolveInWindow(before, "test-model");
+    } finally {
+      await before.dispose();
+    }
+
+    const after = await createSession({ historyService, config, buildMemorySessionContext });
+    try {
+      expect((await resolveInWindow(after, "test-model"))?.hotMemoriesBlock).toBe(
+        "<hot_memories>v1</hot_memories>"
+      );
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
+    } finally {
+      await after.dispose();
+    }
+  });
+
   test("rebuilds the context when the saved file is malformed", async () => {
     const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;

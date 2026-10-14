@@ -13044,8 +13044,10 @@ export class AgentSession {
     // A rollover can swap the live map while a build is awaited.
     if (windowKey === undefined || cache !== this.memoryContextByModelString) return;
     if (!options.force && this.savedMemoryContextWindowKey === windowKey) return;
-    this.savedMemoryContextWindowKey = windowKey;
-    await this.memoryContextStore.save(windowKey, cache);
+    // Record the key only after a confirmed write, so a failed save is retried on the next hit.
+    if (await this.memoryContextStore.save(windowKey, cache)) {
+      this.savedMemoryContextWindowKey = windowKey;
+    }
   }
 
   /** A window boundary: drop the cached context in memory and on disk. */
