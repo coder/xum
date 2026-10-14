@@ -193,9 +193,5 @@ export const TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS = 2_000;
  * (~340 rows of heavy replies, many short steps) must still reveal fully.
  */
 export const TRANSCRIPT_REVEAL_AUTO_MAX_ROWS = 500;
-/**
- * Most rows the transcript keeps mounted once a caller opts into the two-sided slice (#4961
- * F20): reading back mounts older rows and unmounts the newest. Each mounted row holds ~118 KB of
- * heap, so this bounds the transcript near 140 MB however far the reader pages back.
- */
+/** Mounted-row cap of the two-sided transcript slice (#4961 F20): ~118 KB heap per row. */
 export const TRANSCRIPT_MAX_MOUNTED_ROWS = 1_200;

@@ -27,7 +27,7 @@ export interface BoundedTranscriptRevealArgs<Row extends RevealRow> {
    * row, which makes the row ceilings the only limit.
    */
   rowWeight?: (index: number) => number;
-  /** Opt-in cap on mounted rows (#4961 F20); without it the slice always ends at the tail. */
+  /** Opt-in cap on mounted rows (#4961 F20), at least one automatic budget plus a chunk. */
   maxMountedRows?: number;
 }
 
@@ -47,13 +47,11 @@ export interface BoundedTranscriptReveal {
    * row is already inside the mounted range.
    */
   revealThrough: (index: number) => void;
-  /** Rows at indices < toIndex are eligible to mount; the transcript length unless detached. */
+  /** Rows below toIndex may mount; it is the length unless detached (newest rows unmounted). */
   toIndex: number;
-  /** The newest rows are unmounted (only with `maxMountedRows`). */
   isDetached: boolean;
-  /** Mounts up to `TRANSCRIPT_REVEAL_AUTO_MAX_ROWS` newer rows, unmounting the oldest past the cap. */
+  /** Mounts up to one budget of newer rows; resetToLatest restarts tail-first, like a switch. */
   revealNewer: () => void;
-  /** Restarts tail-first, as on a workspace switch: the newest rows mount, older ones unmount. */
   resetToLatest: () => void;
 }
 
@@ -119,47 +117,45 @@ export const transcriptRevealFrameScheduler: {
   schedule: (callback: () => void) => () => void;
 } = { schedule: scheduleStagedFrame };
 
-/** Index of the row with `id`, trying `hint` first; -1 when it is gone. */
-function findRowIndex(messages: readonly RevealRow[], id: string, hint: number): number {
-  return messages[hint]?.id === id ? hint : messages.findIndex((row) => row.id === id);
-}
+type IsSafeCut = (index: number) => boolean;
 
 /** Smallest safe cut at or after `index`, clamped to [0, length]; length is always safe. */
-function nearestSafeCutAtOrAfter(
-  index: number,
-  length: number,
-  isSafeCut: (index: number) => boolean
-): number {
+function nearestSafeCutAtOrAfter(index: number, length: number, isSafeCut: IsSafeCut): number {
   let cut = Math.min(Math.max(index, 0), length);
   while (cut < length && !isSafeCut(cut)) cut += 1;
   return cut;
 }
 
+/** A detached slice's stored end; a vanished end row falls back to the nearest older row. */
+function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCut: IsSafeCut) {
+  const { endMessageId: id, endIndexHint: hint } = state;
+  if (id === null) return rows.length;
+  const endIndex = rows[hint]?.id === id ? hint : rows.findIndex((row) => row.id === id);
+  return nearestSafeCutAtOrBefore(endIndex === -1 ? hint : endIndex + 1, rows.length, isSafeCut);
+}
+
 /**
- * Where a slice starting at `fromIndex` ends. Order of operations (#4961 F20): the start is
- * settled first; a slice longer than the cap then gives up its newest rows (the end moves to the
- * safe cut at or before `fromIndex + max`), in the same render. A bundle larger than the cap
- * mounts whole. A vanished end row falls back to the nearest kept older row, never the tail.
+ * Where a slice starting at `fromIndex` ends. Order of operations (#4961 F20): the start is settled
+ * first, then a slice over the cap gives up its newest rows in the same render. A first bundle over
+ * the cap keeps the end (it mounts whole).
  */
 function resolveSliceEnd(
   state: RevealState,
   messages: readonly RevealRow[],
   fromIndex: number,
-  maxMountedRows: number | undefined,
-  isSafeCut: (index: number) => boolean
+  max: number | undefined,
+  isSafeCut: IsSafeCut
 ): number {
   const length = messages.length;
-  const max = maxMountedRows ?? Number.POSITIVE_INFINITY;
-  let to = length;
-  if (state.endMessageId !== null) {
-    const endIndex = findRowIndex(messages, state.endMessageId, state.endIndexHint);
-    to = nearestSafeCutAtOrBefore(
-      endIndex === -1 ? state.endIndexHint : endIndex + 1,
-      length,
-      isSafeCut
-    );
-  }
-  if (to - fromIndex > max) to = nearestSafeCutAtOrBefore(fromIndex + max, length, isSafeCut);
+  // An uncapped slice always ends at the tail, even if a cap was dropped while detached.
+  if (max === undefined) return length;
+  assert(
+    max >= TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS,
+    "maxMountedRows must hold an automatic reveal budget plus a chunk"
+  );
+  let to = storedSliceEnd(state, messages, isSafeCut);
+  const fitted = nearestSafeCutAtOrBefore(fromIndex + max, length, isSafeCut);
+  if (to - fromIndex > max && fitted > fromIndex) to = fitted;
   return to > fromIndex ? to : nearestSafeCutAtOrAfter(fromIndex + 1, length, isSafeCut);
 }
 
@@ -180,27 +176,34 @@ interface RevealSnapshot {
 }
 
 /**
- * The slice moved to start at the safe cut `start` and end at most `max` rows later. The budget
- * is set to what is mounted, so the automatic reveal never walks the start back down.
+ * The slice moved to start at or before `desired`, end at most `max` rows later and keep row
+ * `include`. The budget becomes what is mounted, so the automatic reveal never walks it back.
  */
 function sliceStateAt(
   previous: RevealState,
   snapshot: RevealSnapshot,
-  start: number,
-  max: number | undefined,
-  isSafeCut: (index: number) => boolean
+  desired: number,
+  include: number,
+  max: number,
+  isSafeCut: IsSafeCut
 ): RevealState {
-  if (previous.generation !== snapshot.generation) return previous;
   const { messages } = snapshot;
+  if (previous.generation !== snapshot.generation) return previous;
+  const length = messages.length;
+  const endFrom = (start: number) => {
+    const fitted = nearestSafeCutAtOrBefore(start + max, length, isSafeCut);
+    return fitted > start ? fitted : nearestSafeCutAtOrAfter(start + 1, length, isSafeCut);
+  };
+  let start = nearestSafeCutAtOrBefore(desired, length, isSafeCut);
+  if (endFrom(start) <= include) start = nearestSafeCutAtOrBefore(include, length, isSafeCut);
   const moved: RevealState = {
     ...previous,
     anchorMessageId: start === 0 ? null : messages[start].id,
     anchorIndexHint: start,
-    autoRowLimit: messages.length - start,
+    autoRowLimit: length - start,
     targetMessageId: null,
-    endMessageId: null,
   };
-  return withSliceEnd(moved, messages, resolveSliceEnd(moved, messages, start, max, isSafeCut));
+  return withSliceEnd(moved, messages, endFrom(start));
 }
 
 /** revealNewer: mount up to one budget of newer rows, unmounting the oldest past the cap. */
@@ -208,31 +211,28 @@ function revealNewerState(
   previous: RevealState,
   snapshot: RevealSnapshot,
   max: number | undefined,
-  isSafeCut: (index: number) => boolean
+  isSafeCut: IsSafeCut
 ): RevealState {
+  const { fromIndex, toIndex } = snapshot;
   const length = snapshot.messages.length;
-  if (max === undefined || snapshot.toIndex >= length) return previous;
-  const to = Math.min(snapshot.toIndex + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS, length);
-  const start = nearestSafeCutAtOrAfter(Math.max(snapshot.fromIndex, to - max), length, isSafeCut);
-  return sliceStateAt(previous, snapshot, start, max, isSafeCut);
+  if (max === undefined || toIndex >= length) return previous;
+  const to = Math.min(toIndex + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS, length);
+  return sliceStateAt(previous, snapshot, Math.max(fromIndex, to - max), toIndex, max, isSafeCut);
 }
 
 /**
- * revealThrough: a target the slice cannot reach while keeping its end (newer than the slice,
- * or more than `max` rows below its end) centers the slice on it; an older target within reach
- * becomes the navigation target the steps reveal down to; a mounted one changes nothing.
+ * revealThrough: a target the slice cannot reach while keeping its end centers the slice on it;
+ * an older target within reach becomes the navigation target; a mounted one changes nothing.
  */
 function revealThroughState(
   previous: RevealState,
   snapshot: RevealSnapshot,
   index: number,
   max: number | undefined,
-  isSafeCut: (index: number) => boolean
+  isSafeCut: IsSafeCut
 ): RevealState {
   if (max !== undefined && (index >= snapshot.toIndex || snapshot.toIndex - index > max)) {
-    const length = snapshot.messages.length;
-    const start = nearestSafeCutAtOrBefore(index - Math.floor(max / 2), length, isSafeCut);
-    return sliceStateAt(previous, snapshot, start, max, isSafeCut);
+    return sliceStateAt(previous, snapshot, index - Math.floor(max / 2), index, max, isSafeCut);
   }
   if (index >= snapshot.fromIndex || previous.generation !== snapshot.generation) return previous;
   const targetMessageId = snapshot.messages[index].id;
