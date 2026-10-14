@@ -88,7 +88,7 @@ interface RevealState {
    * mounted, then it clears. Cleared as well when the row disappears or the reveal restarts.
    */
   targetMessageId: string | null;
-  /** Newest mounted row while detached, anchored by id like the start; null ⇒ ends at the tail. */
+  /** First unmounted newer row while detached, anchored by id like the start; null ⇒ the tail. */
   endMessageId: string | null;
   endIndexHint: number;
 }
@@ -126,18 +126,18 @@ function nearestSafeCutAtOrAfter(index: number, length: number, isSafeCut: IsSaf
   return cut;
 }
 
-/** A detached slice's stored end; a vanished end row falls back to the nearest older row. */
+/** A detached slice's stored end: its first unmounted row survives deleted mounted rows. */
 function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCut: IsSafeCut) {
   const { endMessageId: id, endIndexHint: hint } = state;
   if (id === null) return rows.length;
   const endIndex = rows[hint]?.id === id ? hint : rows.findIndex((row) => row.id === id);
-  return nearestSafeCutAtOrBefore(endIndex === -1 ? hint : endIndex + 1, rows.length, isSafeCut);
+  return nearestSafeCutAtOrBefore(endIndex === -1 ? hint : endIndex, rows.length, isSafeCut);
 }
 
 /**
  * Where a slice starting at `fromIndex` ends. Order of operations (#4961 F20): the start is settled
  * first, then a slice over the cap gives up its newest rows in the same render (a first bundle over
- * the cap keeps the end: it mounts whole).
+ * the cap mounts whole, alone).
  */
 function resolveSliceEnd(
   state: RevealState,
@@ -154,14 +154,14 @@ function resolveSliceEnd(
   );
   let to = storedSliceEnd(state, messages, isSafeCut);
   const fitted = nearestSafeCutAtOrBefore(fromIndex + max, length, isSafeCut);
-  if (to - fromIndex > max && fitted > fromIndex) to = fitted;
+  if (to - fromIndex > max) to = fitted;
   return to > fromIndex ? to : nearestSafeCutAtOrAfter(fromIndex + 1, length, isSafeCut);
 }
 
 /** `state` with its end fields set for a slice ending at `to` (null at the tail). */
 function withSliceEnd(state: RevealState, messages: readonly RevealRow[], to: number): RevealState {
-  const endMessageId = to < messages.length ? messages[to - 1].id : null;
-  const endIndexHint = endMessageId === null ? 0 : to - 1;
+  const endMessageId = to < messages.length ? messages[to].id : null;
+  const endIndexHint = endMessageId === null ? 0 : to;
   return state.endMessageId === endMessageId && state.endIndexHint === endIndexHint
     ? state
     : { ...state, endMessageId, endIndexHint };

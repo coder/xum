@@ -657,13 +657,13 @@ describe("useBoundedTranscriptReveal", () => {
       expect(ids(reveal().fromIndex, reveal().toIndex)).toEqual(before);
       expect(reveal().toIndex).toBe(toIndex + 30);
 
-      // An edit deletes the end row: the slice ends at the bundle edge by the kept row above it.
-      const keptId = props().messages[toIndex + 28].id;
-      setProps({ messages: props().messages.filter((_, index) => index !== toIndex + 29) });
-      const keptIndex = props().messages.findIndex((row) => row.id === keptId);
-      expect(bundled(reveal().toIndex)).toBe(true);
-      expect(keptIndex - reveal().toIndex).toBeLessThan(10);
-      expect(keptIndex).toBeGreaterThanOrEqual(reveal().toIndex - 1);
+      // An edit deletes a run ending at the end row: the slice ends by the kept row above the run.
+      const run = (i: number) => i >= toIndex + 5 && i < toIndex + 30;
+      setProps({ messages: props().messages.filter((_, i) => !run(i)) });
+      // Kept row toIndex + 4; the slice ends at its bundle edge (toIndex + 0), never past it.
+      expect(reveal().toIndex).toBe(toIndex);
+      setProps({ messages: props().messages.filter((_, i) => i !== toIndex) }); // first unmounted row
+      expect(reveal().toIndex).toBe(toIndex);
     });
 
     test("revealNewer walks back to the tail; resetToLatest and a dropped cap reattach", () => {
@@ -702,8 +702,8 @@ describe("useBoundedTranscriptReveal", () => {
 
     test("bundles larger than the cap mount whole; centering and revealNewer still reach rows", () => {
       const { reveal, runFrames } = renderSlice(MAX, (index) => index % 1500 === 0);
-      runFrames(); // The automatic reveal mounts a 1,500-row bundle whole and stays attached.
-      expect(reveal()).toMatchObject({ fromIndex: 3000, toIndex: LONG });
+      runFrames(); // The automatic reveal reaches a 1,500-row bundle: it mounts whole, alone.
+      expect(reveal()).toMatchObject({ fromIndex: 3000, toIndex: 4500 });
       act(() => reveal().revealThrough(2000));
       expect(reveal()).toMatchObject({ fromIndex: 1500, toIndex: 3000 });
       act(() => reveal().revealNewer());
