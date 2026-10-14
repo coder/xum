@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 
 /**
  * MCP Apps view-domain approvals this renderer changed (artifacts experiment), per project and
@@ -49,4 +50,17 @@ export function useMcpAppViewDomains(
   return useSyncExternalStore(subscribe, () =>
     projectPath == null ? undefined : entries.get(keyOf(projectPath, serverName))
   );
+}
+
+/**
+ * The origins a view may be granted: the published list when it is newer than the list the
+ * view's own getView read, else the view's list.
+ */
+export function newestMcpAppViewDomains(
+  published: McpAppViewDomainsEntry | undefined,
+  view: Pick<McpAppView, "approvedDomains" | "approvedDomainsRevision"> | null | undefined
+): readonly string[] {
+  return published != null && published.revision > (view?.approvedDomainsRevision ?? 0)
+    ? published.origins
+    : (view?.approvedDomains ?? []);
 }
