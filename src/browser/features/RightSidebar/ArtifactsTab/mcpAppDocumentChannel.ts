@@ -61,7 +61,9 @@ export function mcpAppDocumentChannelScript(nonce: string): string {
       dispatch(new MessageEventCtor("message", { data: event.data, source: port }));
     };
     window.addEventListener("keydown", function (event) {
-      var target = event.target;
+      // The innermost target: an input inside an open shadow root retargets event.target to
+      // its host element.
+      var target = typeof event.composedPath === "function" ? event.composedPath()[0] || event.target : event.target;
       var editable = !!target && target.nodeType === 1 && (target.isContentEditable ||
         target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT");
       var plain = !event.ctrlKey && !event.metaKey && !event.altKey;

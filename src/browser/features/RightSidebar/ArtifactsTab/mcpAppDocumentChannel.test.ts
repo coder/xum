@@ -40,7 +40,12 @@ function openDocument(nonce: string, hostWindow: HostWindow) {
     events,
     hide: () => listeners.get("pagehide")?.(),
     /** Dispatch a keydown to the preamble's listener; returns the event for later handlers. */
-    key: (event: { key: string; shiftKey?: boolean; target?: unknown }) => {
+    key: (event: {
+      key: string;
+      shiftKey?: boolean;
+      target?: unknown;
+      composedPath?: () => unknown[];
+    }) => {
       const dispatched = { shiftKey: false, defaultPrevented: false, ...event };
       listeners.get("keydown")?.(dispatched);
       return dispatched;
@@ -74,6 +79,13 @@ describe("MCP App document channel", () => {
     view.key({ key: "Escape" }).defaultPrevented = true;
     // Typing a capital F in a text field, or another key: no exit.
     view.key({ key: "F", shiftKey: true, target: { nodeType: 1, tagName: "INPUT" } });
+    // An input inside an open shadow root: event.target is its non-editable host element.
+    view.key({
+      key: "F",
+      shiftKey: true,
+      target: { nodeType: 1, tagName: "MY-FIELD" },
+      composedPath: () => [{ nodeType: 1, tagName: "INPUT" }],
+    });
     view.key({ key: "f" });
     // The preamble reads defaultPrevented in a task, then the port delivers in another.
     await tick();
