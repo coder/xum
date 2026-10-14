@@ -308,6 +308,15 @@ describe("MCP Apps host router", () => {
       { u: undefined },
     ])
       await send(changed);
+    // A sparse array (JSON turns holes into null).
+    // eslint-disable-next-line no-sparse-arrays -- the hole is the point
+    await send({ a: [1, , 3] });
+    // Shared references that JSON would expand exponentially: refused before any serialization.
+    let shared: Record<string, unknown> = { leaf: 1 };
+    for (let i = 0; i < 60; i++) shared = { left: shared, right: shared };
+    const started = Date.now();
+    await send(shared);
+    expect(Date.now() - started).toBeLessThan(1000);
     await send(null);
     expect(t.widgetStates).toEqual([{ n: 1 }, null]);
   });

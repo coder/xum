@@ -69,43 +69,51 @@ const LogParams = z.object({ level: z.string().max(32).optional(), data: z.unkno
 const WidgetStateParams = z.object({ state: z.unknown().refine(isStorableWidgetState) });
 
 /**
- * JSON within the cap, which JSON keeps exactly: no cycle or BigInt (stringify throws), and no
- * NaN, Infinity, undefined member, Date, Map or other class instance (stringify changes them),
- * so the stored state is what the widget set.
+ * JSON within the cap, which JSON keeps exactly: no cycle, BigInt, NaN, Infinity, undefined
+ * member, sparse array, Date, Map or other class instance, so the stored state is what the
+ * widget set.
+ *
+ * SECURITY: the value comes from the view by structured clone, which keeps shared references, so
+ * a small message can stand for a huge JSON text. A bounded walk runs first and gives up after
+ * MCP_APP_WIDGET_STATE_MAX_BYTES units (every node and string character is at least one byte of
+ * JSON), so JSON.stringify only ever sees a value within the cap.
  */
 function isStorableWidgetState(state: unknown): boolean {
-  let json: string;
-  try {
-    json = JSON.stringify(state ?? null);
-  } catch {
-    return false;
-  }
-  return (
-    new TextEncoder().encode(json).length <= MCP_APP_WIDGET_STATE_MAX_BYTES && isJsonValue(state)
-  );
+  const value = state ?? null;
+  if (!isJsonValue(value, { left: MCP_APP_WIDGET_STATE_MAX_BYTES })) return false;
+  return new TextEncoder().encode(JSON.stringify(value)).length <= MCP_APP_WIDGET_STATE_MAX_BYTES;
 }
 
-/** Whether JSON round-trips `value` unchanged. Called after the size check, so it is bounded. */
-function isJsonValue(value: unknown): boolean {
-  switch (typeof value) {
-    case "string":
-    case "boolean":
-      return true;
-    case "number":
-      return Number.isFinite(value);
-    case "object":
-      return value === null || isJsonContainer(value as Readonly<Record<string, unknown>>);
-    default:
-      return false;
-  }
+interface JsonBudget {
+  left: number;
+}
+type JsonContainer = Readonly<Record<string, unknown>> | readonly unknown[];
+
+/** Whether JSON round-trips `value` unchanged, within `budget` (spent as it walks). */
+function isJsonValue(value: unknown, budget: JsonBudget): boolean {
+  budget.left -= typeof value === "string" ? value.length + 1 : 1;
+  if (budget.left < 0) return false;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object") return typeof value === "string" || typeof value === "boolean";
+  return value === null || isJsonContainer(value as JsonContainer, budget);
 }
 
-/** An array or a plain object (no Date, Map or other class) of JSON values. */
-function isJsonContainer(value: Readonly<Record<string, unknown>> | readonly unknown[]): boolean {
-  if (Array.isArray(value)) return value.every(isJsonValue);
+/** An array without holes, or a plain object (no Date, Map or other class), of JSON values. */
+function isJsonContainer(value: JsonContainer, budget: JsonBudget): boolean {
+  if (Array.isArray(value)) return isJsonArray(value, budget);
   const prototype: unknown = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) return false;
-  return Object.values(value).every(isJsonValue);
+  return Object.entries(value).every(([key, member]) => {
+    budget.left -= key.length;
+    return isJsonValue(member, budget);
+  });
+}
+
+function isJsonArray(value: readonly unknown[], budget: JsonBudget): boolean {
+  for (let i = 0; i < value.length; i++) {
+    if (!(i in value) || !isJsonValue(value[i], budget)) return false;
+  }
+  return true;
 }
 const ToolCallParams = z.object({
   name: z.string().min(1).max(256),
