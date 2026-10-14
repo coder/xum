@@ -63,6 +63,11 @@ import {
   readPluginFileWithinRootCapped,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
 } from "@/node/services/agentPlugins/discovery";
+import {
+  isPluginSkillConsented,
+  pluginSkillConsentGate,
+  type PluginSkillConsentGate,
+} from "@/node/services/agentPlugins/componentConsent";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import {
   getCanonicalProjectMetadataRelativePath,
@@ -238,6 +243,8 @@ interface AgentSkillScanCandidate {
   /** Agent Plugins only: contributing plugin name for descriptor attribution. */
   pluginName?: string;
   importedSkills?: string[];
+  /** Managed plugins only: the reviewed skill fingerprints (#6498). */
+  skillConsent?: PluginSkillConsentGate;
 }
 
 /**
@@ -298,6 +305,7 @@ async function buildPluginScanCandidates(args: {
 
     // One candidate per root, in declared order: the scan keeps the first skill of a name.
     const importedSkills = plugin.importedComponents?.skills;
+    const skillConsent = pluginSkillConsentGate(plugin);
     candidates.push(
       ...plugin.skillsDirs.map((root) => ({
         scope: args.scope,
@@ -306,6 +314,7 @@ async function buildPluginScanCandidates(args: {
         pluginRoot: plugin.rootPath,
         pluginName: plugin.name,
         importedSkills,
+        skillConsent,
       }))
     );
   }
@@ -585,12 +594,70 @@ async function listSkillDirectoriesFromRuntime(
     .filter(Boolean);
 }
 
+/**
+ * Read a non-plugin SKILL.md for the skill index. Each failure becomes a diagnostic and null, so
+ * the scan skips the skill. A transport failure throws: an unreachable host is not a bad skill.
+ */
+async function readRuntimeSkillFileForScan(
+  runtime: Runtime,
+  skillFilePath: string,
+  directoryName: SkillName,
+  scope: AgentSkillScope,
+  pushInvalidSkill: (message: string, hint: string) => void
+): Promise<{ content: string; byteSize: number } | null> {
+  let stat;
+  try {
+    stat = await runtime.stat(skillFilePath);
+  } catch (error) {
+    if (isRuntimeTransportError(error)) throw error;
+    pushInvalidSkill(
+      "SKILL.md is missing or unreadable.",
+      "Create a SKILL.md file with YAML frontmatter (--- ... ---)."
+    );
+    return null;
+  }
+
+  if (stat.isDirectory) {
+    pushInvalidSkill(
+      "SKILL.md is a directory (expected a file).",
+      "Replace SKILL.md with a regular file."
+    );
+    return null;
+  }
+
+  // Avoid reading very large files into memory (parseSkillMarkdown enforces the same limit).
+  const sizeValidation = validateFileSize(stat);
+  if (sizeValidation) {
+    log.warn(`Skipping skill '${directoryName}' (${scope}): ${sizeValidation.error}`);
+    pushInvalidSkill(sizeValidation.error, "Reduce SKILL.md size below 1MB.");
+    return null;
+  }
+
+  try {
+    return { content: await readFileString(runtime, skillFilePath), byteSize: stat.size };
+  } catch (err) {
+    if (isRuntimeTransportError(err)) throw err;
+    const message = getErrorMessage(err);
+    log.warn(`Failed to read SKILL.md for ${directoryName}: ${message}`);
+    pushInvalidSkill(
+      `Failed to read SKILL.md: ${message}`,
+      "Check file permissions and ensure the file is UTF-8 text."
+    );
+    return null;
+  }
+}
+
 async function readSkillDescriptorFromDir(
   runtime: Runtime,
   skillDir: string,
   directoryName: SkillName,
   scope: AgentSkillScope,
-  options?: { invalidSkills?: AgentSkillIssue[]; pluginName?: string; pluginRoot?: string }
+  options?: {
+    invalidSkills?: AgentSkillIssue[];
+    pluginName?: string;
+    pluginRoot?: string;
+    skillConsent?: PluginSkillConsentGate;
+  }
 ): Promise<AgentSkillDescriptor | null> {
   const skillFilePath = runtime.normalizePath("SKILL.md", skillDir);
 
@@ -633,47 +700,15 @@ async function readSkillDescriptorFromDir(
       return null;
     }
   } else {
-    let stat;
-    try {
-      stat = await runtime.stat(skillFilePath);
-    } catch (error) {
-      if (isRuntimeTransportError(error)) throw error;
-      pushInvalidSkill(
-        "SKILL.md is missing or unreadable.",
-        "Create a SKILL.md file with YAML frontmatter (--- ... ---)."
-      );
-      return null;
-    }
-
-    if (stat.isDirectory) {
-      pushInvalidSkill(
-        "SKILL.md is a directory (expected a file).",
-        "Replace SKILL.md with a regular file."
-      );
-      return null;
-    }
-
-    // Avoid reading very large files into memory (parseSkillMarkdown enforces the same limit).
-    const sizeValidation = validateFileSize(stat);
-    if (sizeValidation) {
-      log.warn(`Skipping skill '${directoryName}' (${scope}): ${sizeValidation.error}`);
-      pushInvalidSkill(sizeValidation.error, "Reduce SKILL.md size below 1MB.");
-      return null;
-    }
-
-    try {
-      content = await readFileString(runtime, skillFilePath);
-    } catch (err) {
-      if (isRuntimeTransportError(err)) throw err;
-      const message = getErrorMessage(err);
-      log.warn(`Failed to read SKILL.md for ${directoryName}: ${message}`);
-      pushInvalidSkill(
-        `Failed to read SKILL.md: ${message}`,
-        "Check file permissions and ensure the file is UTF-8 text."
-      );
-      return null;
-    }
-    byteSize = stat.size;
+    const read = await readRuntimeSkillFileForScan(
+      runtime,
+      skillFilePath,
+      directoryName,
+      scope,
+      pushInvalidSkill
+    );
+    if (read === null) return null;
+    ({ content, byteSize } = read);
   }
 
   try {
@@ -682,6 +717,13 @@ async function readSkillDescriptorFromDir(
       byteSize,
       directoryName,
     });
+    if (!isPluginSkillConsented(options?.skillConsent, skillDir, parsed.frontmatter)) {
+      pushInvalidSkill(
+        "This plugin skill has not been reviewed on this install, so it does not load.",
+        "Open Settings → Plugins and select Review on the plugin."
+      );
+      return null;
+    }
 
     const descriptor: AgentSkillDescriptor = {
       name: parsed.frontmatter.name,
@@ -831,6 +873,7 @@ export async function discoverAgentSkills(
           invalidSkills: issues,
           ...(scan.pluginName !== undefined ? { pluginName: scan.pluginName } : {}),
           ...(scan.pluginRoot !== undefined ? { pluginRoot: scan.pluginRoot } : {}),
+          skillConsent: scan.skillConsent,
         }
       );
       if (!descriptor) continue;
@@ -923,13 +966,32 @@ export interface ResolvedAgentSkill {
   pluginRoot?: string;
 }
 
+/** Read a non-plugin SKILL.md for a direct skill read; every failure throws. */
+async function readRuntimeSkillFile(
+  runtime: Runtime,
+  skillFilePath: string
+): Promise<{ content: string; byteSize: number }> {
+  const stat = await runtime.stat(skillFilePath);
+  if (stat.isDirectory) {
+    throw new Error(`SKILL.md is not a file: ${skillFilePath}`);
+  }
+
+  const sizeValidation = validateFileSize(stat);
+  if (sizeValidation) {
+    throw new Error(sizeValidation.error);
+  }
+
+  return { content: await readFileString(runtime, skillFilePath), byteSize: stat.size };
+}
+
 async function readAgentSkillFromDir(
   runtime: Runtime,
   skillDir: string,
   directoryName: SkillName,
   scope: AgentSkillScope,
-  pluginRoot?: string
-): Promise<ResolvedAgentSkill> {
+  pluginRoot?: string,
+  skillConsent?: PluginSkillConsentGate
+): Promise<ResolvedAgentSkill | null> {
   const skillFilePath = runtime.normalizePath("SKILL.md", skillDir);
 
   let content: string;
@@ -947,24 +1009,15 @@ async function readAgentSkillFromDir(
     content = result.content;
     byteSize = result.byteSize;
   } else {
-    const stat = await runtime.stat(skillFilePath);
-    if (stat.isDirectory) {
-      throw new Error(`SKILL.md is not a file: ${skillFilePath}`);
-    }
-
-    const sizeValidation = validateFileSize(stat);
-    if (sizeValidation) {
-      throw new Error(sizeValidation.error);
-    }
-
-    content = await readFileString(runtime, skillFilePath);
-    byteSize = stat.size;
+    ({ content, byteSize } = await readRuntimeSkillFile(runtime, skillFilePath));
   }
   const parsed = parseSkillMarkdown({
     content,
     byteSize,
     directoryName,
   });
+  // An unreviewed plugin skill reads like a missing one, so a lower-scope skill can serve.
+  if (!isPluginSkillConsented(skillConsent, skillDir, parsed.frontmatter)) return null;
 
   const pkg: AgentSkillPackage = {
     scope,
@@ -1014,6 +1067,57 @@ function isLookupCandidate(
 }
 
 /**
+ * The skill `candidate` serves under `name`, or null when it has none (missing, not contained,
+ * invalid, or an unreviewed plugin skill), so the next candidate can serve.
+ */
+async function readCandidateSkill(
+  candidate: AgentSkillScanCandidate,
+  name: SkillName,
+  containment: ProjectSkillContainment
+): Promise<ResolvedAgentSkill | null> {
+  let resolvedRoot: string;
+  try {
+    resolvedRoot = await candidate.runtime.resolvePath(candidate.root);
+  } catch (error) {
+    // An unreachable host is not a missing skill root: never fall back to a
+    // lower-scope or built-in skill on a transport failure (#4438).
+    if (isRuntimeTransportError(error)) throw error;
+    return null;
+  }
+
+  const skillDir = candidate.runtime.normalizePath(name, resolvedRoot);
+  const skillFilePath = candidate.runtime.normalizePath("SKILL.md", skillDir);
+
+  const contained = await isCandidateSkillContained({
+    candidate,
+    containment,
+    skillDir,
+    skillFilePath,
+    directoryName: name,
+  });
+  if (!contained) return null;
+
+  try {
+    const stat = await candidate.runtime.stat(skillDir);
+    if (!stat.isDirectory) return null;
+
+    return await readAgentSkillFromDir(
+      candidate.runtime,
+      skillDir,
+      name,
+      candidate.scope,
+      candidate.pluginRoot,
+      candidate.skillConsent
+    );
+  } catch (error) {
+    // An unreadable skill (transport, permission) must not let a lower-scope
+    // skill with the same name win (#4438, #4827).
+    if (isRuntimeReadFailure(error)) throw error;
+    return null;
+  }
+}
+
+/**
  * Resolve a skill by lookup name. A bare name follows scan precedence with the
  * built-in fallback. `<plugin>:<skill>` considers only that plugin's candidates
  * (project plugin before global plugin) and never falls back to non-plugin or
@@ -1053,45 +1157,8 @@ export async function readAgentSkill(
 
   for (const candidate of candidates) {
     if (!isLookupCandidate(candidate, pluginName, name)) continue;
-    let resolvedRoot: string;
-    try {
-      resolvedRoot = await candidate.runtime.resolvePath(candidate.root);
-    } catch (error) {
-      // An unreachable host is not a missing skill root: never fall back to a
-      // lower-scope or built-in skill on a transport failure (#4438).
-      if (isRuntimeTransportError(error)) throw error;
-      continue;
-    }
-
-    const skillDir = candidate.runtime.normalizePath(name, resolvedRoot);
-    const skillFilePath = candidate.runtime.normalizePath("SKILL.md", skillDir);
-
-    const contained = await isCandidateSkillContained({
-      candidate,
-      containment,
-      skillDir,
-      skillFilePath,
-      directoryName: name,
-    });
-    if (!contained) continue;
-
-    try {
-      const stat = await candidate.runtime.stat(skillDir);
-      if (!stat.isDirectory) continue;
-
-      return await readAgentSkillFromDir(
-        candidate.runtime,
-        skillDir,
-        name,
-        candidate.scope,
-        candidate.pluginRoot
-      );
-    } catch (error) {
-      // An unreadable skill (transport, permission) must not let a lower-scope
-      // skill with the same name win (#4438, #4827).
-      if (isRuntimeReadFailure(error)) throw error;
-      continue;
-    }
+    const resolved = await readCandidateSkill(candidate, name, containment);
+    if (resolved !== null) return resolved;
   }
 
   // Check built-in skills as fallback (bare lookups only)

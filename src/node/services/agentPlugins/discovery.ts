@@ -14,6 +14,7 @@ import { log } from "@/node/services/log";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { isMutationEpochUnreadable, readContainerMutationState } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginComponentImports } from "./registry";
+import { noComponentConsent, type ComponentConsent } from "./componentConsent";
 import {
   isPlainObject,
   isValidAgentPluginName,
@@ -222,6 +223,11 @@ export interface AgentPluginInfo {
   /** Managed global imports; absent means legacy/unmanaged import-all. */
   importedComponents?: AgentPluginImportedComponents;
   componentPolicy?: { registryPath: string; name: string };
+  /**
+   * Managed plugins only: the reviewed fingerprints (#6498). Set together with componentPolicy;
+   * an install without records gets empty ones, so nothing of it loads until reviewed.
+   */
+  componentConsent?: ComponentConsent;
   name: string;
   scope: AgentPluginScope;
   /** Canonical (realpath) plugin root directory. */
@@ -789,6 +795,35 @@ async function resolveAgentPluginContainerPath(containerPath: string): Promise<s
 }
 
 /** Canonical project plugins shadow same-named legacy copies during ordered scans. */
+/**
+ * The install-owned fields of one discovered plugin, from its container's registry read. A
+ * corrupt registry, or an unidentified row that can own the directory, imports nothing. Managed
+ * plugins also get their reviewed fingerprints (#6498): an install without records gets empty
+ * ones, so nothing of it loads until reviewed.
+ */
+function managedPluginFields(
+  entryName: string,
+  imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,
+  registryPath: string | undefined
+): Pick<AgentPluginInfo, "componentPolicy" | "componentConsent" | "importedComponents"> {
+  if (imports === null) return { importedComponents: { skills: [], mcpServers: [] } };
+  if (imports === undefined) return {};
+  if (!imports.byName.has(entryName)) {
+    return imports.hasUnidentifiedEntries
+      ? { importedComponents: { skills: [], mcpServers: [] } }
+      : {};
+  }
+  return {
+    importedComponents: imports.byName.get(entryName),
+    ...(registryPath !== undefined
+      ? {
+          componentPolicy: { registryPath, name: entryName },
+          componentConsent: imports.consentByName.get(entryName) ?? noComponentConsent(),
+        }
+      : {}),
+  };
+}
+
 export async function discoverAgentPlugins(
   containers: AgentPluginContainer[],
   options?: {
@@ -1047,15 +1082,14 @@ export async function discoverAgentPlugins(
         });
         snapshot.plugins.set(entryName, plugin);
         if (plugin) {
-          const imports = snapshot.imports;
-          const registryPath = groups.get(canonicalPath)?.registryPath;
-          if (registryPath !== undefined && imports?.byName.has(entryName)) {
-            plugin.componentPolicy = { registryPath, name: entryName };
-          }
-          plugin.importedComponents =
-            imports === null || (imports?.hasUnidentifiedEntries && !imports.byName.has(entryName))
-              ? { skills: [], mcpServers: [] }
-              : imports?.byName.get(entryName);
+          Object.assign(
+            plugin,
+            managedPluginFields(
+              entryName,
+              snapshot.imports,
+              groups.get(canonicalPath)?.registryPath
+            )
+          );
         }
       }
       if (plugin)

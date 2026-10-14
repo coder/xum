@@ -205,6 +205,7 @@ import {
   AgentPluginInstallEntrySchema,
   AgentPluginInstallPreviewSchema,
   AgentPluginComponentsSchema,
+  AgentPluginComponentRefSchema,
   AgentPluginHooksSchema,
   AgentPluginListItemSchema,
   AgentPluginUpdateCheckSchema,
@@ -1319,6 +1320,26 @@ export const agentPlugins = {
       consent: AgentPluginUpdateConsentSchema.nullish(),
     }),
     output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
+  },
+  /**
+   * Component review of the installed tree (#6498): every imported skill or MCP server whose
+   * current fingerprint the user has not reviewed, in the update review shape (fromSha = toSha).
+   */
+  previewComponentReview: {
+    input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginUpdateReviewSchema, z.string()),
+  },
+  /** Record consent for the reviewed components that still match the installed tree. */
+  confirmComponentReview: {
+    input: z.object({
+      name: z.string(),
+      expectedLockedSha: z.string(),
+      reviewed: z.array(AgentPluginComponentRefSchema),
+    }),
+    output: ResultSchema(
+      z.object({ entry: AgentPluginInstallEntrySchema, cleanupWarning: z.string().optional() }),
+      z.string()
+    ),
   },
 };
 
