@@ -613,7 +613,9 @@ async function runGit(
  * cloneRef checks out after narrowToSubpath has set the sparse pattern.
  */
 function sparseCloneFlags(subpath: string | undefined): string[] {
-  return subpath === undefined ? [] : ["--filter=blob:none", "--no-checkout"];
+  // --no-local: for a plain local-path source, git's local-clone shortcut
+  // ignores --depth and --filter and copies the whole repository history.
+  return subpath === undefined ? [] : ["--filter=blob:none", "--no-checkout", "--no-local"];
 }
 
 /** `git fetch` counterpart of sparseCloneFlags (the sparse checkout is set before checkout). */
@@ -1931,14 +1933,20 @@ export class AgentPluginInstallService {
         }
       }
       await this.renameIntoStaging(path.join(cloneDir, subpath), pluginDir);
-    } finally {
+    } catch (error) {
       await this.removeDir(cloneDir);
+      throw error;
     }
     try {
+      // The clone goes first: the symlink check must not resolve into it.
+      await this.removeDir(cloneDir);
       await this.assertStagedTreeWithinQuota(pluginDir);
       return pluginDir;
     } catch (error) {
-      await this.removeDir(pluginDir);
+      // The caller only knows cloneDir, so pluginDir must not outlive this
+      // failure. If even its removal fails (e.g. a Windows file lock), drop
+      // the in-process claim so stale-staging reclamation can reap it later.
+      await this.removeDir(pluginDir).catch(() => this.activeStagingPaths.delete(pluginDir));
       throw error;
     }
   }

@@ -4808,6 +4808,30 @@ describe("AgentPluginInstallService", () => {
       expect(await registry()).toEqual([]);
     });
 
+    test("a failed clone cleanup after extraction leaves no extracted plugin tree behind", async () => {
+      // A transient lock (e.g. on Windows) can make the first delete of the
+      // sparse clone fail after the plugin folder was already moved out of it.
+      const rm = fsPromises.rm;
+      let failedOnce = false;
+      const rmSpy = spyOn(fsPromises, "rm").mockImplementation((async (
+        ...args: Parameters<typeof fsPromises.rm>
+      ) => {
+        const target = String(args[0]);
+        if (!failedOnce && /[\\/]stage-[^\\/]+$/.test(target)) {
+          failedOnce = true;
+          throw Object.assign(new Error("EBUSY: resource busy or locked"), { code: "EBUSY" });
+        }
+        return rm(...args);
+      }) as typeof fsPromises.rm);
+      try {
+        await expect(service.preview({ input: monoUrl, subpath })).rejects.toThrow(/EBUSY/);
+      } finally {
+        rmSpy.mockRestore();
+      }
+      expect(failedOnce).toBe(true);
+      expect(await stagingLeftovers()).toEqual([]);
+    });
+
     test("updates need consent only for changes inside the subpath", async () => {
       const preview = await service.preview({ input: monoUrl, subpath });
       await service.install({ source: preview.source, expectedSha: preview.lockedSha });
