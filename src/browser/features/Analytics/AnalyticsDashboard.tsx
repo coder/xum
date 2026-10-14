@@ -30,62 +30,8 @@ import { SummaryCards } from "./SummaryCards";
 import { TimingChart } from "./TimingChart";
 import { TokensByModelChart } from "./TokensByModelChart";
 import { formatProjectDisplayName } from "./analyticsUtils";
+import { computeDateRange } from "./dateRange";
 import { buildTimeFilterPredicate } from "./sqlTimeFilter";
-import type { AnalyticsTimeRange } from "@/common/config/schemas/userPreferences";
-
-/** Build a calendar-date boundary for the selected timezone. */
-function getDateKeyInTimeZone(date: Date, timeZone: string): string {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(date);
-  const values = new Map(parts.map((part) => [part.type, part.value]));
-  const year = values.get("year");
-  const month = values.get("month");
-  const day = values.get("day");
-  if (year == null || month == null || day == null) {
-    throw new Error(`Unable to format date for timezone ${timeZone}`);
-  }
-
-  return `${year}-${month}-${day}`;
-}
-
-function dateFromDateKey(dateKey: string): Date {
-  const [year, month, day] = dateKey.split("-").map(Number);
-  return new Date(Date.UTC(year, month - 1, day));
-}
-
-function daysAgoInTimeZone(days: number, timeZone: string): Date {
-  const dateKey = getDateKeyInTimeZone(new Date(), timeZone);
-  const date = dateFromDateKey(dateKey);
-  date.setUTCDate(date.getUTCDate() - days);
-  return date;
-}
-
-function computeDateRange(
-  timeRange: AnalyticsTimeRange,
-  timeZone: string
-): {
-  from: Date | null;
-  to: Date | null;
-  granularity: "hour" | "day" | "week";
-} {
-  switch (timeRange) {
-    case "7d":
-      return { from: daysAgoInTimeZone(6, timeZone), to: null, granularity: "day" };
-    case "30d":
-      return { from: daysAgoInTimeZone(29, timeZone), to: null, granularity: "day" };
-    case "90d":
-      return { from: daysAgoInTimeZone(89, timeZone), to: null, granularity: "week" };
-    case "all":
-      return { from: null, to: null, granularity: "week" };
-    default:
-      // Self-heal: unknown persisted value → safe default.
-      return { from: daysAgoInTimeZone(29, timeZone), to: null, granularity: "day" };
-  }
-}
 
 function getBrowserTimeZone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -263,6 +209,7 @@ function AnalyticsDashboardContent() {
                 ["7d", "7D"],
                 ["30d", "30D"],
                 ["90d", "90D"],
+                ["month-utc", "This month (UTC)"],
                 ["all", "All"],
               ] as const
             ).map(([range, label]) => (
