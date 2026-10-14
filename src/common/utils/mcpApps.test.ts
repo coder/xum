@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   isAppCallableTool,
   isModelVisibleTool,
+  mcpAppEntrypointKey,
   parseMCPAppEntrypoints,
   parseMCPToolUiMeta,
 } from "./mcpApps";
@@ -27,6 +28,17 @@ describe("parseMCPAppEntrypoints", () => {
     for (const meta of [undefined, {}, { "openai/ui": [] }, entrypoints("global")]) {
       expect(parseMCPAppEntrypoints(meta)).toEqual({ types: [], skippedFile: false });
     }
+  });
+});
+
+describe("mcpAppEntrypointKey", () => {
+  test("names one server, tool and type: a colon in a name cannot shift the split", () => {
+    expect(mcpAppEntrypointKey("a", "b:c", "global")).not.toBe(
+      mcpAppEntrypointKey("a:b", "c", "global")
+    );
+    expect(mcpAppEntrypointKey("a", "b", "global")).not.toBe(
+      mcpAppEntrypointKey("a", "b", "thread")
+    );
   });
 });
 
