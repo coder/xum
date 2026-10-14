@@ -84,6 +84,9 @@ export function mapForeignPluginAgentFrontmatter(
     // their bodies are written for delegates, so keep them out of the picker.
     ui: { hidden: true },
     subagent: { runnable: true },
+    // The body is the whole system prompt in both ecosystems, so it replaces
+    // the base body instead of Xum's default append.
+    prompt: { append: false },
     ...(Object.keys(ai).length > 0 ? { ai } : {}),
   };
   // `is_background` / `background` stay ignored: Xum's task caller already

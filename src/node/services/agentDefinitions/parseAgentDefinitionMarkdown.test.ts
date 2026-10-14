@@ -126,6 +126,7 @@ Body
         base: "exec",
         ui: { hidden: true },
         subagent: { runnable: true },
+        prompt: { append: false },
       });
     });
 

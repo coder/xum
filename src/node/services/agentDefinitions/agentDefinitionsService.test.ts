@@ -1056,7 +1056,9 @@ base: a
           workspaceId: "ws",
         });
         return {
-          body: agentDefinition.body,
+          body: await resolveAgentBody(runtime, project.path, AgentIdSchema.parse(agentId), {
+            roots,
+          }),
           policy: resolveToolPolicyForAgent({
             agents: chain,
             isSubagent: true,
@@ -1071,7 +1073,8 @@ base: a
       expect(applyToolPolicyToNames(sampleTools, pluginAgent.policy)).toEqual(
         applyToolPolicyToNames(sampleTools, exec.policy)
       );
-      // The plugin body is the whole system prompt, as in Claude Code and Cursor.
+      // The plugin body is the whole system prompt, as in Claude Code and Cursor:
+      // it replaces Exec's body instead of appending to it.
       expect(pluginAgent.body.trim()).toBe("You are a delegate.");
       // The project copy of the same file stays toolless.
       expect(
