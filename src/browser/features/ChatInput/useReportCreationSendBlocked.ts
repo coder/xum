@@ -21,6 +21,11 @@ export interface CreationSendBlockers {
   draftMoving: boolean;
 }
 
+/** Whether any blocker turns Send off. */
+export function isSendBlocked(blockers: CreationSendBlockers): boolean {
+  return Object.values(blockers).some(Boolean);
+}
+
 /**
  * #6038, #6423: tells the creation page whether its composer can send right now, so actions that
  * send through the composer (the "Run /init" banner) stay off whenever Send is off, instead of
@@ -34,7 +39,7 @@ export function useReportCreationSendBlocked(
 ): void {
   // Only the creation variant reports; a workspace composer has no such page.
   const report = props.variant === "creation" ? props.onCreationSendBlockedChange : undefined;
-  const blocked = Object.values(blockers).some(Boolean);
+  const blocked = isSendBlocked(blockers);
   useEffect(() => {
     report?.(blocked);
   }, [blocked, report]);

@@ -217,7 +217,11 @@ import {
 import { useComposerDraft } from "./useComposerDraft";
 import { getDraftStore, type SendOutcome } from "@/browser/stores/DraftStore";
 import { useComposerTypingLock } from "./useComposerTypingLock";
-import { useReportCreationSendBlocked } from "./useReportCreationSendBlocked";
+import {
+  isSendBlocked,
+  useReportCreationSendBlocked,
+  type CreationSendBlockers,
+} from "./useReportCreationSendBlocked";
 import { assert } from "@/common/utils/assert";
 import { acceptedSendIds, isEditSendAccepted } from "./sendAcceptance";
 import { createSendId } from "@/common/utils/drafts";
@@ -986,18 +990,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     creationState.branchLoad !== "loaded" &&
     creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
   const isProcessingAttachments = processingAttachmentCount > 0;
-  // #6423: the same blockers as canSend below, so "Run /init" is off whenever Send is.
-  useReportCreationSendBlocked(
-    {
-      disabled,
-      sendInFlight: sendInFlightBlocksInput,
-      processingAttachments: isProcessingAttachments,
-      coderPresetsLoading,
-      branchesNotLoaded: creationBranchesLoading,
-      draftMoving: creationDraftMove.moving,
-    },
-    props
-  );
+  // #6423: canSend below checks the same blockers, so "Run /init" is off whenever Send is.
+  const sendBlockers: CreationSendBlockers = {
+    disabled,
+    sendInFlight: sendInFlightBlocksInput,
+    processingAttachments: isProcessingAttachments,
+    coderPresetsLoading,
+    branchesNotLoaded: creationBranchesLoading,
+    draftMoving: creationDraftMove.moving,
+  };
+  useReportCreationSendBlocked(sendBlockers, props);
   const hasSendableDraft = hasTypedText || hasImages || hasReviews;
   // Workspace sends/edits mutate history relative to the visible transcript, so they wait for
   // the onChat replay to finish; the creation composer has no transcript to catch up with.
@@ -1015,12 +1017,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const editPreconditionInvalidated = editingMessageForUi?.preconditionInvalidated === true;
   const canSend =
     hasSendableDraft &&
-    !disabled &&
-    !sendInFlightBlocksInput &&
-    !isProcessingAttachments &&
-    !coderPresetsLoading &&
-    !creationBranchesLoading &&
-    !creationDraftMove.moving &&
+    !isSendBlocked(sendBlockers) &&
     !transcriptBlocksSend &&
     !editPreconditionInvalidated;
   const runningGoalActive =
