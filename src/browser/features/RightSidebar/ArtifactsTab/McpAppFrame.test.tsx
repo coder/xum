@@ -1071,6 +1071,52 @@ describe("McpAppFrame host strips", () => {
     getViewGate = null;
   });
 
+  // The container mounts only once getView answered, after the first render's effects ran.
+  test("the view container is observed for size changes once it mounts", async () => {
+    const observed: Element[] = [];
+    const original = globalThis.ResizeObserver;
+    // The component reads the global (the test DOM's window is a separate object).
+    globalThis.ResizeObserver = class {
+      observe(target: Element) {
+        observed.push(target);
+      }
+      unobserve = () => undefined;
+      disconnect = () => undefined;
+    } as unknown as typeof ResizeObserver;
+    try {
+      const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
+        wrapper: Wrapper,
+      });
+      const frame = await view.findByTestId("mcp-app-frame");
+      await waitFor(() => expect(observed.includes(frame.parentElement!)).toBe(true));
+    } finally {
+      globalThis.ResizeObserver = original;
+    }
+  });
+
+  test("a resize between the initialize reply and initialized still reaches the view", async () => {
+    Object.defineProperty(window, "innerHeight", { value: 800, configurable: true });
+    const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
+      wrapper: Wrapper,
+    });
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+    Object.defineProperty(window, "innerHeight", { value: 500, configurable: true });
+    act(() => {
+      window.dispatchEvent(new window.Event("resize"));
+    });
+    postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    await waitFor(() => {
+      const changed = posted.find((m) => m.method === "ui/notifications/host-context-changed");
+      const params = changed?.params as { containerDimensions?: { maxHeight?: number } };
+      expect(params?.containerDimensions?.maxHeight).toBe(400);
+    });
+    // The inline container's own cap follows the window too.
+    expect(frame.parentElement!.style.maxHeight).toBe("400px");
+  });
+
   test("a resize tells the view its new maximum height", async () => {
     Object.defineProperty(window, "innerHeight", { value: 800, configurable: true });
     const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {

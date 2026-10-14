@@ -303,29 +303,55 @@ function containerDimensionsOf(container: HTMLElement | null, inline: boolean) {
 /**
  * Tells the view when its container dimensions change (window resize, or the container itself:
  * a sidebar drag), so window.openai.maxHeight and the standard containerDimensions follow.
+ *
+ * - `attach` is the container's ref. A callback ref, because the container mounts only after
+ *   getView answered, and the observer must follow it. Stable: React calls a ref again whenever
+ *   its identity changes.
+ * - `inlineCap` is the inline container's height cap, kept equal to the maxHeight the view is
+ *   told (a resize updates both).
+ * - `initial()` gives the dimensions for the ui/initialize reply and records them as sent.
+ * - `flush()` sends dimensions that changed since: the host drops updates until the view sent
+ *   initialized, so a resize between the two is sent then.
  */
-function useContainerDimensionsUpdates(
-  hostRef: { current: McpAppHost | null },
-  containerRef: { current: HTMLDivElement | null },
-  inline: boolean
-) {
+function useContainerDimensionsUpdates(hostRef: { current: McpAppHost | null }, inline: boolean) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [container, setContainer] = useState<HTMLDivElement | null>(null);
+  const [inlineCap, setInlineCap] = useState(inlineMaxHeight);
+  const [attach] = useState(() => (element: HTMLDivElement | null) => {
+    containerRef.current = element;
+    setContainer(element);
+  });
+  const sent = useRef("");
+  const flushRef = useRef(() => undefined as void);
   useEffect(() => {
-    let sent = "";
     const update = () => {
-      const containerDimensions = containerDimensionsOf(containerRef.current, inline);
+      setInlineCap(inlineMaxHeight());
+      const containerDimensions = containerDimensionsOf(container, inline);
       const next = JSON.stringify(containerDimensions);
-      if (next === sent || hostRef.current == null) return;
-      sent = next;
-      hostRef.current.sendHostContextChanged({ containerDimensions });
+      if (next === sent.current) return;
+      if (hostRef.current?.sendHostContextChanged({ containerDimensions }) === true) {
+        sent.current = next;
+      }
     };
+    flushRef.current = update;
     window.addEventListener("resize", update);
     const observer = typeof ResizeObserver === "function" ? new ResizeObserver(update) : null;
-    if (containerRef.current != null) observer?.observe(containerRef.current);
+    if (container != null) observer?.observe(container);
     return () => {
       window.removeEventListener("resize", update);
       observer?.disconnect();
     };
-  }, [hostRef, containerRef, inline]);
+  }, [hostRef, container, inline]);
+  return {
+    attach,
+    inlineCap,
+    initial: () => {
+      const dimensions = containerDimensionsOf(containerRef.current, inline);
+      sent.current = JSON.stringify(dimensions);
+      return dimensions;
+    },
+    flush: () => flushRef.current(),
+  };
 }
 
 /** The domain prompt's text: the origins, and the project that keeps the approval. */
@@ -390,8 +416,8 @@ export function McpAppFrame(props: {
   const consentArming = useConfirmArmed(consent?.id ?? null);
   const [height, setHeight] = useState<number | null>(null);
   const frameRef = useRef<HTMLIFrameElement | null>(null);
-  const containerRef = useRef<HTMLDivElement | null>(null);
   const hostRef = useRef<McpAppHost | null>(null);
+  const dimensions = useContainerDimensionsUpdates(hostRef, inline);
   const { workspaceId, view } = props;
   const { toolCallId, serverName, resourceUri } = view;
   // The view's host lives as long as its frame. The API is null while Xum reconnects and a new
@@ -516,7 +542,7 @@ export function McpAppFrame(props: {
       // is the view's fullscreen, its tool card the inline mode. A move mounts a new instance.
       displayMode: inline ? "inline" : "fullscreen",
       availableDisplayModes: ["inline", "fullscreen"],
-      containerDimensions: containerDimensionsOf(containerRef.current, inline),
+      containerDimensions: dimensions.initial(),
       locale: navigator.language,
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       platform: hostPlatform(),
@@ -604,6 +630,7 @@ export function McpAppFrame(props: {
         if (currentView.cancelled) {
           host.sendToolCancelled(currentView.failed ? "failed" : "interrupted");
         } else if (result?.resultAvailable) host.sendToolResult(result.result);
+        dimensions.flush();
       },
       // Fullscreen from the card opens (or focuses) the view's tab, which takes over as its one
       // live instance; inline from the tab closes the tab, and the view returns to its card.
@@ -652,8 +679,6 @@ export function McpAppFrame(props: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [srcDoc, workspaceId, serverName, boundServerName, guard.navigated, navigatedRef]);
   useCloseDiscardedDocumentChannel(viewDocument, !guard.navigated);
-
-  useContainerDimensionsUpdates(hostRef, containerRef, inline);
 
   // Keep the view's theme current without reloading it.
   useEffect(() => {
@@ -756,9 +781,9 @@ export function McpAppFrame(props: {
       )}
       {guard.navigated && <FrameNavigatedNotice onReload={guard.reload} />}
       <div
-        ref={containerRef}
+        ref={dimensions.attach}
         className={inline ? "overflow-auto" : "min-h-0 flex-1 overflow-auto"}
-        style={inline ? { maxHeight: inlineMaxHeight() } : undefined}
+        style={inline ? { maxHeight: dimensions.inlineCap } : undefined}
       >
         {/* SECURITY AUDIT: MCP Apps view sink (see the component comment). sandbox stays exactly
             ARTIFACT_IFRAME_SANDBOX, srcdoc carries the view CSP meta first in <head>, and no
