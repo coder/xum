@@ -5,6 +5,7 @@ import { isStreamFailure } from "@/browser/contexts/connectionLink";
 import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { normalizeTerminalFontConfig } from "@/common/constants/storage";
 import { useTerminalRouter } from "@/browser/terminal/TerminalRouterContext";
+import { registerTerminalView } from "@/browser/terminal/terminalViews";
 import {
   appendTerminalIconFallback,
   formatCssFontFamilyList,
@@ -368,6 +369,11 @@ export function TerminalView({
       controller.abort();
     };
   }, [api, sessionId, handleExit]);
+
+  // After a server restart the new server lists no sessions, and the sidebar's session sync
+  // would remove this tab before the exit report arrives. Registered, the view keeps its tab
+  // until handleExit has written the exit line.
+  useEffect(() => registerTerminalView(sessionId), [sessionId]);
 
   // Subscribe to router when terminal is ready and visible
   useEffect(() => {

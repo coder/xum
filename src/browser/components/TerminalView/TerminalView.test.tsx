@@ -4,8 +4,8 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { createTestApiClient } from "@/browser/testUtils";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
-import type { ReactNode } from "react";
-import { APIProvider } from "@/browser/contexts/API";
+import { useState, type ReactNode } from "react";
+import { APIProvider, useAPI } from "@/browser/contexts/API";
 import * as RealGhosttyModule from "ghostty-web";
 import * as RealTerminalRouterContextModule from "@/browser/terminal/TerminalRouterContext";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
@@ -128,6 +128,18 @@ void mock.module("@/browser/terminal/TerminalRouterContext", () => ({
 import { TerminalView } from "./TerminalView";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { DEFAULT_TERMINAL_BADGE_CONFIG } from "@/common/constants/storage";
+import { useTerminalSessionSync } from "@/browser/features/RightSidebar/RightSidebar";
+import {
+  getTerminalSessionId,
+  isTerminalTab,
+  makeTerminalTabType,
+} from "@/browser/types/rightSidebar";
+import {
+  addTabToFocusedTabset,
+  collectAllTabs,
+  getDefaultRightSidebarLayoutState,
+  removeTabEverywhere,
+} from "@/browser/utils/rightSidebarLayout";
 
 function createRouter(): MockRouter {
   unsubscribeMock = mock(() => undefined);
@@ -240,6 +252,75 @@ describe("TerminalView", () => {
     await waitFor(() => expect(exitSubscriptions).toBe(2));
     expect(onExit).not.toHaveBeenCalled();
   });
+
+  // A server restart ends every PTY. The new server lists no sessions and reports exit 0 for
+  // each one, and that report can come after the list. The sidebar's session sync must leave the
+  // tab to the view's exit path, which writes the exit line before it closes the tab.
+  test.each([...GAP_MODES])(
+    "after a server restart the exit line is written before the tab closes (%s)",
+    async (mode) => {
+      let restarted = false;
+      let reportExit: () => void = () => undefined;
+      const exitReported = new Promise<void>((resolve) => (reportExit = resolve));
+      const harness = createConnectionHarness(mode, () => {
+        const serverRestarted = restarted;
+        return {
+          terminal: {
+            listSessions: () => Promise.resolve(serverRestarted ? [] : ["terminal-1"]),
+            onExit: () =>
+              Promise.resolve(
+                (async function* (): AsyncGenerator<number, void, unknown> {
+                  // Before the restart the process keeps running.
+                  await (serverRestarted ? exitReported : new Promise(() => undefined));
+                  yield 0;
+                })()
+              ),
+          },
+        };
+      });
+
+      // The sidebar's terminal part: the session sync, and a view per tab that closes it on exit.
+      function Sidebar() {
+        const { api } = useAPI();
+        const [layout, setLayout] = useState(() =>
+          addTabToFocusedTabset(
+            getDefaultRightSidebarLayoutState(),
+            makeTerminalTabType("terminal-1")
+          )
+        );
+        useTerminalSessionSync(api, "workspace-1", layout, setLayout);
+        return collectAllTabs(layout.root)
+          .filter(isTerminalTab)
+          .map((tab) => (
+            <div key={tab} data-testid={tab}>
+              <TerminalView
+                workspaceId="workspace-1"
+                sessionId={getTerminalSessionId(tab) ?? ""}
+                visible
+                setDocumentTitle={false}
+                autoFocus={false}
+                onExit={() => setLayout((prev) => removeTabEverywhere(prev, tab))}
+              />
+            </div>
+          ));
+      }
+      const view = render(<Sidebar />, { wrapper: harness.Wrapper });
+      await waitFor(() => expect(terminalInstances).toHaveLength(1));
+      const terminal = terminalInstances[0];
+
+      await harness.drop();
+      restarted = true;
+      harness.reconnect();
+      // Let the new server's session list arrive before its exit report.
+      await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+      reportExit();
+
+      await waitFor(() =>
+        expect(terminal?.calls).toContain("write:\r\n[Process exited with code 0]\r\n")
+      );
+      await waitFor(() => expect(view.queryByTestId("terminal:terminal-1")).toBeNull());
+    }
+  );
 
   test("keeps the router subscription stable when onExit changes", async () => {
     const firstOnExit = mock((_exitCode: number) => undefined);
