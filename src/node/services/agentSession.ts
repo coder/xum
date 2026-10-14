@@ -10449,8 +10449,10 @@ export class AgentSession {
     if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
     if (provenance.delegatedWorkspaceTurn) return;
     // Input queued during the turn is its next turn: the turn has not stopped, so Stop does
-    // not run (Codex PRRT_kwDOPxxmWM6rPrjz). The flush below dispatches it.
-    if (this.hasDispatchableFollowUp()) {
+    // not run (Codex PRRT_kwDOPxxmWM6rPrjz). The flush below dispatches it. A turn whose end an
+    // outside client already received ran to its end for that client: its hooks still run
+    // (they only lose the continuation, below).
+    if (!provenance.externallyOwnedTurn && this.hasDispatchableFollowUp()) {
       this.stopHookContinuations = 0;
       return;
     }

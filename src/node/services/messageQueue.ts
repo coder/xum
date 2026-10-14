@@ -468,9 +468,17 @@ export class MessageQueue {
     return this.entries.find((entry) => entry.cancelSignal?.aborted !== true);
   }
 
-  /** Whether any entry would still dispatch (a withdrawn entry drains as a no-op). */
+  /**
+   * Whether any entry would still dispatch: a withdrawn entry drains as a no-op, and an entry
+   * whose admission went stale is refused at the drain (or kept as held input) without streaming.
+   */
   hasDispatchableEntries(): boolean {
-    return this.nextDispatchableEntry() !== undefined;
+    return this.entries.some(
+      (entry) =>
+        entry.cancelSignal?.aborted !== true &&
+        entry.admissionStale?.() !== true &&
+        entry.turnAdmission?.admissionStale() !== true
+    );
   }
 
   getNextDispatchableMode(): QueueDispatchMode | undefined {

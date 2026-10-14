@@ -503,6 +503,42 @@ describe("turn.stop", () => {
     expect(calls.map((call) => call.messageId)).toEqual(["a2"]);
   });
 
+  test("a queued entry whose admission went stale does not skip the Stop hooks", async () => {
+    const calls: StopCall[] = [];
+    addConsumer(() => undefined, calls);
+    const { h } = await setup({
+      whileStreaming: (turn, session) => {
+        if (turn === 1)
+          session.session.queueMessage("stale work", options, {
+            acceptanceOrigin: "automatic",
+            synthetic: true,
+            admissionStale: () => true,
+          });
+      },
+    });
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    // The drain refuses the stale entry, so turn 1 is the last turn: its Stop must run.
+    expect(calls.map((call) => call.messageId)).toEqual(["a1"]);
+  });
+
+  test("an ACP turn with queued input still runs its Stop hooks", async () => {
+    const calls: StopCall[] = [];
+    addConsumer(() => undefined, calls);
+    const { h } = await setup({
+      whileStreaming: (turn, session) => {
+        if (turn === 1) session.session.queueMessage("also lint", options);
+      },
+    });
+
+    await h.session.sendMessage("fix the tests", { ...options, acpPromptId: "acp-prompt-1" });
+    await settle(h);
+
+    expect(calls.map((call) => call.messageId)).toEqual(["a1", "a2"]);
+  });
+
   test("a withdrawn queue entry does not cancel a Stop continuation", async () => {
     addConsumer((ctx) => {
       if (!ctx.stopHookActive) keepGoing(ctx);
