@@ -1819,9 +1819,7 @@ describe("WorktreeManager.createWorkspace", () => {
           expect(existsSync(readmePath)).toBe(false);
         } else {
           expect(await fsPromises.readFile(readmePath, "utf8")).toBe("hello\n");
-          expect(gitRevParseHead(result.workspacePath)).toBe(
-            gitRevParseHead(fixture.projectPath)
-          );
+          expect(gitRevParseHead(result.workspacePath)).toBe(gitRevParseHead(fixture.projectPath));
           expect(
             execFileSync("git", ["status", "--porcelain"], {
               cwd: result.workspacePath,
