@@ -17,9 +17,10 @@ describe("coalesceCatalogChanges", () => {
     setSystemTime(new Date(startedAt));
   });
   afterEach(() => {
-    const now = Date.now();
     fakeTimers.useRealTimers();
-    setSystemTime(new Date(now));
+    // No argument: back to the real clock. A fixed date would leave Date.now() frozen for every
+    // later test file in this process (lock deadlines and event-order checks then fail).
+    setSystemTime();
   });
 
   test("a burst re-lists once now and once after the interval, then reports each", async () => {
