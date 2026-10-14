@@ -34,7 +34,7 @@ import type { SendMessageError } from "@/common/types/errors";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI, type APIClient } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
@@ -239,6 +239,20 @@ async function probeRuntimeAvailability(
   }
 }
 
+/** A runtime probe's answer and the client that gave it. */
+interface ClientProbe {
+  client: APIClient | null;
+  state: RuntimeAvailabilityState;
+}
+
+const UNPROBED: RuntimeAvailabilityState = { status: "loading" };
+const NO_PROBE: ClientProbe = { client: null, state: UNPROBED };
+
+/** The probe's answer if `api` gave it, else "loading" (not probed by this client yet). */
+function probeOfClient(probe: ClientProbe, api: APIClient | null): RuntimeAvailabilityState {
+  return api != null && probe.client === api ? probe.state : UNPROBED;
+}
+
 /** True for a real (non-blank) creation draft ID. */
 function isDraftId(draftId: string | null | undefined): draftId is string {
   return typeof draftId === "string" && draftId.trim().length > 0;
@@ -328,11 +342,12 @@ export function useCreationWorkspace({
   } | null>(null);
   const [runtimeAvailabilityState, setRuntimeAvailabilityState] =
     useState<RuntimeAvailabilityState>({ status: "loading" });
-  // What the current client's probe answered: "loading" until then, a reconnect too (#6383). The
-  // shown state above keeps the last answer, but a Dev Container config can be gone since then,
-  // so the send preflight reads this one.
-  const [probedRuntimeAvailability, setProbedRuntimeAvailability] =
-    useState<RuntimeAvailabilityState>({ status: "loading" });
+  // What a probe answered, and the client it came from (#6383). The shown state above keeps the
+  // last answer, but a Dev Container config can be gone since then, so the send preflight reads
+  // this one. It counts only for the current client, so the first render with a new client (a
+  // reconnect) is already unprobed; the effect's reset lands one commit later.
+  const [probed, setProbed] = useState<ClientProbe>(NO_PROBE);
+  const probedRuntimeAvailability = probeOfClient(probed, api);
 
   // Centralized draft workspace settings with automatic persistence
   const { settings, coderConfigFallback, sshHostFallback, setSelectedRuntime, setTrunkBranch } =
@@ -382,7 +397,7 @@ export function useCreationWorkspace({
       shownProjectPathRef.current = projectPath;
       setRuntimeAvailabilityState({ status: "loading" });
     }
-    setProbedRuntimeAvailability({ status: "loading" });
+    setProbed(NO_PROBE);
     // Both requests run at once and settle independently. Send waits for the branch list (#6033),
     // so it must not also wait for the runtime probe (Docker, Podman, devcontainer CLI), which can
     // take several seconds after the branches are ready.
@@ -403,7 +418,7 @@ export function useCreationWorkspace({
       );
       if (!mounted || state == null) return;
       setRuntimeAvailabilityState(state);
-      setProbedRuntimeAvailability(state);
+      setProbed({ client: api, state });
     };
     void loadRuntimeAvailability();
     return () => {

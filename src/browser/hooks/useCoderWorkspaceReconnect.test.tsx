@@ -4,7 +4,7 @@ import "../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { installDom } from "../../../tests/ui/dom";
-import type { APIClient } from "@/browser/contexts/API";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
 import {
   createConnectionHarness,
   GAP_MODES,
@@ -204,6 +204,34 @@ describe.each([...GAP_MODES])("useCoderWorkspace across a reconnect (%s)", (mode
       existingWorkspace: true,
       workspaceName: undefined,
     });
+  });
+
+  // No render with the new client may show the previous client's list as fresh: a click before
+  // the reload effect runs would still send it.
+  test("no render with the new client lets an existing-workspace send through before the reload", async () => {
+    const renders: Array<{ api: APIClient | null; blocksSend: boolean }> = [];
+    renderHook(
+      () => {
+        const coder = useCoderWorkspace({
+          coderConfig: { existingWorkspace: true, workspaceName: "w1" },
+          onCoderConfigChange: () => undefined,
+          coderInfoRefreshPolicy: "mount-only",
+        });
+        renders.push({ api: useAPI().api, blocksSend: coder.blocksSend });
+        return coder;
+      },
+      { wrapper: harness.Wrapper }
+    );
+    await waitFor(() => expect(renders.at(-1)?.blocksSend).toBe(false));
+
+    serverLists = new Promise(() => undefined);
+    await harness.drop();
+    harness.reconnect();
+    await settle();
+    const newClient = harness.client;
+    const withNewClient = renders.filter((render) => render.api === newClient);
+    expect(withNewClient.length).toBeGreaterThan(0);
+    expect(withNewClient.every((render) => render.blocksSend)).toBe(true);
   });
 
   test("a window focus while offline keeps the Coder info and config", async () => {

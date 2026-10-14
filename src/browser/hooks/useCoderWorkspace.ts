@@ -6,7 +6,7 @@
  * This hook only manages async-fetched data and derived state.
  */
 import { useState, useEffect, useCallback, useRef } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import type {
   CoderInfo,
@@ -105,6 +105,11 @@ function formatCoderListError(error: unknown): string {
   return message || "Unknown error";
 }
 
+/** True when `answeredBy`, the client a result came from, is the current client. */
+function isAnswerOf(answeredBy: APIClient | null, api: APIClient | null): boolean {
+  return api != null && answeredBy === api;
+}
+
 /** True while the list the send of `config` depends on is not fresh (see `blocksSend`). */
 function listsBlockSend(
   enabled: boolean,
@@ -173,9 +178,12 @@ export function useCoderWorkspace({
   const [loadingTemplates, setLoadingTemplates] = useState(false);
   const [loadingPresets, setLoadingPresets] = useState(false);
   const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
-  // False until the current client's workspace list answers. Unlike `loadingWorkspaces`, a reload
-  // resets it too (#6383): the shown list stays selectable, but a send must wait for the fresh one.
-  const [workspacesFresh, setWorkspacesFresh] = useState(false);
+  // The client whose workspace list answered (null while a load runs). Unlike `loadingWorkspaces`,
+  // a reload resets it too (#6383): the shown list stays selectable, but a send must wait for the
+  // fresh one. Freshness compares it with the current client during render, so the first render
+  // with a new client (a reconnect) is already not fresh; the effect's reset lands one commit later.
+  const [workspacesFreshClient, setWorkspacesFreshClient] = useState<APIClient | null>(null);
+  const workspacesFresh = isAnswerOf(workspacesFreshClient, api);
   // What the lists show: a reload of shown data keeps it on screen instead of a spinner.
   const templatesShownRef = useRef(false);
   const workspacesShownRef = useRef(false);
@@ -307,14 +315,15 @@ export function useCoderWorkspace({
     let mounted = true;
     // Only the first load shows "loading": a reload keeps the shown workspaces.
     if (!workspacesShownRef.current) setLoadingWorkspaces(true);
-    setWorkspacesFresh(false);
+    setWorkspacesFreshClient(null);
     setWorkspacesError(null);
 
     api.coder
       .listWorkspaces()
       .then((result) => {
         if (!mounted) return;
-        setWorkspacesFresh(true);
+        // The oRPC client is a callable proxy: pass it through an updater, or React calls it.
+        setWorkspacesFreshClient(() => api);
         if (result.ok) {
           workspacesShownRef.current = true;
           setExistingWorkspaces(result.workspaces);
@@ -333,7 +342,7 @@ export function useCoderWorkspace({
       .catch((error) => {
         // A lost connection leaves the list not fresh: the next client reloads it.
         if (!mounted || isConnectionLostError(error)) return;
-        setWorkspacesFresh(true);
+        setWorkspacesFreshClient(() => api);
         setExistingWorkspaces([]);
         setWorkspacesError(formatCoderListError(error));
       })

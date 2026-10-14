@@ -1,5 +1,5 @@
 import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider, useAPI, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
 import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
@@ -848,6 +848,45 @@ describe("useCreationWorkspace", () => {
 
       act(() => answerProbe?.());
       await waitFor(() => expect(resultRef.current?.runtimeAvailabilityFresh).toBe(true));
+    });
+
+    // No render with the new client may show the previous client's probe as fresh: a click
+    // before the reload effect runs would still send it.
+    test("no render with the new client shows the old probe as fresh", async () => {
+      setupWindow({});
+      const harness = createConnectionHarness(mode, () => currentORPCClient ?? {});
+      const renders: Array<{ api: APIClient | null; fresh: boolean }> = [];
+      function Harness() {
+        const result = useCreationWorkspace({
+          projectPath: TEST_PROJECT_PATH,
+          onWorkspaceCreated: () => undefined,
+          message: "",
+        });
+        renders.push({ api: useAPI().api, fresh: result.runtimeAvailabilityFresh });
+        return null;
+      }
+      render(
+        <harness.Wrapper>
+          <Harness />
+        </harness.Wrapper>
+      );
+      await waitFor(() => expect(renders.at(-1)?.fresh).toBe(true));
+
+      const previous = currentORPCClient;
+      if (!previous) throw new Error("setupWindow() sets the client");
+      currentORPCClient = {
+        ...previous,
+        projects: { ...previous.projects, runtimeAvailability: () => new Promise(() => undefined) },
+      };
+      await harness.drop();
+      harness.reconnect();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+      const newClient = harness.client;
+      const withNewClient = renders.filter((entry) => entry.api === newClient);
+      expect(withNewClient.length).toBeGreaterThan(0);
+      expect(withNewClient.some((entry) => entry.fresh)).toBe(false);
     });
   });
 
