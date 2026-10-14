@@ -1001,6 +1001,28 @@ export const WorkspaceMCPServerSettingsRefreshDuringSave: Story = {
   },
 };
 
+const saveDuringRefreshGate = storyGate();
+
+/** The reverse order: while Refresh Tools runs (its settings read follows), Save settings waits. */
+export const WorkspaceMCPServerSettingsSaveDuringRefresh: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () =>
+    renderWorkspaceMCPModal({ ...settingsStoryOptions(), testGate: saveDuringRefreshGate }),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const zoom = section.getByLabelText("Default zoom setting");
+    await userEvent.clear(zoom);
+    await userEvent.type(zoom, "3");
+    const save = section.getByRole("button", { name: "Save settings" });
+    await waitFor(() => expect(save).toBeEnabled());
+    await userEvent.click(modal.getByRole("button", { name: "Fetch Tools" }));
+    await waitFor(() => expect(save).toBeDisabled());
+    saveDuringRefreshGate.open();
+    await expect(modal.findByRole("button", { name: "Refresh Tools" })).resolves.toBeEnabled();
+  },
+};
+
 /** Pick `option` in a Radix select (its list renders in a portal). */
 async function chooseSetting(
   canvasElement: HTMLElement,

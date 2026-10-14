@@ -609,6 +609,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                             serverName={name}
                             snapshot={entry.snapshot}
                             beginSave={() => beginSettingsSave(name)}
+                            refreshing={isLoadingTools === true}
                           />
                         </div>
                       );

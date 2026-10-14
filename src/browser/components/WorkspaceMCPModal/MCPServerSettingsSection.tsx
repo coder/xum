@@ -25,6 +25,11 @@ interface MCPServerSettingsSectionProps {
    * stored, and keeps Refresh Tools disabled until the save ends.
    */
   beginSave: () => (values: MCPSettingsSnapshot["values"] | null) => void;
+  /**
+   * Refresh Tools runs for this server. Its settings read would take a newer request ID than
+   * a save started now, and the save's result would be dropped, so Save waits for it.
+   */
+  refreshing: boolean;
 }
 
 /** Lets the dialog check, at Save time, for edits this section has not saved yet. */
@@ -56,7 +61,11 @@ export const MCPServerSettingsSection = React.forwardRef<
     Object.entries(draft).filter(([name, value]) => getOwn(saved, name) !== value)
   );
   const errors = settingsErrors(properties, draft);
-  const canSave = Object.keys(changed).length > 0 && Object.keys(errors).length === 0 && !saving;
+  const canSave =
+    Object.keys(changed).length > 0 &&
+    Object.keys(errors).length === 0 &&
+    !saving &&
+    !props.refreshing;
   // The dialog's Save does not send settings, so it must not close over a pending edit.
   useImperativeHandle(ref, () => ({ hasUnsavedChanges: () => Object.keys(changed).length > 0 }));
 
