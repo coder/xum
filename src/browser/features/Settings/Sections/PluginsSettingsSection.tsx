@@ -12,15 +12,19 @@ import {
   XCircle,
 } from "lucide-react";
 import { useAPI } from "@/browser/contexts/API";
+import { useTheme } from "@/browser/contexts/ThemeContext";
+import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { Button } from "@/browser/components/Button/Button";
 import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { cn } from "@/common/lib/utils";
 import type {
+  AgentPluginComponentRef,
   AgentPluginComponents,
   AgentPluginInstallPreview,
   AgentPluginInterfaceSummary,
   AgentPluginListItem,
   AgentPluginUpdateCheck,
+  AgentPluginUpdateConsent,
   AgentPluginUpdateReview,
 } from "@/common/orpc/schemas/agentPlugins";
 import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
@@ -70,7 +74,7 @@ const Badge: React.FC<{
       "rounded px-1.5 py-0.5 text-[10px] font-medium",
       props.wrap === true ? "max-w-full wrap-anywhere" : "whitespace-nowrap",
       props.tone === "muted" && "bg-foreground/10 text-muted",
-      props.tone === "accent" && "bg-accent/15 text-accent",
+      props.tone === "accent" && "bg-accent/15 text-accent-text",
       props.tone === "warning" && "bg-warning/15 text-warning",
       props.tone === "error" && "bg-destructive/15 text-destructive"
     )}
@@ -78,6 +82,23 @@ const Badge: React.FC<{
     {props.children}
   </span>
 );
+
+/**
+ * The interface logo for the current theme. A light logo can vanish on a dark
+ * background (#6124), so dark themes use OpenAI's dark variant. Each theme
+ * falls back to the other image when its own is missing or failed to read:
+ * some logo beats none, as before.
+ */
+const PluginLogo: React.FC<{
+  info: Pick<AgentPluginInterfaceSummary, "logoDataUrl" | "logoDarkDataUrl">;
+}> = (props) => {
+  const isLight = isLightThemeMode(useTheme().theme);
+  const logo = isLight
+    ? (props.info.logoDataUrl ?? props.info.logoDarkDataUrl)
+    : (props.info.logoDarkDataUrl ?? props.info.logoDataUrl);
+  if (logo?.startsWith("data:image/") !== true) return null;
+  return <img src={logo} alt="" className="size-8 shrink-0 rounded" />;
+};
 
 /**
  * OpenAI `interface` metadata. Every manifest string renders as React text
@@ -95,9 +116,7 @@ const PluginInterfaceDetails: React.FC<{ info: AgentPluginInterfaceSummary }> = 
   const httpsLinks = links.filter((link) => link.url?.startsWith("https://") === true);
   return (
     <div className="mt-1 flex min-w-0 items-start gap-2" data-testid="plugin-interface">
-      {props.info.logoDataUrl?.startsWith("data:image/") && (
-        <img src={props.info.logoDataUrl} alt="" className="size-8 shrink-0 rounded" />
-      )}
+      <PluginLogo info={props.info} />
       <div className="min-w-0 space-y-0.5">
         <p className="text-foreground text-xs break-words">
           <span className="font-medium">{props.info.displayName}</span>
@@ -405,7 +424,7 @@ const ManageComponentsPanel: React.FC<{
         </p>
       )}
       {saved && (
-        <p role="status" className="text-accent text-xs">
+        <p role="status" className="text-accent-text text-xs">
           Component selection saved.
         </p>
       )}
@@ -618,7 +637,7 @@ const AddPluginPanel: React.FC<{
                 phone widths. */}
             <p className="text-muted text-[11px] break-all">
               {preview.source.url} @ {preview.source.ref} →{" "}
-              <code className="text-accent">{preview.targetPath}</code>
+              <code className="text-accent-text">{preview.targetPath}</code>
               {preview.manifest.authorName ? ` · by ${preview.manifest.authorName}` : ""}
               {preview.manifest.license ? ` · ${preview.manifest.license}` : ""}
             </p>
@@ -828,75 +847,246 @@ const UninstallConfirm: React.FC<{
  * value so the user can judge it, instead of being routed through uninstall
  * + reinstall. Conditional rendering keeps this testable without portals.
  */
+/** The component references a review showed; confirming sends them back (#6498). */
+function reviewedComponents(review: AgentPluginUpdateReview): AgentPluginComponentRef[] {
+  return review.changes.flatMap((change) => (change.component ? [change.component] : []));
+}
+
+/**
+ * Update review, also reused for the component review of an installed tree (#6498): the same
+ * Before/After rows, with `mode: "components"` changing only the wording and the confirm action.
+ */
+type ReviewPanelMode = "update" | "components";
+const REVIEW_PANEL_COPY: Record<
+  ReviewPanelMode,
+  {
+    intro: (review: AgentPluginUpdateReview) => string;
+    commits: (review: AgentPluginUpdateReview) => string;
+    confirm: string;
+    busy: string;
+  }
+> = {
+  update: {
+    intro: (review) =>
+      `This update${review.version ? ` (v${review.version})` : ""} changes what the plugin can do. Review the changes before applying it:`,
+    commits: (review) => `${review.fromSha.slice(0, 12)} → ${review.toSha.slice(0, 12)}`,
+    confirm: "Apply update",
+    busy: "Updating…",
+  },
+  components: {
+    intro: () =>
+      "These skills and MCP servers have not been reviewed on this install. Review them before you approve them:",
+    commits: (review) => review.fromSha.slice(0, 12),
+    confirm: "Approve components",
+    busy: "Approving…",
+  },
+};
+
 const UpdateReviewPanel: React.FC<{
   review: AgentPluginUpdateReview;
+  mode: ReviewPanelMode;
   selective: boolean;
   busy: boolean;
   onConfirm: () => void;
   onCancel: () => void;
-}> = (props) => (
-  <div className="border-border-medium bg-background-secondary mt-2 space-y-2 rounded-md border p-3">
-    <p className="text-foreground text-xs">
-      This update{props.review.version ? ` (v${props.review.version})` : ""} changes what the plugin
-      can do. Review the changes before applying it:
-    </p>
-    {props.selective && (
-      <p className="text-warning text-xs">
-        Your imported selection is preserved. Newly disclosed skills and MCP servers stay unimported
-        until you add them; this review still covers the full package.
-      </p>
-    )}
-    <ul className="space-y-2">
-      {props.review.changes.map((change) => (
-        <li key={change.summary} className="text-xs">
-          <span className="text-foreground break-words">{change.summary}</span>
-          {(change.before !== undefined || change.after !== undefined) && (
-            <dl className="mt-1 space-y-1">
-              {change.before !== undefined && (
-                <div className="flex gap-2">
-                  <dt className="text-muted w-10 shrink-0 text-[11px]">Before</dt>
-                  <dd className="bg-modal-bg border-border-medium min-w-0 flex-1 rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
-                    {change.before}
-                  </dd>
-                </div>
-              )}
-              {change.after !== undefined && (
-                <div className="flex gap-2">
-                  <dt className="text-muted w-10 shrink-0 text-[11px]">After</dt>
-                  <dd className="bg-modal-bg border-border-medium min-w-0 flex-1 rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
-                    {change.after}
-                  </dd>
-                </div>
-              )}
-            </dl>
-          )}
-        </li>
-      ))}
-    </ul>
-    {props.review.warnings.length > 0 && (
-      <div className="bg-warning/10 space-y-1 rounded-md px-3 py-2">
-        {props.review.warnings.map((warning) => (
-          <div key={warning} className="text-warning flex items-start gap-2 text-xs">
-            <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span className="break-words">{warning}</span>
-          </div>
+}> = (props) => {
+  const copy = REVIEW_PANEL_COPY[props.mode];
+  return (
+    <div className="border-border-medium bg-background-secondary mt-2 space-y-2 rounded-md border p-3">
+      <p className="text-foreground text-xs">{copy.intro(props.review)}</p>
+      {props.mode !== "components" && props.selective && (
+        <p className="text-warning text-xs">
+          Your imported selection is preserved. Newly disclosed skills and MCP servers stay
+          unimported until you add them; this review still covers the full package.
+        </p>
+      )}
+      <ul className="space-y-2">
+        {props.review.changes.map((change) => (
+          <li key={change.summary} className="text-xs">
+            <span className="text-foreground break-words">{change.summary}</span>
+            {(change.before !== undefined || change.after !== undefined) && (
+              <dl className="mt-1 space-y-1">
+                {change.before !== undefined && (
+                  <div className="flex gap-2">
+                    <dt className="text-muted w-10 shrink-0 text-[11px]">Before</dt>
+                    <dd className="bg-modal-bg border-border-medium min-w-0 flex-1 rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
+                      {change.before}
+                    </dd>
+                  </div>
+                )}
+                {change.after !== undefined && (
+                  <div className="flex gap-2">
+                    <dt className="text-muted w-10 shrink-0 text-[11px]">After</dt>
+                    <dd className="bg-modal-bg border-border-medium min-w-0 flex-1 rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
+                      {change.after}
+                    </dd>
+                  </div>
+                )}
+              </dl>
+            )}
+          </li>
         ))}
+      </ul>
+      {props.review.warnings.length > 0 && (
+        <div className="bg-warning/10 space-y-1 rounded-md px-3 py-2">
+          {props.review.warnings.map((warning) => (
+            <div key={warning} className="text-warning flex items-start gap-2 text-xs">
+              <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span className="break-words">{warning}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <p className="text-muted text-[11px] break-all">{copy.commits(props.review)}</p>
+      <div className="flex gap-2">
+        <Button size="sm" onClick={props.onConfirm} disabled={props.busy}>
+          {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+          {props.busy ? copy.busy : copy.confirm}
+        </Button>
+        <Button variant="ghost" size="sm" onClick={props.onCancel} disabled={props.busy}>
+          Cancel
+        </Button>
       </div>
-    )}
-    <p className="text-muted text-[11px] break-all">
-      {props.review.fromSha.slice(0, 12)} → {props.review.toSha.slice(0, 12)}
-    </p>
-    <div className="flex gap-2">
-      <Button size="sm" onClick={props.onConfirm} disabled={props.busy}>
-        {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-        {props.busy ? "Updating…" : "Apply update"}
-      </Button>
-      <Button variant="ghost" size="sm" onClick={props.onCancel} disabled={props.busy}>
-        Cancel
-      </Button>
     </div>
-  </div>
-);
+  );
+};
+
+/** Section notice while any plugin has components not reviewed on this install (#6498). */
+const ComponentReviewNotice: React.FC<{ items: AgentPluginListItem[] | null }> = (props) => {
+  if (!(props.items ?? []).some((item) => (item.reviewRequiredCount ?? 0) > 0)) return null;
+  return (
+    <div
+      role="status"
+      className="bg-warning/10 text-warning mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm"
+    >
+      <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+      <span className="break-words">
+        Some plugins have skills or MCP servers that you have not reviewed on this install. Xum
+        loads a plugin component only after you approve its current version, so these do not load
+        until you review them. After an upgrade, each plugin needs this review once. Select Review
+        on each plugin marked &quot;needs review&quot; to approve them.
+      </span>
+    </div>
+  );
+};
+
+const NeedsReviewBadge: React.FC<{ item: AgentPluginListItem }> = (props) =>
+  (props.item.reviewRequiredCount ?? 0) > 0 ? <Badge tone="warning">needs review</Badge> : null;
+
+const ReviewComponentsButton: React.FC<{
+  item: AgentPluginListItem;
+  disabled: boolean;
+  onReview: () => void;
+}> = (props) => {
+  if (!props.item.present || (props.item.reviewRequiredCount ?? 0) === 0) return null;
+  return (
+    <Button
+      size="sm"
+      className="h-7 px-2 text-xs"
+      disabled={props.disabled}
+      onClick={props.onReview}
+      aria-label={`Review components of ${props.item.name}`}
+    >
+      Review
+    </Button>
+  );
+};
+
+/**
+ * The open component review of the section (#6498) and its actions. Callers share the section's
+ * busy and error state, like the update handlers.
+ */
+interface ComponentReviewDeps {
+  api: ReturnType<typeof useAPI>["api"];
+  busyPlugin: string | null;
+  setBusyPlugin: (name: string | null) => void;
+  setError: (error: string | null) => void;
+  refresh: () => Promise<void>;
+}
+
+/** One busy-guarded plugin action with the section's error capture. */
+async function runPluginAction(
+  deps: ComponentReviewDeps,
+  name: string,
+  action: (api: NonNullable<ComponentReviewDeps["api"]>) => Promise<void>
+): Promise<void> {
+  const api = deps.api;
+  if (!api || deps.busyPlugin !== null) return;
+  deps.setBusyPlugin(name);
+  deps.setError(null);
+  try {
+    await action(api);
+  } catch (err) {
+    deps.setError(getErrorMessage(err));
+  } finally {
+    deps.setBusyPlugin(null);
+  }
+}
+
+/** What the section shows after a review confirm: its error, or the saved review's cleanup warning. */
+function confirmMessage(
+  result: { success: true; data: { cleanupWarning?: string } } | { success: false; error: string }
+): string | undefined {
+  return result.success ? result.data.cleanupWarning : result.error;
+}
+
+function useComponentReview(deps: ComponentReviewDeps) {
+  const [review, setReview] = useState<AgentPluginUpdateReview | null>(null);
+  const open = (name: string) =>
+    runPluginAction(deps, name, async (api) => {
+      // Close a panel that is open for another plugin first: if this preview fails, the old panel
+      // must not stay actionable under this plugin's error.
+      setReview(null);
+      const preview = await api.agentPlugins.previewComponentReview({ name });
+      if (!preview.success) return deps.setError(preview.error);
+      const hasRows = preview.data.changes.length > 0;
+      setReview(hasRows ? preview.data : null);
+      if (!hasRows) await deps.refresh();
+    });
+  const confirm = (shown: AgentPluginUpdateReview) =>
+    runPluginAction(deps, shown.name, async (api) => {
+      const result = await api.agentPlugins.confirmComponentReview({
+        name: shown.name,
+        expectedLockedSha: shown.fromSha,
+        reviewed: reviewedComponents(shown),
+      });
+      if (result.success) {
+        publishAgentPluginsMutated();
+        setReview(null);
+      }
+      // Refresh first: its success path clears the error state.
+      await deps.refresh();
+      const message = confirmMessage(result);
+      if (message !== undefined) deps.setError(message);
+    });
+  /** A palette "Review Plugin Components" intent, also one that arrived before the section mounted. */
+  const openFromIntent = (intent: PluginsSectionIntent | null) => {
+    if (intent?.type === "review-components") void open(intent.name);
+  };
+  return { review, open, confirm, openFromIntent, close: () => setReview(null) };
+}
+
+/** The component review under its plugin's row (managed rows only, like the update review). */
+const ComponentReviewRow: React.FC<{
+  item: AgentPluginListItem;
+  review: AgentPluginUpdateReview | null;
+  busy: boolean;
+  onConfirm: (review: AgentPluginUpdateReview) => void;
+  onCancel: () => void;
+}> = (props) => {
+  const review = props.review;
+  if (!props.item.managed || review?.name !== props.item.name) return null;
+  return (
+    <UpdateReviewPanel
+      review={review}
+      mode="components"
+      selective={false}
+      busy={props.busy}
+      onConfirm={() => props.onConfirm(review)}
+      onCancel={props.onCancel}
+    />
+  );
+};
 
 export const PluginsSettingsSection: React.FC = () => {
   const { api } = useAPI();
@@ -940,6 +1130,15 @@ export const PluginsSettingsSection: React.FC = () => {
   /** Monotonic ids of the latest list/update-check requests; stale responses must not commit state. */
   const listGenerationRef = useRef(0);
   const checkGenerationRef = useRef(0);
+
+  const componentReview = useComponentReview({
+    api,
+    busyPlugin,
+    setBusyPlugin,
+    setError,
+    // Lazy: `refresh` is declared below.
+    refresh: () => refresh(),
+  });
 
   const openAddPanel = () => {
     // Feedback belongs to the completed install, not the next attempt from any entry point.
@@ -1004,11 +1203,21 @@ export const PluginsSettingsSection: React.FC = () => {
 
   // Approved update policy: passive check on section open + explicit button only.
   useEffect(() => {
-    void refresh();
+    // A palette review intent opens after the first list refresh: the refresh clears the shared
+    // error, so a concurrent preview failure would vanish without an explanation.
+    void refresh().finally(() => componentReview.openFromIntent(initialIntent));
     void checkForUpdates();
     void api?.agentPlugins.containerLocation().then(setContainerLocation, () => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fetch on mount / API reconnect only; refresh/checkForUpdates are plain handlers (compiler-memoized), not inputs
   }, [api]);
+
+  // The intent listener below subscribes once per API, so it reads the review actions through
+  // this ref: they must see the current busy state, or a palette review could start during a
+  // running update and clear its busy flag.
+  const latestComponentReview = useRef(componentReview);
+  useEffect(() => {
+    latestComponentReview.current = componentReview;
+  });
 
   // Live palette intents while mounted (see pluginsSectionIntents).
   useEffect(() => {
@@ -1028,6 +1237,9 @@ export const PluginsSettingsSection: React.FC = () => {
           break;
         case "review-update":
           setUpdateReview(intent.review);
+          break;
+        case "review-components":
+          latestComponentReview.current.openFromIntent(intent);
           break;
         case "refresh":
           void refresh();
@@ -1049,6 +1261,8 @@ export const PluginsSettingsSection: React.FC = () => {
     setBusyPlugin(name);
     setError(null);
     setUpdateReview(null);
+    // The update moves lockedSha, so an open component review would confirm against a stale tree.
+    componentReview.close();
     try {
       const preview = await api.agentPlugins.previewUpdate({ name });
       if (!preview.success) {
@@ -1072,7 +1286,12 @@ export const PluginsSettingsSection: React.FC = () => {
     setBusyPlugin(review.name);
     setError(null);
     try {
-      await applyUpdate(review.name, { fromSha: review.fromSha, toSha: review.toSha });
+      // Only the shown components get consent records (#6498).
+      await applyUpdate(review.name, {
+        fromSha: review.fromSha,
+        toSha: review.toSha,
+        reviewed: reviewedComponents(review),
+      });
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
@@ -1081,10 +1300,7 @@ export const PluginsSettingsSection: React.FC = () => {
   };
 
   /** Shared tail of both update paths; callers own busy state and error capture. */
-  const applyUpdate = async (
-    name: string,
-    consent: { fromSha: string; toSha: string } | undefined
-  ) => {
+  const applyUpdate = async (name: string, consent: AgentPluginUpdateConsent | undefined) => {
     if (!api) return;
     const result = await api.agentPlugins.update({ name, consent: consent ?? null });
     if (result.success) {
@@ -1135,7 +1351,7 @@ export const PluginsSettingsSection: React.FC = () => {
         <p className="text-muted mb-4 text-xs">
           Install Agent Plugins from git repositories into{" "}
           {containerLocation !== null ? (
-            <code className="text-accent">{containerLocation}</code>
+            <code className="text-accent-text">{containerLocation}</code>
           ) : (
             "the managed plugins directory"
           )}
@@ -1186,7 +1402,7 @@ export const PluginsSettingsSection: React.FC = () => {
         )}
 
         {installSucceeded && (
-          <p role="status" className="text-accent mb-3 text-xs">
+          <p role="status" className="text-accent-text mb-3 text-xs">
             Plugin installed.
           </p>
         )}
@@ -1202,6 +1418,8 @@ export const PluginsSettingsSection: React.FC = () => {
             <span className="break-words">Update check failed: {updateCheckError}</span>
           </div>
         )}
+
+        <ComponentReviewNotice items={items} />
 
         <div className="space-y-2">
           {items === null ? (
@@ -1247,6 +1465,7 @@ export const PluginsSettingsSection: React.FC = () => {
                         {check?.status === "tag-moved" && <Badge tone="warning">tag moved</Badge>}
                         {check?.status === "pinned" && <Badge tone="muted">pinned</Badge>}
                         {check?.status === "error" && <Badge tone="warning">check failed</Badge>}
+                        <NeedsReviewBadge item={item} />
                       </div>
                       {item.description && (
                         <p className="text-muted mt-0.5 text-xs">{item.description}</p>
@@ -1276,6 +1495,11 @@ export const PluginsSettingsSection: React.FC = () => {
 
                     {item.managed && (
                       <div className="flex flex-wrap gap-1">
+                        <ReviewComponentsButton
+                          item={item}
+                          disabled={busyPlugin !== null}
+                          onReview={() => void componentReview.open(item.name)}
+                        />
                         {item.present && (
                           <Button
                             variant="outline"
@@ -1362,12 +1586,20 @@ export const PluginsSettingsSection: React.FC = () => {
                   {item.managed && updateReview?.name === item.name && (
                     <UpdateReviewPanel
                       review={updateReview}
+                      mode="update"
                       selective={item.importedComponents !== undefined}
                       busy={isBusy}
                       onConfirm={() => void handleConfirmUpdate(updateReview)}
                       onCancel={() => setUpdateReview(null)}
                     />
                   )}
+                  <ComponentReviewRow
+                    item={item}
+                    review={componentReview.review}
+                    busy={isBusy}
+                    onConfirm={(review) => void componentReview.confirm(review)}
+                    onCancel={componentReview.close}
+                  />
                   {item.managed && uninstallTarget === item.name && (
                     <UninstallConfirm
                       item={item}

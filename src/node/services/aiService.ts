@@ -171,9 +171,13 @@ export class AIService extends EventEmitter {
     )
   ) {
     super();
-    // Increase max listeners to accommodate multiple concurrent workspace listeners
-    // Each workspace subscribes to stream events, and we expect >10 concurrent workspaces
-    this.setMaxListeners(50);
+    // No listener cap: every live AgentSession adds one listener per forwarded event, and a
+    // session lives from first use of its workspace until archive, removal or shutdown, so the
+    // count tracks how many workspaces this process has touched. Any fixed cap is a false
+    // MaxListenersExceededWarning for a user with many workspaces or sub-agents. A leak (a
+    // disposed session that keeps its listeners) is caught by
+    // workspaceService.sessionListeners.test.ts instead.
+    this.setMaxListeners(0);
     this.workspaceMcpOverridesService =
       workspaceMcpOverridesService ?? new WorkspaceMcpOverridesService(config);
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
@@ -511,8 +515,15 @@ export class AIService extends EventEmitter {
     return Ok(eventSpine.captureRequestAssembly(workspaceId));
   }
 
-  hasMessageSendHooks(): boolean {
-    return eventSpine.hasMiddleware("message.send");
+  /**
+   * Load the workspace's lazy hooks, then report whether any message.send hook applies to it.
+   * The accepted-send check reads this: before the load, a first send after a restart saw no
+   * hook and skipped the check, so a retry could run a stateful hook twice (Codex
+   * PRRT_kwDOPxxmWM6rSBny). Another workspace's hooks do not count (PRRT_kwDOPxxmWM6rQd90).
+   */
+  async prepareMessageSendHooks(workspaceId: string): Promise<boolean> {
+    await this.loadRequestHooksForPrompt(workspaceId);
+    return eventSpine.hasMiddlewareFor("message.send", workspaceId);
   }
 
   /**
@@ -523,8 +534,40 @@ export class AIService extends EventEmitter {
   async runMessageSendHooks(
     workspaceId: string,
     input: MessageSendHookInput,
-    cancelSignal?: AbortSignal
+    cancelSignal?: AbortSignal,
+    /** prepareMessageSendHooks already ran the lazy load for this send. */
+    hooksLoaded = false
   ): Promise<MessageSendHookOutcome> {
+    if (!hooksLoaded) await this.loadRequestHooksForPrompt(workspaceId);
+    // Codex UserPromptSubmit hooks call their plugin's MCP server, which the turn only starts
+    // after this chain: start it first (the turn's own startup, bounded), or the first prompt
+    // after a restart misses the hooks. A canceled send ends this wait and its hook calls (see
+    // MessageSendContext.signal).
+    await codexPluginHookService.prepareForPromptHooks(
+      workspaceId,
+      (signal) => this.turnRequestBuilder.startWorkspaceMcpServers(workspaceId, signal),
+      cancelSignal
+    );
+    // After the setup above, so the check sees the hooks it loaded.
+    const cwd = eventSpine.hasMiddlewareFor("message.send", workspaceId)
+      ? await this.resolvePromptHookCwd(workspaceId)
+      : undefined;
+    return runMessageSendHooks(eventSpine, workspaceId, { ...input, cwd, signal: cancelSignal });
+  }
+
+  /** Run the turn.stop prompt-hook chain for one finished turn (fail-open). */
+  async runTurnStopHooks(
+    workspaceId: string,
+    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">
+  ): Promise<TurnStopHookOutcome> {
+    const cwd = eventSpine.hasMiddlewareFor("turn.stop", workspaceId)
+      ? await this.resolvePromptHookCwd(workspaceId)
+      : undefined;
+    return runTurnStopHooks(eventSpine, workspaceId, { ...input, cwd });
+  }
+
+  /** The lazy hook setup of request building, fail-soft: the hooks already loaded still run. */
+  private async loadRequestHooksForPrompt(workspaceId: string): Promise<void> {
     const snapshot = await this.captureRequestAssemblySnapshot(workspaceId).catch(
       (error: unknown) => {
         log.warn("Prompt hooks: hook setup failed; running the hooks already loaded", {
@@ -537,31 +580,6 @@ export class AIService extends EventEmitter {
     if (snapshot?.success === false) {
       log.debug("Prompt hooks: hook setup skipped", { workspaceId, error: snapshot.error });
     }
-    // Codex UserPromptSubmit hooks call their plugin's MCP server, which the turn only starts
-    // after this chain: start it first (the turn's own startup, bounded), or the first prompt
-    // after a restart misses the hooks. A canceled send ends this wait; the hooks still run, so a
-    // send whose cancellation is disabled cannot skip them.
-    await codexPluginHookService.prepareForPromptHooks(
-      workspaceId,
-      (signal) => this.turnRequestBuilder.startWorkspaceMcpServers(workspaceId, signal),
-      cancelSignal
-    );
-    // After the setup above, so the check sees the hooks it loaded.
-    const cwd = eventSpine.hasMiddleware("message.send")
-      ? await this.resolvePromptHookCwd(workspaceId)
-      : undefined;
-    return runMessageSendHooks(eventSpine, workspaceId, { ...input, cwd });
-  }
-
-  /** Run the turn.stop prompt-hook chain for one finished turn (fail-open). */
-  async runTurnStopHooks(
-    workspaceId: string,
-    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">
-  ): Promise<TurnStopHookOutcome> {
-    const cwd = eventSpine.hasMiddleware("turn.stop")
-      ? await this.resolvePromptHookCwd(workspaceId)
-      : undefined;
-    return runTurnStopHooks(eventSpine, workspaceId, { ...input, cwd });
   }
 
   /** The workspace path prompt hooks see as `cwd` (the tools' cwd); undefined when unreadable. */

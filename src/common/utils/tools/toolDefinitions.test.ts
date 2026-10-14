@@ -657,6 +657,26 @@ describe("TOOL_DEFINITIONS", () => {
     expect(parsed.success).toBe(false);
   });
 
+  it("accepts <plugin>:<skill> on the skill read tools but keeps writes bare", () => {
+    // Tool tests call execute() directly, so only this schema check sees what the model may send.
+    expect(TOOL_DEFINITIONS.agent_skill_read.schema.safeParse({ name: "pstack:tdd" }).success).toBe(
+      true
+    );
+    expect(
+      TOOL_DEFINITIONS.agent_skill_read_file.schema.safeParse({
+        name: "pstack:tdd",
+        filePath: "SKILL.md",
+      }).success
+    ).toBe(true);
+    expect(
+      TOOL_DEFINITIONS.agent_skill_write.schema.safeParse({
+        name: "pstack:tdd",
+        filePath: "SKILL.md",
+        content: "x",
+      }).success
+    ).toBe(false);
+  });
+
   it("always includes global skill management tools", () => {
     const tools = getAvailableTools("openai:gpt-4o");
 

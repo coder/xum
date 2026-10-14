@@ -21,6 +21,8 @@ export type PluginsSectionIntent =
   | { type: "manage-components"; name: string }
   /** Open the hooks.json hook review (trust / turn off) for a managed plugin. */
   | { type: "review-hooks"; name: string }
+  /** Open the component review (skills and MCP servers not reviewed on this install, #6498). */
+  | { type: "review-components"; name: string }
   /** Open the uninstall confirmation for a managed plugin. */
   | { type: "confirm-uninstall"; name: string }
   /** Show the in-place update review for a capability-changing update the palette previewed. */

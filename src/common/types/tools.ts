@@ -4,7 +4,11 @@
  */
 
 import type { z } from "zod";
-import type { AgentSkillDescriptor, AgentSkillFrontmatter } from "@/common/types/agentSkill";
+import type {
+  AgentSkillDescriptor,
+  AgentSkillFrontmatter,
+  AgentSkillScope,
+} from "@/common/types/agentSkill";
 import type {
   AgentReportToolResultSchema,
   AgentSkillReadFileToolResultSchema,
@@ -273,6 +277,20 @@ export const FILE_EDIT_TOOL_NAMES = [
  * contents).
  */
 export const FILE_READ_TOOL_NAMES = ["file_read"] as const;
+
+/**
+ * Field a successful direct file_read / file_edit_* result carries when the touched
+ * file matches a path-scoped skill (`paths` frontmatter). Unlike the model-only
+ * `__mux_notifications`, it is persisted to chat.jsonl: the pointer stays in the
+ * append-only prompt prefix, and later turns of the same context window see it and
+ * do not surface the skill again.
+ */
+export const PATH_SKILLS_RESULT_FIELD = "path_skills" as const;
+
+export interface PathSkillsResultField {
+  message: string;
+  skills: Array<{ name: string; scope: AgentSkillScope; description: string }>;
+}
 
 /**
  * Prefix for edit failure notes (agent-only messages).

@@ -119,6 +119,8 @@ export const AgentPluginInterfaceSummarySchema = z.object({
   supportURL: z.string().optional(),
   /** `data:image/...;base64,` read through the contained capped reader; never a path. */
   logoDataUrl: z.string().optional(),
+  /** Dark-theme variant (OpenAI `logoDark`/`composerIconDark`), read the same way. */
+  logoDarkDataUrl: z.string().optional(),
 });
 export type AgentPluginInterfaceSummary = z.infer<typeof AgentPluginInterfaceSummarySchema>;
 
@@ -181,6 +183,11 @@ export const AgentPluginListItemSchema = z.object({
   importedComponents: AgentPluginImportedComponentsSchema.optional(),
   importedSkillCount: z.number().int().nonnegative().optional(),
   importedMcpServerCount: z.number().int().nonnegative().optional(),
+  /**
+   * Managed rows: imported skills and MCP servers whose current fingerprint the user has not
+   * reviewed (#6498). They do not load until a component review confirms them.
+   */
+  reviewRequiredCount: z.number().int().nonnegative().optional(),
   interface: AgentPluginInterfaceSummarySchema.optional(),
   /** Available counts include components not yet imported. */
   skillCount: z.number().int().nonnegative(),
@@ -202,10 +209,23 @@ export const AgentPluginUpdateCheckSchema = z.object({
  * human-readable value on each side so the user can judge the change instead
  * of only being told that something changed; additions have no `before`.
  */
+/**
+ * One imported skill or MCP server at the consent fingerprint a review showed (#6498). The
+ * renderer sends the shown refs back on confirm, and the backend records only refs that still
+ * match, so a component that changed after the review never gets consent.
+ */
+export const AgentPluginComponentRefSchema = z.object({
+  kind: z.enum(["skills", "mcpServers"]),
+  name: z.string(),
+  fingerprint: z.string(),
+});
+
 export const AgentPluginCapabilityChangeSchema = z.object({
   summary: z.string(),
   before: z.string().optional(),
   after: z.string().optional(),
+  /** Set for a skill or MCP server change: what confirming the review approves. */
+  component: AgentPluginComponentRefSchema.optional(),
 });
 
 /** Ties an update confirmation to the exact trees the user reviewed. */
@@ -214,6 +234,11 @@ export const AgentPluginUpdateConsentSchema = z.object({
   fromSha: z.string(),
   /** Commit the review staged; update installs exactly this commit. */
   toSha: z.string(),
+  /**
+   * The component changes the review showed. Only these get consent records. Without it, every
+   * changed component needs a component review after the update (fails closed).
+   */
+  reviewed: z.array(AgentPluginComponentRefSchema).optional(),
 });
 
 /**
@@ -233,6 +258,7 @@ export const AgentPluginUpdateReviewSchema = z.object({
 });
 
 export type AgentPluginCapabilityChange = z.infer<typeof AgentPluginCapabilityChangeSchema>;
+export type AgentPluginComponentRef = z.infer<typeof AgentPluginComponentRefSchema>;
 export type AgentPluginUpdateConsent = z.infer<typeof AgentPluginUpdateConsentSchema>;
 export type AgentPluginUpdateReview = z.infer<typeof AgentPluginUpdateReviewSchema>;
 export type AgentPluginPreviewSkill = z.infer<typeof AgentPluginPreviewSkillSchema>;

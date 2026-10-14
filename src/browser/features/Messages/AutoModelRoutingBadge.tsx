@@ -104,7 +104,7 @@ export const AutoModelRoutingBadge: React.FC<AutoModelRoutingBadgeProps> = (prop
           tabIndex={0}
           className={cn(
             "inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase",
-            isFallback ? "text-warning bg-warning/10" : "text-accent bg-accent/10"
+            isFallback ? "text-warning bg-warning/10" : "text-accent-text bg-accent/10"
           )}
           data-auto-model-routing-badge={props.record.status}
         >

@@ -6,8 +6,8 @@
 #   make help          - Show all available targets
 #   make dev           - Start development server with hot reload
 #   make build         - Build all targets (parallel when possible)
-#   make static-check  - Run fast local static checks (lint + typecheck + fmt-check)
-#   make static-check-full - Run the full CI static check suite
+#   make static-check  - Run fast local static checks (oxlint + typecheck + fmt-check)
+#   make static-check-full - Run the full CI static check suite (adds type-aware ESLint on all files)
 #   make test          - Run tests
 #
 # Parallelism:
@@ -90,7 +90,7 @@ include fmt.mk
 
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
-.PHONY: lint lint-fix typecheck static-check static-check-full
+.PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config typecheck static-check static-check-full
 .PHONY: crap crap-check test-crap-scripts
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
 .PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
@@ -98,7 +98,7 @@ include fmt.mk
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
-.PHONY: benchmark-terminal bench bench-compare first-load-js page-timing bug-bash mcp-apps-e2e
+.PHONY: benchmark-terminal bench bench-compare first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
@@ -479,9 +479,15 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 ## Quality checks (can run in parallel)
 # Keep the default local path fast. Docs link crawling and lockfile-free bench-agent
 # verification stay in static-check-full so local validation remains responsive.
-static-check: lint typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments lint-shellcheck lint-hadolint ## Run fast local static checks
+# static-check lints with oxlint, which runs the eslint.config.mjs rules it supports in seconds
+# (.oxlintrc.json, kept in step by check-oxlint-config); static-check-full also runs type-aware
+# ESLint on all files, so CI still catches what oxlint cannot check, including type-aware
+# findings that a change surfaces in files it did not touch.
+STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments check-oxlint-config lint-shellcheck lint-hadolint
 
-static-check-full: static-check check-bench-agent test-bench-scripts test-crap-scripts check-docs-links ## Run the full CI static check suite
+static-check: lint $(STATIC_CHECKS) ## Run fast local static checks
+
+static-check-full: lint-full $(STATIC_CHECKS) check-bench-agent test-bench-scripts test-crap-scripts check-docs-links ## Run the full CI static check suite
 
 # Harbor version for benchmark-terminal and the adapter tests below, so CI tests the
 # adapter against the same Harbor API the scheduled benchmark runs.
@@ -526,6 +532,9 @@ test-crap-scripts: ## Test the Crapper adapter (hand-counted fixtures) and crap-
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh
 
+check-oxlint-config: node_modules/.installed ## Fail when .oxlintrc.json applies different rules than eslint.config.mjs to any lint file
+	@node scripts/check-oxlint-config.mjs
+
 # <1 s: the matcher's tests run first so a broken guard cannot pass vacuously.
 check-test-seam-comments: node_modules/.installed ## Fail when production code gains an unlisted "Exported for tests"-style comment
 	@bun test ./scripts/check-test-seam-comments.test.ts
@@ -534,11 +543,19 @@ check-test-seam-comments: node_modules/.installed ## Fail when production code g
 check-bench-agent: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Verify terminal-bench agent configuration and imports
 	@./scripts/check-bench-agent.sh
 
-lint: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run ESLint (typecheck runs in separate target)
+LINT_PREREQS := node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+
+lint: $(LINT_PREREQS) ## Run oxlint on all files (the eslint.config.mjs rules it supports; no type-aware rules)
 	@./scripts/lint.sh
 
-lint-fix: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run linter with --fix
-	@./scripts/lint.sh --fix
+lint-eslint: $(LINT_PREREQS) ## Run oxlint, then type-aware ESLint on files changed since the merge base with origin/main [XUM_LINT_BASE=<ref>]
+	@./scripts/lint.sh --eslint
+
+lint-full: $(LINT_PREREQS) ## Run oxlint, then ESLint on all files, one ESLint run per machine at a time (as CI does)
+	@./scripts/lint.sh --full
+
+lint-fix: $(LINT_PREREQS) ## Run oxlint --fix, then ESLint --fix on changed files (scripts/lint.sh --full --fix for all files)
+	@./scripts/lint.sh --eslint --fix
 
 lint-actions: lint-actionlint lint-zizmor ## Lint GitHub Actions workflows
 
@@ -825,6 +842,9 @@ first-load-js: ## Report first-load JS bytes of dist/ (run make build-renderer f
 
 page-timing: node_modules/.installed ## Paired mobile UCS/IR timing of two built trees (PAGE_TIMING_ARGS; see scripts/perf/pageTiming.ts)
 	@node --import tsx scripts/perf/pageTiming.ts $(PAGE_TIMING_ARGS)
+
+first-run-view-parity: node_modules/.installed ## Static vs live first-run view boxes and screenshots, 4 widths x 2 themes (FIRST_RUN_VIEW_PARITY_ARGS; see scripts/perf/firstRunViewParity.ts)
+	@node --import tsx scripts/perf/firstRunViewParity.ts $(FIRST_RUN_VIEW_PARITY_ARGS)
 
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
 	@# Pin Harbor with the Daytona extra so scheduled ingestion does not break on future CLI or adapter API drift.

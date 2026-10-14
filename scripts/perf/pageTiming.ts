@@ -4,7 +4,8 @@
  *   make page-timing PAGE_TIMING_ARGS="--base <tree> --head <tree> [--aa | --qualification <file>]
  *     [--pages p1,p2] [--predict p1.ucs=3.9,p2.ir=1.2] [--out <dir>] [--chrome <path>]"
  * A tree is a built checkout (`make build`). P1 is "/" on an empty root, P2 "/workspace/<id>" on the neutral
- * seed. Every run gets a fresh root, server and browser profile. --aa qualifies the host (one confirmatory
+ * seed, and P1r (`--pages p1r`, the returning user) "/" on that seed (core.PAGE_SETUP). Every run gets a
+ * fresh root, server and browser profile. --aa qualifies the host (one confirmatory
  * block for a failed page) and writes qualification.json, which gated runs read with --qualification.
  * For --aa, base and head are two builds of one commit, so build-to-build noise counts as host noise.
  * PAGE_TIMING_LOCK=<file>: one flock hold per run, never per block (the shared dev-host measurement lock).
@@ -124,10 +125,11 @@ async function measure(o: Common & { tree: string; mode: Signal; name: string })
     const [seedDir, log] = [path.join(tmp, "seed"), path.join(o.out, `${o.name}.server.log`)];
     let home = path.join(tmp, "home"); // a P2 run uses its seed's home
     try {
-      const seed = o.page === "p2" ? writeNeutralSeed(seedDir) : null;
+      const setup = core.PAGE_SETUP[o.page];
+      const seed = setup.seeded ? writeNeutralSeed(seedDir) : null;
       const root = seed?.root ?? path.join(tmp, "root");
       home = seed?.home ?? home;
-      const route = seed ? `/workspace/${seed.workspaceId}` : "/";
+      const route = setup.route(seed?.workspaceId ?? "");
       const before = seed && snapshotSeed(seedDir);
       for (const dir of [root, home]) fs.mkdirSync(dir, { recursive: true });
       const server = await startServer(o.tree, root, home, log);

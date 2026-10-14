@@ -385,4 +385,96 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
       await cleanupView(view, cleanupDom);
     }
   }, 90_000);
+
+  // #6423: "Run /init" sends through the creation composer once, so it stays off whenever that
+  // composer's Send is off, not only while the branch list loads.
+  test("Run /init is off while the Coder presets load", async () => {
+    const env = getSharedEnv();
+    const coder = env.services.coderService;
+    let releasePresets: () => void = () => undefined;
+    const presetsHeld = new Promise<void>((resolve) => {
+      releasePresets = resolve;
+    });
+    const spies = [
+      jest
+        .spyOn(coder, "getCoderInfo")
+        .mockResolvedValue({ state: "available", version: "2.30.0" }),
+      jest.spyOn(coder, "listTemplates").mockResolvedValue({
+        ok: true,
+        templates: [{ name: "dev", displayName: "Dev", organizationName: "default" }],
+      }),
+      jest.spyOn(coder, "listWorkspaces").mockResolvedValue({ ok: true, workspaces: [] }),
+    ];
+    const presets = jest.spyOn(coder, "listPresets").mockImplementation(async () => {
+      await presetsHeld;
+      return { ok: true, presets: [] };
+    });
+    const { view, cleanupDom, held, create } = await openCreationViewWithHeldBranches({
+      showAgentsInitBanner: true,
+    });
+    try {
+      held.release();
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(false), {
+        timeout: 10_000,
+      });
+      await selectRuntime(view.container, "Coder");
+      await waitFor(() => expect(presets).toHaveBeenCalled(), { timeout: 10_000 });
+      // The composer reports from an effect, and the page renders the banner after it.
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(true), {
+        timeout: 5_000,
+      });
+
+      releasePresets();
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(false), {
+        timeout: 10_000,
+      });
+      expect(create).not.toHaveBeenCalled();
+    } finally {
+      releasePresets();
+      for (const spy of [...spies, presets]) spy.mockRestore();
+      held.release();
+      held.spy.mockRestore();
+      create.mockRestore();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  test("Run /init is off while a send is in flight", async () => {
+    const env = getSharedEnv();
+    const opened = await openCreationViewWithHeldBranches({ showAgentsInitBanner: true });
+    const { view, cleanupDom, chat, held } = opened;
+    // Replace the helper's call-through spy with one that holds the creation send.
+    opened.create.mockRestore();
+    const workspaceService = env.services.workspaceService;
+    const realCreate = workspaceService.create.bind(workspaceService);
+    let releaseCreate: () => void = () => undefined;
+    const createHeld = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    const create = jest
+      .spyOn(workspaceService, "create")
+      .mockImplementation(async (...args: Parameters<typeof workspaceService.create>) => {
+        await createHeld;
+        return realCreate(...args);
+      });
+    try {
+      held.release();
+      await chat.typeWithoutSending("hello while Run /init waits");
+      await waitFor(() => expect(sendButton(view.container).disabled).toBe(false), {
+        timeout: 10_000,
+      });
+      expect(runInitButtonNow(view.container)?.disabled).toBe(false);
+      fireEvent.click(sendButton(view.container));
+      await waitFor(() => expect(create).toHaveBeenCalledTimes(1), { timeout: 30_000 });
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(true), {
+        timeout: 5_000,
+      });
+    } finally {
+      releaseCreate();
+      held.release();
+      held.spy.mockRestore();
+      create.mockRestore();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
 });

@@ -41,3 +41,28 @@ describe("SkillIndicator while skills load (#6221)", () => {
     expect(view.getByTestId("slot").children).toHaveLength(0);
   });
 });
+
+describe("SkillIndicator plugin skill names", () => {
+  let cleanupDom: (() => void) | null = null;
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("counts a qualified read of a winning plugin skill as that listed skill", () => {
+    const tdd = { name: "tdd", description: "pstack tdd", scope: "global" as const };
+    const view = render(
+      <TooltipProvider>
+        <SkillIndicator
+          loadedSkills={[{ ...tdd, name: "pstack:tdd" }, tdd]}
+          availableSkills={[{ ...tdd, pluginName: "pstack" }]}
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("button").getAttribute("aria-label")).toContain("1 of 1 skill loaded");
+  });
+});

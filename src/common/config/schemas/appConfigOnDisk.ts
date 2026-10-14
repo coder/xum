@@ -143,6 +143,8 @@ export const AppConfigMigrationsSchema = z
     defaultModelFallbacksSeededFable51: z.boolean().optional(),
     /** One-time migration from the legacy auto-delete default to persistent sub-agents. */
     persistentSubagentsDefaulted: z.boolean().optional(),
+    /** One-time move of task limits still at PREVIOUS_TASK_SETTINGS_DEFAULTS to the new defaults. */
+    taskSettingsDefaultsRaised: z.boolean().optional(),
     /** One-time carry-over of the former workspace-heartbeats experiment into agentHeartbeatsEnabled. */
     agentHeartbeatsSeeded: z.boolean().optional(),
   })

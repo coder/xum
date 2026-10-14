@@ -1132,6 +1132,53 @@ describe("buildStreamSystemContext", () => {
     expect(outcome).toMatchObject({ type: "network" });
   });
 
+  test("lists a plugin skill shadowed by a global skill under <plugin>:<skill> in the skills index", async () => {
+    // Plugin skill namespaces: the model index must offer `pstack:tdd`, or the model
+    // never learns the shadowed plugin skill exists.
+    using tempRoot = new DisposableTempDir("stream-system-context-plugin-skill-namespace");
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "xum-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    const writeSkill = async (skillsRoot: string, description: string) => {
+      await fs.mkdir(path.join(skillsRoot, "tdd"), { recursive: true });
+      await fs.writeFile(
+        path.join(skillsRoot, "tdd", "SKILL.md"),
+        `---\nname: tdd\ndescription: ${description}\n---\nBody\n`
+      );
+    };
+    await writeSkill(path.join(xumHome, "skills"), "global tdd");
+    const pluginDir = path.join(xumHome, "plugins", "pstack");
+    await writeSkill(path.join(pluginDir, "skills"), "pstack tdd");
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "pstack",
+      })
+    );
+
+    const metadata = createWorkspaceMetadata({
+      id: "plugin-skill-namespace-ws",
+      name: "plugin-skill-namespace-workspace",
+      projectName: "project",
+      projectPath,
+    });
+    const { availableSkills } = await buildSystemContextForTest({
+      runtime: new TestRuntime(projectPath, xumHome),
+      metadata,
+      workspacePath: projectPath,
+      cfg: createProjectsConfig({
+        projectPath,
+        workspaces: [{ id: metadata.id, name: metadata.name }],
+      }),
+      isSubagentWorkspace: false,
+    });
+
+    const byName = new Map(availableSkills?.map((skill) => [skill.name, skill.description]));
+    expect(byName.get("tdd")).toBe("global tdd");
+    expect(byName.get("pstack:tdd")).toBe("pstack tdd");
+  });
+
   test("reads instruction files while agent discovery is still in flight", async () => {
     using tempRoot = new DisposableTempDir("stream-system-context-parallel-reads");
 

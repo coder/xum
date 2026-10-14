@@ -6,7 +6,16 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { startFakeUpstream } from "./fakeUpstream";
-import { checkDocker, exitFor, launch, launchJob, ownerState, probeApp, recover } from "./launch";
+import {
+  checkDocker,
+  exitFor,
+  launch,
+  launchJob,
+  ownerState,
+  preflight,
+  probeApp,
+  recover,
+} from "./launch";
 import * as proxyModule from "./proxy";
 import { Ledger } from "./proxyPolicy";
 import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
@@ -17,6 +26,8 @@ import { checkSet, CONTAINER_CHECKS, runSelfCheck, selfCheckExit } from "./selfC
 const SANDBOX = "tests/bugbash/sandbox";
 const DIGEST = `sha256:${"61".repeat(32)}`;
 const REF = `ghcr.io/coder/xum-bugbash-sandbox@${DIGEST}`;
+/** The ID of build.sh's local image in the fake. */
+const LOCAL_ID = `sha256:${"b1".repeat(32)}`;
 const FAKE = `#!/bin/sh
 bin=$(dirname "$0"); . "$bin/fake.env"
 unregister() { awk -v id="$1" '$1!=id' "$bin/containers" > "$bin/c.tmp"; mv "$bin/c.tmp" "$bin/containers"; }
@@ -24,7 +35,10 @@ echo "$* [home=\${HOME-} cfg=\${DOCKER_CONFIG-}]" >> "$bin/calls.log"
 case "$1" in
   context) if [ "\${CONTEXT-}" = hang ]; then trap '' TERM; exec sleep 30; fi; echo "$HOST" ;;
   info) echo "$INFO" ;;
-  images) [ "$IMAGES_RC" = 0 ] || { echo "daemon down" >&2; exit 1; }; echo "$IMAGES" ;;
+  images) [ "$IMAGES_RC" = 0 ] || { echo "daemon down" >&2; exit 1; }
+    case "$*" in *xum-bugbash-sandbox:inputs-*) echo "$LOCAL" ;; *) echo "$IMAGES" ;; esac ;;
+  # build.sh's local build: it prints the ID of its tag with \`image inspect\` next.
+  buildx) [ "$BUILD" = fail ] && { echo "build failed" >&2; exit 1; }; exit 0 ;;
   pull)
     if [ "$PULL" = hang ]; then trap '' TERM; exec sleep 30; fi
     # A grandchild that holds no pipe: only a signal to the whole group reaches it.
@@ -35,7 +49,7 @@ case "$1" in
     if [ "$PULL" = fail ]; then echo "pull failed" >&2; exit 1; fi
     # Exits at once and leaves a member in its group (cleanup item 7).
     if [ "$PULL" = leave ]; then (trap '' TERM; exec sleep 60) >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; fi ;;
-  image) echo "{\\"org.xum.bugbash.inputs\\":\\"$LABEL\\"}" ;;
+  image) if [ "$4" = "{{.Id}}" ]; then echo "$LOCAL_ID"; else echo "{\\"org.xum.bugbash.inputs\\":\\"$LABEL\\"}"; fi ;;
   # Lines of bin/containers: id name owner checkout. ps prints the ids that match every filter.
   ps) [ "$PS_RC" = 0 ] || exit 1
     n=""; o=""; c=""
@@ -145,6 +159,9 @@ function fake(over: Record<string, string> = {}) {
     INFO: '{"OSType":"linux","OperatingSystem":"Ubuntu 22.04","Architecture":"x86_64","SecurityOptions":["name=seccomp"]}',
     IMAGES_RC: "0",
     IMAGES: "",
+    LOCAL: "",
+    LOCAL_ID,
+    BUILD: "ok",
     PULL: "ok",
     LABEL: key,
     PS_RC: "0",
@@ -256,6 +273,47 @@ test("U6: an amd64 daemon pulls the image", async () => {
   fake();
   expect(await session().ensureImage()).toBe(REF);
   expect(calls()).toContain("pull");
+});
+
+// The stale-key local build: with `localBuild` and a stale key only, build.sh's local image replaces the pinned one.
+// The launcher sets `localBuild` by the job kind (the launch tests below).
+test("local build: a stale key with localBuild builds through build.sh, with the private client config", async () => {
+  lock("0".repeat(64));
+  expect(await session().ensureImage({ localBuild: true })).toBe(LOCAL_ID);
+  const lines = calls().trim().split("\n");
+  const build = lines.find((l) => l.startsWith("buildx build "))!;
+  expect(build).toContain(` --load --tag xum-bugbash-sandbox:inputs-${key} `);
+  const cfg = /cfg=(\S+)\]/.exec(lines[2])![1];
+  expect(build).toEndWith(`[home= cfg=${cfg}]`);
+  // The label check is of the built image. Nothing is pulled, pushed or logged in to.
+  expect(lines.at(-1)).toStartWith(`image inspect --format {{json .Config.Labels}} ${LOCAL_ID} `);
+  expect(calls()).not.toMatch(/^(pull|push|login)|--push|ghcr\.io/m);
+});
+
+test("local build: a present local image of the stale key is reused, not built again", async () => {
+  lock("0".repeat(64));
+  fake({ LOCAL: LOCAL_ID });
+  expect(await session().ensureImage({ localBuild: true })).toBe(LOCAL_ID);
+  expect(calls()).not.toMatch(/^(buildx|pull)/m);
+});
+
+test("local build: a matching key takes the pinned digest and never builds, even with localBuild", async () => {
+  expect(await session().ensureImage({ localBuild: true })).toBe(REF);
+  expect(calls()).toMatch(/^pull --quiet /m);
+  expect(calls()).not.toMatch(/^buildx/m);
+});
+
+test.each([
+  [
+    "a label for other inputs",
+    { LABEL: "f".repeat(64) },
+    /label org.xum.bugbash.inputs is f+, not/,
+  ],
+  ["a failed build", { BUILD: "fail" }, /build\.sh: build failed/],
+])("local build: a local image with %s refuses", async (_name, over, message) => {
+  lock("0".repeat(64));
+  fake(over);
+  expect(await failure(session().ensureImage({ localBuild: true }))).toThrow(message);
 });
 
 const JOB = { name: "xbb-1", owner: "boot:pid", checkout: "abc" };
@@ -1239,7 +1297,11 @@ test("B2: an explore job spends from the run's ledger and writes its output to t
   }
 });
 
-async function selfCheckLaunch(over: Record<string, string>, args: string[]) {
+async function selfCheckLaunch(
+  over: Record<string, string>,
+  args: string[],
+  extra: Record<string, string> = {}
+) {
   const upstream = await startFakeUpstream();
   try {
     const cwd = prepare(over);
@@ -1249,6 +1311,7 @@ async function selfCheckLaunch(over: Record<string, string>, args: string[]) {
       ANTHROPIC_API_KEY: UPSTREAM_KEY,
       ANTHROPIC_BASE_URL: `${upstream.baseUrl}/v1`,
       BUGBASH_MODEL: "anthropic:claude-haiku-5-5",
+      ...extra,
     };
     const o = { root: fs.realpathSync(root), cwd, env, stop: new AbortController().signal };
     const outcome = await launchJob(args, { ...o, log: () => undefined }).catch((e: unknown) => e);
@@ -1683,5 +1746,96 @@ test("U1: the Docker preflight reports an unknown cleanup instead of a refusal o
     ensure.mockRestore();
     cleanup.mockRestore();
     error.mockRestore();
+  }
+});
+
+// The local build's gate in the launcher. Only the self-check and exact-step repros may use a local image, and
+// only with BUGBASH_SANDBOX_BUILD_STALE=1 (CI's bugbash-sandbox job).
+const OPT_IN = { BUGBASH_SANDBOX_BUILD_STALE: "1" };
+const SELF_CHECK_ARGS = ["self-check", "--output", ".e2e/s"];
+/** One job's `docker run` line and stderr, without its per-job values (name, folders, nonce). */
+async function jobRun(kind: "repro" | "self-check", env: Record<string, string>) {
+  fs.rmSync(path.join(root, "tests/bugbash/.e2e"), { recursive: true, force: true });
+  fs.rmSync(path.join(bin, "calls.log"), { force: true });
+  const stderr: string[] = [];
+  const error = spyOn(console, "error").mockImplementation(
+    (line: string) => void stderr.push(line)
+  );
+  try {
+    const outcome =
+      kind === "repro"
+        ? await launchJob(ARGS, {
+            root: fs.realpathSync(root),
+            cwd: prepare(),
+            env: { ...HOST_ENV, ...env },
+            stop: new AbortController().signal,
+            log: () => undefined,
+          })
+        : (await selfCheckLaunch({}, SELF_CHECK_ARGS, env)).outcome;
+    expect(outcome).toMatchObject({ code: 7, cleanup: "removed" });
+  } finally {
+    error.mockRestore();
+  }
+  const run = calls()
+    .split("\n")
+    .find((line) => line.startsWith("run "))!
+    .replace(/xbb-[0-9a-f]{6}-[0-9a-f]{6}/g, "JOB")
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "NONCE")
+    .replace(/xum-bugbash-docker-\w+/g, "CFG");
+  return { run, stderr, built: /^buildx build /m.test(calls()) };
+}
+
+test.each(["repro", "self-check"] as const)(
+  "local build: with the opt-in, a stale key gives the %s job a local image with the same container flags",
+  async (kind) => {
+    const pinned = await jobRun(kind, { ...OPT_IN, GITHUB_ACTIONS: "true" });
+    expect(pinned.built).toBe(false);
+    expect(pinned.stderr.filter((l) => l.startsWith("::warning::"))).toEqual([]);
+    lock("0".repeat(64));
+    const local = await jobRun(kind, { ...OPT_IN, GITHUB_ACTIONS: "true" });
+    expect(local.built).toBe(true);
+    // Only the image differs: every hardening flag stays.
+    expect(local.run).toContain(` ${LOCAL_ID} `);
+    expect(local.run.replace(LOCAL_ID, REF)).toBe(pinned.run);
+    // One annotation in CI's log.
+    expect(local.stderr.filter((l) => l.startsWith("::warning::"))).toHaveLength(1);
+  }
+);
+
+test.each([
+  ["an explore charter", "1"],
+  ["the MCP Apps suite", "1"],
+  ["a repro whose opt-in is not exactly 1", "true"],
+])("local build: %s refuses a stale key, and nothing is built", async (job, value) => {
+  lock("0".repeat(64));
+  const env = { BUGBASH_SANDBOX_BUILD_STALE: value };
+  const error =
+    job === "an explore charter"
+      ? ((await exploreLaunch({}, env)).outcome as { error: unknown }).error
+      : job === "the MCP Apps suite"
+        ? (await mcpLaunch({}, env)).code
+        : await launchIn({}, new AbortController(), { ...HOST_ENV, ...env }).catch(
+            (e: unknown) => e
+          );
+  expect(error).toBeInstanceOf(Refusal);
+  expect((error as Error).message).toMatch(/stale image/);
+  expect(calls()).not.toMatch(/^buildx/m);
+});
+
+test("local build: the Docker preflight refuses a stale key, even with the opt-in", async () => {
+  lock("0".repeat(64));
+  const saved = process.env.BUGBASH_SANDBOX_BUILD_STALE;
+  process.env.BUGBASH_SANDBOX_BUILD_STALE = "1";
+  try {
+    const stop = new AbortController().signal;
+    const o = { root: fs.realpathSync(root), stop };
+    // run.ts's preflight (make bug-bash), then launch.ts --preflight (make mcp-apps-e2e).
+    expect(await failure(checkDocker(o))).toThrow(/stale image/);
+    const env = { ...HOST_ENV, ...OPT_IN };
+    expect(await failure(preflight(ARGS, { ...o, cwd: prepare(), env }))).toThrow(/stale image/);
+    expect(calls()).not.toMatch(/^buildx/m);
+  } finally {
+    if (saved === undefined) delete process.env.BUGBASH_SANDBOX_BUILD_STALE;
+    else process.env.BUGBASH_SANDBOX_BUILD_STALE = saved;
   }
 });

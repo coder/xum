@@ -37,6 +37,7 @@ import {
   sanitizeModelFallbacks,
 } from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
+import { PREVIOUS_TASK_SETTINGS_DEFAULTS } from "@/common/config/schemas/taskSettings";
 import {
   getDefaultAutoModelRoutingConfig,
   normalizeAutoModelRoutingConfig,
@@ -647,6 +648,40 @@ function normalizeConfigMigrations(value: unknown): AppConfigMigrations {
   return migrations;
 }
 
+/**
+ * Move task limits that still hold PREVIOUS_TASK_SETTINGS_DEFAULTS to the current defaults and
+ * keep every other value. Saves write the normalized settings, so an old default on disk is
+ * almost always Xum's write, not the user's choice. Known limit: a user who picked exactly an
+ * old default is moved once; after the migration flag is set, a value they set back sticks.
+ */
+function raisePreviousTaskSettingsDefaults(raw: unknown): Record<string, unknown> {
+  const record =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? { ...(raw as Record<string, unknown>) }
+      : {};
+  for (const key of ["maxParallelAgentTasks", "maxTaskNestingDepth"] as const) {
+    if (record[key] === PREVIOUS_TASK_SETTINGS_DEFAULTS[key]) {
+      record[key] = DEFAULT_TASK_SETTINGS[key];
+    }
+  }
+  return record;
+}
+
+/**
+ * Run the one-time raised-defaults migration on `parsed` (mutated in place) and return whether
+ * the config now needs a write-back: true when it already did or when this migration ran.
+ */
+function migrateRaisedTaskSettingsDefaults(
+  parsed: Partial<AppConfigOnDisk> & Record<string, unknown>,
+  configModified: boolean
+): boolean {
+  const migrations = normalizeConfigMigrations(parsed.migrations);
+  if (migrations.taskSettingsDefaultsRaised === true) return configModified;
+  parsed.taskSettings = raisePreviousTaskSettingsDefaults(parsed.taskSettings);
+  parsed.migrations = { ...migrations, taskSettingsDefaultsRaised: true };
+  return true;
+}
+
 function parseOptionalPort(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
     return undefined;
@@ -999,7 +1034,63 @@ function mergeProjectAliases(group: StoredProjectEntry[]): {
   return { config: merged, conflictingIds: [...conflictingIds] };
 }
 
-/** An alias group whose merge kept one of two different rows with the same id. */
+/**
+ * The ids of the rows that have one, by checkout path. Rows without a string path are left out:
+ * config.json rows are not schema-checked, and a load must not throw on a malformed row (#5929).
+ */
+function idRowIdsByPath(workspaces: ProjectConfig["workspaces"]): Map<string, string[]> {
+  const idsByPath = new Map<string, string[]>();
+  for (const workspace of workspaces) {
+    if (!workspace.id || typeof workspace.path !== "string") continue;
+    const ids = idsByPath.get(workspace.path);
+    if (ids) ids.push(workspace.id);
+    else idsByPath.set(workspace.path, [workspace.id]);
+  }
+  return idsByPath;
+}
+
+/**
+ * Drop each id-less legacy row that is the same workspace as an id row on its checkout path
+ * (#5929). One alias can hold a legacy row while another holds its migrated copy. The read-time
+ * id migration would give the legacy row that same id, and config.json would then keep two rows
+ * with one id. `resolveLegacyId` returns the id the migration would give a row, or undefined
+ * when that id is unknown. An unknown or different id keeps both rows: the legacy row is then
+ * another identity with its own session history. Returns the ids whose legacy copy was dropped.
+ */
+function dropLegacyDuplicateRows(
+  workspaces: ProjectConfig["workspaces"],
+  resolveLegacyId: (workspace: Workspace) => string | undefined
+): string[] {
+  const idsByPath = idRowIdsByPath(workspaces);
+  const dropped: string[] = [];
+  for (let index = workspaces.length - 1; index >= 0; index--) {
+    const workspace = workspaces[index];
+    // Only a legacy row that shares its path with an id row costs a lookup. idsByPath holds only
+    // string paths, so a row without one never matches.
+    const pathIds = workspace.id ? undefined : idsByPath.get(workspace.path);
+    if (pathIds === undefined) continue;
+    const resolvedId = resolveLegacyId(workspace);
+    if (resolvedId === undefined || !pathIds.includes(resolvedId)) continue;
+    workspaces.splice(index, 1);
+    dropped.push(resolvedId);
+  }
+  return dropped;
+}
+
+/**
+ * The non-empty string `id` that a legacy metadata.json names. Null when the file does not exist,
+ * undefined when it cannot be read or parsed, or names no id.
+ */
+function readLegacyMetadataId(file: string): string | null | undefined {
+  try {
+    const id = (JSON.parse(fs.readFileSync(file, "utf-8")) as { id?: unknown } | null)?.id;
+    return typeof id === "string" && id.length > 0 ? id : undefined;
+  } catch (error) {
+    return isEnoentError(error) ? null : undefined;
+  }
+}
+
+/** An alias group whose merge kept one of two different rows for the same workspace. */
 interface ProjectAliasConflict {
   path: string;
   storedKeys: string[];
@@ -1010,12 +1101,14 @@ interface ProjectAliasConflict {
  * Build the project map from the loaded entries. Stored keys that normalize to the same path
  * ("/repo" and "/repo/") are aliases of one project. `new Map(pairs)` used to keep only the last
  * alias, so the next save dropped the other aliases' workspace rows. Group every alias first,
- * then merge the group's rows. Groups with a same-id conflict go to `conflicts`, so the caller
- * can back up the original bytes before a save drops the other variant (#5929).
+ * then merge the group's rows. Groups with a same-id conflict, or with a legacy copy of an id row
+ * (see dropLegacyDuplicateRows), go to `conflicts`, so the caller can back up the original bytes
+ * before a save drops the other row (#5929).
  */
 function buildProjectsFromStoredEntries(
   entries: StoredProjectEntry[],
-  conflicts: ProjectAliasConflict[]
+  conflicts: ProjectAliasConflict[],
+  resolveLegacyId: (projectPath: string, workspace: Workspace) => string | undefined
 ): Map<string, ProjectConfig> {
   const groups = new Map<string, StoredProjectEntry[]>();
   for (const entry of entries) {
@@ -1031,8 +1124,14 @@ function buildProjectsFromStoredEntries(
     }
     const storedKeys = group.map((entry) => entry.storedKey);
     const merged = mergeProjectAliases(group);
-    if (merged.conflictingIds.length > 0) {
-      conflicts.push({ path: key, storedKeys, conflictingIds: merged.conflictingIds });
+    const conflictingIds = [
+      ...merged.conflictingIds,
+      ...dropLegacyDuplicateRows(merged.config.workspaces, (workspace) =>
+        resolveLegacyId(key, workspace)
+      ),
+    ];
+    if (conflictingIds.length > 0) {
+      conflicts.push({ path: key, storedKeys, conflictingIds });
     } else {
       log.warn("Merged project config entries with the same path", { path: key, storedKeys });
     }
@@ -1152,7 +1251,31 @@ const configLoadFailureStates = new Map<string, ConfigLoadFailureState>();
 // Config files whose last load merged conflicting alias rows but could not back up the bytes
 // (#5929): the backup error for the edit refusal, and a log-dedupe signature (content hash plus
 // errno code: fs messages embed the timestamped sidecar path). Process-scoped as above.
-const aliasConflictBackupFailures = new Map<string, { message: string; signature: string }>();
+const aliasConflictBackupFailures = new Map<string, { message: string }>();
+
+// Failed alias-conflict backups already logged, per config file: sha256 of the bytes plus the
+// errno code (#5929). While backups keep failing, a content that comes back does not log again.
+// A load that needs no backup, or a backup that succeeds, clears it. Capped, so a file that
+// keeps changing cannot grow it without bound.
+const loggedAliasBackupFailures = new Map<string, Set<string>>();
+const MAX_LOGGED_ALIAS_BACKUP_FAILURES = 16;
+
+/** Record `signature` for `configFile`; true when it was not recorded before. */
+function rememberAliasBackupFailure(configFile: string, signature: string): boolean {
+  let seen = loggedAliasBackupFailures.get(configFile);
+  if (seen === undefined) {
+    seen = new Set();
+    loggedAliasBackupFailures.set(configFile, seen);
+  }
+  if (seen.has(signature)) return false;
+  seen.add(signature);
+  // A Set iterates in insertion order: drop the oldest signature first.
+  for (const oldest of seen) {
+    if (seen.size <= MAX_LOGGED_ALIAS_BACKUP_FAILURES) break;
+    seen.delete(oldest);
+  }
+  return true;
+}
 
 /**
  * A `config.json.<tag>-*` sidecar that already holds exactly `rawBytes`, tightened to 0600, or
@@ -1185,6 +1308,10 @@ function findIdenticalConfigSidecar(
     }
   }
   return null;
+}
+
+function sha256Hex(bytes: Buffer): string {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
 /**
@@ -1408,8 +1535,8 @@ export class Config {
   /**
    * Cheap durable change signal for config.json: one stat, no parse. Any
    * backend's rewrite changes size/mtime (atomic replace also changes the
-   * inode), so a memo built against a previous stamp knows to rebuild —
-   * unlike onConfigChanged, which only fires for THIS process's edits. A
+   * inode), so a memo built against a previous stamp knows to rebuild, even
+   * before onConfigChanged's watcher delivers another backend's edit. A
    * missing/unreadable file yields a distinct stamp.
    */
   configFileStamp(): string {
@@ -1519,11 +1646,165 @@ export class Config {
       .map((workspace) => ({ ...workspace, bestOf: { ...workspace.bestOf } }));
   }
 
+  /**
+   * Fires after every config.json change: this process's own edits (notified right after the
+   * write), and rewrites by another Xum backend (seen through a watch on the config dir).
+   */
   onConfigChanged(callback: () => void): () => void {
     this.emitter.on("configChanged", callback);
+    this.ensureConfigFileWatcher();
     return () => {
       this.emitter.off("configChanged", callback);
+      this.closeUnusedConfigFileWatcher();
     };
+  }
+
+  /**
+   * Watches on the config dir (and on a symlinked config.json's target dir); open only while
+   * onConfigChanged has listeners.
+   */
+  private configFileWatchers: fs.FSWatcher[] = [];
+  /**
+   * The config.json stamp the last notification covers. Own saves set it before they
+   * notify, so the watcher's echo of an own save compares equal and stays silent. A stamp
+   * read after a foreign rename that raced an own save is adopted too, but the own save's
+   * notification then fires after that rename, so listeners still re-read the foreign bytes.
+   */
+  private notifiedConfigFileStamp = "missing";
+
+  /** The resolved config.json path the target-dir watch follows (see startConfigFileWatchers). */
+  private watchedConfigFileTarget: string | null = null;
+
+  /** Set by stopWatchingConfigFile: a disposed backend never watches again. */
+  private configFileWatchStopped = false;
+
+  /** Closes the config.json watches for good (service teardown). Own edits still notify. */
+  stopWatchingConfigFile(): void {
+    this.configFileWatchStopped = true;
+    this.closeConfigFileWatcher();
+  }
+
+  private ensureConfigFileWatcher(): void {
+    if (this.configFileWatchers.length > 0 || this.configFileWatchStopped) return;
+    // The baseline comes before the watch: a rewrite between the two then reads as a new
+    // stamp in the check below instead of being adopted silently.
+    const baseline = this.configFileStamp();
+    try {
+      // Another backend can create the root with its first save; a watch needs it to exist.
+      ensurePrivateDirSync(this.rootDir);
+    } catch (error) {
+      log.debug("Config dir not created for the config file watcher", { error });
+    }
+    this.startConfigFileWatchers();
+    // Without a watch, writeConfigFileTracked retries after this process's next save.
+    if (this.configFileWatchers.length === 0) return;
+    this.notifiedConfigFileStamp = baseline;
+    // Relink-aware: the link can also change between the realpath read and the root watch.
+    this.handleConfigFileEventWithRelink();
+  }
+
+  private startConfigFileWatchers(): void {
+    // Watch directories, not the file: atomic saves rename a temp file over config.json, and
+    // a file watch follows the old inode. writeFileAtomic renames over a symlink's target, so
+    // a symlinked config.json also needs its target's directory.
+    const realFile = this.realConfigFilePath();
+    this.watchedConfigFileTarget = realFile;
+    // Names per dir: a link to a sibling file shares the root dir with config.json itself.
+    const targets = new Map([[this.rootDir, new Set([path.basename(this.configFile)])]]);
+    const targetDir = path.dirname(realFile);
+    targets.set(targetDir, (targets.get(targetDir) ?? new Set()).add(path.basename(realFile)));
+    for (const [dir, fileNames] of targets) {
+      const watcher = this.watchConfigDir(dir, fileNames);
+      if (watcher) this.configFileWatchers.push(watcher);
+    }
+  }
+
+  /** A config.json event: re-resolve a replaced symlink first, so the watch follows it. */
+  private handleConfigFileEventWithRelink(): void {
+    if (this.realConfigFilePath() !== this.watchedConfigFileTarget) {
+      // Keep the notified stamp: the new target's bytes still count as a change below.
+      this.closeConfigFileWatcher();
+      this.startConfigFileWatchers();
+    }
+    this.handleConfigFileEvent();
+  }
+
+  private realConfigFilePath(): string {
+    try {
+      return fs.realpathSync(this.configFile);
+    } catch {
+      return this.configFile;
+    }
+  }
+
+  private watchConfigDir(dir: string, fileNames: ReadonlySet<string>): fs.FSWatcher | null {
+    let watcher: fs.FSWatcher;
+    try {
+      watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
+        // Some platforms omit the filename; treat that as a possible config.json change.
+        if (filename != null && !fileNames.has(filename)) return;
+        this.handleConfigFileEventWithRelink();
+      });
+    } catch (error) {
+      log.debug("Config file watcher not started", { dir, error });
+      return null;
+    }
+    watcher.on("error", (error) => {
+      log.debug("Config file watcher stopped", { dir, error });
+      if (this.configFileWatchers.includes(watcher)) this.closeConfigFileWatcher();
+    });
+    return watcher;
+  }
+
+  private closeConfigFileWatcher(): void {
+    for (const watcher of this.configFileWatchers) watcher.close();
+    this.configFileWatchers = [];
+  }
+
+  private closeUnusedConfigFileWatcher(): void {
+    if (this.emitter.listenerCount("configChanged") === 0) this.closeConfigFileWatcher();
+  }
+
+  /**
+   * writeFileAtomic for config.json that keeps the watcher from echoing this write.
+   * `beforeRename`: the edit's unchanged-file check (#6568). A refused or failed write records
+   * no stamp, so the watcher still announces the foreign bytes that made it refuse.
+   */
+  private async writeConfigFileTracked(
+    text: string,
+    beforeRename: (() => void) | undefined
+  ): Promise<void> {
+    // The watcher can see the rename before this write's stamp is recorded. It holds
+    // events until then, so the echo of this write compares equal and stays silent.
+    this.configSavesInFlight += 1;
+    try {
+      await writeFileAtomic(this.configFile, text, { encoding: "utf-8", beforeRename });
+      this.notifiedConfigFileStamp = this.configFileStamp();
+    } finally {
+      this.configSavesInFlight -= 1;
+      if (this.configSavesInFlight === 0 && this.configFileEventHeld) {
+        this.configFileEventHeld = false;
+        this.handleConfigFileEvent();
+      }
+    }
+    // The first save creates the root dir, which a listener's earlier watch attempt lacked.
+    if (this.emitter.listenerCount("configChanged") > 0) this.ensureConfigFileWatcher();
+  }
+
+  private configSavesInFlight = 0;
+  private configFileEventHeld = false;
+
+  private handleConfigFileEvent(): void {
+    if (this.configSavesInFlight > 0) {
+      this.configFileEventHeld = true;
+      return;
+    }
+    const stamp = this.configFileStamp();
+    // Xum replaces config.json by rename, so it never goes missing between writes. A deleted
+    // file is not an edit to announce: a listener reading it would see defaults.
+    if (stamp === "missing" || stamp === this.notifiedConfigFileStamp) return;
+    this.notifiedConfigFileStamp = stamp;
+    this.notifyConfigChanged();
   }
 
   private deferredChangeNotificationDepth = 0;
@@ -1788,30 +2069,76 @@ export class Config {
   private preserveAliasConflictBytes(rawBytes: Buffer, conflicts: ProjectAliasConflict[]): boolean {
     if (conflicts.length === 0) {
       aliasConflictBackupFailures.delete(this.configFile);
+      loggedAliasBackupFailures.delete(this.configFile);
       return true;
     }
     try {
+      // Every degraded load retries in full, including the search for an identical sidecar: that
+      // search is how a backup that becomes readable again is found (#5929).
       const sidecar = writeConfigBytesSidecar(this.configFile, "alias-conflict", rawBytes);
       aliasConflictBackupFailures.delete(this.configFile);
+      loggedAliasBackupFailures.delete(this.configFile);
       // A reused sidecar means an earlier load already logged this content.
       if (!sidecar.reused) {
         log.error(
-          `Project config entries share a path but hold different rows with the same id. Xum keeps the last alias's row for each such id. The original config.json bytes, with every variant, were backed up to ${sidecar.path}.`,
+          `Project config entries share a path and hold conflicting rows for the same workspace. Xum keeps one row per workspace. The original config.json bytes, with every row, were backed up to ${sidecar.path}.`,
           { conflicts }
         );
       }
       return true;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const signature = `${crypto.createHash("sha256").update(rawBytes).digest("hex")}:${(error as NodeJS.ErrnoException).code ?? message}`;
-      if (aliasConflictBackupFailures.get(this.configFile)?.signature !== signature) {
-        log.error(
-          `Project config entries share a path but hold different rows with the same id, and the backup of ${this.configFile} failed (${message}). Settings changes will not overwrite config.json until a backup succeeds.`,
-          { conflicts }
-        );
-      }
-      aliasConflictBackupFailures.set(this.configFile, { message, signature });
+      this.recordAliasBackupFailure(rawBytes, error, conflicts);
       return false;
+    }
+  }
+
+  /** Arm the edit gate for a failed alias-conflict backup, and log it once per signature. */
+  private recordAliasBackupFailure(
+    rawBytes: Buffer,
+    error: unknown,
+    conflicts: ProjectAliasConflict[]
+  ): void {
+    const message = error instanceof Error ? error.message : String(error);
+    // fs messages embed the timestamped sidecar path: dedupe on the errno code instead.
+    const signature = `${sha256Hex(rawBytes)}:${(error as NodeJS.ErrnoException).code ?? message}`;
+    if (rememberAliasBackupFailure(this.configFile, signature)) {
+      log.error(
+        `Project config entries share a path and hold conflicting rows for the same workspace, and the backup of ${this.configFile} failed (${message}). Settings changes will not overwrite config.json until a backup succeeds.`,
+        { conflicts }
+      );
+    }
+    aliasConflictBackupFailures.set(this.configFile, { message });
+  }
+
+  /**
+   * The stamp an edit records before its fresh read: configFileStamp, the same stamp the
+   * cross-process watcher compares, so the two never disagree on what "changed" means.
+   */
+  private readEditStatKey(): string {
+    return this.configFileStamp();
+  }
+
+  /** The beforeRename check for a save, or undefined when the save has no read to compare. */
+  private unchangedConfigCheck(expectedStatKey: string | undefined) {
+    if (expectedStatKey === undefined) return undefined;
+    return () => this.assertConfigFileUnchanged(expectedStatKey);
+  }
+
+  /**
+   * Throw when config.json changed since the edit read it (#5929): a writer that skips the
+   * registration lock (a manual editor, an older build) replaced it, and this save would drop
+   * that write. One stat, right before the rename. An in-place rewrite with the same inode,
+   * size and mtime still passes; a content hash would cost a read per save.
+   */
+  private assertConfigFileUnchanged(expectedStatKey: string): void {
+    // configFileStamp stats the configured path, not the writer's resolved target: a
+    // config.json symlink retargeted after the writer resolved it then shows up as changed.
+    // Any stat failure reads as "missing", which refuses unless the edit also read none.
+    const currentKey = this.configFileStamp();
+    if (currentKey !== expectedStatKey) {
+      throw new Error(
+        `config.json changed on disk while Xum was saving it (${this.configFile}). Your change was not saved. Retry the change.`
+      );
     }
   }
 
@@ -1935,9 +2262,11 @@ export class Config {
       // The last load decides the alias-conflict gate (#5929): a missing or corrupt file has
       // no merged rows to protect, and the corrupt-file gate below covers the latter.
       aliasConflictBackupFailures.delete(this.configFile);
+      loggedAliasBackupFailures.delete(this.configFile);
       configLoadFailureStates.delete(this.configFile);
     } catch (error) {
       aliasConflictBackupFailures.delete(this.configFile);
+      loggedAliasBackupFailures.delete(this.configFile);
       this.handleConfigLoadFailure(rawBytes, error);
       if (options?.throwOnError) throw error;
     }
@@ -1963,6 +2292,7 @@ export class Config {
         defaultModelFallbacksSeededFable51: true,
         persistentSubagentsDefaulted: true,
         agentHeartbeatsSeeded: true,
+        taskSettingsDefaultsRaised: true,
       },
     };
   }
@@ -2050,6 +2380,28 @@ export class Config {
     }
   }
 
+  /**
+   * The one id that an id-less legacy row stands for, or undefined when that is not certain. The
+   * read-time migration reads sessions/<legacy id>/metadata.json, and findWorkspace also resolves
+   * the old layout's sessions/<checkout basename>/metadata.json. Every such file that exists must
+   * name the same id. Two different ids, a file that cannot be read, or a file without an id
+   * give undefined, so the caller keeps the row: dropping it would hide the other identity from
+   * known-id checks that delete data (#5929). With no file, the row stands for the legacy id.
+   */
+  private resolveLegacyRowId(projectPath: string, workspace: Workspace): string | undefined {
+    const legacyId = this.generateLegacyId(projectPath, workspace.path);
+    // The same basename expression as buildWorkspaceMetadata (#6485 tracks its Windows gap).
+    const basename =
+      workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+    const ids = new Set<string | undefined>();
+    for (const candidate of basename === legacyId ? [legacyId] : [legacyId, basename]) {
+      const id = readLegacyMetadataId(path.join(this.sessionsDir, candidate, "metadata.json"));
+      if (id !== null) ids.add(id);
+    }
+    if (ids.size === 0) return legacyId;
+    return ids.size === 1 ? [...ids][0] : undefined;
+  }
+
   private normalizeConfigProjects(
     projects: AppConfigOnDisk["projects"] | undefined,
     aliasConflicts: ProjectAliasConflict[]
@@ -2088,7 +2440,9 @@ export class Config {
           config: normalizeProjectRuntimeSettings(projectConfig),
         };
       });
-    return buildProjectsFromStoredEntries(storedEntries, aliasConflicts);
+    return buildProjectsFromStoredEntries(storedEntries, aliasConflicts, (projectPath, workspace) =>
+      this.resolveLegacyRowId(projectPath, workspace)
+    );
   }
 
   private normalizeParsedConfig(
@@ -2301,6 +2655,9 @@ export class Config {
       parsed.migrations = { ...heartbeatMigrations, agentHeartbeatsSeeded: true };
       configModified = true;
     }
+    // The task-limit defaults were raised for orchestration fan-out and depth. Configs that
+    // still hold the previous defaults (written by every save) move once; explicit values stay.
+    configModified = migrateRaisedTaskSettingsDefaults(parsed, configModified);
     const taskSettings = normalizeTaskSettings(parsed.taskSettings);
 
     const muxGatewayEnabled = parseOptionalBoolean(parsed.muxGatewayEnabled);
@@ -2561,8 +2918,12 @@ export class Config {
    * Kept as a Promise facade (tests spy on it with Promise mocks to simulate a write
    * that did not land); saveConfigEffect below holds the actual pipeline.
    */
-  private saveConfig(config: ProjectsConfig): Promise<void> {
-    return Effect.runPromise(this.saveConfigEffect(config));
+  /**
+   * `expectedStatKey`: the stat key of the bytes the edit read. The save then fails without
+   * writing when config.json no longer has it. Undefined skips the check.
+   */
+  private saveConfig(config: ProjectsConfig, expectedStatKey?: string): Promise<void> {
+    return Effect.runPromise(this.saveConfigEffect(config, expectedStatKey));
   }
 
   /**
@@ -2570,7 +2931,10 @@ export class Config {
    * atomic write) happens before the rename, so a failure means the previous bytes are
    * still on disk; nothing after the write can fail.
    */
-  private saveConfigEffect(config: LegacyAdvisorProjectsConfig): Effect.Effect<void, unknown> {
+  private saveConfigEffect(
+    config: LegacyAdvisorProjectsConfig,
+    expectedStatKey?: string
+  ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
@@ -2871,7 +3235,7 @@ export class Config {
       // and the npm write-file-atomic package renamed that truncated file over
       // config.json, which then loaded as an empty registry (coder/xum#4197).
       yield* Effect.tryPromise({
-        try: async () => writeFileAtomic(self.configFile, text, "utf-8"),
+        try: () => self.writeConfigFileTracked(text, self.unchangedConfigCheck(expectedStatKey)),
         catch: (error) => error,
       });
       // A competing rename may already have replaced our write; only a fresh read can publish it.
@@ -3383,7 +3747,14 @@ export class Config {
      * pure (callers run their own updaters and record results inside it): only after the
      * edit holds the lock it will write under, so no invocation's result is discarded.
      */
-    const transform = (): ProjectsConfig => fn(self.readConfigOrDefault({ keepSnapshot: true }));
+    // The stat key of config.json just before the edit's fresh read: the save refuses to replace
+    // bytes this edit did not read (#5929). A rename between this stat and the read only makes
+    // the save refuse (fail closed), never overwrite.
+    let readStatKey: string | undefined;
+    const transform = (): ProjectsConfig => {
+      readStatKey = self.readEditStatKey();
+      return fn(self.readConfigOrDefault({ keepSnapshot: true }));
+    };
     const write = Effect.fn(function* (
       newConfig: ProjectsConfig,
       lock: ProjectRegistrationLockHandle
@@ -3402,7 +3773,10 @@ export class Config {
       // Route through the saveConfig Promise facade (not saveConfigEffect) so test
       // spies on saveConfig keep intercepting the serialized write. A failed save rejects
       // the edit and skips the change notification below (#4444).
-      yield* Effect.tryPromise({ try: () => self.saveConfig(newConfig), catch: (error) => error });
+      yield* Effect.tryPromise({
+        try: () => self.saveConfig(newConfig, readStatKey),
+        catch: (error) => error,
+      });
       // Backend-initiated config edits (for example gateway auth changes) use this signal
       // so frontend subscribers can refresh derived state without polling.
       self.notifyConfigChanged();

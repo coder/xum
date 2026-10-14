@@ -1,3 +1,4 @@
+import { MAX_AGENT_SKILL_SNAPSHOT_CHARS } from "@/common/constants/attachments";
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -217,6 +218,56 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(snapshotText).toContain("not run: CLAUDE_SKILL_DIR has no value");
   });
 
+  it("tells the model when a slash skill's files are not where bash runs", async () => {
+    // A devcontainer reads skills on the host but runs bash in the container,
+    // the same split as host plugin skills in SSH/Docker workspaces. No tool
+    // result reaches the model for a slash skill, so the snapshot must say it.
+    // Longer than the snapshot cap: the note must survive truncation.
+    const skillBody = `Run sh \${CLAUDE_SKILL_DIR}/scripts/hello.sh\n${"x".repeat(MAX_AGENT_SKILL_SNAPSHOT_CHARS)}`;
+    const offHost = await createTestWorkspaceWithSkill({ skillName: "split-skill", skillBody });
+    const onHost = await createTestWorkspaceWithSkill({ skillName: "split-skill", skillBody });
+    const cases = [
+      {
+        workspacePath: offHost.workspacePath,
+        runtimeConfig: {
+          type: "devcontainer",
+          configPath: ".devcontainer/devcontainer.json",
+        } as const,
+        expectNote: true,
+      },
+      {
+        workspacePath: onHost.workspacePath,
+        runtimeConfig: { type: "local" } as const,
+        expectNote: false,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const { session, messages } = await createSessionHarness({
+        workspacePath: testCase.workspacePath,
+        runtimeConfig: testCase.runtimeConfig,
+      });
+      const result = await session.sendMessage("do X", {
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/split-skill",
+          skillName: "split-skill",
+          scope: "project",
+        },
+      });
+
+      expect(result.success).toBe(true);
+      const snapshotText = getMessageText(messages[0]);
+      expect(snapshotText.includes("agent_skill_read_file")).toBe(testCase.expectNote);
+      // The host path is never offered to the off-host bash.
+      expect(snapshotText.includes(testCase.workspacePath)).toBe(!testCase.expectNote);
+      await historyCleanup?.();
+      historyCleanup = undefined;
+    }
+  });
+
   it("resolves checkout-level plugin skills for subproject execution paths (agent-plugins)", async () => {
     const workspaceId = "ws-test";
 
@@ -281,6 +332,54 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(snapshotMessage.metadata?.agentSkillSnapshot?.skillName).toBe("plugin-skill");
     const snapshotText = snapshotMessage.parts.find((p) => p.type === "text")?.text;
     expect(snapshotText).toContain("Follow the plugin skill.");
+  });
+
+  it("materializes <plugin>:<skill> refs from the named plugin (plugin skill namespaces)", async () => {
+    // A project `tdd` hides the pstack plugin's `tdd` for the bare name.
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "tdd",
+      skillBody: "PROJECT-TDD",
+    });
+    const pluginDir = path.join(workspacePath, ".mux", "plugins", "pstack");
+    await fs.mkdir(path.join(pluginDir, "skills", "tdd"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "pstack",
+      })
+    );
+    await fs.writeFile(
+      path.join(pluginDir, "skills", "tdd", "SKILL.md"),
+      "---\nname: tdd\ndescription: Plugin tdd\n---\n\nPSTACK-TDD\n"
+    );
+    const { session, messages } = await createSessionHarness({ workspacePath });
+
+    const result = await session.sendMessage("do X", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "normal",
+        agentSkillRefs: [
+          { skillName: "pstack:tdd", scope: "project", source: "slash" },
+          { skillName: "tdd", scope: "project", source: "inline" },
+          // Unknown plugin: skipped like any unknown inline skill.
+          { skillName: "nope:tdd", scope: "project", source: "inline" },
+        ],
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(messages).toHaveLength(3);
+    const [qualified, bare] = messages;
+    expect(qualified.metadata?.agentSkillSnapshot?.skillName).toBe("pstack:tdd");
+    expect(getMessageText(qualified)).toStartWith(
+      '<agent-skill name="pstack:tdd" scope="project">'
+    );
+    expect(getMessageText(qualified)).toContain("PSTACK-TDD");
+    expect(bare.metadata?.agentSkillSnapshot?.skillName).toBe("tdd");
+    expect(getMessageText(bare)).toContain("PROJECT-TDD");
+    expect(getMessageText(messages[2])).toBe("do X");
   });
 
   it("dedupes identical skill snapshots when recently inserted", async () => {

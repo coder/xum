@@ -45,7 +45,13 @@ const curlFallsBack = (() => {
   );
   if (!match) throw new Error("could not read the curl version for the fallback tests");
   const [major, minor] = [Number(match[1]), Number(match[2])];
-  return major > 8 || (major === 8 && minor >= 7);
+  const fallsBack = major > 8 || (major === 8 && minor >= 7);
+  // CI's extra run installs curl 8.7+ for these tests (#6414). Refuse to quietly test the
+  // single-attempt path there if that curl is not the one on PATH.
+  if (process.env.XUM_WEB_FETCH_REQUIRE_CURL_FALLBACK === "1" && !fallsBack) {
+    throw new Error(`XUM_WEB_FETCH_REQUIRE_CURL_FALLBACK=1 needs curl 8.7+, found ${match[0]}`);
+  }
+  return fallsBack;
 })();
 // Probed at load, because it.skipIf needs the answer before the suite runs (#5990): a host
 // without ::1 shows the IPv6 case as skipped, and CI fails it instead of losing coverage.

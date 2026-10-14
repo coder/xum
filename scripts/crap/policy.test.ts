@@ -86,6 +86,36 @@ describe("new functions", () => {
     expect(verdicts(base, split(35))).toEqual([["new-function", "violation", piece]]);
   });
 
+  describe("relief with coverage", () => {
+    const base = [row("big", 40, [1, 99], 1)];
+    const piece = `${PATH}::demo.mod::piece`;
+    const withCrap = (crap: number): FunctionRow => ({ ...row("piece", 12, [61, 99], 0), crap });
+    // big keeps 29 of 40: a pure move (move relief); 25: a net decrease.
+    const moved = (bigCc: number, crap: number) => [row("big", bigCc, [1, 60], 1), withCrap(crap)];
+
+    test("covers a piece up to CRAP 30, either kind", () => {
+      for (const bigCc of [29, 25]) {
+        expect(verdicts(base, moved(bigCc, 30))).toEqual([["new-function", "warning", piece]]);
+        expect(verdicts(base, moved(bigCc, 30.5))).toEqual([["new-function", "violation", piece]]);
+      }
+    });
+
+    test("does not cover an untested piece, and says why", () => {
+      // CC 12 untested: CRAP 156. The CC-only move above warns for the same split.
+      const head = [row("big", 29, [1, 60], 1), row("piece", 12, [61, 99], 0)];
+      const [finding] = evaluate(base, head, NOTHING_CHANGED).findings;
+      expect(finding?.severity).toBe("violation");
+      expect(finding?.message).toContain("relief needs CRAP <= 30");
+    });
+
+    test("an incomplete coverage report turns the capped violation into a warning", () => {
+      // At full coverage the piece scores CRAP 12, under the cap, so only coverage blocks it.
+      const head = [row("big", 29, [1, 60], 1), row("piece", 12, [61, 99], 0)];
+      const findings = evaluate(base, head, NOTHING_CHANGED, "shard reports missing").findings;
+      expect(findings.map((finding) => finding.severity)).toEqual(["warning"]);
+    });
+  });
+
   describe("move relief", () => {
     const base = [row("big", 40, [1, 99])];
     const key = (name: string) => `${PATH}::demo.mod::${name}`;
@@ -243,9 +273,9 @@ describe("Bun inlined-const suspects", () => {
     ]);
     // A fully covered CC 31 hotspot that keeps its CC cannot end lower: at
     // full coverage it passes the CRAP floor but still owes the CRAP tax.
-    expect(verdicts([row("f", 31, [1, 9], 1)], [suspect(row("f", 31, [1, 9], 0))], touchedAt(3))).toEqual([
-      ["floor-crap", "violation", `${PATH}::demo.mod::f`],
-    ]);
+    expect(
+      verdicts([row("f", 31, [1, 9], 1)], [suspect(row("f", 31, [1, 9], 0))], touchedAt(3))
+    ).toEqual([["floor-crap", "violation", `${PATH}::demo.mod::f`]]);
   });
 
   test("the warning says why, and a complexity gain stays a violation", () => {
@@ -261,5 +291,56 @@ describe("Bun inlined-const suspects", () => {
     expect(findings[0].bunInlinedConstSuspect).toBe(true);
     expect(findings[0].message).toContain("inlined-const");
     expect(findings[1].bunInlinedConstSuspect).toBeUndefined();
+  });
+});
+
+describe("incomplete coverage", () => {
+  const INCOMPLETE = "shard reports missing (5/6 unit, 3/3 integration)";
+
+  test("coverage-based violations warn and say why, complexity-only verdicts stand", () => {
+    const changed = touchedAt(1, 49);
+    const base = [row("f", 5, [1, 9], 1), row("t", 31, [11, 19], 0), row("h", 2, [21, 22], 1)];
+    const head = [
+      row("f", 5, [1, 9], 0.5), // floor-crap
+      row("t", 31, [11, 19], 0), // crap-tax: CRAP 992 unchanged, but 31 at full coverage
+      row("h", 3, [21, 23], 1), // floor-cc
+      row("g", 3, [31, 39], 0), // new function, CRAP 12 but CC 3
+      row("k", 9, [41, 49], 1), // new function, CC 9 > 8 at any coverage
+    ];
+    const complete = evaluate(base, head, changed);
+    const incomplete = evaluate(base, head, changed, INCOMPLETE);
+    const verdicts = (findings: typeof complete.findings) =>
+      findings.map((finding) => [finding.head.name, finding.rule, finding.severity]);
+    expect(verdicts(complete.findings)).toEqual([
+      ["f", "floor-crap", "violation"],
+      ["g", "new-function", "violation"],
+      ["h", "floor-cc", "violation"],
+      ["k", "new-function", "violation"],
+      ["t", "crap-tax", "violation"],
+    ]);
+    expect(verdicts(incomplete.findings)).toEqual([
+      ["f", "floor-crap", "warning"],
+      ["g", "new-function", "warning"],
+      ["h", "floor-cc", "violation"],
+      ["k", "new-function", "violation"],
+      ["t", "crap-tax", "warning"],
+    ]);
+    const relieved = incomplete.findings.find((finding) => finding.head.name === "g");
+    expect(relieved?.message).toContain(INCOMPLETE);
+    expect(relieved?.bunInlinedConstSuspect).toBeUndefined();
+  });
+
+  test("leaves complexity-only reports and existing warnings alone", () => {
+    // Without coverage the rules compare CC, which a missing report cannot change.
+    expect(verdicts([], [row("g", 9, [1, 9])])).toEqual([
+      ["new-function", "violation", `${PATH}::demo.mod::g`],
+    ]);
+    const { findings } = evaluate([], [row("g", 9, [1, 9])], NOTHING_CHANGED, INCOMPLETE);
+    expect(findings.map((finding) => finding.severity)).toEqual(["violation"]);
+    const hotspot = row("t", 31, [1, 9]);
+    const tax = evaluate([hotspot], [hotspot], touchedAt(3), INCOMPLETE).findings;
+    expect(
+      tax.map((finding) => [finding.rule, finding.severity, finding.message.includes("incomplete")])
+    ).toEqual([["crap-tax", "warning", false]]);
   });
 });

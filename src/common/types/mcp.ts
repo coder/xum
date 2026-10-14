@@ -39,6 +39,11 @@ export interface MCPServerPluginProvenance {
   sourceLocation: string;
   /** Canonical managed owner; retained even if its registry row later disappears. */
   componentPolicy?: { registryPath: string; name: string };
+  /**
+   * Consent fingerprint of this exact server definition (componentConsent.ts, #6498), set where the
+   * plugin's config is loaded. A managed server starts only when the user reviewed this value.
+   */
+  consentFingerprint?: string;
 }
 
 export interface MCPServerBaseInfo {

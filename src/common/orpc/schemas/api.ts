@@ -160,7 +160,11 @@ import {
   WorkspaceHeartbeatSettingsSchema,
 } from "./workspace";
 import { WorkspaceAgentAISettingsSchema, WorkspaceAISettingsSchema } from "./workspaceAiSettings";
-import { AgentSkillListResultSchema, AgentSkillPackageSchema, SkillNameSchema } from "./agentSkill";
+import {
+  AgentSkillListResultSchema,
+  AgentSkillPackageSchema,
+  SkillLookupNameSchema,
+} from "./agentSkill";
 import {
   AvailableWorkflowSchema,
   WorkflowRunIdSchema,
@@ -183,7 +187,7 @@ import {
   MCPRemoveParamsSchema,
   MCPServerMapSchema,
   MCPSettingsReadInputSchema,
-  MCPSettingsSnapshotSchema,
+  MCPSettingsReadSnapshotSchema,
   MCPSettingsUpdateParamsSchema,
   MCPSetEnabledGlobalParamsSchema,
   MCPSetEnabledParamsSchema,
@@ -201,6 +205,7 @@ import {
   AgentPluginInstallEntrySchema,
   AgentPluginInstallPreviewSchema,
   AgentPluginComponentsSchema,
+  AgentPluginComponentRefSchema,
   AgentPluginHooksSchema,
   AgentPluginListItemSchema,
   AgentPluginUpdateCheckSchema,
@@ -1152,7 +1157,7 @@ export const mcp = {
         z.string(),
         ResultSchema(
           z
-            .union([MCPSettingsSnapshotSchema, z.object({ notConnected: z.literal(true) })])
+            .union([MCPSettingsReadSnapshotSchema, z.object({ notConnected: z.literal(true) })])
             .nullable(),
           z.string()
         )
@@ -1160,7 +1165,8 @@ export const mcp = {
     },
     update: {
       input: MCPSettingsUpdateParamsSchema,
-      output: ResultSchema(MCPSettingsSnapshotSchema.shape.values, z.string()),
+      /** The snapshot the server shows after the update (its schema can change). */
+      output: ResultSchema(MCPSettingsReadSnapshotSchema, z.string()),
     },
   },
   configureDesign: {
@@ -1314,6 +1320,26 @@ export const agentPlugins = {
       consent: AgentPluginUpdateConsentSchema.nullish(),
     }),
     output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
+  },
+  /**
+   * Component review of the installed tree (#6498): every imported skill or MCP server whose
+   * current fingerprint the user has not reviewed, in the update review shape (fromSha = toSha).
+   */
+  previewComponentReview: {
+    input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginUpdateReviewSchema, z.string()),
+  },
+  /** Record consent for the reviewed components that still match the installed tree. */
+  confirmComponentReview: {
+    input: z.object({
+      name: z.string(),
+      expectedLockedSha: z.string(),
+      reviewed: z.array(AgentPluginComponentRefSchema),
+    }),
+    output: ResultSchema(
+      z.object({ entry: AgentPluginInstallEntrySchema, cleanupWarning: z.string().optional() }),
+      z.string()
+    ),
   },
 };
 
@@ -1545,13 +1571,16 @@ export const mcpApps = {
   },
   approveViewDomains: {
     input: McpAppApproveDomainsRequestSchema,
-    output: ResultSchema(z.object({ approvedDomains: z.array(z.string()) }), z.string()),
+    output: ResultSchema(
+      z.object({ approvedDomains: z.array(z.string()), revision: z.number() }),
+      z.string()
+    ),
   },
   listViewDomains: { input: z.void(), output: z.array(McpAppViewDomainsSchema) },
   /** Mounted views of the server in this renderer reload under the narrower policy. */
   revokeViewDomains: {
     input: McpAppViewDomainsSchema.pick({ projectPath: true, serverName: true }),
-    output: z.void(),
+    output: z.object({ revision: z.number() }),
   },
   /** ui/update-model-context of a view; used by the workspace's next requests. */
   updateModelContext: {
@@ -1562,6 +1591,11 @@ export const mcpApps = {
   listEntrypoints: {
     input: z.object({ workspaceId: z.string().min(1) }),
     output: z.array(McpAppEntrypointSchema),
+  },
+  /** Ticks when a server of the workspace sends tools/list_changed: re-list entry points. */
+  onEntrypointsChanged: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: eventIterator(z.void()),
   },
   /** Call an entry point's tool with `{}` and store its view record (no chat row). */
   openEntrypoint: {
@@ -2827,7 +2861,8 @@ export const agentSkills = {
     output: AgentSkillListResultSchema,
   },
   get: {
-    input: AgentDiscoveryInputSchema.and(z.object({ skillName: SkillNameSchema })),
+    // `<plugin>:<skill>` reaches a plugin skill shadowed by a higher-precedence one.
+    input: AgentDiscoveryInputSchema.and(z.object({ skillName: SkillLookupNameSchema })),
     output: AgentSkillPackageSchema,
   },
 };

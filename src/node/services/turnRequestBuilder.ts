@@ -198,6 +198,10 @@ import {
   WORKFLOW_RESULT_METADATA_TYPE,
 } from "@/common/utils/workflowRunMessages";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import {
+  createPathSkillActivation,
+  loadedSnapshotSkillNames,
+} from "@/node/services/agentSkills/pathSkillActivation";
 import { eventSpine, type RequestAssembleContext } from "@/node/services/events/eventSpine";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
@@ -2706,6 +2710,17 @@ export class TurnRequestBuilder {
       // Dynamic context for tool descriptions (moved from system prompt for better model attention)
       availableSubagents: agentDefinitions,
       availableSkills,
+      // Built once per turn (refusal-fallback rebuilds reuse this config) from the
+      // context window, so path-scoped skills surface once per window.
+      pathSkillActivation: createPathSkillActivation({
+        skills: availableSkills,
+        messages: activeContextMessages,
+        // The first request after compaction re-injects loaded skills from this
+        // attachment, outside history: those skills need no pointer either.
+        loadedSkillNames: loadedSnapshotSkillNames(postCompactionAttachments),
+        cwd: workspacePath,
+        runtime,
+      }),
       mcpPromptRuntime,
       // Session-segment memory index advertised in the memory tool
       // description (same disclosure mechanic as skills).
@@ -3093,17 +3108,11 @@ export class TurnRequestBuilder {
           compactionContextRetryAvailable === true
         );
         // Shared by the initial build and thinking rebuilds so their assembly
-        // inputs cannot drift apart mid-turn. `measureOnly` assembles a candidate history and
-        // returns its estimate without throwing: it runs after `request.assemble`, so no hook,
-        // tool-search seeding or skill step reruns. Turn-start stage decisions (#5286) count a
-        // candidate message list here.
-        const assemblePayloadForThinkingLevel = (
-          level: ThinkingLevel,
-          measureOnly?: { history: MuxMessage[] }
-        ) =>
+        // inputs cannot drift apart mid-turn.
+        const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
           assembleBudgetCheckedPromptPayload(
             {
-              history: measureOnly?.history ?? options.sourceMessages,
+              history: options.sourceMessages,
               systemMessage: attemptSystem,
               volatileSystemSuffixLength: attemptVolatileSystemSuffixLength,
               tools: attemptTools,
@@ -3131,7 +3140,6 @@ export class TurnRequestBuilder {
               activeTools: forcedFirstStepToolNames?.length
                 ? forcedFirstStepToolNames
                 : (computeLoadedToolNames(toolSearchRuntime?.state) ?? [...firstStepToolNames]),
-              measureOnly: measureOnly != null,
             }
           );
         const prepareMessagesForProviderStartedAt = Date.now();
@@ -3191,8 +3199,6 @@ export class TurnRequestBuilder {
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
           contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
           ...compactionInputBudget,
-          measureMessages: (history: MuxMessage[]) =>
-            assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel, { history }),
           systemMessageTokens: attemptSystemTokens,
           tools: attemptTools,
           engineTools: attemptPayload.tools ?? attemptTools,

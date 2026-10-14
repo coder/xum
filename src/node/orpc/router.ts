@@ -28,6 +28,7 @@ import {
   getWorkspaceMcpOverrides,
   getWorkspacePluginComposition,
   listWorkspaceMcpPrompts,
+  warmWorkspaceMcpServers,
   listWorkspacePluginSlashCommands,
   setWorkspaceMcpOverrides,
 } from "@/node/services/agentPlugins/workspacePluginOperations";
@@ -139,6 +140,7 @@ import { clearLogsForApi, getLogFilePath } from "@/node/services/log";
 import {
   attachTerminal,
   subscribeConfigChanges,
+  subscribeMcpAppEntrypointChanges,
   subscribeDevTools,
   subscribeReviewState,
   subscribeDrafts,
@@ -191,8 +193,9 @@ import { resolveDraftSends } from "@/node/services/draftSendResolution";
 import type { SendAcceptance } from "@/node/services/draftService";
 import {
   boundMCPSettingsError,
+  mcpSettingsSnapshotForIpc,
   MCP_SETTINGS_READ_TIMEOUT_MS,
-  type MCPSettingsSnapshot,
+  type MCPSettingsReadSnapshot,
 } from "@/common/utils/mcpSettings";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 
@@ -238,8 +241,11 @@ async function runMcpSettingsRoute<T>(
 }
 
 type McpSettingsReadResult =
-  | { success: true; data: MCPSettingsSnapshot | { notConnected: true } | null }
+  | { success: true; data: MCPSettingsReadSnapshot | { notConnected: true } | null }
   | { success: false; error: string };
+
+const forIpc = (snapshot: MCPSettingsReadSnapshot | null) =>
+  snapshot === null ? null : mcpSettingsSnapshotForIpc(snapshot);
 
 /**
  * `mcp.settings.read` for several servers in one call (concurrently). With `ifConnected`, a
@@ -255,11 +261,17 @@ async function readMcpSettingsRoute(
 ): Promise<Record<string, McpSettingsReadResult>> {
   const manager = context.mcpServerManager;
   // Per server: a hung server times out with its own error and does not hold back the others.
-  const timeoutMs = MCP_SETTINGS_READ_TIMEOUT_MS;
+  const readTimeoutMs = MCP_SETTINGS_READ_TIMEOUT_MS;
   const readOne = async (serverName: string): Promise<McpSettingsReadResult> => {
+    // A dialog reopened during a save must not show the values from before the save. The read
+    // gets the time the wait left, so the two share one deadline.
+    const timeoutMs = await manager.settingsSavesSettled(input.workspaceId, serverName, {
+      signal,
+      timeoutMs: readTimeoutMs,
+    });
     if (input.ifConnected !== true)
-      return runMcpSettingsRoute(context, input.workspaceId, signal, () =>
-        manager.readSettings(input.workspaceId, serverName, { signal, timeoutMs })
+      return runMcpSettingsRoute(context, input.workspaceId, signal, async () =>
+        forIpc(await manager.readSettings(input.workspaceId, serverName, { signal, timeoutMs }))
       );
     if (!manager.isWorkspaceServerConnected(input.workspaceId, serverName))
       return { success: true, data: { notConnected: true } };
@@ -269,7 +281,7 @@ async function readMcpSettingsRoute(
         timeoutMs,
         noStart: true,
       });
-      return { success: true, data };
+      return { success: true, data: forIpc(data) };
     } catch (error) {
       return { success: false, error: boundMCPSettingsError(getErrorMessage(error)) };
     }
@@ -1302,22 +1314,17 @@ export const router = (authToken?: string) => {
           .input(schemas.mcp.settings.update.input)
           .output(schemas.mcp.settings.update.output)
           .handler(({ context, input, signal }) =>
-            // Validate against a fresh read: the renderer's schema can be stale.
-            runMcpSettingsRoute(context, input.workspaceId, signal, async () => {
-              const snapshot = await context.mcpServerManager.readSettings(
-                input.workspaceId,
-                input.serverName,
-                { signal }
-              );
-              if (snapshot === null)
-                throw new Error(`MCP server '${input.serverName}' has no settings`);
-              return context.mcpServerManager.updateSettings(
-                input.workspaceId,
-                input.serverName,
-                input.set,
-                snapshot
-              );
-            })
+            runMcpSettingsRoute(context, input.workspaceId, signal, async () =>
+              mcpSettingsSnapshotForIpc(
+                await context.mcpServerManager.saveSettings(
+                  input.workspaceId,
+                  input.serverName,
+                  input.set,
+                  input.instanceToken,
+                  { signal }
+                )
+              )
+            )
           ),
       },
       designStatus: t
@@ -1440,6 +1447,18 @@ export const router = (authToken?: string) => {
             name: input.name,
             consent: input.consent ?? undefined,
           })
+        ),
+      previewComponentReview: t
+        .input(schemas.agentPlugins.previewComponentReview.input)
+        .output(schemas.agentPlugins.previewComponentReview.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.previewComponentReviewResult(input)
+        ),
+      confirmComponentReview: t
+        .input(schemas.agentPlugins.confirmComponentReview.input)
+        .output(schemas.agentPlugins.confirmComponentReview.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.confirmComponentReviewResult(input)
         ),
     },
     mcpOauth: {
@@ -1839,15 +1858,21 @@ export const router = (authToken?: string) => {
         .output(schemas.mcpApps.listEntrypoints.output)
         .handler(({ context, input, signal }) =>
           listMcpAppEntrypoints(context, input.workspaceId, signal, (workspaceId, warmSignal) =>
-            listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
+            warmWorkspaceMcpServers(context, workspaceId, warmSignal)
           )
+        ),
+      onEntrypointsChanged: t
+        .input(schemas.mcpApps.onEntrypointsChanged.input)
+        .output(schemas.mcpApps.onEntrypointsChanged.output)
+        .handler(({ context, input, signal }) =>
+          subscribeMcpAppEntrypointChanges(context, input.workspaceId, signal)
         ),
       openEntrypoint: t
         .input(schemas.mcpApps.openEntrypoint.input)
         .output(schemas.mcpApps.openEntrypoint.output)
         .handler(({ context, input, signal }) =>
           openMcpAppEntrypoint(context, input, signal, (workspaceId, warmSignal) =>
-            listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
+            warmWorkspaceMcpServers(context, workspaceId, warmSignal)
           )
         ),
     },

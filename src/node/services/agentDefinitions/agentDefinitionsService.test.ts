@@ -1010,6 +1010,48 @@ base: a
       expect(shared[1]?.pluginName).toBe("my-plugin");
     });
 
+    test("remote runtimes list global host plugin agents but not project plugin agents", async () => {
+      using hostHome = new DisposableTempDir("agent-defs-remote-plugin-host-home");
+      using checkout = new DisposableTempDir("agent-defs-remote-plugin-checkout");
+      await writePluginWithAgent(
+        path.join(hostHome.path, "plugins"),
+        "host-plugin",
+        "host-helper",
+        "Host Helper"
+      );
+      await writePluginWithAgent(
+        path.join(checkout.path, ".xum", "plugins"),
+        "checkout-plugin",
+        "checkout-helper",
+        "Checkout Helper"
+      );
+      // Identity mapping: the checkout path also exists on the host, so a regression
+      // that scans project plugin containers with the host runtime would find it.
+      const runtime = new RemotePathMappedRuntime(checkout.path, checkout.path);
+
+      const previousRoot = process.env.XUM_ROOT;
+      process.env.XUM_ROOT = hostHome.path;
+      try {
+        const agents = await discoverAgentDefinitions(runtime, checkout.path);
+        expect(agents.find((agent) => agent.id === "host-helper")).toMatchObject({
+          scope: "global",
+          pluginName: "host-plugin",
+        });
+        expect(agents.some((agent) => agent.id === "checkout-helper")).toBe(false);
+
+        const pkg = await readAgentDefinition(runtime, checkout.path, "host-helper");
+        expect(pkg.scope).toBe("global");
+        expect(pkg.frontmatter.name).toBe("Host Helper");
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types `rejects` as void
+        await expect(
+          readAgentDefinition(runtime, checkout.path, "checkout-helper")
+        ).rejects.toThrow("Agent definition not found");
+      } finally {
+        if (previousRoot === undefined) delete process.env.XUM_ROOT;
+        else process.env.XUM_ROOT = previousRoot;
+      }
+    });
+
     test("readAgentDefinition falls back to a plugin agent when no project/global agent exists", async () => {
       using project = new DisposableTempDir("agent-defs-plugin-project");
       using global = new DisposableTempDir("agent-defs-plugin-global");

@@ -54,6 +54,7 @@ import {
 } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
 import { mcpAppEntrypointDescription } from "@/browser/features/RightSidebar/AppViewTab/mcpAppEntrypoints";
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
+import { revokeMcpAppViewDomains } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore";
 
 /**
  * One palette action per MCP App entry point: opens its app tab (calling the tool with {}) or
@@ -78,6 +79,54 @@ function entrypointActions(
       if (error !== null) showCommandFeedbackToast({ type: "error", message: error });
     },
   }));
+}
+
+/**
+ * "Revoke MCP App View Domains…": the keyboard path to Revoke under "Allowed view domains" in
+ * Settings (#6181). Picks one stored approval (server and project) and revokes it. The palette
+ * has closed by the time the call settles, so the outcome shows as a toast.
+ */
+function revokeViewDomainsAction(api: APIClient | null, settings: string): CommandAction {
+  return {
+    id: CommandIds.mcpAppsRevokeViewDomains(),
+    title: "Revoke MCP App View Domains…",
+    subtitle: "Stop a server's views from reaching the domains you allowed",
+    section: settings,
+    keywords: ["mcp", "app", "view", "domains", "csp", "allowed", "revoke", "network"],
+    run: () => undefined,
+    prompt: {
+      title: "Revoke MCP App View Domains",
+      fields: [
+        {
+          type: "select",
+          name: "approval",
+          label: "Allowed view domains",
+          placeholder: "Choose a server and project…",
+          // A failed list rejects: the open palette shows the error (CommandPalette).
+          getOptions: async () => {
+            if (!api) throw new Error(MCP_APP_ENTRYPOINT_NOT_CONNECTED);
+            const approvals = await api.mcpApps.listViewDomains();
+            return approvals.map((approval) => ({
+              id: JSON.stringify([approval.projectPath, approval.serverName]),
+              label: `${approval.serverName} in ${approval.projectPath}: ${approval.origins.join(", ")}`,
+              keywords: [approval.serverName, approval.projectPath, ...approval.origins],
+            }));
+          },
+        },
+      ],
+      onSubmit: async (values) => {
+        const [projectPath, serverName] = JSON.parse(values.approval) as [string, string];
+        const error = api
+          ? await revokeMcpAppViewDomains(api, { projectPath, serverName })
+          : MCP_APP_ENTRYPOINT_NOT_CONNECTED;
+        showCommandFeedbackToast(
+          error == null
+            ? { type: "success", message: `Revoked the view domains of ${serverName}` }
+            : { type: "error", message: `Could not revoke: ${error}` }
+        );
+      },
+    },
+  };
 }
 
 /**
@@ -470,6 +519,15 @@ function openGoalPanel(workspaceId: string, openCompleteInput = false): void {
 /** Subtitle for an On/Off toggle backed by config.json; `fallback` until the value is known. */
 function describeConfigToggle(value: boolean | undefined, fallback: string): string {
   return value === undefined ? fallback : `Current: ${value ? "On" : "Off"}`;
+}
+
+/** Palette options: managed plugins with components not reviewed on this install (#6498). */
+async function pluginsNeedingReviewOptions(api: BuildSourcesParams["api"]) {
+  const result = await api?.agentPlugins.list();
+  if (!result?.success) return [];
+  return result.data
+    .filter((item) => item.managed && (item.reviewRequiredCount ?? 0) > 0)
+    .map((item) => ({ id: item.name, label: item.name, keywords: [item.name, item.location] }));
 }
 
 export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandAction[]> {
@@ -2221,6 +2279,11 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     },
   ]);
 
+  // MCP App view-domain approvals: the palette path to Settings' Revoke.
+  // Not behind the artifacts experiment: Settings lists stored approvals with Revoke either way,
+  // so the palette keeps the keyboard path to them.
+  actions.push(() => [revokeViewDomainsAction(p.api, section.settings)]);
+
   // Settings
   if (p.onOpenSettings) {
     const openSettings = p.onOpenSettings;
@@ -2370,6 +2433,30 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           ],
           onSubmit: (values) => {
             publishPluginsSectionIntent({ type: "review-hooks", name: values.pluginName });
+            openSettings("plugins");
+          },
+        },
+      },
+      {
+        id: CommandIds.pluginsReviewComponents(),
+        title: "Review Plugin Components…",
+        subtitle: "Approve skills and MCP servers that do not load until you review them",
+        section: section.settings,
+        keywords: ["plugin", "components", "review", "approve", "skills", "mcp", "consent"],
+        run: () => undefined,
+        prompt: {
+          title: "Review Plugin Components",
+          fields: [
+            {
+              type: "select",
+              name: "pluginName",
+              label: "Plugin that needs review",
+              placeholder: "Search plugins that need review…",
+              getOptions: () => pluginsNeedingReviewOptions(p.api),
+            },
+          ],
+          onSubmit: (values) => {
+            publishPluginsSectionIntent({ type: "review-components", name: values.pluginName });
             openSettings("plugins");
           },
         },

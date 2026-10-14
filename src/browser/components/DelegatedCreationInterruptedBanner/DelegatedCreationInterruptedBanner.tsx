@@ -119,11 +119,12 @@ export const DelegatedCreationInterruptedNotice: React.FC<
               )}
               Keep workspace
             </button>
+            {/* text-foreground: --color-secondary on the bg-muted/10 tint was below 4.5:1 (#6453). */}
             <button
               type="button"
               disabled={pendingAction != null}
               onClick={remove}
-              className={`text-secondary bg-muted/10 ${buttonClass}`}
+              className={`text-foreground bg-muted/10 ${buttonClass}`}
             >
               {pendingAction === "remove" ? (
                 <Loader2 className="size-3 animate-spin" />

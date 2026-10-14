@@ -14,6 +14,7 @@ import { log } from "@/node/services/log";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { isMutationEpochUnreadable, readContainerMutationState } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginComponentImports } from "./registry";
+import { noComponentConsent, type ComponentConsent } from "./componentConsent";
 import {
   isPlainObject,
   isValidAgentPluginName,
@@ -222,6 +223,11 @@ export interface AgentPluginInfo {
   /** Managed global imports; absent means legacy/unmanaged import-all. */
   importedComponents?: AgentPluginImportedComponents;
   componentPolicy?: { registryPath: string; name: string };
+  /**
+   * Managed plugins only: the reviewed fingerprints (#6498). Set together with componentPolicy;
+   * an install without records gets empty ones, so nothing of it loads until reviewed.
+   */
+  componentConsent?: ComponentConsent;
   name: string;
   scope: AgentPluginScope;
   /** Canonical (realpath) plugin root directory. */
@@ -244,8 +250,11 @@ export interface AgentPluginInfo {
    * (a Codex-only package or the overlay). Codex hooks label their inline entries with it.
    */
   openaiManifestPath?: string;
-  /** Canonical `skills/` directory; present only when it exists, is a directory, and stays inside the root (§6.2). */
-  skillsDir?: string;
+  /**
+   * Canonical skills roots in declared order (`skills/` by default, or `contributes.skills`).
+   * Each one exists, is a directory, and stays inside the root (§6.2). Absent when none does.
+   */
+  skillsDirs?: string[];
   /** Canonical `mcp.json` path; present only when it exists, is a regular file, and stays inside the root (§6.2). */
   mcpConfigPath?: string;
   /** "codex": the MCP file is in the Codex `.mcp.json` dialect (see loadPluginMcpServers). */
@@ -401,10 +410,33 @@ async function readManifestCandidate(
     };
   }
   try {
-    return { status: "ok", raw: JSON.parse(await fsPromises.readFile(manifestReal, "utf8")) };
+    // The checks above only classify the candidate. The bytes come from one handle that is
+    // identity-checked, contained and capped, so a local replacement after the size check
+    // cannot redirect or grow the read (Codex PRRT_kwDOPxxmWM6rvwzc, #6297).
+    const { content } = await readPluginFileWithinRootCapped({
+      filePath: manifestReal,
+      pluginRoot: rootReal,
+      maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
+      label: relative,
+    });
+    return { status: "ok", raw: JSON.parse(content) };
   } catch (error) {
     return { status: "invalid", message: `Failed to read ${relative}: ${getErrorMessage(error)}` };
   }
+}
+
+/** Resolve each declared skills root (default `skills/`), dropping missing, invalid and repeated ones. */
+async function resolveSkillsRoots(
+  declared: string | string[] | undefined,
+  resolveComponent: (relativePath: string, expectKind: "directory") => Promise<string | undefined>
+): Promise<string[]> {
+  const roots: string[] = [];
+  for (const relative of typeof declared === "string" ? [declared] : (declared ?? ["skills"])) {
+    const canonical = await resolveComponent(relative, "directory");
+    // Two spellings (or a symlink) can name one directory: scan it once.
+    if (canonical !== undefined && !roots.includes(canonical)) roots.push(canonical);
+  }
+  return roots;
 }
 
 async function discoverPluginAt(args: {
@@ -526,7 +558,7 @@ async function discoverPluginAt(args: {
       ...(options?.maxBytes !== undefined ? { maxBytes: options.maxBytes } : {}),
     });
 
-  const skillsDir = await resolveComponent(contributes?.skills ?? "skills", "directory");
+  const skillsDirs = await resolveSkillsRoots(contributes?.skills, resolveComponent);
   // Codex packages ship `.mcp.json`; it is the default only when `mcp.json` is
   // absent (an invalid `mcp.json` still reports its own diagnostic).
   const defaultMcpPath = (await fsPromises.lstat(path.join(rootReal, "mcp.json")).catch(() => null))
@@ -562,7 +594,7 @@ async function discoverPluginAt(args: {
     manifest: validation.manifest,
     ...(codexFallback ? { codexFallback: true } : {}),
     ...(openai.extension !== undefined ? { openai: openai.extension, openaiManifestPath } : {}),
-    ...(skillsDir !== undefined ? { skillsDir } : {}),
+    ...(skillsDirs.length > 0 ? { skillsDirs } : {}),
     ...(mcpConfigPath !== undefined ? { mcpConfigPath } : {}),
     ...(mcpConfigPath !== undefined && mcpConfigDialect !== undefined ? { mcpConfigDialect } : {}),
     ...(hooksPath !== undefined ? { hooksPath } : {}),
@@ -763,6 +795,35 @@ async function resolveAgentPluginContainerPath(containerPath: string): Promise<s
 }
 
 /** Canonical project plugins shadow same-named legacy copies during ordered scans. */
+/**
+ * The install-owned fields of one discovered plugin, from its container's registry read. A
+ * corrupt registry, or an unidentified row that can own the directory, imports nothing. Managed
+ * plugins also get their reviewed fingerprints (#6498): an install without records gets empty
+ * ones, so nothing of it loads until reviewed.
+ */
+function managedPluginFields(
+  entryName: string,
+  imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,
+  registryPath: string | undefined
+): Pick<AgentPluginInfo, "componentPolicy" | "componentConsent" | "importedComponents"> {
+  if (imports === null) return { importedComponents: { skills: [], mcpServers: [] } };
+  if (imports === undefined) return {};
+  if (!imports.byName.has(entryName)) {
+    return imports.hasUnidentifiedEntries
+      ? { importedComponents: { skills: [], mcpServers: [] } }
+      : {};
+  }
+  return {
+    importedComponents: imports.byName.get(entryName),
+    ...(registryPath !== undefined
+      ? {
+          componentPolicy: { registryPath, name: entryName },
+          componentConsent: imports.consentByName.get(entryName) ?? noComponentConsent(),
+        }
+      : {}),
+  };
+}
+
 export async function discoverAgentPlugins(
   containers: AgentPluginContainer[],
   options?: {
@@ -1021,15 +1082,14 @@ export async function discoverAgentPlugins(
         });
         snapshot.plugins.set(entryName, plugin);
         if (plugin) {
-          const imports = snapshot.imports;
-          const registryPath = groups.get(canonicalPath)?.registryPath;
-          if (registryPath !== undefined && imports?.byName.has(entryName)) {
-            plugin.componentPolicy = { registryPath, name: entryName };
-          }
-          plugin.importedComponents =
-            imports === null || (imports?.hasUnidentifiedEntries && !imports.byName.has(entryName))
-              ? { skills: [], mcpServers: [] }
-              : imports?.byName.get(entryName);
+          Object.assign(
+            plugin,
+            managedPluginFields(
+              entryName,
+              snapshot.imports,
+              groups.get(canonicalPath)?.registryPath
+            )
+          );
         }
       }
       if (plugin)

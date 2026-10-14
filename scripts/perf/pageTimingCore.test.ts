@@ -1,5 +1,8 @@
-import { expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { GlobalWindow } from "happy-dom";
 import {
+  PAGE_SETUP,
+  TARGET,
   hostIsQuiet,
   pairDiffs,
   qualifyHostPage,
@@ -9,6 +12,7 @@ import {
   usefulContentShown,
   type Run,
 } from "./pageTimingCore";
+import { probe, STATIC_VIEW_ID } from "./pageTimingProbe";
 
 test("UCS takes the later of Element Timing and visibility, and a static view counts only for UCS (any)", () => {
   const record = {
@@ -108,4 +112,134 @@ test("never holds the lock while the host is busy, and bounds its waits and lock
   const busy = { isQuiet: () => --busyProbes < 0, sleep };
   await expect(runOnQuietHost(busy, withLock, run)).rejects.toThrow("busy for 10 minutes");
   expect(events).not.toContain("lock");
+});
+
+// Pins p1 and p2 (plan section 5.6, PR 3c): adding p1r must not change what they open or match.
+// Catches, for example, a table that seeds p1 or sends p2 to "/".
+test("p1 and p2 keep today's root, route and target", () => {
+  const id = "a1b2c3d4e5";
+  const setup = (page: "p1" | "p2") => ({
+    seeded: PAGE_SETUP[page].seeded,
+    route: PAGE_SETUP[page].route(id),
+    target: TARGET[page],
+  });
+  expect(setup("p1")).toEqual({
+    seeded: false,
+    route: "/",
+    target: { selector: "p", text: "OSS contributors with GitHub accounts" },
+  });
+  expect(setup("p2")).toEqual({
+    seeded: true,
+    route: `/workspace/${id}`,
+    target: { selector: ".code-line", text: "export function subtract(" },
+  });
+});
+
+describe("the probe's IR check", () => {
+  // The probe runs in the page, so it reads these as globals. The test lends it a happy-dom window.
+  const names = [
+    "window",
+    "document",
+    "Navigator",
+    "MutationObserver",
+    "getComputedStyle",
+    "requestAnimationFrame",
+    "HTMLTextAreaElement",
+    "Event",
+  ] as const;
+  const saved = new Map<string, PropertyDescriptor | undefined>();
+  let dom: GlobalWindow;
+
+  beforeEach(() => {
+    dom = new GlobalWindow({ url: "http://localhost/" });
+    for (const name of [...names, "PerformanceObserver"]) {
+      saved.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+    }
+    for (const name of names) {
+      const value = (dom as unknown as Record<string, unknown>)[name];
+      const bound = typeof value === "function" && /^[a-z]/.test(name) ? value.bind(dom) : value;
+      Object.defineProperty(globalThis, name, { value: bound, configurable: true, writable: true });
+    }
+    // Element Timing is UCS, not IR: a no-op observer keeps this test on the IR path.
+    const observer = class {
+      observe() {}
+    };
+    Object.defineProperty(globalThis, "PerformanceObserver", {
+      value: observer,
+      configurable: true,
+      writable: true,
+    });
+  });
+
+  afterEach(async () => {
+    for (const [name, descriptor] of saved) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete (globalThis as Record<string, unknown>)[name];
+    }
+    await dom.happyDOM.close();
+  });
+
+  /** Starts the probe in IR mode, renders `html`, and waits for its IR (seconds, or null). */
+  async function irOf(page: keyof typeof TARGET, html: string, wire: (doc: Document) => void) {
+    probe({ target: TARGET[page], mode: "ir", page, staticViewId: STATIC_VIEW_ID });
+    dom.document.body.innerHTML = html;
+    wire(dom.document as unknown as Document);
+    for (
+      let i = 0;
+      i < 50 &&
+      (dom as unknown as { __pageTiming: { ir: number | null } }).__pageTiming.ir === null;
+      i++
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return (dom as unknown as { __pageTiming: { ir: number | null } }).__pageTiming.ir;
+  }
+  const onClick = (doc: Document, label: string, effect: () => void) => {
+    const button = [...doc.querySelectorAll("button")].find((b) => b.textContent === label)!;
+    let clicks = 0;
+    button.addEventListener("click", () => (clicks++, effect()));
+    return () => clicks;
+  };
+
+  // Pins p1 and p2. Catches a p1r branch that also takes another page (for example `page !== "p2"`).
+  test("p1: one click on the wizard's Next, ready once step 2 shows", async () => {
+    let clicks = () => 0;
+    const ir = await irOf("p1", '<div role="dialog"><button>Next</button></div>', (doc) => {
+      clicks = onClick(doc, "Next", () =>
+        doc
+          .querySelector("[role=dialog]")!
+          .insertAdjacentHTML("beforeend", '<div role="img" aria-label="Step 2 of 7"></div>')
+      );
+    });
+    expect(ir).not.toBeNull();
+    expect(clicks()).toBe(1);
+  });
+
+  test("p2: typed text stays and Send is enabled", async () => {
+    const html =
+      '<textarea aria-label="Message"></textarea><button aria-label="Send message" disabled>Send</button>';
+    let box: HTMLTextAreaElement | null = null;
+    const ir = await irOf("p2", html, (doc) => {
+      box = doc.querySelector("textarea");
+      const send = doc.querySelector<HTMLButtonElement>("button")!;
+      box!.addEventListener("input", () => (send.disabled = box!.value === ""));
+    });
+    expect(ir).not.toBeNull();
+    expect(box!.value).toBe("hi");
+  });
+
+  // Catches a probe without a p1r branch: it never clicks, so IR stays null.
+  test("p1r: one click on Open Provider Settings, ready once the provider settings show", async () => {
+    let clicks = () => 0;
+    const ir = await irOf("p1r", "<main><button>Open Provider Settings</button></main>", (doc) => {
+      clicks = onClick(doc, "Open Provider Settings", () =>
+        doc.body.insertAdjacentHTML(
+          "beforeend",
+          "<p>Configure API keys and endpoints for AI providers. Keys are stored in <code>~/.xum/providers.jsonc</code></p>"
+        )
+      );
+    });
+    expect(ir).not.toBeNull();
+    expect(clicks()).toBe(1);
+  });
 });

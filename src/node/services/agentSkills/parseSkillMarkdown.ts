@@ -4,6 +4,7 @@ import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { formatZodIssues, normalizeNewlines, stripUtf8Bom } from "@/node/utils/markdownFrontmatter";
 import YAML from "yaml";
 import { getErrorMessage } from "@/common/utils/errors";
+import { normalizeSkillPaths } from "@/common/utils/skills/skillPaths";
 
 export class AgentSkillParseError extends Error {
   constructor(message: string) {
@@ -20,6 +21,17 @@ export interface ParsedSkillMarkdown {
 function assertObject(value: unknown, message: string): asserts value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new AgentSkillParseError(message);
+  }
+}
+
+/**
+ * Invalid `paths` globs make the whole skill invalid (surfaced through invalidSkills),
+ * so descriptor builders can resolve `paths` without re-validating.
+ */
+function assertValidSkillPaths(frontmatter: AgentSkillFrontmatter): void {
+  const result = normalizeSkillPaths(frontmatter.paths);
+  if (!result.ok) {
+    throw new AgentSkillParseError(`Invalid SKILL.md frontmatter: paths: ${result.error}`);
   }
 }
 
@@ -79,6 +91,8 @@ export function parseSkillMarkdown(input: {
       `Invalid SKILL.md frontmatter: ${formatZodIssues(parsed.error.issues)}`
     );
   }
+
+  assertValidSkillPaths(parsed.data);
 
   if (input.directoryName && parsed.data.name !== input.directoryName) {
     throw new AgentSkillParseError(

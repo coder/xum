@@ -735,3 +735,167 @@ export const HooksReviewTruncatedInputPhoneViewport: Story = {
     }
   },
 };
+
+/** 48x48 dark disc: the light-theme logo, unreadable on a dark background. */
+const DARK_DISC_LOGO =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAh0lEQVR42u3ZwQ3AIAwEQcpASv91XkqIFLA5m31sAfNC+Macz6jcAADAD6CP7ABa7BhAm0sFKKhwgJIKASi5rQAdagtAh7sbIJN+AWTWXQCZBgBABkDmAQAAAACAWAAvMQAA/Mg8AOU/9dyFXADlT4stjrstzustBo42E1OLka/NzMpSD6ByL24kjnoh5of0AAAAAElFTkSuQmCC";
+/** 48x48 light disc: the dark-theme variant (OpenAI `logoDark`). */
+const LIGHT_DISC_LOGO =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAhklEQVR42u3ZsRHAIAwEQfqvF8fvEjxjkHiJC66AjRj0Y85nVG4AAOAH0Ed2AC12DKDNpQIUVDhASYUAlNxWgA61BaDD3Q2QSb8AMusugEwDACADIPMAAAAAAEAsgJcYAAB+ZB6A8p967kIugPKnxRbH3Rbn9RYDR5uJqcXI12ZmZakHULkXyaGx0xu95bMAAAAASUVORK5CYII=";
+
+/** Two rows: one with both logos, one with only the light logo (its dark read failed). */
+const THEMED_LOGO_ITEMS: AgentPluginListItem[] = [
+  {
+    ...MANAGED_ITEM,
+    interface: {
+      ...OPENAI_INTERFACE,
+      logoDataUrl: DARK_DISC_LOGO,
+      logoDarkDataUrl: LIGHT_DISC_LOGO,
+    },
+  },
+  {
+    ...UNMANAGED_ITEM,
+    interface: { ...OPENAI_INTERFACE, displayName: "Light only", logoDataUrl: DARK_DISC_LOGO },
+  },
+];
+
+const ThemedLogoStory: FC = () => (
+  <PluginsSectionStoryShell options={{ agentPlugins: { items: THEMED_LOGO_ITEMS } }}>
+    <PluginsSettingsSection />
+  </PluginsSectionStoryShell>
+);
+
+/** The logo `src` of each interface row, in list order. */
+async function themedLogoSources(canvasElement: HTMLElement): Promise<Array<string | null>> {
+  const canvas = within(canvasElement);
+  await canvas.findByText("Light only");
+  return Array.from(
+    canvasElement.querySelectorAll("[data-testid='plugin-interface']"),
+    (details) => details.querySelector("img")?.getAttribute("src") ?? null
+  );
+}
+
+/** Dark theme: the dark variant shows; a row without one keeps its light logo. */
+export const ThemedLogoDark: Story = {
+  globals: { theme: "dark" },
+  // Behavioral contract only: the Pixel budget has no headroom (see HooksReview).
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <ThemedLogoStory />,
+  play: async ({ canvasElement }) => {
+    const sources = await themedLogoSources(canvasElement);
+    if (sources[0] !== LIGHT_DISC_LOGO) throw new Error("Dark theme must show the dark logo");
+    if (sources[1] !== DARK_DISC_LOGO)
+      throw new Error("A missing dark logo falls back to the light one");
+  },
+};
+
+/** Light theme: every row shows its light logo. */
+export const ThemedLogoLight: Story = {
+  globals: { theme: "light" },
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <ThemedLogoStory />,
+  play: async ({ canvasElement }) => {
+    const sources = await themedLogoSources(canvasElement);
+    if (sources.some((source) => source !== DARK_DISC_LOGO)) {
+      throw new Error("Light theme must show the light logo");
+    }
+  },
+};
+
+/** A plugin installed before #6498: its components have no consent records yet. */
+function componentReviewOptions(): MockORPCClientOptions {
+  const item: AgentPluginListItem = { ...MANAGED_ITEM, reviewRequiredCount: 2 };
+  return {
+    agentPlugins: {
+      items: [item],
+      componentReview: {
+        name: item.name,
+        fromSha: item.lockedSha ?? "",
+        toSha: item.lockedSha ?? "",
+        changes: [
+          {
+            summary: "Skill 'grilling' needs review",
+            before: "Not reviewed on this install",
+            after: "Grill the user about a plan or decision.",
+            component: { kind: "skills", name: "grilling", fingerprint: "a".repeat(64) },
+          },
+          {
+            summary: "MCP server 'planner' needs review",
+            before: "Changed since you reviewed it",
+            after:
+              "node ~/.mux/plugins/grill/servers/planner-with-a-very-long-entry-point.js --stdio",
+            component: { kind: "mcpServers", name: "planner", fingerprint: "b".repeat(64) },
+          },
+        ],
+        warnings: [],
+      },
+    },
+  };
+}
+
+async function approveComponents(canvasElement: HTMLElement): Promise<HTMLElement> {
+  const canvas = within(canvasElement);
+  // The row badge and the section notice name the state and the action.
+  await canvas.findByText("needs review");
+  await canvas.findByText(/Select Review on each plugin marked "needs review"/);
+  await userEvent.click(
+    await canvas.findByRole("button", { name: /^Review components of grill$/ })
+  );
+  await canvas.findByText(/Skill 'grilling' needs review/);
+  await canvas.findByText("Changed since you reviewed it");
+  return canvas.findByRole("button", { name: /Approve components/ });
+}
+
+/**
+ * Component review (#6498): the update review panel lists the plugin's unreviewed skills and MCP
+ * servers, and approving clears the badge and the notice.
+ */
+export const ComponentReview: Story = {
+  // Out of Pixel snapshots (snapshot budget, like HooksReview). The play checks the flow.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell options={componentReviewOptions()}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await approveComponents(canvasElement));
+    await canvas.findByText("Plans, **grilled** <b>hard</b>");
+    if (canvas.queryByText("needs review") !== null) {
+      throw new Error("Approving the review must clear the needs-review badge");
+    }
+    if (canvas.queryByText(/Select Review on each plugin/) !== null) {
+      throw new Error("Approving the review must clear the notice");
+    }
+  },
+};
+
+/** Phone width (390 px): the notice, the badge and the review rows wrap inside the card. */
+export const ComponentReviewPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={componentReviewOptions()}>
+      {/* Fixed phone width so the play's overflow assertion holds in the CI test-runner too. */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const approve = await approveComponents(canvasElement);
+    const card = approve.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) throw new Error("Component review card not found");
+    if (card.scrollWidth > card.clientWidth + 1) {
+      throw new Error("Component review overflows its card at phone width");
+    }
+  },
+};

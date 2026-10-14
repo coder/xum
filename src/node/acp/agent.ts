@@ -39,6 +39,7 @@ import { execFileAsync } from "@/node/utils/disposableExec";
 import { RuntimeConfigSchema } from "@/common/orpc/schemas";
 import type { OnChatMode, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import type { AgentSkillDescriptor, AgentSkillListResult } from "@/common/types/agentSkill";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 import type { CompactionRequestData } from "@/common/types/message";
 import { buildAgentSkillMetadata } from "@/common/types/message";
 import { isWorktreeRuntime, type RuntimeConfig, type RuntimeMode } from "@/common/types/runtime";
@@ -1400,7 +1401,7 @@ export class MuxAgent implements Agent {
       const result = await this.server.client.agentSkills.list({ workspaceId });
       if (!isLatestRead()) return;
       this.cacheSessionSkills(sessionId, result);
-      advertisedSkills = result.skills;
+      advertisedSkills = listInvocableSkills(result);
     } catch (error) {
       // Command advertisement should not block session creation/loading.
       console.error("[acp] Failed to load skills while publishing slash commands", error);
@@ -1455,12 +1456,12 @@ export class MuxAgent implements Agent {
     const isLatestRead = this.startSkillsRead(sessionId);
     const result = await this.server.client.agentSkills.list({ workspaceId });
     if (!isLatestRead()) {
-      return mapSkillsByName(result.skills);
+      return mapSkillsByName(listInvocableSkills(result));
     }
     const skillsByName = this.cacheSessionSkills(sessionId, result);
     // No cache means the client was last sent a partial list (or none), so its
     // command picker is stale too: send it the list just read.
-    await this.publishSessionCommands(sessionId, result.skills);
+    await this.publishSessionCommands(sessionId, listInvocableSkills(result));
     return skillsByName;
   }
 
@@ -1468,7 +1469,8 @@ export class MuxAgent implements Agent {
     sessionId: string,
     result: AgentSkillListResult
   ): Map<string, AgentSkillDescriptor> {
-    const skillsByName = mapSkillsByName(result.skills);
+    // Shadowed plugin skills join under `<plugin>:<skill>` (e.g. /pstack:tdd).
+    const skillsByName = mapSkillsByName(listInvocableSkills(result));
     // The cache holds only the latest complete list. After a partial list (e.g.
     // SSH host unreachable) the next prompt asks again, and an older complete
     // list cannot keep accepting commands the partial list no longer has.
