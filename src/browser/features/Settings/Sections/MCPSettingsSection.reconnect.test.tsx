@@ -82,6 +82,42 @@ describe.each([...GAP_MODES])("MCPSettingsSection across a reconnect (%s)", (mod
     expect(view.queryByText("alpha-mcp")).toBeNull();
   });
 
+  // An edit begun on a stale row would overwrite the configuration the reload brings.
+  test("locks the kept rows until the reload answers", async () => {
+    const view = renderSection();
+    const edit = await waitFor(() => view.getByRole("button", { name: "Edit server" }));
+    // happy-dom does not apply a disabled fieldset to `disabled`: read the fieldset.
+    const isLocked = () => edit.closest("fieldset")?.disabled === true;
+    expect(isLocked()).toBe(false);
+
+    let answer: ((list: ServerList) => void) | null = null;
+    serverList = new Promise((resolve) => (answer = resolve));
+    await harness.drop();
+    harness.reconnect();
+    await settle();
+    expect(isLocked()).toBe(true);
+
+    act(() => answer?.({ alpha: stdio("alpha-mcp") }));
+    await waitFor(() => expect(isLocked()).toBe(false));
+  });
+
+  // A first load cut off by the drop never read the list: it must not claim "no servers".
+  test("keeps the loading placeholder when the first load is cut off", async () => {
+    serverList = new Promise(() => undefined);
+    harness = createConnectionHarness(mode, serverOverrides);
+    const view = renderSection();
+    await settle();
+
+    serverList = { alpha: stdio("alpha-mcp") };
+    await harness.drop();
+    await settle();
+    expect(view.queryByText("No MCP servers configured yet.")).toBeNull();
+    expect(view.queryByText("Loading servers…")).not.toBeNull();
+
+    harness.reconnect();
+    await waitFor(() => expect(view.queryByText("alpha-mcp")).not.toBeNull());
+  });
+
   test("shows no load failure for a reload the drop cut off", async () => {
     const view = renderSection();
     await waitFor(() => expect(view.queryByText("alpha-mcp")).not.toBeNull());

@@ -860,9 +860,17 @@ function describeListFailure(err: unknown): string | null {
   return err instanceof Error ? err.message : "Failed to load MCP servers";
 }
 
-/** "Loading servers…" replaces the rows only before the first list: later loads keep them. */
-function isFirstListLoad(loading: boolean, listLoaded: boolean): boolean {
-  return loading && !listLoaded;
+/**
+ * "Loading servers…" shows until the first list: later loads keep the rows. A first load cut off
+ * by a lost connection reports no error, so the placeholder stays (not "No MCP servers").
+ */
+function isFirstListLoad(state: {
+  loading: boolean;
+  listLoaded: boolean;
+  error: string | null;
+}): boolean {
+  if (state.listLoaded) return false;
+  return state.loading || state.error == null;
 }
 
 export const MCPSettingsSection: React.FC = () => {
@@ -1357,8 +1365,10 @@ export const MCPSettingsSection: React.FC = () => {
         )}
 
         {/* Server list */}
-        <div className="space-y-2">
-          {isFirstListLoad(loading, listLoaded) ? (
+        {/* A load in flight (a reconnect, a removal) locks the kept rows: an edit begun on a stale
+            row would overwrite the configuration the load brings. */}
+        <fieldset disabled={loading} className="min-w-0 space-y-2">
+          {isFirstListLoad({ loading, listLoaded, error }) ? (
             <div className="text-content-secondary flex items-center gap-2 py-4 text-sm">
               <Loader2 className="h-4 w-4 animate-spin" />
               Loading servers…
@@ -1669,7 +1679,7 @@ export const MCPSettingsSection: React.FC = () => {
               );
             })
           )}
-        </div>
+        </fieldset>
         <McpAppViewDomainsSection
           entries={unlistedMcpAppViewDomains(viewDomains.entries, servers)}
           onRevoke={(e) => void viewDomains.revoke(e)}
