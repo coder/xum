@@ -164,13 +164,12 @@ import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLay
 import {
   hasTab,
   openToolFromNewTab,
-  selectTabInTabset,
-  setFocusedTabset,
   splitFocusedTabset,
   toggleTab,
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
 import {
+  focusRightSidebarTab,
   readRightSidebarLayout,
   updateRightSidebarLayout,
 } from "@/browser/utils/rightSidebarTabFocus";
@@ -410,6 +409,11 @@ const findFirstTerminalSessionTab = (
   );
 };
 
+function focusExistingTerminalTab(workspaceId: string): void {
+  const found = findFirstTerminalSessionTab(readRightSidebarLayout(workspaceId).root);
+  if (found) focusRightSidebarTab(workspaceId, found.tab);
+}
+
 /**
  * Whether right-sidebar commands have a visible sidebar to act on. Narrow layouts hide the
  * sidebar entirely, so opening tabs there would produce no visible result (the keyboard
@@ -519,6 +523,15 @@ function openGoalPanel(workspaceId: string, openCompleteInput = false): void {
 /** Subtitle for an On/Off toggle backed by config.json; `fallback` until the value is known. */
 function describeConfigToggle(value: boolean | undefined, fallback: string): string {
   return value === undefined ? fallback : `Current: ${value ? "On" : "Off"}`;
+}
+
+/** Palette options: managed plugins with components not reviewed on this install (#6498). */
+async function pluginsNeedingReviewOptions(api: BuildSourcesParams["api"]) {
+  const result = await api?.agentPlugins.list();
+  if (!result?.success) return [];
+  return result.data
+    .filter((item) => item.managed && (item.reviewRequiredCount ?? 0) > 0)
+    .map((item) => ({ id: item.name, label: item.name, keywords: [item.name, item.location] }));
 }
 
 export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandAction[]> {
@@ -1050,28 +1063,25 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           id: CommandIds.navRightSidebarFocusTerminal(),
           title: "Right Sidebar: Focus Terminal",
           section: section.navigation,
-          run: () =>
-            updateRightSidebarLayout(wsId, (s) => {
-              const found = findFirstTerminalSessionTab(s.root);
-              if (!found) return s;
-              return selectTabInTabset(
-                setFocusedTabset(s, found.tabsetId),
-                found.tabsetId,
-                found.tab
-              );
-            }),
+          run: () => focusExistingTerminalTab(wsId),
         },
         {
           id: CommandIds.navRightSidebarSplitHorizontal(),
           title: "Right Sidebar: Split Horizontally",
           section: section.navigation,
-          run: () => updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "horizontal")),
+          run: () => {
+            updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+            updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "horizontal"));
+          },
         },
         {
           id: CommandIds.navRightSidebarSplitVertical(),
           title: "Right Sidebar: Split Vertically",
           section: section.navigation,
-          run: () => updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "vertical")),
+          run: () => {
+            updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+            updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "vertical"));
+          },
         },
         {
           id: CommandIds.navRightSidebarNewTab(),
@@ -1130,20 +1140,13 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               // "terminal" is now an alias for "focus an existing terminal session tab".
               // Creating new terminal sessions is handled in the main UI ("+" button).
               if (tool === "terminal") {
-                updateRightSidebarLayout(wsId, (s) => {
-                  const found = findFirstTerminalSessionTab(s.root);
-                  if (!found) return s;
-                  return selectTabInTabset(
-                    setFocusedTabset(s, found.tabsetId),
-                    found.tabsetId,
-                    found.tab
-                  );
-                });
+                focusExistingTerminalTab(wsId);
                 return;
               }
 
               // Same as picking the tool in the focused pane's New tab: it takes the New tab's
               // place, or is selected where it is already open.
+              updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
               updateRightSidebarLayout(wsId, (s) => openToolFromNewTab(s, s.focusedTabsetId, tool));
               // While the sidebar is hidden (phones) that tab cannot be seen, so WorkspaceMenuBar
               // shows it in the full-screen sidebar; with the sidebar visible it ignores the event.
@@ -2424,6 +2427,30 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           ],
           onSubmit: (values) => {
             publishPluginsSectionIntent({ type: "review-hooks", name: values.pluginName });
+            openSettings("plugins");
+          },
+        },
+      },
+      {
+        id: CommandIds.pluginsReviewComponents(),
+        title: "Review Plugin Components…",
+        subtitle: "Approve skills and MCP servers that do not load until you review them",
+        section: section.settings,
+        keywords: ["plugin", "components", "review", "approve", "skills", "mcp", "consent"],
+        run: () => undefined,
+        prompt: {
+          title: "Review Plugin Components",
+          fields: [
+            {
+              type: "select",
+              name: "pluginName",
+              label: "Plugin that needs review",
+              placeholder: "Search plugins that need review…",
+              getOptions: () => pluginsNeedingReviewOptions(p.api),
+            },
+          ],
+          onSubmit: (values) => {
+            publishPluginsSectionIntent({ type: "review-components", name: values.pluginName });
             openSettings("plugins");
           },
         },

@@ -482,6 +482,19 @@ describe("WorkspaceShell loading placeholders", () => {
   // T3 #5971: RightSidebar is code-split. Until its chunk loads, the shell keeps the sidebar's
   // place, and nothing meant for the sidebar is lost.
   describe("while the sidebar chunk loads", () => {
+    it("reserves no sidebar width for a new chat without a saved preference", () => {
+      gateSidebar();
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      const box = view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
+      expect(box?.style.width).toBe("0px");
+      expect(
+        view.container
+          .querySelector("[data-workspace-shell]")
+          ?.getAttribute("data-right-sidebar-collapsed")
+      ).toBe("true");
+    });
+
     it("keeps the sidebar's box, empty when collapsed (the card floats, so it takes no room)", () => {
       gateSidebar();
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);

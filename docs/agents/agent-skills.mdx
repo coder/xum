@@ -75,6 +75,20 @@ Removing imports does not delete source files, plugin data, or workspace MCP set
 
 Updates preserve explicit selections: newly available skills and MCP servers stay unimported until you add them. Updates still require consent for full-package capability changes, including unimported components. Older managed installs without a saved selection continue importing everything, including new components on update. Unmanaged and project-local plugins are unchanged.
 
+#### Component review
+
+Xum loads a skill or MCP server from a managed plugin only after you review that exact version of it. Xum records what you approved at install, at each update, and in a component review. If its reviewed definition changes later, or if a newer Xum reads more of the plugin than you saw, it stops loading until you review it again. For a skill, the definition is its folder in the plugin and its `SKILL.md` frontmatter. A change to the skill's instructions (the `SKILL.md` body) does not need a new review. For an MCP server, the definition is everything Xum starts or connects with, such as the command, arguments, environment, URL and OAuth settings.
+
+After you upgrade to a Xum version with component review, every managed plugin needs one review. Its skills and MCP servers do not load until then. Xum does not approve them for you, because your earlier approval did not record what you saw.
+
+To review a plugin:
+
+1. Open **Settings → Plugins**. Each plugin that needs a review shows **needs review**, and a notice at the top says that its components do not load.
+2. Select **Review** on the plugin. The review lists each skill and MCP server with the fields you approve.
+3. Select **Approve components** to load them. You can also run **Review Plugin Components…** from the command palette.
+
+Plugins in `~/.agents/plugins` and project plugins are not managed installs. They load as before.
+
 <Warning>
   Import selection controls discovery, not filesystem access: skipped files remain in the plugin
   directory and can still be read. It is not a filesystem sandbox. Older Xum versions may ignore the
@@ -109,6 +123,7 @@ A skill is a directory named after the skill:
 ```
 
 Skill directory names must match `^[a-z0-9]+(?:-[a-z0-9]+)*$` (1–64 chars).
+The directory name is the skill ID. A directory name that does not match is an error, and Xum does not load the skill.
 
 ## Bundled files and the skill directory
 
@@ -150,7 +165,7 @@ Xum enforces a 1MB maximum file size for `SKILL.md`.
 
 Required fields:
 
-- `name`: must match the directory name
+- `name`: must match the directory name (see [Display names](#display-names))
 - `description`: short summary shown in Xum’s skills index
 
 Optional fields:
@@ -166,6 +181,21 @@ Optional fields:
 - `paths` (list or comma-separated string) — globs that limit the skill to matching files (see [Path-scoped skills](#path-scoped-skills)).
 
 Xum ignores unknown frontmatter keys (for example `allowed-tools`).
+
+### Display names
+
+Some skills from other tools set a `name` that is not kebab-case or is not the directory name, for example `name: Poteto Mode` in `poteto-mode/`.
+Xum loads such a skill from a project, global or plugin skills root under its directory name.
+Xum shows the `name` as a display name in the slash menu and the skills list, with a warning.
+The display name must be a single line of at most 64 characters, with no control or invisible formatting characters.
+
+The skill ID stays the directory name:
+
+- Invoke the skill as `/poteto-mode`.
+- The agent loads it with `agent_skill_read({ name: "poteto-mode" })`.
+- A plugin skill is also reachable as `<plugin>:poteto-mode`.
+
+Set `name` to the directory name to remove the warning. A missing `name` is still an error.
 
 ## Controlling who invokes a skill
 

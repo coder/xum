@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { formatQualifiedSkillName } from "@/common/utils/agentSkills/skillLookupName";
+import {
+  formatQualifiedSkillName,
+  formatSkillMenuDescription,
+} from "@/common/utils/agentSkills/skillLookupName";
 import type { AvailableCommand } from "@agentclientprotocol/sdk";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import { SLASH_COMMAND_HINTS } from "@/common/constants/slashCommandHints";
@@ -117,7 +120,7 @@ export function buildAcpAvailableCommands(skills: AgentSkillDescriptor[]): Avail
 
     commands.push({
       name: skill.name,
-      description: `${skill.description} (${formatSkillScope(skill.scope)})`,
+      description: formatSkillMenuDescription(skill, formatSkillScope(skill.scope)),
       input: { hint: skill.argumentHint ?? "Describe how to apply this skill" },
     });
     seenNames.add(skill.name);

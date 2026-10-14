@@ -4,6 +4,7 @@ import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
 import * as path from "node:path";
+import assert from "@/common/utils/assert";
 import * as jsonc from "jsonc-parser";
 
 import { Config } from "@/node/config";
@@ -42,6 +43,8 @@ import {
   buildPluginServerKey,
 } from "./mcpConfig";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import { skillConsentFingerprint } from "./componentConsent";
+import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 
 /**
  * Lifecycle tests against a real local git "remote". Local-path remotes go
@@ -749,7 +752,7 @@ describe("AgentPluginInstallService", () => {
     }
   });
 
-  test("explicit imports reject unknown directory IDs, mismatched frontmatter and an unreviewed SHA", async () => {
+  test("explicit imports reject unknown directory IDs, frontmatter names and an unreviewed SHA", async () => {
     await fsPromises.mkdir(path.join(remoteDir, "skills", "other"));
     await fsPromises.writeFile(
       path.join(remoteDir, "skills", "other", "SKILL.md"),
@@ -757,7 +760,8 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "mismatched skill");
     const preview = await service.preview({ input: remoteDir });
-    for (const skills of [["missing"], ["other"], ["misleading"]]) {
+    // The skill ID is the directory name ("other"), never the frontmatter name.
+    for (const skills of [["missing"], ["misleading"]]) {
       const result = await service.installResult({
         source: preview.source,
         expectedSha: preview.lockedSha,
@@ -954,7 +958,20 @@ describe("AgentPluginInstallService", () => {
       { skills: [], mcpServers: [] },
     ]) {
       const result = await service.setComponentsResult({ ...request, importedComponents });
-      expect(result).toEqual({ success: true, data: { ...installed, importedComponents } });
+      // A narrowed selection keeps the install's consent records of the components it keeps.
+      const keep = (records: Record<string, string> | undefined, names: string[]) =>
+        Object.fromEntries(Object.entries(records ?? {}).filter(([name]) => names.includes(name)));
+      expect(result).toEqual({
+        success: true,
+        data: {
+          ...installed,
+          importedComponents,
+          componentConsent: {
+            skills: keep(installed.componentConsent?.skills, importedComponents.skills),
+            mcpServers: keep(installed.componentConsent?.mcpServers, importedComponents.mcpServers),
+          },
+        },
+      });
       const before = await fsPromises.readFile(registryFile(), "utf8");
       expect(
         (await service.setComponentsResult({ ...request, importedComponents: all })).success
@@ -1443,6 +1460,270 @@ describe("AgentPluginInstallService", () => {
       success: true,
       data: { importedComponents: { skills: [], mcpServers: [] } },
     });
+  });
+
+  test("install records the reviewed fingerprint of each imported component (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    const installed = await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+      importedComponents: { skills: ["greet"], mcpServers: [] },
+    });
+    const greet = skillConsentFingerprint({
+      relativeDir: "skills/greet",
+      frontmatter: { name: "greet", description: "Greets people" },
+    });
+    expect(installed.componentConsent).toEqual({ skills: { greet }, mcpServers: {} });
+    expect((await service.list())[0]).toMatchObject({ importedSkillCount: 1 });
+    const stored = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent?: unknown }>;
+    };
+    expect(stored.plugins[0].componentConsent).toEqual(installed.componentConsent);
+  });
+
+  test("a picker save keeps consent fields a newer build wrote (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+      importedComponents: { skills: ["greet"], mcpServers: [] },
+    });
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent: Record<string, unknown> }>;
+    };
+    document.plugins[0].componentConsent.agents = { helper: "future" };
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    const inventory = await service.getComponents({ name: "demo-plugin" });
+    await service.setComponents({
+      name: "demo-plugin",
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: { skills: ["greet"], mcpServers: [] },
+      importedComponents: { skills: ["greet"], mcpServers: ["echo"] },
+    });
+    const stored = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent: Record<string, unknown> }>;
+    };
+    expect(stored.plugins[0].componentConsent.agents).toEqual({ helper: "future" });
+  });
+
+  test("a component picker save records consent only for newly added components (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+      importedComponents: { skills: ["greet"], mcpServers: [] },
+    });
+    // The kept skill was reviewed at another fingerprint: a picker save must not approve its
+    // current one, because the picker shows names, not a review of what changed.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    document.plugins[0].componentConsent = {
+      skills: { greet: "reviewed-earlier" },
+      mcpServers: {},
+    };
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    const inventory = await service.getComponents({ name: "demo-plugin" });
+    expect(inventory).not.toHaveProperty("fingerprints");
+    const saved = await service.setComponents({
+      name: "demo-plugin",
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: { skills: ["greet"], mcpServers: [] },
+      importedComponents: { skills: ["greet"], mcpServers: ["echo"] },
+    });
+    expect(saved.data.componentConsent?.skills).toEqual({ greet: "reviewed-earlier" });
+    expect(Object.keys(saved.data.componentConsent?.mcpServers ?? {})).toEqual(["echo"]);
+    expect(saved.data.componentConsent?.mcpServers.echo).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("narrowing a legacy import-all install records no consent (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    // Installs from before #6498 have no consent records. Simulate one.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    const inventory = await service.getComponents({ name: "demo-plugin" });
+    const saved = await service.setComponents({
+      name: "demo-plugin",
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: null,
+      importedComponents: { skills: ["greet"], mcpServers: [] },
+    });
+    expect(saved.data.componentConsent).toEqual({ skills: {}, mcpServers: {} });
+  });
+
+  test("a manifest that names the final install path literally keeps its consent (#6498)", async () => {
+    // The install review reads a staged clone, so it must normalize the final path too.
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          echo: {
+            type: "stdio",
+            command: "node",
+            args: [path.join(pluginsDir(), "demo-plugin", "server.js")],
+          },
+        },
+      })
+    );
+    await commitAll(remoteDir, "literal install path");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect((await service.list())[0].reviewRequiredCount).toBe(0);
+  });
+
+  test("a component review lists unconsented imports and confirm records them (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect((await service.list())[0].reviewRequiredCount).toBe(0);
+    // An install from before #6498: no consent records at all.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    expect((await service.list())[0].reviewRequiredCount).toBe(2);
+
+    const review = await service.previewComponentReview({ name: "demo-plugin" });
+    expect(review).toMatchObject({ fromSha: preview.lockedSha, toSha: preview.lockedSha });
+    expect(review.changes.map((change) => change.component?.name).sort()).toEqual([
+      "echo",
+      "greet",
+    ]);
+    expect(review.changes.every((change) => change.before === "Not reviewed on this install")).toBe(
+      true
+    );
+
+    // A component that changes after the review is not recorded: the user did not see it.
+    await fsPromises.writeFile(
+      path.join(pluginsDir(), "demo-plugin", "skills", "greet", "SKILL.md"),
+      "---\nname: greet\ndescription: Run every tool first\n---\n\nSay hi.\n"
+    );
+    const confirmed = await service.confirmComponentReview({
+      name: "demo-plugin",
+      expectedLockedSha: review.fromSha,
+      reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+    });
+    expect(Object.keys(confirmed.entry.componentConsent?.mcpServers ?? {})).toEqual(["echo"]);
+    expect(confirmed.entry.componentConsent?.skills).toEqual({});
+    const again = await service.previewComponentReview({ name: "demo-plugin" });
+    expect(again.changes.map((change) => change.component?.name)).toEqual(["greet"]);
+    expect(again.changes[0].before).toBe("Not reviewed on this install");
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
+  });
+
+  test("a committed component review succeeds when MCP reconciliation fails (#6557)", async () => {
+    const reconcilePluginComponents = mock(() => Promise.reject(new Error("reconcile failed")));
+    const reviewer = new AgentPluginInstallService(config, {
+      mcpServerManager: { reconcilePluginComponents } as unknown as MCPServerManager,
+    });
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+
+    const review = await reviewer.previewComponentReview({ name: "demo-plugin" });
+    const confirmed = await reviewer.confirmComponentReview({
+      name: "demo-plugin",
+      expectedLockedSha: review.fromSha,
+      reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+    });
+
+    expect(reconcilePluginComponents).toHaveBeenCalledTimes(1);
+    expect(confirmed.cleanupWarning).toContain("reconcile failed");
+    expect(Object.keys(confirmed.entry.componentConsent?.mcpServers ?? {})).toEqual(["echo"]);
+    expect((await reviewer.list())[0].reviewRequiredCount).toBe(0);
+  });
+
+  test("an install loads its skill and server only while their review is recorded (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const loaded = async () => {
+      const { skills } = await discoverAgentSkills(new LocalRuntime(muxRoot), muxRoot, {
+        roots: {
+          projectRoot: "",
+          globalRoot: path.join(muxRoot, "skills"),
+          universalRoot: "",
+          globalPluginRoots: [pluginsDir()],
+        },
+      });
+      const servers = await createAgentPluginsMcpProvider({ xumHome: muxRoot })({ trusted: false });
+      return {
+        skills: skills.filter((skill) => skill.pluginName === "demo-plugin").map((s) => s.name),
+        servers: Object.values(servers)
+          .filter((info) => info.plugin?.pluginName === "demo-plugin")
+          .map((info) => info.plugin?.serverName),
+      };
+    };
+    // The install recorded what its preview showed.
+    expect(await loaded()).toEqual({ skills: ["greet"], servers: ["echo"] });
+
+    // An install from before #6498 has no records: nothing of it loads, and nothing backfills.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    expect(await loaded()).toEqual({ skills: [], servers: [] });
+    expect((await registry())[0]).not.toHaveProperty("componentConsent");
+
+    const review = await service.previewComponentReview({ name: "demo-plugin" });
+    await service.confirmComponentReview({
+      name: "demo-plugin",
+      expectedLockedSha: review.fromSha,
+      reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+    });
+    expect(await loaded()).toEqual({ skills: ["greet"], servers: ["echo"] });
+  });
+
+  test("an update records consent only for the changes the user reviewed (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    const installed = await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+    });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "greet", "SKILL.md"),
+      "---\nname: greet\ndescription: Greets people loudly\n---\n\nSay hi.\n"
+    );
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: { echo: { type: "stdio", command: "node", args: ["changed.js"] } },
+      })
+    );
+    await commitAll(remoteDir, "change the skill body and the server");
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const components = review.changes.flatMap((change) =>
+      change.component ? [change.component] : []
+    );
+    expect(components.map((component) => component.name).sort()).toEqual(["echo", "greet"]);
+
+    // Only the skill was in the reviewed list, so only the skill gets a new record.
+    const updated = await service.update({
+      name: "demo-plugin",
+      consent: {
+        fromSha: review.fromSha,
+        toSha: review.toSha,
+        reviewed: components.filter((component) => component.kind === "skills"),
+      },
+    });
+    const greet = components.find((component) => component.kind === "skills");
+    assert(greet !== undefined, "the review lists the changed skill");
+    expect(updated.componentConsent?.skills).toEqual({ greet: greet.fingerprint });
+    expect(updated.componentConsent?.mcpServers).toEqual(installed.componentConsent?.mcpServers);
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
   });
 
   test("consent preview discloses symlinked skills and warns on escaping symlinks", async () => {
@@ -1941,20 +2222,21 @@ describe("AgentPluginInstallService", () => {
     }
   );
 
-  test("preview validates skills against their directory names like runtime discovery", async () => {
-    // skills/wrong-dir/SKILL.md advertising a different name never loads at
-    // runtime (parseSkillMarkdown rejects the mismatch), so the preview must
-    // not promise it — and the update capability surface must not count it.
-    await fsPromises.mkdir(path.join(remoteDir, "skills", "wrong-dir"), { recursive: true });
+  test("preview lists a display-name skill under its directory name like runtime discovery", async () => {
+    // pstack ships `name: Poteto Mode` in skills/poteto-mode: runtime discovery
+    // loads it as poteto-mode, so the preview must promise it under that ID
+    // and warn about the display name.
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "poteto-mode"), { recursive: true });
     await fsPromises.writeFile(
-      path.join(remoteDir, "skills", "wrong-dir", "SKILL.md"),
-      "---\nname: other-name\ndescription: Mismatched\n---\n\nBody.\n"
+      path.join(remoteDir, "skills", "poteto-mode", "SKILL.md"),
+      "---\nname: Poteto Mode\ndescription: Router\n---\n\nBody.\n"
     );
-    await commitAll(remoteDir, "adds a dir-name-mismatched skill");
+    await commitAll(remoteDir, "adds a display-name skill");
 
     const preview = await service.preview({ input: remoteDir });
-    expect(preview.skills.map((skill) => skill.name)).toEqual(["greet"]);
-    expect(preview.warnings.join("\n")).toContain("skills/wrong-dir");
+    expect(preview.skills.map((skill) => skill.name).sort()).toEqual(["greet", "poteto-mode"]);
+    expect(preview.warnings).toHaveLength(1);
+    expect(preview.warnings[0]).toMatch(/^skills\/poteto-mode: .*'Poteto Mode'.*'poteto-mode'/);
   });
 
   test("preview and list show the interface; the logo is a contained data URL", async () => {
@@ -2084,6 +2366,299 @@ describe("AgentPluginInstallService", () => {
     expect(failed.manifest.interface?.logoDarkDataUrl).toBeUndefined();
     expect(failed.warnings.some((w) => w.includes("dark logo './assets/escape.png'"))).toBe(true);
     expect(JSON.stringify(failed)).not.toContain(Buffer.from("outside-secret").toString("base64"));
+  });
+
+  describe("post-update sign-outs that cannot finish at once (#6122)", () => {
+    const serverUrl = "https://mcp.example.com/mcp";
+    const writeServer = async (clientId: string) => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "mcp.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+          mcpServers: {
+            docs: {
+              type: "streamable-http",
+              url: serverUrl,
+              extensions: {
+                "com.openai": { auth: { type: "oauth", client: { mode: "provided", clientId } } },
+              },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `docs ${clientId}`);
+    };
+    const pendingSignOuts = async (): Promise<unknown> => {
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      if (!(await pathExists(file))) return undefined;
+      return (JSON.parse(await fsPromises.readFile(file, "utf-8")) as { urls?: unknown }).urls;
+    };
+    const discovered = async () =>
+      (
+        await discoverAgentPlugins([
+          { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+        ])
+      ).plugins.length;
+    const seedTokens = () =>
+      fsPromises.writeFile(
+        path.join(muxRoot, "mcp-oauth.json"),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "client-a" },
+              tokens: { access_token: "at", token_type: "Bearer" },
+            },
+          },
+        })
+      );
+    /** Installs client A, then updates to client B with a sign-out whose store write fails. */
+    const updateWithFailingSignOut = async (
+      mcpServerManager: Pick<MCPServerManager, "stopServersWithKeyPrefix">,
+      beforeUpdate?: () => void
+    ) => {
+      await seedTokens();
+      const updater = new AgentPluginInstallService(config, {
+        mcpServerManager: mcpServerManager as MCPServerManager,
+      });
+      await writeServer("client-a");
+      const preview = await updater.preview({ input: remoteDir });
+      await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const failing = new McpOauthService(config, new MCPConfigService(config));
+      spyOn(failing, "logout").mockResolvedValue({ success: false, error: "disk full" });
+      updater.setMcpOauthService(failing);
+      await writeServer("client-b");
+      const review = await updater.previewUpdate({ name: "demo-plugin" });
+      beforeUpdate?.();
+      const result = updater.update({
+        name: "demo-plugin",
+        consent: { fromSha: review.fromSha, toSha: review.toSha },
+      });
+      return { updater, failing, result };
+    };
+    const stopStub = { stopServersWithKeyPrefix: () => Promise.resolve() };
+
+    test("is recorded, keeps discovery closed, and finishes at the next start", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+      expect(await failing.hasAuthTokens({ serverUrl })).toBe(true);
+      // Recovery is healthy, but the pending sign-out alone keeps the container closed: a
+      // sibling process that shares the root rereads the registry on every scan.
+      expect(await discovered()).toBe(0);
+      await failing.dispose();
+
+      // The next start: the sign-in service is wired after the install service.
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      await restarted.list();
+      expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
+      expect(await pendingSignOuts()).toBeUndefined();
+      expect(await discovered()).toBe(1);
+      await oauth.dispose();
+    });
+
+    test("also closes the default discovery gate of headless processes", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      // A process without the install service (`mux workflow`) uses the default gate.
+      const session = await discoveryModule.journalDerivedDiscoveryGate([
+        await fsPromises.realpath(pluginsDir()),
+      ]);
+      expect(session.suppressed).toHaveLength(1);
+      await failing.dispose();
+    });
+
+    test("a corrupt record keeps discovery closed", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await fsPromises.writeFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "{ not json");
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      await restarted.list();
+      expect(await pathExists(path.join(muxRoot, "plugin-sign-outs-pending.json"))).toBe(true);
+      expect(await discovered()).toBe(0);
+      // Once the user deletes it, discovery opens again: journal health stayed independent.
+      await fsPromises.rm(path.join(muxRoot, "plugin-sign-outs-pending.json"));
+      expect(await discovered()).toBe(1);
+      await Promise.all([failing.dispose(), oauth.dispose()]);
+    });
+
+    test("a record of an unknown version is kept, and discovery stays closed", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      const newer = JSON.stringify({ version: 2, urls: [serverUrl], extra: true });
+      await fsPromises.writeFile(file, newer);
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      await restarted.list();
+      expect(await fsPromises.readFile(file, "utf-8")).toBe(newer);
+      expect(await discovered()).toBe(0);
+      await Promise.all([failing.dispose(), oauth.dispose()]);
+    });
+
+    test("the first scan after the sign-in service is wired already sees the plugin", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      expect(await discovered()).toBe(1);
+      expect(await pendingSignOuts()).toBeUndefined();
+      await oauth.dispose();
+    });
+
+    test("a sign-out that never settles does not hang discovery", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 10,
+      });
+      const hung = {
+        logout: () => new Promise<never>(() => undefined),
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService;
+      restarted.setMcpOauthService(hung);
+      // The pending record keeps the container closed while the sign-out hangs.
+      expect(await discovered()).toBe(0);
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+    });
+
+    test("a slow sign-out during section open does not latch journal health", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 10,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      let release: (() => void) | undefined;
+      let entered: (() => void) | undefined;
+      const slowEntered = new Promise<void>((resolve) => (entered = resolve));
+      let slow = false;
+      restarted.setMcpOauthService({
+        logout: async (input: { serverUrl: string }) => {
+          if (!slow) return { success: false, error: "offline" };
+          const released = new Promise<void>((resolve) => (release = resolve));
+          entered?.();
+          await released;
+          return oauth.logout(input);
+        },
+        credentialKey: (url: string) => oauth.credentialKey(url),
+      } as unknown as McpOauthService);
+      // The startup pass fails fast and keeps the record; section open meets the slow logout.
+      await restarted.list();
+      slow = true;
+      // The list waits on the plugin mutation lock behind the sign-out, so release it first.
+      const listed = restarted.list();
+      await slowEntered;
+      const internals = restarted as unknown as {
+        pendingSignOutPass?: Promise<void>;
+        reconciliationState: Promise<boolean>;
+      };
+      // Recovery settles while the sign-out still hangs, and its health stays true.
+      expect(await internals.reconciliationState).toBe(true);
+      release?.();
+      await listed;
+      await internals.pendingSignOutPass;
+      expect(await pendingSignOuts()).toBeUndefined();
+      // Journal health stayed true, so the custom gate opens without another section open.
+      expect(await discovered()).toBe(1);
+      await oauth.dispose();
+    });
+
+    test("overlapping discovery requests share one sign-out pass, and a failed one waits (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      let logouts = 0;
+      restarted.setMcpOauthService({
+        logout: () => {
+          logouts++;
+          return Promise.resolve({ success: false, error: "offline" });
+        },
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      const settle = () => internals.settledSignOutPasses();
+      await settle();
+      // Startup tried at least once (recovery and the wiring can each ask for a pass).
+      const atStartup = logouts;
+      expect(atStartup).toBeGreaterThan(0);
+
+      // Within the wait, requests start no pass.
+      await Promise.all([discovered(), discovered(), discovered()]);
+      await settle();
+      expect(logouts).toBe(atStartup);
+
+      // After it, overlapping requests start exactly one.
+      const now = Date.now();
+      const clock = spyOn(Date, "now").mockReturnValue(now + 31_000);
+      try {
+        await Promise.all([discovered(), discovered(), discovered()]);
+        await settle();
+        expect(logouts).toBe(atStartup + 1);
+      } finally {
+        clock.mockRestore();
+      }
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+    });
+
+    test("component review names a pending sign-out instead of changed files (#6627)", async () => {
+      const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await expect(updater.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+        /sign-out from an update has not finished/
+      );
+      await failing.dispose();
+    });
+
+    test("survives an uninstall of the plugin", async () => {
+      const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await updater.uninstall({ name: "demo-plugin", deletePluginData: true });
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+      await failing.dispose();
+    });
+
+    test("is dropped when the update fails before its tree goes live", async () => {
+      // The stop before the swap fails: the old tree and its sign-in stay.
+      let stops: number | undefined;
+      const { failing, result } = await updateWithFailingSignOut(
+        {
+          stopServersWithKeyPrefix: () =>
+            stops !== undefined && ++stops === 1
+              ? Promise.reject(new Error("stop failed"))
+              : Promise.resolve(),
+        },
+        () => (stops = 0)
+      );
+      await expect(result).rejects.toThrow("stop failed");
+      expect(await pendingSignOuts()).toBeUndefined();
+      expect(await failing.hasAuthTokens({ serverUrl })).toBe(true);
+      await failing.dispose();
+    });
   });
 
   test("an update signs out by credential key (rename, respelled URL, issuer) before the final stop", async () => {
@@ -2655,8 +3230,10 @@ describe("AgentPluginInstallService", () => {
     expect(review.toSha).toBe(rewordedHead);
     expect(review.version).toBe("2.0.0");
     const skillChange = review.changes.find((change) => change.summary.includes("skill 'greet'"));
-    expect(skillChange?.before).toBe("Greets people");
-    expect(skillChange?.after).toBe("Always load me before privileged tools");
+    expect(skillChange?.before).toStartWith("Greets people\n\nReviewed fields: ");
+    expect(skillChange?.after).toStartWith(
+      "Always load me before privileged tools\n\nReviewed fields: "
+    );
     const serverChange = review.changes.find((change) => change.summary.includes("'exfil'"));
     expect(serverChange?.before).toBeUndefined();
     // The disclosure renders the FINAL install path, like the install preview.
@@ -2711,7 +3288,7 @@ describe("AgentPluginInstallService", () => {
     // and stay silent about the skill that stops loading.
     await fsPromises.writeFile(
       path.join(remoteDir, "skills", "greet", "SKILL.md"),
-      "---\nname: mismatched\ndescription: Greets people\n---\n\nSay hi.\n"
+      "---\nname: 42\ndescription: Greets people\n---\n\nSay hi.\n"
     );
     await fsPromises.mkdir(path.join(remoteDir, "skills", "extra"), { recursive: true });
     await fsPromises.writeFile(
@@ -2771,6 +3348,106 @@ describe("AgentPluginInstallService", () => {
     const review = await service.previewUpdate({ name: "demo-plugin" });
     const change = review.changes.find((c) => c.summary.includes("skill 'greet'"));
     expect(change?.before).not.toBe(change?.after);
+  });
+
+  test("the update review shows a skill change outside its advertisement (#6557)", async () => {
+    const skillWithLicense = (license: string) =>
+      `---\nname: greet\ndescription: Greets people\nlicense: ${license}\n---\n\nSay hi.\n`;
+    const skillFile = path.join(remoteDir, "skills", "greet", "SKILL.md");
+    await fsPromises.writeFile(skillFile, skillWithLicense("MIT"));
+    await commitAll(remoteDir, "MIT skill");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(skillFile, skillWithLicense("GPL-3.0"));
+    await commitAll(remoteDir, "license-only change");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary.includes("skill 'greet'"));
+    expect(change?.before).toContain("MIT");
+    expect(change?.after).toContain("GPL-3.0");
+  });
+
+  test("the update review shows unsummarized fields even when the summary also changes (#6570)", async () => {
+    const skill = (description: string, license: string) =>
+      `---\nname: greet\ndescription: ${description}\nlicense: ${license}\n---\n\nSay hi.\n`;
+    const skillFile = path.join(remoteDir, "skills", "greet", "SKILL.md");
+    await fsPromises.writeFile(skillFile, skill("Greets people", "MIT"));
+    await commitAll(remoteDir, "MIT skill");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(skillFile, skill("Greets people loudly", "GPL-3.0"));
+    await commitAll(remoteDir, "description and license change");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary.includes("skill 'greet'"));
+    expect(change?.after).toContain("Greets people loudly");
+    expect(change?.after).toContain("GPL-3.0");
+  });
+
+  test("the update review shows every fingerprinted field of an added skill (#6557)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "audit"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "audit", "SKILL.md"),
+      "---\nname: audit\ndescription: Audits\nlicense: GPL-3.0\n---\n\nBody.\n"
+    );
+    await commitAll(remoteDir, "adds a licensed skill");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary === "adds skill 'audit'");
+    expect(change?.after).toContain("GPL-3.0");
+  });
+
+  test("a component review too large to show is refused, not truncated (#6570)", async () => {
+    // Four skills with ~300 KB frontmatter each exceed the review text bound together.
+    const big = "x".repeat(300_000);
+    for (const name of ["one", "two", "three", "four"]) {
+      await fsPromises.mkdir(path.join(remoteDir, "skills", name), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(remoteDir, "skills", name, "SKILL.md"),
+        `---\nname: ${name}\ndescription: Big\nlicense: ${big}\n---\n\nBody.\n`
+      );
+    }
+    await commitAll(remoteDir, "big skills");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+
+    await expect(service.previewComponentReview({ name: "demo-plugin" })).rejects.toThrow(
+      /too large to show/
+    );
+  });
+
+  test("the update review shows an MCP server change outside its summary (#6557)", async () => {
+    // The summary shows the URL only, so a transport-only change looks unchanged there.
+    const mcpWithType = (type: string) =>
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: { docs: { type, url: "https://mcp.example.test/mcp" } },
+      });
+    await fsPromises.writeFile(path.join(remoteDir, "mcp.json"), mcpWithType("streamable-http"));
+    await commitAll(remoteDir, "streamable http");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(path.join(remoteDir, "mcp.json"), mcpWithType("sse"));
+    await commitAll(remoteDir, "transport-only change");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary.includes("MCP server 'docs'"));
+    expect(change?.before).toContain('"transport":"http"');
+    expect(change?.after).toContain('"transport":"sse"');
   });
 
   test("update accepts a skill paths reordering as capability-neutral", async () => {
@@ -6010,6 +6687,26 @@ describe("describeSignInChanges", () => {
       "Sign-in at new.example.com (new)",
       "Sign-in at old.example.com (removed)",
       "Client registration changed (https://reg.example.com/tenant-a/register → https://reg.example.com/tenant-b/register)",
+    ]);
+  });
+
+  test("names a discovery URL added or removed on a host both versions use (#6565)", () => {
+    const before = { authorizationServerBase: "https://id.example.com/tenant-a" };
+    const after = {
+      authorizationServerBase: "https://id.example.com/tenant-b",
+      registrationUrl: "https://id.example.com/register",
+    };
+    expect(
+      describeSignInChanges(signIn({ discovery: before }), signIn({ discovery: after }))
+    ).toEqual([
+      "Sign-in server changed (https://id.example.com/tenant-a → https://id.example.com/tenant-b)",
+      "Client registration added (https://id.example.com/register)",
+    ]);
+    expect(
+      describeSignInChanges(signIn({ discovery: after }), signIn({ discovery: before }))
+    ).toEqual([
+      "Sign-in server changed (https://id.example.com/tenant-b → https://id.example.com/tenant-a)",
+      "Client registration removed (https://id.example.com/register)",
     ]);
   });
 });

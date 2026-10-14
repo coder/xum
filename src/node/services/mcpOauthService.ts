@@ -41,6 +41,10 @@ import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 const DEFAULT_DESKTOP_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_SERVER_TIMEOUT_MS = 10 * 60 * 1000;
+const OAUTH_FLOW_CANCELLED = "OAuth flow cancelled";
+/** Caller-generated flow IDs double as the OAuth state, so they must be long and URL-safe. */
+const CALLER_FLOW_ID_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+const MAX_PRE_CANCELLED_FLOWS = 256;
 const COMPLETED_FLOW_TTL_MS = 60 * 1000;
 /** Shown on the callback page when a sign-out or another sign-in superseded this sign-in. */
 const DROPPED_SIGN_IN_ERROR =
@@ -140,10 +144,23 @@ interface OAuthFlowBase {
   resultPromise: Promise<Result<void, string>>;
   resolveResult: (result: Result<void, string>) => void;
   settled: boolean;
+  /**
+   * Set when mcp_oauth_flow_started was sent. A flow that settles before (deadline, Cancel,
+   * sign-out or shutdown during discovery) sends no end event either (#6565).
+   */
+  startReported: boolean;
   /** The server key's sign-out generation when the flow started (see signOutGenerations). */
   signOutGeneration: number;
   /** Aborted when the flow settles: the start's discovery requests end with it (#6164). */
   startAbort: AbortController;
+}
+
+/** The server a sign-in runs against (see resolveServerForOauthFlow). */
+interface OAuthFlowServer {
+  serverUrlForDiscovery: string;
+  serverUrlForStoreKey: string;
+  transport: "http" | "sse" | "auto";
+  oauth?: MCPServerOAuthConfig;
 }
 
 interface DesktopFlow extends OAuthFlowBase {
@@ -400,6 +417,40 @@ function serverTokens(tokens: Parameters<OAuthClientProvider["saveTokens"]>[0]):
   const copy: MCPOAuthTokens = { ...tokens };
   delete copy.requested_scope;
   return copy;
+}
+
+/**
+ * What one background auth() call read before it writes: the client it refreshes with (its
+ * tokens are saved only while that client is stored), the stored client record (the SDK's
+ * issuer back-stamp may replace only it), and the stored grant it refreshes (see saveTokens
+ * refreshedFrom). An undefined client record means nothing was read yet.
+ */
+interface AuthCallRead {
+  clientId?: string;
+  readClient?: StoredClientIdentity;
+  refreshedFrom?: MCPOAuthTokens;
+}
+
+/**
+ * The reads of each overlapping auth() call on one provider (#6537). Parallel requests that
+ * all get a 401 run auth() at once, and one shared slot let a later call's read replace an
+ * earlier call's. The SDK passes one context object to every provider call of an auth() call,
+ * so the reads are keyed by it. A call without a context uses the latest read, as before.
+ */
+type AuthCallContext = Parameters<OAuthClientProvider["tokens"]>[0];
+
+class AuthCallReads {
+  private readonly byCall = new WeakMap<NonNullable<AuthCallContext>, AuthCallRead>();
+  private latest: AuthCallRead = {};
+
+  record(ctx: AuthCallContext, read: AuthCallRead): void {
+    this.latest = { ...this.latest, ...read };
+    if (ctx !== undefined) this.byCall.set(ctx, { ...this.byCall.get(ctx), ...read });
+  }
+
+  of(ctx: AuthCallContext): AuthCallRead {
+    return (ctx !== undefined ? this.byCall.get(ctx) : undefined) ?? this.latest;
+  }
 }
 
 /**
@@ -1087,6 +1138,14 @@ export class McpOauthService {
 
   private readonly desktopFlows = new Map<string, DesktopFlow>();
   private readonly serverFlows = new Map<string, ServerFlow>();
+  /**
+   * Cancels that named a caller flow ID before its flow was registered (the start still
+   * resolved the server config or bound the listener), keyed by ID with the cancel time.
+   * The start refuses such a flow at registration (#6565).
+   */
+  private readonly preCancelledFlowIds = new Map<string, number>();
+  /** Caller flow IDs of starts that run but have not registered a flow yet. */
+  private readonly startingFlowIds = new Set<string>();
   private readonly telemetryService?: TelemetryService;
 
   constructor(
@@ -1372,17 +1431,7 @@ export class McpOauthService {
     projectPath: string;
     serverName: string;
     pendingServer?: MCPOAuthPendingServerConfig;
-  }): Promise<
-    Result<
-      {
-        serverUrlForDiscovery: string;
-        serverUrlForStoreKey: string;
-        transport: "http" | "sse" | "auto";
-        oauth?: MCPServerOAuthConfig;
-      },
-      string
-    >
-  > {
+  }): Promise<Result<OAuthFlowServer, string>> {
     if (input.pendingServer) {
       // Defensive: pendingServer comes from user input (add-server form), so validate.
       const transport = input.pendingServer.transport;
@@ -1434,62 +1483,80 @@ export class McpOauthService {
     });
   }
 
+  /** A desktop callback with another flow's state: answers 400 and fails a started flow. */
+  private rejectDesktopState(flowId: string, res: http.ServerResponse): void {
+    res.statusCode = 400;
+    res.setHeader("Content-Type", "text/html");
+    res.end("<h1>Invalid OAuth state</h1>");
+
+    // Strict state validation: if we receive an OAuth callback that doesn't
+    // match the active flow state, fail the flow rather than waiting for a timeout.
+    //
+    // Note: We only fail once the flow has an authorizeUrl to avoid cancelling
+    // due to unrelated localhost probes against the ephemeral loopback port.
+    const flow = this.desktopFlows.get(flowId);
+    if (flow?.authorizeUrl && !flow?.settled) {
+      void this.finishDesktopFlow(flowId, Err("Invalid OAuth state"));
+    }
+  }
+
+  /** The desktop flow's loopback listener: only GET /callback with the flow's state counts. */
+  private handleDesktopRequest(
+    flowId: string,
+    req: http.IncomingMessage,
+    res: http.ServerResponse
+  ): void {
+    const reqUrl = req.url ?? "/";
+    const url = new URL(reqUrl, "http://localhost");
+
+    if (req.method !== "GET" || url.pathname !== "/callback") {
+      res.statusCode = 404;
+      res.end("Not found");
+      return;
+    }
+
+    if (url.searchParams.get("state") !== flowId) {
+      this.rejectDesktopState(flowId, res);
+      return;
+    }
+
+    const code = url.searchParams.get("code");
+    const error = url.searchParams.get("error");
+    const errorDescription = url.searchParams.get("error_description") ?? undefined;
+    const iss = url.searchParams.get("iss");
+
+    void this.handleDesktopCallback({
+      flowId,
+      code,
+      iss,
+      error,
+      errorDescription,
+      res,
+    });
+  }
+
   async startDesktopFlow(input: {
     projectPath: string;
     serverName: string;
     pendingServer?: MCPOAuthPendingServerConfig;
+    flowId?: string;
   }): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
-    const serverConfig = await this.resolveServerForOauthFlow(input);
-    if (!serverConfig.success) {
-      return Err(serverConfig.error);
-    }
+    return this.withReservedFlowId(input.flowId, (flowId) => this.launchDesktopFlow(input, flowId));
+  }
 
-    const flowId = crypto.randomUUID();
+  private async launchDesktopFlow(
+    input: { projectPath: string; serverName: string; pendingServer?: MCPOAuthPendingServerConfig },
+    flowId: string
+  ): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
+    const server = await this.prepareFlowStart(input, flowId);
+    if (!server.success) return server;
+
     const { promise: resultPromise, resolve: resolveResult } =
       createDeferred<Result<void, string>>();
 
-    const serverListener = http.createServer((req, res) => {
-      const reqUrl = req.url ?? "/";
-      const url = new URL(reqUrl, "http://localhost");
-
-      if (req.method !== "GET" || url.pathname !== "/callback") {
-        res.statusCode = 404;
-        res.end("Not found");
-        return;
-      }
-
-      const state = url.searchParams.get("state");
-      if (state !== flowId) {
-        res.statusCode = 400;
-        res.setHeader("Content-Type", "text/html");
-        res.end("<h1>Invalid OAuth state</h1>");
-
-        // Strict state validation: if we receive an OAuth callback that doesn't
-        // match the active flow state, fail the flow rather than waiting for a timeout.
-        //
-        // Note: We only fail once the flow has an authorizeUrl to avoid cancelling
-        // due to unrelated localhost probes against the ephemeral loopback port.
-        const flow = this.desktopFlows.get(flowId);
-        if (flow?.authorizeUrl && !flow?.settled) {
-          void this.finishDesktopFlow(flowId, Err("Invalid OAuth state"));
-        }
-        return;
-      }
-
-      const code = url.searchParams.get("code");
-      const error = url.searchParams.get("error");
-      const errorDescription = url.searchParams.get("error_description") ?? undefined;
-      const iss = url.searchParams.get("iss");
-
-      void this.handleDesktopCallback({
-        flowId,
-        code,
-        iss,
-        error,
-        errorDescription,
-        res,
-      });
-    });
+    const serverListener = http.createServer((req, res) =>
+      this.handleDesktopRequest(flowId, req, res)
+    );
 
     try {
       await new Promise<void>((resolve, reject) => {
@@ -1508,11 +1575,15 @@ export class McpOauthService {
     }
 
     const redirectUri = `http://127.0.0.1:${address.port}/callback`;
+    if (this.takePreCancel(flowId)) {
+      await closeServer(serverListener).catch(() => undefined);
+      return Err(OAUTH_FLOW_CANCELLED);
+    }
 
     // Register the flow and start its deadline before any network request, so the deadline,
     // Cancel and a sign-out also end a stalled discovery (#6164).
     const flow: DesktopFlow = {
-      ...this.newFlowBase(input, serverConfig.data, redirectUri),
+      ...this.newFlowBase(input, server.data, redirectUri),
       server: serverListener,
       timeout: setTimeout(() => {
         void this.finishDesktopFlow(flowId, Err("Timed out waiting for OAuth callback"));
@@ -1523,7 +1594,7 @@ export class McpOauthService {
     };
     this.desktopFlows.set(flowId, flow);
 
-    const started = await this.beginAuthorization(flow, serverConfig.data.oauth);
+    const started = await this.beginAuthorization(flow, server.data.oauth);
     if (!started.success) {
       await this.finishDesktopFlow(flowId, started);
       return started;
@@ -1560,6 +1631,7 @@ export class McpOauthService {
       codeVerifier: null,
       cleanupTimeout: null,
       settled: false,
+      startReported: false,
       signOutGeneration: this.signOutGeneration(server.serverUrlForStoreKey),
       startAbort: new AbortController(),
     };
@@ -1590,7 +1662,7 @@ export class McpOauthService {
       );
       if (flow.settled) return await flow.resultPromise;
 
-      this.captureTelemetry({
+      flow.startReported = this.captureTelemetry({
         event: "mcp_oauth_flow_started",
         properties: {
           transport: flow.transport,
@@ -1650,10 +1722,78 @@ export class McpOauthService {
 
   async cancelDesktopFlow(flowId: string): Promise<void> {
     const flow = this.desktopFlows.get(flowId);
-    if (!flow) return;
+    if (!flow) return this.recordPreCancel(flowId);
 
     log.debug("[MCP OAuth] Desktop flow cancelled", { flowId });
-    await this.finishDesktopFlow(flowId, Err("OAuth flow cancelled"));
+    await this.finishDesktopFlow(flowId, Err(OAUTH_FLOW_CANCELLED));
+  }
+
+  /**
+   * Runs a sign-in start with its flow ID reserved: two starts that send the same caller ID
+   * cannot both pass the availability check while their server lookups run (#6565). Once the
+   * start returns, its flow (if any) is in desktopFlows or serverFlows.
+   */
+  private async withReservedFlowId<T>(
+    callerFlowId: string | undefined,
+    run: (flowId: string) => Promise<Result<T, string>>
+  ): Promise<Result<T, string>> {
+    const claimed = this.claimFlowId(callerFlowId);
+    if (!claimed.success) return claimed;
+    this.startingFlowIds.add(claimed.data);
+    try {
+      return await run(claimed.data);
+    } finally {
+      this.startingFlowIds.delete(claimed.data);
+    }
+  }
+
+  /**
+   * The server of a new sign-in. A Cancel that named the flow's ID while the server lookup ran
+   * refuses the start (see preCancelledFlowIds).
+   */
+  private async prepareFlowStart(
+    input: { projectPath: string; serverName: string; pendingServer?: MCPOAuthPendingServerConfig },
+    flowId: string
+  ): Promise<Result<OAuthFlowServer, string>> {
+    const server = await this.resolveServerForOauthFlow(input);
+    if (!server.success) return server;
+    return this.takePreCancel(flowId) ? Err(OAUTH_FLOW_CANCELLED) : server;
+  }
+
+  /** The caller's flow ID (validated and unused), or a new one when the caller sent none. */
+  private claimFlowId(flowId: string | undefined): Result<string, string> {
+    if (flowId === undefined) return Ok(crypto.randomUUID());
+    if (!CALLER_FLOW_ID_PATTERN.test(flowId)) return Err("Invalid OAuth flow ID");
+    const inUse =
+      this.startingFlowIds.has(flowId) ||
+      this.desktopFlows.has(flowId) ||
+      this.serverFlows.has(flowId);
+    return inUse ? Err("OAuth flow ID already in use") : Ok(flowId);
+  }
+
+  /** Remembers a Cancel for a flow that is still starting (see preCancelledFlowIds). */
+  private recordPreCancel(flowId: string): void {
+    if (!CALLER_FLOW_ID_PATTERN.test(flowId)) return;
+    this.prunePreCancels();
+    // Bounded: a Cancel burst for IDs that never start must not grow the map without limit.
+    const oldest = this.preCancelledFlowIds.keys().next();
+    if (this.preCancelledFlowIds.size >= MAX_PRE_CANCELLED_FLOWS && !oldest.done)
+      this.preCancelledFlowIds.delete(oldest.value);
+    this.preCancelledFlowIds.set(flowId, Date.now());
+  }
+
+  /** True (and consumes the record) when a Cancel named `flowId` within the flow deadline. */
+  private takePreCancel(flowId: string): boolean {
+    this.prunePreCancels();
+    return this.preCancelledFlowIds.delete(flowId);
+  }
+
+  /** Drops pre-cancel records older than the longest flow deadline. */
+  private prunePreCancels(): void {
+    const cutoff = Date.now() - DEFAULT_SERVER_TIMEOUT_MS;
+    for (const [id, cancelledAt] of this.preCancelledFlowIds) {
+      if (cancelledAt < cutoff) this.preCancelledFlowIds.delete(id);
+    }
   }
 
   async startServerFlow(input: {
@@ -1661,11 +1801,22 @@ export class McpOauthService {
     serverName: string;
     redirectUri: string;
     pendingServer?: MCPOAuthPendingServerConfig;
+    flowId?: string;
   }): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
-    const serverConfig = await this.resolveServerForOauthFlow(input);
-    if (!serverConfig.success) {
-      return Err(serverConfig.error);
-    }
+    return this.withReservedFlowId(input.flowId, (flowId) => this.launchServerFlow(input, flowId));
+  }
+
+  private async launchServerFlow(
+    input: {
+      projectPath: string;
+      serverName: string;
+      redirectUri: string;
+      pendingServer?: MCPOAuthPendingServerConfig;
+    },
+    flowId: string
+  ): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
+    const server = await this.prepareFlowStart(input, flowId);
+    if (!server.success) return server;
 
     let redirectUri: URL;
     try {
@@ -1678,13 +1829,12 @@ export class McpOauthService {
       return Err("OAuth redirect URI must be http(s)");
     }
 
-    const flowId = crypto.randomUUID();
     const { promise: resultPromise, resolve: resolveResult } =
       createDeferred<Result<void, string>>();
 
     // Registered before any network request, like the desktop flow (#6164).
     const flow: ServerFlow = {
-      ...this.newFlowBase(input, serverConfig.data, redirectUri.toString()),
+      ...this.newFlowBase(input, server.data, redirectUri.toString()),
       timeout: setTimeout(() => {
         void this.finishServerFlow(flowId, Err("Timed out waiting for OAuth callback"));
       }, DEFAULT_SERVER_TIMEOUT_MS),
@@ -1694,7 +1844,7 @@ export class McpOauthService {
     };
     this.serverFlows.set(flowId, flow);
 
-    const started = await this.beginAuthorization(flow, serverConfig.data.oauth);
+    const started = await this.beginAuthorization(flow, server.data.oauth);
     if (!started.success) {
       await this.finishServerFlow(flowId, started);
       return started;
@@ -1740,10 +1890,10 @@ export class McpOauthService {
 
   async cancelServerFlow(flowId: string): Promise<void> {
     const flow = this.serverFlows.get(flowId);
-    if (!flow) return;
+    if (!flow) return this.recordPreCancel(flowId);
 
     log.debug("[MCP OAuth] Server flow cancelled", { flowId });
-    await this.finishServerFlow(flowId, Err("OAuth flow cancelled"));
+    await this.finishServerFlow(flowId, Err(OAUTH_FLOW_CANCELLED));
   }
 
   async handleServerCallbackAndExchange(input: {
@@ -1781,12 +1931,15 @@ export class McpOauthService {
     return result;
   }
 
-  private captureTelemetry(payload: Parameters<TelemetryService["capture"]>[0]): void {
+  /** False when capture threw (see OAuthFlowBase.startReported). */
+  private captureTelemetry(payload: Parameters<TelemetryService["capture"]>[0]): boolean {
     try {
       this.telemetryService?.capture(payload);
+      return true;
     } catch (error) {
       // Telemetry must never block or crash OAuth flows.
       log.debug("[MCP OAuth] Failed to capture telemetry", { error });
+      return false;
     }
   }
 
@@ -1938,29 +2091,24 @@ export class McpOauthService {
     oauth?: MCPServerOAuthConfig;
   }): OAuthClientProvider {
     let discoveryState: OAuthDiscoveryState | undefined;
-    // The client a refresh runs with: its tokens are saved only while that client is stored.
-    let refreshedWithClientId: string | undefined;
-    // The stored grant auth() read before it refreshes (see saveTokens refreshedFrom). Only a
-    // read with the SDK's context counts: a transport request reads tokens without one.
-    let refreshedFrom: MCPOAuthTokens | undefined;
-    // The stored client record the refresh read; the SDK's back-stamp may replace only it.
-    // The SDK reads the client before every write; undefined means nothing was read yet.
-    let readClient: StoredClientIdentity | undefined;
+    const calls = new AuthCallReads();
     const pluginState = pluginDiscoveryState(input.oauth);
 
     return {
       tokens: async (ctx) => {
         const tokens = await this.readMatchingTokens(input.serverUrl, input.oauth);
-        if (ctx !== undefined) refreshedFrom = tokens;
+        // Only a read with the SDK's context counts: a transport request reads without one.
+        if (ctx !== undefined) calls.record(ctx, { refreshedFrom: tokens });
         return tokens;
       },
-      saveTokens: async (tokens) => {
+      saveTokens: async (tokens, ctx) => {
+        const read = calls.of(ctx);
         await this.saveTokens({
           serverUrl: input.serverUrl,
           tokens: serverTokens(tokens),
           legacyBinding: deriveAuthorizationServerBinding(discoveryState),
-          clientId: refreshedWithClientId ?? input.oauth?.clientId,
-          refreshedFrom,
+          clientId: read.clientId ?? input.oauth?.clientId,
+          refreshedFrom: read.refreshedFrom,
         });
       },
       saveDiscoveryState: (state) => {
@@ -2002,13 +2150,15 @@ export class McpOauthService {
           redirect_uris: ["http://127.0.0.1/"],
         };
       },
-      clientInformation: async () => {
+      clientInformation: async (ctx) => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
         const stored = storedClientUsable(creds, input.oauth)
           ? creds?.clientInformation
           : undefined;
-        refreshedWithClientId = stored?.client_id;
-        readClient = storedClientIdentity(stored);
+        calls.record(ctx, {
+          clientId: stored?.client_id,
+          readClient: storedClientIdentity(stored),
+        });
         // Token refresh re-reads a plugin secret from its consented file.
         const plugin = stored && pluginClient(input.oauth, await readClientSecret(input.oauth));
         return stored && { ...stored, ...plugin };
@@ -2017,7 +2167,7 @@ export class McpOauthService {
       ...(input.oauth?.resource !== undefined
         ? { validateResourceURL: pluginResourceValidator(input.oauth.resource) }
         : {}),
-      saveClientInformation: async (clientInformation) => {
+      saveClientInformation: async (clientInformation, ctx) => {
         await this.saveClientInformation({
           serverUrl: input.serverUrl,
           clientInformation: persistedClientInfo(
@@ -2026,7 +2176,7 @@ export class McpOauthService {
             input.oauth
           ),
           legacyBinding: deriveAuthorizationServerBinding(discoveryState),
-          expectedStoredClient: readClient,
+          expectedStoredClient: calls.of(ctx).readClient,
         });
       },
     };
@@ -2138,6 +2288,25 @@ export class McpOauthService {
     }
   }
 
+  /** mcp_oauth_flow_completed or _failed, for a flow that sent its start event. */
+  private captureFlowEndTelemetry(flow: OAuthFlowBase, result: Result<void, string>): void {
+    if (!flow.startReported) return;
+    const properties = {
+      transport: flow.transport,
+      duration_ms_b2: roundToBase2(Math.max(0, Date.now() - flow.startedAtMs)),
+      has_scope_hint: Boolean(flow.scope),
+      has_resource_metadata_hint: Boolean(flow.resourceMetadataUrl),
+    };
+    if (result.success) {
+      this.captureTelemetry({ event: "mcp_oauth_flow_completed", properties });
+      return;
+    }
+    this.captureTelemetry({
+      event: "mcp_oauth_flow_failed",
+      properties: { ...properties, error_category: this.getOAuthFlowErrorCategory(result.error) },
+    });
+  }
+
   private async finishDesktopFlow(flowId: string, result: Result<void, string>): Promise<void> {
     const flow = this.desktopFlows.get(flowId);
     if (!flow || flow.settled) return;
@@ -2146,34 +2315,7 @@ export class McpOauthService {
     clearTimeout(flow.timeout);
     flow.startAbort.abort();
 
-    const durationMs = Math.max(0, Date.now() - flow.startedAtMs);
-    const durationMsB2 = roundToBase2(durationMs);
-    const hasScopeHint = Boolean(flow.scope);
-    const hasResourceMetadataHint = Boolean(flow.resourceMetadataUrl);
-
-    if (result.success) {
-      this.captureTelemetry({
-        event: "mcp_oauth_flow_completed",
-        properties: {
-          transport: flow.transport,
-          duration_ms_b2: durationMsB2,
-          has_scope_hint: hasScopeHint,
-          has_resource_metadata_hint: hasResourceMetadataHint,
-        },
-      });
-    } else {
-      const errorCategory = this.getOAuthFlowErrorCategory(result.error);
-      this.captureTelemetry({
-        event: "mcp_oauth_flow_failed",
-        properties: {
-          transport: flow.transport,
-          duration_ms_b2: durationMsB2,
-          has_scope_hint: hasScopeHint,
-          has_resource_metadata_hint: hasResourceMetadataHint,
-          error_category: errorCategory,
-        },
-      });
-    }
+    this.captureFlowEndTelemetry(flow, result);
 
     try {
       flow.resolveResult(result);
@@ -2201,34 +2343,7 @@ export class McpOauthService {
     clearTimeout(flow.timeout);
     flow.startAbort.abort();
 
-    const durationMs = Math.max(0, Date.now() - flow.startedAtMs);
-    const durationMsB2 = roundToBase2(durationMs);
-    const hasScopeHint = Boolean(flow.scope);
-    const hasResourceMetadataHint = Boolean(flow.resourceMetadataUrl);
-
-    if (result.success) {
-      this.captureTelemetry({
-        event: "mcp_oauth_flow_completed",
-        properties: {
-          transport: flow.transport,
-          duration_ms_b2: durationMsB2,
-          has_scope_hint: hasScopeHint,
-          has_resource_metadata_hint: hasResourceMetadataHint,
-        },
-      });
-    } else {
-      const errorCategory = this.getOAuthFlowErrorCategory(result.error);
-      this.captureTelemetry({
-        event: "mcp_oauth_flow_failed",
-        properties: {
-          transport: flow.transport,
-          duration_ms_b2: durationMsB2,
-          has_scope_hint: hasScopeHint,
-          has_resource_metadata_hint: hasResourceMetadataHint,
-          error_category: errorCategory,
-        },
-      });
-    }
+    this.captureFlowEndTelemetry(flow, result);
 
     try {
       flow.resolveResult(result);
@@ -2495,7 +2610,9 @@ export class McpOauthService {
     try {
       await this.persistStoreLocked(store);
     } catch (error) {
-      // Store read/repair must never crash the app at startup.
+      // Store read/repair must never crash the app at startup. Keep the in-memory state: the
+      // failed write dropped the cache, and the file still holds what the repair replaces.
+      this.store = store;
       log.warn("[MCP OAuth] Failed to persist store file; continuing with in-memory state", {
         error,
       });
@@ -2509,6 +2626,11 @@ export class McpOauthService {
     await writeFileAtomic(this.storeFilePath, JSON.stringify(store, null, 2), {
       encoding: "utf-8",
       mode: 0o600,
+    }).catch((error: unknown) => {
+      // The caller already changed the cached store: drop it, so the next read reloads the
+      // file. Otherwise a failed sign-out reads as done and a retry would not write it (#6122).
+      this.store = null;
+      throw error;
     });
     // Another process can replace the file right after this write, so a stat here can name
     // its file: reread on the next use instead (the cache is this process's own content).
