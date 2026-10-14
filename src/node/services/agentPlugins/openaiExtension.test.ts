@@ -192,12 +192,17 @@ describe("readOpenAIExtension", () => {
   test("joiner and tag exceptions need their exact context; Hangul fillers are refused (#6560)", () => {
     const read = (iface: Record<string, unknown>) =>
       readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
-    // A Devanagari half-form joined with ZWJ, as Indic shaping needs it.
-    const halfForm = "\u0915\u094d\u200d\u0937";
-    const good = read({ ...validInterface, displayName: halfForm, developerName: halfForm });
-    expect(good.warnings).toEqual([]);
-    expect(good.extension?.interface?.displayName).toBe(halfForm);
+    // A Devanagari half-form (ZWJ after a virama), and a mark after a Persian ZWNJ.
+    for (const text of ["\u0915\u094d\u200d\u0937", "\u0647\u200c\u0610\u0627"]) {
+      const good = read({ ...validInterface, displayName: text, developerName: text });
+      expect(good.warnings).toEqual([]);
+      expect(good.extension?.interface?.displayName).toBe(text);
+    }
     for (const bad of [
+      // ZWJ without a virama shapes nothing, and a ZWJ across scripts is a spoof.
+      "\u0915\u200d\u0937",
+      "\u0627\u200d\u0915",
+      "\u0915\u094d\u200d\u0627",
       // ZWNJ between Arabic-Indic digits: digits are not letters.
       "\u0661\u200c\u0662",
       // A tag that is not a digit or lowercase letter, and a one-tag payload.

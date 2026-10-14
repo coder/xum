@@ -135,7 +135,7 @@ const RULES: Record<FieldKind, string> = {
 const UNSAFE_TEXT =
   // eslint-disable-next-line no-control-regex -- the control characters are the point
   /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\p{Cf}\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u115f\u1160\u3164\uffa0]/u;
-/** Scripts in which ZWNJ and ZWJ change how letters join or form conjuncts (Persian, Indic). */
+/** Scripts in which ZWNJ changes how letters join or form conjuncts (Persian, Indic). */
 const ZWNJ_SCRIPTS =
   "\\p{Script=Arabic}\\p{Script=Syriac}\\p{Script=Devanagari}\\p{Script=Bengali}\\p{Script=Gurmukhi}" +
   "\\p{Script=Gujarati}\\p{Script=Oriya}\\p{Script=Tamil}\\p{Script=Telugu}\\p{Script=Kannada}" +
@@ -147,13 +147,31 @@ const ZWNJ_SCRIPTS =
  */
 const SHAPING_LETTER = `(?=[${ZWNJ_SCRIPTS}])\\p{L}`;
 /**
+ * Each Indic script and its virama. ZWJ shapes Indic text only right after a virama (UTS #39
+ * joining controls), as in the half-form क्‍ष, and only before a letter of the same script.
+ * Anywhere else it changes nothing on screen, so it could make two names look alike.
+ */
+const VIRAMA_SCRIPTS: ReadonlyArray<[script: string, virama: string]> = [
+  ["Devanagari", "\\u094d"],
+  ["Bengali", "\\u09cd"],
+  ["Gurmukhi", "\\u0a4d"],
+  ["Gujarati", "\\u0acd"],
+  ["Oriya", "\\u0b4d"],
+  ["Tamil", "\\u0bcd"],
+  ["Telugu", "\\u0c4d"],
+  ["Kannada", "\\u0ccd"],
+  ["Malayalam", "\\u0d4d"],
+  ["Sinhala", "\\u0dca"],
+];
+/**
  * The invisible characters normal text needs, removed before the UNSAFE_TEXT test, but only inside
  * the sequences that need them. Anywhere else they can spoof a name or fake a blank label (Codex
  * PRRT_kwDOPxxmWM6sQExO, PRRT_kwDOPxxmWM6sQ79s, PRRT_kwDOPxxmWM6sQ79z). OpenAI names no exact
  * list, but calls only "unsupported" formatting characters invalid.
  * - ZWJ (U+200D) between emoji (after an optional skin tone or VS16), as in 👩‍💻.
- * - ZWNJ or ZWJ (U+200C, U+200D) between letters of a shaping script (SHAPING_LETTER, marks after
- *   the left letter), as in Persian words and Devanagari half-forms (क्‍ष).
+ * - ZWNJ (U+200C) between letters of a shaping script (SHAPING_LETTER), with combining marks on
+ *   either side (UTS #39 allows transparent characters there), as in Persian.
+ * - ZWJ (U+200D) after an Indic virama, before a letter of the same script (VIRAMA_SCRIPTS).
  * - Tag characters in a subdivision flag: U+1F3F4, 2 to 7 tag digits or lowercase tag letters,
  *   then U+E007F (the Unicode tag sequence form for regions such as gbsct).
  * - VS15/VS16 (U+FE0E, U+FE0F) after an emoji, and VS16 in a keycap (digit, VS16, U+20E3).
@@ -166,7 +184,11 @@ const ALLOWED_FORMAT_SEQUENCES: ReadonlyArray<[RegExp, string]> = [
     /(\p{Extended_Pictographic}(?:[\u{1f3fb}-\u{1f3ff}]|\ufe0f)?)\u200d(?=\p{Extended_Pictographic})/gu,
     "$1",
   ],
-  [new RegExp(`(${SHAPING_LETTER}\\p{M}*)[\\u200c\\u200d](?=${SHAPING_LETTER})`, "gu"), "$1"],
+  [new RegExp(`(${SHAPING_LETTER}\\p{M}*)\\u200c(?=\\p{M}*${SHAPING_LETTER})`, "gu"), "$1"],
+  ...VIRAMA_SCRIPTS.map(([script, virama]): [RegExp, string] => [
+    new RegExp(`(${virama})\\u200d(?=\\p{Script=${script}})`, "gu"),
+    "$1",
+  ]),
   [/\u{1f3f4}[\u{e0030}-\u{e0039}\u{e0061}-\u{e007a}]{2,7}\u{e007f}/gu, "\u{1f3f4}"],
   [/(\p{Extended_Pictographic})(?:\ufe0e|\ufe0f)/gu, "$1"],
   [/([0-9#*])\ufe0f(?=\u20e3)/gu, "$1"],
