@@ -11,7 +11,10 @@ import type {
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
-import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
+import {
+  useDraftWorkspaceSettings,
+  type SelectedRuntimeChangeOptions,
+} from "@/browser/hooks/useDraftWorkspaceSettings";
 import { handOffCreationAiSelection } from "@/browser/utils/aiSelectionIntent";
 import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -193,7 +196,7 @@ interface UseCreationWorkspaceReturn {
   sshHostFallback: string;
   defaultRuntimeMode: RuntimeChoice;
   /** Set the currently selected runtime (discriminated union) */
-  setSelectedRuntime: (runtime: ParsedRuntime) => void;
+  setSelectedRuntime: (runtime: ParsedRuntime, options?: SelectedRuntimeChangeOptions) => void;
   toast: Toast | null;
   setToast: (toast: Toast | null) => void;
   isSending: boolean;

@@ -161,6 +161,7 @@ import type {
   QueueDispatchMode,
 } from "./types";
 import { CreationControls } from "./CreationControls";
+import { useCreationDraftMove } from "./useCreationDraftMove";
 import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
 import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useCoderConfigChangeHandler } from "./useCoderConfigChangeHandler";
@@ -615,7 +616,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   );
 
   const { open } = useSettings();
-  const { selectedWorkspace, moveWorkspaceDraft, workspaceMetadata } = useWorkspaceContext();
+  const { selectedWorkspace, workspaceMetadata } = useWorkspaceContext();
   const { agentId, currentAgent, agents } = useAgent();
 
   // Use current agent's uiColor, or neutral border until agents load
@@ -896,14 +897,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     coderInfoRefreshPolicy: variant === "creation" ? "mount-and-focus" : "mount-only",
   });
 
-  // The project selector moves the draft being edited instead of opening the destination's own.
-  const moveCreationDraft = (destination: string) =>
-    moveWorkspaceDraft({
-      projectPath: creationParentProjectPath,
-      draftId: creationPendingDraftId,
-      destination,
-      runtimePick: creationState.explicitRuntimePick,
-    });
+  const creationDraftMove = useCreationDraftMove({
+    projectPath: creationParentProjectPath,
+    draftId: creationPendingDraftId,
+    runtimePick: creationState.explicitRuntimePick,
+    sendInFlight: isSendInFlight,
+    processingAttachmentCount,
+    payloadsLoaded: draft.payloadsLoaded,
+  });
 
   const creationRuntimeError =
     variant === "creation" && props.kind !== "scratch"
@@ -936,7 +937,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           // routes (deep link to a sub-project, or sidebar "+") collapse here.
           selectedProjectPath: creationSubProjectPath ?? props.projectPath,
           userProjects,
-          onSelectedProjectPathChange: moveCreationDraft,
+          onSelectedProjectPathChange: creationDraftMove.move,
+          projectSelectorDisabled: creationDraftMove.locked,
           projectName: props.projectName,
           nameState: creationState.nameState,
           runtimeAvailabilityState: creationState.runtimeAvailabilityState,
@@ -3357,8 +3359,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               <CreationProjectSelect
                 selected={SCRATCH_PROJECT_CONFIG_KEY}
                 userProjects={userProjects}
-                onChange={moveCreationDraft}
-                disabled={isSendInFlight}
+                onChange={creationDraftMove.move}
+                disabled={creationDraftMove.locked}
               />
             </div>
           )}

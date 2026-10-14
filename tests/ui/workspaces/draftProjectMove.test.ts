@@ -7,6 +7,7 @@ import "../dom";
 
 import { fireEvent, waitFor } from "@testing-library/react";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { shouldRunIntegrationTests } from "../../testUtils";
@@ -59,8 +60,18 @@ function textareaValue(container: HTMLElement): string | undefined {
   return container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message"]')?.value;
 }
 
+function projectSelector(container: HTMLElement): HTMLButtonElement | null {
+  return container.querySelector<HTMLButtonElement>('[data-testid="project-selector"]');
+}
+
 function projectSelectorLabel(container: HTMLElement): string | undefined {
-  return container.querySelector('[data-testid="project-selector"]')?.textContent?.trim();
+  return projectSelector(container)?.textContent?.trim();
+}
+
+function runtimeSelector(container: HTMLElement): HTMLElement | null {
+  return container.querySelector<HTMLElement>(
+    '[data-component="RuntimeTypeGroup"] button[aria-label="Workspace type"]'
+  );
 }
 
 /** Radix Select content portals into document.body. */
@@ -82,7 +93,7 @@ async function pickOption(
 
 async function moveDraftTo(container: HTMLElement, label: string): Promise<void> {
   const trigger = await waitFor(() => {
-    const element = container.querySelector<HTMLElement>('[data-testid="project-selector"]');
+    const element = projectSelector(container);
     if (!element) throw new Error("Project selector not found");
     return element;
   }, WAIT);
@@ -216,9 +227,7 @@ describeIntegration("Creation project selector moves the draft", () => {
       // The destination's own Auto pick must not survive the move.
       setAutoRoutingPick(getProjectScopeId(b), "plan", "model", true);
       await pickOption(
-        container.querySelector<HTMLElement>(
-          '[data-component="RuntimeTypeGroup"] button[aria-label="Workspace type"]'
-        )!,
+        runtimeSelector(container)!,
         "Local",
         // Runtime options also show a description.
         (text) => text.startsWith("Local")
@@ -232,11 +241,7 @@ describeIntegration("Creation project selector moves the draft", () => {
         expect(container.querySelector<HTMLInputElement>("#workspace-name")?.value).toBe(
           "moved-name"
         );
-        expect(
-          container.querySelector(
-            '[data-component="RuntimeTypeGroup"] button[aria-label="Workspace type"]'
-          )?.textContent
-        ).toContain("Local");
+        expect(runtimeSelector(container)?.textContent).toContain("Local");
       }, WAIT);
       expect(readScopeAgentId(getProjectScopeId(b))).toBe("plan");
       expect(getWorkspaceAiSelection(getProjectScopeId(b)).model).toBe(KNOWN_MODELS.HAIKU.id);
@@ -375,20 +380,126 @@ describeIntegration("Creation project selector moves the draft", () => {
     const naming = holdNameGeneration(getSharedEnv().orpc);
     const { view, cleanupDom, a } = await openTwoProjects(naming.client);
     const { container } = view;
-    const selector = () =>
-      container.querySelector<HTMLButtonElement>('[data-testid="project-selector"]');
     try {
       await openProjectCreationView(view, a);
       const draftId = await onlyDraftId(a);
       getDraftStore().setText(creationScope(a, draftId), "send me");
       await waitFor(() => expect(naming.calls()).toBeGreaterThan(0), WAIT);
-      expect(selector()?.disabled).toBe(false);
+      expect(projectSelector(container)?.disabled).toBe(false);
 
       fireEvent.click(container.querySelector<HTMLElement>('button[aria-label="Send message"]')!);
 
-      await waitFor(() => expect(selector()?.disabled).toBe(true), WAIT);
+      await waitFor(() => expect(projectSelector(container)?.disabled).toBe(true), WAIT);
     } finally {
       await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  test("the project selector is disabled while an attached file is read", async () => {
+    const { view, cleanupDom, a } = await openTwoProjects();
+    const { container } = view;
+    let releaseFile!: () => void;
+    const fileRead = new Promise<void>((resolve) => {
+      releaseFile = resolve;
+    });
+    try {
+      await openProjectCreationView(view, a);
+      const draftId = await onlyDraftId(a);
+      // Not a provider type: the creation composer reads its bytes into a pending file.
+      const file = new File(["held"], "held.bin", { type: "application/octet-stream" });
+      Object.defineProperty(file, "arrayBuffer", {
+        value: () => fileRead.then(() => new TextEncoder().encode("held").buffer),
+      });
+      expect(projectSelector(container)?.disabled).toBe(false);
+
+      fireEvent.change(
+        container.querySelector<HTMLInputElement>(
+          '[data-component="InputMethodGroup"] input[type="file"]'
+        )!,
+        { target: { files: [file] } }
+      );
+
+      // The read file is added to the draft the composer showed when it was attached.
+      await waitFor(() => expect(projectSelector(container)?.disabled).toBe(true), WAIT);
+      releaseFile();
+      await waitFor(() => {
+        expect(projectSelector(container)?.disabled).toBe(false);
+        expect(
+          getDraftStore()
+            .getView(creationScope(a, draftId))
+            .attachments.map(({ filename }) => filename)
+        ).toEqual(["held.bin"]);
+      }, WAIT);
+    } finally {
+      releaseFile();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  test("the project selector is disabled while the draft's attachments load", async () => {
+    const { view, cleanupDom, a } = await openTwoProjects();
+    const { container } = view;
+    const draftService = getSharedEnv().services.draftService;
+    const realGet = draftService.get.bind(draftService);
+    let releasePayloads!: () => void;
+    const payloadGate = new Promise<void>((resolve) => {
+      releasePayloads = resolve;
+    });
+    const getSpy = jest.spyOn(draftService, "get").mockImplementation(async (scope) => {
+      await payloadGate;
+      return realGet(scope);
+    });
+    try {
+      await openProjectCreationView(view, a);
+      const draftId = await onlyDraftId(a);
+      // Another window attaches a file: this one gets its metadata and then loads its payload.
+      await getSharedEnv().orpc.drafts.update({
+        scope: creationScope(a, draftId),
+        text: "attachments load later",
+        attachments: [ATTACHMENT],
+      });
+      await waitFor(() => {
+        expect(getDraftStore().getView(creationScope(a, draftId))).toMatchObject({
+          attachmentCount: 1,
+          payloadsLoaded: false,
+        });
+        expect(getSpy).toHaveBeenCalled();
+      }, WAIT);
+
+      // A move now would copy the text at once and the attachments only once they load.
+      await waitFor(() => expect(projectSelector(container)?.disabled).toBe(true), WAIT);
+      releasePayloads();
+      await waitFor(() => expect(projectSelector(container)?.disabled).toBe(false), WAIT);
+    } finally {
+      releasePayloads();
+      getSpy.mockRestore();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  test("a runtime the composer fell back to on its own does not move with the draft", async () => {
+    // Not a git repository: the composer switches from the default Worktree to Local.
+    const plainDir = await fs.mkdtemp(path.join(os.tmpdir(), "draft-move-plain-"));
+    const created = await getSharedEnv().orpc.projects.create({ projectPath: plainDir });
+    if (!created.success) throw new Error(`Failed to add the plain project: ${created.error}`);
+    const plain = created.data.normalizedPath;
+    await trustProject(getSharedEnv(), plain);
+    const { view, cleanupDom, b } = await openTwoProjects();
+    const { container } = view;
+    try {
+      await openProjectCreationView(view, plain);
+      await waitFor(() => expect(runtimeSelector(container)?.textContent).toContain("Local"), WAIT);
+
+      await moveDraftTo(container, path.basename(b));
+
+      await waitFor(
+        () => expect(runtimeSelector(container)?.textContent).toContain("Worktree"),
+        WAIT
+      );
+    } finally {
+      await cleanupView(view, cleanupDom);
+      await getSharedEnv().orpc.projects.remove({ projectPath: plain });
+      await fs.rm(plainDir, { recursive: true, force: true });
     }
   }, 90_000);
 });

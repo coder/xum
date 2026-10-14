@@ -15,7 +15,7 @@ interface CreationProjectSelectProps {
   selected: string;
   userProjects: Map<string, ProjectConfig>;
   onChange: (scope: string) => void;
-  /** While a creation send is in flight the draft cannot move. */
+  /** Set while the draft cannot move yet. */
   disabled?: boolean;
 }
 

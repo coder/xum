@@ -197,6 +197,11 @@ const buildRuntimeFromChoice = (choice: RuntimeChoice): ParsedRuntime => {
   }
 };
 
+export interface SelectedRuntimeChangeOptions {
+  /** An automatic switch away from an unavailable runtime, not the user's pick. */
+  fallback?: boolean;
+}
+
 /**
  * Hook to manage all draft workspace settings with centralized persistence
  * Loads saved preferences when projectPath changes, persists all changes automatically
@@ -221,7 +226,7 @@ export function useDraftWorkspaceSettings(
   /** Preserves the last SSH host when leaving Coder so the input stays populated. */
   sshHostFallback: string;
   /** Set the currently selected runtime (discriminated union) */
-  setSelectedRuntime: (runtime: ParsedRuntime) => void;
+  setSelectedRuntime: (runtime: ParsedRuntime, options?: SelectedRuntimeChangeOptions) => void;
   setTrunkBranch: (branch: string) => void;
   getRuntimeString: () => string | undefined;
 } {
@@ -467,7 +472,10 @@ export function useDraftWorkspaceSettings(
   const lastSshCoder = lastSsh.coder;
 
   // Setter for selected runtime (also persists host/image/coder for future mode switches)
-  const setSelectedRuntime = (runtime: ParsedRuntime) => {
+  const setSelectedRuntime = (
+    runtime: ParsedRuntime,
+    options: SelectedRuntimeChangeOptions = {}
+  ) => {
     // Construct remembered values only when the user changes runtimes. Keeping
     // this object off the render path lets React Compiler retain the setter
     // identity while unrelated ChatInput draft text changes.
@@ -480,7 +488,9 @@ export function useDraftWorkspaceSettings(
     });
 
     setRuntimePickState(mergedRuntime);
-    setRuntimePickExplicit(true);
+    // A moved draft carries only the user's pick: another project may offer the runtime that a
+    // fallback here replaced.
+    setRuntimePickExplicit(options.fallback !== true);
 
     // Persist host/image/coder so they're remembered when switching modes.
     // Avoid wiping the remembered value when the UI switches modes with an empty field.
