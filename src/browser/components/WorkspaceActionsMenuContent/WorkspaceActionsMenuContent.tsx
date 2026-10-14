@@ -1,7 +1,6 @@
 import {
   formatKeybind,
   isAltGraphPressed,
-  isEditableElement,
   KEYBINDS,
   matchesKeybind,
   type Keybind,
@@ -227,10 +226,10 @@ const ROW_KEYBINDS = (Object.keys(ACTION_ROWS) as WorkspaceActionId[]).flatMap((
  * one, so the menu takes the key before they see it. A row key whose row this menu hides does
  * nothing here (fail closed) instead of reaching the selected workspace.
  *
- * The listener sits on the window's capture phase, not on the menu: a click on the menu's padding
- * or a separator focuses the popover itself, outside the rows, and the key then never passed
- * through the menu (#6434). It runs before every bubble-phase handler and only while the menu is
- * mounted, so one listener exists at most.
+ * The menu hears keys from its whole popover, not only from its rows: a click on the popover's
+ * padding or a separator focuses the popover itself, outside the rows, and the key then never
+ * passed through the menu (#6434). Keys from outside the popover keep their global meaning. The
+ * listener sits on the window's capture phase and exists only while the menu is mounted.
  */
 function useRowShortcutKeys(
   rootRef: React.RefObject<HTMLDivElement>,
@@ -244,13 +243,19 @@ function useRowShortcutKeys(
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       const root = rootRef.current;
-      // Ctrl+Alt chords: AltGr types characters with the same modifiers. A field keeps its keys.
-      if (!root || isAltGraphPressed(event) || isEditableElement(event.target)) return;
+      // Ctrl+Alt chords: AltGr types characters with the same modifiers.
+      if (!root || !isInMenuPopover(root, event.target) || isAltGraphPressed(event)) return;
       handleRowShortcut(event, root, latestRef.current.shown, latestRef.current.props);
     };
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
   }, [rootRef]);
+}
+
+/** The key comes from the popover around the menu (Radix PopoverContent, role dialog). */
+function isInMenuPopover(root: HTMLElement, target: EventTarget | null): boolean {
+  const popover = root.closest('[role="dialog"]') ?? root;
+  return target instanceof Node && popover.contains(target);
 }
 
 function handleRowShortcut(

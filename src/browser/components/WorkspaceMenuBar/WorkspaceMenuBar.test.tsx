@@ -618,6 +618,32 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(updateWorkspaceTitleMock).not.toHaveBeenCalled();
   });
 
+  it("a save from a field that is gone leaves a newer edit of the same workspace open", async () => {
+    let settleSave: (result: { success: boolean }) => void = () => undefined;
+    updateWorkspaceTitleMock.mockImplementation(
+      () => new Promise((resolve) => (settleSave = resolve))
+    );
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    await typeTitle(view.getByTestId("workspace-title-input"), "Renamed");
+
+    // Away and back while the unmount save is pending, then a new edit of the same workspace.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+    view.rerender(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    await act(async () => {
+      settleSave({ success: true });
+      await Promise.resolve();
+    });
+
+    expect(updateWorkspaceTitleMock).toHaveBeenCalledTimes(1);
+    expect(view.getByTestId("workspace-title-input")).toBeTruthy();
+  });
+
   it("reports a save that fails after its field is gone in the shared toast", async () => {
     const toast = spyOn(FeedbackToastModule, "showFeedbackToast").mockImplementation(
       () => undefined

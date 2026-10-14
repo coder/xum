@@ -180,7 +180,9 @@ function useTitleDraft(props: WorkspaceHeaderTitleInputProps) {
 
   const finish = () => {
     phaseRef.current = "done";
-    props.onDone(document.activeElement === inputRef.current);
+    // A field that is gone ended its edit when it unmounted. Its late save must not end a newer
+    // edit, even one for the same workspace (Codex on #6461).
+    if (mountedRef.current) props.onDone(document.activeElement === inputRef.current);
   };
   const showError = (error: string) =>
     titleError.showError(props.workspaceId, error, getErrorAnchorBelow(inputRef.current));

@@ -228,6 +228,7 @@ describe("WorkspaceActionsMenuContent row shortcut keys (#6328)", () => {
   test("a hinted key acts on the menu while focus is on the popover around the rows", () => {
     const actions = allActions();
     const popover = document.createElement("div");
+    popover.setAttribute("role", "dialog");
     popover.tabIndex = -1;
     document.body.appendChild(popover);
     const onCloseMenu = mock(() => undefined);
@@ -248,12 +249,13 @@ describe("WorkspaceActionsMenuContent row shortcut keys (#6328)", () => {
     expect(windowKeys).toEqual([]);
   });
 
-  test("a hinted key typed into a field outside the menu stays with that field", () => {
+  // Coordinator scoping rule (#6434): keys from outside the menu's popover keep their global meaning.
+  test("a hinted key from outside the menu's popover stays with the global handlers", () => {
     const actions = allActions();
     renderSidebarMenu(actions);
-    const field = document.createElement("input");
-    document.body.appendChild(field);
-    field.focus();
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
 
     pressKey(toKeyEvent(KEYBINDS.EDIT_WORKSPACE_TITLE));
     expect(actions.editTitle).not.toHaveBeenCalled();
