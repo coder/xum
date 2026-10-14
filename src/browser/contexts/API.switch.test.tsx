@@ -5,17 +5,9 @@ import { os } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/websocket";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { isConnectionLostError } from "./connectionLink";
-import type { APIProvider as APIProviderType, UseAPIResult } from "./API";
-
-// Other suites mock this module (and bun module mocks leak between files): the query string
-// gives the real one. This suite also runs the real oRPC client and WebSocket link.
-/* eslint-disable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
-const RealAPIModule: {
-  APIProvider: typeof APIProviderType;
-  useAPI: () => UseAPIResult;
-} = require("./API?real=switch");
-/* eslint-enable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
-const { APIProvider, useAPI } = RealAPIModule;
+// The real module: suites that mock it restore it after they finish (restoreModulesAfterSuite).
+// This suite also runs the real oRPC client and WebSocket link.
+import { APIProvider, useAPI, type UseAPIResult } from "./API";
 
 /**
  * One fake socket per connect, wired to a real oRPC server handler in this process. Server N
