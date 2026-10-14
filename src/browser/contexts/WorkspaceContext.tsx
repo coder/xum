@@ -255,6 +255,25 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
   getWorkspaceInfo: (workspaceId: string) => Promise<FrontendWorkspaceMetadata | null>;
 }
 
+/**
+ * Move the project's default creation draft into the new listed `draft` and open it once moved.
+ * A failed move lists and opens an empty draft instead; the default draft keeps its content.
+ * Skipped when the user opened another route meanwhile.
+ */
+async function promoteDefaultDraft(
+  projectPath: string,
+  draft: WorkspaceDraft,
+  route: { isRouteCurrent: () => boolean; openDraft: () => void }
+): Promise<void> {
+  const moved = await getDraftStore().moveCreationDraft(defaultCreationDraftScope(projectPath), {
+    projectPath,
+    ...draft,
+  });
+  if (!route.isRouteCurrent()) return;
+  if (!moved) getDraftStore().putCreationDraft(projectPath, draft);
+  route.openDraft();
+}
+
 const WorkspaceActionsContext = createContext<
   Omit<WorkspaceContext, "workspaceMetadata" | "loading" | "loaded" | "loadError"> | undefined
 >(undefined);
@@ -430,6 +449,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     pendingDraftId,
   } = useRouter();
   const location = useLocation();
+  // Read when an awaited navigation lands: a route the user opened meanwhile wins.
+  const locationKeyRef = useRef(location.key);
+  locationKeyRef.current = location.key;
 
   const workspaceStore = useWorkspaceStoreRaw();
 
@@ -1685,20 +1707,23 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         createdAt,
       };
 
-      // One-time migration: if the user has an old per-project pending draft, move it
-      // into the first draft scope so it stays accessible.
-      // The default creation composer's draft (no draft id) moves into the first listed one.
+      // The default creation composer's draft (no draft id) moves into the first listed one, in
+      // one backend step (the body, its workspace name included, and the row). The new draft
+      // opens once it moved; a failed move opens an empty one, and the default draft keeps its
+      // content.
+      const openDraft = () =>
+        navigateToProject(projectPath, draftId, { replace: options?.replace });
       if (existingDrafts.length === 0 && !isDefaultCreationDraftEmpty(projectPath)) {
-        // One backend step moves the body (its workspace name included) and lists the row; the
-        // new draft shows the moved content at once.
-        getDraftStore()
-          .moveCreationDraft(defaultCreationDraftScope(projectPath), { projectPath, ...draft })
-          .catch((error: unknown) => console.warn("Failed to move the default draft:", error));
-      } else {
-        getDraftStore().putCreationDraft(projectPath, draft);
+        const routeKey = locationKeyRef.current;
+        promoteDefaultDraft(projectPath, draft, {
+          isRouteCurrent: () => locationKeyRef.current === routeKey,
+          openDraft,
+        }).catch((error: unknown) => console.warn("Failed to open the new draft:", error));
+        return;
       }
 
-      navigateToProject(projectPath, draftId, { replace: options?.replace });
+      getDraftStore().putCreationDraft(projectPath, draft);
+      openDraft();
     },
     [navigateToProject]
   );
