@@ -4,10 +4,8 @@ import { AlertTriangle, Check } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import { useLiveAPI } from "@/browser/contexts/API";
+import { useNonBlockingQuestionAnswers } from "@/browser/features/Tools/AskUserQuestion/useNonBlockingQuestionAnswers";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
-import { flushUserPreferences } from "@/browser/stores/AppConfigStore";
-import { useHostTranscriptMutationCheck } from "@/browser/utils/transcriptBarrier";
-import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { useAutoResizeTextarea } from "@/browser/hooks/useAutoResizeTextarea";
@@ -39,12 +37,9 @@ import type {
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 import {
   ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE,
-  buildAskUserQuestionAnswerMessage,
-  hasAskUserQuestionLeftContext,
+  type AskUserQuestionSelection,
   isAsyncAskUserQuestionOutput,
 } from "@/common/utils/tools/askUserQuestionSummary";
-import type { DisplayedUserMessage } from "@/common/types/message";
-import { createSendId } from "@/common/utils/drafts";
 import { getErrorMessage } from "@/common/utils/errors";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 
@@ -147,6 +142,29 @@ function parsePrefilledAnswer(question: AskUserQuestionQuestion, answer: string)
   return { selected, otherText: otherParts.join(", ") };
 }
 
+/**
+ * The card's picks as 1-based option numbers plus the user's own text. A non-blocking answer is
+ * built from these, never from the flattened answer string, where a label plus Other text can
+ * read like another label.
+ */
+function buildAnswerSelections(
+  questions: readonly AskUserQuestionQuestion[],
+  draftAnswers: Record<string, DraftAnswer>
+): AskUserQuestionSelection[] {
+  return questions.map((q) => {
+    const draft = draftAnswers[q.question];
+    if (!draft || !isQuestionAnswered(q, draft)) {
+      return { optionNumbers: [], otherText: "" };
+    }
+    return {
+      optionNumbers: draft.selected
+        .map((label) => q.options.findIndex((option) => option.label === label) + 1)
+        .filter((optionNumber) => optionNumber > 0),
+      otherText: draft.selected.includes(OTHER_VALUE) ? draft.otherText : "",
+    };
+  });
+}
+
 function isQuestionAnswered(_question: AskUserQuestionQuestion, draft: DraftAnswer): boolean {
   if (draft.selected.length === 0) {
     return false;
@@ -227,6 +245,63 @@ function AutoResizeTextarea(props: {
   );
 }
 
+/**
+ * A finished question: the submitted answers, one row per question with the picked options'
+ * descriptions, or a note when a non-blocking question left the agent's context unanswered.
+ */
+function AnsweredQuestions(props: {
+  result: { questions: AskUserQuestionQuestion[]; answers: Record<string, string> } | null;
+  closedUnanswered: boolean;
+}): JSX.Element | null {
+  const result = props.result;
+  if (result == null) {
+    return props.closedUnanswered ? (
+      <div className="text-muted text-[11px] italic">
+        Not answered. {ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE}
+      </div>
+    ) : null;
+  }
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="text-secondary text-[10px] tracking-wide uppercase">User answered</div>
+      {Object.entries(result.answers).map(([question, answer]) => {
+        const questionDef = result.questions.find((q) => q.question === question);
+        // Parse answer labels (could be comma-separated for multi-select)
+        const answerLabels = answer.split(",").map((s) => s.trim());
+        const descriptions = questionDef ? getDescriptionsForLabels(questionDef, answerLabels) : [];
+        const header = questionDef?.header ?? question;
+
+        return (
+          <div
+            key={question}
+            className="bg-code-bg flex flex-col gap-0.5 rounded border border-white/5 px-2.5 py-1.5"
+          >
+            <div className="text-secondary text-[10px] tracking-wide uppercase">{header}</div>
+            <div className="text-foreground text-sm leading-snug">{answer}</div>
+            {descriptions.length > 0 && (
+              <div className="text-muted-foreground text-[11px] italic">
+                {descriptions.join("; ")}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Copy that differs between blocking (Plan) and non-blocking (Exec) questions. */
+const ANSWERING_HINTS = {
+  blocking: {
+    header: "Answer below, or type a message in chat to cancel.",
+    footer: "Tip: type a message in chat to cancel these questions.",
+  },
+  nonBlocking: {
+    header: "The agent keeps working; your answers reach it after its current step.",
+    footer: "Your answers are sent to the agent as a message.",
+  },
+} as const;
+
 export function AskUserQuestionToolCall(props: {
   args: AskUserQuestionToolArgs;
   result: AskUserQuestionToolResult | null;
@@ -234,8 +309,6 @@ export function AskUserQuestionToolCall(props: {
   toolCallId: string;
   workspaceId?: string;
 }): JSX.Element {
-  const isTranscriptMutationAllowed = useHostTranscriptMutationCheck();
-
   const argsAnswers = props.args.answers ?? {};
 
   // Restore from cache if available (survives workspace switches)
@@ -244,16 +317,6 @@ export function AskUserQuestionToolCall(props: {
   const [activeIndex, setActiveIndex] = useState(() => cachedState?.activeIndex ?? 0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  // Non-blocking questions: answers whose message the backend accepted. Like Codex, the question
-  // is then done from this card's view; the message is ordinary input, so a queued one the user
-  // withdraws (Stop) comes back to the composer like any queued message. This also covers a
-  // message batched into an earlier queued one, whose metadata the queue does not keep.
-  const [sentAnswers, setSentAnswers] = useState<Record<string, string> | null>(null);
-  // The idempotency id of the last unconfirmed answer send. A retry of the same message reuses
-  // it, so a lost success response cannot produce a second answer row (the backend never
-  // appends a second row for an id a row already carries).
-  const pendingAnswerSendRef = useRef<{ message: string; sendId: string } | null>(null);
-
   const workspaceStore = useWorkspaceStoreRaw();
   const workspaceState = useSyncExternalStore(
     (listener) => {
@@ -280,27 +343,17 @@ export function AskUserQuestionToolCall(props: {
 
   // Codex-style questions (non-plan agents) returned without waiting: the tool is complete, but
   // the questions stay answerable until they are answered from this card or an answer message
-  // for this tool call is in history. The latest such message is the user's final word.
+  // for this tool call is in history.
   const isAsyncQuestion = isAsyncAskUserQuestionOutput(props.result);
-  const transcript = workspaceState?.messages ?? [];
-  // A durable row wins over this card's local send (another client may have sent a correction);
-  // the local send covers an answer whose metadata the queue dropped by batching it.
-  const deliveredAnswers = isAsyncQuestion
-    ? ([...transcript]
-        .reverse()
-        .find(
-          (message): message is DisplayedUserMessage =>
-            message.type === "user" &&
-            message.askUserQuestionAnswer?.toolCallId === props.toolCallId
-        )?.askUserQuestionAnswer?.answers ?? sentAnswers)
-    : null;
-  // Answers name questions and options by number only, so a question that a compaction, Start
-  // Here or reset dropped from the agent's context closes unanswered.
-  const leftAgentContext =
-    isAsyncQuestion && hasAskUserQuestionLeftContext(transcript, props.toolCallId);
-  const isAnswering =
-    props.status === "executing" ||
-    (isAsyncQuestion && deliveredAnswers == null && !leftAgentContext);
+  const nonBlocking = useNonBlockingQuestionAnswers({
+    enabled: isAsyncQuestion,
+    workspaceId: props.workspaceId,
+    toolCallId: props.toolCallId,
+    questions: props.args.questions,
+    transcript: workspaceState?.messages,
+  });
+  const isAnswering = props.status === "executing" || nonBlocking.isOpen;
+  const answeringHints = isAsyncQuestion ? ANSWERING_HINTS.nonBlocking : ANSWERING_HINTS.blocking;
 
   // A question awaiting answers must never be hidden behind a collapsed "tools"
   // preference, so force it open while answerable. forceExpanded only overrides the
@@ -461,11 +514,7 @@ export function AskUserQuestionToolCall(props: {
     uiOnlyPayload ??
     (resultUnwrapped && isAskUserQuestionPayload(resultUnwrapped) ? resultUnwrapped : null);
   // A non-blocking question's tool result carries no answers; they come from the answer message.
-  const successResult = isAsyncQuestion
-    ? deliveredAnswers != null
-      ? { questions: props.args.questions, answers: deliveredAnswers }
-      : null
-    : toolResultPayload;
+  const successResult = isAsyncQuestion ? nonBlocking.answered : toolResultPayload;
 
   const errorResult =
     resultUnwrapped && isToolErrorResult(resultUnwrapped) ? resultUnwrapped : null;
@@ -531,74 +580,9 @@ export function AskUserQuestionToolCall(props: {
     }
 
     if (isAsyncQuestion) {
-      // Codex-style: answers to a non-blocking question are ordinary user input, sent like a
-      // composer message. The default queue mode steers a running turn after its current step;
-      // an idle workspace starts a new turn. The metadata only lets this card show the answers.
-      const message = buildAskUserQuestionAnswerMessage(
-        props.toolCallId,
-        props.args.questions.map((q) => {
-          const draft = draftAnswers[q.question];
-          if (!draft || !isQuestionAnswered(q, draft)) {
-            return { optionNumbers: [], otherText: "" };
-          }
-          return {
-            optionNumbers: draft.selected
-              .map((label) => q.options.findIndex((option) => option.label === label) + 1)
-              .filter((optionNumber) => optionNumber > 0),
-            otherText: draft.selected.includes(OTHER_VALUE) ? draft.otherText : "",
-          };
-        })
-      );
-      const pendingSend = pendingAnswerSendRef.current;
-      const sendId = pendingSend?.message === message ? pendingSend.sendId : createSendId();
-      pendingAnswerSendRef.current = { message, sendId };
-      // Same barrier as the composer: the backend reads send preferences from config.json.
-      flushUserPreferences()
-        .then(() => {
-          // The composer's dispatch-time barrier: while the transcript replays, this card may be
-          // a stale copy of a question that was edited away or moved behind a boundary.
-          if (!isTranscriptMutationAllowed(workspaceId)) {
-            throw new Error(TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
-          }
-          // The render-time check above is a snapshot: a boundary may have landed while the
-          // preferences flushed, so re-read the latest transcript before sending.
-          if (
-            hasAskUserQuestionLeftContext(
-              workspaceStore.getWorkspaceState(workspaceId).messages,
-              props.toolCallId
-            )
-          ) {
-            throw new Error(ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE);
-          }
-          return liveApi.workspace.sendMessage({
-            workspaceId,
-            message,
-            options: {
-              ...getSendOptionsFromStorage(workspaceId),
-              sendId,
-              muxMetadata: {
-                type: "normal",
-                askUserQuestionAnswer: { toolCallId: props.toolCallId, answers },
-              },
-            },
-          });
-        })
-        .then((result) => {
-          if (!result.success) {
-            const formatted = formatSendMessageError(result.error);
-            setSubmitError(
-              formatted.resolutionHint
-                ? `${formatted.message} ${formatted.resolutionHint}`
-                : formatted.message
-            );
-            return;
-          }
-          pendingAnswerSendRef.current = null;
-          setSentAnswers(answers);
-        })
-        .catch((error) => {
-          setSubmitError(getErrorMessage(error));
-        })
+      nonBlocking
+        .send(buildAnswerSelections(props.args.questions, draftAnswers), answers)
+        .then(setSubmitError)
         .finally(() => {
           setIsSubmitting(false);
         });
@@ -706,11 +690,7 @@ export function AskUserQuestionToolCall(props: {
         <div className="flex min-w-0 flex-1 flex-col">
           <ToolName>{title}</ToolName>
           {isAnswering && (
-            <div className="text-secondary text-[10px] leading-tight">
-              {isAsyncQuestion
-                ? "The agent keeps working; your answers reach it after its current step."
-                : "Answer below, or type a message in chat to cancel."}
-            </div>
+            <div className="text-secondary text-[10px] leading-tight">{answeringHints.header}</div>
           )}
         </div>
         <StatusIndicator status={props.status}>{statusDisplay}</StatusIndicator>
@@ -980,46 +960,10 @@ export function AskUserQuestionToolCall(props: {
 
             {!isAnswering && (
               <div className="flex flex-col gap-2">
-                {leftAgentContext && successResult == null && (
-                  <div className="text-muted text-[11px] italic">
-                    Not answered. {ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE}
-                  </div>
-                )}
-                {successResult && (
-                  <div className="flex flex-col gap-1.5">
-                    <div className="text-secondary text-[10px] tracking-wide uppercase">
-                      User answered
-                    </div>
-                    {Object.entries(successResult.answers).map(([question, answer]) => {
-                      const questionDef = successResult.questions.find(
-                        (q) => q.question === question
-                      );
-                      // Parse answer labels (could be comma-separated for multi-select)
-                      const answerLabels = answer.split(",").map((s) => s.trim());
-                      const descriptions = questionDef
-                        ? getDescriptionsForLabels(questionDef, answerLabels)
-                        : [];
-                      const header = questionDef?.header ?? question;
-
-                      return (
-                        <div
-                          key={question}
-                          className="bg-code-bg flex flex-col gap-0.5 rounded border border-white/5 px-2.5 py-1.5"
-                        >
-                          <div className="text-secondary text-[10px] tracking-wide uppercase">
-                            {header}
-                          </div>
-                          <div className="text-foreground text-sm leading-snug">{answer}</div>
-                          {descriptions.length > 0 && (
-                            <div className="text-muted-foreground text-[11px] italic">
-                              {descriptions.join("; ")}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
+                <AnsweredQuestions
+                  result={successResult}
+                  closedUnanswered={nonBlocking.closedUnanswered}
+                />
 
                 {errorResult && <ErrorBox>{errorResult.error}</ErrorBox>}
               </div>
@@ -1028,9 +972,7 @@ export function AskUserQuestionToolCall(props: {
             {isAnswering && (
               <div className="flex items-center justify-between gap-3 border-t border-white/5 pt-2">
                 <div className="text-muted min-w-0 flex-1 text-[10px] italic">
-                  {isAsyncQuestion
-                    ? "Your answers are sent to the agent as a message."
-                    : "Tip: type a message in chat to cancel these questions."}
+                  {answeringHints.footer}
                 </div>
                 {isOnSummary ? (
                   <Button

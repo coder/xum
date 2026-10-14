@@ -285,7 +285,7 @@ import type {
   WorkspaceRemovalDescendant,
   WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
-import { isDynamicToolPart } from "@/common/types/toolParts";
+import { type DynamicToolPart, isDynamicToolPart } from "@/common/types/toolParts";
 import {
   ASK_USER_QUESTION_NOT_WAITING_MESSAGE,
   buildAskUserQuestionSummary,
@@ -2409,6 +2409,75 @@ function mintUnrelatedWorkspaceConsent(): string {
     "minted unrelated-workspace consent must satisfy the fail-closed reader"
   );
   return generation;
+}
+
+type MuxMessagePart = MuxMessage["parts"][number];
+
+/** Finalizes one ask_user_question tool part with `answers` (already answered is idempotent). */
+function finalizeAskUserQuestionPart(
+  part: DynamicToolPart,
+  answers: Record<string, string>
+): Result<{ part: MuxMessagePart; output: AskUserQuestionToolSuccessResult }> {
+  if (part.toolName !== "ask_user_question") {
+    return Err(
+      `toolCallId=${part.toolCallId} is toolName=${part.toolName}, expected ask_user_question`
+    );
+  }
+
+  if (part.state === "output-available") {
+    // A non-blocking question completed without answers; its answers are a chat message, so this
+    // path must not report them as delivered.
+    if (isAsyncAskUserQuestionOutput(part.output)) {
+      return Err(ASK_USER_QUESTION_NOT_WAITING_MESSAGE);
+    }
+    // Already answered - treat as idempotent.
+    const parsedOutput = AskUserQuestionToolResultSchema.safeParse(part.output);
+    return parsedOutput.success
+      ? Ok({ part, output: parsedOutput.data })
+      : Err(`ask_user_question output validation failed: ${parsedOutput.error.message}`);
+  }
+
+  const parsedArgs = AskUserQuestionToolArgsSchema.safeParse(part.input);
+  if (!parsedArgs.success) {
+    return Err(`ask_user_question input validation failed: ${parsedArgs.error.message}`);
+  }
+
+  const output: AskUserQuestionToolSuccessResult = {
+    summary: buildAskUserQuestionSummary(answers),
+    ui_only: {
+      ask_user_question: {
+        questions: parsedArgs.data.questions,
+        answers,
+      },
+    },
+  };
+  return Ok({ part: { ...part, state: "output-available" as const, output }, output });
+}
+
+/**
+ * Restart fallback of answerAskUserQuestion: finalizes the ask_user_question tool call in `msg`
+ * with `answers`, or reports why it cannot.
+ */
+function finalizeAskUserQuestionMessage(
+  msg: MuxMessage,
+  toolCallId: string,
+  answers: Record<string, string>
+): Result<{ updated: MuxMessage; output: AskUserQuestionToolSuccessResult }> {
+  const index = msg.parts.findIndex(
+    (part) => isDynamicToolPart(part) && part.toolCallId === toolCallId
+  );
+  const part = msg.parts[index];
+  if (!isDynamicToolPart(part)) {
+    return Err("ask_user_question toolCallId not found in message");
+  }
+  const finalized = finalizeAskUserQuestionPart(part, answers);
+  if (!finalized.success) {
+    return Err(finalized.error);
+  }
+  return Ok({
+    updated: { ...msg, parts: msg.parts.with(index, finalized.data.part) },
+    output: finalized.data.output,
+  });
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
@@ -17526,81 +17595,6 @@ export class WorkspaceService
         return Err(ASK_USER_QUESTION_NOT_WAITING_MESSAGE);
       }
       try {
-        // Helper: update a message in-place if it contains this ask_user_question tool call.
-        const tryFinalizeMessage = (
-          msg: MuxMessage
-        ): Result<{ updated: MuxMessage; output: AskUserQuestionToolSuccessResult }> => {
-          let foundToolCall = false;
-          let output: AskUserQuestionToolSuccessResult | null = null;
-          let errorMessage: string | null = null;
-
-          const updatedParts = msg.parts.map((part) => {
-            if (!isDynamicToolPart(part) || part.toolCallId !== toolCallId) {
-              return part;
-            }
-
-            foundToolCall = true;
-
-            if (part.toolName !== "ask_user_question") {
-              errorMessage = `toolCallId=${toolCallId} is toolName=${part.toolName}, expected ask_user_question`;
-              return part;
-            }
-
-            // A non-blocking question completed without answers; its answers are a chat message,
-            // so this path must not report them as delivered.
-            if (part.state === "output-available" && isAsyncAskUserQuestionOutput(part.output)) {
-              errorMessage = ASK_USER_QUESTION_NOT_WAITING_MESSAGE;
-              return part;
-            }
-
-            // Already answered - treat as idempotent.
-            if (part.state === "output-available") {
-              const parsedOutput = AskUserQuestionToolResultSchema.safeParse(part.output);
-              if (!parsedOutput.success) {
-                errorMessage = `ask_user_question output validation failed: ${parsedOutput.error.message}`;
-                return part;
-              }
-              output = parsedOutput.data;
-              return part;
-            }
-
-            const parsedArgs = AskUserQuestionToolArgsSchema.safeParse(part.input);
-            if (!parsedArgs.success) {
-              errorMessage = `ask_user_question input validation failed: ${parsedArgs.error.message}`;
-              return part;
-            }
-
-            const nextOutput: AskUserQuestionToolSuccessResult = {
-              summary: buildAskUserQuestionSummary(answers),
-              ui_only: {
-                ask_user_question: {
-                  questions: parsedArgs.data.questions,
-                  answers,
-                },
-              },
-            };
-            output = nextOutput;
-
-            return {
-              ...part,
-              state: "output-available" as const,
-              output: nextOutput,
-            };
-          });
-
-          if (errorMessage) {
-            return Err(errorMessage);
-          }
-          if (!foundToolCall) {
-            return Err("ask_user_question toolCallId not found in message");
-          }
-          if (!output) {
-            return Err("ask_user_question output missing after update");
-          }
-
-          return Ok({ updated: { ...msg, parts: updatedParts }, output });
-        };
-
         // 1) Prefer partial.json (most common after restart while waiting)
         const partial = await this.historyService.readPartial(workspaceId);
         if (partial) {
@@ -17613,7 +17607,7 @@ export class WorkspaceService
             workspaceId,
             partial.id,
             (current) => {
-              const finalized = tryFinalizeMessage(current);
+              const finalized = finalizeAskUserQuestionMessage(current, toolCallId, answers);
               if (!finalized.success) return null;
               output = finalized.data.output;
               return finalized.data.updated;
@@ -17682,7 +17676,7 @@ export class WorkspaceService
           );
         }
 
-        const finalized = tryFinalizeMessage(best);
+        const finalized = finalizeAskUserQuestionMessage(best, toolCallId, answers);
         if (!finalized.success) {
           return Err(finalized.error);
         }

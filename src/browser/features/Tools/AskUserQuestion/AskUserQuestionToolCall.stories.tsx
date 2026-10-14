@@ -178,6 +178,9 @@ export const AskUserQuestionCompleted: AppStory = {
  * questions stay answerable; answers are delivered later as a steering message.
  */
 export const AskUserQuestionNonBlocking: AppStory = {
+  // Same open form as AskUserQuestionPending apart from two hint lines, so a Pixel snapshot would
+  // spend repo budget on repeated layout; the card's behavior is covered by unit tests.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   render: () => (
     <AppWithMocks
       setup={() => {

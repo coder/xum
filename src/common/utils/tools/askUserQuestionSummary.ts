@@ -1,3 +1,5 @@
+import { z } from "zod";
+
 import type { AskUserQuestionAnswerMetadata } from "@/common/types/message";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 
@@ -83,20 +85,19 @@ export function isAsyncAskUserQuestionOutput(output: unknown): boolean {
   return getToolOutputUiOnly(output)?.ask_user_question?.answerDelivery === "message";
 }
 
-/** Reads `muxMetadata.askUserQuestionAnswer`, dropping malformed values (self-healing). */
+const AskUserQuestionAnswerHolderSchema = z.object({
+  askUserQuestionAnswer: z.object({
+    toolCallId: z.string().min(1),
+    answers: z.record(z.string(), z.string()),
+  }),
+});
+
+/** Reads `muxMetadata.askUserQuestionAnswer`, dropping missing or malformed values (self-healing). */
 export function parseAskUserQuestionAnswerMetadata(
-  value: unknown
+  muxMetadata: unknown
 ): AskUserQuestionAnswerMetadata | undefined {
-  if (value == null || typeof value !== "object") return undefined;
-  const record = value as { toolCallId?: unknown; answers?: unknown };
-  if (typeof record.toolCallId !== "string" || record.toolCallId.length === 0) return undefined;
-  if (record.answers == null || typeof record.answers !== "object") return undefined;
-  const answers: Record<string, string> = {};
-  for (const [question, answer] of Object.entries(record.answers)) {
-    if (typeof answer !== "string") return undefined;
-    answers[question] = answer;
-  }
-  return { toolCallId: record.toolCallId, answers };
+  const parsed = AskUserQuestionAnswerHolderSchema.safeParse(muxMetadata);
+  return parsed.success ? parsed.data.askUserQuestionAnswer : undefined;
 }
 
 export function buildAskUserQuestionSummary(answers: Record<string, string>): string {
