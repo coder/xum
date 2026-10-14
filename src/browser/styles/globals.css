@@ -614,7 +614,9 @@
   --color-content-tertiary: #575653;
   --color-content-disabled: #403e3c;
   --color-muted-foreground: #878580;
-  --color-secondary: #575653;
+  /* Flexoki base-400: WCAG AA (4.5:1) on every flexoki-dark surface, down to the slash command
+     rows (#343331, 4.65:1). base-700 was 2.61:1 on the main surface (#6021). */
+  --color-secondary: #9f9d96;
   --color-surface-primary: #100f0f;
   --color-surface-secondary: #1c1b1a;
   --color-content-destructive: #d14d41;
