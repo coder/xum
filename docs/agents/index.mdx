@@ -63,17 +63,18 @@ Definitions larger than 1 MB are rejected at parse time. Filenames that don't ma
 
 A plugin agent without any of those fields is read as a Claude Code or Cursor subagent. Both tools give such an agent every tool when it omits `tools`, so Xum maps it like this:
 
-| Plugin field                         | Xum meaning                                                                         |
-| ------------------------------------ | ----------------------------------------------------------------------------------- |
-| (always)                             | `base: exec`, `subagent.runnable: true`, `ui.hidden: true`, `prompt.append: false`  |
-| `name` omitted                       | The file name (agent id), as both tools do for plugin agents                        |
-| `readonly: true` (Cursor)            | `base: explore` instead (no file edits or task spawning; bash stays)                |
-| `model`                              | `ai.model` for an alias or a known Claude ID. Other values use the inherited model. |
-| `effort` (Claude Code)               | `ai.thinkingLevel`, when it is a valid thinking level                               |
-| `is_background`, `background`        | Ignored. The `task` caller chooses `run_in_background`.                             |
-| `tools`, `disallowedTools` as a list | Not supported yet. Xum skips the agent rather than grant every tool.                |
+| Plugin field                                                                                               | Xum meaning                                                                                                                  |
+| ---------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| (always)                                                                                                   | `base: exec`, `subagent.runnable: true`, `ui.hidden: true`, `prompt.append: false`                                           |
+| `name` omitted                                                                                             | The file name (agent id), as both tools do for plugin agents                                                                 |
+| `readonly: true` (Cursor)                                                                                  | `base: explore` instead (no file edits or task spawning; bash stays)                                                         |
+| `model`                                                                                                    | `ai.model` for an alias or a known Claude ID. Other values use the inherited model.                                          |
+| `effort` (Claude Code)                                                                                     | `ai.thinkingLevel`, when it is a valid thinking level                                                                        |
+| `is_background`, `background`                                                                              | Ignored. The `task` caller chooses `run_in_background`.                                                                      |
+| Other keys (`maxTurns`, `skills`, `memory`, `hooks`, `mcpServers`, `permissionMode`, `isolation`, `color`) | Ignored, as Xum ignores unknown keys. Claude Code also ignores `hooks`, `mcpServers` and `permissionMode` for plugin agents. |
+| `tools`, `disallowedTools` as a list                                                                       | Not supported yet. Xum skips the agent rather than grant every tool.                                                         |
 
-So `task({ agentId: "<file name>" })` spawns the agent with Exec's tools: it can run shell commands and edit files. The body replaces Exec's prompt. The agent does not appear in the agent picker. This mapping applies only to plugin agents. A project or global agent file in the same format keeps the Xum defaults (not runnable, no tools).
+So `task({ agentId: "<file name>" })` spawns the agent with Exec's tools: it can run shell commands and edit files. The body replaces Exec's prompt. Xum still adds its sub-agent instructions (commit the work so the parent can apply the patch, and report back), because the parent depends on them. The agent does not appear in the agent picker. This mapping applies only to plugin agents. A project or global agent file in the same format keeps the Xum defaults (not runnable, no tools).
 
 ## File Format
 
