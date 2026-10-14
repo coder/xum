@@ -13,6 +13,13 @@
  *   is skipped until the user trusts it. `hash` is that key (see pluginHookTrust.ts).
  *
  * Fail-soft like the manifest: every invalid file, group or handler is dropped with a warning.
+ *
+ * Where Xum accepts more than Codex (each one is intended):
+ * - A float literal with a whole value (`30.0`, `3e1`) is a valid `timeout`: JSON.parse returns
+ *   the same number as for `30`, so the text cannot be told apart. Codex's u64 parse rejects it.
+ * - An invalid handler drops only itself (with a warning). Codex rejects the whole file.
+ * - `timeout: null` and an omitted `timeout` both mean the default, but they hash differently
+ *   (the hash covers the raw definition), so changing one into the other needs a new review.
  */
 import * as crypto from "node:crypto";
 import * as path from "node:path";
