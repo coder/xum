@@ -211,6 +211,11 @@ export interface MCPClientHandle {
    * included, settings tools excluded). Undefined when the listing has no such tool.
    */
   settingsToolAction(name: string): MCPSettingsToolAction | undefined;
+  /**
+   * Re-list the server's tools (tools/list), so settingsToolAction reflects the current catalog.
+   * Settings actions call it before a dispatch on a connection without another refresh.
+   */
+  relistTools(): Promise<void>;
   /** tools/call for a settings layout tool action, with the spec's `{}` arguments. */
   callSettingsActionTool(
     name: string,
@@ -584,6 +589,9 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       );
     },
     settingsToolAction: (name) => listedSettingsActions.get(name),
+    relistTools: async () => {
+      await handle.tools();
+    },
     callSettingsActionTool: (name, meta, options) => {
       assert(listedSettingsActions.has(name), "callSettingsActionTool only calls listed tools");
       // The spec's layout tool accepts `{}`.

@@ -84,6 +84,9 @@ test("settings tool actions: the spec's display name order, readOnlyHint, and {}
   // The settings tools themselves are no actions.
   expect(client.settingsToolAction("settings.update")).toBeUndefined();
 
+  // relistTools re-reads the catalog (tools/list), as a settings action does before a dispatch.
+  await client.relistTools();
+  expect(client.settingsToolAction("library")?.title).toBe("Part library");
   const result = await client.callSettingsActionTool("library", { "xum/workspaceId": "ws-1" });
   expect(result.structuredContent).toEqual({ received: {}, meta: { "xum/workspaceId": "ws-1" } });
   expect(() => client!.callSettingsActionTool("settings.update", {})).toThrow();

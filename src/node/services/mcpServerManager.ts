@@ -1428,7 +1428,11 @@ interface MCPServerInstance {
   /** OpenAI structured settings (`openai/settings`); its tools are hidden from the model. */
   settings?: Pick<
     MCPClientHandle,
-    "settingsCapability" | "callSettingsTool" | "settingsToolAction" | "callSettingsActionTool"
+    | "settingsCapability"
+    | "callSettingsTool"
+    | "settingsToolAction"
+    | "callSettingsActionTool"
+    | "relistTools"
   >;
   /** True once the underlying MCP client/transport has been closed. */
   isClosed: boolean;
@@ -5228,6 +5232,26 @@ export class MCPServerManager {
   }
 
   /**
+   * A fresh tools/list for a settings action: a modern instance refreshes through its response
+   * cache (refreshInstanceTools). A legacy instance has no such refresh, and without MCP Apps
+   * nothing re-lists it on tools/list_changed, so it lists again here. Resolves false on failure.
+   */
+  private refreshSettingsActionTools(instance: MCPServerInstance): Promise<boolean> {
+    if (instance.refreshTools !== undefined || instance.settings === undefined)
+      return this.refreshInstanceTools(instance);
+    return instance.settings.relistTools().then(
+      () => true,
+      (error: unknown) => {
+        log.debug("[MCP] Tool list refresh for a settings action failed", {
+          name: instance.name,
+          error: getErrorMessage(error),
+        });
+        return false;
+      }
+    );
+  }
+
+  /**
    * Refresh the running instance's catalog before a settings action dispatch (bounded). Fails
    * closed: when the refresh times out or fails, the held catalog can be stale (a tool that
    * became writable still reads as read-only and would run without the user's confirmation),
@@ -5240,7 +5264,7 @@ export class MCPServerManager {
   ): Promise<void> {
     const instance = this.workspaceServers.get(workspaceId)?.instances.get(serverName);
     if (instance === undefined || instance.isClosed) return;
-    const refreshed = await raceWithAbortAndTimeout(this.refreshInstanceTools(instance), {
+    const refreshed = await raceWithAbortAndTimeout(this.refreshSettingsActionTools(instance), {
       ...(signal !== undefined ? { signal } : {}),
       timeoutMs: MCP_APP_CATALOG_REFRESH_TIMEOUT_MS,
     });

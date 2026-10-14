@@ -60,7 +60,11 @@ export interface FakeServerBehavior {
   settings?: Partial<
     Pick<
       MCPClientHandle,
-      "settingsCapability" | "callSettingsTool" | "settingsToolAction" | "callSettingsActionTool"
+      | "settingsCapability"
+      | "callSettingsTool"
+      | "settingsToolAction"
+      | "callSettingsActionTool"
+      | "relistTools"
     >
   >;
 }
@@ -287,6 +291,7 @@ export class FakeMcpServers {
       ...behavior.apps,
       settingsCapability: () => undefined,
       settingsToolAction: () => undefined,
+      relistTools: () => Promise.resolve(),
       ...behavior.settings,
     };
     // Tests supply loosely typed prompt/result fixtures; the manager validates them itself.
