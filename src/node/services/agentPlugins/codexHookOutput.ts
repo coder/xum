@@ -106,8 +106,14 @@ export function parsePreToolUseOutput(result: unknown): PreToolUseOutput | null 
   // output; Xum still honors its deny (see NO_REASON) and voids the rest: a rewrite, the context
   // (PRRT_kwDOPxxmWM6sSNEa).
   const unsupported = unknown ?? unsupportedPreToolUseField(raw);
+  // A voided rewrite falls back to a legacy block next to it: the hook refused the original call
+  // and allowed only its rewritten form (Codex PRRT_kwDOPxxmWM6sT8v7).
   const decision: Decision<PreToolUseOutput> =
-    unsupported !== undefined && !("denyReason" in chosen) ? { invalid: unsupported } : chosen;
+    unsupported === undefined || "denyReason" in chosen
+      ? chosen
+      : "denyReason" in legacy
+        ? legacy
+        : { invalid: unsupported };
   return withContext(
     raw,
     decision,
@@ -335,14 +341,28 @@ function readWire(
   const unknown =
     findUnknown(raw, ALLOWED_FIELDS[event].top, "output") ??
     findUnknown(specific, ALLOWED_FIELDS[event].specific ?? [], "hookSpecificOutput");
+  checkFieldTypes(raw, specific, event);
+  return unknown !== undefined ? { raw, specific, unknown } : { raw, specific };
+}
+
+/** Throws when a field has the wrong type or an enum value Codex's schema does not list. */
+function checkFieldTypes(
+  raw: Record<string, unknown>,
+  specific: Record<string, unknown>,
+  event: HookEventName
+): void {
   typed(raw, ["continue", "suppressOutput"], "boolean");
   typed(raw, ["stopReason", "systemMessage", "reason"], "string");
-  typed(specific, ["permissionDecisionReason", "additionalContext"], "string");
+  typed(specific, ["additionalContext"], "string");
   // Every enum is checked here, also one a later rule ignores: Codex's schema rejects the whole
   // output first (PRRT_kwDOPxxmWM6sQVfa, PRRT_kwDOPxxmWM6sQVfk).
   enumField(raw, "decision", event === "PreToolUse" ? ["approve", "block"] : ["block"]);
-  enumField(specific, "permissionDecision", ["allow", "deny", "ask"]);
-  return unknown !== undefined ? { raw, specific, unknown } : { raw, specific };
+  // PreToolUse fields only: elsewhere they are unknown fields, which keep a refusal next to them
+  // (Codex PRRT_kwDOPxxmWM6sT8wA).
+  if (event === "PreToolUse") {
+    typed(specific, ["permissionDecisionReason"], "string");
+    enumField(specific, "permissionDecision", ["allow", "deny", "ask"]);
+  }
 }
 
 /** JSON text; text that looks like JSON but does not parse is a malformed output. */

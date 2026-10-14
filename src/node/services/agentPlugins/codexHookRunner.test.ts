@@ -860,6 +860,47 @@ describe("Codex output rules (output_parser.rs)", () => {
     expect((await runTool(post.spine, "bash", {})).result).toEqual({ ran: {} });
   });
 
+  test("a voided rewrite keeps a legacy block next to it", async () => {
+    // Codex PRRT_kwDOPxxmWM6sT8v7: the hook allowed only the rewritten call.
+    const schema = { type: "object", properties: { script: { type: "string" } } };
+    for (const extra of [{ suppressOutput: true }, { unexpectedField: true }]) {
+      const { spine } = setup([hook("PreToolUse")], () =>
+        json({
+          ...extra,
+          decision: "block",
+          reason: "Only the safe form.",
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "allow",
+            updatedInput: { script: "safe" },
+          },
+        })
+      );
+      expect((await runTool(spine, "bash", { script: "ls" }, schema)).executed).toBe(false);
+    }
+  });
+
+  test("a PreToolUse-only field elsewhere is unknown and keeps the refusal", async () => {
+    // Codex PRRT_kwDOPxxmWM6sT8wA: its value must not make the output malformed.
+    const specific = {
+      hookEventName: "PostToolUse",
+      permissionDecision: "bogus",
+      permissionDecisionReason: 1,
+    };
+    const post = setup([hook("PostToolUse")], () =>
+      json({ decision: "block", reason: "x", hookSpecificOutput: specific })
+    );
+    expect((await runTool(post.spine, "bash", {})).postBlocked).toBe(true);
+    const blocked = await prompt(
+      json({
+        decision: "block",
+        reason: "No.",
+        hookSpecificOutput: { ...specific, hookEventName: "UserPromptSubmit" },
+      })
+    );
+    expect(blocked.kind).toBe("blocked");
+  });
+
   test("an invalid decision value is malformed even when another field decides", async () => {
     const pre = setup([hook("PreToolUse")], () =>
       json({
