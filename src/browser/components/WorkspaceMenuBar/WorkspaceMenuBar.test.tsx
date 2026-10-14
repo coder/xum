@@ -1,6 +1,6 @@
 import "../../../../tests/ui/dom";
 
-import type { ComponentProps, PropsWithChildren, ReactNode } from "react";
+import { StrictMode, type ComponentProps, type PropsWithChildren, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -19,6 +19,7 @@ import * as PopoverErrorHookModule from "@/browser/hooks/usePopoverError";
 import * as DesktopTitlebarModule from "@/browser/hooks/useDesktopTitlebar";
 import * as TutorialContextModule from "@/browser/contexts/TutorialContext";
 import * as ChatCommandsModule from "@/browser/utils/chatCommands";
+import * as FeedbackToastModule from "@/browser/utils/feedbackToast";
 import type { WorkspaceMenuBar as WorkspaceMenuBarComponent } from "./WorkspaceMenuBar";
 import * as WorkspaceMCPModalModule from "../WorkspaceMCPModal/WorkspaceMCPModal";
 import * as WorkspaceUnrelatedMessagingModalModule from "../WorkspaceUnrelatedMessagingModal";
@@ -567,6 +568,108 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
     expect(updateWorkspaceTitleMock).toHaveBeenCalledWith(workspaceId, "Renamed");
     expect(view.getByTestId("workspace-title-input")).toBeTruthy();
+  });
+
+  // #6434: the header is reused across workspaces, so a switch unmounts the open field.
+  it("saves the typed title when the workspace changes under the open field", async () => {
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    await typeTitle(view.getByTestId("workspace-title-input"), "Renamed");
+
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+
+    expect(view.queryByTestId("workspace-title-input")).toBeNull();
+    expect(updateWorkspaceTitleMock.mock.calls).toEqual([[workspaceId, "Renamed"]]);
+  });
+
+  it("reports an emptied title in the shared toast when the workspace changes under the field", async () => {
+    const toast = spyOn(FeedbackToastModule, "showFeedbackToast").mockImplementation(
+      () => undefined
+    );
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    await typeTitle(view.getByTestId("workspace-title-input"), "{Backspace}");
+
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+
+    expect(updateWorkspaceTitleMock).not.toHaveBeenCalled();
+    expect(toast).toHaveBeenCalledWith({
+      type: "error",
+      title: "Could not rename the workspace",
+      message: "Title cannot be empty",
+    });
+  });
+
+  // StrictMode mounts effects twice in development: the first unmount must not save or close.
+  it("keeps the field open under StrictMode's dev remount", () => {
+    const view = render(
+      <StrictMode>
+        <WorkspaceMenuBar {...defaultProps} />
+      </StrictMode>
+    );
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    expect(view.getByTestId("workspace-title-input")).toBeTruthy();
+    expect(updateWorkspaceTitleMock).not.toHaveBeenCalled();
+  });
+
+  it("a save from a field that is gone leaves a newer edit of the same workspace open", async () => {
+    let settleSave: (result: { success: boolean }) => void = () => undefined;
+    updateWorkspaceTitleMock.mockImplementation(
+      () => new Promise((resolve) => (settleSave = resolve))
+    );
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    await typeTitle(view.getByTestId("workspace-title-input"), "Renamed");
+
+    // Away and back while the unmount save is pending, then a new edit of the same workspace.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+    view.rerender(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    await act(async () => {
+      settleSave({ success: true });
+      await Promise.resolve();
+    });
+
+    expect(updateWorkspaceTitleMock).toHaveBeenCalledTimes(1);
+    expect(view.getByTestId("workspace-title-input")).toBeTruthy();
+  });
+
+  it("reports a save that fails after its field is gone in the shared toast", async () => {
+    const toast = spyOn(FeedbackToastModule, "showFeedbackToast").mockImplementation(
+      () => undefined
+    );
+    let settleSave: (result: { success: boolean; error?: string }) => void = () => undefined;
+    updateWorkspaceTitleMock.mockImplementation(
+      () => new Promise((resolve) => (settleSave = resolve))
+    );
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    await typeTitle(view.getByTestId("workspace-title-input"), "Renamed{Enter}");
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+
+    await act(async () => {
+      settleSave({ success: false, error: "Title taken" });
+      await Promise.resolve();
+    });
+    expect(toast).toHaveBeenCalledWith({
+      type: "error",
+      title: "Could not rename the workspace",
+      message: "Title taken",
+    });
+    // The popover belongs to the gone field: it shows nothing.
+    expect(archiveShowErrorMock).not.toHaveBeenCalled();
   });
 
   it("ignores Escape while the save is pending, so the field closes only when it settles", async () => {

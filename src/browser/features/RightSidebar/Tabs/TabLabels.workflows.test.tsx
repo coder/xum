@@ -48,7 +48,7 @@ describe("WorkflowsTabLabel", () => {
 
     expect(getByText("Workflows")).toBeTruthy();
     // No active-run accent when the workspace has nothing running.
-    expect(container.querySelector(".text-accent")).toBeNull();
+    expect(container.querySelector(".text-accent-text")).toBeNull();
   });
 
   test("shows the active-run count badge when runs are in flight", () => {
@@ -56,7 +56,7 @@ describe("WorkflowsTabLabel", () => {
 
     const { container, getByText } = render(<WorkflowsTabLabel workspaceId="w1" />);
 
-    const badge = container.querySelector(".text-accent");
+    const badge = container.querySelector(".text-accent-text");
     expect(badge).not.toBeNull();
     expect(getByText("3")).toBeTruthy();
   });
@@ -67,6 +67,6 @@ describe("WorkflowsTabLabel", () => {
     const { container, getByText } = render(<WorkflowsTabLabel workspaceId="w1" />);
 
     expect(getByText("Workflows")).toBeTruthy();
-    expect(container.querySelector(".text-accent")).toBeNull();
+    expect(container.querySelector(".text-accent-text")).toBeNull();
   });
 });

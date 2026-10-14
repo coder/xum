@@ -36,6 +36,8 @@ export const McpAppViewSchema = z.object({
   result: z.unknown().nullable(),
   /** Origins the user allowed this view's server to reach in this project (mcpAppViewDomains). */
   approvedDomains: z.array(z.string()).optional(),
+  /** Backend commit revision of `approvedDomains` (mcpAppsOperations.ts): newer lists win. */
+  approvedDomainsRevision: z.number().optional(),
   /**
    * The project whose approvals the view's server uses (a multi-project workspace's server
    * project, never the shared `_multi` bucket); null when none can be approved.
@@ -81,6 +83,10 @@ export const McpAppViewRecordSchema = z
     toolName: z.string().min(1),
     resourceUri: z.string().refine(isMcpAppResourceUri, "resourceUri must be a ui:// URI"),
     arguments: z.unknown(),
+    /** The record is an entry point's view, not a tool call's (only an open writes it). */
+    entrypoint: z.literal(true).optional(),
+    /** How a call without a result ended (McpAppResultRecord.outcome); absent when it completed. */
+    outcome: z.enum(["failed", "interrupted"]).optional(),
   })
   .nullable();
 export type McpAppViewRecord = z.infer<typeof McpAppViewRecordSchema>;

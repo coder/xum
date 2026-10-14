@@ -42,7 +42,7 @@ import {
   hasDraftBlock,
   joinDraftText,
   removeDraftBlock,
-  removeSentText,
+  takeSentText,
 } from "@/common/utils/composerDraftText";
 import {
   buildLegacyDraftText,
@@ -607,7 +607,7 @@ export class DraftService extends EventEmitter {
 
   /**
    * Idempotent sends: the one draft write before a composer send. The sent text leaves the visible
-   * text (removeSentText, computed here so another window's newer visible edits stay) and is
+   * text (takeSentText, computed here so another window's newer visible edits stay) and is
    * retained in the legacy text with the attachments; the entry keeps the exact request for
    * retries. Idempotent by send id: a repeat with the same send changes nothing but its receiver; a
    * different payload under a known id is refused.
@@ -655,7 +655,11 @@ export class DraftService extends EventEmitter {
       }
       const merged = mergeWrite(current, { text: input.text }, basis, accepted);
       const next = storedDraftFrom(
-        removeSentText(merged.visibleText, pendingSend.text),
+        takeSentText(
+          merged.visibleText,
+          pendingSend.text,
+          merged.visibleText === input.typedAfterSendText
+        ),
         attachments,
         [...current.pendingSends, pendingSend]
       );

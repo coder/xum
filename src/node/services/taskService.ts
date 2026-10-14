@@ -306,6 +306,7 @@ import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibil
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import type { StartupRecoveryState } from "@/node/services/startupRecovery";
 import { judgeLifecycleMarkerOwner } from "@/node/services/lifecycleMarkerOwners";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
@@ -1196,6 +1197,57 @@ const WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE = "Workspace is busy; idle-only send
  */
 const MULTI_PROJECT_SHARED_ISOLATION_ERROR =
   'isolation: "none" is not supported for multi-project workspaces; omit isolation or pass isolation: "fork" to run the sub-agent in forked checkouts.';
+
+/**
+ * Whether startup recovery acts on this row: a `running` or `awaiting_report` task (a legacy row
+ * without a taskStatus reads as running) that no other live backend holds a use lease on.
+ */
+function isActiveStartupTask(
+  task: AgentTaskWorkspaceEntry,
+  inUseElsewhere: ReadonlySet<string>
+): boolean {
+  if (!task.id || inUseElsewhere.has(task.id)) return false;
+  return ["running", "awaiting_report"].includes(task.taskStatus ?? "running");
+}
+
+/**
+ * Whether startup recovery re-drives this row. Archived rows are not re-driven. Archiving stops a
+ * task's stream but keeps its taskStatus (see isActiveAgentTaskEntry), and every send to an
+ * archived workspace is refused, so a re-drive failed on every restart. An unarchive makes the row
+ * an ordinary one again, and a task_send_message to it unarchives and reactivates it.
+ */
+function isStartupRedriveCandidate(
+  task: AgentTaskWorkspaceEntry,
+  inUseElsewhere: ReadonlySet<string>
+): boolean {
+  return (
+    isActiveStartupTask(task, inUseElsewhere) &&
+    !isWorkspaceArchived(task.archivedAt, task.unarchivedAt)
+  );
+}
+
+/**
+ * A legacy task row (no taskStatus) has no durable evidence that it was running: startup recovery
+ * sends it the restart nudge only for an interrupted history tail.
+ */
+function lacksLegacyRestartEvidence(
+  task: AgentTaskWorkspaceEntry,
+  state: StartupRecoveryState | undefined
+): boolean {
+  return task.taskStatus == null && state !== "interrupted";
+}
+
+/**
+ * A legacy task row that startup recovery has no work for: no restart evidence, no pending
+ * guidance, and an `idle` probe, which proves no compaction follow-up is pending either.
+ */
+function isIdleLegacyStartupTask(
+  task: AgentTaskWorkspaceEntry,
+  state: StartupRecoveryState | undefined,
+  pendingGuidanceCount: number
+): boolean {
+  return state === "idle" && pendingGuidanceCount === 0 && lacksLegacyRestartEvidence(task, state);
+}
 
 function isWorkspaceBusyIdleOnlySend(error: unknown): boolean {
   return (
@@ -5696,15 +5748,16 @@ export class TaskService implements AgentTaskIntegration {
     let config = this.config.loadConfigOrDefault();
     let taskIndex = this.buildAgentTaskIndex(config);
     const startupTasks = () =>
-      this.listAgentTaskWorkspaces(config).filter(
-        (task) =>
-          task.id &&
-          !inUseElsewhere.has(task.id) &&
-          ["running", "awaiting_report"].includes(task.taskStatus ?? "running")
+      this.listAgentTaskWorkspaces(config).filter((task) =>
+        isStartupRedriveCandidate(task, inUseElsewhere)
       );
 
-    // Workflow cancellation is authoritative even when a child has its own Stop or question.
-    for (const task of startupTasks()) {
+    // Workflow cancellation is authoritative even when a child has its own Stop or question, and
+    // for archived rows too: a cancelled run's archived child must not stay active until unarchive.
+    const activeTasks = this.listAgentTaskWorkspaces(config).filter((task) =>
+      isActiveStartupTask(task, inUseElsewhere)
+    );
+    for (const task of activeTasks) {
       await this.interruptTaskRecoveryForInactiveWorkflowOwner(
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         task.id!,
@@ -5882,6 +5935,9 @@ export class TaskService implements AgentTaskIntegration {
         skippedRunningDueToActiveDescendants += 1;
         continue;
       }
+      // Decided before the attempt rotation below: that rotation writes the whole config file,
+      // and a large config with many legacy rows outlived the startup step bound (#6511).
+      if (isIdleLegacyStartupTask(task, states.get(task.id), pendingGuidance.length)) continue;
 
       // Admission classification: startup re-drive (compaction follow-up, guidance replay or the
       // restart nudge) = new UNOWNED attempt; rotate + mark once before the first send, guarded
@@ -5959,7 +6015,7 @@ export class TaskService implements AgentTaskIntegration {
       }
 
       // Legacy tasks lack active-status evidence. Durable compaction/guidance above still wins.
-      if (task.taskStatus == null && states.get(task.id) !== "interrupted") continue;
+      if (lacksLegacyRestartEvidence(task, states.get(task.id))) continue;
       const isPlanLike = await this.isPlanLikeTaskWorkspace({
         projectPath: task.projectPath,
         workspace: task,
@@ -16488,7 +16544,7 @@ export class TaskService implements AgentTaskIntegration {
 
   listAgentTaskExecutionEntries(
     config: ReturnType<Config["loadConfigOrDefault"]>
-  ): Array<{ id?: string; taskExecutionId?: string }> {
+  ): Array<Pick<WorkspaceConfigEntry, "id" | "taskExecutionId" | "taskExecutionStatus">> {
     return this.listAgentTaskWorkspaces(config);
   }
 

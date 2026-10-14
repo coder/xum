@@ -119,7 +119,8 @@ export function registerCodexPluginHooks(
               "UserPromptSubmit",
               registration,
               parseUserPromptSubmitOutput,
-              { cwd: ctx.cwd }
+              // A withdrawn send ends this call, and invoke skips the later ones.
+              { cwd: ctx.cwd, abortSignal: ctx.signal }
             );
             if (output === null) continue;
             if (output.stopped === true || output.blockReason !== undefined) {

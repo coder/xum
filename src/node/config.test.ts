@@ -625,6 +625,135 @@ describe("Config", () => {
     });
   });
 
+  // #5929: a writer that skips the registration lock (a manual editor, an older build) can
+  // replace config.json between an edit's fresh read and its save. The save then refuses to
+  // overwrite the bytes it did not read.
+  describe("saveConfig after an outside write", () => {
+    const outside = JSON.stringify({ projects: [], updateChannel: "npm", note: "outside" });
+
+    async function editWithOutsideWrite(writeOutside: (file: string) => void): Promise<unknown> {
+      const configFile = path.join(tempDir, "config.json");
+      return config
+        .editConfig((value) => {
+          // The transform runs after the edit's fresh read: write the way an outside writer would.
+          writeOutside(configFile);
+          return { ...value, updateChannel: "nightly" };
+        })
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+    }
+
+    beforeEach(async () => {
+      await config.setUpdateChannel("stable");
+    });
+
+    const writers: Array<[string, (file: string) => void]> = [
+      [
+        "an atomic rename",
+        (file) => {
+          fs.writeFileSync(`${file}.outside`, outside);
+          fs.renameSync(`${file}.outside`, file);
+        },
+      ],
+      ["an in-place write", (file) => fs.writeFileSync(file, outside)],
+    ];
+    for (const [name, writeOutside] of writers) {
+      it(`rejects the edit and keeps the outside bytes after ${name}`, async () => {
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          const error = await editWithOutsideWrite(writeOutside);
+          expect(String(error)).toContain("config.json changed on disk");
+          expect(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")).toBe(outside);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+    }
+
+    it("rejects the edit when config.json appears after a read that found none", async () => {
+      fs.rmSync(path.join(tempDir, "config.json"));
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        const error = await editWithOutsideWrite((file) => fs.writeFileSync(file, outside));
+        expect(String(error)).toContain("config.json changed on disk");
+        expect(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")).toBe(outside);
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("rejects the edit when the config.json symlink is retargeted during the save", async () => {
+      const configFile = path.join(tempDir, "config.json");
+      const first = path.join(tempDir, "first.json");
+      const second = path.join(tempDir, "second.json");
+      fs.renameSync(configFile, first);
+      fs.symlinkSync(first, configFile);
+      fs.writeFileSync(second, outside);
+      // Retarget the link right after the atomic writer resolved it, so it renames onto `first`,
+      // which config.json no longer names.
+      // writeFileAtomic reads fs through the CommonJS object, so spy on that one.
+      const realRealpath = cjsFs.realpath.bind(cjsFs);
+      const realpathSpy = spyOn(cjsFs, "realpath").mockImplementation(((
+        file: fs.PathLike,
+        callback: (error: NodeJS.ErrnoException | null, resolved?: string) => void
+      ) => {
+        realRealpath(file, (error, resolved) => {
+          if (String(file) === configFile) {
+            fs.rmSync(configFile);
+            fs.symlinkSync(second, configFile);
+          }
+          callback(error, resolved);
+        });
+      }) as unknown as typeof cjsFs.realpath);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        const error = await config.setUpdateChannel("nightly").then(
+          () => null,
+          (caught: unknown) => caught
+        );
+        expect(String(error)).toContain("config.json changed on disk");
+        expect(fs.readFileSync(configFile, "utf-8")).toBe(outside);
+      } finally {
+        realpathSpy.mockRestore();
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("saves two edits in a row without an outside write", async () => {
+      // The second edit reads the bytes the first one renamed into place, so its own check holds.
+      await config.setUpdateChannel("nightly");
+      await config.setUpdateChannel("npm");
+      expect(new Config(tempDir).getUpdateChannel()).toBe("npm");
+    });
+
+    it("saves a retry on the same Config after a refusal, and memory matches disk", async () => {
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        const error = await editWithOutsideWrite((file) => fs.writeFileSync(file, outside));
+        expect(String(error)).toContain("config.json changed on disk");
+      } finally {
+        errorSpy.mockRestore();
+      }
+      // No restart: the retry reads the outside bytes fresh and saves on top of them.
+      await config.setUpdateChannel("nightly");
+      const saved = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        updateChannel?: string;
+        note?: string;
+      };
+      expect(saved.updateChannel).toBe("nightly");
+      expect(config.getUpdateChannel()).toBe("nightly");
+      expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+    });
+
+    it("saves an edit that reads the outside bytes first", async () => {
+      fs.writeFileSync(path.join(tempDir, "config.json"), outside);
+      await config.setUpdateChannel("nightly");
+      expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+    });
+  });
+
   describe("loadConfigOrDefault settingsBackup sanitizing", () => {
     it("degrades a malformed settingsBackup instead of returning it", () => {
       // Reaching the IPC output validator would fail the whole settings read, so one bad field
@@ -1386,6 +1515,260 @@ describe("Config", () => {
         }
       });
     }
+
+    // #5929: a degraded load (the backup keeps failing) logs once per distinct content.
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "logs a failed backup once per distinct content",
+      () => {
+        const contentA = conflictCases[0][1]();
+        const contentB = conflictCases[1][1]();
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        const logged = () =>
+          errorSpy.mock.calls.filter(([message]) => String(message).includes("the backup of"))
+            .length;
+        writeProjects(contentA);
+        // A read-only config dir makes the sidecar write fail. config.json itself stays
+        // writable, so the test can still change its contents.
+        fs.chmodSync(tempDir, 0o500);
+        try {
+          config.loadConfigOrDefault();
+          config.loadConfigOrDefault();
+          expect(logged()).toBe(1);
+
+          writeProjects(contentB);
+          config.loadConfigOrDefault();
+          writeProjects(contentA);
+          config.loadConfigOrDefault();
+          expect(logged()).toBe(2);
+        } finally {
+          fs.chmodSync(tempDir, 0o700);
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "logs a failed backup again after a load without the conflict ends the failure",
+      () => {
+        const content = conflictCases[0][1]();
+        const configFile = path.join(tempDir, "config.json");
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        const logged = () =>
+          errorSpy.mock.calls.filter(([message]) => String(message).includes("the backup of"))
+            .length;
+        writeProjects(content);
+        fs.chmodSync(tempDir, 0o500);
+        try {
+          config.loadConfigOrDefault();
+          // The file goes away, then comes back with the same bytes: a new failure episode.
+          fs.chmodSync(tempDir, 0o700);
+          fs.renameSync(configFile, `${configFile}.moved`);
+          config.loadConfigOrDefault();
+          fs.renameSync(`${configFile}.moved`, configFile);
+          fs.chmodSync(tempDir, 0o500);
+          config.loadConfigOrDefault();
+          expect(logged()).toBe(2);
+        } finally {
+          fs.chmodSync(tempDir, 0o700);
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
+    // Each degraded load searches for an identical backup again: a search that failed found
+    // nothing, and an identical backup it missed must still be reused later.
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "scans again after a reuse scan that failed, and reuses the backup it then finds",
+      async () => {
+        writeProjects(conflictCases[0][1]());
+        const configFile = path.join(tempDir, "config.json");
+        const existing = `${configFile}.alias-conflict-1`;
+        fs.writeFileSync(existing, fs.readFileSync(configFile), { mode: 0o600 });
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        // A read-only config dir makes every new sidecar fail, so only a reuse can succeed.
+        fs.chmodSync(tempDir, 0o500);
+        const readdirSpy = spyOn(fs, "readdirSync").mockImplementationOnce(() => {
+          throw Object.assign(new Error("EIO: i/o error, scandir"), { code: "EIO" });
+        });
+        let blocked: unknown;
+        try {
+          config.loadConfigOrDefault();
+          config.loadConfigOrDefault();
+          blocked = await config.setUpdateChannel("nightly").then(
+            () => null,
+            (error: unknown) => error
+          );
+        } finally {
+          readdirSpy.mockRestore();
+          fs.chmodSync(tempDir, 0o700);
+          errorSpy.mockRestore();
+        }
+        // The second load found the existing backup, so the alias gate no longer refuses edits.
+        expect(String(blocked)).not.toContain("could not back them up");
+        expect(aliasConflictBackups()).toEqual([existing]);
+      }
+    );
+
+    // Perf contract (#5929): the alias merge adds no file reads or directory listings to a load
+    // without a legacy-copy shape, with or without aliases.
+    for (const [name, stored] of [
+      ["no aliases", () => [["/home/u/repo", { workspaces: [row("ws-one")] }]] as StoredPair[]],
+      [
+        "two aliases with distinct rows",
+        () =>
+          [
+            ["/home/u/repo", { workspaces: [row("ws-one")] }],
+            ["/home/u/repo/", { workspaces: [row("ws-two")] }],
+          ] as StoredPair[],
+      ],
+    ] as const) {
+      it(`reads no session metadata and lists no directory on a load with ${name}`, () => {
+        writeProjects(stored());
+        const readSpy = spyOn(fs, "readFileSync");
+        const readdirSpy = spyOn(fs, "readdirSync");
+        const warnSpy = spyOn(log, "warn").mockImplementation(() => undefined);
+        try {
+          config.loadConfigOrDefault();
+          // feature_flags.json is the existing legacy heartbeat probe, not the alias merge.
+          expect(readSpy.mock.calls.map(([file]) => path.basename(String(file))).sort()).toEqual([
+            "config.json",
+            "feature_flags.json",
+          ]);
+          expect(readdirSpy).not.toHaveBeenCalled();
+        } finally {
+          readSpy.mockRestore();
+          readdirSpy.mockRestore();
+          warnSpy.mockRestore();
+        }
+      });
+    }
+
+    // #5929: an id-less legacy row in one alias and an id row in another, on one checkout path.
+    describe("an id-less row and an id row on the same path", () => {
+      // StoredPair rows need an id, so this writes the id-less row as plain JSON.
+      function writeLegacyAndIdRows(checkout: string, id: string): void {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              ["/home/u/repo/", { workspaces: [{ name: "x", path: checkout }] }],
+              ["/home/u/repo", { workspaces: [{ id, name: "x", path: checkout }] }],
+            ],
+          })
+        );
+      }
+
+      function checkoutPath(): string {
+        return path.join(config.srcDir, "repo", "x");
+      }
+
+      function writeLegacyMetadata(checkout: string, id: string): string {
+        const dir = path.join(
+          config.sessionsDir,
+          config.generateLegacyId("/home/u/repo", checkout)
+        );
+        fs.mkdirSync(dir, { recursive: true });
+        const file = path.join(dir, "metadata.json");
+        fs.writeFileSync(file, JSON.stringify({ id, name: "x", projectPath: "/home/u/repo" }));
+        return file;
+      }
+
+      async function savedIdsOnCheckout(checkout: string): Promise<Array<string | undefined>> {
+        await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+        await flushConfigEdits();
+        return readSavedProjects()
+          .flatMap(([, project]) => project.workspaces)
+          .filter((w) => w.path === checkout)
+          .map((w) => (w as { id?: string }).id);
+      }
+
+      const sameWorkspaceCases: Array<[string, (checkout: string) => string]> = [
+        [
+          "the id row has the legacy id",
+          (checkout) => config.generateLegacyId("/home/u/repo", checkout),
+        ],
+        [
+          "the legacy metadata.json names the id row's id",
+          (checkout) => {
+            writeLegacyMetadata(checkout, "stable-1");
+            return "stable-1";
+          },
+        ],
+      ];
+      for (const [name, idForCheckout] of sameWorkspaceCases) {
+        it(`keeps one row and backs up the original bytes when ${name}`, async () => {
+          const checkout = checkoutPath();
+          const id = idForCheckout(checkout);
+          writeLegacyAndIdRows(checkout, id);
+          const original = fs.readFileSync(path.join(tempDir, "config.json"));
+          const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+          try {
+            expect(await savedIdsOnCheckout(checkout)).toEqual([id]);
+            const backups = aliasConflictBackups();
+            expect(backups).toHaveLength(1);
+            expect(fs.readFileSync(backups[0])).toEqual(original);
+          } finally {
+            errorSpy.mockRestore();
+          }
+        });
+      }
+
+      it("keeps both rows when the two legacy metadata files name different ids", () => {
+        const checkout = checkoutPath();
+        writeLegacyMetadata(checkout, "stable-1");
+        // The old layout's sessions/<checkout basename>/metadata.json names a second identity.
+        const basenameDir = path.join(config.sessionsDir, path.basename(checkout));
+        fs.mkdirSync(basenameDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(basenameDir, "metadata.json"),
+          JSON.stringify({ id: "other-1" })
+        );
+        writeLegacyAndIdRows(checkout, "stable-1");
+        const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+        expect(rows?.filter((w) => w.path === checkout)).toHaveLength(2);
+        expect(aliasConflictBackups()).toHaveLength(0);
+      });
+
+      it("keeps both rows and loads normally when the rows have no path", () => {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              ["/home/u/repo/", { workspaces: [{ name: "x" }] }],
+              ["/home/u/repo", { workspaces: [{ id: "stable-1", name: "x" }] }],
+            ],
+          })
+        );
+        const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+        expect(rows?.map((w) => w.id)).toEqual([undefined, "stable-1"]);
+        expect(config.getConfigLoadError()).toBeNull();
+      });
+
+      it("keeps both rows when the legacy row resolves to another id", async () => {
+        const checkout = checkoutPath();
+        writeLegacyAndIdRows(checkout, "stable-1");
+        const ids = await savedIdsOnCheckout(checkout);
+        expect(ids).toHaveLength(2);
+        expect(ids).toContain("stable-1");
+        expect(aliasConflictBackups()).toHaveLength(0);
+      });
+
+      (process.getuid?.() === 0 ? it.skip : it)(
+        "keeps both rows when the legacy metadata.json cannot be read",
+        () => {
+          const checkout = checkoutPath();
+          const metadataFile = writeLegacyMetadata(checkout, "stable-1");
+          fs.chmodSync(metadataFile, 0o000);
+          writeLegacyAndIdRows(checkout, "stable-1");
+          try {
+            const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+            expect(rows?.filter((w) => w.path === checkout)).toHaveLength(2);
+          } finally {
+            fs.chmodSync(metadataFile, 0o600);
+          }
+        }
+      );
+    });
 
     it("gives merged legacy rows without an id distinct workspace ids", async () => {
       const first = { name: "first", path: path.join(config.srcDir, "repo", "first") };

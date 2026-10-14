@@ -28,20 +28,21 @@ const McpAppWidgetCspSchema = z.object({
   frame_domains: DomainList,
 });
 
+/**
+ * `_meta.ui.csp` with each list it omits taken from the legacy alias. A declared standard list
+ * (even an empty one) replaces its legacy list: OpenAI documents `openai/widgetCSP` as superseded
+ * by `_meta.ui.csp`, so a server that narrowed the standard list must not get the stale legacy
+ * origins back (#6181).
+ */
 function mergeCsp(
   ui: McpAppCspDeclaration,
   alias: z.infer<typeof McpAppWidgetCspSchema>
 ): McpAppCspDeclaration {
-  // Capped like each source list, so the merged view still fits McpAppCspDeclarationSchema.
-  const union = (a: string[] | undefined, b: string[] | undefined) =>
-    a === undefined && b === undefined
-      ? undefined
-      : [...new Set([...(a ?? []), ...(b ?? [])])].slice(0, MCP_APP_CSP_DOMAINS_MAX);
   const merged: McpAppCspDeclaration = {
     ...ui,
-    connectDomains: union(ui.connectDomains, alias.connect_domains),
-    resourceDomains: union(ui.resourceDomains, alias.resource_domains),
-    frameDomains: union(ui.frameDomains, alias.frame_domains),
+    connectDomains: ui.connectDomains ?? alias.connect_domains,
+    resourceDomains: ui.resourceDomains ?? alias.resource_domains,
+    frameDomains: ui.frameDomains ?? alias.frame_domains,
   };
   return Object.fromEntries(Object.entries(merged).filter(([, v]) => v !== undefined));
 }
@@ -61,8 +62,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * `openai/outputTemplate`: the alias is resolved into a plain resourceUri at tool discovery, so
  * this reader cannot tell which key named the view, and carrying that through would add a field
  * to tool metadata, display snapshots and result records. Both types are HTML rendered in the
- * same sandbox, so accepting either grants nothing extra. The declared CSP is `_meta.ui.csp`
- * merged with ChatGPT's `openai/widgetCSP` alias (mergeCsp). Either way a declared domain is
+ * same sandbox, so accepting either grants nothing extra. The declared CSP is `_meta.ui.csp`,
+ * with ChatGPT's `openai/widgetCSP` alias for each list it omits (mergeCsp). Either way a declared domain is
  * granted only after the user approves it for the server (mcpAppCsp.ts).
  */
 export function extractMcpAppResource(result: unknown, uri: string): McpAppResource {
@@ -95,14 +96,17 @@ export function extractMcpAppResource(result: unknown, uri: string): McpAppResou
     );
   }
   const ui = isRecord(content._meta) && isRecord(content._meta.ui) ? content._meta.ui : {};
-  const csp = McpAppCspDeclarationSchema.safeParse(ui.csp ?? {});
+  // Only an absent ui.csp means "not declared": a present null is a malformed declaration.
+  const csp = McpAppCspDeclarationSchema.safeParse(ui.csp === undefined ? {} : ui.csp);
   const alias = McpAppWidgetCspSchema.safeParse(
     (isRecord(content._meta) ? content._meta["openai/widgetCSP"] : undefined) ?? {}
   );
   return {
     html: bytes.toString("utf8"),
-    // A malformed declaration grants nothing rather than failing the whole view.
-    csp: mergeCsp(csp.success ? csp.data : {}, alias.success ? alias.data : {}),
+    // A malformed declaration grants nothing rather than failing the whole view. A declared but
+    // malformed ui.csp also blocks the legacy alias (fail closed, #6181): the server declared the
+    // standard field, which supersedes the alias, and Xum cannot tell which lists it meant.
+    csp: csp.success ? mergeCsp(csp.data, alias.success ? alias.data : {}) : {},
     prefersBorder: typeof ui.prefersBorder === "boolean" ? ui.prefersBorder : null,
   };
 }

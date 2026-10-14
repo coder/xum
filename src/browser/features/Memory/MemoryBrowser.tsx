@@ -449,13 +449,13 @@ function MemoryFileRow(props: MemoryFileRowProps) {
         >
           <span className="truncate">{base}</span>
           {props.agentEdited && (
-            <span className="bg-accent/15 text-accent shrink-0 rounded px-1.5 py-px text-[10px] font-medium">
+            <span className="bg-accent/15 text-accent-text shrink-0 rounded px-1.5 py-px text-[10px] font-medium">
               agent edited
             </span>
           )}
         </button>
         {props.file.pinned && (
-          <Pin className="text-accent h-3.5 w-3.5 shrink-0 fill-current" aria-hidden="true" />
+          <Pin className="text-accent-text h-3.5 w-3.5 shrink-0 fill-current" aria-hidden="true" />
         )}
         {/* Reserved-width actions revealed on hover/focus so rows stay quiet
             at rest without layout shift. */}

@@ -22,6 +22,19 @@ export function removeSentText(current: string, sent: string): string {
 }
 
 /**
+ * The composer text after its own send took `sent`, the text it held at Enter (#6405). The
+ * composer stays on from Enter, so keys typed before the take follow the sent text directly
+ * ("first messagex", "first message  indented"). `typedAfterSend`: every edit since Enter kept
+ * `sent` as the prefix (DraftStore.takeSendMark). Then exactly that prefix goes, and the keys
+ * after it stay as typed. Otherwise the text was replaced or restored meanwhile, and only
+ * removeSentText's whitespace rule applies: "yesterday" is not a copy of "yes".
+ */
+export function takeSentText(current: string, sent: string, typedAfterSend: boolean): string {
+  if (typedAfterSend && current.startsWith(sent)) return current.slice(sent.length);
+  return removeSentText(current, sent);
+}
+
+/**
  * Where the whitespace run next to `index` ends, walking in `step` direction (-1: before it,
  * 1: from it), and whether that run holds a blank line (two line breaks).
  */

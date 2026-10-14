@@ -222,7 +222,7 @@ Xum also provides flattened tool input env vars so hook scripts can stay compact
 - Nested objects become `XUM_TOOL_INPUT_<PARENT>_<CHILD>`
 - Arrays also include `..._COUNT` and per-index variables like `..._<INDEX>`
 
-If a value is too large for the environment, it may be omitted (not set). Xum also caps the number of flattened env vars and array elements to keep hook execution reliable.
+If a value is too large for the environment or contains a NUL byte, Xum omits it (not set). Xum also caps the number of flattened env vars and array elements to keep hook execution reliable.
 
 {/* BEGIN TOOL_HOOK_ENV_VARS */}
 
@@ -260,21 +260,21 @@ If a value is too large for the environment, it may be omitted (not set). Xum al
 <details>
 <summary>agent_skill_read (1)</summary>
 
-| Env var               | JSON path | Type   | Description          |
-| --------------------- | --------- | ------ | -------------------- |
-| `XUM_TOOL_INPUT_NAME` | `name`    | string | Skill directory name |
+| Env var               | JSON path | Type   | Description                                                      |
+| --------------------- | --------- | ------ | ---------------------------------------------------------------- |
+| `XUM_TOOL_INPUT_NAME` | `name`    | string | Skill name, or &lt;plugin&gt;:&lt;skill&gt; for a plugin's skill |
 
 </details>
 
 <details>
 <summary>agent_skill_read_file (4)</summary>
 
-| Env var                    | JSON path  | Type   | Description                                            |
-| -------------------------- | ---------- | ------ | ------------------------------------------------------ |
-| `XUM_TOOL_INPUT_FILE_PATH` | `filePath` | string | Path inside the skill directory (relative; no ~ or ..) |
-| `XUM_TOOL_INPUT_LIMIT`     | `limit`    | number | Max lines from offset (default all)                    |
-| `XUM_TOOL_INPUT_NAME`      | `name`     | string | Skill directory name                                   |
-| `XUM_TOOL_INPUT_OFFSET`    | `offset`   | number | 1-based start line (default 1)                         |
+| Env var                    | JSON path  | Type   | Description                                                      |
+| -------------------------- | ---------- | ------ | ---------------------------------------------------------------- |
+| `XUM_TOOL_INPUT_FILE_PATH` | `filePath` | string | Path inside the skill directory (relative; no ~ or ..)           |
+| `XUM_TOOL_INPUT_LIMIT`     | `limit`    | number | Max lines from offset (default all)                              |
+| `XUM_TOOL_INPUT_NAME`      | `name`     | string | Skill name, or &lt;plugin&gt;:&lt;skill&gt; for a plugin's skill |
+| `XUM_TOOL_INPUT_OFFSET`    | `offset`   | number | 1-based start line (default 1)                                   |
 
 </details>
 

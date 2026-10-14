@@ -50,9 +50,15 @@ export function useMcpAppEntrypoints(workspaceId: string): readonly McpAppEntryp
  * point, so a tool with both types does not show two identical rows.
  */
 export function mcpAppEntrypointDescription(entrypoint: McpAppEntrypoint): string {
-  return entrypoint.type === "thread"
-    ? `${entrypoint.serverLabel} · this chat`
-    : entrypoint.serverLabel;
+  return withEntrypointScope(entrypoint.serverLabel, entrypoint.type);
+}
+
+/** `text`, then " · this chat" for a `thread` entry point (rows, palette, app tabs). */
+export function withEntrypointScope(
+  text: string,
+  type: McpAppEntrypoint["type"] | undefined
+): string {
+  return type === "thread" ? `${text} · this chat` : text;
 }
 
 /** Publish a settled list, or `"pending"` while it is being listed. */
@@ -76,15 +82,34 @@ function setMcpAppEntrypoints(workspaceId: string, list: readonly McpAppEntrypoi
   emit();
 }
 
-/** An open returned the entry point as it is now (its view may have moved): list that one. */
+/**
+ * An open returned the entry point as it is now (its view may have moved): list that one, in
+ * its place, so the launcher and palette rows do not move. Only a new key goes at the end.
+ */
 function updateMcpAppEntrypoint(workspaceId: string, entrypoint: McpAppEntrypoint) {
   const list = entrypointsByWorkspace.get(workspaceId);
   if (list === undefined) return;
-  setMcpAppEntrypoints(workspaceId, [
-    ...list.filter((listed) => listed.viewKey !== entrypoint.viewKey),
-    entrypoint,
-  ]);
+  setMcpAppEntrypoints(workspaceId, withEntrypoint(list, entrypoint));
 }
+
+/** `list` with `entrypoint` in place of the item of its key, or at the end when it is new. */
+function withEntrypoint(
+  list: readonly McpAppEntrypoint[],
+  entrypoint: McpAppEntrypoint
+): readonly McpAppEntrypoint[] {
+  const index = list.findIndex((item) => item.viewKey === entrypoint.viewKey);
+  return index === -1 ? [...list, entrypoint] : list.with(index, entrypoint);
+}
+
+/** The fields of an entry point's view ref that come from its entry point. */
+const REF_FIELDS = [
+  "serverName",
+  "serverLabel",
+  "resourceUri",
+  "toolName",
+  "label",
+  "entrypointType",
+] as const satisfies ReadonlyArray<keyof McpAppViewRef>;
 
 /** The view an entry point's app tab shows: its stored record is keyed by `viewKey`. */
 export function entrypointViewRef(
@@ -93,15 +118,6 @@ export function entrypointViewRef(
 ): McpAppViewRef {
   const key = refKey(workspaceId, entrypoint.viewKey);
   const known = viewRefs.get(key);
-  if (
-    known?.serverName === entrypoint.serverName &&
-    known.serverLabel === entrypoint.serverLabel &&
-    known.resourceUri === entrypoint.resourceUri &&
-    known.toolName === entrypoint.toolName &&
-    known.label === entrypoint.title
-  ) {
-    return known;
-  }
   const ref: McpAppViewRef = {
     toolCallId: entrypoint.viewKey,
     serverName: entrypoint.serverName,
@@ -112,7 +128,10 @@ export function entrypointViewRef(
     arguments: {},
     cancelled: false,
     failed: false,
+    entrypointType: entrypoint.type,
   };
+  // Keep the known ref while it shows the same view (no arguments or outcome to compare).
+  if (known !== undefined && REF_FIELDS.every((field) => known[field] === ref[field])) return known;
   viewRefs.set(key, ref);
   return ref;
 }

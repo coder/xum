@@ -210,6 +210,9 @@ describe("MCP Apps view domain approvals", () => {
       record?: McpAppResultRecord;
       // A multi-project workspace (stored under _multi, first project /a) and its servers.
       multi?: Record<string, Partial<MCPServerInfo>>;
+      // A task of a multi-project workspace: stored under its first project, but it keeps the
+      // parent's project list (Task.createMany).
+      multiTask?: boolean;
       // A scratch chat: stored under the shared _scratch bucket.
       scratch?: boolean;
     } = {}
@@ -226,7 +229,16 @@ describe("MCP Apps view domain approvals", () => {
         id !== "ws"
           ? null
           : options.multi
-            ? { projectPath: MULTI_PROJECT_CONFIG_KEY, attributionProjectPath: "/a" }
+            ? options.multiTask
+              ? {
+                  projectPath: "/a",
+                  attributionProjectPath: "/a",
+                  projects: [
+                    { projectPath: "/a", projectName: "a" },
+                    { projectPath: "/repo", projectName: "repo" },
+                  ],
+                }
+              : { projectPath: MULTI_PROJECT_CONFIG_KEY, attributionProjectPath: "/a" }
             : options.scratch
               ? {
                   projectPath: SCRATCH_PROJECT_CONFIG_KEY,
@@ -268,10 +280,8 @@ describe("MCP Apps view domain approvals", () => {
 
   test("an approval is stored per server in the project, read back by every view, and revoked", async () => {
     const { ctx, projects } = projectConfig();
-    expect(await approveMcpAppViewDomains(ctx, approve(["https://api.example.com/"]))).toEqual({
-      success: true,
-      data: { approvedDomains: ["https://api.example.com"] },
-    });
+    const approved = await approveMcpAppViewDomains(ctx, approve(["https://api.example.com/"]));
+    expect(approved.success && approved.data.approvedDomains).toEqual(["https://api.example.com"]);
     // A grown list adds only the new origin.
     await approveMcpAppViewDomains(
       ctx,
@@ -312,9 +322,12 @@ describe("MCP Apps view domain approvals", () => {
     expect(projects.get("/repo")?.mcpAppViewDomains).toBeUndefined();
   });
 
-  test("a multi-project workspace keeps approvals on its server's project, never in _multi", async () => {
+  test.each([
+    ["a multi-project workspace", false],
+    ["a task of a multi-project workspace", true],
+  ])("%s keeps approvals on its server's project, never in _multi", async (_name, multiTask) => {
     // The project's own server: its approval lands on that project.
-    const own = projectConfig({ multi: { charts: { configLayer: "project" } } });
+    const own = projectConfig({ multi: { charts: { configLayer: "project" } }, multiTask });
     expect(
       (await approveMcpAppViewDomains(own.ctx, approve(["https://api.example.com"]))).success
     ).toBe(true);
@@ -327,7 +340,7 @@ describe("MCP Apps view domain approvals", () => {
     expect(view.success && view.data.approvedDomains).toEqual(["https://api.example.com"]);
 
     // A global server has no single owner project there: refused, nothing stored anywhere.
-    const global = projectConfig({ multi: { charts: { configLayer: "global" } } });
+    const global = projectConfig({ multi: { charts: { configLayer: "global" } }, multiTask });
     expect(
       (await approveMcpAppViewDomains(global.ctx, approve(["https://api.example.com"]))).success
     ).toBe(false);
@@ -364,10 +377,7 @@ describe("MCP Apps view domain approvals", () => {
       ctx,
       approve(["https://api.example.com"], { serverName: "constructor" })
     );
-    expect(result).toEqual({
-      success: true,
-      data: { approvedDomains: ["https://api.example.com"] },
-    });
+    expect(result.success && result.data.approvedDomains).toEqual(["https://api.example.com"]);
   });
 
   test("an approval that would exceed the cap fails and keeps the stored list", async () => {
@@ -380,6 +390,50 @@ describe("MCP Apps view domain approvals", () => {
       (await approveMcpAppViewDomains(ctx, approve(["https://new.example.com"]))).success
     ).toBe(false);
     expect(projects.get("/repo")?.mcpAppViewDomains?.charts).toEqual(full);
+  });
+
+  test("each approval list carries its backend commit revision, in commit order", async () => {
+    const { ctx } = projectConfig();
+    const config = ctx.config as unknown as {
+      editConfig: (fn: (c: unknown) => unknown) => Promise<void>;
+    };
+    const commit = config.editConfig;
+    // The first request's edit waits until the second one committed: the later request
+    // commits first, as when its RPC reaches the config queue first.
+    let releaseFirst = () => undefined as void;
+    const held = new Promise<void>((resolve) => (releaseFirst = resolve));
+    let edits = 0;
+    config.editConfig = async (fn) => {
+      if (edits++ === 0) await held;
+      return commit(fn);
+    };
+    const first = approveMcpAppViewDomains(ctx, approve(["https://a.example.com"]));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const second = await approveMcpAppViewDomains(ctx, approve(["https://b.example.com"]));
+    releaseFirst();
+    const firstResult = await first;
+    if (!firstResult.success || !second.success) throw new Error("approval failed");
+    expect(second.data.approvedDomains).toEqual(["https://b.example.com"]);
+    expect(firstResult.data.approvedDomains).toEqual([
+      "https://b.example.com",
+      "https://a.example.com",
+    ]);
+    // The complete list was committed last, so it carries the newer revision.
+    expect(firstResult.data.revision).toBeGreaterThan(second.data.revision);
+    // A read after both commits is at least as new as the last one.
+    const view = await getMcpAppView(ctx, request(), undefined, noWarm);
+    if (!view.success) throw new Error(view.error);
+    expect(view.data.approvedDomainsRevision).toBeGreaterThanOrEqual(firstResult.data.revision);
+    // A revoke committed later is newer still, and so is a read after it.
+    const revoked = await revokeMcpAppViewDomains(ctx, {
+      projectPath: "/repo",
+      serverName: "charts",
+    });
+    expect(revoked.revision).toBeGreaterThan(firstResult.data.revision);
+    const after = await getMcpAppView(ctx, request(), undefined, noWarm);
+    expect(after.success && after.data.approvedDomainsRevision).toBeGreaterThanOrEqual(
+      revoked.revision
+    );
   });
 
   test("one request carries a view's whole pending batch (resource and connect lists)", () => {
@@ -499,14 +553,82 @@ describe("getMcpAppViewRecords", () => {
     });
     const own = await viewRecord(ctx, { workspaceId: "ws-a", toolCallId: "call-a" });
     if (!own.success || own.data === null) throw new Error("expected ws-a's record");
-    // Only the view's binding: never the tool result (content, structuredContent, _meta).
-    expect(Object.keys(own.data).sort()).toEqual([
+    // Only the view's binding: never the tool result (content, structuredContent, _meta). An
+    // unset key (a tool call's `entrypoint`) does not cross IPC.
+    const sent = Object.entries(own.data).filter(([, value]) => value !== undefined);
+    expect(sent.map(([key]) => key).sort()).toEqual([
       "arguments",
       "resourceUri",
       "serverName",
       "toolName",
     ]);
     expect(JSON.stringify(own.data)).not.toContain("secret");
+  });
+
+  test("marks an entry point's record, also after a backend restart", async () => {
+    using tmp = new DisposableTempDir("mcp-app-view-record-entrypoint");
+    const sessionDir = (id: string) => path.join(tmp.path, id);
+    await new McpAppResultStore(sessionDir).record("ws", {
+      toolCallId: "entrypoint:charts:show_chart:global",
+      serverName: "charts",
+      toolName: "show_chart",
+      resourceUri: "ui://charts/view",
+      arguments: {},
+      result: { content: [] },
+      entrypoint: true,
+    });
+    // A new store reads the record from disk, like a restarted backend.
+    const store = new McpAppResultStore(sessionDir);
+    const ctx = {
+      experimentsService: { isExperimentEnabled: () => true },
+      mcpServerManager: {
+        getMcpAppResult: (workspaceId: string, toolCallId: string) =>
+          store.get(workspaceId, toolCallId),
+      },
+    } as unknown as McpAppsContext;
+    const result = await getMcpAppViewRecords(ctx, {
+      workspaceId: "ws",
+      toolCallIds: ["entrypoint:charts:show_chart:global", "call-1"],
+    });
+    if (!result.success) throw new Error(result.error);
+    expect(result.data[0].view).toMatchObject({ entrypoint: true });
+    // A tool call's record (none here) never carries the marker.
+    expect(result.data[1].view).toBeNull();
+  });
+
+  test("returns how a call without a result ended, also after a backend restart", async () => {
+    using tmp = new DisposableTempDir("mcp-app-view-record-outcome");
+    const sessionDir = (id: string) => path.join(tmp.path, id);
+    const base = {
+      serverName: "charts",
+      toolName: "show_chart",
+      resourceUri: "ui://charts/view",
+      arguments: {},
+      result: null,
+    };
+    const writer = new McpAppResultStore(sessionDir);
+    await writer.record("ws", { ...base, toolCallId: "failed", outcome: "failed" });
+    await writer.record("ws", { ...base, toolCallId: "interrupted", outcome: "interrupted" });
+    // A record written before outcomes existed reads as before.
+    await writer.record("ws", { ...base, toolCallId: "older" });
+    const store = new McpAppResultStore(sessionDir);
+    const ctx = {
+      experimentsService: { isExperimentEnabled: () => true },
+      mcpServerManager: {
+        getMcpAppResult: (workspaceId: string, toolCallId: string) =>
+          store.get(workspaceId, toolCallId),
+      },
+    } as unknown as McpAppsContext;
+    const result = await getMcpAppViewRecords(ctx, {
+      workspaceId: "ws",
+      toolCallIds: ["failed", "interrupted", "older"],
+    });
+    if (!result.success) throw new Error(result.error);
+    expect(result.data.map(({ view }) => view?.outcome)).toEqual([
+      "failed",
+      "interrupted",
+      undefined,
+    ]);
   });
 
   test("refuses while the artifacts experiment is off", async () => {

@@ -133,6 +133,27 @@ describe("extractLoadedSkillSnapshotsFromMessages", () => {
     expect(snapshots[0].body).toContain("Nested body");
   });
 
+  it("keeps the qualified <plugin>:<skill> identity of a plugin skill read", () => {
+    // After compaction the model must re-read `pstack:tdd`: a bare `tdd` can resolve elsewhere.
+    const read = (id: string, inputName: string) => {
+      const message = createAgentSkillReadToolMessage({ id, skillName: "tdd", body: id });
+      const part = message.parts[0];
+      if (part.type !== "dynamic-tool") throw new Error("expected a tool part");
+      part.input = { name: inputName };
+      return message;
+    };
+
+    const snapshots = extractLoadedSkillSnapshotsFromMessages([
+      read("qualified", "pstack:tdd"),
+      // A qualified input naming another skill cannot claim this result.
+      read("mismatched", "pstack:other"),
+    ]);
+    expect(snapshots.map((snapshot) => [snapshot.name, snapshot.body])).toEqual([
+      ["pstack:tdd", "qualified"],
+      ["tdd", "mismatched"],
+    ]);
+  });
+
   it("dedupes by scope/name and keeps the latest read order", () => {
     const snapshots = extractLoadedSkillSnapshotsFromMessages([
       createAgentSkillReadToolMessage({
