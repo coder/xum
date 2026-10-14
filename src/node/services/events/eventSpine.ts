@@ -55,8 +55,17 @@ export interface ObserverEventMap {
 // ---------------------------------------------------------------------------
 
 /** Host execution context a tool runs in (shell hooks need all of these). */
+/** The model turn a tool call belongs to, as plugin hooks see it (Codex `turn_id`, `model`). */
+export interface HookTurn {
+  /** The turn's assistant message ID. */
+  turnId: string;
+  model: string;
+}
+
 export interface ToolExecutionHost {
   runtime: Runtime;
+  /** Absent for calls outside a model turn. */
+  turn?: HookTurn;
   /** Runtime temp dir for hook scratch files (paths in the runtime's context). */
   runtimeTempDir: string;
   /** Working directory where hooks are discovered. */
@@ -68,6 +77,11 @@ export interface ToolExecutionHost {
 
 export interface ToolExecuteContext {
   readonly toolName: string;
+  /**
+   * The call's ID (Codex `tool_use_id`): the AI SDK `toolCallId`, or a generated one for a
+   * host-side call that has none, so a PreToolUse and its PostToolUse share it.
+   */
+  readonly toolCallId?: string;
   /** Mutable before the terminal runs: middleware may rewrite tool args. */
   args: unknown;
   readonly host: ToolExecutionHost;

@@ -192,6 +192,7 @@ async function runToolHooks(
   // hooks.json works without edits. Xum's own names and fields stay available too.
   const view = codexToolView(ctx.toolName, ctx.mcpOrigin);
   const toolEvent = () => ({
+    ...turnFields(ctx),
     tool_name: view.codexName ?? ctx.toolName,
     tool_input: isPlainObject(ctx.args)
       ? { ...ctx.args, ...view.toCodexFields(ctx.args) }
@@ -257,6 +258,23 @@ async function runToolHooks(
   }
   // Model-visible tool context rides on the tool result (logged in chat.jsonl with it).
   if (notes.length > 0 && ctx.executed) ctx.result = annotate(ctx.result, notes, registration);
+}
+
+/**
+ * Codex's common tool-event fields (core/src/hook_runtime.rs). `permission_mode` is always
+ * "bypassPermissions": Xum asks no tool approval, and Codex sends that value for the same policy
+ * (it never sends "plan"). `transcript_path` is null: chat.jsonl is not a Codex transcript, and
+ * Codex allows null. A call outside a model turn has no `turn_id` and `model`.
+ */
+function turnFields(ctx: ToolExecuteContext): Record<string, unknown> {
+  return {
+    ...(ctx.toolCallId !== undefined ? { tool_use_id: ctx.toolCallId } : {}),
+    ...(ctx.host.turn !== undefined
+      ? { turn_id: ctx.host.turn.turnId, model: ctx.host.turn.model }
+      : {}),
+    permission_mode: "bypassPermissions",
+    transcript_path: null,
+  };
 }
 
 function applyUpdatedInput(

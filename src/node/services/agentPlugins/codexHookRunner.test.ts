@@ -67,13 +67,25 @@ async function runTool(
   args: unknown,
   inputJsonSchema?: unknown,
   mcpOrigin?: { serverName: string; toolName: string },
-  opts: { abortSignal?: AbortSignal; result?: unknown } = {}
+  opts: {
+    abortSignal?: AbortSignal;
+    result?: unknown;
+    toolCallId?: string;
+    turn?: { turnId: string; model: string };
+  } = {}
 ): Promise<ToolExecuteContext> {
   const ctx: ToolExecuteContext = {
     toolName,
+    ...(opts.toolCallId !== undefined ? { toolCallId: opts.toolCallId } : {}),
     args,
     ...(mcpOrigin !== undefined ? { mcpOrigin } : {}),
-    host: { runtime: new LocalRuntime("/tmp"), runtimeTempDir: "/tmp", cwd: "/w", workspaceId },
+    host: {
+      runtime: new LocalRuntime("/tmp"),
+      runtimeTempDir: "/tmp",
+      cwd: "/w",
+      workspaceId,
+      ...(opts.turn !== undefined ? { turn: opts.turn } : {}),
+    },
     ...(inputJsonSchema !== undefined ? { inputJsonSchema: () => inputJsonSchema } : {}),
     ...(opts.abortSignal !== undefined ? { abortSignal: opts.abortSignal } : {}),
     executed: false,
@@ -386,6 +398,33 @@ describe("PreToolUse", () => {
     const { spine, calls } = setup([hook("PreToolUse", { input: { dir: "${cwd}" } })], () => null);
     await runTool(spine, "bash", {});
     expect(calls).toEqual([{ dir: "/w" }]);
+  });
+
+  test("tool events carry Codex's common fields: call ID, turn, model, permission mode", async () => {
+    // Codex PRRT_kwDOPxxmWM6rNI5C, PRRT_kwDOPxxmWM6r_rjV (core/src/hook_runtime.rs).
+    const input = {
+      id: "${tool_use_id}",
+      turn: "${turn_id}",
+      model: "${model}",
+      mode: "${permission_mode}",
+    };
+    const { spine, calls } = setup(
+      [hook("PreToolUse", { input }), hook("PostToolUse", { input })],
+      () => null
+    );
+
+    await runTool(spine, "file_read", {}, undefined, undefined, {
+      toolCallId: "call-1",
+      turn: { turnId: "assistant-1", model: "openai:gpt-4o" },
+    });
+
+    const fields = {
+      id: "call-1",
+      turn: "assistant-1",
+      model: "openai:gpt-4o",
+      mode: "bypassPermissions",
+    };
+    expect(calls).toEqual([fields, fields]);
   });
 
   test("updatedInput applies only with allow and a schema-valid value", async () => {

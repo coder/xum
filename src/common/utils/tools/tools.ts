@@ -70,6 +70,7 @@ import { createWorkflowRunTool } from "@/node/services/tools/workflow_run";
 import { createWorkflowResumeTool } from "@/node/services/tools/workflow_resume";
 import { createAgentReportTool } from "@/node/services/tools/agent_report";
 import { wrapWithInitWait } from "@/node/services/tools/wrapWithInitWait";
+import type { HookTurn } from "@/node/services/events/eventSpine";
 import { deriveToolHookConfig, withHooks } from "@/node/services/tools/withHooks";
 import { log } from "@/node/services/log";
 import {
@@ -160,6 +161,8 @@ export interface WorkflowServiceScriptInput {
 export interface ToolConfiguration {
   /** Working directory for command execution - actual path in runtime's context (local or remote) */
   cwd: string;
+  /** The model turn plugin tool hooks report (Codex `turn_id`, `model`); see HookConfig.turn. */
+  hookTurn?: HookTurn;
   /** Runtime environment for executing commands and file operations */
   runtime: Runtime;
   /** Project roots in this workspace (single- or multi-project context for tool descriptions) */

@@ -2510,6 +2510,8 @@ export class TurnRequestBuilder {
     // Hoisted so refusal fallback can rebuild tools without changing their context.
     const toolsForModelConfig: ToolConfiguration = {
       cwd: workspacePath,
+      // Codex hook fields: one turn ID for every tool call of this turn (its assistant message).
+      hookTurn: { turnId: assistantMessageId, model: modelString },
       runtime,
       projects: getProjects(metadata),
       secrets: projectSecretsRecord,
