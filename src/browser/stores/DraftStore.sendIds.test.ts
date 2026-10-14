@@ -92,6 +92,7 @@ async function createHarness(tempDir: TestTempDir) {
   /** Test hooks around the transport: hold an update, or lose a beginSend reply. */
   const hooks = {
     beforeUpdate: null as null | (() => Promise<void>),
+    beforeBeginSend: null as null | (() => Promise<void>),
     loseBeginSendReply: false,
   };
   const drafts = {
@@ -104,6 +105,9 @@ async function createHarness(tempDir: TestTempDir) {
       return service.update(input, acceptance);
     },
     beginSend: async (input: Parameters<DraftService["beginSend"]>[0]) => {
+      const hold = hooks.beforeBeginSend;
+      hooks.beforeBeginSend = null;
+      await hold?.();
       const reply = await service.beginSend(input, acceptance);
       if (hooks.loseBeginSendReply) {
         hooks.loseBeginSendReply = false;
@@ -760,5 +764,45 @@ describe("DraftStore idempotent sends", () => {
       fileParts: [{ url: image.url, mediaType: image.mediaType }, foreignPart],
     });
     expect([rest.text, rest.fileParts]).toEqual(["from elsewhere", [foreignPart]]);
+  });
+
+  // #6438: the reply of a send begun on the old backend arrived after the switch. Its view
+  // carried the old backend's (higher) revisions, so every write reply of the new backend lost
+  // to it and the old text came back over typing.
+  test("a send's reply from a replaced backend does not outrank the new backend's replies", async () => {
+    using oldDir = new TestTempDir("draft-sends-old-backend");
+    using newDir = new TestTempDir("draft-sends-new-backend");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    store.setText(SCOPE, "hello");
+    let release: () => void = () => undefined;
+    old.hooks.beforeBeginSend = () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    const request = pendingSend("s1", "hello", RECEIVER).request;
+    const sending = store
+      .beginSend(SCOPE, { sendId: "s1", text: "hello", attachments: [], request })
+      .catch(() => undefined);
+    await waitFor(() => old.hooks.beforeBeginSend === null);
+
+    // A new backend process whose clock is behind numbers its revisions lower.
+    const realNow = Date.now;
+    Date.now = () => realNow() - 3_600_000;
+    let next: Awaited<ReturnType<typeof createHarness>>;
+    try {
+      next = await createHarness(newDir);
+    } finally {
+      Date.now = realNow;
+    }
+    store.setClient(next.client);
+    await waitFor(() => store.isHydrated());
+    release();
+    await sending;
+
+    store.setText(SCOPE, "typed after the switch");
+    await store.flush(SCOPE);
+    expect(store.getText(SCOPE)).toBe("typed after the switch");
   });
 });

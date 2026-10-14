@@ -893,4 +893,65 @@ describe("DraftStore", () => {
       )
     ).toBe(false);
   });
+
+  // #6438: a new backend (another process, its clock behind) numbers its revisions lower. The
+  // store kept the old backend's saved view, and a write reply below that view's revision put
+  // the old text back over what the user had just typed.
+  test("a write reply from a new backend with lower revisions keeps the typed text", async () => {
+    using tempDir = new TestTempDir("draft-store-new-backend");
+    const { config, client } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "text on the old backend");
+    await store.flush(WS_SCOPE);
+
+    // The same drafts on disk, served by a new process whose revisions start lower.
+    const realNow = Date.now;
+    Date.now = () => realNow() - 3_600_000;
+    let service: DraftService;
+    try {
+      service = new DraftService(config);
+    } finally {
+      Date.now = realNow;
+    }
+    const next = createClient(service);
+    store.setClient(next.client);
+    await waitFor(() => next.control.updates === 0 && store.isHydrated());
+
+    store.setText(WS_SCOPE, "typed after the switch");
+    await store.flush(WS_SCOPE);
+    expect(next.control.updates).toBeGreaterThan(0);
+    expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
+    expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
+  });
+
+  // #6438, the same switch with a write in flight: the old backend's late reply confirmed the
+  // edit, so it was never written to the new backend (lost on reload), and its view (the old
+  // backend's higher revision) again outranked every later reply of the new one.
+  test("an edit whose write was in flight when the backend changed reaches the new backend", async () => {
+    using oldDir = new TestTempDir("draft-store-old-backend");
+    using newDir = new TestTempDir("draft-store-switched-backend");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    old.control.updateGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    store.setText(WS_SCOPE, "typed during the switch");
+    const inFlight = store.flush(WS_SCOPE).catch(() => undefined);
+    await waitFor(() => old.control.updates === 1);
+
+    const next = await createHarness(newDir);
+    store.setClient(next.client);
+    await waitFor(() => store.isHydrated() && next.control.updates === 0);
+    release();
+    await inFlight;
+    await store.flush(WS_SCOPE);
+    expect((await next.service.get(WS_SCOPE)).text).toBe("typed during the switch");
+
+    store.setText(WS_SCOPE, "typed later");
+    await store.flush(WS_SCOPE);
+    expect(store.getText(WS_SCOPE)).toBe("typed later");
+  });
 });

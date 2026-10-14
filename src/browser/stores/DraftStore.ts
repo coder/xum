@@ -243,6 +243,23 @@ export function draftStoreScopeKey(scope: DraftStoreScope): string {
   return scope.kind === "pending" ? `pending:${scope.projectPath}` : draftScopeKey(scope);
 }
 
+/** Marks the field versions a confirmed write sent as saved (only the fields it wrote). */
+function confirmWrite(
+  entry: Entry,
+  wrote: { text: boolean; attachments: boolean },
+  versions: { text: number; attachments: number }
+): void {
+  if (wrote.text) {
+    entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, versions.text);
+  }
+  if (wrote.attachments) {
+    entry.confirmedAttachmentsVersion = Math.max(
+      entry.confirmedAttachmentsVersion,
+      versions.attachments
+    );
+  }
+}
+
 function isTextDirty(entry: Entry): boolean {
   return entry.textVersion > entry.confirmedTextVersion;
 }
@@ -1000,7 +1017,7 @@ export class DraftStore {
         entry.inFlight = null;
         settle();
       }
-      this.applyWriteReply(entry, reply, { text: true, attachments: false });
+      this.applyWriteReply(entry, reply, { text: true, attachments: false }, client);
     } catch (error) {
       tracking.issuing.delete(input.sendId);
       if (this.entries.get(key) === entry) {
@@ -1622,11 +1639,15 @@ export class DraftStore {
       seen.add(draftStoreScopeKey(summary.scope));
       // Each subscription restarts the revision sequence, so a restarted backend is never ignored.
       entry.revision = summary.revision;
+      // The view of the backend before goes with it: a new backend can number its revisions lower
+      // (another process, its clock behind), and that view would outrank all of its replies (#6438).
+      entry.serverView = null;
       this.applyServerState(entry, summary.text, summary.attachments, summary.pendingSends ?? []);
     }
     for (const [key, entry] of this.entries) {
       if (entry.scope.kind !== "pending" && !seen.has(key)) {
         entry.revision = Number.NEGATIVE_INFINITY;
+        entry.serverView = null;
         this.applyServerState(entry, "", [], []);
       }
     }
@@ -1989,17 +2010,19 @@ export class DraftStore {
           // lost reply is retried with the same basis, which merges the same way again.
           ...(entry.basisSends.size > 0 ? { basisSends: [...entry.basisSends.values()] } : {}),
         });
+        // A reply of a replaced backend confirms nothing: the edit must reach the current one,
+        // so the loop writes it again there (#6438).
+        if (this.client !== client) continue;
         entry.flushAttempt = 0;
         entry.failing = false;
-        if (sendText) {
-          entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, textVersion);
-        }
-        if (sendAttachments) {
-          entry.confirmedAttachmentsVersion = Math.max(
-            entry.confirmedAttachmentsVersion,
-            attachmentsVersion
-          );
-        }
+        confirmWrite(
+          entry,
+          { text: sendText, attachments: sendAttachments },
+          {
+            text: textVersion,
+            attachments: attachmentsVersion,
+          }
+        );
       } catch (error) {
         this.reportSaveError(entry, key, error);
         // The backend's size refusal (measurable only there while payloads are unloaded) is
@@ -2017,7 +2040,7 @@ export class DraftStore {
         entry.inFlight = null;
         settle();
       }
-      this.applyWriteReply(entry, reply, { text: sendText, attachments: sendAttachments });
+      this.applyWriteReply(entry, reply, { text: sendText, attachments: sendAttachments }, client);
     }
   }
 
@@ -2026,12 +2049,21 @@ export class DraftStore {
    * the newest server view (this reply, or a push that came after it); the echo push of this
    * write is stale for this window, so the reply is how the merge reaches it.
    */
+  /**
+   * The entry is still this scope's, and the write went to the current backend. A replaced
+   * backend's reply is not comparable with the current one's revisions (#6438).
+   */
+  private isCurrentWrite(entry: Entry, client: APIClient): boolean {
+    return this.entries.get(draftStoreScopeKey(entry.scope)) === entry && this.client === client;
+  }
+
   private applyWriteReply(
     entry: Entry,
     reply: DraftWriteOutput,
-    wrote: { text: boolean; attachments: boolean }
+    wrote: { text: boolean; attachments: boolean },
+    client: APIClient
   ): void {
-    if (this.entries.get(draftStoreScopeKey(entry.scope)) !== entry) return;
+    if (!this.isCurrentWrite(entry, client)) return;
     entry.revision = Math.max(entry.revision, reply.revision);
     if (entry.serverView === null || reply.revision >= entry.serverView.revision) {
       entry.serverView = {
