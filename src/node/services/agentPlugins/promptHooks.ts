@@ -47,7 +47,7 @@ export async function runMessageSendHooks(
   workspaceId: string,
   input: MessageSendHookInput & { cwd?: string }
 ): Promise<MessageSendHookOutcome> {
-  if (!spine.hasMiddleware("message.send")) return { kind: "none" };
+  if (!spine.hasMiddlewareFor("message.send", workspaceId)) return { kind: "none" };
   const base = {
     workspaceId,
     origin: input.origin,
@@ -121,7 +121,7 @@ export async function runTurnStopHooks(
   workspaceId: string,
   input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "cwd">
 ): Promise<TurnStopHookOutcome> {
-  if (!spine.hasMiddleware("turn.stop")) return { kind: "none" };
+  if (!spine.hasMiddlewareFor("turn.stop", workspaceId)) return { kind: "none" };
   const ctx: TurnStopContext = { workspaceId, ...input, continueReasons: [] };
   try {
     await spine.run("turn.stop", ctx);

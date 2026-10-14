@@ -48,6 +48,12 @@ export interface EnsureCodexHooksArgs {
    * another path (prompt listing) started the plugin's server (Codex PRRT_kwDOPxxmWM6rN8JJ).
    */
   sideChat: boolean;
+  /**
+   * The workspace has no plugin MCP context (SSH, Docker, devcontainer, multi-project): no plugin
+   * server runs there, so no Codex hook can run either. None registers, so a send skips the MCP
+   * startup preflight (Codex PRRT_kwDOPxxmWM6rSBix).
+   */
+  noPluginMcp?: boolean;
 }
 
 interface WorkspaceRegistration {
@@ -55,6 +61,15 @@ interface WorkspaceRegistration {
   unregister: () => void;
   /** Longest UserPromptSubmit hook timeout (ms); undefined when the workspace has none. */
   promptHookBudgetMs?: number;
+}
+
+/**
+ * False where no Codex hook may run: a `/side` chat, a workspace without plugin MCP, and
+ * XUM_DISABLE_AGENT_TOOLS (bug-bash real mode, which sends no tools: no hook may call MCP either,
+ * Codex PRRT_kwDOPxxmWM6rPrkn).
+ */
+function canRunCodexHooks(args: EnsureCodexHooksArgs): boolean {
+  return !args.sideChat && args.noPluginMcp !== true && !isAgentToolsDisabled();
 }
 
 export class CodexPluginHookService {
@@ -71,9 +86,7 @@ export class CodexPluginHookService {
       this.locks.set(args.workspaceId, lock);
     }
     await using _guard = await lock.acquire();
-    // XUM_DISABLE_AGENT_TOOLS (bug-bash real mode) sends no tools: no hook may call MCP either
-    // (Codex PRRT_kwDOPxxmWM6rPrkn).
-    if (args.sideChat || isAgentToolsDisabled()) {
+    if (!canRunCodexHooks(args)) {
       this.registrations.get(args.workspaceId)?.unregister();
       this.registrations.delete(args.workspaceId);
       return;

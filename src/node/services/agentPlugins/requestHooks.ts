@@ -37,6 +37,7 @@ export async function prepareWorkspaceRequestHooks(args: {
     await codexPluginHookService.ensureWorkspaceHooks({
       workspaceId: metadata.id,
       sideChat: sideChatCapabilityGrants(metadata) != null,
+      noPluginMcp: pluginContext === null,
       xumHome: config.rootDir,
       // A function, not a value: the gate re-reads trust before every hook call. Every project of
       // the workspace must be trusted: hooks run MCP tools in the runtime they all share, the

@@ -391,6 +391,11 @@ export class EventSpine {
     return (this.waterfalls.get(point)?.length ?? 0) > 0;
   }
 
+  /** hasMiddleware for one workspace: global middleware and middleware scoped to it. */
+  hasMiddlewareFor(point: keyof WaterfallPointMap, workspaceId: string): boolean {
+    return this.applicableRegistrations(point, workspaceId).length > 0;
+  }
+
   /**
    * Run the waterfall for a hook point. Middleware is composed around the
    * optional terminal. Contract: a context with a truthy `blocked` property

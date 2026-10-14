@@ -54,6 +54,8 @@ test("a multi-project workspace with an untrusted secondary project runs no Code
     mcpServerManager: mcp,
   });
 
+  // No host checkout: no plugin MCP context, so no Codex hook can run (PRRT_kwDOPxxmWM6rSBix).
+  expect(codexArgs?.noPluginMcp).toBe(true);
   // The service reads this gate at registration and again before every hook call.
   expect(codexArgs?.isProjectTrusted()).toBe(false);
   projects.set("/repo/secondary", { workspaces: [], trusted: true });

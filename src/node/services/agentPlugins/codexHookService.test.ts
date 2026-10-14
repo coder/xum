@@ -297,6 +297,15 @@ describe("CodexPluginHookService", () => {
     expect(calledKeys).toHaveLength(1);
   });
 
+  test("a workspace without a plugin MCP context registers no hook", async () => {
+    // Codex PRRT_kwDOPxxmWM6rSBix: no plugin server runs there, so a send must not wait for one.
+    await writePlugin("guard", "scanner");
+    await trustAll("guard");
+    await service.ensureWorkspaceHooks({ ...args(), noPluginMcp: true });
+    expect((await runBash()).executed).toBe(true);
+    expect(calledKeys).toEqual([]);
+  });
+
   test("XUM_DISABLE_AGENT_TOOLS=1 registers no hook: a trusted hook makes no MCP call", async () => {
     await writePlugin("guard", "scanner");
     await trustAll("guard");
