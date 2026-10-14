@@ -135,6 +135,11 @@ function viewServerLabel(view: McpAppViewRef): string {
   return view.serverLabel ?? mcpServerDisplayName(view.serverName);
 }
 
+/** Calls `callback` when the host passed one (an optional panel prop). */
+function runIfSet(callback: (() => void) | undefined): void {
+  callback?.();
+}
+
 /** Maximizes the app tab over the window, or restores it (#6165). None without a toggle. */
 function MaximizeViewButton(props: { maximized?: boolean; onToggle?: () => void }) {
   if (props.onToggle == null) return null;
@@ -811,7 +816,7 @@ export function McpAppFrame(props: {
         if (!navigatedRef.current) void host.handleMessage(data);
       },
       leave: leaveDocument,
-      exit: () => latest.current.onExitKey?.(),
+      exit: () => runIfSet(latest.current.onExitKey),
     });
     const handler = (event: MessageEvent) => {
       const frameWindow = navigatedRef.current ? null : frameRef.current?.contentWindow;
