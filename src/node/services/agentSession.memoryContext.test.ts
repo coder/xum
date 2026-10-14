@@ -50,11 +50,26 @@ interface PrivateSessionAccess {
   resolveMemoryContext: (
     modelString: string,
     options?: Parameters<AIService["buildMemorySessionContext"]>[2],
-    cache?: Map<string, unknown>
+    cache?: Map<string, unknown>,
+    persistence?: { windowKey: string | undefined }
   ) => Promise<MemorySessionContext | undefined>;
   getPostCompactionAttachmentsIfNeeded: () => Promise<unknown>;
   clearPostCompactionState: () => Promise<void>;
   applyContextResetSideEffects: () => Promise<void>;
+}
+
+/** Resolve as a stream of the context window whose first history row is `windowKey`. */
+function resolveInWindow(
+  session: AgentSession,
+  modelString: string,
+  windowKey = "window-1"
+): Promise<MemorySessionContext | undefined> {
+  return (session as unknown as PrivateSessionAccess).resolveMemoryContext(
+    modelString,
+    undefined,
+    undefined,
+    { windowKey }
+  );
 }
 
 async function writePendingPostCompactionState(sessionDir: string): Promise<void> {
@@ -303,18 +318,17 @@ describe("AgentSession memory context", () => {
     const before = await createSession({ historyService, config, buildMemorySessionContext });
     let first: MemorySessionContext | undefined;
     try {
-      first = await (before as unknown as PrivateSessionAccess).resolveMemoryContext("test-model");
+      first = await resolveInWindow(before, "test-model");
     } finally {
       await before.dispose();
     }
 
     const after = await createSession({ historyService, config, buildMemorySessionContext });
     try {
-      const priv = after as unknown as PrivateSessionAccess;
-      expect(await priv.resolveMemoryContext("test-model")).toEqual(first);
+      expect(await resolveInWindow(after, "test-model")).toEqual(first);
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
       // A model the old process never resolved still gets its own fresh context.
-      expect((await priv.resolveMemoryContext("other-model"))?.hotMemoriesBlock).toBe(
+      expect((await resolveInWindow(after, "other-model"))?.hotMemoriesBlock).toBe(
         "<hot_memories>v2</hot_memories>"
       );
     } finally {
@@ -340,7 +354,7 @@ describe("AgentSession memory context", () => {
       const before = await createSession({ historyService, config, buildMemorySessionContext });
       try {
         const priv = before as unknown as PrivateSessionAccess;
-        await priv.resolveMemoryContext("test-model");
+        await resolveInWindow(before, "test-model");
         if (boundary === "reset") await priv.applyContextResetSideEffects();
         else if (boundary === "new segment") await priv.clearPostCompactionState();
         else {
@@ -353,15 +367,45 @@ describe("AgentSession memory context", () => {
 
       const after = await createSession({ historyService, config, buildMemorySessionContext });
       try {
-        expect(
-          (await (after as unknown as PrivateSessionAccess).resolveMemoryContext("test-model"))
-            ?.hotMemoriesBlock
-        ).toBe("<hot_memories>v2</hot_memories>");
+        expect((await resolveInWindow(after, "test-model"))?.hotMemoriesBlock).toBe(
+          "<hot_memories>v2</hot_memories>"
+        );
       } finally {
         await after.dispose();
       }
     }
   );
+
+  // A file can outlive its window: a failed delete, or an older build that crossed a
+  // boundary without knowing the file. The next window's first row differs, so it is ignored.
+  test("rebuilds after a restart when the saved file names another window", async () => {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    let version = 0;
+    const buildMemorySessionContext = mock(() => {
+      version++;
+      return Promise.resolve<MemorySessionContext>({
+        indexEntries: [],
+        hotMemoriesBlock: `<hot_memories>v${version}</hot_memories>`,
+      });
+    });
+    const before = await createSession({ historyService, config, buildMemorySessionContext });
+    try {
+      await resolveInWindow(before, "test-model", "window-1");
+    } finally {
+      await before.dispose();
+    }
+
+    const after = await createSession({ historyService, config, buildMemorySessionContext });
+    try {
+      expect((await resolveInWindow(after, "test-model", "window-2"))?.hotMemoriesBlock).toBe(
+        "<hot_memories>v2</hot_memories>"
+      );
+    } finally {
+      await after.dispose();
+    }
+  });
 
   test("rebuilds the context when the saved file is malformed", async () => {
     const { historyService, config, cleanup } = await createTestHistoryService();
@@ -378,10 +422,9 @@ describe("AgentSession memory context", () => {
     );
     const session = await createSession({ historyService, config, buildMemorySessionContext });
     try {
-      expect(
-        (await (session as unknown as PrivateSessionAccess).resolveMemoryContext("test-model"))
-          ?.hotMemoriesBlock
-      ).toBe("<hot_memories>fresh</hot_memories>");
+      expect((await resolveInWindow(session, "test-model"))?.hotMemoriesBlock).toBe(
+        "<hot_memories>fresh</hot_memories>"
+      );
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
     } finally {
       await session.dispose();

@@ -1094,6 +1094,14 @@ interface AgentSessionOptions {
   callerOwnsTurnEnd?: boolean;
 }
 
+/**
+ * Identity of a context window for the saved memory context: its first history row. Every
+ * window boundary (compaction, reset, rollover, history clear) starts a window with a new row.
+ */
+function contextWindowKey(rows: readonly MuxMessage[]): string | undefined {
+  return rows[0]?.id;
+}
+
 /** Memory/HotSet gate changes must not reuse a context built under the old gates. */
 function canReuseMemoryContext(
   cached: CachedMemoryContext | undefined,
@@ -1628,6 +1636,8 @@ export class AgentSession {
   private readonly memoryContextStore: MemoryContextStore;
   /** Restores the saved window context once per session; resolved after a window boundary. */
   private memoryContextRestore: Promise<void> | undefined;
+  /** The window key of the last save or restore; undefined when the file holds no window. */
+  private savedMemoryContextWindowKey: string | undefined;
 
   /**
    * Cache the last-known experiment state so we don't spam metadata refresh
@@ -7023,6 +7033,8 @@ export class AgentSession {
         message: "Full request preparation is unavailable; use /compact or restart.",
       });
     const cache = new Map<string, CachedMemoryContext>();
+    // The rows open the new window, so its first row keys the saved context.
+    const windowKey = contextWindowKey(messages);
 
     const providersConfig = this.getProvidersConfigSafe();
     const minThinkingLevel = resolveMinimumThinkingLevel(
@@ -7081,7 +7093,7 @@ export class AgentSession {
         recordProposedPlan: this.recordProposedPlan,
         postCompactionAttachments: null,
         resolveMemoryContext: (model, memoryOptions) =>
-          this.resolveMemoryContext(model, memoryOptions, cache),
+          this.resolveMemoryContext(model, memoryOptions, cache, { windowKey }),
         workspaceGoalService: this.workspaceGoalService,
         goalTurnKind: goalKind,
         goalTurnGoalId: goalId,
@@ -7117,7 +7129,7 @@ export class AgentSession {
         // The candidate's snapshot is the new window's frozen memory context. Save it before
         // the stream: a restart during this turn must not rebuild the window's bytes.
         this.memoryContextByModelString = cache;
-        await this.memoryContextStore.save(cache);
+        await this.persistMemoryContext(cache, windowKey, { force: true });
         return prepared.data.start(startOptions);
       },
       [Symbol.asyncDispose]: () => prepared.data[Symbol.asyncDispose](),
@@ -8965,8 +8977,11 @@ export class AgentSession {
         // listing needs a running runtime). Still ordered after the
         // post-compaction check above: a just-consumed compaction boundary has
         // already reset the segment cache, so this stream recomputes the context.
+        // The window's first row keys the saved context (see resolveMemoryContext).
         resolveMemoryContext: (forModelString, memoryOptions) =>
-          this.resolveMemoryContext(forModelString, memoryOptions),
+          this.resolveMemoryContext(forModelString, memoryOptions, undefined, {
+            windowKey: contextWindowKey(historyResult.data),
+          }),
         workspaceGoalService: this.workspaceGoalService,
         goalTurnKind: goalKind,
         goalTurnGoalId: goalId,
@@ -12960,19 +12975,21 @@ export class AgentSession {
   private async resolveMemoryContext(
     modelString: string,
     options?: { includeHotMemories?: boolean },
-    cache = this.memoryContextByModelString
+    cache = this.memoryContextByModelString,
+    persistence?: { windowKey: string | undefined }
   ): Promise<MemorySessionContext | undefined> {
     assert(modelString.length > 0, "resolveMemoryContext requires a model string");
     const includeHotMemories = options?.includeHotMemories !== false;
     const enabled = (id: ExperimentId) => this.aiService.isExperimentEnabled(id);
     const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
     const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
+    const windowKey = persistence?.windowKey;
     // The rollover candidate cache belongs to a window that may never start: only the
-    // live map is restored from and saved to disk.
-    const live = cache === this.memoryContextByModelString;
-    if (live) await this.restoreMemoryContext();
+    // live map is restored from disk.
+    if (cache === this.memoryContextByModelString) await this.restoreMemoryContext(windowKey);
     const cached = cache.get(modelString);
     if (canReuseMemoryContext(cached, { memoryEnabled, hotSetEnabled, includeHotMemories })) {
+      await this.persistMemoryContext(cache, windowKey, { force: false });
       return cached.context ?? undefined;
     }
 
@@ -12989,27 +13006,46 @@ export class AgentSession {
       memoryEnabled,
       hotSetEnabled,
     });
-    // Re-check: a rollover can start while the build is awaited.
-    if (cache === this.memoryContextByModelString) await this.memoryContextStore.save(cache);
+    await this.persistMemoryContext(cache, windowKey, { force: true });
     return context ?? undefined;
   }
 
   /**
    * Restore the window's saved memory context once per session (the first resolve after a
-   * server restart). Entries this process already built win: they are what it sent.
+   * server restart). The file must name the same window: its first row id. A file left from
+   * an older window (a failed delete, or an older build that crossed a boundary without
+   * deleting it) is ignored. Entries this process already built win: they are what it sent.
    */
-  private restoreMemoryContext(): Promise<void> {
+  private restoreMemoryContext(windowKey: string | undefined): Promise<void> {
+    if (windowKey === undefined) return Promise.resolve();
     this.memoryContextRestore ??= (async () => {
       const map = this.memoryContextByModelString;
       const saved = await this.memoryContextStore.load();
-      // load() returns nothing when a window boundary ran during the read. A rollover that
+      // load() returns null when a window boundary ran during the read. A rollover that
       // started meanwhile swapped in its own map: the saved file is not its window.
-      if (this.memoryContextByModelString !== map || saved.size === 0) return;
-      for (const [modelString, cached] of saved) {
+      if (this.memoryContextByModelString !== map || saved?.windowKey !== windowKey) return;
+      for (const [modelString, cached] of saved.contexts) {
         if (!map.has(modelString)) map.set(modelString, cached);
       }
+      this.savedMemoryContextWindowKey = windowKey;
     })();
     return this.memoryContextRestore;
+  }
+
+  /**
+   * Save the live map for this window. `force: false` (a cache hit) writes only when the file
+   * names another window, for example after a rollover keyed by its own first row.
+   */
+  private async persistMemoryContext(
+    cache: Map<string, CachedMemoryContext>,
+    windowKey: string | undefined,
+    options: { force: boolean }
+  ): Promise<void> {
+    // A rollover can swap the live map while a build is awaited.
+    if (windowKey === undefined || cache !== this.memoryContextByModelString) return;
+    if (!options.force && this.savedMemoryContextWindowKey === windowKey) return;
+    this.savedMemoryContextWindowKey = windowKey;
+    await this.memoryContextStore.save(windowKey, cache);
   }
 
   /** A window boundary: drop the cached context in memory and on disk. */
@@ -13017,6 +13053,7 @@ export class AgentSession {
     this.memoryContextByModelString.clear();
     // The saved file belongs to the window that just ended: never restore it.
     this.memoryContextRestore = Promise.resolve();
+    this.savedMemoryContextWindowKey = undefined;
     await this.memoryContextStore.discard();
   }
 
