@@ -14,6 +14,8 @@ import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
  *   pointer-events. The disabled attributes are gone too: the live buttons are enabled, and
  *   `disabled:opacity-50` made the copy look disabled.
  * - The root is `inert`, so no part of the copy takes focus or clicks before the handoff.
+ * - The root is `fixed`, so it is a stacking context: its z-index is the live overlay's 1500
+ *   (`z-[1500]`), or the iOS standalone `.ios-status-bar-band` (1001) would paint over the copy.
  * tests/ui/onboarding/firstRunViewParity.test.ts fails when the overlay or the dialog drifts from
  * the live wizard in tags, classes or text.
  *
@@ -22,7 +24,7 @@ import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
  * PR 4 inserts it with `template.content.cloneNode(true)`, never with innerHTML, outerHTML or
  * insertAdjacentHTML.
  */
-export const FIRST_RUN_VIEW_HTML = `<div id="${FIRST_RUN_VIEW_ID}" inert style="position:fixed;inset:0;overflow:hidden">
+export const FIRST_RUN_VIEW_HTML = `<div id="${FIRST_RUN_VIEW_ID}" inert style="position:fixed;inset:0;z-index:1500;overflow:hidden">
   <div class="h-full">
     <div class="bg-surface-primary h-full">
       <div class="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
