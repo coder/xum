@@ -1080,7 +1080,8 @@ function DesktopApiStub(props: { children: ReactNode }) {
 function renderMcpAppView(
   html: string = MCP_APP_VIEW_HTML,
   // A non-https host is never granted, so it is listed as not granted.
-  csp: McpAppView["csp"] = { resourceDomains: ["http://tiles.example.com"] }
+  csp: McpAppView["csp"] = { resourceDomains: ["http://tiles.example.com"] },
+  approveViewDomainsError?: string
 ) {
   openMcpAppViewTab(WORKSPACE_ID, {
     toolCallId: MCP_APP_TOOL_CALL_ID,
@@ -1117,6 +1118,7 @@ function renderMcpAppView(
             input.consented
               ? { status: "ok", result: { content: [{ type: "text", text: "Sunny tomorrow" }] } }
               : { status: "consent_required" },
+          approveViewDomainsError,
         },
       })}
     >
@@ -1215,6 +1217,26 @@ export const McpAppViewDomainsAllow: Story = {
       await expect(csp).toContain("https://cdn.example.com");
     });
     await expect(strip.isConnected).toBe(false);
+  },
+};
+
+// A failed Allow keeps the strip with its error, so Allow can retry (phone width: the error and
+// both buttons fit).
+export const McpAppViewDomainsAllowFailsPhone: Story = {
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () =>
+    renderMcpAppView(MCP_APP_VIEW_HTML, DOMAINS_CSP, "Could not write the project config"),
+  play: async ({ canvasElement }) => {
+    const strip = await findDomainsStrip(canvasElement);
+    const allow = within(strip).getByRole("button", { name: "Allow" });
+    await waitFor(() => expect(allow).toBeEnabled(), { timeout: 5000 });
+    await userEvent.click(allow);
+    await within(canvasElement).findByText(/Could not allow the domains: Could not write/);
+    await waitFor(() => expect(allow).toBeEnabled());
+    await expect(within(strip).getByRole("button", { name: "Not now" })).toBeEnabled();
+    const csp = within(canvasElement).getByTestId("mcp-app-frame").getAttribute("srcdoc") ?? "";
+    await expect(csp).not.toContain("https://api.example.com");
   },
 };
 

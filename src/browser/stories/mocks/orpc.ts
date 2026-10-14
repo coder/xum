@@ -247,6 +247,8 @@ export interface MockORPCClientOptions {
   mcpApps?: {
     views: Record<string, McpAppView>;
     callTool?: (input: { toolName: string; consented: boolean }) => McpAppToolCallResult;
+    /** When set, every approveViewDomains call fails with this error. */
+    approveViewDomainsError?: string;
   };
   /** Initial updater status for update.onStatus (About dialog stories). */
   updateStatus?: UpdateStatus;
@@ -2458,6 +2460,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         serverName: string;
         origins: string[];
       }) => {
+        if (mcpApps?.approveViewDomainsError != null) {
+          return Promise.resolve({
+            success: false as const,
+            error: mcpApps.approveViewDomainsError,
+          });
+        }
         const view = mcpApps?.views[input.toolCallId];
         const entry = {
           projectPath: view?.approvalProjectPath ?? "",
