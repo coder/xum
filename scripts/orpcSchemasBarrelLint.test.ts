@@ -95,6 +95,10 @@ describe("src/node guard for browser and common code", () => {
     ["src/common/types/example.ts", 'export { X } from "@/node/utils/main/tokenizer";'],
     ["src/common/orpc/client.ts", 'import { X } from "@/node/services/log";'],
     ["src/common/config/schemas/example.ts", 'import { X } from "@/node/services/log";'],
+    // tsconfig maps @shared/* to src/* too.
+    ["src/common/types/example.ts", 'import { X } from "@shared/node/services/log";'],
+    // The highlight worker is exempt from the shiki rule only.
+    ["src/browser/workers/highlightWorker.ts", 'import { X } from "@/node/services/log";'],
   ])("reports a value import of src/node in %s: %s", async (filePath, code) => {
     expect(await restrictedImports(filePath, code)).toEqual([nodeMessage]);
   });
@@ -109,6 +113,9 @@ describe("src/node guard for browser and common code", () => {
     ["src/common/utils/tokens/example.ts", 'import { X } from "./tokenStatsCalculator.ts";'],
     ["src/common/utils/ai/example.ts", 'import { X } from "./providerOptions";'],
     ["src/common/orpc/client.ts", 'import { X } from "@/common/utils/ai/providerOptions";'],
+    // Files in subfolders reach the module through "../".
+    ["src/common/utils/tools/internal/example.ts", 'import { X } from "../tools";'],
+    ["src/common/utils/ai/a/b/example.ts", 'import { X } from "../../providerOptions";'],
   ])("reports a value import of a backend-only module in %s: %s", async (filePath, code) => {
     expect(await restrictedImports(filePath, code)).toEqual([backendOnlyMessage]);
   });
@@ -127,7 +134,23 @@ describe("src/node guard for browser and common code", () => {
     ],
     ["src/common/utils/ai/providerOptions.ts", 'import { log } from "@/node/services/log";'],
     ["src/node/services/example.ts", 'import { X } from "@/common/utils/tools/tools";'],
+    // Tests may use src/node helpers in every folder, including the folders with own blocks.
+    ["src/common/types/example.test.ts", 'import { X } from "@/node/services/log";'],
+    ["src/common/orpc/example.test.ts", 'import { X } from "@/node/services/log";'],
+    ["src/common/config/schemas/example.test.ts", 'import { X } from "@/node/services/log";'],
+    ["src/browser/workers/highlightWorker.ts", 'import { createHighlighter } from "shiki";'],
   ])("allows %s: %s", async (filePath, code) => {
     expect(await restrictedImports(filePath, code)).toEqual([]);
+  });
+
+  test.each([
+    ["src/common/orpc/example.test.ts", 'import { X } from "./schemas";', barrelMessage],
+    [
+      "src/common/config/schemas/example.test.ts",
+      'import { X } from "@/common/orpc/schemas/runtime";',
+      expect.stringContaining("Config schemas must not import from ORPC"),
+    ],
+  ])("keeps the folder rules for tests in %s: %s", async (filePath, code, message) => {
+    expect(await restrictedImports(filePath, code)).toEqual([message]);
   });
 });

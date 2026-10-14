@@ -2170,7 +2170,8 @@ const ORPC_SCHEMAS_BARREL_RESTRICTION = {
 // src/node/services/tools/agent_skill_read.ts -> @/common/orpc/schemas). Unlike the first-load
 // forbid list in scripts/perf/firstLoadJs.ts, this runs in CI and also guards lazy chunks.
 const NODE_VALUE_IMPORT_RESTRICTION = {
-  regex: "^(@/|(\\.\\./)+)node(/|$)",
+  // tsconfig maps both @/* and @shared/* to src/*.
+  regex: "^(@/|@shared/|(\\.\\./)+)node(/|$)",
   allowTypeImports: true,
   message:
     "Browser and common code must not value-import src/node: backend modules can pull the @/common/orpc/schemas barrel and Node APIs into the browser bundle. Move the shared code to src/common. Type-only imports are fine.",
@@ -2189,7 +2190,8 @@ const backendOnlyCommonRestriction = (regex) => ({
     "This src/common module is backend-only: it value-imports src/node, so browser and common code must not value-import it. Type-only imports are fine.",
 });
 // Matches "@/common/utils/tools/tools" and relative forms such as "../tools/tools". A file in the
-// module's own folder imports it as "./tools", which the per-folder blocks below cover.
+// module's folder or a subfolder imports it as "./tools" or "../tools", which the per-folder
+// blocks below cover.
 const BACKEND_ONLY_COMMON_RESTRICTION = backendOnlyCommonRestriction(
   `(^|/)(${BACKEND_ONLY_COMMON_FILES.map((file) => file.split("/").slice(-2).join("/").replace(/\.ts$/, "")).join("|")})(\\.[jt]s)?$`
 );
@@ -2201,6 +2203,25 @@ const BROWSER_COMMON_RESTRICTED_PATTERNS = [
   ...SHARED_RESTRICTED_PATTERNS,
   NODE_VALUE_IMPORT_RESTRICTION,
   BACKEND_ONLY_COMMON_RESTRICTION,
+];
+const restrictedImportsRule = (paths, patterns) => ({
+  "no-restricted-imports": ["error", { paths: [...SHARED_RESTRICTED_PATHS, ...paths], patterns }],
+});
+// A common folder with its own no-restricted-imports options gets two blocks: production files
+// get the full browser/common list, and tests get only the shared list, because tests may use
+// src/node helpers like every other test. Both keep the folder's own paths and patterns.
+const TEST_FILES = "src/**/*.test.{ts,tsx}";
+const commonFolderBlocks = ({ glob, paths = [], patterns }) => [
+  {
+    files: [glob],
+    ignores: [TEST_FILES],
+    rules: restrictedImportsRule(paths, [...BROWSER_COMMON_RESTRICTED_PATTERNS, ...patterns]),
+  },
+  {
+    // A nested array matches files that match every glob in it.
+    files: [[glob, TEST_FILES]],
+    rules: restrictedImportsRule(paths, [...SHARED_RESTRICTED_PATTERNS, ...patterns]),
+  },
 ];
 
 export default defineConfig([
@@ -2598,93 +2619,68 @@ export default defineConfig([
     // erased at compile time, so they stay allowed. Restates the block above, because this block
     // replaces its no-restricted-imports options for the files it matches.
     files: ["src/browser/**/*.{ts,tsx}", "src/common/**/*.{ts,tsx}"],
-    ignores: ["src/browser/workers/highlightWorker.ts", "src/**/*.test.{ts,tsx}"],
-    rules: {
-      "no-restricted-imports": [
-        "error",
-        {
-          paths: SHARED_RESTRICTED_PATHS,
-          patterns: BROWSER_COMMON_RESTRICTED_PATTERNS,
-        },
-      ],
-    },
+    ignores: ["src/browser/workers/highlightWorker.ts", TEST_FILES],
+    rules: restrictedImportsRule([], BROWSER_COMMON_RESTRICTED_PATTERNS),
+  },
+  {
+    // The highlight worker is exempt from the shiki rule only.
+    files: ["src/browser/workers/highlightWorker.ts"],
+    rules: restrictedImportsRule(
+      [],
+      BROWSER_COMMON_RESTRICTED_PATTERNS.filter((pattern) => pattern !== SHIKI_RESTRICTION)
+    ),
   },
   {
     // The backend-only src/common modules may value-import src/node and each other.
     files: BACKEND_ONLY_COMMON_FILES,
-    rules: {
-      "no-restricted-imports": [
-        "error",
-        { paths: SHARED_RESTRICTED_PATHS, patterns: SHARED_RESTRICTED_PATTERNS },
-      ],
-    },
+    rules: restrictedImportsRule([], SHARED_RESTRICTED_PATTERNS),
   },
-  // Files next to a backend-only module import it as "./<name>".
+  // Files in a backend-only module's folder or its subfolders import it as "./<name>" or
+  // "../<name>". This can also report a same-named module in a subfolder, which is rare.
   ...BACKEND_ONLY_COMMON_FILES.map((file) => ({
-    files: [`${path.posix.dirname(file)}/*.{ts,tsx}`],
-    ignores: [file, "src/**/*.test.{ts,tsx}"],
-    rules: {
-      "no-restricted-imports": [
-        "error",
-        {
-          paths: SHARED_RESTRICTED_PATHS,
-          patterns: [
-            ...BROWSER_COMMON_RESTRICTED_PATTERNS,
-            backendOnlyCommonRestriction(`^\\./${path.posix.basename(file, ".ts")}(\\.[jt]s)?$`),
-          ],
-        },
-      ],
-    },
+    files: [`${path.posix.dirname(file)}/**/*.{ts,tsx}`],
+    ignores: [file, TEST_FILES],
+    rules: restrictedImportsRule(
+      [],
+      [
+        ...BROWSER_COMMON_RESTRICTED_PATTERNS,
+        backendOnlyCommonRestriction(
+          `^(\\./|(\\.\\./)+)${path.posix.basename(file, ".ts")}(\\.[jt]s)?$`
+        ),
+      ]
+    ),
   })),
-  {
-    // ORPC must import config schemas via direct file paths, never the schemas barrel
-    files: ["src/common/orpc/**/*.ts"],
-    rules: {
-      "no-restricted-imports": [
-        "error",
-        {
-          paths: [
-            ...SHARED_RESTRICTED_PATHS,
-            {
-              name: "@/common/config/schemas",
-              message:
-                "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel.",
-            },
-            {
-              name: "@/common/config/schemas/index",
-              message:
-                "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel.",
-            },
-          ],
-          patterns: [
-            ...BROWSER_COMMON_RESTRICTED_PATTERNS,
-            // Inside src/common/orpc, "./schemas" and "../schemas" are the barrel too.
-            { ...ORPC_SCHEMAS_BARREL_RESTRICTION, regex: "^\\.\\.?/schemas(\\.[jt]s)?$" },
-          ],
-        },
-      ],
-    },
-  },
-  {
-    // Config schemas must remain independent from ORPC schema definitions
-    files: ["src/common/config/schemas/**/*.ts"],
-    rules: {
-      "no-restricted-imports": [
-        "error",
-        {
-          paths: SHARED_RESTRICTED_PATHS,
-          patterns: [
-            {
-              group: ["@/common/orpc/schemas/*", "**/orpc/schemas/*"],
-              message:
-                "Config schemas must not import from ORPC; use @/common/schemas/* or @/common/config/schemas/* instead.",
-            },
-            ...BROWSER_COMMON_RESTRICTED_PATTERNS,
-          ],
-        },
-      ],
-    },
-  },
+  // ORPC must import config schemas via direct file paths, never the schemas barrel
+  ...commonFolderBlocks({
+    glob: "src/common/orpc/**/*.ts",
+    paths: [
+      {
+        name: "@/common/config/schemas",
+        message:
+          "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel.",
+      },
+      {
+        name: "@/common/config/schemas/index",
+        message:
+          "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel.",
+      },
+    ],
+    patterns: [
+      // Inside src/common/orpc, "./schemas" and "../schemas" are the barrel too.
+      { ...ORPC_SCHEMAS_BARREL_RESTRICTION, regex: "^\\.\\.?/schemas(\\.[jt]s)?$" },
+    ],
+  }),
+  // Config schemas must remain independent from ORPC schema definitions
+  ...commonFolderBlocks({
+    glob: "src/common/config/schemas/**/*.ts",
+    patterns: [
+      {
+        group: ["@/common/orpc/schemas/*", "**/orpc/schemas/*"],
+        message:
+          "Config schemas must not import from ORPC; use @/common/schemas/* or @/common/config/schemas/* instead.",
+      },
+    ],
+  }),
   {
     // Production code must not add non-null assertions: `x!` hides a missing
     // check, and the CRAP gate (.xum/skills/crap-gate) forbids trading `?.`/`??`
