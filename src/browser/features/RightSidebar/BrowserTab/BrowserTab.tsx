@@ -338,7 +338,10 @@ export function BrowserTab(props: BrowserTabProps) {
   ]);
 
   useEffect(() => {
-    if (api == null || selectedSessionName == null || selectedDiscoveredSession == null) {
+    // Offline the bridge stays as it is (the preview keeps its last frame): the new client
+    // reruns this effect and reconnects it if needed. Only a missing session disconnects.
+    if (api == null) return;
+    if (selectedSessionName == null || selectedDiscoveredSession == null) {
       lastConnectAttemptRef.current = null;
       disconnect();
       return;

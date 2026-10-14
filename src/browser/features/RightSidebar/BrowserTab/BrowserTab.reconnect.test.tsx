@@ -24,11 +24,15 @@ restoreModulesAfterSuite([
     { ...RealBrowserBridgeConnectionModule },
   ],
 ]);
+/** How often BrowserTab disconnected the (stubbed) bridge. */
+let bridgeDisconnects = 0;
 void mock.module("@/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection", () => ({
   useBrowserBridgeConnection: () => ({
     session: null,
     connect: () => undefined,
-    disconnect: () => undefined,
+    disconnect: () => {
+      bridgeDisconnects += 1;
+    },
     sendInput: () => undefined,
     setPendingUrl: () => undefined,
   }),
@@ -142,6 +146,21 @@ describe.each([...GAP_MODES])("BrowserTab across a dropped connection (%s)", (mo
     await reconnect();
     await view.findByTestId("browser-page-tab-t3");
     expect(view.queryByTestId("browser-page-tab-t2")).toBeNull();
+  });
+
+  // The selected session is still listed while offline: dropping its bridge would throw away the
+  // shown preview for a connection the reconnect restores.
+  test("does not disconnect the bridge while offline", async () => {
+    const view = render(<BrowserTab workspaceId="ws-1" projectPath="/project" />, {
+      wrapper: Wrapper,
+    });
+    await view.findByTestId("browser-page-tab-t2");
+    const disconnectsBefore = bridgeDisconnects;
+
+    await drop();
+    expect(bridgeDisconnects).toBe(disconnectsBefore);
+    await reconnect();
+    expect(bridgeDisconnects).toBe(disconnectsBefore);
   });
 
   test("picking another session while reconnecting clears the previous session's page tabs", async () => {
