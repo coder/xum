@@ -58,6 +58,16 @@ function mapModel(value: unknown): string | undefined {
   return KNOWN_MODEL_IDS.has(anthropicId) ? anthropicId : undefined;
 }
 
+/** Claude `model` / `effort` as Xum `ai` defaults; empty when neither maps. */
+function mapAiDefaults(raw: Record<string, unknown>): { model?: string; thinkingLevel?: string } {
+  const model = mapModel(raw.model);
+  const effort = ThinkingLevelSchema.safeParse(raw.effort);
+  return {
+    ...(model !== undefined ? { model } : {}),
+    ...(effort.success ? { thinkingLevel: effort.data } : {}),
+  };
+}
+
 /**
  * Map a plugin agent's raw YAML frontmatter to Xum frontmatter (before schema
  * validation, so the foreign keys the schema strips are still visible).
@@ -74,12 +84,7 @@ export function mapForeignPluginAgentFrontmatter(
     if (key in raw) throw new ForeignPluginAgentToolsError(key);
   }
 
-  const model = mapModel(raw.model);
-  const effort = ThinkingLevelSchema.safeParse(raw.effort);
-  const ai = {
-    ...(model !== undefined ? { model } : {}),
-    ...(effort.success ? { thinkingLevel: effort.data } : {}),
-  };
+  const ai = mapAiDefaults(raw);
 
   const mapped: Record<string, unknown> = {
     ...raw,
