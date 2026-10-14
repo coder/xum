@@ -70,8 +70,8 @@ async function setup(
     ending?: (turn: number) => "completed" | "aborted";
     /** Routing record the prepared request streams with (stream-start). */
     streamRouting?: (turn: number) => AutoModelRoutingRecord | undefined;
-    /** The model the stream-end reports (a refusal fallback answered); default `model`. */
-    endModel?: (turn: number) => string;
+    /** A refusal fallback answered turn N with this model (stream-end metadata). */
+    fallbackModel?: (turn: number) => string | undefined;
     /** Runs while turn N streams, before it ends. */
     whileStreaming?: (turn: number, h: AgentSessionHarness) => void;
     session?: Omit<AgentSessionHarnessOptions, "workspaceId" | "aiEmitter" | "aiServiceOverrides">;
@@ -112,7 +112,7 @@ async function setup(
                 streamEnd: {
                   type: "stream-end",
                   workspaceId,
-                  metadata: { model: input.endModel?.(turns) ?? model },
+                  metadata: endMetadata(input.fallbackModel?.(turns)),
                   parts: input.parts?.(turns) ?? [{ type: "text", text: `reply ${turns}` }],
                 },
               };
@@ -123,6 +123,13 @@ async function setup(
   holder.h = h;
   harnesses.push(h);
   return { h, streams: () => turns, requests };
+}
+
+/** Stream-end metadata: the turn's model, or a refusal fallback that answered instead. */
+function endMetadata(fallbackModel: string | undefined) {
+  return fallbackModel === undefined
+    ? { model }
+    : { model: fallbackModel, modelFallback: { requestedModel: model, refusedModels: [model] } };
 }
 
 /** Wait until no turn runs and nothing is queued (each continuation is its own turn). */
@@ -224,12 +231,27 @@ describe("turn.stop", () => {
     // Codex PRRT_kwDOPxxmWM6sbewj: only the stream-end reports the fallback model.
     const calls: StopCall[] = [];
     addConsumer(() => undefined, calls);
-    const { h } = await setup({ endModel: () => "anthropic:claude-haiku-4-5" });
+    const { h } = await setup({
+      fallbackModel: (turn) => (turn === 1 ? "anthropic:claude-haiku-4-5" : undefined),
+    });
 
     await h.session.sendMessage("fix the tests", options);
     await settle(h);
 
     expect(calls.map((call) => call.model)).toEqual(["anthropic:claude-haiku-4-5"]);
+  });
+
+  test("without a fallback the Stop hooks see the raw model the turn streamed with", async () => {
+    // Tool events send the raw provider-qualified string (gateway prefix kept): Stop matches it.
+    const calls: StopCall[] = [];
+    addConsumer(() => undefined, calls);
+    const gateway = "mux-gateway:anthropic/claude-haiku-4-5";
+    const { h } = await setup();
+
+    await h.session.sendMessage("fix the tests", { ...options, model: gateway });
+    await settle(h);
+
+    expect(calls.map((call) => call.model)).toEqual([gateway]);
   });
 
   test("one consumer's halt overrides every continuation", async () => {

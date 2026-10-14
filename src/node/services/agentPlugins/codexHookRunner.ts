@@ -27,7 +27,6 @@ import type {
 import { getErrorMessage } from "@/common/utils/errors";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/client/validators/ajv";
 import { effectiveHookTimeoutSeconds } from "@/constants/pluginHooks";
-import { getModelName } from "@/common/utils/ai/models";
 import { log } from "@/node/services/log";
 import { compileHookMatcher, type PluginHookDefinition } from "./codexHooks";
 import { isPlainObject } from "./manifest";
@@ -247,7 +246,10 @@ async function runToolHooks(
 /**
  * Codex's common fields for UserPromptSubmit and Stop (hooks/src/events/user_prompt_submit.rs,
  * stop.rs; Codex PRRT_kwDOPxxmWM6rN7nt). Stop's `turn_id` is the finished turn's assistant
- * message ID, and its `model` the one the turn streamed with. UserPromptSubmit has neither yet:
+ * message ID, and its `model` the one the turn streamed with. `model` is Xum's provider-qualified
+ * string (`openai:gpt-5.2`, gateway prefixes kept), as on tool events: trusted guards match on
+ * it, so it must not change form in place. Codex sends the bare name; that parity needs a new
+ * field (tracked on #6166, Codex security review PRRT_kwDOPxxmWM6scwO-). UserPromptSubmit has neither yet:
  * its hooks run before the turn ID exists and before auto routing and fallback pick the model, so
  * any value there could be wrong, and a guard must not act on a wrong model (Codex
  * PRRT_kwDOPxxmWM6sZTZ2, PRRT_kwDOPxxmWM6sZTZ9; tracked on #6166).
@@ -255,19 +257,10 @@ async function runToolHooks(
  * that value for the same policy (it never sends "plan"). `transcript_path` is null: chat.jsonl
  * is not a Codex transcript, and Codex allows null.
  */
-/**
- * The bare model name Codex sends (`gpt-5.2`), not Xum's `provider:model` string: a Codex
- * hooks.json that checks `model` works without edits. Gateway prefixes resolve to the canonical
- * model (getModelName).
- */
-function codexModelName(model: string): string {
-  return getModelName(model);
-}
-
 function promptEventFields(turnId?: string, model?: string): Record<string, unknown> {
   return {
     ...(turnId !== undefined ? { turn_id: turnId } : {}),
-    ...(model !== undefined ? { model: codexModelName(model) } : {}),
+    ...(model !== undefined ? { model } : {}),
     permission_mode: "bypassPermissions",
     transcript_path: null,
   };
@@ -283,7 +276,7 @@ function turnFields(ctx: ToolExecuteContext): Record<string, unknown> {
   return {
     ...(ctx.toolCallId !== undefined ? { tool_use_id: ctx.toolCallId } : {}),
     ...(ctx.host.turn !== undefined
-      ? { turn_id: ctx.host.turn.turnId, model: codexModelName(ctx.host.turn.model) }
+      ? { turn_id: ctx.host.turn.turnId, model: ctx.host.turn.model }
       : {}),
     permission_mode: "bypassPermissions",
     transcript_path: null,

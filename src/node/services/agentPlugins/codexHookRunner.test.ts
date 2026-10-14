@@ -439,8 +439,8 @@ describe("PreToolUse", () => {
     const fields = {
       id: "call-1",
       turn: "assistant-1",
-      // Codex's bare model name, not Xum's provider:model string.
-      model: "gpt-4o",
+      // Xum's provider-qualified string (Codex sends the bare name; see promptEventFields).
+      model: "openai:gpt-4o",
       mode: "bypassPermissions",
     };
     expect(calls).toEqual([fields, fields]);
@@ -848,7 +848,7 @@ describe("UserPromptSubmit and Stop", () => {
       // A prompt hook runs before the turn has an ID and before routing picks its model:
       // both expand to null rather than to a value that could be wrong.
       { turn: null, model: null, mode: "bypassPermissions" },
-      { turn: "assistant-1", model: "gpt-4o", mode: "bypassPermissions" },
+      { turn: "assistant-1", model: "openai:gpt-4o", mode: "bypassPermissions" },
     ]);
   });
 

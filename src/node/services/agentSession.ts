@@ -1338,6 +1338,22 @@ interface PreparationAttempt {
   sendIdentities?: readonly SendIdentity[];
 }
 
+/**
+ * The model the Stop hooks see, in the form tool events use: the raw provider-qualified string
+ * the turn streamed with (gateway prefixes kept), so one guard matches both events. After a
+ * refusal fallback only the stream-end payload names the model that answered (Codex
+ * PRRT_kwDOPxxmWM6sbewj); it carries the metadata identity, which drops a non-Coder gateway
+ * prefix. Direct and Coder models read the same in both forms.
+ */
+function stopHookModel(
+  payload: StreamEndEvent,
+  provenance: StopContinuationProvenance
+): string | undefined {
+  return payload.metadata.modelFallback == null
+    ? (provenance.streamModel ?? payload.metadata.model)
+    : payload.metadata.model;
+}
+
 export class AgentSession {
   private readonly replayPublication = new AsyncLocalStorage<{
     listener: (event: AgentSessionChatEvent) => void;
@@ -10563,9 +10579,7 @@ export class AgentSession {
       messageId: payload.messageId,
       lastAssistantMessage: lastAssistantText(payload.parts),
       stopHookActive: this.stopHookContinuations > 0,
-      // The model that answered: a refusal fallback swaps it during the stream, and only the
-      // stream-end payload reports that (Codex PRRT_kwDOPxxmWM6sbewj).
-      model: payload.metadata.model,
+      model: stopHookModel(payload, provenance),
     });
     if (outcome.kind === "none" || options == null) {
       this.stopHookContinuations = 0;
