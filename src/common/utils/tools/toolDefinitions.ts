@@ -3515,15 +3515,20 @@ export function getToolSchemas(): Record<string, ToolSchema> {
 }
 
 /**
- * Google's mixed built-in + function tool path is currently supported for Gemini 3.
+ * Google's mixed built-in + function tool path is supported for Gemini 3 and Gemini 4 Argon.
  * Keep native Google tools gated here so the prompt allowlist matches the actual toolset.
  */
 export function supportsGoogleNativeToolsWithFunctionTools(modelId: string): boolean {
   const bareModelId = modelId.split("/").pop() ?? modelId;
+  if (bareModelId.startsWith("gemini-4-argon")) {
+    // Argon documents Search grounding and URL context alongside function calling, and
+    // @ai-sdk/google gives every post-2.x Gemini ID the mixed native/function serialization
+    // (includeServerSideToolInvocations). Other Gemini 4 IDs stay off until documented.
+    return true;
+  }
   const match = /^gemini-(\d+)(?:[.-]|$)/.exec(bareModelId);
   if (!match) return false;
   const major = Number.parseInt(match[1], 10);
-  // The installed @ai-sdk/google mixed native/function serialization path is Gemini 3-only.
   return major === 3;
 }
 

@@ -83,6 +83,7 @@ export function isGeminiFlashMinimalRejectingModelName(modelName: string): boole
  *   (native max; the API rejects "none", so reasoning cannot be disabled)
  * - openai:gpt-6-luna → ["off", "low", "medium", "high", "xhigh", "max"] (6 levels)
  * - Gemini 3.8 Flash → ["low", "medium", "high"] (API rejects minimal, so no "off")
+ * - Gemini 4 Argon → ["low", "medium", "high"] (no minimal level, so no "off")
  * - Older Gemini Flash chat variants → ["off", "low", "medium", "high"]
  * - gemini-3 Pro variants → ["low", "high"] (thinking level only)
  * - xai:grok-4.7 / xai:grok-4.6 → ["low", "medium", "high", "xhigh"] (reasoning cannot be disabled)
@@ -177,11 +178,10 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["off", "low", "medium", "high"];
   }
 
-  // Gemini 4 Argon supports reasoning with at least "low" and "high" levels (benchmark
-  // evaluations used "high"). Broader level support is undocumented; expose the same
-  // conservative set as Gemini 3 Pro until official API docs confirm more levels.
+  // Gemini 4 Argon documents thinking levels low, medium (its default), and high; it has
+  // no "minimal", so thinking cannot be disabled and "off" clamps to "low".
   if (withoutProviderNamespace.startsWith("gemini-4-argon")) {
-    return ["low", "high"];
+    return ["low", "medium", "high"];
   }
 
   // Gemini 3 Pro only supports "low" and "high" reasoning levels

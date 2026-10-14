@@ -17,8 +17,8 @@ export interface ResolvedModelParameterOverrides {
 const SAMPLING_CALL_SETTINGS = ["temperature", "topP", "topK"] as const;
 
 /**
- * Gemini 3.8/3.7/3.6 Flash and Gemini 3.5 Flash-Lite deprecate the sampling parameters
- * temperature/top_p/top_k; Google's migration guides require stripping them from
+ * Gemini 4 Argon, Gemini 3.8/3.7/3.6 Flash and Gemini 3.5 Flash-Lite deprecate the sampling
+ * parameters temperature/top_p/top_k; Google's migration guides require stripping them from
  * generation configs, so forwarding user overrides would break existing setups
  * (e.g. a wildcard temperature) when the gemini-flash alias repoints.
  *
@@ -37,6 +37,7 @@ export function modelRejectsSamplingParameters(modelString: string): boolean {
   return (
     // Bedrock ids keep an `anthropic.` (and optional region) prefix after stripping.
     /(?:^|\.)claude-haiku-(?:[5-9]|\d{2,})/.test(bareModelId) ||
+    bareModelId.startsWith("gemini-4-argon") ||
     bareModelId.startsWith("gemini-3.8-flash") ||
     bareModelId.startsWith("gemini-3.7-flash") ||
     bareModelId.startsWith("gemini-3.6-flash") ||

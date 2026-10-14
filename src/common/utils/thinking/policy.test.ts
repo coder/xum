@@ -492,6 +492,14 @@ describe("getThinkingPolicyForModel", () => {
     expect(getThinkingPolicyForModel("google:gemini-3.1-pro-preview")).toEqual(["low", "high"]);
   });
 
+  test("returns low/medium/high (no off) for Gemini 4 Argon, unlike the Gemini 3 Pro set", () => {
+    for (const model of ["google:gemini-4-argon", "openrouter:google/gemini-4-argon"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
+      expect(enforceThinkingPolicy(model, "off")).toBe("low");
+      expect(enforceThinkingPolicy(model, "medium")).toBe("medium");
+    }
+  });
+
   test("returns off/low/medium/high for stable Gemini 3.5 Flash", () => {
     expect(getThinkingPolicyForModel("google:gemini-3.5-flash")).toEqual([
       "off",

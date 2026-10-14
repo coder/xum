@@ -176,14 +176,9 @@ const MODEL_DEFINITIONS = {
     aliases: ["gemini-flash"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },
-  // Gemini 4 Argon - Google DeepMind's frontier model, announced September 30, 2026.
-  // First of the Gemini 4 generation; built for sustained multi-step coding, research,
-  // and cybersecurity work. 1M context, up to 1M output tokens, intro pricing $2/M in
-  // $10/M out. Currently gated to the Fairwind Program; broader API rollout to paid
-  // customers and AI Ultra subscribers is announced but undated. The model ID
-  // `gemini-4-argon` follows Google's naming convention and is used by benchmark
-  // evaluators (vals.ai, artificialanalysis.ai); update if the official API docs
-  // publish a different ID.
+  // Gemini 4 Argon - Google's flagship reasoning model, GA on the paid Gemini API on
+  // October 13, 2026 (stable ID `gemini-4-argon`; not on the free tier). See
+  // models-extra for limits and pricing.
   GEMINI_4_ARGON: {
     provider: "google",
     providerModelId: "gemini-4-argon",
