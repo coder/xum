@@ -234,6 +234,90 @@ function mergeRawConsent(raw: unknown, consent: ComponentConsent): Record<string
   return { ...(isPlainObject(raw) ? raw : {}), ...consent };
 }
 
+function skillChangeSummary(current: SurfaceSkill, staged: SurfaceSkill, name: string): string {
+  return current.fingerprint !== staged.fingerprint
+    ? `changes the model-visible advertisement of skill '${name}'`
+    : `changes the definition of skill '${name}'`;
+}
+
+/** List row field: managed rows count imported components that need a review (#6498). */
+function reviewRequiredField(
+  entry: AgentPluginInstallEntry | undefined,
+  fingerprints: ComponentConsent
+): { reviewRequiredCount?: number } {
+  if (entry === undefined) return {};
+  return {
+    reviewRequiredCount: countUnreviewed({
+      current: fingerprints,
+      selection: entry.importedComponents,
+      consent: entry.componentConsent,
+    }),
+  };
+}
+
+/** Consent after a confirmed review: only the shown refs that still match get records. */
+function consentAfterReview(
+  entry: AgentPluginInstallEntry,
+  changes: readonly AgentPluginCapabilityChange[],
+  consent: { reviewed?: readonly AgentPluginComponentRef[] } | undefined
+): ComponentConsent {
+  return recordReviewedComponents({
+    previous: entry.componentConsent,
+    current: changes.flatMap((change) => (change.component ? [change.component] : [])),
+    reviewed: consent?.reviewed ?? [],
+  });
+}
+
+/**
+ * Component review rows: imported skills and MCP servers whose current consent fingerprint has
+ * no matching record. `before` says whether the user ever reviewed the component on this install.
+ */
+function unreviewedRows(
+  entry: AgentPluginInstallEntry,
+  surface: { skills: Map<string, SurfaceSkill>; servers: Map<string, SurfaceServer> }
+): AgentPluginCapabilityChange[] {
+  return [
+    ...[...surface.skills].flatMap(([name, item]) => unreviewedRow(entry, "skills", name, item)),
+    ...[...surface.servers].flatMap(([name, item]) =>
+      unreviewedRow(entry, "mcpServers", name, item)
+    ),
+  ];
+}
+
+const COMPONENT_LABELS: Record<keyof ComponentConsent, string> = {
+  skills: "Skill",
+  mcpServers: "MCP server",
+};
+
+function reviewedBefore(
+  consent: ComponentConsent | undefined,
+  kind: keyof ComponentConsent,
+  name: string
+): string {
+  return consent !== undefined && getOwn(consent[kind], name) !== undefined
+    ? "Changed since you reviewed it"
+    : "Not reviewed on this install";
+}
+
+function unreviewedRow(
+  entry: AgentPluginInstallEntry,
+  kind: "skills" | "mcpServers",
+  name: string,
+  item: SurfaceSkill | SurfaceServer
+): AgentPluginCapabilityChange[] {
+  const imported = entry.importedComponents?.[kind].includes(name) ?? true;
+  const fingerprint = item.consentFingerprint;
+  if (!imported || isComponentConsented(entry.componentConsent, kind, name, fingerprint)) return [];
+  return [
+    {
+      summary: `${COMPONENT_LABELS[kind]} '${name}' needs review`,
+      before: reviewedBefore(entry.componentConsent, kind, name),
+      after: item.display,
+      component: { kind, name, fingerprint },
+    },
+  ];
+}
+
 /** Every component of an inventory: what a legacy import-all entry (no selection) imports. */
 function fullSelection(
   inventory: Pick<AgentPluginComponents, "skills" | "mcpServers">
@@ -1632,9 +1716,10 @@ export class AgentPluginInstallService {
       });
       warnings.push(...diagnostics.map((d) => d.message));
       const rewrite = (value: string): string => value.split(plugin.rootPath).join(finalTargetPath);
+      // A staged update review normalizes the final path too (see collectMcpServers).
       const paths = {
-        rootPath: plugin.rootPath,
-        dataPath: getPluginDataPath(this.config.rootDir, instanceId),
+        rootPaths: [plugin.rootPath, finalTargetPath],
+        dataPaths: [getPluginDataPath(this.config.rootDir, instanceId)],
       };
       for (const info of Object.values(infos)) {
         assert(info.plugin !== undefined, "plugin server info must carry provenance");
@@ -1803,10 +1888,7 @@ export class AgentPluginInstallService {
         // The skill's location and whole frontmatter count (#6498), so a moved skill or a new
         // frontmatter field shows here. The summary names an advertisement change when there is one.
         changes.push({
-          summary:
-            currentSkill.fingerprint !== skill.fingerprint
-              ? `changes the model-visible advertisement of skill '${skillName}'`
-              : `changes the definition of skill '${skillName}'`,
+          summary: skillChangeSummary(currentSkill, skill, skillName),
           before: currentSkill.display,
           after: skill.display,
           component,
@@ -3420,15 +3502,7 @@ export class AgentPluginInstallService {
         importedMcpServerCount: inventory.mcpServers.filter(
           (server) => selection === undefined || selection.mcpServers.includes(server.serverName)
         ).length,
-        ...(entry !== undefined
-          ? {
-              reviewRequiredCount: countUnreviewed({
-                current: inventory.fingerprints,
-                selection: entry.importedComponents,
-                consent: entry.componentConsent,
-              }),
-            }
-          : {}),
+        ...reviewRequiredField(entry, inventory.fingerprints),
       });
     }
 
@@ -4475,16 +4549,18 @@ export class AgentPluginInstallService {
       if (entry.lockedSha !== args.expectedLockedSha)
         throw new Error("Plugin changed since the review. Review it again.");
       const { changes } = await this.unreviewedComponents(entry);
-      const componentConsent = recordReviewedComponents({
-        previous: entry.componentConsent,
-        current: changes.flatMap((change) => (change.component ? [change.component] : [])),
-        reviewed: args.reviewed,
-      });
+      const componentConsent = consentAfterReview(entry, changes, { reviewed: args.reviewed });
       await this.writeRegistry(
         envelope,
         rawEntries.map((raw) =>
           this.rawEntryName(raw) === entry.name
-            ? { ...(raw as Record<string, unknown>), componentConsent }
+            ? {
+                ...(raw as Record<string, unknown>),
+                componentConsent: mergeRawConsent(
+                  (raw as Record<string, unknown>).componentConsent,
+                  componentConsent
+                ),
+              }
             : raw
         )
       );
@@ -4510,35 +4586,7 @@ export class AgentPluginInstallService {
       targetPath,
       warnings
     );
-    const selection = entry.importedComponents ?? {
-      skills: [...surface.skills.keys()],
-      mcpServers: [...surface.servers.keys()],
-    };
-    const changes: AgentPluginCapabilityChange[] = [];
-    const add = (
-      kind: "skills" | "mcpServers",
-      name: string,
-      label: string,
-      item: SurfaceSkill | SurfaceServer
-    ) => {
-      if (isComponentConsented(entry.componentConsent, kind, name, item.consentFingerprint)) return;
-      changes.push({
-        summary: `${label} '${name}' needs review`,
-        before:
-          getOwn(entry.componentConsent?.[kind] ?? {}, name) === undefined
-            ? "Not reviewed on this install"
-            : "Changed since you reviewed it",
-        after: item.display,
-        component: { kind, name, fingerprint: item.consentFingerprint },
-      });
-    };
-    for (const [name, skill] of surface.skills) {
-      if (selection.skills.includes(name)) add("skills", name, "Skill", skill);
-    }
-    for (const [name, server] of surface.servers) {
-      if (selection.mcpServers.includes(name)) add("mcpServers", name, "MCP server", server);
-    }
-    return { changes, warnings };
+    return { changes: unreviewedRows(entry, surface), warnings };
   }
 
   async previewUpdate(args: { name: string }): Promise<AgentPluginUpdateReview> {
@@ -4628,11 +4676,7 @@ export class AgentPluginInstallService {
           signInResets
         );
         // Only changes the user saw at these fingerprints get consent records (#6498).
-        const componentConsent = recordReviewedComponents({
-          previous: entry.componentConsent,
-          current: changes.flatMap((change) => (change.component ? [change.component] : [])),
-          reviewed: args.consent?.reviewed ?? [],
-        });
+        const componentConsent = consentAfterReview(entry, changes, args.consent);
         if (changes.length > 0 && args.consent === undefined) {
           throw new Error(
             `The update to '${entry.name}' ${changes.map((change) => change.summary).join("; ")}. Updates cannot expand a plugin's capabilities without review — open Settings → Plugins and review the update to confirm it.`
@@ -4815,7 +4859,7 @@ export class AgentPluginInstallService {
                 lockedSha: updated.lockedSha,
                 updatedAt: updated.updatedAt,
                 manifest: { ...preservedManifest, ...updated.manifest },
-                componentConsent,
+                componentConsent: mergeRawConsent(rawRecord.componentConsent, componentConsent),
               };
             })
           );

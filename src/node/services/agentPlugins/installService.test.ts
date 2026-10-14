@@ -1556,6 +1556,27 @@ describe("AgentPluginInstallService", () => {
     expect(saved.data.componentConsent).toEqual({ skills: {}, mcpServers: {} });
   });
 
+  test("a manifest that names the final install path literally keeps its consent (#6498)", async () => {
+    // The install review reads a staged clone, so it must normalize the final path too.
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          echo: {
+            type: "stdio",
+            command: "node",
+            args: [path.join(pluginsDir(), "demo-plugin", "server.js")],
+          },
+        },
+      })
+    );
+    await commitAll(remoteDir, "literal install path");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect((await service.list())[0].reviewRequiredCount).toBe(0);
+  });
+
   test("a component review lists unconsented imports and confirm records them (#6498)", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
