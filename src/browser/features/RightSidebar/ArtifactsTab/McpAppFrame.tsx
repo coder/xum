@@ -236,6 +236,31 @@ function DomainsPromptText(props: { origins: readonly string[]; projectPath: str
   );
 }
 
+/**
+ * Close the channel of a document that left the frame: a new one replaced it, it navigated away
+ * (the frame is removed until Reload, which loads a new document), or the view unmounted. The
+ * HTML standard asks to close discarded ports. StrictMode replays effects (setup, cleanup,
+ * setup) synchronously, so the cleanup closes only in a microtask, and only if no setup took
+ * the same document back by then. The host's own cleanup runs before it, so its teardown still
+ * went out on the channel.
+ */
+function useCloseDiscardedDocumentChannel(
+  viewDocument: { channel: McpAppDocumentChannel } | null,
+  frameMounted: boolean
+) {
+  const mountedDocument = useRef<typeof viewDocument>(null);
+  useLayoutEffect(() => {
+    if (viewDocument == null || !frameMounted) return;
+    mountedDocument.current = viewDocument;
+    return () => {
+      mountedDocument.current = null;
+      queueMicrotask(() => {
+        if (mountedDocument.current !== viewDocument) viewDocument.channel.close();
+      });
+    };
+  }, [viewDocument, frameMounted]);
+}
+
 export function McpAppFrame(props: {
   workspaceId: string;
   view: McpAppViewRef;
@@ -527,22 +552,7 @@ export function McpAppFrame(props: {
     // The host lives as long as the document; `grant` is derived from the same inputs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [srcDoc, workspaceId, serverName, boundServerName, guard.navigated, navigatedRef]);
-  // Close the channel of a document that left the frame: a new one replaced it, or the view
-  // unmounted (the HTML standard asks to close discarded ports). StrictMode replays effects
-  // (setup, cleanup, setup) synchronously, so the cleanup closes only in a microtask, and only
-  // if no setup took the same document back by then. The host's own cleanup runs before it, so
-  // its teardown still went out on the channel.
-  const mountedDocument = useRef<typeof viewDocument>(null);
-  useLayoutEffect(() => {
-    if (viewDocument == null) return;
-    mountedDocument.current = viewDocument;
-    return () => {
-      mountedDocument.current = null;
-      queueMicrotask(() => {
-        if (mountedDocument.current !== viewDocument) viewDocument.channel.close();
-      });
-    };
-  }, [viewDocument]);
+  useCloseDiscardedDocumentChannel(viewDocument, !guard.navigated);
 
   // Keep the view's theme current without reloading it.
   useEffect(() => {

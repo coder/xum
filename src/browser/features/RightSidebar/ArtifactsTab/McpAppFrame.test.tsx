@@ -846,6 +846,20 @@ describe("McpAppFrame", () => {
     }
   });
 
+  test("a view that navigated away has its document's port closed", async () => {
+    delete window.api;
+    const close = spyOn(MessagePort.prototype, "close");
+    try {
+      const { view, document } = await renderFrame();
+      const before = close.mock.calls.length;
+      document.dispatch("pagehide");
+      expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+      await waitFor(() => expect(close.mock.calls.length).toBeGreaterThan(before));
+    } finally {
+      close.mockRestore();
+    }
+  });
+
   test("the host answers nothing before the document opened its channel", async () => {
     const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
     const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
