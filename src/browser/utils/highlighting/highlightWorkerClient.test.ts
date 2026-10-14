@@ -648,6 +648,35 @@ describe("highlightCode worker start-up", () => {
     LONG_TEST_TIMEOUT_MS
   );
 
+  // #6369 follow-up: a recovery start deleted its language's map entry when it settled, whatever
+  // that entry was by then. A start still running across __resetForTests deleted the newer
+  // recovery of the same language, so a later waiter queued a second start, one worker too many.
+  it(
+    "a recovery start that settles after a reset leaves the newer recovery in place",
+    async () => {
+      // w1, w2: never start. w3: its script fails. w4, w5 (and w6, only with the defect): never start.
+      const created = plan([null, null, { errorAfterMs: 100 }, null, null, null]);
+      const first = highlightCode("const a = 1;", "typescript", "dark");
+      // At 20 s w1 gives up; the old recovery starts w2, which gives up at 40 s.
+      await advanceFakeTime(21_000, undefined, 1_000);
+      expect(created).toHaveLength(2);
+
+      __resetForTests();
+      // w3 fails at once: a new recovery is queued behind `queued`, whose w4 gives up at ~41 s,
+      // after the old recovery settled (40 s). `queued` then waits on the new recovery.
+      const next = highlightCode("const b = 2;", "typescript", "dark");
+      const queued = highlightCode("const c = 3;", "typescript", "dark");
+      const all = Promise.allSettled([first, next, queued]);
+      expect(await settleWithin(all, 100_000, 1_000)).not.toBe("pending");
+      for (const request of [first, next, queued]) {
+        await expect(request).rejects.toThrow("HIGHLIGHT_WORKER_START");
+      }
+      // One recovery start (w5) after the reset, shared by both waiters.
+      expect(created).toHaveLength(5);
+    },
+    LONG_TEST_TIMEOUT_MS
+  );
+
   it("a worker that crashes during a highlight rejects at once and does not mark the input", async () => {
     const created = plan([0, 0]);
     const outcome = await settleWithin(highlightCode(CRASHING_INPUT, "typescript", "dark"), 1_000);

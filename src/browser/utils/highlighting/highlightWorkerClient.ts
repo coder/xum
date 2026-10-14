@@ -460,12 +460,18 @@ function startRecovery(language: string): { done: Promise<void>; waiters: number
   entry.done = enqueue(() =>
     entry.waiters > 0 ? prepareWorker(language) : Promise.resolve()
   ).finally(() => {
-    workerRecoveries.delete(language);
+    // Only its own entry: a newer recovery of this language (after __resetForTests) stays.
+    deleteIfCurrent(workerRecoveries, language, entry);
   });
   // Its waiters may all have left: an unawaited rejection must not be reported.
   entry.done.catch(() => undefined);
   workerRecoveries.set(language, entry);
   return entry;
+}
+
+/** Deletes `key` only while it still maps to `value`, not to an entry that replaced it. */
+function deleteIfCurrent<K, V>(map: Map<K, V>, key: K, value: V): void {
+  if (map.get(key) === value) map.delete(key);
 }
 
 /** `promise`, or a rejection with `signal.reason` once the caller aborts first. */
