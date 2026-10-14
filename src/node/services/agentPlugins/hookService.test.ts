@@ -703,6 +703,31 @@ describe("AgentPluginHookService", () => {
     expect(contributed).toHaveLength(2);
   });
 
+  test("a tool call prefetches settings only for sibling plugins that grant the tool", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "reads-files",
+      `({ "tool.execute.before": () => ({}) })`,
+      { tools: ["file_read"] }
+    );
+    await writeHookPlugin(
+      harness.container,
+      "runs-bash",
+      `({ "tool.execute.before": () => ({}) })`,
+      { tools: ["bash"] }
+    );
+    const prefixes: string[] = [];
+    harness.service.setSettingsProvider((_workspaceId, prefix) => {
+      prefixes.push(prefix);
+      return Promise.resolve({});
+    });
+    await harness.ensure();
+    await runTool(harness.spine, makeToolCtx("file_read", { path: "/repo/a.txt" }));
+    // Only the plugin that can run on file_read has its settings read.
+    expect(new Set(prefixes).size).toBe(1);
+  });
+
   test("hook settings above the size cap are omitted with a flag", async () => {
     const harness = await createHarness();
     await writeHookPlugin(

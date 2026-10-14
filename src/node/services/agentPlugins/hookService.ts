@@ -636,22 +636,23 @@ export class AgentPluginHookService {
   }
 
   /**
-   * This plugin's settings, after starting the reads of every sibling plugin with the same hook
-   * point (#6186). The spine runs plugin middleware serially, so plugins that each wait on their
+   * This plugin's settings, after starting the reads of every sibling plugin that can run the
+   * same hook point (#6186): on a tool hook, only siblings that grant `toolName`. The spine runs plugin middleware serially, so plugins that each wait on their
    * own unresponsive settings server would add one timeout each. The siblings' own calls later
    * join the reads the MCP manager already has in flight, so the dispatch waits about one timeout.
    */
   private readHookSettings(
     workspaceId: string,
     state: LoadedPluginHookState,
-    hookName: PluginHookPoint
+    hookName: PluginHookPoint,
+    toolName: string | undefined
   ): Promise<Record<string, unknown>> {
     const provider = this.settingsProvider;
     if (provider === undefined) {
       return Promise.resolve({});
     }
     for (const sibling of this.registrations.get(workspaceId)?.states ?? []) {
-      if (sibling !== state && !sibling.disposed && sibling.hookNames.includes(hookName)) {
+      if (sibling !== state && canRunHook(sibling, hookName, toolName)) {
         // Only starts the read: the result is discarded, and the provider never throws.
         provider(workspaceId, sibling.serverKeyPrefix, this.settingsTimeoutMs).catch(
           () => undefined
@@ -684,7 +685,8 @@ export class AgentPluginHookService {
     // lands during this read must stop the call, or withPersistentMount would
     // recreate the dropped mount and run the removed hook once more
     // (the last review fix of #6040).
-    const settings = await this.readHookSettings(workspaceId, state, hookName);
+    const toolName = typeof input.toolName === "string" ? input.toolName : undefined;
+    const settings = await this.readHookSettings(workspaceId, state, hookName, toolName);
     if (await this.retireIfEpochStale(workspaceId)) {
       return null;
     }
@@ -761,6 +763,24 @@ export class AgentPluginHookService {
       log.warn(`Agent plugin hooks: failed to drop sandbox scope ${scopeKey}`, { error });
     }
   }
+}
+
+/**
+ * Whether a plugin's hook would run for this hook point (and, on a tool hook, this tool). The
+ * sibling settings prefetch skips the rest: a read of a plugin that cannot run is not only
+ * wasted, a failed read is memoized per server instance, so a transient failure would cost that
+ * plugin its settings later.
+ */
+function canRunHook(
+  state: LoadedPluginHookState,
+  hookName: PluginHookPoint,
+  toolName: string | undefined
+): boolean {
+  return (
+    !state.disposed &&
+    state.hookNames.includes(hookName) &&
+    (toolName === undefined || isBridgeToolGranted(state.grants, toolName))
+  );
 }
 
 /**
