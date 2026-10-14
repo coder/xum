@@ -348,6 +348,8 @@ export interface MockORPCClientOptions {
   mcpSettingsAfterUpdate?: Map<string, MCPSettingsSnapshot>;
   /** When set, the first settings read takes its values, then waits for this promise. */
   mcpSettingsFirstReadGate?: { promise: Promise<void> };
+  /** Records every settings tool action run; each one returns "<tool> finished". */
+  mcpSettingsToolRuns?: Array<{ toolName: string; confirmed: boolean }>;
   /** When set, mcp.test waits for this promise (stories hold a Fetch Tools in flight). */
   mcpTestGate?: { promise: Promise<void> };
   /** Session icon registry for mcp.icon - maps iconRef to a PNG data URL (unknown refs resolve null) */
@@ -499,6 +501,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpSettingsUpdateGate,
     mcpSettingsAfterUpdate,
     mcpSettingsFirstReadGate,
+    mcpSettingsToolRuns,
     mcpTestGate,
     mcpIcons = new Map<string, string>(),
     mcpOauthAuthStatus = new Map<string, MCPOAuthAuthStatus>(),
@@ -1437,6 +1440,13 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
               instanceToken: mockSettingsToken(input.serverName),
             },
           };
+        },
+        runTool: (input: { toolName: string; confirmed: boolean }) => {
+          mcpSettingsToolRuns?.push({ toolName: input.toolName, confirmed: input.confirmed });
+          return Promise.resolve({
+            success: true,
+            data: { text: `${input.toolName} finished`, isError: false },
+          });
         },
       },
       list: (input?: { projectPath?: string }) => {

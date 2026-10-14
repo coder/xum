@@ -5,6 +5,7 @@ import { expect, fireEvent, userEvent, waitFor, within } from "@storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, useAPI, type APIClient } from "@/browser/contexts/API";
+import { ConfirmDialogProvider } from "@/browser/contexts/ConfirmDialogContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
@@ -72,6 +73,7 @@ interface WorkspaceMCPStoryOptions {
   settingsUpdateGate?: { promise: Promise<void> } | Array<{ promise: Promise<void> }>;
   settingsFirstReadGate?: { promise: Promise<void> };
   settingsAfterSave?: Record<string, MCPSettingsSnapshot>;
+  settingsToolRuns?: Array<{ toolName: string; confirmed: boolean }>;
   testGate?: { promise: Promise<void> };
 }
 
@@ -151,6 +153,7 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
     mcpSettingsUpdateGate: options.settingsUpdateGate,
     mcpSettingsFirstReadGate: options.settingsFirstReadGate,
     mcpSettingsAfterUpdate: new Map(Object.entries(options.settingsAfterSave ?? {})),
+    mcpSettingsToolRuns: options.settingsToolRuns,
     mcpTestGate: options.testGate,
   });
 }
@@ -171,7 +174,9 @@ const WorkspaceMCPModalStoryShell: FC<{ setup: () => APIClient; children: ReactN
       <TooltipProvider>
         <APIProvider client={clientRef.current}>
           <RouterProvider>
-            <SettingsProvider>{children}</SettingsProvider>
+            <SettingsProvider>
+              <ConfirmDialogProvider>{children}</ConfirmDialogProvider>
+            </SettingsProvider>
           </RouterProvider>
         </APIProvider>
       </TooltipProvider>
@@ -579,7 +584,24 @@ const CAD_SETTINGS: MCPSettingsSnapshot = {
       items: [
         { kind: "property", property: "units" },
         { kind: "property", property: "grid" },
-        { kind: "tool", tool: "cad.library", description: "Manage part libraries" },
+        {
+          kind: "tool",
+          tool: "cad.library",
+          description: "Manage part libraries",
+          action: { title: "Part library", readOnly: true, opensApp: false },
+        },
+        {
+          kind: "tool",
+          tool: "cad.reset",
+          action: { title: "Reset parts", readOnly: false, opensApp: false },
+        },
+        {
+          kind: "tool",
+          tool: "cad.payment",
+          action: { title: "Payment method", readOnly: false, opensApp: true },
+        },
+        // Not listed by the server, or excluded by the tool allowlist.
+        { kind: "tool", tool: "cad.export" },
       ],
     },
     {
@@ -673,6 +695,43 @@ export const WorkspaceMCPServerSettingsNarrow: Story = {
 // Settings stories marked PIXEL_DISABLED exist for their plays (which still run in Test /
 // Storybook). Their first frame adds no look beyond WorkspaceMCPServerSettings and its Narrow
 // variant, so they skip Pixel to stay within the snapshot budget.
+/** The latest WorkspaceMCPServerSettingsToolActions render's runs (its play reads them). */
+let toolActionRuns: Array<{ toolName: string; confirmed: boolean }> = [];
+/**
+ * Layout tool actions: a read-only tool runs at once and shows its text; a tool that can write
+ * asks first (Cancel runs nothing); an MCP App tool and an unavailable tool stay disabled.
+ */
+export const WorkspaceMCPServerSettingsToolActions: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    const runs: Array<{ toolName: string; confirmed: boolean }> = [];
+    toolActionRuns = runs;
+    return renderWorkspaceMCPModal({ ...settingsStoryOptions(), settingsToolRuns: runs });
+  },
+  play: async ({ canvasElement }) => {
+    const dialog = await findWorkspaceMCPDialog(canvasElement);
+    const section = within(await within(dialog).findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    // The spec's display name (the tool's title), not the raw tool name.
+    await userEvent.click(await section.findByRole("button", { name: "Run Part library" }));
+    await expect(section.findByText("cad.library finished")).resolves.toBeInTheDocument();
+    await expect(toolActionRuns).toEqual([{ toolName: "cad.library", confirmed: false }]);
+
+    await userEvent.click(section.getByRole("button", { name: "Run Reset parts" }));
+    await userEvent.click(await page.findByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(page.queryByText("Run Reset parts?")).not.toBeInTheDocument());
+    await expect(toolActionRuns).toHaveLength(1);
+    await userEvent.click(section.getByRole("button", { name: "Run Reset parts" }));
+    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    await expect(section.findByText("cad.reset finished")).resolves.toBeInTheDocument();
+    await expect(toolActionRuns[1]).toEqual({ toolName: "cad.reset", confirmed: true });
+
+    await expect(section.getByText("Opens in a later version")).toBeInTheDocument();
+    await expect(section.getByText("Not available")).toBeInTheDocument();
+    await expect(section.queryByRole("button", { name: /Payment method|cad\.export/ })).toBeNull();
+  },
+};
+
 /** Not running yet: the dialog does not start it on open; Fetch Tools connects it. */
 export const WorkspaceMCPServerSettingsNotConnected: Story = {
   parameters: { pixel: PIXEL_DISABLED },

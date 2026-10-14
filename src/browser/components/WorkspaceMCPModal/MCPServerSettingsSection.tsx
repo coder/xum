@@ -12,6 +12,7 @@ import {
   type MCPSettingValue,
   type MCPSettingsReadSnapshot,
 } from "@/common/utils/mcpSettings";
+import { MCPSettingsToolActionRow } from "./MCPSettingsToolActionRow";
 import { settingsErrors } from "./serverSettingsEntries";
 
 interface MCPServerSettingsSectionProps {
@@ -190,14 +191,13 @@ export const MCPServerSettingsSection = React.forwardRef<
           {group.items.map((item) => {
             if (item.kind === "tool")
               return (
-                <div
+                <MCPSettingsToolActionRow
                   key={`tool:${item.tool}`}
-                  className="text-content-secondary flex items-center justify-between gap-3 text-xs opacity-60"
-                  aria-disabled="true"
-                >
-                  <span className="min-w-0 wrap-anywhere">{item.description ?? item.tool}</span>
-                  <span className="shrink-0">Opens in a later version</span>
-                </div>
+                  workspaceId={props.workspaceId}
+                  serverName={props.serverName}
+                  instanceToken={props.snapshot.instanceToken}
+                  item={item}
+                />
               );
             const schema = getOwn(properties, item.property);
             if (schema === undefined) return null;

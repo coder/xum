@@ -246,12 +246,6 @@ function createHttpTransport(config: MCPHttpTransportConfig): Transport {
 }
 
 /**
- * MCP CallToolResult -> AI SDK tool-result output for the model.
- *
- * Mirrors @ai-sdk/mcp's mcpToModelOutput so model-visible tool results stay
- * identical across the SDK swap.
- */
-/**
  * Record one tools/list entry as a settings layout tool action. The title follows the settings
  * spec's display name order with the same cleaning as entry point titles; a tool whose name
  * cleans to nothing is left out.
@@ -275,6 +269,12 @@ function addSettingsToolAction(
   });
 }
 
+/**
+ * MCP CallToolResult -> AI SDK tool-result output for the model.
+ *
+ * Mirrors @ai-sdk/mcp's mcpToModelOutput so model-visible tool results stay
+ * identical across the SDK swap.
+ */
 function mcpToModelOutput({
   output,
 }: {
