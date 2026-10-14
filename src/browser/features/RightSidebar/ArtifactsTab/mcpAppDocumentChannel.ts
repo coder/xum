@@ -40,7 +40,8 @@ export function newMcpAppDocumentNonce(): string {
  * `pagehide` (the document unloads: it navigated away) is announced over the port, so the host
  * can close the frame early. That is cleanup only: the port already keeps the next page out.
  *
- * Escape or Shift+F that the view did not handle (no preventDefault) is announced as `exit`:
+ * Escape, or Shift+F outside a text field, that the view did not handle (no preventDefault,
+ * read once every listener ran) is announced as `exit`:
  * keys inside the frame never reach the app, and a maximized app tab (#6165) restores on it.
  * The view's script can post `exit` without a key press too, so the host only ever restores on
  * it, never maximizes.
@@ -60,8 +61,18 @@ export function mcpAppDocumentChannelScript(nonce: string): string {
       dispatch(new MessageEventCtor("message", { data: event.data, source: port }));
     };
     window.addEventListener("keydown", function (event) {
-      var exit = event.key === "Escape" || (event.key === "F" && event.shiftKey);
-      if (exit && !event.defaultPrevented) send({ ${MCP_APP_DOCUMENT_MARKER}: 1, type: "exit" });
+      var target = event.target;
+      var editable = !!target && target.nodeType === 1 && (target.isContentEditable ||
+        target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT");
+      var plain = !event.ctrlKey && !event.metaKey && !event.altKey;
+      var exit = event.key === "Escape" || (plain && event.shiftKey && !editable &&
+        (event.key === "F" || event.key === "f"));
+      if (!exit) return;
+      // After the view's own listeners (also window-level ones added later): setTimeout reads
+      // the event's final defaultPrevented, as the Artifacts bridge does. Not a timing guess.
+      window.setTimeout(function () {
+        if (!event.defaultPrevented) send({ ${MCP_APP_DOCUMENT_MARKER}: 1, type: "exit" });
+      }, 0);
     });
     window.addEventListener("pagehide", function () {
       send({ ${MCP_APP_DOCUMENT_MARKER}: 1, type: "leave" });

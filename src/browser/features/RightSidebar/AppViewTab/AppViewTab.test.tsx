@@ -53,6 +53,7 @@ function bootViewDocument(
     },
     addEventListener: (type: string, listener: (event: unknown) => void) =>
       listeners.set(type, listener),
+    setTimeout: (callback: () => void, ms: number) => setTimeout(callback, ms),
   };
   // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
   (new Function("window", preamble) as (window: unknown) => void)(documentWindow);

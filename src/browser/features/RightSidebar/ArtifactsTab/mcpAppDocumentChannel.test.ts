@@ -26,6 +26,7 @@ function openDocument(nonce: string, hostWindow: HostWindow) {
     },
     addEventListener: (type: string, listener: (event?: unknown) => void) =>
       listeners.set(type, listener),
+    setTimeout: (callback: () => void, ms: number) => setTimeout(callback, ms),
   };
   // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
   (new Function("window", mcpAppDocumentChannelScript(nonce)) as (w: unknown) => void)(
@@ -38,8 +39,12 @@ function openDocument(nonce: string, hostWindow: HostWindow) {
     parent,
     events,
     hide: () => listeners.get("pagehide")?.(),
-    key: (event: { key: string; shiftKey?: boolean; defaultPrevented?: boolean }) =>
-      listeners.get("keydown")?.({ shiftKey: false, defaultPrevented: false, ...event }),
+    /** Dispatch a keydown to the preamble's listener; returns the event for later handlers. */
+    key: (event: { key: string; shiftKey?: boolean; target?: unknown }) => {
+      const dispatched = { shiftKey: false, defaultPrevented: false, ...event };
+      listeners.get("keydown")?.(dispatched);
+      return dispatched;
+    },
   };
 }
 
@@ -65,9 +70,13 @@ describe("MCP App document channel", () => {
     const view = openDocument("ab12", hostFor(channel));
     view.key({ key: "Escape" });
     view.key({ key: "F", shiftKey: true });
-    // The view handled it (its own dialog), or it is another key: no exit.
-    view.key({ key: "Escape", defaultPrevented: true });
+    // A view listener that runs after the preamble's (a window-level one) handles it: no exit.
+    view.key({ key: "Escape" }).defaultPrevented = true;
+    // Typing a capital F in a text field, or another key: no exit.
+    view.key({ key: "F", shiftKey: true, target: { nodeType: 1, tagName: "INPUT" } });
     view.key({ key: "f" });
+    // The preamble reads defaultPrevented in a task, then the port delivers in another.
+    await tick();
     await tick();
     expect(exits).toBe(2);
     expect(received).toEqual([]);
