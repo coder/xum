@@ -1376,17 +1376,7 @@ export class DraftStore {
     // Captured with the copy it describes: an edit during the payload load below must keep the
     // source (the text was copied before it).
     const textVersion = source.textVersion;
-    if (!source.payloadsLoaded) {
-      // A hydrated source may not have its attachment payloads yet. Deleting it before they
-      // arrive would lose the attachments, so move them once loaded; on failure the source stays.
-      try {
-        await this.ensurePayloads(from);
-      } catch (error) {
-        console.warn("Failed to load draft attachments to move; keeping the source draft:", error);
-        return;
-      }
-      if (this.entries.get(key) !== source || !source.payloadsLoaded) return;
-    }
+    if (!(await this.loadPayloadsToMove(from, source))) return;
     if (source.attachments.length > 0) this.setAttachments(to, source.attachments);
     const attachmentsVersion = source.attachmentsVersion;
     try {
@@ -1404,6 +1394,22 @@ export class DraftStore {
       return;
     }
     await this.deleteDraft(from);
+  }
+
+  /**
+   * A hydrated source may not have its attachment payloads yet. Deleting it before they arrive
+   * would lose the attachments, so they move once loaded. False (the source stays) when the load
+   * fails or the source changed meanwhile.
+   */
+  private async loadPayloadsToMove(from: DraftStoreScope, source: Entry): Promise<boolean> {
+    if (source.payloadsLoaded) return true;
+    try {
+      await this.ensurePayloads(from);
+    } catch (error) {
+      console.warn("Failed to load draft attachments to move; keeping the source draft:", error);
+      return false;
+    }
+    return this.entries.get(draftStoreScopeKey(from)) === source && source.payloadsLoaded;
   }
 
   /** Drop local state of a removed workspace (its session dir, and draft, are gone). */
