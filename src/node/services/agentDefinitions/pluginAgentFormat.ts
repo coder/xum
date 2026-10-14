@@ -1,3 +1,4 @@
+import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 import { ThinkingLevelSchema } from "@/common/types/thinking";
 import assert from "@/common/utils/assert";
 
@@ -41,16 +42,20 @@ function isXumFormat(raw: Record<string, unknown>): boolean {
   return XUM_ONLY_KEYS.some((key) => key in raw) || isPlainObject(raw.tools);
 }
 
-/** Claude `model`: alias, full ID or `inherit`; Cursor `model`: `inherit` or an ID. */
+const KNOWN_MODEL_IDS = new Set<string>(Object.values(KNOWN_MODELS).map((model) => model.id));
+
+/**
+ * Claude `model`: alias, bare Claude ID or `inherit`; Cursor `model`: `inherit`
+ * or a Cursor ID. Map only what names a known Xum model: anything else
+ * (inherit, Cursor IDs, a stale or mistyped Claude ID) uses the inherited
+ * model, as Cursor does for unavailable models, instead of failing the spawn.
+ */
 function mapModel(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const model = value.trim();
-  if (model.length === 0 || model === "inherit") return undefined;
-  // A bare Claude ID (`claude-opus-5-5`) names an Anthropic model. Anything
-  // Xum cannot resolve falls through to the inherited model at resolve time,
-  // which matches Cursor's fallback for unavailable models.
-  if (!model.includes(":") && model.startsWith("claude-")) return `anthropic:${model}`;
-  return model;
+  if (Object.hasOwn(MODEL_ABBREVIATIONS, model)) return model;
+  const anthropicId = `anthropic:${model}`;
+  return KNOWN_MODEL_IDS.has(anthropicId) ? anthropicId : undefined;
 }
 
 /**

@@ -141,6 +141,9 @@ Body
       expect(parse("name: a\nmodel: sonnet", "plugin").ai).toEqual({ model: "sonnet" });
       // inherit (and an unknown effort) leave the AI defaults to inheritance.
       expect(parse("name: a\nmodel: inherit\neffort: turbo", "plugin").ai).toBeUndefined();
+      // A mistyped Claude ID or a Cursor ID is not a known model: inherit it.
+      expect(parse("name: a\nmodel: claude-sonnet-typo", "plugin").ai).toBeUndefined();
+      expect(parse("name: a\nmodel: composer-2", "plugin").ai).toBeUndefined();
     });
 
     test("a Claude tools or disallowedTools list skips the agent instead of granting every tool", () => {
