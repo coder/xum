@@ -65,9 +65,25 @@ MCP servers declared in an [Agent Plugin's](https://agent-plugins.org) `mcp.json
 
 Stdio plugin servers launch with the spec's `PLUGIN_ROOT` and `PLUGIN_DATA` environment variables; per-plugin data directories live under `~/.xum/plugin-data/`.
 
-Stdio plugin servers do not inherit your full shell environment, so a plugin cannot read tokens such as `GITHUB_TOKEN` that you exported for other tools. A plugin server receives only basic variables (`PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `TERM`, temp and time-zone variables, their Windows equivalents, and CA bundle paths such as `NODE_EXTRA_CA_CERTS`), plus the `env` its MCP configuration declares. Proxy variables such as `HTTPS_PROXY` are not passed. Servers you configure yourself keep the full environment.
-
 **Settings → Plugins** installs plugins from git into `~/.xum/plugins` (paste a git URL or `owner/repo[@ref]`); the exact location derives from the active Xum home (a legacy `~/.mux` home keeps working) and is shown in the section. Before anything is written, a consent preview lists the plugin's manifest, every skill, and every MCP server command line. Installs are pinned to the resolved commit; update checks compare the tracked branch or tag against the pinned commit and never auto-apply. Applying an update replaces the plugin directory wholesale — local edits to a managed plugin directory are discarded — and restarts that plugin's running MCP servers. Uninstalling removes the directory, the registry entry, and the plugin's global enablement and per-workspace server overrides, but keeps `~/.xum/plugin-data/` unless you opt in to deleting it.
+
+### Plugin server environment
+
+Stdio plugin servers do not inherit your shell environment. A plugin cannot read tokens such as `GITHUB_TOKEN` that you exported for other tools. Servers that you configure yourself in `mcp.jsonc` keep your full environment.
+
+A plugin stdio server receives only these variables:
+
+1. The variables its MCP configuration sets in `env`, plus `PLUGIN_ROOT` and `PLUGIN_DATA`.
+2. These host variables, when they are set: `HOME`, `LOGNAME`, `PATH`, `SHELL`, `USER`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `TZ` and `__CF_USER_TEXT_ENCODING`. On Windows, the core system variables (`PATH`, `PATHEXT`, `SYSTEMROOT`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP` and similar) and `HOME`.
+3. CA bundle paths: `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`, `PIP_CERT`, `BUNDLE_SSL_CA_CERT`, `npm_config_cafile` and `NPM_CONFIG_CAFILE`.
+
+Xum does not pass any other variable. This includes proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`), because a proxy URL can contain a password. It also includes package-manager and version-manager variables such as `NVM_DIR`, `VOLTA_HOME`, `npm_config_registry`, `UV_*` and `XDG_CACHE_HOME`. A plugin server that starts through `npx` or `uvx` behind a proxy, or that needs a token, fails until it gets the variable another way.
+
+To give a plugin server another variable:
+
+1. The plugin publisher sets it in the server's `env` in the plugin's MCP configuration.
+2. You cannot add a variable to a plugin server from Xum settings. Xum has no per-server environment override for plugin servers. Local edits to a managed plugin are lost on the next update.
+3. If you need a variable now, configure the same command as your own server in `mcp.jsonc`. Your own servers inherit your full environment.
 
 ## Tool search
 
