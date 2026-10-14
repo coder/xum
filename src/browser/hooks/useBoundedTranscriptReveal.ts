@@ -317,7 +317,7 @@ const unitRowWeight = (): number => 1;
 
 /** What identifies one reveal: a new workspace or a changed cap restarts it. */
 const transcriptKey = (reveal: { workspaceId: string; maxMountedRows?: number }) =>
-  `${reveal.workspaceId}\u0000${reveal.maxMountedRows}`;
+  `${reveal.workspaceId}\u0000${String(reveal.maxMountedRows)}`;
 
 /**
  * Bundle-granular tail-first reveal for the transcript (progressive RENDERING only; the data
