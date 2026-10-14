@@ -684,6 +684,43 @@ describe("Config", () => {
       }
     });
 
+    it("rejects the edit when the config.json symlink is retargeted during the save", async () => {
+      const configFile = path.join(tempDir, "config.json");
+      const first = path.join(tempDir, "first.json");
+      const second = path.join(tempDir, "second.json");
+      fs.renameSync(configFile, first);
+      fs.symlinkSync(first, configFile);
+      fs.writeFileSync(second, outside);
+      // Retarget the link right after the atomic writer resolved it, so it renames onto `first`,
+      // which config.json no longer names.
+      // writeFileAtomic reads fs through the CommonJS object, so spy on that one.
+      const realRealpath = cjsFs.realpath.bind(cjsFs);
+      const realpathSpy = spyOn(cjsFs, "realpath").mockImplementation(((
+        file: fs.PathLike,
+        callback: (error: NodeJS.ErrnoException | null, resolved?: string) => void
+      ) => {
+        realRealpath(file, (error, resolved) => {
+          if (String(file) === configFile) {
+            fs.rmSync(configFile);
+            fs.symlinkSync(second, configFile);
+          }
+          callback(error, resolved);
+        });
+      }) as unknown as typeof cjsFs.realpath);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        const error = await config.setUpdateChannel("nightly").then(
+          () => null,
+          (caught: unknown) => caught
+        );
+        expect(String(error)).toContain("config.json changed on disk");
+        expect(fs.readFileSync(configFile, "utf-8")).toBe(outside);
+      } finally {
+        realpathSpy.mockRestore();
+        errorSpy.mockRestore();
+      }
+    });
+
     it("saves two edits in a row without an outside write", async () => {
       // The second edit reads the bytes the first one renamed into place, so its own check holds.
       await config.setUpdateChannel("nightly");

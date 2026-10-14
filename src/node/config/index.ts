@@ -1967,7 +1967,7 @@ export class Config {
   /** The beforeRename check for a save, or undefined when the save has no read to compare. */
   private unchangedConfigCheck(expectedStatKey: string | undefined) {
     if (expectedStatKey === undefined) return undefined;
-    return (target: string) => this.assertConfigFileUnchanged(target, expectedStatKey);
+    return () => this.assertConfigFileUnchanged(expectedStatKey);
   }
 
   /**
@@ -1976,10 +1976,12 @@ export class Config {
    * that write. One stat, right before the rename. An in-place rewrite with the same inode,
    * size and mtime still passes; a content hash would cost a read per save.
    */
-  private assertConfigFileUnchanged(target: string, expectedStatKey: string): void {
+  private assertConfigFileUnchanged(expectedStatKey: string): void {
     let currentKey = CONFIG_FILE_ABSENT;
     try {
-      currentKey = this.configStatKey(fs.statSync(target));
+      // Stat the configured path, not the writer's resolved target: a config.json symlink
+      // retargeted after the writer resolved it then shows up as a changed file.
+      currentKey = this.configStatKey(fs.statSync(this.configFile));
     } catch (error) {
       if (!isEnoentError(error)) throw error;
     }
