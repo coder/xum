@@ -247,26 +247,32 @@ describe.each([...GAP_MODES])("panes kept across a dropped connection (%s)", (mo
     await waitFor(() => expect(mutations).toEqual(["start"]));
   });
 
-  test("goal-board changes made offline say so, and an edit stays open", async () => {
+  // Offline the board stays on screen read-only, as other kept panes do: its actions are server
+  // changes, so they are disabled (not "offline" on click). An open editor keeps its text.
+  test("goal-board actions are disabled while offline, and return after the reconnect", async () => {
     const view = render(
       <GoalBoardSections workspaceId="ws-1" board={goalBoard()} onMutated={noop} />,
       { wrapper: Wrapper }
     );
     await flush();
-    await drop();
-
-    fireEvent.click(view.getByRole("button", { name: "Promote Ship it" }));
-    await view.findByText(/Not connected/);
-
-    fireEvent.click(view.getByRole("button", { name: "Edit Ship it" }));
-    fireEvent.click(view.getByRole("button", { name: "Save" }));
-    await flush();
-    // The editor stays open: nothing was saved.
-    expect(view.queryByLabelText("Goal objective")).not.toBeNull();
-
     fireEvent.click(view.getByRole("button", { name: /Archived/ }));
-    fireEvent.click(view.getByRole("button", { name: "Revive Old idea" }));
-    await waitFor(() => expect(view.queryAllByText(/Not connected/).length).toBe(2));
+    fireEvent.click(view.getByRole("button", { name: "Edit Ship it" }));
+    const actions = ["Save", "Revive Old idea", "Queue another goal"];
+    // happy-dom does not apply a disabled fieldset to `disabled`: read the fieldset too.
+    const enabledActions = () =>
+      actions.filter((name) => {
+        const button = view.getByRole("button", { name }) as HTMLButtonElement;
+        return !button.disabled && button.closest("fieldset")?.disabled !== true;
+      });
+    expect(enabledActions()).toEqual(actions);
+
+    await drop();
+    expect(enabledActions()).toEqual([]);
+    expect(view.queryByLabelText("Goal objective")).not.toBeNull();
+    expect(view.queryByText(/Not connected/)).toBeNull();
+
+    await reconnect();
+    expect(enabledActions()).toEqual(actions);
     expect(mutations).toEqual([]);
   });
 

@@ -119,6 +119,7 @@ interface SectionShellProps {
 
 function SectionShell(props: SectionShellProps) {
   const [isOpen, setIsOpen] = useState(props.defaultOpen);
+  const offline = useLiveAPI() == null;
   return (
     <section className="border-border-light bg-surface-secondary rounded-md border">
       <button
@@ -136,7 +137,13 @@ function SectionShell(props: SectionShellProps) {
         <span className="text-muted lowercase">({props.count})</span>
         {props.trailing && <span className="ml-auto">{props.trailing}</span>}
       </button>
-      {isOpen && <div className="border-border-light border-t p-2">{props.children}</div>}
+      {/* Offline the board stays on screen read-only: its actions are server changes. The header
+          above still opens and closes the section. */}
+      {isOpen && (
+        <fieldset disabled={offline} className="border-border-light min-w-0 border-t p-2">
+          {props.children}
+        </fieldset>
+      )}
     </section>
   );
 }
@@ -318,8 +325,12 @@ interface UpcomingRowProps {
 }
 
 function UpcomingRow(props: UpcomingRowProps) {
+  const offline = useLiveAPI() == null;
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: props.goal.goalId,
+    // A reorder is a server change: no drag while offline (the section's fieldset disables the
+    // buttons, not dnd-kit's pointer listeners).
+    disabled: offline,
   });
   const [isEditing, setIsEditing] = useState(false);
   const style: React.CSSProperties = {
@@ -728,6 +739,7 @@ function UpcomingAdder(props: UpcomingAdderProps) {
           "rounded-md border border-dashed px-2 py-1.5 text-xs"
         )}
         aria-label="Queue another goal"
+        disabled={api == null}
         onClick={() => setIsOpen(true)}
       >
         <Plus className="h-3 w-3" aria-hidden="true" />
@@ -737,7 +749,10 @@ function UpcomingAdder(props: UpcomingAdderProps) {
   }
 
   return (
-    <div className="border-border-light bg-surface-primary flex flex-col gap-2 rounded-md border p-2">
+    <fieldset
+      disabled={api == null}
+      className="border-border-light bg-surface-primary flex min-w-0 flex-col gap-2 rounded-md border p-2"
+    >
       <input
         ref={objectiveRef}
         aria-label="Queued goal objective"
@@ -806,6 +821,6 @@ function UpcomingAdder(props: UpcomingAdderProps) {
           {error}
         </p>
       )}
-    </div>
+    </fieldset>
   );
 }
