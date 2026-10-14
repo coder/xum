@@ -1117,4 +1117,48 @@ describe("DraftService workspace name state", () => {
       nameState,
     });
   });
+
+});
+
+describe("DraftService workspace name state size", () => {
+  const oversized = {
+    generatedIdentity: { name: "fix-a1b2", title: "t".repeat(MAX_DRAFT_JSON_BYTES) },
+    manualName: "",
+    autoGenerate: true,
+    lastGeneratedFor: "fix the sidebar",
+  };
+
+  async function rejection(write: Promise<unknown>): Promise<unknown> {
+    try {
+      await write;
+    } catch (error) {
+      return error;
+    }
+    return undefined;
+  }
+
+  it("refuses a write or legacy import whose name state makes the draft too large", async () => {
+    using tempDir = new TestTempDir("drafts-name-state-too-large");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "huge-name" };
+
+    expect(
+      isDraftTooLargeError(await rejection(service.update({ scope, nameState: oversized })))
+    ).toBe(true);
+    expect(
+      isDraftTooLargeError(
+        await rejection(service.importLegacy({ scope, text: "typed", nameState: oversized }))
+      )
+    ).toBe(true);
+    // A legacy name merged under a stored body counts that body too.
+    await service.update({ scope, text: "x".repeat(MAX_DRAFT_JSON_BYTES - 100) });
+    const nearLimitName = { ...oversized, generatedIdentity: { name: "n", title: "t".repeat(200) } };
+    expect(
+      isDraftTooLargeError(
+        await rejection(service.importLegacy({ scope, nameState: nearLimitName }))
+      )
+    ).toBe(true);
+    expect((await new DraftService(config).get(scope)).nameState).toBeUndefined();
+  });
 });
