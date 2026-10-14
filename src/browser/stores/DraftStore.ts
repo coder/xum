@@ -2048,16 +2048,16 @@ export class DraftStore {
     }
   }
 
-  /**
-   * A write's reply carries the backend's merge of it. Fields without a newer unsaved edit take
-   * the newest server view (this reply, or a push that came after it); the echo push of this
-   * write is stale for this window, so the reply is how the merge reaches it.
-   */
   /** Throws when `client` was replaced (a new backend): its replies are not the current one's. */
   private assertCurrentClient(client: APIClient): void {
     if (this.client !== client) throw new Error("Draft save failed: the drafts backend changed");
   }
 
+  /**
+   * A write's reply carries the backend's merge of it. Fields without a newer unsaved edit take
+   * the newest server view (this reply, or a push that came after it); the echo push of this
+   * write is stale for this window, so the reply is how the merge reaches it.
+   */
   private applyWriteReply(
     entry: Entry,
     reply: DraftWriteOutput,
