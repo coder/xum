@@ -9,7 +9,9 @@
  * block for a failed page) and writes qualification.json, which gated runs read with --qualification.
  * For --aa, base and head are two builds of one commit, so build-to-build noise counts as host noise.
  * PAGE_TIMING_LOCK=<file>: one flock hold per run, never per block (the shared dev-host measurement lock).
- * Exit: 0 pass or qualified, 1 a gate failed or the host did not qualify, 2 bad input, 3 an invalid run.
+ * Exit: 0 pass or qualified, 1 a gate failed or the host did not qualify, 2 bad input, 3 an invalid run,
+ * 130/143 after Ctrl-C/SIGTERM (which stops the browser and the server, then frees the lock).
+ * --out must be a new or empty folder, so a result file in it is always this invocation's.
  * A gated run (--qualification) takes one page: the summary is written only when every page ends.
  */
 import { spawn } from "node:child_process";
@@ -43,28 +45,40 @@ type Values = Partial<core.Run["values"]>;
 type Host = ReturnType<typeof core.qualifyHostPage>;
 type Common = { page: core.Page; out: string; chrome: string };
 
+/** Cleanups of the run in progress, in start order, for an interrupt (core.interrupt). */
+const active = new Set<() => Promise<unknown>>();
+let interrupted = false;
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    interrupted = true; // main() may now reject: its handler must not exit before the cleanups end
+    core.interrupt(signal, [...active], (code) => process.exit(code)).catch(() => process.exit(3));
+  });
+}
+
 /** Holds `flock <file>` while fn runs. The holder exits, and frees the lock, when its stdin closes. */
 async function withLock<T>(fn: () => Promise<T>): Promise<T> {
   const file = process.env.PAGE_TIMING_LOCK;
   if (!file) return fn();
-  const holder = spawn("flock", ["-w", "3600", file, "sh", "-c", "echo held; exec cat >/dev/null"]);
+  // Detached: a terminal's Ctrl-C reaches the whole foreground group, and the lock must outlive it.
+  const lockArgs = ["-w", "3600", file, "sh", "-c", "echo held; exec cat >/dev/null"];
+  const holder = spawn("flock", lockArgs, { detached: true });
   const exited = once(holder, "exit").then(() => null);
   if ((await Promise.race([once(holder.stdout, "data"), exited])) === null) {
     throw new Error(`could not take the lock ${file}`);
   }
+  const release = () => (holder.stdin.end(), exited);
+  active.add(release);
   try {
     return await fn();
   } finally {
-    holder.stdin.end();
-    await exited;
+    await release();
+    active.delete(release);
   }
 }
 
-function hostIsQuietNow(): boolean {
-  const psiFile = "/proc/pressure/cpu";
-  const psi = fs.existsSync(psiFile) ? fs.readFileSync(psiFile, "utf8") : null;
-  return core.hostIsQuiet(os.loadavg()[0], psi, os.availableParallelism());
-}
+const psiFile = "/proc/pressure/cpu";
+const psi = () => (fs.existsSync(psiFile) ? fs.readFileSync(psiFile, "utf8") : null);
+const hostIsQuietNow = () => core.hostIsQuiet(os.loadavg()[0], psi(), os.availableParallelism());
 
 /** PIDs of the processes whose environment holds the entry (Linux /proc; elsewhere none are found). */
 function withEnv(entry: string): number[] {
@@ -98,7 +112,7 @@ async function startServer(tree: string, root: string, home: string, logFile: st
       .then((r) => r.ok)
       .catch(() => false);
   for (let i = 0; i < 120 && !(await up()); i++) await sleep(500);
-  const stop = async () => {
+  const stopOnce = async () => {
     try {
       process.kill(-server.pid!, "SIGTERM");
     } catch (error) {
@@ -107,12 +121,22 @@ async function startServer(tree: string, root: string, home: string, logFile: st
     if (server.exitCode === null && server.signalCode === null) await once(server, "exit");
     // Workspace commands run in their own process groups, so the group kill misses them, and they can
     // still write into the seed after the server exits. All inherit HOME: wait until no process has it.
-    for (let i = 0; withEnv(`HOME=${home}`).length > 0; i++) {
-      if (i === 100) throw new Error(`${logFile}: processes outlived the server by 10 s`);
-      await sleep(100);
-    }
+    const kill = (pid: number) => {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    };
     fs.closeSync(log);
+    await core
+      .reapRun(() => withEnv(`HOME=${home}`), kill, sleep)
+      .catch((error: unknown) => {
+        throw new Error(`${logFile}: ${String(error)}`);
+      });
   };
+  let stopping: Promise<void> | undefined; // the interrupt and the run's own finally both stop it
+  const stop = () => (stopping ??= stopOnce());
   return { origin, stop };
 }
 
@@ -121,9 +145,15 @@ async function measure(o: Common & { tree: string; mode: Signal; name: string })
   // One lock hold per run, from seed creation to folder removal, never per block (see the header).
   // Never on a busy host either: runOnQuietHost waits for quiet outside the lock.
   return core.runOnQuietHost({ isQuiet: hostIsQuietNow, sleep }, withLock, async () => {
+    const host = core.hostState(os.loadavg()[0], psi()); // the state runOnQuietHost just accepted
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "page-timing-"));
     const [seedDir, log] = [path.join(tmp, "seed"), path.join(o.out, `${o.name}.server.log`)];
     let home = path.join(tmp, "home"); // a P2 run uses its seed's home
+    // Invalid runs clean up too, unless a process still uses the folder (stop() then threw).
+    const removeTmp = async () => {
+      if (withEnv(`HOME=${home}`).length === 0) fs.rmSync(tmp, { recursive: true, force: true });
+    };
+    active.add(removeTmp);
     try {
       const setup = core.PAGE_SETUP[o.page];
       const seed = setup.seeded ? writeNeutralSeed(seedDir) : null;
@@ -133,20 +163,42 @@ async function measure(o: Common & { tree: string; mode: Signal; name: string })
       const before = seed && snapshotSeed(seedDir);
       for (const dir of [root, home]) fs.mkdirSync(dir, { recursive: true });
       const server = await startServer(o.tree, root, home, log);
-      const values = await browse(o, `${server.origin}${route}`).finally(server.stop);
+      active.add(server.stop);
+      const run = await browse(o, `${server.origin}${route}`).finally(async () => {
+        await server.stop();
+        active.delete(server.stop);
+      });
       const now = (rel: string) => fs.readFileSync(path.join(seedDir, rel));
-      const rewrites = before ? core.seedRewrites(diffSeed(before, seedDir), before, now) : [];
+      const diff = before && diffSeed(before, seedDir);
+      const rewrites = diff ? core.seedRewrites(diff, before, now) : [];
+      const record = {
+        ...o,
+        ...run,
+        host,
+        seedAdded: diff ? diff.added : [],
+        seedRewrites: rewrites,
+      };
+      fs.writeFileSync(path.join(o.out, `${o.name}.json`), JSON.stringify(record));
       if (rewrites.length > 0) throw new Error(`${o.name}: a build rewrote the seed: ${rewrites}`);
-      return values;
+      return run.values;
     } finally {
-      // Invalid runs clean up too, unless a process still uses the folder (stop() then threw).
-      if (withEnv(`HOME=${home}`).length === 0) fs.rmSync(tmp, { recursive: true, force: true });
+      await removeTmp();
+      active.delete(removeTmp);
     }
   });
 }
 
-async function browse(o: Parameters<typeof measure>[0], url: string): Promise<Values> {
-  const browser = await chromium.launch({ executablePath: o.chrome, headless: true }); // fresh profile
+async function browse(o: Parameters<typeof measure>[0], url: string) {
+  // A fresh profile. The interrupt handler, not Playwright's, closes the browser (then the server).
+  const launch = {
+    executablePath: o.chrome,
+    headless: true,
+    handleSIGINT: false,
+    handleSIGTERM: false,
+  };
+  const browser = await chromium.launch(launch);
+  const close = () => browser.close();
+  active.add(close);
   try {
     const context = await browser.newContext(PHONE.context);
     let [workers, fromWorker] = [0, 0];
@@ -175,11 +227,12 @@ async function browse(o: Parameters<typeof measure>[0], url: string): Promise<Va
     const apiAfterRun = (await tab.evaluate('"serviceWorker" in navigator')) as boolean;
     const failures = core.serviceWorkerProofFailures({ workers, fromWorker, apiAfterRun });
     if (failures.length > 0) throw new Error(`${o.name}: ${failures.join(", ")}`);
-    const values = o.mode === "ucs" ? core.usefulContentShown(record) : { ir: record.ir! / 1000 };
-    fs.writeFileSync(file("json"), JSON.stringify({ ...o, url, record, values }));
-    return values;
+    const values: Values =
+      o.mode === "ucs" ? core.usefulContentShown(record) : { ir: record.ir! / 1000 };
+    return { url, record, values }; // measure() writes the per-run JSON once the seed check ran
   } finally {
     await browser.close();
+    active.delete(close);
   }
 }
 
@@ -225,6 +278,15 @@ async function main(): Promise<number> {
   });
   const pages = a.pages.split(",") as core.Page[];
   const predict = new URLSearchParams(a.predict.replaceAll(",", "&")); // "p1.ucs=3.9,p2.ir=1.2"
+  const predictKeys = [...predict.keys()];
+  const twice = predictKeys.find((k, i) => predictKeys.indexOf(k) !== i);
+  const outUsed = a.out && fs.existsSync(a.out) && fs.readdirSync(a.out).length > 0;
+  const html = (t?: string) =>
+    t && fs.existsSync(path.join(t, "dist/index.html"))
+      ? fs.readFileSync(path.join(t, "dist/index.html"))
+      : null;
+  const [baseHtml, headHtml] = [html(a.base), html(a.head)];
+  const twoCommits = a.aa && baseHtml && headHtml && !baseHtml.equals(headHtml);
   const keys = pages.flatMap((p) => [`${p}.ucs`, `${p}.ir`]);
   const cli = (t?: string) => (t ? path.resolve(t, "dist/cli/index.js") : "");
   const missing = [cli(a.base), cli(a.head)].filter((f) => f && !fs.existsSync(f));
@@ -232,12 +294,16 @@ async function main(): Promise<number> {
   const errors = [
     !a.base || !a.head ? "--base and --head are required" : "",
     missing.length > 0 ? `not a built tree, missing: ${missing.join(", ")}` : "",
-    pages.some((p) => !(p in core.TARGET)) ? `unknown page in --pages ${a.pages}` : "",
+    pages.some((p) => !Object.hasOwn(core.TARGET, p)) ? `unknown page in --pages ${a.pages}` : "",
+    fs.existsSync(a.chrome) ? "" : `--chrome ${a.chrome} does not exist`,
+    outUsed ? `--out ${a.out} is not empty: use a new folder` : "",
+    twoCommits ? "--aa needs two builds of one commit: their dist/index.html differs" : "",
     a.aa && a.qualification ? "--aa and --qualification exclude each other" : "",
     a.qualification && pages.length !== 1 ? "a gated run takes one page (--pages p1)" : "",
     a.qualification && !host ? `${a.qualification} has no qualified ${pages[0]} entry` : "",
     a.predict && !a.qualification ? "--predict needs --qualification" : "",
     [...predict].some(([k, v]) => !keys.includes(k) || !(+v > 0)) ? "bad --predict keys" : "",
+    twice ? `duplicate --predict key ${twice}` : "",
   ].filter(Boolean);
   if (!a.base || !a.head || errors.length > 0) {
     console.error(`${errors.join("; ")} (usage: see the header of scripts/perf/pageTiming.ts)`);
@@ -284,8 +350,9 @@ async function main(): Promise<number> {
 
 // A parseArgs error is bad input (2). Any other throw (seed, service worker, timeout, busy host) is 3.
 main().then(
-  (code) => process.exit(code),
+  (code) => interrupted || process.exit(code),
   (error: unknown) => {
+    if (interrupted) return; // core.interrupt exits once the cleanups end
     console.error(error);
     process.exit(String((error as { code?: unknown }).code).startsWith("ERR_PARSE_ARGS") ? 2 : 3);
   }
