@@ -2695,7 +2695,13 @@ describe("Revoke MCP App View Domains…", () => {
       const events = collectCommandEvents();
       try {
         // The open palette shows a rejected list (CommandPalette): a toast would sit under it.
-        await expect(Promise.resolve(field.getOptions({}))).rejects.toThrow("backend busy");
+        let listError: unknown;
+        try {
+          await field.getOptions({});
+        } catch (error) {
+          listError = error;
+        }
+        expect(String(listError)).toContain("backend busy");
         await action.prompt!.onSubmit({ approval: JSON.stringify(["/repo/a", "charts"]) });
         const messages = events.receivedToasts.map((toast) => toast.message);
         expect(messages).toHaveLength(1);
