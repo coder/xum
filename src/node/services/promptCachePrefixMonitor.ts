@@ -5,8 +5,9 @@
  * but the next turn's first request is rebuilt from chat.jsonl, and any byte
  * difference re-processes the conversation uncached. This compares every
  * chat-turn request with the previous request of its workspace and records
- * the first block that broke the prefix. It keeps hashes only, in memory, for
- * a bounded set of workspaces.
+ * the first block that broke the prefix. It keeps hashes only (plus the
+ * request options of the two sentinel blocks, never prompt text), in memory,
+ * for a bounded set of workspaces.
  */
 
 import { log } from "@/node/services/log";
@@ -19,7 +20,7 @@ import {
 import type { TimelineRecorder } from "@/node/services/timelineRecorder";
 
 /**
- * Baselines kept in memory, one per workspace and route/model identity; the least recently
+ * Baselines kept in memory, one per workspace and route/endpoint/model identity; the least recently
  * observed is dropped first.
  */
 const MAX_TRACKED_BASELINES = 128;
@@ -94,10 +95,12 @@ export interface PromptCacheTurnScope {
   setContextEpoch(epoch: string | undefined): void;
 }
 
-/** Requests compare only within one wire route and effective model. */
+/** Requests compare only within one wire route, endpoint and effective model. */
 export interface PromptCacheRouteIdentity {
   route: string;
   modelString: string;
+  /** Origin and path of the request URL: another base URL reaches another cache. */
+  endpoint: string;
 }
 
 export class PromptCachePrefixMonitor {
@@ -156,12 +159,13 @@ export class PromptCachePrefixMonitor {
   ): void {
     try {
       const workspaceId = scope.workspaceId;
-      const key = `${workspaceId}\0${identity.route}\0${identity.modelString}`;
+      const key = [workspaceId, identity.route, identity.endpoint, identity.modelString].join("\0");
       const previous = this.latest.get(key);
       // Re-inserting keeps Map order equal to recency, so eviction drops the oldest.
       this.latest.delete(key);
       if (scope.skip) return;
-      const blocks = fingerprintAnthropicRequest(body);
+      // The gateway prompt form names no model; the route identity does.
+      const blocks = fingerprintAnthropicRequest(body, { modelId: identity.modelString });
       const observedAt = this.now();
       this.latest.set(key, {
         workspaceId,
@@ -190,7 +194,12 @@ export class PromptCachePrefixMonitor {
         boundary: previous.scope === scope ? ("step" as const) : ("turn" as const),
       };
       const description = describePromptCacheBreak(comparison);
-      log.info("Prompt cache prefix break", { workspaceId, ...identity, ...promptCacheBreak });
+      log.info("Prompt cache prefix break", {
+        workspaceId,
+        route: identity.route,
+        modelString: identity.modelString,
+        ...promptCacheBreak,
+      });
       scope.recorder.record(workspaceId, {
         kind: "cache.prefix_break",
         source: { system: "chat" },

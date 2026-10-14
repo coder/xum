@@ -55,8 +55,10 @@ interface MemoryBrowserProps {
  * list + whole-file editor. Consumed by the right-sidebar Memory tab (all
  * scopes) and Settings → Memory (global scope only, no workspace).
  *
- * SECURITY: memory file contents and descriptions are attacker-influenceable,
- * so everything renders as plain React text — never through innerHTML-family sinks.
+ * SECURITY: memory file contents and descriptions are attacker-influenceable.
+ * Descriptions and paths render as plain React text; file contents also render
+ * through the shared Markdown pipeline (sanitized and hardened, raw HTML shown
+ * as text). Neither reaches innerHTML-family sinks directly.
  */
 export function MemoryBrowser(props: MemoryBrowserProps) {
   const { api } = useAPI();

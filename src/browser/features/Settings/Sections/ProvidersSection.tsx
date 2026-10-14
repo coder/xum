@@ -33,6 +33,7 @@ import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { ProviderIcon, ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import { getStoredAuthToken } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import { ConfigSwitchSetting, type SettingsApi } from "./ConfigSwitchSetting";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -3459,7 +3460,20 @@ export function ProvidersSection() {
         <div className="text-muted text-xs font-medium tracking-wide uppercase">Bash commands</div>
         <ConfigSwitchSetting
           title="Count AI calls from bash commands"
-          description="Bash commands get ANTHROPIC_BASE_URL, OPENAI_BASE_URL and a workspace key that point at Xum (on SSH and Coder hosts through a reverse SSH forward). Xum forwards their calls with the API keys above and adds the tokens and cost to the workspace's Cost tab and to Analytics. Agent CLIs that you start in bash, such as Claude Code, then bill these API keys instead of your subscription. When off, new commands get no proxy variables, and Xum refuses calls from commands that still hold a workspace key."
+          description={
+            <>
+              Bash commands get ANTHROPIC_BASE_URL, OPENAI_BASE_URL and a workspace key that point
+              at Xum (on SSH and Coder hosts through a reverse SSH forward). Xum forwards their
+              calls with the API keys above and adds the tokens and cost to the workspace&apos;s
+              Cost tab and to Analytics. Agent CLIs that you start in bash, such as Claude Code,
+              then bill these API keys instead of your subscription. When off, new commands get no
+              proxy variables, and Xum refuses calls from commands that still hold a workspace key.
+              Xum skips a provider when secrets set its variables or Xum has no key for it, and
+              skips all providers in untrusted projects, with XUM_DISABLE_PROJECT_AUTOMATION=1, and
+              in Docker and devcontainer workspaces. Xum logs each skip.{" "}
+              <DocsLink path="/config/providers#ai-calls-from-bash-commands">docs</DocsLink>
+            </>
+          }
           ariaLabel="Count AI calls from bash commands"
           placeholderChecked={false}
           load={loadBashAiProxyEnabled}

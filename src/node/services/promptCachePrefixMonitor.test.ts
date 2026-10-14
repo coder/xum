@@ -8,7 +8,12 @@ import {
 } from "./promptCachePrefixMonitor";
 
 const SECRET_OUTPUT = "SECRET-FILE-CONTENTS ".repeat(800);
-const ANTHROPIC = { route: "anthropic", modelString: "anthropic:claude-sonnet-5-5" };
+const ENDPOINT = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC = {
+  route: "anthropic",
+  modelString: "anthropic:claude-sonnet-5-5",
+  endpoint: ENDPOINT,
+};
 
 function recorderFor(events: TimelineEventDraft[]) {
   return {
@@ -103,6 +108,28 @@ describe("PromptCachePrefixMonitor through the Anthropic wire wrapper", () => {
       },
     });
     expect(JSON.stringify(events[0])).not.toMatch(/SECRET|README/);
+    expect(events[0].data?.promptCacheBreak).not.toHaveProperty("changedOptions");
+  });
+
+  test("an effort change between steps names the option in the event", async () => {
+    const events: TimelineEventDraft[] = [];
+    const monitor = new PromptCachePrefixMonitor();
+    const turn = monitor.createTurnScope("ws-1", recorderFor(events));
+    const withEffort = (effort: string) =>
+      JSON.stringify({ ...JSON.parse(requestBody("x")), output_config: { effort } });
+    await send(monitor, [
+      { scope: turn, body: withEffort("xhigh") },
+      { scope: turn, body: withEffort("high") },
+    ]);
+
+    expect(events).toHaveLength(1);
+    expect(TimelineEventDraftSchema.safeParse(events[0]).success).toBe(true);
+    expect(events[0].data?.promptCacheBreak).toMatchObject({
+      boundary: "step",
+      previous: { type: "message_options" },
+      changedOptions: [{ key: "effort", previous: "xhigh", next: "high" }],
+    });
+    expect(events[0].data?.description).toEndWith("changed options: effort xhigh -> high");
   });
 
   test("an extending step, a compaction request and a route change record nothing", async () => {
@@ -123,7 +150,11 @@ describe("PromptCachePrefixMonitor through the Anthropic wire wrapper", () => {
       {
         scope: scope(),
         body: requestBody("other model"),
-        identity: { route: "coder:anthropic", modelString: "coder:anthropic/claude-opus-5-5" },
+        identity: {
+          route: "coder:anthropic",
+          modelString: "coder:anthropic/claude-opus-5-5",
+          endpoint: ENDPOINT,
+        },
       },
     ]);
     expect(events).toEqual([]);
@@ -221,7 +252,7 @@ describe("PromptCachePrefixMonitor through the Anthropic wire wrapper", () => {
     const events: TimelineEventDraft[] = [];
     const monitor = new PromptCachePrefixMonitor();
     const scope = () => monitor.createTurnScope("ws-1", recorderFor(events));
-    const opus = { route: "anthropic", modelString: "anthropic:claude-opus-5-5" };
+    const opus = { ...ANTHROPIC, modelString: "anthropic:claude-opus-5-5" };
     // Sonnet -> Opus -> Sonnet: the second Sonnet request compares with the first.
     await send(monitor, [
       { scope: scope(), body: requestBody(SECRET_OUTPUT) },

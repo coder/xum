@@ -4,6 +4,7 @@ import { ChevronDown, ChevronRight, FileText, RefreshCw } from "lucide-react";
 import { useAPI } from "@/browser/contexts/API";
 import { ErrorBoundary } from "@/browser/components/ErrorBoundary/ErrorBoundary";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
+import { MarkdownFilePreview } from "@/browser/features/Messages/MarkdownFilePreview";
 import { ChatInstructionsPanel } from "./AdditionalSystemContextScratchpad";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { setWorkspaceInstructionsFileCount } from "@/browser/utils/workspaceInstructionsStore";
@@ -231,14 +232,14 @@ function FileRow({ file, projectName }: FileRowProps) {
           </div>
         </div>
       </button>
-      {/* The body's left padding is calibrated so the text inside its <pre>
+      {/* The body's left padding is calibrated so the text inside its boxes
           starts exactly where the column inside the button starts — at
           `px-3 (12px) + icon h-3.5 (14px) + gap-2 (8px) = 34px` from the row
-          edge. We give the body wrapper `pl-[26px]` and the inner <pre>s a
+          edge. We give the body wrapper `pl-[26px]` and the inner boxes a
           matching `px-2 py-1` so:
             - text x-position = 26px + 8px = 34px (matches the column)
             - text y-position is identical between preview and expanded
-              because both <pre>s share the same `mt-1 px-2 py-1`.
+              because both boxes share the same `mt-1 px-2 py-1`.
           The preview keeps an invisible border so its box height matches the
           expanded box exactly, eliminating any vertical jump. Putting the
           body outside the <button> also lets users select/scroll long files
@@ -250,9 +251,9 @@ function FileRow({ file, projectName }: FileRowProps) {
           </pre>
         )}
         {expanded && (
-          <pre className="bg-muted/10 border-border/50 mt-1 max-h-[60vh] overflow-auto rounded border px-2 py-1 font-mono text-[11px] whitespace-pre-wrap">
-            {file.content}
-          </pre>
+          <div className="bg-muted/10 border-border/50 mt-1 max-h-[60vh] overflow-auto rounded border px-2 py-1">
+            <MarkdownFilePreview content={file.content} className="compact-report-markdown" />
+          </div>
         )}
       </div>
     </li>

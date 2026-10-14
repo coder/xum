@@ -84,7 +84,10 @@ import {
 } from "@/common/utils/tools/toolAvailability";
 import * as agentResolution from "./agentResolution";
 import * as turnContextAssembler from "./turnContextAssembler";
-import { assembleBudgetCheckedPromptPayload } from "./turnRequestBuilder";
+import {
+  assembleBudgetCheckedPromptPayload,
+  resolveCompactionInputBudgetTokens,
+} from "./turnRequestBuilder";
 import * as messagePipeline from "./messagePipeline";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
@@ -801,9 +804,14 @@ describe("AIService workspace metadata lookup", () => {
 describe("AIService turn engine events", () => {
   const workspaceId = "workspace-1";
 
-  async function createForwardingHarness(tempDirName: string): Promise<{
+  async function createForwardingHarness(
+    tempDirName: string,
+    request: Partial<Parameters<AIService["streamMessage"]>[0]> = {},
+    modelFallbacks?: Record<string, { models: string[] }>
+  ): Promise<{
     historyService: HistoryService;
     service: AIService;
+    startStreamCalls: TurnExecutionOptions[];
     /** The sink AIService installed on its engine (production wiring, not a private hook). */
     emitEngineEvent: (event: TurnEngineEvent) => void | Promise<void>;
     /** Message id of a turn whose DevTools run metadata AIService is tracking. */
@@ -813,6 +821,7 @@ describe("AIService turn engine events", () => {
     [Symbol.dispose]: () => void;
   }> {
     const xumHome = new DisposableTempDir(tempDirName);
+    if (modelFallbacks != null) await writeMainConfig(xumHome.path, { modelFallbacks });
     const clearPendingRunMetadataSpy = mock(
       (_workspaceId: string, _metadataId?: string) => undefined
     );
@@ -853,6 +862,7 @@ describe("AIService turn engine events", () => {
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
+      ...request,
     });
     expect(result.success).toBe(true);
     const trackedMessageId = startStreamCalls[0]?.messageId;
@@ -862,6 +872,7 @@ describe("AIService turn engine events", () => {
     return {
       historyService,
       service,
+      startStreamCalls,
       emitEngineEvent: sink,
       trackedMessageId,
       clearPendingRunMetadataSpy,
@@ -892,6 +903,63 @@ describe("AIService turn engine events", () => {
       "stream-token",
       expect.objectContaining({ contextEpoch: "user-message" })
     );
+  });
+
+  it("queues the compaction input budget so replay trims the same way", async () => {
+    using harness = await createForwardingHarness("ai-service-compaction-budget-run-metadata", {
+      messages: [
+        createMuxMessage("user-message", "user", "Summarize.", {
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        }),
+      ],
+      compactionInputBudgetScale: 0.5,
+    });
+    expect(harness.setPendingRunMetadataSpy).toHaveBeenCalledWith(
+      workspaceId,
+      "stream-token",
+      expect.objectContaining({
+        compactionInputBudgetTokens: resolveCompactionInputBudgetTokens(
+          "openai:gpt-5.2",
+          undefined,
+          null,
+          0.5
+        ),
+      })
+    );
+  });
+
+  it("queues a refusal fallback's own compaction input budget for its run", async () => {
+    const primary = "openai:gpt-5.2";
+    const fallback = "anthropic:claude-haiku-4-5";
+    using harness = await createForwardingHarness(
+      "ai-service-compaction-budget-fallback-run-metadata",
+      {
+        messages: [
+          createMuxMessage("user-message", "user", "Summarize.", {
+            muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+          }),
+        ],
+        modelString: primary,
+      },
+      { [primary]: { models: [fallback] } }
+    );
+    const budgetOf = (model: string) => resolveCompactionInputBudgetTokens(model, undefined, null);
+    // Different windows, so a reused primary budget would show.
+    expect(budgetOf(fallback)).not.toBe(budgetOf(primary));
+    const prepared = await harness.startStreamCalls[0]?.modelFallback?.prepare(fallback);
+    expect(prepared?.success).toBe(true);
+    const queued = harness.setPendingRunMetadataSpy.mock.calls.map(
+      ([, id, metadata]) =>
+        [
+          id,
+          (metadata as { compactionInputBudgetTokens?: number }).compactionInputBudgetTokens,
+        ] as const
+    );
+    // The fallback run reads the same metadata ID, after the primary run was created.
+    expect(queued).toEqual([
+      ["stream-token", budgetOf(primary)],
+      ["stream-token", budgetOf(fallback)],
+    ]);
   });
 
   it("forwards stream-abort without mutating a workspace partial", async () => {
@@ -1587,6 +1655,227 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       }
     }
   );
+
+  // A compaction request skips the preflight above, so its history is trimmed to the
+  // compaction budget instead (trimCompactionInput). Continuous compaction's fallback sends an
+  // auto-compaction request, so it reaches the same path.
+  it.each([
+    // Each turn is `turnShare` of the full budget: two turns overflow it.
+    { name: "a /compact request", kind: "compact", experiments: [], turnShare: 0.6 },
+    {
+      name: "continuous compaction's auto-compaction fallback",
+      kind: "auto-compaction",
+      experiments: [EXPERIMENT_IDS.CONTINUOUS_COMPACTION],
+      turnShare: 0.6,
+    },
+    // Two turns fit the full budget, but not the retry's half of it.
+    { name: "the half-budget retry", kind: "compact", experiments: [], turnShare: 0.3, scale: 0.5 },
+    { name: "an ordinary request", kind: "ordinary", experiments: [], turnShare: 0.6 },
+  ] as const)(
+    "applies the compaction input budget only to compaction requests: $name",
+    async (testCase) => {
+      using xumHome = new DisposableTempDir("ai-service-compaction-trim");
+      const metadata = createLocalWorkspaceMetadata("compaction-trim", xumHome.path);
+      const harness = createHarness(xumHome.path, metadata, {
+        experimentsService: await experimentsServiceWith(xumHome.path, [...testCase.experiments]),
+      });
+      const model = "openai:gpt-5.2";
+      const budget = resolveCompactionInputBudgetTokens(model, undefined, null);
+      if (budget == null) throw new Error("expected a known context window");
+      const oldTurnChars = Math.floor(budget * testCase.turnShare) * 4;
+      const compactionMetadata = {
+        type: "compaction-request" as const,
+        rawCommand: "/compact",
+        parsed: {},
+        ...(testCase.kind === "auto-compaction" ? { source: "auto-compaction" as const } : {}),
+      };
+      const result = await harness.service.streamMessage({
+        workspaceId: metadata.id,
+        messages: [
+          createMuxMessage("old-user", "user", "x".repeat(oldTurnChars)),
+          createMuxMessage("old-assistant", "assistant", "ok"),
+          createMuxMessage("new-user", "user", "y".repeat(oldTurnChars)),
+          createMuxMessage("new-assistant", "assistant", "ok"),
+          createMuxMessage("request", "user", "Summarize.", {
+            ...(testCase.kind === "ordinary" ? {} : { muxMetadata: compactionMetadata }),
+          }),
+        ],
+        modelString: model,
+        thinkingLevel: "off",
+        ...("scale" in testCase ? { compactionInputBudgetScale: testCase.scale } : {}),
+      });
+
+      expect(result.success).toBe(true);
+      const ids = harness.preparedPayloadMessageIds[0];
+      // Over the budget, the oldest turn goes first; the newest turn and the request stay.
+      expect(ids).toEqual(
+        testCase.kind === "ordinary"
+          ? ["old-user", "old-assistant", "new-user", "new-assistant", "request"]
+          : ["new-user", "new-assistant", "request"]
+      );
+      const sent = JSON.stringify(harness.startStreamCalls[0]?.messages);
+      expect(sent.includes("1 oldest turns were left out")).toBe(testCase.kind !== "ordinary");
+    }
+  );
+
+  // A model with no known window has no budget on the first attempt. Its retry must still
+  // trim (to the retry scale of the history's own estimate), or it resends the same request.
+  it.each([
+    { name: "first attempt is sent whole", scale: undefined, expected: ["t1", "t2", "t3"] },
+    { name: "retry trims to half the estimate", scale: 0.5, expected: ["t3"] },
+  ])("compaction on a model with an unknown window: $name", async (testCase) => {
+    using xumHome = new DisposableTempDir("ai-service-compaction-trim-unknown");
+    const metadata = createLocalWorkspaceMetadata("compaction-trim-unknown", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    const model = "openai:unlisted-model-without-stats";
+    expect(resolveCompactionInputBudgetTokens(model, undefined, null)).toBeUndefined();
+    // Three equal turns: half of their estimate has room for the newest one only.
+    const turns = ["t1", "t2", "t3"].flatMap((id) => [
+      createMuxMessage(id, "user", "x".repeat(40_000)),
+      createMuxMessage(`${id}-answer`, "assistant", "ok"),
+    ]);
+    const result = await harness.service.streamMessage({
+      workspaceId: metadata.id,
+      messages: [
+        ...turns,
+        createMuxMessage("request", "user", "Summarize.", {
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        }),
+      ],
+      modelString: model,
+      thinkingLevel: "off",
+      ...(testCase.scale != null ? { compactionInputBudgetScale: testCase.scale } : {}),
+    });
+
+    expect(result.success).toBe(true);
+    const userIds = harness.preparedPayloadMessageIds[0]?.filter(
+      (id) => id.startsWith("t") && !id.endsWith("-answer")
+    );
+    expect(userIds).toEqual([...testCase.expected]);
+  });
+
+  // A model whose context_exceeded retry switches to 1M is not trimmed on the first attempt
+  // (it summarized the full history before trimming existed); the 1M retry trims to the 1M
+  // window, not to the 200k one. Without a retry left (a compact-agent stream without
+  // compaction-request metadata), nothing would switch it, so its first attempt is trimmed.
+  it.each([
+    {
+      name: "first attempt is not trimmed",
+      use1M: false,
+      retry: true,
+      expected: ["t1", "t2", "t3"],
+    },
+    { name: "1M retry trims to the 1M window", use1M: true, retry: false, expected: ["t2", "t3"] },
+    {
+      name: "first attempt without a retry trims to the 200k window",
+      use1M: false,
+      retry: false,
+      expected: ["t3"],
+    },
+  ])("compaction on a model that can switch to 1M: $name", async (testCase) => {
+    using xumHome = new DisposableTempDir("ai-service-compaction-trim-1m");
+    const metadata = createLocalWorkspaceMetadata("compaction-trim-1m", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    const model = "anthropic:claude-sonnet-4-5";
+    const use1MOptions = { anthropic: { use1MContext: true, use1MContextModels: [model] } };
+    const budget1M = resolveCompactionInputBudgetTokens(model, use1MOptions, null);
+    expect(resolveCompactionInputBudgetTokens(model, undefined, null)).toBeUndefined();
+    if (budget1M == null) throw new Error("expected a 1M budget");
+    // Three turns of 40% of the 1M budget each: the 1M budget keeps two of them, a budget
+    // from the 200k window would keep only the newest.
+    const turnChars = Math.floor(budget1M * 0.4) * 4;
+    const turns = ["t1", "t2", "t3"].flatMap((id) => [
+      createMuxMessage(id, "user", "x".repeat(turnChars)),
+      createMuxMessage(`${id}-answer`, "assistant", "ok"),
+    ]);
+    const result = await harness.service.streamMessage({
+      workspaceId: metadata.id,
+      messages: [
+        ...turns,
+        createMuxMessage("request", "user", "Summarize.", {
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        }),
+      ],
+      modelString: model,
+      thinkingLevel: "off",
+      ...(testCase.use1M ? { muxProviderOptions: use1MOptions } : {}),
+      compactionContextRetryAvailable: testCase.retry,
+    });
+
+    expect(result.success).toBe(true);
+    const userIds = harness.preparedPayloadMessageIds[0]?.filter((id) => id.startsWith("t"));
+    expect(userIds?.filter((id) => !id.endsWith("-answer"))).toEqual([...testCase.expected]);
+    // Untrimmed means the rows reach the provider as they are: no note on the request row.
+    const sent = JSON.stringify(harness.startStreamCalls[0]?.messages);
+    expect(sent.includes("Compaction input trimmed")).toBe(!testCase.retry);
+  });
+
+  // MCP Apps model context goes into the request after the trim, but the provider receives it
+  // with the history, so it must take its share of the compaction budget.
+  it.each([
+    { name: "without MCP Apps context the history fits", contextShare: 0, expected: ["t1", "t2"] },
+    { name: "MCP Apps context takes its share", contextShare: 0.5, expected: ["t2"] },
+  ])("compaction budget and request-only context: $name", async (testCase) => {
+    using xumHome = new DisposableTempDir("ai-service-compaction-trim-mcp-context");
+    const metadata = createLocalWorkspaceMetadata("compaction-trim-mcp-context", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata);
+    const model = "openai:gpt-5.2";
+    const budget = resolveCompactionInputBudgetTokens(model, undefined, null);
+    if (budget == null) throw new Error("expected a known context window");
+    const server = { transport: "stdio" as const, command: "dice", disabled: false };
+    const contextChars = Math.floor(budget * testCase.contextShare) * 4;
+    harness.service.turnRequestBuilderBindings.mcpServerManager = {
+      listServers: () => Promise.resolve({ dice: server }),
+      getToolsForWorkspace: () =>
+        Promise.resolve({
+          tools: {},
+          promptDescriptors: [],
+          stats: {
+            totalTools: 0,
+            activeServerCount: 1,
+            failedServerCount: 0,
+            failedServerNames: [],
+          },
+          overridesUsed: {},
+          serversUsed: { dice: server },
+        }),
+      getMcpAppModelContexts: () =>
+        Promise.resolve(
+          contextChars === 0
+            ? []
+            : [
+                {
+                  toolCallId: "view",
+                  serverName: "dice",
+                  toolName: "roll",
+                  text: "z".repeat(contextChars),
+                  updatedAt: 1,
+                },
+              ]
+        ),
+    } as unknown as MCPServerManager;
+    // Two turns of 30% of the budget each: they fit alone, not beside a 50% context.
+    const turnChars = Math.floor(budget * 0.3) * 4;
+    const result = await harness.service.streamMessage({
+      workspaceId: metadata.id,
+      messages: [
+        ...["t1", "t2"].flatMap((id) => [
+          createMuxMessage(id, "user", "x".repeat(turnChars)),
+          createMuxMessage(`${id}-answer`, "assistant", "ok"),
+        ]),
+        createMuxMessage("request", "user", "Summarize.", {
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        }),
+      ],
+      modelString: model,
+      thinkingLevel: "off",
+    });
+
+    expect(result.success).toBe(true);
+    const ids = harness.preparedPayloadMessageIds[0] ?? [];
+    expect(ids.filter((id) => id === "t1" || id === "t2")).toEqual([...testCase.expected]);
+    expect(ids.includes("mcp-app-context")).toBe(testCase.contextShare > 0);
+  });
 
   // Every top-level workspace may set a goal: delegated workspace turns,
   // heartbeats and goal continuations send no opt-in flag and must not be refused.
@@ -5163,10 +5452,11 @@ describe("AIService.streamMessage multi-project trust gating", () => {
 
   // Untrusted repos and the project-automation kill switch get blanked provider keys in bash, so
   // the bash AI proxy must not hand them a proxy URL either (it would pair with a blank key).
-  for (const [label, trusted, killSwitch, expected] of [
-    ["trusted project", true, false, "http://proxy"],
-    ["untrusted project", false, false, undefined],
-    ["project automation kill switch", true, true, undefined],
+  // The proxy service logs the reason it gets (#6357).
+  for (const [label, trusted, killSwitch, expected, blockedBy] of [
+    ["trusted project", true, false, "http://proxy", []],
+    ["untrusted project", false, false, undefined, ["untrusted"]],
+    ["project automation kill switch", true, true, undefined, ["kill_switch"]],
   ] as const) {
     it(`adds bash AI proxy variables only for shared-trusted execution (${label})`, async () => {
       using xumHome = new DisposableTempDir("ai-service-bash-ai-proxy-trust");
@@ -5174,8 +5464,10 @@ describe("AIService.streamMessage multi-project trust gating", () => {
       await fs.mkdir(projectPath, { recursive: true });
       const workspaceId = "workspace-bash-ai-proxy-trust";
       const harness = createHarness(xumHome.path, createTrustMetadata(workspaceId, [projectPath]));
+      const blocked: string[] = [];
       harness.service.turnRequestBuilderBindings.bashAiProxy = {
         envFor: () => Promise.resolve({ ANTHROPIC_BASE_URL: "http://proxy" }),
+        noteBlocked: (_workspaceId, reason) => blocked.push(reason),
       };
       await harness.config.editConfig((cfg) => {
         cfg.projects.set(projectPath, { workspaces: [], trusted });
@@ -5193,6 +5485,7 @@ describe("AIService.streamMessage multi-project trust gating", () => {
         | { xumEnv?: Record<string, string> }
         | undefined;
       expect(toolConfig?.xumEnv?.ANTHROPIC_BASE_URL).toBe(expected);
+      expect(blocked).toEqual([...blockedBy]);
     });
   }
 

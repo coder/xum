@@ -39,6 +39,7 @@ import { ConfirmationModal } from "@/browser/components/ConfirmationModal/Confir
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import type { WorkspaceCreatedOptions } from "@/browser/features/ChatInput/types";
+import { startBranchListLoad, type BranchLoadStatus } from "./branchListLoad";
 import type {
   ChatAttachment,
   PendingFileChatAttachment,
@@ -177,8 +178,8 @@ function estimateBase64DataUrlBytes(dataUrl: string): number | null {
 
 interface UseCreationWorkspaceReturn {
   branches: string[];
-  /** Whether listBranches has completed (to distinguish loading vs non-git repo) */
-  branchesLoaded: boolean;
+  /** Where listBranches stands: a failed list is not an empty (non-git) one (#6055). */
+  branchLoad: BranchLoadStatus;
   trunkBranch: string;
   setTrunkBranch: (branch: string) => void;
   /** Currently selected runtime (discriminated union: SSH has host, Docker has image) */
@@ -203,8 +204,6 @@ interface UseCreationWorkspaceReturn {
   ) => Promise<CreationSendResult>;
   /** Workspace name/title generation state and actions (for CreationControls) */
   nameState: WorkspaceNameState;
-  /** Reload branches (e.g., after git init) */
-  reloadBranches: () => Promise<void>;
   /** Runtime availability state for each mode (loading/failed/loaded) */
   runtimeAvailabilityState: RuntimeAvailabilityState;
   /** Trust confirmation dialog element — render in parent component tree */
@@ -291,7 +290,7 @@ export function useCreationWorkspace({
   const { getProjectConfig, refreshProjects, loading: projectsLoading } = useProjectContext();
   const { config: providersConfig } = useProvidersConfig();
   const [branches, setBranches] = useState<string[]>([]);
-  const [branchesLoaded, setBranchesLoaded] = useState(false);
+  const [branchLoad, setBranchLoad] = useState<BranchLoadStatus>("loading");
   const [recommendedTrunk, setRecommendedTrunk] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [isSending, setIsSending] = useState(false);
@@ -333,49 +332,30 @@ export function useCreationWorkspace({
   // Destructure name state functions for use in callbacks
   const { waitForGeneration } = workspaceNameState;
 
-  // Load branches - used on mount and after git init
-  // Returns a cleanup function to track mounted state
-  const loadBranches = useCallback(async () => {
-    if (kind === "scratch" || !projectPath.length || !api) return;
-    setBranchesLoaded(false);
-    try {
-      const result = await api.projects.listBranches({ projectPath });
-      setBranches(result.branches);
-      setRecommendedTrunk(result.recommendedTrunk);
-    } catch (err) {
-      console.error("Failed to load branches:", err);
-    } finally {
-      setBranchesLoaded(true);
-    }
-  }, [kind, projectPath, api]);
-
   // Load branches and runtime availability on mount with mounted guard
   useEffect(() => {
     if (kind === "scratch") {
-      setBranchesLoaded(true);
+      setBranchLoad("loaded");
       return;
     }
     if (!projectPath.length || !api) return;
     let mounted = true;
-    setBranchesLoaded(false);
+    setBranchLoad("loading");
     setRuntimeAvailabilityState({ status: "loading" });
     // Both requests run at once and settle independently. Send waits for the branch list (#6033),
     // so it must not also wait for the runtime probe (Docker, Podman, devcontainer CLI), which can
     // take several seconds after the branches are ready.
-    const loadBranches = async () => {
-      try {
-        const result = await api.projects.listBranches({ projectPath });
-        if (!mounted) return;
-        setBranches(result.branches);
-        setRecommendedTrunk(result.recommendedTrunk);
-      } catch (error) {
-        console.error("Failed to load branches:", error);
-      } finally {
-        if (mounted) {
-          setBranchesLoaded(true);
+    // A list that rejects or hangs reports "failed" (#6055); one that settles late still loads.
+    const cancelBranchLoad = startBranchListLoad(
+      () => api.projects.listBranches({ projectPath }),
+      (outcome) => {
+        if (outcome.status === "loaded") {
+          setBranches(outcome.branches);
+          setRecommendedTrunk(outcome.recommendedTrunk);
         }
+        setBranchLoad(outcome.status);
       }
-    };
+    );
     const loadRuntimeAvailability = async () => {
       try {
         const data = await api.projects.runtimeAvailability({ projectPath });
@@ -384,10 +364,10 @@ export function useCreationWorkspace({
         if (mounted) setRuntimeAvailabilityState({ status: "failed" });
       }
     };
-    void loadBranches();
     void loadRuntimeAvailability();
     return () => {
       mounted = false;
+      cancelBranchLoad();
     };
   }, [kind, projectPath, api]);
 
@@ -1022,7 +1002,7 @@ export function useCreationWorkspace({
 
   return {
     branches,
-    branchesLoaded,
+    branchLoad,
     trunkBranch: settings.trunkBranch,
     setTrunkBranch,
     selectedRuntime: settings.selectedRuntime,
@@ -1036,8 +1016,6 @@ export function useCreationWorkspace({
     handleSend,
     // Workspace name/title state (for CreationControls)
     nameState: workspaceNameState,
-    // Reload branches (e.g., after git init)
-    reloadBranches: loadBranches,
     // Runtime availability state for each mode
     runtimeAvailabilityState,
     trustDialog,

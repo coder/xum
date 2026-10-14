@@ -31,6 +31,7 @@ import { tool, type Tool } from "ai";
 import { z } from "zod";
 
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import type { ToolSearchStreamState } from "@/common/utils/tools/toolCatalog";
 import { attachModelOnlyToolNotifications } from "@/common/utils/tools/internalToolResultFields";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import type { HistoryService } from "./historyService";
@@ -53,6 +54,11 @@ interface WireBody {
 
 /** One scripted model step: the SSE events the fake Anthropic API streams back. */
 type ScriptedStep = Array<Record<string, unknown>>;
+/** A scripted HTTP error reply instead of a step. */
+interface ScriptedError {
+  status: number;
+  message: string;
+}
 
 function sse(events: ScriptedStep): string {
   return events
@@ -149,11 +155,20 @@ function toolThenTextTurn(toolName: string, toolCallId: string): ScriptedStep[] 
  */
 function createScriptedAnthropic() {
   const bodies: WireBody[] = [];
-  let queue: ScriptedStep[] = [];
+  let queue: Array<ScriptedStep | ScriptedError> = [];
   const baseFetch = ((_input: unknown, init?: { body?: unknown }) => {
     bodies.push(JSON.parse(String(init?.body)) as WireBody);
     const step = queue.shift();
     if (step == null) throw new Error("scripted anthropic: no step left");
+    if (!Array.isArray(step)) {
+      const error = { type: "invalid_request_error", message: step.message };
+      return Promise.resolve(
+        new Response(JSON.stringify({ type: "error", error }), {
+          status: step.status,
+          headers: { "content-type": "application/json" },
+        })
+      );
+    }
     return Promise.resolve(
       new Response(sse(step), { status: 200, headers: { "content-type": "text/event-stream" } })
     );
@@ -166,7 +181,7 @@ function createScriptedAnthropic() {
   return {
     model: provider(MODEL_ID),
     bodies,
-    script(steps: ScriptedStep[]) {
+    script(steps: Array<ScriptedStep | ScriptedError>) {
       queue = [...steps];
     },
   };
@@ -259,9 +274,11 @@ async function readHistory(): Promise<MuxMessage[]> {
 async function runTurn(
   anthropic: ReturnType<typeof createScriptedAnthropic>,
   tools: Record<string, Tool>,
-  steps: ScriptedStep[],
+  steps: Array<ScriptedStep | ScriptedError>,
   /** Volatile system tail (hot memories, MCP warning, context-window ids) after SYSTEM. */
-  volatileTail = ""
+  volatileTail = "",
+  /** Tool search: the advertised tool set changes when a step activates a deferred tool. */
+  toolSearchState?: ToolSearchStreamState
 ): Promise<WireBody[]> {
   const history = await readHistory();
   const payload = await assemblePromptPayload({
@@ -302,6 +319,7 @@ async function runTurn(
     providerOptions: { anthropic: { thinking: { type: "adaptive" } } },
     historySequence,
     thinkingLevel: "high",
+    toolSearchState,
     runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
     providedRuntimeTempDir: "",
   });
@@ -339,13 +357,16 @@ async function expectNextTurnExtendsLastStep(params: {
     params.tools,
     toolThenTextTurn("probe", "call-next")
   );
-  const lastStep = firstTurnBodies[firstTurnBodies.length - 1];
+  expectExtendsLastStep(firstTurnBodies[firstTurnBodies.length - 1], nextFirst, MONITOR_WAKE);
+}
 
+/** The contract for one turn boundary: `nextFirst` repeats `lastStep`, then sends `trigger`. */
+function expectExtendsLastStep(lastStep: WireBody, nextFirst: WireBody, trigger: string): void {
   expect(withoutCacheControl(nextFirst.system)).toEqual(withoutCacheControl(lastStep.system));
   expect(withoutCacheControl(nextFirst.tools)).toEqual(withoutCacheControl(lastStep.tools));
   // A request that dropped the new trigger would match the previous one exactly, so check it
   // is sent after the previous request's messages before checking the prefix.
-  expect(sendsAfter(lastStep, nextFirst, MONITOR_WAKE)).toBe(true);
+  expect(sendsAfter(lastStep, nextFirst, trigger)).toBe(true);
   // The previous turn's final answer must precede the trigger: a rebuild that lost it would
   // still repeat every earlier message and end with the trigger.
   expect(endsWithAnswerThenTrigger(nextFirst)).toBe(true);
@@ -581,6 +602,168 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
   });
 });
 
+/** A turn step that thinks, then calls `toolName`. */
+function thinkThenCall(toolCallId: string, toolName: string): ScriptedStep {
+  return [
+    messageStart(),
+    ...thinkingBlock(0, `plan-${toolCallId}`),
+    ...toolUseBlock(1, toolCallId, toolName, { script: "echo hi" }),
+    ...finish("tool_use"),
+  ];
+}
+
+function thinkThenAnswer(label: string): ScriptedStep {
+  return [
+    messageStart(),
+    ...thinkingBlock(0, `done-${label}`),
+    ...textBlock(1, `Answer ${label}.`),
+    ...finish("end_turn"),
+  ];
+}
+
+/** Thinking texts a wire body replays (Anthropic `thinking` blocks). */
+function sentThinking(body: WireBody): string[] {
+  return body.messages.flatMap((message) => {
+    const content = (message as { content?: unknown }).content;
+    return Array.isArray(content)
+      ? content
+          .filter((block) => (block as { type?: unknown }).type === "thinking")
+          .map((block) => String((block as { thinking?: unknown }).thinking))
+      : [];
+  });
+}
+
+/**
+ * Mechanism 11: a thinking-replay receipt (an in-turn strip or a signature repair) used to make
+ * every later turn strip all Anthropic thinking of the context segment, while the turn itself
+ * kept sending the thinking produced after the strip. Each later turn then rewrote the previous
+ * turn's tail. The receipt now records its point, and the rebuild strips only up to it.
+ */
+describe("prompt-cache prefix: thinking-replay receipt", () => {
+  // Core tools, plus deferred tools a step activates: the advertised tool set changes in-turn.
+  const deferredTools = ["slack_send", "slack_list"];
+  const toolSearchState = (): ToolSearchStreamState => ({
+    catalog: deferredTools.map((name) => ({ name, description: name, paramText: "" })),
+    deferredToolNames: new Set(deferredTools),
+    allToolNames: ["bash", "probe", "activate_send", "activate_list", ...deferredTools],
+    activatedToolNames: new Set(),
+    native: false,
+  });
+  const activating = (state: ToolSearchStreamState, name: string) =>
+    tool({
+      description: `activate ${name}`,
+      inputSchema: z.object({ script: z.string() }),
+      execute: () => {
+        state.activatedToolNames.add(name);
+        return Promise.resolve({ success: true, output: "activated" });
+      },
+    });
+  const toolsFor = (state: ToolSearchStreamState): Record<string, Tool> => ({
+    bash: plainTool("bash"),
+    probe: plainTool("probe"),
+    activate_send: activating(state, "slack_send"),
+    activate_list: activating(state, "slack_list"),
+    slack_send: plainTool("slack_send"),
+    slack_list: plainTool("slack_list"),
+  });
+
+  /**
+   * Runs a thinking turn, then `stripTurn`, then two more turns, and checks both later turn
+   * boundaries: the second one fails when the rebuild keeps rewriting older turns.
+   */
+  async function expectStripTurnKeepsPrefix(params: {
+    stripTurn: Array<ScriptedStep | ScriptedError>;
+    /** Thinking the strip turn's last step sent after the strip: the rebuild must keep it. */
+    keptThinking: string;
+  }): Promise<{ receipt: MuxMessage["metadata"] }> {
+    const state = toolSearchState();
+    const tools = toolsFor(state);
+    const anthropic = createScriptedAnthropic();
+    await appendUser("Start the job and wait for it.");
+    await runTurn(
+      anthropic,
+      tools,
+      [thinkThenCall("call-0", "bash"), thinkThenAnswer("0")],
+      "",
+      state
+    );
+    await appendUser("Now the next part.");
+    const stripBodies = await runTurn(anthropic, tools, params.stripTurn, "", state);
+    const stripLast = stripBodies[stripBodies.length - 1];
+    // The strip happened: the last step sent no earlier thinking, but kept the newer block.
+    expect(sentThinking(stripLast)).toEqual([params.keptThinking]);
+    const receipt = (await readHistory()).at(-1)?.metadata;
+
+    await appendUser(MONITOR_WAKE);
+    const nextBodies = await runTurn(
+      anthropic,
+      tools,
+      toolThenTextTurn("probe", "call-n"),
+      "",
+      state
+    );
+    expectExtendsLastStep(stripLast, nextBodies[0], MONITOR_WAKE);
+    const laterWake = "[bash monitor] The second job finished.";
+    await appendUser(laterWake);
+    const [laterFirst] = await runTurn(
+      anthropic,
+      tools,
+      toolThenTextTurn("probe", "call-l"),
+      "",
+      state
+    );
+    expectExtendsLastStep(nextBodies[nextBodies.length - 1], laterFirst, laterWake);
+    return { receipt };
+  }
+
+  test("an in-turn tool-set change keeps the thinking sent after the strip", async () => {
+    // Step 0 activates a deferred tool, so step 1 advertises another tool set and strips
+    // every earlier thinking block. Step 1's own block keeps replaying in step 2.
+    const { receipt } = await expectStripTurnKeepsPrefix({
+      stripTurn: [
+        thinkThenCall("call-1", "activate_send"),
+        thinkThenCall("call-2", "bash"),
+        thinkThenAnswer("1"),
+      ],
+      keptThinking: "plan-call-2",
+    });
+    expect(receipt?.anthropicThinkingReplay).toBe("off");
+    expect(receipt?.anthropicThinkingReplayFromStep).toBe(1);
+  });
+
+  test("a signature repair at the turn start keeps the thinking produced after it", async () => {
+    // The first request is rejected for its replayed thinking. The retry sends no thinking,
+    // and every block of this row is bound to that stripped prefix.
+    const { receipt } = await expectStripTurnKeepsPrefix({
+      stripTurn: [
+        {
+          status: 400,
+          message: "messages.1.content.0: Invalid `signature` in `thinking` block",
+        },
+        thinkThenCall("call-1", "bash"),
+        thinkThenAnswer("1"),
+      ],
+      keptThinking: "plan-call-1",
+    });
+    expect(receipt?.anthropicThinkingReplayFromStep).toBe(0);
+  });
+
+  test("a second strip in the same turn moves the point forward", async () => {
+    // Steps 1 and 2 both see a new tool set. Step 2's strip also removed step 1's block,
+    // so the next turn must not put it back.
+    const { receipt } = await expectStripTurnKeepsPrefix({
+      stripTurn: [
+        thinkThenCall("call-1", "activate_send"),
+        thinkThenCall("call-2", "activate_list"),
+        thinkThenCall("call-3", "bash"),
+        thinkThenAnswer("1"),
+      ],
+      keptThinking: "plan-call-3",
+    });
+    expect(receipt?.anthropicThinkingReplayFromStep).toBe(2);
+  });
+});
+
 /** Every cacheable block in Anthropic prefix order: tools, then system blocks, then messages. */
 function wireBlocks(body: WireBody): string[] {
   const asArray = (value: unknown): unknown[] =>
@@ -626,6 +809,9 @@ async function hotMemoryChangeKeepsHistoryCached(): Promise<void> {
   );
 
   expect(sendsAfter(first, second, MONITOR_WAKE)).toBe(true);
+  // The first turn's answer must precede the trigger: a fix that rebuilt the history without
+  // it would still keep the tail-only change below and pass the target assertion.
+  expect(endsWithAnswerThenTrigger(second)).toBe(true);
   // Each request must send its own hot memories: a fix that dropped the tail or kept "A"
   // would otherwise pass the prefix check below.
   expect(JSON.stringify(first)).toContain("<hot_memories>\\nA\\n</hot_memories>");

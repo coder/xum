@@ -22,6 +22,9 @@ import {
 import type { Instructions, ModelMessage, SystemModelMessage, Tool } from "ai";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
+import type { CountCompactionRowTokens } from "@/common/utils/messages/compactionRowSizing";
+import { trimCompactionInput } from "@/common/utils/messages/trimCompactionInput";
+import { createCompactionRowCounter, projectCompactionInput } from "./compactionInputSizing";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
@@ -198,6 +201,11 @@ export interface AssemblePromptPayloadOptions {
   /** Token budget: end each persisted user row with its session_history item ID. */
   tagHistoryItemIds?: boolean;
   /**
+   * Compaction requests only: the estimated token budget their history must fit
+   * (trimCompactionInput). Absent for every other request, which is never trimmed.
+   */
+  compactionInputBudgetTokens?: number;
+  /**
    * Request-only user-role context (MCP Apps model context), never persisted. It goes before the
    * newest user row (insertRequestContextMessage has the trailing-partial rule), or last when
    * the request ends without one, so the cached prefix (system prompt and earlier turns) is
@@ -269,6 +277,43 @@ function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
   });
 }
 
+/**
+ * A compaction request's history fitted to its budget; any other request unchanged. The trim
+ * sizes and edits the redacted projection the provider receives (projectCompactionInput),
+ * counting rows with the model's tokenizer. A history that fits keeps its original rows, so
+ * the request stays byte-identical.
+ */
+async function trimToCompactionInputBudget(
+  messages: MuxMessage[],
+  budgetTokens: number | undefined,
+  modelString: string,
+  requestContextMessage: MuxMessage | undefined
+): Promise<MuxMessage[]> {
+  if (budgetTokens == null) return messages;
+  const countRow = createCompactionRowCounter(modelString);
+  const sized = projectCompactionInput(messages);
+  const trim = await trimCompactionInput(
+    sized,
+    await historyShareOfBudget(budgetTokens, requestContextMessage, countRow),
+    countRow
+  );
+  return trim.messages === sized ? messages : trim.messages;
+}
+
+/**
+ * The request-only context (MCP Apps) is inserted after the trim but sent with the history, so
+ * it takes its share of the budget first. At least 1 token is left: the trim then cuts all it
+ * can, and the context_exceeded retry decides the rest.
+ */
+async function historyShareOfBudget(
+  budgetTokens: number,
+  requestContextMessage: MuxMessage | undefined,
+  countRow: CountCompactionRowTokens
+): Promise<number> {
+  const contextTokens = requestContextMessage ? await countRow(requestContextMessage) : 0;
+  return Math.max(1, budgetTokens - contextTokens);
+}
+
 export async function assemblePromptPayload(
   options: AssemblePromptPayloadOptions
 ): Promise<PromptPayload> {
@@ -277,12 +322,18 @@ export async function assemblePromptPayload(
     options.providerForMessages,
     options.effectiveThinkingLevel
   );
+  const providerRequestMessages = await trimToCompactionInputBudget(
+    prepared.providerRequestMessages,
+    options.compactionInputBudgetTokens,
+    options.modelString,
+    options.requestContextMessage
+  );
   let messages = await prepareMessagesForProvider({
     messagesWithSentinel: addInterruptedSentinel(
       insertRequestContextMessage(
         options.tagHistoryItemIds === true
-          ? tagUserRowsWithHistoryItemIds(prepared.providerRequestMessages)
-          : prepared.providerRequestMessages,
+          ? tagUserRowsWithHistoryItemIds(providerRequestMessages)
+          : providerRequestMessages,
         options.requestContextMessage
       )
     ),
@@ -348,7 +399,7 @@ export async function assemblePromptPayload(
   }
 
   return {
-    providerRequestMessages: prepared.providerRequestMessages,
+    providerRequestMessages,
     messages,
     system,
     tools: options.tools
