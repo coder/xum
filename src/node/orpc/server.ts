@@ -59,6 +59,13 @@ import {
 import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { assert } from "@/common/utils/assert";
 import {
+  FIRST_RUN_EARLY_SCRIPT,
+  FIRST_RUN_MODULES_ID,
+  FIRST_RUN_TEMPLATE_ID,
+  FIRST_RUN_VIEW_HTML,
+} from "@/node/orpc/firstRunView";
+import {
+  deferAppModules,
   findFirstViewFont,
   firstViewFontPreload,
   isHashedStaticAssetName,
@@ -200,6 +207,32 @@ function injectBaseHref(
 function escapeJsonForHtmlScript(value: unknown): string {
   // Prevent `</script>` injection when embedding untrusted strings in an inline <script>.
   return JSON.stringify(value).replaceAll("<", "\\u003c");
+}
+
+/**
+ * T3 C step 2 (plan section 5.6, PR 4b), for "/" only (`isAppRoot`): the static first-run view in a <template>
+ * before </body>, and JS-after-paint. Vite's module tags move into a JSON list after the <base>,
+ * then the early script, which shows the view and loads the app from that list once the view has
+ * painted, or at once (fact list: paint-cache key, hidden tab, a failed or slow POST, rule says no).
+ * The list must precede the early script, which can load the app before the parser goes on, and
+ * both precede the stylesheet, so the script does not wait for the CSS. A page without exactly one
+ * module script, a <base> and a </body> is served as is.
+ * Split origin (VITE_BACKEND_URL, a renderer served apart from its backend): the early script posts
+ * to this page's own `api/`. There those POSTs fail, and the script loads the app with no view, as
+ * today (PR 4a's failed-POST tests). Known limit: no static view on a split origin.
+ */
+function injectFirstRunView(html: string, isAppRoot: boolean): string {
+  const deferred = isAppRoot ? deferAppModules(html) : null;
+  if (!deferred || !/<base\b[^>]*>/i.test(deferred.html) || !/<\/body>/i.test(deferred.html)) {
+    return html;
+  }
+  const list = escapeJsonForHtmlScript(deferred.modules);
+  const head = `\n    <script type="application/json" id="${FIRST_RUN_MODULES_ID}">${list}</script>\n    <script>${FIRST_RUN_EARLY_SCRIPT}</script>`;
+  const template = `<template id="${FIRST_RUN_TEMPLATE_ID}">${FIRST_RUN_VIEW_HTML}</template>\n  `;
+  // Function replacers: the inserted text holds `$` signs, which string replacements would expand.
+  return deferred.html
+    .replace(/<base\b[^>]*>/i, (base) => base + head)
+    .replace(/<\/body>/i, (end) => template + end);
 }
 
 function getBrowserProxyUriTemplate(): string | null {
@@ -1645,10 +1678,14 @@ export async function createOrpcServer({
       }
 
       if (rawSpaIndexHtml !== null) {
+        const isAppRoot = shouldInjectSlashlessRootRedirect(req);
         const spaIndexHtml = injectProxyUriTemplate(
-          injectBaseHref(rawSpaIndexHtml, getPublicBaseHref(req, res), {
-            includeSlashlessRootRedirect: shouldInjectSlashlessRootRedirect(req),
-          }),
+          injectFirstRunView(
+            injectBaseHref(rawSpaIndexHtml, getPublicBaseHref(req, res), {
+              includeSlashlessRootRedirect: isAppRoot,
+            }),
+            isAppRoot
+          ),
           getBrowserProxyUriTemplate()
         );
         varyPublicBasePathHeaders(res);

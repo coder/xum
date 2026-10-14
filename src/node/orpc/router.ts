@@ -61,6 +61,7 @@ import {
   updateMcpAppModelContext,
   approveMcpAppViewDomains,
   listMcpAppViewDomains,
+  readMcpAppViewDomains,
   revokeMcpAppViewDomains,
 } from "@/node/services/mcpAppsOperations";
 import {
@@ -1877,6 +1878,10 @@ export const router = (authToken?: string) => {
         .input(schemas.mcpApps.listViewDomains.input)
         .output(schemas.mcpApps.listViewDomains.output)
         .handler(({ context }) => listMcpAppViewDomains(context)),
+      readViewDomains: t
+        .input(schemas.mcpApps.readViewDomains.input)
+        .output(schemas.mcpApps.readViewDomains.output)
+        .handler(({ context }) => readMcpAppViewDomains(context)),
       revokeViewDomains: t
         .input(schemas.mcpApps.revokeViewDomains.input)
         .output(schemas.mcpApps.revokeViewDomains.output)

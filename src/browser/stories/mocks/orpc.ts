@@ -2592,6 +2592,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         options.mcpAppViewDomainsListError != null
           ? Promise.reject(new Error(options.mcpAppViewDomainsListError))
           : Promise.resolve([...mockViewDomains.values()]),
+      readViewDomains: () =>
+        Promise.resolve({
+          revision: ++mockViewDomainsRevision,
+          approvals: [...mockViewDomains.values()],
+        }),
       revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
         mockViewDomains.delete(JSON.stringify([input.projectPath, input.serverName]));
         return Promise.resolve({ revision: ++mockViewDomainsRevision });

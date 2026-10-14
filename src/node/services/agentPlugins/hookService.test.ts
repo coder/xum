@@ -752,6 +752,16 @@ describe("AgentPluginHookService", () => {
     // About what four servers at the per-server limits can send.
     value = "x".repeat(400 * 1024);
     expect(await assemble()).toBe("base\n\n0:true");
+    // The cap counts UTF-8 bytes of the settings JSON, `{"cad":{"notes":"…"}}` (20 bytes around
+    // the value): exactly at the cap passes, one byte over is omitted.
+    const cap = 64 * 1024;
+    value = "x".repeat(cap - 20);
+    expect(await assemble()).toBe("base\n\n1:undefined");
+    value = "x".repeat(cap - 19);
+    expect(await assemble()).toBe("base\n\n0:true");
+    // Non-ASCII text: fewer UTF-16 units than the cap, but more bytes.
+    value = "é".repeat((cap - 20) / 2 + 1);
+    expect(await assemble()).toBe("base\n\n0:true");
   });
 
   test.each(["dispose", "epoch"] as const)(

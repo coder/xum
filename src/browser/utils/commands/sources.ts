@@ -43,8 +43,10 @@ import {
 import {
   appViewDetails,
   appViewServerNames,
+  focusMcpAppViewTab,
   getMcpAppViews,
   openMcpAppViewTab,
+  reloadMcpAppView,
   transcriptViews,
   type McpAppViewRef,
 } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
@@ -53,6 +55,7 @@ import {
   openMcpAppEntrypoint,
 } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
 import { mcpAppEntrypointDescription } from "@/browser/features/RightSidebar/AppViewTab/mcpAppEntrypoints";
+import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 import { revokeMcpAppViewDomains } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore";
 
@@ -66,19 +69,53 @@ function entrypointActions(
   entrypoints: readonly McpAppEntrypoint[],
   navigation: string
 ): CommandAction[] {
-  return entrypoints.map((entrypoint) => ({
-    id: CommandIds.navOpenAppEntrypoint(entrypoint.viewKey),
-    title: `Open Plugin View: ${entrypoint.title}`,
-    subtitle: mcpAppEntrypointDescription(entrypoint),
-    section: navigation,
-    keywords: ["plugin", "view", "app", "mcp", entrypoint.serverName],
-    run: async () => {
-      const error = api
-        ? await openMcpAppEntrypoint(api, workspaceId, entrypoint)
-        : MCP_APP_ENTRYPOINT_NOT_CONNECTED;
-      if (error !== null) showCommandFeedbackToast({ type: "error", message: error });
+  return entrypoints.flatMap((entrypoint) => {
+    const subtitle = mcpAppEntrypointDescription(entrypoint);
+    const open: CommandAction = {
+      id: CommandIds.navOpenAppEntrypoint(entrypoint.viewKey),
+      title: `Open Plugin View: ${entrypoint.title}`,
+      subtitle,
+      section: navigation,
+      keywords: ["plugin", "view", "app", "mcp", entrypoint.serverName],
+      run: async () => {
+        const error = api
+          ? await openMcpAppEntrypoint(api, workspaceId, entrypoint)
+          : MCP_APP_ENTRYPOINT_NOT_CONNECTED;
+        if (error !== null) showCommandFeedbackToast({ type: "error", message: error });
+      },
+    };
+    // An entry point's tab is keyed by its view key. Open only focuses that tab while its
+    // record is current, so a failed load needs this action to retry from the keyboard.
+    const reload = reloadAppViewActions(workspaceId, entrypoint.viewKey, {
+      title: `Reload Plugin View: ${entrypoint.title}`,
+      subtitle,
+      section: navigation,
+      keywords: ["plugin", "view", "app", "mcp", "reload", "retry", entrypoint.serverName],
+    });
+    return [open, ...reload];
+  });
+}
+
+/**
+ * "Reload" for an app tab that is open (after a failed load, or a stuck view): remounts the
+ * tab's frame, which loads the view again, and focuses the tab. Empty when no tab is open.
+ */
+function reloadAppViewActions(
+  workspaceId: string,
+  toolCallId: string,
+  action: Pick<CommandAction, "title" | "subtitle" | "section" | "keywords">
+): CommandAction[] {
+  if (!hasTab(readRightSidebarLayout(workspaceId), appViewTabFor(toolCallId))) return [];
+  return [
+    {
+      ...action,
+      id: CommandIds.navReloadAppView(toolCallId),
+      run: () => {
+        reloadMcpAppView(workspaceId, toolCallId);
+        focusMcpAppViewTab(workspaceId, toolCallId);
+      },
     },
-  }));
+  ];
 }
 
 /**
@@ -523,6 +560,37 @@ function openGoalPanel(workspaceId: string, openCompleteInput = false): void {
 /** Subtitle for an On/Off toggle backed by config.json; `fallback` until the value is known. */
 function describeConfigToggle(value: boolean | undefined, fallback: string): string {
   return value === undefined ? fallback : `Current: ${value ? "On" : "Off"}`;
+}
+
+/**
+ * The palette actions of the workspace's MCP App views: one "Open App View" per view (its tab,
+ * or the tab it has), and one "Reload App View" per view whose tab is open. The subtitle carries
+ * each call's detail, so several calls of one tool differ.
+ */
+function appViewActions(
+  wsId: string,
+  messages: Parameters<typeof appViewEntries>[1],
+  navigationSection: CommandAction["section"]
+): CommandAction[] {
+  return appViewEntries(wsId, messages).flatMap(({ view, server, detail }) => {
+    const subtitle = detail === "" ? server : `${server} · ${detail}`;
+    const open: CommandAction = {
+      id: CommandIds.navOpenAppView(view.toolCallId),
+      title: `Open App View: ${view.label}`,
+      subtitle,
+      section: navigationSection,
+      keywords: ["app", "view", "mcp", "tab", view.serverName],
+      run: () => openMcpAppViewTab(wsId, view),
+    };
+    // The keyboard path to an open tab's Reload.
+    const reload = reloadAppViewActions(wsId, view.toolCallId, {
+      title: `Reload App View: ${view.label}`,
+      subtitle,
+      section: navigationSection,
+      keywords: ["app", "view", "mcp", "reload", "retry", view.serverName],
+    });
+    return [open, ...reload];
+  });
 }
 
 /** Palette options: managed plugins with components not reviewed on this install (#6498). */
@@ -1019,16 +1087,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               // One per MCP App view of the workspace (transcript or opened this session): opens
               // its tab or focuses the one it has, the keyboard path to "Open in tab".
               // The subtitle carries each call's detail, so several calls of one tool differ.
-              ...appViewEntries(wsId, p.selectedWorkspaceState?.messages ?? []).map(
-                ({ view, server, detail }) => ({
-                  id: CommandIds.navOpenAppView(view.toolCallId),
-                  title: `Open App View: ${view.label}`,
-                  subtitle: detail === "" ? server : `${server} · ${detail}`,
-                  section: section.navigation,
-                  keywords: ["app", "view", "mcp", "tab", view.serverName],
-                  run: () => openMcpAppViewTab(wsId, view),
-                })
-              ),
+              ...appViewActions(wsId, p.selectedWorkspaceState?.messages ?? [], section.navigation),
               // One per MCP App entry point of an enabled server: opens its app tab (calling
               // the tool with {}) or focuses the one it has.
               ...entrypointActions(p.api, wsId, p.mcpAppEntrypoints ?? [], section.navigation),

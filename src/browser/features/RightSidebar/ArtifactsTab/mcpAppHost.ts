@@ -191,6 +191,8 @@ export interface McpAppHostOptions {
    * A move unmounts this instance, so the host runs it only once the view has its reply.
    */
   setDisplayMode: (mode: McpAppDisplayMode) => (() => void) | null;
+  /** The display modes the view declared in ui/initialize (undefined: none, so any). */
+  onViewDisplayModes?: (modes: readonly string[] | undefined) => void;
   requestConsent: (request: McpAppConsentRequest) => Promise<boolean>;
   insertIntoComposer: (text: string) => void;
   openExternalLink: (url: string) => void;
@@ -201,6 +203,29 @@ export interface McpAppHostOptions {
 
 export function clampMcpAppHeight(height: number): number {
   return Math.min(MCP_APP_MAX_HEIGHT, Math.max(MCP_APP_MIN_HEIGHT, Math.round(height)));
+}
+
+/** Whether a view's declared display modes include fullscreen but not inline. */
+export function declaresFullscreenOnly(declared: readonly string[] | undefined): boolean {
+  return declared !== undefined && declared.includes("fullscreen") && !declared.includes("inline");
+}
+
+/**
+ * The view's declared display modes after a ui/initialize, told to the frame. A later initialize
+ * without a list (the window.openai shim's, mcpAppOpenAiShim.ts) keeps the view's own
+ * declaration: it must not widen the modes the view is told about.
+ */
+function declaredDisplayModes(
+  params: unknown,
+  previous: readonly string[] | undefined,
+  options: Pick<McpAppHostOptions, "onViewDisplayModes">
+): readonly string[] | undefined {
+  const declared = InitializeParams.safeParse(params);
+  const modes =
+    (declared.success ? declared.data.appCapabilities?.availableDisplayModes : undefined) ??
+    previous;
+  options.onViewDisplayModes?.(modes);
+  return modes;
 }
 
 export function createMcpAppHost(options: McpAppHostOptions) {
@@ -279,12 +304,7 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   async function handleRequest(id: string | number, method: string, params: unknown) {
     switch (method) {
       case "ui/initialize": {
-        const declared = InitializeParams.safeParse(params);
-        // A later initialize without a list (the window.openai shim's, mcpAppOpenAiShim.ts) keeps
-        // the view's own declaration: it must not widen the modes the view is told about.
-        viewDisplayModes =
-          (declared.success ? declared.data.appCapabilities?.availableDisplayModes : undefined) ??
-          viewDisplayModes;
+        viewDisplayModes = declaredDisplayModes(params, viewDisplayModes, options);
         const context = options.getHostContext();
         const hostContext = { ...context, displayMode: viewMode(context.displayMode) };
         notifiedDisplayMode = hostContext.displayMode;

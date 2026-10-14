@@ -1596,6 +1596,14 @@ export const mcpApps = {
     ),
   },
   listViewDomains: { input: z.void(), output: z.array(McpAppViewDomainsSchema) },
+  /**
+   * Every project's approvals with the revision of this read, newer than every list committed
+   * before it: the live follow of mounted views re-reads after each config change (#6181).
+   */
+  readViewDomains: {
+    input: z.void(),
+    output: z.object({ revision: z.number(), approvals: z.array(McpAppViewDomainsSchema) }),
+  },
   /** Mounted views of the server in this renderer reload under the narrower policy. */
   revokeViewDomains: {
     input: McpAppViewDomainsSchema.pick({ projectPath: true, serverName: true }),

@@ -271,6 +271,9 @@ async function disposeWorkflowResources(input: {
 }
 
 async function disposeWorkflowContext(ctx: WorkflowContext): Promise<void> {
+  // Stop the config.json watches before the services go, so no watch callback reaches a
+  // torn-down service. A failed setup skips this, but the watches are non-persistent.
+  ctx.config.stopWatchingConfigFile();
   await disposeWorkflowResources({
     tempDir: ctx.tempDir,
     services: ctx.services,

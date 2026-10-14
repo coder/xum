@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
@@ -26,14 +26,23 @@ import {
 import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
 import {
   createMcpAppHost,
+  declaresFullscreenOnly,
   type McpAppConsentRequest,
+  type McpAppDisplayMode,
   type McpAppHost,
   type McpAppHostContext,
 } from "./mcpAppHost";
-import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
+import {
+  isMcpAppViewHosted,
+  setMcpAppViewFullscreenOnly,
+  openMcpAppViewTab,
+  reloadMcpAppView,
+  type McpAppViewRef,
+} from "./mcpAppViewsStore";
 import {
   newestMcpAppViewDomains,
   publishMcpAppViewDomains,
+  useFollowMcpAppViewDomains,
   useMcpAppViewDomains,
 } from "./mcpAppViewDomainsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
@@ -366,6 +375,27 @@ function useContainerDimensionsUpdates(hostRef: { current: McpAppHost | null }, 
   };
 }
 
+/**
+ * Runs an accepted display-mode move of a view (setDisplayMode): fullscreen opens or focuses
+ * its tab, any other mode (inline) closes the tab so its expanded card takes the view back.
+ */
+function moveViewTo(
+  mode: McpAppDisplayMode,
+  input: { workspaceId: string; view: McpAppViewRef; onClose?: () => void }
+) {
+  if (mode === "fullscreen") {
+    openMcpAppViewTab(input.workspaceId, input.view);
+    return;
+  }
+  // The user collapsed the card during the teardown wait: closing the tab would leave the view
+  // without a frame. It stays in its tab and loads again (it was torn down).
+  if (!isMcpAppViewHosted(input.workspaceId, input.view.toolCallId, "card")) {
+    reloadMcpAppView(input.workspaceId, input.view.toolCallId);
+    return;
+  }
+  input.onClose?.();
+}
+
 /** The domain prompt's text: the origins, and the project that keeps the approval. */
 function DomainsPromptText(props: { origins: readonly string[]; projectPath: string | null }) {
   return (
@@ -395,6 +425,36 @@ function useExposedClose(
       closeRef.current = null;
     };
   });
+}
+
+/**
+ * A view that could not be shown. A failed load (an error) can be retried where the host
+ * offers Reload (its app tab remounts the frame); a missing view cannot.
+ */
+function McpAppViewUnavailable(props: {
+  header: ReactNode;
+  inline: boolean;
+  error: string | null;
+  onReload?: () => void;
+}) {
+  return (
+    <div className="flex min-h-0 flex-col">
+      {props.header}
+      <div className="text-danger p-4 text-xs">
+        {props.inline ? null : "This view is no longer available. "}
+        {props.error ?? "The view could not be loaded."}
+      </div>
+      {props.onReload != null && props.error != null && (
+        <button
+          type="button"
+          onClick={props.onReload}
+          className="border-border-light focus-visible:ring-accent mx-4 self-start rounded border px-2 py-0.5 text-xs focus-visible:ring-1"
+        >
+          Reload
+        </button>
+      )}
+    </div>
+  );
 }
 
 /**
@@ -428,6 +488,8 @@ export function McpAppFrame(props: {
   variant?: McpAppFrameVariant;
   /** Panel only: closes the panel's host (its app tab). */
   onClose?: () => void;
+  /** Panel only: loads the view again (its tab remounts the frame), offered when loading failed. */
+  onReload?: () => void;
   /**
    * Panel only: receives the frame's close sequence (the view's teardown, then onClose), so a
    * host's own dismissal (a modal's Escape or outside click) closes the view the same way.
@@ -492,6 +554,8 @@ export function McpAppFrame(props: {
   const approvalProjectPath = current?.view?.approvalProjectPath ?? null;
   // An approval or revoke of this server committed after this view's read applies here too.
   const published = useMcpAppViewDomains(approvalProjectPath, boundServerName);
+  // A Revoke in another window or Xum process narrows this view while it stays mounted.
+  useFollowMcpAppViewDomains(approvalProjectPath, boundServerName);
   const approved = newestMcpAppViewDomains(published, current?.view);
   const grant = current?.view ? grantMcpAppCsp(current.view.csp, approved) : null;
   // Only a view with a result record can be approved (the record binds its server), and only
@@ -670,15 +734,24 @@ export function McpAppFrame(props: {
       // Inline only while the card is expanded in the loaded transcript: a collapsed (or
       // unloaded) card mounts no inline instance, so closing the tab would lose the view.
       // The host runs the move later; skip it once this instance is gone (closed meanwhile).
+      // A view that declared fullscreen but not inline is not hosted inline (#6181): marked,
+      // its cards show the "Open in tab" notice instead of a frame (mcpAppViewsStore.ts), so a
+      // card instance that learns it unmounts, and the user opens the view in its tab. A later
+      // declaration with inline clears the mark. A list-less initialize (the window.openai
+      // shim's) says nothing about the modes, so it keeps the mark of an earlier mount.
+      onViewDisplayModes: (modes) => {
+        if (modes === undefined) return;
+        setMcpAppViewFullscreenOnly(workspaceId, toolCallId, declaresFullscreenOnly(modes));
+      },
       setDisplayMode: (mode) => {
         if (mode === "inline" && !isMcpAppViewHosted(workspaceId, toolCallId, "card")) return null;
         return () => {
           if (hostRef.current !== host) return;
-          if (mode === "fullscreen") {
-            openMcpAppViewTab(workspaceId, latest.current.view);
-            return;
-          }
-          latest.current.onClose?.();
+          moveViewTo(mode, {
+            workspaceId,
+            view: latest.current.view,
+            onClose: latest.current.onClose,
+          });
         };
       },
       log: (message, data) =>
@@ -749,13 +822,12 @@ export function McpAppFrame(props: {
     );
   if (current.view == null || srcDoc == null || grant == null) {
     return (
-      <div className="flex min-h-0 flex-col">
-        {header}
-        <div className="text-danger p-4 text-xs">
-          {inline ? null : "This view is no longer available. "}
-          {current.error ?? "The view could not be loaded."}
-        </div>
-      </div>
+      <McpAppViewUnavailable
+        header={header}
+        inline={inline}
+        error={current.error}
+        onReload={props.onReload}
+      />
     );
   }
   return (

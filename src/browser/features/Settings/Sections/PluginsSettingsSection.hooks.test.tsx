@@ -168,3 +168,35 @@ test("a failed reload after a decision clears the stale review states", async ()
   await view.findByText("connection lost");
   expect(view.queryByText(/new_tool/)).toBeNull();
 });
+
+test("a successful reload after a reconnect clears the old load error", async () => {
+  // Codex PRRT_kwDOPxxmWM6rgooW: the error stayed next to the fresh data.
+  const item: AgentPluginListItem = {
+    name: "grill",
+    managed: true,
+    present: true,
+    location: "~/.mux/plugins/grill",
+    lockedSha: "a".repeat(40),
+    skillCount: 0,
+    mcpServerCount: 0,
+  };
+  const options = { agentPlugins: { items: [item], hooks: { grill: hooksAt("new_tool") } } };
+  const offline = createMockORPCClient(options);
+  offline.agentPlugins.getHooks = () => Promise.reject(new Error("connection lost"));
+  const tree = (client: ReturnType<typeof createMockORPCClient>) => (
+    <APIProvider client={client}>
+      <TooltipProvider>
+        <PluginsSettingsSection />
+      </TooltipProvider>
+    </APIProvider>
+  );
+
+  const view = render(tree(offline));
+  fireEvent.click(await view.findByRole("button", { name: "Review hooks for grill" }));
+  await view.findByText("connection lost");
+
+  view.rerender(tree(createMockORPCClient(options)));
+
+  await view.findByText(/new_tool/);
+  await waitFor(() => expect(view.queryByText("connection lost")).toBeNull());
+});

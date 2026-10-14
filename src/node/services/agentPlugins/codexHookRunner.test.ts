@@ -852,6 +852,22 @@ describe("UserPromptSubmit and Stop", () => {
     ]);
   });
 
+  test("a Stop hook's stopReason reaches the user, never the model", async () => {
+    // Codex PRRT_kwDOPxxmWM6rgpoD (hooks/src/events/stop.rs: a Stop entry).
+    const { spine, notices } = setup([hook("Stop")], () =>
+      json({ continue: false, stopReason: "Tests are red; stopping." })
+    );
+
+    expect(
+      await runTurnStopHooks(spine, workspaceId, {
+        messageId: "a1",
+        lastAssistantMessage: "done",
+        stopHookActive: false,
+      })
+    ).toEqual({ kind: "none" });
+    expect(notices).toEqual(["Tests are red; stopping."]);
+  });
+
   test("UserPromptSubmit blocks, or adds context (JSON or plain text)", async () => {
     const block = setup([hook("UserPromptSubmit", { input: { p: "${prompt}" } })], () =>
       json({ decision: "block", reason: "Contains a token." })
