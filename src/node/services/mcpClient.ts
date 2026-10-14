@@ -251,6 +251,30 @@ function createHttpTransport(config: MCPHttpTransportConfig): Transport {
  * Mirrors @ai-sdk/mcp's mcpToModelOutput so model-visible tool results stay
  * identical across the SDK swap.
  */
+/**
+ * Record one tools/list entry as a settings layout tool action. The title follows the settings
+ * spec's display name order with the same cleaning as entry point titles; a tool whose name
+ * cleans to nothing is left out.
+ */
+function addSettingsToolAction(
+  actions: Map<string, MCPSettingsToolAction>,
+  definition: Awaited<ReturnType<Client["listTools"]>>["tools"][number],
+  ui: MCPToolUi | undefined
+): void {
+  const title = mcpAppEntrypointTitle(
+    [definition.title, definition.annotations?.title],
+    definition.name
+  );
+  if (title === undefined) return;
+  actions.set(definition.name, {
+    title,
+    readOnly: definition.annotations?.readOnlyHint === true,
+    // Without MCP Apps (the connection did not announce the extension), `ui` is undefined:
+    // the host cannot tell an app tool apart, and it runs as a regular tool.
+    opensApp: ui?.resourceUri !== undefined,
+  });
+}
+
 function mcpToModelOutput({
   output,
 }: {
@@ -394,19 +418,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         if (settingsTools.has(definition.name)) continue;
         const ui = mcpApps ? parseMCPToolUiMeta(definition._meta) : undefined;
         listed.set(definition.name, ui);
-        // The settings spec's display name order; the same cleaning as entry point titles.
-        const actionTitle = mcpAppEntrypointTitle(
-          [definition.title, definition.annotations?.title],
-          definition.name
-        );
-        if (actionTitle !== undefined)
-          settingsActions.set(definition.name, {
-            title: actionTitle,
-            readOnly: definition.annotations?.readOnlyHint === true,
-            // Without MCP Apps (the connection did not announce the extension), `ui` is
-            // undefined: the host cannot tell an app tool apart, and it runs as a regular tool.
-            opensApp: ui?.resourceUri !== undefined,
-          });
+        addSettingsToolAction(settingsActions, definition, ui);
         // Read before the visibility filter below: entry points ignore visibility.
         if (ui?.resourceUri !== undefined) {
           const { types, skippedFile } = parseMCPAppEntrypoints(definition._meta);
@@ -533,12 +545,10 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     settingsToolAction: (name) => listedSettingsActions.get(name),
     callSettingsActionTool: (name, meta, options) => {
       assert(listedSettingsActions.has(name), "callSettingsActionTool only calls listed tools");
+      // The spec's layout tool accepts `{}`.
       return client.callTool(
         { name, arguments: {}, _meta: meta },
-        {
-          timeout: APP_TOOL_CALL_TIMEOUT_MS,
-          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-        }
+        { ...options, timeout: APP_TOOL_CALL_TIMEOUT_MS }
       );
     },
     close: () => client.close(),

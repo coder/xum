@@ -37,6 +37,7 @@ import {
   validateMCPSettingValue,
   type MCPSettingValue,
   type MCPSettingsReadSnapshot,
+  type MCPSettingsGroup,
   type MCPSettingsSnapshot,
   type MCPSettingsToolAction,
 } from "@/common/utils/mcpSettings";
@@ -5049,7 +5050,21 @@ export class MCPServerManager {
     assert(source !== undefined, "a settings snapshot comes from a server instance");
     this.cacheSettings(source.instance, workspaceId, source.requestId, snapshot.values);
     const { instance } = source;
-    const layout = snapshot.layout.map((group) => ({
+    return {
+      ...snapshot,
+      layout: this.withSettingsToolActions(instance, workspaceId, serverName, snapshot.layout),
+      instanceToken: this.settingsInstanceToken(instance),
+    };
+  }
+
+  /** The layout with each tool item's action (see settingsToolAction). */
+  private withSettingsToolActions(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    layout: MCPSettingsGroup[]
+  ): MCPSettingsGroup[] {
+    return layout.map((group) => ({
       ...group,
       items: group.items.map((item) => {
         if (item.kind !== "tool") return item;
@@ -5057,7 +5072,6 @@ export class MCPServerManager {
         return action === undefined ? item : { ...item, action };
       }),
     }));
-    return { ...snapshot, layout, instanceToken: this.settingsInstanceToken(instance) };
   }
 
   /** A layout tool item's action: a tool the server lists and the tool allowlist allows. */
@@ -5093,15 +5107,12 @@ export class MCPServerManager {
       `MCP settings tool '${serverName}/${toolName}'`,
       (instance) => {
         if (dispatched !== null) return dispatched;
-        if (this.settingsInstanceToken(instance) !== instanceToken)
-          return Promise.reject(staleSettingsInstanceError(serverName));
-        const action = this.settingsToolAction(instance, workspaceId, serverName, toolName);
-        if (instance.settings === undefined || action === undefined)
-          return Promise.reject(new Error(`'${serverName}' has no tool named '${toolName}'`));
-        if (action.opensApp)
-          return Promise.reject(new Error(`'${action.title}' opens an MCP App: not supported yet`));
-        if (!action.readOnly && !options.confirmed)
-          return Promise.reject(new Error(`'${action.title}' runs only after a confirmation`));
+        const refusal = this.settingsToolRefusal(instance, workspaceId, serverName, toolName, {
+          instanceToken,
+          confirmed: options.confirmed,
+        });
+        if (refusal !== null) return Promise.reject(refusal);
+        assert(instance.settings !== undefined, "a settings tool action has a settings client");
         log.info("[MCP] Settings tool action", { workspaceId, serverName, toolName });
         dispatched = instance.settings.callSettingsActionTool(
           toolName,
@@ -5110,20 +5121,27 @@ export class MCPServerManager {
         );
         return dispatched;
       },
-      (result) => {
-        const parts: unknown[] = Array.isArray(result.content) ? result.content : [];
-        const text = parts
-          .map((part) =>
-            part !== null && typeof part === "object" && Reflect.get(part, "type") === "text"
-              ? String(Reflect.get(part, "text"))
-              : ""
-          )
-          .filter((part) => part.length > 0)
-          .join("\n");
-        return { text: boundMCPSettingsToolResult(text), isError: result.isError === true };
-      },
+      settingsToolResultText,
       options
     );
+  }
+
+  /** Why runSettingsTool refuses to call the tool on this instance; null when it may. */
+  private settingsToolRefusal(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    request: { instanceToken: string; confirmed: boolean }
+  ): Error | null {
+    if (this.settingsInstanceToken(instance) !== request.instanceToken)
+      return staleSettingsInstanceError(serverName);
+    const action = this.settingsToolAction(instance, workspaceId, serverName, toolName);
+    if (action === undefined) return new Error(`'${serverName}' has no tool named '${toolName}'`);
+    if (action.opensApp) return new Error(`'${action.title}' opens an MCP App: not supported yet`);
+    if (!action.readOnly && !request.confirmed)
+      return new Error(`'${action.title}' runs only after a confirmation`);
+    return null;
   }
 
   /**
@@ -7912,6 +7930,20 @@ export class MCPServerManager {
       signal.removeEventListener("abort", onAbort);
     }
   }
+}
+
+/** A settings tool action's result for the dialog: its text parts, bounded. */
+function settingsToolResultText(result: MCPRawCallToolResult): { text: string; isError: boolean } {
+  const parts: unknown[] = Array.isArray(result.content) ? result.content : [];
+  const text = parts
+    .map((part) =>
+      part !== null && typeof part === "object" && Reflect.get(part, "type") === "text"
+        ? String(Reflect.get(part, "text"))
+        : ""
+    )
+    .filter((part) => part.length > 0)
+    .join("\n");
+  return { text: boundMCPSettingsToolResult(text), isError: result.isError === true };
 }
 
 function staleSettingsInstanceError(serverName: string): Error {
