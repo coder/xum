@@ -5057,7 +5057,7 @@ export class MCPServerManager {
         workspaceId,
         serverName,
         snapshot.layout,
-        options?.signal
+        options
       ),
       instanceToken: this.settingsInstanceToken(instance),
     };
@@ -5073,10 +5073,10 @@ export class MCPServerManager {
     workspaceId: string,
     serverName: string,
     layout: MCPSettingsGroup[],
-    signal: AbortSignal | undefined
+    options: { signal?: AbortSignal } | undefined
   ): Promise<MCPSettingsGroup[]> {
     if (layout.some((group) => group.items.some((item) => item.kind === "tool")))
-      await this.refreshAppCatalogs([{ instance }], signal);
+      await this.refreshAppCatalogs([{ instance }], options?.signal);
     return layout.map((group) => ({
       ...group,
       items: group.items.map((item) => {
@@ -5101,8 +5101,12 @@ export class MCPServerManager {
     const action = instance.settings?.settingsToolAction(toolName);
     const allowlist = this.appToolAllowlist(workspaceId, serverName);
     if (allowlist !== null && !allowlist.has(toolName)) return undefined;
-    const appsUsable = this.mcpApps?.isEnabled() === true && instance.apps !== undefined;
-    return action?.opensApp === true && !appsUsable ? undefined : action;
+    return action?.opensApp === true && !this.canOpenApps(instance) ? undefined : action;
+  }
+
+  /** MCP Apps work on this instance now: the experiment is on and it has an apps connection. */
+  private canOpenApps(instance: MCPServerInstance): boolean {
+    return this.mcpApps?.isEnabled() === true && instance.apps !== undefined;
   }
 
   /** Refresh the running instance's catalog before a settings action dispatch (bounded). */
