@@ -1,3 +1,4 @@
+import assert from "@/common/utils/assert";
 import { tool } from "ai";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -17,6 +18,7 @@ import {
 } from "@/common/types/workflow";
 
 import { fromBashTaskId, isWorkflowRunTaskId, toBashTaskId } from "./taskId";
+import { pageToolTextForResult } from "@/common/utils/tools/pageToolText";
 import { formatBashOutputReport } from "./bashTaskReport";
 import {
   dedupeStrings,
@@ -103,6 +105,27 @@ function buildTaskAwaitSequencingError(taskId: string, suggestedTaskIds: string[
       "Wait for the spawning tool result first, then call task_await in a later step. " +
       `Use one of these returned task IDs instead: ${suggestedTaskIds.join(", ")}.`,
   };
+}
+
+/**
+ * Page a completed report (sub-agent, workspace turn or workflow) to TOOL_TEXT_PAGE_MAX_CHARS.
+ * The report stays persisted, so task_await with timeout_secs 0 and offset_chars re-fetches the
+ * next page. Bash reports are not paged: their output is already capped per read, and an offset
+ * would skip output of an incremental read that no later read returns.
+ */
+function pageCompletedReport<T extends { status: string; taskId: string }>(
+  result: T,
+  offsetChars: number | null | undefined
+): T {
+  if (result.status !== "completed" || fromBashTaskId(result.taskId) != null) return result;
+  if (!("reportMarkdown" in result) || typeof result.reportMarkdown !== "string") return result;
+  const { text, ...paging } = pageToolTextForResult(
+    result.reportMarkdown,
+    offsetChars,
+    `task_await(task_ids: ["${result.taskId}"], timeout_secs: 0, offset_chars: <offset>)`
+  );
+  // A whole report keeps its result as is (including the re-fetch note).
+  return text === result.reportMarkdown ? result : { ...result, reportMarkdown: text, ...paging };
 }
 
 function getWorkflowRunElapsedMs(run: WorkflowRunRecord): number | undefined {
@@ -982,8 +1005,11 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       // those to land so every awaited task has a result before assembling the ordered array.
       await Promise.all(taskPromises);
 
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-      const results = uniqueTaskIds.map((taskId) => resultsByTaskId.get(taskId)!);
+      const results = uniqueTaskIds.map((taskId) => {
+        const result = resultsByTaskId.get(taskId);
+        assert(result != null, "every awaited task has a result once all promises settled");
+        return pageCompletedReport(result, args.offset_chars);
+      });
 
       return parseToolResult(TaskAwaitToolResultSchema, { results }, "task_await");
     },

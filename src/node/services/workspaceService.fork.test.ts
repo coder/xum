@@ -580,7 +580,13 @@ describe("WorkspaceService fork", () => {
       createMuxMessage("assistant-1", "assistant", "Hello", {
         model: "claude-sonnet-4-20250514",
         usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        timestamp: 7_000,
       })
+    );
+    // An idle compaction keeps an older recency timestamp, so the newest row is not the last.
+    await historyService.appendToHistory(
+      sourceWorkspaceId,
+      createMuxMessage("summary-1", "assistant", "Summary", { timestamp: 3_000 })
     );
 
     // Review notes/read state live in the session dir and must follow the fork.
@@ -664,8 +670,10 @@ describe("WorkspaceService fork", () => {
       }
       expect(result.data.metadata.forkFamilyBaseName).toBeUndefined();
 
+      // Empty ledger whose fork marker is the newest copied row, not the reset time: a
+      // first turn in the reset's millisecond is still the fork's own.
       const forkedUsage = await sessionUsageService.getSessionUsage(newWorkspaceId);
-      expect(forkedUsage).toEqual({ byModel: {}, version: 1 });
+      expect(forkedUsage).toEqual({ byModel: {}, version: 1, forkedAt: 7_000 });
 
       const forkedMessages: string[] = [];
       const historyResult = await historyService.iterateFullHistory(

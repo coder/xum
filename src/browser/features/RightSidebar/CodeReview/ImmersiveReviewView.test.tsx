@@ -2,7 +2,8 @@ import "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as RealClipboardModule from "@/browser/utils/clipboard";
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import * as highlightWorkerClient from "@/browser/utils/highlighting/highlightWorkerClient";
+import { afterEach, beforeEach, describe, expect, jest, mock, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { useEffect, useState, type ComponentProps, type ReactElement, type ReactNode } from "react";
@@ -590,6 +591,60 @@ describe("ImmersiveReviewView", () => {
     await waitFor(() =>
       expect(view.container.textContent ?? "").toContain("context after selected hunk")
     );
+  });
+
+  // #6303 item 2: the full-file read finished, but its highlight preload waited on a cold
+  // highlight worker (a 5-20 s start). The 5 s reveal timer, or the preload's start failure,
+  // then dropped the file that was read, and the overlay fell back to the compact hunks.
+  describe("keeps full-file context while the highlighter is not ready", () => {
+    // Content no other test reads: DiffRenderer caches highlighted diffs per content for the
+    // module's life, and a cache hit would skip the slow highlighter this test needs.
+    const contextLine = "context kept while the highlighter starts";
+    const fileContent = `new line\n${contextLine}\n`;
+    const readFile = () =>
+      Promise.resolve(createTestBashResult({ output: encodeFileReadOutput(fileContent) }));
+
+    test("when the highlight preload fails because no worker started", async () => {
+      const highlightSpy = spyOn(highlightWorkerClient, "highlightCode").mockImplementation(() =>
+        Promise.reject(new Error("HIGHLIGHT_WORKER_START_TIMEOUT"))
+      );
+      mockApi.workspace.executeBash = mock(readFile);
+      try {
+        const view = renderImmersiveReview();
+        await waitFor(() => expect(mockApi.workspace.executeBash).toHaveBeenCalledTimes(1));
+        await waitFor(() => expect(view.container.textContent ?? "").toContain(contextLine));
+        expect(highlightSpy).toHaveBeenCalled();
+      } finally {
+        highlightSpy.mockRestore();
+      }
+    });
+
+    test("when the highlight preload outlasts the reveal timer", async () => {
+      // Pending: the worker is still starting.
+      const highlightSpy = spyOn(highlightWorkerClient, "highlightCode").mockImplementation(
+        () => new Promise<string>(() => undefined)
+      );
+      mockApi.workspace.executeBash = mock(readFile);
+      // bun-types lacks advanceTimersByTime; bun implements it.
+      const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
+      jest.useFakeTimers();
+      try {
+        const view = renderImmersiveReview();
+        await act(async () => {
+          for (let i = 0; i < 10; i++) await Promise.resolve();
+        });
+        expect(mockApi.workspace.executeBash).toHaveBeenCalledTimes(1);
+        await act(async () => {
+          fakeTimers.advanceTimersByTime(6_000);
+          for (let i = 0; i < 10; i++) await Promise.resolve();
+        });
+        expect(view.container.textContent ?? "").toContain(contextLine);
+        expect(highlightSpy).toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+        highlightSpy.mockRestore();
+      }
+    });
   });
 
   test("retries full-file context after a transient read failure", async () => {

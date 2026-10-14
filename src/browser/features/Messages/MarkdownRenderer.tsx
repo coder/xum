@@ -29,6 +29,8 @@ interface MarkdownRendererProps {
   inlineSkillSnapshots?: InlineSkillSnapshotMap;
   /** See MarkdownCore. Default: true. */
   renderRawHtml?: boolean;
+  /** See MarkdownCore. Default: false. */
+  filePreview?: boolean;
 }
 
 const DISABLED_INLINE_SKILL_PREVIEW_CONTEXT: InlineSkillPreviewContextValue = {
@@ -42,12 +44,14 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
   preserveLineBreaks,
   inlineSkillSnapshots,
   renderRawHtml,
+  filePreview,
 }) => {
   const markdownCore = (
     <MarkdownCore
       content={content}
       preserveLineBreaks={preserveLineBreaks}
       renderRawHtml={renderRawHtml}
+      filePreview={filePreview}
     />
   );
   const markdownContent =

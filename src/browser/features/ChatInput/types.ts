@@ -118,6 +118,8 @@ export interface ChatInputCreationVariant {
   onModelChange?: (model: string) => void;
   disabled?: boolean;
   onReady?: (api: ChatInputAPI) => void;
+  /** #6038: whether this composer cannot send yet (its branch list is loading or failed). */
+  onCreationSendBlockedChange?: (blocked: boolean) => void;
 }
 
 export type ChatInputProps = ChatInputWorkspaceVariant | ChatInputCreationVariant;

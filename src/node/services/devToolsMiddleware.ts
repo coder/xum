@@ -21,6 +21,7 @@ import {
   DEVTOOLS_RUN_METADATA_ID_HEADER,
   DEVTOOLS_STEP_ID_HEADER,
   consumeCapturedRequestHeaders,
+  consumePromptCacheWire,
   closeCapturedRequestBody,
   consumeRedactedRequestBody,
   discardCapturedRequestBody,
@@ -243,6 +244,20 @@ export function extractUsage(
   return normalizedUsage;
 }
 
+/**
+ * A step's finalization update, with the cache wrapper's facts for its last fetch (route,
+ * markers, observation time) for the replay audit. Consumes them: they are absent when no
+ * Anthropic cache wrapper saw the step.
+ */
+function finalizationUpdate(
+  stepId: string,
+  durationMs: number,
+  update: Partial<DevToolsStep>
+): Partial<DevToolsStep> {
+  const promptCacheWire = consumePromptCacheWire(stepId);
+  return { durationMs, ...update, ...(promptCacheWire != null ? { promptCacheWire } : {}) };
+}
+
 export function createDevToolsMiddleware(
   workspaceId: string,
   service: DevToolsService
@@ -380,10 +395,11 @@ export function createDevToolsMiddleware(
         }
 
         try {
-          await service.updateStep(workspaceId, stepId, {
-            durationMs: Date.now() - startedAtMs,
-            ...update,
-          });
+          await service.updateStep(
+            workspaceId,
+            stepId,
+            finalizationUpdate(stepId, Date.now() - startedAtMs, update)
+          );
         } catch (error) {
           // DevTools persistence is best-effort; never let observability failures
           // reject the model call that already succeeded.
@@ -539,10 +555,11 @@ export function createDevToolsMiddleware(
         }
 
         try {
-          await service.updateStep(workspaceId, stepId, {
-            durationMs: Date.now() - startedAtMs,
-            ...update,
-          });
+          await service.updateStep(
+            workspaceId,
+            stepId,
+            finalizationUpdate(stepId, Date.now() - startedAtMs, update)
+          );
         } catch (error) {
           // DevTools persistence is best-effort; never let observability failures
           // reject the model call that already succeeded.

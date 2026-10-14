@@ -95,6 +95,8 @@ export interface ReplayFixtureTurnSpec {
    * before the final one — simulates retried attempts whose streams failed.
    */
   extraEnvelopeAttempts?: number;
+  /** A trimmed compaction request: the budget production recorded in its DevTools run. */
+  compactionInputBudgetTokens?: number;
 }
 
 /** Mutable state threaded through appendReplayFixtureTurn calls. */
@@ -207,6 +209,7 @@ export async function appendReplayFixtureTurn(
       mcpAppModelContext: spec.mcpAppModelContext,
       // Production derives these from the request tools (assemblePromptPayload).
       deferLoadingToolNames: collectDeferLoadingToolNames(spec.tools),
+      compactionInputBudgetTokens: spec.compactionInputBudgetTokens,
       workspaceId: ctx.workspaceId,
     });
     // Wire tool definitions use the same cache treatment as the prompt assembler.
@@ -229,6 +232,8 @@ export async function appendReplayFixtureTurn(
         workspaceId: ctx.workspaceId,
         startedAt: new Date(baseTimestamp + 1_000).toISOString(),
         requestHistorySequence,
+        // JSON drops the key when the turn has no budget.
+        compactionInputBudgetTokens: spec.compactionInputBudgetTokens,
       },
     };
     const stepEntry: DevToolsLogEntry = {

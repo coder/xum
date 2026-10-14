@@ -713,8 +713,8 @@ describe("useCreationWorkspace", () => {
   });
 
   // A reconnect reloads branches and runtime availability through the new client. The creation
-  // controls keep the shown values until the reload answers. `branchesLoaded` is the send barrier
-  // (#6033), so it is false until the new branch list answers.
+  // controls keep the shown values until the reload answers. `branchLoad` is the send barrier
+  // (#6033), so it is "loading" until the new branch list answers.
   describe.each([...GAP_MODES])("reload after a reconnect (%s)", (mode) => {
     test("keeps the shown branches and runtimes, and blocks the send, until the reload answers", async () => {
       setupWindow({
@@ -737,7 +737,7 @@ describe("useCreationWorkspace", () => {
           <Harness />
         </harness.Wrapper>
       );
-      await waitFor(() => expect(resultRef.current?.branchesLoaded).toBe(true));
+      await waitFor(() => expect(resultRef.current?.branchLoad).toBe("loaded"));
       await waitFor(() =>
         expect(resultRef.current?.runtimeAvailabilityState.status).toBe("loaded")
       );
@@ -761,13 +761,13 @@ describe("useCreationWorkspace", () => {
         await new Promise((resolve) => setTimeout(resolve, 30));
       });
 
-      expect(resultRef.current?.branchesLoaded).toBe(false);
+      expect(resultRef.current?.branchLoad).toBe("loading");
       expect(resultRef.current?.branches).toEqual(["main"]);
       expect(resultRef.current?.runtimeAvailabilityState.status).toBe("loaded");
 
       act(() => answerBranches?.());
       await waitFor(() => expect(resultRef.current?.branches).toEqual(["main", "next"]));
-      expect(resultRef.current?.branchesLoaded).toBe(true);
+      expect(resultRef.current?.branchLoad).toBe("loaded");
     });
   });
 

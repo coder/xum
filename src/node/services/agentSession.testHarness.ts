@@ -38,7 +38,7 @@ export function createStartedTurnHandle(
 
 export function createFailedTurnHandle(
   messageId: string,
-  failure: { error: string; errorType: StreamErrorType }
+  failure: { error: string; errorType: StreamErrorType; model?: string }
 ): TurnStreamHandle {
   return {
     messageId,

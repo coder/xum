@@ -1,3 +1,5 @@
+import type { MuxMessage } from "@/common/types/message";
+import type { Result } from "@/common/types/result";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import {
@@ -23,8 +25,12 @@ import { printStepPrefixAudit, resolveReplaySessionDir } from "./replay-verify";
  * Usage: bun debug cache-audit <workspace-id>
  * (use the workspace ID "replay-fixture" to run against the committed fixture)
  */
-export async function cacheAuditCommand(workspaceId: string): Promise<void> {
-  const { sessionDir, historyService } = resolveReplaySessionDir(workspaceId);
+export async function cacheAuditCommand(
+  workspaceId: string,
+  // Tests pass the real instance they inject a failure into (AGENTS.md: real HistoryService).
+  session: ReturnType<typeof resolveReplaySessionDir> = resolveReplaySessionDir(workspaceId)
+): Promise<void> {
+  const { sessionDir, historyService } = session;
   const journal = new DurableEventJournal(sessionDir);
   const events = await journal.read();
   // Final envelope per sequence only: fallback turns emit a superseding row.
@@ -41,9 +47,7 @@ export async function cacheAuditCommand(workspaceId: string): Promise<void> {
   if (envelopes.length === 0) {
     console.log("No turn-envelope rows found in durable-events.jsonl — nothing to audit.");
     // The step audit needs only devtools.jsonl, so older logs without envelopes still get it.
-    printStepPrefixAudit(
-      await auditRecordedStepPrefixes(sessionDir, historyResult.success ? historyResult.data : [])
-    );
+    await printStepAudit(sessionDir, historyResult);
     return;
   }
 
@@ -100,7 +104,22 @@ export async function cacheAuditCommand(workspaceId: string): Promise<void> {
   );
   // Envelopes only see prefix inputs (system prompt, tools, model); the step
   // audit also catches history bytes that changed between requests.
-  printStepPrefixAudit(
-    await auditRecordedStepPrefixes(sessionDir, historyResult.success ? historyResult.data : [])
-  );
+  await printStepAudit(sessionDir, historyResult);
+}
+
+/**
+ * The step audit needs the history: it names the compaction runs to skip. Against an empty
+ * history it would audit their prompts as chat turns and report false prefix breaks, so a
+ * failed read skips it and reports the error instead.
+ */
+async function printStepAudit(
+  sessionDir: string,
+  historyResult: Result<MuxMessage[]>
+): Promise<void> {
+  if (!historyResult.success) {
+    console.error(`\nStep audit skipped: failed to read chat history: ${historyResult.error}`);
+    process.exitCode = 1;
+    return;
+  }
+  printStepPrefixAudit(await auditRecordedStepPrefixes(sessionDir, historyResult.data));
 }
