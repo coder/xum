@@ -245,6 +245,20 @@ function DomainsPromptText(props: { origins: readonly string[]; projectPath: str
   );
 }
 
+/** Hands a frame's close sequence to its host (McpAppFrame `closeRef`) while it is mounted. */
+function useExposedClose(
+  closeRef: { current: (() => void) | null } | undefined,
+  close: () => void
+): void {
+  useEffect(() => {
+    if (closeRef === undefined) return;
+    closeRef.current = close;
+    return () => {
+      closeRef.current = null;
+    };
+  });
+}
+
 export function McpAppFrame(props: {
   workspaceId: string;
   view: McpAppViewRef;
@@ -554,14 +568,7 @@ export function McpAppFrame(props: {
     await hostRef.current?.teardown("closed");
     props.onClose?.();
   };
-  const { closeRef } = props;
-  useEffect(() => {
-    if (closeRef === undefined) return;
-    closeRef.current = () => void close();
-    return () => {
-      closeRef.current = null;
-    };
-  });
+  useExposedClose(props.closeRef, () => void close());
 
   const header = inline ? null : (
     <McpAppViewHeader serverName={serverName} onClose={() => void close()} />
