@@ -5,6 +5,8 @@ import {
   MAX_MCP_SETTING_ENUM_OPTIONS,
   MAX_MCP_SETTING_NAME,
   MAX_MCP_SETTINGS,
+  MAX_MCP_SETTINGS_ENUM_OPTIONS_TOTAL,
+  MAX_MCP_SETTINGS_ENUM_TEXT,
   parseMCPSettingsCapability,
   parseMCPSettingsReadResult,
   validateMCPSettingValue,
@@ -166,6 +168,52 @@ describe("parseMCPSettingsReadResult", () => {
     if ("error" in result) throw new Error(result.error);
     expect(Object.keys(result.properties)).toEqual(["ok"]);
     expect(result.droppedSettingCount).toBe(1);
+  });
+
+  test("one option budget covers all enums of a snapshot; settings past it are dropped", () => {
+    const enumSetting = (options: string[]) => ({ type: "string", title: "T", enum: options });
+    const options = (n: number, length = 1) =>
+      Array.from({ length: n }, (_, i) => `${i}`.padEnd(length, "x"));
+    // Option count: each enum fits its own cap, but together they pass the snapshot budget.
+    const perEnum = MAX_MCP_SETTING_ENUM_OPTIONS;
+    const fullEnums = Math.floor(MAX_MCP_SETTINGS_ENUM_OPTIONS_TOTAL / perEnum);
+    const names = Array.from({ length: fullEnums + 1 }, (_, i) => `e${i}`);
+    const byCount = parseMCPSettingsReadResult({
+      schema: {
+        type: "object",
+        properties: {
+          ...Object.fromEntries(names.map((n) => [n, enumSetting(options(perEnum))])),
+          flag: { type: "boolean", title: "Flag" },
+        },
+      },
+      values: { ...Object.fromEntries(names.map((n) => [n, "0"])), flag: true },
+    });
+    if ("error" in byCount) throw new Error(byCount.error);
+    const kept = Object.keys(byCount.properties);
+    expect(kept).toEqual([...names.slice(0, fullEnums), "flag"]);
+    // The dropped setting's value does not cross IPC either.
+    expect(Object.keys(byCount.values)).toEqual(kept);
+    expect(byCount.droppedSettingCount).toBe(1);
+    expect(byCount.warnings).toHaveLength(1);
+
+    // Option text: two long enums pass the text budget, a later short enum still fits.
+    const longEnum = options(perEnum, Math.ceil(MAX_MCP_SETTINGS_ENUM_TEXT / perEnum / 2) + 1);
+    const byText = parseMCPSettingsReadResult({
+      schema: {
+        type: "object",
+        properties: {
+          a: enumSetting(longEnum),
+          b: enumSetting(longEnum),
+          c: enumSetting(["on", "off"]),
+        },
+      },
+      values: { a: longEnum[0], b: longEnum[0], c: "on" },
+    });
+    if ("error" in byText) throw new Error(byText.error);
+    expect(Object.keys(byText.properties)).toEqual(["a", "c"]);
+    expect(byText.values).toEqual({ a: longEnum[0], c: "on" });
+    expect(byText.droppedSettingCount).toBe(1);
+    expect(byText.warnings).toHaveLength(1);
   });
 
   test("a setting named __proto__ stays an own key of properties, values and layout", () => {
