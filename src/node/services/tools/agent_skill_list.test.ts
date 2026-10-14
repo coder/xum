@@ -1003,6 +1003,45 @@ describe("agent_skill_list", () => {
       }
     });
   });
+  // The display name is user-facing only: plugin model-visible fields are
+  // consent-fingerprinted, so this model-facing list must not carry it.
+  it("lists a display-name skill under its directory name without the display name", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-list-display-name");
+    const skillDir = path.join(tempDir.path, ".agents", "skills", "poteto-mode");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      "---\nname: Poteto Mode\ndescription: pstack router\n---\nBody\n",
+      "utf-8"
+    );
+    const xumScope = {
+      type: "project" as const,
+      xumHome: tempDir.path,
+      projectRoot: tempDir.path,
+    };
+    // host-local reads SKILL.md itself; runtime authority goes through discovery.
+    const configs = (["host-local", "runtime"] as const).map((projectStorageAuthority) =>
+      createTestToolConfig(tempDir.path, {
+        workspaceId: "regular-workspace",
+        xumScope: { ...xumScope, projectStorageAuthority },
+      })
+    );
+
+    await withHomeDir(tempDir.path, async () => {
+      for (const config of configs) {
+        const result = (await createAgentSkillListTool(config).execute!(
+          { includeUnadvertised: true },
+          mockToolCallOptions
+        )) as AgentSkillListToolResult;
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const skill = getSkill(result.skills, "poteto-mode");
+        expect(skill.description).toBe("pstack router");
+        expect("displayName" in skill).toBe(false);
+      }
+    });
+  });
+
   describe("split-root (project-runtime)", () => {
     it("routes through project-runtime when runtime is non-local", async () => {
       using tempDir = new TestTempDir("test-agent-skill-list-split-root-project-runtime");

@@ -213,6 +213,9 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               return true;
             })
             .filter((skill) => includeUnadvertised === true || skill.advertise !== false)
+            // The display name is user-facing only: plugin model-visible fields are
+            // consent-fingerprinted (installService describeSkillAdvertisement).
+            .map(({ displayName: _displayName, ...skill }) => skill)
             .sort((a, b) => a.name.localeCompare(b.name));
 
           return {
