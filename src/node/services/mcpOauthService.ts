@@ -405,8 +405,22 @@ function storedIssuerMatches(
  * authorizationServerBase replaced the client record. A late token of the old issuer would
  * leave a mixed record that storedClientMatches refuses, signing the new issuer out (#6297).
  * So the SDK's issuer stamps must match; a legacy unstamped record has none to compare.
+ *
+ * A background refresh started from one stored grant. When another write replaced that grant
+ * (a new sign-in, or another refresh), the refresh answer is dropped: it would overwrite the
+ * newer grant, and a scope-less answer would carry that grant's scope (#6141).
  */
 function tokenWriteConflict(
+  stored: MCPOAuthStoredCredentials | undefined,
+  input: { clientId?: string; tokens: MCPOAuthTokens; refreshedFrom?: MCPOAuthTokens }
+): string | undefined {
+  if (input.refreshedFrom !== undefined && !sameGrant(stored?.tokens, input.refreshedFrom))
+    return "of a refresh whose token another write replaced";
+  return clientConflict(stored?.clientInformation, input.clientId, input.tokens);
+}
+
+/** The client and issuer part of tokenWriteConflict. */
+function clientConflict(
   storedClient: MCPOAuthClientInformation | undefined,
   clientId: string | undefined,
   tokens: MCPOAuthTokens
@@ -418,6 +432,19 @@ function tokenWriteConflict(
   return issuersMatch(storedClient.issuer, issuer)
     ? undefined
     : "of another issuer than the stored client's";
+}
+
+/** A refresh response without scope keeps the refreshed grant's scope (RFC 6749 §6). */
+function refreshedScope(input: { tokens: MCPOAuthTokens; refreshedFrom?: MCPOAuthTokens }): {
+  scope?: string;
+} {
+  const scope = input.tokens.scope ?? input.refreshedFrom?.scope;
+  return scope !== undefined ? { scope } : {};
+}
+
+/** The same stored grant: the SDK's issuer back-stamp keeps both tokens. */
+function sameGrant(a: MCPOAuthTokens | undefined, b: MCPOAuthTokens): boolean {
+  return a?.access_token === b.access_token && a.refresh_token === b.refresh_token;
 }
 
 /** The identity of a stored client record: its ID and SEP-2352 issuer stamp (null: none). */
@@ -1824,17 +1851,18 @@ export class McpOauthService {
     let discoveryState: OAuthDiscoveryState | undefined;
     // The client a refresh runs with: its tokens are saved only while that client is stored.
     let refreshedWithClientId: string | undefined;
-    // The scope of the token the refresh read (see saveTokens scopeIfOmitted).
-    let refreshedTokenScope: string | undefined;
+    // The stored grant auth() read before it refreshes (see saveTokens refreshedFrom). Only a
+    // read with the SDK's context counts: a transport request reads tokens without one.
+    let refreshedFrom: MCPOAuthTokens | undefined;
     // The stored client record the refresh read; the SDK's back-stamp may replace only it.
     // The SDK reads the client before every write; undefined means nothing was read yet.
     let readClient: StoredClientIdentity | undefined;
     const pluginState = pluginDiscoveryState(input.oauth);
 
     return {
-      tokens: async () => {
+      tokens: async (ctx) => {
         const tokens = await this.readMatchingTokens(input.serverUrl, input.oauth);
-        refreshedTokenScope = tokens?.scope;
+        if (ctx !== undefined) refreshedFrom = tokens;
         return tokens;
       },
       saveTokens: async (tokens) => {
@@ -1844,7 +1872,7 @@ export class McpOauthService {
           tokens: tokens as unknown as MCPOAuthTokens,
           legacyBinding: deriveAuthorizationServerBinding(discoveryState),
           clientId: refreshedWithClientId ?? input.oauth?.clientId,
-          scopeIfOmitted: refreshedTokenScope,
+          refreshedFrom,
         });
       },
       saveDiscoveryState: (state) => {
@@ -2194,19 +2222,15 @@ export class McpOauthService {
     /** The client the tokens were issued to (the flow's or the refresh's). */
     clientId?: string;
     /**
-     * Stored when the response has no scope: a refresh keeps the scope of the token it
-     * refreshed (RFC 6749 §6), read with that token, never a newer grant's.
+     * A background refresh: the stored grant it started from. The save is dropped once another
+     * write replaced that grant; a response without scope keeps its scope (RFC 6749 §6).
      */
-    scopeIfOmitted?: string;
+    refreshedFrom?: MCPOAuthTokens;
   }): Promise<void> {
     const saved = await this.storeLock.withLock(this.storeFilePath, async () => {
       if (this.isStaleFlowSave(input.serverUrl, input.flowGeneration)) return false;
       const store = await this.ensureStoreLoadedLocked();
-      const conflict = tokenWriteConflict(
-        store.entries[input.serverUrl]?.clientInformation,
-        input.clientId,
-        input.tokens
-      );
+      const conflict = tokenWriteConflict(store.entries[input.serverUrl], input);
       if (conflict !== undefined) {
         log.info(`[MCP OAuth] Dropping tokens ${conflict}`, { serverUrl: input.serverUrl });
         return false;
@@ -2226,13 +2250,8 @@ export class McpOauthService {
         creds.clientInformation = undefined;
       }
 
-      const scope = input.tokens.scope ?? input.scopeIfOmitted;
       creds.serverUrl = input.serverUrl;
-      creds.tokens = {
-        ...input.tokens,
-        ...(scope !== undefined ? { scope } : {}),
-        ...legacyBinding,
-      };
+      creds.tokens = { ...input.tokens, ...refreshedScope(input), ...legacyBinding };
       creds.updatedAtMs = Date.now();
 
       await this.persistStoreLocked(store);

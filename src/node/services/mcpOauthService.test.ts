@@ -1409,43 +1409,60 @@ describe("McpOauthService OAuth flows", () => {
     expect(await usable({ clientId: "c", baseScopes: ["read admin"] })).toBe(false);
   });
 
-  test("a scope-less refresh keeps the scope of the token it refreshed, not a newer grant's (#6141)", async () => {
-    const serverUrl = "https://example.com/mcp";
-    const oauth: MCPServerOAuthConfig = { clientId: "c", baseScopes: ["read", "write"] };
-    await fs.writeFile(
-      getStoreFilePath(xumHome),
-      JSON.stringify({
-        version: 2,
-        entries: {
-          [serverUrl]: {
-            serverUrl,
-            updatedAtMs: Date.now(),
-            clientInformation: { client_id: "c" },
-            tokens: { access_token: "at-narrow", token_type: "Bearer", scope: "read" },
+  // The SDK's auth() reads the tokens with a context before it refreshes; a transport request
+  // reads them without one (@modelcontextprotocol/client auth(), StreamableHTTP transport).
+  const authCtx = { issuer: "https://example.com" } as never;
+
+  test.each([
+    ["auth() read only", false],
+    ["a transport read of the newer grant in between", true],
+  ])(
+    "a refresh whose token was replaced meanwhile never overwrites the newer grant (%s) (#6141)",
+    async (_label, transportRead) => {
+      const serverUrl = "https://example.com/mcp";
+      const oauth: MCPServerOAuthConfig = { clientId: "c", baseScopes: ["read", "write"] };
+      await fs.writeFile(
+        getStoreFilePath(xumHome),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "c" },
+              tokens: { access_token: "at-narrow", token_type: "Bearer", scope: "read" },
+            },
           },
-        },
-      })
-    );
-    // An old refresh reads the narrow token...
-    const old = await service.getAuthProviderForServer({ serverUrl });
-    if (old === undefined) throw new Error("expected a provider");
-    await old.tokens();
-    await old.clientInformation();
-    // ...a newer write stores a wider grant for the same client...
-    const newer = await service.getAuthProviderForServer({ serverUrl });
-    if (newer === undefined) throw new Error("expected a provider");
-    await newer.clientInformation();
-    await newer.saveTokens({
-      access_token: "at-wide",
-      token_type: "Bearer",
-      scope: "read write",
-    } as never);
-    expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
-    // ...then the old refresh's scope-less answer lands: it is labeled with the narrow scope.
-    await old.saveTokens({ access_token: "at-narrow-2", token_type: "Bearer" } as never);
-    expect((await service.getAuthStatus({ serverUrl })).scope).toBe("read");
-    expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(false);
-  });
+        })
+      );
+      // An old refresh reads the narrow token...
+      const old = await service.getAuthProviderForServer({ serverUrl });
+      if (old === undefined) throw new Error("expected a provider");
+      await old.clientInformation();
+      await old.tokens(authCtx);
+      // ...a newer write stores a wider grant for the same client...
+      const newer = await service.getAuthProviderForServer({ serverUrl });
+      if (newer === undefined) throw new Error("expected a provider");
+      await newer.clientInformation();
+      await newer.tokens(authCtx);
+      await newer.saveTokens({
+        access_token: "at-wide",
+        token_type: "Bearer",
+        scope: "read write",
+      } as never);
+      if (transportRead) await old.tokens();
+      // ...then the old refresh's answers land (with or without scope): both are dropped.
+      await old.saveTokens({ access_token: "at-narrow-2", token_type: "Bearer" } as never);
+      await old.saveTokens({
+        access_token: "at-narrow-3",
+        token_type: "Bearer",
+        scope: "read",
+      } as never);
+      const status = await service.getAuthStatus({ serverUrl, oauth });
+      expect(status.scope).toBe("read write");
+      expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+    }
+  );
 
   test("a grant without scope records the requested scope, and a refresh keeps it (#6141)", async () => {
     await withAuthServer(async (base) => {
@@ -1474,7 +1491,7 @@ describe("McpOauthService OAuth flows", () => {
       const provider = await service.getAuthProviderForServer({ serverUrl, oauth });
       if (provider === undefined) throw new Error("expected a provider");
       await provider.clientInformation();
-      await provider.tokens();
+      await provider.tokens(authCtx);
       await provider.saveTokens({ access_token: "refreshed", token_type: "Bearer" } as never);
       expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
     });
