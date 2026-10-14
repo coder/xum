@@ -610,6 +610,34 @@ describe("PostToolUse", () => {
 });
 
 describe("UserPromptSubmit and Stop", () => {
+  test("prompt and Stop events carry Codex's common fields", async () => {
+    // Codex PRRT_kwDOPxxmWM6rN7nt (user_prompt_submit.rs, stop.rs).
+    const input = { turn: "${turn_id}", model: "${model}", mode: "${permission_mode}" };
+    const { spine, calls } = setup(
+      [hook("UserPromptSubmit", { input }), hook("Stop", { input })],
+      () => null
+    );
+
+    await runMessageSendHooks(spine, workspaceId, {
+      text: "fix",
+      origin: "user",
+      canBlock: true,
+      model: "openai:gpt-4o",
+    });
+    await runTurnStopHooks(spine, workspaceId, {
+      messageId: "assistant-1",
+      lastAssistantMessage: "done",
+      stopHookActive: false,
+      model: "openai:gpt-4o",
+    });
+
+    expect(calls).toEqual([
+      // A prompt hook runs before the turn has an ID: `${turn_id}` expands to null.
+      { turn: null, model: "openai:gpt-4o", mode: "bypassPermissions" },
+      { turn: "assistant-1", model: "openai:gpt-4o", mode: "bypassPermissions" },
+    ]);
+  });
+
   test("UserPromptSubmit blocks, or adds context (JSON or plain text)", async () => {
     const block = setup([hook("UserPromptSubmit", { input: { p: "${prompt}" } })], () =>
       json({ decision: "block", reason: "Contains a token." })

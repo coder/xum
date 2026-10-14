@@ -37,7 +37,10 @@ afterEach(async () => {
   }
 });
 
-type StopCall = Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">;
+type StopCall = Pick<
+  TurnStopContext,
+  "messageId" | "lastAssistantMessage" | "stopHookActive" | "model"
+>;
 
 function addConsumer(decide: (ctx: TurnStopContext) => void, calls?: StopCall[]): void {
   unregisters.push(
@@ -48,6 +51,7 @@ function addConsumer(decide: (ctx: TurnStopContext) => void, calls?: StopCall[])
           messageId: ctx.messageId,
           lastAssistantMessage: ctx.lastAssistantMessage,
           stopHookActive: ctx.stopHookActive,
+          model: ctx.model,
         });
         decide(ctx);
       },
@@ -200,6 +204,8 @@ describe("turn.stop", () => {
       messageId: "a1",
       lastAssistantMessage: "reply 1",
       stopHookActive: false,
+      // Codex `model` (PRRT_kwDOPxxmWM6rN7nt): the model the turn streamed with.
+      model,
     });
 
     // A new message from the user starts a new turn: Stop may continue it again.

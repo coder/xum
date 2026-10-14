@@ -1008,7 +1008,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   /** The turn.stop prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
   runTurnStopHooks?(
     workspaceId: string,
-    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">
+    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "model">
   ): Promise<TurnStopHookOutcome>;
   resolveXumToolScopeForWorkspace?(
     metadata: WorkspaceMetadata,
@@ -1336,6 +1336,11 @@ interface PreparationAttempt {
   evaluatorGoalCostUsd?: number;
   /** The send ids this attempt carries: pending (getPendingSendIds) until the attempt settles. */
   sendIdentities?: readonly SendIdentity[];
+}
+
+/** The model a send asks for; auto routing and fallback can change it later. */
+function requestedModelOf(options: SendMessageOptions | undefined): string | undefined {
+  return options?.model;
 }
 
 export class AgentSession {
@@ -4666,7 +4671,9 @@ export class AgentSession {
      * readSendHooksPresent's result: false skips the chain, true skips its reload (Codex
      * PRRT_kwDOPxxmWM6sVlZG: a broken hooks.js must not cost its evaluation timeout twice).
      */
-    hooksPresent?: boolean
+    hooksPresent: boolean | undefined,
+    /** The send's options: the hooks see its requested model (MessageSendContext.model). */
+    options: SendMessageOptions | undefined
   ): Promise<
     MessageSendHookOutcome & {
       /** The hooks checked the request's follow-up; its outcome travels with the follow-up. */
@@ -4691,6 +4698,7 @@ export class AgentSession {
           text,
           origin: resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin),
           canBlock,
+          model: requestedModelOf(options),
         },
         internal?.cancelSignal,
         hooksPresent === true
@@ -5059,7 +5067,8 @@ export class AgentSession {
       internal,
       attempt.acceptanceOrigin,
       // The load above ran once for this send: the chain does not repeat it.
-      sendHooksPresent
+      sendHooksPresent,
+      options
     );
     if (await cancelBeforeAcceptance()) {
       return Ok(undefined);
@@ -10563,6 +10572,7 @@ export class AgentSession {
       messageId: payload.messageId,
       lastAssistantMessage: lastAssistantText(payload.parts),
       stopHookActive: this.stopHookContinuations > 0,
+      model: provenance.streamModel,
     });
     if (outcome.kind === "none" || options == null) {
       this.stopHookContinuations = 0;
