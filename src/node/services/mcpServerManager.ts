@@ -5157,42 +5157,47 @@ export class MCPServerManager {
    * applies (opening one calls the tool); `_meta.ui.visibility` does not (spec).
    */
   async listMcpAppEntrypoints(workspaceId: string): Promise<McpAppEntrypoint[]> {
-    const before = this.workspaceServers.get(workspaceId);
-    if (before === undefined || this.mcpApps?.isEnabled() !== true) return [];
+    if (this.mcpApps?.isEnabled() !== true) return [];
     // The send path refreshes tool catalogs in the background, so after tools/list_changed the
     // held catalog is stale until the next send. Wait for a refresh here: through the SDK's
     // response cache a still-fresh list costs no round trip.
     await Promise.all(
-      [...before.instances]
-        .filter(
-          ([serverName, instance]) => before.enabledServerNames.has(serverName) && instance.apps
-        )
-        .map(([, instance]) => this.refreshInstanceTools(instance))
+      this.appInstances(workspaceId).map(({ instance }) => this.refreshInstanceTools(instance))
     );
     // Read again: the servers can stop or restart while the refresh runs.
-    const entry = this.workspaceServers.get(workspaceId);
-    if (entry === undefined) return [];
-    const entrypoints: McpAppEntrypoint[] = [];
-    for (const [serverName, instance] of entry.instances) {
-      if (!entry.enabledServerNames.has(serverName) || instance.isClosed || !instance.apps)
-        continue;
+    return this.appInstances(workspaceId).flatMap(({ serverName, apps }) => {
       const allowlist = this.appToolAllowlist(workspaceId, serverName);
-      for (const tool of instance.apps.appEntrypoints()) {
-        if (allowlist !== null && !allowlist.has(tool.toolName)) continue;
-        for (const type of tool.types) {
-          entrypoints.push({
+      const serverLabel = this.appServerLabel(workspaceId, serverName);
+      return apps
+        .appEntrypoints()
+        .filter((tool) => allowlist === null || allowlist.has(tool.toolName))
+        .flatMap((tool) =>
+          tool.types.map((type) => ({
             serverName,
-            serverLabel: this.appServerLabel(workspaceId, serverName),
+            serverLabel,
             toolName: tool.toolName,
             title: tool.title,
             resourceUri: tool.resourceUri,
             type,
             viewKey: mcpAppEntrypointKey(serverName, tool.toolName, type),
-          });
-        }
-      }
-    }
-    return entrypoints;
+          }))
+        );
+    });
+  }
+
+  /** The workspace's enabled, open instances with an MCP Apps connection. */
+  private appInstances(workspaceId: string): Array<{
+    serverName: string;
+    instance: MCPServerInstance;
+    apps: NonNullable<MCPServerInstance["apps"]>;
+  }> {
+    const entry = this.workspaceServers.get(workspaceId);
+    if (entry === undefined) return [];
+    return [...entry.instances].flatMap(([serverName, instance]) =>
+      entry.enabledServerNames.has(serverName) && !instance.isClosed && instance.apps
+        ? [{ serverName, instance, apps: instance.apps }]
+        : []
+    );
   }
 
   /**
@@ -5285,6 +5290,13 @@ export class MCPServerManager {
   }
 
   private readonly entrypointCallWindows = new Map<string, { start: number; count: number }>();
+
+  /** Entry point budgets of a stopped workspace would otherwise outlive it. */
+  private dropEntrypointBudgets(workspaceId: string): void {
+    for (const key of this.entrypointCallWindows.keys()) {
+      if (key.startsWith(`${workspaceId}\0`)) this.entrypointCallWindows.delete(key);
+    }
+  }
 
   /** The view tool-call budget (mcpAppHost), applied per workspace and server. */
   private allowEntrypointCall(workspaceId: string, serverName: string): boolean {
@@ -5741,10 +5753,7 @@ export class MCPServerManager {
       this.latestWorkspaceOverrides.delete(workspaceId);
       this.idleStoppedPromptCatalogs.delete(workspaceId);
     }
-    // Entry point budgets of a stopped workspace would otherwise outlive it.
-    for (const key of this.entrypointCallWindows.keys()) {
-      if (key.startsWith(`${workspaceId}\0`)) this.entrypointCallWindows.delete(key);
-    }
+    this.dropEntrypointBudgets(workspaceId);
     const entry = this.workspaceServers.get(workspaceId);
     if (!entry) return;
 
