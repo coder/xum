@@ -206,6 +206,11 @@ describe("readOpenAIExtension", () => {
       // After the virama ZWJ must come a letter, not a digit or a vowel sign.
       "\u0915\u094d\u200d\u0967",
       "\u0915\u094d\u200d\u093e",
+      // A virama ZWJ needs a same-script letter before the virama too.
+      "\u094d\u200d\u0937",
+      "A\u094d\u200d\u0937",
+      // Only marks of a shaping script may sit after a ZWNJ (a Khmer vowel sign may not).
+      "\u0628\u200c\u17b6\u0628",
       // ZWNJ between Arabic-Indic digits: digits are not letters.
       "\u0661\u200c\u0662",
       // A tag that is not a digit or lowercase letter, and a one-tag payload.

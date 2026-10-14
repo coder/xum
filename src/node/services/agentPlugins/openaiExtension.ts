@@ -146,6 +146,8 @@ const ZWNJ_SCRIPTS =
  * string from every mark in a run (quadratic).
  */
 const SHAPING_LETTER = `(?=[${ZWNJ_SCRIPTS}])\\p{L}`;
+/** A combining mark of a shaping script: the transparent characters UTS #39 allows near ZWNJ. */
+const SHAPING_MARK = `(?=[${ZWNJ_SCRIPTS}])\\p{Mn}`;
 /**
  * Each Indic script and its virama. ZWJ shapes Indic text only right after a virama (UTS #39
  * joining controls), as in the half-form क्‍ष, and only before a letter of the same script.
@@ -171,7 +173,8 @@ const VIRAMA_SCRIPTS: ReadonlyArray<[script: string, virama: string]> = [
  * - ZWJ (U+200D) between emoji (after an optional skin tone or VS16), as in 👩‍💻.
  * - ZWNJ (U+200C) between letters of a shaping script (SHAPING_LETTER), with combining marks on
  *   either side (UTS #39 allows transparent characters there), as in Persian.
- * - ZWJ (U+200D) after an Indic virama, before a letter of the same script (VIRAMA_SCRIPTS).
+ * - ZWJ (U+200D) after a letter, its marks and a virama of an Indic script, before a letter of
+ *   the same script (VIRAMA_SCRIPTS).
  * - Tag characters in a subdivision flag: U+1F3F4, 2 to 7 tag digits or lowercase tag letters,
  *   then U+E007F (the Unicode tag sequence form for regions such as gbsct).
  * - VS15/VS16 (U+FE0E, U+FE0F) after an emoji, and VS16 in a keycap (digit, VS16, U+20E3).
@@ -184,9 +187,15 @@ const ALLOWED_FORMAT_SEQUENCES: ReadonlyArray<[RegExp, string]> = [
     /(\p{Extended_Pictographic}(?:[\u{1f3fb}-\u{1f3ff}]|\ufe0f)?)\u200d(?=\p{Extended_Pictographic})/gu,
     "$1",
   ],
-  [new RegExp(`(${SHAPING_LETTER}\\p{M}*)\\u200c(?=\\p{M}*${SHAPING_LETTER})`, "gu"), "$1"],
+  [
+    new RegExp(`(${SHAPING_LETTER}\\p{M}*)\\u200c(?=(?:${SHAPING_MARK})*${SHAPING_LETTER})`, "gu"),
+    "$1",
+  ],
   ...VIRAMA_SCRIPTS.map(([script, virama]): [RegExp, string] => [
-    new RegExp(`(${virama})\\u200d(?=(?=\\p{Script=${script}})\\p{L})`, "gu"),
+    new RegExp(
+      `((?=\\p{Script=${script}})\\p{L}(?:(?=\\p{Script=${script}})\\p{M})*?${virama})\\u200d(?=(?=\\p{Script=${script}})\\p{L})`,
+      "gu"
+    ),
     "$1",
   ]),
   [/\u{1f3f4}[\u{e0030}-\u{e0039}\u{e0061}-\u{e007a}]{2,7}\u{e007f}/gu, "\u{1f3f4}"],
