@@ -60,7 +60,7 @@ import {
 } from "@/browser/features/ChatInput/initialStagingLock";
 import { appendStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getDraftStore, listedCreationDraftId } from "@/browser/stores/DraftStore";
 import { joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
@@ -314,12 +314,15 @@ export function useCreationWorkspace({
   const [runtimeAvailabilityState, setRuntimeAvailabilityState] =
     useState<RuntimeAvailabilityState>({ status: "loading" });
 
+  // Read like the composer reads its route: a blank or invalid id edits the default draft, whose
+  // name a draft move takes along.
+  const listedDraftId = listedCreationDraftId(draftId);
   // Persist draft workspace name generation state per draft (so multiple drafts don't share a
   // single auto-naming/manual-name state).
   const workspaceNameScopeId =
     projectPath.trim().length > 0
-      ? isDraftId(draftId)
-        ? getDraftScopeId(projectPath, draftId)
+      ? listedDraftId != null
+        ? getDraftScopeId(projectPath, listedDraftId)
         : getPendingScopeId(projectPath)
       : null;
 
@@ -630,8 +633,8 @@ export function useCreationWorkspace({
             return;
           }
 
-          if (isDraftScope && deleteWorkspaceDraft && typeof draftId === "string") {
-            deleteWorkspaceDraft(projectPath, draftId);
+          if (listedDraftId != null && deleteWorkspaceDraft) {
+            deleteWorkspaceDraft(projectPath, listedDraftId);
             return;
           }
 
@@ -714,9 +717,9 @@ export function useCreationWorkspace({
                 },
         });
 
-        if (isDraftId(draftId) && promoteWorkspaceDraft) {
+        if (listedDraftId != null && promoteWorkspaceDraft) {
           // UI-only: show the created workspace in-place where the draft was rendered.
-          promoteWorkspaceDraft(projectPath, draftId, metadata);
+          promoteWorkspaceDraft(projectPath, listedDraftId, metadata);
         }
 
         // An initial /goal sends no user message, so nothing durable holds its input until the
@@ -978,6 +981,7 @@ export function useCreationWorkspace({
       message,
       subProjectPath,
       draftId,
+      listedDraftId,
       promoteWorkspaceDraft,
       deleteWorkspaceDraft,
       providersConfig,

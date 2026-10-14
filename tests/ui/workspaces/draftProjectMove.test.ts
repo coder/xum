@@ -816,48 +816,60 @@ describeIntegration("Creation project selector moves the draft", () => {
     }
   }, 90_000);
 
-  // The composer edits the project's default draft for a blank or invalid draft id: the move must
-  // take that draft, not look for a listed one with the route's id.
-  test("a route with a blank draft id moves the project's default draft", async () => {
-    const a = getSharedRepoPath();
-    const { view, cleanupDom, b } = await openTwoProjects(
-      getSharedEnv().orpc,
-      `/project?project=${getProjectRouteId(a)}&draft=`
-    );
-    const { container } = view;
-    try {
-      const textarea = await waitFor(() => {
-        const element = container.querySelector<HTMLTextAreaElement>(
-          'textarea[aria-label="Message"]'
+  // The composer reads the route's draft id trimmed, and edits the project's default draft for a
+  // blank or invalid one: the move must take that draft and its name.
+  const draftRoutes = [
+    { label: "a blank", draftParam: "", listedId: null },
+    { label: "a padded", draftParam: "%20padded-id%20", listedId: "padded-id" },
+    { label: "an invalid", draftParam: "..%2Fx", listedId: null },
+  ] as const;
+  for (const route of draftRoutes) {
+    test(`a route with ${route.label} draft id moves the draft the composer edits`, async () => {
+      const a = getSharedRepoPath();
+      const { view, cleanupDom, b } = await openTwoProjects(
+        getSharedEnv().orpc,
+        `/project?project=${getProjectRouteId(a)}&draft=${route.draftParam}`
+      );
+      const { container } = view;
+      const source =
+        route.listedId != null ? creationScope(a, route.listedId) : defaultCreationDraftScope(a);
+      try {
+        const textarea = await waitFor(() => {
+          const element = container.querySelector<HTMLTextAreaElement>(
+            'textarea[aria-label="Message"]'
+          );
+          if (!element) throw new Error("Composer not found");
+          return element;
+        }, WAIT);
+        fireEvent.change(textarea, { target: { value: "typed on a draft route" } });
+        await waitFor(
+          () => expect(getDraftStore().getView(source).text).toBe("typed on a draft route"),
+          WAIT
         );
-        if (!element) throw new Error("Composer not found");
-        return element;
-      }, WAIT);
-      fireEvent.change(textarea, { target: { value: "typed on a blank draft route" } });
-      await waitFor(
-        () =>
-          expect(getDraftStore().getView(defaultCreationDraftScope(a)).text).toBe(
-            "typed on a blank draft route"
-          ),
-        WAIT
-      );
+        const nameInput = await waitFor(() => {
+          const element = container.querySelector<HTMLInputElement>("#workspace-name");
+          if (!element) throw new Error("Workspace name input not found");
+          return element;
+        }, WAIT);
+        fireEvent.focus(nameInput);
+        fireEvent.change(nameInput, { target: { value: "route-name" } });
+        await waitFor(() => expect(nameInput.value).toBe("route-name"), WAIT);
 
-      await moveDraftTo(container, path.basename(b));
+        await moveDraftTo(container, path.basename(b));
 
-      const movedId = await onlyDraftId(b);
-      await waitFor(
-        () =>
+        const movedId = await onlyDraftId(b);
+        await waitFor(() => {
           expect(getDraftStore().getView(creationScope(b, movedId)).text).toBe(
-            "typed on a blank draft route"
-          ),
-        WAIT
-      );
-      await waitFor(
-        () => expect(getDraftStore().getView(defaultCreationDraftScope(a)).text).toBe(""),
-        WAIT
-      );
-    } finally {
-      await cleanupView(view, cleanupDom);
-    }
-  }, 90_000);
+            "typed on a draft route"
+          );
+          expect(container.querySelector<HTMLInputElement>("#workspace-name")?.value).toBe(
+            "route-name"
+          );
+        }, WAIT);
+        await waitFor(() => expect(getDraftStore().getView(source).text).toBe(""), WAIT);
+      } finally {
+        await cleanupView(view, cleanupDom);
+      }
+    }, 90_000);
+  }
 });
