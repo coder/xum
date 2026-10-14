@@ -6,6 +6,7 @@ import {
   type DraftScope,
   type DraftSummary,
   type PendingSend,
+  type WorkspaceNamePersistedState,
 } from "@/common/orpc/schemas/drafts";
 import { joinDraftText } from "@/common/utils/composerDraftText";
 import { MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
@@ -213,7 +214,7 @@ export function toDraftAttachmentMetadata(attachment: DraftAttachment): DraftAtt
 
 export function summarizeDraft(
   scope: DraftScope,
-  draft: Draft,
+  draft: Draft & { nameState?: WorkspaceNamePersistedState },
   revision: number,
   pendingSends: readonly PendingSend[] = []
 ): DraftSummary {
@@ -222,6 +223,7 @@ export function summarizeDraft(
     text: draft.text,
     attachments: draft.attachments.map(toDraftAttachmentMetadata),
     ...(pendingSends.length > 0 ? { pendingSends: [...pendingSends] } : {}),
+    nameState: draft.nameState,
     revision,
   };
 }

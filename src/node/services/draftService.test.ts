@@ -7,6 +7,10 @@ import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { DEFAULT_CREATION_DRAFT_ID, MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
+import {
+  WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS,
+  toStoredMessage,
+} from "@/common/utils/workspaceNameState";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import type {
   DraftAttachment,
@@ -1029,3 +1033,90 @@ async function readdirOrEmpty(dir: string): Promise<string[]> {
     return [];
   }
 }
+
+describe("DraftService workspace name state", () => {
+  const nameState = {
+    generatedIdentity: { name: "fix-a1b2", title: "Fix the sidebar" },
+    manualName: "",
+    autoGenerate: true,
+    lastGeneratedFor: "fix the sidebar",
+  };
+
+  it("keeps the name state in the body through partial writes, bounded, until null clears it", async () => {
+    using tempDir = new TestTempDir("drafts-name-state");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "named" };
+    const long = { ...nameState, manualName: "m".repeat(5000), lastGeneratedFor: "x".repeat(9000) };
+
+    expect((await service.update({ scope, text: "fix it", nameState: long })).nameState).toEqual({
+      ...long,
+      manualName: "m".repeat(WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS - 2),
+      lastGeneratedFor: toStoredMessage(long.lastGeneratedFor),
+    });
+    // Typing sends only text: the stored name state stays.
+    await service.update({ scope, text: "fix it now" });
+    const restarted = new DraftService(config);
+    const loaded = await restarted.get(scope);
+    expect(loaded.text).toBe("fix it now");
+    expect(loaded.nameState?.manualName).toHaveLength(
+      WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS - 2
+    );
+    const [summary] = (await restarted.list()).filter((draft) => draft.scope.kind === "creation");
+    expect(summary.nameState?.generatedIdentity).toEqual(nameState.generatedIdentity);
+
+    await restarted.update({ scope, nameState: null });
+    expect(await restarted.get(scope)).toMatchObject({ text: "fix it now" });
+    expect((await new DraftService(config).get(scope)).nameState).toBeUndefined();
+  });
+
+  it("drops a malformed stored name state and still loads the draft", async () => {
+    using tempDir = new TestTempDir("drafts-name-state-malformed");
+    const { config, projectPath } = await createHarness(tempDir);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "broken" };
+    await new DraftService(config).update({ scope, text: "kept", nameState });
+    const draftsDir = path.join(config.rootDir, "drafts");
+    const files = await fs.readdir(draftsDir, { recursive: true });
+    const filePath = path.join(draftsDir, files.find((name) => name.endsWith("broken.json")) ?? "");
+    const stored = JSON.parse(await fs.readFile(filePath, "utf-8")) as Record<string, unknown>;
+    await fs.writeFile(filePath, JSON.stringify({ ...stored, nameState: { manualName: 7 } }));
+
+    const service = new DraftService(config);
+    const loaded = await service.get(scope);
+    expect(loaded.text).toBe("kept");
+    expect(loaded.nameState).toBeUndefined();
+    const snapshot = await service.getSnapshotEvent();
+    expect(snapshot.drafts.find((draft) => draft.scope.kind === "creation")?.text).toBe("kept");
+  });
+
+  it("keeps a name-only body and relists it when its row is missing", async () => {
+    using tempDir = new TestTempDir("drafts-name-only");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "name-only" };
+    // The list put failed before an exit: only the body was written.
+    await service.update({ scope, nameState });
+
+    const snapshot = await new DraftService(config).getSnapshotEvent();
+    expect(snapshot.list.entries.map(({ draftId }) => draftId)).toEqual(["name-only"]);
+    expect(snapshot.drafts.find((draft) => draft.scope.kind === "creation")?.nameState).toEqual(
+      nameState
+    );
+  });
+
+  it("imports a legacy name state where the draft has none, never over a stored one", async () => {
+    using tempDir = new TestTempDir("drafts-name-import");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: DEFAULT_CREATION_DRAFT_ID };
+    await service.update({ scope, text: "typed on the project page" });
+
+    expect((await service.importLegacy({ scope, nameState })).result).toBe("applied");
+    const other = { ...nameState, manualName: "other-origin", autoGenerate: false };
+    expect((await service.importLegacy({ scope, nameState: other })).result).toBe("present");
+    expect(await service.get(scope)).toMatchObject({
+      text: "typed on the project page",
+      nameState,
+    });
+  });
+});

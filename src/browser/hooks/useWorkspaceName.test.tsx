@@ -6,10 +6,8 @@ import { restartLocalStorage } from "../../../tests/ui/quotaLimitedStorage";
 import { APIProvider } from "@/browser/contexts/API";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createTestApiClient } from "@/browser/testUtils";
-import {
-  WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS,
-  getWorkspaceNameStateKey,
-} from "@/common/constants/storage";
+import { getWorkspaceNameStateKey } from "@/common/constants/storage";
+import { WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS } from "@/common/utils/workspaceNameState";
 import { useWorkspaceName } from "./useWorkspaceName";
 
 const generateMock = mock(() =>

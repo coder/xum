@@ -107,6 +107,25 @@ export const PendingSendSchema = z.object({
   }),
 });
 
+/** A generated workspace identity: a short git-safe name and a human-readable title. */
+export const WorkspaceIdentitySchema = z.object({
+  /** Short git-safe name with suffix (e.g., "plan-a1b2") */
+  name: z.string(),
+  /** Human-readable title (e.g., "Fix plan mode over SSH") */
+  title: z.string(),
+});
+
+/**
+ * A creation draft's workspace name state (useWorkspaceName), stored in the draft body next to
+ * its text so both move and persist together. Bounded by boundWorkspaceNamePersistedState.
+ */
+export const WorkspaceNamePersistedStateSchema = z.object({
+  generatedIdentity: WorkspaceIdentitySchema.nullable(),
+  manualName: z.string(),
+  autoGenerate: z.boolean(),
+  lastGeneratedFor: z.string(),
+});
+
 /**
  * Per-scope monotonic revision, bumped on every persisted change. Scopes start at the backend
  * process start time, so a restarted backend does not regress below the previous one in practice.
@@ -123,11 +142,13 @@ export const DraftSummarySchema = z.object({
   text: z.string(),
   attachments: z.array(DraftAttachmentMetadataSchema),
   pendingSends: z.array(PendingSendSchema).optional(),
+  nameState: WorkspaceNamePersistedStateSchema.optional(),
   revision: DraftRevisionSchema,
 });
 
 export const DraftGetOutputSchema = DraftSchema.extend({
   pendingSends: z.array(PendingSendSchema).optional(),
+  nameState: WorkspaceNamePersistedStateSchema.optional(),
   revision: DraftRevisionSchema,
 });
 
@@ -157,6 +178,8 @@ export const DraftUpdateInputSchema = z.object({
   // the VISIBLE part: the backend keeps what pending sends retain.
   text: z.string().optional(),
   attachments: z.array(DraftAttachmentSchema).optional(),
+  // Omitted keeps the stored name state, null clears it.
+  nameState: WorkspaceNamePersistedStateSchema.nullable().optional(),
   basisSends: z.array(BasisSendSchema).max(1000).optional(),
 });
 
@@ -166,6 +189,7 @@ export const DraftWriteOutputSchema = z.object({
   text: z.string(),
   attachments: z.array(DraftAttachmentMetadataSchema),
   pendingSends: z.array(PendingSendSchema).optional(),
+  nameState: WorkspaceNamePersistedStateSchema.optional(),
 });
 
 const WorkspaceDraftScopeSchema = z.object({
@@ -278,6 +302,8 @@ export const DraftEventSchema = z.discriminatedUnion("type", [
 ]);
 
 export type DraftScope = z.infer<typeof DraftScopeSchema>;
+export type WorkspaceIdentity = z.infer<typeof WorkspaceIdentitySchema>;
+export type WorkspaceNamePersistedState = z.infer<typeof WorkspaceNamePersistedStateSchema>;
 export type DraftAttachment = z.infer<typeof DraftAttachmentSchema>;
 export type DraftAttachmentMetadata = z.infer<typeof DraftAttachmentMetadataSchema>;
 export type Draft = z.infer<typeof DraftSchema>;

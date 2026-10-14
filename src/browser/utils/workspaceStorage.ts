@@ -11,7 +11,7 @@ import {
   removePersistedStateKeys,
   writePersistedRawString,
 } from "@/browser/hooks/usePersistedState";
-import { boundWorkspaceNamePersistedState } from "@/browser/hooks/useWorkspaceName";
+import { boundWorkspaceNamePersistedState } from "@/common/utils/workspaceNameState";
 import {
   MCP_TEST_RESULTS_KEY_PREFIX,
   WORKSPACE_KEY_REGISTRATIONS,

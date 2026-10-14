@@ -1,16 +1,20 @@
 import { useState, useRef, useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
-import { z } from "zod";
 import { useAPI } from "@/browser/contexts/API";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   createSessionValueStore,
   truncateStringToChars,
 } from "@/browser/utils/boundedPersistedValue";
+import { getWorkspaceNameStateKey } from "@/common/constants/storage";
+import {
+  WorkspaceNamePersistedStateSchema,
+  type WorkspaceIdentity,
+  type WorkspaceNamePersistedState,
+} from "@/common/orpc/schemas/drafts";
 import {
   WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS,
-  WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS,
-  getWorkspaceNameStateKey,
-} from "@/common/constants/storage";
+  toStoredMessage,
+} from "@/common/utils/workspaceNameState";
 import type { NameGenerationError } from "@/common/types/errors";
 import {
   validateWorkspaceBranchName,
@@ -61,16 +65,6 @@ export interface UseWorkspaceNameOptions {
   scopeId?: string | null;
 }
 
-/** Generated workspace identity (name + title) */
-const WorkspaceIdentitySchema = z.object({
-  /** Short git-safe name with suffix (e.g., "plan-a1b2") */
-  name: z.string(),
-  /** Human-readable title (e.g., "Fix plan mode over SSH") */
-  title: z.string(),
-});
-
-export type WorkspaceIdentity = z.infer<typeof WorkspaceIdentitySchema>;
-
 /** State and actions for workspace name generation, suitable for passing to components */
 export interface WorkspaceNameState {
   /** The generated or manually entered name (shown in CreationControls UI) */
@@ -92,59 +86,6 @@ export interface WorkspaceNameState {
 export interface UseWorkspaceNameReturn extends WorkspaceNameState {
   /** Wait for any pending generation to complete, returns both name and title */
   waitForGeneration: () => Promise<WorkspaceIdentity | null>;
-}
-
-const WorkspaceNamePersistedStateSchema = z.object({
-  generatedIdentity: WorkspaceIdentitySchema.nullable(),
-  manualName: z.string(),
-  autoGenerate: z.boolean(),
-  lastGeneratedFor: z.string(),
-});
-
-export type WorkspaceNamePersistedState = z.infer<typeof WorkspaceNamePersistedStateSchema>;
-
-/** FNV-1a (32-bit). Only detects changes past the stored prefix; not a security hash. */
-function hashMessage(message: string): string {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < message.length; index++) {
-    hash ^= message.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(16);
-}
-
-/**
- * lastGeneratedFor only detects whether the message changed, so a long message is stored as a
- * bounded fingerprint: the full creation message can be many KB, and the persisted state must fit
- * its localStorage budget. The fingerprint ends with the full message's length and hash, so an
- * edit past the prefix still counts as a change and regenerates the name.
- */
-function toStoredMessage(message: string): string {
-  if (JSON.stringify(message).length <= WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS) return message;
-  // The suffix needs no JSON escapes, so the result serializes within the cap (and maps to itself).
-  const suffix = `\u2026#${message.length}:${hashMessage(message)}`;
-  return (
-    truncateStringToChars(message, WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS - suffix.length) + suffix
-  );
-}
-
-/**
- * Bound the user-input-sized fields of persisted name state so it fits its key budget; also
- * shrinks state that older builds stored unbounded. Returns null when `state` is not name state.
- */
-export function boundWorkspaceNamePersistedState(
-  state: unknown
-): WorkspaceNamePersistedState | null {
-  const parsed = WorkspaceNamePersistedStateSchema.safeParse(state);
-  if (!parsed.success) return null;
-  return {
-    ...parsed.data,
-    manualName: truncateStringToChars(
-      parsed.data.manualName,
-      WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS
-    ),
-    lastGeneratedFor: toStoredMessage(parsed.data.lastGeneratedFor),
-  };
 }
 
 // Full manual names whose persisted copy is a bounded prefix (see setNameManual), so they stay

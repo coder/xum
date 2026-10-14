@@ -37,7 +37,9 @@ import {
   type DraftUpdateInput,
   type DraftWriteOutput,
   type PendingSend,
+  type WorkspaceNamePersistedState,
 } from "@/common/orpc/schemas/drafts";
+import { boundWorkspaceNamePersistedState } from "@/common/utils/workspaceNameState";
 import {
   hasDraftBlock,
   joinDraftText,
@@ -109,23 +111,68 @@ interface IndexEntry {
  * holds the retained ones (in entry order) before the visible ones. `pendingSends` is the
  * idempotent-send bookkeeping; an older build drops it on its next write, which leaves everything
  * visible (never lost). Only this service builds `text`; clients see and edit the visible part
- * (DraftSummary, DraftUpdateInput).
+ * (DraftSummary, DraftUpdateInput). `nameState` is a creation draft's workspace name state; an
+ * older build ignores it and drops it on its next write (the name resets, the text stays).
  */
 interface StoredDraft {
   text: string;
   attachments: DraftAttachment[];
   pendingSends: PendingSend[];
+  nameState?: WorkspaceNamePersistedState;
 }
 
 function emptyStoredDraft(): StoredDraft {
   return { text: "", attachments: [], pendingSends: [] };
 }
 
-/** No file: an attachment-only or review-only pending send still keeps its file. */
+/**
+ * No file: an attachment-only or review-only pending send still keeps its file, and so does a
+ * name-only creation draft (relisted like any other body without a row).
+ */
 function isStoredDraftEmpty(draft: StoredDraft): boolean {
+  return isBodyEmpty(draft) && draft.nameState === undefined;
+}
+
+/** No text, attachments or pending sends (a name state may still be stored). */
+function isBodyEmpty(draft: StoredDraft): boolean {
   return (
     draft.text.length === 0 && draft.attachments.length === 0 && draft.pendingSends.length === 0
   );
+}
+
+/** Like the text: an omitted name state keeps the stored one, and null clears it. */
+function mergeNameState(
+  current: StoredDraft,
+  write: DraftUpdateInput
+): WorkspaceNamePersistedState | undefined {
+  if (write.nameState === undefined) return current.nameState;
+  return boundWorkspaceNamePersistedState(write.nameState) ?? undefined;
+}
+
+/**
+ * What a legacy import stores, or null when the backend keeps its draft ("present"). The body and
+ * the name state were separate legacy keys, so each is imported only where the backend has none.
+ */
+function legacyImportOf(current: StoredDraft | null, legacy: StoredDraft): StoredDraft | null {
+  if (current === null) return legacy;
+  const bodyKept = !isBodyEmpty(current);
+  if (bodyKept && (current.nameState !== undefined || legacy.nameState === undefined)) return null;
+  return { ...(bodyKept ? current : legacy), nameState: current.nameState ?? legacy.nameState };
+}
+
+/** The name state of a parsed draft file; a malformed one is dropped (the draft still loads). */
+function loadNameState(
+  raw: unknown,
+  filePath: string
+): { nameState?: WorkspaceNamePersistedState } {
+  const stored = (raw as { nameState?: unknown } | null)?.nameState;
+  if (stored === undefined) return {};
+  const nameState = boundWorkspaceNamePersistedState(stored);
+  if (nameState === null) {
+    log.warn(`Dropping malformed workspace name state of draft file ${filePath}`);
+    return {};
+  }
+  return { nameState };
 }
 
 /** The composer's part of a validated stored draft (load drops bookkeeping that does not fit). */
@@ -135,9 +182,9 @@ function visibleTextOf(draft: StoredDraft): string {
   return visible;
 }
 
-/** The API view: visible text, every attachment (clients hide retained ones), pending sends. */
-function viewOf(draft: StoredDraft): Draft {
-  return { text: visibleTextOf(draft), attachments: draft.attachments };
+/** The API view: visible text, every attachment (clients hide retained ones), name state. */
+function viewOf(draft: StoredDraft): Draft & { nameState?: WorkspaceNamePersistedState } {
+  return { text: visibleTextOf(draft), attachments: draft.attachments, nameState: draft.nameState };
 }
 
 /**
@@ -253,7 +300,8 @@ function writeOutput(scope: DraftScope, draft: StoredDraft, revision: number): D
 function storedDraftFrom(
   visibleText: string,
   attachments: readonly DraftAttachment[],
-  pendingSends: PendingSend[]
+  pendingSends: PendingSend[],
+  nameState?: WorkspaceNamePersistedState
 ): StoredDraft {
   const byId = new Map(attachments.map((attachment) => [attachment.id, attachment]));
   const retainedIds = [...new Set(pendingSends.flatMap((send) => send.attachmentIds))];
@@ -273,6 +321,7 @@ function storedDraftFrom(
     text: buildLegacyDraftText(pendingSends, visibleText),
     attachments: [...retained, ...visible],
     pendingSends,
+    nameState,
   };
 }
 
@@ -501,7 +550,12 @@ export class DraftService extends EventEmitter {
       // Clients write the visible part; what pending sends retain stays (only their resolution
       // removes it), and what happened to the sends the client wrote against is merged here.
       const merged = mergeWrite(current, input, basis, accepted);
-      const next = storedDraftFrom(merged.visibleText, merged.attachments, current.pendingSends);
+      const next = storedDraftFrom(
+        merged.visibleText,
+        merged.attachments,
+        current.pendingSends,
+        mergeNameState(current, input)
+      );
       const bytes = draftJsonBytes(next);
       if (bytes > MAX_DRAFT_JSON_BYTES) {
         throw new Error(draftTooLargeMessage(bytes));
@@ -563,8 +617,9 @@ export class DraftService extends EventEmitter {
   }
 
   /**
-   * Non-clobbering one-way migration of a legacy localStorage draft: stored only when the backend
-   * has no draft for the scope. localStorage is per origin (desktop app vs browser tab) while this
+   * Non-clobbering one-way migration of a legacy localStorage draft: its body (text, attachments)
+   * is stored only when the backend has none for the scope, and its name state only when the
+   * backend has no name state. localStorage is per origin (desktop app vs browser tab) while this
    * store is shared, so another origin may already have imported (or since edited) this scope.
    */
   async importLegacy(input: DraftUpdateInput): Promise<DraftImportLegacyOutput> {
@@ -588,16 +643,20 @@ export class DraftService extends EventEmitter {
     if (bytes > MAX_DRAFT_JSON_BYTES) {
       throw new Error(draftTooLargeMessage(bytes));
     }
+    const imported: StoredDraft = {
+      ...legacy,
+      pendingSends: [],
+      nameState: boundWorkspaceNamePersistedState(input.nameState) ?? undefined,
+    };
     return this.withWriteLock(scope, async () => {
       const key = draftScopeKey(scope);
-      const current = await this.load(scope);
-      if (current !== null && !isStoredDraftEmpty(current)) {
+      const stored = legacyImportOf(await this.load(scope), imported);
+      if (stored === null) {
         return { result: "present", revision: this.getRevision(key) };
       }
       if (!(await this.hasOwner(scope))) {
         return { result: "orphaned", revision: this.getRevision(key) };
       }
-      const stored: StoredDraft = { ...legacy, pendingSends: [] };
       if (isStoredDraftEmpty(stored)) {
         return { result: "applied", revision: this.getRevision(key) };
       }
@@ -661,7 +720,8 @@ export class DraftService extends EventEmitter {
           merged.visibleText === input.typedAfterSendText
         ),
         attachments,
-        [...current.pendingSends, pendingSend]
+        [...current.pendingSends, pendingSend],
+        current.nameState
       );
       const bytes = draftJsonBytes(next);
       if (bytes > MAX_DRAFT_JSON_BYTES) throw new Error(draftTooLargeMessage(bytes));
@@ -740,7 +800,8 @@ export class DraftService extends EventEmitter {
       const next = storedDraftFrom(
         joinDraftText(...restoredTexts, visibleTextOf(current)),
         current.attachments.filter(({ id }) => !acceptedIds.has(id)),
-        current.pendingSends.filter((send) => statusOf(send) === undefined)
+        current.pendingSends.filter((send) => statusOf(send) === undefined),
+        current.nameState
       );
       await this.persist(scope, filePath, next);
     });
@@ -944,7 +1005,7 @@ export class DraftService extends EventEmitter {
             filePath
           )
         : [];
-    return { ...draft, pendingSends };
+    return { ...draft, pendingSends, ...loadNameState(raw, filePath) };
   }
 
   /**
@@ -1215,7 +1276,7 @@ export class DraftService extends EventEmitter {
     projectPath: string;
     draftId: string;
     filePath: string;
-    draft: Draft | null;
+    draft: (Draft & { nameState?: WorkspaceNamePersistedState }) | null;
   }> {
     for (const name of await readDirNames(projectDir)) {
       if (!name.endsWith(".json")) continue;
@@ -1250,7 +1311,7 @@ export class DraftService extends EventEmitter {
         projectPath,
         draftId,
         filePath,
-        draft,
+        draft: { ...draft, ...loadNameState(raw, filePath) },
       };
     }
   }
