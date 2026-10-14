@@ -48,7 +48,7 @@ import { MCPConfigService } from "./mcpConfigService";
 import { Config } from "@/node/config";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 import type { TelemetryService } from "./telemetryService";
-import type { Runtime } from "@/node/runtime/Runtime";
+import type { ExecOptions, Runtime } from "@/node/runtime/Runtime";
 import * as crossProcessLock from "@/node/utils/main/crossProcessLock";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
@@ -848,11 +848,17 @@ describe("MCPServerManager", () => {
     expect(manager.getCachedSettings("settings-ws", "cad")).toEqual({ units: "in", grid: false });
     // An invalid value is refused before anything reaches the server.
     const refused = await manager
-      .updateSettings("settings-ws", "cad", { units: "ft" }, snapshot)
+      .updateSettings("settings-ws", "cad", { units: "ft" }, snapshot, snapshot.instanceToken)
       .catch((error: unknown) => error);
     expect(refused).toBeInstanceOf(Error);
 
-    const values = await manager.updateSettings("settings-ws", "cad", { units: "mm" }, snapshot);
+    const values = await manager.updateSettings(
+      "settings-ws",
+      "cad",
+      { units: "mm" },
+      snapshot,
+      snapshot.instanceToken
+    );
     expect(values).toEqual({ units: "mm", grid: false });
     expect(calls).toEqual([
       { name: "s.read", args: {}, meta: { "xum/workspaceId": "settings-ws" } },
@@ -1086,12 +1092,19 @@ describe("MCPServerManager", () => {
 
     const hookSettings = manager.getSettingsForPluginHooks("hooks-race-ws", "plugin:abc:", 1000);
     expect(pendingReads).toHaveLength(2);
-    // While both reads are in flight, the user saves one server and disables the other.
+    // While both reads are in flight, the user saves one server and disables the other. The
+    // dialog's read (settled first) gives the save its instance token.
+    const dialogRead = manager.readSettings("hooks-race-ws", "plugin:abc:saved");
+    await waitFor(() => pendingReads.length === 3);
+    pendingReads.pop()?.();
+    const prior = await dialogRead;
+    if (prior === null) throw new Error("expected settings");
     await manager.updateSettings(
       "hooks-race-ws",
       "plugin:abc:saved",
       { units: "in" },
-      { properties: { units: { type: "string", title: "Units" } }, values: { units: "mm" } }
+      prior,
+      prior.instanceToken
     );
     await manager.applyWorkspaceOverrides("hooks-race-ws", {
       disabledServers: ["plugin:abc:gone"],
@@ -1174,7 +1187,8 @@ describe("MCPServerManager", () => {
       "settings-latest-ws",
       "cad",
       { units: "in" },
-      prior
+      prior,
+      prior.instanceToken
     );
     expect(values).toEqual({ units: "in", grid: true });
     releaseRead?.();
@@ -1223,7 +1237,88 @@ describe("MCPServerManager", () => {
     expect(after.instanceToken).toBe(before.instanceToken);
   });
 
-  test("settings: a save read from a replaced server instance is refused", async () => {
+  test("settings: a save read from a replaced server instance saves only when the schema is unchanged", async () => {
+    const updates: string[] = [];
+    const settingsServer = (id: string, title: string) => ({
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: (name: string) => {
+          if (name === "s.update") updates.push(id);
+          return Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: { units: { type: "string", title } } },
+              values: { units: "in" },
+            },
+          });
+        },
+      },
+    });
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-token-v1") });
+    servers.serve("settings-token-v1", settingsServer("v1", "Units"));
+    // The same schema: an idle stop or crash restart brings back the same server.
+    servers.serve("settings-token-v1b", settingsServer("v1b", "Units"));
+    servers.serve("settings-token-v2", settingsServer("v2", "Measurement units"));
+    const request = workspaceRequest("settings-token-ws");
+    await manager.getToolsForWorkspace(request);
+    const read = await manager.readSettings("settings-token-ws", "cad");
+    if (read === null) throw new Error("expected settings");
+    const save = () =>
+      manager
+        .saveSettings("settings-token-ws", "cad", { units: "mm" }, read.instanceToken)
+        .then(() => "saved")
+        .catch((error: unknown) => String(error));
+
+    // The dialog stays open while the server restarts with the same schema: the save lands.
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-token-v1b") });
+    await manager.getToolsForWorkspace(request);
+    expect(await save()).toBe("saved");
+    expect(updates).toEqual(["v1b"]);
+
+    // A replacement with another schema is refused: the dialog validated against the old one.
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-token-v2") });
+    await manager.getToolsForWorkspace(request);
+    expect(await save()).toContain("Reopen");
+    expect(updates).toEqual(["v1b"]);
+  });
+
+  test("settings: a token read from one server never passes the schema check of another", async () => {
+    const updates: string[] = [];
+    const settingsServer = (id: string) => ({
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: (name: string) => {
+          if (name === "s.update") updates.push(id);
+          // The same schema on both servers: only the server key tells them apart.
+          return Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: { units: { type: "string", title: "Units" } } },
+              values: { units: "in" },
+            },
+          });
+        },
+      },
+    });
+    configService.listServers.mockResolvedValue({
+      a: stdioConfig("settings-cross-a"),
+      b: stdioConfig("settings-cross-b"),
+    });
+    servers.serve("settings-cross-a", settingsServer("a"));
+    servers.serve("settings-cross-b", settingsServer("b"));
+    await manager.getToolsForWorkspace(workspaceRequest("settings-cross-ws"));
+    const readA = await manager.readSettings("settings-cross-ws", "a");
+    if (readA === null) throw new Error("expected settings");
+    const refused = await manager
+      .saveSettings("settings-cross-ws", "b", { units: "mm" }, readA.instanceToken)
+      .catch((error: unknown) => String(error));
+    expect(refused).toContain("Reopen");
+    expect(updates).toEqual([]);
+  });
+
+  test("settings: a server replaced between the save's fresh read and its update is refused", async () => {
     const updates: string[] = [];
     const settingsServer = (id: string) => ({
       tools: { draw: testTool() },
@@ -1241,23 +1336,96 @@ describe("MCPServerManager", () => {
         },
       },
     });
-    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-token-v1") });
-    servers.serve("settings-token-v1", settingsServer("v1"));
-    servers.serve("settings-token-v2", settingsServer("v2"));
-    const request = workspaceRequest("settings-token-ws");
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-race-v1") });
+    servers.serve("settings-race-v1", settingsServer("v1"));
+    servers.serve("settings-race-v2", settingsServer("v2"));
+    const request = workspaceRequest("settings-race-ws");
     await manager.getToolsForWorkspace(request);
-    const read = await manager.readSettings("settings-token-ws", "cad");
+    const read = await manager.readSettings("settings-race-ws", "cad");
     if (read === null) throw new Error("expected settings");
 
-    // The dialog stays open while the server's configuration is replaced.
-    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-token-v2") });
-    await manager.getToolsForWorkspace(request);
+    // The save's fresh read returns, then the server is replaced before the update is sent.
+    const realRead = manager.readSettings.bind(manager);
+    const readSpy = spyOn(manager, "readSettings").mockImplementationOnce(async (...args) => {
+      const fresh = await realRead(...args);
+      configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-race-v2") });
+      await manager.getToolsForWorkspace(request);
+      return fresh;
+    });
     const refused = await manager
-      .saveSettings("settings-token-ws", "cad", { units: "mm" }, read.instanceToken)
-      .catch((error: unknown) => error);
-    expect(refused).toBeInstanceOf(Error);
-    expect(String(refused)).toContain("Reopen");
+      .saveSettings("settings-race-ws", "cad", { units: "mm" }, read.instanceToken)
+      .catch((error: unknown) => String(error));
+    readSpy.mockRestore();
+    expect(refused).toContain("Reopen");
     expect(updates).toEqual([]);
+  });
+
+  test("settings: a read after pending saves waits for them (the dialog reopened during a save)", async () => {
+    const updateGate = Promise.withResolvers<void>();
+    const releaseUpdate = () => updateGate.resolve();
+    let units = "in";
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-reopen") });
+    servers.serve("settings-reopen", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: async (name) => {
+          if (name === "s.update") {
+            await updateGate.promise;
+            units = "mm";
+          }
+          return {
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: { units: { type: "string", title: "Units" } } },
+              values: { units },
+            },
+          };
+        },
+      },
+    });
+    const request = workspaceRequest("settings-reopen-ws");
+    await manager.getToolsForWorkspace(request);
+    const read = await manager.readSettings("settings-reopen-ws", "cad");
+    if (read === null) throw new Error("expected settings");
+    const save = manager.saveSettings(
+      "settings-reopen-ws",
+      "cad",
+      { units: "mm" },
+      read.instanceToken
+    );
+    // A plain read does not wait (the save's own reads use it).
+    expect((await manager.readSettings("settings-reopen-ws", "cad"))?.values).toEqual({
+      units: "in",
+    });
+    // A stalled save holds a read no longer than the read's deadline or abort, and the read
+    // gets only the time left (at least 1 ms).
+    expect(await manager.settingsSavesSettled("settings-reopen-ws", "cad", { timeoutMs: 1 })).toBe(
+      1
+    );
+    const aborted = new AbortController();
+    const abortedWait = manager.settingsSavesSettled("settings-reopen-ws", "cad", {
+      signal: aborted.signal,
+      timeoutMs: 60_000,
+    });
+    aborted.abort();
+    await abortedWait;
+    let settled = false;
+    const reopened = manager
+      .settingsSavesSettled("settings-reopen-ws", "cad", { timeoutMs: 60_000 })
+      .then(() => (settled = true));
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    releaseUpdate();
+    await save;
+    await reopened;
+    expect((await manager.readSettings("settings-reopen-ws", "cad"))?.values).toEqual({
+      units: "mm",
+    });
+    // No save in flight: nothing to wait for, and the whole deadline is left.
+    expect(
+      await manager.settingsSavesSettled("settings-reopen-ws", "cad", { timeoutMs: 60_000 })
+    ).toBe(60_000);
   });
 
   test("settings: a replaced server instance does not keep the old instance's cached values", async () => {
@@ -1883,6 +2051,30 @@ describe("MCPServerManager", () => {
     await manager.stopServers(request.workspaceId);
     await manager.getToolsForWorkspace(request);
     expect(await open("apps", "board")).toBe(true);
+  });
+
+  test("a server's tools/list_changed reaches the MCP Apps catalog listeners", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-list-changed");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-list-changed") });
+    servers.serve("apps-list-changed", { tools: { show: testTool() } });
+    const request = workspaceRequest("apps-list-changed");
+    await manager.getToolsForWorkspace(request);
+    const changed: string[] = [];
+    const unsubscribe = manager.onMcpAppCatalogChanged((workspaceId) => changed.push(workspaceId));
+
+    // The server announces a changed tool catalog on its connection.
+    const [config] = (mcpSdk.createMCPClient as unknown as ReturnType<typeof mock>).mock.calls.at(
+      -1
+    ) as [mcpSdk.MCPClientConfig];
+    config.onToolsListChanged?.();
+    unsubscribe();
+    config.onToolsListChanged?.();
+
+    expect(changed).toEqual([request.workspaceId]);
   });
 
   test("listing entry points refreshes the tool catalog first (tools/list_changed)", async () => {
@@ -4272,6 +4464,44 @@ describe("MCPServerManager", () => {
     expect(heldAtExec).toEqual([true]);
     expect(raced.stats.failedServerNames).toEqual(["fenced"]);
     expect(lockHeld).toBe(false);
+  });
+
+  test("starts plugin stdio servers with the minimal host environment (#6509)", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-host-env");
+    configService.listServers = mock(() =>
+      Promise.resolve({
+        user: stdioConfig("user-cmd"),
+        "plugin:instance:srv": {
+          ...stdioConfig("plugin-cmd"),
+          env: { PLUGIN_DATA: path.join(tmp.path, "data") },
+          plugin: {
+            pluginName: "demo",
+            serverName: "srv",
+            sourceScope: "global",
+            sourceLocation: "plugins/demo",
+          },
+        },
+      })
+    );
+    servers.serve("user-cmd", { tools: { ping: testTool() } });
+    servers.serve("plugin-cmd", { tools: { pong: testTool() } });
+    const hostEnvByCommand = new Map<string, unknown>();
+    const runtime = {
+      exec: (...args: Parameters<typeof servers.exec>) => {
+        hostEnvByCommand.set(args[0], args[1].hostEnv);
+        return servers.exec(...args);
+      },
+    } as unknown as Runtime;
+
+    const started = await manager.getToolsForWorkspace(
+      workspaceRequest("ws-plugin-host-env", { runtime })
+    );
+
+    expect(Object.keys(started.tools)).toHaveLength(2);
+    expect(Object.fromEntries(hostEnvByCommand)).toEqual({
+      "user-cmd": "inherit",
+      "plugin-cmd": "minimal",
+    });
   });
 
   /**
@@ -7161,6 +7391,41 @@ describe("MCPServerManager", () => {
       expect(text.error.length).toBeLessThanOrEqual(300);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  test("named Test connection launches a plugin stdio server with the minimal host environment (#6509)", async () => {
+    using tmp = new DisposableTempDir("mcp-named-test-host-env");
+    configService.listServers = mock(() =>
+      Promise.resolve({
+        "plugin:instance:srv": {
+          ...stdioConfig("plugin-cmd"),
+          env: { PLUGIN_DATA: path.join(tmp.path, "data") },
+          plugin: {
+            pluginName: "demo",
+            serverName: "srv",
+            sourceScope: "global",
+            sourceLocation: "plugins/demo",
+          },
+        },
+        user: stdioConfig("user-cmd"),
+      })
+    );
+    const exec = mock((_command: string, _options: ExecOptions) =>
+      Promise.reject(new Error("launch reached"))
+    );
+    const runtime = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      exec,
+    } as unknown as Runtime);
+    try {
+      await manager.test({ projectPath: tmp.path, name: "plugin:instance:srv" });
+      await manager.test({ projectPath: tmp.path, name: "user" });
+      expect(exec.mock.calls.map(([command, options]) => [command, options.hostEnv])).toEqual([
+        ["plugin-cmd", "minimal"],
+        ["user-cmd", "inherit"],
+      ]);
+    } finally {
+      runtime.mockRestore();
     }
   });
 
@@ -10147,7 +10412,7 @@ describe("prepareStdioLaunch", () => {
       command: "bunx -y some-server",
       disabled: false,
     });
-    expect(launch).toEqual({ command: "bunx -y some-server" });
+    expect(launch).toEqual({ command: "bunx -y some-server", hostEnv: "inherit" });
   });
 
   test("argv mode quotes command and each arg against shell injection", async () => {
@@ -10184,6 +10449,8 @@ describe("prepareStdioLaunch", () => {
     expect((await fs.stat(dataPath)).isDirectory()).toBe(true);
     expect(launch.cwd).toBe(tmp.path);
     expect(launch.env?.PLUGIN_DATA).toBe(dataPath);
+    // #6509: plugin servers start without the full host environment.
+    expect(launch.hostEnv).toBe("minimal");
     // Plugin-root cwd is shipped plugin content: never created by launch.
     expect(await fs.readdir(tmp.path)).toEqual(["plugin-data"]);
   });

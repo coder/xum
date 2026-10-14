@@ -137,6 +137,42 @@ describe("runMessageSendHooks", () => {
       entries: [{ pluginId: "healthy", text: "kept" }],
     });
   });
+
+  test("a consumer that removes earlier context and then throws leaves the context whole", async () => {
+    // Undoing by length alone left holes here, and the context cap then threw outside the runner.
+    const spine = new EventSpine();
+    spine.useBefore("message.send", (ctx) => {
+      ctx.additionalContext.push({ pluginId: "a", text: "one" }, { pluginId: "b", text: "two" });
+    });
+    spine.useBefore("message.send", (ctx) => {
+      // Codex PRRT_kwDOPxxmWM6sV4NP: a change in place is undone too.
+      ctx.additionalContext[1].text = "changed";
+      ctx.additionalContext.splice(0, 1, { pluginId: "broken", text: "replaced" });
+      throw new Error("broken plugin");
+    });
+
+    expect(await runMessageSendHooks(spine, "ws", input)).toEqual({
+      kind: "context",
+      entries: [
+        { pluginId: "a", text: "one" },
+        { pluginId: "b", text: "two" },
+      ],
+    });
+  });
+
+  test("the undo after a throw keeps a very long context array", async () => {
+    // Codex PRRT_kwDOPxxmWM6sV4NX: spreading a million entries into splice threw a RangeError.
+    const spine = new EventSpine();
+    spine.useBefore("message.send", (ctx) => {
+      for (let i = 0; i < 1_000_000; i++) ctx.additionalContext.push({ pluginId: "a", text: "x" });
+    });
+    spine.useBefore("message.send", () => {
+      throw new Error("broken plugin");
+    });
+
+    const outcome = await runMessageSendHooks(spine, "ws", input);
+    expect(outcome.kind).toBe("context");
+  });
 });
 
 describe("runTurnStopHooks", () => {

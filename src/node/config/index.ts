@@ -1350,9 +1350,6 @@ function writeConfigBytesSidecar(
   return { path: backupPath, reused: false };
 }
 
-/** The stat key an edit records when config.json does not exist (#5929). */
-const CONFIG_FILE_ABSENT = "absent";
-
 /** Location of config.json under a Xum root (also used by callers that must stat it without a Config). */
 export function configFilePath(rootDir: string): string {
   return path.join(rootDir, "config.json");
@@ -1538,8 +1535,8 @@ export class Config {
   /**
    * Cheap durable change signal for config.json: one stat, no parse. Any
    * backend's rewrite changes size/mtime (atomic replace also changes the
-   * inode), so a memo built against a previous stamp knows to rebuild —
-   * unlike onConfigChanged, which only fires for THIS process's edits. A
+   * inode), so a memo built against a previous stamp knows to rebuild, even
+   * before onConfigChanged's watcher delivers another backend's edit. A
    * missing/unreadable file yields a distinct stamp.
    */
   configFileStamp(): string {
@@ -1649,11 +1646,165 @@ export class Config {
       .map((workspace) => ({ ...workspace, bestOf: { ...workspace.bestOf } }));
   }
 
+  /**
+   * Fires after every config.json change: this process's own edits (notified right after the
+   * write), and rewrites by another Xum backend (seen through a watch on the config dir).
+   */
   onConfigChanged(callback: () => void): () => void {
     this.emitter.on("configChanged", callback);
+    this.ensureConfigFileWatcher();
     return () => {
       this.emitter.off("configChanged", callback);
+      this.closeUnusedConfigFileWatcher();
     };
+  }
+
+  /**
+   * Watches on the config dir (and on a symlinked config.json's target dir); open only while
+   * onConfigChanged has listeners.
+   */
+  private configFileWatchers: fs.FSWatcher[] = [];
+  /**
+   * The config.json stamp the last notification covers. Own saves set it before they
+   * notify, so the watcher's echo of an own save compares equal and stays silent. A stamp
+   * read after a foreign rename that raced an own save is adopted too, but the own save's
+   * notification then fires after that rename, so listeners still re-read the foreign bytes.
+   */
+  private notifiedConfigFileStamp = "missing";
+
+  /** The resolved config.json path the target-dir watch follows (see startConfigFileWatchers). */
+  private watchedConfigFileTarget: string | null = null;
+
+  /** Set by stopWatchingConfigFile: a disposed backend never watches again. */
+  private configFileWatchStopped = false;
+
+  /** Closes the config.json watches for good (service teardown). Own edits still notify. */
+  stopWatchingConfigFile(): void {
+    this.configFileWatchStopped = true;
+    this.closeConfigFileWatcher();
+  }
+
+  private ensureConfigFileWatcher(): void {
+    if (this.configFileWatchers.length > 0 || this.configFileWatchStopped) return;
+    // The baseline comes before the watch: a rewrite between the two then reads as a new
+    // stamp in the check below instead of being adopted silently.
+    const baseline = this.configFileStamp();
+    try {
+      // Another backend can create the root with its first save; a watch needs it to exist.
+      ensurePrivateDirSync(this.rootDir);
+    } catch (error) {
+      log.debug("Config dir not created for the config file watcher", { error });
+    }
+    this.startConfigFileWatchers();
+    // Without a watch, writeConfigFileTracked retries after this process's next save.
+    if (this.configFileWatchers.length === 0) return;
+    this.notifiedConfigFileStamp = baseline;
+    // Relink-aware: the link can also change between the realpath read and the root watch.
+    this.handleConfigFileEventWithRelink();
+  }
+
+  private startConfigFileWatchers(): void {
+    // Watch directories, not the file: atomic saves rename a temp file over config.json, and
+    // a file watch follows the old inode. writeFileAtomic renames over a symlink's target, so
+    // a symlinked config.json also needs its target's directory.
+    const realFile = this.realConfigFilePath();
+    this.watchedConfigFileTarget = realFile;
+    // Names per dir: a link to a sibling file shares the root dir with config.json itself.
+    const targets = new Map([[this.rootDir, new Set([path.basename(this.configFile)])]]);
+    const targetDir = path.dirname(realFile);
+    targets.set(targetDir, (targets.get(targetDir) ?? new Set()).add(path.basename(realFile)));
+    for (const [dir, fileNames] of targets) {
+      const watcher = this.watchConfigDir(dir, fileNames);
+      if (watcher) this.configFileWatchers.push(watcher);
+    }
+  }
+
+  /** A config.json event: re-resolve a replaced symlink first, so the watch follows it. */
+  private handleConfigFileEventWithRelink(): void {
+    if (this.realConfigFilePath() !== this.watchedConfigFileTarget) {
+      // Keep the notified stamp: the new target's bytes still count as a change below.
+      this.closeConfigFileWatcher();
+      this.startConfigFileWatchers();
+    }
+    this.handleConfigFileEvent();
+  }
+
+  private realConfigFilePath(): string {
+    try {
+      return fs.realpathSync(this.configFile);
+    } catch {
+      return this.configFile;
+    }
+  }
+
+  private watchConfigDir(dir: string, fileNames: ReadonlySet<string>): fs.FSWatcher | null {
+    let watcher: fs.FSWatcher;
+    try {
+      watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
+        // Some platforms omit the filename; treat that as a possible config.json change.
+        if (filename != null && !fileNames.has(filename)) return;
+        this.handleConfigFileEventWithRelink();
+      });
+    } catch (error) {
+      log.debug("Config file watcher not started", { dir, error });
+      return null;
+    }
+    watcher.on("error", (error) => {
+      log.debug("Config file watcher stopped", { dir, error });
+      if (this.configFileWatchers.includes(watcher)) this.closeConfigFileWatcher();
+    });
+    return watcher;
+  }
+
+  private closeConfigFileWatcher(): void {
+    for (const watcher of this.configFileWatchers) watcher.close();
+    this.configFileWatchers = [];
+  }
+
+  private closeUnusedConfigFileWatcher(): void {
+    if (this.emitter.listenerCount("configChanged") === 0) this.closeConfigFileWatcher();
+  }
+
+  /**
+   * writeFileAtomic for config.json that keeps the watcher from echoing this write.
+   * `beforeRename`: the edit's unchanged-file check (#6568). A refused or failed write records
+   * no stamp, so the watcher still announces the foreign bytes that made it refuse.
+   */
+  private async writeConfigFileTracked(
+    text: string,
+    beforeRename: (() => void) | undefined
+  ): Promise<void> {
+    // The watcher can see the rename before this write's stamp is recorded. It holds
+    // events until then, so the echo of this write compares equal and stays silent.
+    this.configSavesInFlight += 1;
+    try {
+      await writeFileAtomic(this.configFile, text, { encoding: "utf-8", beforeRename });
+      this.notifiedConfigFileStamp = this.configFileStamp();
+    } finally {
+      this.configSavesInFlight -= 1;
+      if (this.configSavesInFlight === 0 && this.configFileEventHeld) {
+        this.configFileEventHeld = false;
+        this.handleConfigFileEvent();
+      }
+    }
+    // The first save creates the root dir, which a listener's earlier watch attempt lacked.
+    if (this.emitter.listenerCount("configChanged") > 0) this.ensureConfigFileWatcher();
+  }
+
+  private configSavesInFlight = 0;
+  private configFileEventHeld = false;
+
+  private handleConfigFileEvent(): void {
+    if (this.configSavesInFlight > 0) {
+      this.configFileEventHeld = true;
+      return;
+    }
+    const stamp = this.configFileStamp();
+    // Xum replaces config.json by rename, so it never goes missing between writes. A deleted
+    // file is not an edit to announce: a listener reading it would see defaults.
+    if (stamp === "missing" || stamp === this.notifiedConfigFileStamp) return;
+    this.notifiedConfigFileStamp = stamp;
+    this.notifyConfigChanged();
   }
 
   private deferredChangeNotificationDepth = 0;
@@ -1959,9 +2110,12 @@ export class Config {
     aliasConflictBackupFailures.set(this.configFile, { message });
   }
 
-  /** The stat key an edit records before its fresh read: CONFIG_FILE_ABSENT when there is no file. */
+  /**
+   * The stamp an edit records before its fresh read: configFileStamp, the same stamp the
+   * cross-process watcher compares, so the two never disagree on what "changed" means.
+   */
   private readEditStatKey(): string {
-    return this.readConfigStatKey() ?? CONFIG_FILE_ABSENT;
+    return this.configFileStamp();
   }
 
   /** The beforeRename check for a save, or undefined when the save has no read to compare. */
@@ -1977,14 +2131,10 @@ export class Config {
    * size and mtime still passes; a content hash would cost a read per save.
    */
   private assertConfigFileUnchanged(expectedStatKey: string): void {
-    let currentKey = CONFIG_FILE_ABSENT;
-    try {
-      // Stat the configured path, not the writer's resolved target: a config.json symlink
-      // retargeted after the writer resolved it then shows up as a changed file.
-      currentKey = this.configStatKey(fs.statSync(this.configFile));
-    } catch (error) {
-      if (!isEnoentError(error)) throw error;
-    }
+    // configFileStamp stats the configured path, not the writer's resolved target: a
+    // config.json symlink retargeted after the writer resolved it then shows up as changed.
+    // Any stat failure reads as "missing", which refuses unless the edit also read none.
+    const currentKey = this.configFileStamp();
     if (currentKey !== expectedStatKey) {
       throw new Error(
         `config.json changed on disk while Xum was saving it (${this.configFile}). Your change was not saved. Retry the change.`
@@ -3085,11 +3235,7 @@ export class Config {
       // and the npm write-file-atomic package renamed that truncated file over
       // config.json, which then loaded as an empty registry (coder/xum#4197).
       yield* Effect.tryPromise({
-        try: async () =>
-          writeFileAtomic(self.configFile, text, {
-            encoding: "utf-8",
-            beforeRename: self.unchangedConfigCheck(expectedStatKey),
-          }),
+        try: () => self.writeConfigFileTracked(text, self.unchangedConfigCheck(expectedStatKey)),
         catch: (error) => error,
       });
       // A competing rename may already have replaced our write; only a fresh read can publish it.

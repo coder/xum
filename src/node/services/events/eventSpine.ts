@@ -199,27 +199,43 @@ interface Registration {
   preservesToolset: boolean;
 }
 
-/** Duck-check for contexts that support blocking (tool.execute, message.send). */
-/** Per isolated point: snapshot what a consumer may change, and return its undo. */
+/**
+ * Per isolated point: snapshot what a consumer may change, and return its undo. The arrays and
+ * their entries are copied: a consumer can also remove earlier entries or change them in place
+ * before it throws, and an undo by length alone would then leave holes for the later readers.
+ */
 const ISOLATED_CONSUMERS = {
   "message.send": (ctx: MessageSendContext) => {
     const { blocked } = ctx;
-    const contextLength = ctx.additionalContext.length;
+    const context = ctx.additionalContext.map((entry) => ({ ...entry }));
     return () => {
       ctx.blocked = blocked;
-      ctx.additionalContext.length = contextLength;
+      restoreArray(ctx.additionalContext, context);
     };
   },
   "turn.stop": (ctx: TurnStopContext) => {
     const { halted } = ctx;
-    const reasons = ctx.continueReasons.length;
+    const reasons = [...ctx.continueReasons];
     return () => {
       ctx.halted = halted;
-      ctx.continueReasons.length = reasons;
+      restoreArray(ctx.continueReasons, reasons);
     };
   },
 } satisfies Partial<{ [K in keyof WaterfallPointMap]: (ctx: WaterfallPointMap[K]) => () => void }>;
 
+/**
+ * Put `snapshot` back into `target` in place (the context holds the array). Index assignment,
+ * not `splice(0, n, ...snapshot)`: spreading a large array into call arguments can throw a
+ * RangeError in the very catch path that runs this.
+ */
+function restoreArray<T>(target: T[], snapshot: readonly T[]): void {
+  target.length = snapshot.length;
+  snapshot.forEach((item, index) => {
+    target[index] = item;
+  });
+}
+
+/** Duck-check for contexts that support blocking (tool.execute, message.send). */
 function isBlocked(ctx: unknown): boolean {
   return (
     typeof ctx === "object" &&
@@ -423,6 +439,11 @@ export class EventSpine {
    * paths skip context construction entirely when the pipeline is empty. */
   hasMiddleware(point: keyof WaterfallPointMap): boolean {
     return (this.waterfalls.get(point)?.length ?? 0) > 0;
+  }
+
+  /** hasMiddleware for one workspace: global middleware and middleware scoped to it. */
+  hasMiddlewareFor(point: keyof WaterfallPointMap, workspaceId: string): boolean {
+    return this.applicableRegistrations(point, workspaceId).length > 0;
   }
 
   /**
