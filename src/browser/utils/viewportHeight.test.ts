@@ -4,7 +4,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { installDom } from "../../../tests/ui/dom";
-import { APP_VIEWPORT_HEIGHT_PROPERTY, installViewportHeightSync } from "./viewportHeight";
+import {
+  APP_VIEWPORT_HEIGHT_PROPERTY,
+  installIosFocusZoomGuard,
+  installViewportHeightSync,
+} from "./viewportHeight";
 
 function setStandalone(value: boolean | undefined) {
   Object.defineProperty(globalThis.navigator, "standalone", {
@@ -97,5 +101,57 @@ describe("iOS standalone viewport", () => {
     setInnerHeight(852);
     window.dispatchEvent(new window.Event("resize"));
     expect(appViewportHeight()).toBe("");
+  });
+});
+
+describe("iOS focus-zoom guard", () => {
+  let cleanupDom: (() => void) | null = null;
+  const originalCss = globalThis.CSS;
+
+  /** Mirrors index.html's viewport meta and reports whether iOS's touch-callout probe passes. */
+  async function setup(isIosWebKit: boolean): Promise<HTMLMetaElement> {
+    const html = await readFile(path.join(process.cwd(), "index.html"), "utf8");
+    const source = new window.DOMParser().parseFromString(html, "text/html");
+    const content = source.querySelector('meta[name="viewport"]')?.getAttribute("content");
+    if (content == null) throw new Error("index.html has no viewport meta");
+
+    const meta = document.createElement("meta");
+    meta.name = "viewport";
+    meta.content = content;
+    document.head.appendChild(meta);
+    globalThis.CSS = {
+      supports: (property: string, value?: string) =>
+        isIosWebKit && property === "-webkit-touch-callout" && value === "none",
+    } as unknown as typeof CSS;
+    return meta;
+  }
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    globalThis.CSS = originalCss;
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("adds maximum-scale=1 once on iOS WebKit", async () => {
+    const meta = await setup(true);
+    const original = meta.content;
+
+    installIosFocusZoomGuard();
+    installIosFocusZoomGuard();
+
+    expect(meta.content).toBe(`${original}, maximum-scale=1`);
+  });
+
+  test("leaves the viewport zoomable elsewhere", async () => {
+    const meta = await setup(false);
+    const original = meta.content;
+
+    installIosFocusZoomGuard();
+
+    expect(meta.content).toBe(original);
   });
 });
