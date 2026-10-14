@@ -18,6 +18,7 @@ import type {
   BackgroundMonitorProbeResult,
   BackgroundOutputRead,
   ExecStream,
+  OutputReadOptions,
 } from "@/node/runtime/Runtime";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -373,7 +374,8 @@ interface SpawnRecordProbe {
   readOutputFrom(
     offset: number,
     fileSize: number,
-    maxBytes?: number
+    maxBytes?: number,
+    options?: OutputReadOptions
   ): Promise<BackgroundOutputRead>;
   /** Raw exit marker contents; "" when the marker does not exist yet (process still running). */
   readExitCodeMarker(): Promise<string>;
@@ -396,19 +398,22 @@ function outputReadLength(offset: number, fileSize: number, maxBytes?: number): 
  * each side apart gives the same text as decoding them together: before a byte that is not a
  * UTF-8 continuation byte (10xxxxxx), or after 3 continuation bytes (no character needs more).
  * So the pages of a log decode to exactly the text of the whole log, invalid bytes included.
+ *
+ * A bounded read that is not `final` also stops before an incomplete character at its end: the
+ * file size was sampled before the read, so a character the process is still writing would
+ * otherwise decode to U+FFFD and the cursor would move past its first bytes.
  */
 function decodeOutputBytes(
   bytes: Uint8Array,
   offset: number,
   fileSize: number,
-  maxBytes?: number
+  maxBytes?: number,
+  options?: OutputReadOptions
 ): BackgroundOutputRead {
-  let end = bytes.length;
-  if (maxBytes != null && bytes.length > maxBytes && offset + bytes.length < fileSize) {
-    end = maxBytes;
-    const limit = maxBytes + UTF8_CHARACTER_MARGIN_BYTES;
-    while (end < limit && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end++;
-  }
+  const end =
+    maxBytes == null
+      ? bytes.length
+      : boundedReadEnd(bytes, offset + bytes.length < fileSize, maxBytes, options);
   const newOffset = offset + end;
   return {
     // ignoreBOM: a read that starts at a U+FEFF must return it, not strip it as a byte-order mark.
@@ -418,18 +423,63 @@ function decodeOutputBytes(
   };
 }
 
+/** Where a bounded read stops in the bytes it loaded (see decodeOutputBytes). */
+function boundedReadEnd(
+  bytes: Uint8Array,
+  fileGoesOn: boolean,
+  maxBytes: number,
+  options?: OutputReadOptions
+): number {
+  const end = bytes.length > maxBytes && fileGoesOn ? safeCutAfter(bytes, maxBytes) : bytes.length;
+  // Only the last loaded byte can end a character that more bytes may complete: a cut before
+  // the last one sees the byte after it, so a sequence cut there is already known to be broken.
+  if (end < bytes.length || options?.final === true) return end;
+  return incompleteCharacterStart(bytes, end);
+}
+
+/** The first cut at or after `maxBytes` where the bytes decode the same apart as together. */
+function safeCutAfter(bytes: Uint8Array, maxBytes: number): number {
+  let end = maxBytes;
+  const limit = maxBytes + UTF8_CHARACTER_MARGIN_BYTES;
+  while (end < limit && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end++;
+  return end;
+}
+
+/**
+ * Where an incomplete UTF-8 character at the end of `bytes[0, end)` starts (`end` when there is
+ * none): a lead byte followed by fewer continuation bytes than it announces. Invalid leads
+ * (0xC0, 0xC1, 0xF5 and above) announce nothing, so they decode at once.
+ */
+function incompleteCharacterStart(bytes: Uint8Array, end: number): number {
+  for (let back = 1; back <= UTF8_CHARACTER_MARGIN_BYTES && back <= end; back++) {
+    const byte = bytes[end - back];
+    if ((byte & 0xc0) === 0x80) continue;
+    return utf8SequenceLength(byte) > back ? end - back : end;
+  }
+  return end;
+}
+
+/** The length a UTF-8 lead byte announces; 1 for ASCII and for bytes that cannot start one. */
+function utf8SequenceLength(byte: number): number {
+  if (byte >= 0xc2 && byte <= 0xdf) return 2;
+  if (byte >= 0xe0 && byte <= 0xef) return 3;
+  if (byte >= 0xf0 && byte <= 0xf4) return 4;
+  return 1;
+}
+
 /** Read output.log on the host from `offset` (see SpawnRecordProbe.readOutputFrom). */
 async function readLocalOutputFile(
   outputPath: string,
   offset: number,
   fileSize: number,
-  maxBytes?: number
+  maxBytes?: number,
+  options?: OutputReadOptions
 ): Promise<BackgroundOutputRead> {
   const fd = await fs.open(outputPath, "r");
   try {
     const buffer = Buffer.alloc(outputReadLength(offset, fileSize, maxBytes));
     const { bytesRead } = await fd.read(buffer, 0, buffer.length, offset);
-    return decodeOutputBytes(buffer.subarray(0, bytesRead), offset, fileSize, maxBytes);
+    return decodeOutputBytes(buffer.subarray(0, bytesRead), offset, fileSize, maxBytes, options);
   } finally {
     await fd.close();
   }
@@ -465,9 +515,10 @@ class LocalFsSpawnRecordProbe implements SpawnRecordProbe {
   readOutputFrom(
     offset: number,
     fileSize: number,
-    maxBytes?: number
+    maxBytes?: number,
+    options?: OutputReadOptions
   ): Promise<BackgroundOutputRead> {
-    return readLocalOutputFile(this.outputPath, offset, fileSize, maxBytes);
+    return readLocalOutputFile(this.outputPath, offset, fileSize, maxBytes, options);
   }
 
   async readExitCodeMarker(): Promise<string> {
@@ -481,6 +532,16 @@ class LocalFsSpawnRecordProbe implements SpawnRecordProbe {
       throw error;
     }
     return fs.readFile(this.exitCodePath, "utf-8");
+  }
+}
+
+/** What the remote read prints on stderr when tail fails (see readOutputFrom). */
+const TAIL_FAILED_MARKER = "xum-tail-exit:";
+
+/** Fail the remote read when tail failed before it sent all `length` bytes (see readOutputFrom). */
+function assertTailSucceeded(bytesRead: number, length: number, stderr: string): void {
+  if (bytesRead < length && stderr.includes(TAIL_FAILED_MARKER)) {
+    throw new Error(`readOutput tail probe failed (${stderr.trim()})`);
   }
 }
 
@@ -514,25 +575,33 @@ class ShellSpawnRecordProbe implements SpawnRecordProbe {
   async readOutputFrom(
     offset: number,
     fileSize: number,
-    maxBytes?: number
+    maxBytes?: number,
+    options?: OutputReadOptions
   ): Promise<BackgroundOutputRead> {
     const filePath = this.quotePath(this.outputPath);
     // Read from offset using tail -c (faster than dd bs=1); tail -c +N means "start at byte N"
-    // (1-indexed). head -c stops at fileSize, or after one page for a bounded read. The [ -r ]
-    // check keeps a missing file a probe failure: a pipeline exits with head's status.
+    // (1-indexed). head -c stops at fileSize, or after one page for a bounded read.
+    //
+    // A pipeline exits with head's status, so tail reports its own failure on stderr (its
+    // messages go to /dev/null). Plain POSIX sh, BusyBox ash included: no pipefail. A tail that
+    // failed only because head stopped early (SIGPIPE, exit 141, or EPIPE where SIGPIPE is
+    // ignored) still sent all `length` bytes, so only a short read with a tail failure fails.
     const length = outputReadLength(offset, fileSize, maxBytes);
-    const command = `[ -r ${filePath} ] && tail -c +${offset + 1} ${filePath} 2>/dev/null | head -c ${length}`;
+    const command =
+      `{ tail -c +${offset + 1} ${filePath} 2>/dev/null || echo "${TAIL_FAILED_MARKER}$?" >&2; }` +
+      ` | head -c ${length}`;
     const stream = await this.runtime.exec(command, { cwd: FALLBACK_CWD, timeout: 30 });
     await stream.stdin.close();
     // Raw bytes, not execBuffered's text: the offset counts bytes, and a decoded U+FFFD or a
     // stripped byte-order mark has a different size than the bytes it came from.
-    const [bytes, , exitCode] = await Promise.all([
+    const [bytes, stderr, exitCode] = await Promise.all([
       readStreamBytes(stream.stdout),
       readStreamBytes(stream.stderr),
       stream.exitCode,
     ]);
     this.assertProbeSucceeded("readOutput tail probe", exitCode);
-    return decodeOutputBytes(bytes, offset, fileSize, maxBytes);
+    assertTailSucceeded(bytes.length, length, stderr.toString("utf8"));
+    return decodeOutputBytes(bytes, offset, fileSize, maxBytes, options);
   }
 
   async readExitCodeMarker(): Promise<string> {
@@ -673,22 +742,30 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     }
   }
 
-  private async readOutputStrict(offset: number, maxBytes?: number): Promise<BackgroundOutputRead> {
+  private async readOutputStrict(
+    offset: number,
+    maxBytes?: number,
+    options?: OutputReadOptions
+  ): Promise<BackgroundOutputRead> {
     const fileSize = await this.probe.outputFileSize();
 
     if (offset >= fileSize) {
       return { content: "", newOffset: offset, fileSize: offset };
     }
 
-    return this.probe.readOutputFrom(offset, fileSize, maxBytes);
+    return this.probe.readOutputFrom(offset, fileSize, maxBytes, options);
   }
 
   /**
    * Read output from output.log at the given byte offset.
    */
-  async readOutput(offset: number, maxBytes?: number): Promise<BackgroundOutputRead> {
+  async readOutput(
+    offset: number,
+    maxBytes?: number,
+    options?: OutputReadOptions
+  ): Promise<BackgroundOutputRead> {
     try {
-      return await this.readOutputStrict(offset, maxBytes);
+      return await this.readOutputStrict(offset, maxBytes, options);
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.readOutput: Error: ${errorMsg(error)}`);
       return { content: "", newOffset: offset, fileSize: offset };
@@ -929,7 +1006,11 @@ class MigratedBackgroundHandle implements BackgroundHandle {
     }
   }
 
-  async readOutput(offset: number, maxBytes?: number): Promise<BackgroundOutputRead> {
+  async readOutput(
+    offset: number,
+    maxBytes?: number,
+    options?: OutputReadOptions
+  ): Promise<BackgroundOutputRead> {
     try {
       const fileSize = await this.getOutputFileSize();
 
@@ -937,7 +1018,7 @@ class MigratedBackgroundHandle implements BackgroundHandle {
         return { content: "", newOffset: offset, fileSize: offset };
       }
 
-      return await readLocalOutputFile(this.outputPath, offset, fileSize, maxBytes);
+      return await readLocalOutputFile(this.outputPath, offset, fileSize, maxBytes, options);
     } catch (error) {
       log.debug(`MigratedBackgroundHandle.readOutput: ${errorMsg(error)}`);
       return { content: "", newOffset: offset, fileSize: offset };

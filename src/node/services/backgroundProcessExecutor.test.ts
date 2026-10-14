@@ -12,14 +12,24 @@ import { BG_EXIT_CODE_FILENAME, spawnProcess } from "./backgroundProcessExecutor
  * Delegates to a real LocalRuntime but is NOT an instanceof LocalBaseRuntime, so
  * spawnProcess treats it like a remote runtime. With `throwOnSpawn`, its exec throws for the
  * spawn command itself, simulating a transport-level (SSH/Coder channel) error after dispatch.
+ * `beforeTail.script` runs right before each `tail -c` read (after the size probe), with `{}`
+ * replaced by the quoted output.log path.
  */
-function createRemoteLikeRuntime(base: LocalRuntime, throwOnSpawn = false): LocalRuntime {
+function createRemoteLikeRuntime(
+  base: LocalRuntime,
+  throwOnSpawn = false,
+  beforeTail?: { script?: string }
+): LocalRuntime {
   return new Proxy({} as LocalRuntime, {
     get(_target, prop) {
       if (prop === "exec") {
         return (command: string, opts: never) => {
           if (throwOnSpawn && command.includes("output.log")) {
             throw new Error("SSH channel error after dispatch");
+          }
+          const tailPath = /tail -c \+\d+ ('[^']+')/.exec(command)?.[1];
+          if (beforeTail?.script != null && tailPath != null) {
+            return base.exec(`${beforeTail.script.replaceAll("{}", tailPath)}; ${command}`, opts);
           }
           return base.exec(command, opts);
         };
@@ -391,11 +401,15 @@ describe("spawnProcess", () => {
     );
     const decode = (bytes: Buffer) => new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);
 
-    async function spawnWithLog(kind: "local" | "remote", log: Buffer) {
+    async function spawnWithLog(
+      kind: "local" | "remote",
+      log: Buffer,
+      beforeTail?: { script?: string }
+    ) {
       const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-bounded-read-"));
       cleanupDirs.push(hostDir);
       const base = new LocalRuntime(hostDir);
-      const runtime = kind === "local" ? base : createRemoteLikeRuntime(base);
+      const runtime = kind === "local" ? base : createRemoteLikeRuntime(base, false, beforeTail);
       const result = await spawnProcess(runtime, "sleep 60", {
         cwd: hostDir,
         workspaceId: `bounded-read-${kind}-${Date.now()}`,
@@ -404,8 +418,9 @@ describe("spawnProcess", () => {
       if (!result.success) throw new Error(result.error);
       handles.push(result.handle);
       cleanupDirs.push(result.outputDir);
-      await fs.appendFile(path.join(result.outputDir, "output.log"), log);
-      return result.handle;
+      const outputPath = path.join(result.outputDir, "output.log");
+      await fs.appendFile(outputPath, log);
+      return Object.assign(result.handle, { outputPath });
     }
 
     it.each(["local", "remote"] as const)(
@@ -437,5 +452,53 @@ describe("spawnProcess", () => {
       expect(read.content).toBe("\uFEFFb\n");
       expect(read.newOffset).toBe(log.length);
     });
+
+    // The read pipes tail into head, and a pipeline exits with head's status. A log that turns
+    // unreadable after the size probe (here a directory takes its place) must still fail the
+    // strict read, as plain tail did, instead of reading as an empty page.
+    it("fails the strict remote read when tail cannot read output.log", async () => {
+      const beforeTail: { script?: string } = {};
+      const handle = await spawnWithLog("remote", Buffer.from("hello\n"), beforeTail);
+      beforeTail.script = "rm -f {} && mkdir {}";
+      const read = await handle.readOutputForMonitor!(0);
+      expect(read.success).toBe(false);
+    });
+
+    // head stops after one page, so tail dies of SIGPIPE on every capped read of a large log.
+    it("keeps a capped remote read that ends tail with SIGPIPE", async () => {
+      const handle = await spawnWithLog("remote", Buffer.alloc(1024 * 1024, "x"));
+      const read = await handle.readOutput(0, 1_000);
+      expect(read.newOffset).toBe(1_000);
+      expect(read.content).toBe("x".repeat(1_000));
+    });
+
+    // A running process can write one character in two writes. The read that lands between them
+    // must leave the first bytes for the next read instead of decoding them to U+FFFD.
+    it.each(["local", "remote"] as const)(
+      "rebuilds a %s character split across two writes at the end of the log",
+      async (kind) => {
+        const handle = await spawnWithLog(kind, Buffer.from([0x61, 0x62, 0xe2, 0x82]));
+        const first = await handle.readOutput(0, 1_000);
+        expect(first.newOffset).toBe(2);
+        await fs.appendFile(handle.outputPath, Buffer.from([0xac, 0x0a]));
+        const second = await handle.readOutput(first.newOffset, 1_000);
+        expect(first.content + second.content).toBe("ab€\n");
+        expect(second.newOffset).toBe(6);
+      }
+    );
+
+    // Output that really ends in a truncated character settles on the final read (the drain
+    // after exit), so the drain reaches the end of the file.
+    it.each(["local", "remote"] as const)(
+      "takes a %s truncated character on the final read",
+      async (kind) => {
+        const handle = await spawnWithLog(kind, Buffer.from([0x61, 0xe2, 0x82]));
+        const held = await handle.readOutput(1, 1_000);
+        expect(held.newOffset).toBe(1);
+        const final = await handle.readOutput(1, 1_000, { final: true });
+        expect(final.content).toBe("\uFFFD");
+        expect(final.newOffset).toBe(final.fileSize);
+      }
+    );
   });
 });
