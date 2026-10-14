@@ -4,7 +4,9 @@
  * mock AI) that reads the renderer's `xum:app-shell-ready` mark startTime. Pairs run ABBA (see
  * launchPlan) so order effects and drift hit both arms alike. Each launch gets a fresh copy of the
  * seeded root at one fixed path: config.json holds absolute paths, and state one launch writes must
- * not speed up the next. Each tree runs its own Electron, so an Electron bump is measured too.
+ * not speed up the next. The seed's config is already migrated (see desktopColdStartSeed.ts), so a
+ * launch measures a start with a current config, not the one-time migration. Each tree runs its own
+ * Electron, so an Electron bump is measured too.
  * Runs under Node (tsx), not Bun: under Bun 1.3.12 Playwright never finishes the websocket
  * upgrade to Electron's debugger, so every launch hangs (`bun x playwright test` uses Node too).
  */
@@ -18,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { _electron as electron } from "playwright";
 import { setXumE2EEnv } from "../../tests/e2e/env";
-import { prepareDemoProject } from "../../tests/e2e/utils/demoProject";
+import { prepareColdStartSeed } from "./desktopColdStartSeed";
 import { launchPlan, pairedRelativeDelta, type PlannedLaunch } from "./desktopColdStartStats";
 
 const MARK = "xum:app-shell-ready";
@@ -107,7 +109,7 @@ async function main(): Promise<void> {
     }
   };
   const launches: Launch[] = [];
-  prepareDemoProject(root);
+  await prepareColdStartSeed(root);
   fs.cpSync(root, seed, { recursive: true });
   for (const [index, { arm, pair }] of launchPlan(pairs, warmups).entries()) {
     fs.rmSync(root, { recursive: true, force: true });
