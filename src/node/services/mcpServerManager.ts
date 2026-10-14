@@ -472,12 +472,12 @@ export function wrapMCPTools(
         let sanitizedArgs: unknown;
         let argsSanitized = false;
         let appResultRecorded = false;
+        // Hoisted so the failure path can tell an interrupted call from a failed one.
+        const abortSignal =
+          context && typeof context === "object" && "abortSignal" in context
+            ? (context as { abortSignal?: AbortSignal }).abortSignal
+            : undefined;
         try {
-          const abortSignal =
-            context && typeof context === "object" && "abortSignal" in context
-              ? (context as { abortSignal?: AbortSignal }).abortSignal
-              : undefined;
-
           sanitizedArgs = sanitizeMCPToolArgs(args, rawInputSchema(tool.inputSchema));
           argsSanitized = true;
           const result: unknown = await runMCPToolWithDeadline(
@@ -563,6 +563,8 @@ export function wrapMCPTools(
               resourceUri: appResourceUri,
               arguments: sanitizedArgs,
               result: null,
+              // A deadline is a failure, not a user interrupt: only the call's abort signal counts.
+              outcome: abortSignal?.aborted === true ? "interrupted" : "failed",
             });
           }
           if (shouldRecycleClientAfterToolError(error)) {

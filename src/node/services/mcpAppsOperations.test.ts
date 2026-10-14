@@ -596,6 +596,41 @@ describe("getMcpAppViewRecords", () => {
     expect(result.data[1].view).toBeNull();
   });
 
+  test("returns how a call without a result ended, also after a backend restart", async () => {
+    using tmp = new DisposableTempDir("mcp-app-view-record-outcome");
+    const sessionDir = (id: string) => path.join(tmp.path, id);
+    const base = {
+      serverName: "charts",
+      toolName: "show_chart",
+      resourceUri: "ui://charts/view",
+      arguments: {},
+      result: null,
+    };
+    const writer = new McpAppResultStore(sessionDir);
+    await writer.record("ws", { ...base, toolCallId: "failed", outcome: "failed" });
+    await writer.record("ws", { ...base, toolCallId: "interrupted", outcome: "interrupted" });
+    // A record written before outcomes existed reads as before.
+    await writer.record("ws", { ...base, toolCallId: "older" });
+    const store = new McpAppResultStore(sessionDir);
+    const ctx = {
+      experimentsService: { isExperimentEnabled: () => true },
+      mcpServerManager: {
+        getMcpAppResult: (workspaceId: string, toolCallId: string) =>
+          store.get(workspaceId, toolCallId),
+      },
+    } as unknown as McpAppsContext;
+    const result = await getMcpAppViewRecords(ctx, {
+      workspaceId: "ws",
+      toolCallIds: ["failed", "interrupted", "older"],
+    });
+    if (!result.success) throw new Error(result.error);
+    expect(result.data.map(({ view }) => view?.outcome)).toEqual([
+      "failed",
+      "interrupted",
+      undefined,
+    ]);
+  });
+
   test("refuses while the artifacts experiment is off", async () => {
     const { ctx } = context(RECORD);
     const off = {
