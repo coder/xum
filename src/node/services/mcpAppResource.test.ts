@@ -50,6 +50,7 @@ describe("extractMcpAppResource CSP", () => {
       { connectDomains: "https://api.example.com" },
       { connectDomains: hosts("ui", 33) },
       "https://api.example.com",
+      null,
     ]) {
       expect(read({ ui: { csp }, "openai/widgetCSP": alias }).csp).toEqual({});
     }

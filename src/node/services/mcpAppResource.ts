@@ -96,7 +96,8 @@ export function extractMcpAppResource(result: unknown, uri: string): McpAppResou
     );
   }
   const ui = isRecord(content._meta) && isRecord(content._meta.ui) ? content._meta.ui : {};
-  const csp = McpAppCspDeclarationSchema.safeParse(ui.csp ?? {});
+  // Only an absent ui.csp means "not declared": a present null is a malformed declaration.
+  const csp = McpAppCspDeclarationSchema.safeParse(ui.csp === undefined ? {} : ui.csp);
   const alias = McpAppWidgetCspSchema.safeParse(
     (isRecord(content._meta) ? content._meta["openai/widgetCSP"] : undefined) ?? {}
   );
