@@ -68,6 +68,8 @@ function createClient(service: DraftService) {
     updates: 0,
     /** Snapshots the store finished handling (it asks for the next event only after that). */
     snapshotsHandled: 0,
+    /** Change events (not snapshots) the store finished handling. */
+    changesHandled: 0,
   };
   const drafts = {
     list: () => service.list(),
@@ -142,6 +144,7 @@ function createClient(service: DraftService) {
             if (next) {
               yield next;
               if (next.type === "snapshot") control.snapshotsHandled++;
+              else control.changesHandled++;
               continue;
             }
             await new Promise<void>((resolve) => {
@@ -703,10 +706,10 @@ describe("DraftStore", () => {
     await waitFor(() => control.updates > 0);
     // The draft is deleted while its write is in flight, so the delete waits for that write.
     const deleted = store.deleteDraft(scope);
+    const changesBefore = control.changesHandled;
     releaseUpdate();
-    // The write lands, and its change event reaches the store before the write's reply.
-    await waitFor(async () => (await service.get(scope)).text === "typed");
-    await sleep(50);
+    // The write lands, and the store handles its change event before the write's reply.
+    await waitFor(() => control.changesHandled > changesBefore);
     releaseReply();
     await written;
     await deleted;

@@ -601,7 +601,8 @@ export class DraftStore {
    * Deletes still waiting for a write or list put of their scope to land (count per scope key).
    * The backend pushes that write's change event, and it can arrive before the write's reply:
    * applied, it would recreate the dropped entry, and the delete would take it for a new edit and
-   * give up, leaving the draft file behind (#6724). Server state for such a key is ignored.
+   * give up, leaving the draft file behind (#6724). Server state for such a key must not recreate
+   * its entry. A local edit during the wait recreates it, and then server state applies as usual.
    */
   private readonly deletesAwaitingWrites = new Map<string, number>();
   /**
@@ -1621,6 +1622,11 @@ export class DraftStore {
     return entry;
   }
 
+  /** True while a delete of `key` waits and no local edit has recreated its entry. */
+  private isDeletedWhileWaiting(key: string): boolean {
+    return this.deletesAwaitingWrites.has(key) && !this.entries.has(key);
+  }
+
   private getOrCreateEntry(scope: DraftStoreScope): Entry {
     const key = draftStoreScopeKey(scope);
     const existing = this.entries.get(key);
@@ -1808,9 +1814,8 @@ export class DraftStore {
     for (const summary of drafts) {
       const summaryKey = draftStoreScopeKey(summary.scope);
       if (this.pendingDeletes.has(summaryKey)) continue;
+      if (this.isDeletedWhileWaiting(summaryKey)) continue;
       seen.add(summaryKey);
-      // An entry here is a local edit made while the delete waits: leave it alone.
-      if (this.deletesAwaitingWrites.has(summaryKey)) continue;
       const entry = this.getOrCreateEntry(summary.scope);
       // Each subscription restarts the revision sequence, so a restarted backend is never ignored.
       entry.revision = summary.revision;
@@ -1826,7 +1831,7 @@ export class DraftStore {
 
   private applyEvent(event: Extract<DraftEvent, { type: "changed" | "deleted" }>): void {
     const key = draftScopeKey(event.scope);
-    if (this.pendingDeletes.has(key) || this.deletesAwaitingWrites.has(key)) return;
+    if (this.pendingDeletes.has(key) || this.isDeletedWhileWaiting(key)) return;
     const existing = this.entries.get(key);
     // Pushes that trail a newer write reply (or the snapshot) are stale.
     const stale = existing !== undefined && event.revision <= existing.revision;
