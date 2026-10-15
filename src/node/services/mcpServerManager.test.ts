@@ -2195,10 +2195,7 @@ describe("MCPServerManager", () => {
     // The older open must not report the newer (unstored) result as its own and mount a stale
     // record under the shared key.
     calls[0].resolve({ content: [{ type: "text", text: "older" }] });
-    expect(await Promise.all(opens)).toEqual([
-      expect.stringContaining("could not keep"),
-      expect.stringContaining("could not keep"),
-    ]);
+    for (const outcome of await Promise.all(opens)) expect(outcome).toContain("could not keep");
     expect(recordSpy).toHaveBeenCalledTimes(1);
     recordSpy.mockRestore();
   });
