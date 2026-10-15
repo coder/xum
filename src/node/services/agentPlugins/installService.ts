@@ -2744,6 +2744,11 @@ export class AgentPluginInstallService {
         skills.push(skill);
       }
     }
+    // The install preview and the component picker list every directive command, and install
+    // records consent for them, so the list is bounded like a review and never cut (#6766).
+    assertReviewFits(
+      skills.map((skill) => ({ summary: skill.name, after: (skill.directives ?? []).join("\n") }))
+    );
     return skills;
   }
 

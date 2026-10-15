@@ -49,11 +49,6 @@ export const SKILL_DYNAMIC_OUTPUT_CAP_BYTES = 16 * 1024;
  */
 const SKILL_DYNAMIC_DIRECTIVE_RE = /^\s*!`([^`]+)`\s*$/;
 
-/** Whether `line` is a whole-line !`command` directive (it would run when injection is on). */
-export function isSkillDynamicDirectiveLine(line: string): boolean {
-  return SKILL_DYNAMIC_DIRECTIVE_RE.test(line);
-}
-
 /** The command of a directive line, or undefined for any other line. */
 function directiveCommand(line: string): string | undefined {
   return SKILL_DYNAMIC_DIRECTIVE_RE.exec(line)?.[1];
@@ -72,10 +67,40 @@ function directiveCommand(line: string): string | undefined {
  */
 export function skillDynamicDirectiveCommands(body: string): string[] {
   return body.split("\n").flatMap((line) => {
-    const command =
-      directiveCommand(line) ?? directiveCommand(substituteSkillArguments(line, "").body);
+    const command = rawDirectiveCommand(line);
     return command === undefined ? [] : [command];
   });
+}
+
+/** The command of a raw body line, as the fingerprint counts it (see above). */
+function rawDirectiveCommand(line: string): string | undefined {
+  return directiveCommand(line) ?? directiveCommand(substituteSkillArguments(line, "").body);
+}
+
+/**
+ * Substitute a raw skill body line by line for injectSkillDynamicContext, and list the output
+ * lines that may run (#6766). Only a line the fingerprint counts as a directive may run, and only
+ * while it stays one directive line: a slash argument with a newline must not create a directive
+ * that no plugin review showed. Other lines get `substituteText` too (directory placeholders);
+ * runnable directives do not, because they read those values from the environment.
+ */
+export function substituteSkillBodyForDirectives(args: {
+  rawBody: string;
+  substituteArguments: (line: string) => string;
+  substituteText: (text: string) => string;
+}): { body: string; runnableLines: ReadonlySet<number> } {
+  const outputLines: string[] = [];
+  const runnableLines = new Set<number>();
+  for (const rawLine of args.rawBody.split("\n")) {
+    const line = args.substituteArguments(rawLine);
+    if (rawDirectiveCommand(rawLine) !== undefined && directiveCommand(line) !== undefined) {
+      runnableLines.add(outputLines.length);
+      outputLines.push(line);
+    } else {
+      outputLines.push(...args.substituteText(line).split("\n"));
+    }
+  }
+  return { body: outputLines.join("\n"), runnableLines };
 }
 
 export interface SkillDynamicExecResult {
@@ -159,6 +184,11 @@ export async function injectSkillDynamicContext(args: {
   body: string;
   execute: SkillDynamicExecute;
   timeoutMs?: number;
+  /**
+   * Indexes of the lines that may run (substituteSkillBodyForDirectives). Other directive-like
+   * lines stay text. Without it every directive line may run (a body with nothing substituted).
+   */
+  runnableLines?: ReadonlySet<number>;
 }): Promise<{ body: string; injected: boolean }> {
   assert(typeof args.body === "string", "injectSkillDynamicContext requires a string body");
   assert(
@@ -173,8 +203,11 @@ export async function injectSkillDynamicContext(args: {
   let executedCount = 0;
   let injected = false;
 
-  for (const line of lines) {
-    const command = directiveCommand(line);
+  for (const [index, line] of lines.entries()) {
+    const command =
+      args.runnableLines === undefined || args.runnableLines.has(index)
+        ? directiveCommand(line)
+        : undefined;
     if (command === undefined) {
       outputLines.push(line);
       continue;

@@ -4361,6 +4361,20 @@ describe("AgentPluginInstallService", () => {
       const greet = preview.skills.find((skill) => skill.name === "greet");
       expect(greet?.directives).toEqual(["rm -rf \\u{200B}/tmp/x"]);
     });
+
+    test("an install preview with too much directive text is refused, not truncated (#6766)", async () => {
+      // Install records consent for every command the preview lists, so it cannot cut the list.
+      const command = "x".repeat(600_000);
+      for (const name of ["one", "two"]) {
+        await fsPromises.mkdir(path.join(remoteDir, "skills", name), { recursive: true });
+        await fsPromises.writeFile(
+          path.join(remoteDir, "skills", name, "SKILL.md"),
+          `---\nname: ${name}\ndescription: Big\n---\n\n!\`${command}\`\n`
+        );
+      }
+      await commitAll(remoteDir, "skills with long directives");
+      await expect(service.preview({ input: remoteDir })).rejects.toThrow(/too large to show/);
+    });
   });
 
   test("update accepts a skill paths reordering as capability-neutral", async () => {
