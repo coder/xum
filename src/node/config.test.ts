@@ -1229,6 +1229,24 @@ describe("Config", () => {
       expect(metadata.map((meta) => meta.id)).toEqual(["stable-1"]);
     });
 
+    // A POSIX path keeps today's basename: PlatformPaths splits only on "/" off Windows, and a
+    // trailing separator still gives "" as before (#6485 changes only the backslash case).
+    it("keeps the POSIX basename lookup unchanged", () => {
+      Object.defineProperty(globalThis, "navigator", {
+        value: { platform: "Linux x86_64" },
+        configurable: true,
+      });
+      const posixCheckout = "/home/u/.xum/src/repo/feature-y";
+      const dir = path.join(config.sessionsDir, "feature-y");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "metadata.json"), JSON.stringify({ id: "stable-2" }));
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ projects: [["/home/u/repo", { workspaces: [{ path: posixCheckout }] }]] })
+      );
+      expect(config.findWorkspace("stable-2")?.workspacePath).toBe(posixCheckout);
+    });
+
     it("finds the workspace by the stable id from the basename metadata", () => {
       expect(config.findWorkspace("stable-1")?.workspacePath).toBe(checkout);
     });
