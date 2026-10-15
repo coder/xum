@@ -18,6 +18,7 @@ import type {
   MCPSettingsLayoutItem,
   MCPSettingsToolAction,
 } from "@/common/utils/mcpSettings";
+import type { SettingsToolRunResult } from "./settingsToolRuns";
 
 interface MCPSettingsToolActionRowProps {
   workspaceId: string;
@@ -27,8 +28,15 @@ interface MCPSettingsToolActionRowProps {
   item: Extract<MCPSettingsLayoutItem, { kind: "tool" }>;
   /** A save or refresh of the section is in flight. */
   disabled: boolean;
-  /** The run starts; the returned callback ends it (the section and dialog wait for it). */
-  beginRun: () => () => void;
+  /** A run of this tool is in flight (it can predate this mount: settingsToolRuns). */
+  running: boolean;
+  /** The last run's text result, or null. */
+  result: SettingsToolRunResult | null;
+  /**
+   * The run starts; the returned callback ends it with the result to show (the section and
+   * dialog wait for it).
+   */
+  beginRun: () => (result: SettingsToolRunResult | null) => void;
 }
 
 /**
@@ -53,13 +61,9 @@ export function MCPSettingsToolActionRow(props: MCPSettingsToolActionRowProps) {
   return <RunnableToolRow {...props} action={action} />;
 }
 
-interface ToolRunResult {
-  text: string;
-  isError: boolean;
-}
-
 function RunnableToolRow(props: MCPSettingsToolActionRowProps & { action: MCPSettingsToolAction }) {
-  const { running, result, app, closeApp, run } = useToolActionRun(props);
+  const { app, closeApp, run } = useToolActionRun(props);
+  const { running, result } = props;
   const label = props.action.title;
   const verb = props.action.opensApp ? "Open" : "Run";
   return (
@@ -92,7 +96,7 @@ function RunnableToolRow(props: MCPSettingsToolActionRowProps & { action: MCPSet
 }
 
 /** A run's text result (or error) under its row. */
-function ToolRunResultText(props: { result: ToolRunResult }) {
+function ToolRunResultText(props: { result: SettingsToolRunResult }) {
   return (
     <div
       role="status"
@@ -115,6 +119,9 @@ function SettingsAppModal(props: {
   const { view } = props.app;
   // The frame's close sequence: Escape and outside clicks give the view its teardown too.
   const closeFrame = useRef<(() => void) | null>(null);
+  // A failed view read (getView) offers Reload: it mounts the stored record again. Open would
+  // call the tool again.
+  const [reloads, setReloads] = useState(0);
   const ref: McpAppViewRef = {
     toolCallId: view.viewKey,
     serverName: view.serverName,
@@ -151,10 +158,11 @@ function SettingsAppModal(props: {
         </VisuallyHidden>
         <McpAppFrame
           // Each open calls the tool again: a new result is a new document.
-          key={props.app.openCount}
+          key={`${props.app.openCount}:${reloads}`}
           workspaceId={props.workspaceId}
           view={ref}
           variant="panel"
+          onReload={() => setReloads(reloads + 1)}
           onClose={props.onClose}
           closeRef={closeFrame}
         />
@@ -163,14 +171,15 @@ function SettingsAppModal(props: {
   );
 }
 
-/** Confirm (a tool that can write), run or open, and keep the latest result or app. */
+/**
+ * Confirm (a tool that can write), run or open, and keep the latest app. The result goes to the
+ * run's end callback (settingsToolRuns keeps it).
+ */
 function useToolActionRun(
   props: MCPSettingsToolActionRowProps & { action: MCPSettingsToolAction }
 ) {
   const { api } = useAPI();
   const { confirm } = useConfirmDialog();
-  const [running, setRunning] = useState(false);
-  const [result, setResult] = useState<ToolRunResult | null>(null);
   const [app, setApp] = useState<{ view: MCPSettingsAppView; openCount: number } | null>(null);
   const [openCount, setOpenCount] = useState(0);
   const { readOnly, title, opensApp } = props.action;
@@ -186,9 +195,8 @@ function useToolActionRun(
         confirmLabel: "Run",
       }));
     if (!confirmed) return;
-    setRunning(true);
-    setResult(null);
     const endRun = props.beginRun();
+    let result: SettingsToolRunResult | null = null;
     const request = {
       workspaceId: props.workspaceId,
       serverName: props.serverName,
@@ -202,17 +210,16 @@ function useToolActionRun(
         if (response.success) {
           setApp({ view: response.data, openCount: openCount + 1 });
           setOpenCount(openCount + 1);
-        } else setResult({ text: response.error, isError: true });
+        } else result = { text: response.error, isError: true };
       } else {
         const response = await api.mcp.settings.runTool(request);
-        setResult(response.success ? response.data : { text: response.error, isError: true });
+        result = response.success ? response.data : { text: response.error, isError: true };
       }
     } catch (caught) {
-      setResult({ text: getErrorMessage(caught), isError: true });
+      result = { text: getErrorMessage(caught), isError: true };
     } finally {
-      setRunning(false);
-      endRun();
+      endRun(result);
     }
   };
-  return { running, result, app, closeApp: () => setApp(null), run };
+  return { app, closeApp: () => setApp(null), run };
 }
