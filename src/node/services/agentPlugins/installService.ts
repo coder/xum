@@ -98,6 +98,7 @@ import {
   bumpContainerMutationEpoch,
   MUTATION_LOCK_FILE,
   containerHasPendingSignOuts,
+  pendingSignOutsRecordState,
   isJournalName,
   JOURNAL_PREFIXES,
   MUTATION_EPOCH_FILE,
@@ -209,6 +210,27 @@ const PENDING_SIGN_OUT_RETRY_MS = 30_000;
 const LS_REMOTE_TIMEOUT_MS = 30_000;
 const CLONE_TIMEOUT_MS = 120_000;
 
+/** Milliseconds on a monotonic clock (wall-clock changes do not move it). */
+function monotonicNow(): number {
+  return performance.now();
+}
+
+/**
+ * Whether logout() succeeded before the pass deadline. A late or hung logout counts as failed:
+ * the URL stays in the record, and a later pass retries it (logout is idempotent).
+ */
+async function signedOutBefore(
+  oauth: Pick<McpOauthService, "logout">,
+  serverUrl: string,
+  deadline: number
+): Promise<boolean> {
+  const timeoutMs = Math.max(0, deadline - monotonicNow());
+  const settled = await raceWithAbortAndTimeout(oauth.logout({ serverUrl }), { timeoutMs });
+  if (settled.kind === "ok") return settled.value.success;
+  log.warn("A pending plugin MCP sign-out timed out", { timeoutMs });
+  return false;
+}
+
 /** Waits for the startup sign-out pass at most timeoutMs, then lets discovery go on. */
 async function waitForPendingSignOuts(
   pass: Promise<void>,
@@ -216,6 +238,20 @@ async function waitForPendingSignOuts(
 ): Promise<void> {
   const settled = await raceWithAbortAndTimeout(pass, { timeoutMs });
   if (settled.kind === "timeout") log.warn("Pending plugin sign-outs timed out", { timeoutMs });
+}
+
+/** A component review that a pending or an unreadable sign-out record closed (#6627). */
+function pendingSignOutError(
+  record: { kind: "present" } | { kind: "unreadable"; code: string },
+  file: string
+): Error {
+  if (record.kind === "unreadable")
+    return new Error(
+      `Xum cannot read the pending plugin sign-out record (${record.code}). Plugin components are unavailable until Xum can read it: ${file}.`
+    );
+  return new Error(
+    "A plugin MCP sign-out from an update has not finished yet. Plugin components are unavailable until Xum finishes it; check the log for the reason."
+  );
 }
 
 function componentsChangedError(): Error {
@@ -3834,10 +3870,10 @@ export class AgentPluginInstallService {
    * file changed, and a refresh fails the same way until the sign-out finishes (#6627).
    */
   private async closedComponentReviewError(): Promise<Error> {
-    if (!(await this.hasPendingSignOuts())) return componentsChangedError();
-    return new Error(
-      "A plugin MCP sign-out from an update has not finished yet. Plugin components are unavailable until Xum finishes it; check the log for the reason."
-    );
+    const record = await pendingSignOutsRecordState(this.containerDir);
+    return record.kind === "absent"
+      ? componentsChangedError()
+      : pendingSignOutError(record, shortenHome(this.pendingSignOutsFile));
   }
 
   async setComponents(args: {
@@ -3916,6 +3952,11 @@ export class AgentPluginInstallService {
     }
   }
 
+  /** The bound of startup crash-recovery waits and of each sign-out pass. */
+  private get recoveryTimeoutMs(): number {
+    return this.deps.reconciliationTimeoutMs ?? JOURNAL_RECONCILIATION_TIMEOUT_MS;
+  }
+
   private get pendingSignOutsFile(): string {
     return path.join(this.config.rootDir, PENDING_SIGN_OUTS_FILE_NAME);
   }
@@ -3987,15 +4028,20 @@ export class AgentPluginInstallService {
   /**
    * Finishes the sign-outs that an update recorded but could not complete (#6122). Runs with
    * crash recovery and from the discovery gate. Without the sign-in service it does nothing.
+   * Returns true when it tried, and sign-outs are left.
+   *
+   * The pass holds the plugin mutation lock, so it is bounded like journal recovery: a logout
+   * that does not settle in time counts as failed (#6627). Its URL stays in the record, and the
+   * lock is released, so a section open, an install or an update does not hang behind it.
    */
-  /** True when it tried, and sign-outs are left. */
   private async completePendingSignOuts(): Promise<boolean> {
     const oauth = this.mcpOauthService;
     if (oauth === undefined || !(await this.hasPendingSignOuts())) return false;
     return this.runExclusive(async () => {
+      const deadline = monotonicNow() + this.recoveryTimeoutMs;
       const left: string[] = [];
       for (const serverUrl of await this.readPendingSignOuts()) {
-        if (!(await oauth.logout({ serverUrl })).success) left.push(serverUrl);
+        if (!(await signedOutBefore(oauth, serverUrl, deadline))) left.push(serverUrl);
       }
       await this.writePendingSignOuts(left);
       return left.length > 0;
@@ -4035,7 +4081,7 @@ export class AgentPluginInstallService {
 
   /** True while the gate's wait after a pass that left the record runs. */
   private signOutRetryWaits(retryNow: boolean): boolean {
-    return !retryNow && Date.now() < this.pendingSignOutRetryAtMs;
+    return !retryNow && monotonicNow() < this.pendingSignOutRetryAtMs;
   }
 
   /** Resolves once no pass runs, the passes that `retryNow` callers asked for included. */
@@ -4061,11 +4107,11 @@ export class AgentPluginInstallService {
       log.warn("Could not finish pending plugin sign-outs", { error: getErrorMessage(error) });
       return true;
     });
-    this.pendingSignOutRetryAtMs = left ? Date.now() + PENDING_SIGN_OUT_RETRY_MS : 0;
+    this.pendingSignOutRetryAtMs = left ? monotonicNow() + PENDING_SIGN_OUT_RETRY_MS : 0;
   }
 
   private pendingSignOutPass: Promise<void> | undefined;
-  /** See startPendingSignOutPass. */
+  /** See startPendingSignOutPass. On the monotonic clock: a wall-clock jump must not move it. */
   private pendingSignOutRetryAtMs = 0;
   /** See signOutPassRunning. */
   private pendingSignOutRerun = false;

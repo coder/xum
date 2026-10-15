@@ -162,11 +162,20 @@ export const PENDING_SIGN_OUTS_FILE_NAME = "plugin-sign-outs-pending.json";
 
 /** One stat. Fail-closed: a record that cannot be stat'ed counts as pending. */
 export async function containerHasPendingSignOuts(containerPath: string): Promise<boolean> {
+  return (await pendingSignOutsRecordState(containerPath)).kind !== "absent";
+}
+
+/** The record's state from one stat; `unreadable` carries the error code (#6627). */
+export async function pendingSignOutsRecordState(
+  containerPath: string
+): Promise<{ kind: "absent" } | { kind: "present" } | { kind: "unreadable"; code: string }> {
   try {
     await fsPromises.stat(path.join(path.dirname(containerPath), PENDING_SIGN_OUTS_FILE_NAME));
-    return true;
+    return { kind: "present" };
   } catch (error) {
-    return !hasErrorCode(error, "ENOENT");
+    if (hasErrorCode(error, "ENOENT")) return { kind: "absent" };
+    const code = error instanceof Error && "code" in error ? error.code : undefined;
+    return { kind: "unreadable", code: typeof code === "string" ? code : "unknown error" };
   }
 }
 

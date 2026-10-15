@@ -2648,8 +2648,8 @@ describe("AgentPluginInstallService", () => {
       expect(logouts).toBe(atStartup);
 
       // After it, overlapping requests start exactly one.
-      const now = Date.now();
-      const clock = spyOn(Date, "now").mockReturnValue(now + 31_000);
+      const now = performance.now();
+      const clock = spyOn(performance, "now").mockReturnValue(now + 31_000);
       try {
         await Promise.all([discovered(), discovered(), discovered()]);
         await settle();
@@ -2658,6 +2658,71 @@ describe("AgentPluginInstallService", () => {
         clock.mockRestore();
       }
       expect(await pendingSignOuts()).toEqual([serverUrl]);
+    });
+
+    test("a hung sign-out does not hang the section open, and keeps the record (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 20,
+      });
+      restarted.setMcpOauthService({
+        logout: () => new Promise<never>(() => undefined),
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      // The pass holds the plugin lock while logout() hangs: the section open waits for it.
+      expect(await restarted.list()).toBeDefined();
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+      expect(await discovered()).toBe(0);
+    });
+
+    test("the retry wait ignores a wall-clock jump (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      let logouts = 0;
+      restarted.setMcpOauthService({
+        logout: () => {
+          logouts++;
+          return Promise.resolve({ success: false, error: "offline" });
+        },
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      await internals.settledSignOutPasses();
+      const atStartup = logouts;
+      // The wall clock jumps a day back, while 31 s pass on the monotonic clock.
+      const wall = spyOn(Date, "now").mockReturnValue(Date.now() - 86_400_000);
+      const mono = spyOn(performance, "now").mockReturnValue(performance.now() + 31_000);
+      try {
+        await discovered();
+        await internals.settledSignOutPasses();
+        expect(logouts).toBe(atStartup + 1);
+      } finally {
+        wall.mockRestore();
+        mono.mockRestore();
+      }
+    });
+
+    test("component review names an unreadable sign-out record (#6627)", async () => {
+      const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      // A self-referencing link: stat fails with ELOOP, not ENOENT.
+      const record = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      await fsPromises.rm(record);
+      await fsPromises.symlink(record, record);
+      await expect(updater.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+        /cannot read the pending plugin sign-out record \(ELOOP\)/
+      );
+      // Still fail-closed.
+      expect(await discovered()).toBe(0);
+      await fsPromises.rm(record);
+      await failing.dispose();
     });
 
     test("component review names a pending sign-out instead of changed files (#6627)", async () => {
