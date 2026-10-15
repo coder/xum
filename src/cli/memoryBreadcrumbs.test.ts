@@ -1,39 +1,40 @@
 import { describe, expect, test } from "bun:test";
-import { createMajorGcHeapTracker, formatMajorGcHeapFields } from "./memoryBreadcrumbs";
+import {
+  createMajorGcHeapTracker,
+  formatMajorGcHeapFields,
+  type GcStatistic,
+} from "./memoryBreadcrumbs";
+
+const gc = (gcType: string, usedHeapSize: number): GcStatistic => ({
+  gcType,
+  afterGC: { heapStatistics: { usedHeapSize } },
+});
 
 describe("createMajorGcHeapTracker", () => {
-  test("reports the heap after the last major GC and the lowest one since the last window", () => {
-    const readings = [900, 400, 650];
-    const tracker = createMajorGcHeapTracker(() => {
-      const next = readings.shift();
-      if (next === undefined) throw new Error("unexpected heap read");
-      return next;
-    });
+  test("keeps every major GC of a batch: the last value and the window minimum", () => {
+    const tracker = createMajorGcHeapTracker();
 
-    for (let i = 0; i < 3; i++) tracker.onMajorGc();
+    tracker.record([gc("MarkSweepCompact", 900), gc("MarkSweepCompact", 400)]);
+    tracker.record([gc("Scavenge", 50), gc("MarkSweepCompact", 650), gc("Scavenge", 80)]);
 
     expect(tracker.takeWindow()).toEqual({ lastAfterMajorGc: 650, minAfterMajorGc: 400 });
   });
 
   test("a window without a major GC keeps the last value and has no minimum", () => {
-    let used = 500;
-    const tracker = createMajorGcHeapTracker(() => used);
-    tracker.onMajorGc();
+    const tracker = createMajorGcHeapTracker();
+    tracker.record([gc("MarkSweepCompact", 500)]);
     tracker.takeWindow();
 
-    // The minimum is per window, so the next window does not repeat the old low.
+    // Minor GCs alone do not count, and the old low does not carry into the new window.
+    tracker.record([gc("Scavenge", 20)]);
     expect(tracker.takeWindow()).toEqual({ lastAfterMajorGc: 500, minAfterMajorGc: null });
-
-    used = 700;
-    tracker.onMajorGc();
-    expect(tracker.takeWindow()).toEqual({ lastAfterMajorGc: 700, minAfterMajorGc: 700 });
   });
 
   test("before any major GC both values are missing", () => {
-    const tracker = createMajorGcHeapTracker(() => {
-      throw new Error("heap must not be read without a GC");
+    expect(createMajorGcHeapTracker().takeWindow()).toEqual({
+      lastAfterMajorGc: null,
+      minAfterMajorGc: null,
     });
-    expect(tracker.takeWindow()).toEqual({ lastAfterMajorGc: null, minAfterMajorGc: null });
   });
 });
 

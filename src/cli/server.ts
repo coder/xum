@@ -332,10 +332,11 @@ async function main(): Promise<void> {
 // external kill recoverable from the launcher's log, and splits V8 heap from external/native
 // memory, which an outside sampler reading RSS cannot do.
 const MEMORY_BREADCRUMB_INTERVAL_MS = 10 * 60 * 1000;
+// Started at module load, before main()'s startup work, so a major GC during startup counts.
+const majorGcHeapFields = startMajorGcHeapFields();
 
 function startMemoryBreadcrumbs(): void {
   const toMb = (bytes: number) => Math.round(bytes / (1024 * 1024));
-  const majorGcHeapFields = startMajorGcHeapFields();
   const emit = () => {
     const usage = process.memoryUsage();
     // New fields go last so readers of the older fields keep parsing the line. heapUsed is a
