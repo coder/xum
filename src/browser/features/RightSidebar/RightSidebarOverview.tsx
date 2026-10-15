@@ -260,14 +260,13 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
         </OverviewSection>
       )}
 
-      {(props.artifactsEnabled || props.mcpAppsEnabled) && (
-        <OverviewOutputs
-          workspaceId={props.workspaceId}
-          onOpenTab={props.onOpenTab}
-          showFiles={props.artifactsEnabled}
-          showAppViews={props.mcpAppsEnabled}
-        />
-      )}
+      {/* Renders nothing while both experiments are off: no files and no app views. */}
+      <OverviewOutputs
+        workspaceId={props.workspaceId}
+        onOpenTab={props.onOpenTab}
+        showFiles={props.artifactsEnabled}
+        showAppViews={props.mcpAppsEnabled}
+      />
 
       {showSideChats && (
         <OverviewSection
@@ -402,6 +401,54 @@ function overviewAppRows(appViews: number, files: number, revealed: boolean): nu
 const NO_APP_VIEWS: ReturnType<typeof useMcpAppViews> = [];
 const NO_FILES: readonly ArtifactEntry[] = [];
 
+/**
+ * The workspace's newest artifact files for the Outputs card, refreshed after file-modifying
+ * tools. With Artifacts off (#6760: MCP Apps can be on alone) it lists nothing, also no listing
+ * from before the toggle.
+ */
+function useOverviewArtifactFiles(
+  workspaceId: string,
+  enabled: boolean
+): { files: readonly ArtifactEntry[]; truncated: boolean } {
+  const api = useOptionalAPI()?.api ?? null;
+  const [files, setFiles] = React.useState<readonly ArtifactEntry[]>([]);
+  // The backend capped its walk (entry limit, depth, unreadable folders): more files exist than
+  // `files` holds, so the "more" row cannot give an exact count.
+  const [truncated, setTruncated] = React.useState(false);
+  const [refreshTick, setRefreshTick] = React.useState(0);
+
+  React.useEffect(() => {
+    if (api == null || !enabled) return;
+    const controller = new AbortController();
+    api.artifacts
+      .list({ workspaceId }, { signal: controller.signal })
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        // A failed listing hides the section; the Artifacts tab reports the error.
+        const listing = result.success && result.data.available ? result.data : null;
+        setFiles(listing?.entries ?? []);
+        setTruncated(listing?.truncated === true);
+      })
+      .catch((error: unknown) => {
+        if (isAbortError(error) || controller.signal.aborted) return;
+        setFiles([]);
+        setTruncated(false);
+      });
+    return () => controller.abort();
+  }, [api, enabled, workspaceId, refreshTick]);
+
+  React.useEffect(
+    () =>
+      workspaceStore.subscribeFileModifyingTool(
+        () => setRefreshTick((tick) => tick + 1),
+        workspaceId
+      ),
+    [workspaceId]
+  );
+
+  return enabled ? { files, truncated } : { files: NO_FILES, truncated: false };
+}
+
 const OverviewOutputs: React.FC<{
   workspaceId: string;
   onOpenTab: (tab: TabType) => void;
@@ -410,51 +457,16 @@ const OverviewOutputs: React.FC<{
   /** MCP App views (mcp-apps experiment, independent of Artifacts). */
   showAppViews: boolean;
 }> = (props) => {
-  const api = useOptionalAPI()?.api ?? null;
   const allAppViews = useMcpAppViews(props.workspaceId);
   const appViews = props.showAppViews ? allAppViews : NO_APP_VIEWS;
   // The Artifacts tab lists only files, so More reveals hidden app views here (like side chats):
   // the first view it revealed, null until then. An ID, not a row index: newer views arrive at
   // the top, and an index would then point a later render's focus at another row.
   const [revealedViewId, setRevealedViewId] = React.useState<string | null>(null);
-  const [files, setFiles] = React.useState<readonly ArtifactEntry[]>([]);
-  // The backend capped its walk (entry limit, depth, unreadable folders): more files exist than
-  // `files` holds, so the "more" row cannot give an exact count.
-  const [filesTruncated, setFilesTruncated] = React.useState(false);
-  const [refreshTick, setRefreshTick] = React.useState(0);
-
-  React.useEffect(() => {
-    if (api == null || !props.showFiles) return;
-    const controller = new AbortController();
-    api.artifacts
-      .list({ workspaceId: props.workspaceId }, { signal: controller.signal })
-      .then((result) => {
-        if (controller.signal.aborted) return;
-        // A failed listing hides the section; the Artifacts tab reports the error.
-        const listing = result.success && result.data.available ? result.data : null;
-        setFiles(listing?.entries ?? []);
-        setFilesTruncated(listing?.truncated === true);
-      })
-      .catch((error: unknown) => {
-        if (isAbortError(error) || controller.signal.aborted) return;
-        setFiles([]);
-        setFilesTruncated(false);
-      });
-    return () => controller.abort();
-  }, [api, props.showFiles, props.workspaceId, refreshTick]);
-
-  React.useEffect(
-    () =>
-      workspaceStore.subscribeFileModifyingTool(
-        () => setRefreshTick((tick) => tick + 1),
-        props.workspaceId
-      ),
-    [props.workspaceId]
+  const { files, truncated: filesTruncated } = useOverviewArtifactFiles(
+    props.workspaceId,
+    props.showFiles
   );
-
-  // With Artifacts off, a listing from before the toggle must not show.
-  const listedFiles = props.showFiles ? files : NO_FILES;
-  const listedTruncated = props.showFiles && filesTruncated;
 
   // Several calls of one MCP app tool share a label, so each row carries the call's detail
   // (outcome, arguments, and `#n` for repeats) to tell them apart.
@@ -463,8 +475,8 @@ const OverviewOutputs: React.FC<{
   // app result is never pushed out by files, each kind keeps at least one of the capped rows
   // when it has any. A file opens in the Artifacts tab; an app view in its own app tab (Artifacts
   // lists only files). Either tab gets focus (the activated row unmounts as the sidebar expands).
-  const appRows = overviewAppRows(appViews.length, listedFiles.length, revealedViewId != null);
-  const fileRows = Math.min(listedFiles.length, Math.max(0, OVERVIEW_MAX_LIST_ROWS - appRows));
+  const appRows = overviewAppRows(appViews.length, files.length, revealedViewId != null);
+  const fileRows = Math.min(files.length, Math.max(0, OVERVIEW_MAX_LIST_ROWS - appRows));
   const hiddenAppViews = appViews.length - appRows;
   const shown: Array<{
     key: string;
@@ -474,7 +486,7 @@ const OverviewOutputs: React.FC<{
     focusOnMount?: boolean;
     open: () => void;
   }> = [
-    ...listedFiles.slice(0, fileRows).map((file) => {
+    ...files.slice(0, fileRows).map((file) => {
       const slash = file.path.lastIndexOf("/");
       return {
         key: `file:${file.path}`,
@@ -506,7 +518,7 @@ const OverviewOutputs: React.FC<{
   ];
   // A truncated walk can end before reaching any file (only a too-deep or unreadable folder), yet
   // outputs still exist: keep the section for its "More" row.
-  if (shown.length === 0 && !listedTruncated) return null;
+  if (shown.length === 0 && !filesTruncated) return null;
 
   return (
     <OverviewSection title="Outputs">
@@ -521,8 +533,8 @@ const OverviewOutputs: React.FC<{
         />
       ))}
       <MoreRow
-        count={listedFiles.length + appViews.length - shown.length}
-        atLeast={listedTruncated}
+        count={files.length + appViews.length - shown.length}
+        atLeast={filesTruncated}
         onClick={() =>
           hiddenAppViews > 0
             ? setRevealedViewId(appViews[appRows].toolCallId)

@@ -56,14 +56,34 @@ async function readOverridesFile(filePath: string): Promise<Map<ExperimentId, bo
   } catch {
     // Ignore missing/corrupt overrides
   }
-  // #6760 upgrade default: before MCP Apps had their own experiment, the Artifacts experiment
-  // gated them. A file without an mcp-apps entry predates the split, so MCP Apps stay on for
-  // users who had Artifacts on and use MCP Apps today. setOverride persists the entry before it
-  // changes Artifacts, so from then on the two experiments are independent.
+  applyMcpAppsUpgradeDefault(overrides);
+  return overrides;
+}
+
+/**
+ * #6760 upgrade default: before MCP Apps had their own experiment, the Artifacts experiment
+ * gated them. A file without an mcp-apps entry predates the split, so MCP Apps stay on for users
+ * who had Artifacts on and use MCP Apps today. freezeMcpAppsUpgradeDefault persists the entry
+ * before Artifacts changes, so from then on the two experiments are independent.
+ */
+function applyMcpAppsUpgradeDefault(overrides: Map<ExperimentId, boolean>): void {
   if (!overrides.has(EXPERIMENT_IDS.MCP_APPS) && overrides.get(EXPERIMENT_IDS.ARTIFACTS) === true) {
     overrides.set(EXPERIMENT_IDS.MCP_APPS, true);
   }
-  return overrides;
+}
+
+/**
+ * Before a write changes Artifacts, store the MCP Apps value it derives today: turning Artifacts
+ * on must not turn MCP Apps on, and turning it off must not turn them off. The read already
+ * derived "on", so a missing entry here means "off".
+ */
+function freezeMcpAppsUpgradeDefault(
+  overrides: Map<ExperimentId, boolean>,
+  changing: ExperimentId
+): void {
+  if (changing === EXPERIMENT_IDS.ARTIFACTS && !overrides.has(EXPERIMENT_IDS.MCP_APPS)) {
+    overrides.set(EXPERIMENT_IDS.MCP_APPS, false);
+  }
 }
 
 /**
@@ -149,11 +169,7 @@ export class ExperimentsService {
       // Merge the individual mutation into current disk state. A stale sibling
       // changing an unrelated flag must never restore withdrawn Design consent.
       const next = await readOverridesFile(this.overridesFilePath);
-      // Freeze the upgrade default (see readOverridesFile) before Artifacts changes: turning
-      // Artifacts on must not turn MCP Apps on, and turning it off must not turn them off.
-      if (experimentId === EXPERIMENT_IDS.ARTIFACTS && !next.has(EXPERIMENT_IDS.MCP_APPS)) {
-        next.set(EXPERIMENT_IDS.MCP_APPS, false);
-      }
+      freezeMcpAppsUpgradeDefault(next, experimentId);
       const value = this.isExperimentSupported(experimentId) ? enabled : null;
       if (value == null) next.delete(experimentId);
       else next.set(experimentId, value);

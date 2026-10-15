@@ -569,6 +569,25 @@ function describeConfigToggle(value: boolean | undefined, fallback: string): str
  * or the tab it has), and one "Reload App View" per view whose tab is open. The subtitle carries
  * each call's detail, so several calls of one tool differ.
  */
+/**
+ * The mcp-apps experiment's palette commands (independent of Artifacts, #6760): one per MCP App
+ * view of the workspace (transcript or opened this session), which opens its tab or focuses the
+ * one it has (the keyboard path to "Open in tab"; the subtitle carries each call's detail, so
+ * several calls of one tool differ), and one per entry point of an enabled server, which opens
+ * its app tab (calling the tool with {}) or focuses the one it has.
+ */
+function mcpAppNavigationActions(
+  p: BuildSourcesParams,
+  wsId: string,
+  navigationSection: CommandAction["section"]
+): CommandAction[] {
+  if (p.mcpAppsEnabled !== true) return [];
+  return [
+    ...appViewActions(wsId, p.selectedWorkspaceState?.messages ?? [], navigationSection),
+    ...entrypointActions(p.api, wsId, p.mcpAppEntrypoints ?? [], navigationSection),
+  ];
+}
+
 function appViewActions(
   wsId: string,
   messages: Parameters<typeof appViewEntries>[1],
@@ -1113,17 +1132,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               },
             ]
           : []),
-        ...(p.mcpAppsEnabled === true
-          ? [
-              // One per MCP App view of the workspace (transcript or opened this session): opens
-              // its tab or focuses the one it has, the keyboard path to "Open in tab".
-              // The subtitle carries each call's detail, so several calls of one tool differ.
-              ...appViewActions(wsId, p.selectedWorkspaceState?.messages ?? [], section.navigation),
-              // One per MCP App entry point of an enabled server: opens its app tab (calling
-              // the tool with {}) or focuses the one it has.
-              ...entrypointActions(p.api, wsId, p.mcpAppEntrypoints ?? [], section.navigation),
-            ]
-          : []),
+        ...mcpAppNavigationActions(p, wsId, section.navigation),
         {
           id: CommandIds.navRightSidebarFocusTerminal(),
           title: "Right Sidebar: Focus Terminal",
