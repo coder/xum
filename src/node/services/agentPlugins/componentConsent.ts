@@ -242,18 +242,21 @@ export function workflowConsentDetail(args: WorkflowConsentInput): string {
 interface AgentConsentInput {
   /** The agent ID the runtime loads the definition under (the lowercased file stem). */
   id: string;
+  /** The file name in the plugin's agents directory. */
+  file: string;
   /** The frontmatter as the runtime parses it (plugin format mapping applied). */
   frontmatter: unknown;
 }
 
 /**
- * The fingerprinted agent fields (#6629). Keyed by ID, not file name: the runtime lists an agent
- * by its file name but loads it as `<id>.md`, which can differ in case. The body (the agent's
+ * The fingerprinted agent fields (#6629). Recorded by ID, the name the runtime loads an agent
+ * under. The file name is fingerprinted too: a rename (`helper.md` to `Helper.md`) changes which
+ * file the runtime opens, so it needs a review. The body (the agent's
  * system prompt) is not covered yet, the same as a skill body: #6617 decides for both, and
  * covering it is one more field here (`bodySha256`).
  */
-function agentConsentSubject(args: AgentConsentInput): { id: string; frontmatter: unknown } {
-  return { id: args.id, frontmatter: args.frontmatter };
+function agentConsentSubject(args: AgentConsentInput): AgentConsentInput {
+  return { id: args.id, file: args.file, frontmatter: args.frontmatter };
 }
 
 /** Fingerprint of one plugin agent: its ID and its whole parsed frontmatter. */

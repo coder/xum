@@ -301,7 +301,25 @@ interface ReviewTextSource {
 }
 
 function reviewText(item: ReviewTextSource): string {
-  return `${item.display}\n\nReviewed fields: ${item.consentDetail()}`;
+  return showInvisibleControls(`${item.display}\n\nReviewed fields: ${item.consentDetail()}`);
+}
+
+/**
+ * Bidi format and zero-width characters, which can make plugin text (a workflow's source, #6629)
+ * display reordered or hide part of it, while the fingerprint approves the raw bytes.
+ */
+const REVIEW_TEXT_CONTROLS = /[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/gu;
+
+/**
+ * Review text as the user reads it: each such character becomes a visible `<U+XXXX>` mark. The
+ * mark is not a JavaScript escape, so a literal `\u202e` in the source still reads differently
+ * from the character itself.
+ */
+function showInvisibleControls(text: string): string {
+  return text.replace(
+    REVIEW_TEXT_CONTROLS,
+    (char) => `<U+${char.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}>`
+  );
 }
 
 /**
@@ -918,11 +936,27 @@ function slashCommandSurface(plugin: AgentPluginInfo): Map<string, SurfaceWhole>
   );
 }
 
+/**
+ * Update rows for agents that stop loading because a second file claims their ID (#6629). The
+ * agent drops out of the staged surface, which alone would read as a removal and apply without a
+ * review, so the user would never see why the agent is gone.
+ */
+function ambiguousAgentChanges(
+  staged: ReadonlySet<string>,
+  current: ReadonlySet<string> | undefined
+): AgentPluginCapabilityChange[] {
+  return [...staged]
+    .filter((agentId) => !(current?.has(agentId) ?? false))
+    .map((agentId) => ({
+      summary: `agent '${agentId}' will not load: more than one file claims its ID`,
+    }));
+}
+
 /** The consent view of one plugin agent (#6629). */
 function agentSurface(agent: PluginAgentFile): SurfaceWhole {
   return {
     consentFingerprint: agentConsentFingerprint(agent),
-    display: `Agent ${agent.id} (agents file ${agent.name})`,
+    display: `Agent ${agent.id} (agents file ${agent.file})`,
     consentDetail: () => agentConsentDetail(agent),
   };
 }
@@ -2261,8 +2295,10 @@ export class AgentPluginInstallService {
      * compared), display (the advertisement as the model sees it) }.
      */
     skills: Map<string, SurfaceSkill>;
-    /** agent ID → consent view (#6629): any frontmatter change is a change. */
+    /** agent ID → consent view (#6629): any frontmatter or file name change is a change. */
     agents: Map<string, SurfaceWhole>;
+    /** IDs that two agent files claim: such an agent does not load (#6629). */
+    ambiguousAgents: Set<string>;
     /** file → consent view (#6629): any byte change of a script is a change. */
     workflows: Map<string, SurfaceWhole>;
     /** name → consent view (#6629): the expansion is what the command inserts. */
@@ -2278,8 +2314,9 @@ export class AgentPluginInstallService {
         consentDetail: skill.consentDetail,
       });
     }
+    const ambiguousAgents = new Set<string>();
     const agents = new Map(
-      (await listPluginAgentFiles(plugin.agentsDir, warnings)).map((agent) => [
+      (await listPluginAgentFiles(plugin.agentsDir, warnings, ambiguousAgents)).map((agent) => [
         agent.id,
         agentSurface(agent),
       ])
@@ -2322,7 +2359,15 @@ export class AgentPluginInstallService {
         });
       }
     }
-    return { hook, servers, skills, agents, workflows, slashCommands: slashCommandSurface(plugin) };
+    return {
+      hook,
+      servers,
+      skills,
+      agents,
+      ambiguousAgents,
+      workflows,
+      slashCommands: slashCommandSurface(plugin),
+    };
   }
 
   /**
@@ -2480,6 +2525,7 @@ export class AgentPluginInstallService {
     // privileges, so a changed definition behind an unchanged filename is
     // gated exactly like an addition.
     changes.push(...wholeComponentChanges("agents", staged.agents, current?.agents));
+    changes.push(...ambiguousAgentChanges(staged.ambiguousAgents, current?.ambiguousAgents));
     changes.push(...wholeComponentChanges("workflows", staged.workflows, current?.workflows));
     changes.push(
       ...wholeComponentChanges("slashCommands", staged.slashCommands, current?.slashCommands)
@@ -2864,7 +2910,7 @@ export class AgentPluginInstallService {
       warnings.push(...codexHooks.warnings);
       const openaiInterface = await interfaceSummary(plugin, warnings);
       const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
-      const agents = agentFiles.map((agent) => agent.name);
+      const agents = agentFiles.map((agent) => agent.file);
       const workflows = await listPluginWorkflowFiles(plugin.workflowsDir);
       const reviewedComponents = reviewedComponentRows([
         [

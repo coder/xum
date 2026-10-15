@@ -293,17 +293,22 @@ function withoutAmbiguousPluginAgents(
 }
 
 /**
- * The definition read of a plugin agent: contained in the plugin, and the only file of its agents
- * dir that claims the ID (#6629), so the bytes it opens are the bytes the review covered.
+ * The file the definition read of a plugin agent opens (#6629): the one file of its agents dir
+ * that claims the ID, under its real name (`Helper.md` for ID `helper`), and contained in the
+ * plugin. Discovery lists the same name, so both paths fingerprint the same bytes and file name.
+ * Null when no single contained file claims the ID.
  */
-async function isPluginAgentLoadable(args: {
+async function resolvePluginAgentFile(args: {
   pluginRoot: string;
   agentsDir: string;
-  filePath: string;
   agentId: AgentId;
-}): Promise<boolean> {
-  const ambiguous = warnAmbiguousPluginAgents(await listAgentFilesFromLocalFs(args.agentsDir));
-  return !ambiguous.has(args.agentId) && (await isPluginAgentContained(args));
+}): Promise<string | null> {
+  const names = await listAgentFilesFromLocalFs(args.agentsDir);
+  const ambiguous = warnAmbiguousPluginAgents(names);
+  const name = names.find((candidate) => pluginAgentIdOf(candidate) === args.agentId);
+  if (name === undefined || ambiguous.has(args.agentId)) return null;
+  const filePath = path.join(args.agentsDir, name);
+  return (await isPluginAgentContained({ ...args, filePath })) ? filePath : null;
 }
 
 /**
@@ -396,7 +401,7 @@ function parseSource(
  * nor loads. It throws like an invalid definition, which both callers skip.
  */
 function parseAgentFile(
-  args: { content: string; byteSize: number; agentId: AgentId },
+  args: { content: string; byteSize: number; agentId: AgentId; filePath: string },
   candidate: Pick<AgentDefinitionScanCandidate, "pluginRoot" | "pluginName" | "pluginConsent">
 ) {
   const parsed = parseAgentDefinitionMarkdown({
@@ -404,7 +409,11 @@ function parseAgentFile(
     byteSize: args.byteSize,
     ...parseSource(candidate.pluginRoot, args.agentId),
   });
-  const consentInput = { id: args.agentId, frontmatter: parsed.frontmatter };
+  const consentInput = {
+    id: args.agentId,
+    file: path.basename(args.filePath),
+    frontmatter: parsed.frontmatter,
+  };
   if (!isPluginAgentConsented(candidate.pluginConsent, consentInput)) {
     throw new Error(
       `Agent '${args.agentId}' of plugin '${candidate.pluginName ?? "?"}' has not been reviewed on this install. Open Settings → Plugins and select Review on the plugin.`
@@ -478,7 +487,7 @@ async function readAgentDescriptorFromFile(
 
   try {
     const parsed = parseAgentFile(
-      { content, byteSize, agentId },
+      { content, byteSize, agentId, filePath },
       { pluginRoot, pluginName, pluginConsent }
     );
 
@@ -783,16 +792,16 @@ async function loadAgentDefinition(
       continue;
     }
 
-    const filePath = candidate.runtime.normalizePath(`${agentId}.md`, resolvedRoot);
+    let filePath = candidate.runtime.normalizePath(`${agentId}.md`, resolvedRoot);
 
     if (candidate.pluginRoot != null) {
-      const loadable = await isPluginAgentLoadable({
+      const pluginFile = await resolvePluginAgentFile({
         pluginRoot: candidate.pluginRoot,
         agentsDir: resolvedRoot,
-        filePath,
         agentId,
       });
-      if (!loadable) continue;
+      if (pluginFile === null) continue;
+      filePath = pluginFile;
     }
 
     try {
@@ -826,7 +835,7 @@ async function loadAgentDefinition(
         content = await readFileString(candidate.runtime, filePath, abortSignal);
         byteSize = stat.size;
       }
-      const parsed = parseAgentFile({ content, byteSize, agentId }, candidate);
+      const parsed = parseAgentFile({ content, byteSize, agentId, filePath }, candidate);
 
       const pkg: AgentDefinitionPackage = {
         id: agentId,
