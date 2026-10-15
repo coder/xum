@@ -968,7 +968,8 @@ describe("McpOauthService OAuth flows", () => {
       docs: { transport: "http", url: "https://example.com/mcp", disabled: true },
     });
     const flowId = "caller-flow-id-0123456789";
-    const listen = Server.prototype.listen;
+    // The original, read before the spy replaces it (Reflect.get: no unbound method reference).
+    const listen = Reflect.get(Server.prototype, "listen") as (...a: unknown[]) => Server;
     const listeners: Server[] = [];
     const bind = spyOn(Server.prototype, "listen").mockImplementationOnce(function (
       this: Server,
@@ -977,7 +978,7 @@ describe("McpOauthService OAuth flows", () => {
       listeners.push(this);
       // The Cancel lands after the lookup's check and before the bind completes.
       void service.cancelDesktopFlow(flowId);
-      return (listen as (...a: unknown[]) => Server).apply(this, args);
+      return listen.apply(this, args);
     });
     try {
       expect(await service.startDesktopFlow({ projectPath, serverName: "docs", flowId })).toEqual({
