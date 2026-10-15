@@ -72,10 +72,6 @@ function normalizeModelKey(modelName: string): ModelName | null {
   return normalized as ModelName;
 }
 
-/**
- * Resolves a model string to a ModelName, falling back to a similar model if unknown.
- * Optionally logs a warning when falling back.
- */
 const GOOGLE_VERTEX_MODEL_PREFIX = "google-vertex:";
 
 /** Canonical model string keyed for tokenizer lookup. */
@@ -87,6 +83,10 @@ function normalizeTokenizerModelString(modelString: string): string {
     : canonical;
 }
 
+/**
+ * Resolves a model string to a ModelName, falling back to a similar model if unknown.
+ * Optionally logs a warning when falling back.
+ */
 function resolveModelName(modelString: string): ModelName {
   const normalized = normalizeTokenizerModelString(modelString);
   let modelName = normalizeModelKey(normalized);

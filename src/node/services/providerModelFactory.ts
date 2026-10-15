@@ -1128,9 +1128,6 @@ export function requestEndpoint(requestUrl: string): string {
   }
 }
 
-/**
- * Get fetch function for provider - use custom if provided, otherwise unlimited timeout default
- */
 /** Google Vertex AI: ADC by default, express mode when an API key resolves. */
 function createGoogleVertexModelEffect(
   providerConfig: ProviderConfig,
@@ -1160,6 +1157,9 @@ function createGoogleVertexModelEffect(
   });
 }
 
+/**
+ * Get fetch function for provider - use custom if provided, otherwise unlimited timeout default
+ */
 function getProviderFetch(providerConfig: ProviderConfig): typeof fetch {
   if (typeof providerConfig.fetch !== "function") {
     return defaultFetchWithUnlimitedTimeout;
