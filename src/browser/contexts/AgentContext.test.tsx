@@ -1,6 +1,7 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { GlobalWindow } from "happy-dom";
 
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
@@ -269,6 +270,23 @@ describe("AgentContext", () => {
     await waitFor(() => {
       expect(getWorkspaceAiSelection(workspaceId, "review").model).toBe("openai:gpt-5.2");
     });
+  });
+
+  test("a plugin mutation reloads the agent list (#6629)", async () => {
+    mockAgentDefinitions = [EXEC_AGENT];
+    let contextValue: AgentContextValue | undefined;
+    renderAgentHarness({
+      projectPath: "/tmp/project",
+      onChange: (value) => (contextValue = value),
+    });
+    await waitFor(() => expect(contextValue?.agents.map((agent) => agent.id)).toEqual(["exec"]));
+
+    // A component review approved a plugin agent: the picker must show it without a remount.
+    mockAgentDefinitions = [EXEC_AGENT, REVIEW_PROJECT_AGENT];
+    act(() => publishAgentPluginsMutated());
+    await waitFor(() =>
+      expect(contextValue?.agents.map((agent) => agent.id)).toEqual(["exec", "review"])
+    );
   });
 
   test("a failed agent refresh drops the inherited defaults it loaded before", async () => {
