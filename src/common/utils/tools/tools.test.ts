@@ -640,6 +640,27 @@ describe("getToolsForModel", () => {
     expect(vertexGemini35Tools.url_context).toBeDefined();
   });
 
+  test("adds Google native tools for mapped Gemini 3 aliases", async () => {
+    const runtime = new LocalRuntime(process.cwd());
+    const initStateManager = createInitStateManager();
+
+    const tools = await getToolsForModel(
+      "google-vertex:team-gemini",
+      {
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        workspaceId: "ws-1",
+        capabilityModelString: "google-vertex:gemini-3.5-flash",
+      },
+      "ws-1",
+      initStateManager
+    );
+
+    expect(tools.google_search).toBeDefined();
+    expect(tools.url_context).toBeDefined();
+  });
+
   test("adds xAI native web and X search tools for Grok 4.5", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();

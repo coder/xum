@@ -280,6 +280,14 @@ describe("resolveProviderCredentials - Google Vertex AI", () => {
   it("treats the express mode env key as a provider secret", () => {
     expect(providerSecretEnvVarNames()).toContain("GOOGLE_VERTEX_API_KEY");
   });
+
+  // The CLI starts only when the env bootstrap yields a configured provider.
+  it.each([
+    { name: "ADC from the env project", env: { GOOGLE_VERTEX_PROJECT: "env-project" } },
+    { name: "express mode from the env API key", env: { GOOGLE_VERTEX_API_KEY: "env-vertex-key" } },
+  ])("bootstraps $name for the CLI", ({ env }) => {
+    expect(hasAnyConfiguredProvider(buildProvidersFromEnv(env))).toBe(true);
+  });
 });
 
 describe("resolveProviderCredentials - Z.ai", () => {

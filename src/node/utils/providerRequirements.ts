@@ -696,6 +696,10 @@ export function buildProvidersFromEnv(
       if (creds.baseUrl) entry.baseUrl = creds.baseUrl;
       if (creds.organization) entry.organization = creds.organization;
       providers[provider] = entry;
+    } else if (creds.isConfigured && creds.project) {
+      // Vertex AI with Application Default Credentials has no API key; the
+      // project selects it, and the location keeps resolving from env.
+      providers[provider] = { project: creds.project };
     }
   }
 
