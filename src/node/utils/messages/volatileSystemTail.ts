@@ -79,6 +79,31 @@ export interface VolatileSystemTailPlan {
   record?: VolatileSystemTailRecord;
 }
 
+/** The segment's recorded assistant rows (after the latest context boundary), in order. */
+function readSegmentRecords(messages: MuxMessage[]): Map<MuxMessage, VolatileSystemTailRecord> {
+  const records = new Map<MuxMessage, VolatileSystemTailRecord>();
+  for (const message of messages.slice(findLatestContextBoundaryIndex(messages) + 1)) {
+    const record = message.role === "assistant" ? readRecord(message) : undefined;
+    if (record != null) records.set(message, record);
+  }
+  return records;
+}
+
+/** `messages` with each recorded row put back right before its assistant row. */
+function withRecordedRows(
+  messages: MuxMessage[],
+  records: Map<MuxMessage, VolatileSystemTailRecord>
+): MuxMessage[] {
+  return messages.flatMap((message, index) => {
+    const record = records.get(message);
+    // Anthropic rejects a system row after an assistant message: skip one that no longer
+    // follows a user row (self-healing), rather than send a request that fails.
+    return record?.placement === "row" && messages[index - 1]?.role === "user"
+      ? [systemRow(`${message.id}-volatile-tail`, record.text), message]
+      : [message];
+  });
+}
+
 /**
  * Where this request sends `liveTail`. `messages` are the rows the request sends (after the
  * boundary slice and the empty-row filter), so a dropped assistant row also drops its row.
@@ -90,41 +115,21 @@ export function planVolatileSystemTail(
   rowsSupported: boolean
 ): VolatileSystemTailPlan {
   if (!rowsSupported) return { systemTail: liveTail, messages };
-  const segmentStart = findLatestContextBoundaryIndex(messages) + 1;
-  let frozen: string | undefined;
-  let lastSent: string | undefined;
-  const withRows: MuxMessage[] = [];
-  messages.forEach((message, index) => {
-    const record =
-      index >= segmentStart && message.role === "assistant" ? readRecord(message) : undefined;
-    if (record?.placement === "system") frozen = record.text;
-    // Anthropic rejects a system row after an assistant message: skip one that no longer
-    // follows a user row (self-healing), rather than send a request that fails.
-    if (record?.placement === "row" && withRows.at(-1)?.role === "user") {
-      withRows.push(systemRow(`${message.id}-volatile-tail`, record.text));
-    }
-    if (record != null) lastSent = record.text;
-    withRows.push(message);
-  });
-
+  const records = readSegmentRecords(messages);
+  const sent = [...records.values()];
+  const frozen = sent.findLast((record) => record.placement === "system")?.text;
+  const withRows = withRecordedRows(messages, records);
+  const asBefore: VolatileSystemTailPlan = {
+    systemTail: liveTail,
+    messages: withRows,
+    record: { text: liveTail, placement: "system" },
+  };
   // Segment start (or a history from before this rule): send as before and freeze here.
-  if (frozen === undefined) {
-    return {
-      systemTail: liveTail,
-      messages: withRows,
-      record: { text: liveTail, placement: "system" },
-    };
-  }
-  if (liveTail === lastSent) return { systemTail: frozen, messages: withRows };
+  if (frozen === undefined) return asBefore;
+  if (liveTail === sent.at(-1)?.text) return { systemTail: frozen, messages: withRows };
   // A row must follow a user message. Otherwise (a resume after an assistant row) send the new
   // tail as before, which re-freezes the segment at it.
-  if (messages.at(-1)?.role !== "user") {
-    return {
-      systemTail: liveTail,
-      messages: withRows,
-      record: { text: liveTail, placement: "system" },
-    };
-  }
+  if (messages.at(-1)?.role !== "user") return asBefore;
   return {
     systemTail: frozen,
     messages: withRows,

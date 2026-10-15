@@ -326,6 +326,42 @@ async function historyShareOfBudget(
   return Math.max(1, budgetTokens - contextTokens);
 }
 
+/**
+ * The system prompt split into its cached stable block and the volatile tail, and where the
+ * tail goes: a tail change inside a segment becomes a system row instead of a system edit
+ * (prompt-cache mechanism 10, volatileSystemTail.ts).
+ */
+function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMessage[]) {
+  const volatileLength = options.volatileSystemSuffixLength ?? 0;
+  assert(
+    Number.isSafeInteger(volatileLength) &&
+      volatileLength >= 0 &&
+      (volatileLength === 0 || volatileLength < options.systemMessage.length),
+    "volatileSystemSuffixLength must leave a non-empty stable system prefix"
+  );
+  const stableSystem = options.systemMessage.slice(
+    0,
+    options.systemMessage.length - volatileLength
+  );
+  const cachedSystemMessage = createCachedSystemMessage(
+    stableSystem,
+    options.modelString,
+    options.anthropicCacheTtl,
+    options.providersConfig
+  );
+  const tailPlan = planVolatileSystemTail(
+    history,
+    options.systemMessage.slice(stableSystem.length),
+    cachedSystemMessage != null &&
+      acceptsVolatileSystemTailRow(
+        options.modelString,
+        options.routeProvider,
+        options.providersConfig
+      )
+  );
+  return { stableSystem, cachedSystemMessage, tailPlan };
+}
+
 export async function assemblePromptPayload(
   options: AssemblePromptPayloadOptions
 ): Promise<PromptPayload> {
@@ -349,33 +385,9 @@ export async function assemblePromptPayload(
     options.modelString,
     options.requestContextMessage
   );
-  const volatileLength = options.volatileSystemSuffixLength ?? 0;
-  assert(
-    Number.isSafeInteger(volatileLength) &&
-      volatileLength >= 0 &&
-      (volatileLength === 0 || volatileLength < options.systemMessage.length),
-    "volatileSystemSuffixLength must leave a non-empty stable system prefix"
-  );
-  const stableSystem = options.systemMessage.slice(
-    0,
-    options.systemMessage.length - volatileLength
-  );
-  const cachedSystemMessage = createCachedSystemMessage(
-    stableSystem,
-    options.modelString,
-    options.anthropicCacheTtl,
-    options.providersConfig
-  );
-  // A tail change inside a segment becomes a system row instead of a system edit (mechanism 10).
-  const tailPlan = planVolatileSystemTail(
-    providerRequestMessages,
-    options.systemMessage.slice(stableSystem.length),
-    cachedSystemMessage != null &&
-      acceptsVolatileSystemTailRow(
-        options.modelString,
-        options.routeProvider,
-        options.providersConfig
-      )
+  const { stableSystem, cachedSystemMessage, tailPlan } = planSystemPrompt(
+    options,
+    providerRequestMessages
   );
   const historyWithSentinel = addInterruptedSentinel(
     insertRequestContextMessage(
