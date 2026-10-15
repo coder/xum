@@ -8,6 +8,7 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import {
   AgentPluginInstallEntrySchema,
+  AgentPluginComponentConsentSchema,
   AgentPluginImportedComponentsSchema,
   type AgentPluginImportedComponents,
   type AgentPluginGitSource,
@@ -262,8 +263,28 @@ type CollectedPluginSkill = AgentPluginPreviewSkill & {
  * The raw registry consent with this build's kinds replaced. A newer build may store more kinds,
  * and a save on this build must keep them (downgrade round-trip).
  */
+/**
+ * The consent an update journal carries (#6589). Absent in journals from older builds, and a
+ * malformed value is not consent: both return undefined, so recovery keeps the old records and
+ * the changed components ask for review again (fails closed).
+ */
+function journalComponentConsent(
+  doc: Record<string, unknown> | null
+): ComponentConsent | undefined {
+  const parsed = AgentPluginComponentConsentSchema.safeParse(doc?.componentConsent);
+  return parsed.success ? parsed.data : undefined;
+}
+
 function mergeRawConsent(raw: unknown, consent: ComponentConsent): Record<string, unknown> {
   return { ...(isPlainObject(raw) ? raw : {}), ...consent };
+}
+
+/** The registry patch for recovered consent: none when the journal carried none. */
+function recoveredConsentPatch(
+  raw: unknown,
+  consent: ComponentConsent | undefined
+): { componentConsent?: Record<string, unknown> } {
+  return consent === undefined ? {} : { componentConsent: mergeRawConsent(raw, consent) };
 }
 
 function skillChangeSummary(current: SurfaceSkill, staged: SurfaceSkill, name: string): string {
@@ -3404,7 +3425,8 @@ export class AgentPluginInstallService {
             const reconciled = await this.reconcilePromotedUpdateProvenance(
               name,
               targetPath,
-              newSha
+              newSha,
+              journalComponentConsent(journal.doc)
             );
             if (!reconciled) {
               return false; // Keep the journal; retried next reconciliation.
@@ -3497,7 +3519,9 @@ export class AgentPluginInstallService {
   private async reconcilePromotedUpdateProvenance(
     name: string,
     targetPath: string,
-    newSha: string
+    newSha: string,
+    /** The consent the interrupted update meant to record; undefined keeps the old one. */
+    componentConsent: ComponentConsent | undefined
   ): Promise<boolean> {
     const { envelope, rawEntries } = await this.readRegistryDocument("strict");
     const rawEntry = rawEntries.find((entry) => this.rawEntryName(entry) === name);
@@ -3537,6 +3561,7 @@ export class AgentPluginInstallService {
           ...rawRecord,
           lockedSha: newSha,
           updatedAt: new Date().toISOString(),
+          ...recoveredConsentPatch(rawRecord.componentConsent, componentConsent),
           manifest: {
             ...preservedManifest,
             ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
@@ -5391,12 +5416,16 @@ export class AgentPluginInstallService {
           // between the promote below and the registry write leaves the
           // (consented) replacement live while the registry still claims the
           // old commit — recovery must be able to commit the recorded SHA.
+          // componentConsent: the consent this update records, so recovery can record it too
+          // instead of asking again for what the user just reviewed (#6589). Recovery reads it
+          // tolerantly: a journal without it (an older build) keeps the old consent.
           await this.writeJournalFile(updateJournalPath, {
             name: entry.name,
             trashDir,
             nonce: updateNonce,
             stagedAt: Date.now(),
             newSha: targetSha,
+            componentConsent,
           });
           try {
             await this.renameIntoStaging(targetPath, trashDir);
