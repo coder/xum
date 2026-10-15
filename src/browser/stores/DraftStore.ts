@@ -2391,7 +2391,7 @@ export class DraftStore {
     const listed = this.creationDrafts[scope.projectPath] ?? [];
     if (listed.some(({ draftId }) => draftId === scope.draftId)) return true;
     const entry = this.entries.get(draftScopeKey(scope));
-    return entry !== undefined && !isEmptyView(entry.view);
+    return entry !== undefined && hasContent(entry.view);
   }
 
   private async importLegacyNameState(
