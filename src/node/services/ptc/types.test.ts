@@ -2,9 +2,9 @@ import { describe, expect, it } from "bun:test";
 import { parsePatch } from "diff";
 import { AgentSkillPackageSchema } from "@/common/orpc/schemas/agentSkill";
 import { MAX_FILE_CONTENT_SIZE } from "@/common/constants/attachments";
-import { KERNEL_COMPACT_ARGS_CAP_BYTES } from "@/constants/kernelOutput";
 import { extractLoadedSkillSnapshotsFromMessages } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import {
+  KERNEL_COMPACT_ARGS_CAP_BYTES,
   KERNEL_RETAINED_CONTAINER_MAX_PARTS,
   KERNEL_RETAINED_MEDIA_BUDGET_BYTES,
 } from "@/constants/kernelOutput";
