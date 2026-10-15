@@ -47,11 +47,12 @@ const CLAUDE_TOOL_PATTERNS: Readonly<Record<string, readonly string[]>> = {
   // Provider-native fetch and search tools (Gemini url_context/google_search, Grok x_search).
   WebFetch: ["web_fetch", "url_context"],
   WebSearch: ["web_search", "google_search", "x_search"],
-  // TaskCreate/TaskGet/TaskList/TaskUpdate replace TodoWrite as Claude Code's checklist.
+  // TaskCreate/TaskGet/TaskList/TaskUpdate replace TodoWrite as Claude Code's
+  // checklist. The read-only ones grant only todo_read.
   TodoWrite: TODO_TOOLS,
   TaskCreate: TODO_TOOLS,
-  TaskGet: TODO_TOOLS,
-  TaskList: TODO_TOOLS,
+  TaskGet: ["todo_read"],
+  TaskList: ["todo_read"],
   TaskUpdate: TODO_TOOLS,
   // Claude Code renamed Task to Agent and keeps Task as an alias.
   Agent: TASK_TOOLS,
@@ -108,13 +109,19 @@ const ALSO_DENIED = new Map<string, readonly string[]>([
   ["task", WORKFLOW_TOOLS],
 ]);
 
-/** Claude Code removes these from every sub-agent, so listing them in `tools` grants nothing. */
-const NEVER_IN_SUBAGENTS = new Set([
+/** Names that grant nothing in `tools`; in `disallowedTools` they still remove their Xum tools. */
+const DENYLIST_ONLY_TOOLS = new Set([
+  // Claude Code removes these from every sub-agent.
   "AskUserQuestion",
   "EnterPlanMode",
   "ExitPlanMode",
   "ScheduleWakeup",
   "Workflow",
+  // Xum's one heartbeat tool also sets and removes schedules, so it cannot
+  // grant only one Cron operation (CronList must not create schedules).
+  "CronCreate",
+  "CronDelete",
+  "CronList",
 ]);
 
 export class ForeignPluginAgentToolsError extends Error {
@@ -141,13 +148,34 @@ function foreignToolListKeys(raw: Record<string, unknown>): ForeignToolListKey[]
   );
 }
 
+/**
+ * Split a comma-separated list on commas outside parentheses, so a specifier
+ * such as Agent(worker, researcher) stays one entry. One pass: agent files can
+ * be 1 MB, and a lookahead regex would be quadratic.
+ */
+function splitToolList(value: string): string[] {
+  const entries: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < value.length; i++) {
+    const char = value[i];
+    if (char === "(") depth++;
+    else if (char === ")") depth = Math.max(0, depth - 1);
+    else if (char === "," && depth === 0) {
+      entries.push(value.slice(start, i));
+      start = i + 1;
+    }
+  }
+  entries.push(value.slice(start));
+  return entries;
+}
+
 /** Claude accepts a comma-separated string or a YAML list. */
 function readToolList(raw: Record<string, unknown>, key: ForeignToolListKey): string[] {
   const value = raw[key];
   const entries =
     typeof value === "string"
-      ? // Commas inside a specifier, such as Agent(worker, researcher), do not split entries.
-        value.split(/,(?![^(]*\))/)
+      ? splitToolList(value)
       : Array.isArray(value) && value.every((entry) => typeof entry === "string")
         ? value
         : undefined;
@@ -218,7 +246,7 @@ function mapAllowedEntry(entry: string): readonly string[] {
   // that, so it does not grant the tool, except Agent(...), whose type list
   // Claude Code ignores in sub-agents.
   if (specifier !== undefined && !SPECIFIER_IGNORED_TOOLS.has(name)) return [];
-  if (NEVER_IN_SUBAGENTS.has(name)) return [];
+  if (DENYLIST_ONLY_TOOLS.has(name)) return [];
   return Object.hasOwn(CLAUDE_TOOL_PATTERNS, name) ? CLAUDE_TOOL_PATTERNS[name] : [];
 }
 
@@ -239,7 +267,7 @@ function mapToolLists(raw: Record<string, unknown>): { remove: string[] } | unde
 
   if (keys.includes("tools")) {
     const entries = readToolList(raw, "tools");
-    const grants = entries.flatMap(mapAllowedEntry);
+    const grants = [...new Set(entries.flatMap(mapAllowedEntry))];
     const allowed = XUM_BUILT_IN_TOOL_NAMES.filter(
       (name) => matchesAnyPattern(name, grants) && !matchesAnyPattern(name, denied)
     );

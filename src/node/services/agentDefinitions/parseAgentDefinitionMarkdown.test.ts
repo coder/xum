@@ -172,6 +172,7 @@ Body
         "web_fetch",
         "url_context",
         "todo_write",
+        "todo_read",
         "todo_sync",
         "memory",
         "github_create_issue",
@@ -196,6 +197,13 @@ Body
         "task",
         "task_await",
         "todo_write",
+        "todo_read",
+      ]);
+      // A read-only Claude tool grants only the read-only Xum tool.
+      expect(toolsOf("name: a\ntools: TaskList, Read")).toEqual([
+        "file_read",
+        "attach_file",
+        "todo_read",
       ]);
       // A comma inside a specifier does not split the entry; Agent does not grant workflows.
       expect(toolsOf("name: a\ntools: Agent(worker, researcher), Read")).toEqual([
@@ -237,6 +245,8 @@ Body
         "name: a\ndisallowedTools: FutureTool",
         // Claude Code never gives a sub-agent AskUserQuestion, so it does not resolve.
         "name: a\ntools: AskUserQuestion",
+        // Xum's heartbeat tool also creates schedules, so CronList cannot grant it.
+        "name: a\ntools: CronList",
       ]) {
         expect(() => parse(frontmatter, "plugin")).toThrow(AgentDefinitionParseError);
       }
