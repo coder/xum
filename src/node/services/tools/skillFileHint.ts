@@ -37,7 +37,9 @@ const MAX_BASH_PATH_TOKENS = 8;
 function formatSkillFileHint(location: SkillFileLocation): string {
   const name = JSON.stringify(location.skillName);
   const filePath = JSON.stringify(location.filePath);
-  return `${filePath} is a file of skill ${name}. Read it whole, long lines included, with agent_skill_read_file (name: ${name}, filePath: ${filePath}).`;
+  // agent_skill_read_file cannot return a single line over its 16 KB page cap
+  // either (it says so), so the hint does not promise more.
+  return `${filePath} is a file of skill ${name}. agent_skill_read_file (name: ${name}, filePath: ${filePath}) returns its lines whole, up to 16 KB per page.`;
 }
 
 /**
@@ -61,10 +63,14 @@ export async function skillFileBashHint(
   config: ToolConfiguration,
   script: string
 ): Promise<string> {
+  // A quoted operand is one token, so a path with spaces stays whole.
+  const operands = [...script.matchAll(/'([^']*)'|"([^"]*)"|([^\s'"`;|&<>()]+)/g)].map(
+    (match) => match[1] ?? match[2] ?? match[3]
+  );
   const tokens = new Set(
-    script
-      .split(/[\s'"`;|&<>()]+/)
-      .filter((token) => token.includes("/") && !token.startsWith("-") && !/[$*?]/.test(token))
+    operands.filter(
+      (token) => token.includes("/") && !token.startsWith("-") && !/[$*?]/.test(token)
+    )
   );
   for (const token of [...tokens].slice(0, MAX_BASH_PATH_TOKENS)) {
     const location = await findSkillFileForPath(config, token);
@@ -96,7 +102,8 @@ async function findSkillFileForPath(
           return { skillName: name, filePath: relativePath };
         }
       }
-      return null;
+      // An undiscovered SKILL.md (a template a skill bundles) does not end the
+      // search: the enclosing skill can still own the file.
     }
     const parent = pathApi.dirname(dir);
     if (parent === dir) return null;

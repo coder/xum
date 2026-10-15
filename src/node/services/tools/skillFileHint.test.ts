@@ -71,6 +71,13 @@ describe("skill file hint", () => {
       'agent_skill_read_file (name: "demo", filePath: "playbooks/long.md")'
     );
 
+    // A SKILL.md template the skill bundles does not hide the enclosing skill.
+    await fs.mkdir(path.join(skillDir, "templates"));
+    await fs.writeFile(path.join(skillDir, "templates", "SKILL.md"), "template\n");
+    await fs.writeFile(path.join(skillDir, "templates", "long.md"), LONG_LINE);
+    const nested = await fileRead(config, path.join(skillDir, "templates", "long.md"));
+    expect(nested.note).toContain('(name: "demo", filePath: "templates/long.md")');
+
     const whole = await createAgentSkillReadFileTool(config).execute!(
       { name: "demo", filePath: "playbooks/long.md" },
       mockToolCallOptions
@@ -138,7 +145,7 @@ describe("skill file hint", () => {
   });
 
   it("bash names the agent_skill_read_file call when it cannot show a skill file", async () => {
-    using tmp = new TestTempDir("skill-file-hint-bash");
+    using tmp = new TestTempDir("skill file hint bash");
     const { config, skillDir } = await setup(tmp);
 
     const inside = await bashNote(config, `head -c 6000 '${skillDir}/SKILL.md'; echo done`);
@@ -151,7 +158,7 @@ describe("skill file hint", () => {
     expect(whole).toMatchObject({ success: true });
     expect((whole as { content: string }).content).toContain(`\t${LONG_LINE}`);
 
-    const outside = await bashNote(config, `head -c 6000 ${tmp.path}/plain.md`);
+    const outside = await bashNote(config, `head -c 6000 "${tmp.path}/plain.md"`);
     expect(outside).toContain("per-line limit");
     expect(outside).not.toContain("agent_skill_read_file");
   });
