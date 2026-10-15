@@ -722,6 +722,7 @@ export class DraftStore {
   private resubscribeAttempt = 0;
   /** A real snapshot was applied: writes may go out (they could clobber unseen data before). */
   private hydrated = false;
+  private snapshotCurrent = false;
   /** Composers may render: hydrated, or the first subscription failed (self-heal). */
   private ready = false;
   private resolveReady: () => void = () => undefined;
@@ -769,7 +770,24 @@ export class DraftStore {
     return this.hydrated;
   }
 
-  /** Called when the store becomes ready and when it hydrates (also later, after a timeout). */
+  /**
+   * The running subscription has applied its snapshot. Unlike `hydrated`, false again from each
+   * (re)subscription until its snapshot: cached views may be stale until then.
+   */
+  hasCurrentSnapshot(): boolean {
+    return this.snapshotCurrent;
+  }
+
+  private setSnapshotCurrent(current: boolean): void {
+    if (this.snapshotCurrent === current) return;
+    this.snapshotCurrent = current;
+    for (const listener of this.readyListeners) listener();
+  }
+
+  /**
+   * Called when the store becomes ready, when it hydrates (also later, after a timeout), and when
+   * the running subscription's snapshot turns current or stale (hasCurrentSnapshot).
+   */
   subscribeReady = (listener: () => void): (() => void) => {
     this.readyListeners.add(listener);
     return () => this.readyListeners.delete(listener);
@@ -2033,6 +2051,23 @@ export class DraftStore {
     if (!wasHydrated) for (const listener of this.readyListeners) listener();
   }
 
+  /** After each (re)subscription's snapshot: send what waited for it. */
+  private resendAfterSnapshot(): void {
+    for (const entry of this.entries.values()) this.scheduleFlush(entry);
+    for (const key of [...this.pendingDeletes.keys()]) {
+      this.sendDelete(key, 0).catch(() => undefined);
+    }
+    for (const [key, pending] of this.pendingListPuts) {
+      if (pending.confirmedRevision === null) this.startListPut(key, pending);
+    }
+    // Load and every reconnect (a new subscription): resolve every pending send.
+    for (const entry of this.entries.values()) {
+      if (entry.scope.kind === "workspace" && entry.pendingSends.length > 0) {
+        this.triggerSendResolution(entry.scope.workspaceId, { afterStop: true });
+      }
+    }
+  }
+
   private startSubscription(client: APIClient): void {
     if (this.resubscribeTimer) {
       clearTimeout(this.resubscribeTimer);
@@ -2042,6 +2077,7 @@ export class DraftStore {
     this.subscription = controller;
     const { signal } = controller;
     this.forgetServerViews();
+    this.setSnapshotCurrent(false);
     if (!this.ready && !this.readyTimer) {
       // Startup must never hang on drafts (a subscription that never yields, a stuck legacy
       // import): let composers render after a bound. Writes still wait for hydration, and a late
@@ -2073,19 +2109,9 @@ export class DraftStore {
             // scan is cheap.
             await this.migrateLegacyDrafts(client);
             this.markHydrated();
-            for (const entry of this.entries.values()) this.scheduleFlush(entry);
-            for (const key of [...this.pendingDeletes.keys()]) {
-              this.sendDelete(key, 0).catch(() => undefined);
-            }
-            for (const [key, pending] of this.pendingListPuts) {
-              if (pending.confirmedRevision === null) this.startListPut(key, pending);
-            }
-            // Load and every reconnect (a new subscription): resolve every pending send.
-            for (const entry of this.entries.values()) {
-              if (entry.scope.kind === "workspace" && entry.pendingSends.length > 0) {
-                this.triggerSendResolution(entry.scope.workspaceId, { afterStop: true });
-              }
-            }
+            // A newer subscription started during the import: its own snapshot sets this.
+            if (!signal.aborted) this.setSnapshotCurrent(true);
+            this.resendAfterSnapshot();
           } else if (event.type === "list") {
             // Pushes that trail a newer snapshot are stale.
             if (event.revision > this.serverListRevision) this.applyList(event);
@@ -2562,6 +2588,12 @@ export function useCreationDraftsByProject(): CreationDraftsByProject {
 export function useDraftStoreHydrated(): boolean {
   const store = getDraftStore();
   return useSyncExternalStore(store.subscribeReady, () => store.isHydrated());
+}
+
+/** True while the running subscription has applied its snapshot (see hasCurrentSnapshot). */
+export function useDraftStoreSnapshotCurrent(): boolean {
+  const store = getDraftStore();
+  return useSyncExternalStore(store.subscribeReady, () => store.hasCurrentSnapshot());
 }
 
 /** True once drafts are hydrated (or hydration failed and the app must not wait for it). */

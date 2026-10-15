@@ -146,6 +146,52 @@ describe("useWorkspaceName draft state", () => {
     );
   });
 
+  // The user discarded the draft (navigation unmounts the composer) while its name was being
+  // generated: the late result must not write a name, which would bring the draft back.
+  test("a name generated after unmount is not written to the draft", async () => {
+    const generation = Promise.withResolvers<Awaited<ReturnType<typeof generateMock>>>();
+    generateMock.mockImplementationOnce(() => generation.promise);
+    const view = renderWorkspaceName("fix the sidebar");
+    await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(1));
+    view.unmount();
+
+    await act(async () => {
+      generation.resolve({
+        success: true as const,
+        data: { name: "sidebar-a1b2", title: "Fix sidebar", modelUsed: "test:model" },
+      });
+      await generation.promise;
+    });
+    expect(getDraftStore().getView(SCOPE).nameState).toBeNull();
+  });
+
+  // After a reconnect the cached draft may be stale until the new subscription's snapshot: a
+  // name generated for it would be an unsaved edit and outrank the backend's name.
+  test("waits for a replacement client's snapshot before generating a name", async () => {
+    const snapshot = Promise.withResolvers<void>();
+    getDraftStore().setClient(
+      createTestApiClient({
+        drafts: {
+          ...draftBackend.drafts,
+          subscribe: async (input: void, opts?: { signal?: AbortSignal }) => {
+            await snapshot.promise;
+            return draftBackend.drafts.subscribe(input, opts);
+          },
+        },
+      })
+    );
+    const view = renderWorkspaceName("fix the sidebar");
+    await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect(generateMock).toHaveBeenCalledTimes(0);
+
+    await act(async () => {
+      snapshot.resolve();
+      await snapshot.promise;
+    });
+    await waitFor(() => expect(view.result.current.name).toBe("quotes-a1b2"));
+    expect(generateMock).toHaveBeenCalledTimes(1);
+  });
+
   test("another window's name edit replaces the shown name", async () => {
     const view = renderWorkspaceName("");
     act(() => view.result.current.setAutoGenerate(false));
