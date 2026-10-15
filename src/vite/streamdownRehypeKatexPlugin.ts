@@ -9,7 +9,8 @@ import type { Plugin } from "vite";
  * Only Streamdown's own imports are stubbed. Build only, like streamdownShikiLangsPlugin (the dev
  * server pre-bundles Streamdown). A build that stubs nothing fails, so a Streamdown upgrade cannot
  * silently bring KaTeX back.
- */ const STREAMDOWN_MARKER = "/node_modules/streamdown/";
+ */
+const STREAMDOWN_MARKER = "/node_modules/streamdown/";
 const STUB_ID = "\0xum-streamdown-rehype-katex";
 
 export function streamdownRehypeKatexPlugin(): Plugin {

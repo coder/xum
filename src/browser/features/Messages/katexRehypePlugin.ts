@@ -30,7 +30,8 @@ const rehypeMarkMathAncestors: Plugin<[], Root> = () => (tree) => {
  * Loaded only once a message contains math (T3, #5971). Vite resolves the import after this
  * chunk's CSS has loaded, so math never shows unstyled. MarkdownCore appends these last, after
  * sanitize and harden, as before the split: KaTeX adds its own trusted classes and styles.
- */ export const katexRehypePlugins: Pluggable[] = [
+ */
+export const katexRehypePlugins: Pluggable[] = [
   rehypeMarkMathAncestors,
   [rehypeKatex, { errorColor: "var(--color-muted-foreground)" }],
 ];
