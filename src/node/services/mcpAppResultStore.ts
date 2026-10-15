@@ -126,6 +126,8 @@ function fileNameFor(toolCallId: string): string {
 
 export class McpAppResultStore {
   private readonly memory = new Map<string, McpAppResultRecord>();
+  /** Changes around each record file a prune deletes: get() caches a read only if none landed. */
+  private prunedCount = 0;
   /** Queues this backend's model-context updates, so superseded ones skip the target lock. */
   private readonly modelContextLock = new AsyncMutex();
   /**
@@ -302,8 +304,11 @@ export class McpAppResultStore {
       return null;
     }
     // A corrupt or foreign record reads as missing (self-healing), never as an error.
+    const pruned = this.prunedCount;
     const record = await this.readRecord(filePath, toolCallId);
-    if (record) this.remember(workspaceId, record);
+    // A prune that landed during the read may have deleted this record (#6611): caching it
+    // would return it until a restart. Return it once, uncached.
+    if (record && pruned === this.prunedCount) this.remember(workspaceId, record);
     return record;
   }
 
@@ -439,8 +444,11 @@ export class McpAppResultStore {
     const withTimes = stated.filter((entry) => entry !== null);
     withTimes.sort((a, b) => a.mtimeMs - b.mtimeMs);
     for (const { name } of withTimes.slice(0, excess)) {
+      // Counted before and after the delete: a read that overlaps either side skips the cache.
+      this.prunedCount++;
       await fs.rm(path.join(dir, name), { force: true });
       this.forget(workspaceId, name);
+      this.prunedCount++;
     }
   }
 

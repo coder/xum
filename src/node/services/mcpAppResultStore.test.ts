@@ -106,6 +106,43 @@ describe("McpAppResultStore", () => {
     expect(await fs.readdir(dir)).toHaveLength(MCP_APP_RESULT_MAX_PER_WORKSPACE);
   });
 
+  test("a read that overlaps the prune of its record does not cache it", async () => {
+    using tmp = new DisposableTempDir("mcp-app-store");
+    const sessionDir = (id: string) => path.join(tmp.path, id);
+    const writer = new McpAppResultStore(sessionDir);
+    for (let i = 0; i < MCP_APP_RESULT_MAX_PER_WORKSPACE; i++) {
+      await writer.record("ws", entry(`c${i}`));
+    }
+    const dir = path.join(tmp.path, "ws", MCP_APP_RESULT_DIR);
+    const oldName = `${createHash("sha256").update("c0").digest("hex").slice(0, 40)}.json`;
+    // "c0" is the oldest, so the next record prunes it.
+    await fs.utimes(path.join(dir, oldName), 1, 1);
+    const reader = new McpAppResultStore(sessionDir);
+    // The reader has read c0's bytes (an open file) but not finished when the prune lands.
+    const gate = Promise.withResolvers<void>();
+    const realReadFile = fs.readFile;
+    const readFile = spyOn(fs, "readFile").mockImplementation((async (
+      target: string,
+      ...rest: unknown[]
+    ) => {
+      const read = (realReadFile as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
+      if (path.basename(target) !== oldName) return read;
+      const bytes = await read;
+      await gate.promise;
+      return bytes;
+    }) as typeof fs.readFile);
+    try {
+      const pending = reader.get("ws", "c0");
+      await reader.record("ws", entry("next"));
+      expect(await fs.readdir(dir)).not.toContain(oldName);
+      gate.resolve();
+      await pending;
+    } finally {
+      readFile.mockRestore();
+    }
+    expect(await reader.get("ws", "c0")).toBeNull();
+  });
+
   test("pruning never deletes the record it just wrote", async () => {
     using tmp = new DisposableTempDir("mcp-app-store");
     const sessionDir = (id: string) => path.join(tmp.path, id);
