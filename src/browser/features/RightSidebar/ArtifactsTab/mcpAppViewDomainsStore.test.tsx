@@ -207,4 +207,81 @@ describe("live follow of view-domain approvals", () => {
       }
     );
   });
+
+  // #6181: a backend that ends each stream right after one good read must not get a new
+  // stream every 500 ms forever.
+  test("a stream that ends right after its first read reconnects with a growing backoff", async () => {
+    // Each stream of the follow reads once. Counted by reads: the app's own config store opens
+    // streams too.
+    let reads = 0;
+    const client: APIClient = createTestApiClient({
+      config: {
+        // A stream that ends at once, with no changes.
+        onConfigChanged: () =>
+          Promise.resolve({
+            [Symbol.asyncIterator]: () => ({
+              next: () => Promise.resolve({ done: true as const, value: undefined }),
+            }),
+          }),
+      },
+      mcpApps: {
+        readViewDomains: () =>
+          Promise.resolve({
+            revision: 7_000 + ++reads,
+            approvals: [
+              { projectPath: "/ends", serverName: "charts", origins: ["https://e.example.com"] },
+            ],
+          }),
+      },
+    });
+    const view = render(
+      <APIProvider client={client}>
+        <Follower projectPath="/ends" serverName="charts" />
+      </APIProvider>
+    );
+    await waitFor(() =>
+      expect(view.getByTestId("/ends:charts").textContent).toBe("https://e.example.com")
+    );
+    // A reset backoff reads at about 0, 0.5, 1.0, 1.5 and 2.0 s. A growing one reads at
+    // about 0, 0.5 and 1.5 s.
+    await new Promise((resolve) => setTimeout(resolve, 2_200));
+    expect(reads).toBeLessThanOrEqual(3);
+    view.unmount();
+  });
+
+  // #6181: one read that never settles must not stall the follow for good.
+  test("a read that never settles times out, and a new stream reads again", async () => {
+    let reads = 0;
+    const changes = changeStream();
+    const client: APIClient = createTestApiClient({
+      config: { onConfigChanged: changes.open },
+      mcpApps: {
+        readViewDomains: (_input: unknown, options?: { signal?: AbortSignal }) => {
+          reads++;
+          if (reads === 1) {
+            // Hangs until the follow gives up on it.
+            return new Promise((_resolve, reject) =>
+              options?.signal?.addEventListener("abort", () => reject(new Error("aborted")))
+            );
+          }
+          return Promise.resolve({
+            revision: 8_000 + reads,
+            approvals: [
+              { projectPath: "/hang", serverName: "charts", origins: ["https://h.example.com"] },
+            ],
+          });
+        },
+      },
+    });
+    const view = render(
+      <APIProvider client={client}>
+        <Follower projectPath="/hang" serverName="charts" />
+      </APIProvider>
+    );
+    await waitFor(
+      () => expect(view.getByTestId("/hang:charts").textContent).toBe("https://h.example.com"),
+      { timeout: 8_000 }
+    );
+    view.unmount();
+  }, 10_000);
 });

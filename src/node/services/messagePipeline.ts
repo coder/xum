@@ -14,7 +14,7 @@ import { sanitizeToolInputs } from "@/browser/utils/messages/sanitizeToolInput";
 import { inlineSvgAsTextForProvider } from "@/node/utils/messages/inlineSvgAsTextForProvider";
 import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
 import { neutralizeAgentEnvelopeLookalikesForProvider } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
-import { extractToolMediaAsUserMessages } from "@/node/utils/messages/extractToolMediaAsUserMessages";
+import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
 import { sanitizeAnthropicPdfFilenames } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import { convertDataUriFilePartsForSdk } from "@/node/utils/messages/convertDataUriFilePartsForSdk";
 import { insertStepStartPartsForSdk } from "@/node/utils/messages/insertStepStartPartsForSdk";
@@ -180,17 +180,10 @@ export async function prepareMessagesForProvider(
       ? sanitizeAnthropicPdfFilenames(messagesWithHookContext)
       : messagesWithHookContext;
 
-  // Rewrite supported tool-result attachments to small text placeholders + file parts.
-  // Prevents providers from treating large base64 payloads as text/JSON context.
-  const messagesWithToolMediaExtracted =
-    await extractToolMediaAsUserMessages(messagesWithSanitizedPdf);
-
   // Rewrite user file-part data URIs to raw base64 payloads before SDK conversion.
   // convertToModelMessages maps FileUIPart.url -> FilePart.data; keeping data: URLs here
   // can trigger URL-download validation in downstream provider utilities.
-  const messagesWithSdkSafeFileParts = convertDataUriFilePartsForSdk(
-    messagesWithToolMediaExtracted
-  );
+  const messagesWithSdkSafeFileParts = convertDataUriFilePartsForSdk(messagesWithSanitizedPdf);
 
   // Mirror persisted reasoning replay data (signatures, encrypted reasoning) into
   // providerMetadata, the only field convertToModelMessages forwards to the request.
@@ -229,9 +222,19 @@ export async function prepareMessagesForProvider(
 
   // --- ModelMessage-level transforms ---
 
+  // Rewrite supported tool-result attachments to small text placeholders + file parts, so
+  // providers do not read large base64 payloads as text. Runs on ModelMessages, the same
+  // transform StreamManager applies to every in-turn step (transformStepMessages): each image
+  // lands right after its own step's tool result. The MuxMessage-level extraction this
+  // replaces appended it after the whole assistant row instead. Every later thinking block of
+  // that turn then lost part of its prefix, and Anthropic rejected it ("Content that preceded
+  // this block when it was created is missing").
+  const messagesWithToolMediaExtracted =
+    await extractToolMediaAsUserMessagesFromModelMessages(rawModelMessages);
+
   const modelMessages = applyNativeToolSearchReplay(
     normalizeLegacyToolSearchMessages(
-      sanitizeAssistantModelMessages(rawModelMessages, workspaceId)
+      sanitizeAssistantModelMessages(messagesWithToolMediaExtracted, workspaceId)
     ),
     deferLoadingToolNames ?? new Set()
   );

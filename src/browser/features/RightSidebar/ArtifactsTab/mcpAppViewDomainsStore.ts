@@ -131,6 +131,15 @@ interface ViewDomainsFollow {
 }
 const FOLLOW_RETRY_FIRST_MS = 500;
 const FOLLOW_RETRY_MAX_MS = 30_000;
+/**
+ * A stream that lived this long counts as healthy, so the next one starts with the first retry
+ * delay again. A stream that ends sooner keeps growing the backoff, even after a good read:
+ * otherwise a backend that ends each stream right after its first read gets a new stream every
+ * FOLLOW_RETRY_FIRST_MS for good (#6181).
+ */
+const FOLLOW_HEALTHY_STREAM_MS = 10_000;
+/** A read that takes longer fails like any other: the follow retries on a new stream (#6181). */
+const FOLLOW_READ_TIMEOUT_MS = 5_000;
 const follows = new Map<APIClient, ViewDomainsFollow>();
 
 /** Follow the approvals of a mounted view's server in its project while it stays mounted. */
@@ -187,21 +196,24 @@ async function runViewDomainsFollow(
   }
 }
 
-/** One stream: read now, then after each change. Returns whether a read succeeded. */
+/**
+ * One stream: read now, then after each change. Returns whether the stream was healthy: a read
+ * that a change caused succeeded, or the stream lived FOLLOW_HEALTHY_STREAM_MS.
+ */
 async function followChanges(
   api: APIClient,
   follow: ViewDomainsFollow,
   signal: AbortSignal
 ): Promise<boolean> {
   let changes: AsyncIterator<unknown> | null = null;
-  let read = false;
+  const openedAt = Date.now();
+  let changeRead = false;
   try {
     const stream = await api.config.onConfigChanged(undefined, { signal });
     changes = stream[Symbol.asyncIterator]();
     // A change can land between a view's getView and the stream start, or fire while the
     // backend starts its watch (before onConfigChanged returns there): read once now.
     await rereadViewDomains(api, follow, signal);
-    read = true;
     let change = changes.next();
     while (!signal.aborted) {
       // A key that joins while no read runs wakes this wait: its view's getView list can
@@ -214,13 +226,14 @@ async function followChanges(
         change = changes.next();
       }
       await rereadViewDomains(api, follow, signal);
+      if (woke !== "joined") changeRead = true;
     }
   } catch {
     // A failed stream or read: the caller retries after a backoff, unless stopped.
   } finally {
     void changes?.return?.();
   }
-  return read;
+  return changeRead || Date.now() - openedAt >= FOLLOW_HEALTHY_STREAM_MS;
 }
 
 function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
@@ -244,7 +257,9 @@ async function rereadViewDomains(
   do {
     follow.keysJoined = false;
     const keys = [...follow.keys.keys()];
-    const { revision, approvals } = await api.mcpApps.readViewDomains();
+    const { revision, approvals } = await api.mcpApps.readViewDomains(undefined, {
+      signal: AbortSignal.any([signal, AbortSignal.timeout(FOLLOW_READ_TIMEOUT_MS)]),
+    });
     if (signal.aborted) return;
     const read = new Map(approvals.map((a) => [keyOf(a.projectPath, a.serverName), a.origins]));
     for (const key of keys) publishByKey(key, read.get(key) ?? [], revision);

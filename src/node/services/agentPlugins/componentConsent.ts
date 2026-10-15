@@ -23,7 +23,12 @@ import { getOwn } from "@/common/utils/getOwn";
 import { stableStringify } from "@/common/utils/stableStringify";
 import { skillDynamicDirectiveCommands } from "@/node/services/agentSkills/skillDynamicContext";
 
-/** Bump when the fingerprint input changes: every record then needs a new review (fails closed). */
+/**
+ * Bump when the fingerprint input changes for every record: each then needs a new review (fails
+ * closed). An input added only for some records can skip the bump when its key is absent
+ * otherwise. The skill `directives` key (#6617) does this on purpose: a skill without directive
+ * lines keeps its fingerprint, and only skills with them need a new review.
+ */
 const CONSENT_SCHEME = 1;
 
 /** "presence": only whether the field is set counts (a secret's location and value do not). */

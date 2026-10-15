@@ -13,7 +13,12 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider } from "@/browser/contexts/API";
 import { useWorkspaceStoreRaw, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import { createTestApiClient } from "@/browser/testUtils";
-import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTab";
+import {
+  AppViewTabLabel,
+  AppViewTabPanel,
+  AppViewTabTooltip,
+  findOwnMaximizedAppPanel,
+} from "./AppViewTab";
 
 /**
  * Run the view document's preamble (its first script) as the frame's document would: it opens
@@ -376,6 +381,19 @@ describe("AppViewTabPanel", () => {
     // The keyboard path: the Artifacts fullscreen shortcut toggles it, Escape restores it.
     fireEvent.keyDown(panel(), { key: "F", shiftKey: true });
     expect(panel().className).toContain("fixed");
+    // A held key auto-repeats: the repeats must not flip the panel back (#6181).
+    fireEvent.keyDown(panel(), { key: "F", shiftKey: true, repeat: true });
+    expect(panel().className).toContain("fixed");
+    // Cmd/Ctrl+W: the sidebar treats its own maximized panel as its tab, not as a blocking
+    // modal (#6181), but only while no other modal is open.
+    expect(findOwnMaximizedAppPanel(view.container)).toBe(panel());
+    expect(findOwnMaximizedAppPanel(document.createElement("div"))).toBeNull();
+    const otherModal = document.createElement("div");
+    otherModal.setAttribute("role", "dialog");
+    otherModal.setAttribute("aria-modal", "true");
+    document.body.appendChild(otherModal);
+    expect(findOwnMaximizedAppPanel(view.container)).toBeNull();
+    otherModal.remove();
     // Escape restores the panel only: it must not reach window handlers (Escape-to-interrupt).
     let windowEscapes = 0;
     const onWindowKey = (event: KeyboardEvent) => {

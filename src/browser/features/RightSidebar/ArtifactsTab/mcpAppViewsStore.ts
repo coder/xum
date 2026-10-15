@@ -524,6 +524,11 @@ export function setMcpAppViewFullscreenOnly(
   emit();
 }
 
+/** Whether the view's latest initialize declared fullscreen but not inline (see above). */
+export function isMcpAppViewFullscreenOnly(workspaceId: string, toolCallId: string): boolean {
+  return fullscreenOnlyViews.has(lookupKey(workspaceId, toolCallId));
+}
+
 export function useMcpAppViewFullscreenOnly(workspaceId: string, toolCallId: string): boolean {
   return useSyncExternalStore(subscribe, () =>
     fullscreenOnlyViews.has(lookupKey(workspaceId, toolCallId))
