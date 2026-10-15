@@ -1027,6 +1027,14 @@ describe("task launch races", () => {
         await s.launched;
         await s.launchFailureRecorded;
         await box.stop;
+        // The Stop resolves before its latch drops: the release waits for the attempt's
+        // settlement receipt to reach disk (recheckWorkspaceStopRelease), and a reawakening sent
+        // before that is refused as "A stop is in progress" (#6677). Wait for the release itself.
+        await waitUntil(
+          () => !internals.isWorkspaceStopInProgress(CHILD),
+          "the Stop to release the child",
+          10_000
+        );
         expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("interrupted");
         // The session rolled the launch's row back: the brief is kept for the reawakening.
         expect(await s.briefsInHistory()).toBe(0);
