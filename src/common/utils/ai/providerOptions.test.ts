@@ -109,6 +109,16 @@ describe("resolveProviderOptionsNamespaceKey", () => {
     expect(resolveProviderOptionsNamespaceKey("meta", "openrouter")).toBe("openrouter");
   });
 
+  test("merges Google Vertex AI extras into the namespace its thinking options use", () => {
+    // Saved provider extras merge under this key; a Vertex model reads `googleVertex`
+    // before `google`, so a split namespace would drop the thinking options or the extras.
+    const thinkingOptions = buildProviderOptions("google-vertex:gemini-2.5-pro", "medium");
+    expect(Object.keys(thinkingOptions)).toEqual([
+      resolveProviderOptionsNamespaceKey("google-vertex"),
+    ]);
+    expect(resolveProviderOptionsNamespaceKey("google-vertex")).toBe("googleVertex");
+  });
+
   test("returns the canonical provider for direct routing", () => {
     expect(resolveProviderOptionsNamespaceKey("openai")).toBe("openai");
   });

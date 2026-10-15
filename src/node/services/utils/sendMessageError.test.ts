@@ -104,6 +104,20 @@ describe("formatSendMessageError", () => {
     expect(result.message).toContain("API key");
   });
 
+  test("points Google Vertex AI at its Project instead of an API key", () => {
+    // Vertex authenticates with Google Cloud credentials by default, so "add your
+    // API key" would send the user to an optional express mode setting.
+    const result = formatSendMessageError({
+      type: "api_key_not_found",
+      provider: "google-vertex",
+    });
+
+    expect(result.errorType).toBe("authentication");
+    expect(result.message).toContain("Google Vertex AI");
+    expect(result.message).toContain("Project");
+    expect(result.message).not.toContain("Please add your API key");
+  });
+
   test("formats provider_not_supported", () => {
     const result = formatSendMessageError({
       type: "provider_not_supported",
