@@ -3075,6 +3075,12 @@ describe("AgentPluginInstallService", () => {
       await expect(restarted.signOutPluginServers()).rejects.toThrow(/demo-plugin/);
       expect(await pathExists(file)).toBe(true);
       await fsPromises.writeFile(mcpFile, mcpJson);
+      // So does a tree without a manifest: restored later, it would load with the old sign-in.
+      const manifest = path.join(pluginsDir(), "demo-plugin", "plugin.json");
+      await fsPromises.rename(manifest, `${manifest}.moved`);
+      await expect(restarted.signOutPluginServers()).rejects.toThrow(/manifest of plugin/);
+      expect(await pathExists(file)).toBe(true);
+      await fsPromises.rename(`${manifest}.moved`, manifest);
       // The record names no usable URL, so the servers come from the installed plugin trees.
       spyOn(oauth, "logout").mockResolvedValueOnce({ success: false, error: "disk full" });
       await expect(restarted.signOutPluginServers()).rejects.toThrow(/disk full/);
@@ -3088,10 +3094,61 @@ describe("AgentPluginInstallService", () => {
       expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
       expect(await pathExists(file)).toBe(false);
       expect(await discovered()).toBe(1);
+      // A record of a newer version whose sign-outs this version cannot read stays: it can name
+      // a URL that no current plugin tree has.
+      await fsPromises.writeFile(
+        file,
+        JSON.stringify({ version: 2, signOuts: [{ url: serverUrl }] })
+      );
+      await expect(restarted.signOutPluginServers()).rejects.toThrow(/another Xum version/);
+      expect(await pathExists(file)).toBe(true);
+      // An unmanaged tree whose directory name is not a managed-plugin name does not block it.
+      const handMade = path.join(pluginsDir(), ".hand_made");
+      await fsPromises.mkdir(handMade);
+      await fsPromises.writeFile(
+        path.join(handMade, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "hand-made",
+          version: "1.0.0",
+        })
+      );
+      await fsPromises.copyFile(mcpFile, path.join(handMade, "mcp.json"));
+      // A newer record that still names its URLs is finished like a current one.
+      await fsPromises.writeFile(file, JSON.stringify({ version: 2, urls: [serverUrl] }));
+      await restarted.signOutPluginServers();
+      expect(await pathExists(file)).toBe(false);
       // A directory at the record path is removed too, or the fence would never open.
       await fsPromises.mkdir(path.join(file, "junk"), { recursive: true });
       await restarted.signOutPluginServers();
       expect(await pathExists(file)).toBe(false);
+      // A damaged current record keeps the URLs it can read: an uninstalled plugin's URL is in
+      // no tree, so the record is its only trace.
+      const logout = spyOn(oauth, "logout");
+      const oldUrl = "https://old.example/mcp";
+      await fsPromises.writeFile(file, JSON.stringify({ version: 1, urls: [oldUrl, 42] }));
+      await restarted.signOutPluginServers();
+      expect(logout.mock.calls.map(([args]) => args.serverUrl)).toContain(oldUrl);
+      logout.mockRestore();
+      // A directory that is not installed and has no manifest is skipped, as discovery skips it.
+      const marketplace = path.join(pluginsDir(), "marketplace");
+      await fsPromises.mkdir(marketplace);
+      await fsPromises.writeFile(path.join(marketplace, "marketplace.json"), "{}");
+      await fsPromises.writeFile(file, "{ not json");
+      await restarted.signOutPluginServers();
+      expect(await pathExists(file)).toBe(false);
+      // A tree that stat cannot reach (EACCES) can load after a repair: the record stays.
+      const locked = path.join(muxRoot, "locked");
+      await fsPromises.mkdir(path.join(locked, "tree"), { recursive: true });
+      await fsPromises.symlink(path.join(locked, "tree"), path.join(pluginsDir(), "linked"));
+      await fsPromises.chmod(locked, 0o000);
+      await fsPromises.writeFile(file, "{ not json");
+      try {
+        await expect(restarted.signOutPluginServers()).rejects.toThrow(/EACCES/);
+        expect(await pathExists(file)).toBe(true);
+      } finally {
+        await fsPromises.chmod(locked, 0o755);
+      }
       await oauth.dispose();
     });
 
