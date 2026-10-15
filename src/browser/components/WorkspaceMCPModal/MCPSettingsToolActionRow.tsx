@@ -27,6 +27,8 @@ interface MCPSettingsToolActionRowProps {
   serverName: string;
   /** The settings read's instanceToken: the tool must belong to the instance the user saw. */
   instanceToken: string;
+  /** The settings read's readId: the backend runs only tools that very read offered. */
+  readId: string;
   item: Extract<MCPSettingsLayoutItem, { kind: "tool" }>;
   /** A save or refresh of the section is in flight. */
   disabled: boolean;
@@ -185,6 +187,7 @@ interface ToolActionTarget {
   serverName: string;
   toolName: string;
   instanceToken: string;
+  readId: string;
 }
 
 /** A run's outcome: its text result or opened view, and whether the tool may have written. */
@@ -346,6 +349,7 @@ function useToolActionRun(
       serverName: props.serverName,
       toolName: props.item.tool,
       instanceToken: props.instanceToken,
+      readId: props.readId,
     };
     let result: SettingsToolRunResult | null = null;
     try {

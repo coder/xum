@@ -1492,7 +1492,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
               data:
                 snapshot === undefined
                   ? null
-                  : { ...structuredClone(snapshot), instanceToken: readToken(serverName) },
+                  : {
+                      ...structuredClone(snapshot),
+                      instanceToken: readToken(serverName),
+                      readId: `mock-read-${serverName}`,
+                    },
             };
           };
           const result = Object.fromEntries(input.serverNames.map((name) => [name, readOne(name)]));
@@ -1521,6 +1525,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             data: {
               ...structuredClone(snapshot),
               instanceToken: mockSettingsToken(input.serverName),
+              readId: `mock-read-${input.serverName}`,
             },
           };
         },

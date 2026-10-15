@@ -970,7 +970,13 @@ describe("MCPServerManager", () => {
 
     const run = (tool: string, confirmed = false, token = snapshot.instanceToken) =>
       manager
-        .runSettingsTool(workspaceId, "cad", tool, token, { confirmed })
+        .runSettingsTool(
+          workspaceId,
+          "cad",
+          tool,
+          { ...snapshot, instanceToken: token },
+          { confirmed }
+        )
         .catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
     // A read-only tool runs at once; only the text parts of its result come back.
     expect(await run("library")).toEqual({ text: "3 libraries\nsynced", isError: false });
@@ -1036,7 +1042,7 @@ describe("MCPServerManager", () => {
     listing = new Set(["new"]);
     const run = (tool: string) =>
       manager
-        .runSettingsTool(workspaceId, "cad", tool, first.instanceToken, { confirmed: false })
+        .runSettingsTool(workspaceId, "cad", tool, first, { confirmed: false })
         .then(() => "ran")
         .catch((error: unknown) => String(error));
     expect(await run("old")).toContain("no tool");
@@ -1087,7 +1093,7 @@ describe("MCPServerManager", () => {
     if (snapshot === null) throw new Error("expected settings");
     const run = () =>
       manager
-        .runSettingsTool(workspaceId, "cad", "reset", snapshot.instanceToken, { confirmed: false })
+        .runSettingsTool(workspaceId, "cad", "reset", snapshot, { confirmed: false })
         .then(() => "ran")
         .catch((error: unknown) => String(error));
     // The tool became writable, but the listing that would say so fails, or stalls past the
@@ -1147,7 +1153,7 @@ describe("MCPServerManager", () => {
     if (snapshot === null) throw new Error("expected settings");
     const run = (confirmed: boolean) =>
       manager
-        .runSettingsTool(workspaceId, "cad", "reset", snapshot.instanceToken, { confirmed })
+        .runSettingsTool(workspaceId, "cad", "reset", snapshot, { confirmed })
         .then(() => "ran")
         .catch((error: unknown) => String(error));
     serverReadOnly = false;
@@ -1295,19 +1301,79 @@ describe("MCPServerManager", () => {
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     const first = await manager.readSettings(workspaceId, "cad");
     if (first === null) throw new Error("expected settings");
-    const run = (tool: string) =>
+    const run = (tool: string, read: { instanceToken: string; readId: string } = first) =>
       manager
-        .runSettingsTool(workspaceId, "cad", tool, first.instanceToken, { confirmed: true })
+        .runSettingsTool(workspaceId, "cad", tool, read, { confirmed: true })
         .then(() => "ran")
         .catch((error: unknown) => String(error));
     // A crafted call for a listed, allowed tool that the layout never offered is refused.
     expect(await run("reset")).toContain("settings do not offer 'reset'");
     expect(await run("library")).toBe("ran");
-    // The instance's latest read decides: a tool the new layout dropped is refused.
+    // A dialog that reads the new layout gets that layout's tools: the dropped one is refused.
     offered = "reset";
-    await manager.readSettings(workspaceId, "cad");
-    expect(await run("library")).toContain("settings do not offer 'library'");
-    expect(await run("reset")).toBe("ran");
+    const second = await manager.readSettings(workspaceId, "cad");
+    if (second === null) throw new Error("expected settings");
+    expect(await run("library", second)).toContain("settings do not offer 'library'");
+    expect(await run("reset", second)).toBe("ran");
+    expect(runs).toEqual(["library", "reset"]);
+  });
+
+  test("settings tool actions run only tools of the very read the dialog names", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-actions-per-read") });
+    // The first window reads a layout with "library". The server then adds "reset", and a
+    // second window's newer read shows both.
+    let offered = ["library"];
+    const runs: string[] = [];
+    servers.serve("settings-actions-per-read", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [
+                {
+                  kind: "group",
+                  title: "Parts",
+                  items: offered.map((tool) => ({ kind: "tool", tool })),
+                },
+              ],
+            },
+          }),
+        settingsToolAction: (name) =>
+          name === "library" || name === "reset"
+            ? { title: name, readOnly: true, opensApp: false }
+            : undefined,
+        callSettingsActionTool: (name) => {
+          runs.push(name);
+          return Promise.resolve({ content: [] });
+        },
+      },
+    });
+    const workspaceId = "settings-actions-per-read-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const firstWindow = await manager.readSettings(workspaceId, "cad");
+    offered = ["library", "reset"];
+    const secondWindow = await manager.readSettings(workspaceId, "cad");
+    if (firstWindow === null || secondWindow === null) throw new Error("expected settings");
+    // One server instance, so both windows carry the same instance token.
+    expect(secondWindow.instanceToken).toBe(firstWindow.instanceToken);
+    const run = (tool: string, read: { instanceToken: string; readId: string }) =>
+      manager
+        .runSettingsTool(workspaceId, "cad", tool, read, { confirmed: true })
+        .then(() => "ran")
+        .catch((error: unknown) => String(error));
+    // The newer read does not widen what the first window's read may run.
+    expect(await run("reset", firstWindow)).toContain("settings do not offer 'reset'");
+    expect(await run("library", firstWindow)).toBe("ran");
+    expect(await run("reset", secondWindow)).toBe("ran");
+    // A read Xum does not know (forgotten, or never made) asks the user to reopen the dialog.
+    expect(await run("library", { ...firstWindow, readId: "unknown-read" })).toContain(
+      "Reopen the dialog"
+    );
     expect(runs).toEqual(["library", "reset"]);
   });
 
@@ -1379,7 +1445,7 @@ describe("MCPServerManager", () => {
     if (shown === null) throw new Error("expected settings");
     const run = (tool: string) =>
       manager
-        .runSettingsTool(workspaceId, "cad", tool, shown.instanceToken, { confirmed: true })
+        .runSettingsTool(workspaceId, "cad", tool, shown, { confirmed: true })
         .then(() => "ran")
         .catch((error: unknown) => String(error));
     // The dialog shows the newer read: its tool runs, and the older layout's tool does not.
@@ -1461,7 +1527,13 @@ describe("MCPServerManager", () => {
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     // No read has seen this instance, so no token can name it: a crafted call is refused.
     const refusal = await manager
-      .runSettingsTool(workspaceId, "cad", "reset", "never-read", { confirmed: true })
+      .runSettingsTool(
+        workspaceId,
+        "cad",
+        "reset",
+        { instanceToken: "never-read", readId: "never-read" },
+        { confirmed: true }
+      )
       .then(() => "ran")
       .catch((error: unknown) => String(error));
     expect(refusal).toContain("Reopen the dialog");
@@ -2100,7 +2172,7 @@ describe("MCPServerManager", () => {
 
     const run = () =>
       manager
-        .runSettingsTool("settings-token-ws", "cad", "lib", read.instanceToken, {
+        .runSettingsTool("settings-token-ws", "cad", "lib", read, {
           confirmed: false,
         })
         .then(() => "ran")
@@ -2435,14 +2507,14 @@ describe("MCPServerManager", () => {
     if (snapshot === null) throw new Error("expected settings");
     const open = (tool: string, confirmed: boolean) =>
       manager
-        .openSettingsApp(workspaceId, "cad", tool, snapshot.instanceToken, { confirmed })
+        .openSettingsApp(workspaceId, "cad", tool, snapshot, { confirmed })
         .catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
 
     // Each path takes only its own kind of tool; a tool that can write needs a confirmation.
     expect(await open("library", true)).toContain("has no MCP App");
     expect(await open("payment", false)).toContain("confirmation");
     const runRefusal = await manager
-      .runSettingsTool(workspaceId, "cad", "payment", snapshot.instanceToken, { confirmed: true })
+      .runSettingsTool(workspaceId, "cad", "payment", snapshot, { confirmed: true })
       .catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
     expect(runRefusal).toContain("opens an MCP App");
     expect(calls).toEqual([]);
@@ -2526,12 +2598,10 @@ describe("MCPServerManager", () => {
     const snapshot = await manager.readSettings(workspaceId, "cad");
     if (snapshot === null) throw new Error("expected settings");
     const open = () =>
-      manager
-        .openSettingsApp(workspaceId, "cad", "payment", snapshot.instanceToken, { confirmed: true })
-        .then(
-          () => "opened",
-          (error: unknown) => (error instanceof Error ? error.message : String(error))
-        );
+      manager.openSettingsApp(workspaceId, "cad", "payment", snapshot, { confirmed: true }).then(
+        () => "opened",
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
 
     // Two windows open the app at once. The call dispatched second (the newer open) finishes
     // first, and its write fails.
