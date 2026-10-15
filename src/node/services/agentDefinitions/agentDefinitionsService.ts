@@ -49,6 +49,7 @@ import {
   isPluginAgentConsented,
   type ComponentConsent,
 } from "@/node/services/agentPlugins/componentConsent";
+import { ambiguousPluginAgentIds, pluginAgentIdOf } from "@/node/services/agentPlugins/agentFiles";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 import { getBuiltInAgentDefinitions } from "./builtInAgentDefinitions";
@@ -271,6 +272,38 @@ async function buildScanCandidates(
     },
     ...globalPluginCandidates,
   ];
+}
+
+/** Logs each refusal of `ambiguousPluginAgentIds` and returns the IDs. */
+function warnAmbiguousPluginAgents(fileNames: readonly string[]): Set<string> {
+  const warnings: string[] = [];
+  const ambiguous = ambiguousPluginAgentIds(fileNames, warnings);
+  for (const warning of warnings) log.warn(warning);
+  return ambiguous;
+}
+
+/** A plugin agents dir without the IDs two files claim (#6629). Other roots keep first-wins. */
+function withoutAmbiguousPluginAgents(
+  scan: Pick<AgentDefinitionScanCandidate, "pluginRoot">,
+  fileNames: string[]
+): string[] {
+  if (scan.pluginRoot == null) return fileNames;
+  const ambiguous = warnAmbiguousPluginAgents(fileNames);
+  return fileNames.filter((name) => !ambiguous.has(pluginAgentIdOf(name) ?? ""));
+}
+
+/**
+ * The definition read of a plugin agent: contained in the plugin, and the only file of its agents
+ * dir that claims the ID (#6629), so the bytes it opens are the bytes the review covered.
+ */
+async function isPluginAgentLoadable(args: {
+  pluginRoot: string;
+  agentsDir: string;
+  filePath: string;
+  agentId: AgentId;
+}): Promise<boolean> {
+  const ambiguous = warnAmbiguousPluginAgents(await listAgentFilesFromLocalFs(args.agentsDir));
+  return !ambiguous.has(args.agentId) && (await isPluginAgentContained(args));
 }
 
 /**
@@ -532,10 +565,12 @@ export async function discoverAgentDefinitions(
       continue;
     }
 
-    const filenames =
+    const filenames = withoutAmbiguousPluginAgents(
+      scan,
       scan.runtime instanceof RemoteRuntime
         ? await listAgentFilesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
-        : await listAgentFilesFromLocalFs(resolvedRoot);
+        : await listAgentFilesFromLocalFs(resolvedRoot)
+    );
 
     for (const filename of filenames) {
       const agentId = getAgentIdFromFilename(filename);
@@ -751,12 +786,13 @@ async function loadAgentDefinition(
     const filePath = candidate.runtime.normalizePath(`${agentId}.md`, resolvedRoot);
 
     if (candidate.pluginRoot != null) {
-      const contained = await isPluginAgentContained({
+      const loadable = await isPluginAgentLoadable({
         pluginRoot: candidate.pluginRoot,
+        agentsDir: resolvedRoot,
         filePath,
         agentId,
       });
-      if (!contained) continue;
+      if (!loadable) continue;
     }
 
     try {

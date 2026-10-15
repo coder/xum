@@ -1,4 +1,3 @@
-import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
@@ -25,7 +24,11 @@ export interface PluginAgentFile {
  * introduce a runnable agent without re-consent; the preview could
  * likewise advertise an agent that never loads.
  */
-export async function listPluginAgentFiles(dir: string | undefined): Promise<PluginAgentFile[]> {
+export async function listPluginAgentFiles(
+  dir: string | undefined,
+  /** Receives one warning per agent refused because two files claim its ID. */
+  warnings: string[] = []
+): Promise<PluginAgentFile[]> {
   if (dir === undefined) {
     return [];
   }
@@ -35,39 +38,54 @@ export async function listPluginAgentFiles(dir: string | undefined): Promise<Plu
   } catch {
     return [];
   }
+  const names = entries.flatMap((entry) => (entry.isFile() ? [entry.name] : []));
+  const ambiguous = ambiguousPluginAgentIds(names, warnings);
   const agents: PluginAgentFile[] = [];
-  // Runtime discovery dedupes by normalized agent ID with the first
-  // successfully parsed file winning (discoverAgentDefinitions sets byId
-  // once per ID, in the same readdir enumeration order used here). Mirror
-  // that: on a case-sensitive filesystem agents/foo.md and agents/FOO.md
-  // are ONE loadable agent, so the preview must promise one row and the
-  // capability surface must not fingerprint a definition that never loads.
-  const seenAgentIds = new Set<string>();
-  for (const entry of entries) {
-    const agentId = agentIdOfEntry(entry);
-    if (agentId === null || seenAgentIds.has(agentId)) {
+  for (const name of names) {
+    const agentId = pluginAgentIdOf(name);
+    if (agentId === null || ambiguous.has(agentId)) {
       continue;
     }
-    const frontmatter = await readAgentFrontmatter(path.join(dir, entry.name), agentId);
+    const frontmatter = await readAgentFrontmatter(path.join(dir, name), agentId);
     if (frontmatter === undefined) {
       continue;
     }
-    // Seen only AFTER a successful parse, mirroring runtime dedupe: when
-    // the enumeration-order winner is malformed (skipped above), the next
-    // same-ID file is the one that actually loads.
-    seenAgentIds.add(agentId);
-    agents.push({ name: entry.name, id: agentId, frontmatter });
+    agents.push({ name, id: agentId, frontmatter });
   }
   return agents.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-/** The agent ID of a directory entry that can load: a regular `.md` file with a valid ID stem. */
-function agentIdOfEntry(entry: Dirent): string | null {
-  const agentIdParse = AgentIdSchema.safeParse(path.parse(entry.name).name.trim().toLowerCase());
-  if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".md") || !agentIdParse.success) {
-    return null;
-  }
+/** The agent ID a plugin file loads under: a `.md` file with a valid ID stem, lowercased. */
+export function pluginAgentIdOf(fileName: string): string | null {
+  const agentIdParse = AgentIdSchema.safeParse(path.parse(fileName).name.trim().toLowerCase());
+  if (!fileName.toLowerCase().endsWith(".md") || !agentIdParse.success) return null;
   return agentIdParse.data;
+}
+
+/**
+ * Agent IDs that two files of one agents directory claim (`Reviewer.md` and `reviewer.md` on a
+ * case-sensitive filesystem). Discovery would list one file and the definition read would open the
+ * other, so a review of one could approve the other's bytes. Xum refuses such an agent (#6629):
+ * the review, discovery and the definition read all skip it, and each caller warns.
+ */
+export function ambiguousPluginAgentIds(
+  fileNames: readonly string[],
+  warnings: string[]
+): Set<string> {
+  const filesById = new Map<string, string[]>();
+  for (const name of fileNames) {
+    const agentId = pluginAgentIdOf(name);
+    if (agentId !== null) filesById.set(agentId, [...(filesById.get(agentId) ?? []), name]);
+  }
+  const ambiguous = new Set<string>();
+  for (const [agentId, files] of filesById) {
+    if (files.length < 2) continue;
+    ambiguous.add(agentId);
+    warnings.push(
+      `Agent '${agentId}' does not load: more than one file claims its ID (${files.sort().join(", ")}). Keep one of them.`
+    );
+  }
+  return ambiguous;
 }
 
 /** The parsed frontmatter of one agent file, or undefined when the runtime would skip it. */

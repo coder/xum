@@ -2235,7 +2235,10 @@ export class AgentPluginInstallService {
       });
     }
     const agents = new Map(
-      (await listPluginAgentFiles(plugin.agentsDir)).map((agent) => [agent.id, agentSurface(agent)])
+      (await listPluginAgentFiles(plugin.agentsDir, warnings)).map((agent) => [
+        agent.id,
+        agentSurface(agent),
+      ])
     );
     const workflows = new Map(
       (await this.collectWorkflowScripts(plugin, warnings)).map((w) => [w.file, w] as const)
@@ -2824,7 +2827,9 @@ export class AgentPluginInstallService {
       const codexHooks = await loadPluginCodexHooks(plugin);
       warnings.push(...codexHooks.warnings);
       const openaiInterface = await interfaceSummary(plugin, warnings);
-      const agents = (await listPluginAgentFiles(plugin.agentsDir)).map((agent) => agent.name);
+      const agents = (await listPluginAgentFiles(plugin.agentsDir, warnings)).map(
+        (agent) => agent.name
+      );
       const workflows = await listPluginWorkflowFiles(plugin.workflowsDir);
       const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
         name: command.name,
@@ -3667,7 +3672,7 @@ export class AgentPluginInstallService {
           workflows.map((workflow) => [workflow.file, workflow.consentFingerprint])
         ),
         agents: Object.fromEntries(
-          (await listPluginAgentFiles(plugin.agentsDir)).map((agent) => [
+          (await listPluginAgentFiles(plugin.agentsDir, warnings)).map((agent) => [
             agent.id,
             agentConsentFingerprint(agent),
           ])
