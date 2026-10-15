@@ -422,6 +422,9 @@ const divergesAt = (index: number) => ({
   received: String(index),
 });
 
+const ONE_PIXEL_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
 /** Display data the real MCP wrapper publishes for each call; runTurn's StreamManager reads it. */
 const displayRegistry = new ToolCallDisplayRegistry();
 
@@ -429,12 +432,15 @@ const displayRegistry = new ToolCallDisplayRegistry();
  * An MCP tool as mcpServerManager builds it: the client's raw tool (mcpToModelOutput) inside
  * the real wrapMCPTools, optionally inside the model-only notification wrapper of tools.ts.
  */
-function mcpTool(name: string, notes: string[] = []): Tool {
+function mcpTool(
+  name: string,
+  notes: string[] = [],
+  content: unknown[] = [{ type: "text", text: "page body" }]
+): Tool {
   const raw = tool({
     description: `${name} tool`,
     inputSchema: z.object({ script: z.string() }),
-    execute: () =>
-      Promise.resolve({ content: [{ type: "text", text: "page body" }], isError: false }),
+    execute: () => Promise.resolve({ content, isError: false }),
     toModelOutput: mcpToModelOutput,
   });
   const wrapped = wrapMCPTools(
@@ -542,6 +548,24 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
     await expectNextTurnExtendsLastStep({
       tools: { notion_fetch: reminded, probe: plainTool("probe") },
       firstTurn: toolThenTextTurn("notion_fetch", "call-1"),
+    });
+  });
+
+  // In-turn, mcpToModelOutput keeps an MCP image inside the tool result as a file part, which
+  // the step's media extraction leaves alone. The rebuild used to extract it on MuxMessages
+  // before the MCP conversion ran and moved it behind the turn's final text (#6747).
+  test("MCP image results keep the prefix", async () => {
+    const screenshot = mcpTool(
+      "browser_screenshot",
+      [],
+      [
+        { type: "text", text: "Captured." },
+        { type: "image", data: ONE_PIXEL_PNG, mimeType: "image/png" },
+      ]
+    );
+    await expectNextTurnExtendsLastStep({
+      tools: { browser_screenshot: screenshot, probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("browser_screenshot", "call-1"),
     });
   });
 
@@ -666,8 +690,6 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
   // the tool result of that step. The rebuild used to extract on whole MuxMessages and append
   // the image after the assistant row, behind the turn's final text.
   test("attach_file media stays where the in-turn step put it", async () => {
-    const png =
-      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
     const attachFile = tool({
       description: "attach_file tool",
       inputSchema: z.object({ script: z.string() }),
@@ -676,7 +698,7 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
           type: "content",
           value: [
             { type: "text", text: "[Attachment prepared: a.png]" },
-            { type: "media", data: png, mediaType: "image/png", filename: "a.png" },
+            { type: "media", data: ONE_PIXEL_PNG, mediaType: "image/png", filename: "a.png" },
           ],
         }),
     });
