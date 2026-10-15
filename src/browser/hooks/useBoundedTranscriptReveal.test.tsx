@@ -985,6 +985,44 @@ describe("useBoundedTranscriptReveal", () => {
         expect(slice.mounted().length).toBeLessThanOrEqual(CAP);
       });
 
+      // #6757 review: a detached slice; one update replaces a mounted row, a later one deletes
+      // the start row. The replacement stays mounted. And with every mounted row gone, the slice
+      // does not jump forward to rows that were never mounted.
+      function detachedPastCap() {
+        const slice = grouped();
+        slice.atCap();
+        slice.set({ followsTail: false });
+        slice.append(15, () => false); // Past the cap: the slice detaches at the first new row.
+        expect(slice.reveal().isDetached).toBe(true);
+        return slice;
+      }
+
+      test("a replaced mounted row stays mounted when the start row goes later", () => {
+        const slice = detachedPastCap();
+        const before = slice.mounted();
+        const swapped = slice
+          .messages()
+          .map((row) => (row.id === before[1] ? { id: "swap" } : row));
+        slice.set({ messages: swapped }); // The row right after the start row is replaced, ...
+        slice.set({ messages: slice.messages().filter((row) => row.id !== before[0]) });
+        expect(slice.mounted()).toContain("swap"); // ... then the start row goes.
+        subset(before.slice(2), slice.mounted());
+      });
+
+      test("deleting every mounted row does not mount rows that were never mounted", () => {
+        const slice = detachedPastCap();
+        // Rows inside the slice go first: it gets shorter than the cap with the same start.
+        const inner = slice.mounted().slice(10, 110);
+        slice.set({ messages: slice.messages().filter((row) => !inner.includes(row.id)) });
+        const before = slice.mounted();
+        const unread = slice
+          .messages()
+          .slice(slice.reveal().toIndex)
+          .map((row) => row.id);
+        slice.set({ messages: slice.messages().filter((row) => !before.includes(row.id)) });
+        expect(slice.mounted().filter((row) => unread.includes(row))).toEqual([]);
+      });
+
       test("held, deleting only the newest rows keeps the start; new rows replacing them restart", () => {
         const slice = grouped();
         slice.atCap();
