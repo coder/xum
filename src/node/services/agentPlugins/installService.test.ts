@@ -1934,6 +1934,22 @@ describe("AgentPluginInstallService", () => {
     // The run started from another scope, so the managed skill cannot vouch for its snapshot.
     await createSkillRun("wfr_other_scope", source, "project");
     await expect(resume("wfr_other_scope")).rejects.toThrow("cannot resume");
+    // A record from before sourceKind existed is gated by its skill:// path (PRRT_kwDOPxxmWM6s3UjX).
+    await runStore.createRun({
+      id: "wfr_legacy",
+      workspaceId: "workspace-1",
+      workflow: {
+        name: "greet",
+        description: "Skill workflow",
+        scope: "global",
+        sourcePath: "skill://greet/workflow.js",
+        executable: true,
+      },
+      source: `${source}// legacy record\n`,
+      args: {},
+      now: "2026-10-15T00:00:00.000Z",
+    });
+    await expect(resume("wfr_legacy")).rejects.toThrow("has not been reviewed on this install");
   });
 
   test("review labels show a bidi control in a workflow file name; the identity stays raw (#6629)", async () => {

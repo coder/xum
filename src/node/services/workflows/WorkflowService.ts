@@ -211,6 +211,21 @@ function isThisProcessIncarnation(starter: WorkflowRunStarterRecord): boolean {
   );
 }
 
+/**
+ * The source kind of a stored run. A record from before `sourceKind` existed omits it (the schema
+ * accepts that shape), so its script path decides: a legacy `plugin://` or `skill://` run must
+ * still pass resume admission (#6777).
+ */
+function storedRunSourceKind(
+  sourceKind: WorkflowRunRecord["workflow"]["sourceKind"],
+  scriptPath: string | undefined
+): WorkflowRunRecord["workflow"]["sourceKind"] {
+  if (sourceKind !== undefined) return sourceKind;
+  if (scriptPath?.startsWith("plugin://")) return "plugin";
+  if (scriptPath?.startsWith("skill://")) return "skill";
+  return undefined;
+}
+
 export class WorkflowService {
   private readonly runStore: WorkflowRunStore;
   private readonly runtimeFactory: IJSRuntimeFactory;
@@ -928,10 +943,11 @@ export class WorkflowService {
   private async assertStoredRunReviewed(
     run: Pick<WorkflowRunRecord, "workflow" | "source">
   ): Promise<void> {
-    const { sourceKind, scope } = run.workflow;
+    const { scope } = run.workflow;
+    const scriptPath = run.workflow.canonicalScriptPath ?? run.workflow.sourcePath;
+    const sourceKind = storedRunSourceKind(run.workflow.sourceKind, scriptPath);
     if (sourceKind !== "plugin" && (sourceKind !== "skill" || scope === "built-in")) return;
     const gate = this.assertStoredPluginWorkflowReviewed;
-    const scriptPath = run.workflow.canonicalScriptPath ?? run.workflow.sourcePath;
     if (gate === undefined || scriptPath === undefined || scope === "built-in") {
       throw new Error("Xum cannot check this workflow's consent, so the run cannot resume");
     }
