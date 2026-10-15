@@ -1703,7 +1703,9 @@ describe("AgentPluginInstallService", () => {
     await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
     await fsPromises.writeFile(
       path.join(remoteDir, "workflows", "run.js"),
-      "export const meta = { name: 'run' }; // \u202e\nconst safe\ufe0f = 1;\n"
+      "export const meta = { name: 'run' }; // \u202e\nconst safe\ufe0f = 1;\n" +
+        "// comment\rEVIL();\n// comment\u2028EVIL();\n// comment\u2029EVIL();\n" +
+        "const crlf = 1;\r\n\tconst tab = 2;\n"
     );
     await commitAll(remoteDir, "add a workflow");
     const preview = await service.preview({ input: remoteDir });
@@ -1714,6 +1716,13 @@ describe("AgentPluginInstallService", () => {
     expect(preview.reviewedComponents[0]?.detail).not.toContain("\u202e");
     // A variation selector is valid in an identifier and invisible, so it is marked too.
     expect(preview.reviewedComponents[0]?.detail).toContain("const safe<U+FE0F> = 1;");
+    // A lone CR, U+2028 and U+2029 end a `//` comment in JavaScript but draw as nothing or a
+    // space, so the code after them is marked as code, not shown as comment text.
+    expect(preview.reviewedComponents[0]?.detail).toContain("// comment<U+000D>EVIL();");
+    expect(preview.reviewedComponents[0]?.detail).toContain("// comment<U+2028>EVIL();");
+    expect(preview.reviewedComponents[0]?.detail).toContain("// comment<U+2029>EVIL();");
+    // A CRLF line break and a tab stay as they are.
+    expect(preview.reviewedComponents[0]?.detail).toContain("const crlf = 1;\r\n\tconst tab = 2;");
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
     const resolve = () =>
       resolveWorkflowScript({
