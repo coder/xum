@@ -76,6 +76,32 @@ describe("McpAppResultStore", () => {
     expect(files).toHaveLength(MCP_APP_RESULT_MAX_PER_WORKSPACE);
   });
 
+  test("pruning never deletes the record it just wrote", async () => {
+    using tmp = new DisposableTempDir("mcp-app-store");
+    const sessionDir = (id: string) => path.join(tmp.path, id);
+    const store = new McpAppResultStore(sessionDir);
+    for (let i = 0; i < MCP_APP_RESULT_MAX_PER_WORKSPACE; i++) {
+      await store.record("ws", entry(`c${i}`));
+    }
+    // A failed stat sorts a file as the oldest. For the new record, pruning must skip it anyway.
+    const newName = `${createHash("sha256").update("fresh").digest("hex").slice(0, 40)}.json`;
+    const realStat = fs.stat;
+    const stat = spyOn(fs, "stat").mockImplementation(((target: string, ...rest: unknown[]) =>
+      path.basename(target) === newName
+        ? Promise.reject(new Error("EIO"))
+        : (realStat as (...args: unknown[]) => unknown)(target, ...rest)) as typeof fs.stat);
+    try {
+      expect(await store.record("ws", entry("fresh"))).toBe(true);
+    } finally {
+      stat.mockRestore();
+    }
+    expect(await new McpAppResultStore(sessionDir).get("ws", "fresh")).toMatchObject({
+      toolCallId: "fresh",
+    });
+    const files = await fs.readdir(path.join(tmp.path, "ws", MCP_APP_RESULT_DIR));
+    expect(files).toHaveLength(MCP_APP_RESULT_MAX_PER_WORKSPACE);
+  });
+
   test("a pruning failure still counts as stored: the record is written and published", async () => {
     using tmp = new DisposableTempDir("mcp-app-store");
     const sessionDir = (id: string) => path.join(tmp.path, id);

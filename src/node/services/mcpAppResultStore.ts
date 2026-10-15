@@ -193,7 +193,7 @@ export class McpAppResultStore {
       this.remember(workspaceId, record);
       // Best effort (#6611): the record is already stored, so a failed prune must not make the
       // caller (openSettingsApp) refuse it. The next record prunes again.
-      await this.prune(dir).catch((error: unknown) => {
+      await this.prune(dir, fileNameFor(record.toolCallId)).catch((error: unknown) => {
         log.debug("[MCP Apps] Failed to prune tool results", { workspaceId, error });
       });
       return true;
@@ -413,23 +413,27 @@ export class McpAppResultStore {
     return path.join(path.dirname(this.dirFor(workspaceId)), MCP_APP_MODEL_CONTEXT_FILE);
   }
 
-  private async prune(dir: string) {
+  /**
+   * Drop the oldest records past the cap. Never `keep`, the record just written: a failed stat
+   * sorts a file as the oldest, and the record that counts as stored must survive a restart.
+   */
+  private async prune(dir: string, keep: string) {
     const names = (await fs.readdir(dir)).filter((name) => name.endsWith(".json"));
-    if (names.length <= MCP_APP_RESULT_MAX_PER_WORKSPACE) return;
+    const excess = names.length - MCP_APP_RESULT_MAX_PER_WORKSPACE;
+    if (excess <= 0) return;
     const withTimes = await Promise.all(
-      names.map(async (name) => {
-        try {
-          return { name, mtimeMs: (await fs.stat(path.join(dir, name))).mtimeMs };
-        } catch {
-          return { name, mtimeMs: 0 };
-        }
-      })
+      names
+        .filter((name) => name !== keep)
+        .map(async (name) => {
+          try {
+            return { name, mtimeMs: (await fs.stat(path.join(dir, name))).mtimeMs };
+          } catch {
+            return { name, mtimeMs: 0 };
+          }
+        })
     );
     withTimes.sort((a, b) => a.mtimeMs - b.mtimeMs);
-    for (const { name } of withTimes.slice(
-      0,
-      withTimes.length - MCP_APP_RESULT_MAX_PER_WORKSPACE
-    )) {
+    for (const { name } of withTimes.slice(0, excess)) {
       await fs.rm(path.join(dir, name), { force: true });
     }
   }
