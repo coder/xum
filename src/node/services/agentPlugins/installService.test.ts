@@ -4375,6 +4375,26 @@ describe("AgentPluginInstallService", () => {
       await commitAll(remoteDir, "skills with long directives");
       await expect(service.preview({ input: remoteDir })).rejects.toThrow(/too large to show/);
     });
+
+    test("an installed plugin with too much directive text still lists; its picker refuses", async () => {
+      // The bound applies where a response lists the commands, not to every load of the tree,
+      // so one oversized plugin cannot break the plugin list (PRRT_kwDOPxxmWM6s2_dv).
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const command = "x".repeat(600_000);
+      for (const name of ["one", "two"]) {
+        const dir = path.join(pluginsDir(), "demo-plugin", "skills", name);
+        await fsPromises.mkdir(dir, { recursive: true });
+        await fsPromises.writeFile(
+          path.join(dir, "SKILL.md"),
+          `---\nname: ${name}\ndescription: Big\n---\n\n!\`${command}\`\n`
+        );
+      }
+      expect((await service.list()).map((item) => item.name)).toEqual(["demo-plugin"]);
+      await expect(service.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+        /too large to show/
+      );
+    });
   });
 
   test("update accepts a skill paths reordering as capability-neutral", async () => {

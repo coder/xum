@@ -93,7 +93,13 @@ export function substituteSkillBodyForDirectives(args: {
   const runnableLines = new Set<number>();
   for (const rawLine of args.rawBody.split("\n")) {
     const line = args.substituteArguments(rawLine);
-    if (rawDirectiveCommand(rawLine) !== undefined && directiveCommand(line) !== undefined) {
+    // `[^`]+` matches a newline, so a directive that an argument split must not count as one
+    // line: the runner splits it, and every later index would point at the wrong line.
+    if (
+      rawDirectiveCommand(rawLine) !== undefined &&
+      !line.includes("\n") &&
+      directiveCommand(line) !== undefined
+    ) {
       runnableLines.add(outputLines.length);
       outputLines.push(line);
     } else {

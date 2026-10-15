@@ -335,7 +335,7 @@ import {
   mergeLoadedSkillSnapshots,
   stringifyAgentSkillFrontmatter,
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
-import { substituteSkillArguments } from "@/node/services/agentSkills/skillArguments";
+import { createSkillArgumentSubstituter } from "@/node/services/agentSkills/skillArguments";
 import {
   assertSkillDirectoryPlaceholdersResolved,
   prependSkillDirectoryNote,
@@ -13766,8 +13766,10 @@ export class AgentSession {
       // consent fingerprint covers those, and a slash argument with a newline must not add one.
       const substituted = substituteSkillBodyForDirectives({
         rawBody: skill.body,
-        substituteArguments: (line) =>
-          slashArgumentText != null ? substituteSkillArguments(line, slashArgumentText).body : line,
+        substituteArguments:
+          slashArgumentText != null
+            ? createSkillArgumentSubstituter(slashArgumentText)
+            : (line) => line,
         substituteText: (text) => substituteSkillDirectoryPlaceholders(text, skillDirectory),
       });
 
