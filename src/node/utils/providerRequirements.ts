@@ -48,6 +48,7 @@ export const PROVIDER_ENV_VARS: Partial<
       region?: string[];
       project?: string[];
       location?: string[];
+      keyFilename?: string[];
     }
   >
 > = {
@@ -94,6 +95,7 @@ export const PROVIDER_ENV_VARS: Partial<
     apiKey: ["GOOGLE_VERTEX_API_KEY"],
     project: ["GOOGLE_VERTEX_PROJECT"],
     location: ["GOOGLE_VERTEX_LOCATION"],
+    keyFilename: ["GOOGLE_APPLICATION_CREDENTIALS"],
   },
 };
 
@@ -124,7 +126,8 @@ export const BEDROCK_AUTH_ENV_VARS = {
 export function providerSecretEnvVarNames(): string[] {
   const names = new Set<string>();
   for (const mapping of Object.values(PROVIDER_ENV_VARS)) {
-    for (const key of mapping.apiKey ?? []) {
+    // A key file path is not a secret itself, but it leads straight to one.
+    for (const key of [...(mapping.apiKey ?? []), ...(mapping.keyFilename ?? [])]) {
       names.add(key);
     }
   }
@@ -206,7 +209,8 @@ export interface ResolvedCredentials {
   region?: string; // bedrock
   project?: string; // google-vertex (ADC mode)
   location?: string; // google-vertex
-  keyFilename?: string; // google-vertex service-account key (home-expanded), ADC mode only
+  keyFilename?: string; // google-vertex ADC key file (config path home-expanded, else env), ADC mode only
+  keyFilenameSource?: "config" | "env";
   couponCode?: string; // mux-gateway
   deploymentUrl?: string; // coder
   baseUrl?: string; // runtime value from config or env when API-key auth is active
@@ -510,13 +514,16 @@ function resolveGoogleVertexCredentials(
   if (!project) {
     return { isConfigured: false, missingRequirement: "project", ...baseUrlInfo };
   }
+  // The env key file is resolved too, so the factory can check it before the
+  // first request, as it checks the configured one.
+  const envKeyFilename = resolveEnv(envMapping?.keyFilename, env);
   return {
     isConfigured: true,
     project,
     location,
-    keyFilename: hasNonEmptyString(config.keyFilename)
-      ? expandHomePath(config.keyFilename.trim())
-      : undefined,
+    ...(hasNonEmptyString(config.keyFilename)
+      ? { keyFilename: expandHomePath(config.keyFilename.trim()), keyFilenameSource: "config" }
+      : envKeyFilename != null && { keyFilename: envKeyFilename, keyFilenameSource: "env" }),
     ...withActiveBaseUrl(baseUrlInfo),
   };
 }

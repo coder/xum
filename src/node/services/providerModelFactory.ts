@@ -1157,7 +1157,9 @@ function createGoogleVertexModelEffect(
       apiKey: creds.apiKey ?? "",
       project: creds.project,
       location: creds.location,
-      ...(keyFilename != null && { googleAuthOptions: { keyFilename } }),
+      // google-auth-library reads the env key file itself: its ADC lookup also
+      // applies GOOGLE_CLOUD_QUOTA_PROJECT, which an explicit keyFilename skips.
+      ...(creds.keyFilenameSource === "config" && { googleAuthOptions: { keyFilename } }),
       ...(creds.baseUrl != null && { baseURL: creds.baseUrl }),
       headers: providerConfig.headers,
       fetch: getProviderFetch(providerConfig),

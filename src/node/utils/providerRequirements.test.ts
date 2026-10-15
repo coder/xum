@@ -247,6 +247,16 @@ describe("resolveProviderCredentials - Google Vertex AI", () => {
       expected: { isConfigured: true, project: "saved-project", location: "europe-west4" },
     },
     {
+      name: "the saved key file over GOOGLE_APPLICATION_CREDENTIALS",
+      config: { project: "my-project", keyFilename: "/keys/saved-sa.json" },
+      env: { GOOGLE_APPLICATION_CREDENTIALS: "/keys/env-sa.json" },
+      expected: {
+        isConfigured: true,
+        keyFilename: "/keys/saved-sa.json",
+        keyFilenameSource: "config",
+      },
+    },
+    {
       name: "a lowercased location, since Vertex location IDs are lowercase",
       config: { project: "my-project", location: " US-Central1 " },
       env: {},
