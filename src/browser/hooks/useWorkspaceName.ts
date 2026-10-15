@@ -7,6 +7,7 @@ import {
   useDraft,
   useDraftStoreSnapshotCurrent,
   type DraftStoreScope,
+  type DraftView,
 } from "@/browser/stores/DraftStore";
 import type { WorkspaceIdentity, WorkspaceNamePersistedState } from "@/common/orpc/schemas/drafts";
 import type { NameGenerationError } from "@/common/types/errors";
@@ -255,16 +256,23 @@ function canTrustDraftView(target: DraftStoreScope | null): boolean {
 
 /** What a name request started from. */
 interface NamingBasis {
-  text: string;
-  attachmentCount: number;
+  hadContent: boolean;
   nameState: WorkspaceNamePersistedState | null;
+}
+
+/**
+ * Text, or attachments (an attachment-only draft is named from their file names). Whether there
+ * is any, not what: edits that keep the message (a pasted screenshot) keep the reply.
+ */
+function hasDraftContent(view: DraftView): boolean {
+  return view.text.trim().length > 0 || view.attachmentCount > 0;
 }
 
 /** Null without a draft scope: only the hook writes its component-local name state. */
 function namingBasisOf(target: DraftStoreScope | null): NamingBasis | null {
   if (target === null) return null;
-  const { text, attachmentCount, nameState } = getDraftStore().getView(target);
-  return { text, attachmentCount, nameState };
+  const view = getDraftStore().getView(target);
+  return { hadContent: hasDraftContent(view), nameState: view.nameState };
 }
 
 /** Compares name states by value: a snapshot or push replaces the objects with equal copies. */
@@ -281,18 +289,17 @@ function nameStateKey(state: WorkspaceNamePersistedState | null): string {
 }
 
 /**
- * A reply may name its draft only if the draft still holds what the request started from: its
- * content and its name state. Anything that changed meanwhile (another window's delete, name or
- * text, a reconnect's snapshot) makes the reply stale, whatever the path that changed it. A new
- * message or the snapshot starts another request if the draft still needs a name; otherwise the
- * submit does.
+ * A reply may name its draft only if the draft still holds content (another window's delete
+ * empties it) and the name state the request started from (another window's name, a reconnect's
+ * snapshot), whatever the path that changed them. A message change needs no check here: it
+ * cancels the request, and a reply that lands before that is for the older message, which the
+ * debounce then names again.
  */
 function holdsNamingBasis(target: DraftStoreScope | null, basis: NamingBasis | null): boolean {
   if (target === null || basis === null) return true;
   const view = getDraftStore().getView(target);
   return (
-    view.text === basis.text &&
-    view.attachmentCount === basis.attachmentCount &&
+    (hasDraftContent(view) || !basis.hadContent) &&
     nameStateKey(view.nameState) === nameStateKey(basis.nameState)
   );
 }

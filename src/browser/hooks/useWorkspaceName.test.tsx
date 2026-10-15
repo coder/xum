@@ -446,6 +446,36 @@ describe("useWorkspaceName draft state", () => {
     expect(getDraftStore().getView(SCOPE).nameState).toBeNull();
   });
 
+  // Pasting a screenshot leaves the message (and so the request) as it is: its reply still names
+  // the draft, or the name would stay empty until the next message change.
+  test("a name still lands after a screenshot is pasted while its request runs", async () => {
+    act(() => getDraftStore().setText(SCOPE, "fix the sidebar"));
+    const generation = Promise.withResolvers<Awaited<ReturnType<typeof generateMock>>>();
+    generateMock.mockImplementationOnce(() => generation.promise);
+    const view = renderWorkspaceName("fix the sidebar");
+    await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(1));
+
+    act(() =>
+      getDraftStore().setAttachments(SCOPE, [
+        {
+          kind: "provider",
+          id: "img-1",
+          url: "data:image/png;base64,iVBORw0KGgo=",
+          mediaType: "image/png",
+        },
+      ])
+    );
+    await act(async () => {
+      generation.resolve({
+        success: true as const,
+        data: { name: "sidebar-a1b2", title: "Fix the sidebar", modelUsed: "test:model" },
+      });
+      await generation.promise;
+    });
+    expect(view.result.current.name).toBe("sidebar-a1b2");
+    expect(generateMock).toHaveBeenCalledTimes(1);
+  });
+
   // A Send click after a reconnect, before its snapshot: the cached draft may be stale, so no
   // request starts (its reply would replace the backend's newer name once the snapshot is in).
   test("a submit before a replacement client's snapshot starts no name request", async () => {
