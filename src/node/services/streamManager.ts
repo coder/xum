@@ -4437,6 +4437,14 @@ export class StreamManager {
       };
     }
 
+    // Before any await: the stream may already be preparing its first step, and a step-0
+    // thinking rebuild there records a newer volatile-tail plan (recordVolatileSystemTail),
+    // which must win over the patch's baseline. That rebuild always runs after an await.
+    streamInfo.initialMetadata = {
+      ...streamInfo.initialMetadata,
+      ...prepared.data.initialMetadataPatch,
+    };
+
     // The fallback stream exists now; durable side effects describing this
     // request identity (superseding turn envelope) may be recorded.
     await prepared.data.onStreamConstructed?.();
@@ -4478,10 +4486,9 @@ export class StreamManager {
       streamInfo.thinkingLevel = prepared.data.thinkingLevel;
     }
     // Final stream-end metadata spreads initialMetadata, so route attribution
-    // corrections and the fallback record propagate automatically.
+    // corrections (the patch, applied above) and the fallback record propagate automatically.
     streamInfo.initialMetadata = {
       ...streamInfo.initialMetadata,
-      ...prepared.data.initialMetadataPatch,
       modelFallback: {
         requestedModel: fallbackState.requestedModel,
         refusedModels: [...fallbackState.refusedModels],

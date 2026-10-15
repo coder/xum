@@ -366,10 +366,14 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
   // Length 0 means no volatile sections, or a tail the caller could not split off (middleware
   // edited it; turnRequestBuilder passes 0 then). Either way this request sends as before and
   // records nothing: a row could only claim that sections still in the prompt are gone.
+  // A compaction request (it has a budget) does the same: the trim already fitted `history`
+  // to its budget, so rows added now could exceed it. Its system prompt is the compact
+  // agent's, so no cached prefix is lost, and its summary starts a new segment anyway.
   const tailPlan = planVolatileSystemTail(
     history,
     options.systemMessage.slice(stableSystem.length),
     volatileLength > 0 &&
+      options.compactionInputBudgetTokens == null &&
       cachedSystemMessage != null &&
       acceptsVolatileSystemTailRow(
         options.modelString,

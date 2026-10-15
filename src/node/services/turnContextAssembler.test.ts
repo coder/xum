@@ -824,6 +824,33 @@ describe("assemblePromptPayload", () => {
       ]);
     });
 
+    test("a compaction request sends the live tail with no rows", async () => {
+      // Codex P2 (PRRT_kwDOPxxmWM6srL1X): the compaction trim fits the history to the budget
+      // before the tail is planned, so rebuilt rows would add tokens the trim never counted.
+      const history = [
+        createMuxMessage("u1", "user", "first"),
+        answer("a1", "system", hot("A")),
+        createMuxMessage("u2", "user", "second"),
+        answer("a2", "row", hot("B")),
+        createMuxMessage("u3", "user", "third"),
+        answer("a3", "row", hot("C")),
+        createMuxMessage("u4", "user", "summarize"),
+      ];
+      const tail = hot("D");
+      const payload = await assemble({
+        ...opus,
+        history,
+        systemMessage: stable + tail,
+        volatileSystemSuffixLength: tail.length,
+        compactionInputBudgetTokens: 100_000,
+      });
+      expect(roles(payload).filter((role) => role.startsWith("system"))).toEqual([
+        "system:stable",
+        `system:${tail}`,
+      ]);
+      expect(payload.volatileSystemTail).toBeUndefined();
+    });
+
     test("an empty or unsplittable tail turns the rows off for the request", async () => {
       // Codex P2 (PRRT_kwDOPxxmWM6sqhpD): length 0 also means turnRequestBuilder could not
       // split the tail off (middleware edited it), so its content may be in the stable part. A
