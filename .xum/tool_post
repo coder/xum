@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# .xum/tool_post - Format TypeScript and Markdown files after edits
+# .xum/tool_post - Format TypeScript and Markdown files after edits, report the
+# CRAP gate after agent commits and pushes, then run the user's own tool_post.
 
-if [[ "$XUM_TOOL" == file_edit_* ]]; then
+# Recursion guard: a user hook that calls this file again (directly or through
+# a wrapper) gets nothing done twice. Set only below, right before the exec.
+[[ -n "${XUM_INTERNAL_PROJECT_TOOL_POST_DONE:-}" ]] && exit 0
+
+# A function, so its early returns still reach the user's hook below.
+format_edited_file() {
   file="${XUM_TOOL_INPUT_FILE_PATH:-}"
-  [[ -z "$file" ]] && exit 0
+  [[ -z "$file" ]] && return 0
 
   case "$file" in
     *.ts|*.tsx)
-      before=$(cat "$file" 2>/dev/null) || exit 0
+      before=$(cat "$file" 2>/dev/null) || return 0
       # 1. Format with prettier
       bun run prettier --write --log-level silent "$file" 2>/dev/null || true
       # 2. Fix tailwind class ordering (minimal config for speed)
@@ -18,16 +24,56 @@ if [[ "$XUM_TOOL" == file_edit_* ]]; then
       fi
       ;;
     *.md|*.mdx)
-      before=$(cat "$file" 2>/dev/null) || exit 0
+      before=$(cat "$file" 2>/dev/null) || return 0
       bun run prettier --write --log-level silent "$file" 2>/dev/null || true
       if [[ "$(cat "$file")" != "$before" ]]; then
         echo "Formatted: $file"
       fi
       ;;
   esac
+}
+
+if [[ "$XUM_TOOL" == file_edit_* ]]; then
+  format_edited_file
 fi
 
 # CRAP gate report after agent `git commit` / `git push` (warn mode only).
 if [[ "$XUM_TOOL" == "bash" ]]; then
   "${0%/*}/../scripts/crap/agent-gate.sh" post
 fi
+
+# Xum runs the first tool_post it finds, so this project hook replaces the
+# user's own tool_post. Run the user's hook last, through exec: its output, exit
+# code, env, stdin, args and cwd pass through unchanged. Only bash builtins up
+# to the exec: this runs after every tool call.
+#
+# The lookup mirrors the local runtime's getXumHome() (src/common/constants/
+# paths.ts): XUM_ROOT, else MUX_ROOT (the first one set wins, as with `??`, and
+# an empty value means unset), else ~/.xum (~/.xum-dev when NODE_ENV is
+# development). Known limits, all fail-open (no user hook runs, as before):
+# - SSH, Docker and devcontainer workspaces: their home is on the remote host
+#   or in the container (~/.mux, /var/mux).
+# - Xum's leftover-home fallbacks (~/.mux, ~/.cmux, the .legacy-fallback
+#   marker) are not looked up.
+# - A relative or Windows-style XUM_ROOT, no HOME, and HOME=/ are skipped.
+# - A user hook that is this file (a symlink or a project at the Xum home).
+# A missing or non-executable ~/.xum/tool_post means Xum would not run it either.
+run_user_tool_post() {
+  case ${XUM_RUNTIME:-local} in
+    local | worktree) ;;
+    *) return 0 ;;
+  esac
+  local home=${XUM_ROOT-${MUX_ROOT-}}
+  if [[ -n "$home" ]]; then
+    [[ "$home" == /* ]] || return 0
+  else
+    [[ "${HOME:-}" == /?* ]] || return 0
+    home=$HOME/.xum
+    [[ "${NODE_ENV:-}" == "development" ]] && home+=-dev
+  fi
+  local hook=$home/tool_post
+  [[ -f "$hook" && -x "$hook" && ! "$hook" -ef "$0" ]] || return 0
+  export XUM_INTERNAL_PROJECT_TOOL_POST_DONE=1
+  exec "$hook" "$@"
+}
+run_user_tool_post "$@"
