@@ -110,6 +110,7 @@ export interface WorkflowServiceOptions {
   assertStoredPluginWorkflowReviewed?: (stored: {
     scriptPath: string;
     source: string;
+    scope: "project" | "global";
   }) => Promise<void>;
   onBackgroundRunTerminal?: (event: WorkflowBackgroundRunTerminalEvent) => Promise<void> | void;
   onRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
@@ -928,10 +929,11 @@ export class WorkflowService {
     if (run.workflow.sourceKind !== "plugin") return;
     const gate = this.assertStoredPluginWorkflowReviewed;
     const scriptPath = run.workflow.canonicalScriptPath ?? run.workflow.sourcePath;
-    if (gate === undefined || scriptPath === undefined) {
+    const scope = run.workflow.scope;
+    if (gate === undefined || scriptPath === undefined || scope === "built-in") {
       throw new Error("Xum cannot check this plugin workflow's consent, so the run cannot resume");
     }
-    await gate({ scriptPath, source: run.source });
+    await gate({ scriptPath, source: run.source, scope });
   }
 
   /**

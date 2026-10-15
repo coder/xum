@@ -1703,14 +1703,15 @@ describe("AgentPluginInstallService", () => {
     await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
     await fsPromises.writeFile(
       path.join(remoteDir, "workflows", "run.js"),
-      "export const meta = { name: 'run' };\n"
+      "export const meta = { name: 'run' }; // \u202e\n"
     );
     await commitAll(remoteDir, "add a workflow");
     const preview = await service.preview({ input: remoteDir });
-    // The preview shows the script that install approves.
+    // The preview shows the script that install approves, with a bidi control made visible.
     expect(preview.reviewedComponents).toHaveLength(1);
     expect(preview.reviewedComponents[0]).toMatchObject({ kind: "workflows", name: "run.js" });
-    expect(preview.reviewedComponents[0]?.detail).toContain("name: 'run'");
+    expect(preview.reviewedComponents[0]?.detail).toContain("name: 'run' }; // <U+202E>");
+    expect(preview.reviewedComponents[0]?.detail).not.toContain("\u202e");
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
     const resolve = () =>
       resolveWorkflowScript({
@@ -1788,6 +1789,16 @@ describe("AgentPluginInstallService", () => {
         args: {},
         now: "2026-10-15T00:00:00.000Z",
       });
+    // A trusted project ships a plugin of the same name: it must not stand in for the managed one.
+    const projectPlugins = path.join(muxRoot, "project", ".xum", "plugins");
+    await fsPromises.mkdir(projectPlugins, { recursive: true });
+    await fsPromises.cp(
+      path.join(pluginsDir(), "demo-plugin"),
+      path.join(projectPlugins, "demo-plugin"),
+      {
+        recursive: true,
+      }
+    );
     const workflows = new WorkflowService({
       archiveAdmission: { getWorkflowArchiveRefusal: () => null },
       runStore,
@@ -1802,11 +1813,12 @@ describe("AgentPluginInstallService", () => {
           ...stored,
           runtime: new LocalRuntime(muxRoot),
           workspacePath: muxRoot,
-          projectTrusted: false,
+          projectTrusted: true,
           roots: {
             projectRoot: "",
             globalRoot: path.join(muxRoot, "skills"),
             universalRoot: "",
+            projectPluginRoots: [projectPlugins],
             globalPluginRoots: [pluginsDir()],
           },
         }),
