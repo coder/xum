@@ -1188,6 +1188,50 @@ describe("Config", () => {
     });
   });
 
+  // #6485: on Windows, an id-less legacy row's checkout path uses backslashes. The old session
+  // layout keys its metadata by the checkout basename, so the lookup must split on "\\" too. The
+  // backend helper reads process.platform once at import, so the Windows cases run on Windows
+  // only (CI's "Test / Windows" job runs this describe).
+  describe("legacy rows with a Windows checkout path", () => {
+    const onWindows = process.platform === "win32" ? it : it.skip;
+    const offWindows = process.platform === "win32" ? it.skip : it;
+
+    function seedBasenameLayout(projectPath: string, checkout: string, id: string): void {
+      // The old layout: sessions/<checkout basename>/metadata.json names the stable id.
+      const dir = path.join(config.sessionsDir, "feature-x");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "metadata.json"), JSON.stringify({ id, projectPath }));
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ projects: [[projectPath, { workspaces: [{ path: checkout }] }]] })
+      );
+    }
+
+    const winProject = "C:\\Users\\u\\repo";
+    const winCheckout = "C:\\Users\\u\\.xum\\src\\repo\\feature-x";
+
+    onWindows(
+      "resolves the stable id from the basename metadata in the metadata build",
+      async () => {
+        seedBasenameLayout(winProject, winCheckout, "stable-1");
+        const metadata = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+        expect(metadata.map((meta) => meta.id)).toEqual(["stable-1"]);
+      }
+    );
+
+    onWindows("finds the workspace by the stable id from the basename metadata", () => {
+      seedBasenameLayout(winProject, winCheckout, "stable-1");
+      expect(config.findWorkspace("stable-1")?.workspacePath).toBe(winCheckout);
+    });
+
+    // POSIX keeps today's basename: the helper splits only on "/" off Windows.
+    offWindows("keeps the POSIX basename lookup unchanged", () => {
+      const posixCheckout = "/home/u/.xum/src/repo/feature-x";
+      seedBasenameLayout("/home/u/repo", posixCheckout, "stable-2");
+      expect(config.findWorkspace("stable-2")?.workspacePath).toBe(posixCheckout);
+    });
+  });
+
   // Stored keys that normalize to the same project path ("aliases", e.g. "/repo" and "/repo/").
   // The loader used to build `new Map(pairs)`, so the last alias silently replaced the others
   // and the next save dropped their workspace rows.
