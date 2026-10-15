@@ -9,7 +9,8 @@ import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { WorkspaceViewTail, WorkspaceViewTailRow } from "@/common/orpc/schemas/api";
 import type { AIService } from "./aiService";
 import type { HistoryService } from "./historyService";
-import type { WorkspaceService } from "./workspaceService";
+import type { Config } from "@/node/config";
+import { isMultiProject } from "@/common/utils/multiProject";
 
 /**
  * The read behind `workspace.history.tail` (T3 #5971): the newest rows for the static first view of
@@ -29,7 +30,7 @@ const keySet = (...lines: string[]) => new Set(lines.join(" ").split(" "));
 const SAFE_KEYS = {
   user: keySet(
     "historySequence timestamp toolPolicy disableWorkspaceAgents sendIds sendDigests enqueuedAtMs",
-    "retrySendOptions muxMetadata"
+    "retrySendOptions autoModelRouting muxMetadata"
   ),
   assistant: keySet(
     "historySequence requestHistorySequence timestamp model metadataModel agentId mode thinkingLevel",
@@ -50,7 +51,8 @@ const isPlainSend = (value: unknown) =>
 function hasOnlySafeMetadata(role: "user" | "assistant", metadata: Record<string, unknown>) {
   if (!Object.keys(metadata).every((key) => SAFE_KEYS[role].has(key))) return false;
   // Other finish reasons add a notice under the reply (length, refusal, content filter).
-  return role === "user" ? isPlainSend(metadata.muxMetadata) : metadata.finishReason === "stop";
+  if (role === "user") return isPlainSend(metadata.muxMetadata);
+  return metadata.finishReason === undefined || metadata.finishReason === "stop";
 }
 
 /** The row's markdown when the static view can draw it like the live transcript, else null. */
@@ -112,20 +114,22 @@ function toWorkspaceViewTailRow(message: MuxMessage): WorkspaceViewTailRow {
 
 /**
  * Null when there is nothing to draw: an unknown workspace (checked before any history read), a
- * stream in flight or interrupted (the live transcript then ends in a row chat.jsonl lacks), a
- * failed read, or a tail not windowable within the caps (one turn or row larger than them).
+ * stream in flight (the live transcript then ends in a row chat.jsonl lacks), a failed read, or a
+ * tail not windowable within the caps (one turn or row larger than them).
  */
 export async function readWorkspaceViewTail(
   deps: {
-    workspaceService: Pick<WorkspaceService, "getInfo">;
+    config: Pick<Config, "getWorkspaceMetadataById">;
     aiService: Pick<AIService, "isStreaming">;
-    historyService: Pick<HistoryService, "getHistoryWindowFromLatestBoundary" | "hasPartial">;
+    historyService: Pick<HistoryService, "getHistoryWindowFromLatestBoundary">;
   },
   workspaceId: string
 ): Promise<WorkspaceViewTail | null> {
-  const info = await deps.workspaceService.getInfo(workspaceId);
-  if (!info || deps.aiService.isStreaming(workspaceId)) return null;
-  if (await deps.historyService.hasPartial(workspaceId)) return null;
+  // Registry only: a checkout probe can wait seconds on a stalled mount. A multi-project
+  // workspace gets no view, which also keeps one that getInfo would hide from showing here.
+  const options = { probeCheckouts: false, persistMigrations: false } as const;
+  const info = await deps.config.getWorkspaceMetadataById(workspaceId, options);
+  if (!info || isMultiProject(info) || deps.aiService.isStreaming(workspaceId)) return null;
   const window = await deps.historyService.getHistoryWindowFromLatestBoundary(
     workspaceId,
     WORKSPACE_VIEW_TAIL_CAPS

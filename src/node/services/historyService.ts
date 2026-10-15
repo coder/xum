@@ -3240,17 +3240,6 @@ export class HistoryService {
   }
 
   /**
-   * Whether partial.json exists (an in-flight or interrupted stream), without reading it: the
-   * static first view's tail read (workspaceViewTail.ts) must stay cheap for a large partial.
-   */
-  async hasPartial(workspaceId: string): Promise<boolean> {
-    return fs.access(this.getPartialPath(workspaceId)).then(
-      () => true,
-      () => false
-    );
-  }
-
-  /**
    * Read the partial message for a workspace, if it exists.
    * Startup admission must distinguish unreadable state from an absent partial.
    */

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { HistoryService } from "./historyService";
@@ -23,15 +23,12 @@ beforeEach(async () => {
 });
 afterEach(() => cleanup());
 
-const read = (info: FrontendWorkspaceMetadata | null = INFO) =>
-  readWorkspaceViewTail(
-    {
-      workspaceService: { getInfo: () => Promise.resolve(info) },
-      aiService: { isStreaming: () => streaming },
-      historyService,
-    },
-    ID
-  );
+const lookup = mock((_id: string, _options?: object) => Promise.resolve<typeof INFO | null>(INFO));
+const read = (info: FrontendWorkspaceMetadata | null = INFO) => {
+  lookup.mockImplementation(() => Promise.resolve(info));
+  const deps = { aiService: { isStreaming: () => streaming }, historyService };
+  return readWorkspaceViewTail({ ...deps, config: { getWorkspaceMetadataById: lookup } }, ID);
+};
 const msg = (id: string, role: "user" | "assistant", text: string, meta = {}, parts = []) =>
   createMuxMessage(
     id,
@@ -48,25 +45,21 @@ async function append(messages: MuxMessage[]) {
 }
 
 describe("readWorkspaceViewTail", () => {
-  test("an unknown workspace returns null before any history read", async () => {
+  test("an unknown or multi-project workspace returns null before any history read", async () => {
     const window = spyOn(historyService, "getHistoryWindowFromLatestBoundary");
-    const partial = spyOn(historyService, "hasPartial");
     expect(await read(null)).toBeNull();
+    const projects = [INFO, INFO].map((p) => ({ projectPath: p.projectPath, projectName: "x" }));
+    expect(await read({ ...INFO, projects })).toBeNull();
     expect(window).not.toHaveBeenCalled();
-    expect(partial).not.toHaveBeenCalled();
+    // Registry only: a checkout probe can stall on a slow mount.
+    expect(lookup).toHaveBeenCalledWith(ID, { probeCheckouts: false, persistMigrations: false });
   });
 
-  test("a stream in flight or an interrupted partial gives no view", async () => {
+  test("a stream in flight gives no view", async () => {
     await append(turns(2));
     streaming = true;
     expect(await read()).toBeNull();
     streaming = false;
-    const partial = msg("a2", "assistant", "half a repl");
-    expect((await historyService.writePartial(ID, partial)).success).toBe(true);
-    expect(await historyService.hasPartial(ID)).toBe(true);
-    expect(await read()).toBeNull();
-    expect((await historyService.deletePartial(ID)).success).toBe(true);
-    expect(await historyService.hasPartial(ID)).toBe(false);
     expect(await read()).not.toBeNull();
   });
 
@@ -81,7 +74,12 @@ describe("readWorkspaceViewTail", () => {
 
   test("draws rows as the send and stream paths persist them today", async () => {
     // The keys AgentSession.sendMessage and the StreamManager stream-end write today.
-    const send = { retrySendOptions: {}, muxMetadata: { type: "normal", requestedModel: "x" } };
+    const muxMetadata = { type: "normal", requestedModel: "x" };
+    const send = {
+      retrySendOptions: {},
+      autoModelRouting: { requestedFallbackModel: "x" },
+      muxMetadata,
+    };
     const numbers = { requestHistorySequence: 0, systemMessageTokens: 9, duration: 9, ttftMs: 5 };
     const objects = {
       usage: {},
@@ -104,7 +102,7 @@ describe("readWorkspaceViewTail", () => {
       msg("a", "assistant", "", stream, textPart("direct")),
       msg("g", "assistant", "", { ...stream, routeProvider: "mux-gateway" }, textPart("routed")),
       msg("bad", "assistant", "damaged", { model: 7, timestamp: "x" }),
-      msg("ok", "assistant", "after"),
+      msg("ok", "assistant", "after", { finishReason: undefined }),
     ]);
     const { rows, ...tail } = (await read())!;
     expect(tail).toEqual({ title: "seed", project: "demo-app", hasOlder: false });
