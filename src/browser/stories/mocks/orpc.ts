@@ -633,6 +633,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
   let createdWorkspaceCounter = 0;
   let mcpSettingsReadCount = 0;
+  /** A settings tool action writes its mcpSettingsToolRunSets values on the server. */
+  const applyMockSettingsToolRunSet = (input: { serverName: string; toolName: string }) => {
+    const stored = mcpSettings?.get(input.serverName);
+    const set = mcpSettingsToolRunSets?.get(input.toolName);
+    if (stored !== undefined && set !== undefined) stored.values = { ...stored.values, ...set };
+  };
 
   const agentDefinitions: AgentDefinitionDescriptor[] =
     initialAgentDefinitions ??
@@ -1499,6 +1505,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           const refusal = mockSettingsToolRefusal(mcpSettings, input);
           if (refusal !== null) return Promise.resolve({ success: false, error: refusal });
           mcpSettingsToolRuns?.push({ toolName: input.toolName, confirmed: input.confirmed });
+          applyMockSettingsToolRunSet(input);
           // The backend titles the view with the action's display name.
           const action = mockSettingsToolItem(mcpSettings, input);
           return Promise.resolve({
@@ -1520,10 +1527,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           const gated = mcpSettingsToolRuns?.length === 0 ? mcpSettingsToolRunGate : undefined;
           mcpSettingsToolRuns?.push({ toolName: input.toolName, confirmed: input.confirmed });
           await gated?.promise;
-          const stored = mcpSettings?.get(input.serverName);
-          const set = mcpSettingsToolRunSets?.get(input.toolName);
-          if (stored !== undefined && set !== undefined)
-            stored.values = { ...stored.values, ...set };
+          applyMockSettingsToolRunSet(input);
           return {
             success: true,
             data: { text: `${input.toolName} finished`, isError: false },

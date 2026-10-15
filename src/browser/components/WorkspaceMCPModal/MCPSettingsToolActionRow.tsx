@@ -92,7 +92,13 @@ function RunnableToolRow(props: MCPSettingsToolActionRowProps & { action: MCPSet
         </Button>
       </div>
       {result && <ToolRunResultText result={result} />}
-      {app && <SettingsAppModal workspaceId={props.workspaceId} app={app} onClose={closeApp} />}
+      {app && (
+        <SettingsAppModal
+          workspaceId={props.workspaceId}
+          app={app}
+          onClose={() => void closeApp()}
+        />
+      )}
     </div>
   );
 }
@@ -201,8 +207,8 @@ async function callToolAction(
   const request = { ...target, confirmed };
   if (action.opensApp) {
     const response = await api.mcp.settings.openApp(request);
-    // An app's changes happen in its view, after the open: a re-read now would remount the
-    // section and close the app modal.
+    // The open (or the app's own calls) can change the settings, but a re-read now would
+    // remount the section and close the app modal: closeApp re-reads instead.
     return response.success
       ? { success: true, result: null, view: response.data, wrote: false }
       : response;
@@ -294,7 +300,12 @@ function useToolActionRun(
 ) {
   const { api } = useAPI();
   const { confirm } = useConfirmDialog();
-  const [app, setApp] = useState<{ view: MCPSettingsAppView; openCount: number } | null>(null);
+  const [app, setApp] = useState<{
+    view: MCPSettingsAppView;
+    openCount: number;
+    /** A tool that can write opened it: the settings are read again when it closes. */
+    canWrite: boolean;
+  } | null>(null);
   const [openCount, setOpenCount] = useState(0);
   // The action as this row's latest re-read saw it (callWithFreshFlag).
   const [refreshed, setRefreshed] = useState<MCPSettingsToolAction | null>(null);
@@ -306,8 +317,8 @@ function useToolActionRun(
       description: `This tool of ${props.serverName} can change data. Run it only if you trust the server.`,
       confirmLabel: "Run",
     });
-  const openApp = (view: MCPSettingsAppView) => {
-    setApp({ view, openCount: openCount + 1 });
+  const openApp = (view: MCPSettingsAppView, canWrite: boolean) => {
+    setApp({ view, openCount: openCount + 1, canWrite });
     setOpenCount(openCount + 1);
   };
 
@@ -325,8 +336,10 @@ function useToolActionRun(
     let result: SettingsToolRunResult | null = null;
     try {
       const outcome = await callWithFreshFlag(api, target, action, setRefreshed);
-      result = await settleOutcome(outcome, openApp, () =>
-        publishSettingsToolWrite(props.workspaceId, props.serverName)
+      result = await settleOutcome(
+        outcome,
+        (view) => openApp(view, !action.readOnly),
+        () => publishSettingsToolWrite(props.workspaceId, props.serverName)
       );
     } catch (caught) {
       result = { text: getErrorMessage(caught), isError: true };
@@ -334,5 +347,19 @@ function useToolActionRun(
       endRun(result);
     }
   };
-  return { app, closeApp: () => setApp(null), run };
+  /**
+   * The app of a tool that can write may have changed the settings (the open or its own tool
+   * calls): read them again once it closes. The read counts as a run, so Save waits for it.
+   */
+  const closeApp = async () => {
+    setApp(null);
+    if (app?.canWrite !== true) return;
+    const endRun = props.beginRun();
+    try {
+      await publishSettingsToolWrite(props.workspaceId, props.serverName);
+    } finally {
+      endRun(null);
+    }
+  };
+  return { app, closeApp, run };
 }
