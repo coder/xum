@@ -2,6 +2,7 @@ import type { PluginSlashCommandDescriptor } from "@/common/orpc/schemas/agentPl
 
 import { isPluginSlashCommandConsented } from "./componentConsent";
 import type { AgentPluginInfo } from "./discovery";
+import type { AgentPluginSlashCommandContribution } from "./manifest";
 
 /**
  * Collect manifest-contributed slash commands from discovered plugins.
@@ -25,15 +26,22 @@ export function collectPluginSlashCommands(
       ) {
         continue;
       }
-      byName.set(command.name, {
-        name: command.name,
-        expansion: command.expansion,
-        pluginName: plugin.name,
-        scope: plugin.scope,
-        ...(command.description !== undefined ? { description: command.description } : {}),
-      });
+      byName.set(command.name, slashCommandDescriptor(plugin, command));
     }
   }
 
   return Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function slashCommandDescriptor(
+  plugin: AgentPluginInfo,
+  command: AgentPluginSlashCommandContribution
+): PluginSlashCommandDescriptor {
+  return {
+    name: command.name,
+    expansion: command.expansion,
+    pluginName: plugin.name,
+    scope: plugin.scope,
+    ...(command.description !== undefined ? { description: command.description } : {}),
+  };
 }
