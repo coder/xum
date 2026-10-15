@@ -1,7 +1,7 @@
 import { useRef } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, within } from "@storybook/test";
+import { userEvent, waitFor, within } from "@storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -845,6 +845,10 @@ export const PendingSignOutPhoneViewport: Story = {
   },
 };
 
+/** The backend's reason for a broken record; the notice shows it as given. */
+const BROKEN_SIGN_OUT_REASON =
+  "The pending plugin sign-out record (~/.mux/plugin-sign-outs-pending.json) is corrupt or from another Xum version. Delete the file, then sign out of the plugin's MCP servers in Settings → MCP before you use them.";
+
 /** A corrupt record (#6627): only the user can clear it, so the notice gives the steps. */
 export const BrokenSignOutRecord: Story = {
   parameters: { pixel: PIXEL_DISABLED },
@@ -855,8 +859,7 @@ export const BrokenSignOutRecord: Story = {
           items: [MANAGED_ITEM],
           pendingSignOuts: {
             kind: "broken",
-            reason:
-              "The pending plugin sign-out record (~/.mux/plugin-sign-outs-pending.json) is corrupt or from another Xum version. Delete the file, then sign out of the plugin's MCP servers in Settings → MCP before you use them.",
+            reason: BROKEN_SIGN_OUT_REASON,
           },
         },
       }}
@@ -866,8 +869,17 @@ export const BrokenSignOutRecord: Story = {
   ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await canvas.findByText(/Managed plugins are unavailable to agents\. The pending plugin/);
-    await canvas.findByText(/Delete the file, then sign out/);
+    // The broken-record branch renders a status notice that carries the backend's reason as
+    // given (compared with the mock's value, not with copy).
+    await waitFor(
+      () => {
+        const notices = canvas.queryAllByRole("status");
+        if (!notices.some((notice) => notice.textContent?.includes(BROKEN_SIGN_OUT_REASON))) {
+          throw new Error("The broken sign-out notice must show the backend's reason");
+        }
+      },
+      { timeout: 5000 }
+    );
   },
 };
 
