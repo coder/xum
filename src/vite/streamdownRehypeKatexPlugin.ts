@@ -1,21 +1,15 @@
 import type { Plugin } from "vite";
 
 /**
- * Stubs Streamdown's static `rehype-katex` import (T3, #5971).
- *
- * Streamdown's entry imports rehype-katex for its default rehype plugins and to check whether a
- * caller's plugin list holds it. Xum always passes its own list and loads KaTeX only for messages
- * with math (MarkdownCore -> KatexStreamdown), so this import was the only thing that kept KaTeX
- * (~600 KiB raw) in the transcript's first-load chunk. With the stub, Streamdown never finds
- * rehype-katex in Xum's list, so it also stops injecting its CDN KaTeX stylesheet
- * (streamdown.ai) for math; KatexStreamdown imports the local CSS instead. Only imports from
- * Streamdown's own files are stubbed: Xum's import keeps the real plugin.
- *
- * Build only, like streamdownShikiLangsPlugin: the dev server pre-bundles Streamdown with
- * esbuild, so the import never reaches this plugin there. A build that stubs nothing fails, so a
- * Streamdown upgrade that changes shape cannot silently bring KaTeX back.
- */
-const STREAMDOWN_MARKER = "/node_modules/streamdown/";
+ * Stubs Streamdown's static `rehype-katex` import (T3, #5971). Streamdown imports it for its
+ * default plugins and to check a caller's list. Xum passes its own list and loads KaTeX only for
+ * messages with math (MarkdownCore -> katexRehypePlugin), so this import alone kept KaTeX in the
+ * transcript's first-load chunk. With the stub Streamdown never finds rehype-katex in Xum's list,
+ * so it also stops injecting its CDN KaTeX stylesheet (streamdown.ai); Xum loads the local CSS.
+ * Only Streamdown's own imports are stubbed. Build only, like streamdownShikiLangsPlugin (the dev
+ * server pre-bundles Streamdown). A build that stubs nothing fails, so a Streamdown upgrade cannot
+ * silently bring KaTeX back.
+ */ const STREAMDOWN_MARKER = "/node_modules/streamdown/";
 const STUB_ID = "\0xum-streamdown-rehype-katex";
 
 export function streamdownRehypeKatexPlugin(): Plugin {
@@ -34,8 +28,7 @@ export function streamdownRehypeKatexPlugin(): Plugin {
       return STUB_ID;
     },
     load(id) {
-      // A no-op rehype plugin: never equal to Xum's rehype-katex, and harmless if Streamdown's
-      // defaults ever run.
+      // A no-op rehype plugin, harmless if Streamdown's defaults ever run.
       return id === STUB_ID ? "export default function rehypeKatexStub() {}" : null;
     },
     generateBundle() {

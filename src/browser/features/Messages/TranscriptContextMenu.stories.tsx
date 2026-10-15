@@ -38,12 +38,14 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const SelectedMarkdown: Story = {
-  play: async ({ canvasElement }) => {
+  play: async ({ canvasElement, args }) => {
     const document = canvasElement.ownerDocument;
     const canvas = within(canvasElement);
     const body = within(document.body);
     // KaTeX loads lazily and then re-renders the message, so select text only after that.
-    await waitFor(() => expect(canvasElement.querySelector(".katex")).not.toBeNull());
+    if (args.markdown?.includes("$$")) {
+      await waitFor(() => expect(canvasElement.querySelector(".katex")).not.toBeNull());
+    }
     const selected = await canvas.findByText("bold selection", {
       selector: 'strong, [data-streamdown="strong"]',
     });

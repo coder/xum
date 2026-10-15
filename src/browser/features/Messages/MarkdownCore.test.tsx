@@ -22,7 +22,7 @@ function renderCore(renderSynchronously: boolean) {
   );
 }
 
-describe("MarkdownCore incomplete-markdown repair", () => {
+describe("MarkdownCore", () => {
   let cleanupDom: (() => void) | null = null;
 
   beforeEach(() => {
@@ -82,20 +82,6 @@ describe("MarkdownCore incomplete-markdown repair", () => {
     );
     expect(view.container.textContent).toContain("and more text.");
   });
-});
-
-describe("MarkdownCore math", () => {
-  let cleanupDom: (() => void) | null = null;
-
-  beforeEach(() => {
-    cleanupDom = installDom();
-  });
-
-  afterEach(() => {
-    cleanup();
-    cleanupDom?.();
-    cleanupDom = null;
-  });
 
   // Every form that remark-math or rehype-katex renders. KaTeX loads lazily, so each case fails
   // if the math check misses the form or the lazy KaTeX render breaks.
@@ -105,6 +91,7 @@ describe("MarkdownCore math", () => {
     ["a tilde math fence", "~~~ math\nx^2\n~~~"],
     ["raw language-math code", '<code class="language-math">x^2</code>'],
     ["raw math-inline code", '<code class="math-inline">x^2</code>'],
+    ["an encoded raw math class", '<code class="math&#45;inline">x^2</code>'],
   ])("renders %s with KaTeX", async (_name, content) => {
     const view = render(
       <ThemeProvider forcedTheme="dark">
@@ -114,6 +101,24 @@ describe("MarkdownCore math", () => {
     await waitFor(() =>
       expect(view.container.querySelector(".katex annotation")?.textContent?.trim()).toBe("x^2")
     );
+  });
+
+  // Browser scroll anchoring holds on to a DOM node in view. If KaTeX's arrival replaced the whole
+  // row's DOM (as a Suspense swap does), the rows on screen jumped. A fresh module instance makes
+  // KaTeX arrive after the first render even when an earlier test already loaded it.
+  test("keeps the row's other DOM nodes when KaTeX arrives", async () => {
+    const freshModule = "./MarkdownCore.tsx?katex-arrives";
+    // eslint-disable-next-line no-restricted-syntax -- a second module instance, not a project import
+    const fresh = (await import(freshModule)) as { MarkdownCore: typeof MarkdownCore };
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <fresh.MarkdownCore content={"Intro paragraph.\n\n$$x^2$$"} />
+      </ThemeProvider>
+    );
+    const intro = view.getByText("Intro paragraph.");
+    expect(view.container.querySelector(".katex")).toBeNull();
+    await waitFor(() => expect(view.container.querySelector(".katex")).not.toBeNull());
+    expect(view.getByText("Intro paragraph.")).toBe(intro);
   });
 
   // remark-math leaves these as text (single-dollar math is off), so they must not load KaTeX.

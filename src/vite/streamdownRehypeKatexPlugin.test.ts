@@ -26,7 +26,6 @@ describe("streamdownRehypeKatexPlugin", () => {
     const h = harness();
     // Windows importer paths use backslashes.
     const id = h.resolve("rehype-katex", STREAMDOWN_IMPORTER.replaceAll("/", "\\"));
-    expect(id).toEqual(expect.any(String));
     // eslint-disable-next-line no-restricted-syntax -- evaluates the generated stub module, not a project import
     const mod = (await import(`data:text/javascript,${String(h.load(id))}`)) as {
       default: () => unknown;
