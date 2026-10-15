@@ -2694,6 +2694,170 @@ describe("Config", () => {
       }
     });
 
+    it("keeps the listener guard for a batch that holds an own edit and a foreign edit", async () => {
+      await config.setUpdateChannel("npm");
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      const unsubscribeThrowing = config.onConfigChanged(() => {
+        throw new Error("listener failed");
+      });
+      const next = nextNotification(config);
+      // The watcher reads the stamp right before it notifies, in the same callback.
+      const realStamp = config.configFileStamp.bind(config);
+      const seenStamps = new Set<string>();
+      let stampSeen = Promise.withResolvers<void>();
+      const stampSpy = spyOn(config, "configFileStamp").mockImplementation(() => {
+        const stamp = realStamp();
+        seenStamps.add(stamp);
+        stampSeen.resolve();
+        return stamp;
+      });
+      try {
+        await config.withDeferredChangeNotifications(async () => {
+          await config.setUpdateChannel("nightly");
+          await new Config(tempDir).setUpdateChannel("npm");
+          const foreignStamp = realStamp();
+          while (!seenStamps.has(foreignStamp)) {
+            await stampSeen.promise;
+            stampSeen = Promise.withResolvers<void>();
+          }
+        });
+        await next.promise;
+        expect(errorSpy).toHaveBeenCalled();
+        expect(config.getUpdateChannel()).toBe("npm");
+      } finally {
+        stampSpy.mockRestore();
+        next.unsubscribe();
+        unsubscribeThrowing();
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("retries a failed folder watch on a read of a changed config.json", async () => {
+      const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      const target = path.join(targetDir, "config.json");
+      const realWatch = fs.watch;
+      let failing = true;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (failing && fs.realpathSync(String(args[0])) === fs.realpathSync(targetDir)) {
+          throw Object.assign(new Error("ENOSPC: inotify watch limit reached"), { code: "ENOSPC" });
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
+      try {
+        fs.writeFileSync(target, JSON.stringify({ projects: [] }));
+        fs.symlinkSync(target, path.join(tempDir, "config.json"));
+        let notified = Promise.withResolvers<void>();
+        let notifications = 0;
+        const unsubscribe = config.onConfigChanged(() => {
+          notifications += 1;
+          notified.resolve();
+        });
+        failing = false;
+        // No await until the read: no event from the config dir watch can retry the watch.
+        fs.writeFileSync(target, JSON.stringify({ projects: [], updateChannel: "nightly" }));
+        expect(config.getUpdateChannel()).toBe("nightly");
+        expect(notifications).toBe(1);
+        // The retried watch on targetDir sees the next save there.
+        notified = Promise.withResolvers<void>();
+        await new Config(tempDir).setUpdateChannel("npm");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("npm");
+      } finally {
+        debugSpy.mockRestore();
+        watchSpy.mockRestore();
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rebuilds the watches once per config.json change for an error every new watch raises", () => {
+      const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      const target = path.join(targetDir, "config.json");
+      const watchers = new Map<string, fs.FSWatcher>();
+      let watchCalls = 0;
+      const realWatch = fs.watch;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        watchCalls += 1;
+        const watcher = realWatch(...args);
+        watchers.set(fs.realpathSync(String(args[0])), watcher);
+        return watcher;
+      }) as typeof fs.watch);
+      const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
+      const failTargetWatch = () => {
+        const watcher = watchers.get(fs.realpathSync(targetDir));
+        if (!watcher) throw new Error("expected a watch on the target dir");
+        watcher.emit("error", new Error("EPERM: operation not permitted"));
+      };
+      try {
+        fs.writeFileSync(target, JSON.stringify({ projects: [] }));
+        fs.symlinkSync(target, path.join(tempDir, "config.json"));
+        const unsubscribe = config.onConfigChanged(() => undefined);
+        const started = watchCalls;
+        failTargetWatch();
+        const rebuilt = watchCalls;
+        expect(rebuilt).toBeGreaterThan(started);
+        // The new watch fails the same way. config.json did not change, so no rebuild.
+        failTargetWatch();
+        expect(watchCalls).toBe(rebuilt);
+        // A read of the changed file rebuilds once more.
+        fs.writeFileSync(target, JSON.stringify({ projects: [], updateChannel: "nightly" }));
+        expect(config.getUpdateChannel()).toBe("nightly");
+        expect(watchCalls).toBeGreaterThan(rebuilt);
+        unsubscribe();
+      } finally {
+        debugSpy.mockRestore();
+        watchSpy.mockRestore();
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    });
+
+    it("stops resolving a config.json symlink loop at the link limit", async () => {
+      const loopA = path.join(tempDir, "loop-a");
+      const loopB = path.join(tempDir, "loop-b");
+      fs.symlinkSync(loopB, loopA);
+      fs.symlinkSync(loopA, loopB);
+      const link = path.join(tempDir, "config.json");
+      fs.symlinkSync(loopA, link);
+      // Without the link limit, resolving the loop never ends and this call hangs.
+      const next = nextNotification(config);
+      // The config dir watch still sees a real file that replaces the loop.
+      const replacement = path.join(tempDir, "replacement.json");
+      fs.writeFileSync(replacement, JSON.stringify({ projects: [], updateChannel: "nightly" }));
+      fs.renameSync(replacement, link);
+      await next.promise;
+      next.unsubscribe();
+      expect(config.getUpdateChannel()).toBe("nightly");
+    });
+
+    it("follows a config.json path through a symlink to the filesystem root", async () => {
+      const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      try {
+        const target = path.join(targetDir, "config.json");
+        fs.writeFileSync(target, JSON.stringify({ projects: [] }));
+        const { root } = path.parse(target);
+        const rootLink = path.join(tempDir, "root");
+        fs.symlinkSync(root, rootLink);
+        // config.json -> root/<target without the root>: the walk goes on from the root.
+        fs.symlinkSync(
+          path.join(rootLink, target.slice(root.length)),
+          path.join(tempDir, "config.json")
+        );
+        const next = nextNotification(config);
+        // The save lands in targetDir: only a watch there sees it.
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await next.promise;
+        next.unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    });
+
     it("retries a target folder watch that failed to start", async () => {
       const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
       const realWatch = fs.watch;

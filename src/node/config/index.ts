@@ -1801,7 +1801,8 @@ export class Config {
       if (watcher) this.configFileWatchers.push(watcher);
       else complete = false;
     }
-    // A dir whose watch failed to start is retried by the next relink check (the next event).
+    // A dir whose watch failed to start is retried by the next relink check (the next event)
+    // or by the next read of a changed config.json (retryIncompleteConfigFileWatch).
     this.watchedConfigFileDirsKey = complete ? configFileWatchDirsKey(dirs) : null;
   }
 
@@ -1847,9 +1848,27 @@ export class Config {
       // each dir that still resolves (a vanished dir moves to an existing ancestor), and
       // the stamp check after it reports an edit made while the watch was down.
       this.watchedConfigFileDirsKey = null;
-      this.handleConfigFileEventWithRelink();
+      this.retryIncompleteConfigFileWatch();
     });
     return watcher;
+  }
+
+  /** The config.json stamp of the last retry by retryIncompleteConfigFileWatch. */
+  private configFileWatchRetryStamp: string | null = null;
+
+  /**
+   * Rebuilds a watch set with a failed watch, at most once per config.json stamp. Watcher
+   * errors and config reads call it. A read retries a watch that failed to start, so the
+   * retry needs no event from another watch. The stamp bound stops an error that every new
+   * watch raises from rebuilding the set at the pace of the OS errors. No timer: until the
+   * stamp changes, a retry would see no new edit to report.
+   */
+  private retryIncompleteConfigFileWatch(): void {
+    if (this.watchedConfigFileDirsKey !== null || this.configFileWatchers.length === 0) return;
+    const stamp = this.configFileStamp();
+    if (stamp === this.configFileWatchRetryStamp) return;
+    this.configFileWatchRetryStamp = stamp;
+    this.handleConfigFileEventWithRelink();
   }
 
   private closeConfigFileWatcher(): void {
@@ -1920,7 +1939,7 @@ export class Config {
   }
 
   /**
-   * A batch with an own edit notifies as an own save does. A batch with only foreign edits
+   * A batch with only own edits notifies as an own save does. A batch with a foreign edit
    * keeps the listener guard of notifyConfigChangedByAnotherProcess.
    */
   private flushDeferredChangeNotification(): void {
@@ -1928,8 +1947,9 @@ export class Config {
     const foreign = this.foreignChangeNotificationPending;
     this.changeNotificationPending = false;
     this.foreignChangeNotificationPending = false;
-    if (own) this.notifyConfigChanged();
-    else if (foreign) this.notifyConfigChangedByAnotherProcess();
+    // A foreign edit has no caller to throw to, so it keeps the guard even next to an own edit.
+    if (foreign) this.notifyConfigChangedByAnotherProcess();
+    else if (own) this.notifyConfigChanged();
   }
 
   private notifyConfigChanged(): void {
@@ -2331,7 +2351,11 @@ export class Config {
     if (key !== undefined && this.configSnapshot?.key === key) {
       return this.configSnapshot.config;
     }
-    return this.readConfigOrDefault(options, key);
+    const config = this.readConfigOrDefault(options, key);
+    // A changed file: retry a failed watch after the read, so a listener it notifies reads
+    // the snapshot this read stored.
+    this.retryIncompleteConfigFileWatch();
+    return config;
   }
 
   private readConfigOrDefault(
