@@ -960,7 +960,10 @@ function getStreamingMessageKey(workspaceId: string, messageId: string): string 
 
 export class WorkspaceStore {
   // Per workspace: chat events held until the lazy tool cards load (see dispatchChatEvent).
-  private readonly toolCardsHolds = new Map<string, Array<() => void>>();
+  private readonly toolCardsHolds = new Map<
+    string,
+    { queue: Array<() => void>; cancel: () => void; loopSignal: AbortSignal }
+  >();
   // Per-workspace state (lazy computed on get)
   private states = new MapStore<string, WorkspaceState>();
 
@@ -4568,7 +4571,7 @@ export class WorkspaceStore {
       },
       onEvent: (data, attemptContext, attemptSignal) =>
         queueMicrotask(() =>
-          this.dispatchChatEvent(workspaceId, data, () => {
+          this.dispatchChatEvent(workspaceId, data, signal, () => {
             if (!signal.aborted && !attemptSignal.aborted)
               this.handleChatMessage(workspaceId, data, attemptContext);
           })
@@ -4590,6 +4593,7 @@ export class WorkspaceStore {
         if (this.currentOnChatAttempts.get(workspaceId)?.loopSignal === signal) {
           this.currentOnChatAttempts.delete(workspaceId);
         }
+        this.dropToolCardsHold(workspaceId, signal);
         if (!this.isWorkspaceRegistered(workspaceId)) return;
         this.clearReplayBuffers(workspaceId);
         // An attempt that ended without caught-up (transport error, stall watchdog) opens
@@ -4610,6 +4614,7 @@ export class WorkspaceStore {
         this.historyPagination.set(workspaceId, { ...existingPagination, loading: false });
       },
     });
+    this.dropToolCardsHold(workspaceId, signal);
     // The loop is over (signal aborted, client gone, or a stop from onError): no attempt of
     // this loop can deliver a baseline anymore. Switch/dispose already settled `cancelled`;
     // anything still pending under this loop's signal fails. A request bound to a newer loop
@@ -5073,17 +5078,46 @@ export class WorkspaceStore {
    * rows have tool calls (bounded). Otherwise those rows would first mount header-only and grow
    * when the cards arrive: on desktop the chunk's evaluation often loses that race (#6800).
    */
-  private dispatchChatEvent(workspaceId: string, data: WorkspaceChatMessage, run: () => void) {
+  private dispatchChatEvent(
+    workspaceId: string,
+    data: WorkspaceChatMessage,
+    loopSignal: AbortSignal,
+    run: () => void
+  ) {
     const held = this.toolCardsHolds.get(workspaceId);
-    if (held) return void held.push(run);
-    const buffered = this.chatTransientState.get(workspaceId)?.historicalMessages ?? [];
-    if (!isCaughtUpMessage(data) || toolCardsLoaded() || !rowsHaveToolCalls(buffered)) return run();
+    if (held) return void held.queue.push(run);
+    if (!isCaughtUpMessage(data) || toolCardsLoaded() || !this.replayHasToolCalls(workspaceId))
+      return run();
     const queue = [run];
-    this.toolCardsHolds.set(workspaceId, queue);
-    afterToolCardsLoad(CHAT_VIEW_DATA_READY_TIMEOUT_MS, () => {
+    const cancel = afterToolCardsLoad(CHAT_VIEW_DATA_READY_TIMEOUT_MS, () => {
       this.toolCardsHolds.delete(workspaceId);
       for (const next of queue) next();
     });
+    this.toolCardsHolds.set(workspaceId, { queue, cancel, loopSignal });
+  }
+
+  /** Persisted tool rows, or a tool call of the active stream (reconnect mid-tool). */
+  private replayHasToolCalls(workspaceId: string): boolean {
+    const transient = this.chatTransientState.get(workspaceId);
+    if (!transient) return false;
+    const toolEvent = (event: WorkspaceChatMessage) =>
+      "type" in event && event.type === "tool-call-start";
+    return (
+      rowsHaveToolCalls(transient.historicalMessages) ||
+      transient.pendingStreamEvents.some(toolEvent)
+    );
+  }
+
+  /**
+   * An ended attempt's held events must never apply: the retry replays everything, and an old
+   * caught-up would run against the retry's state. A newer loop's hold (switch away and back)
+   * is not this loop's to drop.
+   */
+  private dropToolCardsHold(workspaceId: string, loopSignal: AbortSignal): void {
+    const hold = this.toolCardsHolds.get(workspaceId);
+    if (hold?.loopSignal !== loopSignal) return;
+    hold.cancel();
+    this.toolCardsHolds.delete(workspaceId);
   }
 
   private handleChatMessage(

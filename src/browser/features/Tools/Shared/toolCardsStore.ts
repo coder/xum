@@ -39,15 +39,19 @@ export function publishToolCards(next: ToolCards): void {
 /**
  * Runs `callback` once the cards publish, or after `timeoutMs` (a failed or slow chunk must not
  * hold the caller forever). Check toolCardsLoaded() first: the cards publish only once.
+ * Returns a cancel function.
  */
-export function afterToolCardsLoad(timeoutMs: number, callback: () => void): void {
-  const done = () => {
-    if (!waiters.delete(done)) return;
+export function afterToolCardsLoad(timeoutMs: number, callback: () => void): () => void {
+  const cancel = () => {
     clearTimeout(timer);
-    callback();
+    return waiters.delete(done);
+  };
+  const done = () => {
+    if (cancel()) callback();
   };
   const timer = setTimeout(done, timeoutMs);
   waiters.add(done);
+  return cancel;
 }
 
 export function toolCardsLoaded(): boolean {

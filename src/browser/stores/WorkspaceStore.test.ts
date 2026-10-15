@@ -16,6 +16,8 @@ import type { TurnCoordinator, OperationId } from "@/node/services/turnCoordinat
 import { Ok } from "@/common/types/result";
 import { GlobalWindow } from "happy-dom";
 import * as toolCardsStore from "@/browser/features/Tools/Shared/toolCardsStore";
+// The app loads the cards before tool rows reveal; tests of the wait itself stub toolCardsLoaded.
+import "@/browser/features/Tools/Shared/toolCardsLoader";
 import { createORPCClient } from "@orpc/client";
 import { RPCLink as MessagePortLink } from "@orpc/client/message-port";
 import { eventIterator, os, type RouterClient } from "@orpc/server";
@@ -900,24 +902,84 @@ describe("WorkspaceStore", () => {
     });
     afterEach(() => loaded?.mockRestore());
 
+    /** Stands in for the store's wait: `publish()` runs every wait that was not cancelled. */
+    function fakeCardsWait() {
+      const waits: Array<{ cb: () => void; cancelled: boolean }> = [];
+      const spy = spyOn(toolCardsStore, "afterToolCardsLoad").mockImplementation((_ms, cb) => {
+        const wait = { cb, cancelled: false };
+        waits.push(wait);
+        return () => !(wait.cancelled = true);
+      });
+      const publish = () => {
+        for (const wait of waits.splice(0)) if (!wait.cancelled) wait.cb();
+      };
+      return { waits, publish, restore: () => spy.mockRestore() };
+    }
+    const caughtUp: WorkspaceChatMessage = { type: "caught-up", historyReplayStatus: "complete" };
+
     // Rows that mount before their cards load first render header-only, then grow.
     it("holds caught-up for replayed tool rows until the cards publish", async () => {
-      let publish: (() => void) | undefined;
-      const wait = spyOn(toolCardsStore, "afterToolCardsLoad").mockImplementation((_ms, cb) => {
-        publish = cb;
-      });
+      const cards = fakeCardsWait();
       try {
-        mockChatScript([toolRow, { type: "caught-up", historyReplayStatus: "complete" }], {
-          keepOpen: true,
-        });
+        mockChatScript([toolRow, caughtUp], { keepOpen: true });
         createAndAddWorkspace(store, "ws-tools");
-        expect(await waitUntil(() => publish !== undefined)).toBe(true);
+        expect(await waitUntil(() => cards.waits.length > 0)).toBe(true);
         expect(hydrating("ws-tools")).toBe(true);
-        publish!();
+        cards.publish();
         expect(hydrating("ws-tools")).toBe(false);
         expect(store.getWorkspaceState("ws-tools").messages.length).toBeGreaterThan(0);
       } finally {
-        wait.mockRestore();
+        cards.restore();
+      }
+    });
+
+    // The retry replays everything; the ended attempt's caught-up must not apply over it.
+    it("drops a held caught-up when its attempt ends", async () => {
+      const cards = fakeCardsWait();
+      try {
+        const retryRow: WorkspaceChatMessage = { ...toolRow, id: "assistant-retry" };
+        mockChatReconnectScript((attempt, signal) =>
+          attempt === 1
+            ? [toolRow, caughtUp]
+            : [retryRow, caughtUp, () => waitForAbortSignal(signal)]
+        );
+        createAndAddWorkspace(store, "ws-retry");
+        expect(await waitUntil(() => cards.waits.length === 2, 5000)).toBe(true);
+        cards.publish();
+        const ids = store
+          .getWorkspaceState("ws-retry")
+          .messages.map((m) => ("historyId" in m ? m.historyId : m.id));
+        expect(hydrating("ws-retry")).toBe(false);
+        expect(ids).toContain("assistant-retry");
+      } finally {
+        cards.restore();
+      }
+    });
+
+    // Reconnecting to an active turn: its tool call is not persisted yet.
+    it("holds caught-up for a replayed active tool call", async () => {
+      const cards = fakeCardsWait();
+      try {
+        const live = { workspaceId: "ws-live", messageId: "m-live", replay: true } as const;
+        const toolStart: WorkspaceChatMessage = {
+          ...live,
+          type: "tool-call-start",
+          toolCallId: "t-live",
+          toolName: "bash",
+          args: {},
+          tokens: 1,
+          timestamp: 2,
+        };
+        mockChatScript(
+          [streamStartEvent("ws-live", "m-live", { replay: true }), toolStart, caughtUp],
+          {
+            keepOpen: true,
+          }
+        );
+        createAndAddWorkspace(store, "ws-live");
+        expect(await waitUntil(() => cards.waits.length > 0)).toBe(true);
+      } finally {
+        cards.restore();
       }
     });
 
