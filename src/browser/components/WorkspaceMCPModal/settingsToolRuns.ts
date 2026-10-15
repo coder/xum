@@ -1,0 +1,107 @@
+import { useSyncExternalStore } from "react";
+import { getOwn } from "@/common/utils/getOwn";
+
+/** A settings tool action's text result (or error), shown under its row. */
+export interface SettingsToolRunResult {
+  text: string;
+  isError: boolean;
+}
+
+/** One server's settings tool actions: the tools of runs in flight, and each tool's last result. */
+export interface ServerSettingsToolRuns {
+  /** One entry per run in flight (a tool can appear twice: two dialogs of one workspace). */
+  running: readonly string[];
+  results: Readonly<Record<string, SettingsToolRunResult>>;
+}
+
+type WorkspaceSettingsToolRuns = Readonly<Record<string, ServerSettingsToolRuns>>;
+
+/**
+ * Settings tool action runs, per workspace and server, outside the dialog. Closing the workspace
+ * MCP dialog unmounts its settings sections (the sidebar row even unmounts the dialog), and a
+ * reopen used to forget a run still in flight: Run and Save settings were enabled while it ran.
+ * Results live here too, so a section remounted by a reopen or re-read still shows the result.
+ * Module-level and in memory only: a reload ends every run anyway.
+ */
+const runsByWorkspace = new Map<string, WorkspaceSettingsToolRuns>();
+const listeners = new Set<() => void>();
+const NO_RUNS: WorkspaceSettingsToolRuns = {};
+export const NO_SERVER_RUNS: ServerSettingsToolRuns = { running: [], results: {} };
+
+function update(
+  workspaceId: string,
+  serverName: string,
+  change: (runs: ServerSettingsToolRuns) => ServerSettingsToolRuns
+): void {
+  const workspace = runsByWorkspace.get(workspaceId) ?? NO_RUNS;
+  const { [serverName]: previous, ...rest } = workspace;
+  const next = change(previous ?? NO_SERVER_RUNS);
+  const empty = next.running.length === 0 && Object.keys(next.results).length === 0;
+  const nextWorkspace = empty ? rest : { ...rest, [serverName]: next };
+  if (Object.keys(nextWorkspace).length === 0) runsByWorkspace.delete(workspaceId);
+  else runsByWorkspace.set(workspaceId, nextWorkspace);
+  for (const listener of listeners) listener();
+}
+
+function withoutResult(runs: ServerSettingsToolRuns, toolName: string) {
+  const { [toolName]: _previous, ...results } = runs.results;
+  return results;
+}
+
+/**
+ * A run of `toolName` starts (it clears the tool's last result). The returned callback ends it,
+ * once, with the result to show (null: none, as for an app that opened).
+ */
+export function startSettingsToolRun(
+  workspaceId: string,
+  serverName: string,
+  toolName: string
+): (result: SettingsToolRunResult | null) => void {
+  update(workspaceId, serverName, (runs) => ({
+    running: [...runs.running, toolName],
+    results: withoutResult(runs, toolName),
+  }));
+  let ended = false;
+  return (result) => {
+    if (ended) return;
+    ended = true;
+    update(workspaceId, serverName, (runs) => {
+      const index = runs.running.indexOf(toolName);
+      return {
+        running: runs.running.filter((_, i) => i !== index),
+        results:
+          result === null ? withoutResult(runs, toolName) : { ...runs.results, [toolName]: result },
+      };
+    });
+  };
+}
+
+/** A new dialog open starts without the results of earlier opens (runs in flight stay). */
+export function clearSettingsToolResults(workspaceId: string): void {
+  const workspace = runsByWorkspace.get(workspaceId);
+  if (workspace === undefined) return;
+  for (const serverName of Object.keys(workspace))
+    update(workspaceId, serverName, (runs) => ({ running: runs.running, results: {} }));
+}
+
+export function settingsToolRunsOf(workspaceId: string): WorkspaceSettingsToolRuns {
+  return runsByWorkspace.get(workspaceId) ?? NO_RUNS;
+}
+
+/** One server's runs (NO_SERVER_RUNS when it has none). */
+export function serverSettingsToolRuns(
+  runs: WorkspaceSettingsToolRuns,
+  serverName: string
+): ServerSettingsToolRuns {
+  return getOwn(runs, serverName) ?? NO_SERVER_RUNS;
+}
+
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+/** The workspace's settings tool runs; re-renders when they change. */
+export function useSettingsToolRuns(workspaceId: string): WorkspaceSettingsToolRuns {
+  return useSyncExternalStore(subscribe, () => settingsToolRunsOf(workspaceId));
+}
