@@ -126,6 +126,7 @@ export const CommandIds = {
   pluginsCheckUpdates: () => "plugins:check-updates" as const,
   pluginsUpdateAll: () => "plugins:update-all" as const,
   pluginsUpdateOne: () => "plugins:update-one" as const,
+  pluginsSignOutServers: () => "plugins:sign-out-servers" as const,
 
   // Help commands
   helpKeybinds: () => "help:keybinds" as const,

@@ -1217,8 +1217,11 @@ const BrokenSignOutRecord: React.FC<{ reason: string; onCleared: () => void }> =
     setSignOutError(null);
     try {
       const result = await api.agentPlugins.signOutPluginServers();
-      if (result.success) props.onCleared();
-      else setSignOutError(result.error);
+      if (result.success) {
+        props.onCleared();
+        // Mounted consumers (skills, slash commands, MCP apps) cached the fenced, empty inventory.
+        publishAgentPluginsMutated();
+      } else setSignOutError(result.error);
     } catch (error) {
       setSignOutError(getErrorMessage(error));
     } finally {

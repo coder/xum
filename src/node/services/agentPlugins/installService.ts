@@ -4456,22 +4456,31 @@ export class AgentPluginInstallService {
       // Read only a regular file: readFile on a FIFO blocks while this holds the lock.
       const recorded =
         record.kind === "present" ? await this.readPendingSignOuts().catch(() => []) : [];
-      const urls = [...recorded, ...(await this.installedPluginServerUrls())];
-      const deadline = monotonicNow() + this.recoveryTimeoutMs;
-      const done = new Set<string>();
-      for (const serverUrl of urls) {
-        const key = oauth.credentialKey(serverUrl) ?? serverUrl;
-        if (done.has(key)) continue;
-        const failure = await signOutFailure(oauth, serverUrl, deadline, this.inFlightSignOuts);
-        if (failure !== undefined)
-          throw new Error(`Could not sign out of ${serverUrl}: ${failure}`);
-        done.add(key);
-      }
-      // Sign out first, delete last (see parsePendingSignOuts).
-      await this.writePendingSignOuts([]);
+      await this.signOutEach(oauth, [...recorded, ...(await this.installedPluginServerUrls())]);
+      // Sign out first, delete last (see parsePendingSignOuts). A non-regular record (a
+      // directory) is Xum's own path too: remove it whole, or the fence never opens.
+      if (record.kind === "unreadable")
+        await fsPromises.rm(this.pendingSignOutsFile, { recursive: true, force: true });
+      else await this.writePendingSignOuts([]);
       this.pendingSignOutLastError = undefined;
       this.pendingSignOutRetryAtMs = 0;
     });
+  }
+
+  /** Signs out of each credential once, within one pass deadline; throws on the first failure. */
+  private async signOutEach(
+    oauth: Pick<McpOauthService, "logout" | "credentialKey">,
+    urls: readonly string[]
+  ): Promise<void> {
+    const deadline = monotonicNow() + this.recoveryTimeoutMs;
+    const done = new Set<string>();
+    for (const serverUrl of urls) {
+      const key = oauth.credentialKey(serverUrl) ?? serverUrl;
+      if (done.has(key)) continue;
+      const failure = await signOutFailure(oauth, serverUrl, deadline, this.inFlightSignOuts);
+      if (failure !== undefined) throw new Error(`Could not sign out of ${serverUrl}: ${failure}`);
+      done.add(key);
+    }
   }
 
   /** The URLs of the remote MCP servers in every plugin tree of the managed container. */
@@ -4481,20 +4490,31 @@ export class AgentPluginInstallService {
       throw error;
     });
     const urls: string[] = [];
-    for (const dirName of dirs) {
-      const { plugin } = await discoverAgentPluginAt({
-        pluginDir: path.join(this.containerDir, dirName),
-        scope: "global",
-      });
-      if (plugin?.mcpConfigPath === undefined) continue;
-      const { servers } = await loadPluginMcpServers(plugin, {
-        xumHome: this.config.rootDir,
-        instanceId: this.instanceIdFor(dirName),
-      });
-      for (const info of Object.values(servers))
-        if (info.transport !== "stdio") urls.push(info.url);
-    }
+    for (const dirName of dirs) urls.push(...(await this.pluginTreeServerUrls(dirName)));
     return urls;
+  }
+
+  /** One plugin tree's remote MCP server URLs; throws when the tree's servers cannot be read. */
+  private async pluginTreeServerUrls(dirName: string): Promise<string[]> {
+    // Plugin trees are directories (or links to one); skip stray files such as .DS_Store.
+    const pluginDir = path.join(this.containerDir, dirName);
+    if (dirName.startsWith(".") || !(await fsPromises.stat(pluginDir)).isDirectory()) return [];
+    const { plugin, diagnostics } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
+    const loaded =
+      plugin?.mcpConfigPath === undefined
+        ? { servers: {}, diagnostics: [] }
+        : await loadPluginMcpServers(plugin, {
+            xumHome: this.config.rootDir,
+            instanceId: this.instanceIdFor(dirName),
+          });
+    // A server this scan cannot read can load later, after a repair, with its old sign-in:
+    // the list must be complete before the record goes.
+    const error = [...diagnostics, ...loaded.diagnostics].find((d) => d.severity === "error");
+    if (error !== undefined)
+      throw new Error(`Xum cannot read the MCP servers of plugin '${dirName}': ${error.message}`);
+    return Object.values(loaded.servers).flatMap((info) =>
+      info.transport === "stdio" ? [] : [info.url]
+    );
   }
   /** Logouts a pass started that have not settled yet (see signOutFailure). */
   private readonly inFlightSignOuts = new Map<
