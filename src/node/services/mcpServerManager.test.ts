@@ -1377,6 +1377,108 @@ describe("MCPServerManager", () => {
     expect(runs).toEqual(["library", "reset"]);
   });
 
+  /** A settings server whose layout offers `offered()`; both tools are listed, read-only. */
+  const layoutServer = (offered: () => string[], runs: string[]) => ({
+    tools: { draw: testTool() },
+    settings: {
+      settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+      callSettingsTool: () =>
+        Promise.resolve({
+          content: [],
+          structuredContent: {
+            schema: { type: "object", properties: {} },
+            values: {},
+            layout: [
+              {
+                kind: "group",
+                title: "Parts",
+                items: offered().map((tool) => ({ kind: "tool", tool })),
+              },
+            ],
+          },
+        }),
+      settingsToolAction: (name: string) =>
+        name === "library" || name === "reset"
+          ? { title: name, readOnly: true, opensApp: false }
+          : undefined,
+      callSettingsActionTool: (name: string) => {
+        runs.push(name);
+        return Promise.resolve({ content: [] });
+      },
+    },
+  });
+
+  test("settings tool actions: a read ID runs only with the instance token of its own read", async () => {
+    const runs: string[] = [];
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-pair-v1") });
+    servers.serve(
+      "settings-pair-v1",
+      layoutServer(() => ["reset"], runs)
+    );
+    // The replacement shows another layout (another schema hash), but still lists "reset".
+    servers.serve(
+      "settings-pair-v2",
+      layoutServer(() => ["library"], runs)
+    );
+    const workspaceId = "settings-pair-ws";
+    const request = workspaceRequest(workspaceId);
+    await manager.getToolsForWorkspace(request);
+    const old = await manager.readSettings(workspaceId, "cad");
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-pair-v2") });
+    await manager.getToolsForWorkspace(request);
+    const current = await manager.readSettings(workspaceId, "cad");
+    if (old === null || current === null) throw new Error("expected settings");
+    expect(current.instanceToken).not.toBe(old.instanceToken);
+    // A crafted pair: the replacement's token with the old read's ID.
+    const crafted = await manager
+      .runSettingsTool(
+        workspaceId,
+        "cad",
+        "reset",
+        { instanceToken: current.instanceToken, readId: old.readId },
+        { confirmed: true }
+      )
+      .then(() => "ran")
+      .catch((error: unknown) => String(error));
+    expect(crafted).toContain("Reopen the dialog");
+    expect(runs).toEqual([]);
+  });
+
+  test("settings tool actions: a restart is checked against the action's own read", async () => {
+    const runs: string[] = [];
+    let offered = ["library"];
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-own-hash-v1") });
+    servers.serve(
+      "settings-own-hash-v1",
+      layoutServer(() => offered, runs)
+    );
+    // The restarted instance shows the second window's layout.
+    servers.serve(
+      "settings-own-hash-v2",
+      layoutServer(() => ["reset"], runs)
+    );
+    const workspaceId = "settings-own-hash-ws";
+    const request = workspaceRequest(workspaceId);
+    await manager.getToolsForWorkspace(request);
+    // Two windows read one instance, and the layout changes between the reads.
+    const firstWindow = await manager.readSettings(workspaceId, "cad");
+    offered = ["reset"];
+    const secondWindow = await manager.readSettings(workspaceId, "cad");
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-own-hash-v2") });
+    await manager.getToolsForWorkspace(request);
+    await manager.readSettings(workspaceId, "cad");
+    if (firstWindow === null || secondWindow === null) throw new Error("expected settings");
+    const run = (tool: string, read: { instanceToken: string; readId: string }) =>
+      manager
+        .runSettingsTool(workspaceId, "cad", tool, read, { confirmed: true })
+        .then(() => "ran")
+        .catch((error: unknown) => String(error));
+    // The restarted instance matches the second window's schema, not the first window's.
+    expect(await run("library", firstWindow)).toContain("Reopen the dialog");
+    expect(await run("reset", secondWindow)).toBe("ran");
+    expect(runs).toEqual(["reset"]);
+  });
+
   test("settings tool actions: an older read that settles last does not replace the newer layout", async () => {
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-actions-overlap") });
     const reads: Array<{ tool: string; answer: () => void }> = [];

@@ -5327,7 +5327,8 @@ export class MCPServerManager {
       crypto.randomUUID(),
       workspaceId,
       serverName,
-      read.layout
+      instanceToken,
+      read
     );
     return { ...read, instanceToken, readId };
   }
@@ -5519,10 +5520,11 @@ export class MCPServerManager {
   }
 
   /**
-   * Why a tool action fails the dialog's read: the instance is not the one read
-   * (isSettingsTokenAccepted), or that very read's layout does not offer the tool (#6611). A
-   * crafted renderer call must not run a listed, allowed tool the settings never showed, and
-   * a second window's newer read must not widen what the first window's read may run.
+   * Why a tool action fails the dialog's read: the read is unknown, foreign, or named with
+   * another read's instance token; the instance is not the one read and does not show that very
+   * read's schema (a restart); or that read's layout does not offer the tool (#6611). A crafted
+   * renderer call must not run a listed, allowed tool the settings never showed, and a second
+   * window's newer read must not widen what the first window's read may run.
    */
   private settingsReadRefusal(
     instance: MCPServerInstance,
@@ -5531,12 +5533,13 @@ export class MCPServerManager {
     toolName: string,
     read: SettingsActionRead
   ): Error | null {
-    const currentToken = this.settingsInstanceToken(instance);
-    if (!this.isSettingsTokenAccepted(workspaceId, serverName, currentToken, read.instanceToken))
-      return staleSettingsInstanceError(serverName);
     const offered = this.settingsReadTools.get(read.readId);
-    // A forgotten (bounded) or foreign read: the dialog must read again.
-    if (offered?.key !== settingsSaveKey(workspaceId, serverName))
+    // A forgotten (bounded), foreign or mismatched read: the dialog must read again.
+    if (
+      offered?.key !== settingsSaveKey(workspaceId, serverName) ||
+      offered.instanceToken !== read.instanceToken ||
+      !this.isSettingsReadCurrent(workspaceId, serverName, instance, offered)
+    )
       return staleSettingsInstanceError(serverName);
     return offered.tools.has(toolName)
       ? null
@@ -5676,10 +5679,25 @@ export class MCPServerManager {
    * The tools each read's layout offered, by the read's readId (settingsReadRefusal), with its
    * workspace and server key. Bounded like settingsSchemaHashes: the oldest read goes first.
    */
-  private readonly settingsReadTools = new Map<
-    string,
-    { key: string; tools: ReadonlySet<string> }
-  >();
+  private readonly settingsReadTools = new Map<string, SettingsReadRecord>();
+
+  /**
+   * Whether the read still applies to `instance`: the same instance, or a restarted one whose
+   * latest read showed this very read's schema (not another window's later read, #6611).
+   */
+  private isSettingsReadCurrent(
+    workspaceId: string,
+    serverName: string,
+    instance: MCPServerInstance,
+    read: SettingsReadRecord
+  ): boolean {
+    const currentToken = this.settingsInstanceToken(instance);
+    if (currentToken === read.instanceToken) return true;
+    const current = this.settingsSchemaHashes.get(
+      settingsSchemaKey(workspaceId, serverName, currentToken)
+    );
+    return current === read.schemaHash;
+  }
 
   /**
    * Whether a request that names `requestToken` (the dialog's read) may act on this workspace
@@ -5729,16 +5747,19 @@ export class MCPServerManager {
     this.settingsSchemaRequestIds.delete(oldest);
   }
 
-  /** Remember what read `readId`'s layout offered (settingsReadRefusal); returns `readId`. */
+  /** Remember read `readId` for its tool actions (settingsReadRefusal); returns `readId`. */
   private rememberSettingsReadTools(
     readId: string,
     workspaceId: string,
     serverName: string,
-    layout: MCPSettingsGroup[]
+    instanceToken: string,
+    snapshot: MCPSettingsSnapshot
   ): string {
     this.settingsReadTools.set(readId, {
       key: settingsSaveKey(workspaceId, serverName),
-      tools: settingsLayoutToolNames(layout),
+      instanceToken,
+      schemaHash: settingsSchemaHash(snapshot),
+      tools: settingsLayoutToolNames(snapshot.layout),
     });
     if (this.settingsReadTools.size > MAX_REMEMBERED_SETTINGS_SCHEMAS) {
       const oldest = this.settingsReadTools.keys().next().value;
@@ -8702,6 +8723,14 @@ async function raceUntilAborted(work: Promise<unknown>, signals: AbortSignal[]):
 
 function settingsSchemaKey(workspaceId: string, serverName: string, token: string): string {
   return `${settingsSaveKey(workspaceId, serverName)}\0${token}`;
+}
+
+/** One settings read, for its tool actions: its server, instance, schema and offered tools. */
+interface SettingsReadRecord {
+  key: string;
+  instanceToken: string;
+  schemaHash: string;
+  tools: ReadonlySet<string>;
 }
 
 /** What a settings tool action names of the dialog's read (MCPSettingsReadSnapshot). */
