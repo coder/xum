@@ -1630,4 +1630,36 @@ describe("DraftStore", () => {
     store.setClient(null);
     expect(store.hasCurrentSnapshot()).toBe(false);
   });
+
+  // Another window saves just before this window's write: the reply carries the backend's merge,
+  // and the delayed push of that save is stale by then (the reply's revision is newer).
+  test("a write reply shows what another window saved in the fields it did not write", async () => {
+    using tempDir = new TestTempDir("draft-store-partial-reply");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    await service.update({ scope, text: "fix the sidebar" });
+    const store = createStore(client);
+    await store.whenReady();
+    let releaseEvents: () => void = () => undefined;
+    control.eventGate = new Promise<void>((resolve) => {
+      releaseEvents = resolve;
+    });
+
+    // Another window names the draft; this one writes only its text.
+    await service.update({ scope, nameState: NAME_STATE });
+    store.setText(scope, "fix the sidebar now");
+    await store.flush(scope);
+    // Another window edits the text; this one writes only its attachments (a field from main).
+    await service.update({ scope, text: "fix the sidebar today" });
+    store.setAttachments(scope, [image]);
+    await store.flush(scope);
+    releaseEvents();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(store.getView(scope)).toMatchObject({
+      text: "fix the sidebar today",
+      nameState: NAME_STATE,
+      attachmentCount: 1,
+    });
+  });
 });

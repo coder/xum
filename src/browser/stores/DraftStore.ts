@@ -340,14 +340,12 @@ type ServerDraftState = Pick<
 
 const EMPTY_SERVER_STATE: ServerDraftState = { text: "", attachments: [] };
 
-/** The fields a write sent (a reply speaks only for those). */
+/** The fields a write sent (only those are confirmed saved). */
 interface WrittenFields {
   text: boolean;
   attachments: boolean;
   name: boolean;
 }
-
-const ALL_FIELDS: WrittenFields = { text: true, attachments: true, name: true };
 
 /** Marks the field versions a confirmed write sent as saved (only the fields it wrote). */
 function confirmWrite(
@@ -1320,7 +1318,7 @@ export class DraftStore {
         entry.inFlight = null;
         settle();
       }
-      this.applyWriteReply(entry, reply, { text: true, attachments: false, name: false });
+      this.applyWriteReply(entry, reply);
     } catch (error) {
       tracking.issuing.delete(input.sendId);
       if (this.entries.get(key) === entry) {
@@ -1825,7 +1823,7 @@ export class DraftStore {
     // its attachments at once instead of after a payload load (R7-SLOW-MOVE). Taken from the
     // mark: the move's own change event may have emptied the source entry by now.
     seedLoadedAttachments(destEntry, sent.mark.loadedAttachments, sent.reply.dest.attachments);
-    this.applyWriteReply(destEntry, sent.reply.dest, ALL_FIELDS);
+    this.applyWriteReply(destEntry, sent.reply.dest);
   }
 
   /** Drop local state of a removed workspace (its session dir, and draft, are gone). */
@@ -1981,15 +1979,8 @@ export class DraftStore {
     this.readyTimer = null;
   }
 
-  /**
-   * Apply server state to the fields without an unconfirmed local change (`fields`: only these;
-   * a write's reply speaks for the fields it wrote).
-   */
-  private applyServerState(
-    entry: Entry,
-    state: ServerDraftState,
-    fields: WrittenFields = ALL_FIELDS
-  ): void {
+  /** Apply server state to the fields without an unconfirmed local change. */
+  private applyServerState(entry: Entry, state: ServerDraftState): void {
     const pendingSends = state.pendingSends ?? [];
     if (entry.serverView === null || entry.revision >= entry.serverView.revision) {
       entry.serverView = { ...state, revision: entry.revision };
@@ -2005,9 +1996,9 @@ export class DraftStore {
       // so its lookup returns it (not accepted).
       this.triggerSendResolution(entry.scope.workspaceId);
     }
-    if (fields.text && !isTextDirty(entry)) entry.text = state.text;
-    if (fields.name && !isNameDirty(entry)) entry.nameState = state.nameState ?? null;
-    if (fields.attachments && !isAttachmentsDirty(entry)) {
+    if (!isTextDirty(entry)) entry.text = state.text;
+    if (!isNameDirty(entry)) entry.nameState = state.nameState ?? null;
+    if (!isAttachmentsDirty(entry)) {
       this.applyServerAttachments(entry, state.attachments);
     }
     this.recompute(entry);
@@ -2452,7 +2443,7 @@ export class DraftStore {
     const entry = this.getOrCreateEntry(scope);
     // The legacy payloads are at hand: when the stored attachments are those, none need loading.
     seedLoadedAttachments(entry, legacyAttachments, reply.attachments);
-    this.applyWriteReply(entry, reply, ALL_FIELDS);
+    this.applyWriteReply(entry, reply);
   }
 
   /**
@@ -2577,7 +2568,7 @@ export class DraftStore {
         entry.inFlight = null;
         settle();
       }
-      this.applyWriteReply(entry, reply, wrote);
+      this.applyWriteReply(entry, reply);
     }
   }
 
@@ -2597,15 +2588,17 @@ export class DraftStore {
   /**
    * A write's reply carries the backend's merge of it. Fields without a newer unsaved edit take
    * the newest server view (this reply, or a push that came after it); the echo push of this
-   * write is stale for this window, so the reply is how the merge reaches it.
+   * write is stale for this window, so the reply is how the merge reaches it. That holds for
+   * every field, not only the ones written: the reply's revision also makes the pushes of other
+   * windows' earlier saves stale, so their changes would otherwise never show here.
    */
-  private applyWriteReply(entry: Entry, reply: DraftWriteOutput, wrote: WrittenFields): void {
+  private applyWriteReply(entry: Entry, reply: DraftWriteOutput): void {
     if (this.entries.get(draftStoreScopeKey(entry.scope)) !== entry) return;
     entry.revision = Math.max(entry.revision, reply.revision);
     if (entry.serverView === null || reply.revision >= entry.serverView.revision) {
       entry.serverView = reply;
     }
-    this.applyServerState(entry, entry.serverView, wrote);
+    this.applyServerState(entry, entry.serverView);
   }
 }
 
