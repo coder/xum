@@ -10593,7 +10593,7 @@ export class AgentSession {
   /**
    * Run the turn.stop prompt hooks (Codex Stop) for a turn that ended normally. A continuation
    * (Codex `decision: "block"`) queues its prompt as a new synthetic user row, at most
-   * MAX_STOP_HOOK_CONTINUATIONS times per user turn. Xum's own todo nudge (buildTodoTurnEndNudge)
+   * MAX_STOP_HOOK_CONTINUATIONS times per user turn. Xum's own todo nudge (needsTodoTurnEndNudge)
    * rides the same continuation and gates. Sub-agent turns skip the hooks: TaskService
    * owns their stream end (Codex has SubagentStop for them). A delegated workspace turn
    * (`workspace-turn-task`) skips them for the same reason: WorkspaceTurnManager settles its
