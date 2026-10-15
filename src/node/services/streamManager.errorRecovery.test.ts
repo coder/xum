@@ -1028,6 +1028,16 @@ describe("StreamManager - stream error classification", () => {
     }
   );
 
+  // Google Vertex AI ADC: google-auth-library could not reach Google's OAuth token endpoint
+  // (offline, a proxy, a firewall). A retry can succeed; compacting the chat cannot help.
+  test("classifies a failed connection to Google's token endpoint as a network error", async () => {
+    const error = new Error(
+      "request to https://oauth2.googleapis.com/token failed, reason: connect ECONNREFUSED 142.250.0.1:443"
+    );
+
+    expect(await errorTypeForStreamFailure(error)).toBe("network");
+  });
+
   describe("OpenAI Daybreak access program rejections", () => {
     // Built-in OpenAI provider with a custom base URL, the route that gets the
     // Responses base-URL hint on generic 400s.

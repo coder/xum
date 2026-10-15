@@ -6329,7 +6329,14 @@ export class StreamManager {
 
       if (error.name === "AbortError" || message.includes("abort")) {
         return "aborted";
-      } else if (message.includes("network") || message.includes("fetch")) {
+      } else if (
+        message.includes("network") ||
+        message.includes("fetch") ||
+        // node-fetch's text for a failed connection, which google-auth-library's HTTP client
+        // (gaxios) keeps. Its URL can be Google's OAuth token endpoint, and the "token" rule
+        // below would read that as a context window error.
+        (message.startsWith("request to ") && message.includes(" failed, reason: "))
+      ) {
         return "network";
       } else if (
         message.includes("model") &&
