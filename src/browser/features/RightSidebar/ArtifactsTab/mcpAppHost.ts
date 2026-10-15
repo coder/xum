@@ -308,6 +308,38 @@ export function declaresFullscreenOnly(declared: readonly string[] | undefined):
 }
 
 /**
+ * ui/resource-teardown; resolves when the view replies or after the bounded wait. A view that
+ * never sent initialized gets none: the spec lets a host send requests only after it, and such a
+ * view has nothing set up to tear down (#6181). Resolves at once then.
+ */
+function requestTeardown(input: {
+  initialized: boolean;
+  id: string;
+  pending: Map<string, (ok: boolean) => void>;
+  post: (message: unknown) => void;
+  reason: string;
+}): Promise<void> {
+  if (!input.initialized) return Promise.resolve();
+  const { id, pending } = input;
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      resolve();
+    }, MCP_APP_TEARDOWN_TIMEOUT_MS);
+    pending.set(id, () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    input.post({
+      jsonrpc: "2.0",
+      id,
+      method: "ui/resource-teardown",
+      params: { reason: input.reason },
+    });
+  });
+}
+
+/**
  * The view's declared display modes after a ui/initialize, told to the frame. A later initialize
  * without a list (the window.openai shim's, mcpAppOpenAiShim.ts) keeps the view's own
  * declaration: it must not widen the modes the view is told about.
@@ -377,31 +409,14 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   const notify = (method: string, params: unknown) =>
     options.postToView({ jsonrpc: "2.0", method, params });
 
-  /**
-   * ui/resource-teardown; resolves when the view replies or after the bounded wait. A view that
-   * never sent initialized gets none: the spec lets a host send requests only after it, and such a
-   * view has nothing set up to tear down (#6181). Resolves at once then.
-   */
-  const teardown = (reason: string): Promise<void> => {
-    if (!initialized) return Promise.resolve();
-    const id = `host-${nextHostRequestId++}`;
-    return new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        pendingHostRequests.delete(id);
-        resolve();
-      }, MCP_APP_TEARDOWN_TIMEOUT_MS);
-      pendingHostRequests.set(id, () => {
-        clearTimeout(timer);
-        resolve();
-      });
-      options.postToView({
-        jsonrpc: "2.0",
-        id,
-        method: "ui/resource-teardown",
-        params: { reason },
-      });
+  const teardown = (reason: string): Promise<void> =>
+    requestTeardown({
+      initialized,
+      id: `host-${nextHostRequestId++}`,
+      pending: pendingHostRequests,
+      post: options.postToView,
+      reason,
     });
-  };
 
   async function handleRequest(id: string | number, method: string, params: unknown) {
     switch (method) {
