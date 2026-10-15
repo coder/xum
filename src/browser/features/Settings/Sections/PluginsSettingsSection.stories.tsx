@@ -1,11 +1,12 @@
 import { useRef, useState } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, waitFor, within } from "storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { PIXEL_DISABLED } from "@/browser/stories/meta";
 import { createMockORPCClient, type MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
 import type {
@@ -466,6 +467,13 @@ export const AddPluginConsentPreview: Story = {
     await canvas.findByText(/Unknown top-level field 'hooks' ignored/);
     await canvas.findByRole("button", { name: /Install/ });
     await expectInterfaceAsText(canvasElement);
+    // The muted-tone chips reach WCAG AA in every theme; dark muted text on their tint was
+    // 4.06:1 (#6544).
+    const chips = () => [
+      ...canvas.getAllByText("Interactive"),
+      ...canvas.getAllByText(/^branch · /),
+    ];
+    await expect(textsBelowAaInThemes(chips).join("\n")).toBe("");
   },
 };
 

@@ -91,7 +91,8 @@ const Badge: React.FC<{
     className={cn(
       "rounded px-1.5 py-0.5 text-[10px] font-medium",
       props.wrap === true ? "max-w-full wrap-anywhere" : "whitespace-nowrap",
-      props.tone === "muted" && "bg-foreground/10 text-muted",
+      // Foreground text: muted text on this tint stayed below 4.5:1 even after #6544 raised the token.
+      props.tone === "muted" && "bg-foreground/10 text-foreground",
       props.tone === "accent" && "bg-accent/15 text-accent-text",
       props.tone === "warning" && "bg-warning/15 text-warning",
       props.tone === "error" && "bg-destructive/15 text-destructive"

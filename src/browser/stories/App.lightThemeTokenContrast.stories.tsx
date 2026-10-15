@@ -39,6 +39,7 @@ import {
   textContrastOnBase,
   textContrasts,
   tokenTextContrasts,
+  textsBelowAaInThemes,
   type TextContrast,
 } from "@/browser/stories/helpers/contrast";
 import {
@@ -734,3 +735,26 @@ export const AccentLinksLight = accentLinkStory("light");
 export const AccentLinksFlexokiLight = accentLinkStory("flexoki-light");
 export const AccentLinksDark = accentLinkStory("dark");
 export const AccentLinksFlexokiDark = accentLinkStory("flexoki-dark");
+
+// ─── Dark muted text on raised surfaces (#6544) ──────────────────────────────────────────────
+
+/**
+ * Every `--color-muted` text on the Settings > Agents cards (`bg-background-secondary`) reaches
+ * 4.5:1 in dark and flexoki-dark. Dark muted at 53% was 4.16:1 on these cards.
+ */
+export const MutedOnRaisedSurfacesDark: AppStory = {
+  globals: { theme: "dark" },
+  parameters: lightContract,
+  render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
+  play: async ({ canvasElement }) => {
+    const dialog = await openSettingsDialog(canvasElement);
+    await userEvent.click(await within(dialog).findByRole("button", { name: "Agents" }));
+    await within(dialog).findByRole("group", { name: "Exec defaults" });
+    // Read the muted texts per theme: the token resolves to a different color in each one.
+    const mutedTexts = () => tokenTextContrasts(dialog, ["--color-muted"]).map((e) => e.element);
+    await waitFor(() => {
+      if (mutedTexts().length < 5) throw new Error("expected 5+ muted texts on the Agents cards");
+    });
+    await expect(textsBelowAaInThemes(mutedTexts, ["dark", "flexoki-dark"]).join("\n")).toBe("");
+  },
+};

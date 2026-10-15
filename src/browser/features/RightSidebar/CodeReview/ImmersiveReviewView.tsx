@@ -205,7 +205,8 @@ function getReviewStatusSidebarClasses(status: Review["status"]): {
 
   return {
     accent: "bg-muted",
-    badge: "bg-muted/25 text-muted",
+    // Foreground text: muted text on its own muted tint was 3.2-4.3:1 in every theme (#6544).
+    badge: "bg-muted/25 text-foreground",
     icon: "text-muted",
   };
 }
@@ -2496,7 +2497,12 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
               >
                 Notes
               </h2>
-              <span className="bg-muted/20 text-muted rounded px-1.5 py-0.5 font-mono text-[10px]">
+              {/* Foreground text: the muted tint lightens with --color-muted, so muted text on it
+                  fell to 4.23:1 on this dark panel (#6544). */}
+              <span
+                data-testid="immersive-notes-count"
+                className="bg-muted/20 text-foreground rounded px-1.5 py-0.5 font-mono text-[10px]"
+              >
                 {allReviews.length}
               </span>
             </div>

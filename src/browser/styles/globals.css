@@ -713,7 +713,9 @@
   --color-input-border: #4385be;
   --color-input-border-focus: color-mix(in srgb, var(--color-input-border), white 22%);
 
-  --color-muted: #878580;
+  /* Flexoki base-400, the same as --color-secondary: WCAG AA on every flexoki-dark surface, down to
+     #343331 (4.65:1). base-500 #878580 was 4.04:1 on hover (#6544). */
+  --color-muted: #9f9d96;
   --color-muted-light: #cecdc3;
   --color-muted-dark: #575653;
   --color-placeholder: #575653;
