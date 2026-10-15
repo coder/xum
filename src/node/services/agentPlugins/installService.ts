@@ -391,7 +391,7 @@ function reviewText(item: ReviewTextSource): string {
  * as comment text in the review while the fingerprint approves it.
  */
 const REVIEW_TEXT_CONTROLS =
-  /[\p{Default_Ignorable_Code_Point}\u061c\u202a-\u202e\u2066-\u2069\u2028\u2029\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]|\r(?!\n)/gu;
+  /[\p{Default_Ignorable_Code_Point}\u061c\u202a-\u202e\u2066-\u2069\u2028\u2029]|\r(?!\n)|(?![\t\n\r])\p{Cc}/gu;
 
 /**
  * Review text as the user reads it: each such character becomes a visible `<U+XXXX>` mark. The
