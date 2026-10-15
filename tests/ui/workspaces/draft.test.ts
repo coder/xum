@@ -596,6 +596,89 @@ describeIntegration("Draft workspace behavior", () => {
     }
   }, 60_000);
 
+  test("the default composer keeps showing its draft until the promoted draft opens", async () => {
+    const subProjectDir = path.join(getSharedRepoPath(), `promote-shown-sub-${Date.now()}`);
+    await fs.mkdir(subProjectDir, { recursive: true });
+    const opened = await openPromotion(subProjectDir);
+    const { env, view, cleanupDom, projectPath, defaultScope } = opened;
+    const createdScopes: DraftScope[] = [defaultScope];
+    const draftService = env.services.draftService;
+    const moveCreation = draftService.moveCreation.bind(draftService);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    // The backend moves the draft (and pushes the source's deletion and the new row) before its
+    // reply, which is held.
+    const moveSpy = jest
+      .spyOn(draftService, "moveCreation")
+      .mockImplementation(async (...args: Parameters<typeof moveCreation>) => {
+        const reply = await moveCreation(...args);
+        await held;
+        return reply;
+      });
+    const nameInput = () => view.container.querySelector<HTMLInputElement>("#workspace-name");
+    // Every task boundary is a chance to paint: the composer must never show an empty draft. A
+    // message channel samples between tasks, as a browser paints (timers come too late).
+    const shown: (string | undefined)[] = [];
+    const sampler = new MessageChannel();
+    let polling = true;
+    sampler.port1.onmessage = () => {
+      shown.push(composerText(view.container));
+      if (polling) sampler.port2.postMessage(null);
+    };
+
+    try {
+      await waitFor(() => expect(composerText(view.container)).toBe("typed on the project page"), {
+        timeout: 10_000,
+      });
+      sampler.port2.postMessage(null);
+      fireEvent.click(opened.newSubProjectChat);
+      const [draftId] = await waitForDraftCount(projectPath, 1);
+      const listedScope: DraftScope = { kind: "creation", projectPath, draftId };
+      createdScopes.push(listedScope);
+      await waitFor(
+        async () => {
+          expect(moveSpy).toHaveBeenCalled();
+          expect((await env.orpc.drafts.get({ scope: defaultScope })).text).toBe("");
+        },
+        { timeout: 10_000 }
+      );
+      // The pushes have arrived; the composer still shows the draft it moves.
+      expect(composerText(view.container)).toBe("typed on the project page");
+      expect(nameInput()?.value).toBe(NAME_STATE.manualName);
+      release();
+      await waitFor(
+        () => {
+          // The default draft shows empty again, so the composer showing the text is the listed one.
+          expect(getDraftStore().getView(defaultScope).text).toBe("");
+          expect(composerText(view.container)).toBe("typed on the project page");
+        },
+        { timeout: 10_000 }
+      );
+      polling = false;
+      expect(shown.filter((text) => text !== "typed on the project page")).toEqual([]);
+      expect(await env.orpc.drafts.get({ scope: listedScope })).toMatchObject({
+        text: "typed on the project page",
+        attachments: [IMAGE],
+        nameState: NAME_STATE,
+      });
+      const source = await env.orpc.drafts.get({ scope: defaultScope });
+      expect(source.text).toBe("");
+      expect(source.nameState).toBeUndefined();
+      expect((await env.orpc.drafts.getList()).entries.map((entry) => entry.draftId)).toEqual([
+        draftId,
+      ]);
+    } finally {
+      polling = false;
+      sampler.port1.close();
+      release();
+      moveSpy.mockRestore();
+      await Promise.all(createdScopes.map((scope) => getDraftStore().deleteDraft(scope)));
+      await env.orpc.projects.remove({ projectPath: opened.subProjectPath });
+      await cleanupView(view, cleanupDom);
+      await fs.rm(subProjectDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("a failed promotion opens an empty listed draft and keeps the default draft", async () => {
     const subProjectDir = path.join(getSharedRepoPath(), `promote-fail-sub-${Date.now()}`);
     await fs.mkdir(subProjectDir, { recursive: true });

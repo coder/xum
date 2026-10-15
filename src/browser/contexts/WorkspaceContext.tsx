@@ -10,6 +10,7 @@ import {
   type ReactNode,
   type SetStateAction,
 } from "react";
+import { flushSync } from "react-dom";
 import { useLocation } from "react-router-dom";
 import type { FrontendWorkspaceMetadata, WorkspaceRemoveResult } from "@/common/types/workspace";
 import type { ArchivePreflightResult, ArchiveWorkspaceResult } from "@/common/orpc/schemas/api";
@@ -363,7 +364,10 @@ async function promoteDefaultDraft(
   });
   if (!route.isRouteCurrent()) return;
   if (!moved) getDraftStore().putCreationDraft(projectPath, draft);
-  route.openDraft();
+  // The default composer showed the draft until the move ended, a few microtasks ago, and now
+  // shows it emptied. A route change renders in a later task, after a possible paint, so render
+  // it now: no frame shows the default draft cleared.
+  flushSync(route.openDraft);
 }
 
 const WorkspaceActionsContext = createContext<

@@ -698,6 +698,13 @@ export class DraftStore {
   /** Creation drafts with moves waiting for the backend, by key: how many (see moveCreationDraft). */
   private readonly movingCreationDrafts = new Map<string, number>();
   /**
+   * What a moving creation draft shows, by key: its view when the first of its moves started. The
+   * backend pushes the source's deletion before the move's reply, and the composer must not look
+   * cleared until the destination opens. Its input is locked meanwhile, so this is what the move
+   * saves; the entry itself takes the pushes (revisions, late edits and retries use it).
+   */
+  private readonly movingViews = new Map<string, DraftView>();
+  /**
    * The creation draft list (sidebar rows), owned by the backend (drafts/list.json). The view
    * overlays puts the list has not reflected yet and hides pending deletes.
    */
@@ -933,8 +940,14 @@ export class DraftStore {
     this.recomputeList();
   }
 
+  /** The draft as shown: a moving creation draft shows itself as its move began (movingViews). */
   getView(scope: DraftStoreScope): DraftView {
-    return this.entries.get(draftStoreScopeKey(scope))?.view ?? EMPTY_VIEW;
+    const key = draftStoreScopeKey(scope);
+    return this.movingViews.get(key) ?? this.entryView(key);
+  }
+
+  private entryView(key: string): DraftView {
+    return this.entries.get(key)?.view ?? EMPTY_VIEW;
   }
 
   /** Ids of the draft's pending sends (their text and attachments are retained, hidden). */
@@ -1669,7 +1682,9 @@ export class DraftStore {
     // The pending scope (no project yet) is memory-only: nothing to move on the backend.
     if (from.kind !== "creation") return false;
     const key = draftScopeKey(from);
-    this.movingCreationDrafts.set(key, (this.movingCreationDrafts.get(key) ?? 0) + 1);
+    const moves = this.movingCreationDrafts.get(key) ?? 0;
+    if (moves === 0) this.movingViews.set(key, this.getView(from));
+    this.movingCreationDrafts.set(key, moves + 1);
     this.notify(key);
     try {
       const sourceRow = this.getCreationDraftsByProject()[from.projectPath]?.find(
@@ -1695,8 +1710,14 @@ export class DraftStore {
 
   private endMoving(key: string): void {
     const remaining = (this.movingCreationDrafts.get(key) ?? 1) - 1;
-    if (remaining > 0) this.movingCreationDrafts.set(key, remaining);
-    else this.movingCreationDrafts.delete(key);
+    if (remaining > 0) {
+      this.movingCreationDrafts.set(key, remaining);
+    } else {
+      // Synchronously after applyMoved on success: the caller opens the destination before the
+      // next paint. After a failure the live view returns: the source as the backend has it.
+      this.movingCreationDrafts.delete(key);
+      this.movingViews.delete(key);
+    }
     this.notify(key);
   }
 

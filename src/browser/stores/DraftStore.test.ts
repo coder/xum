@@ -1470,4 +1470,41 @@ describe("DraftStore", () => {
     expect((await service.get(source)).text).toBe("draft");
     expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual(["src"]);
   });
+
+  test("a moving draft shows itself as its move began, and after a failure as the backend has it", async () => {
+    using tempDir = new TestTempDir("draft-store-move-shown");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    await service.update({ scope: source, text: "draft" });
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.moveGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    control.failMoves = 100;
+
+    const moved = store.moveCreationDraft(source, {
+      projectPath,
+      draftId: "dst",
+      subProjectPath: null,
+      createdAt: 2,
+    });
+    const pushed = new Promise<void>((resolve) => {
+      const unsubscribe = store.subscribe(source, () => {
+        unsubscribe();
+        resolve();
+      });
+    });
+    // Another window edits the source while the move waits.
+    await service.update({ scope: source, text: "draft, theirs" });
+    await pushed;
+    expect(store.getView(source).text).toBe("draft");
+    control.moveGate = null;
+    release();
+
+    expect(await moved).toBe(false);
+    expect(store.getView(source).text).toBe("draft, theirs");
+  });
 });
