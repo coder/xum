@@ -258,14 +258,10 @@ export async function discoverWorkflowPlugins(input: {
   }
   await addContainers(roots.globalPluginRoots ?? [], "global");
 
-  // The managed home names the registry, so managed plugins carry their consent records (#6629),
-  // as plugin skill discovery does.
-  const managedHome = getPluginManagedHome(roots);
-  const { plugins } = await discoverAgentPlugins(containers, {
-    ...(managedHome !== undefined
-      ? { managedHome: await localRuntime.resolvePath(managedHome) }
-      : {}),
-  });
+  const { plugins } = await discoverAgentPlugins(
+    containers,
+    await managedHomeOption(localRuntime, roots)
+  );
 
   // Project plugin roots keep the repo-symlink posture: a committed
   // .xum/plugins/<name> symlink must not resolve outside the checkout.
@@ -281,6 +277,20 @@ export async function discoverWorkflowPlugins(input: {
     eligible.push(plugin);
   }
   return eligible;
+}
+
+/**
+ * The managed home names the registry, so managed plugins carry their consent records (#6629), as
+ * plugin skill discovery does.
+ */
+async function managedHomeOption(
+  localRuntime: LocalRuntime,
+  roots: AgentSkillsRoots
+): Promise<{ managedHome?: string }> {
+  const managedHome = getPluginManagedHome(roots);
+  return managedHome !== undefined
+    ? { managedHome: await localRuntime.resolvePath(managedHome) }
+    : {};
 }
 
 async function resolvePluginWorkflowScript(
