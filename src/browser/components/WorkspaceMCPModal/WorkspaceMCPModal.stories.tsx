@@ -797,6 +797,142 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
   },
 };
 
+/**
+ * The backend checks the SAVED tool allowlist: while the dialog has an unsaved allowlist edit
+ * for the server, its tool actions do not run.
+ */
+export const WorkspaceMCPServerSettingsUnsavedAllowlist: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () =>
+    renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      testResults: { cad: ["cad.library", "cad.reset", "cad.payment"] },
+      preCacheTools: true,
+    }),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const run = await section.findByRole("button", { name: "Run Part library" });
+    await expect(run).toBeEnabled();
+    await userEvent.click(modal.getByRole("checkbox", { name: "cad.library" }));
+    await waitFor(() => expect(run).toBeDisabled());
+    await expect(section.getByRole("button", { name: "Open Payment method" })).toBeDisabled();
+    // Undoing the edit (the saved allowlist again) allows the runs.
+    await userEvent.click(modal.getByRole("checkbox", { name: "cad.library" }));
+    await waitFor(() => expect(run).toBeEnabled());
+  },
+};
+
+let retryViewRuns: Array<{ toolName: string; confirmed: boolean }> = [];
+let retryViews: Record<string, McpAppView> = {};
+/**
+ * The settings app modal's view read fails (a transient getView error): Reload mounts the
+ * stored record again, without a second tool call.
+ */
+export const WorkspaceMCPServerSettingsAppViewRetry: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    retryViewRuns = [];
+    retryViews = {};
+    return renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settingsToolRuns: retryViewRuns,
+      mcpAppViews: retryViews,
+    });
+  },
+  play: async ({ canvasElement }) => {
+    const dialog = await findWorkspaceMCPDialog(canvasElement);
+    const section = within(await within(dialog).findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await section.findByRole("button", { name: "Open Payment method" }));
+    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    const appDialog = await page.findByRole("dialog", { name: "Payment method" });
+    const reload = await within(appDialog).findByRole("button", { name: "Reload" });
+    retryViews["settings:cad:cad.payment"] = {
+      html: "<!doctype html><html><body><strong>Card form</strong></body></html>",
+      csp: {},
+      prefersBorder: null,
+      resultAvailable: true,
+      result: { content: [] },
+      invocation: null,
+    };
+    await userEvent.click(reload);
+    await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
+    await expect(retryViewRuns).toHaveLength(1);
+  },
+};
+
+/** The modal mounts only while open, like the sidebar row's settings dialog. */
+const RemountingWorkspaceMCPModal: FC = () => {
+  const [open, setOpen] = useState(true);
+  return (
+    <>
+      <button type="button" onClick={() => setOpen(true)}>
+        Open workspace MCP
+      </button>
+      {open && (
+        <WorkspaceMCPModal
+          workspaceId={WORKSPACE_ID}
+          projectPath={PROJECT_PATH}
+          open
+          onOpenChange={setOpen}
+        />
+      )}
+    </>
+  );
+};
+
+let remountRuns: Array<{ toolName: string; confirmed: boolean }> = [];
+let remountGate = Promise.withResolvers<void>();
+/**
+ * A run still in flight when the dialog closes keeps blocking the runs, Refresh Tools and Save
+ * of the reopened dialog until it ends.
+ */
+export const WorkspaceMCPServerSettingsRunAcrossRemount: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    remountRuns = [];
+    remountGate = Promise.withResolvers<void>();
+    return (
+      <WorkspaceMCPModalStoryShell
+        setup={() =>
+          setupWorkspaceMCPModalStory({
+            ...settingsStoryOptions(),
+            settingsToolRuns: remountRuns,
+            settingsToolRunGate: remountGate,
+          })
+        }
+      >
+        <RemountingWorkspaceMCPModal />
+      </WorkspaceMCPModalStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    await userEvent.click(await section.findByRole("button", { name: "Run Part library" }));
+    await waitFor(() => expect(remountRuns).toHaveLength(1));
+    await userEvent.click(modal.getByRole("button", { name: "Cancel" }));
+    await waitFor(() =>
+      expect(queryWorkspaceMCPDialog(canvasElement.ownerDocument)).not.toBeInTheDocument()
+    );
+    await userEvent.click(
+      within(canvasElement).getByRole("button", { name: "Open workspace MCP" })
+    );
+    const reopened = within(await findWorkspaceMCPDialog(canvasElement));
+    const again = within(await reopened.findByTestId("mcp-server-settings"));
+    await expect(again.findByRole("button", { name: "Run Reset parts" })).resolves.toBeDisabled();
+    await expect(again.getByRole("button", { name: "Run Part library" })).toBeDisabled();
+    await expect(reopened.getByRole("button", { name: /(Fetch|Refresh) Tools/ })).toBeDisabled();
+    await expect(reopened.getByRole("button", { name: "Save" })).toBeDisabled();
+    remountGate.resolve();
+    await waitFor(() =>
+      expect(again.getByRole("button", { name: "Run Reset parts" })).toBeEnabled()
+    );
+    await expect(reopened.getByRole("button", { name: "Save" })).toBeEnabled();
+  },
+};
+
 /** Not running yet: the dialog does not start it on open; Fetch Tools connects it. */
 export const WorkspaceMCPServerSettingsNotConnected: Story = {
   parameters: { pixel: PIXEL_DISABLED },

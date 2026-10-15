@@ -1027,6 +1027,7 @@ describe("task launch races", () => {
         await s.launched;
         await s.launchFailureRecorded;
         await box.stop;
+        await waitForStopRelease(s.taskService);
         expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("interrupted");
         // The session rolled the launch's row back: the brief is kept for the reawakening.
         expect(await s.briefsInHistory()).toBe(0);
@@ -1054,6 +1055,7 @@ describe("task launch races", () => {
       );
       // The user Stops the running child, so the parent's message reawakens it.
       expect((await s.taskService.stopDescendantAgentTask(ROOT, CHILD)).success).toBe(true);
+      await waitForStopRelease(s.taskService);
       expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("interrupted");
 
       const reawakened = await s.taskService.sendMessageToDescendantAgentTask(
@@ -1105,6 +1107,18 @@ async function waitUntil(
     if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
+}
+
+/**
+ * A Stop resolves before its latch drops: the release waits for the attempt's settlement receipt
+ * to reach disk (recheckWorkspaceStopRelease), and a reawakening sent before that is refused as
+ * "A stop is in progress" (#6677). Wait for the release itself, not for time to pass.
+ */
+async function waitForStopRelease(taskService: TaskService): Promise<void> {
+  await waitUntil(
+    () => !taskService.isWorkspaceStopInProgress(CHILD),
+    "the Stop to release the child"
+  );
 }
 
 /** Runs `then` each time the launch's private step `method` returns. */

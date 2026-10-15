@@ -438,7 +438,7 @@ describe("settled context hard ceiling", () => {
                   effectiveLevel: "high" as const,
                 }),
                 rebuildFirstStepForThinkingLevel: () =>
-                  Promise.resolve([{ role: "user" as const, content: large }]),
+                  Promise.resolve({ messages: [{ role: "user" as const, content: large }] }),
               }
             : {
                 modelFallback: {

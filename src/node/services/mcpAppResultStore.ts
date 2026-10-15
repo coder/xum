@@ -188,10 +188,8 @@ export class McpAppResultStore {
       const dir = this.dirFor(workspaceId);
       if (!(await this.writeRecord(workspaceId, dir, record.toolCallId, serialized))) return false;
       // Publish to memory only once the record is durable: a failed write must not leave a
-      // record that opens now but vanishes on restart. Before prune, so a prune failure does
-      // not hide a record that is already on disk.
+      // record that opens now but vanishes on restart.
       this.remember(workspaceId, record);
-      await this.prune(dir);
       return true;
     } catch (error) {
       log.debug("[MCP Apps] Failed to record tool result", { workspaceId, error });
@@ -215,7 +213,14 @@ export class McpAppResultStore {
       if (this.rootDir !== null && (await isWorkspaceRemovalTombstoned(this.rootDir, workspaceId)))
         return false;
       await ensurePrivateDir(dir);
-      await writeFileAtomic(path.join(dir, fileNameFor(toolCallId)), serialized);
+      const name = fileNameFor(toolCallId);
+      await writeFileAtomic(path.join(dir, name), serialized);
+      // Under the same lock (#6611): a concurrent record's prune must not run between this
+      // write and this prune. Best effort: the record is stored, so a failed prune must not make
+      // the caller (openSettingsApp) refuse it. The next record prunes again.
+      await this.prune(dir, name).catch((error: unknown) => {
+        log.debug("[MCP Apps] Failed to prune tool results", { workspaceId, error });
+      });
       return true;
     });
   }
@@ -409,23 +414,29 @@ export class McpAppResultStore {
     return path.join(path.dirname(this.dirFor(workspaceId)), MCP_APP_MODEL_CONTEXT_FILE);
   }
 
-  private async prune(dir: string) {
+  /**
+   * Drop the oldest records past the cap. Never `keep` (the record just written) and never a file
+   * whose stat fails: its age is unknown, and a record that counts as stored must survive a
+   * restart. Callers hold the session dir's target lock (writeRecord).
+   */
+  private async prune(dir: string, keep: string) {
     const names = (await fs.readdir(dir)).filter((name) => name.endsWith(".json"));
-    if (names.length <= MCP_APP_RESULT_MAX_PER_WORKSPACE) return;
-    const withTimes = await Promise.all(
-      names.map(async (name) => {
-        try {
-          return { name, mtimeMs: (await fs.stat(path.join(dir, name))).mtimeMs };
-        } catch {
-          return { name, mtimeMs: 0 };
-        }
-      })
+    const excess = names.length - MCP_APP_RESULT_MAX_PER_WORKSPACE;
+    if (excess <= 0) return;
+    const stated = await Promise.all(
+      names
+        .filter((name) => name !== keep)
+        .map(async (name) => {
+          try {
+            return { name, mtimeMs: (await fs.stat(path.join(dir, name))).mtimeMs };
+          } catch {
+            return null;
+          }
+        })
     );
+    const withTimes = stated.filter((entry) => entry !== null);
     withTimes.sort((a, b) => a.mtimeMs - b.mtimeMs);
-    for (const { name } of withTimes.slice(
-      0,
-      withTimes.length - MCP_APP_RESULT_MAX_PER_WORKSPACE
-    )) {
+    for (const { name } of withTimes.slice(0, excess)) {
       await fs.rm(path.join(dir, name), { force: true });
     }
   }

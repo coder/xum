@@ -33,17 +33,27 @@ describe("removeSentText", () => {
 // the sent text directly.
 describe("takeSentText", () => {
   test("keys typed right after the sent text stay exactly as typed, without the sent text", () => {
-    expect(takeSentText("first messagex", "first message", true)).toBe("x");
-    expect(takeSentText("first message", "first message", true)).toBe("");
-    expect(takeSentText("first message  indented", "first message", true)).toBe("  indented");
-    expect(takeSentText("first message\nmore", "first message", true)).toBe("\nmore");
-    expect(takeSentText("restored draft", "", true)).toBe("restored draft");
+    expect(takeSentText("first messagex", "first message", "typed-after")).toBe("x");
+    expect(takeSentText("first message", "first message", "typed-after")).toBe("");
+    expect(takeSentText("first message  indented", "first message", "typed-after")).toBe(
+      "  indented"
+    );
+    expect(takeSentText("first message\nmore", "first message", "typed-after")).toBe("\nmore");
+    expect(takeSentText("restored draft", "", "typed-after")).toBe("restored draft");
   });
 
-  test("a text replaced or restored since Enter keeps the whitespace-boundary rule", () => {
-    expect(takeSentText("yesterday", "yes", false)).toBe("yesterday");
-    expect(takeSentText("restored\n\nyes", "yes", false)).toBe("restored");
-    expect(takeSentText("hello\n\nfrom the other window", "hello", false)).toBe(
+  // #6585: a select-all paste or a deleted and retyped text can start with the sent text.
+  test("a text the user edited through the composer since Enter stays whole", () => {
+    expect(takeSentText("Fix the bug in parser.ts", "Fix the bug", "edited")).toBe(
+      "Fix the bug in parser.ts"
+    );
+    expect(takeSentText("yes please", "yes", "edited")).toBe("yes please");
+  });
+
+  test("a text replaced or restored otherwise keeps the whitespace-boundary rule", () => {
+    expect(takeSentText("yesterday", "yes", "unknown")).toBe("yesterday");
+    expect(takeSentText("restored\n\nyes", "yes", "unknown")).toBe("restored");
+    expect(takeSentText("hello\n\nfrom the other window", "hello", "unknown")).toBe(
       "from the other window"
     );
   });

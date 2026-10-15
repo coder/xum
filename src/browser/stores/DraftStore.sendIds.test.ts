@@ -5,7 +5,7 @@
  */
 import * as fs from "fs/promises";
 import * as path from "path";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestApiClient } from "@/browser/testUtils";
 import type { DraftAttachment, DraftEvent, PendingSend } from "@/common/orpc/schemas/drafts";
 import type { FilePart } from "@/common/orpc/types";
@@ -347,14 +347,25 @@ describe("DraftStore idempotent sends", () => {
 
   // #6405: the composer stays on from Enter until the send takes its draft.
   describe("keys typed between Enter and the take", () => {
-    async function takeAfter(edits: string[], options?: { flushFirst: boolean }) {
+    /** Each edit is a setText; `{ edited }` is a composer edit other than typing at the end. */
+    async function takeAfter(
+      edits: Array<string | { edited: string }>,
+      options?: { flushFirst: boolean }
+    ) {
       using tempDir = new TestTempDir("draft-sends-typed-after");
       const { service, client } = await createHarness(tempDir);
       const store = createStore(client);
       await store.whenReady();
       store.setText(SCOPE, "yes");
       store.markSendStart(SCOPE, "yes");
-      for (const edit of edits) store.setText(SCOPE, edit);
+      for (const edit of edits) {
+        if (typeof edit === "string") {
+          store.setText(SCOPE, edit);
+          continue;
+        }
+        store.markSendEdited(SCOPE);
+        store.setText(SCOPE, edit.edited);
+      }
       if (options?.flushFirst) await store.flush(SCOPE);
       const send = pendingSend("s1", "yes", RECEIVER);
       await store.beginSend(SCOPE, {
@@ -384,6 +395,41 @@ describe("DraftStore idempotent sends", () => {
     test("a text retyped since Enter that starts with the sent text stays whole", async () => {
       const kept = { composer: "yesterday", stored: "yesterday" };
       expect(await takeAfter(["y", "yesterday"])).toEqual(kept);
+    });
+
+    // #6585: the same text shape as typing after the sent text, from a select-all paste.
+    test("a composer edit other than typing at the end keeps the whole text", async () => {
+      const kept = { composer: "yes please", stored: "yes please" };
+      expect(await takeAfter([{ edited: "yes please" }])).toEqual(kept);
+      expect(await takeAfter([{ edited: "yes please" }], { flushFirst: true })).toEqual(kept);
+      // Typing at the end afterwards does not make the edit typing.
+      expect(await takeAfter([{ edited: "yes" }, "yes please"])).toEqual(kept);
+    });
+
+    // A draft near the size limit must still fit the request: the take adds no copy of it.
+    test("the request carries the composer text once, saved or not", async () => {
+      using tempDir = new TestTempDir("draft-sends-one-copy");
+      const { service, client } = await createHarness(tempDir);
+      const sent = spyOn(service, "beginSend");
+      const store = createStore(client);
+      await store.whenReady();
+      for (const flushFirst of [false, true]) {
+        store.setText(SCOPE, "yes");
+        store.markSendStart(SCOPE, "yes");
+        store.markSendEdited(SCOPE);
+        store.setText(SCOPE, "yes please");
+        if (flushFirst) await store.flush(SCOPE);
+        const send = pendingSend(`s-${flushFirst}`, "yes", RECEIVER);
+        await store.beginSend(SCOPE, {
+          sendId: send.sendId,
+          text: send.text,
+          attachments: [],
+          request: send.request,
+        });
+        const input = sent.mock.calls.at(-1)?.[0];
+        const copies = [input?.text, input?.localTake?.from].filter((text) => text !== undefined);
+        expect(copies).toEqual(["yes please"]);
+      }
     });
   });
 
