@@ -1156,7 +1156,7 @@ function createGoogleVertexModelEffect(
       apiKey: creds.apiKey ?? "",
       project: creds.project,
       location: creds.location,
-      ...(creds.keyFilename != null && { googleAuthOptions: { keyFilename: creds.keyFilename } }),
+      ...(keyFilename != null && { googleAuthOptions: { keyFilename } }),
       ...(creds.baseUrl != null && { baseURL: creds.baseUrl }),
       headers: providerConfig.headers,
       fetch: getProviderFetch(providerConfig),

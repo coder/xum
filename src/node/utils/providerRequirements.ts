@@ -510,12 +510,13 @@ function resolveGoogleVertexCredentials(
   if (!project) {
     return { isConfigured: false, missingRequirement: "project", ...baseUrlInfo };
   }
-  const keyFilename = resolveConfigOrEnv(config.keyFilename, undefined, env);
   return {
     isConfigured: true,
     project,
     location,
-    keyFilename: keyFilename != null ? expandHomePath(keyFilename) : undefined,
+    keyFilename: hasNonEmptyString(config.keyFilename)
+      ? expandHomePath(config.keyFilename.trim())
+      : undefined,
     ...withActiveBaseUrl(baseUrlInfo),
   };
 }
