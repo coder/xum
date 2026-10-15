@@ -20,7 +20,7 @@
 
 import assert from "node:assert";
 import { randomUUID } from "node:crypto";
-import type { Tool } from "ai";
+import { asSchema, type FlexibleSchema, type Tool } from "ai";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
@@ -40,6 +40,7 @@ import {
   eventSpine,
   type HookTurn,
   type ToolExecuteContext,
+  type ToolInputParseResult,
   type WaterfallNext,
 } from "@/node/services/events/eventSpine";
 import { log } from "@/node/services/log";
@@ -144,6 +145,7 @@ export function withHooks<TParameters, TResult>(
       ...(typeof toolCallId === "string" ? { toolCallId } : {}),
       // The full schema: OpenAI requests carry a sanitized copy that drops constraints.
       inputJsonSchema: () => extractToolJsonSchema(unsanitizedTool(tool)),
+      parseInput: toolInputParser(unsanitizedTool(tool)),
       mcpOrigin: readMcpToolOrigin(tool),
       execute: (currentArgs) =>
         Promise.resolve(executeFn.call(tool, currentArgs, options) as TResult | Promise<TResult>),
@@ -153,6 +155,34 @@ export function withHooks<TParameters, TResult>(
   };
 
   return wrappedTool;
+}
+
+/**
+ * The parser the AI SDK runs on a model's tool input (a Zod schema's refinements, defaults and
+ * transforms), for a hook rewrite to pass too. Undefined when the schema has none: a plain JSON
+ * schema (MCP tools) is checked by the hook runner's validator alone.
+ */
+function toolInputParser(
+  rawTool: unknown
+): ((value: unknown) => Promise<ToolInputParseResult>) | undefined {
+  const raw =
+    rawTool !== null && typeof rawTool === "object"
+      ? (rawTool as { inputSchema?: unknown }).inputSchema
+      : undefined;
+  if (raw === null || typeof raw !== "object") return undefined;
+  // asSchema converts a standard schema (Zod). A plain object would make it call the object as a
+  // lazy schema (see extractToolJsonSchema), so only jsonSchema() wrappers pass through as-is.
+  const schema: { validate?: unknown } =
+    "~standard" in raw ? asSchema(raw as FlexibleSchema<unknown>) : raw;
+  const validate = schema.validate;
+  if (typeof validate !== "function") return undefined;
+  return async (value) => {
+    const parsed = (await (validate as (value: unknown) => unknown).call(schema, value)) as {
+      success?: unknown;
+      value?: unknown;
+    };
+    return parsed.success === true ? { success: true, value: parsed.value } : { success: false };
+  };
 }
 
 function readToolOption(options: unknown, key: "abortSignal" | "toolCallId"): unknown {
@@ -189,6 +219,8 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
   toolCallId?: string;
   /** See ToolExecuteContext.inputJsonSchema. */
   inputJsonSchema?: () => unknown;
+  /** See ToolExecuteContext.parseInput. */
+  parseInput?: (value: unknown) => Promise<ToolInputParseResult>;
   /** See ToolExecuteContext.mcpOrigin. */
   mcpOrigin?: { serverName: string; toolName: string };
   execute: (args: TArgs) => Promise<TResult>;
@@ -204,6 +236,7 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
     host: { ...config },
     abortSignal: input.abortSignal,
     ...(input.inputJsonSchema != null ? { inputJsonSchema: input.inputJsonSchema } : {}),
+    ...(input.parseInput != null ? { parseInput: input.parseInput } : {}),
     ...(input.mcpOrigin != null ? { mcpOrigin: input.mcpOrigin } : {}),
     executed: false,
   };

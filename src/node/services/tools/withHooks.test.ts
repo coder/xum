@@ -9,6 +9,7 @@ import { eventSpine, type ToolExecuteContext } from "@/node/services/events/even
 import { MCP_TOOL_ORIGIN } from "@/node/services/agentPlugins/codexToolNames";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { sanitizeMCPToolsForOpenAI } from "@/common/utils/tools/schemaSanitizer";
+import { registerCodexPluginHooks } from "@/node/services/agentPlugins/codexHookRunner";
 
 describe("withHooks", () => {
   let tempDir: string;
@@ -444,6 +445,78 @@ exit 0
       );
       const result: unknown = await wrapped.execute!({ input: "x" }, {} as never);
       expect(result).toEqual(feedback);
+    } finally {
+      unregister();
+    }
+  });
+
+  test("a plugin hook's rewrite runs through the tool's own parser", async () => {
+    // Codex PRRT_kwDOPxxmWM6rgsaE: the JSON Schema projection omits refinements and defaults,
+    // so a rewrite must also pass the tool's own parser and run with its parsed value.
+    const executed: unknown[] = [];
+    const strictTool = tool({
+      description: "Test tool",
+      inputSchema: z
+        .object({ input: z.string(), mode: z.string().default("safe") })
+        .refine((args) => args.input !== "forbidden", { message: "forbidden input" }),
+      execute: (args) => {
+        executed.push(args);
+        return Promise.resolve({ ok: true });
+      },
+    });
+    let rewrite: unknown;
+    const unregister = registerCodexPluginHooks(eventSpine, {
+      workspaceId: "parse-ws",
+      pluginName: "guard",
+      order: 0,
+      hooks: [
+        {
+          key: "hooks/hooks.json#PreToolUse[0][0]",
+          hash: "h".repeat(64),
+          event: "PreToolUse",
+          handler: { type: "mcp_tool", server: "guard", tool: "check", input: {} },
+          status: "runnable",
+          source: "hooks/hooks.json",
+        },
+      ],
+      deps: {
+        isHookAllowed: () => Promise.resolve(true),
+        canCallPluginTool: () => true,
+        callPluginTool: () =>
+          Promise.resolve({
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  hookSpecificOutput: {
+                    hookEventName: "PreToolUse",
+                    permissionDecision: "allow",
+                    updatedInput: rewrite,
+                  },
+                }),
+              },
+            ],
+          }),
+        notifyUser: () => undefined,
+      },
+    });
+    try {
+      const wrapped = withHooks("test_tool", strictTool, {
+        runtime,
+        cwd: tempDir,
+        runtimeTempDir: tempDir,
+        workspaceId: "parse-ws",
+      });
+      rewrite = { input: "forbidden" };
+      const refused: unknown = await wrapped.execute!({ input: "x", mode: "safe" }, {} as never);
+      expect(refused).toEqual({
+        error:
+          "Tool call blocked by plugin 'guard' hook: its rewrite of this call does not match the tool's input.",
+      });
+      expect(executed).toEqual([]);
+      rewrite = { input: "ok" };
+      await wrapped.execute!({ input: "x", mode: "safe" }, {} as never);
+      expect(executed).toEqual([{ input: "ok", mode: "safe" }]);
     } finally {
       unregister();
     }

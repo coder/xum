@@ -220,7 +220,7 @@ async function runToolHooks(
       return;
     }
     if (output.updatedInput !== undefined) {
-      applyUpdatedInput(ctx, output.updatedInput, view, registration, hook);
+      await applyUpdatedInput(ctx, output.updatedInput, view, registration, hook);
       if (ctx.blocked) return;
     }
     if (output.additionalContext !== undefined) notes.push(output.additionalContext);
@@ -367,13 +367,13 @@ function haltTurn(
   if (halt.stopReason !== undefined) registration.deps.notifyUser(halt.stopReason);
 }
 
-function applyUpdatedInput(
+async function applyUpdatedInput(
   ctx: ToolExecuteContext,
   updatedInput: unknown,
   view: CodexToolView,
   registration: CodexHookRegistration,
   hook: PluginHookDefinition
-): void {
+): Promise<void> {
   // A Codex-shaped rewrite (Bash `command`) maps back to Xum's names before the schema check.
   const updated = view.fromCodexInput(updatedInput, ctx.args);
   const schema = ctx.inputJsonSchema?.();
@@ -389,7 +389,13 @@ function applyUpdatedInput(
     };
     return;
   }
-  if (!matchesToolSchema(schema, updated)) {
+  // The tool's own parser too, when it has one: the JSON schema omits Zod refinements and
+  // defaults, and the tool runs with the parsed value as for a model's call (Codex
+  // PRRT_kwDOPxxmWM6rgsaE).
+  const parsed = matchesToolSchema(schema, updated)
+    ? ((await ctx.parseInput?.(updated)) ?? { success: true, value: updated })
+    : { success: false as const };
+  if (!parsed.success) {
     // Deny, as for a missing schema: the hook allowed only its rewrite, so running the original
     // arguments would bypass it (a mux.load guard that narrows a read to a range, Codex
     // PRRT_kwDOPxxmWM6rb3ih).
@@ -401,7 +407,7 @@ function applyUpdatedInput(
     };
     return;
   }
-  ctx.args = updated;
+  ctx.args = parsed.value;
 }
 
 /**
