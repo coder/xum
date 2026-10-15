@@ -38,7 +38,10 @@ import { closeScopeBounded, disposeAppRuntime } from "@/node/services/di/appRunt
 import { log, type LogLevel } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
+import {
+  assertStoredPluginWorkflowReviewed,
+  resolveWorkflowScript,
+} from "@/node/services/workflows/workflowScriptResolver";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { WorkflowService } from "@/node/services/workflows/WorkflowService";
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
@@ -460,6 +463,13 @@ function createWorkflowService(input: {
     resolveWorkflowScript: (scriptPath) =>
       resolveWorkflowScript({
         scriptPath,
+        runtime,
+        workspacePath: input.ctx.workspacePath,
+        projectTrusted: input.ctx.projectTrusted,
+      }),
+    assertStoredPluginWorkflowReviewed: (stored) =>
+      assertStoredPluginWorkflowReviewed({
+        ...stored,
         runtime,
         workspacePath: input.ctx.workspacePath,
         projectTrusted: input.ctx.projectTrusted,
