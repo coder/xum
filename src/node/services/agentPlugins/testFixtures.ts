@@ -83,6 +83,7 @@ export async function reviewedComponentConsent(args: {
       consent.skills[parsed.frontmatter.name] ??= skillConsentFingerprint({
         relativeDir: path.relative(plugin.rootPath, path.join(skillsDir, dirName)),
         frontmatter: skillConsentFrontmatter(parsed),
+        body: parsed.body,
       });
     }
   }

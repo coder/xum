@@ -17,6 +17,11 @@ export { AgentPluginGitSourceSchema, AgentPluginInstallEntrySchema };
 export const AgentPluginPreviewSkillSchema = z.object({
   name: z.string(),
   description: z.string().optional(),
+  /**
+   * Commands of the body's directive lines, invisible characters escaped (#6617). They run when
+   * the user invokes the skill, so the review shows them. Absent when there are none.
+   */
+  directives: z.array(z.string()).optional(),
 });
 
 export const AgentPluginPreviewMcpServerSchema = z.object({

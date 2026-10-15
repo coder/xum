@@ -91,6 +91,7 @@ import {
   serverConsentFingerprint,
   skillConsentDetail,
   skillConsentFingerprint,
+  skillReviewDirectives,
   type ComponentConsent,
 } from "./componentConsent";
 import type { OpenAIPluginInterface } from "./openaiExtension";
@@ -347,6 +348,11 @@ function skillChangeSummary(current: SurfaceSkill, staged: SurfaceSkill, name: s
   return current.fingerprint !== staged.fingerprint
     ? `changes the model-visible advertisement of skill '${name}'`
     : `changes the definition of skill '${name}'`;
+}
+
+/** A skill row's directive commands, absent when there are none. */
+function directivesField(directives: readonly string[]): { directives?: string[] } {
+  return directives.length > 0 ? { directives: [...directives] } : {};
 }
 
 /** Both consent views of one skill (componentConsent.ts). */
@@ -2685,7 +2691,10 @@ export class AgentPluginInstallService {
           ...skillConsentFields({
             relativeDir: path.relative(pluginRoot, path.join(skillsDir, dirName)),
             frontmatter: skillConsentFrontmatter(parsed),
+            body: parsed.body,
           }),
+          // The commands the skill can run when invoked (#6617): shown, then fingerprinted.
+          ...directivesField(skillReviewDirectives(parsed.body)),
           ...(parsed.frontmatter.description !== undefined
             ? { description: parsed.frontmatter.description }
             : {}),
@@ -3741,9 +3750,10 @@ export class AgentPluginInstallService {
       warnings
     );
     return {
-      skills: skills.map(({ name, description }) => ({
+      skills: skills.map(({ name, description, directives }) => ({
         name,
         ...(description !== undefined ? { description } : {}),
+        ...directivesField(directives ?? []),
       })),
       mcpServers,
       /** What this review showed, as consent fingerprints (#6498). Never sent to the renderer. */

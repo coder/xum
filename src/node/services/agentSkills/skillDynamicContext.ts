@@ -53,6 +53,23 @@ export function isSkillDynamicDirectiveLine(line: string): boolean {
   return SKILL_DYNAMIC_DIRECTIVE_RE.test(line);
 }
 
+/** The command of a directive line, or undefined for any other line. */
+function directiveCommand(line: string): string | undefined {
+  return SKILL_DYNAMIC_DIRECTIVE_RE.exec(line)?.[1];
+}
+
+/**
+ * The commands of a body's directive lines, in order, as injectSkillDynamicContext would run
+ * them (both split on \n and match with directiveCommand). The plugin consent fingerprint covers
+ * these (#6617), so it and the runner must agree on what a directive is.
+ */
+export function skillDynamicDirectiveCommands(body: string): string[] {
+  return body.split("\n").flatMap((line) => {
+    const command = directiveCommand(line);
+    return command === undefined ? [] : [command];
+  });
+}
+
 export interface SkillDynamicExecResult {
   stdout: string;
   stderr: string;
@@ -149,14 +166,13 @@ export async function injectSkillDynamicContext(args: {
   let injected = false;
 
   for (const line of lines) {
-    const match = SKILL_DYNAMIC_DIRECTIVE_RE.exec(line);
-    if (!match) {
+    const command = directiveCommand(line);
+    if (command === undefined) {
       outputLines.push(line);
       continue;
     }
 
     injected = true;
-    const command = match[1];
 
     if (executedCount >= MAX_SKILL_DYNAMIC_COMMANDS) {
       // Over the cap: keep the literal directive and explain why it did not run.

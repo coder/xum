@@ -739,7 +739,14 @@ async function readSkillDescriptorFromDir(
       directoryName,
       allowDisplayName: true,
     });
-    if (!isPluginSkillConsented(options?.skillConsent, skillDir, skillConsentFrontmatter(parsed))) {
+    if (
+      !isPluginSkillConsented(
+        options?.skillConsent,
+        skillDir,
+        skillConsentFrontmatter(parsed),
+        parsed.body
+      )
+    ) {
       pushInvalidSkill(
         "This plugin skill has not been reviewed on this install, so it does not load.",
         "Open Settings → Plugins and select Review on the plugin."
@@ -1081,7 +1088,8 @@ async function readAgentSkillFromDir(
     allowDisplayName: true,
   });
   // An unreviewed plugin skill reads like a missing one, so a lower-scope skill can serve.
-  if (!isPluginSkillConsented(skillConsent, skillDir, skillConsentFrontmatter(parsed))) return null;
+  if (!isPluginSkillConsented(skillConsent, skillDir, skillConsentFrontmatter(parsed), parsed.body))
+    return null;
 
   const pkg: AgentSkillPackage = {
     scope,

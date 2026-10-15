@@ -418,7 +418,11 @@ export const AddPluginConsentPreview: Story = {
               interface: OPENAI_INTERFACE,
             },
             skills: [
-              { name: "grill", description: "Stress-test a plan before committing to it." },
+              {
+                name: "grill",
+                description: "Stress-test a plan before committing to it.",
+                directives: ["git log --oneline -5"],
+              },
               { name: "grill-lite", description: "A gentler grilling for small changes." },
             ],
             mcpServers: [

@@ -1473,6 +1473,7 @@ describe("AgentPluginInstallService", () => {
     const greet = skillConsentFingerprint({
       relativeDir: "skills/greet",
       frontmatter: { name: "greet", description: "Greets people" },
+      body: "\nSay hi.\n",
     });
     expect(installed.componentConsent).toEqual({ skills: { greet }, mcpServers: {} });
     expect((await service.list())[0]).toMatchObject({ importedSkillCount: 1 });
@@ -3708,6 +3709,55 @@ describe("AgentPluginInstallService", () => {
     const change = review.changes.find((c) => c.summary.includes("MCP server 'docs'"));
     expect(change?.before).toContain('"transport":"http"');
     expect(change?.after).toContain('"transport":"sse"');
+  });
+
+  describe("skill directive lines need a review (#6617)", () => {
+    const skillFile = () => path.join(remoteDir, "skills", "greet", "SKILL.md");
+    const withBody = (body: string) =>
+      `---\nname: greet\ndescription: Greets people\n---\n\n${body}\n`;
+
+    test("an update that adds or changes a directive line needs a review", async () => {
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+      for (const body of ["Say hi.\n!`git status`", "Say hi.\n!`git log --oneline`"]) {
+        await writePluginFixture(remoteDir, { version: "1.0.1" });
+        await fsPromises.writeFile(skillFile(), withBody(body));
+        await commitAll(remoteDir, `directive: ${body}`);
+        const review = await service.previewUpdate({ name: "demo-plugin" });
+        const change = review.changes.find((c) => c.summary.includes("skill 'greet'"));
+        expect(change?.after).toContain(body.split("\n")[1].slice(2, -1));
+        await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/review/);
+        const reviewed = review.changes.flatMap((c) => (c.component ? [c.component] : []));
+        await service.update({
+          name: "demo-plugin",
+          consent: { fromSha: review.fromSha, toSha: review.toSha, reviewed },
+        });
+        expect((await service.list())[0].reviewRequiredCount).toBe(0);
+      }
+    });
+
+    test("a prose-only body change still applies without a review", async () => {
+      await fsPromises.writeFile(skillFile(), withBody("Say hi.\n!`git status`"));
+      await commitAll(remoteDir, "skill with a directive");
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+      await writePluginFixture(remoteDir, { version: "1.0.1" });
+      await fsPromises.writeFile(skillFile(), withBody("Greet warmly.\n  !`git status`"));
+      const proseHead = await commitAll(remoteDir, "reword the prose only");
+      const updated = await service.update({ name: "demo-plugin" });
+      expect(updated.lockedSha).toBe(proseHead);
+      expect((await service.list())[0].reviewRequiredCount).toBe(0);
+    });
+
+    test("the install preview shows directive lines with invisible characters escaped", async () => {
+      await fsPromises.writeFile(skillFile(), withBody("Say hi.\n!`rm -rf \u200b/tmp/x`"));
+      await commitAll(remoteDir, "skill with a hidden character in a directive");
+      const preview = await service.preview({ input: remoteDir });
+      const greet = preview.skills.find((skill) => skill.name === "greet");
+      expect(greet?.directives).toEqual(["rm -rf \\u{200B}/tmp/x"]);
+    });
   });
 
   test("update accepts a skill paths reordering as capability-neutral", async () => {

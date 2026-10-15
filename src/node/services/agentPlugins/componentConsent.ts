@@ -21,6 +21,7 @@ import type {
 } from "@/common/types/mcp";
 import { getOwn } from "@/common/utils/getOwn";
 import { stableStringify } from "@/common/utils/stableStringify";
+import { skillDynamicDirectiveCommands } from "@/node/services/agentSkills/skillDynamicContext";
 
 /** Bump when the fingerprint input changes: every record then needs a new review (fails closed). */
 const CONSENT_SCHEME = 1;
@@ -186,32 +187,65 @@ export function serverConsentDetail(info: MCPServerInfo, paths: ConsentPaths): s
 interface SkillConsentInput {
   relativeDir: string;
   frontmatter: Readonly<Record<string, unknown>>;
+  /** The SKILL.md body. Only its directive lines count (#6617): prose edits need no review. */
+  body: string;
 }
 
-function skillConsentSubject(args: SkillConsentInput): { dir: string; frontmatter: unknown } {
+function skillConsentSubject(args: SkillConsentInput): {
+  dir: string;
+  frontmatter: unknown;
+  directives?: string[];
+} {
   const { paths } = args.frontmatter;
+  // The commands the skill can run when the user invokes it (skillDynamicContext.ts). The key
+  // is absent without directives, so the fingerprint of every other skill stays the same.
+  const directives = skillDynamicDirectiveCommands(args.body);
   return {
     dir: args.relativeDir.replaceAll("\\", "/"),
     frontmatter: {
       ...args.frontmatter,
       ...(Array.isArray(paths) ? { paths: [...(paths as unknown[])].map(String).sort() } : {}),
     },
+    ...(directives.length > 0 ? { directives } : {}),
   };
 }
 
 /**
  * Fingerprint of one skill: where it lives in the plugin (the #6494 `extra/foo` vs `skills/foo`
- * case) and its whole parsed frontmatter, so a new frontmatter field fails closed. The body is
- * not covered: no review shows it, and the update review has always treated a body edit as
- * capability-neutral. `paths` patterns are OR-ed, so their order does not count.
+ * case), its whole parsed frontmatter, so a new frontmatter field fails closed, and the commands
+ * of its body's directive lines (#6617). Other body text is not covered: a prose edit applies
+ * without a review, as before. `paths` patterns are OR-ed, so their order does not count.
  */
 export function skillConsentFingerprint(args: SkillConsentInput): string {
   return digest({ scheme: CONSENT_SCHEME, kind: "skill", ...skillConsentSubject(args) });
 }
 
-/** The fingerprinted skill fields as text, for a review whose advertisement looks unchanged. */
+/** The fingerprinted skill fields as review text, invisible characters escaped. */
 export function skillConsentDetail(args: SkillConsentInput): string {
-  return stableStringify(skillConsentSubject(args));
+  return visibleReviewText(stableStringify(skillConsentSubject(args)));
+}
+
+/** The directive commands of a skill body as review text (#6617), invisible characters escaped. */
+export function skillReviewDirectives(body: string): string[] {
+  return skillDynamicDirectiveCommands(body).map(visibleReviewText);
+}
+
+// Characters that render as nothing or look like another character: controls, format characters
+// (bidi overrides, zero-width), separators, private use, variation selectors and the blank
+// letters. The three combining marks stay outside the class: in a class they would combine
+// with the character before them (no-misleading-character-class).
+const INVISIBLE_REVIEW_CHARACTER =
+  /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u115f\u1160\u3164\uffa0\u2800]|\u034f|\u17b4|\u17b5/gu;
+
+/**
+ * Review text with each invisible character written as `\u{HEX}`, so a hidden character in a
+ * command (for example U+200B inside a path) shows in the review.
+ */
+export function visibleReviewText(text: string): string {
+  return text.replace(
+    INVISIBLE_REVIEW_CHARACTER,
+    (char) => `\\u{${(char.codePointAt(0) ?? 0).toString(16).toUpperCase()}}`
+  );
 }
 
 /** Reviewed fingerprints of one install, by component name (registry `componentConsent`). */
@@ -343,12 +377,15 @@ export function pluginSkillConsentGate(plugin: {
 export function isPluginSkillConsented(
   gate: PluginSkillConsentGate | undefined,
   skillDir: string,
-  frontmatter: Readonly<Record<string, unknown>> & { name: string }
+  frontmatter: Readonly<Record<string, unknown>> & { name: string },
+  /** The SKILL.md body: its directive lines are part of the fingerprint (#6617). */
+  body: string
 ): boolean {
   if (gate === undefined) return true;
   const fingerprint = skillConsentFingerprint({
     relativeDir: path.relative(gate.pluginRoot, skillDir),
     frontmatter,
+    body,
   });
   return getOwn(gate.consented, frontmatter.name) === fingerprint;
 }

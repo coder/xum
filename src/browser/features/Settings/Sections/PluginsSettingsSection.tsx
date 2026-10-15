@@ -183,10 +183,15 @@ const ComponentChooser: React.FC<{
       const label = group === "skills" ? "Skills" : "MCP servers";
       const entries =
         group === "skills"
-          ? props.inventory.skills.map((skill) => ({ name: skill.name, detail: skill.description }))
+          ? props.inventory.skills.map((skill) => ({
+              name: skill.name,
+              detail: skill.description,
+              directives: skill.directives ?? [],
+            }))
           : props.inventory.mcpServers.map((server) => ({
               name: server.serverName,
               detail: `${server.transport} · ${server.summary}`,
+              directives: [],
             }));
       const imported = props.imported?.[group] ?? [];
       const selectable = entries.map((entry) => entry.name);
@@ -224,7 +229,7 @@ const ComponentChooser: React.FC<{
             </Button>
           </div>
           {entries.length === 0 && <p className="text-muted text-xs">None available</p>}
-          {entries.map(({ name, detail }) => (
+          {entries.map(({ name, detail, directives }) => (
             <label key={name} className="flex items-start gap-2 text-xs">
               <Checkbox
                 aria-label={name}
@@ -243,6 +248,21 @@ const ComponentChooser: React.FC<{
                 {imported.includes(name) && <span className="text-muted"> — imported</span>}
                 {detail && (
                   <span className="text-muted block break-all whitespace-pre-wrap">{detail}</span>
+                )}
+                {/* #6617: directive commands run when the user invokes the skill, so the review
+                    shows them. The backend escapes invisible characters; React escapes the rest. */}
+                {directives.length > 0 && (
+                  <span className="block">
+                    <span className="text-muted block">Runs these commands when invoked:</span>
+                    {directives.map((command, index) => (
+                      <code
+                        key={index}
+                        className="text-foreground block font-mono break-all whitespace-pre-wrap"
+                      >
+                        {command}
+                      </code>
+                    ))}
+                  </span>
                 )}
               </span>
             </label>

@@ -122,21 +122,60 @@ describe("serverConsentFingerprint", () => {
 describe("skillConsentFingerprint", () => {
   test("covers the root-relative directory and every frontmatter field, not path order", () => {
     const frontmatter = { name: "foo", description: "d", paths: ["src/**", "tests/**"] };
-    const fp = skillConsentFingerprint({ relativeDir: "skills/foo", frontmatter });
-    expect(skillConsentFingerprint({ relativeDir: "skills\\foo", frontmatter })).toBe(fp);
+    const fp = skillConsentFingerprint({ relativeDir: "skills/foo", frontmatter, body: "" });
+    expect(skillConsentFingerprint({ relativeDir: "skills\\foo", frontmatter, body: "" })).toBe(fp);
     expect(
       skillConsentFingerprint({
         relativeDir: "skills/foo",
         frontmatter: { ...frontmatter, paths: ["tests/**", "src/**"] },
+        body: "",
       })
     ).toBe(fp);
     const changed = [
-      { relativeDir: "extra/foo", frontmatter },
-      { relativeDir: "skills/foo", frontmatter: { ...frontmatter, description: "other" } },
+      { relativeDir: "extra/foo", frontmatter, body: "" },
+      {
+        relativeDir: "skills/foo",
+        frontmatter: { ...frontmatter, description: "other" },
+        body: "",
+      },
       // A field no review shows today still counts, so a new field fails closed.
-      { relativeDir: "skills/foo", frontmatter: { ...frontmatter, metadata: { a: "b" } } },
+      {
+        relativeDir: "skills/foo",
+        frontmatter: { ...frontmatter, metadata: { a: "b" } },
+        body: "",
+      },
     ];
     for (const input of changed) expect(skillConsentFingerprint(input)).not.toBe(fp);
+  });
+
+  test("covers the body's directive lines, not its prose (#6617)", () => {
+    const skill = (body: string) =>
+      skillConsentFingerprint({
+        relativeDir: "skills/foo",
+        frontmatter: { name: "foo", description: "d" },
+        body,
+      });
+    // A skill without directives keeps the fingerprint it had before #6617, so its stored
+    // consent stays valid (value computed on main before this change).
+    const legacy = "5a8709e834b91cb348b0e3b5625dba84fba9a27b344108fad614157476abd234";
+    expect(skill("")).toBe(legacy);
+    expect(skill("Say hi.\nThen say bye.")).toBe(legacy);
+    // Inline or empty directives do not run, so they are prose.
+    expect(skill("Run !`git status` first.\n!``")).toBe(legacy);
+
+    const withStatus = skill("Say hi.\n!`git status`");
+    expect(withStatus).not.toBe(legacy);
+    // The runner runs the command inside the backticks: surrounding whitespace and prose do not count.
+    expect(skill("Other prose.\n   !`git status`  \r")).toBe(withStatus);
+    // A changed, added or reordered command needs a new review.
+    for (const body of [
+      "!`git log`",
+      "!`git status`\n!`git log`",
+      "!`git log`\n!`git status`",
+      "!`git status`\n!`git status`",
+    ]) {
+      expect(skill(body)).not.toBe(withStatus);
+    }
   });
 });
 

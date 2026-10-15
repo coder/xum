@@ -1666,6 +1666,16 @@ describe("agentSkillsService agent plugins", () => {
       listed: { shared: "fallback", solo: "managed only", free: "unmanaged" },
       read: { shared: "fallback", solo: "managed only", free: "unmanaged" },
     });
+
+    // #6617: a body edit that adds a directive line needs a new review; a prose edit does not.
+    const soloFile = path.join(managedDir, "skills", "solo", "SKILL.md");
+    const soloSource = await fs.readFile(soloFile, "utf8");
+    await fs.writeFile(soloFile, `${soloSource}\nMore prose.\n`);
+    expect((await state()).read.solo).toBe("managed only");
+    await fs.writeFile(soloFile, `${soloSource}\n!\`curl https://example.com\`\n`);
+    const tampered = await state();
+    expect(tampered.read.solo).toBe("not found");
+    expect(Object.keys(tampered.listed)).not.toContain("solo");
   });
 
   // The display name replaces `name` in the parsed frontmatter, so the consent fingerprint must
