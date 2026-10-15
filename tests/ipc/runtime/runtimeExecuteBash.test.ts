@@ -221,9 +221,14 @@ describeIntegration("Runtime Bash Execution", () => {
             .getEvents()
             .flatMap((e) => ("type" in e && e.type === "init-output" ? [e.line] : []));
           if (end == null) {
-            throw new Error(
-              `ssh init did not end within ${SSH_INIT_BUDGET_MS} ms (#6588). ${describeSsh(ctx)}`
-            );
+            const message = `ssh init did not end within ${SSH_INIT_BUDGET_MS} ms (#6588). ${describeSsh(ctx)}`;
+            // The caller never gets `cleanup` on this path, so remove the workspace here. Bounded:
+            // a removal that hangs too must not hide the init message behind the watchdog.
+            await Promise.race([
+              created.cleanup().catch(() => undefined),
+              new Promise((resolve) => setTimeout(resolve, 10_000)),
+            ]);
+            throw new Error(message);
           }
         } finally {
           collector.stop();
