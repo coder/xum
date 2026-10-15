@@ -452,7 +452,7 @@ describe("ArchivedWorkspaces", () => {
     expect(alert.textContent).toContain("Restore failed");
   });
 
-  test("bulk deletion removes selected descendants before their parent", async () => {
+  test("bulk deletion removes a row's folded sub-agents before the row", async () => {
     const parent = createWorkspace({
       id: "parent",
       name: "parent",
@@ -474,7 +474,9 @@ describe("ArchivedWorkspaces", () => {
 
     fireEvent.click(view.getByLabelText("Expand archived workspaces"));
     fireEvent.click(await waitFor(() => view.getByLabelText("Select parent")));
-    fireEvent.click(view.getByLabelText("Select child"));
+    // The child was archived with its parent, so the parent's row stands for it.
+    expect(view.queryByLabelText("Select child")).toBeNull();
+    expect(view.getByText("Archived Workspaces (1)")).toBeTruthy();
     fireEvent.click(view.getByLabelText("Delete selected"));
     fireEvent.click(view.getByRole("button", { name: "Yes, delete 2" }));
 

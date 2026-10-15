@@ -9,7 +9,10 @@ import type {
 } from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
-import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import {
+  useOptionalWorkspaceMetadata,
+  useWorkspaceContext,
+} from "@/browser/contexts/WorkspaceContext";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { formatWorkspaceRemoveWarnings } from "@/browser/utils/workspace";
@@ -38,6 +41,12 @@ import {
 } from "@/common/utils/tokens/usageAggregator";
 import { useOptimisticBatchLRU } from "@/browser/hooks/useOptimisticBatchLRU";
 import { sessionCostCache } from "@/browser/utils/sessionCostCache";
+import {
+  expandHistorySelection,
+  getHistoryRowCost,
+  partitionArchivedHistoryRows,
+  sumKnownCosts,
+} from "./archivedHistoryRows";
 
 type SessionUsageFile = z.infer<typeof SessionUsageFileSchema>;
 
@@ -333,6 +342,12 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   const archivedRegionId = React.useId();
 
   const { unarchiveWorkspace, removeWorkspace, setSelectedWorkspace } = useWorkspaceContext();
+  // Sub-agents swept into the archive with their parent fold into its row (see the helper).
+  // Live (unarchived) metadata only tells which parents are still active.
+  const { rows: historyRows, foldedByRowId } = partitionArchivedHistoryRows(
+    workspaces,
+    useOptionalWorkspaceMetadata()?.workspaceMetadata
+  );
   const { api } = useAPI();
   const liveApi = useLiveAPI();
   const [searchQuery, setSearchQuery] = React.useState("");
@@ -400,44 +415,30 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   });
   const costsLoading = costsStatus === "idle" || costsStatus === "loading";
 
+  const getRowCost = (workspaceId: string) =>
+    getHistoryRowCost(workspaceId, foldedByRowId, costsByWorkspace);
+
   // Filter workspaces by search query (frontend-only)
   const filteredWorkspaces = searchQuery.trim()
-    ? workspaces.filter((ws) => {
+    ? historyRows.filter((ws) => {
         const query = searchQuery.toLowerCase();
         const title = (ws.title ?? ws.name).toLowerCase();
         const name = ws.name.toLowerCase();
         return title.includes(query) || name.includes(query);
       })
-    : workspaces;
+    : historyRows;
 
   const groupedWorkspaces = groupByTimePeriod(filteredWorkspaces);
   const flatWorkspaces = flattenGrouped(groupedWorkspaces);
 
   // Calculate total cost and per-period costs from cached/fetched values
-  let totalCost: number | undefined;
-  for (const ws of workspaces) {
-    const cost = costsByWorkspace[ws.id];
-    if (cost !== undefined) {
-      totalCost = (totalCost ?? 0) + cost;
-    }
-  }
-
-  const periodCosts = React.useMemo(() => {
-    const costs = new Map<string, number | undefined>();
-    for (const [period, periodWorkspaces] of groupedWorkspaces) {
-      let sum = 0;
-      let hasCost = false;
-      for (const ws of periodWorkspaces) {
-        const cost = costsByWorkspace[ws.id];
-        if (cost !== undefined) {
-          sum += cost;
-          hasCost = true;
-        }
-      }
-      costs.set(period, hasCost ? sum : undefined);
-    }
-    return costs;
-  }, [groupedWorkspaces, costsByWorkspace]);
+  const totalCost = sumKnownCosts(historyRows.map((ws) => getRowCost(ws.id)));
+  const periodCosts = new Map(
+    Array.from(groupedWorkspaces, ([period, periodWorkspaces]) => [
+      period,
+      sumKnownCosts(periodWorkspaces.map((ws) => getRowCost(ws.id))),
+    ])
+  );
 
   // Handle checkbox click with shift-click range selection
   const handleCheckboxClick = (workspaceId: string, event: React.MouseEvent) => {
@@ -538,10 +539,13 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
     onWorkspacesChanged?.();
   };
 
+  // Deleting a row deletes the sub-agents folded into it.
+  const bulkDeleteIds = expandHistorySelection(selectedIds, foldedByRowId);
+
   // Bulk delete (always force: true) - requires confirmation
   const handleBulkDelete = async () => {
     setBulkDeleteConfirm(false);
-    const idsToDelete = sortWorkspaceIdsDeepestFirst(Array.from(selectedIds), workspaces);
+    const idsToDelete = sortWorkspaceIdsDeepestFirst(bulkDeleteIds, workspaces);
     setBulkOperation({
       type: "delete",
       total: idsToDelete.length,
@@ -868,7 +872,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
           <ArchiveIcon className="text-muted h-4 w-4" />
           <span className="text-foreground font-medium">
             Archived Workspaces
-            {isExpanded && loadedWorkspaces !== undefined && ` (${loadedWorkspaces.length})`}
+            {isExpanded && loadedWorkspaces !== undefined && ` (${historyRows.length})`}
           </span>
           {isExpanded && <CostBadge cost={totalCost} loading={costsLoading} size="lg" />}
           <span className="flex-1" />
@@ -884,7 +888,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
                     onClick={() => void handleBulkDelete()}
                     className="rounded bg-red-600 px-2 py-0.5 text-xs text-white hover:bg-red-700"
                   >
-                    Yes, delete {selectedIds.size}
+                    Yes, delete {bulkDeleteIds.length}
                   </button>
                   <button
                     onClick={() => setBulkDeleteConfirm(false)}
@@ -961,7 +965,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
             )}
 
             {/* Search input with select all */}
-            {workspaces.length > 1 && (
+            {historyRows.length > 1 && (
               <div className="border-border flex items-center gap-2 border-b px-4 py-2">
                 <input
                   type="checkbox"
@@ -970,7 +974,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
                   className="h-4 w-4 rounded border-gray-600 bg-transparent"
                   aria-label="Select all"
                 />
-                {workspaces.length > 3 && (
+                {historyRows.length > 3 && (
                   <div className="relative flex-1">
                     <Search className="text-muted pointer-events-none absolute top-1/2 left-2 h-4 w-4 -translate-y-1/2" />
                     <input
@@ -1056,7 +1060,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
                                   </span>
                                 )}
                                 <CostBadge
-                                  cost={costsByWorkspace[workspace.id]}
+                                  cost={getRowCost(workspace.id)}
                                   loading={costsLoading}
                                   size="sm"
                                 />
