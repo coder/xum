@@ -105,19 +105,19 @@ export interface TurnSteps {
   stepCount?: number;
 }
 
+function isTokenCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
 /** The turn's step record from persisted message metadata, which is not schema-validated. */
 export function readTurnSteps(metadata: {
   contextUsage?: unknown;
   contextProviderMetadata?: unknown;
   stepStartPartIndices?: unknown;
 }): TurnSteps | undefined {
-  // A last step without a prompt count cannot place the turn's tier; the summed usage then
-  // prices as one request.
-  if (
-    !isPlainObject(metadata.contextUsage) ||
-    typeof metadata.contextUsage.inputTokens !== "number" ||
-    !Number.isFinite(metadata.contextUsage.inputTokens)
-  ) {
+  // A last step without a valid prompt count cannot place the turn's tier; the summed usage
+  // then prices as one request.
+  if (!isPlainObject(metadata.contextUsage) || !isTokenCount(metadata.contextUsage.inputTokens)) {
     return undefined;
   }
   return {

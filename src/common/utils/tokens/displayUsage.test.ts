@@ -742,19 +742,21 @@ describe("long-context tiers chosen per request", () => {
       expect(estimate).toBeLessThan(totalCost(createDisplayUsage(turnUsage(turn.steps), MODEL)!));
     });
 
-    test("a last step without a prompt count prices the turn as one request", () => {
+    test("a last step without a valid prompt count prices the turn as one request", () => {
       const usage = turnUsage([step({ inputTokens: 130_000 })]);
       const oneRequest = createDisplayUsage(usage, MODEL)!;
 
-      const priced = createDisplayUsage(
-        usage,
-        MODEL,
-        undefined,
-        undefined,
-        readTurnSteps({ contextUsage: {} })
-      )!;
+      for (const contextUsage of [{}, { inputTokens: -1 }]) {
+        const priced = createDisplayUsage(
+          usage,
+          MODEL,
+          undefined,
+          undefined,
+          readTurnSteps({ contextUsage })
+        )!;
 
-      expect(totalCost(priced)).toBeCloseTo(totalCost(oneRequest), 12);
+        expect(totalCost(priced)).toBeCloseTo(totalCost(oneRequest), 12);
+      }
     });
 
     test("a recorded per-request share wins over the last-step estimate", () => {
