@@ -205,6 +205,25 @@ function holdBackendMove() {
   return { release, calls: () => spy.mock.calls.length, restore: () => spy.mockRestore() };
 }
 
+/**
+ * Holds the replies of the backend's creation draft moves until release(): each move commits, and
+ * its pushes (the source's deletion, the new row) arrive, first.
+ */
+function holdBackendMoveReply() {
+  const draftService = getSharedEnv().services.draftService;
+  const realMove = draftService.moveCreation.bind(draftService);
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const spy = jest.spyOn(draftService, "moveCreation").mockImplementation(async (input) => {
+    const reply = await realMove(input);
+    await released;
+    return reply;
+  });
+  return { release, calls: () => spy.mock.calls.length, restore: () => spy.mockRestore() };
+}
+
 /** The app's API client, reporting an OpenAI key, which voice input needs to transcribe. */
 function withTranscription(orpc: OrpcClient): OrpcClient {
   const providers = new Proxy(orpc.providers, {
@@ -664,6 +683,52 @@ describeIntegration("Creation project selector moves the draft", () => {
       move.restore();
       await cleanupView(view, cleanupDom);
       restoreVoice();
+    }
+  }, 90_000);
+
+  test("the source composer shows the draft until the destination opens", async () => {
+    const { view, cleanupDom, a, b } = await openTwoProjects();
+    const { container } = view;
+    const move = holdBackendMoveReply();
+    // Every task boundary is a chance to paint: the composer must never show an empty draft. A
+    // message channel samples between tasks, as a browser paints (timers come too late).
+    const shown: (string | undefined)[] = [];
+    const sampler = new MessageChannel();
+    let sampling = false;
+    sampler.port1.onmessage = () => {
+      shown.push(textareaValue(container));
+      if (sampling) sampler.port2.postMessage(null);
+    };
+    try {
+      await openProjectCreationView(view, a);
+      const draftId = await onlyDraftId(a);
+      getDraftStore().setText(creationScope(a, draftId), "shown while it moves");
+      await waitFor(() => expect(textareaValue(container)).toBe("shown while it moves"), WAIT);
+      sampling = true;
+      sampler.port2.postMessage(null);
+
+      await startMoveTo(container, path.basename(b));
+      await waitFor(async () => {
+        expect(move.calls()).toBeGreaterThan(0);
+        const source = await getSharedEnv().orpc.drafts.get({ scope: creationScope(a, draftId) });
+        expect(source.text).toBe("");
+        expect(getWorkspaceDraftIds(a)).toEqual([]);
+      }, WAIT);
+      // The move committed and its pushes arrived; the reply has not.
+      expect(textareaValue(container)).toBe("shown while it moves");
+      move.release();
+      await waitFor(() => {
+        expect(projectSelectorLabel(container)).toBe(path.basename(b));
+        expect(textareaValue(container)).toBe("shown while it moves");
+      }, WAIT);
+      sampling = false;
+      expect(shown.filter((text) => text !== "shown while it moves")).toEqual([]);
+    } finally {
+      sampling = false;
+      sampler.port1.close();
+      move.release();
+      move.restore();
+      await cleanupView(view, cleanupDom);
     }
   }, 90_000);
 

@@ -1938,7 +1938,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       // The source stays open until the draft moved; a failed move leaves it as it was.
       const draftId = await moveDraftToProject(source, dest);
       if (draftId !== null && locationKeyRef.current === startKey) {
-        navigateToProject(dest.projectPath, draftId, { replace: true });
+        // Rendered now, as the promotion's (see promoteDefaultDraft): the source composer shows
+        // the draft emptied once the move ended, and no frame may show it.
+        flushSync(() => navigateToProject(dest.projectPath, draftId, { replace: true }));
       }
     },
     [userProjects, navigateToProject]
