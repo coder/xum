@@ -894,11 +894,11 @@ describe("WorkspaceStore", () => {
     };
     const hydrating = (workspaceId: string) =>
       store.getWorkspaceState(workspaceId).isHydratingTranscript;
-    let loaded: ReturnType<typeof spyOn>;
+    let loaded: Mock<typeof toolCardsStore.toolCardsLoaded> | undefined;
     beforeEach(() => {
       loaded = spyOn(toolCardsStore, "toolCardsLoaded").mockReturnValue(false);
     });
-    afterEach(() => loaded.mockRestore());
+    afterEach(() => loaded?.mockRestore());
 
     // Rows that mount before their cards load first render header-only, then grow.
     it("holds caught-up for replayed tool rows until the cards publish", async () => {
