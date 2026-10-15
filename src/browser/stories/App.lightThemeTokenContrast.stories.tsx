@@ -126,7 +126,9 @@ export const Home: AppStory = {
   render: () => <AppWithMocks setup={() => createMockORPCClient()} />,
   play: async ({ canvasElement }) => {
     await within(canvasElement).findByText("No projects", {}, { timeout: 15_000 });
-    await expectTokenTextsReadable(canvasElement, { "--color-muted": 1 });
+    // No minimum: home shows no muted or secondary text (the sidebar toggle is an icon), and the
+    // scan still checks any that a later change adds.
+    await expectTokenTextsReadable(canvasElement, {});
   },
 };
 
