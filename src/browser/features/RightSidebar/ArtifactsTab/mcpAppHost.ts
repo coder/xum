@@ -314,12 +314,14 @@ export function declaresFullscreenOnly(declared: readonly string[] | undefined):
  */
 function requestTeardown(input: {
   initialized: boolean;
+  /** Sent also before initialized: the caller needs its reply as a delivery barrier. */
+  barrier: boolean;
   id: string;
   pending: Map<string, (ok: boolean) => void>;
   post: (message: unknown) => void;
   reason: string;
 }): Promise<void> {
-  if (!input.initialized) return Promise.resolve();
+  if (!input.initialized && !input.barrier) return Promise.resolve();
   const { id, pending } = input;
   return new Promise<void>((resolve) => {
     const timer = setTimeout(() => {
@@ -411,7 +413,8 @@ export function createMcpAppHost(options: McpAppHostOptions) {
 
   const teardown = (reason: string, barrier = false): Promise<void> =>
     requestTeardown({
-      initialized: initialized || barrier,
+      initialized,
+      barrier,
       id: `host-${nextHostRequestId++}`,
       pending: pendingHostRequests,
       post: options.postToView,
