@@ -168,6 +168,18 @@ export class McpAppResultStore {
     }
   }
 
+  /**
+   * Cache a read's record, unless a prune landed since `pruned` (prunedCount before the read): it
+   * may have deleted this record (#6611), and caching it would return it until a restart.
+   */
+  private rememberUnlessPruned(
+    workspaceId: string,
+    record: McpAppResultRecord | null,
+    pruned: number
+  ) {
+    if (record !== null && pruned === this.prunedCount) this.remember(workspaceId, record);
+  }
+
   /** Record a tool result. Never throws: a failed write only means the view opens without it. */
   /** Resolves true once the record is stored (a failure is logged, never thrown). */
   async record(
@@ -306,9 +318,7 @@ export class McpAppResultStore {
     // A corrupt or foreign record reads as missing (self-healing), never as an error.
     const pruned = this.prunedCount;
     const record = await this.readRecord(filePath, toolCallId);
-    // A prune that landed during the read may have deleted this record (#6611): caching it
-    // would return it until a restart. Return it once, uncached.
-    if (record && pruned === this.prunedCount) this.remember(workspaceId, record);
+    this.rememberUnlessPruned(workspaceId, record, pruned);
     return record;
   }
 
