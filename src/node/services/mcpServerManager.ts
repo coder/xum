@@ -8266,10 +8266,6 @@ export class MCPServerManager {
     }
   }
 
-  /**
-   * Connect an HTTP/SSE MCP server (with auto http→sse fallback and one
-   * stale-modern-verdict retry). Returns null when aborted.
-   */
   /** A refused tool call keeps the tokens and asks for a sign-in in Settings (#6622). */
   private insufficientScopeOption(
     serverUrl: string,
@@ -8282,6 +8278,10 @@ export class MCPServerManager {
     };
   }
 
+  /**
+   * Connect an HTTP/SSE MCP server (with auto http→sse fallback and one
+   * stale-modern-verdict retry). Returns null when aborted.
+   */
   private async startRemoteInstance(
     name: string,
     info: Exclude<MCPServerInfo, MCPStdioServerInfo>,
