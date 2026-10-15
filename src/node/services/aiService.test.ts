@@ -3382,6 +3382,21 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect((await send()).description).toContain("tracker_add_label");
   });
 
+  it("shares one overview between selections that reach the same wire model", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview-alias");
+    const { fixture, harness, send } = createOverviewHarness(xumHome.path);
+    const wireModel = "mux-gateway:anthropic/claude-sonnet-4-5";
+    const resolveToWire = harness.resolveAndCreateModelSpy.getMockImplementation();
+    if (resolveToWire === undefined) throw new Error("Expected a resolveAndCreateModel stub");
+    // Like routing: the direct selection goes out through the gateway the explicit one names.
+    harness.resolveAndCreateModelSpy.mockImplementation((_requested, ...rest) =>
+      resolveToWire(wireModel, ...rest)
+    );
+    const direct = await send("anthropic:claude-sonnet-4-5");
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
+    expect((await send(wireModel)).description).toBe(direct.description);
+  });
+
   it("rebuilds the least recently used model's overview past the per-workspace bound", async () => {
     using xumHome = new DisposableTempDir("ai-tool-search-overview-bound");
     const { fixture, send } = createOverviewHarness(xumHome.path);

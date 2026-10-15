@@ -865,6 +865,12 @@ export class TurnRequestBuilder {
     this.toolCatalogOverviews.delete(workspaceId);
   }
 
+  /**
+   * Keyed by the effective model string (the routed wire model), not the selected one: the
+   * prompt cache is per route and wire model, so two selections that reach the same wire model
+   * (an explicit gateway string and a direct string routed through that gateway) share one cache
+   * and must share one overview, or alternating between them rewrites that cache.
+   */
   private toolCatalogOverviewMemo(
     workspaceId: string,
     modelString: string
@@ -2990,7 +2996,7 @@ export class TurnRequestBuilder {
             "anthropic";
         const toolCatalogOverviewMemo = this.toolCatalogOverviewMemo(
           workspaceId,
-          seed.rawModelString
+          seed.effectiveModelString
         );
         if (toolSearchRuntime) {
           if (options.initializeToolSearch) {
