@@ -4166,17 +4166,33 @@ export class AgentPluginInstallService {
    * are unavailable to agents, so Settings names it and the recovery step. Never throws.
    */
   async pendingSignOutStatus(): Promise<AgentPluginPendingSignOuts> {
+    // Settings re-reads this while the notice shows: retry like the discovery gate does (at most
+    // once per PENDING_SIGN_OUT_RETRY_MS), so a fixed cause clears without an agent request.
+    this.startPendingSignOutPass({ retryNow: false });
+    const record = await pendingSignOutsRecordState(this.containerDir);
+    if (record.kind === "absent") {
+      // An old record's failure must not describe the next one.
+      this.pendingSignOutLastError = undefined;
+      return { kind: "none" };
+    }
+    return this.readPendingSignOutStatus(record);
+  }
+
+  /** The status of an existing record (see pendingSignOutStatus). */
+  private async readPendingSignOutStatus(
+    record: { kind: "present" } | { kind: "unreadable"; code: string }
+  ): Promise<AgentPluginPendingSignOuts> {
+    const file = shortenHome(this.pendingSignOutsFile);
+    // A special file (a FIFO would block the read) is reported without reading it.
+    if (record.kind === "unreadable")
+      return { kind: "broken", reason: unusableRecordReason({ code: record.code }, file) };
     let servers: string[];
     try {
       servers = await this.readPendingSignOuts();
     } catch (error) {
-      return {
-        kind: "broken",
-        reason: unusableRecordReason(error, shortenHome(this.pendingSignOutsFile)),
-      };
+      return { kind: "broken", reason: unusableRecordReason(error, file) };
     }
     // An empty record still fences discovery while it exists (the next pass deletes it).
-    if (servers.length === 0 && !(await this.hasPendingSignOuts())) return { kind: "none" };
     const lastError = this.pendingSignOutLastError;
     return { kind: "pending", servers, ...(lastError !== undefined ? { lastError } : {}) };
   }

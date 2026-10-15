@@ -2786,10 +2786,32 @@ describe("AgentPluginInstallService", () => {
       });
       expect(await discovered()).toBe(0);
 
+      // A special file is reported without reading it (a FIFO would block the read).
+      if (process.platform !== "win32") {
+        await fsPromises.rm(file);
+        execFileSync("mkfifo", [file]);
+        const fifo = await restarted.pendingSignOutStatus();
+        expect(fifo.kind === "broken" && fifo.reason).toMatch(/not a regular file/);
+        await fsPromises.rm(file);
+      }
+
+      // A deleted record drops the old failure, so it cannot describe the next record.
+      await fsPromises.rm(file, { force: true });
+      expect(await restarted.pendingSignOutStatus()).toEqual({ kind: "none" });
       await fsPromises.writeFile(file, kept);
+      const next = await restarted.pendingSignOutStatus();
+      expect(next).toEqual({ kind: "pending", servers: [serverUrl] });
+
+      // Reading the status retries like the discovery gate, so a fixed cause clears it.
       fail = false;
-      await restarted.list();
       await internals.settledSignOutPasses();
+      const later = spyOn(performance, "now").mockReturnValue(performance.now() + 31_000);
+      try {
+        await restarted.pendingSignOutStatus();
+        await internals.settledSignOutPasses();
+      } finally {
+        later.mockRestore();
+      }
       expect(await restarted.pendingSignOutStatus()).toEqual({ kind: "none" });
       await oauth.dispose();
     });

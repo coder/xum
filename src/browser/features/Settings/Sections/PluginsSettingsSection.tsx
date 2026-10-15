@@ -1004,14 +1004,26 @@ const PENDING_SIGN_OUT_POLL_MS = 30_000;
  * action, so the hook re-reads it while the notice shows.
  */
 function usePendingSignOuts(
-  api: ReturnType<typeof useAPI>["api"]
+  api: ReturnType<typeof useAPI>["api"],
+  /** Re-lists the plugins: rows read while the record fenced discovery show as missing. */
+  onCleared: () => void
 ): [AgentPluginPendingSignOuts | null, (status: AgentPluginPendingSignOuts | null) => void] {
   const [status, setStatus] = useState<AgentPluginPendingSignOuts | null>(null);
   const shown = status !== null && status.kind !== "none";
+  // The interval reads the latest callback (the section's refresh is a plain handler).
+  const onClearedRef = useRef(onCleared);
+  onClearedRef.current = onCleared;
   useEffect(() => {
     if (!api || !shown) return;
+    // Each read also lets the backend retry the sign-out (at most every 30 s).
     const timer = setInterval(() => {
-      api.agentPlugins.pendingSignOuts().then(setStatus, () => undefined);
+      api.agentPlugins.pendingSignOuts().then(
+        (next) => {
+          setStatus(next);
+          if (next.kind === "none") onClearedRef.current();
+        },
+        () => undefined
+      );
     }, PENDING_SIGN_OUT_POLL_MS);
     return () => clearInterval(timer);
   }, [api, shown]);
@@ -1206,7 +1218,8 @@ export const PluginsSettingsSection: React.FC = () => {
   // ~/.shux, possibly custom/legacy), so this copy must never hardcode it.
   const [containerLocation, setContainerLocation] = useState<string | null>(null);
   // The record that keeps managed plugins closed after a failed post-update sign-out (#6627).
-  const [pendingSignOuts, setPendingSignOuts] = usePendingSignOuts(api);
+  // Lazy: `refresh` is declared below.
+  const [pendingSignOuts, setPendingSignOuts] = usePendingSignOuts(api, () => void refresh());
   // Palette intents (keyboard rule: install/uninstall/update need keyboard
   // paths). The initializer covers palette → fresh mount; the subscription
   // below covers commands invoked while this section is already on screen
