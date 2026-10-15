@@ -560,6 +560,61 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(latestMessages()).toEqual(result.messages);
   });
 
+  it("a swap lifts each volatile-tail row to the front once, in order", async () => {
+    // Mechanism 10 rows are system messages inside the history, and the swap moves every
+    // system message to the front. The cut lies in the live turn's steps, after every row.
+    const hot = (text: string) => `\n\n<hot_memories>${text}</hot_memories>`;
+    const tail = hot("C");
+    const payload = await assemblePromptPayload({
+      modelString: "anthropic:claude-opus-5-5",
+      providerForMessages: "anthropic",
+      routeProvider: "anthropic",
+      effectiveThinkingLevel: "off",
+      effectiveAgentId: "exec",
+      toolNamesForSentinel: [],
+      workspaceId,
+      systemMessage: `stable${tail}`,
+      volatileSystemSuffixLength: tail.length,
+      history: [
+        createMuxMessage("u1", "user", "first"),
+        createMuxMessage("a1", "assistant", "one", {
+          volatileSystemTail: { text: hot("A"), placement: "system" },
+        }),
+        createMuxMessage("u2", "user", "second"),
+        createMuxMessage("a2", "assistant", "two", {
+          volatileSystemTail: { text: hot("B"), placement: "row" },
+        }),
+        createMuxMessage("u3", "user", "current prompt"),
+      ],
+    });
+    // Frozen A in the system prompt, row B restored, row C appended after the newest user row.
+    expect(payload.volatileSystemTail).toEqual({ text: tail, placement: "row" });
+    const systemTexts = (messages: ai.ModelMessage[]) =>
+      messages.flatMap((message) =>
+        message.role === "system" ? [message.content.replace(/^Update: [^\n]*/, "row")] : []
+      );
+    const expected = ["stable", hot("A"), `row${hot("B")}`, `row${tail}`];
+    expect(systemTexts(payload.messages)).toEqual(expected);
+
+    const turn = await startLiveTurn({ requestOptions: { messages: payload.messages } });
+    const prepared = turn.manager.getPrefixSwapPreparation(workspaceId);
+    assert(prepared, "Expected a live stream to prepare");
+    const journal = journalFixture();
+    journal.systemPrefix = z.array(z.json()).parse(exactJson(prepared.systemPrefix));
+    const prefix = await rebuildContinuousPrefix(journal, workspaceId);
+    expect(
+      turn.manager.setPrefixSwap(workspaceId, { journal, prefix, firstTailToolCallId: "keep" })
+    ).toBe(true);
+    // The live turn's first step called the anchor tool.
+    const result = await turn.run([...payload.messages, ...originalMessages.slice(3)]);
+    assert(result?.messages, "Expected swapped messages");
+    expect(turn.swapState()).toBe("consumed");
+    // Each row once, in its order, before any other message: the last one (the live tail) wins.
+    expect(systemTexts(result.messages)).toEqual(expected);
+    expect(result.messages.slice(0, expected.length).every((m) => m.role === "system")).toBe(true);
+    expect(JSON.stringify(result.messages)).not.toContain("first");
+  });
+
   const searchResult = (toolCallId: string): ai.ModelMessage => {
     const raw: unknown = {
       role: "tool",
