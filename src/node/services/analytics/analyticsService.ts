@@ -641,6 +641,7 @@ export class AnalyticsService {
     from?: Date | null;
     to?: Date | null;
     timeZone?: string | null;
+    filterTimeZone?: string | null;
   }): Promise<Array<{ bucket: string; model: string; costUsd: number }>> {
     const rows = await this.executeQuery<SpendOverTimeRow[]>("getSpendOverTime", {
       granularity: params.granularity,
@@ -648,6 +649,7 @@ export class AnalyticsService {
       from: toDateFilterString(params.from),
       to: toDateFilterString(params.to),
       timeZone: params.timeZone ?? "UTC",
+      filterTimeZone: params.filterTimeZone,
     });
 
     return rows.map((row) => ({

@@ -194,6 +194,8 @@ export const analytics = {
       from: z.coerce.date().nullish(),
       to: z.coerce.date().nullish(),
       timeZone: z.string().nullish(),
+      /** The zone whose calendar dates `from` and `to` bound; defaults to `timeZone`. */
+      filterTimeZone: z.string().nullish(),
     }),
     output: z.array(
       z.object({

@@ -110,6 +110,7 @@ function AnalyticsDashboardContent() {
     from: spendDateRange.from,
     to: spendDateRange.to,
     timeZone,
+    filterTimeZone: spendDateRange.filterTimeZone,
   });
   const spendByProject = useAnalyticsSpendByProject({
     from: dateRange.from,

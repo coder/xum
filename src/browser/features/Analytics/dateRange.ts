@@ -4,6 +4,8 @@ interface AnalyticsDateRange {
   from: Date | null;
   to: Date | null;
   granularity: "hour" | "day" | "week";
+  /** The zone whose calendar dates `from` and `to` bound. */
+  filterTimeZone: string;
 }
 
 /** Build a calendar-date boundary for the selected timezone. */
@@ -43,25 +45,46 @@ export function computeDateRange(
 ): AnalyticsDateRange {
   switch (timeRange) {
     case "7d":
-      return { from: daysAgoInTimeZone(6, timeZone), to: null, granularity: "day" };
+      return {
+        from: daysAgoInTimeZone(6, timeZone),
+        to: null,
+        granularity: "day",
+        filterTimeZone: timeZone,
+      };
     case "30d":
-      return { from: daysAgoInTimeZone(29, timeZone), to: null, granularity: "day" };
+      return {
+        from: daysAgoInTimeZone(29, timeZone),
+        to: null,
+        granularity: "day",
+        filterTimeZone: timeZone,
+      };
     case "90d":
-      return { from: daysAgoInTimeZone(89, timeZone), to: null, granularity: "week" };
+      return {
+        from: daysAgoInTimeZone(89, timeZone),
+        to: null,
+        granularity: "week",
+        filterTimeZone: timeZone,
+      };
     case "month-utc": {
-      // AI Gateway budgets run on the UTC calendar month, so this range starts at 00:00 UTC on the
+      // AI Gateway budgets run on the UTC calendar month, so this range covers UTC dates from the
       // 1st in both time zone modes; only the spend chart's day buckets follow the zone.
       const now = new Date();
       return {
         from: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)),
         to: null,
         granularity: "day",
+        filterTimeZone: "UTC",
       };
     }
     case "all":
-      return { from: null, to: null, granularity: "week" };
+      return { from: null, to: null, granularity: "week", filterTimeZone: timeZone };
     default:
       // Self-heal: unknown persisted value → safe default.
-      return { from: daysAgoInTimeZone(29, timeZone), to: null, granularity: "day" };
+      return {
+        from: daysAgoInTimeZone(29, timeZone),
+        to: null,
+        granularity: "day",
+        filterTimeZone: timeZone,
+      };
   }
 }

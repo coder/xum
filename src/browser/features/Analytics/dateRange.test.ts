@@ -33,4 +33,11 @@ describe("computeDateRange month-utc", () => {
       "2026-10-01T00:00:00.000Z"
     );
   });
+
+  test("bounds UTC dates in a local display zone, where rolling ranges bound local dates", () => {
+    expect(computeDateRange("month-utc", "America/Los_Angeles").filterTimeZone).toBe("UTC");
+    expect(computeDateRange("30d", "America/Los_Angeles").filterTimeZone).toBe(
+      "America/Los_Angeles"
+    );
+  });
 });

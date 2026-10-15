@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { createDisplayUsage, recomputeUsageCosts } from "./displayUsage";
+import { createDisplayUsage, readTurnSteps, recomputeUsageCosts } from "./displayUsage";
 import { getTotalCost, sumUsageHistory, type ChatUsageDisplay } from "./usageAggregator";
 import { accumulateStepsProviderMetadata, addUsage } from "./usageHelpers";
 import { ChatUsageDisplaySchema } from "@/common/orpc/schemas/chatStats";
@@ -688,6 +688,26 @@ describe("long-context tiers chosen per request", () => {
     expect(recomputeUsageCosts(aggregate, MODEL, { aggregatedUsage: true })).toEqual(aggregate);
   });
 
+  test("an aggregate of exact xAI costs keeps them when repriced", () => {
+    const xaiModel = "xai:grok-4.7";
+    const steps = [
+      { usage: { inputTokens: 150_000, outputTokens: 1_000, totalTokens: 0 }, ticks: 7e9 },
+      { usage: { inputTokens: 250_000, outputTokens: 1_000, totalTokens: 0 }, ticks: 13e9 },
+    ].map((s) => ({ usage: s.usage, providerMetadata: { xai: { costInUsdTicks: s.ticks } } }));
+    const turn = createDisplayUsage(
+      turnUsage(steps),
+      xaiModel,
+      accumulateStepsProviderMetadata(steps, xaiModel)
+    )!;
+    expect(totalCost(turn)).toBeCloseTo(2, 12);
+
+    const repriced = recomputeUsageCosts(sumUsageHistory([turn])!, xaiModel, {
+      aggregatedUsage: true,
+    });
+
+    expect(totalCost(repriced)).toBeCloseTo(2, 12);
+  });
+
   describe("turns recorded without per-request shares", () => {
     /** A legacy row: the summed usage plus the last step and step count, no shares. */
     const legacyTurn = (prompts: number[]) => {
@@ -720,6 +740,21 @@ describe("long-context tiers chosen per request", () => {
       const estimate = totalCost(turn.price());
       expect(estimate / totalCost(priceRequests(turn.steps))).toBeCloseTo(1, 1);
       expect(estimate).toBeLessThan(totalCost(createDisplayUsage(turnUsage(turn.steps), MODEL)!));
+    });
+
+    test("a last step without a prompt count prices the turn as one request", () => {
+      const usage = turnUsage([step({ inputTokens: 130_000 })]);
+      const oneRequest = createDisplayUsage(usage, MODEL)!;
+
+      const priced = createDisplayUsage(
+        usage,
+        MODEL,
+        undefined,
+        undefined,
+        readTurnSteps({ contextUsage: {} })
+      )!;
+
+      expect(totalCost(priced)).toBeCloseTo(totalCost(oneRequest), 12);
     });
 
     test("a recorded per-request share wins over the last-step estimate", () => {

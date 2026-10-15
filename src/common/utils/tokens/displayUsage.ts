@@ -111,7 +111,15 @@ export function readTurnSteps(metadata: {
   contextProviderMetadata?: unknown;
   stepStartPartIndices?: unknown;
 }): TurnSteps | undefined {
-  if (!isPlainObject(metadata.contextUsage)) return undefined;
+  // A last step without a prompt count cannot place the turn's tier; the summed usage then
+  // prices as one request.
+  if (
+    !isPlainObject(metadata.contextUsage) ||
+    typeof metadata.contextUsage.inputTokens !== "number" ||
+    !Number.isFinite(metadata.contextUsage.inputTokens)
+  ) {
+    return undefined;
+  }
   return {
     lastStepUsage: metadata.contextUsage as AiSdkUsageLike,
     ...(isPlainObject(metadata.contextProviderMetadata) && {
@@ -284,7 +292,9 @@ export function createDisplayUsage(
 
   const xaiCostInUsdTicks = (providerMetadata?.xai as { costInUsdTicks?: number } | undefined)
     ?.costInUsdTicks;
-  if (xaiCostInUsdTicks != null && Number.isFinite(xaiCostInUsdTicks) && xaiCostInUsdTicks >= 0) {
+  const hasExactXaiCost =
+    xaiCostInUsdTicks != null && Number.isFinite(xaiCostInUsdTicks) && xaiCostInUsdTicks >= 0;
+  if (hasExactXaiCost) {
     // xAI reports the exact amount billed after caching, tools, and Priority Processing.
     // Scale the estimated component breakdown so its total reconciles to the billed amount.
     const exactCostUsd = xaiCostInUsdTicks / 10_000_000_000;
@@ -317,7 +327,9 @@ export function createDisplayUsage(
     ...(serviceTier !== undefined && serviceTier !== "standard" ? { serviceTier } : {}),
     // Persisted so a later repricing keeps the 1h-TTL write premium.
     ...(tokens.cacheCreate1h > 0 ? { cacheCreate1hTokens: tokens.cacheCreate1h } : {}),
-    ...(longContextTokens !== undefined ? { longContextTokens } : {}),
+    // A billed amount cannot be repriced from tokens, so an exact xAI cost carries no share:
+    // aggregates that include it keep their recorded costs.
+    ...(longContextTokens !== undefined && !hasExactXaiCost ? { longContextTokens } : {}),
     input: {
       tokens: tokens.input,
       cost_usd: inputCost,
