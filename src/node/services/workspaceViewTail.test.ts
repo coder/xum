@@ -67,7 +67,7 @@ describe("readWorkspaceViewTail", () => {
     await append(turns(maxRows + 1));
     const tail = (await read())!;
     expect(tail.rows.length).toBeLessThanOrEqual(maxRows);
-    expect([tail.hasOlder, tail.rows.at(-1)?.id]).toEqual([true, `m${maxRows}`]);
+    expect(tail.rows.at(-1)?.id).toBe(`m${maxRows}`);
     await append([msg("big", "user", "y".repeat(maxBytes + 1))]);
     expect(await read()).toBeNull();
   });
@@ -102,10 +102,11 @@ describe("readWorkspaceViewTail", () => {
       msg("a", "assistant", "", stream, textPart("direct")),
       msg("g", "assistant", "", { ...stream, routeProvider: "mux-gateway" }, textPart("routed")),
       msg("bad", "assistant", "damaged", { model: 7, timestamp: "x" }),
+      msg("proto", "assistant", "", { ...stream, routeProvider: "constructor" }, textPart("odd")),
       msg("ok", "assistant", "after", { finishReason: undefined }),
     ]);
     const { rows, ...tail } = (await read())!;
-    expect(tail).toEqual({ title: "seed", project: "demo-app", hasOlder: false });
+    expect(tail).toEqual({ title: "seed", project: "demo-app" });
     const model = { label: "Sonnet 4.5", provider: "anthropic", via: null };
     expect(rows[2]).toEqual({ id: "a", role: "assistant", text: "direct", timestamp: 7, model });
     expect(rows.map((row) => [row.id, row.text, row.timestamp, row.model?.via])).toEqual([
@@ -114,6 +115,7 @@ describe("readWorkspaceViewTail", () => {
       ["a", "direct", 7, null],
       ["g", "routed", 7, PROVIDER_DEFINITIONS["mux-gateway"].displayName],
       ["bad", null, null, undefined],
+      ["proto", "odd", 7, "constructor"],
       ["ok", "after", 1, null],
     ]);
   });

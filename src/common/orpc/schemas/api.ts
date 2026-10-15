@@ -1795,7 +1795,6 @@ export const WorkspaceViewTailRowSchema = z.object({
 export const WorkspaceViewTailSchema = z.object({
   title: z.string(),
   project: z.string(),
-  hasOlder: z.boolean(),
   rows: z.array(WorkspaceViewTailRowSchema),
 });
 export type WorkspaceViewTail = z.infer<typeof WorkspaceViewTailSchema>;

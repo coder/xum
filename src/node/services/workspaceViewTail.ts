@@ -69,7 +69,8 @@ function routeLabel(metadata: Record<string, unknown>, provider: string): string
   const gateway = metadata.routedThroughGateway === true ? "mux-gateway" : null;
   const route = typeof metadata.routeProvider === "string" ? metadata.routeProvider : gateway;
   if (route == null || route === provider) return null;
-  return route in PROVIDER_DEFINITIONS
+  // Own keys only: a damaged row's "constructor" must not resolve to Object.prototype.
+  return Object.hasOwn(PROVIDER_DEFINITIONS, route)
     ? PROVIDER_DEFINITIONS[route as ProviderName].displayName
     : route;
 }
@@ -138,7 +139,6 @@ export async function readWorkspaceViewTail(
   return {
     title: info.title ?? info.name,
     project: info.projectName,
-    hasOlder: !window.data.reachedEpochStart,
     rows: window.data.messages.map(toWorkspaceViewTailRow),
   };
 }
