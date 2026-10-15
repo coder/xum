@@ -73,7 +73,7 @@ import { useWorkspaceActions, useWorkspaceContext } from "@/browser/contexts/Wor
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
-import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { addWindowListenerWhile, stopKeyboardPropagation } from "@/browser/utils/events";
 import {
   NARROW_VIEWPORT_MAX_WIDTH_PX,
   RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
@@ -411,9 +411,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // handles the same events on wider layouts).
   // Each event listens only while its own experiment is on (MCP Apps are independent, #6760).
   useEffect(() => {
-    if (!artifactsExperimentEnabled && !mcpAppsExperimentEnabled) {
-      return;
-    }
     const handler = (event: Event) => {
       const detail = (event as CustomEvent<{ workspaceId: string }>).detail;
       if (detail?.workspaceId !== workspaceId || !isTimelineSidebarHidden()) {
@@ -430,15 +427,19 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       }
       openSidebarTab(appViewTabFor(detail.toolCallId), activeElement());
     };
-    if (mcpAppsExperimentEnabled) {
-      window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
-    }
-    if (artifactsExperimentEnabled) {
-      window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
-    }
+    const removeAppView = addWindowListenerWhile(
+      mcpAppsExperimentEnabled,
+      CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
+      appViewHandler
+    );
+    const removeArtifact = addWindowListenerWhile(
+      artifactsExperimentEnabled,
+      CUSTOM_EVENTS.OPEN_ARTIFACT,
+      handler
+    );
     return () => {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
+      removeAppView();
+      removeArtifact();
     };
   }, [
     artifactsExperimentEnabled,

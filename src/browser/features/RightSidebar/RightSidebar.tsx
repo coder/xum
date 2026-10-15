@@ -1,4 +1,5 @@
 import { RIGHT_SIDEBAR_DEFAULT_COLLAPSED } from "@/constants/layout";
+import { addWindowListenerWhile } from "@/browser/utils/events";
 import React from "react";
 import { X } from "lucide-react";
 import {
@@ -1550,7 +1551,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // out, so one event never acts twice.
   // Each event listens only while its own experiment is on (MCP Apps are independent, #6760).
   React.useEffect(() => {
-    if (!artifactsExperimentEnabled && !mcpAppsExperimentEnabled) return;
     const shown = () => {
       const container = sidebarContainerRef.current;
       return container == null || !isRightSidebarResponsivelyHidden(container);
@@ -1567,15 +1567,19 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       setCollapsed(false);
       setLayout((prev) => withAppViewTab(prev, detail.toolCallId));
     };
-    if (mcpAppsExperimentEnabled) {
-      window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenAppViewTab);
-    }
-    if (artifactsExperimentEnabled) {
-      window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handleOpenArtifactsTab);
-    }
+    const removeAppView = addWindowListenerWhile(
+      mcpAppsExperimentEnabled,
+      CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
+      handleOpenAppViewTab
+    );
+    const removeArtifact = addWindowListenerWhile(
+      artifactsExperimentEnabled,
+      CUSTOM_EVENTS.OPEN_ARTIFACT,
+      handleOpenArtifactsTab
+    );
     return () => {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenAppViewTab);
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handleOpenArtifactsTab);
+      removeAppView();
+      removeArtifact();
     };
   }, [artifactsExperimentEnabled, mcpAppsExperimentEnabled, setCollapsed, setLayout, workspaceId]);
 

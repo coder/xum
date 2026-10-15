@@ -25,7 +25,7 @@ import { formatHeartbeatIntervalShort, HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/c
 import { useAppConfig } from "@/browser/stores/AppConfigStore";
 import { SIDE_CHAT_INITIAL_TITLE } from "@/constants/workspaceDefaults";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
-import { useOptionalAPI } from "@/browser/contexts/API";
+import { useOptionalAPI, type APIClient } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import {
   formatGoalBudgetSummary,
@@ -399,41 +399,27 @@ function overviewAppRows(appViews: number, files: number, revealed: boolean): nu
  * after the agent's file edits; the card is a glance, so it skips the tab's polling.
  */
 const NO_APP_VIEWS: ReturnType<typeof useMcpAppViews> = [];
-const NO_FILES: readonly ArtifactEntry[] = [];
 
 /**
  * The workspace's newest artifact files for the Outputs card, refreshed after file-modifying
  * tools. With Artifacts off (#6760: MCP Apps can be on alone) it lists nothing, also no listing
  * from before the toggle.
  */
-function useOverviewArtifactFiles(
-  workspaceId: string,
-  enabled: boolean
-): { files: readonly ArtifactEntry[]; truncated: boolean } {
+function useOverviewArtifactFiles(workspaceId: string, enabled: boolean): ArtifactFilesListing {
   const api = useOptionalAPI()?.api ?? null;
-  const [files, setFiles] = React.useState<readonly ArtifactEntry[]>([]);
-  // The backend capped its walk (entry limit, depth, unreadable folders): more files exist than
-  // `files` holds, so the "more" row cannot give an exact count.
-  const [truncated, setTruncated] = React.useState(false);
+  const [listing, setListing] = React.useState<ArtifactFilesListing>(EMPTY_LISTING);
   const [refreshTick, setRefreshTick] = React.useState(0);
 
   React.useEffect(() => {
     if (api == null || !enabled) return;
     const controller = new AbortController();
-    api.artifacts
-      .list({ workspaceId }, { signal: controller.signal })
-      .then((result) => {
-        if (controller.signal.aborted) return;
-        // A failed listing hides the section; the Artifacts tab reports the error.
-        const listing = result.success && result.data.available ? result.data : null;
-        setFiles(listing?.entries ?? []);
-        setTruncated(listing?.truncated === true);
-      })
-      .catch((error: unknown) => {
-        if (isAbortError(error) || controller.signal.aborted) return;
-        setFiles([]);
-        setTruncated(false);
-      });
+    // readArtifactFilesListing never rejects; the second handler only satisfies the promise lint.
+    readArtifactFilesListing(api, workspaceId, controller.signal).then(
+      (next) => {
+        if (next != null) setListing(next);
+      },
+      () => undefined
+    );
     return () => controller.abort();
   }, [api, enabled, workspaceId, refreshTick]);
 
@@ -446,7 +432,35 @@ function useOverviewArtifactFiles(
     [workspaceId]
   );
 
-  return enabled ? { files, truncated } : { files: NO_FILES, truncated: false };
+  return enabled ? listing : EMPTY_LISTING;
+}
+
+interface ArtifactFilesListing {
+  files: readonly ArtifactEntry[];
+  /**
+   * The backend capped its walk (entry limit, depth, unreadable folders): more files exist than
+   * `files` holds, so the "more" row cannot give an exact count.
+   */
+  truncated: boolean;
+}
+
+const EMPTY_LISTING: ArtifactFilesListing = { files: [], truncated: false };
+
+/** One listing for the Outputs card; null once aborted, so a stale read never lands. */
+async function readArtifactFilesListing(
+  api: APIClient,
+  workspaceId: string,
+  signal: AbortSignal
+): Promise<ArtifactFilesListing | null> {
+  try {
+    const result = await api.artifacts.list({ workspaceId }, { signal });
+    if (signal.aborted) return null;
+    // A failed listing hides the section; the Artifacts tab reports the error.
+    if (!result.success || !result.data.available) return EMPTY_LISTING;
+    return { files: result.data.entries, truncated: result.data.truncated === true };
+  } catch (error) {
+    return isAbortError(error) || signal.aborted ? null : EMPTY_LISTING;
+  }
 }
 
 const OverviewOutputs: React.FC<{
