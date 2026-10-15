@@ -464,7 +464,9 @@ export const AddPluginConsentPreview: Story = {
     await canvas.findByText("Agents (1)");
     await canvas.findByText(/grill-master\.md/);
     await canvas.findByText("Workflows (1)");
-    await canvas.findByText(/grill-report\.js/);
+    await canvas.findAllByText(/grill-report\.js/);
+    // The workflow install approves is shown with its reviewed fields (#6629).
+    await canvas.findByText(/Reviewed definitions \(1\)/);
     await canvas.findByText("Slash commands (1)");
     await canvas.findByText("/grill");
     await canvas.findByText("hooks.json hooks (3)");
