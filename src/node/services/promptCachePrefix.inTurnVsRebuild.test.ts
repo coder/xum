@@ -663,9 +663,8 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
 
   // In-turn, StreamManager's transformStepMessages
   // (extractToolMediaAsUserMessagesFromModelMessages) puts the extracted image right after
-  // the tool result of that step. The rebuild's extractToolMediaAsUserMessages works on
-  // whole MuxMessages and appends the synthetic attachment row after the assistant row, so
-  // the image moves behind the turn's final text and merges into the NEXT user message.
+  // the tool result of that step. The rebuild used to extract on whole MuxMessages and append
+  // the image after the assistant row, behind the turn's final text.
   test("attach_file media stays where the in-turn step put it", async () => {
     const png =
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
@@ -681,14 +680,10 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
           ],
         }),
     });
-    await expectReproFailure(
-      () =>
-        expectNextTurnExtendsLastStep({
-          tools: { attach_file: attachFile, probe: plainTool("probe") },
-          firstTurn: toolThenTextTurn("attach_file", "call-1"),
-        }),
-      divergesAt(2)
-    );
+    await expectNextTurnExtendsLastStep({
+      tools: { attach_file: attachFile, probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("attach_file", "call-1"),
+    });
   });
 });
 
