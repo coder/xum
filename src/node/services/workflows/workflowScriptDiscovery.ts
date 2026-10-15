@@ -3,7 +3,10 @@ import type { AvailableWorkflow } from "@/common/types/workflow";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
-import { listPluginWorkflowFiles } from "@/node/services/agentPlugins/workflowFiles";
+import {
+  listPluginWorkflowFiles,
+  SKILL_WORKFLOW_ENTRY,
+} from "@/node/services/agentPlugins/workflowFiles";
 import { getBuiltInSkillDescriptors } from "@/node/services/agentSkills/builtInSkillDefinitions";
 import type { SkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { log } from "@/node/services/log";
@@ -14,7 +17,7 @@ import { resolveWorkflowPhaseManifest } from "./workflowPhaseManifest";
 import { discoverWorkflowPlugins, resolveWorkflowScript } from "./workflowScriptResolver";
 
 /** Conventional entry file for a workflow-bearing skill (e.g. deep-research). */
-const WORKFLOW_SKILL_ENTRY = "workflow.js";
+const WORKFLOW_SKILL_ENTRY = SKILL_WORKFLOW_ENTRY;
 
 export interface DiscoverWorkflowScriptsInput {
   runtime: Runtime;

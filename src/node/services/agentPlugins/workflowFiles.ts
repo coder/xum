@@ -1,6 +1,8 @@
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
+import { SkillNameSchema } from "@/common/orpc/schemas";
+
 /**
  * Top-level `*.js` entries of a plugin workflows/ dir, files and symlinks, sorted. The one lister
  * of the runtime launcher and the consent review (#6629): the resolver runs exactly these names
@@ -27,7 +29,8 @@ export const SKILL_WORKFLOW_ENTRY = "workflow.js";
  * Top-level workflow keys are bare file names, so the two key spaces never collide.
  */
 export function pluginSkillScriptKey(pluginRoot: string, scriptPath: string): string {
-  return path.relative(pluginRoot, scriptPath).replaceAll("\\", "/");
+  // Only the platform separator becomes `/`: on POSIX a backslash is a literal name character.
+  return path.relative(pluginRoot, scriptPath).split(path.sep).join("/");
 }
 
 /**
@@ -43,6 +46,9 @@ export async function listPluginSkillScripts(plugin: {
   const scripts: Array<{ file: string; filePath: string }> = [];
   for (const skillsDir of plugin.skillsDirs ?? []) {
     for (const dirName of await listSubdirectories(skillsDir)) {
+      // Only a folder the runtime loads as a skill: a valid skill name with a SKILL.md.
+      if (!SkillNameSchema.safeParse(dirName).success) continue;
+      if (!(await isFileOrLink(path.join(skillsDir, dirName, "SKILL.md")))) continue;
       const filePath = path.join(skillsDir, dirName, SKILL_WORKFLOW_ENTRY);
       if (!(await isFileOrLink(filePath))) continue;
       scripts.push({ file: pluginSkillScriptKey(plugin.rootPath, filePath), filePath });

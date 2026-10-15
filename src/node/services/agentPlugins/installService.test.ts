@@ -1891,6 +1891,9 @@ describe("AgentPluginInstallService", () => {
       "export const meta = { name: 'greet' };\n"
     );
     await fsPromises.writeFile(path.join(remoteDir, "skills", "greet", "helper.js"), "1;\n");
+    // A folder without SKILL.md is not a skill, so its script cannot run and is not listed.
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "notes"), { recursive: true });
+    await fsPromises.writeFile(path.join(remoteDir, "skills", "notes", "workflow.js"), "2;\n");
     await commitAll(remoteDir, "add a skill workflow");
     const preview = await service.preview({ input: remoteDir });
     // The preview shows the skill script that install approves.
