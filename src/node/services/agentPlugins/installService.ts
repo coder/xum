@@ -647,9 +647,13 @@ function inventoryFingerprints(parts: {
  */
 function assertInventoryMatchesPreview(
   expectedDigest: string | undefined,
-  fingerprints: ComponentConsent
+  fingerprints: ComponentConsent,
+  hook: AgentPluginPreviewHook | undefined
 ): void {
-  if (expectedDigest === undefined || expectedDigest === componentConsentDigest(fingerprints)) {
+  if (
+    expectedDigest === undefined ||
+    expectedDigest === componentConsentDigest(fingerprints, hook)
+  ) {
     return;
   }
   throw new Error(
@@ -3120,7 +3124,8 @@ export class AgentPluginInstallService {
           workflows: workflowScripts,
           agents: agentFiles,
           slashCommands: slashSurface,
-        })
+        }),
+        hook
       );
       const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
         name: command.name,
@@ -3208,7 +3213,11 @@ export class AgentPluginInstallService {
         const { plugin } = await this.validateStagedClone(stagedDir, args.source.subpath);
         const name = plugin.name;
         const inventory = await this.collectComponents(plugin, this.targetPathFor(name));
-        assertInventoryMatchesPreview(args.expectedConsentDigest, inventory.fingerprints);
+        assertInventoryMatchesPreview(
+          args.expectedConsentDigest,
+          inventory.fingerprints,
+          this.collectHook(plugin)
+        );
         const importedComponents =
           args.importedComponents === undefined
             ? undefined
