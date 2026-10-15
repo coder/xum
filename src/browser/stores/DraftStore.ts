@@ -2210,6 +2210,15 @@ export function getDraftStore(): DraftStore {
   return storeInstance;
 }
 
+/**
+ * Drop the singleton so the next getDraftStore() starts unhydrated. A store kept from an earlier
+ * test file is already ready, so whenReady() no longer waits for the next client's snapshot.
+ */
+export function resetDraftStoreForTests(): void {
+  storeInstance?.setClient(null);
+  storeInstance = null;
+}
+
 /** The draft of one scope; re-renders only when that scope changes. */
 export function useDraft(scope: DraftStoreScope): DraftView {
   const store = getDraftStore();

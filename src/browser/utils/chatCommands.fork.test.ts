@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getDraftStore, resetDraftStoreForTests } from "@/browser/stores/DraftStore";
 import { createTestApiClient } from "@/browser/testUtils";
 import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
 import { toDraftAttachmentMetadata } from "@/common/utils/drafts";
@@ -38,6 +38,7 @@ let cleanupDom: (() => void) | undefined;
 
 beforeEach(() => {
   cleanupDom = installDom();
+  resetDraftStoreForTests();
 });
 
 afterEach(() => {
