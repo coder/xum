@@ -96,6 +96,8 @@ async function createHarness(tempDir: TestTempDir) {
     /** Holds the next subscription's snapshot (a slow reconnect). */
     beforeSubscribe: null as null | (() => Promise<void>),
     loseBeginSendReply: false,
+    /** Snapshots the store finished handling (it asks for the next event only after that). */
+    snapshotsHandled: 0,
   };
   const drafts = {
     list: () => service.list(),
@@ -142,6 +144,7 @@ async function createHarness(tempDir: TestTempDir) {
             const next = queue.shift();
             if (next) {
               yield next;
+              if (next.type === "snapshot") hooks.snapshotsHandled++;
               continue;
             }
             await new Promise<void>((resolve) => {
@@ -192,7 +195,9 @@ async function createHarness(tempDir: TestTempDir) {
     },
   };
   const client = createTestApiClient({ drafts, workspace } as never);
-  return { service, client, receiver: receiver.control, hooks, receiverHooks };
+  /** A new connection to this same backend (a reconnect makes a new client). */
+  const reconnect = () => createTestApiClient({ drafts, workspace } as never);
+  return { service, client, reconnect, receiver: receiver.control, hooks, receiverHooks };
 }
 
 function pendingSend(sendId: string, text: string, receiverId: string, ids: string[] = []) {
@@ -868,7 +873,7 @@ describe("DraftStore idempotent sends", () => {
       Date.now = realNow;
     }
     store.setClient(next.client);
-    await waitFor(() => store.isHydrated());
+    await waitFor(() => next.hooks.snapshotsHandled > 0);
     release();
     // The new backend holds neither the send nor its text removal: the send must not go out,
     // and its text comes back and is saved there.
@@ -901,12 +906,67 @@ describe("DraftStore idempotent sends", () => {
       new Promise<void>((resolve) => {
         releaseSnapshot = resolve;
       });
+    const handled = hooks.snapshotsHandled;
     store.setClient(client);
     expect([...store.getPendingSendIds(SCOPE)]).toEqual(["s1"]);
     expect(store.getText(SCOPE)).toBe("");
     releaseSnapshot();
-    await waitFor(() => store.isHydrated());
+    await waitFor(() => hooks.snapshotsHandled > handled);
     expect([...store.getPendingSendIds(SCOPE)]).toEqual(["s1"]);
     expect(store.getText(SCOPE)).toBe("");
+  });
+
+  // #6542: a reconnect (a new client to the same backend) during a send. Its reply comes from the
+  // replaced client, so the send is refused and its text comes back. That text is saved only
+  // after the new snapshot, and the backend's pending-send record never brings it back twice.
+  test("a reconnect during a send refuses it, and its text comes back once after the snapshot", async () => {
+    using tempDir = new TestTempDir("draft-sends-reconnect-during-send");
+    const { service, client, reconnect, receiver, hooks } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(SCOPE, "hello");
+    await store.flush(SCOPE);
+
+    const next = reconnect();
+    let releaseSnapshot: () => void = () => undefined;
+    hooks.beforeBeginSend = () => {
+      hooks.beforeSubscribe = () =>
+        new Promise<void>((resolve) => {
+          releaseSnapshot = resolve;
+        });
+      store.setClient(next);
+      return Promise.resolve();
+    };
+    const request = pendingSend("s1", "hello", RECEIVER).request;
+    const outcome = await store
+      .beginSend(SCOPE, { sendId: "s1", text: "hello", attachments: [], request })
+      .then(
+        () => "began",
+        () => "refused"
+      );
+    expect(outcome).toBe("refused");
+    expect(store.getText(SCOPE)).toBe("hello");
+    // Before the new snapshot nothing is written: the backend still holds the send's take.
+    const saved = await store.flush(SCOPE).then(
+      () => "",
+      (error: unknown) => String(error)
+    );
+    expect(saved).toContain("drafts are not loaded");
+    const before = await service.get(SCOPE);
+    expect([before.text, before.pendingSends?.map(({ sendId }) => sendId)]).toEqual(["", ["s1"]]);
+
+    releaseSnapshot();
+    await waitFor(() => hooks.snapshotsHandled > 1);
+    await waitFor(async () => {
+      const draft = await service.get(SCOPE);
+      return draft.text === "hello" && draft.pendingSends === undefined;
+    });
+    expect(store.getText(SCOPE)).toBe("hello");
+    expect(receiver.sends).toHaveLength(0);
+    const reloaded = createStore(reconnect());
+    await reloaded.whenReady();
+    expect(reloaded.getText(SCOPE)).toBe("hello");
+    expect((await service.get(SCOPE)).text).toBe("hello");
+    expect(store.getText(SCOPE)).toBe("hello");
   });
 });

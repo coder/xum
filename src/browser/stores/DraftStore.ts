@@ -231,6 +231,8 @@ interface Entry {
 }
 
 const FLUSH_DEBOUNCE_MS = 300;
+/** A write before the current client's snapshot: on a cold start and during a reconnect alike. */
+const DRAFTS_NOT_LOADED = "Draft save failed: drafts are not loaded";
 const RETRY_BASE_MS = 250;
 const RETRY_MAX_MS = 5_000;
 const EMPTY_VIEW: DraftView = {
@@ -551,8 +553,14 @@ export class DraftStore {
   private receiver: { client: APIClient; receiverId: string } | null = null;
   private resubscribeTimer: ReturnType<typeof setTimeout> | null = null;
   private resubscribeAttempt = 0;
-  /** A real snapshot was applied: writes may go out (they could clobber unseen data before). */
+  /** A real snapshot was applied once (composers and the draft GC read this; never reset). */
   private hydrated = false;
+  /**
+   * The client whose snapshot (and legacy import) this store applied: writes go only to it. A
+   * new client may reach another backend, and a write before its snapshot could clobber drafts
+   * the store has not seen yet (#6542). Separate from `hydrated`, which other readers use.
+   */
+  private snapshotClient: APIClient | null = null;
   /** Composers may render: hydrated, or the first subscription failed (self-heal). */
   private ready = false;
   private resolveReady: () => void = () => undefined;
@@ -579,8 +587,10 @@ export class DraftStore {
   setClient(client: APIClient | null): void {
     if (client === this.client) return;
     this.client = client;
-    // A new connection may reach another backend process: ask for its receiver id again.
+    // A new connection may reach another backend process: ask for its receiver id again, and
+    // hold writes until its snapshot (canWrite). Edits stay in memory; the snapshot saves them.
     this.receiver = null;
+    this.snapshotClient = null;
     // A retry scheduled for the old connection must not outlive it; the new connection's
     // snapshot resolves the entries again and re-arms retries.
     for (const tracking of this.sendTracking.values()) {
@@ -673,9 +683,9 @@ export class DraftStore {
   /** Never rejects. */
   private async sendListPut(key: string, pending: PendingListPut): Promise<void> {
     const client = this.client;
-    // Puts wait for hydration: the legacy list import runs first, and the first import (before a
-    // list.json exists) also lists orphaned draft bodies. The snapshot handler resends.
-    if (!client || !this.hydrated || this.pendingListPuts.get(key) !== pending) return;
+    // Puts wait for the client's snapshot: the legacy list import runs first, and the first import
+    // (before a list.json exists) also lists orphaned draft bodies. The snapshot handler resends.
+    if (!this.canWrite(client) || this.pendingListPuts.get(key) !== pending) return;
     const sent = pending.entry;
     try {
       const { revision } = await client.drafts.putListEntry(sent);
@@ -956,7 +966,7 @@ export class DraftStore {
       entry.flushTimer = null;
     }
     await this.readyPromise;
-    if (!this.hydrated) throw new Error("Draft save failed: drafts are not loaded");
+    if (!this.hydrated) throw new Error(DRAFTS_NOT_LOADED);
     // An attachment update waiting for the payloads is not saved yet: apply it (by loading them)
     // first, so this never confirms a draft without it. A failed load rejects.
     if (entry.queuedAttachmentUpdates.length > 0) await this.ensurePayloads(scope);
@@ -976,7 +986,7 @@ export class DraftStore {
     const key = draftScopeKey(scope);
     await this.readyPromise;
     const client = this.client;
-    if (!client || !this.hydrated) throw new Error("Draft save failed: drafts are not loaded");
+    if (!this.canWrite(client)) throw new Error(DRAFTS_NOT_LOADED);
     const entry = this.getOrCreateEntry(scope);
     const tracking = this.trackingFor(key);
     // From now until the send's reply this window never looks the id up (see SendTracking).
@@ -1765,6 +1775,9 @@ export class DraftStore {
             // every (re)subscription: keys whose import failed are retried, and without keys the
             // scan is cheap.
             await this.migrateLegacyDrafts(client);
+            // A replaced run must not open writes for the client after it (#6542).
+            if (signal.aborted || this.client !== client) break;
+            this.snapshotClient = client;
             this.hydrated = true;
             this.markReady();
             for (const entry of this.entries.values()) this.scheduleFlush(entry);
@@ -2010,7 +2023,7 @@ export class DraftStore {
   }
 
   private flushInBackground(entry: Entry): void {
-    if (!this.hydrated) return;
+    if (!this.canWrite(this.client)) return;
     // Failures already scheduled a retry inside drain().
     this.drain(entry).catch(() => undefined);
   }
@@ -2115,12 +2128,17 @@ export class DraftStore {
     }
   }
 
-  /** The client a write may go to: connected, and drafts hydrated. */
+  /** The client a write may go to: connected, and its snapshot applied. */
   private writableClient(): APIClient {
     const client = this.client;
     if (!client) throw new Error("Draft save failed: not connected");
-    if (!this.hydrated) throw new Error("Draft save failed: drafts are not loaded");
+    if (!this.canWrite(client)) throw new Error(DRAFTS_NOT_LOADED);
     return client;
+  }
+
+  /** Writes wait for the snapshot of the client they go to (#6542). */
+  private canWrite(client: APIClient | null): client is APIClient {
+    return client !== null && this.snapshotClient === client;
   }
 
   /** Throws when `client` was replaced (a new backend): its replies are not the current one's. */
