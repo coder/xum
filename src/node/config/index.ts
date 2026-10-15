@@ -86,6 +86,8 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
+// process.platform-based: the common helper reads navigator, which Node 20 lacks (#6485).
+import { PlatformPaths as NodePlatformPaths } from "@/node/utils/paths.main";
 import { sharesPlanDirectory } from "@/common/utils/planStorage";
 import { stableStringify } from "@/common/utils/stableStringify";
 import type { RuntimeConfig } from "@/common/types/runtime";
@@ -1787,9 +1789,11 @@ export class Config {
       log.debug("Config dir not created for the config file watcher", { error });
     }
     this.startConfigFileWatchers();
-    // Without a watch, writeConfigFileTracked retries after this process's next save.
-    if (this.configFileWatchers.length === 0) return;
+    // Set without a watch too: the read that starts one later then reports the edits since.
     this.notifiedConfigFileStamp = baseline;
+    // Without a watch, the next read of a changed config.json or this process's next save
+    // retries.
+    if (this.configFileWatchers.length === 0) return;
     // Relink-aware: the link can also change between the realpath read and the root watch.
     this.handleConfigFileEventWithRelink();
   }
@@ -1801,7 +1805,8 @@ export class Config {
       if (watcher) this.configFileWatchers.push(watcher);
       else complete = false;
     }
-    // A dir whose watch failed to start is retried by the next relink check (the next event).
+    // A dir whose watch failed to start is retried by the next relink check (the next event)
+    // or by the next read of a changed config.json (retryIncompleteConfigFileWatch).
     this.watchedConfigFileDirsKey = complete ? configFileWatchDirsKey(dirs) : null;
   }
 
@@ -1831,11 +1836,9 @@ export class Config {
   private watchConfigDir(dir: string, fileNames: ReadonlySet<string>): fs.FSWatcher | null {
     let watcher: fs.FSWatcher;
     try {
-      watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
-        // Some platforms omit the filename; treat that as a possible config.json change.
-        if (filename != null && !fileNames.has(filename)) return;
-        this.handleConfigFileEventWithRelink();
-      });
+      watcher = fs.watch(dir, { persistent: false }, (_event, filename) =>
+        this.handleConfigDirEvent(dir, fileNames, filename)
+      );
     } catch (error) {
       log.debug("Config file watcher not started", { dir, error });
       return null;
@@ -1847,9 +1850,61 @@ export class Config {
       // each dir that still resolves (a vanished dir moves to an existing ancestor), and
       // the stamp check after it reports an edit made while the watch was down.
       this.watchedConfigFileDirsKey = null;
-      this.handleConfigFileEventWithRelink();
+      this.configFileWatchErrorDir = dir;
+      this.retryIncompleteConfigFileWatch("error");
     });
     return watcher;
+  }
+
+  /**
+   * The config.json stamp of the last retry each trigger started. Separate per trigger: a
+   * read that repaired the set must not hold back the rebuild for a later watcher error.
+   */
+  private readonly configFileWatchRetryStamps: Record<"read" | "error", string | null> = {
+    read: null,
+    error: null,
+  };
+  /** The dir of the last watch that raised an error (see the watch callback). */
+  private configFileWatchErrorDir: string | null = null;
+
+  /**
+   * Rebuilds a watch set with a failed watch, at most once per config.json stamp and trigger.
+   * A read retries a watch that failed to start, so the retry needs no event from another
+   * watch. The error bound stops an error that every new watch raises from rebuilding the set
+   * at the pace of the OS errors: the next rebuild waits for a watch event or a changed stamp.
+   * No timer: until the stamp changes, a retry would see no new edit to report.
+   */
+  private retryIncompleteConfigFileWatch(trigger: "read" | "error"): void {
+    if (!this.configFileWatchIncomplete()) return;
+    const stamp = this.configFileStamp();
+    if (stamp === this.configFileWatchRetryStamps[trigger]) return;
+    this.configFileWatchRetryStamps[trigger] = stamp;
+    this.handleConfigFileEventWithRelink();
+  }
+
+  /**
+   * A listener needs a watch that is missing: one failed to start or raised an error. An
+   * empty set with listeners counts too: every watch failed to start.
+   */
+  private configFileWatchIncomplete(): boolean {
+    if (this.configFileWatchStopped || this.emitter.listenerCount("configChanged") === 0) {
+      return false;
+    }
+    return this.configFileWatchers.length === 0 || this.watchedConfigFileDirsKey === null;
+  }
+
+  /** An event from the watch on `dir`, which covers the entries in `fileNames`. */
+  private handleConfigDirEvent(
+    dir: string,
+    fileNames: ReadonlySet<string>,
+    filename: string | null
+  ): void {
+    // An event from the replacement of the failed watch shows it works, so its next error
+    // may rebuild again. An event from another dir proves nothing about it.
+    if (dir === this.configFileWatchErrorDir) this.configFileWatchRetryStamps.error = null;
+    // Some platforms omit the filename; treat that as a possible config.json change.
+    if (filename != null && !fileNames.has(filename)) return;
+    this.handleConfigFileEventWithRelink();
   }
 
   private closeConfigFileWatcher(): void {
@@ -1920,7 +1975,7 @@ export class Config {
   }
 
   /**
-   * A batch with an own edit notifies as an own save does. A batch with only foreign edits
+   * A batch with only own edits notifies as an own save does. A batch with a foreign edit
    * keeps the listener guard of notifyConfigChangedByAnotherProcess.
    */
   private flushDeferredChangeNotification(): void {
@@ -1928,8 +1983,9 @@ export class Config {
     const foreign = this.foreignChangeNotificationPending;
     this.changeNotificationPending = false;
     this.foreignChangeNotificationPending = false;
-    if (own) this.notifyConfigChanged();
-    else if (foreign) this.notifyConfigChangedByAnotherProcess();
+    // A foreign edit has no caller to throw to, so it keeps the guard even next to an own edit.
+    if (foreign) this.notifyConfigChangedByAnotherProcess();
+    else if (own) this.notifyConfigChanged();
   }
 
   private notifyConfigChanged(): void {
@@ -2331,7 +2387,11 @@ export class Config {
     if (key !== undefined && this.configSnapshot?.key === key) {
       return this.configSnapshot.config;
     }
-    return this.readConfigOrDefault(options, key);
+    const config = this.readConfigOrDefault(options, key);
+    // A changed file: retry a failed watch after the read, so a listener it notifies reads
+    // the snapshot this read stored.
+    this.retryIncompleteConfigFileWatch("read");
+    return config;
   }
 
   private readConfigOrDefault(
@@ -2517,9 +2577,9 @@ export class Config {
    */
   private resolveLegacyRowId(projectPath: string, workspace: Workspace): string | undefined {
     const legacyId = this.generateLegacyId(projectPath, workspace.path);
-    // The same basename expression as buildWorkspaceMetadata (#6485 tracks its Windows gap).
-    const basename =
-      workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+    // The same basename as buildWorkspaceMetadata and findWorkspace; PlatformPaths also splits on
+    // "\\" on Windows, where checkout paths use backslashes (#6485).
+    const basename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
     const ids = new Set<string | undefined>();
     for (const candidate of basename === legacyId ? [legacyId] : [legacyId, basename]) {
       const id = readLegacyMetadataId(path.join(this.sessionsDir, candidate, "metadata.json"));
@@ -4353,8 +4413,7 @@ export class Config {
       // LEGACY FORMAT: Fall back to metadata.json and legacy ID for unmigrated workspaces
       if (!workspace.id) {
         // Extract workspace basename (could be stable ID or legacy name)
-        const workspaceBasename =
-          workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+        const workspaceBasename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
 
         // Try loading metadata with basename as ID (works for old workspaces)
         const metadataPath = path.join(
@@ -4647,8 +4706,7 @@ export class Config {
           tags: storedWorkspace.tags ? { ...storedWorkspace.tags } : undefined,
         };
         // Extract workspace basename from path (could be stable ID or legacy name)
-        const workspaceBasename =
-          workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+        const workspaceBasename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
 
         // Captured BEFORE any in-memory migration mutates workspace.id: the queued
         // replay must retarget by persisted identity, never by path alone — paths are

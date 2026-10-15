@@ -532,10 +532,10 @@ const taskToolBaseShape = {
     'kind="workspace" target. Omit for a new workspace; mode="existing" with workspaceId only for one you created.'
   ),
   model: TaskToolModelSchema.nullish().describe(
-    "Model override (alias or provider:model; see models_list). Only when the user asked; default inherits yours. Stays pinned when reawakened."
+    "Model override (alias, provider:model, or a skill's slug such as opus-xhigh; see models_list). Only when the user or an invoked skill asks; default inherits yours. Stays pinned when reawakened."
   ),
   thinking: TaskToolThinkingSchema.nullish().describe(
-    `Thinking override: ${THINKING_LEVELS.join(", ")}, or a numeric index for the chosen model. Only when the user asked; default inherits yours. Stays pinned when reawakened.`
+    `Thinking override: ${THINKING_LEVELS.join(", ")}, or a numeric index for the chosen model. Only when the user or an invoked skill asks; default inherits yours. Stays pinned when reawakened.`
   ),
 };
 
@@ -2851,7 +2851,7 @@ export const TOOL_DEFINITIONS = {
   },
   models_list: {
     description:
-      "List model suggestions with aliases and thinking levels; not exhaustive or an availability probe. Other provider:model IDs may work with a configured provider. Pass an ID only for a requested override; else leave `task.model` unset.",
+      "List model suggestions with aliases and thinking levels; not exhaustive or an availability probe. Other provider:model IDs may work with a configured provider. Pass an ID only when the user or an invoked skill asks; else leave `task.model` unset.",
     schema: z.object({}).strict(),
     resultSchema: ModelsListToolResultSchema,
   },

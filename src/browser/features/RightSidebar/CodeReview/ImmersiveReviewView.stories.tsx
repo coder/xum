@@ -1,4 +1,4 @@
-import { within, waitFor } from "@storybook/test";
+import { within, waitFor } from "storybook/test";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useRef, useState } from "react";
 import type { ComponentProps, ComponentType, FC, ReactNode } from "react";

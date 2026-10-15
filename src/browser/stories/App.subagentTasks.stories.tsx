@@ -1,5 +1,5 @@
 import type { ComponentType } from "react";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { createActivityFeed } from "./mocks/activityFeed";
 import { createMockORPCClient } from "./mocks/orpc";
 import { groupWorkspacesByProject } from "./mocks/workspaces";

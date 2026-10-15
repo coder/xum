@@ -78,6 +78,25 @@ describe("AgentSession chat-event listeners", () => {
     expect(chatListeners()).toBe(baseline);
   });
 
+  test("subscribeChat releases its listener when the history replay throws", async () => {
+    const { harness, chatListeners } = await setup();
+    const baseline = chatListeners();
+    // The replay delivers through the same listener: a listener that throws on a replayed event
+    // makes the replay (and subscribeChat) reject.
+    const replayFailure = new Error("listener failed during replay");
+    const subscription = harness.session.subscribeChat(() => {
+      throw replayFailure;
+    });
+
+    expect(
+      await subscription.then(
+        () => null,
+        (error: unknown) => error
+      )
+    ).toBe(replayFailure);
+    expect(chatListeners()).toBe(baseline);
+  });
+
   test("many idle waiters trip no leak warning and each releases its listener when it finishes", async () => {
     const { harness, warnings, chatListeners } = await setup();
     const service = createWorkspaceServiceForTest({

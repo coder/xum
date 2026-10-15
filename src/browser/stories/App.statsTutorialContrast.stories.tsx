@@ -8,7 +8,7 @@
  * foreground color on hover, measured in the PR that added these stories.
  */
 
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";

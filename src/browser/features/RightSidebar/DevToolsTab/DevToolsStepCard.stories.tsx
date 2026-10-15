@@ -1,4 +1,4 @@
-import { waitFor, within } from "@storybook/test";
+import { waitFor, within } from "storybook/test";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import type { DevToolsStep } from "@/common/types/devtools";
 import { PIXEL_DISABLED, StoryUiShell } from "@/browser/stories/meta";

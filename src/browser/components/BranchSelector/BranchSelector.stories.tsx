@@ -1,4 +1,4 @@
-import { expect, fn, waitFor, within } from "@storybook/test";
+import { expect, fn, waitFor, within } from "storybook/test";
 import { PIXEL_DISABLED, appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
 import { createGitStatusExecutor } from "@/browser/stories/helpers/git";
 import {
