@@ -27,9 +27,10 @@ type ForeignToolListKey = (typeof FOREIGN_TOOL_LIST_KEYS)[number];
 /**
  * Claude Code tool names (code.claude.com/docs/en/tools-reference) mapped to
  * Xum tool patterns, separately for each list:
- * - `allow` (in `tools`) grants only Xum tools that do the same narrow job. A
- *   Xum tool that also does more (todo_write replaces the whole checklist,
- *   heartbeat also deletes schedules) is never granted for a narrower name.
+ * - `allow` (in `tools`) grants Xum tools only for the core tools, where the
+ *   Xum tools do the same job and no more. Every other name grants nothing:
+ *   its Xum tools do more than the Claude tool (todo_write replaces the whole
+ *   checklist, task_send_message reaches workspaces outside the agent tree).
  * - `deny` (in `disallowedTools`) removes every Xum tool that can do the job,
  *   so several names share one family: denying Write also removes Edit.
  */
@@ -50,11 +51,10 @@ const denyOnly = (patterns: readonly string[]): ClaudeToolMapping => ({
 const NONE = same([]);
 
 const BASH_TOOLS = ["bash", "bash_output", "bash_background_.*"];
-const EDIT: ClaudeToolMapping = {
-  allow: ["file_edit_.*"],
-  // Every tool that changes workspace files, as Explore's read-only list removes them.
-  deny: ["file_edit_.*", "image_.*", "task_apply_git_patch"],
-};
+// Every tool that changes workspace files, as Explore's read-only list removes them.
+const FILE_CHANGE_TOOLS = ["file_edit_.*", "image_.*", "task_apply_git_patch"];
+// Edit changes existing files only: file_edit_insert also creates files, as Write does.
+const EDIT: ClaudeToolMapping = { allow: ["file_edit_replace_.*"], deny: FILE_CHANGE_TOOLS };
 const WORKFLOW_TOOLS = ["workflow_run", "workflow_resume"];
 const AGENT: ClaudeToolMapping = {
   // Spawning a sub-agent and waiting for its report; the other task tools
@@ -64,17 +64,17 @@ const AGENT: ClaudeToolMapping = {
   deny: ["task", "task_.*", ...WORKFLOW_TOOLS],
 };
 const CHECKLIST_WRITE = denyOnly(["todo_write"]);
-const CHECKLIST_READ = same(["todo_read"]);
+const CHECKLIST_READ = denyOnly(["todo_read"]);
 const SCHEDULE = denyOnly(["heartbeat"]);
 
 const CLAUDE_TOOLS: Readonly<Record<string, ClaudeToolMapping>> = {
   // attach_file also reads files (images, PDFs), as Claude Code's Read does.
   Read: same(["file_read", "attach_file"]),
   Edit: EDIT,
-  Write: EDIT,
   MultiEdit: EDIT,
+  Write: { allow: ["file_edit_.*"], deny: FILE_CHANGE_TOOLS },
   // NotebookEdit edits only notebook cells; Xum's edit tools change any file.
-  NotebookEdit: denyOnly(EDIT.deny),
+  NotebookEdit: denyOnly(FILE_CHANGE_TOOLS),
   Bash: same(BASH_TOOLS),
   // url_context (Gemini) and web_search/google_search/x_search are provider-native
   // tools. MCP naming reserves only Xum's own tool names, so an MCP tool can
@@ -90,14 +90,17 @@ const CLAUDE_TOOLS: Readonly<Record<string, ClaudeToolMapping>> = {
   // Claude Code renamed Task to Agent and keeps Task as an alias.
   Agent: AGENT,
   Task: AGENT,
-  TaskStop: same(["task_stop", "bash_background_terminate"]),
-  SendMessage: same(["task_send_message", "task_message_parent", "task_message_sibling"]),
-  ListAgents: same(["task_list"]),
-  Skill: same(["agent_skill_read", "agent_skill_read_file", "agent_skill_list"]),
-  ToolSearch: same(["tool_catalog_search"]),
-  // Artifact only publishes; artifact_list/artifact_read also read pinned shelves.
-  Artifact: { allow: ["artifact"], deny: ["artifact", "artifact_list", "artifact_read"] },
-  PushNotification: same(["notify"]),
+  // The Xum tools for these do more than the Claude tool, so they are denylist-only.
+  // task_stop and task_send_message/task_list reach outside the agent tree.
+  TaskStop: denyOnly(["task_stop", "bash_background_terminate"]),
+  SendMessage: denyOnly(["task_send_message", "task_message_parent", "task_message_sibling"]),
+  ListAgents: denyOnly(["task_list"]),
+  // TaskOutput read background task output, as task_await and bash_output do.
+  TaskOutput: denyOnly(["task_await", "bash_output"]),
+  Skill: denyOnly(["agent_skill_read", "agent_skill_read_file", "agent_skill_list"]),
+  ToolSearch: denyOnly(["tool_catalog_search"]),
+  Artifact: denyOnly(["artifact", "artifact_list", "artifact_read"]),
+  PushNotification: denyOnly(["notify"]),
   // Claude Code removes these from every sub-agent.
   AskUserQuestion: denyOnly(["ask_user_question"]),
   EnterPlanMode: denyOnly(["propose_plan"]),
@@ -124,7 +127,6 @@ const CLAUDE_TOOLS: Readonly<Record<string, ClaudeToolMapping>> = {
   SendUserFile: NONE,
   ShareOnboardingGuide: NONE,
   SubagentHandback: NONE,
-  TaskOutput: NONE,
   WaitForMcpServers: NONE,
 };
 

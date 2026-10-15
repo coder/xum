@@ -165,6 +165,7 @@ Body
         "file_read",
         "attach_file",
         "file_edit_insert",
+        "file_edit_replace_string",
         "bash",
         "bash_output",
         "task",
@@ -198,26 +199,28 @@ Body
         "file_read",
         "attach_file",
         "file_edit_insert",
+        "file_edit_replace_string",
         "task",
         "task_await",
         "todo_write",
         "todo_read",
       ]);
-      // A Claude tool grants only the Xum tools that do the same narrow job: Artifact
-      // publishes but does not read shelves, TaskCreate cannot get todo_write (it
-      // replaces the whole list), and provider-native names are never granted.
-      expect(toolsOf("name: a\ntools: Artifact, TaskCreate, Read")).toEqual([
+      // Edit changes existing files only: file_edit_insert also creates files, as Write does.
+      expect(toolsOf("name: a\ntools: Edit, Read")).toEqual([
         "file_read",
         "attach_file",
-        "artifact",
+        "file_edit_replace_string",
       ]);
-      expect(toolsOf("name: a\ntools: WebFetch, WebSearch")).toEqual(["web_fetch"]);
-      // A read-only Claude tool grants only the read-only Xum tool.
-      expect(toolsOf("name: a\ntools: TaskList, Read")).toEqual([
+      // Outside the core tools a name grants nothing, because its Xum tools do more than
+      // the Claude tool (Artifact would read pinned shelves, TaskCreate would replace the
+      // whole checklist). Provider-native names are never granted (MCP can reuse them).
+      expect(toolsOf("name: a\ntools: Artifact, TaskCreate, TaskList, WebSearch, Read")).toEqual([
         "file_read",
         "attach_file",
-        "todo_read",
       ]);
+      expect(toolsOf("name: a\ntools: WebFetch")).toEqual(["web_fetch"]);
+      // TaskOutput read background output, as task_await and bash_output do.
+      expect(toolsOf("name: a\ndisallowedTools: TaskOutput")).not.toContain("task_await");
       // A comma inside a specifier does not split the entry; Agent does not grant workflows.
       expect(toolsOf("name: a\ntools: Agent(worker, researcher), Read")).toEqual([
         "file_read",
@@ -266,6 +269,8 @@ Body
         "name: a\ntools: CronList",
         // NotebookEdit edits only notebook cells; Xum's edit tools change any file.
         "name: a\ntools: NotebookEdit",
+        // task_send_message and task_list reach workspaces outside the agent tree.
+        "name: a\ntools: SendMessage, ListAgents",
       ]) {
         expect(() => parse(frontmatter, "plugin")).toThrow(AgentDefinitionParseError);
       }
