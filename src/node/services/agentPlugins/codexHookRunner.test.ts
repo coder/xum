@@ -498,6 +498,18 @@ describe("PreToolUse", () => {
     expect(deniedCtx.executed).toBe(false);
     expect(JSON.stringify(deniedCtx.blocked?.result)).not.toContain(secret);
     expect(JSON.stringify(deniedCtx.blocked?.result)).toContain("(fields: script)");
+    // A later rewrite Xum cannot apply keeps the earlier note too (Codex PRRT_kwDOPxxmWM6s5BSD).
+    const badAfter = setup([hook("PreToolUse"), hook("PreToolUse")], () =>
+      badAfter.calls.length === 1
+        ? rewrite("allow", { command: "ls" })
+        : rewrite("allow", { command: 1 })
+    );
+    const badCtx = await runTool(badAfter.spine, "bash", { script: "x" }, schema);
+    expect(badCtx.blocked?.result).toEqual({
+      error:
+        "Tool call blocked by plugin 'guard' hook: its rewrite of this call does not match the tool's input.",
+      hook_output: "[plugin:guard] Rewrote this tool call's input (fields: script).",
+    });
     // A rewrite that does not match the schema is denied too: the guard allowed only the
     // rewritten call (Codex PRRT_kwDOPxxmWM6rb3ih).
     for (const [output, toolSchema] of [

@@ -384,11 +384,7 @@ async function applyUpdatedInput(
     // original arguments would silently bypass a guard that redirects the call (Codex
     // PRRT_kwDOPxxmWM6rRKxR).
     warn(registration, hook, "returned updatedInput, but the tool has no input schema to check it");
-    ctx.blocked = {
-      result: {
-        error: `Tool call blocked by plugin '${registration.pluginName}' hook: Xum cannot check its rewrite of this call.`,
-      },
-    };
+    blockRewrite(ctx, "Xum cannot check its rewrite of this call.", notes, registration);
     return;
   }
   // The tool's own parser too, when it has one: the JSON schema omits Zod refinements and
@@ -402,16 +398,33 @@ async function applyUpdatedInput(
     // arguments would bypass it (a mux.load guard that narrows a read to a range, Codex
     // PRRT_kwDOPxxmWM6rb3ih).
     warn(registration, hook, "returned updatedInput that does not match the tool's input schema");
-    ctx.blocked = {
-      result: {
-        error: `Tool call blocked by plugin '${registration.pluginName}' hook: its rewrite of this call does not match the tool's input.`,
-      },
-    };
+    blockRewrite(
+      ctx,
+      "its rewrite of this call does not match the tool's input.",
+      notes,
+      registration
+    );
     return;
   }
   const note = rewriteNote(schema, ctx.args, parsed.value);
   if (note !== undefined) notes.push(note);
   ctx.args = parsed.value;
+}
+
+/**
+ * Deny a call whose rewrite Xum cannot apply. The notes so far (an earlier hook's rewrite note and
+ * context) stay on the result, as for an explicit deny (Codex PRRT_kwDOPxxmWM6s5BSD).
+ */
+function blockRewrite(
+  ctx: ToolExecuteContext,
+  reason: string,
+  notes: string[],
+  registration: CodexHookRegistration
+): void {
+  const result = {
+    error: `Tool call blocked by plugin '${registration.pluginName}' hook: ${reason}`,
+  };
+  ctx.blocked = { result: notes.length > 0 ? annotate(result, notes, registration) : result };
 }
 
 /**
