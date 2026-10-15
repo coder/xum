@@ -536,6 +536,18 @@ describe("overview stability across MCP tool refetches", () => {
     expect(linearOnly.description).not.toContain("notion");
   });
 
+  test("the memo is replaced when a server drops to the listed count, kept when it grows past it", () => {
+    const memo: ToolCatalogOverviewMemo = {};
+    const nine = refetch({ notion: notion(9) }, memo);
+    expect(nine.description).toContain(", and more");
+    // Only the unlisted 9th tool goes: every listed name stays, but "and more" is now false.
+    const eight = refetch({ notion: notion(8) }, memo);
+    expect(eight.description).not.toContain(", and more");
+    expect(eight.description).toContain("notion_tool_07");
+    // Growing past the listed count leaves the line incomplete, not false: it is kept.
+    expect(refetch({ notion: notion(9) }, memo).description).toBe(eight.description);
+  });
+
   test("a reused overview is still stripped, not stacked, on a rebuild", () => {
     const memo: ToolCatalogOverviewMemo = {};
     const first = refetch({ notion: notion(12) }, memo);

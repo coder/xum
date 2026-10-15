@@ -365,6 +365,8 @@ export interface ToolCatalogOverview {
   servers: readonly string[];
   /** The tool names its lines list. */
   listedToolNames: readonly string[];
+  /** Servers whose line ends in ", and more" (more tools than it lists). */
+  overflowedServers: readonly string[];
 }
 
 /**
@@ -395,6 +397,7 @@ function buildOverview(catalog: readonly ToolCatalogEntry[]): ToolCatalogOvervie
   const servers = groupCatalogByServer(catalog);
   const lines: string[] = [];
   const listedToolNames: string[] = [];
+  const overflowedServers: string[] = [];
   let usedChars = OVERVIEW_HEADER.length + OVERVIEW_END_MARKER.length;
   let omittedServers = 0;
   for (const [server, names] of servers) {
@@ -416,6 +419,7 @@ function buildOverview(catalog: readonly ToolCatalogEntry[]): ToolCatalogOvervie
     usedChars += line.length + 1;
     lines.push(line);
     listedToolNames.push(...shown);
+    if (suffix.length > 0) overflowedServers.push(server);
   }
   if (omittedServers > 0) {
     lines.push(
@@ -426,6 +430,7 @@ function buildOverview(catalog: readonly ToolCatalogEntry[]): ToolCatalogOvervie
     text: `${OVERVIEW_HEADER}\n${lines.join("\n")}\n${OVERVIEW_END_MARKER}`,
     servers: servers.map(([server]) => server),
     listedToolNames,
+    overflowedServers,
   };
 }
 
@@ -444,16 +449,23 @@ export function buildToolCatalogOverview(catalog: readonly ToolCatalogEntry[]): 
 /**
  * A previous overview stays valid while the catalog has the same servers and
  * still holds every tool it lists: it then names no missing tool or server,
- * and the omitted-server count is unchanged. A tool added since is not
- * listed, but search still finds it (search reads the live catalog).
+ * and the omitted-server count is unchanged. Each ", and more" must stay
+ * true too: a server that drops to the listed count gets a fresh line. A tool
+ * added since is not listed (nor is a server that grows past the listed count
+ * marked "and more"): that leaves the overview incomplete, not false, and
+ * search still finds the tool (search reads the live catalog).
  */
 function canReuseOverview(
   previous: ToolCatalogOverview,
   catalog: readonly ToolCatalogEntry[]
 ): boolean {
-  const servers = groupCatalogByServer(catalog).map(([server]) => server);
-  if (servers.length !== previous.servers.length) return false;
-  if (servers.some((server, index) => server !== previous.servers[index])) return false;
+  const grouped = groupCatalogByServer(catalog);
+  if (grouped.length !== previous.servers.length) return false;
+  if (grouped.some(([server], index) => server !== previous.servers[index])) return false;
+  const toolCounts = new Map(grouped.map(([server, names]) => [server, names.length]));
+  const stillOverflows = (server: string) =>
+    (toolCounts.get(server) ?? 0) > OVERVIEW_MAX_TOOLS_PER_SERVER;
+  if (!previous.overflowedServers.every(stillOverflows)) return false;
   const names = new Set(catalog.map((entry) => entry.name));
   return previous.listedToolNames.every((name) => names.has(name));
 }
