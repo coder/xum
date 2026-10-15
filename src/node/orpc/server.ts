@@ -72,6 +72,15 @@ import {
   PRECOMPRESSED_ENCODINGS,
 } from "@/node/orpc/staticAssets";
 import { getAppProxyBasePathFromPathname, stripAppProxyBasePath } from "@/common/appProxyBasePath";
+import {
+  readWorkspaceViewMode,
+  toWorkspaceViewRows,
+  workspaceViewEarlyScript,
+  WORKSPACE_VIEW_DATA_ID,
+  WORKSPACE_VIEW_MAX_ROWS,
+  WORKSPACE_VIEW_MODULES_ID,
+  type WorkspaceViewData,
+} from "@/node/orpc/workspaceFirstView";
 
 type AliveWebSocket = WebSocket & { isAlive?: boolean };
 
@@ -233,6 +242,37 @@ function injectFirstRunView(html: string, isAppRoot: boolean): string {
   return deferred.html
     .replace(/<base\b[^>]*>/i, (base) => base + head)
     .replace(/<\/body>/i, (end) => template + end);
+}
+
+// THROWAWAY prototype (T3 #5971 C step 4, P2): built once, the early script holds the chrome tree.
+const WORKSPACE_VIEW_SCRIPTS = {
+  fetch: workspaceViewEarlyScript("fetch"),
+  embed: workspaceViewEarlyScript("embed"),
+};
+
+/**
+ * THROWAWAY prototype (T3 #5971 C step 4, P2): on `/workspace/<id>`, JS-after-paint as on "/", plus
+ * the workspace early script, the embedded tail (embed mode, when the server read it) and the
+ * Geist Mono preload (the static code rows must paint in the live font, or the live LCP line
+ * wraps differently and becomes a later candidate).
+ */
+function injectWorkspaceView(
+  html: string,
+  mode: "fetch" | "embed",
+  data: WorkspaceViewData | null,
+  monoPreload: string
+): string {
+  const deferred = deferAppModules(html);
+  if (!deferred || !/<base\b[^>]*>/i.test(deferred.html)) return html;
+  const list = escapeJsonForHtmlScript(deferred.modules);
+  const embed =
+    mode === "embed" && data
+      ? `\n    <script type="application/json" id="${WORKSPACE_VIEW_DATA_ID}">${escapeJsonForHtmlScript(data)}</script>`
+      : "";
+  const head = `\n    <script type="application/json" id="${WORKSPACE_VIEW_MODULES_ID}">${list}</script>${embed}\n    <script>${WORKSPACE_VIEW_SCRIPTS[mode]}</script>`;
+  return deferred.html
+    .replace(/<base\b[^>]*>/i, (base) => base + head)
+    .replace(/<\/head>/i, (end) => monoPreload + end);
 }
 
 function getBrowserProxyUriTemplate(): string | null {
@@ -1069,6 +1109,8 @@ export async function createOrpcServer({
 
   let rawSpaIndexHtml: string | null = null;
   let firstViewFont: string | undefined;
+  let monoFont: string | undefined; // THROWAWAY prototype (P2 static view)
+  const workspaceViewMode = readWorkspaceViewMode(process.env);
 
   // Static file serving (optional)
   if (serveStatic) {
@@ -1082,6 +1124,9 @@ export async function createOrpcServer({
       )) {
         const css = await fs.readFile(path.join(staticDir, href), "utf8").catch(() => "");
         firstViewFont ??= findFirstViewFont(css);
+        monoFont ??= /@font-face\s*\{[^}]*font-family:\s*["']?Geist Mono["']?[^}]*url\(\s*["']?(?:\.\/)?([\w.-]+\.woff2)/.exec(
+          css
+        )?.[1];
       }
     } catch (error) {
       log.error("Failed to read index.html for SPA fallback:", error);
@@ -1646,7 +1691,34 @@ export async function createOrpcServer({
 
   // SPA fallback (optional, only for non-API routes)
   if (serveStatic) {
-    app.use((req, res, next) => {
+    // THROWAWAY prototype (P2 embed): the bounded tail, only for an authenticated request and a
+    // workspace id the server knows, checked before any history read. Any failure: no embed.
+    const readWorkspaceViewData = async (
+      req: express.Request
+    ): Promise<WorkspaceViewData | null> => {
+      try {
+        if (!(await isHttpRequestAuthenticated(req))) return null;
+        const workspaceId = decodeURIComponent(req.path.slice("/workspace/".length));
+        const info = await context.workspaceService.getInfo(workspaceId);
+        if (!info) return null;
+        const tail = await context.historyService.getHistoryWindowFromLatestBoundary(workspaceId, {
+          maxRows: WORKSPACE_VIEW_MAX_ROWS,
+          maxBytes: 256 * 1024,
+        });
+        if (!tail.success || tail.data.kind !== "window") return null;
+        return {
+          workspaceId,
+          title: info.title ?? info.name,
+          project: info.projectName,
+          rows: toWorkspaceViewRows(tail.data.messages),
+        };
+      } catch (error) {
+        log.warn("P2 prototype: no embedded tail", error);
+        return null;
+      }
+    };
+
+    app.use(async (req, res, next) => {
       // Don't swallow API/ORPC routes with index.html.
       if (req.path.startsWith("/orpc") || req.path.startsWith("/api")) {
         return next();
@@ -1679,13 +1751,16 @@ export async function createOrpcServer({
 
       if (rawSpaIndexHtml !== null) {
         const isAppRoot = shouldInjectSlashlessRootRedirect(req);
+        const wsMode = isWorkspaceRoute && workspaceViewMode !== "off" ? workspaceViewMode : null;
+        const wsData = wsMode === "embed" ? await readWorkspaceViewData(req) : null;
+        if (wsMode === "embed") res.vary("Cookie");
+        const withBase = injectBaseHref(rawSpaIndexHtml, getPublicBaseHref(req, res), {
+          includeSlashlessRootRedirect: isAppRoot,
+        });
         const spaIndexHtml = injectProxyUriTemplate(
-          injectFirstRunView(
-            injectBaseHref(rawSpaIndexHtml, getPublicBaseHref(req, res), {
-              includeSlashlessRootRedirect: isAppRoot,
-            }),
-            isAppRoot
-          ),
+          wsMode
+            ? injectWorkspaceView(withBase, wsMode, wsData, firstViewFontPreload(monoFont))
+            : injectFirstRunView(withBase, isAppRoot),
           getBrowserProxyUriTemplate()
         );
         varyPublicBasePathHeaders(res);
