@@ -202,32 +202,35 @@ async function runToolHooks(
     tool_input: view.toCodexInput(ctx.args),
   });
   const matchingPre = pre.filter((candidate) => matches(candidate, ctx.toolName, view));
-  using prePhase = startHookPhase(matchingPre, "PreToolUse", registration, ctx.abortSignal);
-  for (const hook of matchingPre) {
-    const output = await invoke(
-      hook,
-      toolEvent(),
-      "PreToolUse",
-      registration,
-      parsePreToolUseOutput,
-      { ...preCall, abortSignal: prePhase.signal }
-    );
-    if (ctx.abortSignal?.aborted) break;
-    if (output === null) continue;
-    if (output.denyReason !== undefined) {
-      // Codex keeps the context of a blocking PreToolUse, and of the hooks before it.
+  {
+    // Scoped to the hooks: the deadline must not run on into the tool call itself.
+    using prePhase = startHookPhase(matchingPre, "PreToolUse", registration, ctx.abortSignal);
+    for (const hook of matchingPre) {
+      const output = await invoke(
+        hook,
+        toolEvent(),
+        "PreToolUse",
+        registration,
+        parsePreToolUseOutput,
+        { ...preCall, abortSignal: prePhase.signal }
+      );
+      if (ctx.abortSignal?.aborted) break;
+      if (output === null) continue;
+      if (output.denyReason !== undefined) {
+        // Codex keeps the context of a blocking PreToolUse, and of the hooks before it.
+        if (output.additionalContext !== undefined) notes.push(output.additionalContext);
+        const result = {
+          error: `Tool call blocked by plugin '${registration.pluginName}' hook: ${output.denyReason}`,
+        };
+        ctx.blocked = { result: notes.length > 0 ? annotate(result, notes, registration) : result };
+        return;
+      }
+      if (output.updatedInput !== undefined) {
+        applyUpdatedInput(ctx, output.updatedInput, view, registration, hook);
+        if (ctx.blocked) return;
+      }
       if (output.additionalContext !== undefined) notes.push(output.additionalContext);
-      const result = {
-        error: `Tool call blocked by plugin '${registration.pluginName}' hook: ${output.denyReason}`,
-      };
-      ctx.blocked = { result: notes.length > 0 ? annotate(result, notes, registration) : result };
-      return;
     }
-    if (output.updatedInput !== undefined) {
-      applyUpdatedInput(ctx, output.updatedInput, view, registration, hook);
-      if (ctx.blocked) return;
-    }
-    if (output.additionalContext !== undefined) notes.push(output.additionalContext);
   }
   // The user cancelled while a hook ran: the tool must not start after the cancel.
   if (ctx.abortSignal?.aborted) {

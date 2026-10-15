@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { log } from "@/node/services/log";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -421,6 +422,29 @@ describe("PreToolUse", () => {
     const ctx = await runTool(spine, "bash", {});
     expect(performance.now() - started).toBeLessThan(300);
     expect(ctx.executed).toBe(true); // a stalled hook fails open
+  });
+
+  test("the shared deadline ends with the hooks, not with the tool call", async () => {
+    // Codex PRRT_kwDOPxxmWM6s3OZo: a tool that runs past the hooks' deadline is no hook overrun.
+    const { spine } = setup([hook("PreToolUse", { timeoutSeconds: 0.05 })], () => null);
+    const warn = spyOn(log, "warn");
+    try {
+      const ctx: ToolExecuteContext = {
+        toolName: "bash",
+        args: {},
+        host: { runtime: new LocalRuntime("/tmp"), runtimeTempDir: "/tmp", cwd: "/w", workspaceId },
+        executed: false,
+      };
+      await spine.run("tool.execute", ctx, async (c) => {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        c.executed = true;
+      });
+      expect(warn.mock.calls.filter(([message]) => String(message).includes("deadline"))).toEqual(
+        []
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test("the event carries the session cwd", async () => {
