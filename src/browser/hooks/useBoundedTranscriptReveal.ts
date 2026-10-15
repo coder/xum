@@ -118,6 +118,11 @@ interface RevealState {
   tailIds: readonly string[];
   /** A held reader left this attached slice past the cap (see `resolveSliceEnd`). */
   keptPastCap: boolean;
+  /**
+   * The automatic step stopped at the cap before a bundle too large for the room left: the reveal
+   * is paused, and the next Load older press walks to a target, which may pass the cap.
+   */
+  capBlocked: boolean;
 }
 
 /**
@@ -154,14 +159,20 @@ function nearestSafeCutAtOrAfter(index: number, length: number, isSafeCut: IsSaf
 }
 
 /** A detached slice's stored end: its first unmounted row survives deleted mounted rows. */
-function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCut: IsSafeCut) {
+function storedSliceEnd(
+  state: RevealState,
+  rows: readonly RevealRow[],
+  isSafeCut: IsSafeCut,
+  /** Where the end goes from its row's index; the vanished-start fallback keeps the index. */
+  nearest: (index: number, length: number, isSafeCut: IsSafeCut) => number = nearestSafeCutAtOrAfter
+) {
   const { endMessageId: id, endIndexHint: hint, endRows } = state;
   if (id === null) return rows.length;
   const found = rows[hint]?.id === id ? hint : rows.findIndex((row) => row.id === id);
+  if (found === -1) return endAtNearestUnmountedRow(rows, endRows, isSafeCut);
   // A regroup that puts the end row inside a bundle moves the end forward: no mounted row
   // unmounts (cap rule); the bundle mounts whole.
-  if (found !== -1) return nearestSafeCutAtOrAfter(found, rows.length, isSafeCut);
-  return endAtNearestUnmountedRow(rows, endRows, isSafeCut);
+  return nearest(found, rows.length, isSafeCut);
 }
 
 /**
@@ -429,7 +440,9 @@ function autoStepState(
       snapshot.stepInputs
     )
   );
-  if (cut > 0 && cut >= snapshot.fromIndex) return previous; // At the cap: the step stops.
+  // Blocked by the cap: a zero budget pauses the reveal (see capBlocked).
+  if (cut > 0 && cut >= snapshot.fromIndex)
+    return { ...previous, capBlocked: true, autoRowLimit: 0 };
   if (cut === 0) return withStartAt(previous, snapshot.messages, 0);
   return { ...previous, anchorMessageId: snapshot.messages[cut].id, anchorIndexHint: cut };
 }
@@ -453,6 +466,17 @@ function cappedStepCut(
  * the walk ends at the row one budget older (revealThrough's target rule) instead of a count, so
  * no deletion elsewhere can lengthen it (F20 PR3a-2); a vanished target ends it early.
  */
+/** A Load older press adds a budget (main's rule): no cap, or attached, within it, not blocked. */
+function pressFitsBudget(
+  state: RevealState,
+  snapshot: RevealSnapshot,
+  max: number | undefined,
+  limit: number
+): boolean {
+  if (max === undefined) return true;
+  return snapshot.toIndex === snapshot.messages.length && limit <= max && !state.capBlocked;
+}
+
 function revealMoreState(
   previous: RevealState,
   snapshot: RevealSnapshot,
@@ -462,7 +486,7 @@ function revealMoreState(
   if (previous.generation !== snapshot.generation) return previous;
   const length = snapshot.messages.length;
   const limit = length - snapshot.fromIndex + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS;
-  if (max === undefined || (snapshot.toIndex === length && limit <= max)) {
+  if (pressFitsBudget(previous, snapshot, max, limit)) {
     return previous.autoRowLimit >= limit ? previous : { ...previous, autoRowLimit: limit };
   }
   if (snapshot.fromIndex === 0) return previous;
@@ -471,7 +495,7 @@ function revealMoreState(
     length,
     isSafeCut
   );
-  return { ...previous, targetMessageId: snapshot.messages[cut].id };
+  return { ...previous, targetMessageId: snapshot.messages[cut].id, capBlocked: false };
 }
 
 /**
@@ -487,7 +511,8 @@ function vanishedStartFallback(
 ): number {
   if (state.endMessageId === null) return state.anchorIndexHint;
   const mountedBefore = state.endIndexHint - state.anchorIndexHint;
-  return storedSliceEnd(state, messages, isSafeCut) - mountedBefore;
+  // The end row's own index: a safe cut before any regroup in this update (#6742 review).
+  return storedSliceEnd(state, messages, isSafeCut, (index) => index) - mountedBefore;
 }
 
 interface TailAppend {
@@ -686,6 +711,7 @@ function startState<Row extends RevealRow>(
     tailBundleHeadId: null,
     tailIds: newestIds(messages),
     keptPastCap: false,
+    capBlocked: false,
   };
   const cut = nextStepCut(length, TRANSCRIPT_REVEAL_TAIL_ROWS, inputs);
   if (cut === 0) return { ...base, anchorMessageId: null, anchorIndexHint: 0 };
@@ -817,8 +843,10 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       setState(current);
     }
   }
+  // A fully revealed capped start is never paused (#6742 review): Load older must fetch history.
+  const isFullyRevealed = isFullyRevealedAt(current.anchorMessageId, max, fromIndex);
   const isRevealPaused =
-    current.anchorMessageId !== null &&
+    !isFullyRevealed &&
     current.targetMessageId === null &&
     isBudgetSpent(current, { messages: args.messages, fromIndex, toIndex });
 
@@ -845,7 +873,6 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   const scheduleFrame = transcriptRevealFrameScheduler.schedule;
 
   const anchorMessageId = current.anchorMessageId;
-  const isFullyRevealed = isFullyRevealedAt(anchorMessageId, max, fromIndex);
   const generation = current.generation;
   const workspaceId = args.workspaceId;
   useEffect(() => {

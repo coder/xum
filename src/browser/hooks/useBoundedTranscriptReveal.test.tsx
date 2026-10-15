@@ -709,7 +709,10 @@ describe("useBoundedTranscriptReveal", () => {
       // The automatic reveal stops at the cap (cap rule): mounting the 1,500-row bundle alone
       // would unmount the tail under a reader at the bottom. A request mounts it whole, alone.
       runFrames();
-      expect(reveal()).toMatchObject({ fromIndex: 4500, toIndex: 4800 });
+      expect(reveal()).toMatchObject({ fromIndex: 4500, toIndex: 4800, isRevealPaused: true });
+      act(() => reveal().revealMore()); // #6742 review: Load older shows, and a press mounts it.
+      runFrames();
+      expect(reveal()).toMatchObject({ fromIndex: 3000, toIndex: 4500 });
       act(() => reveal().revealThrough(2000));
       expect(reveal()).toMatchObject({ fromIndex: 1500, toIndex: 3000 });
       act(() => reveal().revealNewer());
@@ -912,7 +915,8 @@ describe("useBoundedTranscriptReveal", () => {
           expect(reveal()).toMatchObject({ toIndex: messages.length, isDetached: false });
           expect(reveal().toIndex - reveal().fromIndex).toBe(CAP);
         };
-        const harness = { reveal, mounted, set, append, atCap, stats, joined };
+        const pending = () => frames.hasPending();
+        const harness = { reveal, mounted, set, append, atCap, stats, joined, pending };
         return { ...harness, messages: () => messages, followsTail: () => followsTail };
       }
 
@@ -954,6 +958,22 @@ describe("useBoundedTranscriptReveal", () => {
         subset(before, slice.mounted());
         const oldStart = slice.messages().findIndex((row) => row.id === before[0]);
         expect(slice.reveal().fromIndex).toBeLessThan(oldStart);
+      });
+
+      // #6742 review (Codex's case). Main's fallback can still over-reach by the deleted mounted
+      // rows (#6669 round 7); that is tracked as a part 2b precondition (startRows).
+      test("held, one update that deletes the start row and regroups the end keeps the survivors", () => {
+        const slice = grouped();
+        slice.atCap();
+        slice.set({ followsTail: false });
+        slice.append(15, () => false); // Past the cap: the slice detaches at the first new row.
+        const before = slice.mounted();
+        const { toIndex } = slice.reveal();
+        expect(slice.reveal().isDetached).toBe(true);
+        // The end row and the 9 rows after it join the bundle before them, and the start row goes.
+        for (const row of slice.messages().slice(toIndex, toIndex + 10)) slice.joined.add(row.id);
+        slice.set({ messages: slice.messages().filter((row) => row.id !== before[0]) });
+        subset(before.slice(1), slice.mounted());
       });
 
       test("held, deleting only the newest rows keeps the start; new rows replacing them restart", () => {
@@ -1015,6 +1035,9 @@ describe("useBoundedTranscriptReveal", () => {
             else slice.joined.add(row);
           }
           slice.set({});
+          // Liveness (#6742 review): after the frames, fully revealed or paused, never stuck.
+          const { fromIndex: start, isRevealPaused: paused } = slice.reveal();
+          expect(slice.pending() || (start === 0 ? !paused : paused)).toBe(true);
           if (kind === 5 || kind === 6) continue;
           const ids = slice.messages().map((row) => row.id);
           const { fromIndex: from, toIndex: to } = slice.reveal();
