@@ -4189,6 +4189,9 @@ export class AgentPluginInstallService {
   private async readPendingSignOuts(): Promise<string[]> {
     try {
       const file = this.pendingSignOutsFile;
+      // Callers hold the plugin lock: readFile on a FIFO would block the pass and the update.
+      if (!(await fsPromises.stat(file)).isFile())
+        throw new Error(unusableRecordReason({ code: "not a regular file" }, shortenHome(file)));
       return parsePendingSignOuts(await fsPromises.readFile(file, "utf-8"), file);
     } catch (error) {
       if (hasErrorCode(error, "ENOENT")) return [];
@@ -4274,15 +4277,25 @@ export class AgentPluginInstallService {
     deadline: number
   ): Promise<boolean> {
     if (!(await this.settleInFlightSignOut(name, serverUrl, deadline))) return false;
-    return this.signOutPluginServer(name, serverUrl);
+    return this.signOutPluginServer(name, serverUrl, deadline);
   }
 
-  private async signOutPluginServer(name: string, serverUrl: string): Promise<boolean> {
-    const result = await this.mcpOauthService?.logout({ serverUrl });
-    if (result?.success === true) return true;
+  private async signOutPluginServer(
+    name: string,
+    serverUrl: string,
+    deadline: number
+  ): Promise<boolean> {
+    const oauth = this.mcpOauthService;
+    // Bounded and registered like a pass's logout (#6627): a hung one must not hold the plugin
+    // lock, and a later pass waits for it instead of starting a second logout.
+    const failure =
+      oauth === undefined
+        ? "sign-in service unavailable"
+        : await signOutFailure(oauth, serverUrl, deadline, this.inFlightSignOuts);
+    if (failure === undefined) return true;
     log.warn("Could not sign out a plugin MCP server after its sign-in changed", {
       plugin: name,
-      error: result?.error ?? "sign-in service unavailable",
+      error: failure,
     });
     return false;
   }
