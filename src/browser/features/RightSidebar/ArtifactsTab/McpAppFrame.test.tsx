@@ -11,7 +11,7 @@ import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import assert from "@/common/utils/assert";
-import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
+import type { McpAppView, McpAppViewDomains } from "@/common/orpc/schemas/mcpApps";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
 import {
@@ -53,6 +53,9 @@ let widgetStateBinding: string | null = null;
 let widgetStateWrites: Array<{ binding: string; state: unknown }> = [];
 // When set, setWidgetState answers only once it settles (a write in flight).
 let widgetStateWriteGate: Promise<void> | null = null;
+// The approved list getView returns, and the live follow's reads (null: they never settle).
+let viewApprovedDomains: string[] | undefined;
+let followRead: (() => Promise<{ revision: number; approvals: McpAppViewDomains[] }>) | null = null;
 let toolCalls: Array<{
   serverName: string;
   toolName: string;
@@ -62,7 +65,22 @@ let toolCalls: Array<{
 
 function serverApi(): TestApiOverrides<APIClient> {
   return {
+    config: {
+      // A stream with no changes: the follow reads once when it opens.
+      onConfigChanged: (_input: unknown, options?: { signal?: AbortSignal }) =>
+        Promise.resolve({
+          [Symbol.asyncIterator]: () => ({
+            next: () =>
+              new Promise<{ done: true; value: undefined }>((resolve) =>
+                options?.signal?.addEventListener("abort", () =>
+                  resolve({ done: true, value: undefined })
+                )
+              ),
+          }),
+        }),
+    },
     mcpApps: {
+      readViewDomains: () => (followRead ?? (() => new Promise<never>(() => undefined)))(),
       getView: async () => {
         await getViewGate;
         return Promise.resolve({
@@ -75,6 +93,7 @@ function serverApi(): TestApiOverrides<APIClient> {
             result: { content: [] },
             invocation,
             approvalProjectPath,
+            approvedDomains: viewApprovedDomains,
             widgetState,
             widgetStateBinding,
             // Read now, like the backend: newer than every list published so far.
@@ -288,6 +307,8 @@ describe("McpAppFrame", () => {
     widgetStateWrites = [];
     widgetStateWriteGate = null;
     getViewGate = null;
+    viewApprovedDomains = undefined;
+    followRead = null;
     toolCalls = [];
     // Desktop mode by default: the preload bridge exists (isDesktopMode). Browser tests delete it.
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -373,6 +394,25 @@ describe("McpAppFrame", () => {
     approvalProjectPath = "/work/alpha";
     const { view } = await renderFrame();
     expect(view.getByRole("alert").textContent).toContain("alpha");
+  });
+
+  // #6181: a Revoke in another window or process reaches a mounted view through the follow.
+  test("a revoke that the live follow reads drops the origin from the mounted view's CSP", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    viewApprovedDomains = ["https://api.example.com"];
+    let releaseRead: () => void = () => undefined;
+    const readGate = new Promise<void>((resolve) => (releaseRead = resolve));
+    followRead = async () => {
+      await readGate;
+      return { revision: ++revision, approvals: [] };
+    };
+    const { view } = await renderFrame();
+    const srcdoc = () => view.getByTestId("mcp-app-frame").getAttribute("srcdoc") ?? "";
+    expect(srcdoc()).toContain("connect-src https://api.example.com");
+
+    act(() => releaseRead());
+    await waitFor(() => expect(srcdoc()).not.toContain("https://api.example.com"));
   });
 
   test("an approval applies at once to every mounted view of the same server", async () => {
@@ -1007,6 +1047,8 @@ describe("McpAppFrame host strips", () => {
     invocation = null;
     viewCsp = {};
     getViewGate = null;
+    viewApprovedDomains = undefined;
+    followRead = null;
     toolCalls = [];
     // Desktop mode: the preload bridge exists (isDesktopMode).
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
