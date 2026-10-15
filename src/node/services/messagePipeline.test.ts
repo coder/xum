@@ -1021,6 +1021,43 @@ describe("prepareMessagesForProvider: MCP tool results", () => {
     return outputs;
   }
 
+  /** The tool-result outputs in request order, for one assistant row per entry of `rows`. */
+  async function replayedOutputsByOrder(
+    rows: Array<Array<{ id: string; output: unknown; mcp: boolean }>>
+  ): Promise<unknown[]> {
+    const history: MuxMessage[] = [];
+    rows.forEach((calls, index) => {
+      history.push(
+        createMuxMessage(`user-${index}`, "user", "Fetch the page.", {
+          historySequence: index * 2 + 1,
+        })
+      );
+      const assistant = createMuxMessage(`assistant-${index}`, "assistant", "", {
+        historySequence: index * 2 + 2,
+      });
+      assistant.parts = calls.map((call) => ({
+        type: "dynamic-tool" as const,
+        toolCallId: call.id,
+        toolName: "notion_fetch",
+        input: {},
+        state: "output-available" as const,
+        output: call.output,
+        ...(call.mcp ? { mcpServer } : {}),
+      }));
+      history.push(assistant);
+    });
+    history.push(createMuxMessage("user-last", "user", "Thanks.", { historySequence: 99 }));
+    const messages = await prepareMessagesForProvider({
+      ...options,
+      messagesWithSentinel: history,
+    });
+    return messages.flatMap((message) =>
+      message.role === "tool"
+        ? message.content.flatMap((part) => (part.type === "tool-result" ? [part.output] : []))
+        : []
+    );
+  }
+
   it("converts only the calls marked as MCP, even under a shared tool name", async () => {
     const content = { content: [{ type: "text", text: "page body" }] };
     const outputs = await replayedOutputs([
@@ -1032,6 +1069,18 @@ describe("prepareMessagesForProvider: MCP tool results", () => {
       value: [{ type: "text", text: "page body" }],
     });
     expect(outputs["plain-call"]).toMatchObject({ type: "json", value: content });
+  });
+
+  it("keeps an ordinary call that reuses an MCP call's ID in the JSON form", async () => {
+    const content = { content: [{ type: "text", text: "page body" }] };
+    const outputs = await replayedOutputsByOrder([
+      [{ id: "call-1", output: content, mcp: true }],
+      [{ id: "call-1", output: content, mcp: false }],
+    ]);
+    expect(outputs).toMatchObject([
+      { type: "content", value: [{ type: "text", text: "page body" }] },
+      { type: "json", value: content },
+    ]);
   });
 
   // Persisted output is unvalidated: one malformed MCP result must not fail every later send.
