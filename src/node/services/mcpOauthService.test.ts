@@ -2057,7 +2057,10 @@ describe("McpOauthService OAuth flows", () => {
     // Mounted Settings rows refresh on this signal, keyed like getAuthStatus.
     const keys: string[] = [];
     const unsubscribe = service.onInsufficientScope((key) => keys.push(key));
-    service.recordInsufficientScope({ serverUrl: "https://x.example/mcp/", scopes: ["files.write"] });
+    service.recordInsufficientScope({
+      serverUrl: "https://x.example/mcp/",
+      scopes: ["files.write"],
+    });
     expect(keys).toEqual(["https://x.example/mcp"]);
     unsubscribe();
     service.recordInsufficientScope({ serverUrl: "https://x.example/mcp", scopes: ["admin"] });
