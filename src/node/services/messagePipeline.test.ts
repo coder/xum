@@ -1083,6 +1083,15 @@ describe("prepareMessagesForProvider: MCP tool results", () => {
     ]);
   });
 
+  it("keeps an ordinary output that has the envelope's field name in the JSON form", async () => {
+    const lookalike = { mcpReplayOutput: { content: [{ type: "text", text: "x" }] } };
+    const outputs = await replayedOutputs([
+      { id: "mcp-call", output: { content: [] }, mcp: true },
+      { id: "plain-call", output: lookalike, mcp: false },
+    ]);
+    expect(outputs["plain-call"]).toMatchObject({ type: "json", value: lookalike });
+  });
+
   // Persisted output is unvalidated: one malformed MCP result must not fail every later send.
   it("replays a malformed MCP result as JSON instead of failing the request", async () => {
     const malformed = { content: [null] };

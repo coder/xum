@@ -6,17 +6,10 @@ import { mcpToModelOutput } from "@/node/services/mcpClient";
 
 type ModelOutput = ReturnType<NonNullable<Tool["toModelOutput"]>>;
 
-/** Request-only envelope that marks one persisted call's output as MCP (see prepareMcpReplay). */
+/** Request-only envelope around one persisted MCP call's output (see prepareMcpReplay). */
 interface McpReplayOutput {
   readonly mcpReplayOutput: unknown;
 }
-
-function isMcpReplayOutput(output: unknown): output is McpReplayOutput {
-  return typeof output === "object" && output !== null && MCP_REPLAY_MARK in output;
-}
-
-/** Holds the envelope's key, so a tool's own output field cannot be mistaken for it. */
-const MCP_REPLAY_MARK = "mcpReplayOutput" satisfies keyof McpReplayOutput;
 
 /** convertToModelMessages' own conversion for a tool without `toModelOutput`. */
 function defaultModelOutput(output: unknown): ModelOutput {
@@ -41,14 +34,19 @@ function replayMcpModelOutput(output: unknown): ModelOutput {
   }
 }
 
-/** Only `toModelOutput` is read by convertToModelMessages; the schema is a placeholder. */
-const MCP_REPLAY_TOOL: Tool = tool({
-  inputSchema: jsonSchema({ type: "object" }),
-  toModelOutput: ({ output }) =>
-    isMcpReplayOutput(output)
-      ? replayMcpModelOutput(output.mcpReplayOutput)
-      : defaultModelOutput(output),
-});
+/** The replay tool for one request: it converts exactly the outputs in `envelopes`. */
+function createMcpReplayTool(envelopes: WeakSet<McpReplayOutput>): Tool {
+  const isEnvelope = (output: unknown): output is McpReplayOutput =>
+    typeof output === "object" && output !== null && envelopes.has(output as McpReplayOutput);
+  // Only `toModelOutput` is read by convertToModelMessages; the schema is a placeholder.
+  return tool({
+    inputSchema: jsonSchema({ type: "object" }),
+    toModelOutput: ({ output }) =>
+      isEnvelope(output)
+        ? replayMcpModelOutput(output.mcpReplayOutput)
+        : defaultModelOutput(output),
+  });
+}
 
 /**
  * Request build: convert MCP results the way their in-turn step did. Every MCP tool converts its
@@ -58,13 +56,16 @@ const MCP_REPLAY_TOOL: Tool = tool({
  * thinking block of the turn.
  *
  * A persisted MCP call carries `mcpServer` (the display snapshot every MCP tool wrapper
- * publishes). The mark goes on each such part's output, not on its name or call ID: history can
- * hold an ordinary call under the same name, or a reused call ID, and those keep the JSON form.
- * Returns the messages to convert and the tools to pass to convertToModelMessages.
+ * publishes). The mark is the identity of each such part's envelope object, not its name, call
+ * ID or a field: history can hold an ordinary call under the same name, a reused call ID, or an
+ * output with any field, and those keep the JSON form. Returns the messages to convert and the
+ * tools to pass to convertToModelMessages.
  */
 export function prepareMcpReplay<M extends MuxMessage>(
   messages: readonly M[]
 ): { messages: M[]; tools: ToolSet } {
+  const envelopes = new WeakSet<McpReplayOutput>();
+  const replayTool = createMcpReplayTool(envelopes);
   const tools: ToolSet = {};
   const marked = messages.map((message) => {
     if (message.role !== "assistant") return message;
@@ -73,8 +74,9 @@ export function prepareMcpReplay<M extends MuxMessage>(
       if (part.type !== "dynamic-tool" || part.state !== "output-available") return part;
       if (part.mcpServer == null) return part;
       changed = true;
-      tools[part.toolName] = MCP_REPLAY_TOOL;
+      tools[part.toolName] = replayTool;
       const output: McpReplayOutput = { mcpReplayOutput: part.output };
+      envelopes.add(output);
       return { ...part, output };
     });
     return changed ? { ...message, parts } : message;
