@@ -81,7 +81,11 @@ test.describe("Settings", () => {
     await expect(
       page.getByRole("button", { name: /OpenAI/i }).filter({ has: page.getByText("OpenAI icon") })
     ).toBeVisible();
-    await expect(page.getByRole("button", { name: /Google/i })).toBeVisible();
+    // "Google" is a prefix of "Google Vertex AI", so match the name text exactly.
+    await expect(
+      page.getByRole("button").filter({ has: page.getByText("Google", { exact: true }) })
+    ).toBeVisible();
+    await expect(page.getByRole("button", { name: /Google Vertex AI/ })).toBeVisible();
     await expect(page.getByRole("button", { name: /xAI/i })).toBeVisible();
     await expect(page.getByRole("button", { name: /Ollama/i })).toBeVisible();
     await expect(page.getByRole("button", { name: /OpenRouter/i })).toBeVisible();
