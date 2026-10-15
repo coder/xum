@@ -20,7 +20,7 @@ test(
     await settings.getByRole("button", "Review hooks for hook-odd-matchers").tap();
 
     await expect(
-      settings.getByText(/ignoring its group "\\\\A\(\?:Bash\|Edit\)\\\\z"/)
+      settings.getByText(/ignoring its group "\\\\pL\(\?:Bash\|Edit\)"/)
     ).toBeVisible({
       timeout: 15_000,
     });
