@@ -2807,7 +2807,14 @@ describe("Config", () => {
         // A read of the changed file rebuilds once more.
         fs.writeFileSync(target, JSON.stringify({ projects: [], updateChannel: "nightly" }));
         expect(config.getUpdateChannel()).toBe("nightly");
-        expect(watchCalls).toBeGreaterThan(rebuilt);
+        const reread = watchCalls;
+        expect(reread).toBeGreaterThan(rebuilt);
+        // The read's retry does not use up the error's: an error of the new watch rebuilds once.
+        failTargetWatch();
+        const recovered = watchCalls;
+        expect(recovered).toBeGreaterThan(reread);
+        failTargetWatch();
+        expect(watchCalls).toBe(recovered);
         unsubscribe();
       } finally {
         debugSpy.mockRestore();

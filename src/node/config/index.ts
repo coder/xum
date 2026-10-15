@@ -1833,6 +1833,8 @@ export class Config {
     let watcher: fs.FSWatcher;
     try {
       watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
+        // A delivered event shows the watches work, so the next error may rebuild them again.
+        this.configFileWatchRetryStamps.error = null;
         // Some platforms omit the filename; treat that as a possible config.json change.
         if (filename != null && !fileNames.has(filename)) return;
         this.handleConfigFileEventWithRelink();
@@ -1848,26 +1850,32 @@ export class Config {
       // each dir that still resolves (a vanished dir moves to an existing ancestor), and
       // the stamp check after it reports an edit made while the watch was down.
       this.watchedConfigFileDirsKey = null;
-      this.retryIncompleteConfigFileWatch();
+      this.retryIncompleteConfigFileWatch("error");
     });
     return watcher;
   }
 
-  /** The config.json stamp of the last retry by retryIncompleteConfigFileWatch. */
-  private configFileWatchRetryStamp: string | null = null;
+  /**
+   * The config.json stamp of the last retry each trigger started. Separate per trigger: a
+   * read that repaired the set must not hold back the rebuild for a later watcher error.
+   */
+  private readonly configFileWatchRetryStamps: Record<"read" | "error", string | null> = {
+    read: null,
+    error: null,
+  };
 
   /**
-   * Rebuilds a watch set with a failed watch, at most once per config.json stamp. Watcher
-   * errors and config reads call it. A read retries a watch that failed to start, so the
-   * retry needs no event from another watch. The stamp bound stops an error that every new
-   * watch raises from rebuilding the set at the pace of the OS errors. No timer: until the
-   * stamp changes, a retry would see no new edit to report.
+   * Rebuilds a watch set with a failed watch, at most once per config.json stamp and trigger.
+   * A read retries a watch that failed to start, so the retry needs no event from another
+   * watch. The error bound stops an error that every new watch raises from rebuilding the set
+   * at the pace of the OS errors: the next rebuild waits for a watch event or a changed stamp.
+   * No timer: until the stamp changes, a retry would see no new edit to report.
    */
-  private retryIncompleteConfigFileWatch(): void {
+  private retryIncompleteConfigFileWatch(trigger: "read" | "error"): void {
     if (this.watchedConfigFileDirsKey !== null || this.configFileWatchers.length === 0) return;
     const stamp = this.configFileStamp();
-    if (stamp === this.configFileWatchRetryStamp) return;
-    this.configFileWatchRetryStamp = stamp;
+    if (stamp === this.configFileWatchRetryStamps[trigger]) return;
+    this.configFileWatchRetryStamps[trigger] = stamp;
     this.handleConfigFileEventWithRelink();
   }
 
@@ -2354,7 +2362,7 @@ export class Config {
     const config = this.readConfigOrDefault(options, key);
     // A changed file: retry a failed watch after the read, so a listener it notifies reads
     // the snapshot this read stored.
-    this.retryIncompleteConfigFileWatch();
+    this.retryIncompleteConfigFileWatch("read");
     return config;
   }
 
