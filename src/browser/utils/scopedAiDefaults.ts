@@ -52,7 +52,8 @@ function selectServerDefault<F extends ScopedAiField>(
 
 /**
  * A creation draft owns its choices (the record): they travel with a project change and never
- * write the project's defaults. A draft without an agent shows its project's default agent.
+ * write the project's defaults. A field the draft never set (an imported old draft has none) shows
+ * its project's default, as the old composer did.
  */
 function readCreationDraftDefault<F extends ScopedAiField>(
   draftId: string,
@@ -61,11 +62,11 @@ function readCreationDraftDefault<F extends ScopedAiField>(
 ): AiDefaults[F] {
   const draft = getCreationDraftStore().getView(draftId).draft;
   if (!draft) return undefined;
+  const project = preferences.ai?.projectDefaults?.[draft.projectPath];
   const value: AiDefaults = {
-    model: draft.ai.model,
-    thinkingLevel: draft.ai.thinkingLevel,
-    agentId:
-      draft.execution?.agent?.id ?? preferences.ai?.projectDefaults?.[draft.projectPath]?.agentId,
+    model: draft.ai.model ?? project?.model,
+    thinkingLevel: draft.ai.thinkingLevel ?? project?.thinkingLevel,
+    agentId: draft.execution?.agent?.id ?? project?.agentId,
   };
   return value[field];
 }

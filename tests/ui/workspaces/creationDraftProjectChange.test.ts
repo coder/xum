@@ -146,6 +146,17 @@ describeIntegration("Creation draft project change", () => {
         execution: { agent: { id: "plan", scope: "built-in" }, runtime: null },
       });
       await waitFor(() => expect(messageTextarea(view.container).value).toBe("keep this text"));
+
+      // Back returns to B's route, which still names this draft: it opens where the draft lives.
+      const scratchEditor = messageTextarea(view.container);
+      fireEvent.keyDown(window, { key: "[", ctrlKey: true });
+      await waitFor(() => {
+        const current = messageTextarea(view.container);
+        if (current === scratchEditor) throw new Error("Back did not navigate yet");
+        expect(current.value).toBe("keep this text");
+      });
+      await waitForScope(view.container, SCRATCH_PROJECT_NAME);
+      expect(store.getView(draftId).draft?.projectPath).toBe(SCRATCH_PROJECT_CONFIG_KEY);
     } finally {
       await cleanupView(view, cleanupDom);
     }
