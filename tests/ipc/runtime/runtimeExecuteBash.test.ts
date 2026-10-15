@@ -38,6 +38,7 @@ import { sshConnectionPool } from "../../../src/node/runtime/sshConnectionPool";
 import { ssh2ConnectionPool } from "../../../src/node/runtime/SSH2ConnectionPool";
 import type { WorkspaceChatMessage } from "../../../src/common/orpc/types";
 import type { ToolPolicy } from "../../../src/common/utils/tools/toolPolicy";
+import { subscribeLogFeed, type LogEntry } from "../../../src/node/services/logBuffer";
 
 // Tool policy: Only allow the bash tool.
 const BASH_ONLY: ToolPolicy = [{ regex_match: "bash", action: "require" }];
@@ -91,6 +92,40 @@ function getToolDuration(events: WorkspaceChatMessage[], toolName: string): numb
   return -1;
 }
 
+// Diagnostics for #6588: CI runs jest with --silent, so a hung step left no trace. Each step of
+// the env-var test is bounded; on a timeout the step trace and the backend's recent log entries
+// go to stderr (not console, which --silent drops).
+const backendLog: LogEntry[] = [];
+let stopBackendLog: (() => void) | null = null;
+const stepTrace: string[] = [];
+async function boundedStep<T>(name: string, ms: number, fn: () => Promise<T>): Promise<T> {
+  const start = Date.now();
+  stepTrace.push(`${new Date(start).toISOString()} start ${name}`);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const lines = backendLog
+        .slice(-120)
+        .map(
+          (e) =>
+            `${new Date(e.timestamp).toISOString()} ${e.level} ${e.location} ${e.message.slice(0, 400)}`
+        );
+      process.stderr.write(
+        `\n[#6588] step "${name}" did not finish within ${ms} ms\n` +
+          `[#6588] steps:\n${stepTrace.join("\n")}\n[#6588] backend log:\n${lines.join("\n")}\n`
+      );
+      reject(new Error(`${name} did not finish within ${ms} ms`));
+    }, ms);
+  });
+  try {
+    return await Promise.race([fn(), timeout]);
+  } finally {
+    clearTimeout(timer);
+    stepTrace.push(`${new Date().toISOString()} end ${name} (${Date.now() - start} ms)`);
+  }
+}
+const __step = <T>(name: string, fn: () => Promise<T>) => boundedStep(name, 40_000, fn);
+
 // Skip all tests if TEST_INTEGRATION is not set
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
@@ -117,7 +152,19 @@ describeIntegration("Runtime Bash Execution", () => {
     console.log(`SSH server ready on port ${sshConfig.port}`);
   }, 60000);
 
+  beforeAll(() => {
+    // "debug" makes the backend keep debug entries too.
+    const feed = subscribeLogFeed((event) => {
+      if (event.type === "append") {
+        backendLog.push(event.entry);
+        if (backendLog.length > 2000) backendLog.shift();
+      }
+    }, "debug");
+    stopBackendLog = feed.unsubscribe;
+  });
+
   afterAll(async () => {
+    stopBackendLog?.();
     if (sshConfig) {
       console.log("Stopping SSH server container...");
       await stopSSHServer(sshConfig);
@@ -222,38 +269,50 @@ describeIntegration("Runtime Bash Execution", () => {
       runTest(
         "should handle bash command with environment variables",
         async () => {
-          const env = await createTestEnvironment();
-          const tempGitRepo = await createTempGitRepo();
+          const env = await __step(`${type} env:createTestEnvironment`, () =>
+            createTestEnvironment()
+          );
+          const tempGitRepo = await __step(`${type} env:createTempGitRepo`, () =>
+            createTempGitRepo()
+          );
 
           try {
             // Setup provider
-            await setupProviders(env, {
-              anthropic: {
-                apiKey: getApiKey("ANTHROPIC_API_KEY"),
-              },
-            });
+            await __step(`${type} env:setupProviders`, () =>
+              setupProviders(env, {
+                anthropic: {
+                  apiKey: getApiKey("ANTHROPIC_API_KEY"),
+                },
+              })
+            );
 
             // Create workspace
             const branchName = generateBranchName("bash-env");
             const runtimeConfig = getRuntimeConfig(branchName);
-            const { workspaceId, cleanup } = await createWorkspaceWithInit(
-              env,
-              tempGitRepo,
-              branchName,
-              runtimeConfig,
-              true, // waitForInit
-              type === "ssh"
+            const { workspaceId, cleanup } = await __step(
+              `${type} env:createWorkspaceWithInit`,
+              () =>
+                createWorkspaceWithInit(
+                  env,
+                  tempGitRepo,
+                  branchName,
+                  runtimeConfig,
+                  true, // waitForInit
+                  type === "ssh"
+                )
             );
 
             try {
               // Ask AI to run command that sets and uses env var
-              const events = await sendMessageAndWait(
-                env,
-                workspaceId,
-                'Use the bash tool with args: { script: "export TEST_VAR=test123 && echo Value:$TEST_VAR", timeout_secs: 30, run_in_background: false, display_name: "env-var" }. Do not spawn a sub-agent.',
-                HAIKU_MODEL,
-                BASH_ONLY,
-                streamTimeoutMs
+              const events = await __step(`${type} env:sendMessageAndWait`, () =>
+                sendMessageAndWait(
+                  env,
+                  workspaceId,
+                  'Use the bash tool with args: { script: "export TEST_VAR=test123 && echo Value:$TEST_VAR", timeout_secs: 30, run_in_background: false, display_name: "env-var" }. Do not spawn a sub-agent.',
+                  HAIKU_MODEL,
+                  BASH_ONLY,
+                  streamTimeoutMs
+                )
               );
 
               // Verify the env var value appears in the bash tool output.
@@ -277,11 +336,11 @@ describeIntegration("Runtime Bash Execution", () => {
               });
               expect(bashCall).toBeDefined();
             } finally {
-              await cleanup();
+              await __step(`${type} env:cleanup(remove)`, () => cleanup());
             }
           } finally {
-            await cleanupTempGitRepo(tempGitRepo);
-            await cleanupTestEnvironment(env);
+            await __step(`${type} env:cleanupTempGitRepo`, () => cleanupTempGitRepo(tempGitRepo));
+            await __step(`${type} env:cleanupTestEnvironment`, () => cleanupTestEnvironment(env));
           }
         },
         type === "ssh" ? TEST_TIMEOUT_SSH_MS : TEST_TIMEOUT_LOCAL_MS
