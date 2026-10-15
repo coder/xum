@@ -4030,7 +4030,17 @@ export class AgentPluginInstallService {
     await this.forgetPendingSignOuts(done);
   }
 
+  /**
+   * A timed-out recovery logout can still run: let it settle first, so two logouts never
+   * overlap and the earlier one cannot delete a sign-in made after the later one (#6627).
+   */
+  private async settleInFlightSignOut(serverUrl: string): Promise<void> {
+    const call = this.inFlightSignOuts.get(serverUrl);
+    if (call !== undefined) await call.catch(() => undefined);
+  }
+
   private async signOutPluginServer(name: string, serverUrl: string): Promise<boolean> {
+    await this.settleInFlightSignOut(serverUrl);
     const result = await this.mcpOauthService?.logout({ serverUrl });
     if (result?.success === true) return true;
     log.warn("Could not sign out a plugin MCP server after its sign-in changed", {
