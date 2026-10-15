@@ -96,13 +96,66 @@ const keepContextRow = (message: MuxMessage) =>
   !isModelHiddenMessage(message) && !message.metadata?.contextBudgetRejected;
 
 /**
+ * Moves each row that a turn's request did not include to just after that turn's assistant row.
+ *
+ * A request contains exactly the rows with historySequence <= its requestHistorySequence (the
+ * contract replayVerify's sliceEpochForTurn relies on). A row appended after the request read
+ * history but before the assistant placeholder (a sub-agent report that TaskService delivers at
+ * once) gets a lower sequence than the placeholder, so sequence order puts it before a reply
+ * whose request never contained it. The next request then merged it into the earlier user
+ * message, which changed bytes the provider had already signed: Anthropic rejected the turn's
+ * thinking ("Content before this block differs"), seen in 6 of 200 dogfood sessions. Placing
+ * the row after the reply makes the rebuild match what each turn sent. chat.jsonl keeps its
+ * order, so only provider requests change.
+ */
+function placeRowsAfterTheTurnThatMissedThem(messages: MuxMessage[]): MuxMessage[] {
+  let ordered: MuxMessage[] | undefined;
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    const requestSequence = message.metadata?.requestHistorySequence;
+    const sequence = message.metadata?.historySequence;
+    if (message.role !== "assistant" || requestSequence == null || sequence == null) {
+      ordered?.push(message);
+      continue;
+    }
+    // Late rows sit directly before the assistant row, since history is in sequence order.
+    // The walk stops at an assistant row, so it never reaches rows an earlier turn moved.
+    let lateStart = index;
+    while (lateStart > 0) {
+      const previous = messages[lateStart - 1];
+      const previousSequence = previous.metadata?.historySequence;
+      if (
+        previous.role === "assistant" ||
+        previousSequence == null ||
+        previousSequence <= requestSequence ||
+        previousSequence >= sequence
+      ) {
+        break;
+      }
+      lateStart--;
+    }
+    if (lateStart === index) {
+      ordered?.push(message);
+      continue;
+    }
+    ordered ??= messages.slice(0, index);
+    // Earlier iterations copied the late rows already; they are the tail of `ordered`.
+    const lateRows = ordered.splice(ordered.length - (index - lateStart));
+    ordered.push(message, ...lateRows);
+  }
+  return ordered ?? messages;
+}
+
+/**
  * History rows that can reach the provider, before the thinking-level-dependent empty-row
  * filter. The Sonnet 5.5 effort pin reads these rows (#5279), so it cannot depend on it.
  */
 export function selectActiveContextMessages(messages: MuxMessage[]): MuxMessage[] {
   // A durable reset still seals history when its row is rejected or display-only.
   // Establish the boundary before any content filter can erase that structural evidence.
-  const boundarySlicedMessages = sliceMessagesForProviderFromLatestContextBoundary(messages);
+  const boundarySlicedMessages = sliceMessagesForProviderFromLatestContextBoundary(
+    placeRowsAfterTheTurnThatMissedThem(messages)
+  );
   // RLM keep-recent floor: a stamped compaction request summarizes only the older head.
   return excludeKeepRecentTailForCompactionRequest(boundarySlicedMessages.filter(keepContextRow));
 }

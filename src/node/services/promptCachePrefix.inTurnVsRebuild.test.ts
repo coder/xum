@@ -278,9 +278,16 @@ async function runTurn(
   /** Volatile system tail (hot memories, MCP warning, context-window ids) after SYSTEM. */
   volatileTail = "",
   /** Tool search: the advertised tool set changes when a step activates a deferred tool. */
-  toolSearchState?: ToolSearchStreamState
+  toolSearchState?: ToolSearchStreamState,
+  /** Runs after the request read history and before the assistant row is appended. */
+  beforePlaceholder?: () => Promise<void>
 ): Promise<WireBody[]> {
   const history = await readHistory();
+  // As turnRequestBuilder records it: the highest history row the request includes.
+  const requestHistorySequence = Math.max(
+    -1,
+    ...history.map((row) => row.metadata?.historySequence ?? -1)
+  );
   const payload = await assemblePromptPayload({
     history,
     systemMessage: SYSTEM + volatileTail,
@@ -295,6 +302,7 @@ async function runTurn(
     anthropicCacheTtl: "1h",
     workspaceId: WORKSPACE_ID,
   });
+  await beforePlaceholder?.();
   const messageId = `assistant-${nextSequence}`;
   const historySequence = nextSequence;
   const placeholder = await historyService.appendToHistory(WORKSPACE_ID, {
@@ -319,6 +327,7 @@ async function runTurn(
     tools: payload.tools,
     providerOptions: { anthropic: { thinking: { type: "adaptive" } } },
     historySequence,
+    initialMetadata: { requestHistorySequence },
     thinkingLevel: "high",
     // TurnRequestBuilder puts the assembler's tail record on the turn's assistant row.
     ...(payload.volatileSystemTail != null
@@ -409,6 +418,30 @@ const plainTool = (name: string) =>
   });
 
 describe("prompt-cache prefix: next turn vs the previous turn's last step", () => {
+  // A sub-agent report (TaskService appends it to the parent's history at once) can land after
+  // the request read history but before the assistant row is appended. It then sorts before
+  // that row, although the turn never saw it. Seen live on the dogfood server (f5714aa3af,
+  // 2026-10-14): the next turn rebuilt the earlier user message with the report merged in, and
+  // Anthropic rejected the turn's thinking ("Content before this block differs").
+  test("a row appended while the request was being built keeps the prefix", async () => {
+    const anthropic = createScriptedAnthropic();
+    const tools = { bash: plainTool("bash"), probe: plainTool("probe") };
+    await appendUser("Start the job and wait for it.");
+    const firstTurnBodies = await runTurn(
+      anthropic,
+      tools,
+      toolThenTextTurn("bash", "call-1"),
+      "",
+      undefined,
+      () => appendUser("<mux_subagent_report>done</mux_subagent_report>", { synthetic: true })
+    );
+    await appendUser(MONITOR_WAKE);
+    const [nextFirst] = await runTurn(anthropic, tools, toolThenTextTurn("probe", "call-next"));
+    expectExtendsLastStep(firstTurnBodies[firstTurnBodies.length - 1], nextFirst, MONITOR_WAKE);
+    // The model reads the report after its own reply, where it arrived.
+    expect(JSON.stringify(nextFirst.messages.at(-1))).toContain("mux_subagent_report");
+  });
+
   test("control: a plain tool round trip keeps the prefix", async () => {
     await expectNextTurnExtendsLastStep({
       tools: { bash: plainTool("bash"), probe: plainTool("probe") },
