@@ -1158,6 +1158,105 @@ describe("MCPServerManager", () => {
     expect(runs).toEqual(["reset"]);
   });
 
+  test("a settings read re-lists a legacy catalog before it decorates the layout (no MCP Apps)", async () => {
+    // A legacy-era server and no MCP Apps: only a re-list sees that "reset" became writable.
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-read-legacy") });
+    let listedReadOnly = true;
+    let serverReadOnly = true;
+    servers.serve("settings-read-legacy", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [{ kind: "group", title: "Parts", items: [{ kind: "tool", tool: "reset" }] }],
+            },
+          }),
+        settingsToolAction: (name) =>
+          name === "reset"
+            ? { title: "Reset", readOnly: listedReadOnly, opensApp: false }
+            : undefined,
+        relistTools: () => {
+          listedReadOnly = serverReadOnly;
+          return Promise.resolve();
+        },
+        callSettingsActionTool: () => Promise.resolve({ content: [] }),
+      },
+    });
+    const workspaceId = "settings-read-legacy-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    serverReadOnly = false;
+    // A reopened dialog shows the current flag, not the startup listing's.
+    const snapshot = await manager.readSettings(workspaceId, "cad");
+    expect(snapshot?.layout[0]?.items).toEqual([
+      { kind: "tool", tool: "reset", action: { title: "Reset", readOnly: false, opensApp: false } },
+    ]);
+  });
+
+  test("a settings read's catalog refresh ends at the read's own deadline", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-read-deadline") });
+    const read = Promise.withResolvers<void>();
+    let listings = 0;
+    servers.serve("settings-read-deadline", {
+      era: "modern",
+      // The startup listing answers; the refresh after the read never does.
+      listTools: () =>
+        listings++ === 0
+          ? Promise.resolve({ draw: testTool() })
+          : new Promise<never>(() => undefined),
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: async () => {
+          await read.promise;
+          return {
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [{ kind: "group", title: "Parts", items: [{ kind: "tool", tool: "reset" }] }],
+            },
+          };
+        },
+        settingsToolAction: (name) =>
+          name === "reset" ? { title: "Reset", readOnly: true, opensApp: false } : undefined,
+        callSettingsActionTool: () => Promise.resolve({ content: [] }),
+      },
+    });
+    const workspaceId = "settings-read-deadline-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const flush = async () => {
+      for (let turn = 0; turn < 20; turn++) await new Promise((resolve) => setImmediate(resolve));
+    };
+    const timeoutMs = MCP_APP_CATALOG_REFRESH_TIMEOUT_MS * 2;
+    fakeTimers.useFakeTimers();
+    setSystemTime(new Date());
+    try {
+      const seen: { settled: boolean } = { settled: false };
+      const snapshot = manager.readSettings(workspaceId, "cad", { timeoutMs }).finally(() => {
+        seen.settled = true;
+      });
+      await flush();
+      // The read answers 100 ms before its deadline; the stalled refresh gets only those 100 ms,
+      // not its own full bound on top.
+      fakeTimers.advanceTimersByTime(timeoutMs - 100);
+      read.resolve();
+      await flush();
+      expect(seen.settled).toBe(false);
+      fakeTimers.advanceTimersByTime(100);
+      await flush();
+      expect(seen.settled).toBe(true);
+      // The held catalog decorates the layout, as before.
+      expect((await snapshot)?.layout[0]?.items[0]).toMatchObject({ action: { readOnly: true } });
+    } finally {
+      fakeTimers.useRealTimers();
+      setSystemTime();
+    }
+  });
+
   test("settings: a server counts as connected only once the workspace started it", async () => {
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-connected") });
     servers.serve("settings-connected", { tools: { draw: testTool() } });

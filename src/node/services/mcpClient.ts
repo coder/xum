@@ -424,6 +424,10 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
   let listedTools = new Map<string, MCPToolUi | undefined>();
   let listedEntrypoints: readonly MCPAppEntrypointTool[] = [];
   let listedSettingsActions = new Map<string, MCPSettingsToolAction>();
+  // tools/list calls started, and the newest one whose catalog the fields above hold (#6611):
+  // overlapping listings (relistTools, a send) can answer out of order.
+  let listingsStarted = 0;
+  let listingApplied = 0;
 
   if (config.onUncaughtError) {
     const onUncaughtError = config.onUncaughtError;
@@ -451,6 +455,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
 
   const handle: MCPClientHandle = {
     tools: async () => {
+      const listing = ++listingsStarted;
       const listResult = await client.listTools();
       assert(Array.isArray(listResult.tools), "MCP tools/list result must carry a tools array");
 
@@ -530,9 +535,14 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         if (ui !== undefined) toolUiByTool.set(tool, ui);
         tools[definition.name] = tool;
       }
-      listedTools = listed;
-      listedEntrypoints = entrypoints;
-      listedSettingsActions = settingsActions;
+      // A listing older than the applied one must not overwrite the newer catalog. Its tools
+      // still go to its caller, as before.
+      if (listing > listingApplied) {
+        listingApplied = listing;
+        listedTools = listed;
+        listedEntrypoints = entrypoints;
+        listedSettingsActions = settingsActions;
+      }
       return tools;
     },
     prompts: (options) => listServerPrompts(client, options?.signal),

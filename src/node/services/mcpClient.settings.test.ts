@@ -1,5 +1,6 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import * as path from "node:path";
+import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { createMCPClient, type MCPClientHandle } from "./mcpClient";
 
@@ -90,4 +91,37 @@ test("settings tool actions: the spec's display name order, readOnlyHint, and {}
   const result = await client.callSettingsActionTool("library", { "xum/workspaceId": "ws-1" });
   expect(result.structuredContent).toEqual({ received: {}, meta: { "xum/workspaceId": "ws-1" } });
   expect(() => client!.callSettingsActionTool("settings.update", {})).toThrow();
+});
+
+test("overlapping tool listings: a late, older tools/list response keeps the newer catalog", async () => {
+  client = await createMCPClient({
+    transport: new StdioClientTransport({ command: process.execPath, args: [fixture] }),
+  });
+  await client.tools();
+  // Two re-lists overlap. The first one's response arrives last and still lacks "reset", as
+  // the server listed it before a tools/list_changed.
+  const realListTools = Client.prototype.listTools;
+  const firstHeld = Promise.withResolvers<void>();
+  let calls = 0;
+  const listTools = spyOn(Client.prototype, "listTools").mockImplementation(async function (
+    this: Client,
+    ...args: Parameters<Client["listTools"]>
+  ) {
+    const call = ++calls;
+    const result = await realListTools.apply(this, args);
+    if (call !== 1) return result;
+    await firstHeld.promise;
+    return { ...result, tools: result.tools.filter((tool) => tool.name !== "reset") };
+  });
+  try {
+    const older = client.relistTools();
+    const newer = client.relistTools();
+    await newer;
+    firstHeld.resolve();
+    await older;
+  } finally {
+    listTools.mockRestore();
+  }
+  expect(calls).toBe(2);
+  expect(client.settingsToolAction("reset")?.title).toBe("Reset parts");
 });

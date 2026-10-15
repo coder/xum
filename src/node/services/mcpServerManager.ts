@@ -5228,6 +5228,8 @@ export class MCPServerManager {
     /** `noStart`: read only a running instance; never start or restart the server. */
     options?: { signal?: AbortSignal; timeoutMs?: number; noStart?: boolean }
   ): Promise<MCPSettingsReadSnapshot | null> {
+    // The catalog refresh after the read shares this deadline (#6611).
+    const deadline = options?.timeoutMs !== undefined ? Date.now() + options.timeoutMs : undefined;
     const noSettings = Symbol("no settings");
     let source: { instance: MCPServerInstance; requestId: number } | undefined;
     const snapshot = await this.invokeServerOperation(
@@ -5262,7 +5264,10 @@ export class MCPServerManager {
         workspaceId,
         serverName,
         snapshot.layout,
-        options
+        {
+          signal: options?.signal,
+          deadline,
+        }
       ),
     };
     // The hash covers what this read returns (its layout carries the tool actions), the same
@@ -5273,18 +5278,27 @@ export class MCPServerManager {
 
   /**
    * The layout with each tool item's action (see settingsToolAction). The catalog is refreshed
-   * first (bounded, as for MCP App entry points): after tools/list_changed the held catalog
-   * would show a new tool as unavailable and keep a removed one runnable.
+   * first, as before a dispatch (refreshSettingsActionTools, so a legacy catalog is re-listed
+   * too): after tools/list_changed the held catalog would show a new tool as unavailable and
+   * keep a removed one runnable. Bounded by MCP_APP_CATALOG_REFRESH_TIMEOUT_MS and the read's
+   * own `deadline` (#6611). Unlike a dispatch, a refresh that fails or times out keeps the held
+   * catalog: the dispatch refreshes again and refuses on a stale one.
    */
   private async withSettingsToolActions(
     instance: MCPServerInstance,
     workspaceId: string,
     serverName: string,
     layout: MCPSettingsGroup[],
-    options: { signal?: AbortSignal } | undefined
+    options: { signal: AbortSignal | undefined; deadline: number | undefined }
   ): Promise<MCPSettingsGroup[]> {
-    if (layout.some((group) => group.items.some((item) => item.kind === "tool")))
-      await this.refreshAppCatalogs([{ instance }], options?.signal);
+    if (layout.some((group) => group.items.some((item) => item.kind === "tool"))) {
+      const left =
+        options.deadline !== undefined ? Math.max(1, options.deadline - Date.now()) : Infinity;
+      await raceWithAbortAndTimeout(this.refreshSettingsActionTools(instance), {
+        ...(options.signal !== undefined ? { signal: options.signal } : {}),
+        timeoutMs: Math.min(MCP_APP_CATALOG_REFRESH_TIMEOUT_MS, left),
+      });
+    }
     return layout.map((group) => ({
       ...group,
       items: group.items.map((item) => {
