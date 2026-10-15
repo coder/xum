@@ -278,6 +278,35 @@ function unusableRecordReason(error: unknown, file: string): string {
   return `Xum cannot read the pending plugin sign-out record (${file}): ${code}. Fix its permissions. Or: in Settings → Plugins, choose "Sign out of plugin MCP servers": Xum deletes the file after the sign-outs succeed.`;
 }
 
+/**
+ * The URLs a parsed sign-out record names, for the Settings recovery (#6627). See
+ * recordedUrlsForRecovery: a record of another version without readable `urls` throws.
+ */
+function recoveryUrls(record: unknown, file: string): string[] {
+  const fields =
+    typeof record === "object" && record !== null ? (record as Record<string, unknown>) : {};
+  const urls = fields.urls;
+  if (Array.isArray(urls) && urls.every((url) => typeof url === "string")) return urls;
+  if (fields.version === undefined || fields.version === 1) return [];
+  throw new Error(
+    `The pending plugin sign-out record (${file}) is from another Xum version, and this version cannot read its sign-outs. Open Xum in that version to finish them.`
+  );
+}
+
+/**
+ * Throws when a plugin tree's MCP servers can be missing from a scan (#6627): no readable
+ * manifest (discovery returns null, sometimes without a diagnostic), or a declared MCP file that
+ * is missing (it resolves without a diagnostic). Restored, either loads with the old sign-in.
+ */
+function assertMcpFileReadable(
+  dirName: string,
+  plugin: AgentPluginInfo | null
+): asserts plugin is AgentPluginInfo {
+  if (plugin === null) throw new Error(`Xum cannot read the manifest of plugin '${dirName}'.`);
+  if (plugin.mcpConfigPath === undefined && plugin.manifest.contributes?.mcp !== undefined)
+    throw new Error(`Xum cannot read the MCP file that plugin '${dirName}' declares.`);
+}
+
 /** Waits for the startup sign-out pass at most timeoutMs, then lets discovery go on. */
 async function waitForPendingSignOuts(
   pass: Promise<void>,
@@ -4468,14 +4497,7 @@ export class AgentPluginInstallService {
       if (error instanceof SyntaxError) return [];
       throw error;
     }
-    const fields =
-      typeof record === "object" && record !== null ? (record as Record<string, unknown>) : {};
-    const urls = fields.urls;
-    if (Array.isArray(urls) && urls.every((url) => typeof url === "string")) return urls;
-    if (fields.version === undefined || fields.version === 1) return [];
-    throw new Error(
-      `The pending plugin sign-out record (${shortenHome(file)}) is from another Xum version, and this version cannot read its sign-outs. Open Xum in that version to finish them.`
-    );
+    return recoveryUrls(record, shortenHome(file));
   }
 
   /** Signs out of each credential once, within one pass deadline; throws on the first failure. */
@@ -4511,13 +4533,9 @@ export class AgentPluginInstallService {
     const pluginDir = path.join(this.containerDir, dirName);
     if (dirName.startsWith(".") || !(await fsPromises.stat(pluginDir)).isDirectory()) return [];
     // A server this scan cannot read can load later, after a repair, with its old sign-in:
-    // the list must be complete before the record goes. A tree without a readable manifest
-    // (discovery returns null, sometimes without a diagnostic) is incomplete too.
+    // the list must be complete before the record goes.
     const { plugin, diagnostics } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
-    if (plugin === null) throw new Error(`Xum cannot read the manifest of plugin '${dirName}'.`);
-    // A declared MCP file that is missing resolves without a diagnostic: restored, it loads.
-    if (plugin.mcpConfigPath === undefined && plugin.manifest.contributes?.mcp !== undefined)
-      throw new Error(`Xum cannot read the MCP file that plugin '${dirName}' declares.`);
+    assertMcpFileReadable(dirName, plugin);
     // Without an MCP file, a discovery error can be the MCP path itself. With one, a discovery
     // error names another component (a skill, a hook), and only the MCP diagnostics decide.
     const loaded =
