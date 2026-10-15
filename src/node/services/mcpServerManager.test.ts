@@ -2294,7 +2294,9 @@ describe("MCPServerManager", () => {
             structuredContent: {
               schema: { type: "object", properties: {} },
               values: {},
-              layout: [{ kind: "group", items: [{ kind: "tool", tool: "payment" }] }],
+              layout: [
+                { kind: "group", title: "Billing", items: [{ kind: "tool", tool: "payment" }] },
+              ],
             },
           }),
         settingsToolAction: () => ({ title: "Payment method", readOnly: false, opensApp: true }),
