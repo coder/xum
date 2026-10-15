@@ -180,6 +180,8 @@ async function waitFor(
   }
 }
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /** The message `flush` rejects with, or "" when it resolves. */
 function flushError(store: DraftStore): Promise<string> {
   return store.flush(WS_SCOPE).then(
@@ -942,10 +944,12 @@ describe("DraftStore", () => {
     expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
   });
 
-  // #6438, review round 3, and #6542: an edit saved to a new backend before its snapshot was
-  // compared with the old backend's view, lost to it, and the old text came back. And the write
-  // went to a backend whose drafts the store had not seen. Now no write goes out in that window,
-  // and the edit is saved once the snapshot arrives.
+  // #6438, review round 3, #6542 and #6748: an edit saved to a new backend before its snapshot
+  // was compared with the old backend's view, lost to it, and the old text came back; and the
+  // write went to a backend whose drafts the store had not seen. Then (#6748) a save in that
+  // window was refused, because readiness was the first client's: a fork right after a reconnect
+  // copied the draft without the latest text. Now whenReady and the save wait for the new
+  // client's snapshot, as on a cold start, and the edit is saved once.
   test("an edit waits for a new backend's snapshot before it is saved, and keeps the typed text", async () => {
     using tempDir = new TestTempDir("draft-store-new-backend-early-write");
     const { config, client } = await createHarness(tempDir);
@@ -969,19 +973,26 @@ describe("DraftStore", () => {
     });
     store.setClient(next.client);
 
+    let ready = false;
+    const readiness = store.whenReady().then(() => (ready = true));
     store.setText(WS_SCOPE, "typed after the switch");
-    expect(await flushError(store)).toContain("drafts are not loaded");
+    const saving = flushError(store);
+    await sleep(50);
+    expect(ready).toBe(false);
     expect(next.control.updates).toBe(0);
     expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
     // Other readers still see the drafts as loaded (the WorkspaceContext draft GC).
     expect(store.isHydrated()).toBe(true);
 
     releaseSnapshot();
-    await waitFor(() => next.control.snapshotsHandled > 0);
-    await store.flush(WS_SCOPE);
-    expect(next.control.updates).toBeGreaterThan(0);
+    expect(await saving).toBe("");
+    await readiness;
+    expect(next.control.updates).toBe(1);
     expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
     expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
+    // Saved once: the snapshot's own save of unsaved edits finds nothing left to write.
+    await sleep(400);
+    expect(next.control.updates).toBe(1);
     store.setText(WS_SCOPE, "typed later");
     await store.flush(WS_SCOPE);
     expect(store.getText(WS_SCOPE)).toBe("typed later");
@@ -1020,13 +1031,71 @@ describe("DraftStore", () => {
     // The old run resumes after its import (it removes the legacy key once the backend took the
     // list); it must not open writes for the new client.
     await waitFor(() => listPersistedKeys(WORKSPACE_DRAFTS_BY_PROJECT_KEY).length === 0);
-    expect(await flushError(store)).toContain("drafts are not loaded");
+    const saving = flushError(store);
+    await sleep(50);
     expect(next.control.updates).toBe(0);
 
     releaseSnapshot();
-    await waitFor(() => next.control.snapshotsHandled > 0);
-    await store.flush(WS_SCOPE);
+    expect(await saving).toBe("");
     expect((await next.service.get(WS_SCOPE)).text).toBe("typed during the import");
+  });
+
+  // #6748: a save waiting for a reconnect's snapshot follows a further client change, and gives up
+  // only when the client is removed. The typed text stays either way.
+  test("a save waiting for a reconnect follows the next client, and rejects when the client is removed", async () => {
+    using oldDir = new TestTempDir("draft-store-wait-old");
+    using midDir = new TestTempDir("draft-store-wait-mid");
+    using newDir = new TestTempDir("draft-store-wait-new");
+    using laterDir = new TestTempDir("draft-store-wait-later");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    const mid = await createHarness(midDir);
+    mid.control.subscribeGate = new Promise<void>(() => undefined);
+    store.setClient(mid.client);
+    store.setText(WS_SCOPE, "typed during two reconnects");
+    const saving = flushError(store);
+
+    const next = await createHarness(newDir);
+    store.setClient(next.client);
+    expect(await saving).toBe("");
+    expect((await next.service.get(WS_SCOPE)).text).toBe("typed during two reconnects");
+    expect(mid.control.updates).toBe(0);
+
+    const later = await createHarness(laterDir);
+    later.control.subscribeGate = new Promise<void>(() => undefined);
+    store.setClient(later.client);
+    store.setText(WS_SCOPE, "typed before a disconnect");
+    const refused = flushError(store);
+    store.setClient(null);
+    expect(await refused).toContain("not connected");
+    expect(store.getText(WS_SCOPE)).toBe("typed before a disconnect");
+  });
+
+  // #6753 review: the save waited for the snapshot with the entry from before the wait. A delete
+  // and a new edit meanwhile replaced it, so the save resolved without writing the new text.
+  test("a save waiting for a reconnect writes the draft edited again after a delete", async () => {
+    using oldDir = new TestTempDir("draft-store-wait-replaced-old");
+    using newDir = new TestTempDir("draft-store-wait-replaced-new");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "saved on the old backend");
+    await store.flush(WS_SCOPE);
+
+    const next = await createHarness(newDir);
+    let releaseSnapshot: () => void = () => undefined;
+    next.control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(next.client);
+    const saving = flushError(store);
+    await store.deleteDraft(WS_SCOPE);
+    store.setText(WS_SCOPE, "typed after the delete");
+
+    releaseSnapshot();
+    expect(await saving).toBe("");
+    expect((await next.service.get(WS_SCOPE)).text).toBe("typed after the delete");
   });
 
   // #6438: forgetting the views on a reconnect must not touch what the composer shows.

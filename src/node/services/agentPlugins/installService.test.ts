@@ -1473,6 +1473,7 @@ describe("AgentPluginInstallService", () => {
     const greet = skillConsentFingerprint({
       relativeDir: "skills/greet",
       frontmatter: { name: "greet", description: "Greets people" },
+      body: "\nSay hi.\n",
     });
     expect(installed.componentConsent).toEqual({ skills: { greet }, mcpServers: {} });
     expect((await service.list())[0]).toMatchObject({ importedSkillCount: 1 });
@@ -2739,6 +2740,81 @@ describe("AgentPluginInstallService", () => {
       await failing.dispose();
     });
 
+    test("Settings reads the pending, the failed and the corrupt record (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      // Before the sign-in service is wired, no pass ran: the record is pending without an error.
+      expect(await restarted.pendingSignOutStatus()).toEqual({
+        kind: "pending",
+        servers: [serverUrl],
+      });
+      let fail = true;
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService({
+        logout: (input: { serverUrl: string }) =>
+          fail ? Promise.resolve({ success: false, error: "offline" }) : oauth.logout(input),
+        credentialKey: (url: string) => oauth.credentialKey(url),
+      } as unknown as McpOauthService);
+      await restarted.list();
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      await internals.settledSignOutPasses();
+      // The failed pass's reason is shown next to the record.
+      expect(await restarted.pendingSignOutStatus()).toEqual({
+        kind: "pending",
+        servers: [serverUrl],
+        lastError: "offline",
+      });
+
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      const kept = await fsPromises.readFile(file, "utf-8");
+      await fsPromises.writeFile(file, "{ not json");
+      const broken = await restarted.pendingSignOutStatus();
+      expect(broken.kind).toBe("broken");
+      expect(broken.kind === "broken" && broken.reason).toMatch(
+        /corrupt or from another Xum version/
+      );
+
+      // An empty record still fences discovery, so Settings still shows it.
+      await fsPromises.writeFile(file, JSON.stringify({ version: 1, urls: [] }));
+      expect(await restarted.pendingSignOutStatus()).toMatchObject({
+        kind: "pending",
+        servers: [],
+      });
+      expect(await discovered()).toBe(0);
+
+      // A special file is reported without reading it (a FIFO would block the read).
+      if (process.platform !== "win32") {
+        await fsPromises.rm(file);
+        execFileSync("mkfifo", [file]);
+        const fifo = await restarted.pendingSignOutStatus();
+        expect(fifo.kind === "broken" && fifo.reason).toMatch(/not a regular file/);
+        await fsPromises.rm(file);
+      }
+
+      // A deleted record drops the old failure, so it cannot describe the next record.
+      await fsPromises.rm(file, { force: true });
+      expect(await restarted.pendingSignOutStatus()).toEqual({ kind: "none" });
+      await fsPromises.writeFile(file, kept);
+      const next = await restarted.pendingSignOutStatus();
+      expect(next).toEqual({ kind: "pending", servers: [serverUrl] });
+
+      // Reading the status retries like the discovery gate, so a fixed cause clears it.
+      fail = false;
+      await internals.settledSignOutPasses();
+      const later = spyOn(performance, "now").mockReturnValue(performance.now() + 31_000);
+      try {
+        // The read waits for the retry it started, so it already reports the cleared record.
+        expect(await restarted.pendingSignOutStatus()).toEqual({ kind: "none" });
+      } finally {
+        later.mockRestore();
+      }
+      await oauth.dispose();
+    });
+
     test("a later pass waits for a timed-out logout instead of starting a second one (#6627)", async () => {
       const { failing, result } = await updateWithFailingSignOut(stopStub);
       await result;
@@ -3708,6 +3784,55 @@ describe("AgentPluginInstallService", () => {
     const change = review.changes.find((c) => c.summary.includes("MCP server 'docs'"));
     expect(change?.before).toContain('"transport":"http"');
     expect(change?.after).toContain('"transport":"sse"');
+  });
+
+  describe("skill directive lines need a review (#6617)", () => {
+    const skillFile = () => path.join(remoteDir, "skills", "greet", "SKILL.md");
+    const withBody = (body: string) =>
+      `---\nname: greet\ndescription: Greets people\n---\n\n${body}\n`;
+
+    test("an update that adds or changes a directive line needs a review", async () => {
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+      for (const body of ["Say hi.\n!`git status`", "Say hi.\n!`git log --oneline`"]) {
+        await writePluginFixture(remoteDir, { version: "1.0.1" });
+        await fsPromises.writeFile(skillFile(), withBody(body));
+        await commitAll(remoteDir, `directive: ${body}`);
+        const review = await service.previewUpdate({ name: "demo-plugin" });
+        const change = review.changes.find((c) => c.summary.includes("skill 'greet'"));
+        expect(change?.after).toContain(body.split("\n")[1].slice(2, -1));
+        await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/review/);
+        const reviewed = review.changes.flatMap((c) => (c.component ? [c.component] : []));
+        await service.update({
+          name: "demo-plugin",
+          consent: { fromSha: review.fromSha, toSha: review.toSha, reviewed },
+        });
+        expect((await service.list())[0].reviewRequiredCount).toBe(0);
+      }
+    });
+
+    test("a prose-only body change still applies without a review", async () => {
+      await fsPromises.writeFile(skillFile(), withBody("Say hi.\n!`git status`"));
+      await commitAll(remoteDir, "skill with a directive");
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+      await writePluginFixture(remoteDir, { version: "1.0.1" });
+      await fsPromises.writeFile(skillFile(), withBody("Greet warmly.\n  !`git status`"));
+      const proseHead = await commitAll(remoteDir, "reword the prose only");
+      const updated = await service.update({ name: "demo-plugin" });
+      expect(updated.lockedSha).toBe(proseHead);
+      expect((await service.list())[0].reviewRequiredCount).toBe(0);
+    });
+
+    test("the install preview shows directive lines with invisible characters escaped", async () => {
+      await fsPromises.writeFile(skillFile(), withBody("Say hi.\n!`rm -rf \u200b/tmp/x`"));
+      await commitAll(remoteDir, "skill with a hidden character in a directive");
+      const preview = await service.preview({ input: remoteDir });
+      const greet = preview.skills.find((skill) => skill.name === "greet");
+      expect(greet?.directives).toEqual(["rm -rf \\u{200B}/tmp/x"]);
+    });
   });
 
   test("update accepts a skill paths reordering as capability-neutral", async () => {

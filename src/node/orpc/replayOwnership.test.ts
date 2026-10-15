@@ -247,9 +247,14 @@ test("an aborted replay cannot publish its delayed window to another subscriber"
   }
 });
 
-// Bun 1.4.2 and 1.4.3: AsyncLocalStorage.disable() hides the store from synchronous code but not
-// from a continuation that resumes after it. Node and Bun 1.3.12 hide it there too, and the
-// product runs on Node, so the release is asserted only where the runtime implements it.
+// AsyncLocalStorage.disable() hides the store from synchronous code on every runtime. A
+// continuation that was already waiting when disable() ran still sees the store on Bun 1.4.2+
+// and on Node 24+ (AsyncContextFrame, the default there, and Electron 44 runs Node 24). Only
+// Bun 1.3.13 and older and Node 22 hide it from that continuation too. Bun 1.4.2 adopted Node
+// 24's semantics, so no upstream fix will lift this gate (checked 2026-10-15).
+// Removal trigger: the tripwire in the test fails. Then the pinned Bun hides the resumed store
+// again: make the release assertion unconditional and delete this probe and the tripwire.
+const BUN_KEEPS_RESUMED_STORE_SINCE = "1.4.2";
 async function disableHidesResumedStore(): Promise<boolean> {
   const storage = new AsyncLocalStorage<object>();
   const gate = Promise.withResolvers<void>();
@@ -276,7 +281,13 @@ test("disposing a held replay releases its async context without affecting a sib
     await h.session.dispose();
     h.gates[0].release.resolve();
     const resumedStore = await resumed.promise;
-    if (await disableHidesResumedStore()) expect(resumedStore).toBeUndefined();
+    const hidesResumedStore = await disableHidesResumedStore();
+    // Tripwire: fails loudly when Bun changes disable() semantics, so the gate gets revisited.
+    expect({ bun: Bun.version, hidesResumedStore }).toEqual({
+      bun: Bun.version,
+      hidesResumedStore: Bun.semver.order(Bun.version, BUN_KEEPS_RESUMED_STORE_SINCE) < 0,
+    });
+    if (hidesResumedStore) expect(resumedStore).toBeUndefined();
     await held.caught;
     expect(held.events.some((event) => event.type === "stream-delta")).toBe(false);
     const surviving = sibling.subscribe();

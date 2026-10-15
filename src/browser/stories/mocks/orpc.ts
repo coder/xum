@@ -66,6 +66,7 @@ import type {
   AgentPluginUpdateCheck,
   AgentPluginUpdateReview,
   AgentPluginHooks,
+  AgentPluginPendingSignOuts,
 } from "@/common/orpc/schemas/agentPlugins";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { ChatStats } from "@/common/types/chatStats";
@@ -168,6 +169,8 @@ export interface MockORPCClientOptions {
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
     hooks?: Record<string, AgentPluginHooks>;
+    /** Returned by agentPlugins.pendingSignOuts; omit for no record. */
+    pendingSignOuts?: AgentPluginPendingSignOuts;
     /**
      * Returned by agentPlugins.previewComponentReview for the named plugin. Confirming clears the
      * plugin's reviewRequiredCount in `items`, like the backend does.
@@ -1380,6 +1383,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     agentPlugins: {
       list: () => Promise.resolve({ success: true, data: agentPluginsMock?.items ?? [] }),
       containerLocation: () => Promise.resolve("~/.mux/plugins"),
+      pendingSignOuts: () =>
+        Promise.resolve(agentPluginsMock?.pendingSignOuts ?? { kind: "none" as const }),
       getComponents: () =>
         Promise.resolve({
           success: false,

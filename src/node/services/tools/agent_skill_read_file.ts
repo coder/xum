@@ -13,11 +13,14 @@ import {
 import { pluginSiblingNoteFor } from "@/node/services/agentSkills/pluginSiblingNote";
 import type { InvocableSkill } from "@/common/types/agentSkill";
 import { readPluginFileWithinRootCapped } from "@/node/services/agentPlugins/discovery";
-import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import {
+  resolveSkillStorageContext,
+  type SkillStorageContext,
+} from "@/node/services/agentSkills/skillStorageContext";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { readBuiltInSkillFile } from "@/node/services/agentSkills/builtInSkillDefinitions";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
-import { RuntimeError } from "@/node/runtime/Runtime";
+import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
 import { resolveContainedSkillFilePath } from "./skillFileUtils";
 import { resolveContainedSkillFilePathOnRuntime } from "./runtimeSkillPathUtils";
@@ -134,6 +137,26 @@ function withPluginSkillNote(
 }
 
 /**
+ * Where `filePath` (relative to the skill directory) resolves under the
+ * containment agent_skill_read_file reads with. Throws when the path escapes
+ * the skill directory, also through a symlink.
+ */
+export async function resolveSkillFileTarget(
+  resolvedSkill: ResolvedAgentSkill,
+  skillRuntime: Runtime,
+  containment: SkillStorageContext["containment"],
+  filePath: string
+): Promise<string> {
+  const shouldUseRuntimeContainment =
+    skillRuntime instanceof RemoteRuntime ||
+    (resolvedSkill.package.scope === "project" && containment.kind === "runtime");
+  const { resolvedPath } = shouldUseRuntimeContainment
+    ? await resolveContainedSkillFilePathOnRuntime(skillRuntime, resolvedSkill.skillDir, filePath)
+    : await resolveContainedSkillFilePath(resolvedSkill.skillDir, filePath);
+  return resolvedPath;
+}
+
+/**
  * Agent Skill read_file tool factory.
  * Reads a file within a skill directory with file_read's paging and page caps,
  * but without its per-line cut (see readContentWithFileReadLimits).
@@ -203,24 +226,14 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           );
         }
 
-        const shouldUseRuntimeContainment =
-          skillRuntime instanceof RemoteRuntime ||
-          (resolvedSkill.package.scope === "project" && skillCtx.containment.kind === "runtime");
-
         let targetPath: string;
         try {
-          if (shouldUseRuntimeContainment) {
-            ({ resolvedPath: targetPath } = await resolveContainedSkillFilePathOnRuntime(
-              skillRuntime,
-              resolvedSkill.skillDir,
-              filePath
-            ));
-          } else {
-            ({ resolvedPath: targetPath } = await resolveContainedSkillFilePath(
-              resolvedSkill.skillDir,
-              filePath
-            ));
-          }
+          targetPath = await resolveSkillFileTarget(
+            resolvedSkill,
+            skillRuntime,
+            skillCtx.containment,
+            filePath
+          );
         } catch (error) {
           const message = getErrorMessage(error);
 

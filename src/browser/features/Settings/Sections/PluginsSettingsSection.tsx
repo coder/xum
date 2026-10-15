@@ -23,6 +23,7 @@ import type {
   AgentPluginInstallPreview,
   AgentPluginInterfaceSummary,
   AgentPluginListItem,
+  AgentPluginPendingSignOuts,
   AgentPluginUpdateCheck,
   AgentPluginUpdateConsent,
   AgentPluginUpdateReview,
@@ -91,7 +92,8 @@ const Badge: React.FC<{
     className={cn(
       "rounded px-1.5 py-0.5 text-[10px] font-medium",
       props.wrap === true ? "max-w-full wrap-anywhere" : "whitespace-nowrap",
-      props.tone === "muted" && "bg-foreground/10 text-muted",
+      // Foreground text: muted text on this tint stayed below 4.5:1 even after #6544 raised the token.
+      props.tone === "muted" && "bg-foreground/10 text-foreground",
       props.tone === "accent" && "bg-accent/15 text-accent-text",
       props.tone === "warning" && "bg-warning/15 text-warning",
       props.tone === "error" && "bg-destructive/15 text-destructive"
@@ -170,6 +172,24 @@ const PluginInterfaceDetails: React.FC<{ info: AgentPluginInterfaceSummary }> = 
   );
 };
 
+/**
+ * #6617: a skill's directive commands run when the user invokes it, so the review shows them.
+ * The backend escapes invisible characters; React escapes the rest.
+ */
+const SkillDirectives: React.FC<{ directives?: readonly string[] }> = (props) => {
+  if (props.directives === undefined || props.directives.length === 0) return null;
+  return (
+    <span className="block">
+      <span className="text-muted block">Can run these commands when invoked:</span>
+      {props.directives.map((command, index) => (
+        <code key={index} className="text-foreground block font-mono break-all whitespace-pre-wrap">
+          {command}
+        </code>
+      ))}
+    </span>
+  );
+};
+
 /** Only skills/MCP are selective; keep full-package consent below this shared chooser. */
 const ComponentChooser: React.FC<{
   inventory: Pick<AgentPluginComponents, "skills" | "mcpServers">;
@@ -183,10 +203,15 @@ const ComponentChooser: React.FC<{
       const label = group === "skills" ? "Skills" : "MCP servers";
       const entries =
         group === "skills"
-          ? props.inventory.skills.map((skill) => ({ name: skill.name, detail: skill.description }))
+          ? props.inventory.skills.map((skill) => ({
+              name: skill.name,
+              detail: skill.description,
+              directives: skill.directives,
+            }))
           : props.inventory.mcpServers.map((server) => ({
               name: server.serverName,
               detail: `${server.transport} · ${server.summary}`,
+              directives: undefined,
             }));
       const imported = props.imported?.[group] ?? [];
       const selectable = entries.map((entry) => entry.name);
@@ -224,7 +249,7 @@ const ComponentChooser: React.FC<{
             </Button>
           </div>
           {entries.length === 0 && <p className="text-muted text-xs">None available</p>}
-          {entries.map(({ name, detail }) => (
+          {entries.map(({ name, detail, directives }) => (
             <label key={name} className="flex items-start gap-2 text-xs">
               <Checkbox
                 aria-label={name}
@@ -244,6 +269,7 @@ const ComponentChooser: React.FC<{
                 {detail && (
                   <span className="text-muted block break-all whitespace-pre-wrap">{detail}</span>
                 )}
+                <SkillDirectives directives={directives} />
               </span>
             </label>
           ))}
@@ -994,6 +1020,90 @@ const UpdateReviewPanel: React.FC<{
   );
 };
 
+/**
+ * The plugin list and the pending sign-out status (#6627). Opening the section retries the
+ * sign-outs, so the status is read after the list. When the record existed before the list and is
+ * gone after it, the list may still hold rows the fence hid: list once more.
+ */
+async function listWithSignOuts(api: NonNullable<ReturnType<typeof useAPI>["api"]>) {
+  const readStatus = () => api.agentPlugins.pendingSignOuts().catch(() => null);
+  const before = await readStatus();
+  let result = await api.agentPlugins.list();
+  const signOuts = await readStatus();
+  if (before !== null && before.kind !== "none" && signOuts?.kind === "none")
+    result = await api.agentPlugins.list();
+  return { result, signOuts };
+}
+
+/** How often the section re-reads a pending sign-out record (the backend retries every 30 s). */
+const PENDING_SIGN_OUT_POLL_MS = 30_000;
+
+/**
+ * The pending sign-out record (#6627). The section sets it after each list. A background pass
+ * (the discovery gate retries every 30 s) can clear or change the record without any section
+ * action, so the hook re-reads it while the notice shows.
+ */
+function usePendingSignOuts(
+  api: ReturnType<typeof useAPI>["api"],
+  /** Re-lists the plugins: rows read while the record fenced discovery show as missing. */
+  onCleared: () => void
+): [AgentPluginPendingSignOuts | null, (status: AgentPluginPendingSignOuts | null) => void] {
+  const [status, setStatus] = useState<AgentPluginPendingSignOuts | null>(null);
+  const shown = status !== null && status.kind !== "none";
+  // The interval reads the latest callback (the section's refresh is a plain handler).
+  const onClearedRef = useRef(onCleared);
+  onClearedRef.current = onCleared;
+  useEffect(() => {
+    if (!api || !shown) return;
+    // Each read also lets the backend retry the sign-out (at most every 30 s).
+    const timer = setInterval(() => {
+      api.agentPlugins.pendingSignOuts().then(
+        (next) => {
+          setStatus(next);
+          if (next.kind === "none") onClearedRef.current();
+        },
+        () => undefined
+      );
+    }, PENDING_SIGN_OUT_POLL_MS);
+    return () => clearInterval(timer);
+  }, [api, shown]);
+  return [status, setStatus];
+}
+
+/**
+ * Section notice while a post-update sign-out record exists (#6627). Every discovery gate keeps
+ * managed plugins closed until it is gone, and without this notice they only disappear.
+ */
+const PendingSignOutNotice: React.FC<{ status: AgentPluginPendingSignOuts | null }> = (props) => {
+  const status = props.status;
+  if (status === null || status.kind === "none") return null;
+  return (
+    <div
+      role="status"
+      className="bg-warning/10 text-warning mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm"
+    >
+      <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+      {status.kind === "broken" ? (
+        <span className="break-words">
+          Managed plugins are unavailable to agents. {status.reason}
+        </span>
+      ) : (
+        <span className="space-y-1 break-words">
+          <span className="block">
+            Managed plugins are unavailable to agents until Xum finishes signing out of a plugin MCP
+            server whose sign-in changed in an update
+            {status.servers.length > 0 ? `: ${status.servers.join(", ")}` : ""}. Xum retries on its
+            own and each time you open this section.
+          </span>
+          {status.lastError !== undefined && (
+            <span className="block">Last attempt: {status.lastError}</span>
+          )}
+        </span>
+      )}
+    </div>
+  );
+};
+
 /** Section notice while any plugin has components not reviewed on this install (#6498). */
 const ComponentReviewNotice: React.FC<{ items: AgentPluginListItem[] | null }> = (props) => {
   if (!(props.items ?? []).some((item) => (item.reviewRequiredCount ?? 0) > 0)) return null;
@@ -1166,6 +1276,9 @@ export const PluginsSettingsSection: React.FC = () => {
   // Backend-provided container path: the root is config-derived (canonically
   // ~/.shux, possibly custom/legacy), so this copy must never hardcode it.
   const [containerLocation, setContainerLocation] = useState<string | null>(null);
+  // The record that keeps managed plugins closed after a failed post-update sign-out (#6627).
+  // Lazy: `refresh` is declared below.
+  const [pendingSignOuts, setPendingSignOuts] = usePendingSignOuts(api, () => void refresh());
   // Palette intents (keyboard rule: install/uninstall/update need keyboard
   // paths). The initializer covers palette → fresh mount; the subscription
   // below covers commands invoked while this section is already on screen
@@ -1215,10 +1328,11 @@ export const PluginsSettingsSection: React.FC = () => {
     // response resolving last would resurrect removed rows or old versions.
     const generation = ++listGenerationRef.current;
     try {
-      const result = await api.agentPlugins.list();
+      const { result, signOuts } = await listWithSignOuts(api);
       if (generation !== listGenerationRef.current) {
         return; // A newer list request superseded this one.
       }
+      setPendingSignOuts(signOuts);
       if (result.success) {
         setItems(result.data);
         setError(null);
@@ -1484,6 +1598,7 @@ export const PluginsSettingsSection: React.FC = () => {
           </div>
         )}
 
+        <PendingSignOutNotice status={pendingSignOuts} />
         <ComponentReviewNotice items={items} />
 
         <div className="space-y-2">

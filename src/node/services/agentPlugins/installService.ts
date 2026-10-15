@@ -22,6 +22,7 @@ import type {
   AgentPluginHooks,
   AgentPluginInterfaceSummary,
   AgentPluginListItem,
+  AgentPluginPendingSignOuts,
   AgentPluginManifestSummary,
   AgentPluginPreviewHook,
   AgentPluginPreviewMcpServer,
@@ -91,6 +92,8 @@ import {
   serverConsentFingerprint,
   skillConsentDetail,
   skillConsentFingerprint,
+  skillReviewDirectives,
+  directivesField,
   type ComponentConsent,
 } from "./componentConsent";
 import type { OpenAIPluginInterface } from "./openaiExtension";
@@ -208,6 +211,9 @@ const JOURNAL_RECONCILIATION_TIMEOUT_MS = 30_000;
  */
 const PENDING_SIGN_OUT_RETRY_MS = 30_000;
 
+/** How long a Settings status read waits for the retry it started. */
+const STATUS_RETRY_WAIT_MS = 5_000;
+
 const LS_REMOTE_TIMEOUT_MS = 30_000;
 const CLONE_TIMEOUT_MS = 120_000;
 
@@ -217,22 +223,23 @@ function monotonicNow(): number {
 }
 
 /**
- * Whether logout() succeeded before the pass deadline. A late or hung logout counts as failed:
- * the URL stays in the record, and a later pass retries it (logout is idempotent).
+ * Why logout() did not succeed before the pass deadline, or undefined when it did. A late or
+ * hung logout counts as failed: the URL stays in the record, and a later pass retries it
+ * (logout is idempotent).
  *
  * A late logout keeps running. A later pass waits for that same call instead of starting a
  * second one, so the record stays until the original call settles: a second logout could
  * otherwise clear the record while the first one still runs and later deletes a new sign-in.
  */
-async function signedOutBefore(
+async function signOutFailure(
   oauth: Pick<McpOauthService, "logout" | "credentialKey">,
   serverUrl: string,
   deadline: number,
-  inFlight: Map<string, Promise<{ success: boolean }>>
-): Promise<boolean> {
+  inFlight: Map<string, Promise<Awaited<ReturnType<McpOauthService["logout"]>>>>
+): Promise<string | undefined> {
   // Past the pass deadline: start nothing more. The URL stays in the record for the next pass.
   // Under 1 ms counts as past: timers have 1 ms resolution and can fire that much early.
-  if (deadline - monotonicNow() < 1) return false;
+  if (deadline - monotonicNow() < 1) return "The sign-out pass ran out of time before this server.";
   // Keyed by credential: `/mcp` and `/mcp/` are one stored sign-in, so one logout.
   const key = oauth.credentialKey(serverUrl) ?? serverUrl;
   let call = inFlight.get(key);
@@ -247,9 +254,21 @@ async function signedOutBefore(
   }
   const timeoutMs = Math.max(0, deadline - monotonicNow());
   const settled = await raceWithAbortAndTimeout(call, { timeoutMs });
-  if (settled.kind === "ok") return settled.value.success;
+  if (settled.kind === "ok") return settled.value.success ? undefined : settled.value.error;
   log.warn("A pending plugin MCP sign-out timed out", { timeoutMs });
-  return false;
+  return `The sign-out did not finish within ${Math.round(timeoutMs / 1000)} s.`;
+}
+
+/**
+ * The Settings text for a sign-out record Xum cannot use (#6627). The parser's own errors
+ * already name the recovery step. A read error gets one here.
+ */
+function unusableRecordReason(error: unknown, file: string): string {
+  // fs errors come from another realm under the Jest VM: read `code` without instanceof.
+  const code: unknown =
+    typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  if (typeof code !== "string") return getErrorMessage(error);
+  return `Xum cannot read the pending plugin sign-out record (${file}): ${code}. Fix its permissions. Or: sign out of the plugin's MCP servers in Settings → MCP, then delete the file.`;
 }
 
 /** Waits for the startup sign-out pass at most timeoutMs, then lets discovery go on. */
@@ -952,9 +971,12 @@ function parsePendingSignOuts(raw: string, file: string): string[] {
   const fields =
     typeof record === "object" && record !== null ? (record as Record<string, unknown>) : {};
   const value = fields.version === 1 ? fields.urls : undefined;
+  // Sign out first, delete last: every discovery gate checks only that this file exists
+  // (containerHasPendingSignOuts), so deleting it first lets an agent load the updated
+  // plugin and reuse the old grant before the user signs out.
   if (!Array.isArray(value) || !value.every((url) => typeof url === "string"))
     throw new Error(
-      `The pending plugin sign-out record (${shortenHome(file)}) is corrupt or from another Xum version. Sign out of the plugin MCP servers in Settings, then delete the file.`
+      `The pending plugin sign-out record (${shortenHome(file)}) is corrupt or from another Xum version. Sign out of the plugin's MCP servers in Settings → MCP, then delete the file.`
     );
   return value;
 }
@@ -2685,7 +2707,10 @@ export class AgentPluginInstallService {
           ...skillConsentFields({
             relativeDir: path.relative(pluginRoot, path.join(skillsDir, dirName)),
             frontmatter: skillConsentFrontmatter(parsed),
+            body: parsed.body,
           }),
+          // The commands the skill can run when invoked (#6617): shown, then fingerprinted.
+          ...directivesField(skillReviewDirectives(parsed.body)),
           ...(parsed.frontmatter.description !== undefined
             ? { description: parsed.frontmatter.description }
             : {}),
@@ -3741,9 +3766,10 @@ export class AgentPluginInstallService {
       warnings
     );
     return {
-      skills: skills.map(({ name, description }) => ({
+      skills: skills.map(({ name, description, directives }) => ({
         name,
         ...(description !== undefined ? { description } : {}),
+        ...directivesField(directives),
       })),
       mcpServers,
       /** What this review showed, as consent fingerprints (#6498). Never sent to the renderer. */
@@ -4122,11 +4148,15 @@ export class AgentPluginInstallService {
     return this.runExclusive(async () => {
       const deadline = monotonicNow() + this.recoveryTimeoutMs;
       const left: string[] = [];
+      const failures: string[] = [];
       for (const serverUrl of await this.readPendingSignOuts()) {
-        if (!(await signedOutBefore(oauth, serverUrl, deadline, this.inFlightSignOuts)))
-          left.push(serverUrl);
+        const failure = await signOutFailure(oauth, serverUrl, deadline, this.inFlightSignOuts);
+        if (failure === undefined) continue;
+        left.push(serverUrl);
+        failures.push(failure);
       }
       await this.writePendingSignOuts(left);
+      this.pendingSignOutLastError = failures[0];
       return left.length > 0;
     });
   }
@@ -4187,15 +4217,61 @@ export class AgentPluginInstallService {
     // A pass before the sign-in service is wired tries nothing, so it sets no wait.
     const left = await this.completePendingSignOuts().catch((error: unknown) => {
       // An unreadable record stays: it keeps discovery closed until the user deletes it.
-      log.warn("Could not finish pending plugin sign-outs", { error: getErrorMessage(error) });
+      this.pendingSignOutLastError = getErrorMessage(error);
+      log.warn("Could not finish pending plugin sign-outs", {
+        error: this.pendingSignOutLastError,
+      });
       return true;
     });
     this.pendingSignOutRetryAtMs = left ? monotonicNow() + PENDING_SIGN_OUT_RETRY_MS : 0;
   }
 
   private pendingSignOutPass: Promise<void> | undefined;
-  /** Logouts a pass started that have not settled yet (see signedOutBefore). */
-  private readonly inFlightSignOuts = new Map<string, Promise<{ success: boolean }>>();
+  /** Why the last pass left the record; shown in Settings (pendingSignOutStatus). */
+  private pendingSignOutLastError: string | undefined;
+
+  /**
+   * The pending sign-out record for Settings → Plugins (#6627). While it exists, managed plugins
+   * are unavailable to agents, so Settings names it and the recovery step. Never throws.
+   */
+  async pendingSignOutStatus(): Promise<AgentPluginPendingSignOuts> {
+    // Settings re-reads this while the notice shows: retry like the discovery gate does (at most
+    // once per PENDING_SIGN_OUT_RETRY_MS), so a fixed cause clears without an agent request.
+    this.startPendingSignOutPass({ retryNow: false });
+    // Report the retry's result when it is quick; a slow logout is reported on the next read.
+    await waitForPendingSignOuts(this.settledSignOutPasses(), STATUS_RETRY_WAIT_MS);
+    const record = await pendingSignOutsRecordState(this.containerDir);
+    if (record.kind === "absent") {
+      // An old record's failure must not describe the next one.
+      this.pendingSignOutLastError = undefined;
+      return { kind: "none" };
+    }
+    return this.readPendingSignOutStatus(record);
+  }
+
+  /** The status of an existing record (see pendingSignOutStatus). */
+  private async readPendingSignOutStatus(
+    record: { kind: "present" } | { kind: "unreadable"; code: string }
+  ): Promise<AgentPluginPendingSignOuts> {
+    const file = shortenHome(this.pendingSignOutsFile);
+    // A special file (a FIFO would block the read) is reported without reading it.
+    if (record.kind === "unreadable")
+      return { kind: "broken", reason: unusableRecordReason({ code: record.code }, file) };
+    let servers: string[];
+    try {
+      servers = await this.readPendingSignOuts();
+    } catch (error) {
+      return { kind: "broken", reason: unusableRecordReason(error, file) };
+    }
+    // An empty record still fences discovery while it exists (the next pass deletes it).
+    const lastError = this.pendingSignOutLastError;
+    return { kind: "pending", servers, ...(lastError !== undefined ? { lastError } : {}) };
+  }
+  /** Logouts a pass started that have not settled yet (see signOutFailure). */
+  private readonly inFlightSignOuts = new Map<
+    string,
+    Promise<Awaited<ReturnType<McpOauthService["logout"]>>>
+  >();
   /** See startPendingSignOutPass. On the monotonic clock: a wall-clock jump must not move it. */
   private pendingSignOutRetryAtMs = 0;
   /** See signOutPassRunning. */

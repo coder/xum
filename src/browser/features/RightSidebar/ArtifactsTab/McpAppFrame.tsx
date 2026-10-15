@@ -199,7 +199,7 @@ function McpAppViewHeader(props: {
 }
 
 /**
- * An MCP Apps view (artifacts experiment) in its app tab or tool card: the server's ui:// HTML in the
+ * An MCP Apps view (mcp-apps experiment) in its app tab or tool card: the server's ui:// HTML in the
  * same sandbox as HTML artifacts, talking JSON-RPC to the host (mcpAppHost.ts).
  *
  * SECURITY AUDIT: a single opaque-origin srcdoc iframe (sandbox exactly "allow-scripts", never

@@ -95,12 +95,16 @@ function readSegmentRecords(messages: MuxMessage[]): Array<[MuxMessage, Volatile
   return records;
 }
 
-/** `messages` with each recorded row put back right before its assistant row. */
+/**
+ * `messages` with each recorded row put back right before its assistant row. `lastTail` is
+ * the tail of the last row put back (undefined when none was).
+ */
 function withRecordedRows(
   messages: MuxMessage[],
   records: Map<MuxMessage, VolatileSystemTailRecord>
-): { messages: MuxMessage[]; rowsText: string } {
+): { messages: MuxMessage[]; rowsText: string; lastTail?: string } {
   let rowsText = "";
+  let lastTail: string | undefined;
   const withRows = messages.flatMap((message, index) => {
     const record = records.get(message);
     // Anthropic rejects a system row after an assistant message: skip one that no longer
@@ -108,9 +112,10 @@ function withRecordedRows(
     if (record?.placement !== "row" || messages[index - 1]?.role !== "user") return [message];
     const row = systemRow(`${message.id}-volatile-tail`, record.text);
     rowsText += rowText(row);
+    lastTail = record.text;
     return [row, message];
   });
-  return { messages: withRows, rowsText };
+  return { messages: withRows, rowsText, lastTail };
 }
 
 function rowText(row: MuxMessage): string {
@@ -118,16 +123,40 @@ function rowText(row: MuxMessage): string {
 }
 
 /**
+ * The segment's frozen system tail and the rows recorded after it put back, or undefined
+ * before a freeze (see planVolatileSystemTail). `appliedTail` is the tail the model already reads: the last row put back, else the frozen
+ * one. Not the last record's: withRecordedRows can skip that row, and then the model never
+ * reads it (a reasoning-only partial the empty-row filter dropped when the row was recorded
+ * can come back between the user row and the row's assistant row on a thinking-on rebuild).
+ */
+function restoreFrozenSegment(
+  messages: MuxMessage[]
+): (Omit<VolatileSystemTailPlan, "appendedRow" | "record"> & { appliedTail: string }) | undefined {
+  const records = readSegmentRecords(messages);
+  const freeze = records.findLastIndex(([, record]) => record.placement === "system");
+  if (freeze < 0) return undefined;
+  const systemTail = records[freeze][1].text;
+  const restored = withRecordedRows(messages, new Map(records.slice(freeze + 1)));
+  return {
+    systemTail,
+    messages: restored.messages,
+    rowsText: restored.rowsText,
+    appliedTail: restored.lastTail ?? systemTail,
+  };
+}
+
+/**
  * Replay only: the turn envelope records the system tail the request SENT (the frozen one), so
  * the live tail comes from the planner's own rules. A recorded change names it, and without a
- * record it equals the last tail the segment sent (or the sent tail itself, before any record).
+ * record it equals the tail the request already applied (or the sent tail itself, before any
+ * freeze).
  */
 function replayedLiveTail(
-  records: Array<[MuxMessage, VolatileSystemTailRecord]>,
+  appliedTail: string | undefined,
   sentTail: string,
   turnRecord: VolatileSystemTailRecord | undefined
 ): string {
-  return turnRecord?.text ?? records.at(-1)?.[1].text ?? sentTail;
+  return turnRecord?.text ?? appliedTail ?? sentTail;
 }
 
 /**
@@ -150,11 +179,10 @@ export function planVolatileSystemTail(
 ): VolatileSystemTailPlan {
   if (!rowsSupported) return { systemTail: requestTail, messages, rowsText: "" };
   assert(requestTail !== "", "a volatile-tail row needs a non-empty tail");
-  const records = readSegmentRecords(messages);
+  const restored = restoreFrozenSegment(messages);
   const liveTail = replayedTurn
-    ? replayedLiveTail(records, requestTail, replayedTurn.record)
+    ? replayedLiveTail(restored?.appliedTail, requestTail, replayedTurn.record)
     : requestTail;
-  const freeze = records.findLastIndex(([, record]) => record.placement === "system");
   // Segment start (or a history from before this rule), or a re-freeze below: send as before,
   // with no earlier rows, and freeze here.
   const asBefore: VolatileSystemTailPlan = {
@@ -163,11 +191,9 @@ export function planVolatileSystemTail(
     rowsText: "",
     record: { text: liveTail, placement: "system" },
   };
-  if (freeze < 0) return asBefore;
-  const frozen = records[freeze][1].text;
-  const restored = withRecordedRows(messages, new Map(records.slice(freeze + 1)));
-  const withRows = { systemTail: frozen, ...restored };
-  if (liveTail === records.at(-1)?.[1].text) return withRows;
+  if (restored == null) return asBefore;
+  const { appliedTail, ...withRows } = restored;
+  if (liveTail === appliedTail) return withRows;
   // A row must follow a user message. Otherwise (a resume after an assistant row) send the new
   // tail as before, which re-freezes the segment at it.
   if (messages.at(-1)?.role !== "user") return asBefore;

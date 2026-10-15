@@ -1,4 +1,5 @@
 import { RIGHT_SIDEBAR_DEFAULT_COLLAPSED } from "@/constants/layout";
+import { addWindowListenerWhile } from "@/browser/utils/events";
 import React from "react";
 import { X } from "lucide-react";
 import {
@@ -1157,6 +1158,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const liveApi = liveClientOf(apiState);
   const desktopExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const artifactsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const mcpAppsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MCP_APPS);
   const browserExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_BROWSER);
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   // Child task workspaces own a goal (pause/resume/complete), but goal-board and
@@ -1344,14 +1346,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   );
   const layout = React.useMemo(() => {
     let next = canReviewDiffs ? parsedLayout : removeTabEverywhere(parsedLayout, "review");
-    // App tabs exist only behind the artifacts experiment, like MCP Apps themselves.
-    if (!artifactsExperimentEnabled) {
+    // App tabs exist only behind the mcp-apps experiment, like MCP Apps themselves.
+    if (!mcpAppsExperimentEnabled) {
       for (const tab of collectAllTabs(next.root)) {
         if (getAppViewTabKey(tab) != null) next = removeTabEverywhere(next, tab);
       }
     }
     return next;
-  }, [artifactsExperimentEnabled, canReviewDiffs, parsedLayout]);
+  }, [mcpAppsExperimentEnabled, canReviewDiffs, parsedLayout]);
 
   const hasReviewPanelMounted = React.useMemo(
     () => !collapsed && hasMountedReviewPanel(layout.root),
@@ -1547,8 +1549,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // asks for the view's own app tab, focusing it when it is already open. On small viewports
   // WorkspaceMenuBar shows the tab in the full-screen sidebar instead; these handlers then stay
   // out, so one event never acts twice.
+  // Each event listens only while its own experiment is on (MCP Apps are independent, #6760).
   React.useEffect(() => {
-    if (!artifactsExperimentEnabled) return;
     const shown = () => {
       const container = sidebarContainerRef.current;
       return container == null || !isRightSidebarResponsivelyHidden(container);
@@ -1565,13 +1567,21 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       setCollapsed(false);
       setLayout((prev) => withAppViewTab(prev, detail.toolCallId));
     };
-    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenAppViewTab);
-    window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handleOpenArtifactsTab);
+    const removeAppView = addWindowListenerWhile(
+      mcpAppsExperimentEnabled,
+      CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
+      handleOpenAppViewTab
+    );
+    const removeArtifact = addWindowListenerWhile(
+      artifactsExperimentEnabled,
+      CUSTOM_EVENTS.OPEN_ARTIFACT,
+      handleOpenArtifactsTab
+    );
     return () => {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenAppViewTab);
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handleOpenArtifactsTab);
+      removeAppView();
+      removeArtifact();
     };
-  }, [artifactsExperimentEnabled, setCollapsed, setLayout, workspaceId]);
+  }, [artifactsExperimentEnabled, mcpAppsExperimentEnabled, setCollapsed, setLayout, workspaceId]);
 
   // Global shortcut: open (and un-collapse) the Artifacts tab. Works from the chat input
   // too, because Ctrl+Shift+K inserts nothing there. While the narrow layout hides the
@@ -2602,6 +2612,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             onNewSideChat={canStartSideChat ? () => handleStartSideChat() : undefined}
             creatingSideChat={creatingSideChat}
             artifactsEnabled={artifactsExperimentEnabled}
+            mcpAppsEnabled={mcpAppsExperimentEnabled}
             unreadAssisted={unreadAssisted}
           />
         )}

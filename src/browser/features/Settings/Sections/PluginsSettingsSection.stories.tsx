@@ -1,11 +1,12 @@
 import { useRef, useState } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, waitFor, within } from "storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { PIXEL_DISABLED } from "@/browser/stories/meta";
 import { createMockORPCClient, type MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
 import type {
@@ -418,7 +419,11 @@ export const AddPluginConsentPreview: Story = {
               interface: OPENAI_INTERFACE,
             },
             skills: [
-              { name: "grill", description: "Stress-test a plan before committing to it." },
+              {
+                name: "grill",
+                description: "Stress-test a plan before committing to it.",
+                directives: ["git log --oneline -5"],
+              },
               { name: "grill-lite", description: "A gentler grilling for small changes." },
             ],
             mcpServers: [
@@ -466,6 +471,13 @@ export const AddPluginConsentPreview: Story = {
     await canvas.findByText(/Unknown top-level field 'hooks' ignored/);
     await canvas.findByRole("button", { name: /Install/ });
     await expectInterfaceAsText(canvasElement);
+    // The muted-tone chips reach WCAG AA in every theme; dark muted text on their tint was
+    // 4.06:1 (#6544).
+    const chips = () => [
+      ...canvas.getAllByText("Interactive"),
+      ...canvas.getAllByText(/^branch · /),
+    ];
+    await expect(textsBelowAaInThemes(chips).join("\n")).toBe("");
   },
 };
 
@@ -800,6 +812,87 @@ export const ThemedLogoLight: Story = {
     if (sources.some((source) => source !== DARK_DISC_LOGO)) {
       throw new Error("Light theme must show the light logo");
     }
+  },
+};
+
+/** A post-update sign-out that failed: Settings names the servers and the last error (#6627). */
+const PENDING_SIGN_OUT_URL =
+  "https://mcp.example-identity-provider-with-a-long-host-name.com/tenants/acme-production/mcp";
+
+/**
+ * Pending sign-out (#6627) at phone width: the notice names the server and the last error, and
+ * the long URL wraps inside it. Out of Pixel snapshots (snapshot budget); the play checks it.
+ */
+export const PendingSignOutPhoneViewport: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell
+      options={{
+        agentPlugins: {
+          items: [MANAGED_ITEM],
+          pendingSignOuts: {
+            kind: "pending",
+            servers: [PENDING_SIGN_OUT_URL],
+            lastError: "Failed to write OAuth store: disk full",
+          },
+        },
+      }}
+    >
+      {/* Fixed phone width so the overflow check holds in the CI test-runner too (AGENTS.md). */}
+      <div style={{ width: 375 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const notice = await canvas.findByText(/Managed plugins are unavailable to agents until/);
+    await canvas.findByText(/Last attempt: Failed to write OAuth store: disk full/);
+    if (!notice.textContent?.includes(PENDING_SIGN_OUT_URL)) {
+      throw new Error("The notice must name the server to sign out of");
+    }
+    const box = notice.closest("[role='status']");
+    if (!(box instanceof HTMLElement) || box.scrollWidth > box.clientWidth + 1) {
+      throw new Error("The pending sign-out notice overflows at phone width");
+    }
+  },
+};
+
+/** The backend's reason for a broken record; the notice shows it as given. */
+const BROKEN_SIGN_OUT_REASON =
+  "The pending plugin sign-out record (~/.mux/plugin-sign-outs-pending.json) is corrupt or from another Xum version. Sign out of the plugin's MCP servers in Settings → MCP, then delete the file.";
+
+/** A corrupt record (#6627): only the user can clear it, so the notice gives the steps. */
+export const BrokenSignOutRecord: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell
+      options={{
+        agentPlugins: {
+          items: [MANAGED_ITEM],
+          pendingSignOuts: {
+            kind: "broken",
+            reason: BROKEN_SIGN_OUT_REASON,
+          },
+        },
+      }}
+    >
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    // The broken-record branch renders a status notice that carries the backend's reason as
+    // given (compared with the mock's value, not with copy).
+    await waitFor(
+      () => {
+        const notices = canvas.queryAllByRole("status");
+        if (!notices.some((notice) => notice.textContent?.includes(BROKEN_SIGN_OUT_REASON))) {
+          throw new Error("The broken sign-out notice must show the backend's reason");
+        }
+      },
+      { timeout: 5000 }
+    );
   },
 };
 

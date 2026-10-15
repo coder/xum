@@ -212,6 +212,7 @@ import {
   AgentPluginComponentRefSchema,
   AgentPluginHooksSchema,
   AgentPluginListItemSchema,
+  AgentPluginPendingSignOutsSchema,
   AgentPluginUpdateCheckSchema,
   AgentPluginUpdateConsentSchema,
   AgentPluginUpdateReviewSchema,
@@ -1305,6 +1306,11 @@ export const agentPlugins = {
       z.object({ success: z.literal(false), error: z.string() }),
     ]),
   },
+  /** The pending sign-out record that keeps managed plugins closed (#6627). */
+  pendingSignOuts: {
+    input: z.void(),
+    output: AgentPluginPendingSignOutsSchema,
+  },
   /** Display path of the ACTIVE managed plugin container (config-derived root; never hardcode it in UI). */
   containerLocation: {
     input: z.void(),
@@ -1569,7 +1575,7 @@ export const artifacts = {
 };
 
 /**
- * MCP Apps views in the Artifacts tab (artifacts experiment): the view resource plus the
+ * MCP Apps views in the Artifacts tab (mcp-apps experiment): the view resource plus the
  * host-only tool result, and tools/call and resources/read issued by a view.
  */
 export const mcpApps = {

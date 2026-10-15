@@ -586,6 +586,16 @@ describe("ServiceContainer", () => {
     await disposal;
   });
 
+  it("hands workspace metadata events to AIService, so removal drops its request caches", () => {
+    services = new ServiceContainer(stores);
+    const handleWorkspaceMetadata = spyOn(services.aiService, "handleWorkspaceMetadata");
+    const event = { workspaceId: "removed-workspace", metadata: null };
+
+    services.workspaceService.emit("metadata", event);
+
+    expect(handleWorkspaceMetadata).toHaveBeenCalledWith(event);
+  });
+
   it("attributes multi-project stream-end analytics to the primary project path", async () => {
     const primaryProjectPath = "/fake/project-a";
     const secondaryProjectPath = "/fake/project-b";

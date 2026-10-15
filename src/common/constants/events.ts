@@ -171,7 +171,7 @@ export const CUSTOM_EVENTS = {
   OPEN_SIDE_CHAT_TAB: "mux:openSideChatTab",
 
   /**
-   * Open an MCP Apps view in its app tab (artifacts experiment): uncollapse the right sidebar
+   * Open an MCP Apps view in its app tab (mcp-apps experiment): uncollapse the right sidebar
    * and open or focus the view's tab, or open the view's sheet on small viewports.
    */
   OPEN_MCP_APP_VIEW: "mux:openMcpAppView",

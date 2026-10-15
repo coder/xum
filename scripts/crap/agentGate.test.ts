@@ -58,8 +58,9 @@ function runGate(
   return { status: result.status, out: result.stdout + result.stderr };
 }
 
+// CC 9: the regression below ends at CC 12, above the floor's growth line (CC 10 without coverage).
 const ROUTE = `export function route(a: number) {
-  if (a > 1) return 1;
+${Array.from({ length: 8 }, (_, i) => `  if (a === ${i}) return ${i};`).join("\n")}
   return 0;
 }
 `;
@@ -89,7 +90,7 @@ test("block mode stops a regressing commit before it runs, unless it carries Cra
 
   const blocked = runGate(gate, "pre", "git commit -am 'grow route'");
   expect(blocked.status).toBe(1);
-  expect(blocked.out).toContain("VIOLATION floor-cc     src/route.ts:1-5 route: CC 2 -> 5");
+  expect(blocked.out).toContain("VIOLATION floor-cc     src/route.ts:1-12 route: CC 9 -> 12");
 
   // A reason with the letter n (a past parser stopped there and lost the reason).
   expect(runGate(gate, "pre", "git commit -am 'grow' -m 'Crap-Debt: needs follow-up'").status).toBe(
@@ -110,7 +111,7 @@ test("block mode stops a regressing commit before it runs, unless it carries Cra
   git("commit", "-q", "-am", "grow", "-m", "Crap-Debt: needs follow-up");
   const after = runGate(gate, "post", "git commit -am grow -m 'Crap-Debt: needs follow-up'");
   expect(after.status).toBe(0);
-  expect(after.out).toContain("warning   floor-cc     src/route.ts:1-5 route: CC 2 -> 5");
+  expect(after.out).toContain("warning   floor-cc     src/route.ts:1-12 route: CC 9 -> 12");
 }, 60_000);
 
 test("warn mode lets the commit run and reports after it", () => {
@@ -119,7 +120,7 @@ test("warn mode lets the commit run and reports after it", () => {
   expect(runGate(gate, "pre", "git commit -am 'grow route'")).toEqual({ status: 0, out: "" });
   const reported = runGate(gate, "post", "git commit -am 'grow route'");
   expect(reported.status).toBe(0);
-  expect(reported.out).toContain("VIOLATION floor-cc     src/route.ts:1-5 route: CC 2 -> 5");
+  expect(reported.out).toContain("VIOLATION floor-cc     src/route.ts:1-12 route: CC 9 -> 12");
 }, 60_000);
 
 test("other commands skip the check, and a broken gate never blocks", () => {

@@ -464,7 +464,7 @@ export function wrapMCPTools(
       icons?: { registry: MCPIconRegistry; owner: MCPIconOwner };
     };
     /**
-     * MCP Apps (artifacts experiment): host-only store for the raw results of tools that
+     * MCP Apps (mcp-apps experiment): host-only store for the raw results of tools that
      * declare a view. Omitted when the experiment was off at connect time.
      */
     appResults?: { serverName: string; store: McpAppResultStore };
@@ -1444,7 +1444,7 @@ interface MCPServerInstance {
   /** Codex plugin hooks (see MCPServerManager.callToolForPluginHook). */
   callToolForHook: MCPClientHandle["callToolForHook"];
   /**
-   * MCP Apps (artifacts experiment): present only when the connection announced the
+   * MCP Apps (mcp-apps experiment): present only when the connection announced the
    * extension. Tool metadata includes tools hidden from the model.
    */
   apps?: Pick<
@@ -1838,7 +1838,7 @@ export class MCPServerManager {
 
   private mcpApps: { isEnabled: () => boolean; store: McpAppResultStore } | null = null;
 
-  /** MCP Apps host support, gated by the artifacts experiment (read at each connect). */
+  /** MCP Apps host support, gated by the mcp-apps experiment (read at each connect). */
   setMcpApps(apps: { isEnabled: () => boolean; store: McpAppResultStore }): void {
     this.mcpApps = apps;
   }
@@ -2613,9 +2613,19 @@ export class MCPServerManager {
     const inFlight = this.toolRefreshesInFlight.get(instance);
     if (inFlight !== undefined) return inFlight;
     if (instance.isClosed || !instance.refreshTools) return Promise.resolve(true);
+    const previousToolCount = Object.keys(instance.tools).length;
     const refresh = instance
       .refreshTools()
-      .then(() => true)
+      .then(() => {
+        // Counts per refetch show whether a remote server's tool list drifts between
+        // fetches (which used to change the tool_catalog_search overview).
+        log.debug("[MCP] Refreshed tool catalog", {
+          name: instance.name,
+          previousToolCount,
+          toolCount: Object.keys(instance.tools).length,
+        });
+        return true;
+      })
       .catch((error: unknown) => {
         log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
           name: instance.name,
@@ -5354,7 +5364,7 @@ export class MCPServerManager {
 
   /**
    * A layout tool item's action: a tool the server lists and the tool allowlist allows. An MCP
-   * App tool needs MCP Apps (the artifacts experiment and an apps connection): without them it
+   * App tool needs MCP Apps (the mcp-apps experiment and an apps connection): without them it
    * has no action, so it is never run as a regular tool without its view.
    */
   private settingsToolAction(

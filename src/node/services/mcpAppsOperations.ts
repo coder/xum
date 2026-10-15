@@ -1,5 +1,5 @@
 /**
- * MCP Apps route operations (artifacts experiment): open a view (resources/read + host-only
+ * MCP Apps route operations (mcp-apps experiment): open a view (resources/read + host-only
  * tool result), proxy tools/call and resources/read issued by a view to its own server, and
  * store a view's ui/update-model-context.
  */
@@ -155,7 +155,7 @@ function approvedDomainsIn(
 export const MCP_APP_TOOL_RESULT_MAX_BYTES = 2 * 1024 * 1024;
 
 function assertMcpAppsEnabled(context: McpAppsContext): void {
-  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)) {
+  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)) {
     throw new ORPCError("BAD_REQUEST", { message: "MCP Apps views are disabled" });
   }
 }

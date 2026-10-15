@@ -22,6 +22,7 @@ export const EXPERIMENT_IDS = {
   CLAUDE_DESIGN_MCP: "claude-design-mcp",
   SKILL_DYNAMIC_CONTEXT: "skill-dynamic-context",
   ARTIFACTS: "artifacts",
+  MCP_APPS: "mcp-apps",
   CONTINUOUS_COMPACTION: "continuous-compaction",
   TOKEN_BUDGET: "tokenBudget",
   AUTO_MODEL_ROUTING: "auto-model-routing",
@@ -200,6 +201,14 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     name: "Artifacts",
     description:
       "Show files the agent writes to $XUM_SCRATCH_DIR/artifacts in an Artifacts tab, with previews for Markdown, JSON, CSV, images, diffs, Mermaid and sandboxed HTML/SVG. Works on every runtime with a scratch dir (devcontainers need a local Docker daemon).",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  [EXPERIMENT_IDS.MCP_APPS]: {
+    id: EXPERIMENT_IDS.MCP_APPS,
+    name: "MCP Apps",
+    description:
+      "Show the interactive views (ui:// resources) that MCP server tools declare, each in its own right-sidebar tab, plus the server entry points in the menu bar and command palette. Views run sandboxed and cannot reach the network unless you approve their domains.",
     enabledByDefault: false,
     showInSettings: true,
   },

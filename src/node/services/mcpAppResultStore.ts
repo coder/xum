@@ -16,7 +16,7 @@ import { ensurePrivateDir } from "@/node/utils/fs";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 /**
- * Host-only side store for MCP Apps tool results (artifacts experiment).
+ * Host-only side store for MCP Apps tool results (mcp-apps experiment).
  *
  * A view needs the full CallToolResult (structuredContent and result `_meta`), but the model
  * copy goes through mcpResultTransform, which strips protocol `_meta` and caps sizes so history

@@ -13,7 +13,7 @@ import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
 import { mcpAppEntrypointViewOf, useMcpAppEntrypointView } from "../AppViewTab/mcpAppEntrypoints";
 
 /**
- * MCP Apps views (artifacts experiment), per workspace, for app tabs and the command palette:
+ * MCP Apps views (mcp-apps experiment), per workspace, for app tabs and the command palette:
  * every settled view-declaring tool call in the loaded transcript, so a restored tab resolves
  * its view after a reload. Views opened from cards outside the loaded transcript window are
  * kept in a session-only list on top. The view resource and result are re-fetched from the backend

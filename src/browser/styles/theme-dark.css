@@ -72,8 +72,8 @@
     --color-content-disabled: hsl(240, 5%, 26%);
     --color-muted-foreground: hsl(0 0% 60%);
     /* Lightened to reach WCAG AA (4.5:1) on the dark surfaces, down to the slash command rows
-       (#262626, 5.05:1) (#6021). It is now lighter than --color-muted (53%): the user accepted
-       that order change for AA. Also reaches the VS Code webview, which imports this file. */
+       (#262626, 5.05:1) (#6021). It is about the same gray as --color-muted (#999999, #6544): the
+       user accepted that the two read alike. Also reaches the VS Code webview, which imports this file. */
     --color-secondary: #969696;
     --color-surface-primary: hsla(240, 10%, 4%, 1);
     --color-surface-secondary: hsla(240, 6%, 10%, 1);
@@ -193,7 +193,10 @@
     --color-input-border-focus: hsl(193 91% 64%);
 
     /* Additional Semantic Colors */
-    --color-muted: hsl(0 0% 53%); /* #888 - muted text */
+    /* WCAG AA (4.5:1) on every raised dark surface, down to tooltips #313130 (4.57:1). 53% was
+       4.16:1 on cards (#272726) and 3.78:1 on modals (#6544). It matches --color-muted-foreground
+       and is nearly --color-secondary: the user accepted that muted and secondary read alike. */
+    --color-muted: hsl(0 0% 60%); /* #999 - muted text */
     --color-muted-light: hsl(0 0% 50%); /* #808080 - muted light */
     --color-muted-dark: hsl(0 0% 43%); /* #6e6e6e - muted darker */
     --color-placeholder: hsl(0 0% 42%); /* #6b6b6b - placeholder */

@@ -107,10 +107,10 @@ describe("idempotent composer sends", () => {
     for (const store of reloaded.splice(0)) store.setClient(null);
   });
 
-  // #6542: after a reconnect, draft writes wait for the new connection's snapshot. A send in that
-  // window is refused like a send before the first snapshot on a cold start: the same message,
-  // and the composer keeps the typed text. Once the snapshot arrives, the send goes through.
-  test("a send before a reconnect's snapshot keeps the text and shows the cold-start message", async () => {
+  // #6542, #6748: after a reconnect, draft writes wait for the new connection's snapshot. A send
+  // in that window waits for it, as a send before the first snapshot waits on a cold start: no
+  // row, no error, and the composer keeps the text until the send takes it. Then it goes out once.
+  test("a send before a reconnect's snapshot waits for it, then goes out once", async () => {
     const app = await createAppHarness({ branchPrefix: "send-ids-reconnect-hold" });
     const draftService = app.env.services.draftService;
     const realSnapshot = draftService.getSnapshotEvent.bind(draftService);
@@ -126,26 +126,16 @@ describe("idempotent composer sends", () => {
       // A reconnect: a new client object for the same backend.
       getDraftStore().setClient(new Proxy(app.env.orpc, {}));
       await app.chat.send("held message");
-      await waitFor(
-        () =>
-          expect(app.view.container.textContent ?? "").toContain(
-            "Draft save failed: drafts are not loaded"
-          ),
-        WAIT
-      );
-      expect(await app.chat.getInputValue()).toBe("held message");
+      await new Promise((resolve) => setTimeout(resolve, 500));
       expect(await userRows(app, "held message")).toBe(0);
+      expect(app.view.container.textContent ?? "").not.toContain("Draft save failed");
 
       releaseSnapshot();
-      // The held edit is saved once the snapshot arrives; then the same send goes through.
-      await waitFor(
-        async () => expect((await draftService.get(scopeOf(app))).text).toBe("held message"),
-        WAIT
-      );
-      await app.chat.send("held message");
       await app.chat.expectTranscriptContains("Mock response: held message", WAIT.timeout);
       await app.chat.expectStreamComplete();
+      await waitFor(async () => expect(await pendingIds(app)).toEqual([]), WAIT);
       expect(await userRows(app, "held message")).toBe(1);
+      expect(await app.chat.getInputValue()).toBe("");
     } finally {
       releaseSnapshot();
       spy.mockRestore();

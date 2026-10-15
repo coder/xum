@@ -3285,6 +3285,131 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(off.toolNames).not.toContain("tool_catalog_search");
   });
 
+  // The overview in tool_catalog_search's description is part of the cached tools prefix: a
+  // remote server that lists one more tool on a refetch must not rewrite the cached history.
+  function createOverviewHarness(xumHomePath: string) {
+    const metadata = createLocalWorkspaceMetadata("tool-search-overview", xumHomePath);
+    const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
+    const mcpTools: Record<string, Tool> = {
+      tracker_list_issues: { ...stubTool, description: NATIVE_DEFERRAL_DESCRIPTION },
+    };
+    /** MCP tools a model does not get (like a request.assemble hook filtering by model). */
+    const hiddenByModel: Record<string, readonly string[]> = {};
+    const fixture = { stubTool, mcpTools, hiddenByModel };
+    const harness = createHarness(xumHomePath, metadata, { useRequestedModelString: true });
+    harness.getToolsForModelSpy.mockImplementation((model, config) => {
+      const hidden = new Set(fixture.hiddenByModel[model] ?? []);
+      return Promise.resolve({
+        file_read: stubTool,
+        ...(config.toolSearchRuntime ? { tool_catalog_search: stubTool } : {}),
+        ...Object.fromEntries(Object.entries(fixture.mcpTools).filter(([n]) => !hidden.has(n))),
+      });
+    });
+    harness.service.turnRequestBuilderBindings.mcpServerManager = {
+      listServers: () => Promise.resolve({}),
+      getToolsForWorkspace: () =>
+        Promise.resolve({
+          tools: fixture.mcpTools,
+          toolServerNames: Object.fromEntries(
+            Object.keys(fixture.mcpTools).map((n) => [n, "tracker"])
+          ),
+          promptDescriptors: [],
+          stats: {
+            totalTools: Object.keys(fixture.mcpTools).length,
+            activeServerCount: 1,
+            failedServerCount: 0,
+            failedServerNames: [],
+          },
+        }),
+    } as unknown as MCPServerManager;
+    const send = async (modelString = "anthropic:claude-sonnet-4-5") => {
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "hello")],
+        workspaceId: metadata.id,
+        modelString,
+        thinkingLevel: "off",
+      });
+      expect(result.success).toBe(true);
+      const started = harness.startStreamCalls.at(-1);
+      if (!started) throw new Error("Expected streamManager.startStream call");
+      const description = started.tools?.tool_catalog_search?.description;
+      if (typeof description !== "string") throw new Error("Expected a tool_catalog_search");
+      return { description, state: started.toolSearchState };
+    };
+    return { fixture, harness, metadata, send };
+  }
+
+  it("keeps a workspace's tool_catalog_search description when a refetch adds a tool", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview");
+    const { fixture, harness, send } = createOverviewHarness(xumHome.path);
+
+    const first = await send();
+    expect(first.description).toContain("tracker_list_issues");
+    // Sorts before tracker_list_issues, so a fresh overview would list it.
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
+    const second = await send();
+    expect(harness.startStreamCalls).toHaveLength(2);
+    expect(second.description).toBe(first.description);
+    expect(second.state?.deferredToolNames.has("tracker_add_label")).toBe(true);
+  });
+
+  it("keeps each model's overview when another model sees fewer tools", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview-models");
+    const { fixture, send } = createOverviewHarness(xumHome.path);
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
+    fixture.hiddenByModel = { "anthropic:claude-opus-4-5": ["tracker_add_label"] };
+
+    const sonnet = await send("anthropic:claude-sonnet-4-5");
+    expect(sonnet.description).toContain("tracker_add_label");
+    const opus = await send("anthropic:claude-opus-4-5");
+    expect(opus.description).not.toContain("tracker_add_label");
+    // Opus's overview is valid for Sonnet's catalog too: a shared memo would hand it to Sonnet.
+    expect((await send("anthropic:claude-sonnet-4-5")).description).toBe(sonnet.description);
+  });
+
+  it.each([
+    ["removed", null],
+    ["archived", { archivedAt: "2026-01-01T00:00:00.000Z" }],
+  ])("rebuilds the overview once the workspace is %s", async (_state, eventMetadata) => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview-forget");
+    const { fixture, harness, metadata, send } = createOverviewHarness(xumHome.path);
+    const first = await send();
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
+    // A metadata update of a live workspace keeps the overview.
+    harness.service.handleWorkspaceMetadata({ workspaceId: metadata.id, metadata: {} });
+    expect((await send()).description).toBe(first.description);
+    harness.service.handleWorkspaceMetadata({ workspaceId: metadata.id, metadata: eventMetadata });
+    expect((await send()).description).toContain("tracker_add_label");
+  });
+
+  it("shares one overview between selections that reach the same wire model", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview-alias");
+    const { fixture, harness, send } = createOverviewHarness(xumHome.path);
+    const wireModel = "mux-gateway:anthropic/claude-sonnet-4-5";
+    const resolveToWire = harness.resolveAndCreateModelSpy.getMockImplementation();
+    if (resolveToWire === undefined) throw new Error("Expected a resolveAndCreateModel stub");
+    // Like routing: the direct selection goes out through the gateway the explicit one names.
+    harness.resolveAndCreateModelSpy.mockImplementation((_requested, ...rest) =>
+      resolveToWire(wireModel, ...rest)
+    );
+    const direct = await send("anthropic:claude-sonnet-4-5");
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
+    expect((await send(wireModel)).description).toBe(direct.description);
+  });
+
+  it("rebuilds the least recently used model's overview past the per-workspace bound", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview-bound");
+    const { fixture, send } = createOverviewHarness(xumHome.path);
+    const first = await send("anthropic:claude-sonnet-4-5");
+    for (const model of ["opus-4-5", "haiku-4-5", "opus-4-6", "sonnet-4-6"]) {
+      await send(`anthropic:claude-${model}`);
+    }
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
+    const rebuilt = await send("anthropic:claude-sonnet-4-5");
+    expect(rebuilt.description).not.toBe(first.description);
+    expect(rebuilt.description).toContain("tracker_add_label");
+  });
+
   it.each([true, false])(
     "passes the heartbeat service to tools only when agent heartbeats are enabled (%s)",
     async (enabled) => {

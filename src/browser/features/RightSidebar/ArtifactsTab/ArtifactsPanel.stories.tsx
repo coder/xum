@@ -976,7 +976,7 @@ export const FullscreenKeepsFocusWhenViewerSwaps: Story = {
   },
 };
 
-// MCP Apps view (artifacts experiment) in its app tab (no longer in Artifacts): a fake server
+// MCP Apps view (mcp-apps experiment) in its app tab (no longer in Artifacts): a fake server
 // view implementing the spec handshake.
 // The frame is opaque-origin, so the play test reads progress from the heights the view
 // reports: 321px only after initialize -> initialized -> tool-input -> tool-result, then

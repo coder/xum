@@ -195,6 +195,7 @@ import {
   rebuildToolSearchState,
   seedToolSearchActivationsFromMessages,
   TOOL_SEARCH_TOOL_NAME,
+  type ToolCatalogOverviewMemo,
   type ToolSearchRuntime,
 } from "@/common/utils/tools/toolCatalog";
 import {
@@ -838,11 +839,57 @@ interface PreparedModelAttempt {
   rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel;
 }
 
+/**
+ * Models per workspace that keep their own catalog overview (a primary plus a few fallbacks or
+ * switches). Past it, the least recently used model's overview is rebuilt on its next use.
+ */
+const MAX_TOOL_CATALOG_OVERVIEW_MODELS_PER_WORKSPACE = 4;
+
 export class TurnRequestBuilder {
   /** Remote scratch dirs per workspace and runtime config (see RemoteScratchDirCache). */
   private readonly remoteScratchDirs = new RemoteScratchDirCache();
+  /**
+   * The last deferred-tool catalog overview per workspace and model (ToolCatalogOverviewMemo).
+   * Per model because request.assemble hooks, policies and fallbacks can give each model its own
+   * catalog, and the prompt cache is per model too: one shared memo would let a model with fewer
+   * tools replace the overview another model's cache still holds. In memory only: a restart
+   * builds one fresh overview per model, which costs one cache rewrite. forgetWorkspace drops a
+   * removed or archived workspace's entry.
+   */
+  private readonly toolCatalogOverviews = new Map<string, Map<string, ToolCatalogOverviewMemo>>();
 
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
+
+  /** Drop a removed or archived workspace's in-memory request state, so it does not grow the map. */
+  forgetWorkspace(workspaceId: string): void {
+    this.toolCatalogOverviews.delete(workspaceId);
+  }
+
+  /**
+   * Keyed by the effective model string (the routed wire model), not the selected one: the
+   * prompt cache is per route and wire model, so two selections that reach the same wire model
+   * (an explicit gateway string and a direct string routed through that gateway) share one cache
+   * and must share one overview, or alternating between them rewrites that cache.
+   */
+  private toolCatalogOverviewMemo(
+    workspaceId: string,
+    modelString: string
+  ): ToolCatalogOverviewMemo {
+    let byModel = this.toolCatalogOverviews.get(workspaceId);
+    if (byModel === undefined) {
+      byModel = new Map();
+      this.toolCatalogOverviews.set(workspaceId, byModel);
+    }
+    const memo = byModel.get(modelString) ?? {};
+    // Least recently used goes first: re-insert on every use, evict from the front.
+    byModel.delete(modelString);
+    byModel.set(modelString, memo);
+    for (const model of byModel.keys()) {
+      if (byModel.size <= MAX_TOOL_CATALOG_OVERVIEW_MODELS_PER_WORKSPACE) break;
+      byModel.delete(model);
+    }
+    return memo;
+  }
 
   private resolveOverridesIdentity(
     rawModelString: string,
@@ -2947,6 +2994,10 @@ export class TurnRequestBuilder {
           supportsAnthropicToolSearch(seed.capabilityModelString.split(":")[1] ?? "") &&
           resolveProviderOptionsNamespaceKey(seed.wireProviderName, seed.routeProvider) ===
             "anthropic";
+        const toolCatalogOverviewMemo = this.toolCatalogOverviewMemo(
+          workspaceId,
+          seed.effectiveModelString
+        );
         if (toolSearchRuntime) {
           if (options.initializeToolSearch) {
             const preparedSearch = prepareToolSearch({
@@ -2956,6 +3007,7 @@ export class TurnRequestBuilder {
               toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
             });
             attemptTools = preparedSearch.tools;
             if (preparedSearch.state) {
@@ -2969,6 +3021,7 @@ export class TurnRequestBuilder {
               toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
             }).tools;
           } else if (!(mcpTools && TOOL_SEARCH_TOOL_NAME in mcpTools)) {
             const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = attemptTools;
@@ -3032,6 +3085,7 @@ export class TurnRequestBuilder {
               toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
             }).tools;
           }
           // Middleware may filter tools too, but must not restore policy-denied

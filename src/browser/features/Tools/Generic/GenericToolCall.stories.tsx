@@ -106,7 +106,7 @@ function renderMcpAppCall() {
   return (
     <APIProvider
       client={createMockORPCClient({
-        experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true },
+        experiments: { [EXPERIMENT_IDS.MCP_APPS]: true },
         mcpApps: {
           views: {
             "call-dice-1": {
@@ -228,7 +228,7 @@ function withView(children: ReactNode) {
   return (
     <APIProvider
       client={createMockORPCClient({
-        experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true },
+        experiments: { [EXPERIMENT_IDS.MCP_APPS]: true },
         mcpApps: {
           views: {
             [APP_TAB_TOOL_CALL_ID]: {
