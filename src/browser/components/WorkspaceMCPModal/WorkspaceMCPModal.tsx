@@ -30,7 +30,11 @@ import {
   MCPServerSettingsSection,
   type MCPServerSettingsSectionHandle,
 } from "./MCPServerSettingsSection";
-import { clearSettingsToolResults, useSettingsToolRuns } from "./settingsToolRuns";
+import {
+  clearSettingsToolResults,
+  subscribeSettingsToolWrites,
+  useSettingsToolRuns,
+} from "./settingsToolRuns";
 import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import {
   MCPServerIdentityBadge,
@@ -207,6 +211,16 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
 
     void loadData();
   }, [open, api, projectPath, workspaceId, settingsRequests]);
+
+  // A tool that can write (a reset, an import) may have changed a server's settings: read them
+  // again (the backend's read refreshes its settings caches too). The run can have started in
+  // an earlier mount of this dialog, so its end reaches whichever dialog is open now.
+  useEffect(() => {
+    if (!open) return;
+    return subscribeSettingsToolWrites(workspaceId, (serverName) =>
+      readServerSettingsRef.current([serverName], true, settingsRequests.current())
+    );
+  }, [open, workspaceId, settingsRequests]);
 
   // Fetch/refresh tools for a server
   const fetchTools = useCallback(
@@ -629,9 +643,6 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                               overrides,
                               name
                             )}
-                            rereadSettings={() =>
-                              readServerSettings([name], true, settingsRequests.current())
-                            }
                             refreshing={isLoadingTools === true}
                           />
                         </div>

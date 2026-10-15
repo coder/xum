@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import {
   clearSettingsToolResults,
+  publishSettingsToolWrite,
+  subscribeSettingsToolWrites,
   settingsToolRunsOf,
   startSettingsToolRun,
 } from "./settingsToolRuns";
@@ -22,4 +24,20 @@ test("settings tool runs: tracked per workspace and server until each run ends o
   expect(settingsToolRunsOf("ws-runs").cad).toEqual({ running: ["cad.reset"], results: {} });
   second(null);
   expect(settingsToolRunsOf("ws-runs")).toEqual({});
+});
+
+test("a writing run's end reaches the dialogs of its workspace only", async () => {
+  const reread: string[] = [];
+  const stop = subscribeSettingsToolWrites("ws-write", async (serverName) => {
+    reread.push(serverName);
+  });
+  const other = subscribeSettingsToolWrites("ws-other", async () => {
+    reread.push("other");
+  });
+  await publishSettingsToolWrite("ws-write", "cad");
+  stop();
+  // A closed dialog no longer reads.
+  await publishSettingsToolWrite("ws-write", "cad");
+  other();
+  expect(reread).toEqual(["cad"]);
 });
