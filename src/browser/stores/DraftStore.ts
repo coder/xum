@@ -31,6 +31,7 @@ import type {
   DraftSummary,
   DraftWriteOutput,
   PendingSend,
+  LocalTake,
   SendStatus,
 } from "@/common/orpc/schemas/drafts";
 import type { FilePart } from "@/common/orpc/types";
@@ -39,6 +40,7 @@ import {
   joinDraftText,
   removeSentText,
   takeSentText,
+  type SendTake,
 } from "@/common/utils/composerDraftText";
 import {
   draftJsonBytes,
@@ -215,8 +217,11 @@ interface Entry {
    * text the latest setText wrote; `intact` stays true while every edit since Enter came through
    * setText and appended to the text before it (keys typed after `sent`). Only then does the take cut
    * exactly that prefix: a replaced or restored text keeps the whitespace rule (removeSentText).
+   * `edited` (#6585): the user edited the composer since Enter other than by typing at its end,
+   * which the text alone cannot show (a select-all paste can look like typing). Then the take
+   * removes nothing (see SendTake).
    */
-  sendMark: { sent: string; last: string; intact: boolean } | null;
+  sendMark: { sent: string; last: string; intact: boolean; edited: boolean } | null;
   /**
    * The newest server view (any push, snapshot or write reply). A field with an unsaved edit
    * keeps the edit; once its write is confirmed, the field takes this view.
@@ -283,8 +288,16 @@ function followSendMark(entry: Entry, next: string): void {
   mark.last = next;
 }
 
-function typedAfterSendField(typedHere: boolean, text: string): { typedAfterSendText?: string } {
-  return typedHere ? { typedAfterSendText: text } : {};
+/** The take a send's mark allows for `sent` when the composer holds `text` (see SendTake). */
+function sendTakeOf(mark: Entry["sendMark"], sent: string, text: string | undefined): SendTake {
+  if (mark?.sent !== sent) return "unknown";
+  if (mark.edited) return "edited";
+  return mark.intact && mark.last === text ? "typed-after" : "unknown";
+}
+
+/** The sender's own take, for the backend to repeat on the same text (DraftBeginSendInput). */
+function localTakeField(take: SendTake, from: string, to: string): { localTake?: LocalTake } {
+  return take === "unknown" ? {} : { localTake: { from, to } };
 }
 
 function isTextDirty(entry: Entry): boolean {
@@ -814,19 +827,25 @@ export class DraftStore {
   /** #6405: Enter on `text`; keys typed until its send takes it follow it (see Entry.sendMark). */
   markSendStart(scope: DraftStoreScope, text: string): void {
     const entry = this.getOrCreateEntry(scope);
-    entry.sendMark = { sent: text, last: entry.text, intact: entry.text === text };
+    entry.sendMark = { sent: text, last: entry.text, intact: entry.text === text, edited: false };
   }
 
   /**
-   * Whether the text holds `sent` followed only by keys typed after Enter (see Entry.sendMark).
-   * Ends the mark: one take per Enter.
+   * #6585: the user edited the composer other than by typing at its end. A send not yet taken
+   * then removes nothing from it (see Entry.sendMark).
    */
-  takeSendMark(scope: DraftStoreScope, sent: string): boolean {
+  markSendEdited(scope: DraftStoreScope): void {
+    const mark = this.entries.get(draftStoreScopeKey(scope))?.sendMark;
+    if (mark) mark.edited = true;
+  }
+
+  /** How the send of `sent` takes its text (SendTake). Ends the mark: one take per Enter. */
+  takeSendMark(scope: DraftStoreScope, sent: string): SendTake {
     const entry = this.entries.get(draftStoreScopeKey(scope));
-    if (!entry) return false;
+    if (!entry) return "unknown";
     const mark = entry.sendMark;
     entry.sendMark = null;
-    return mark?.intact === true && mark.sent === sent && mark.last === entry.text;
+    return sendTakeOf(mark, sent, entry.text);
   }
 
   /**
@@ -1005,9 +1024,9 @@ export class DraftStore {
       const textBefore = entry.text;
       const unsavedText = isTextDirty(entry) ? textBefore : undefined;
       // #6405: keys typed after Enter follow the sent text, and the take cuts exactly that prefix
-      // (takeSentText). The backend cuts it only from this same text (saved or not), never from
-      // a newer one another window wrote.
-      const typedHere = this.takeSendMark(scope, input.text);
+      // (takeSentText). The backend repeats this take only on this same text (saved or not),
+      // never on a newer one another window wrote.
+      const take = this.takeSendMark(scope, input.text);
       const missing = input.attachments.filter(
         (sent) => !entry.attachments.some(({ id }) => id === sent.id)
       );
@@ -1018,7 +1037,7 @@ export class DraftStore {
         entry.attachments = [...entry.attachments, ...missing];
         entry.attachmentCount += missing.length;
       }
-      const textAfter = takeSentText(textBefore, input.text, typedHere);
+      const textAfter = takeSentText(textBefore, input.text, take);
       if (textAfter !== textBefore) {
         entry.text = textAfter;
         entry.textVersion++;
@@ -1037,7 +1056,7 @@ export class DraftStore {
           pendingSend,
           attachments: input.attachments,
           ...(unsavedText !== undefined ? { text: unsavedText } : {}),
-          ...typedAfterSendField(typedHere, textBefore),
+          ...localTakeField(take, textBefore, textAfter),
           ...(basisSends.length > 0 ? { basisSends } : {}),
         });
         // A replaced backend's reply: the current one holds neither the removal nor the

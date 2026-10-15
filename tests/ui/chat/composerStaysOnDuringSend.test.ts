@@ -88,6 +88,39 @@ function holdTakes() {
   };
 }
 
+/**
+ * One user edit through the textarea, as a browser runs it: `beforeinput` with the selection the
+ * edit replaces (default: the caret at the end), then the input event React turns into onChange.
+ */
+function editTextarea(
+  app: AppHarness,
+  edit: { inputType: string; value: string; data?: string; selection?: [number, number] }
+) {
+  const textarea = composer(app);
+  const [start, end] = edit.selection ?? [textarea.value.length, textarea.value.length];
+  textarea.setSelectionRange(start, end);
+  // The test DOM's window has InputEvent; the jest global does not.
+  const view = textarea.ownerDocument.defaultView as unknown as typeof globalThis;
+  act(() => {
+    textarea.dispatchEvent(
+      new view.InputEvent("beforeinput", {
+        inputType: edit.inputType,
+        data: edit.data ?? null,
+        bubbles: true,
+        cancelable: true,
+      })
+    );
+  });
+  if (edit.value !== textarea.value) fireEvent.input(textarea, { target: { value: edit.value } });
+}
+
+/** Types `text` one key at a time at the end of the textarea. */
+function typeIntoTextarea(app: AppHarness, text: string) {
+  for (const key of text) {
+    editTextarea(app, { inputType: "insertText", data: key, value: composer(app).value + key });
+  }
+}
+
 describe("composer during an unsettled send (#6259)", () => {
   beforeAll(async () => {
     await preloadTestModules();
@@ -202,4 +235,49 @@ describe("composer during an unsettled send (#6259)", () => {
       await app.dispose();
     }
   }, 120_000);
+
+  // #6585: the same flows through real textarea events (beforeinput + input), not DraftStore.
+  describe("textarea edits between Enter and the take (#6585)", () => {
+    /** Sends `sent`, runs `edit` while the take is held, and returns the composer text after. */
+    async function editBeforeTake(sent: string, edit: (app: AppHarness) => void) {
+      const app = await createAppHarness({ branchPrefix: "composer-textarea-take" });
+      const takes = holdTakes();
+      try {
+        await app.chat.send(sent);
+        await waitFor(() => expect(takes.spy).toHaveBeenCalledTimes(1), WAIT);
+        edit(app);
+        takes.release();
+        await app.chat.expectTranscriptContains(`Mock response: ${sent}`, WAIT.timeout);
+        await app.chat.expectStreamComplete();
+        await waitFor(() => expect(sendButton(app).disabled).toBe(false), WAIT);
+        return composer(app).value;
+      } finally {
+        takes.release();
+        takes.spy.mockRestore();
+        await app.dispose();
+      }
+    }
+
+    test("keys typed into the textarea after Enter stay, without the sent text", async () => {
+      expect(await editBeforeTake("first message", (app) => typeIntoTextarea(app, "  next"))).toBe(
+        "  next"
+      );
+    }, 120_000);
+
+    test("a select-all paste over the sent text keeps the whole pasted text", async () => {
+      const pasted = "Fix the bug in parser.ts";
+      const value = await editBeforeTake("Fix the bug", (app) =>
+        editTextarea(app, { inputType: "insertFromPaste", value: pasted, selection: [0, 11] })
+      );
+      expect(value).toBe(pasted);
+    }, 120_000);
+
+    test("deleting the sent text and typing it again keeps what was typed", async () => {
+      const value = await editBeforeTake("yes", (app) => {
+        editTextarea(app, { inputType: "deleteContentBackward", value: "", selection: [0, 3] });
+        typeIntoTextarea(app, "yes please");
+      });
+      expect(value).toBe("yes please");
+    }, 120_000);
+  });
 });

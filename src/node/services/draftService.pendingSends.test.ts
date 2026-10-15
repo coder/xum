@@ -135,13 +135,13 @@ describe("DraftService pending sends", () => {
       pendingSend: pendingSend("s1", "first message"),
       attachments: [],
       text: "first messagex",
-      typedAfterSendText: "first messagex",
+      localTake: { from: "first messagex", to: "x" },
     });
     expect((await service.get(SCOPE)).text).toBe("x");
     expect((await readFile(file)).text).toBe("first message\n\nx");
   });
 
-  it("takes the typed-after prefix only from the text the sender typed it into", async () => {
+  it("repeats the sender's take only on the text the sender took it from", async () => {
     using tempDir = new TestTempDir("drafts-pending-other-prefix");
     const { service } = await createHarness(tempDir);
     // Another window wrote it: it only starts with the sent text.
@@ -159,7 +159,7 @@ describe("DraftService pending sends", () => {
       scope: SCOPE,
       pendingSend: pendingSend("s2", "yes"),
       attachments: [],
-      typedAfterSendText: "yesx",
+      localTake: { from: "yesx", to: "x" },
     });
     expect((await service.get(SCOPE)).text).toBe("yes, from the other window");
     // Saved and unchanged since: the prefix goes.
@@ -168,9 +168,25 @@ describe("DraftService pending sends", () => {
       scope: SCOPE,
       pendingSend: pendingSend("s3", "yes"),
       attachments: [],
-      typedAfterSendText: "yesx",
+      localTake: { from: "yesx", to: "x" },
     });
     expect((await service.get(SCOPE)).text).toBe("x");
+  });
+
+  // #6585: the user replaced the composer text since Enter; the sender's take removed nothing.
+  it("keeps the whole text when the sender's take removed nothing", async () => {
+    using tempDir = new TestTempDir("drafts-pending-edited");
+    const { service } = await createHarness(tempDir);
+    const pasted = "Fix the bug in parser.ts";
+    await service.update({ scope: SCOPE, text: "Fix the bug" });
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s1", "Fix the bug"),
+      attachments: [],
+      text: pasted,
+      localTake: { from: pasted, to: pasted },
+    });
+    expect((await service.get(SCOPE)).text).toBe(pasted);
   });
 
   it("beginSend is idempotent by send id and refuses another payload under it", async () => {

@@ -347,14 +347,25 @@ describe("DraftStore idempotent sends", () => {
 
   // #6405: the composer stays on from Enter until the send takes its draft.
   describe("keys typed between Enter and the take", () => {
-    async function takeAfter(edits: string[], options?: { flushFirst: boolean }) {
+    /** Each edit is a setText; `{ edited }` is a composer edit other than typing at the end. */
+    async function takeAfter(
+      edits: Array<string | { edited: string }>,
+      options?: { flushFirst: boolean }
+    ) {
       using tempDir = new TestTempDir("draft-sends-typed-after");
       const { service, client } = await createHarness(tempDir);
       const store = createStore(client);
       await store.whenReady();
       store.setText(SCOPE, "yes");
       store.markSendStart(SCOPE, "yes");
-      for (const edit of edits) store.setText(SCOPE, edit);
+      for (const edit of edits) {
+        if (typeof edit === "string") {
+          store.setText(SCOPE, edit);
+          continue;
+        }
+        store.markSendEdited(SCOPE);
+        store.setText(SCOPE, edit.edited);
+      }
       if (options?.flushFirst) await store.flush(SCOPE);
       const send = pendingSend("s1", "yes", RECEIVER);
       await store.beginSend(SCOPE, {
@@ -384,6 +395,15 @@ describe("DraftStore idempotent sends", () => {
     test("a text retyped since Enter that starts with the sent text stays whole", async () => {
       const kept = { composer: "yesterday", stored: "yesterday" };
       expect(await takeAfter(["y", "yesterday"])).toEqual(kept);
+    });
+
+    // #6585: the same text shape as typing after the sent text, from a select-all paste.
+    test("a composer edit other than typing at the end keeps the whole text", async () => {
+      const kept = { composer: "yes please", stored: "yes please" };
+      expect(await takeAfter([{ edited: "yes please" }])).toEqual(kept);
+      expect(await takeAfter([{ edited: "yes please" }], { flushFirst: true })).toEqual(kept);
+      // Typing at the end afterwards does not make the edit typing.
+      expect(await takeAfter([{ edited: "yes" }, "yes please"])).toEqual(kept);
     });
   });
 

@@ -36,13 +36,14 @@ import {
   type DraftSummary,
   type DraftUpdateInput,
   type DraftWriteOutput,
+  type LocalTake,
   type PendingSend,
 } from "@/common/orpc/schemas/drafts";
 import {
   hasDraftBlock,
   joinDraftText,
   removeDraftBlock,
-  takeSentText,
+  removeSentText,
 } from "@/common/utils/composerDraftText";
 import {
   buildLegacyDraftText,
@@ -607,7 +608,7 @@ export class DraftService extends EventEmitter {
 
   /**
    * Idempotent sends: the one draft write before a composer send. The sent text leaves the visible
-   * text (takeSentText, computed here so another window's newer visible edits stay) and is
+   * text (visibleAfterTake, computed here so another window's newer visible edits stay) and is
    * retained in the legacy text with the attachments; the entry keeps the exact request for
    * retries. Idempotent by send id: a repeat with the same send changes nothing but its receiver; a
    * different payload under a known id is refused.
@@ -655,11 +656,7 @@ export class DraftService extends EventEmitter {
       }
       const merged = mergeWrite(current, { text: input.text }, basis, accepted);
       const next = storedDraftFrom(
-        takeSentText(
-          merged.visibleText,
-          pendingSend.text,
-          merged.visibleText === input.typedAfterSendText
-        ),
+        visibleAfterTake(merged.visibleText, pendingSend.text, input.localTake),
         attachments,
         [...current.pendingSends, pendingSend]
       );
@@ -1312,4 +1309,13 @@ async function readDirNames(dir: string, options?: { dirsOnly: boolean }): Promi
     if (hasErrorCode(error, "ENOENT")) return [];
     throw error;
   }
+}
+
+/**
+ * The visible text after a send took `sent` out of it. The sender's own take (#6405, #6585)
+ * applies only to the exact text it took from: any other text (another window's newer write)
+ * keeps the whitespace rule.
+ */
+function visibleAfterTake(visible: string, sent: string, localTake: LocalTake | undefined): string {
+  return localTake?.from === visible ? localTake.to : removeSentText(visible, sent);
 }
