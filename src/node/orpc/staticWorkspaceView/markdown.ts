@@ -15,28 +15,23 @@
  */
 export const UNSUPPORTED_MARKDOWN = {
   block: {
-    heading: /^#{1,6}(\s|$)/,
-    blockquote: /^>/,
-    table: /^\|/,
-    thematicBreak: /^([-*_])(\s*\1){2,}\s*$/,
-    setextUnderline: /^=+\s*$/,
+    setextUnderline: /^(=+|-+)[ \t]*$/, // also a `---` thematic break
+    emptyListItem: /^([-*+]|\d{1,9}[.)])[ \t]*$/,
     indent: /^[ \t]/, // indented code, nested lists, list continuations
-    hardBreak: /( {2,}|\\)$/,
+    hardBreak: / {2,}$/,
   },
   inline: {
-    emphasis: /\*|(^|\W)_|_(\W|$)/,
-    strike: /~~/,
-    link: /\[|\]/,
-    autolink: /https?:\/\/|www\.|[\w.+-]+@[\w-]+\.\w/,
-    rawHtml: /<[a-z!/?]/i,
-    entity: /&(#\d+|#x[\da-f]+|[a-z][a-z\d]*);/i,
-    escape: /\\[!-/:-@[-`{-~]/,
-    math: /\$/,
+    // An allow list, not a deny list: every other character can start markdown (headings, quotes,
+    // tables, emphasis, ~strike~, links, HTML, entities, escapes, math, $skill links), so a form
+    // nobody listed still gets no view. Tabs fall out too (a list marker may end with one).
+    markup: /[^\p{L}\p{N} .,;:!?'"()/%+=_\n-]/u,
+    emphasis: /(^|\W)_|_(\W|$)/, // `_` only inside a word, as in snake_case
+    autolink: /https?:\/\/|www\./i,
   },
   fence: {
-    // Mermaid draws a diagram. The live view adds a Run button to shell blocks when a terminal
-    // can open (MarkdownComponents RUNNABLE_SHELL_LANGUAGES).
-    language: /^(mermaid|bash|sh|shell|zsh|fish|powershell|pwsh|cmd|batch)$/i,
+    // Math draws KaTeX and mermaid a diagram. The live view adds a Run button to shell blocks when
+    // a terminal can open (MarkdownComponents RUNNABLE_SHELL_LANGUAGES).
+    language: /^(math|mermaid|bash|sh|shell|zsh|fish|powershell|pwsh|cmd|batch)$/i,
   },
 } as const;
 
@@ -61,7 +56,9 @@ export function renderMarkdownJs(rules: typeof UNSUPPORTED_MARKDOWN): string {
   const BLOCK = ${toJs(rules.block)};
   const INLINE = ${toJs(rules.inline)};
   const [FENCE_LANGUAGE] = ${toJs(rules.fence)};
-  const FENCE = /^(\`{3,}|~{3,})(.*)$/, OL = /^(\\d{1,9})[.)] +/, UL = /^[-*+] +/;
+  const FENCE = /^(\`{3,}|~{3,})(.*)$/, OL = /^(\\d{1,9})([.)]) /, UL = /^([-*+]) /;
+  // A block form inside a list item (a heading, a nested list, a fence, extra indentation).
+  const nested = (s) => [...BLOCK, FENCE, OL, UL].some((re) => re.test(s));
   const SVG = "http://www.w3.org/2000/svg";
   const el = (tag, attrs, text, ns) => {
     const node = ns ? doc.createElementNS(ns, tag) : doc.createElement(tag);
@@ -107,7 +104,8 @@ export function renderMarkdownJs(rules: typeof UNSUPPORTED_MARKDOWN): string {
     wrapper.append(container, button);
     return wrapper;
   };
-  const lines = text.replace(/\\r\\n?/g, "\\n").split("\\n");
+  // The live renderer (normalizeMarkdown) also breaks lines at U+2028, U+2029 and U+0085.
+  const lines = text.replace(/\\r\\n?|[\\u2028\\u2029\\u0085]/g, "\\n").split("\\n");
   const out = doc.createDocumentFragment();
   let list = null, blankAfterItem = false;
   for (let i = 0; i < lines.length; i++) {
@@ -117,8 +115,11 @@ export function renderMarkdownJs(rules: typeof UNSUPPORTED_MARKDOWN): string {
     const language = fence ? fence[2].trim() : "";
     if (fence && /^[\\w+-]+$/.test(language)) {
       if (FENCE_LANGUAGE.test(language)) return null;
-      // A closing fence: the same character, at least as long, nothing else.
-      const closes = (l) => l.trimEnd().length >= fence[1].length && /^(\`+|~+)$/.test(l.trimEnd()) && l[0] === fence[1][0];
+      // A closing fence: up to 3 spaces, the same character, at least as long, nothing else.
+      const closes = (l) => {
+        const m = /^ {0,3}(\`+|~+)[ \\t]*$/.exec(l);
+        return m !== null && m[1][0] === fence[1][0] && m[1].length >= fence[1].length;
+      };
       const code = [];
       for (i++; i < lines.length && !closes(lines[i]); i++) code.push(lines[i]);
       if (code.length === 0) return null;
@@ -129,16 +130,18 @@ export function renderMarkdownJs(rules: typeof UNSUPPORTED_MARKDOWN): string {
     if (BLOCK.some((re) => re.test(line))) return null;
     const ol = OL.exec(line), ul = UL.exec(line);
     if (ol || ul) {
-      const kind = ol ? "ordered" : "unordered";
-      if (list && (list.kind !== kind || blankAfterItem)) return null; // loose or mixed lists
+      const kind = ol ? "ordered" : "unordered", marker = ol ? ol[2] : ul[1];
+      // A loose list, or a new marker (CommonMark starts a sibling list).
+      if (list && (list.marker !== marker || blankAfterItem)) return null;
       if (!list) {
         if (ol && ol[1] !== "1") return null; // the live list would carry a start attribute
         const cls = "list-inside " + (ol ? "list-decimal" : "list-disc") + " whitespace-normal [li_&]:pl-6";
-        list = { kind, node: el(ol ? "ol" : "ul", { class: cls, "data-streamdown": kind + "-list" }) };
+        list = { marker, node: el(ol ? "ol" : "ul", { class: cls, "data-streamdown": kind + "-list" }) };
         out.append(list.node);
       }
       const item = el("li", { class: "py-1 [&>p]:inline", "data-streamdown": "list-item" });
-      if (!inline(item, line.slice((ol || ul)[0].length).trimEnd())) return null;
+      const content = line.slice((ol || ul)[0].length);
+      if (nested(content) || !inline(item, content.trimEnd())) return null;
       list.node.append(item);
       blankAfterItem = false;
       continue;

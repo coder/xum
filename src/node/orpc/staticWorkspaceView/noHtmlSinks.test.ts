@@ -3,9 +3,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 // SECURITY AUDIT: the static workspace view draws attacker-controlled transcript text. This folder
-// builds DOM nodes only; any API that parses a string as HTML would be an injection sink.
+// builds DOM nodes only; any API that parses a string as HTML would be an injection sink. Case
+// does not matter, so React's srcDoc and dangerouslySetInnerHTML count too.
 const SINKS =
-  /\b(innerHTML|outerHTML|insertAdjacentHTML|document\.write|srcdoc|DOMParser|createContextualFragment)\b/;
+  /\b(innerHTML|outerHTML|insertAdjacentHTML|document\.write|srcdoc|DOMParser|createContextualFragment|dangerouslySetInnerHTML)\b/i;
 
 test("no HTML sink in the static workspace view", async () => {
   const files = (await fs.readdir(__dirname)).filter(
