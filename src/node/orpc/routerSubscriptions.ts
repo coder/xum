@@ -221,6 +221,26 @@ export function subscribeProviderConfig(
   });
 }
 
+/**
+ * The credential keys of recorded insufficient_scope prompts (#6739). Every key counts (a row
+ * refreshes only on its own), so nothing coalesces. The keys that have a prompt at attach time
+ * replay first: a prompt recorded between a row's status read and the attach is not lost.
+ */
+export function subscribeMcpInsufficientScope(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<string> {
+  const oauth = context.mcpOauthService;
+  return runtimeSubscription<string>(context, {
+    signal,
+    buffer: "all",
+    subscribe: (emit) => oauth.onInsufficientScope((key) => emit.push(key)),
+    initialize: (emit) => {
+      for (const key of oauth.insufficientScopeKeys()) emit.push(key);
+    },
+  });
+}
+
 export function subscribeDesignExperiment(
   context: ORPCContext,
   signal?: AbortSignal

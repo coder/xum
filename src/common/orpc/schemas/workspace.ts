@@ -154,6 +154,46 @@ export function getValidUnrelatedWorkspaceConsent(value: unknown): string | unde
 }
 
 /**
+ * Shared description for the messaging tag on persisted config and published metadata.
+ * A root chat carries at most one tag (stored without the leading `@`); chats sharing a tag may
+ * message each other. No agent tool writes this field; it is set only through the local API
+ * (`workspace.setMessagingTag`), which carries the user's authority, so a shell-capable agent
+ * running as the same OS user can reach it too. Removing it revokes the link. Absent means untagged.
+ */
+export const MESSAGING_TAG_DESCRIPTION =
+  "Messaging tag (without the leading @) linking this root chat to other root chats that share the same tag so their agents can message each other. No agent tool can set or clear it; it changes only through the local workspace.setMessagingTag API, which acts with the user's authority. Absent means untagged, and removing it revokes the link.";
+
+const MESSAGING_TAG_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+
+/**
+ * Normalizes user-entered tag text: trims, strips one leading `@`, and lowercases. Returns null
+ * when the result is not a valid tag, so callers can reject it instead of persisting junk.
+ */
+export function normalizeMessagingTag(raw: string): string | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const trimmed = raw.trim();
+  const stripped = trimmed.startsWith("@") ? trimmed.slice(1) : trimmed;
+  const normalized = stripped.toLowerCase();
+  return MESSAGING_TAG_PATTERN.test(normalized) ? normalized : null;
+}
+
+/**
+ * Fail-closed reader for the persisted messaging tag. Config entries are loaded without
+ * per-field schema validation, so only an already-normalized valid tag is published; anything
+ * else (blank, padded, `@`-prefixed, uppercase, malformed) reads as untagged rather than
+ * making the workspace unloadable.
+ */
+export function getValidMessagingTag(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = normalizeMessagingTag(value);
+  return normalized != null && normalized === value ? value : undefined;
+}
+
+/**
  * Recipient-side delivery preference for agent messages that arrive while this workspace is busy:
  * messages from sub-agents (upward), sibling tasks, and unrelated workspaces. Parent guidance to
  * a sub-agent is not affected; sub-agent reports follow this preference. Absent means "tool-end" (deliver after the next tool call), because
@@ -231,6 +271,11 @@ export const WorkspaceMetadataSchema = z.object({
   // keeping a duplicate copy; only a validated (non-blank) generation is published.
   unrelatedWorkspaceConsent: z.string().optional().meta({
     description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
+  }),
+  // Passed through from config so API clients read the tag from metadata instead of keeping
+  // a duplicate copy; only a validated (normalized) tag is published.
+  messagingTag: z.string().optional().meta({
+    description: MESSAGING_TAG_DESCRIPTION,
   }),
   agentMessageDispatchMode: AgentMessageDispatchModeSchema.optional().meta({
     description: AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,

@@ -565,11 +565,6 @@ function describeConfigToggle(value: boolean | undefined, fallback: string): str
 }
 
 /**
- * The palette actions of the workspace's MCP App views: one "Open App View" per view (its tab,
- * or the tab it has), and one "Reload App View" per view whose tab is open. The subtitle carries
- * each call's detail, so several calls of one tool differ.
- */
-/**
  * The mcp-apps experiment's palette commands (independent of Artifacts, #6760): one per MCP App
  * view of the workspace (transcript or opened this session), which opens its tab or focuses the
  * one it has (the keyboard path to "Open in tab"; the subtitle carries each call's detail, so
@@ -588,6 +583,11 @@ function mcpAppNavigationActions(
   ];
 }
 
+/**
+ * The palette actions of the workspace's MCP App views: one "Open App View" per view (its tab,
+ * or the tab it has), and one "Reload App View" per view whose tab is open. The subtitle carries
+ * each call's detail, so several calls of one tool differ.
+ */
 function appViewActions(
   wsId: string,
   messages: Parameters<typeof appViewEntries>[1],

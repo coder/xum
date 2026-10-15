@@ -58,6 +58,8 @@ function createClient(service: DraftService) {
     /** Consumed one per putListEntry call, in call order. */
     listPutGates: [] as Array<Promise<void>>,
     updateGate: null as Promise<void> | null,
+    /** Holds an update's reply after the service applied it (and pushed its change event). */
+    updateReplyGate: null as Promise<void> | null,
     getGate: null as Promise<void> | null,
     subscribeGate: null as Promise<void> | null,
     /** Holds `importLegacyList` (the start of the legacy import that follows a snapshot). */
@@ -66,6 +68,8 @@ function createClient(service: DraftService) {
     updates: 0,
     /** Snapshots the store finished handling (it asks for the next event only after that). */
     snapshotsHandled: 0,
+    /** Change events (not snapshots) the store finished handling. */
+    changesHandled: 0,
   };
   const drafts = {
     list: () => service.list(),
@@ -84,7 +88,9 @@ function createClient(service: DraftService) {
         control.failUpdates--;
         throw new Error("update failed");
       }
-      return service.update(input);
+      const reply = await service.update(input);
+      await control.updateReplyGate;
+      return reply;
     },
     delete: async ({ scope }: { scope: DraftScope }) => {
       if (control.failDeletes > 0) {
@@ -138,6 +144,7 @@ function createClient(service: DraftService) {
             if (next) {
               yield next;
               if (next.type === "snapshot") control.snapshotsHandled++;
+              else control.changesHandled++;
               continue;
             }
             await new Promise<void>((resolve) => {
@@ -678,6 +685,63 @@ describe("DraftStore", () => {
     control.failDeletes = 1;
     await store.deleteDraft(scope);
     await waitFor(async () => (await service.get(scope)).text === "");
+  });
+
+  test("a delete that waits for a write still deletes when that write's change event arrives first", async () => {
+    using tempDir = new TestTempDir("draft-store-delete-echo");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    const store = createStore(client);
+    await store.whenReady();
+    let releaseUpdate: () => void = () => undefined;
+    control.updateGate = new Promise<void>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let releaseReply: () => void = () => undefined;
+    control.updateReplyGate = new Promise<void>((resolve) => {
+      releaseReply = resolve;
+    });
+    store.setText(scope, "typed");
+    const written = store.flush(scope);
+    await waitFor(() => control.updates > 0);
+    // The draft is deleted while its write is in flight, so the delete waits for that write.
+    const deleted = store.deleteDraft(scope);
+    const changesBefore = control.changesHandled;
+    releaseUpdate();
+    // The write lands, and the store handles its change event before the write's reply.
+    await waitFor(() => control.changesHandled > changesBefore);
+    releaseReply();
+    await written;
+    await deleted;
+    expect((await service.get(scope)).text).toBe("");
+    expect(store.getText(scope)).toBe("");
+  });
+
+  test("an edit during a waiting delete replaces the whole stored draft", async () => {
+    using tempDir = new TestTempDir("draft-store-delete-wait-edit");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    const store = createStore(client);
+    await store.whenReady();
+    let releaseReply: () => void = () => undefined;
+    control.updateReplyGate = new Promise<void>((resolve) => {
+      releaseReply = resolve;
+    });
+    store.setText(scope, "typed");
+    const written = store.flush(scope);
+    await waitFor(async () => (await service.get(scope)).text === "typed");
+    const deleted = store.deleteDraft(scope);
+    // The user adds an attachment while the delete waits: the draft is live again, without text.
+    store.setAttachments(scope, [image]);
+    releaseReply();
+    await written;
+    await deleted;
+    control.updateReplyGate = null;
+    await store.flush(scope);
+    const stored = await service.get(scope);
+    expect(stored.text).toBe("");
+    expect(stored.attachments.map(({ id }) => id)).toEqual([image.id]);
+    expect(store.getText(scope)).toBe("");
   });
 
   test("becomes ready without a snapshot, and a late snapshot keeps typed text", async () => {

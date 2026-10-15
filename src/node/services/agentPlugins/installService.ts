@@ -103,6 +103,7 @@ import {
   skillConsentFingerprint,
   skillReviewDirectives,
   directivesField,
+  componentConsentDigest,
   type ComponentConsent,
 } from "./componentConsent";
 import type { OpenAIPluginInterface } from "./openaiExtension";
@@ -406,10 +407,6 @@ type CollectedPluginSkill = AgentPluginPreviewSkill & {
  * imitate it.
  */
 /**
- * The raw registry consent with this build's kinds replaced. A newer build may store more kinds,
- * and a save on this build must keep them (downgrade round-trip).
- */
-/**
  * The consent an update journal carries (#6589). Absent in journals from older builds, and a
  * malformed value is not consent: both return undefined, so recovery keeps the old records and
  * the changed components ask for review again (fails closed).
@@ -421,16 +418,33 @@ function journalComponentConsent(
   return parsed.success ? parsed.data : undefined;
 }
 
+/**
+ * The raw registry consent with this build's kinds replaced. A newer build may store more kinds,
+ * and a save on this build must keep them (downgrade round-trip).
+ */
 function mergeRawConsent(raw: unknown, consent: ComponentConsent): Record<string, unknown> {
   return { ...(isPlainObject(raw) ? raw : {}), ...consent };
 }
 
-/** The registry patch for recovered consent: none when the journal carried none. */
+/**
+ * The registry patch for recovered consent: none when the journal carried none. Records merge per
+ * component, and the journal's win (#6698). The registry can gain records between the crash and
+ * the recovery (setComponents for a newly selected component), and replacing them would ask for
+ * those reviews again. A record for the same name fingerprints the same promoted tree, so it
+ * agrees with the journal's.
+ */
 function recoveredConsentPatch(
   raw: unknown,
   consent: ComponentConsent | undefined
 ): { componentConsent?: Record<string, unknown> } {
-  return consent === undefined ? {} : { componentConsent: mergeRawConsent(raw, consent) };
+  if (consent === undefined) return {};
+  const current = isPlainObject(raw) ? raw : {};
+  const merged = Object.entries(consent).map(([kind, records]) => {
+    const earlier = current[kind];
+    return [kind, { ...(isPlainObject(earlier) ? earlier : {}), ...records }] as const;
+  });
+  // Like mergeRawConsent: kinds this build does not know stay as stored.
+  return { componentConsent: { ...current, ...Object.fromEntries(merged) } };
 }
 
 function skillChangeSummary(current: SurfaceSkill, staged: SurfaceSkill, name: string): string {
@@ -494,6 +508,17 @@ function showInvisibleControls(text: string): string {
  * (fails closed) instead of truncating text the user would approve.
  */
 const MAX_REVIEW_TEXT_CHARS = 1_000_000;
+
+/**
+ * The install preview and the component picker list every directive command, and install records
+ * consent for them, so the list is bounded like a review and never cut (#6766). Only responses
+ * that list the commands check it: one oversized plugin must not break the plugin list.
+ */
+function assertDirectivesFit(skills: ReadonlyArray<{ name: string; directives?: string[] }>): void {
+  assertReviewFits(
+    skills.map((skill) => ({ summary: skill.name, after: (skill.directives ?? []).join("\n") }))
+  );
+}
 
 function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void {
   const size = changes.reduce(
@@ -677,6 +702,51 @@ function fullSelection(
     skills: inventory.skills.map((skill) => skill.name),
     mcpServers: inventory.mcpServers.map((server) => server.serverName),
   };
+}
+
+/**
+ * The consent fingerprints of every component an inventory shows. The install preview and install
+ * both build it from the rows they collected, so the two digests compare like for like (#6777).
+ */
+function inventoryFingerprints(parts: {
+  skills: readonly CollectedPluginSkill[];
+  mcpServers: Record<string, string>;
+  workflows: ReadonlyArray<{ file: string; consentFingerprint: string }>;
+  agents: ReadonlyArray<Parameters<typeof agentConsentFingerprint>[0]>;
+  slashCommands: ReadonlyArray<readonly [string, SurfaceWhole]>;
+}): ComponentConsent {
+  return {
+    skills: Object.fromEntries(parts.skills.map((skill) => [skill.name, skill.consentFingerprint])),
+    mcpServers: parts.mcpServers,
+    workflows: Object.fromEntries(parts.workflows.map((w) => [w.file, w.consentFingerprint])),
+    agents: Object.fromEntries(
+      parts.agents.map((agent) => [agent.id, agentConsentFingerprint(agent)])
+    ),
+    slashCommands: Object.fromEntries(
+      parts.slashCommands.map(([name, item]) => [name, item.consentFingerprint])
+    ),
+  };
+}
+
+/**
+ * Install reads its own clone, so a read that failed only in the preview (a script with no row)
+ * would get a consent record nobody saw (#6777). Install refuses then. Same SHA, so a mismatch
+ * means a read differed: the user can preview again.
+ */
+function assertInventoryMatchesPreview(
+  expectedDigest: string | undefined,
+  fingerprints: ComponentConsent,
+  hook: AgentPluginPreviewHook | undefined
+): void {
+  if (
+    expectedDigest === undefined ||
+    expectedDigest === componentConsentDigest(fingerprints, hook)
+  ) {
+    return;
+  }
+  throw new Error(
+    "This plugin's components differ from the preview, so Xum did not install it. Preview the plugin again."
+  );
 }
 
 /** The consent preview showed every component of the pinned SHA (#6498). */
@@ -3115,7 +3185,8 @@ export class AgentPluginInstallService {
       await this.assertNoCollision(plugin.name);
 
       const skills = await this.collectSkillsFromRoots(plugin, warnings);
-      const { previews: mcpServers } = await this.collectMcpServers(
+      assertDirectivesFit(skills);
+      const { previews: mcpServers, fingerprints: mcpFingerprints } = await this.collectMcpServers(
         plugin,
         targetPath,
         this.instanceIdFor(plugin.name),
@@ -3131,14 +3202,24 @@ export class AgentPluginInstallService {
       const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
         showInvisibleControls
       );
+      const workflowScripts = await this.collectWorkflowScripts(plugin, warnings);
+      const slashSurface = [...slashCommandSurface(plugin)];
       const reviewedComponents = reviewedComponentRows([
-        [
-          "workflows",
-          (await this.collectWorkflowScripts(plugin, warnings)).map((w) => [w.file, w]),
-        ],
+        ["workflows", workflowScripts.map((w) => [w.file, w])],
         ["agents", agentFiles.map((agent) => [agent.id, agentSurface(agent)])],
-        ["slashCommands", [...slashCommandSurface(plugin)]],
+        ["slashCommands", slashSurface],
       ]);
+      // Built from the rows above, never a second read, so it covers exactly what was shown.
+      const consentDigest = componentConsentDigest(
+        inventoryFingerprints({
+          skills,
+          mcpServers: mcpFingerprints,
+          workflows: workflowScripts,
+          agents: agentFiles,
+          slashCommands: slashSurface,
+        }),
+        hook
+      );
       const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
         name: command.name,
         ...(command.description !== undefined ? { description: command.description } : {}),
@@ -3175,6 +3256,7 @@ export class AgentPluginInstallService {
         reviewedComponents,
         warnings,
         targetPath: shortenHome(targetPath),
+        consentDigest,
       };
     } finally {
       await this.removeDir(stagedDir);
@@ -3203,6 +3285,8 @@ export class AgentPluginInstallService {
   async install(args: {
     source: AgentPluginGitSource;
     expectedSha: string;
+    /** The preview's `consentDigest`. The renderer always sends it; tests may omit it. */
+    expectedConsentDigest?: string;
     importedComponents?: AgentPluginImportedComponents;
   }): Promise<AgentPluginInstallEntry> {
     assert(isFullCommitSha(args.expectedSha), "install: expectedSha must be a full commit SHA");
@@ -3222,6 +3306,11 @@ export class AgentPluginInstallService {
         const { plugin } = await this.validateStagedClone(stagedDir, args.source.subpath);
         const name = plugin.name;
         const inventory = await this.collectComponents(plugin, this.targetPathFor(name));
+        assertInventoryMatchesPreview(
+          args.expectedConsentDigest,
+          inventory.fingerprints,
+          this.collectHook(plugin)
+        );
         const importedComponents =
           args.importedComponents === undefined
             ? undefined
@@ -3408,14 +3497,9 @@ export class AgentPluginInstallService {
     journalPath: string,
     document: Record<string, unknown>
   ): Promise<void> {
-    const tempPath = `${journalPath}.${randomBytes(8).toString("hex")}.tmp`;
-    await fsPromises.writeFile(tempPath, JSON.stringify(document));
-    try {
-      await fsPromises.rename(tempPath, journalPath);
-    } catch (error) {
-      await fsPromises.rm(tempPath, { force: true }).catch(() => undefined);
-      throw error;
-    }
+    // writeFileAtomic fsyncs the temp file before the rename and the directory after it, so after
+    // a power loss the journal is the old one or the whole new one, never empty (#6698).
+    await writeFileAtomic(journalPath, JSON.stringify(document));
   }
 
   /**
@@ -3979,22 +4063,13 @@ export class AgentPluginInstallService {
       })),
       mcpServers,
       /** What this review showed, as consent fingerprints (#6498). Never sent to the renderer. */
-      fingerprints: {
-        skills: Object.fromEntries(skills.map((skill) => [skill.name, skill.consentFingerprint])),
+      fingerprints: inventoryFingerprints({
+        skills,
         mcpServers: fingerprints,
-        workflows: Object.fromEntries(
-          workflows.map((workflow) => [workflow.file, workflow.consentFingerprint])
-        ),
-        agents: Object.fromEntries(
-          (await listPluginAgentFiles(plugin.agentsDir, warnings)).map((agent) => [
-            agent.id,
-            agentConsentFingerprint(agent),
-          ])
-        ),
-        slashCommands: Object.fromEntries(
-          [...slashCommandSurface(plugin)].map(([name, item]) => [name, item.consentFingerprint])
-        ),
-      } satisfies ComponentConsent,
+        workflows,
+        agents: await listPluginAgentFiles(plugin.agentsDir, warnings),
+        slashCommands: [...slashCommandSurface(plugin)],
+      }),
     };
   }
 
@@ -4151,6 +4226,7 @@ export class AgentPluginInstallService {
     const { fingerprints, ...inventory } = await this.readInstalledComponents(entry);
     assert(fingerprints !== undefined, "installed inventory carries consent fingerprints");
     if ((await gate.confirm()).length > 0) throw componentsChangedError();
+    assertDirectivesFit(inventory.skills);
     return inventory;
   }
 

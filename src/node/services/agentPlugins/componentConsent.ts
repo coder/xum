@@ -22,8 +22,14 @@ import type {
 import { getOwn } from "@/common/utils/getOwn";
 import { stableStringify } from "@/common/utils/stableStringify";
 import { skillDynamicDirectiveCommands } from "@/node/services/agentSkills/skillDynamicContext";
+import type { AgentPluginSlashCommandContribution } from "./manifest";
 
-/** Bump when the fingerprint input changes: every record then needs a new review (fails closed). */
+/**
+ * Bump when the fingerprint input changes for every record: each then needs a new review (fails
+ * closed). An input added only for some records can skip the bump when its key is absent
+ * otherwise. The skill `directives` key (#6617) does this on purpose: a skill without directive
+ * lines keeps its fingerprint, and only skills with them need a new review.
+ */
 const CONSENT_SCHEME = 1;
 
 /** "presence": only whether the field is set counts (a secret's location and value do not). */
@@ -144,6 +150,19 @@ function pick<T extends object>(
 
 function digest(input: unknown): string {
   return createHash("sha256").update(stableStringify(input)).digest("hex");
+}
+
+/**
+ * One digest of every fingerprint an inventory shows, plus its executable hook (#6777). The install preview returns it, and
+ * install refuses a clone whose inventory digests differently, so install never records consent
+ * for a component the preview did not show.
+ */
+export function componentConsentDigest(
+  consent: ComponentConsent,
+  /** The executable hook disclosure (path and tool grants): hooks.js loads on its own. */
+  hook: unknown
+): string {
+  return digest({ scheme: CONSENT_SCHEME, kind: "inventory", consent, hook: hook ?? null });
 }
 
 /** Everything a plugin MCP server launches or connects with, paths normalized (the hashed part). */
@@ -308,23 +327,18 @@ export function agentConsentDetail(args: AgentConsentInput): string {
   return stableStringify(agentConsentSubject(args));
 }
 
-interface SlashCommandConsentInput {
-  name: string;
-  description?: string;
-  /** The full text the command inserts on use. */
-  expansion: string;
-}
+/** One parsed manifest slash command (manifest.ts): name, description and expansion today. */
+type SlashCommandConsentInput = Readonly<AgentPluginSlashCommandContribution>;
 
-/** The fingerprinted slash command fields (#6629): the whole parsed contribution. */
+/**
+ * The fingerprinted slash command fields (#6629): the whole parsed contribution, copied, not
+ * picked, so a field the manifest type gains later counts too and fails closed (#6777).
+ */
 function slashCommandConsentSubject(args: SlashCommandConsentInput): SlashCommandConsentInput {
-  return {
-    name: args.name,
-    ...(args.description !== undefined ? { description: args.description } : {}),
-    expansion: args.expansion,
-  };
+  return { ...args };
 }
 
-/** Fingerprint of one plugin slash command: its name, description and expansion. */
+/** Fingerprint of one plugin slash command: every field of its parsed contribution. */
 export function slashCommandConsentFingerprint(args: SlashCommandConsentInput): string {
   return digest({
     scheme: CONSENT_SCHEME,

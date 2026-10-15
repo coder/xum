@@ -291,8 +291,12 @@ import type {
   WorkspaceRemovalDescendant,
   WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
-import { isDynamicToolPart } from "@/common/types/toolParts";
-import { buildAskUserQuestionSummary } from "@/common/utils/tools/askUserQuestionSummary";
+import { type DynamicToolPart, isDynamicToolPart } from "@/common/types/toolParts";
+import {
+  ASK_USER_QUESTION_NOT_WAITING_MESSAGE,
+  buildAskUserQuestionSummary,
+  isAsyncAskUserQuestionOutput,
+} from "@/common/utils/tools/askUserQuestionSummary";
 import {
   AskUserQuestionToolArgsSchema,
   AskUserQuestionToolResultSchema,
@@ -412,6 +416,7 @@ import {
   type AgentMessageDispatchMode,
   getValidAgentMessageDispatchMode,
   getValidUnrelatedWorkspaceConsent,
+  normalizeMessagingTag,
 } from "@/common/orpc/schemas/workspace";
 import type {
   ArchiveLossyUntrackedFilesConfirmation,
@@ -2443,6 +2448,73 @@ function aliasesProjectMetadataDir(projectName: string): boolean {
   return PROJECT_METADATA_DIR_NAMES.some((dirName) => dirName === folded);
 }
 
+/**
+ * Why an entry may not carry a messaging tag, or null when it may (see setMessagingTag).
+ * Root chats only: a side chat is discarded with its main chat, and a sub-agent child's
+ * parent owns its messaging — tagging either would create a link that outlives its meaning.
+ */
+function messagingTagRootRefusal(
+  entry: Pick<Workspace, "parentWorkspaceId" | "sideChatParentWorkspaceId">
+): string | null {
+  if (entry.sideChatParentWorkspaceId != null) {
+    return "Messaging tags can only be set on a root chat, not a side chat.";
+  }
+  if (entry.parentWorkspaceId != null) {
+    return "Messaging tags can only be set on a root chat, not a sub-agent chat.";
+  }
+  return null;
+}
+
+/**
+ * Applies a tag write to a fresh entry. Re-mints the revocation generation only on a
+ * real change (mirroring consent's repeat-on rule): a clear/re-tag cycle must fence
+ * tag-linked sends admitted under the previous link, while a no-op write fences nothing.
+ */
+function applyMessagingTag(
+  entry: Pick<Workspace, "messagingTag" | "messagingTagGeneration">,
+  normalizedTag: string | null
+): void {
+  if ((entry.messagingTag ?? null) === normalizedTag) {
+    return;
+  }
+  if (normalizedTag === null) {
+    delete entry.messagingTag;
+  } else {
+    entry.messagingTag = normalizedTag;
+  }
+  entry.messagingTagGeneration = crypto.randomUUID();
+}
+
+/** Root-only refusal first, then tag validation: the value a tag write may persist. */
+function messagingTagWriteValue(
+  entry: Pick<Workspace, "parentWorkspaceId" | "sideChatParentWorkspaceId">,
+  tag: string | null
+): Result<string | null, string> {
+  const refusal = messagingTagRootRefusal(entry);
+  if (refusal != null) {
+    return Err(refusal);
+  }
+  return resolveMessagingTagValue(tag);
+}
+
+/**
+ * Resolves user tag input to the value to persist: null clears (null/empty input), a
+ * normalized tag sets, and anything else is an error the caller returns before any write.
+ */
+function resolveMessagingTagValue(tag: string | null): Result<string | null, string> {
+  if (tag === null || tag.trim() === "") {
+    return Ok(null);
+  }
+  const normalized = normalizeMessagingTag(tag);
+  if (normalized === null) {
+    return Err(
+      "Invalid messaging tag: use 1-32 characters, starting with a letter or digit, " +
+        "followed by letters, digits, hyphens, or underscores (an optional leading @ is allowed)."
+    );
+  }
+  return Ok(normalized);
+}
+
 function mintUnrelatedWorkspaceConsent(): string {
   const generation = crypto.randomUUID();
   assert(
@@ -2450,6 +2522,75 @@ function mintUnrelatedWorkspaceConsent(): string {
     "minted unrelated-workspace consent must satisfy the fail-closed reader"
   );
   return generation;
+}
+
+type MuxMessagePart = MuxMessage["parts"][number];
+
+/** Finalizes one ask_user_question tool part with `answers` (already answered is idempotent). */
+function finalizeAskUserQuestionPart(
+  part: DynamicToolPart,
+  answers: Record<string, string>
+): Result<{ part: MuxMessagePart; output: AskUserQuestionToolSuccessResult }> {
+  if (part.toolName !== "ask_user_question") {
+    return Err(
+      `toolCallId=${part.toolCallId} is toolName=${part.toolName}, expected ask_user_question`
+    );
+  }
+
+  if (part.state === "output-available") {
+    // A non-blocking question completed without answers; its answers are a chat message, so this
+    // path must not report them as delivered.
+    if (isAsyncAskUserQuestionOutput(part.output)) {
+      return Err(ASK_USER_QUESTION_NOT_WAITING_MESSAGE);
+    }
+    // Already answered - treat as idempotent.
+    const parsedOutput = AskUserQuestionToolResultSchema.safeParse(part.output);
+    return parsedOutput.success
+      ? Ok({ part, output: parsedOutput.data })
+      : Err(`ask_user_question output validation failed: ${parsedOutput.error.message}`);
+  }
+
+  const parsedArgs = AskUserQuestionToolArgsSchema.safeParse(part.input);
+  if (!parsedArgs.success) {
+    return Err(`ask_user_question input validation failed: ${parsedArgs.error.message}`);
+  }
+
+  const output: AskUserQuestionToolSuccessResult = {
+    summary: buildAskUserQuestionSummary(answers),
+    ui_only: {
+      ask_user_question: {
+        questions: parsedArgs.data.questions,
+        answers,
+      },
+    },
+  };
+  return Ok({ part: { ...part, state: "output-available" as const, output }, output });
+}
+
+/**
+ * Restart fallback of answerAskUserQuestion: finalizes the ask_user_question tool call in `msg`
+ * with `answers`, or reports why it cannot.
+ */
+function finalizeAskUserQuestionMessage(
+  msg: MuxMessage,
+  toolCallId: string,
+  answers: Record<string, string>
+): Result<{ updated: MuxMessage; output: AskUserQuestionToolSuccessResult }> {
+  const index = msg.parts.findIndex(
+    (part) => isDynamicToolPart(part) && part.toolCallId === toolCallId
+  );
+  const part = msg.parts[index];
+  if (!isDynamicToolPart(part)) {
+    return Err("ask_user_question toolCallId not found in message");
+  }
+  const finalized = finalizeAskUserQuestionPart(part, answers);
+  if (!finalized.success) {
+    return Err(finalized.error);
+  }
+  return Ok({
+    updated: { ...msg, parts: msg.parts.with(index, finalized.data.part) },
+    output: finalized.data.output,
+  });
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
@@ -9154,6 +9295,7 @@ export class WorkspaceService
       | "setHeartbeatSettings"
       | "unsetHeartbeatSettings"
       | "setUnrelatedWorkspaceConsent"
+      | "setMessagingTag"
       | "setAgentMessageDispatchMode"
       | "executeHeartbeat"
   ): Result<HeartbeatWorkspaceConfigEntry, string> {
@@ -9410,6 +9552,64 @@ export class WorkspaceService
       return Ok(undefined);
     } catch (error) {
       return Err(`Failed to update unrelated workspace consent: ${getErrorMessage(error)}`);
+    }
+  }
+
+  /**
+   * User-only messaging tag for a root chat: chats sharing a tag may message each other
+   * (TaskService resolves that relation). Only user API clients call this — no agent tool may
+   * set a tag, and it is never routed through the generic `tags` map. `null`/empty clears the
+   * tag (absent is the only untagged representation); an invalid tag is rejected before any
+   * write. Side chats and sub-agent children are refused: tagging is root-chat only. This
+   * never mints or changes unrelated-workspace consent. Like the consent switch, Ok means
+   * committed to config AND published on the metadata channel; recency is not bumped.
+   */
+  async setMessagingTag(workspaceId: string, tag: string | null): Promise<Result<void, string>> {
+    try {
+      const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "setMessagingTag");
+      if (!resolved.success) {
+        return Err(resolved.error);
+      }
+      const { normalizedWorkspaceId, projectPath, workspacePath, workspaceEntry } = resolved.data;
+      // Root-only, then validate before any write: an invalid tag must not persist or publish.
+      const tagValue = messagingTagWriteValue(workspaceEntry, tag);
+      if (!tagValue.success) {
+        return Err(tagValue.error);
+      }
+      const normalizedTag = tagValue.data;
+
+      // Mutate inside the serialized editConfig transform against the FRESH entry (see
+      // findFreshWorkspaceEntry): a stale snapshot write could resurrect a removed workspace.
+      let outcome: Result<void, string> = Err(this.workspaceNotFoundError());
+      await this.config.editConfig((freshConfig) => {
+        const entry = this.findFreshWorkspaceEntry(freshConfig, {
+          projectPath,
+          workspaceId: normalizedWorkspaceId,
+          workspacePath,
+        });
+        if (!entry) {
+          outcome = Err(this.workspaceNotFoundError());
+          return freshConfig;
+        }
+        // Re-check on the fresh entry: it may have become a child/side chat since resolution.
+        const freshRefusal = messagingTagRootRefusal(entry);
+        if (freshRefusal != null) {
+          outcome = Err(freshRefusal);
+          return freshConfig;
+        }
+        outcome = Ok(undefined);
+        applyMessagingTag(entry, normalizedTag);
+        return freshConfig;
+      });
+      if (!outcome.success) {
+        return Err(outcome.error);
+      }
+      // Publish after every successful write, including no-ops (same reason as consent above):
+      // Ok means committed AND published, so clients observe the tag once this acks.
+      await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
+      return Ok(undefined);
+    } catch (error) {
+      return Err(`Failed to update messaging tag: ${getErrorMessage(error)}`);
     }
   }
 
@@ -17933,75 +18133,15 @@ export class WorkspaceService
       //
       // In that case we persist the tool result into partial.json or chat.jsonl,
       // then emit a synthetic tool-call-end so the renderer updates immediately.
+      //
+      // A live stream owns its partial (it rewrites it from memory), so an unregistered question
+      // while streaming is not a restart leftover: it is a non-blocking (Exec) question whose
+      // immediate result has not reached the renderer yet. Finalizing it here would lose the
+      // answer, so refuse; once the result lands the card answers it with a chat message.
+      if (this.aiService.isStreaming(workspaceId)) {
+        return Err(ASK_USER_QUESTION_NOT_WAITING_MESSAGE);
+      }
       try {
-        // Helper: update a message in-place if it contains this ask_user_question tool call.
-        const tryFinalizeMessage = (
-          msg: MuxMessage
-        ): Result<{ updated: MuxMessage; output: AskUserQuestionToolSuccessResult }> => {
-          let foundToolCall = false;
-          let output: AskUserQuestionToolSuccessResult | null = null;
-          let errorMessage: string | null = null;
-
-          const updatedParts = msg.parts.map((part) => {
-            if (!isDynamicToolPart(part) || part.toolCallId !== toolCallId) {
-              return part;
-            }
-
-            foundToolCall = true;
-
-            if (part.toolName !== "ask_user_question") {
-              errorMessage = `toolCallId=${toolCallId} is toolName=${part.toolName}, expected ask_user_question`;
-              return part;
-            }
-
-            // Already answered - treat as idempotent.
-            if (part.state === "output-available") {
-              const parsedOutput = AskUserQuestionToolResultSchema.safeParse(part.output);
-              if (!parsedOutput.success) {
-                errorMessage = `ask_user_question output validation failed: ${parsedOutput.error.message}`;
-                return part;
-              }
-              output = parsedOutput.data;
-              return part;
-            }
-
-            const parsedArgs = AskUserQuestionToolArgsSchema.safeParse(part.input);
-            if (!parsedArgs.success) {
-              errorMessage = `ask_user_question input validation failed: ${parsedArgs.error.message}`;
-              return part;
-            }
-
-            const nextOutput: AskUserQuestionToolSuccessResult = {
-              summary: buildAskUserQuestionSummary(answers),
-              ui_only: {
-                ask_user_question: {
-                  questions: parsedArgs.data.questions,
-                  answers,
-                },
-              },
-            };
-            output = nextOutput;
-
-            return {
-              ...part,
-              state: "output-available" as const,
-              output: nextOutput,
-            };
-          });
-
-          if (errorMessage) {
-            return Err(errorMessage);
-          }
-          if (!foundToolCall) {
-            return Err("ask_user_question toolCallId not found in message");
-          }
-          if (!output) {
-            return Err("ask_user_question output missing after update");
-          }
-
-          return Ok({ updated: { ...msg, parts: updatedParts }, output });
-        };
-
         // 1) Prefer partial.json (most common after restart while waiting)
         const partial = await this.historyService.readPartial(workspaceId);
         if (partial) {
@@ -18014,7 +18154,7 @@ export class WorkspaceService
             workspaceId,
             partial.id,
             (current) => {
-              const finalized = tryFinalizeMessage(current);
+              const finalized = finalizeAskUserQuestionMessage(current, toolCallId, answers);
               if (!finalized.success) return null;
               output = finalized.data.output;
               return finalized.data.updated;
@@ -18083,7 +18223,7 @@ export class WorkspaceService
           );
         }
 
-        const finalized = tryFinalizeMessage(best);
+        const finalized = finalizeAskUserQuestionMessage(best, toolCallId, answers);
         if (!finalized.success) {
           return Err(finalized.error);
         }

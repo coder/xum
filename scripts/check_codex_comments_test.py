@@ -218,6 +218,55 @@ else:
                 with self.subTest(header=header, body=body):
                     self.assert_gate(expected, snapshot([comment(header + body)]))
 
+    def test_receipt_marker_does_not_hide_findings(self):
+        # Since 2026-10-15 Codex prefixes verdicts with a receipt marker. Only one
+        # leading marker is stripped; anything else around it stays blocking.
+        receipt = "<!-- codex-review-receipt:v1 -->\n\n"
+        clean = FIXTURES["receipt_security_no_findings"]["body"]
+        for body, expected in (
+            (clean, 0),
+            (clean + "\n\n[P1] A security issue still needs fixing.", 1),
+            (receipt + clean, 1),
+            (clean.replace(receipt, receipt + "[P1] Found an issue.\n\n"), 1),
+        ):
+            with self.subTest(body=body):
+                self.assert_gate(expected, snapshot([comment(body)]))
+
+    def test_review_state_line_is_fail_closed(self):
+        # Codex added a review-state line to its board on 2026-10-15. Only the
+        # observed keys and statuses count; has_any_findings stays true after
+        # findings are resolved, so only has_unresolved_findings blocks.
+        body = FIXTURES["review_state_summary"]["body"]
+        head = board_head(body)
+        state = re.search(r"<!-- codex-review-state:v1 .* -->\n", body).group(0)
+        security = re.search(r"<!-- codex-security-review:v1 .* -->\n", body).group(0)
+        unresolved = '"has_unresolved_findings":false'
+        for case, changed, expected in (
+            ("observed", body, 0),
+            # Codex sends null while a review runs; a completed review must say false.
+            ("completed, null findings", body.replace(unresolved, '"has_unresolved_findings":null', 1), 1),
+            ("running, null findings", body.replace(
+                unresolved + ',"status":"completed"}', '"has_unresolved_findings":null,"status":"running"}', 1), 10),
+            ("code unresolved", body.replace(unresolved, '"has_unresolved_findings":true', 1), 1),
+            ("security unresolved", body.replace(
+                '"has_unresolved_findings":false,"status":"completed"}}',
+                '"has_unresolved_findings":true,"status":"completed"}}'), 1),
+            ("unknown review key", body.replace(
+                '"status":"completed"},', '"status":"completed","blocking":false},'), 1),
+            ("unknown top key", body.replace('}} -->', '},"merge_gate":{}} -->', 1), 1),
+            ("missing key", body.replace('"has_any_findings":true,', "", 1), 1),
+            ("unknown status", body.replace('"status":"completed"}', '"status":"failed"}', 1), 1),
+            ("non-boolean findings", body.replace(unresolved, '"has_unresolved_findings":0', 1), 1),
+            ("code running", body.replace('"status":"completed"}', '"status":"running"}', 1), 10),
+            ("older commit", body.replace(head, "c" * 40, 1), 10),
+            ("after security line", body.replace(state + security, security + state), 1),
+            ("two state lines", body.replace(state, state + state), 1),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(changed)], head=head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
+
     def test_summary_completion_requires_metadata_and_every_review_row(self):
         completed = FIXTURES["summary"]["body"]
         completed_pr_opened = (

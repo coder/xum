@@ -782,6 +782,14 @@ const MCPOAuthPendingServerSchema = z
 
 // MCP OAuth
 export const mcpOauth = {
+  /**
+   * The credential key (`serverUrl` of getAuthStatus) each time a refused request records a
+   * sign-in prompt (#6739), after the keys that have one at attach time: re-read that row.
+   */
+  onInsufficientScope: {
+    input: z.void(),
+    output: eventIterator(z.string()),
+  },
   startDesktopFlow: {
     input: z
       .object({
@@ -1262,6 +1270,8 @@ export const agentPlugins = {
       source: AgentPluginGitSourceSchema,
       /** SHA from the preview the user consented to. */
       expectedSha: z.string(),
+      /** `consentDigest` of that preview: install refuses other components (#6777). */
+      expectedConsentDigest: z.string(),
       importedComponents: AgentPluginImportedComponentsSchema.optional(),
     }),
     output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
@@ -2183,6 +2193,16 @@ export const workspace = {
     input: z.object({
       workspaceId: z.string(),
       enabled: z.boolean(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  // User-only messaging tag for a root chat (see WorkspaceMetadata.messagingTag). There is
+  // deliberately no UI for it: users set it through the API (e.g. `xum api workspace
+  // set-messaging-tag`), and no agent tool may set a tag. `tag: null` (or empty) clears it.
+  setMessagingTag: {
+    input: z.object({
+      workspaceId: z.string(),
+      tag: z.string().nullable(),
     }),
     output: ResultSchema(z.void(), z.string()),
   },

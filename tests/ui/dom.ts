@@ -229,3 +229,8 @@ if (typeof globalThis.document === "undefined") {
 // module evaluation.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 require("react-dnd");
+
+// The app loads the tool cards lazily (toolCardsStore). Load them up front, after the DOM
+// bootstrap like react-dnd, so a UI suite renders a tool row's real card in its first commit.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+require("@/browser/features/Tools/Shared/toolCardsLoader");

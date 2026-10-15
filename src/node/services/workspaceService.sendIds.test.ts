@@ -33,6 +33,7 @@ import {
 } from "@/node/services/taskService.testHarness";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { WorkspaceService } from "@/node/services/workspaceService";
+import { eventSpine } from "@/node/services/events/eventSpine";
 
 /**
  * Idempotent sends end to end through the real WorkspaceService + AgentSession + MessageQueue +
@@ -311,6 +312,46 @@ describe("idempotent sends (real host)", () => {
     expect(h.streamCalls()).toBe(calls);
     expect(await send("changed")).toEqual(Err({ type: "unknown", raw: SEND_ID_CONFLICT_MESSAGE }));
     expect(await h.userRows()).toEqual([{ text: "hello", sendIds: ["client-1"] }]);
+  });
+
+  test("concurrent sends of one id run the prompt hooks once", async () => {
+    // Codex PRRT_kwDOPxxmWM6rZqyr: a client retry that races its original passed the accepted-row
+    // check before either was accepted, so the hooks' side effects (logs, notices) ran twice.
+    const h = await createStack();
+    let hookCalls = 0;
+    const release = Promise.withResolvers<void>();
+    const unregister = eventSpine.useBefore(
+      "message.send",
+      async () => {
+        hookCalls++;
+        await release.promise;
+      },
+      { workspaceId }
+    );
+    try {
+      const send = () =>
+        h.workspaceService.sendMessage(workspaceId, "hello", { ...sendOptions, sendId: "race-1" });
+      // Both in one tick: neither is busy-queued behind the other.
+      const first = send();
+      const retry = send();
+      await h.until(() => hookCalls >= 1, "a send to reach the hooks");
+      release.resolve();
+      expect(await first).toEqual(Ok(undefined));
+      expect(await retry).toEqual(Ok(undefined));
+      // The retry was queued behind the first send: end that turn and let the queue dispatch it
+      // (Codex PRRT_kwDOPxxmWM6s4Eb5), so a hook run at dispatch would show here.
+      await h.until(() => h.streamCalls() === 1, "the first send to stream");
+      await h.endStream();
+      await h.until(
+        () => !h.session.isBusy() && !h.session.hasQueuedMessages(),
+        "the queued retry to dispatch"
+      );
+      expect(hookCalls).toBe(1);
+      expect(h.streamCalls()).toBe(1);
+      expect(await h.userRows()).toEqual([{ text: "hello", sendIds: ["race-1"] }]);
+    } finally {
+      unregister();
+    }
   });
 
   test("a queued batch whose id another backend accepted meanwhile is refused whole and held with every id", async () => {

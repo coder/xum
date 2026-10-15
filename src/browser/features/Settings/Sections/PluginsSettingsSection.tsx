@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { EXPERIMENT_IDS, EXPERIMENTS } from "@/common/constants/experiments";
 import {
   ArrowDownToLine,
   ArrowLeft,
@@ -182,7 +183,10 @@ const SkillDirectives: React.FC<{ directives?: readonly string[] }> = (props) =>
   if (props.directives === undefined || props.directives.length === 0) return null;
   return (
     <span className="block">
-      <span className="text-muted block">Can run these commands when invoked:</span>
+      <span className="text-muted block">
+        Runs these commands when invoked, only while the{" "}
+        {EXPERIMENTS[EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT].name} experiment is on:
+      </span>
       {props.directives.map((command, index) => (
         <code key={index} className="text-foreground block font-mono break-all whitespace-pre-wrap">
           {command}
@@ -582,6 +586,7 @@ const AddPluginPanel: React.FC<{
       const result = await api.agentPlugins.install({
         source: preview.source,
         expectedSha: preview.lockedSha,
+        expectedConsentDigest: preview.consentDigest,
         importedComponents: selected,
       });
       if (result.success) {

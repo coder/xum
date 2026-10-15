@@ -447,6 +447,7 @@ export const AddPluginConsentPreview: Story = {
             codexHooks: GRILL_HOOKS.hooks.map(({ review: _review, ...hook }) => hook),
             warnings: ["Unknown top-level field 'hooks' ignored"],
             targetPath: "~/.mux/plugins/grill",
+            consentDigest: "c".repeat(64),
           },
         },
       }}
@@ -530,6 +531,7 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
             codexHooks: [],
             warnings: [],
             targetPath: `~/.mux/plugins/${MAX_LENGTH_NAME}`,
+            consentDigest: "c".repeat(64),
           },
         },
       }}

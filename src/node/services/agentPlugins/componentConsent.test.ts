@@ -7,6 +7,7 @@ import {
   recordReviewedComponents,
   serverConsentFingerprint,
   skillConsentFingerprint,
+  slashCommandConsentFingerprint,
   visibleReviewText,
 } from "./componentConsent";
 import { skillDynamicDirectiveCommands } from "@/node/services/agentSkills/skillDynamicContext";
@@ -193,6 +194,24 @@ describe("skillConsentFingerprint", () => {
     // U+00A0 and U+202F look like a space but are part of a shell word (PRRT_kwDOPxxmWM6swhcG).
     expect(visibleReviewText("rm -rf a\u00a0b\u202fc\u200bd")).toBe(
       "rm -rf a\\u{A0}b\\u{202F}c\\u{200B}d"
+    );
+  });
+});
+
+describe("slashCommandConsentFingerprint", () => {
+  test("covers the whole parsed contribution, so a new field needs a review (#6777)", () => {
+    // Values computed on main before #6777: stored consent stays valid.
+    const command = { name: "grill", description: "d", expansion: "Grill $ARGUMENTS" };
+    expect(slashCommandConsentFingerprint(command)).toBe(
+      "14dff06dea47adcc3c3ee8e8fcb829e5ac86dbbb1cab67f0ab4a2b25606e14d6"
+    );
+    expect(slashCommandConsentFingerprint({ name: "grill", expansion: "Grill" })).toBe(
+      "84eb0821200b86a1bc88729f1f51911a9c0fb4e5bf55cc437899c7532b34c89f"
+    );
+    // A field the manifest type gains later counts without a code change here.
+    const withField = { ...command, icon: "flame" };
+    expect(slashCommandConsentFingerprint(withField)).not.toBe(
+      slashCommandConsentFingerprint(command)
     );
   });
 });

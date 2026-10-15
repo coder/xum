@@ -3064,8 +3064,25 @@ describe("Config", () => {
       fs.symlinkSync(loopA, loopB);
       const link = path.join(tempDir, "config.json");
       fs.symlinkSync(loopA, link);
+      // Record the walk's symlink reads, so the test can tell the 40-link cap from an earlier stop.
+      const loopPaths = new Set([link, loopA, loopB]);
+      const linkReads: string[] = [];
+      const realReadlink = fs.readlinkSync;
+      const readlinkSpy = spyOn(fs, "readlinkSync").mockImplementation(((
+        target: fs.PathLike,
+        ...rest: unknown[]
+      ) => {
+        if (loopPaths.has(String(target))) linkReads.push(String(target));
+        return (realReadlink as (...args: unknown[]) => unknown)(target, ...rest);
+      }) as typeof fs.readlinkSync);
       // Without the link limit, resolving the loop never ends and this call hangs.
       const next = nextNotification(config);
+      readlinkSpy.mockRestore();
+      // Each walk starts at config.json and follows 40 links (the kernel's ELOOP bound) before
+      // it stops: config.json once, then 39 loop links.
+      const walks = linkReads.join("\n").split(link).slice(1);
+      expect(walks.length).toBeGreaterThan(0);
+      for (const walk of walks) expect(walk.split("\n").filter(Boolean)).toHaveLength(39);
       // The config dir watch still sees a real file that replaces the loop.
       const replacement = path.join(tempDir, "replacement.json");
       fs.writeFileSync(replacement, JSON.stringify({ projects: [], updateChannel: "nightly" }));
@@ -5899,6 +5916,57 @@ describe("Config", () => {
       const [metadata] = await reloaded.getAllWorkspaceMetadata();
       await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
       expect(row()).toMatchObject({ title: "Renamed", taskTerminalFailure: marker });
+    });
+
+    it("keeps the messaging-tag revocation generation through reload and a metadata write", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              id: "tagged",
+              name: "tagged",
+              path: projectPath,
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              messagingTag: "research",
+              messagingTagGeneration: "gen-1",
+            },
+          ],
+        });
+        return cfg;
+      });
+      const reloaded = new Config(tempDir);
+      const row = () =>
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      // The tag publishes on metadata; its server-owned generation never does.
+      const [metadata] = await reloaded.getAllWorkspaceMetadata();
+      expect(metadata.messagingTag).toBe("research");
+      await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
+      expect(row()).toMatchObject({
+        title: "Renamed",
+        messagingTag: "research",
+        messagingTagGeneration: "gen-1",
+      });
+    });
+
+    it("publishes the config messaging tag for an id-less legacy workspace with metadata.json", async () => {
+      const projectPath = path.join(tempDir, "repo");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [{ path: projectPath, messagingTag: "research" }],
+        });
+        return cfg;
+      });
+      const sessionDir = path.join(config.sessionsDir, "repo");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      // A stale or absent legacy-file tag must never override the config value.
+      fs.writeFileSync(
+        path.join(sessionDir, "metadata.json"),
+        JSON.stringify({ id: "legacy-tag", name: "legacy-tag", messagingTag: "stale" })
+      );
+      const [metadata] = await config.getAllWorkspaceMetadata();
+      expect(metadata).toMatchObject({ id: "legacy-tag", messagingTag: "research" });
     });
 
     it("keeps a parent's reservation tombstones through reload and a metadata write", async () => {

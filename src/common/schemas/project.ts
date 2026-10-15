@@ -4,6 +4,7 @@ import {
   AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
   AgentMessageDispatchModeSchema,
   BestOfGroupSchema,
+  MESSAGING_TAG_DESCRIPTION,
   ProjectRefSchema,
   UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
   WorkflowTaskMetadataSchema,
@@ -140,6 +141,13 @@ export const WorkspaceConfigSchema = z.object({
   }),
   unrelatedWorkspaceConsent: z.string().optional().meta({
     description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
+  }),
+  messagingTag: z.string().optional().meta({
+    description: MESSAGING_TAG_DESCRIPTION,
+  }),
+  messagingTagGeneration: z.string().optional().meta({
+    description:
+      "Revocation generation for messagingTag, re-minted on every tag change (set or clear). Tag-linked sends capture both endpoints' generations at admission and refuse if either changed, so a clear/re-tag cycle cannot revive queued input. Never published on metadata.",
   }),
   unrelatedWorkspaceConsentPending: z.literal(true).optional().meta({
     description:

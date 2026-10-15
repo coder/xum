@@ -100,7 +100,8 @@ export function pluginFixtures(): PluginFixture[] {
         hooks: {
           PreToolUse: [
             { matcher: "(?i)^bash$", hooks: [guardHook("ok_inline_flag", {})] },
-            { matcher: "\\A(?:Bash|Edit)\\z", hooks: [guardHook("rust_anchors", {})] },
+            // \pL: Rust syntax Xum still refuses (it translates \A and \z since #6808).
+            { matcher: "\\pL(?:Bash|Edit)", hooks: [guardHook("rust_class", {})] },
             { matcher: "^[[:alpha:]]+$", hooks: [guardHook("posix_class", {})] },
             { matcher: "^Bash$", hooks: [guardHook("bad_timeout", {}, { timeout: "ten" })] },
             { matcher: "^Bash$", hooks: [{ type: "mcp_tool", server: " ", tool: "blank_server" }] },
@@ -184,7 +185,7 @@ export async function seedPluginHooks(
   for (const name of PREINSTALLED_PLUGINS) {
     const source = sources.get(name);
     if (source == null) throw new Error(`plugin hook seed: no source for ${name}`);
-    const preview = ok<{ source: unknown; lockedSha: string }>(
+    const preview = ok<{ source: unknown; lockedSha: string; consentDigest: string }>(
       `preview ${name}`,
       await api("agentPlugins/preview", { input: source })
     );
@@ -193,6 +194,7 @@ export async function seedPluginHooks(
       await api("agentPlugins/install", {
         source: preview.source,
         expectedSha: preview.lockedSha,
+        expectedConsentDigest: preview.consentDigest,
       })
     );
   }

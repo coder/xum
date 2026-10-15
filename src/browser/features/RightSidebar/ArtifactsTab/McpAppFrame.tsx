@@ -39,6 +39,7 @@ import {
   type McpAppHostContext,
 } from "./mcpAppHost";
 import {
+  isMcpAppViewFullscreenOnly,
   isMcpAppViewHosted,
   setMcpAppViewFullscreenOnly,
   openMcpAppViewTab,
@@ -415,6 +416,14 @@ function useContainerDimensionsUpdates(hostRef: { current: McpAppHost | null }, 
   };
 }
 
+/** Whether an expanded card can host the view inline (a move to inline closes its tab). */
+function canTakeViewInline(workspaceId: string, toolCallId: string): boolean {
+  return (
+    isMcpAppViewHosted(workspaceId, toolCallId, "card") &&
+    !isMcpAppViewFullscreenOnly(workspaceId, toolCallId)
+  );
+}
+
 /**
  * Runs an accepted display-mode move of a view (setDisplayMode): fullscreen opens or focuses
  * its tab, any other mode (inline) closes the tab so its expanded card takes the view back.
@@ -427,9 +436,10 @@ function moveViewTo(
     openMcpAppViewTab(input.workspaceId, input.view);
     return;
   }
-  // The user collapsed the card during the teardown wait: closing the tab would leave the view
-  // without a frame. It stays in its tab and loads again (it was torn down).
-  if (!isMcpAppViewHosted(input.workspaceId, input.view.toolCallId, "card")) {
+  // The user collapsed the card during the teardown wait, or a late client declared the view
+  // fullscreen-only (its card then shows the "Open in tab" notice, #6181): closing the tab would
+  // leave the view without a frame. It stays in its tab and loads again (it was torn down).
+  if (!canTakeViewInline(input.workspaceId, input.view.toolCallId)) {
     reloadMcpAppView(input.workspaceId, input.view.toolCallId);
     return;
   }
@@ -523,14 +533,11 @@ function useCloseDiscardedDocumentChannel(
 }
 
 /** The widget state a view document starts with; null before the view loaded. */
-function widgetStateSeedOf(
-  workspaceId: string,
-  loaded: Loaded | null,
-  viewDocument: { nonce: string } | null
-): unknown {
+function widgetStateSeedOf(workspaceId: string, loaded: Loaded | null): unknown {
   if (loaded === null) return null;
-  const target = mcpAppWidgetStateTarget(workspaceId, loaded.toolCallId, loaded.view);
-  return mcpAppWidgetStateSeed(viewDocument, target);
+  return mcpAppWidgetStateSeed(
+    mcpAppWidgetStateTarget(workspaceId, loaded.toolCallId, loaded.view)
+  );
 }
 
 /** Widget states saved while Xum reconnected go out with the new client (mcpAppWidgetState.ts). */
@@ -679,7 +686,7 @@ export function McpAppFrame(props: {
     locale: navigator.language,
     platform: hostPlatform(),
     maxHeight: inline ? inlineMaxHeight() : null,
-    widgetState: widgetStateSeedOf(workspaceId, current, null),
+    widgetState: widgetStateSeedOf(workspaceId, current),
   }));
   const srcDoc = buildMcpAppViewSrcDoc(current, grant, viewDocument);
 
@@ -829,7 +836,7 @@ export function McpAppFrame(props: {
         setMcpAppViewFullscreenOnly(workspaceId, toolCallId, declaresFullscreenOnly(modes));
       },
       setDisplayMode: (mode) => {
-        if (mode === "inline" && !isMcpAppViewHosted(workspaceId, toolCallId, "card")) return null;
+        if (mode === "inline" && !canTakeViewInline(workspaceId, toolCallId)) return null;
         return () => {
           if (hostRef.current !== host) return;
           moveViewTo(mode, {

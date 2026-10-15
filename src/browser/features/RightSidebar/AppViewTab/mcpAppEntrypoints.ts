@@ -19,6 +19,15 @@ import type { McpAppViewRef } from "../ArtifactsTab/mcpAppViewsStore";
 const entrypointsByWorkspace = new Map<string, readonly McpAppEntrypoint[]>();
 /** Workspaces whose loader is listing (or re-listing) their entry points. */
 const pendingWorkspaces = new Set<string>();
+/**
+ * Workspaces whose latest listing failed. Their list shows empty, but it says nothing about any
+ * entry point (#6181), unlike a settled list that lacks it: a known entry point keeps its view,
+ * nothing is retired, and the loader lists again after a backoff.
+ */
+const failedWorkspaces = new Set<string>();
+/** The first and the longest wait before a failed listing is tried again. */
+const LIST_RETRY_FIRST_MS = 1_000;
+const LIST_RETRY_MAX_MS = 30_000;
 const listeners = new Set<() => void>();
 
 const refKey = (workspaceId: string, viewKey: string) => `${workspaceId}\u0000${viewKey}`;
@@ -67,16 +76,29 @@ export function withEntrypointScope(
   return type === "thread" ? `${text} · this chat` : text;
 }
 
-/** Publish a settled list, or `"pending"` while it is being listed. */
-function setMcpAppEntrypoints(workspaceId: string, list: readonly McpAppEntrypoint[] | "pending") {
+/**
+ * Publish a settled list, `"pending"` while it is being listed, or `"failed"` when the listing
+ * failed: an empty list that retires nothing.
+ */
+function setMcpAppEntrypoints(
+  workspaceId: string,
+  list: readonly McpAppEntrypoint[] | "pending" | "failed"
+) {
   if (list === "pending") {
     entrypointsByWorkspace.delete(workspaceId);
     pendingWorkspaces.add(workspaceId);
     emit();
     return;
   }
-  entrypointsByWorkspace.set(workspaceId, list);
   pendingWorkspaces.delete(workspaceId);
+  if (list === "failed") {
+    entrypointsByWorkspace.set(workspaceId, []);
+    failedWorkspaces.add(workspaceId);
+    emit();
+    return;
+  }
+  entrypointsByWorkspace.set(workspaceId, list);
+  failedWorkspaces.delete(workspaceId);
   const listed = new Set(list.map((entrypoint) => refKey(workspaceId, entrypoint.viewKey)));
   for (const key of listed) retiredKeys.delete(key);
   for (const key of viewRefs.keys()) {
@@ -93,8 +115,17 @@ function setMcpAppEntrypoints(workspaceId: string, list: readonly McpAppEntrypoi
  * its place, so the launcher and palette rows do not move. Only a new key goes at the end.
  */
 function updateMcpAppEntrypoint(workspaceId: string, entrypoint: McpAppEntrypoint) {
+  // The opened entry point is back, also when an earlier list retired it: a later list that
+  // lacks it retires it again.
+  retiredKeys.delete(refKey(workspaceId, entrypoint.viewKey));
   const list = entrypointsByWorkspace.get(workspaceId);
   if (list === undefined) return;
+  if (failedWorkspaces.has(workspaceId)) {
+    // One open is no full list: keep the failed state, so it retires no other entry point.
+    entrypointsByWorkspace.set(workspaceId, withEntrypoint(list, entrypoint));
+    emit();
+    return;
+  }
   setMcpAppEntrypoints(workspaceId, withEntrypoint(list, entrypoint));
 }
 
@@ -166,6 +197,11 @@ export function mcpAppEntrypointViewOf(
   const list = entrypointsByWorkspace.get(workspaceId);
   const listed = list?.find((entrypoint) => entrypoint.viewKey === viewKey);
   if (listed !== undefined) return entrypointViewRef(workspaceId, listed);
+  // A failed listing keeps the views of entry points known this session.
+  const known = failedWorkspaces.has(workspaceId)
+    ? viewRefs.get(refKey(workspaceId, viewKey))
+    : undefined;
+  if (known !== undefined) return known;
   if (list !== undefined || !pendingWorkspaces.has(workspaceId)) return undefined;
   return viewRefs.get(refKey(workspaceId, viewKey)) ?? "loading";
 }
@@ -257,18 +293,25 @@ function loadMcpAppEntrypoints(
   if (!api) return;
   setMcpAppEntrypoints(workspaceId, "pending");
   const controller = new AbortController();
-  // Through a resolved promise, so a client that throws synchronously (disconnected, disposed)
-  // also settles the list empty instead of throwing out of the effect.
-  Promise.resolve()
-    .then(() => api.mcpApps.listEntrypoints({ workspaceId }, { signal: controller.signal }))
-    .then((list) => {
-      if (!controller.signal.aborted) setMcpAppEntrypoints(workspaceId, list);
-    })
-    .catch(() => {
-      if (!controller.signal.aborted) setMcpAppEntrypoints(workspaceId, []);
-    });
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  const list = (retryMs: number) => {
+    // Through a resolved promise, so a client that throws synchronously (disconnected,
+    // disposed) also settles the list instead of throwing out of the effect.
+    Promise.resolve()
+      .then(() => api.mcpApps.listEntrypoints({ workspaceId }, { signal: controller.signal }))
+      .then((listed) => {
+        if (!controller.signal.aborted) setMcpAppEntrypoints(workspaceId, listed);
+      })
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setMcpAppEntrypoints(workspaceId, "failed");
+        retryTimer = setTimeout(() => list(Math.min(retryMs * 2, LIST_RETRY_MAX_MS)), retryMs);
+      });
+  };
+  list(LIST_RETRY_FIRST_MS);
   return () => {
     controller.abort();
+    clearTimeout(retryTimer);
     // Unloaded: this workspace's tabs resolve as ordinary views until it loads again.
     if (pendingWorkspaces.delete(workspaceId)) emit();
   };

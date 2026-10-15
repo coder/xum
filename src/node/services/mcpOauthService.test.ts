@@ -1981,7 +1981,8 @@ describe("McpOauthService OAuth flows", () => {
   const signInWithGrant = async (
     grant: Record<string, unknown>,
     oauth: MCPServerOAuthConfig,
-    check: (serverUrl: string, result: Result<void, string>) => Promise<void>
+    check: (serverUrl: string, result: Result<void, string>) => Promise<void>,
+    beforeSignIn?: (serverUrl: string) => void
   ): Promise<void> => {
     const server = createServer((req, res) => {
       const pathname = (req.url ?? "/").split("?")[0];
@@ -2006,6 +2007,7 @@ describe("McpOauthService OAuth flows", () => {
       spyOn(mcpConfigService, "listServers").mockResolvedValue({
         docs: { transport: "http", url: serverUrl, disabled: true, oauth },
       });
+      beforeSignIn?.(serverUrl);
       const start = await service.startServerFlow({
         projectPath,
         serverName: "docs",
@@ -2034,6 +2036,35 @@ describe("McpOauthService OAuth flows", () => {
       );
       expect(await service.hasAuthTokens({ serverUrl })).toBe(false);
     });
+  });
+
+  test("a new sign-in ends the insufficient_scope prompt (#6622)", async () => {
+    const oauth = { clientId: "c", baseScopes: ["read"] };
+    await signInWithGrant(
+      { scope: "read files.write" },
+      oauth,
+      async (serverUrl, result) => {
+        expect(result.success).toBe(true);
+        expect(
+          (await service.getAuthStatus({ serverUrl, oauth })).insufficientScopes
+        ).toBeUndefined();
+      },
+      (serverUrl) => service.recordInsufficientScope({ serverUrl, scopes: ["files.write"] })
+    );
+  });
+
+  test("a recorded insufficient_scope prompt notifies subscribers until they unsubscribe (#6739)", () => {
+    // Mounted Settings rows refresh on this signal, keyed like getAuthStatus.
+    const keys: string[] = [];
+    const unsubscribe = service.onInsufficientScope((key) => keys.push(key));
+    service.recordInsufficientScope({
+      serverUrl: "https://x.example/mcp/",
+      scopes: ["files.write"],
+    });
+    expect(keys).toEqual(["https://x.example/mcp"]);
+    unsubscribe();
+    service.recordInsufficientScope({ serverUrl: "https://x.example/mcp", scopes: ["admin"] });
+    expect(keys).toHaveLength(1);
   });
 
   test("a sign-in whose server renames the granted scopes stays signed in (#6564)", async () => {
