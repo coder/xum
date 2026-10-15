@@ -5412,9 +5412,14 @@ export class MCPServerManager {
     toolName: string,
     request: { instanceToken: string; confirmed: boolean; opensApp: boolean }
   ): Error | null {
-    const currentToken = this.settingsInstanceToken(instance);
-    if (!this.isSettingsTokenAccepted(workspaceId, serverName, currentToken, request.instanceToken))
-      return staleSettingsInstanceError(serverName);
+    const unread = this.settingsReadRefusal(
+      instance,
+      workspaceId,
+      serverName,
+      toolName,
+      request.instanceToken
+    );
+    if (unread !== null) return unread;
     const action = this.settingsToolAction(instance, workspaceId, serverName, toolName);
     if (action === undefined) return new Error(`'${serverName}' has no tool named '${toolName}'`);
     if (action.opensApp !== request.opensApp)
@@ -5424,6 +5429,29 @@ export class MCPServerManager {
     if (!action.readOnly && !request.confirmed)
       return new Error(`'${action.title}' runs only after a confirmation`);
     return null;
+  }
+
+  /**
+   * Why a tool action fails the dialog's read (`requestToken`): the instance is not the one
+   * read (isSettingsTokenAccepted), or that read's layout does not offer the tool (#6611). A
+   * crafted renderer call must not run a listed, allowed tool the settings never showed.
+   */
+  private settingsReadRefusal(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    requestToken: string
+  ): Error | null {
+    const currentToken = this.settingsInstanceToken(instance);
+    if (!this.isSettingsTokenAccepted(workspaceId, serverName, currentToken, requestToken))
+      return staleSettingsInstanceError(serverName);
+    const offered = this.settingsLayoutTools.get(
+      settingsSchemaKey(workspaceId, serverName, requestToken)
+    );
+    return offered?.has(toolName) === true
+      ? null
+      : new Error(`'${serverName}' settings do not offer '${toolName}'`);
   }
 
   /** settingsToolRefusal for an app open, then the entry point budget (an open calls the tool). */
@@ -5549,6 +5577,11 @@ export class MCPServerManager {
    * and its save is refused.
    */
   private readonly settingsSchemaHashes = new Map<string, string>();
+  /**
+   * The tools the layout of each token's latest read offered, under the same keys and bound as
+   * settingsSchemaHashes (settingsReadRefusal).
+   */
+  private readonly settingsLayoutTools = new Map<string, ReadonlySet<string>>();
 
   /**
    * Whether a request that names `requestToken` (the dialog's read) may act on this workspace
@@ -5582,9 +5615,13 @@ export class MCPServerManager {
     // validated against (the dialog shows that read).
     this.settingsSchemaHashes.delete(key);
     this.settingsSchemaHashes.set(key, settingsSchemaHash(snapshot));
+    this.settingsLayoutTools.set(key, settingsLayoutToolNames(snapshot.layout));
     if (this.settingsSchemaHashes.size > MAX_REMEMBERED_SETTINGS_SCHEMAS) {
       const oldest = this.settingsSchemaHashes.keys().next().value;
-      if (oldest !== undefined) this.settingsSchemaHashes.delete(oldest);
+      if (oldest !== undefined) {
+        this.settingsSchemaHashes.delete(oldest);
+        this.settingsLayoutTools.delete(oldest);
+      }
     }
   }
 
@@ -8492,6 +8529,15 @@ async function raceUntilAborted(work: Promise<unknown>, signals: AbortSignal[]):
 
 function settingsSchemaKey(workspaceId: string, serverName: string, token: string): string {
   return `${settingsSaveKey(workspaceId, serverName)}\0${token}`;
+}
+
+/** The tools a settings layout offers (its tool items). */
+function settingsLayoutToolNames(layout: MCPSettingsGroup[]): ReadonlySet<string> {
+  return new Set(
+    layout.flatMap((group) =>
+      group.items.flatMap((item) => (item.kind === "tool" ? [item.tool] : []))
+    )
+  );
 }
 
 /**
