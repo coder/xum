@@ -58,6 +58,8 @@ function createClient(service: DraftService) {
     /** Consumed one per putListEntry call, in call order. */
     listPutGates: [] as Array<Promise<void>>,
     updateGate: null as Promise<void> | null,
+    /** Holds an update's reply after the service applied it (and pushed its change event). */
+    updateReplyGate: null as Promise<void> | null,
     getGate: null as Promise<void> | null,
     subscribeGate: null as Promise<void> | null,
     /** Holds `importLegacyList` (the start of the legacy import that follows a snapshot). */
@@ -84,7 +86,9 @@ function createClient(service: DraftService) {
         control.failUpdates--;
         throw new Error("update failed");
       }
-      return service.update(input);
+      const reply = await service.update(input);
+      await control.updateReplyGate;
+      return reply;
     },
     delete: async ({ scope }: { scope: DraftScope }) => {
       if (control.failDeletes > 0) {
@@ -678,6 +682,36 @@ describe("DraftStore", () => {
     control.failDeletes = 1;
     await store.deleteDraft(scope);
     await waitFor(async () => (await service.get(scope)).text === "");
+  });
+
+  test("a delete that waits for a write still deletes when that write's change event arrives first", async () => {
+    using tempDir = new TestTempDir("draft-store-delete-echo");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    const store = createStore(client);
+    await store.whenReady();
+    let releaseUpdate: () => void = () => undefined;
+    control.updateGate = new Promise<void>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let releaseReply: () => void = () => undefined;
+    control.updateReplyGate = new Promise<void>((resolve) => {
+      releaseReply = resolve;
+    });
+    store.setText(scope, "typed");
+    const written = store.flush(scope);
+    await waitFor(() => control.updates > 0);
+    // The draft is deleted while its write is in flight, so the delete waits for that write.
+    const deleted = store.deleteDraft(scope);
+    releaseUpdate();
+    // The write lands, and its change event reaches the store before the write's reply.
+    await waitFor(async () => (await service.get(scope)).text === "typed");
+    await sleep(50);
+    releaseReply();
+    await written;
+    await deleted;
+    expect((await service.get(scope)).text).toBe("");
+    expect(store.getText(scope)).toBe("");
   });
 
   test("becomes ready without a snapshot, and a late snapshot keeps typed text", async () => {

@@ -1,3 +1,4 @@
+import assert from "@/common/utils/assert";
 import { useSyncExternalStore } from "react";
 import type { APIClient } from "@/browser/contexts/API";
 import type {
@@ -596,6 +597,13 @@ export class DraftStore {
    * once its list entry is gone, so nothing else would ever remove its file.
    */
   private readonly pendingDeletes = new Map<string, DraftScope>();
+  /**
+   * Deletes still waiting for a write or list put of their scope to land (count per scope key).
+   * The backend pushes that write's change event, and it can arrive before the write's reply:
+   * applied, it would recreate the dropped entry, and the delete would take it for a new edit and
+   * give up, leaving the draft file behind (#6724). Server state for such a key is ignored.
+   */
+  private readonly deletesAwaitingWrites = new Map<string, number>();
   /**
    * The creation draft list (sidebar rows), owned by the backend (drafts/list.json). The view
    * overlays puts the list has not reflected yet and hides pending deletes.
@@ -1503,8 +1511,17 @@ export class DraftStore {
     if (scope.kind === "creation") this.dropListEntry(key);
     // Let a write in flight land first, so it cannot recreate the file after the delete; the same
     // for a list put, which would relist the draft.
-    await entry?.inFlight;
-    await listPut;
+    this.deletesAwaitingWrites.set(key, (this.deletesAwaitingWrites.get(key) ?? 0) + 1);
+    try {
+      await entry?.inFlight;
+      await listPut;
+    } finally {
+      const waiting = this.deletesAwaitingWrites.get(key) ?? 0;
+      assert(waiting > 0, "deleteDraft: unbalanced wait count");
+      if (waiting === 1) this.deletesAwaitingWrites.delete(key);
+      else this.deletesAwaitingWrites.set(key, waiting - 1);
+    }
+    // Only a local edit meanwhile recreates the entry: it makes the draft live again, so keep it.
     if (this.entries.has(key)) return;
     this.pendingDeletes.set(key, scope);
     // A list event while waiting above may have shown the row again; hide it now.
@@ -1789,9 +1806,12 @@ export class DraftStore {
   private applySnapshot(drafts: DraftSummary[]): void {
     const seen = new Set<string>();
     for (const summary of drafts) {
-      if (this.pendingDeletes.has(draftStoreScopeKey(summary.scope))) continue;
+      const summaryKey = draftStoreScopeKey(summary.scope);
+      if (this.pendingDeletes.has(summaryKey)) continue;
+      seen.add(summaryKey);
+      // An entry here is a local edit made while the delete waits: leave it alone.
+      if (this.deletesAwaitingWrites.has(summaryKey)) continue;
       const entry = this.getOrCreateEntry(summary.scope);
-      seen.add(draftStoreScopeKey(summary.scope));
       // Each subscription restarts the revision sequence, so a restarted backend is never ignored.
       entry.revision = summary.revision;
       this.applyServerState(entry, summary.text, summary.attachments, summary.pendingSends ?? []);
@@ -1806,7 +1826,7 @@ export class DraftStore {
 
   private applyEvent(event: Extract<DraftEvent, { type: "changed" | "deleted" }>): void {
     const key = draftScopeKey(event.scope);
-    if (this.pendingDeletes.has(key)) return;
+    if (this.pendingDeletes.has(key) || this.deletesAwaitingWrites.has(key)) return;
     const existing = this.entries.get(key);
     // Pushes that trail a newer write reply (or the snapshot) are stale.
     const stale = existing !== undefined && event.revision <= existing.revision;
