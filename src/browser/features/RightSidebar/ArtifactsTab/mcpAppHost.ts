@@ -377,8 +377,13 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   const notify = (method: string, params: unknown) =>
     options.postToView({ jsonrpc: "2.0", method, params });
 
-  /** ui/resource-teardown; resolves when the view replies or after the bounded wait. */
+  /**
+   * ui/resource-teardown; resolves when the view replies or after the bounded wait. A view that
+   * never sent initialized gets none: the spec lets a host send requests only after it, and such a
+   * view has nothing set up to tear down (#6181). Resolves at once then.
+   */
   const teardown = (reason: string): Promise<void> => {
+    if (!initialized) return Promise.resolve();
     const id = `host-${nextHostRequestId++}`;
     return new Promise<void>((resolve) => {
       const timer = setTimeout(() => {

@@ -1375,6 +1375,69 @@ describe("McpAppFrame host strips", () => {
     }
   });
 
+  // #6181: an expanded card of a fullscreen-only view shows the "Open in tab" notice, not a
+  // frame, so it cannot take the view back: inline must keep the view in its tab.
+  test("a fullscreen-only view's inline request keeps it in its tab", async () => {
+    let closed = 0;
+    const unmarkCard = markMcpAppViewHosted("ws", "call-1", "card");
+    setMcpAppViewFullscreenOnly("ws", "call-1", true);
+    try {
+      const view = render(<McpAppFrame workspaceId="ws" view={VIEW} onClose={() => closed++} />, {
+        wrapper: Wrapper,
+      });
+      const frame = await findOpenFrame(view);
+      const posted = capturePosted(frame);
+      // A list-less initialize (the shim's) keeps the mark.
+      postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "ui/request-display-mode",
+        params: { mode: "inline" },
+      });
+      await waitFor(() => expect(posted.some((m) => m.id === 2)).toBe(true));
+      expect(posted.some((m) => m.method === "ui/resource-teardown")).toBe(false);
+      expect(closed).toBe(0);
+    } finally {
+      setMcpAppViewFullscreenOnly("ws", "call-1", false);
+      unmarkCard();
+    }
+  });
+
+  test("a fullscreen-only mark that arrives during an inline move keeps the view in its tab", async () => {
+    let closed = 0;
+    const unmarkCard = markMcpAppViewHosted("ws", "call-1", "card");
+    try {
+      const view = render(<McpAppFrame workspaceId="ws" view={VIEW} onClose={() => closed++} />, {
+        wrapper: Wrapper,
+      });
+      const frame = await findOpenFrame(view);
+      const posted = capturePosted(frame);
+      postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "ui/request-display-mode",
+        params: { mode: "inline" },
+      });
+      const teardown = await waitFor(() => {
+        const message = posted.find((m) => m.method === "ui/resource-teardown");
+        if (message === undefined) throw new Error("no teardown yet");
+        return message;
+      });
+      // A late client declares only fullscreen before the view answers the teardown.
+      setMcpAppViewFullscreenOnly("ws", "call-1", true);
+      postFromView(frame, { jsonrpc: "2.0", id: teardown.id, result: {} });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(closed).toBe(0);
+    } finally {
+      setMcpAppViewFullscreenOnly("ws", "call-1", false);
+      unmarkCard();
+    }
+  });
+
   test("fullscreen from the card moves the view to its tab; inline from the tab closes it", async () => {
     // Whether the requester already had its reply when the move (which unmounts it) ran.
     const repliedAtMove: boolean[] = [];

@@ -281,11 +281,19 @@ describe("MCP Apps host router", () => {
       params: { width: 200, height: 1e9 },
     });
     expect(t.sizes).toEqual([{ width: 200, height: MCP_APP_MAX_HEIGHT }]);
+    await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
     const done = t.host.teardown("closed");
     const teardown = t.sent.at(-1) as { id: string; method: string };
     expect(teardown.method).toBe("ui/resource-teardown");
     await t.host.handleMessage({ jsonrpc: "2.0", id: teardown.id, result: {} });
     await done;
+  });
+
+  // #6181: the spec lets a host send requests only after the view's initialized.
+  test("a view that never sent initialized gets no teardown, and teardown resolves at once", async () => {
+    const t = setup();
+    await t.host.teardown("unmount");
+    expect(t.sent.some((m) => m.method === "ui/resource-teardown")).toBe(false);
   });
 
   test("widget state is saved in order, and a state over the cap is dropped", async () => {
