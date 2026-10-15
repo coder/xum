@@ -1,10 +1,12 @@
 import "../../../../tests/ui/dom";
 
-import { cleanup, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { cleanup, render } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
 import { rawHtmlUsesOnlyAllowedTags } from "./MarkdownCore";
 import { MarkdownRenderer } from "./MarkdownRenderer";
+// The lazy KaTeX chunk publishes its plugins when it loads, so the tests below render math at once.
+import "./katexRehypePlugin";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/transcriptContextMenu";
 
@@ -18,15 +20,6 @@ function renderMarkdown(content: string) {
 
 describe("MarkdownRenderer raw HTML handling", () => {
   let cleanupDom: (() => void) | null = null;
-
-  // KaTeX loads on the first math message. Load it once, so the tests below render math at once.
-  beforeAll(async () => {
-    const cleanupKatexDom = installDom();
-    const view = renderMarkdown("$$x$$");
-    await waitFor(() => expect(view.container.querySelector(".katex")).not.toBeNull());
-    cleanup();
-    cleanupKatexDom();
-  });
 
   beforeEach(() => {
     cleanupDom = installDom();

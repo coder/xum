@@ -1,10 +1,11 @@
 import "../../../../tests/ui/dom";
 
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { MarkdownCore, markdownMayContainMath } from "./MarkdownCore";
+import { publishKatexPlugins } from "./mathRendering";
 
 // An earlier block holds a lone `*`. Repairing the whole text (Streamdown's own repair) would
 // append a stray `*` after the last block; repairing only the last block does not.
@@ -104,19 +105,20 @@ describe("MarkdownCore", () => {
   });
 
   // Browser scroll anchoring holds on to a DOM node in view. If KaTeX's arrival replaced the whole
-  // row's DOM (as a Suspense swap does), the rows on screen jumped. A fresh module instance makes
-  // KaTeX arrive after the first render even when an earlier test already loaded it.
+  // row's DOM (as a Suspense swap does), the rows on screen jumped. Publishing an empty list first
+  // makes KaTeX arrive after the first render even when an earlier test already loaded it.
   test("keeps the row's other DOM nodes when KaTeX arrives", async () => {
-    const freshModule = "./MarkdownCore.tsx?katex-arrives";
-    // eslint-disable-next-line no-restricted-syntax -- a second module instance, not a project import
-    const fresh = (await import(freshModule)) as { MarkdownCore: typeof MarkdownCore };
+    // eslint-disable-next-line no-restricted-syntax -- the lazy chunk, loaded as MarkdownCore does
+    const { katexRehypePlugins } = await import("./katexRehypePlugin");
+    act(() => publishKatexPlugins([]));
     const view = render(
       <ThemeProvider forcedTheme="dark">
-        <fresh.MarkdownCore content={"Intro paragraph.\n\n$$x^2$$"} />
+        <MarkdownCore content={"Intro paragraph.\n\n$$x^2$$"} />
       </ThemeProvider>
     );
     const intro = view.getByText("Intro paragraph.");
     expect(view.container.querySelector(".katex")).toBeNull();
+    act(() => publishKatexPlugins(katexRehypePlugins));
     await waitFor(() => expect(view.container.querySelector(".katex")).not.toBeNull());
     expect(view.getByText("Intro paragraph.")).toBe(intro);
   });

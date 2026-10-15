@@ -2,8 +2,9 @@ import type { Element, Root } from "hast";
 import type { Pluggable, Plugin } from "unified";
 import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
+import { MATH_CLASS_NAMES, publishKatexPlugins } from "./mathRendering";
 
-const MATH_CLASSES = new Set(["language-math", "math-inline", "math-display"]);
+const MATH_CLASSES = new Set<string>(MATH_CLASS_NAMES);
 
 // Streamdown memoizes its elements (p, li, strong, ...) on className and source position, so when
 // KaTeX arrives a paragraph would keep its plain math. A marker class on each ancestor of a math
@@ -35,3 +36,10 @@ export const katexRehypePlugins: Pluggable[] = [
   rehypeMarkMathAncestors,
   [rehypeKatex, { errorColor: "var(--color-muted-foreground)" }],
 ];
+
+// Loaded through React.lazy in MarkdownCore: evaluating the chunk switches every math row to KaTeX.
+publishKatexPlugins(katexRehypePlugins);
+
+export default function KatexPluginsLoaded(): null {
+  return null;
+}
