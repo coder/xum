@@ -191,7 +191,11 @@ export class McpAppResultStore {
       // record that opens now but vanishes on restart. Before prune, so a prune failure does
       // not hide a record that is already on disk.
       this.remember(workspaceId, record);
-      await this.prune(dir);
+      // Best effort (#6611): the record is already stored, so a failed prune must not make the
+      // caller (openSettingsApp) refuse it. The next record prunes again.
+      await this.prune(dir).catch((error: unknown) => {
+        log.debug("[MCP Apps] Failed to prune tool results", { workspaceId, error });
+      });
       return true;
     } catch (error) {
       log.debug("[MCP Apps] Failed to record tool result", { workspaceId, error });

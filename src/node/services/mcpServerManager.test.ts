@@ -2136,6 +2136,70 @@ describe("MCPServerManager", () => {
     });
   });
 
+  test("settings app opens: an older open shares a newer open's failed write and fails too", async () => {
+    using tmp = new DisposableTempDir("mcp-settings-apps-race");
+    const store = new McpAppResultStore((id) => path.join(tmp.path, id));
+    manager.setMcpApps({ isEnabled: () => true, store });
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-apps-race") });
+    const calls: Array<PromiseWithResolvers<{ content: Array<{ type: "text"; text: string }> }>> =
+      [];
+    servers.serve("settings-apps-race", {
+      tools: { draw: testTool() },
+      apps: {
+        hasTool: () => true,
+        toolUi: () => ({ resourceUri: "ui://cad/payment", visibility: ["app"] }),
+        appEntrypoints: () => [],
+        callToolForApp: () => Promise.reject(new Error("unused")),
+      },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [{ kind: "group", items: [{ kind: "tool", tool: "payment" }] }],
+            },
+          }),
+        settingsToolAction: () => ({ title: "Payment method", readOnly: false, opensApp: true }),
+        callSettingsActionTool: () => {
+          const call = Promise.withResolvers<{ content: Array<{ type: "text"; text: string }> }>();
+          calls.push(call);
+          return call.promise;
+        },
+      },
+    });
+    const workspaceId = "settings-apps-race-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const snapshot = await manager.readSettings(workspaceId, "cad");
+    if (snapshot === null) throw new Error("expected settings");
+    const open = () =>
+      manager
+        .openSettingsApp(workspaceId, "cad", "payment", snapshot.instanceToken, { confirmed: true })
+        .then(
+          () => "opened",
+          (error: unknown) => (error instanceof Error ? error.message : String(error))
+        );
+
+    // Two windows open the app at once. The call dispatched second (the newer open) finishes
+    // first, and its write fails.
+    const opens = [open(), open()];
+    while (calls.length < 2) await new Promise((resolve) => setImmediate(resolve));
+    const recordSpy = spyOn(store, "record").mockResolvedValueOnce(false);
+    calls[1].resolve({ content: [{ type: "text", text: "newer" }] });
+    expect(await Promise.race(opens)).toContain("could not keep");
+    // The older open must not report the newer (unstored) result as its own and mount a stale
+    // record under the shared key.
+    calls[0].resolve({ content: [{ type: "text", text: "older" }] });
+    expect(await Promise.all(opens)).toEqual([
+      expect.stringContaining("could not keep"),
+      expect.stringContaining("could not keep"),
+    ]);
+    expect(recordSpy).toHaveBeenCalledTimes(1);
+    recordSpy.mockRestore();
+  });
+
   test("entry points: listed per enabled server, opened with {} on their own server only", async () => {
     using tmp = new DisposableTempDir("mcp-apps-entrypoints");
     const store = new McpAppResultStore((id) => path.join(tmp.path, id));

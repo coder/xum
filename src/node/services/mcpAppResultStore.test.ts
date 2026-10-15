@@ -75,6 +75,24 @@ describe("McpAppResultStore", () => {
     const files = await fs.readdir(path.join(tmp.path, "ws", MCP_APP_RESULT_DIR));
     expect(files).toHaveLength(MCP_APP_RESULT_MAX_PER_WORKSPACE);
   });
+
+  test("a pruning failure still counts as stored: the record is written and published", async () => {
+    using tmp = new DisposableTempDir("mcp-app-store");
+    const sessionDir = (id: string) => path.join(tmp.path, id);
+    const store = new McpAppResultStore(sessionDir);
+    // prune() lists the dir first; the write path never does.
+    const readdir = spyOn(fs, "readdir").mockRejectedValueOnce(new Error("EIO"));
+    try {
+      expect(await store.record("ws", entry("c1"))).toBe(true);
+      expect(readdir).toHaveBeenCalledTimes(1);
+    } finally {
+      readdir.mockRestore();
+    }
+    expect(await store.get("ws", "c1")).toMatchObject({ toolCallId: "c1" });
+    expect(await new McpAppResultStore(sessionDir).get("ws", "c1")).toMatchObject({
+      toolCallId: "c1",
+    });
+  });
 });
 
 describe("McpAppResultStore model context", () => {

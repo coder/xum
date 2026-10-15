@@ -6028,8 +6028,14 @@ export class MCPServerManager {
   private readonly entrypointCallWindows = new Map<string, { start: number; count: number }>();
   /** Entry point opens dispatched so far: orders overlapping opens of one entry point. */
   private entrypointOpenCount = 0;
-  /** The newest open whose result was stored, by workspace and entry point view key. */
-  private readonly entrypointStoredOpens = new Map<string, number>();
+  /**
+   * The newest open that started storing its result, and that write's outcome, by workspace and
+   * entry point view key.
+   */
+  private readonly entrypointStoredOpens = new Map<
+    string,
+    { order: number; stored: Promise<boolean> }
+  >();
 
   /** Entry point budgets of a stopped workspace would otherwise outlive it. */
   private dropEntrypointBudgets(workspaceId: string): void {
@@ -6050,10 +6056,14 @@ export class MCPServerManager {
     record: Parameters<McpAppResultStore["record"]>[1]
   ): Promise<boolean> {
     const key = `${workspaceId}\0${record.toolCallId}`;
-    // A newer open's result is stored: this view shows it, which counts as stored.
-    if ((this.entrypointStoredOpens.get(key) ?? 0) > order) return true;
-    this.entrypointStoredOpens.set(key, order);
-    return store.record(workspaceId, record);
+    // A newer open's result is stored: this view shows it, so this open shares that write's
+    // outcome (#6611). A failed newer write fails this open too: the key may still hold a record
+    // older than both opens.
+    const newest = this.entrypointStoredOpens.get(key);
+    if (newest !== undefined && newest.order > order) return newest.stored;
+    const stored = store.record(workspaceId, record);
+    this.entrypointStoredOpens.set(key, { order, stored });
+    return stored;
   }
 
   /** The view tool-call budget (mcpAppHost), applied per workspace and server. */
