@@ -12,10 +12,8 @@ import type { CompletedMessagePart } from "@/common/types/stream";
 import type { TodoItem } from "@/common/types/tools";
 import { getTodoFilePath } from "@/node/services/todos/todoStorage";
 import { TURN_STOP_PROMPT_MAX_CHARS } from "./agentPlugins/promptHooks";
-import {
-  TODO_TURN_END_NUDGE,
-  TODO_TURN_END_NUDGE_TOOL_POLICY,
-} from "@/node/services/agentNotifications/todoTurnEndNudge";
+import { TODO_TURN_END_NUDGE } from "@/node/services/agentNotifications/todoTurnEndNudge";
+import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { Ok } from "@/common/types/result";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { AgentSessionAIService } from "./agentSession";
@@ -724,6 +722,15 @@ describe("todo turn-end nudge", () => {
     { type: "dynamic-tool", ...todoWrite },
     { type: "text", text: "Fixed." },
   ];
+  // An agent that denies todo_write answers the call with a refusal.
+  const refusedTodoWriteThenReply = (): CompletedMessagePart[] => [
+    {
+      type: "dynamic-tool",
+      ...todoWrite,
+      output: { success: false, error: "todo_write is disabled for this agent" },
+    },
+    { type: "text", text: "Fixed." },
+  ];
   // Programmatic tool calling: todo_write runs inside code_execution.
   const nestedTodoWriteThenReply = (): CompletedMessagePart[] => [
     {
@@ -757,8 +764,13 @@ describe("todo turn-end nudge", () => {
 
     expect(streams()).toBe(2);
     expect(await userTexts(h)).toEqual(["fix the bug", TODO_TURN_END_NUDGE]);
-    // The nudge turn may only update the list.
-    expect(requests[1].toolPolicy).toEqual(TODO_TURN_END_NUDGE_TOOL_POLICY);
+    // The nudge turn may only update the list, and never gets a tool its agent denies.
+    const nudgePolicy = requests[1].toolPolicy ?? [];
+    expect(applyToolPolicyToNames(["bash", "file_read", "todo_write"], nudgePolicy)).toEqual([
+      "todo_write",
+    ]);
+    const agentDeny = { regex_match: "todo_write", action: "disable" } as const;
+    expect(applyToolPolicyToNames(["bash", "todo_write"], [agentDeny, ...nudgePolicy])).toEqual([]);
 
     // The next user turn may be nudged again.
     await h.session.sendMessage("now lint", options);
@@ -797,12 +809,18 @@ describe("todo turn-end nudge", () => {
   test.each([
     { name: "a turn whose list is complete", todos: doneTodos },
     { name: "a turn that never called todo_write", noTodoWrite: true },
+    { name: "a turn whose todo_write was refused", refused: true },
     { name: "a Plan mode turn", agentId: "plan" },
     { name: "a turn a plugin halted", halt: true },
   ])("$name gets no nudge", async (row) => {
     if (row.halt === true) addConsumer((ctx) => (ctx.halted = { pluginName: "guard" }));
     const { h, streams } = await setup({
-      parts: row.noTodoWrite === true ? undefined : todoWriteThenReply,
+      parts:
+        row.noTodoWrite === true
+          ? undefined
+          : row.refused === true
+            ? refusedTodoWriteThenReply
+            : todoWriteThenReply,
     });
     await writeTodos(h, row.todos ?? openTodos);
 
