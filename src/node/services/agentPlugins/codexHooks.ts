@@ -454,6 +454,7 @@ const TRANSLATED_ESCAPES: Readonly<Record<string, string>> = {
 function translateRustSyntax(pattern: string): { source: string; refused?: string } {
   let inClass = false;
   let source = "";
+  const names = new Set<string>();
   for (let i = 0; i < pattern.length; ) {
     const step: SyntaxStep =
       pattern[i] === "\\"
@@ -461,7 +462,8 @@ function translateRustSyntax(pattern: string): { source: string; refused?: strin
         : inClass
           ? classStep(pattern, i)
           : textStep(pattern, i);
-    if (step.refused !== undefined) return { source, refused: step.refused };
+    const refused = step.refused ?? claimGroupName(names, step.groupName);
+    if (refused !== undefined) return { source, refused };
     source += step.text;
     i += step.length;
     inClass = step.inClass ?? inClass;
@@ -475,6 +477,16 @@ interface SyntaxStep {
   length: number;
   inClass?: boolean;
   refused?: string;
+  /** The name of a named group this step opens. */
+  groupName?: string;
+}
+
+/** Rust rejects a group name used twice, also across alternatives (JavaScript accepts that). */
+function claimGroupName(names: Set<string>, name: string | undefined): string | undefined {
+  if (name === undefined) return undefined;
+  if (names.has(name)) return "a group name used twice";
+  names.add(name);
+  return undefined;
 }
 
 function escapeStep(pattern: string, index: number, inClass: boolean): SyntaxStep {
@@ -490,16 +502,18 @@ function escapeStep(pattern: string, index: number, inClass: boolean): SyntaxSte
 }
 
 /**
- * Outside a class: `(?P<name>` becomes `(?<name>`, and `[` opens a class (with its `^`). Only a
- * name both dialects accept is translated: Rust rejects `$`, JavaScript rejects `.`, `[` and `]`.
+ * Outside a class: `(?P<name>` becomes `(?<name>` (both dialects read `(?<name>`), and `[` opens a
+ * class (with its `^`). Only a name both dialects accept passes: a letter or `_`, then letters,
+ * decimal digits or `_` (Rust rejects `$`, JavaScript rejects `.`, `[` and `]`).
  */
 function textStep(pattern: string, index: number): SyntaxStep {
-  if (pattern.startsWith("(?P<", index)) {
-    const name = /^\(\?P<([^>]*)>/.exec(pattern.slice(index));
-    if (name === null || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name[1])) {
+  const group = /^\(\?(P?)<(?![=!])([^>]*)>/.exec(pattern.slice(index));
+  if (group !== null) {
+    if (!/^[\p{L}_][\p{L}\p{Nd}_]*$/u.test(group[2])) {
       return { text: "", length: 0, refused: "this '(?P<name>' group name" };
     }
-    return { text: "(?<", length: 4 };
+    const length = group[1] === "P" ? 4 : 3;
+    return { text: "(?<", length, groupName: group[2] };
   }
   if (pattern[index] !== "[") return { text: pattern[index], length: 1 };
   const open = pattern[index + 1] === "^" ? "[^" : "[";

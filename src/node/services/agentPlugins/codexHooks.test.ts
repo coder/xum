@@ -451,6 +451,12 @@ describe("loadPluginCodexHooks", () => {
     for (const name of ["$", "a.b", "1a"]) {
       expect(() => compileHookMatcher(`(?P<${name}>Bash)`)).toThrow(SyntaxError);
     }
+    // Unicode names both accept pass (Codex PRRT_kwDOPxxmWM6s4Py1), a name used twice does not,
+    // also across alternatives and in `(?<name>` form (Codex PRRT_kwDOPxxmWM6s4Py9).
+    expect(matching("^(?P<é>Bash)$|^(?P<名>Edit)$", ["Bash", "Edit"])).toEqual(["Bash", "Edit"]);
+    for (const pattern of ["(?P<tool>Bash)|(?P<tool>Edit)", "(?P<tool>Bash)|(?<tool>Edit)"]) {
+      expect(() => compileHookMatcher(pattern)).toThrow(SyntaxError);
+    }
     // An escaped backslash before `A` is a literal backslash and `A`, not an anchor.
     expect(matching("^a\\\\A$", ["a\\A", "a"])).toEqual(["a\\A"]);
   });
