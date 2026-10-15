@@ -960,8 +960,7 @@ describe("useBoundedTranscriptReveal", () => {
         expect(slice.reveal().fromIndex).toBeLessThan(oldStart);
       });
 
-      // #6742 review (Codex's case). Main's fallback can still over-reach by the deleted mounted
-      // rows (#6669 round 7); that is tracked as a part 2b precondition (startRows).
+      // #6742 review (Codex's case); the random op 8 in the invariant test generalizes it.
       test("held, one update that deletes the start row and regroups the end keeps the survivors", () => {
         const slice = grouped();
         slice.atCap();
@@ -1025,7 +1024,7 @@ describe("useBoundedTranscriptReveal", () => {
         for (let op = 0; op < 300; op += 1) {
           const before = slice.mounted();
           const held = slice.reveal().isDetached || !slice.followsTail();
-          const kind = pick(8);
+          const kind = pick(9);
           const all = slice.messages();
           if (kind === 0) slice.append(1 + pick(3), () => random() < 0.5);
           if (kind === 1) slice.append(TRANSCRIPT_REVEAL_CHUNK_ROWS + 5, () => random() < 0.5);
@@ -1044,6 +1043,13 @@ describe("useBoundedTranscriptReveal", () => {
             if (slice.joined.has(row)) slice.joined.delete(row);
             else slice.joined.add(row);
           }
+          if (kind === 8) {
+            // One update: the start row goes, and the end row plus 9 after it join the bundle
+            // before them (#6742 review; the vanished-start fallback uses startRows).
+            const { fromIndex: start, toIndex: end } = slice.reveal();
+            for (const row of all.slice(end, end + 10)) slice.joined.add(row.id);
+            slice.set({ messages: all.filter((_, i) => i !== start) });
+          }
           slice.set({});
           // Liveness (#6742 review): after the frames, fully revealed or paused, never stuck.
           const { fromIndex: start, isRevealPaused: paused } = slice.reveal();
@@ -1061,11 +1067,16 @@ describe("useBoundedTranscriptReveal", () => {
           }
           expect(isHead(ids, from) && isHead(ids, to)).toBe(true);
           if (to - from > CAP) {
-            // At most one bundle (the first or the last) takes the slice past the cap.
+            // Past the cap, rows that mounted in this step lie only in the first or the last
+            // mounted bundle, and only one that was partly mounted before (it grew or regrouped
+            // at an edge). A held slice already past the cap stays there but mounts nothing else.
             const heads = [...after.keys()].filter((i) => isHead(ids, from + i));
-            const first = (heads[1] ?? after.length) - heads[0];
-            const last = after.length - heads[heads.length - 1];
-            expect(after.length - first <= CAP || after.length - last <= CAP).toBe(true);
+            const wasMounted = (bundle: string[]) => bundle.some((row) => before.includes(row));
+            const edges = [after.slice(0, heads[1] ?? 0), after.slice(heads.at(-1))]
+              .filter(wasMounted)
+              .flat();
+            const added = after.filter((row) => !before.includes(row));
+            expect(added.filter((row) => !edges.includes(row))).toEqual([]);
           }
         }
       });

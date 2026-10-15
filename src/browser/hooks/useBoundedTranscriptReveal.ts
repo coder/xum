@@ -105,6 +105,12 @@ interface RevealState {
    */
   endRows: readonly string[];
   /**
+   * With a cap: ids of the first mounted rows (at most one cap), taken when the first mounted row
+   * changes. Once the start row is gone, the start falls back to the first of them that is still
+   * present, so no surviving mounted row unmounts and no older row mounts (F20 PR3a-3b part 2b-1).
+   */
+  startRows: readonly string[];
+  /**
    * The start row while it heads a bundle larger than the cap, scanned up to the slice end (the
    * newest row, or a detached end) (#6678 review): the next render scans only the rows appended
    * after it, not the whole bundle. A change that makes a cut inside it safe is missed, so the
@@ -188,12 +194,38 @@ function endAtNearestUnmountedRow(
   endRows: readonly string[],
   isSafeCut: IsSafeCut
 ): number {
+  const index = firstPresentIndex(rows, endRows);
+  return index === -1 ? rows.length : nearestSafeCutAtOrBefore(index, rows.length, isSafeCut);
+}
+
+/** Index of the first of `ids` still in `rows`, or -1. */
+function firstPresentIndex(rows: readonly RevealRow[], ids: readonly string[]): number {
+  if (ids.length === 0) return -1;
   const indexById = new Map(rows.map((row, index) => [row.id, index]));
-  for (const id of endRows) {
+  for (const id of ids) {
     const index = indexById.get(id);
-    if (index !== undefined) return nearestSafeCutAtOrBefore(index, rows.length, isSafeCut);
+    if (index !== undefined) return index;
   }
-  return rows.length;
+  return -1;
+}
+
+/**
+ * `state` with `startRows` taken at `from` when a detached slice's first mounted row changed, and
+ * cleared once attached: only the detached fallback reads it, so the attached path renders as on
+ * main (no extra render per step).
+ */
+function withStartRows(
+  state: RevealState,
+  slice: Pick<RevealSnapshot, "messages" | "fromIndex" | "toIndex">
+): RevealState {
+  const { messages, fromIndex: from } = slice;
+  const max = state.maxMountedRows;
+  if (max === undefined) return state;
+  if (slice.toIndex === messages.length) {
+    return state.startRows.length === 0 ? state : { ...state, startRows: [] };
+  }
+  if (messages[from]?.id === state.startRows[0]) return state;
+  return { ...state, startRows: messages.slice(from, from + max).map((row) => row.id) };
 }
 
 interface SliceEndInputs {
@@ -499,7 +531,8 @@ function revealMoreState(
 }
 
 /**
- * Where the slice starts once its start row is gone. Attached: main's rule, the old index. Detached
+ * Where the slice starts once its start row is gone. Attached: main's rule, the old index.
+ * Detached with a cap: the first surviving row of `startRows`. When none survives, detached
  * (#6669 round 7): as many rows before the end as were mounted, so every surviving mounted row
  * stays mounted even when the deleted run put the old start index past the new length. Rows
  * deleted below it mount instead, never more.
@@ -510,6 +543,17 @@ function vanishedStartFallback(
   isSafeCut: IsSafeCut
 ): number {
   if (state.endMessageId === null) return state.anchorIndexHint;
+  return detachedStartFallback(state, messages, isSafeCut);
+}
+
+/** vanishedStartFallback for a detached slice. */
+function detachedStartFallback(
+  state: RevealState,
+  messages: readonly RevealRow[],
+  isSafeCut: IsSafeCut
+): number {
+  const survivor = firstPresentIndex(messages, state.startRows);
+  if (survivor !== -1) return survivor;
   const mountedBefore = state.endIndexHint - state.anchorIndexHint;
   // The end row's own index: a safe cut before any regroup in this update (#6742 review).
   return storedSliceEnd(state, messages, isSafeCut, (index) => index) - mountedBefore;
@@ -708,6 +752,7 @@ function startState<Row extends RevealRow>(
     endMessageId: null,
     endIndexHint: 0,
     endRows: [],
+    startRows: [],
     tailBundleHeadId: null,
     tailIds: newestIds(messages),
     keptPastCap: false,
@@ -829,8 +874,9 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
     holds
   );
   const toIndex = ended.toIndex;
-  if (ended.state !== current) {
-    current = ended.state;
+  const withRows = withStartRows(ended.state, { messages: args.messages, fromIndex, toIndex });
+  if (withRows !== current) {
+    current = withRows;
     setState(current);
   }
 
