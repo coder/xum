@@ -129,7 +129,11 @@ const TURN_STOP_TEXT_MAX_CHARS = 16 * 1024;
 /** A continuation prompt is a new user row; longer prompts are cut. */
 const TURN_STOP_PROMPT_MAX_CHARS = 32_000;
 
-export type TurnStopHookOutcome = { kind: "none" } | { kind: "continue"; prompt: string };
+/** `halted`: a consumer said `continue: false`, so nothing (not even Xum's own nudges) continues. */
+export type TurnStopHookOutcome =
+  | { kind: "none" }
+  | { kind: "halted" }
+  | { kind: "continue"; prompt: string };
 
 export async function runTurnStopHooks(
   spine: EventSpine,
@@ -151,7 +155,7 @@ export async function runTurnStopHooks(
     return { kind: "none" };
   }
   // Codex: a `continue: false` from any Stop hook wins over every continuation.
-  if (ctx.halted != null) return { kind: "none" };
+  if (ctx.halted != null) return { kind: "halted" };
   const prompt = ctx.continueReasons
     .map((reason) => reason.trim())
     .filter((reason) => reason.length > 0)

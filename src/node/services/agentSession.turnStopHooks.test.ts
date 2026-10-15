@@ -5,8 +5,12 @@
  */
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import assert from "node:assert";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { EventEmitter } from "events";
 import type { CompletedMessagePart } from "@/common/types/stream";
+import type { TodoItem } from "@/common/types/tools";
+import { getTodoFilePath } from "@/node/services/todos/todoStorage";
 import { Ok } from "@/common/types/result";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { AgentSessionAIService } from "./agentSession";
@@ -694,6 +698,98 @@ describe("turn.stop", () => {
     await settle(h);
 
     expect(calls).toEqual([]);
+    expect(streams()).toBe(1);
+  });
+});
+
+describe("todo turn-end nudge", () => {
+  const openTodos: TodoItem[] = [
+    { content: "Fix the bug", status: "completed" },
+    { content: "Verify the fix", status: "in_progress" },
+  ];
+  const doneTodos = openTodos.map((todo): TodoItem => ({ ...todo, status: "completed" }));
+  const todoWrite = {
+    toolCallId: "todo-1",
+    toolName: "todo_write",
+    input: { todos: openTodos },
+    state: "output-available",
+    output: { success: true },
+  } as const;
+  const todoWriteThenReply = (): CompletedMessagePart[] => [
+    { type: "dynamic-tool", ...todoWrite },
+    { type: "text", text: "Fixed." },
+  ];
+  // Programmatic tool calling: todo_write runs inside code_execution.
+  const nestedTodoWriteThenReply = (): CompletedMessagePart[] => [
+    {
+      type: "dynamic-tool",
+      toolCallId: "code-1",
+      toolName: "code_execution",
+      input: { code: "" },
+      state: "output-available",
+      output: { success: true },
+      nestedCalls: [todoWrite],
+    },
+    { type: "text", text: "Fixed." },
+  ];
+
+  async function writeTodos(h: AgentSessionHarness, todos: TodoItem[]): Promise<void> {
+    const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(getTodoFilePath(sessionDir), JSON.stringify(todos));
+  }
+
+  test.each([
+    { name: "todo_write", parts: todoWriteThenReply },
+    { name: "a nested todo_write", parts: nestedTodoWriteThenReply },
+  ])("a turn with $name that leaves open items gets exactly one nudge", async (row) => {
+    // Every stream, the nudge's own included, calls todo_write and leaves the list open.
+    const { h, streams } = await setup({ parts: row.parts });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(streams()).toBe(2);
+    const texts = await userTexts(h);
+    expect(texts).toHaveLength(2);
+    // The nudge shows the model the list it left behind.
+    expect(texts[1]).toContain("Verify the fix");
+
+    // The next user turn may be nudged again.
+    await h.session.sendMessage("now lint", options);
+    await settle(h);
+    expect(streams()).toBe(4);
+  });
+
+  test("a plugin continuation and the nudge share one continuation prompt", async () => {
+    addConsumer(keepGoing);
+    const { h } = await setup({ parts: todoWriteThenReply });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    const nudged = (await userTexts(h)).filter((text) => text.includes("Verify the fix"));
+    expect(nudged).toHaveLength(1);
+    expect(nudged[0]).toContain("Run the failing tests again.");
+  });
+
+  test.each([
+    { name: "a turn whose list is complete", todos: doneTodos },
+    { name: "a turn that never called todo_write", noTodoWrite: true },
+    { name: "a Plan mode turn", agentId: "plan" },
+    { name: "a turn a plugin halted", halt: true },
+  ])("$name gets no nudge", async (row) => {
+    if (row.halt === true) addConsumer((ctx) => (ctx.halted = { pluginName: "guard" }));
+    const { h, streams } = await setup({
+      parts: row.noTodoWrite === true ? undefined : todoWriteThenReply,
+    });
+    await writeTodos(h, row.todos ?? openTodos);
+
+    await h.session.sendMessage("fix the bug", { ...options, agentId: row.agentId ?? "exec" });
+    await settle(h);
+
     expect(streams()).toBe(1);
   });
 });

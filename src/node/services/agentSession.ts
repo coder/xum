@@ -119,6 +119,7 @@ import type {
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { COMPACTION_RETRY_INPUT_BUDGET_SCALE } from "@/constants/continuousCompaction";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import { buildTodoTurnEndNudge } from "@/node/services/agentNotifications/todoTurnEndNudge";
 import { readAssistedReviewForSessionDir } from "@/node/services/reviewPane/assistedReviewStorage";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
 import {
@@ -10588,7 +10589,8 @@ export class AgentSession {
   /**
    * Run the turn.stop prompt hooks (Codex Stop) for a turn that ended normally. A continuation
    * (Codex `decision: "block"`) queues its prompt as a new synthetic user row, at most
-   * MAX_STOP_HOOK_CONTINUATIONS times per user turn. Sub-agent turns skip the hooks: TaskService
+   * MAX_STOP_HOOK_CONTINUATIONS times per user turn. Xum's own todo nudge (buildTodoTurnEndNudge)
+   * rides the same continuation and gates. Sub-agent turns skip the hooks: TaskService
    * owns their stream end (Codex has SubagentStop for them). A delegated workspace turn
    * (`workspace-turn-task`) skips them for the same reason: WorkspaceTurnManager settles its
    * handle from this stream end, and can remove a disposable workspace, while a slow hook still
@@ -10599,7 +10601,6 @@ export class AgentSession {
     options: SendMessageOptions | undefined,
     provenance: StopContinuationProvenance
   ): Promise<void> {
-    if (this.aiService.runTurnStopHooks == null) return;
     if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
     if (provenance.delegatedWorkspaceTurn) return;
     // Input queued during the turn is its next turn: the turn has not stopped, so Stop does
@@ -10617,13 +10618,31 @@ export class AgentSession {
     // stream to supersede and clears the queue before the hook returns. Its epoch fences the
     // continuation instead (rechecked below, after the last await).
     const stopEpochAtHook = this.getStopEpoch();
-    const outcome = await this.aiService.runTurnStopHooks(this.workspaceId, {
-      messageId: payload.messageId,
-      lastAssistantMessage: lastAssistantText(payload.parts),
-      stopHookActive: this.stopHookContinuations > 0,
-      model: stopHookModel(payload, provenance),
-    });
-    if (outcome.kind === "none" || options == null) {
+    const hookOutcome: TurnStopHookOutcome = (await this.aiService.runTurnStopHooks?.(
+      this.workspaceId,
+      {
+        messageId: payload.messageId,
+        lastAssistantMessage: lastAssistantText(payload.parts),
+        stopHookActive: this.stopHookContinuations > 0,
+        model: stopHookModel(payload, provenance),
+      }
+    )) ?? { kind: "none" };
+    // One todo nudge per user turn: only before any continuation (so never after the nudge
+    // itself), never against a plugin's halt, and never in Plan mode, where the list is the plan.
+    const todoNudge =
+      hookOutcome.kind !== "halted" &&
+      this.stopHookContinuations === 0 &&
+      options != null &&
+      options.agentId !== "plan"
+        ? await buildTodoTurnEndNudge({
+            sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
+            parts: payload.parts,
+          })
+        : null;
+    const prompt = [hookOutcome.kind === "continue" ? hookOutcome.prompt : null, todoNudge]
+      .filter((text): text is string => text != null)
+      .join("\n\n");
+    if (prompt.length === 0 || options == null) {
       this.stopHookContinuations = 0;
       return;
     }
@@ -10673,7 +10692,7 @@ export class AgentSession {
       return;
     }
     this.stopHookContinuations++;
-    this.queueMessage(outcome.prompt, this.stopContinuationOptions(options, provenance), {
+    this.queueMessage(prompt, this.stopContinuationOptions(options, provenance), {
       acceptanceOrigin: "automatic",
       synthetic: true,
       ...(provenance.agentInitiated === true ? { agentInitiated: true } : {}),
