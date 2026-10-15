@@ -358,15 +358,22 @@ function stripToolCatalogOverview(description: string): string {
   return description.slice(0, regionStart) + description.slice(regionEnd);
 }
 
+/** What one server line of an overview claims. */
+interface ToolCatalogOverviewLine {
+  server: string;
+  /** The tool names the line lists, all from this server. */
+  listed: readonly string[];
+  /** The line ends in ", and more": the server has more tools than it lists. */
+  overflowed: boolean;
+}
+
 /** A built overview plus what decides whether a later catalog may reuse it. */
 export interface ToolCatalogOverview {
   text: string;
   /** Every server key of the catalog it was built from, in overview order. */
   servers: readonly string[];
-  /** The tool names its lines list. */
-  listedToolNames: readonly string[];
-  /** Servers whose line ends in ", and more" (more tools than it lists). */
-  overflowedServers: readonly string[];
+  /** The emitted server lines (servers past the budget have none). */
+  lines: readonly ToolCatalogOverviewLine[];
 }
 
 /**
@@ -396,8 +403,7 @@ function groupCatalogByServer(catalog: readonly ToolCatalogEntry[]): Array<[stri
 function buildOverview(catalog: readonly ToolCatalogEntry[]): ToolCatalogOverview {
   const servers = groupCatalogByServer(catalog);
   const lines: string[] = [];
-  const listedToolNames: string[] = [];
-  const overflowedServers: string[] = [];
+  const claims: ToolCatalogOverviewLine[] = [];
   let usedChars = OVERVIEW_HEADER.length + OVERVIEW_END_MARKER.length;
   let omittedServers = 0;
   for (const [server, names] of servers) {
@@ -418,8 +424,7 @@ function buildOverview(catalog: readonly ToolCatalogEntry[]): ToolCatalogOvervie
     }
     usedChars += line.length + 1;
     lines.push(line);
-    listedToolNames.push(...shown);
-    if (suffix.length > 0) overflowedServers.push(server);
+    claims.push({ server, listed: shown, overflowed: suffix.length > 0 });
   }
   if (omittedServers > 0) {
     lines.push(
@@ -429,8 +434,7 @@ function buildOverview(catalog: readonly ToolCatalogEntry[]): ToolCatalogOvervie
   return {
     text: `${OVERVIEW_HEADER}\n${lines.join("\n")}\n${OVERVIEW_END_MARKER}`,
     servers: servers.map(([server]) => server),
-    listedToolNames,
-    overflowedServers,
+    lines: claims,
   };
 }
 
@@ -447,13 +451,17 @@ export function buildToolCatalogOverview(catalog: readonly ToolCatalogEntry[]): 
 }
 
 /**
- * A previous overview stays valid while the catalog has the same servers and
- * still holds every tool it lists: it then names no missing tool or server,
- * and the omitted-server count is unchanged. Each ", and more" must stay
- * true too: a server that drops to the listed count gets a fresh line. A tool
- * added since is not listed (nor is a server that grows past the listed count
- * marked "and more"): that leaves the overview incomplete, not false, and
- * search still finds the tool (search reads the live catalog).
+ * A previous overview stays valid while none of its claims became false:
+ * - the server set is unchanged, so every line's server still exists, the
+ *   lines keep their order and labels, and the "…and N more servers" count
+ *   (servers minus emitted lines) is the same;
+ * - each listed name is still a tool of the same server (an MCP key can move
+ *   to another server when two server/tool pairs normalize to one name);
+ * - each ", and more" line's server still has more tools than the line lists.
+ * Not checked on purpose: a tool added since is not listed, and a line without
+ * "and more" whose server grew stays without it. That leaves the overview
+ * incomplete, not false, and search still finds the tool (it reads the live
+ * catalog); rebuilding would rewrite the prompt cache for no gain.
  */
 function canReuseOverview(
   previous: ToolCatalogOverview,
@@ -462,12 +470,13 @@ function canReuseOverview(
   const grouped = groupCatalogByServer(catalog);
   if (grouped.length !== previous.servers.length) return false;
   if (grouped.some(([server], index) => server !== previous.servers[index])) return false;
-  const toolCounts = new Map(grouped.map(([server, names]) => [server, names.length]));
-  const stillOverflows = (server: string) =>
-    (toolCounts.get(server) ?? 0) > OVERVIEW_MAX_TOOLS_PER_SERVER;
-  if (!previous.overflowedServers.every(stillOverflows)) return false;
-  const names = new Set(catalog.map((entry) => entry.name));
-  return previous.listedToolNames.every((name) => names.has(name));
+  const namesByServer = new Map(grouped.map(([server, names]) => [server, new Set(names)]));
+  return previous.lines.every((line) => {
+    const names = namesByServer.get(line.server);
+    assert(names !== undefined, "an overview line's server is in the unchanged server set");
+    if (line.overflowed && names.size <= line.listed.length) return false;
+    return line.listed.every((name) => names.has(name));
+  });
 }
 
 function overviewForCatalog(

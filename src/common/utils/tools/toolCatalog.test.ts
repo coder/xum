@@ -548,6 +548,15 @@ describe("overview stability across MCP tool refetches", () => {
     expect(refetch({ notion: notion(9) }, memo).description).toBe(eight.description);
   });
 
+  test("the memo is replaced when a listed name moves to another server", () => {
+    // Two server/tool pairs can normalize to one MCP key: once the first pair
+    // goes, the key belongs to the other server while both servers stay.
+    const memo: ToolCatalogOverviewMemo = {};
+    refetch({ alpha: ["shared_tool", "alpha_other"], beta: ["beta_other"] }, memo);
+    const moved = { alpha: ["alpha_other"], beta: ["beta_other", "shared_tool"] };
+    expect(refetch(moved, memo).description).toBe(refetch(moved).description);
+  });
+
   test("a reused overview is still stripped, not stacked, on a rebuild", () => {
     const memo: ToolCatalogOverviewMemo = {};
     const first = refetch({ notion: notion(12) }, memo);
