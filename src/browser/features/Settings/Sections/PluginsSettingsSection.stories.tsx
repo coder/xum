@@ -856,7 +856,7 @@ export const BrokenSignOutRecord: Story = {
           pendingSignOuts: {
             kind: "broken",
             reason:
-              "The pending plugin sign-out record (~/.mux/plugin-sign-outs-pending.json) is corrupt or from another Xum version. Sign out of the plugin MCP servers in Settings, then delete the file.",
+              "The pending plugin sign-out record (~/.mux/plugin-sign-outs-pending.json) is corrupt or from another Xum version. Delete the file, then sign out of the plugin's MCP servers in Settings → MCP before you use them.",
           },
         },
       }}
@@ -867,7 +867,7 @@ export const BrokenSignOutRecord: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await canvas.findByText(/Managed plugins are unavailable to agents\. The pending plugin/);
-    await canvas.findByText(/then delete the file/);
+    await canvas.findByText(/Delete the file, then sign out/);
   },
 };
 

@@ -995,6 +995,9 @@ const UpdateReviewPanel: React.FC<{
   );
 };
 
+/** How often the section re-reads a pending sign-out record (the backend retries every 30 s). */
+const PENDING_SIGN_OUT_POLL_MS = 30_000;
+
 /**
  * Section notice while a post-update sign-out record exists (#6627). Every discovery gate keeps
  * managed plugins closed until it is gone, and without this notice they only disappear.
@@ -1016,8 +1019,9 @@ const PendingSignOutNotice: React.FC<{ status: AgentPluginPendingSignOuts | null
         <span className="space-y-1 break-words">
           <span className="block">
             Managed plugins are unavailable to agents until Xum finishes signing out of a plugin MCP
-            server whose sign-in changed in an update: {status.servers.join(", ")}. Xum retries on
-            its own and each time you open this section.
+            server whose sign-in changed in an update
+            {status.servers.length > 0 ? `: ${status.servers.join(", ")}` : ""}. Xum retries on its
+            own and each time you open this section.
           </span>
           {status.lastError !== undefined && (
             <span className="block">Last attempt: {status.lastError}</span>
@@ -1282,6 +1286,17 @@ export const PluginsSettingsSection: React.FC = () => {
       }
     }
   };
+
+  // A background pass (the discovery gate retries every 30 s) can clear or change the record
+  // without any section action, so re-read it while the notice shows (#6627).
+  const signOutsPending = pendingSignOuts !== null && pendingSignOuts.kind !== "none";
+  useEffect(() => {
+    if (!api || !signOutsPending) return;
+    const timer = setInterval(() => {
+      api.agentPlugins.pendingSignOuts().then(setPendingSignOuts, () => undefined);
+    }, PENDING_SIGN_OUT_POLL_MS);
+    return () => clearInterval(timer);
+  }, [api, signOutsPending]);
 
   // Approved update policy: passive check on section open + explicit button only.
   useEffect(() => {

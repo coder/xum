@@ -2769,6 +2769,14 @@ describe("AgentPluginInstallService", () => {
         /corrupt or from another Xum version/
       );
 
+      // An empty record still fences discovery, so Settings still shows it.
+      await fsPromises.writeFile(file, JSON.stringify({ version: 1, urls: [] }));
+      expect(await restarted.pendingSignOutStatus()).toMatchObject({
+        kind: "pending",
+        servers: [],
+      });
+      expect(await discovered()).toBe(0);
+
       await fsPromises.writeFile(file, kept);
       fail = false;
       await restarted.list();

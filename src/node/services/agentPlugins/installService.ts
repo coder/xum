@@ -257,7 +257,7 @@ function unusableRecordReason(error: unknown, file: string): string {
   const code: unknown =
     typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
   if (typeof code !== "string") return getErrorMessage(error);
-  return `Xum cannot read the pending plugin sign-out record (${file}): ${code}. Fix its permissions, or sign out of the plugin MCP servers in Settings, then delete the file.`;
+  return `Xum cannot read the pending plugin sign-out record (${file}): ${code}. Fix its permissions. Or: delete the file, then sign out of the plugin's MCP servers in Settings → MCP before you use them.`;
 }
 
 /** Waits for the startup sign-out pass at most timeoutMs, then lets discovery go on. */
@@ -942,7 +942,7 @@ function parsePendingSignOuts(raw: string, file: string): string[] {
   const value = fields.version === 1 ? fields.urls : undefined;
   if (!Array.isArray(value) || !value.every((url) => typeof url === "string"))
     throw new Error(
-      `The pending plugin sign-out record (${shortenHome(file)}) is corrupt or from another Xum version. Sign out of the plugin MCP servers in Settings, then delete the file.`
+      `The pending plugin sign-out record (${shortenHome(file)}) is corrupt or from another Xum version. Delete the file, then sign out of the plugin's MCP servers in Settings → MCP before you use them.`
     );
   return value;
 }
@@ -4165,7 +4165,8 @@ export class AgentPluginInstallService {
         reason: unusableRecordReason(error, shortenHome(this.pendingSignOutsFile)),
       };
     }
-    if (servers.length === 0) return { kind: "none" };
+    // An empty record still fences discovery while it exists (the next pass deletes it).
+    if (servers.length === 0 && !(await this.hasPendingSignOuts())) return { kind: "none" };
     const lastError = this.pendingSignOutLastError;
     return { kind: "pending", servers, ...(lastError !== undefined ? { lastError } : {}) };
   }
