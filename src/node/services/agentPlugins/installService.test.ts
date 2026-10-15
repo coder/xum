@@ -2062,8 +2062,12 @@ describe("AgentPluginInstallService", () => {
     if ((await fsPromises.readdir(agentsDir)).length < 2) return; // case-insensitive filesystem
     expect(await listed()).toEqual([]);
     expect(await loads()).toBeNull();
+    // The row shows why the reviewed agent stopped loading, so the plugin asks for a review.
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
     const review = await service.previewComponentReview({ name: "demo-plugin" });
-    expect(review.changes).toEqual([]);
+    expect(review.changes.map((change) => change.summary)).toEqual([
+      "agent 'reviewer' will not load: more than one file claims its ID",
+    ]);
     expect(review.warnings.join("\n")).toContain("more than one file claims its ID");
 
     await fsPromises.rm(path.join(agentsDir, "Reviewer.md"));

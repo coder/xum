@@ -15,6 +15,7 @@ import { useAPI } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { matchesKeybind, KEYBINDS, paneHandlesKeyEvent } from "@/browser/utils/ui/keybinds";
 import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
@@ -309,8 +310,12 @@ function AgentProviderWithState(props: {
     };
 
     window.addEventListener(CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED, handleRefreshRequested);
-    return () =>
+    // A plugin install, update or component review changes which plugin agents load (#6629).
+    const unsubscribe = subscribeAgentPluginsMutated(handleRefreshRequested);
+    return () => {
       window.removeEventListener(CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED, handleRefreshRequested);
+      unsubscribe();
+    };
   }, [refresh]);
 
   const agentContextValue = useMemo(

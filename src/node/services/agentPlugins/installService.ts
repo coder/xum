@@ -345,16 +345,26 @@ function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void
 /** List row field: managed rows count imported components that need a review (#6498). */
 function reviewRequiredField(
   entry: AgentPluginInstallEntry | undefined,
-  fingerprints: ComponentConsent
+  fingerprints: ComponentConsent,
+  /** Agents two files claim (#6629): they do not load, and the review row says why. */
+  ambiguousAgentCount: number
 ): { reviewRequiredCount?: number } {
   if (entry === undefined) return {};
   return {
-    reviewRequiredCount: countUnreviewed({
-      current: fingerprints,
-      selection: entry.importedComponents,
-      consent: entry.componentConsent,
-    }),
+    reviewRequiredCount:
+      countUnreviewed({
+        current: fingerprints,
+        selection: entry.importedComponents,
+        consent: entry.componentConsent,
+      }) + ambiguousAgentCount,
   };
+}
+
+/** How many agent IDs of a plugin two files claim (#6629). */
+async function countAmbiguousAgents(plugin: Pick<AgentPluginInfo, "agentsDir">): Promise<number> {
+  const ambiguous = new Set<string>();
+  await listPluginAgentFiles(plugin.agentsDir, [], ambiguous);
+  return ambiguous.size;
 }
 
 /** Consent after a confirmed review: only the shown refs that still match get records. */
@@ -4304,7 +4314,7 @@ export class AgentPluginInstallService {
         importedMcpServerCount: inventory.mcpServers.filter(
           (server) => selection === undefined || selection.mcpServers.includes(server.serverName)
         ).length,
-        ...reviewRequiredField(entry, inventory.fingerprints),
+        ...reviewRequiredField(entry, inventory.fingerprints, await countAmbiguousAgents(plugin)),
       });
     }
 
@@ -5391,7 +5401,11 @@ export class AgentPluginInstallService {
       targetPath,
       warnings
     );
-    const changes = unreviewedRows(entry, surface);
+    // An agent a second file disabled after install has no fingerprint, so only this row shows it.
+    const changes = [
+      ...unreviewedRows(entry, surface),
+      ...ambiguousAgentChanges(surface.ambiguousAgents, undefined),
+    ];
     assertReviewFits(changes);
     return { changes, warnings };
   }
