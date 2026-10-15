@@ -1723,6 +1723,11 @@ describe("MessageQueue", () => {
         type: "normal",
         reviews: [first, second],
       });
+      // A dispatch carries them too (Codex PRRT_kwDOPxxmWM6s3-n2).
+      expect(queue.dequeueNext().options?.muxMetadata).toEqual({
+        type: "normal",
+        reviews: [first, second],
+      });
       queue.clear();
       queue.add("plain", { ...options, muxMetadata: { type: "normal" } });
       queue.add("<review>2</review>", {

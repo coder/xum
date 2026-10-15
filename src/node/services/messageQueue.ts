@@ -304,8 +304,8 @@ function recordAddMetadata(entry: QueueEntry, muxMetadata: unknown): void {
 }
 
 /**
- * The entry's metadata with the batched adds' reviews added, for a held re-send: its transcript
- * row shows review blocks from `muxMetadata.reviews` (Codex PRRT_kwDOPxxmWM6s3RUw). A /compact's
+ * The entry's metadata with the batched adds' reviews added, for a dispatch or a held re-send: the
+ * transcript row shows review blocks from `muxMetadata.reviews` (Codex PRRT_kwDOPxxmWM6s3RUw). A /compact's
  * metadata keeps its shape: its restore returns the reviews instead.
  */
 function metadataWithBatchedReviews(entry: QueueEntry): unknown {
@@ -1487,8 +1487,10 @@ export class MessageQueue {
           }
           return {
             ...restOptions,
-            // First metadata takes precedence (preserves compaction + agent-skill invocations)
-            muxMetadata: entry.muxMetadata,
+            // First metadata takes precedence (preserves compaction + agent-skill invocations).
+            // Later adds' reviews join it: the transcript draws review cards from it (Codex
+            // PRRT_kwDOPxxmWM6s3-n2).
+            muxMetadata: metadataWithBatchedReviews(entry),
             fileParts: entry.fileParts.length > 0 ? entry.fileParts : undefined,
           };
         })()
