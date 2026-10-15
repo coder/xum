@@ -430,6 +430,14 @@ export const AddPluginConsentPreview: Story = {
             agents: ["grill-master.md"],
             workflows: ["grill-report.js"],
             slashCommands: [{ name: "grill", description: "Grill the current plan" }],
+            reviewedComponents: [
+              {
+                kind: "workflows",
+                name: "grill-report.js",
+                detail:
+                  "Workflow script workflows/grill-report.js\n\nReviewed fields: sha256 3f2a…\n\nexport const meta = { name: 'grill-report' };",
+              },
+            ],
             codexHooks: GRILL_HOOKS.hooks.map(({ review: _review, ...hook }) => hook),
             warnings: ["Unknown top-level field 'hooks' ignored"],
             targetPath: "~/.mux/plugins/grill",
@@ -503,6 +511,7 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
             agents: [],
             workflows: [],
             slashCommands: [],
+            reviewedComponents: [],
             codexHooks: [],
             warnings: [],
             targetPath: `~/.mux/plugins/${MAX_LENGTH_NAME}`,

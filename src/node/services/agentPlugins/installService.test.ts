@@ -1701,6 +1701,10 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "add a workflow");
     const preview = await service.preview({ input: remoteDir });
+    // The preview shows the script that install approves.
+    expect(preview.reviewedComponents).toHaveLength(1);
+    expect(preview.reviewedComponents[0]).toMatchObject({ kind: "workflows", name: "run.js" });
+    expect(preview.reviewedComponents[0]?.detail).toContain("name: 'run'");
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
     const resolve = () =>
       resolveWorkflowScript({
