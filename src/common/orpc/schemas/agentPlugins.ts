@@ -170,6 +170,7 @@ export const AgentPluginInstallPreviewSchema = z.object({
   reviewedComponents: z.array(
     z.object({
       kind: AgentPluginComponentKindSchema,
+      /** Display form: invisible and bidi controls shown as `<U+XXXX>`, never an identity. */
       name: z.string(),
       detail: z.string(),
     })

@@ -417,7 +417,7 @@ function unreviewedRow(
   if (!imported || isComponentConsented(entry.componentConsent, kind, name, fingerprint)) return [];
   return [
     {
-      summary: `${COMPONENT_LABELS[kind]} '${name}' needs review`,
+      summary: `${COMPONENT_LABELS[kind]} '${showInvisibleControls(name)}' needs review`,
       before: reviewedBefore(entry.componentConsent, kind, name),
       after: reviewText(item),
       component: { kind, name, fingerprint },
@@ -442,12 +442,18 @@ function workflowChanges(
     };
     const before = current?.workflows.get(file);
     if (before === undefined) {
-      return [{ summary: `adds workflow '${file}'`, after: reviewText(workflow), component }];
+      return [
+        {
+          summary: `adds workflow '${showInvisibleControls(file)}'`,
+          after: reviewText(workflow),
+          component,
+        },
+      ];
     }
     if (before.consentFingerprint === workflow.consentFingerprint) return [];
     return [
       {
-        summary: `changes workflow '${file}'`,
+        summary: `changes workflow '${showInvisibleControls(file)}'`,
         before: reviewText(before),
         after: reviewText(workflow),
         component,
@@ -467,7 +473,11 @@ function reviewedComponentRows(
   >
 ): AgentPluginInstallPreview["reviewedComponents"] {
   const rows = groups.flatMap(([kind, items]) =>
-    items.map(([name, item]) => ({ kind, name, detail: reviewText(item) }))
+    items.map(([name, item]) => ({
+      kind,
+      name: showInvisibleControls(name),
+      detail: reviewText(item),
+    }))
   );
   assertReviewFits(rows.map((row) => ({ summary: row.name, after: row.detail })));
   return rows;
@@ -2511,7 +2521,7 @@ export class AgentPluginInstallService {
         ).content;
       } catch (error) {
         warnings.push(
-          `Workflow '${file}' cannot be read and will not run: ${getErrorMessage(error)}`
+          `Workflow '${showInvisibleControls(file)}' cannot be read and will not run: ${getErrorMessage(error)}`
         );
         continue;
       }
@@ -2940,7 +2950,10 @@ export class AgentPluginInstallService {
       warnings.push(...codexHooks.warnings);
       const openaiInterface = await interfaceSummary(plugin, warnings);
       const agents = (await this.collectAgentFiles(plugin.agentsDir)).map((agent) => agent.name);
-      const workflows = await listPluginWorkflowFiles(plugin.workflowsDir);
+      // Display only: the names a user reads before Install show invisible controls (#6629).
+      const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
+        showInvisibleControls
+      );
       const reviewedComponents = reviewedComponentRows([
         [
           "workflows",
