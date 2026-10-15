@@ -102,6 +102,34 @@ describe("McpAppResultStore", () => {
     expect(files).toHaveLength(MCP_APP_RESULT_MAX_PER_WORKSPACE);
   });
 
+  test("pruning never deletes a record whose stat fails", async () => {
+    using tmp = new DisposableTempDir("mcp-app-store");
+    const sessionDir = (id: string) => path.join(tmp.path, id);
+    const store = new McpAppResultStore(sessionDir);
+    for (let i = 0; i < MCP_APP_RESULT_MAX_PER_WORKSPACE; i++) {
+      await store.record("ws", entry(`c${i}`));
+    }
+    // The newest stored record ("c<cap-1>") cannot be stat'ed while the next record prunes. A
+    // failed stat says nothing about the file's age, so pruning must not pick it as the oldest.
+    const newest = `c${MCP_APP_RESULT_MAX_PER_WORKSPACE - 1}`;
+    const newestName = `${createHash("sha256").update(newest).digest("hex").slice(0, 40)}.json`;
+    const realStat = fs.stat;
+    const stat = spyOn(fs, "stat").mockImplementation(((target: string, ...rest: unknown[]) =>
+      path.basename(target) === newestName
+        ? Promise.reject(new Error("EIO"))
+        : (realStat as (...args: unknown[]) => unknown)(target, ...rest)) as typeof fs.stat);
+    try {
+      expect(await store.record("ws", entry("next"))).toBe(true);
+    } finally {
+      stat.mockRestore();
+    }
+    const fresh = new McpAppResultStore(sessionDir);
+    expect(await fresh.get("ws", newest)).toMatchObject({ toolCallId: newest });
+    // The cap still holds: another (stat-able) record went instead.
+    const files = await fs.readdir(path.join(tmp.path, "ws", MCP_APP_RESULT_DIR));
+    expect(files).toHaveLength(MCP_APP_RESULT_MAX_PER_WORKSPACE);
+  });
+
   test("a pruning failure still counts as stored: the record is written and published", async () => {
     using tmp = new DisposableTempDir("mcp-app-store");
     const sessionDir = (id: string) => path.join(tmp.path, id);
