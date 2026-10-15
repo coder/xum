@@ -1043,9 +1043,10 @@ const ReconnectingShell: FC<{ children: ReactNode }> = (props) => {
   });
   const reconnect = () => {
     const next = createMockORPCClient(componentReviewOptions());
-    const list = next.agentPlugins.list.bind(next.agentPlugins);
+    // The section lists through listForSettings (#6627).
+    const list = next.agentPlugins.listForSettings.bind(next.agentPlugins);
     const preview = next.agentPlugins.previewComponentReview.bind(next.agentPlugins);
-    next.agentPlugins.list = (...args: Parameters<typeof list>) => {
+    next.agentPlugins.listForSettings = (...args: Parameters<typeof list>) => {
       reconnectCalls.list++;
       return list(...args);
     };
@@ -1118,6 +1119,7 @@ const MountWhileReconnectingShell: FC<{ children: ReactNode }> = (props) => {
     const client = createMockORPCClient(componentReviewOptions());
     const offline = () => Promise.reject(new Error("connection lost"));
     client.agentPlugins.list = offline;
+    client.agentPlugins.listForSettings = offline;
     client.agentPlugins.previewComponentReview = offline;
     return client;
   });

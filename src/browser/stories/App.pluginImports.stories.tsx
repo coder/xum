@@ -87,6 +87,11 @@ function setupPluginSettings(installed = false, conflict = false) {
           ]
         : [],
     });
+  // Settings → Plugins lists through listForSettings (#6627).
+  client.agentPlugins.listForSettings = async () => ({
+    list: await client.agentPlugins.list(),
+    pendingSignOuts: { kind: "none" },
+  });
   client.agentPlugins.getComponents = () =>
     Promise.resolve({
       success: true,
