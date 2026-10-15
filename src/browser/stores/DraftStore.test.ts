@@ -1344,6 +1344,58 @@ describe("DraftStore", () => {
     expect((await service.get(source)).text).toBe("");
   });
 
+  test("a moved draft shows the source's loaded attachments at once, unless they changed", async () => {
+    using tempDir = new TestTempDir("draft-store-move-payloads");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    const replaced: DraftAttachment = { ...image, mediaType: "image/jpeg" };
+    const moveTo = async (source: DraftScope & { kind: "creation" }, draftId: string) => {
+      store.setText(source, "with an image");
+      store.setAttachments(source, [image]);
+      let release: () => void = () => undefined;
+      control.moveGate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const moved = store.moveCreationDraft(source, {
+        projectPath,
+        draftId,
+        subProjectPath: null,
+        createdAt: 1,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { release, moved };
+    };
+
+    const first = await moveTo(
+      { kind: "creation", projectPath, draftId: DEFAULT_CREATION_DRAFT_ID },
+      "kept-payloads"
+    );
+    control.moveGate = null;
+    first.release();
+    expect(await first.moved).toBe(true);
+    const kept: DraftScope = { kind: "creation", projectPath, draftId: "kept-payloads" };
+    expect(store.getView(kept)).toMatchObject({ attachmentCount: 1, payloadsLoaded: true });
+    expect(store.getAttachments(kept)).toEqual([image]);
+
+    // Another window replaces the attachment under the same id while the move waits: the moved
+    // body has the new one, so the destination loads it instead of showing the old payload.
+    const source: DraftScope & { kind: "creation" } = {
+      kind: "creation",
+      projectPath,
+      draftId: DEFAULT_CREATION_DRAFT_ID,
+    };
+    const second = await moveTo(source, "changed-payloads");
+    await service.update({ scope: source, attachments: [replaced] });
+    control.moveGate = null;
+    second.release();
+    expect(await second.moved).toBe(true);
+    const changed: DraftScope = { kind: "creation", projectPath, draftId: "changed-payloads" };
+    expect(store.getView(changed).payloadsLoaded).toBe(false);
+    await store.ensurePayloads(changed);
+    expect(store.getAttachments(changed)).toEqual([replaced]);
+  });
+
   test("a move whose reply was lost after the backend moved the draft still shows it moved", async () => {
     using tempDir = new TestTempDir("draft-store-move-lost-reply");
     const { projectPath, service, client, control } = await createHarness(tempDir);
