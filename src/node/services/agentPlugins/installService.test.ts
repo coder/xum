@@ -3460,6 +3460,62 @@ describe("AgentPluginInstallService", () => {
       expect(await discovered()).toBe(0);
     });
 
+    test("an update's own hung sign-out is bounded, and a later pass reuses it (#6627)", async () => {
+      await seedTokens();
+      let logouts = 0;
+      const updater = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 20,
+      });
+      await writeServer("client-a");
+      const preview = await updater.preview({ input: remoteDir });
+      await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      updater.setMcpOauthService({
+        logout: () => {
+          logouts++;
+          return new Promise<never>(() => undefined);
+        },
+        credentialKey: (url: string) => oauth.credentialKey(url),
+      } as unknown as McpOauthService);
+      await writeServer("client-b");
+      const review = await updater.previewUpdate({ name: "demo-plugin" });
+      // The update holds the plugin lock while it signs out: a hung logout must not hold it.
+      await updater.update({
+        name: "demo-plugin",
+        consent: { fromSha: review.fromSha, toSha: review.toSha },
+      });
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+      // The section open's pass waits for the same call instead of starting a second logout.
+      await updater.list();
+      expect(logouts).toBe(1);
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+      await oauth.dispose();
+    });
+
+    test.skipIf(process.platform === "win32")(
+      "a FIFO at the record path does not block a sign-out pass (#6627)",
+      async () => {
+        const { failing, result } = await updateWithFailingSignOut(stopStub);
+        await result;
+        await failing.dispose();
+        const record = path.join(muxRoot, "plugin-sign-outs-pending.json");
+        await fsPromises.rm(record);
+        execFileSync("mkfifo", [record]);
+        const restarted = new AgentPluginInstallService(config, {
+          mcpServerManager: stopStub as unknown as MCPServerManager,
+        });
+        const oauth = new McpOauthService(config, new MCPConfigService(config));
+        restarted.setMcpOauthService(oauth);
+        // The pass holds the plugin lock: a blocked read would hang the section open.
+        await restarted.list();
+        expect(await restarted.pendingSignOutStatus()).toMatchObject({ kind: "broken" });
+        expect(await discovered()).toBe(0);
+        await fsPromises.rm(record);
+        await oauth.dispose();
+      }
+    );
+
     test("the retry wait ignores a wall-clock jump (#6627)", async () => {
       const { failing, result } = await updateWithFailingSignOut(stopStub);
       await result;
