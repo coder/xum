@@ -208,7 +208,10 @@ import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
 import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import type { WorkflowArchiveAdmissionGuard } from "@/node/services/workflows/workflowArchiveAdmission";
-import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
+import {
+  assertStoredPluginWorkflowReviewed,
+  resolveWorkflowScript,
+} from "@/node/services/workflows/workflowScriptResolver";
 import {
   WorkflowService,
   type WorkflowRunStatusChangedEvent,
@@ -2321,6 +2324,7 @@ export class TurnRequestBuilder {
     const getWorkflowProjectTrusted = () =>
       isWorkspaceProjectTrusted(this.dependencies.config, metadata);
 
+    const workflowProjectSearchRoot = projectCheckoutRoot ?? workspacePath;
     const workflowService =
       this.dependencies.bindings.taskService != null
         ? new WorkflowService({
@@ -2376,7 +2380,16 @@ export class TurnRequestBuilder {
                 scriptPath,
                 runtime,
                 workspacePath,
-                projectSearchRoot: projectCheckoutRoot ?? workspacePath,
+                projectSearchRoot: workflowProjectSearchRoot,
+                projectTrusted: getWorkflowProjectTrusted(),
+                skillStorageContext: workflowSkillStorageContext,
+              }),
+            assertStoredPluginWorkflowReviewed: (stored) =>
+              assertStoredPluginWorkflowReviewed({
+                ...stored,
+                runtime,
+                workspacePath,
+                projectSearchRoot: workflowProjectSearchRoot,
                 projectTrusted: getWorkflowProjectTrusted(),
                 skillStorageContext: workflowSkillStorageContext,
               }),

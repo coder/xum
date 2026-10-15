@@ -46,7 +46,13 @@ import {
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { skillConsentFingerprint } from "./componentConsent";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
-import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
+import {
+  assertStoredPluginWorkflowReviewed,
+  resolveWorkflowScript,
+} from "@/node/services/workflows/workflowScriptResolver";
+import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import { WorkflowService } from "@/node/services/workflows/WorkflowService";
+import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 
 /**
  * Lifecycle tests against a real local git "remote". Local-path remotes go
@@ -1755,6 +1761,79 @@ describe("AgentPluginInstallService", () => {
     await expect(resolve()).rejects.toThrow("has not been reviewed on this install");
     expect((await approveReview()).changes[0]?.before).toBe("Not reviewed on this install");
     expect((await resolve()).source).toContain("name: 'other'");
+  });
+
+  test("a stored plugin workflow run resumes only while its snapshot is reviewed (#6629)", async () => {
+    const source = "export default function workflow() { return {}; }\n";
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
+    await fsPromises.writeFile(path.join(remoteDir, "workflows", "run.js"), source);
+    await commitAll(remoteDir, "add a workflow");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(muxRoot, "workflow-runs") });
+    const createPluginRun = (id: string) =>
+      runStore.createRun({
+        id,
+        workspaceId: "workspace-1",
+        workflow: {
+          name: "run",
+          description: "Plugin workflow",
+          scope: "global",
+          sourcePath: "plugin://demo-plugin/run.js",
+          canonicalScriptPath: "plugin://demo-plugin/run.js",
+          sourceKind: "plugin",
+          executable: true,
+        },
+        source,
+        args: {},
+        now: "2026-10-15T00:00:00.000Z",
+      });
+    const workflows = new WorkflowService({
+      archiveAdmission: { getWorkflowArchiveRefusal: () => null },
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      assertStoredPluginWorkflowReviewed: (stored) =>
+        assertStoredPluginWorkflowReviewed({
+          ...stored,
+          runtime: new LocalRuntime(muxRoot),
+          workspacePath: muxRoot,
+          projectTrusted: false,
+          roots: {
+            projectRoot: "",
+            globalRoot: path.join(muxRoot, "skills"),
+            universalRoot: "",
+            globalPluginRoots: [pluginsDir()],
+          },
+        }),
+      runnerId: "runner-6629",
+    });
+    const resume = (runId: string) =>
+      workflows.resumeRun({ workspaceId: "workspace-1", runId, projectTrusted: false });
+
+    // The snapshot matches the reviewed script, so the run resumes.
+    await createPluginRun("wfr_reviewed");
+    expect((await resume("wfr_reviewed")).status).toBe("completed");
+
+    // A record from before #6629 has no workflow entries: the stored run fails closed, on an
+    // explicit resume and in crash recovery.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent: Record<string, unknown> }>;
+    };
+    delete document.plugins[0].componentConsent.workflows;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    await createPluginRun("wfr_unreviewed");
+    await runStore.appendStatus("wfr_unreviewed", "running", "2026-10-15T00:00:01.000Z");
+    expect(
+      await workflows.resumeCrashedRuns({ workspaceId: "workspace-1", projectTrusted: false })
+    ).toEqual([]);
+    expect((await runStore.getRun("wfr_unreviewed")).status).toBe("running");
+    await runStore.appendStatus("wfr_unreviewed", "interrupted", "2026-10-15T00:00:02.000Z");
+    await expect(resume("wfr_unreviewed")).rejects.toThrow("has not been reviewed on this install");
   });
 
   test("an update review lists a changed workflow script, and confirming records it (#6629)", async () => {
