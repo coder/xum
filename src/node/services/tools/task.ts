@@ -133,17 +133,17 @@ function buildParentRuntimeAiSettings(
  * Xum alias or a known provider model ID. Xum has no per-task speed mode, so `-fast`
  * runs the same model at standard speed. Returns null when the slug does not map.
  */
+const EFFORT_SLUG_PATTERN = new RegExp(`^(.+?)(?:-(${THINKING_LEVELS.join("|")}))?(?:-fast)?$`);
+
 function mapEffortSlug(raw: string): { model: string; effort?: ThinkingLevel } | null {
-  const tokens = raw.trim().toLowerCase().split("-");
-  if (tokens.length > 1 && tokens.at(-1) === "fast") tokens.pop();
-  const last = tokens.at(-1);
-  const effort = tokens.length > 1 ? THINKING_LEVELS.find((level) => level === last) : undefined;
-  if (effort != null) tokens.pop();
-  const base = tokens.join("-");
+  const match = EFFORT_SLUG_PATTERN.exec(raw.trim().toLowerCase());
+  if (match == null) return null;
+  const [, base, effortToken] = match;
+  const effort = THINKING_LEVELS.find((level) => level === effortToken);
   const model =
     normalizeModelInput(base).model ??
     Object.values(KNOWN_MODELS).find((known) => known.providerModelId === base)?.id;
-  return model == null ? null : { model, ...(effort != null ? { effort } : {}) };
+  return model == null ? null : { model, effort };
 }
 
 /** The configured-model catalog, or undefined when this context has none or it throws. */
@@ -169,6 +169,37 @@ function formatAvailableModels(available: AvailableModel[] | undefined): string 
 }
 
 /**
+ * Resolve a task `model` input: an alias or `provider:model` as the UI does, else a
+ * skill's `<model>-<effort>[-fast]` slug. Throws when neither resolves.
+ */
+function resolveTaskModel(
+  raw: string,
+  listAvailableModels: (() => AvailableModel[]) | undefined
+): { modelString: string; thinkingLevel?: ThinkingLevel } {
+  const normalized = normalizeModelInput(raw).model;
+  if (normalized != null) return { modelString: normalized };
+  // Skills written for other harnesses (e.g. pstack for Cursor) name models as
+  // `<model>-<effort>[-fast]` slugs. Map them so a skill's per-role routing works
+  // unedited, instead of failing or silently inheriting the parent's model.
+  const slug = mapEffortSlug(raw);
+  const available = readAvailableModels(listAvailableModels);
+  // A slug is a translation guess, so it must land on a model this host can run.
+  // Otherwise reject at launch with the configured models: pstack retries with the
+  // closest valid option from this error, rather than starting a child that fails.
+  if (slug == null || (available != null && !available.some((m) => m.model === slug.model))) {
+    throw new Error(
+      `task tool: ${slug == null ? "invalid" : "unavailable"} model "${raw}". ` +
+        `Provide a known alias, a "provider:model" string, or "<model>-<effort>"` +
+        formatAvailableModels(available)
+    );
+  }
+  return {
+    modelString: slug.model,
+    ...(slug.effort != null ? { thinkingLevel: slug.effort } : {}),
+  };
+}
+
+/**
  * Parse the optional `model`/`thinking` overrides supplied on a task launch,
  * reusing the exact parsing the UI uses (`normalizeModelInput` for model alias
  * resolution; `parseThinkingInput` for named levels OR numeric indices). Numeric
@@ -189,28 +220,7 @@ export function parseTaskAiOverrides(
   const overrides: { modelString?: string; thinkingLevel?: ParsedThinkingInput } = {};
 
   if (args.model != null) {
-    const normalized = normalizeModelInput(args.model);
-    if (normalized.model != null) {
-      overrides.modelString = normalized.model;
-    } else {
-      // Skills written for other harnesses (e.g. pstack for Cursor) name models as
-      // `<model>-<effort>[-fast]` slugs. Map them so a skill's per-role routing works
-      // unedited, instead of failing or silently inheriting the parent's model.
-      const slug = mapEffortSlug(args.model);
-      const available = readAvailableModels(listAvailableModels);
-      // A slug is a translation guess, so it must land on a model this host can run.
-      // Otherwise reject at launch with the configured models: pstack retries with the
-      // closest valid option from this error, rather than starting a child that fails.
-      if (slug == null || (available != null && !available.some((m) => m.model === slug.model))) {
-        throw new Error(
-          `task tool: ${slug == null ? "invalid" : "unavailable"} model "${args.model}". ` +
-            `Provide a known alias, a "provider:model" string, or "<model>-<effort>"` +
-            formatAvailableModels(available)
-        );
-      }
-      overrides.modelString = slug.model;
-      if (slug.effort != null) overrides.thinkingLevel = slug.effort;
-    }
+    Object.assign(overrides, resolveTaskModel(args.model, listAvailableModels));
   }
 
   if (args.thinking != null) {
