@@ -8131,6 +8131,18 @@ export class MCPServerManager {
    * Connect an HTTP/SSE MCP server (with auto http→sse fallback and one
    * stale-modern-verdict retry). Returns null when aborted.
    */
+  /** A refused tool call keeps the tokens and asks for a sign-in in Settings (#6622). */
+  private insufficientScopeOption(
+    serverUrl: string,
+    authProvider: unknown
+  ): { onInsufficientScope?: (scopes: string[]) => void } {
+    const oauthService = this.mcpOauthService;
+    if (authProvider === undefined || oauthService == null) return {};
+    return {
+      onInsufficientScope: (scopes) => oauthService.recordInsufficientScope({ serverUrl, scopes }),
+    };
+  }
+
   private async startRemoteInstance(
     name: string,
     info: Exclude<MCPServerInfo, MCPStdioServerInfo>,
@@ -8181,6 +8193,7 @@ export class MCPServerManager {
           url: info.url,
           headers,
           ...(authProvider ? { authProvider } : {}),
+          ...this.insufficientScopeOption(info.url, authProvider),
         };
 
     const verdictKey = JSON.stringify(["remote", name, info.transport, info.url, headers ?? null]);

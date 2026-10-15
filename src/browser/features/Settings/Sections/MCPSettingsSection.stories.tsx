@@ -551,6 +551,56 @@ export const ProjectSettingsOAuthLoggedIn: Story = {
   },
 };
 
+/**
+ * #6622: the server refused a tool call with 403 insufficient_scope. The tokens stay, and the row
+ * names the scopes and the next step. Phone width: long scope URLs wrap. Out of Pixel snapshots
+ * (snapshot budget); the play checks it.
+ */
+export const ProjectSettingsOAuthInsufficientScope: Story = {
+  decorators: withDesktopWindowApi,
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <MCPSettingsSectionStoryShell
+      setup={() =>
+        setupMCPSettingsSectionStory({
+          servers: {
+            "remote-oauth": {
+              transport: "http",
+              url: "https://example.com/mcp",
+              disabled: false,
+            },
+          },
+          mcpOauthAuthStatus: new Map<string, MCPOAuthAuthStatus>([
+            [
+              "https://example.com/mcp",
+              {
+                serverUrl: "https://example.com/mcp",
+                isLoggedIn: true,
+                hasRefreshToken: true,
+                updatedAtMs: Date.now() - 60_000,
+                insufficientScopes: ["https://www.googleapis.com/auth/drive.file", "files.write"],
+              },
+            ],
+          ]),
+        })
+      }
+    >
+      <div style={{ width: 375 }}>
+        <MCPSettingsSection />
+      </div>
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const body = within(canvasElement.ownerDocument.body);
+    await body.findByText(/Logged in/i);
+    const prompt = await body.findByText(/refused a tool call and asks for more permissions/);
+    await expect(prompt.textContent).toContain(
+      "https://www.googleapis.com/auth/drive.file files.write"
+    );
+    await expect(prompt.scrollWidth).toBeLessThanOrEqual(prompt.clientWidth + 1);
+  },
+};
+
 function setupDesignStory(
   enabled = true,
   reuseEnabled = false,

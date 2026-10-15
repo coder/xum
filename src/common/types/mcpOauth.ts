@@ -122,4 +122,9 @@ export interface MCPOAuthAuthStatus {
   hasRefreshToken: boolean;
   scope?: string;
   updatedAtMs?: number;
+  /**
+   * Scopes the server asked for in a 403 `insufficient_scope` answer since the last sign-in
+   * (#6622). Settings → MCP shows a sign-in prompt that names them.
+   */
+  insufficientScopes?: string[];
 }
