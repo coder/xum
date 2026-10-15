@@ -107,10 +107,11 @@ function formatSkillDirectoryLine(dir: Extract<SkillDirectory, { available: true
  * (slash/inline) snapshots, and snapshots re-injected after compaction from
  * agent_skill_read results (their skillDir or skillDirUnavailable). A snapshot
  * reaches the model without any tool result: without the path, models searched
- * the filesystem for the skill (and read another checkout's copy). Same rule as agent_skill_read: the path only
- * when bash can use it, the off-host note when the files are on the Xum host
- * while bash runs elsewhere, and nothing for built-in and other-checkout
- * skills (agent_skill_read_file and agent_skill_read cover those).
+ * the filesystem for the skill (and read another checkout's copy). Same rule
+ * as agent_skill_read: the path only when bash can use it, the off-host note
+ * when the files are on the Xum host while bash runs elsewhere, and nothing
+ * for built-in and other-checkout skills (agent_skill_read_file and
+ * agent_skill_read cover those).
  * The line lives in the body, so it is in the snapshot hash and survives
  * post-compaction re-injection without a new persisted field.
  */
