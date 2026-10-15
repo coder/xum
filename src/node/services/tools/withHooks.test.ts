@@ -544,7 +544,8 @@ exit 0
       executed.length = 0;
       for (const input of ["forbidden", "throw"]) {
         rewrite = { input };
-        expect(await lazyWrapped.execute!({ input: "x" }, {} as never)).toEqual(refused);
+        const result: unknown = await lazyWrapped.execute!({ input: "x" }, {} as never);
+        expect(result).toEqual(refused);
       }
       expect(executed).toEqual([]);
     } finally {
