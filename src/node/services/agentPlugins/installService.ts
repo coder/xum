@@ -624,7 +624,7 @@ function inventoryFingerprints(parts: {
   skills: readonly CollectedPluginSkill[];
   mcpServers: Record<string, string>;
   workflows: ReadonlyArray<{ file: string; consentFingerprint: string }>;
-  agents: Parameters<typeof agentConsentFingerprint>[0][];
+  agents: ReadonlyArray<Parameters<typeof agentConsentFingerprint>[0]>;
   slashCommands: ReadonlyArray<readonly [string, SurfaceWhole]>;
 }): ComponentConsent {
   return {
