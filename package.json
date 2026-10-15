@@ -112,6 +112,7 @@
     "fix-path": "5.0.0",
     "ghostty-web": "^0.4.0-next.7.g03ead6e",
     "happy-dom": "20.0.11",
+    "human-id": "4.2.2",
     "ignore": "^7.0.5",
     "json-schema-to-typescript": "^15.0.4",
     "jsonc-parser": "^3.3.1",

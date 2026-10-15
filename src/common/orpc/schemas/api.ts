@@ -1784,8 +1784,8 @@ export const workspace = {
     input: z.object({
       projectPath: z.string(),
       /**
-       * Workspace branch name. When omitted, the backend picks the next free
-       * "workspace-N" name (as /new does).
+       * Workspace branch name. When omitted, the backend picks a free random
+       * Docker-style name such as "calm-otters-sing" (as /new does).
        */
       branchName: z.string().optional(),
       /** Trunk branch to fork from - only required for worktree/SSH runtimes, ignored for local */
@@ -1807,7 +1807,7 @@ export const workspace = {
       tags: z.record(WorkspaceTagKeySchema, z.string()).optional(),
       /**
        * Name the workspace in the backend after it is announced, so creation does not wait for
-       * the naming model: it opens as "workspace-N", gets the generated title when it arrives,
+       * the naming model: it opens under a random name, gets the generated title when it arrives,
        * and its git branch is renamed before the init hook runs (the directory and workspace
        * name stay). Worktree runtime only; omit `branchName` and `title`.
        */
