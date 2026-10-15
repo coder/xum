@@ -495,6 +495,21 @@ function exceedsOneStep(start: number, end: number, inputs: StepInputs): boolean
   return false;
 }
 
+/**
+ * Whether an append restarts the reveal at the tail: a replaced tail (`previousNewestIndex` -1)
+ * always does. A bulk arrival (more than one step) does too, unless a capped reader is scrolled up
+ * (`holdsSlice`, #6680 review): the slice then keeps its start, and past the cap it detaches.
+ */
+function appendRestarts(
+  previousNewestIndex: number,
+  length: number,
+  inputs: StepInputs,
+  holdsSlice: boolean
+): boolean {
+  if (previousNewestIndex === -1) return true;
+  return !holdsSlice && exceedsOneStep(previousNewestIndex + 1, length, inputs);
+}
+
 function startState<Row extends RevealRow>(
   workspaceId: string,
   messages: readonly Row[],
@@ -575,10 +590,8 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       current.newestMessageId === null
         ? -1
         : args.messages.findIndex((row) => row.id === current.newestMessageId);
-    restart =
-      previousNewestIndex === -1
-        ? true
-        : exceedsOneStep(previousNewestIndex + 1, length, stepInputs);
+    const holdsSlice = args.followsTail === false && args.maxMountedRows !== undefined;
+    restart = appendRestarts(previousNewestIndex, length, stepInputs, holdsSlice);
     appendedFrom = previousNewestIndex + 1;
   }
   let appended = false;

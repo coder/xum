@@ -770,6 +770,53 @@ describe("useBoundedTranscriptReveal", () => {
       expect(reveal().toIndex).toBeLessThan(LONG);
     });
 
+    // #6680 review: a bulk arrival (over one chunk of rows, or over one step of weight) restarted
+    // at the tail before `followsTail` was read, unmounting the row a scrolled-up reader was on.
+    test("a scrolled-up capped reader keeps the read row through bulk and heavy appends", () => {
+      const arrivals = [
+        { count: TRANSCRIPT_REVEAL_CHUNK_ROWS + 1, weight: 1 },
+        { count: 3, weight: TRANSCRIPT_REVEAL_STEP_CHARS },
+        { count: MAX, weight: 1 }, // Past the cap: the newest rows unmount (detached).
+      ];
+      const readers = [
+        { followsTail: false, cap: MAX },
+        { followsTail: undefined, cap: MAX },
+        { followsTail: false, cap: undefined }, // Uncapped, a bulk arrival must not mount at once.
+      ];
+      for (const [arrival, { count, weight }] of arrivals.entries()) {
+        for (const { followsTail, cap } of readers) {
+          let messages = rows(LONG);
+          const frames = manualFrames();
+          const useReader = () =>
+            useBoundedTranscriptReveal({
+              workspaceId: "ws",
+              messages,
+              isSafeCut: bundled,
+              maxMountedRows: cap,
+              followsTail,
+              rowWeight: (index: number) => (index >= LONG ? weight : 1),
+            });
+          const view = renderHook(useReader);
+          while (frames.hasPending()) act(() => frames.flush());
+          const before = view.result.current;
+          const added = rows(count, `bulk-${arrival}`);
+          messages = [...messages, ...added];
+          view.rerender();
+          const after = view.result.current;
+          if (followsTail === false && cap !== undefined) {
+            expect(after.fromIndex).toBe(before.fromIndex); // The read row stays mounted.
+            expect(after.toIndex).toBeLessThanOrEqual(after.fromIndex + MAX);
+            expect(after.isDetached).toBe(messages.length - before.fromIndex > MAX);
+            continue;
+          }
+          // Otherwise the bulk arrival restarts at the tail as on main: like a fresh mount.
+          const fresh = renderHook(useReader).result.current;
+          expect(after).toMatchObject({ fromIndex: fresh.fromIndex, toIndex: fresh.toIndex });
+          expect(after.fromIndex).toBeGreaterThan(before.fromIndex);
+        }
+      }
+    });
+
     test("appends into a tail bundle larger than the cap keep its start; a new bundle moves it", () => {
       // Rows up to 1,000 are safe cuts; later rows are one bundle until a "cut" row arrives.
       let props = { messages: rows(LONG) };
