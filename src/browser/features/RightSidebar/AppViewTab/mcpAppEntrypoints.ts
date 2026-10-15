@@ -19,6 +19,17 @@ import type { McpAppViewRef } from "../ArtifactsTab/mcpAppViewsStore";
 const entrypointsByWorkspace = new Map<string, readonly McpAppEntrypoint[]>();
 /** Workspaces whose loader is listing (or re-listing) their entry points. */
 const pendingWorkspaces = new Set<string>();
+/**
+ * Workspaces whose latest listing failed. Their list shows empty, but it says nothing about any
+ * entry point: a known entry point keeps its view, and a restored tab falls back to its stored
+ * record (#6181), unlike after a settled list that lacks it.
+ */
+const failedWorkspaces = new Set<string>();
+
+/** Whether the workspace's latest entry point listing failed (see failedWorkspaces). */
+export function mcpAppEntrypointListFailed(workspaceId: string): boolean {
+  return failedWorkspaces.has(workspaceId);
+}
 const listeners = new Set<() => void>();
 
 const refKey = (workspaceId: string, viewKey: string) => `${workspaceId}\u0000${viewKey}`;
@@ -67,16 +78,29 @@ export function withEntrypointScope(
   return type === "thread" ? `${text} · this chat` : text;
 }
 
-/** Publish a settled list, or `"pending"` while it is being listed. */
-function setMcpAppEntrypoints(workspaceId: string, list: readonly McpAppEntrypoint[] | "pending") {
+/**
+ * Publish a settled list, `"pending"` while it is being listed, or `"failed"` when the listing
+ * failed: an empty list that retires nothing.
+ */
+function setMcpAppEntrypoints(
+  workspaceId: string,
+  list: readonly McpAppEntrypoint[] | "pending" | "failed"
+) {
   if (list === "pending") {
     entrypointsByWorkspace.delete(workspaceId);
     pendingWorkspaces.add(workspaceId);
     emit();
     return;
   }
-  entrypointsByWorkspace.set(workspaceId, list);
   pendingWorkspaces.delete(workspaceId);
+  if (list === "failed") {
+    entrypointsByWorkspace.set(workspaceId, []);
+    failedWorkspaces.add(workspaceId);
+    emit();
+    return;
+  }
+  entrypointsByWorkspace.set(workspaceId, list);
+  failedWorkspaces.delete(workspaceId);
   const listed = new Set(list.map((entrypoint) => refKey(workspaceId, entrypoint.viewKey)));
   for (const key of listed) retiredKeys.delete(key);
   for (const key of viewRefs.keys()) {
@@ -166,6 +190,11 @@ export function mcpAppEntrypointViewOf(
   const list = entrypointsByWorkspace.get(workspaceId);
   const listed = list?.find((entrypoint) => entrypoint.viewKey === viewKey);
   if (listed !== undefined) return entrypointViewRef(workspaceId, listed);
+  // A failed listing keeps the views of entry points known this session.
+  const known = failedWorkspaces.has(workspaceId)
+    ? viewRefs.get(refKey(workspaceId, viewKey))
+    : undefined;
+  if (known !== undefined) return known;
   if (list !== undefined || !pendingWorkspaces.has(workspaceId)) return undefined;
   return viewRefs.get(refKey(workspaceId, viewKey)) ?? "loading";
 }
@@ -265,7 +294,7 @@ function loadMcpAppEntrypoints(
       if (!controller.signal.aborted) setMcpAppEntrypoints(workspaceId, list);
     })
     .catch(() => {
-      if (!controller.signal.aborted) setMcpAppEntrypoints(workspaceId, []);
+      if (!controller.signal.aborted) setMcpAppEntrypoints(workspaceId, "failed");
     });
   return () => {
     controller.abort();
