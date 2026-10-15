@@ -656,25 +656,16 @@ describe("long-context tiers chosen per request", () => {
     expect(totalCost(turn)).toBeLessThan(totalCost(summedPrompt));
   });
 
-  test("an aggregate of per-request shares reprices exactly after a price-table change", () => {
-    const turns = [
-      priceTurn([step({ inputTokens: 60_000 }), step({ inputTokens: 130_000 })]),
-      priceTurn([step({ inputTokens: 90_000 })]),
-    ];
-    // Persisted through the session-usage schema, then left with costs from an older table.
-    const aggregate = ChatUsageDisplaySchema.parse(sumUsageHistory(turns));
-    const stale: ChatUsageDisplay = {
-      ...aggregate,
-      input: { tokens: aggregate.input.tokens, cost_usd: 0 },
-      cached: { tokens: aggregate.cached.tokens, cost_usd: 0 },
-      cacheCreate: { tokens: aggregate.cacheCreate.tokens, cost_usd: 0 },
-      output: { tokens: aggregate.output.tokens, cost_usd: 0 },
-      reasoning: { tokens: aggregate.reasoning.tokens, cost_usd: 0 },
-    };
+  test("a recorded share keeps its costs when repriced under a model with another threshold", () => {
+    // Classified long under Haiku 5.5's 100K threshold; GPT-6 Sol's is 272K. Neither a session
+    // aggregate nor its last request records which threshold its share was classified at.
+    const recorded = priceTurn([step({ inputTokens: 150_000 })]);
 
-    const repriced = recomputeUsageCosts(stale, MODEL, { aggregatedUsage: true });
+    for (const aggregatedUsage of [false, true]) {
+      const repriced = recomputeUsageCosts(recorded, "openai:gpt-6-sol", { aggregatedUsage });
 
-    expect(totalCost(repriced)).toBeCloseTo(totalCost(turns[0]) + totalCost(turns[1]), 12);
+      expect(totalCost(repriced)).toBeCloseTo(totalCost(recorded), 12);
+    }
   });
 
   test("an aggregate keeps its recorded costs once one summed entry lacks a share", () => {
@@ -726,6 +717,17 @@ describe("long-context tiers chosen per request", () => {
     test("a last step at or under the threshold prices the whole turn at base rates", () => {
       const turn = legacyTurn([60_000, 80_000, 100_000]);
       expect(totalCost(turn.price())).toBeCloseTo(totalCost(priceRequests(turn.steps)), 12);
+    });
+
+    test("a request that crosses the threshold prices whole at the long rate", () => {
+      // Two steps fix both prompts exactly: 50K, then 101K over the 100K threshold.
+      const steps = [50_000, 101_000].map((inputTokens) => step({ inputTokens, outputTokens: 0 }));
+      const priced = createDisplayUsage(turnUsage(steps), MODEL, undefined, undefined, {
+        lastStepUsage: steps[1].usage,
+        stepCount: 2,
+      })!;
+
+      expect(totalCost(priced)).toBeCloseTo(totalCost(priceRequests(steps)), 12);
     });
 
     test("a mid-turn compaction prices the earlier steps long and the last step base", () => {

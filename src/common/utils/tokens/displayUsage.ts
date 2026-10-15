@@ -152,10 +152,10 @@ function readLastStepTokens(steps: TurnSteps, tokens: UsageTokens): UsageTokens 
  * step at or under the threshold means no step crossed it, unless the earlier steps average
  * over it (a mid-turn compaction): then they price long and the last step base. Over it,
  * prompts are taken to grow evenly from the first step to the last, and the steps past the
- * threshold take their share of every token class. On the gateway's per-request ledger
- * (Sept 15 to Oct 14) this came within 2% per model and the compaction rule was exact, while
- * pricing only the last step long was 13-67% low and the whole turn 6-58% high. Undefined
- * when the last step's counts are malformed or its prompt exceeds the turn's.
+ * threshold take their prompts' share of every token class. On the gateway's per-request
+ * ledger (Sept 15 to Oct 14) this came within 2.2% per model and the compaction rule was
+ * exact, while pricing only the last step long was 13-67% low and the whole turn 6-58% high.
+ * Undefined when the last step's counts are malformed or its prompt exceeds the turn's.
  */
 function estimateLongContextTokens(
   threshold: number,
@@ -181,9 +181,12 @@ function estimateLongContextTokens(
     Math.max(0, (2 * summedPrompt) / stepCount - lastPrompt)
   );
   if (stepCount === 1 || firstPrompt >= threshold) return totals;
-  const stepsOver = (stepCount * (lastPrompt - threshold)) / (lastPrompt - firstPrompt);
-  const share = (stepsOver * (threshold + lastPrompt)) / (2 * summedPrompt);
-  return scaleLongContextTokens(totals, Math.min(1, share));
+  // The provider prices each request whole at one tier, so count the steps past the threshold
+  // and take their estimated prompts, not a fraction of the step that crosses it.
+  const growth = (lastPrompt - firstPrompt) / (stepCount - 1);
+  const stepsOver = stepCount - 1 - Math.floor((threshold - firstPrompt) / growth);
+  const promptsOver = stepsOver * lastPrompt - (growth * stepsOver * (stepsOver - 1)) / 2;
+  return scaleLongContextTokens(totals, Math.min(1, promptsOver / summedPrompt));
 }
 
 /**
@@ -376,8 +379,8 @@ export function createDisplayUsage(
  * persisted session cost aggregates without discarding the raw token counts.
  *
  * Pass `{ aggregatedUsage: true }` for buckets like session `byModel` totals that may span
- * many requests. Tiered pricing is non-linear, so those aggregates keep their recorded costs
- * unless they carry their per-request long-context share.
+ * many requests. Tiered pricing is non-linear, so those aggregates, and usage carrying a
+ * recorded long-context share, keep their recorded costs for models with tiered pricing.
  */
 export function recomputeUsageCosts(
   usage: ChatUsageDisplay,
@@ -418,16 +421,17 @@ export function recomputeUsageCosts(
   }
 
   // A sum cannot be split back into per-request tiers: neither service tiers (#4787) nor
-  // context-window tiers without the recorded long-context share, where pricing the summed
-  // prompt would bill every request at the long-context rate. Each request was priced at its
-  // own tiers when recorded, so keep those costs. They are known, not "unknown": that warning
-  // is reserved for unpriced models, and flagging tiered sums showed it for every session that
-  // used Haiku 5.5.
+  // context-window tiers, where pricing the summed prompt would bill every request at the
+  // long-context rate. A recorded long-context share does not help: it says which requests
+  // crossed the threshold of the model that recorded it, which this usage does not name, so
+  // after a remap to a model with another threshold it would misclassify them. Each request
+  // was priced at its own tiers when recorded, so keep those costs. They are known, not
+  // "unknown": that warning is reserved for unpriced models, and flagging tiered sums showed
+  // it for every session that used Haiku 5.5.
   if (
     serviceTier === "mixed" ||
-    (options?.aggregatedUsage === true &&
-      hasTieredPricing(modelStats) &&
-      longContextTokens === undefined)
+    (hasTieredPricing(modelStats) &&
+      (options?.aggregatedUsage === true || longContextTokens !== undefined))
   ) {
     // Keep the stored costs, but replace the 1h share with its clamped value, so a malformed
     // share cannot leak into later aggregates.

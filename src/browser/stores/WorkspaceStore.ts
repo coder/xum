@@ -806,8 +806,7 @@ function repriceSessionUsage(
     if (!model.includes(":") || isCostsIncludedEntry(entry, model, config)) continue;
     const resolved = resolveModelForMetadata(model, config);
     // `byModel` is a session-long aggregate, so tiered models cannot be safely repriced from
-    // the summed token totals alone. recomputeUsageCosts() keeps their recorded costs unless
-    // the aggregate carries its per-request long-context share.
+    // the summed token totals alone. recomputeUsageCosts() keeps their recorded costs.
     usage.byModel[model] = recomputeUsageCosts(entry, resolved, { aggregatedUsage: true });
   }
   if (

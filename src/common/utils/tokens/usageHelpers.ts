@@ -284,6 +284,26 @@ export function withLongContextTokens(
 }
 
 /**
+ * `providerMetadata` without its recorded long-context share when `pricingModel` has another
+ * threshold than `recordingModel`, the model the share was classified for: it says which
+ * requests crossed that model's threshold, so it would misclassify them for a remapped model.
+ */
+export function withoutStaleLongContextTokens(
+  providerMetadata: Record<string, unknown> | undefined,
+  recordingModel: string | undefined,
+  pricingModel: string
+): Record<string, unknown> | undefined {
+  const mux = readMuxMetadata(providerMetadata);
+  if (mux?.longContextTokens === undefined || recordingModel === undefined) {
+    return providerMetadata;
+  }
+  const threshold = (model: string) => getModelStats(model)?.tiered_pricing_threshold_tokens;
+  if (threshold(recordingModel) === threshold(pricingModel)) return providerMetadata;
+  const { longContextTokens: _stale, ...rest } = mux;
+  return { ...providerMetadata, mux: rest };
+}
+
+/**
  * Add two LanguageModelV2Usage values together.
  * Handles undefined first argument and undefined fields within usage objects.
  */
