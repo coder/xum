@@ -256,16 +256,33 @@ jobs:
       - name: web_fetch pinning tests with curl 8.7+
         if: matrix.shard == 1 && github.event.inputs.test_filter == ''
         env:
+          # A version bump needs new checksums for BOTH assets below (#6492). Never copy them
+          # from the release page: download each curl-linux-<arch>-musl-<version>.tar.xz
+          # yourself, run `sha256sum` on it, and check that the result equals the digest
+          # GitHub computed at upload (`gh api repos/stunnel/static-curl/releases/tags/<version>
+          # --jq '.assets[] | select(.name == "<asset>") | .digest'`). The release has no
+          # build attestations, so those two must agree before the new values land.
           STATIC_CURL_VERSION: 8.22.0
-          STATIC_CURL_SHA256: dfb02460ba2abe513087538f12a3cf79b74b64a5ea3787ce8ac0cdb11251f884
+          STATIC_CURL_SHA256_X86_64: dfb02460ba2abe513087538f12a3cf79b74b64a5ea3787ce8ac0cdb11251f884
+          STATIC_CURL_SHA256_AARCH64: cf94cbeaae1b3c1944a4a761ef04478f8f0b23e93a324b5ed009b2082eda11f3
           XUM_WEB_FETCH_REQUIRE_CURL_FALLBACK: "1"
         run: |
+          # Pick the asset for this runner's CPU, so a move to arm64 runners keeps the step
+          # (#6492). Any other CPU fails here instead of silently testing nothing.
+          case "$(uname -m)" in
+            x86_64) arch=x86_64 sha256="$STATIC_CURL_SHA256_X86_64" ;;
+            aarch64 | arm64) arch=aarch64 sha256="$STATIC_CURL_SHA256_AARCH64" ;;
+            *)
+              echo "::error::no pinned static curl for $(uname -m); add its asset and checksum"
+              exit 1
+              ;;
+          esac
           dir="$RUNNER_TEMP/static-curl"
           mkdir -p "$dir"
           archive="$dir/curl.tar.xz"
           curl -fsSL --retry 3 -o "$archive" \
-            "https://github.com/stunnel/static-curl/releases/download/${STATIC_CURL_VERSION}/curl-linux-x86_64-musl-${STATIC_CURL_VERSION}.tar.xz"
-          echo "${STATIC_CURL_SHA256}  ${archive}" | sha256sum -c -
+            "https://github.com/stunnel/static-curl/releases/download/${STATIC_CURL_VERSION}/curl-linux-${arch}-musl-${STATIC_CURL_VERSION}.tar.xz"
+          echo "${sha256}  ${archive}" | sha256sum -c -
           tar -xJf "$archive" -C "$dir" curl
           PATH="$dir:$PATH"
           curl -q --version
