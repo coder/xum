@@ -82,8 +82,6 @@ describe("skill file hint", () => {
     using tmp = new TestTempDir("skill-file-hint-outside");
     const { config, skillDir } = await setup(tmp);
     await fs.writeFile(path.join(skillDir, "short.md"), "short\n");
-    // The project skill "demo" shadows this global one, so "demo" names the other directory.
-    await writeGlobalSkill(tmp.path, "demo", { files: { "playbooks/long.md": LONG_LINE } });
     // A SKILL.md that no skill root discovers does not make a skill directory.
     await writeProjectSkill(path.join(tmp.path, "undiscovered"), "fake", {
       files: { "long.md": LONG_LINE },
@@ -92,12 +90,34 @@ describe("skill file hint", () => {
     for (const filePath of [
       path.join(tmp.path, "plain.md"),
       path.join(skillDir, "short.md"),
-      path.join(tmp.path, "skills", "demo", "playbooks", "long.md"),
       path.join(tmp.path, "undiscovered", ".xum", "skills", "fake", "long.md"),
     ]) {
       const result = await fileRead(config, filePath);
       expect(result.note).toBeUndefined();
     }
+  });
+
+  it("file_read names no call that would read another skill's file", async () => {
+    using tmp = new TestTempDir("skill-file-hint-shadowed");
+    const { config } = await setup(tmp);
+    // The project skill "demo" shadows this global one: agent_skill_read_file
+    // with "demo" reads the project copy, so pointing there would be wrong.
+    await writeGlobalSkill(tmp.path, "demo", { files: { "playbooks/long.md": LONG_LINE } });
+
+    const result = await fileRead(
+      config,
+      path.join(tmp.path, "skills", "demo", "playbooks", "long.md")
+    );
+    expect(result.note).toBeUndefined();
+  });
+
+  it("file_read names the skill a `..` path lands in", async () => {
+    using tmp = new TestTempDir("skill-file-hint-dotdot");
+    const { config, skillDir } = await setup(tmp);
+    await writeProjectSkill(tmp.path, "other", { files: { "long.md": LONG_LINE } });
+
+    const result = await fileRead(config, `${skillDir}/playbooks/../../other/long.md`);
+    expect(result.note).toContain('agent_skill_read_file (name: "other", filePath: "long.md")');
   });
 
   it("file_read adds no note for paths that only look inside a skill directory", async () => {
