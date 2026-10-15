@@ -110,7 +110,7 @@ export function firstRunViewHtml(gitDescribe: string): string {
         <div class="mobile-main-content flex min-w-0 flex-1 flex-col overflow-hidden">
           <div class="mobile-layout flex flex-1 overflow-hidden">
             <div class="bg-surface-primary flex flex-1 flex-col overflow-hidden">
-              <div class="bg-sidebar border-border-light flex shrink-0 items-center border-b px-4 py-2 " data-pre="c">
+              <div class="bg-sidebar border-border-light titlebar-safe-left titlebar-safe-left-gutter-4 flex shrink-0 items-center border-b px-4 py-2 " data-pre="c">
                 <button type="button" class="border-border-medium bg-background-secondary text-foreground hover:bg-hover rounded-md border px-3 py-1.5 text-sm transition-colors " aria-label="Open sidebar menu">Open sidebar</button>
               </div>
               <div class="flex flex-1 items-center justify-center px-6">

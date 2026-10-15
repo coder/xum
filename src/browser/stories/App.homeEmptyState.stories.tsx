@@ -6,12 +6,18 @@
  *
  * KeyboardSidebarToggle: the sidebar toggle unmounts with the sidebar's title bar, so after Enter
  * focus must land on the page's reopen button, and from there back on the toggle.
+ *
+ * ReopenButtonClearsWindowControls: the collapsed sidebar has no width, so the page's reopen button
+ * is the only pointer way back and must start after the inset reserved for the macOS traffic
+ * lights.
  */
 
 import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
+import { MAC_TRAFFIC_LIGHTS_INSET } from "@/browser/hooks/useDesktopTitlebar";
 import { textContrast } from "@/browser/stories/helpers/contrast";
+import { collapseLeftSidebar } from "@/browser/stories/helpers/uiState";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createMockORPCClient } from "./mocks/orpc";
@@ -76,5 +82,34 @@ export const KeyboardSidebarToggle: AppStory = {
     await waitFor(() =>
       expect(document.activeElement).toBe(canvas.getByRole("button", { name: "Collapse sidebar" }))
     );
+  },
+};
+
+export const ReopenButtonClearsWindowControls: AppStory = {
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        return createMockORPCClient();
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    // initTitlebarInsets() sets this on :root in Electron on macOS; the app inherits it from here.
+    canvasElement.style.setProperty("--titlebar-left-inset", `${MAC_TRAFFIC_LIGHTS_INSET}px`);
+    try {
+      const button = await within(canvasElement).findByRole(
+        "button",
+        { name: "Open sidebar menu" },
+        { timeout: 15_000 }
+      );
+      const header = button.parentElement;
+      if (!header) throw new Error("the reopen button has no header");
+      const offset = button.getBoundingClientRect().left - header.getBoundingClientRect().left;
+      await expect(offset).toBeGreaterThanOrEqual(MAC_TRAFFIC_LIGHTS_INSET);
+    } finally {
+      canvasElement.style.removeProperty("--titlebar-left-inset");
+    }
   },
 };
