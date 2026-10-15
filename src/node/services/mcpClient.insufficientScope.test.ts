@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { createServer, type Server } from "http";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -119,6 +119,28 @@ test("a 403 insufficient_scope keeps the tokens and names only the scopes", asyn
   const status = await service.getAuthStatus({ serverUrl });
   expect(status.isLoggedIn).toBe(true);
   expect(status.insufficientScopes).toEqual(["files.write"]);
+  // A hook (or app or settings) call reports the refused scope the same way.
+  service.recordInsufficientScope({ serverUrl, scopes: [] });
+  const hookFailure = await client
+    .callToolForHook("write", {}, { signal: new AbortController().signal })
+    .then(
+      () => undefined,
+      (error: unknown) => error
+    );
+  expect((hookFailure as Error).message).toContain('"files.write"');
+  expect((await service.getAuthStatus({ serverUrl })).insufficientScopes).toEqual(["files.write"]);
+
+  // A sign-out that fails to write the store keeps the token, so it keeps the prompt.
+  const internals = service as unknown as {
+    persistStoreLocked: () => Promise<void>;
+    insufficientScopes: Map<string, string[]>;
+  };
+  const persist = spyOn(internals, "persistStoreLocked").mockImplementationOnce(() =>
+    Promise.reject(new Error("disk full"))
+  );
+  expect((await service.logout({ serverUrl })).success).toBe(false);
+  persist.mockRestore();
+  expect([...internals.insufficientScopes.values()]).toEqual([["files.write"]]);
   // A sign-out ends the prompt.
   await service.logout({ serverUrl });
   expect((await service.getAuthStatus({ serverUrl })).insufficientScopes).toBeUndefined();

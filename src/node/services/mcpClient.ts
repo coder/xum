@@ -475,6 +475,11 @@ function reportToolsListChanged(
 export async function createMCPClient(config: MCPClientConfig): Promise<MCPClientHandle> {
   const mcpApps = config.mcpApps === true;
   const onInsufficientScope = insufficientScopeHandler(config.transport);
+  // App, hook and settings calls report a refused scope the same way as model tools (#6622).
+  const callAnyTool = (...args: Parameters<Client["callTool"]>) =>
+    client.callTool(...args).catch((error: unknown) => {
+      throw toolCallError(error, onInsufficientScope);
+    });
   const client = new Client(CLIENT_INFO, {
     versionNegotiation: {
       mode: "auto",
@@ -622,7 +627,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     appEntrypoints: () => listedEntrypoints,
     callToolForApp: (name, args, options) => {
       assert(mcpApps, "callToolForApp requires an MCP Apps connection");
-      return client.callTool(
+      return callAnyTool(
         { name, arguments: args },
         {
           timeout: APP_TOOL_CALL_TIMEOUT_MS,
@@ -631,7 +636,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       );
     },
     callToolForHook: (name, args, options) =>
-      client.callTool({ name, arguments: args }, { signal: options.signal }),
+      callAnyTool({ name, arguments: args }, { signal: options.signal }),
     readResource: (uri, options) => {
       assert(mcpApps, "readResource requires an MCP Apps connection");
       return client.readResource(
@@ -645,7 +650,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     settingsCapability: () => settings,
     callSettingsTool: (name, args, meta, options) => {
       assert(settingsTools.has(name), "callSettingsTool only calls the advertised settings tools");
-      return client.callTool(
+      return callAnyTool(
         { name, arguments: args, _meta: meta },
         {
           timeout: options?.timeoutMs ?? APP_TOOL_CALL_TIMEOUT_MS,
@@ -660,7 +665,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     callSettingsActionTool: (name, meta, options) => {
       assert(listedSettingsActions.has(name), "callSettingsActionTool only calls listed tools");
       // The spec's layout tool accepts `{}`.
-      return client.callTool(
+      return callAnyTool(
         { name, arguments: {}, _meta: meta },
         { ...options, timeout: APP_TOOL_CALL_TIMEOUT_MS }
       );

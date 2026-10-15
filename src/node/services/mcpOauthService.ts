@@ -1377,7 +1377,6 @@ export class McpOauthService {
     if (!normalizedServerUrl) {
       return Ok(undefined);
     }
-    this.insufficientScopes.delete(normalizedServerUrl);
     // Before any await: an exchange already past its settled check must not save either.
     this.signOutGenerations.set(
       normalizedServerUrl,
@@ -1404,6 +1403,8 @@ export class McpOauthService {
         await this.persistStoreLocked(store);
       });
 
+      // After the store write: a failed sign-out keeps the token, so it keeps the prompt too.
+      this.insufficientScopes.delete(normalizedServerUrl);
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
