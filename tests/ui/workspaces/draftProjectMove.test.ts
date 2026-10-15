@@ -661,20 +661,35 @@ describeIntegration("Creation project selector moves the draft", () => {
         ?.disabled,
       attach: button("Attach file")?.disabled,
       voice: button("Voice input")?.disabled,
+      removable: button("Remove attachment") !== null,
     });
     try {
       await openProjectCreationView(view, a);
       const draftId = await onlyDraftId(a);
       getDraftStore().setText(creationScope(a, draftId), "sent after the move");
-      const enabled = { send: false, textarea: false, attach: false, voice: false };
+      getDraftStore().setAttachments(creationScope(a, draftId), [ATTACHMENT]);
+      const enabled = {
+        send: false,
+        textarea: false,
+        attach: false,
+        voice: false,
+        removable: true,
+      };
       await waitFor(() => expect(inputs()).toEqual(enabled), WAIT);
 
       await startMoveTo(container, path.basename(b));
       await waitFor(() => expect(move.calls()).toBeGreaterThan(0), WAIT);
 
       // The backend may already have given the draft to B: a send now would leave it there too,
-      // and typing, a file read or a recording would land in A's draft after the move.
-      expect(inputs()).toEqual({ send: true, textarea: true, attach: true, voice: true });
+      // and typing, a file read, a recording or a removed attachment would land in A's draft
+      // after the move.
+      expect(inputs()).toEqual({
+        send: true,
+        textarea: true,
+        attach: true,
+        voice: true,
+        removable: false,
+      });
       move.release();
       await waitFor(() => expect(projectSelectorLabel(container)).toBe(path.basename(b)), WAIT);
       await waitFor(() => expect(inputs()).toEqual(enabled), WAIT);
