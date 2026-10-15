@@ -17,6 +17,7 @@ import { createAgentSkillReadTool } from "./agent_skill_read";
 import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
+import { extractLoadedSkillSnapshotsFromMessages } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { createTestToolConfig, TestTempDir, TrueRemotePathMappedRuntime } from "./testHelpers";
 
@@ -672,6 +673,28 @@ describe("agent_skill_read skill directory", () => {
     return parsed;
   }
 
+  /** The snapshot body Xum re-injects after compaction for this agent_skill_read result. */
+  function reinjectedBody(name: string, output: Awaited<ReturnType<typeof readSkill>>): string {
+    const [snapshot] = extractLoadedSkillSnapshotsFromMessages([
+      {
+        id: `read-${name}`,
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: `call-${name}`,
+            toolName: "agent_skill_read",
+            state: "output-available",
+            input: { name },
+            output,
+          },
+        ],
+      },
+    ]);
+    if (snapshot == null) throw new Error(`no snapshot for ${name}`);
+    return snapshot.body;
+  }
+
   /** Run the body's `sh ...` line the way the model would: through bash in the workspace. */
   async function runBodyCommand(runtime: Runtime, cwd: string, body: string): Promise<string> {
     const command = body.split("\n").find((line) => line.startsWith("sh "));
@@ -726,6 +749,10 @@ describe("agent_skill_read skill directory", () => {
           expect(result.skillDirUnavailable).toBeUndefined();
           expect(result.pluginRoot).toBe(name === "plugin-skill" ? pluginRoot : undefined);
           expect(await runBodyCommand(runtime, projectRoot, result.skill.body)).toBe(`ran-${name}`);
+          // After compaction the re-injected copy still names the directory (#6704).
+          const firstLine = reinjectedBody(name, result).split("\n")[0];
+          expect(firstLine).toContain(`\`${dir}\``);
+          if (name === "plugin-skill") expect(firstLine).toContain(`\`${pluginRoot}\``);
         }
       } finally {
         homedirSpy.mockRestore();
@@ -777,6 +804,11 @@ describe("agent_skill_read skill directory", () => {
       expect(result.pluginRoot).toBeUndefined();
       expect(result.skillDirUnavailable).toContain("agent_skill_read_file");
       expect(result.skill.body).toContain("sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh");
+      // After compaction the re-injected copy keeps the off-host note before the
+      // unexpanded placeholder (#6704).
+      const lines = reinjectedBody("host-plugin-skill", result).split("\n");
+      expect(lines[0]).toBe(result.skillDirUnavailable!);
+      expect(lines.indexOf("sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh")).toBeGreaterThan(0);
     } finally {
       if (previousRoot === undefined) delete process.env.XUM_ROOT;
       else process.env.XUM_ROOT = previousRoot;

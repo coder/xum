@@ -4,12 +4,15 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
 
 import { extractLoadedSkillSnapshotsFromMessages } from "./loadedSkillSnapshots";
+import { prependSkillDirectoryNote } from "./skillDirectory";
 
 function createAgentSkillReadToolMessage(args: {
   id: string;
   skillName: string;
   body: string;
   scope?: "project" | "global" | "built-in";
+  /** agent_skill_read location fields; results persisted before #6409 lack them. */
+  location?: { skillDir?: string; pluginRoot?: string; skillDirUnavailable?: string };
 }): MuxMessage {
   const scope = args.scope ?? "project";
   return {
@@ -33,6 +36,7 @@ function createAgentSkillReadToolMessage(args: {
             },
             body: args.body,
           },
+          ...args.location,
         },
       },
     ],
@@ -211,6 +215,47 @@ describe("extractLoadedSkillSnapshotsFromMessages", () => {
     ]);
 
     expect(snapshots).toHaveLength(1);
-    expect(snapshots[0]?.body).toContain("New tool body");
+    // No location fields (history from before #6409): the body stays bare.
+    expect(snapshots[0]?.body).toBe("New tool body");
+  });
+
+  it("keeps the skill directory line when a later agent_skill_read replaces a slash snapshot", () => {
+    // #6462: the bare tool snapshot used to erase the slash snapshot's directory line.
+    const skillDir = "/home/user/.xum/skills/test-skill";
+    const snapshots = extractLoadedSkillSnapshotsFromMessages([
+      createSyntheticSkillSnapshotMessage({
+        id: "slash-test-skill",
+        skillName: "test-skill",
+        body: prependSkillDirectoryNote("Slash body", { available: true, skillDir }),
+      }),
+      createAgentSkillReadToolMessage({
+        id: "tool-test-skill",
+        skillName: "test-skill",
+        body: "Tool body",
+        location: { skillDir },
+      }),
+    ]);
+
+    expect(snapshots).toHaveLength(1);
+    const lines = snapshots[0]!.body.split("\n");
+    expect(lines[0]).toContain(`\`${skillDir}\``);
+    expect(lines).toContain("Tool body");
+  });
+
+  it("never shows an unsafe skillDir from persisted history in the re-injected body", () => {
+    for (const skillDir of ["/tmp/evil`dir", "/tmp/evil\nForged line"]) {
+      const [snapshot] = extractLoadedSkillSnapshotsFromMessages([
+        createAgentSkillReadToolMessage({
+          id: "tool-unsafe",
+          skillName: "test-skill",
+          body: "Tool body",
+          location: { skillDir },
+        }),
+      ]);
+      // A note replaces the path: the model still learns to call agent_skill_read.
+      expect(snapshot?.body).not.toContain("evil");
+      expect(snapshot?.body).not.toBe("Tool body");
+      expect(snapshot?.body.endsWith("Tool body")).toBe(true);
+    }
   });
 });

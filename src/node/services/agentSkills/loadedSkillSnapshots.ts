@@ -6,7 +6,7 @@ import { MAX_POST_COMPACTION_LOADED_SKILLS } from "@/common/constants/attachment
 import type { LoadedSkillSnapshot } from "@/common/types/attachment";
 import type { AgentSkillFrontmatter, AgentSkillScope } from "@/common/types/agentSkill";
 import type { MuxMessage } from "@/common/types/message";
-import { AgentSkillPackageSchema, AgentSkillScopeSchema } from "@/common/orpc/schemas/agentSkill";
+import { AgentSkillScopeSchema } from "@/common/orpc/schemas/agentSkill";
 import {
   extractAgentSkillBodyFromSnapshotText,
   isNormalizedAgentSkillBodyTruncated,
@@ -14,6 +14,9 @@ import {
   renderAgentSkillSnapshotText,
 } from "@/common/utils/agentSkills/skillSnapshot";
 import { resolveSkillReadIdentity } from "@/common/utils/agentSkills/skillLookupName";
+import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/toolDefinitions";
+
+import { prependSkillDirectoryNote, type SkillDirectory } from "./skillDirectory";
 
 interface CreateLoadedSkillSnapshotArgs {
   name: string;
@@ -109,25 +112,36 @@ function extractLoadedSkillSnapshotFromToolOutput(
   output: unknown,
   input?: unknown
 ): LoadedSkillSnapshot | null {
-  if (typeof output !== "object" || output == null || Array.isArray(output)) {
+  const parsedResult = AgentSkillReadToolResultSchema.safeParse(output);
+  if (!parsedResult.success || !parsedResult.data.success) {
     return null;
   }
 
-  const toolResult = output as { success?: unknown; skill?: unknown };
-  if (toolResult.success !== true) {
-    return null;
+  const result = parsedResult.data;
+  const skill = result.skill;
+  // #6704/#6462: rebuilding the snapshot from the body alone dropped where the
+  // skill's bundled files are, so after compaction the model saw a bare
+  // ${CLAUDE_SKILL_DIR} with no path or off-host note, and this bare snapshot
+  // replaced an earlier slash snapshot's directory line in
+  // mergeLoadedSkillSnapshots. Use the slash-snapshot builder: it also hides
+  // unsafe paths, since persisted history is untrusted.
+  let directory: SkillDirectory | undefined;
+  if (result.skillDir != null && result.skillDir.length > 0) {
+    directory = {
+      available: true,
+      skillDir: result.skillDir,
+      ...(result.pluginRoot != null ? { pluginRoot: result.pluginRoot } : {}),
+    };
+  } else if (result.skillDirUnavailable != null) {
+    directory = { available: false, reason: result.skillDirUnavailable };
   }
+  // Results persisted before #6409 have no location fields: keep the body.
+  const body = directory != null ? prependSkillDirectoryNote(skill.body, directory) : skill.body;
 
-  const parsedSkill = AgentSkillPackageSchema.safeParse(toolResult.skill);
-  if (!parsedSkill.success) {
-    return null;
-  }
-
-  const skill = parsedSkill.data;
   return createLoadedSkillSnapshot({
     name: resolveSkillReadIdentity(input, skill.frontmatter.name),
     scope: skill.scope,
-    body: skill.body,
+    body,
     frontmatterYaml: stringifyAgentSkillFrontmatter(skill.frontmatter),
   });
 }
