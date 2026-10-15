@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { parsePatch } from "diff";
 import { AgentSkillPackageSchema } from "@/common/orpc/schemas/agentSkill";
 import { MAX_FILE_CONTENT_SIZE } from "@/common/constants/attachments";
+import { KERNEL_COMPACT_ARGS_CAP_BYTES } from "@/constants/kernelOutput";
 import { extractLoadedSkillSnapshotsFromMessages } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import {
   KERNEL_RETAINED_CONTAINER_MAX_PARTS,
@@ -210,6 +211,19 @@ describe("retainExemptKernelRecordResult", () => {
       }) as { skillDir?: string };
       expect(retained?.skillDir).toBe(skillDir);
       expect(JSON.stringify(retained).length).toBeLessThanOrEqual(MAX_FILE_CONTENT_SIZE);
+    });
+
+    it("drops an oversized location value instead of cutting it", () => {
+      // A cut path would name the wrong directory.
+      const skillDir = "/home/user/.xum/skills/demo";
+      const retained = retainExemptKernelRecordResult("agent_skill_read", {
+        success: true,
+        skill,
+        skillDir,
+        pluginRoot: "/p".repeat(KERNEL_COMPACT_ARGS_CAP_BYTES),
+      }) as { skillDir?: string; pluginRoot?: string };
+      expect(retained?.pluginRoot).toBeUndefined();
+      expect(retained?.skillDir).toBe(skillDir);
     });
   });
 
