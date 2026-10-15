@@ -321,7 +321,7 @@ describe("ProvidersSection", () => {
         apiKeySource: "env",
         isEnabled: true,
         isConfigured: true,
-        googleVertex: { envProject: "env-project", keyFilenameSet: false },
+        googleVertex: { envProject: "env-project", keyFilenameSet: false, envKeyFilenameSet: true },
       },
     });
     const vertexButton = await view.findByRole("button", { name: /Google Vertex AI/ });
@@ -330,8 +330,8 @@ describe("ProvidersSection", () => {
 
     const vertexCard = getProviderCard(vertexButton);
     expect(within(vertexCard).getByText("env-project")).toBeTruthy();
-    // One note for the env project and one for the env express mode API key.
-    expect(within(vertexCard).getAllByText("Set by env vars.")).toHaveLength(2);
+    // One note each for the env project, the env key file and the env express mode API key.
+    expect(within(vertexCard).getAllByText("Set by env vars.")).toHaveLength(3);
   });
 
   test("persists API format changes for an existing custom provider", async () => {

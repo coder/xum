@@ -424,6 +424,9 @@ function getFieldSourceNote(params: {
       ? "Set by env vars."
       : null;
   }
+  if (field === "keyFilename") {
+    return providerInfo?.googleVertex?.envKeyFilenameSet ? "Set by env vars." : null;
+  }
   return !params.fieldValue && params.fieldDisplayValue ? "Set by env vars." : null;
 }
 

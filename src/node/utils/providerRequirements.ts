@@ -528,15 +528,17 @@ function resolveGoogleVertexCredentials(
   };
 }
 
-/** Vertex project/location from env vars only, so Settings can show env-sourced values. */
+/** Vertex settings from env vars only, so Settings can show env-sourced values. */
 export function resolveGoogleVertexEnvSettings(env: Record<string, string | undefined>): {
   project?: string;
   location?: string;
+  keyFilename?: string;
 } {
   const envMapping = PROVIDER_ENV_VARS["google-vertex"];
   return {
     project: resolveEnv(envMapping?.project, env),
     location: resolveEnv(envMapping?.location, env),
+    keyFilename: resolveEnv(envMapping?.keyFilename, env),
   };
 }
 

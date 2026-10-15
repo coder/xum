@@ -78,6 +78,7 @@ const PROVIDER_ENV_KEYS = [
   "ANTHROPIC_BASE_URL",
   "GOOGLE_VERTEX_PROJECT",
   "GOOGLE_VERTEX_LOCATION",
+  "GOOGLE_APPLICATION_CREDENTIALS",
 ] as const;
 
 function withProviderEnv(
@@ -250,45 +251,65 @@ describe("ProviderService.getConfig", () => {
   });
 
   it("reports Google Vertex AI settings without exposing the API key or key file", () => {
-    withTempConfig((config, service) => {
-      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-        "google-vertex": {
-          apiKey: "vertex-secret-key",
-          keyFilename: "/secrets/vertex-sa.json",
-          project: "my-project",
-          location: "us-central1",
-        },
-      });
+    withProviderEnv({ GOOGLE_APPLICATION_CREDENTIALS: "/secrets/env-sa.json" }, () => {
+      withTempConfig((config, service) => {
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+          "google-vertex": {
+            apiKey: "vertex-secret-key",
+            keyFilename: "/secrets/vertex-sa.json",
+            project: "my-project",
+            location: "us-central1",
+          },
+        });
 
-      const vertexConfig = service.getConfig()["google-vertex"];
+        const vertexConfig = service.getConfig()["google-vertex"];
 
-      expect(vertexConfig).toMatchObject({
-        apiKeySet: true,
-        isConfigured: true,
-        googleVertex: { project: "my-project", location: "us-central1", keyFilenameSet: true },
+        expect(vertexConfig).toMatchObject({
+          apiKeySet: true,
+          isConfigured: true,
+          googleVertex: {
+            project: "my-project",
+            location: "us-central1",
+            keyFilenameSet: true,
+            // The saved key file wins, so the env one is not reported.
+            envKeyFilenameSet: false,
+          },
+        });
+        const serialized = JSON.stringify(vertexConfig);
+        expect(serialized).not.toContain("vertex-secret-key");
+        expect(serialized).not.toContain("vertex-sa.json");
+        expect(serialized).not.toContain("env-sa.json");
       });
-      const serialized = JSON.stringify(vertexConfig);
-      expect(serialized).not.toContain("vertex-secret-key");
-      expect(serialized).not.toContain("vertex-sa.json");
     });
   });
 
   it("reports blank saved Google Vertex AI values as unset and env values separately", () => {
-    withProviderEnv({ GOOGLE_VERTEX_PROJECT: "env-project", GOOGLE_VERTEX_LOCATION: "us" }, () => {
-      withTempConfig((config, service) => {
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          "google-vertex": { project: "   ", location: "europe-west4", keyFilename: "  " },
-        });
+    withProviderEnv(
+      {
+        GOOGLE_VERTEX_PROJECT: "env-project",
+        GOOGLE_VERTEX_LOCATION: "us",
+        GOOGLE_APPLICATION_CREDENTIALS: "/secrets/env-sa.json",
+      },
+      () => {
+        withTempConfig((config, service) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            "google-vertex": { project: "   ", location: "europe-west4", keyFilename: "  " },
+          });
 
-        expect(service.getConfig()["google-vertex"]?.googleVertex).toEqual({
-          project: undefined,
-          location: "europe-west4",
-          envProject: "env-project",
-          envLocation: undefined,
-          keyFilenameSet: false,
+          const status = service.getConfig()["google-vertex"]?.googleVertex;
+
+          expect(status).toEqual({
+            project: undefined,
+            location: "europe-west4",
+            envProject: "env-project",
+            envLocation: undefined,
+            keyFilenameSet: false,
+            envKeyFilenameSet: true,
+          });
+          expect(JSON.stringify(status)).not.toContain("env-sa.json");
         });
-      });
-    });
+      }
+    );
   });
 
   it("reports legacy op:// API key references as not set", () => {

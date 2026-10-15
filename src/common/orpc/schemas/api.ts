@@ -392,6 +392,8 @@ export const GoogleVertexCredentialStatusSchema = z.object({
   envLocation: z.string().optional(),
   /** Service-account key file path is never sent to the frontend, only whether one is set. */
   keyFilenameSet: z.boolean(),
+  /** Whether an env var supplies the key file; set only when the saved one is unset. */
+  envKeyFilenameSet: z.boolean().optional(),
 });
 
 export const ProviderConfigInfoSchema = z.object({

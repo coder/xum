@@ -120,13 +120,15 @@ function googleVertexCredentialStatus(
 ): NonNullable<ProviderConfigInfo["googleVertex"]> {
   const project = nonBlankString(config.project);
   const location = nonBlankString(config.location);
+  const keyFilenameSet = nonBlankString(config.keyFilename) != null;
   const envSettings = resolveGoogleVertexEnvSettings(env);
   return {
     project,
     location,
     envProject: project == null ? envSettings.project : undefined,
     envLocation: location == null ? envSettings.location : undefined,
-    keyFilenameSet: nonBlankString(config.keyFilename) != null,
+    keyFilenameSet,
+    envKeyFilenameSet: !keyFilenameSet && envSettings.keyFilename != null,
   };
 }
 
