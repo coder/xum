@@ -39,19 +39,23 @@ import { ssh2ConnectionPool } from "../../../src/node/runtime/SSH2ConnectionPool
 import type { WorkspaceChatMessage } from "../../../src/common/orpc/types";
 import type { ToolPolicy } from "../../../src/common/utils/tools/toolPolicy";
 import { subscribeLogFeed, type LogEntry } from "../../../src/node/services/logBuffer";
-import { DEFAULT_SSH_MAX_WAIT_MS } from "../../../src/node/runtime/sshBackoff";
+import type { BaseSshAcquireConnectionOptions } from "../../../src/node/runtime/sshBackoff";
 
 // #6588: an SSH operation without a deadline waits through connection backoff for
-// DEFAULT_SSH_MAX_WAIT_MS (2 min in the product), which equals this file's SSH test timeout. A
-// test that hit it timed out with no hint of the step. A shorter wait in this test process turns
-// that into an SSH error (or a bounded-step failure below) well inside the test timeout.
+// DEFAULT_SSH_MAX_WAIT_MS (2 min), which equals this file's SSH test timeout. A test that hit it
+// timed out with no hint of the step. The pools are module singletons that tests/setup.ts
+// preloads before this file, so a jest.mock of sshBackoff would come too late. Capping maxWaitMs
+// on the shared pool instances turns that wait into an SSH error well inside the test timeout.
 const TEST_SSH_MAX_WAIT_MS = 20_000;
-jest.mock("../../../src/node/runtime/sshBackoff", () => ({
-  ...jest.requireActual<typeof import("../../../src/node/runtime/sshBackoff")>(
-    "../../../src/node/runtime/sshBackoff"
-  ),
-  DEFAULT_SSH_MAX_WAIT_MS: 20_000,
-}));
+const sshWaitCaps: { mock: { calls: unknown[] }; mockRestore: () => void }[] = [];
+function capSshWait(options: BaseSshAcquireConnectionOptions | number | undefined) {
+  const opts = typeof options === "number" ? { timeoutMs: options } : (options ?? {});
+  // maxWaitMs 0 means "fail fast"; keep it.
+  return {
+    ...opts,
+    maxWaitMs: Math.min(opts.maxWaitMs ?? TEST_SSH_MAX_WAIT_MS, TEST_SSH_MAX_WAIT_MS),
+  };
+}
 
 // Tool policy: Only allow the bash tool.
 const BASH_ONLY: ToolPolicy = [{ regex_match: "bash", action: "require" }];
@@ -106,8 +110,8 @@ function getToolDuration(events: WorkspaceChatMessage[], toolName: string): numb
 }
 
 // #6588: CI runs jest with --silent, so a hung step left no trace. Each step of these tests has
-// a deadline, and the deadlines of one test add up to less than TEST_TIMEOUT_SSH_MS even when a
-// step and the cleanup after it both hang. On a missed deadline the test fails with the step's
+// a deadline, and the deadlines of one test add up to 100 s, under TEST_TIMEOUT_SSH_MS, so the
+// named failure always comes before Jest's timeout. On a missed deadline the test fails with the step's
 // name, and the step trace and the backend's recent log entries go to stderr (not console,
 // which --silent drops).
 const backendLog: LogEntry[] = [];
@@ -152,20 +156,20 @@ const bounded =
   (...args: A): Promise<R> =>
     boundedStep(`${currentTest()} :: ${label}`, ms, () => fn(...args));
 const createTestEnvironmentB = bounded("createTestEnvironment", 10_000, createTestEnvironment);
-const createTempGitRepoB = bounded("createTempGitRepo", 10_000, createTempGitRepo);
-const setupProvidersB = bounded("setupProviders", 10_000, setupProviders);
+const createTempGitRepoB = bounded("createTempGitRepo", 5_000, createTempGitRepo);
+const setupProvidersB = bounded("setupProviders", 5_000, setupProviders);
 // Above the 25 s stream timeout inside sendMessageAndWait, so that error wins when it applies.
-const sendMessageAndWaitB = bounded("sendMessageAndWait", 35_000, sendMessageAndWait);
-const cleanupTempGitRepoB = bounded("cleanupTempGitRepo", 10_000, cleanupTempGitRepo);
+const sendMessageAndWaitB = bounded("sendMessageAndWait", 30_000, sendMessageAndWait);
+const cleanupTempGitRepoB = bounded("cleanupTempGitRepo", 5_000, cleanupTempGitRepo);
 const cleanupTestEnvironmentB = bounded("cleanupTestEnvironment", 10_000, cleanupTestEnvironment);
 const createWorkspaceWithInitB = async (...args: Parameters<typeof createWorkspaceWithInit>) => {
-  const created = await boundedStep(`${currentTest()} :: createWorkspaceWithInit`, 30_000, () =>
+  const created = await boundedStep(`${currentTest()} :: createWorkspaceWithInit`, 25_000, () =>
     createWorkspaceWithInit(...args)
   );
   return {
     ...created,
     cleanup: () =>
-      boundedStep(`${currentTest()} :: cleanup (workspace.remove)`, 15_000, created.cleanup),
+      boundedStep(`${currentTest()} :: cleanup (workspace.remove)`, 10_000, created.cleanup),
   };
 };
 
@@ -196,10 +200,20 @@ describeIntegration("Runtime Bash Execution", () => {
   }, 60000);
 
   beforeAll(() => {
-    // Fail fast if the jest.mock above stops applying (for example after a module move).
-    if (DEFAULT_SSH_MAX_WAIT_MS !== TEST_SSH_MAX_WAIT_MS) {
-      throw new Error(`sshBackoff mock not applied: ${DEFAULT_SSH_MAX_WAIT_MS}`);
-    }
+    const openSshAcquire = sshConnectionPool.acquireConnection.bind(sshConnectionPool);
+    sshWaitCaps.push(
+      jest
+        .spyOn(sshConnectionPool, "acquireConnection")
+        .mockImplementation((config, options?: BaseSshAcquireConnectionOptions | number) =>
+          openSshAcquire(config, capSshWait(options))
+        )
+    );
+    const ssh2Acquire = ssh2ConnectionPool.acquireConnection.bind(ssh2ConnectionPool);
+    sshWaitCaps.push(
+      jest
+        .spyOn(ssh2ConnectionPool, "acquireConnection")
+        .mockImplementation((config, options) => ssh2Acquire(config, capSshWait(options)))
+    );
     // "debug" makes the backend keep debug entries too.
     const feed = subscribeLogFeed((event) => {
       if (event.type === "append") {
@@ -212,6 +226,12 @@ describeIntegration("Runtime Bash Execution", () => {
 
   afterAll(async () => {
     stopBackendLog?.();
+    // Fail if the backend stopped using these pool instances: the cap would then do nothing.
+    const capCalls = sshWaitCaps.reduce((n, spy) => n + spy.mock.calls.length, 0);
+    sshWaitCaps.forEach((spy) => spy.mockRestore());
+    if (sshConfig && capCalls === 0) {
+      throw new Error("SSH tests ran, but no SSH connection went through the capped pools");
+    }
     if (sshConfig) {
       console.log("Stopping SSH server container...");
       await stopSSHServer(sshConfig);
