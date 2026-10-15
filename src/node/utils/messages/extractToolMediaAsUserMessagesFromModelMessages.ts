@@ -33,25 +33,20 @@ type ToolResultOutput = ToolResultPart["output"];
 export async function extractToolMediaAsUserMessagesFromModelMessages(
   messages: ModelMessage[]
 ): Promise<ModelMessage[]> {
-  const { extractionsByPart, totalAttachments, reservedMediaParts, syntheticMediaParts } =
-    collectToolMedia(messages);
+  const pools = collectToolMedia(messages);
+  const { extractionsByPart, totalAttachments, reservedMediaParts, syntheticMediaParts } = pools;
 
   // Request-wide cap (r28 security): capture bounds bytes and per-container
   // parts, not distinct records, so a looped bridged media tool could
   // otherwise fan out tens of thousands of synthetic provider parts.
-  // Chronologically OLDEST tool media is dropped first: prior synthetic parts
-  // (all older — they were extracted from earlier turns' tool results) are
-  // evicted before new extractions are omitted behind bounded placeholders.
+  // Chronologically OLDEST tool media is dropped first, across both kinds: media already in the
+  // request (synthetic parts, MCP images inside tool results) is evicted, and new extractions
+  // are omitted behind bounded placeholders. One order for both keeps a rebuild (which
+  // extracts every step's media again) and an in-turn step (which sees earlier steps' media as
+  // synthetic parts) dropping the same items.
   const budget = Math.max(0, MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST - reservedMediaParts);
   const overBudget = Math.max(0, syntheticMediaParts.length + totalAttachments - budget);
-  // syntheticMediaParts is collected in message order, so a prefix slice is
-  // the chronologically oldest set.
-  const evictedSyntheticParts = new Set(
-    syntheticMediaParts.slice(0, Math.min(overBudget, syntheticMediaParts.length))
-  );
-  const capState = {
-    omitRemaining: overBudget - evictedSyntheticParts.size,
-  };
+  const { evictedSyntheticParts, omittedByPart } = planMediaCap(pools.order, overBudget);
   if (extractionsByPart.size === 0 && evictedSyntheticParts.size === 0) return messages;
 
   const result: ModelMessage[] = [];
@@ -99,8 +94,7 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
         // omitted, and their per-item output placeholders are coalesced so a
         // flooded transcript cannot keep megabytes of placeholder JSON in
         // every request (r29 security).
-        const omittedHere = Math.min(capState.omitRemaining, extracted.attachments.length);
-        capState.omitRemaining -= omittedHere;
+        const omittedHere = omittedByPart.get(part) ?? 0;
         omittedForMessage += omittedHere;
         const keptHere = extracted.attachments.slice(omittedHere);
         // Excess per-item placeholders (cap omission OR same-payload dedup —
@@ -232,6 +226,7 @@ function collectToolMedia(messages: ModelMessage[]) {
     totalAttachments: 0,
     reservedMediaParts: 0,
     syntheticMediaParts: [],
+    order: [],
   };
   for (const message of messages) {
     if (!Array.isArray(message.content)) continue;
@@ -258,13 +253,35 @@ interface ToolMediaPools {
   totalAttachments: number;
   reservedMediaParts: number;
   syntheticMediaParts: unknown[];
+  /** Evictable media and extractions in message order, oldest first (see planMediaCap). */
+  order: Array<{ key: object; count: number; extraction: boolean }>;
+}
+
+/** Drops the oldest `overBudget` media items of `order`: evicts existing ones, omits extractions. */
+function planMediaCap(order: ToolMediaPools["order"], overBudget: number) {
+  const evictedSyntheticParts = new Set<unknown>();
+  const omittedByPart = new Map<object, number>();
+  let remaining = overBudget;
+  for (const entry of order) {
+    if (remaining === 0) break;
+    const dropped = Math.min(remaining, entry.count);
+    remaining -= dropped;
+    if (entry.extraction) omittedByPart.set(entry.key, dropped);
+    else evictedSyntheticParts.add(entry.key);
+  }
+  return { evictedSyntheticParts, omittedByPart };
+}
+
+function addEvictableMedia(pools: ToolMediaPools, parts: object[]): void {
+  pools.syntheticMediaParts.push(...parts);
+  for (const key of parts) pools.order.push({ key, count: 1, extraction: false });
 }
 
 function collectMessageMedia(part: unknown, pools: ToolMediaPools): void {
   const partType = (part as { type?: unknown }).type;
   if (partType !== "image" && partType !== "file") return;
   if (isSyntheticToolMediaPart(part)) {
-    pools.syntheticMediaParts.push(part);
+    addEvictableMedia(pools, [part as object]);
   } else {
     pools.reservedMediaParts++;
   }
@@ -281,15 +298,16 @@ function collectToolResultMedia(part: ToolResultPart, pools: ToolMediaPools): vo
   if (extracted == null) {
     // MCP images stay inside the tool result (mcpToModelOutput), unmarked: evictable
     // like synthetic tool media, or a screenshot loop could pass the provider's limit.
-    pools.syntheticMediaParts.push(...unmarkedToolResultMedia(part.output));
+    addEvictableMedia(pools, unmarkedToolResultMedia(part.output));
     return;
   }
   pools.extractionsByPart.set(part, extracted);
   pools.totalAttachments += extracted.attachments.length;
+  pools.order.push({ key: part, count: extracted.attachments.length, extraction: true });
 }
 
 /** Media items a tool result carries inline without the synthetic marker (MCP images). */
-function unmarkedToolResultMedia(output: ToolResultOutput): unknown[] {
+function unmarkedToolResultMedia(output: ToolResultOutput): object[] {
   if (output.type !== "content") return [];
   return output.value.filter((item) => {
     const type = (item as { type?: unknown }).type;

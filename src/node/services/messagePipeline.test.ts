@@ -1139,6 +1139,33 @@ describe("prepareMessagesForProvider: MCP tool results", () => {
   });
 
   // Persisted output is unvalidated: one malformed MCP result must not fail every later send.
+  // A persisted MCP result with audio or SVG must not fail every later request: the replay
+  // replaces media no provider accepts, as the extraction it used to go through did.
+  it("replaces MCP media that no provider accepts on replay", async () => {
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString("base64");
+    const outputs = await replayedOutputs([
+      {
+        id: "call-1",
+        mcp: true,
+        output: {
+          type: "content",
+          value: [
+            { type: "media", data: "UklGRgAAAABXQVZF", mediaType: "audio/wav" },
+            { type: "media", data: svg, mediaType: "image/svg+xml" },
+            { type: "media", data: "iVBORw0KGgo=", mediaType: "image/png" },
+          ],
+        },
+      },
+    ]);
+    const serialized = JSON.stringify(outputs["call-1"]);
+    expect(serialized).not.toContain("UklGRgAAAABXQVZF");
+    expect(serialized).toContain("audio/wav is not supported");
+    expect(serialized).not.toContain('"mediaType":"image/svg+xml"');
+    expect(serialized).toContain("<svg");
+    // A supported image stays a file part, as the in-turn step sent it.
+    expect(serialized).toContain("iVBORw0KGgo=");
+  });
+
   it("replays a malformed MCP result as JSON instead of failing the request", async () => {
     const malformed = { content: [null] };
     const outputs = await replayedOutputs([

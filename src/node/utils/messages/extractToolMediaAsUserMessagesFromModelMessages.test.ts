@@ -596,6 +596,43 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
     expect(await extractToolMediaAsUserMessagesFromModelMessages(result)).toEqual(result);
   });
 
+  it("drops the oldest media first across extracted and MCP images", async () => {
+    const call = (index: number, value: unknown[]): ModelMessage[] => [
+      {
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: `call-${index}`, toolName: "t", input: {} }],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: `call-${index}`,
+            toolName: "t",
+            output: { type: "content", value },
+          } as unknown as ToolResultPart,
+        ],
+      },
+    ];
+    const attach = (index: number) =>
+      call(index, [{ type: "media", data: `JVBERi${index}AAA`, mediaType: "application/pdf" }]);
+    const older = Array.from({ length: MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST }, (_, i) =>
+      attach(i)
+    ).flat();
+    const latestMcp = call(MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST, [
+      { type: "file", mediaType: "image/png", data: { type: "data", data: "latest-mcp" } },
+    ]);
+
+    const serialized = JSON.stringify(
+      await extractToolMediaAsUserMessagesFromModelMessages([...older, ...latestMcp])
+    );
+
+    // The newest image (the MCP screenshot) stays; the oldest extraction is omitted instead.
+    expect(serialized).toContain("latest-mcp");
+    expect(serialized).not.toContain("JVBERi0AAA");
+    expect(serialized).toContain("JVBERi1AAA");
+  });
+
   it("is a no-op when there is no media", async () => {
     const input: ModelMessage[] = [
       {
