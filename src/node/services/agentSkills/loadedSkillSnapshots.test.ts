@@ -11,8 +11,11 @@ function createAgentSkillReadToolMessage(args: {
   skillName: string;
   body: string;
   scope?: "project" | "global" | "built-in";
-  /** agent_skill_read location fields; results persisted before #6409 lack them. */
-  location?: { skillDir?: string; pluginRoot?: string; skillDirUnavailable?: string };
+  /**
+   * agent_skill_read location fields; results persisted before #6409 lack them.
+   * Typed loosely: persisted history can hold malformed values.
+   */
+  location?: Partial<Record<"skillDir" | "pluginRoot" | "skillDirUnavailable", unknown>>;
 }): MuxMessage {
   const scope = args.scope ?? "project";
   return {
@@ -240,6 +243,19 @@ describe("extractLoadedSkillSnapshotsFromMessages", () => {
     const lines = snapshots[0].body.split("\n");
     expect(lines[0]).toContain(`\`${skillDir}\``);
     expect(lines).toContain("Tool body");
+  });
+
+  it("keeps the skill when a persisted location field is malformed", () => {
+    // Self-healing: one corrupt optional field must not drop the skill from later requests.
+    const snapshots = extractLoadedSkillSnapshotsFromMessages([
+      createAgentSkillReadToolMessage({
+        id: "tool-corrupt",
+        skillName: "test-skill",
+        body: "Tool body",
+        location: { skillDir: null, skillDirUnavailable: 42 },
+      }),
+    ]);
+    expect(snapshots.map((snapshot) => snapshot.body)).toEqual(["Tool body"]);
   });
 
   it("never shows an unsafe skillDir from persisted history in the re-injected body", () => {

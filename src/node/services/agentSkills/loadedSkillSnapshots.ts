@@ -6,7 +6,7 @@ import { MAX_POST_COMPACTION_LOADED_SKILLS } from "@/common/constants/attachment
 import type { LoadedSkillSnapshot } from "@/common/types/attachment";
 import type { AgentSkillFrontmatter, AgentSkillScope } from "@/common/types/agentSkill";
 import type { MuxMessage } from "@/common/types/message";
-import { AgentSkillScopeSchema } from "@/common/orpc/schemas/agentSkill";
+import { AgentSkillPackageSchema, AgentSkillScopeSchema } from "@/common/orpc/schemas/agentSkill";
 import {
   extractAgentSkillBodyFromSnapshotText,
   isNormalizedAgentSkillBodyTruncated,
@@ -14,7 +14,6 @@ import {
   renderAgentSkillSnapshotText,
 } from "@/common/utils/agentSkills/skillSnapshot";
 import { resolveSkillReadIdentity } from "@/common/utils/agentSkills/skillLookupName";
-import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 
 import { prependSkillDirectoryNote, type SkillDirectory } from "./skillDirectory";
 
@@ -108,33 +107,62 @@ function getMessageTextContent(message: MuxMessage): string {
     .join("");
 }
 
+/**
+ * The SkillDirectory an agent_skill_read result reported. Fields are read one
+ * by one, not with the full result schema: persisted history is untrusted, and
+ * one malformed optional field must not drop the whole skill from later
+ * requests (it degrades to the bare body instead).
+ */
+function getToolResultSkillDirectory(toolResult: {
+  skillDir?: unknown;
+  pluginRoot?: unknown;
+  skillDirUnavailable?: unknown;
+}): SkillDirectory | undefined {
+  if (typeof toolResult.skillDir === "string" && toolResult.skillDir.length > 0) {
+    return {
+      available: true,
+      skillDir: toolResult.skillDir,
+      ...(typeof toolResult.pluginRoot === "string" ? { pluginRoot: toolResult.pluginRoot } : {}),
+    };
+  }
+  if (typeof toolResult.skillDirUnavailable === "string") {
+    return { available: false, reason: toolResult.skillDirUnavailable };
+  }
+  return undefined;
+}
+
 function extractLoadedSkillSnapshotFromToolOutput(
   output: unknown,
   input?: unknown
 ): LoadedSkillSnapshot | null {
-  const parsedResult = AgentSkillReadToolResultSchema.safeParse(output);
-  if (!parsedResult.success || !parsedResult.data.success) {
+  if (typeof output !== "object" || output == null || Array.isArray(output)) {
     return null;
   }
 
-  const result = parsedResult.data;
-  const skill = result.skill;
+  const toolResult = output as {
+    success?: unknown;
+    skill?: unknown;
+    skillDir?: unknown;
+    pluginRoot?: unknown;
+    skillDirUnavailable?: unknown;
+  };
+  if (toolResult.success !== true) {
+    return null;
+  }
+
+  const parsedSkill = AgentSkillPackageSchema.safeParse(toolResult.skill);
+  if (!parsedSkill.success) {
+    return null;
+  }
+
+  const skill = parsedSkill.data;
   // #6704/#6462: rebuilding the snapshot from the body alone dropped where the
   // skill's bundled files are, so after compaction the model saw a bare
   // ${CLAUDE_SKILL_DIR} with no path or off-host note, and this bare snapshot
   // replaced an earlier slash snapshot's directory line in
   // mergeLoadedSkillSnapshots. Use the slash-snapshot builder: it also hides
   // unsafe paths, since persisted history is untrusted.
-  let directory: SkillDirectory | undefined;
-  if (result.skillDir != null && result.skillDir.length > 0) {
-    directory = {
-      available: true,
-      skillDir: result.skillDir,
-      ...(result.pluginRoot != null ? { pluginRoot: result.pluginRoot } : {}),
-    };
-  } else if (result.skillDirUnavailable != null) {
-    directory = { available: false, reason: result.skillDirUnavailable };
-  }
+  const directory = getToolResultSkillDirectory(toolResult);
   // Results persisted before #6409 have no location fields: keep the body.
   const body = directory != null ? prependSkillDirectoryNote(skill.body, directory) : skill.body;
 
