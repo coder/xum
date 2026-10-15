@@ -219,9 +219,20 @@ async function callToolAction(
         success: true,
         result: response.data,
         view: null,
-        wrote: confirmed && !response.data.isError,
+        // A tool can report an error after it wrote: every confirmed run counts.
+        wrote: confirmed,
       }
     : response;
+}
+
+/** A settings read only for the backend's settings caches (no dialog shows it). */
+async function readSettingsWithoutDialog(
+  api: APIClient | null,
+  workspaceId: string,
+  serverName: string
+): Promise<void> {
+  if (!api) return;
+  await api.mcp.settings.read({ workspaceId, serverNames: [serverName], ifConnected: true });
 }
 
 /** The action of `toolName` in a settings read, or null when it cannot run. */
@@ -245,6 +256,9 @@ async function readToolAction(
     });
     const read = getOwn(reads, target.serverName);
     if (read?.success !== true || read.data === null || "notConnected" in read.data) return null;
+    // Another server instance (a restart): its flag does not apply, since the run carries the
+    // token of the instance the user saw, which the backend refuses.
+    if (read.data.instanceToken !== target.instanceToken) return null;
     return toolActionOf(read.data, target.toolName);
   } catch {
     // The run's own error is the one to show.
@@ -317,6 +331,10 @@ function useToolActionRun(
       description: `This tool of ${props.serverName} can change data. Run it only if you trust the server.`,
       confirmLabel: "Run",
     });
+  const writeSettled = () =>
+    publishSettingsToolWrite(props.workspaceId, props.serverName, () =>
+      readSettingsWithoutDialog(api, props.workspaceId, props.serverName)
+    );
   const openApp = (view: MCPSettingsAppView, canWrite: boolean) => {
     setApp({ view, openCount: openCount + 1, canWrite });
     setOpenCount(openCount + 1);
@@ -339,7 +357,7 @@ function useToolActionRun(
       result = await settleOutcome(
         outcome,
         (view) => openApp(view, !action.readOnly),
-        () => publishSettingsToolWrite(props.workspaceId, props.serverName)
+        writeSettled
       );
     } catch (caught) {
       result = { text: getErrorMessage(caught), isError: true };
@@ -356,7 +374,7 @@ function useToolActionRun(
     if (app?.canWrite !== true) return;
     const endRun = props.beginRun();
     try {
-      await publishSettingsToolWrite(props.workspaceId, props.serverName);
+      await writeSettled();
     } finally {
       endRun(null);
     }

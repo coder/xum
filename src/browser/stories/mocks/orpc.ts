@@ -368,6 +368,10 @@ export interface MockORPCClientOptions {
   mcpSettingsToolRunGate?: { promise: Promise<void> };
   /** Per tool name: the setting values a run of it writes on the server (a reset, an import). */
   mcpSettingsToolRunSets?: Map<string, Record<string, MCPSettingValue>>;
+  /** Tools whose runs report an MCP error (`isError`) after they wrote their values. */
+  mcpSettingsToolRunErrors?: Set<string>;
+  /** Servers that restart after their first settings read: later reads have a new instanceToken. */
+  mcpSettingsRestartAfterFirstRead?: Set<string>;
   /** When set, mcp.test waits for this promise (stories hold a Fetch Tools in flight). */
   mcpTestGate?: { promise: Promise<void> };
   /** Session icon registry for mcp.icon - maps iconRef to a PNG data URL (unknown refs resolve null) */
@@ -523,6 +527,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpSettingsToolRuns,
     mcpSettingsToolRunGate,
     mcpSettingsToolRunSets,
+    mcpSettingsToolRunErrors,
+    mcpSettingsRestartAfterFirstRead,
     mcpTestGate,
     mcpIcons = new Map<string, string>(),
     mcpOauthAuthStatus = new Map<string, MCPOAuthAuthStatus>(),
@@ -633,6 +639,15 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
   let createdWorkspaceCounter = 0;
   let mcpSettingsReadCount = 0;
+  /** Servers read once already: a server in mcpSettingsRestartAfterFirstRead restarts after it. */
+  const readSettingsServers = new Set<string>();
+  const readToken = (serverName: string) => {
+    const restarted =
+      mcpSettingsRestartAfterFirstRead?.has(serverName) === true &&
+      readSettingsServers.has(serverName);
+    readSettingsServers.add(serverName);
+    return restarted ? `mock-instance-2:${serverName}` : mockSettingsToken(serverName);
+  };
   /** A settings tool action writes its mcpSettingsToolRunSets values on the server. */
   const applyMockSettingsToolRunSet = (input: { serverName: string; toolName: string }) => {
     const stored = mcpSettings?.get(input.serverName);
@@ -1469,7 +1484,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
               data:
                 snapshot === undefined
                   ? null
-                  : { ...structuredClone(snapshot), instanceToken: mockSettingsToken(serverName) },
+                  : { ...structuredClone(snapshot), instanceToken: readToken(serverName) },
             };
           };
           const result = Object.fromEntries(input.serverNames.map((name) => [name, readOne(name)]));
@@ -1530,7 +1545,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           applyMockSettingsToolRunSet(input);
           return {
             success: true,
-            data: { text: `${input.toolName} finished`, isError: false },
+            data: {
+              text: `${input.toolName} finished`,
+              isError: mcpSettingsToolRunErrors?.has(input.toolName) === true,
+            },
           };
         },
       },
