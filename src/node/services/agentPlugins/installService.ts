@@ -278,6 +278,22 @@ function unusableRecordReason(error: unknown, file: string): string {
   return `Xum cannot read the pending plugin sign-out record (${file}): ${code}. Fix its permissions. Or: in Settings → Plugins, choose "Sign out of plugin MCP servers": Xum deletes the file after the sign-outs succeed.`;
 }
 
+/**
+ * A recorded sign-out URL as Settings shows it (#6627). The query, the fragment and the user info
+ * can hold a secret from the plugin manifest, so they are left out. "?…" marks a removed query or
+ * fragment.
+ */
+function displaySignOutUrl(url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return "(an unreadable URL)";
+  }
+  const cut = parsed.search !== "" || parsed.hash !== "";
+  return `${parsed.origin}${parsed.pathname}${cut ? "?…" : ""}`;
+}
+
 /** Waits for the startup sign-out pass at most timeoutMs, then lets discovery go on. */
 async function waitForPendingSignOuts(
   pass: Promise<void>,
@@ -4432,7 +4448,11 @@ export class AgentPluginInstallService {
     }
     // An empty record still fences discovery while it exists (the next pass deletes it).
     const lastError = this.pendingSignOutLastError;
-    return { kind: "pending", servers, ...(lastError !== undefined ? { lastError } : {}) };
+    return {
+      kind: "pending",
+      servers: servers.map(displaySignOutUrl),
+      ...(lastError !== undefined ? { lastError } : {}),
+    };
   }
 
   /**
@@ -4464,7 +4484,7 @@ export class AgentPluginInstallService {
         if (done.has(key)) continue;
         const failure = await signOutFailure(oauth, serverUrl, deadline, this.inFlightSignOuts);
         if (failure !== undefined)
-          throw new Error(`Could not sign out of ${serverUrl}: ${failure}`);
+          throw new Error(`Could not sign out of ${displaySignOutUrl(serverUrl)}: ${failure}`);
         done.add(key);
       }
       // Sign out first, delete last (see parsePendingSignOuts).
