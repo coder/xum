@@ -1092,6 +1092,28 @@ function readLegacyMetadataId(file: string): string | null | undefined {
   }
 }
 
+/**
+ * One stored key can also hold an id-less legacy row next to its migrated copy (a hand edit or
+ * another tool; Xum's own migration fills in the id on the same row). Drop the legacy copy the
+ * same way as in an alias group (#6595). Gated on an id-less row with a string path, so a
+ * migrated project pays one in-memory pass on a cold load and no file access.
+ */
+function dropSingleKeyLegacyCopies(
+  key: string,
+  entry: StoredProjectEntry,
+  conflicts: ProjectAliasConflict[],
+  resolveLegacyId: (projectPath: string, workspace: Workspace) => string | undefined
+): void {
+  const workspaces = entry.config.workspaces;
+  if (!workspaces.some((workspace) => !workspace.id && typeof workspace.path === "string")) return;
+  const conflictingIds = dropLegacyDuplicateRows(workspaces, (workspace) =>
+    resolveLegacyId(key, workspace)
+  );
+  if (conflictingIds.length > 0) {
+    conflicts.push({ path: key, storedKeys: [entry.storedKey], conflictingIds });
+  }
+}
+
 /** An alias group whose merge kept one of two different rows for the same workspace. */
 interface ProjectAliasConflict {
   path: string;
@@ -1122,6 +1144,7 @@ function buildProjectsFromStoredEntries(
   for (const [key, group] of groups) {
     if (group.length === 1) {
       projects.set(key, group[0].config);
+      dropSingleKeyLegacyCopies(key, group[0], conflicts, resolveLegacyId);
       continue;
     }
     const storedKeys = group.map((entry) => entry.storedKey);
@@ -2302,8 +2325,7 @@ export class Config {
   }
 
   /** The beforeRename check for a save, or undefined when the save has no read to compare. */
-  private unchangedConfigCheck(expectedStatKey: string | undefined) {
-    if (expectedStatKey === undefined) return undefined;
+  private unchangedConfigCheck(expectedStatKey: string): () => void {
     return () => this.assertConfigFileUnchanged(expectedStatKey);
   }
 
@@ -3107,9 +3129,10 @@ export class Config {
    */
   /**
    * `expectedStatKey`: the stat key of the bytes the edit read. The save then fails without
-   * writing when config.json no longer has it. Undefined skips the check.
+   * writing when config.json no longer has it. Required, so no save path can skip the check
+   * (#6595).
    */
-  private saveConfig(config: ProjectsConfig, expectedStatKey?: string): Promise<void> {
+  private saveConfig(config: ProjectsConfig, expectedStatKey: string): Promise<void> {
     return Effect.runPromise(this.saveConfigEffect(config, expectedStatKey));
   }
 
@@ -3120,7 +3143,7 @@ export class Config {
    */
   private saveConfigEffect(
     config: LegacyAdvisorProjectsConfig,
-    expectedStatKey?: string
+    expectedStatKey: string
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -3960,8 +3983,11 @@ export class Config {
       // Route through the saveConfig Promise facade (not saveConfigEffect) so test
       // spies on saveConfig keep intercepting the serialized write. A failed save rejects
       // the edit and skips the change notification below (#4444).
+      // transform() always runs before write and records the key.
+      const expectedStatKey = readStatKey;
+      assert(expectedStatKey !== undefined, "config edit saved without a fresh read");
       yield* Effect.tryPromise({
-        try: () => self.saveConfig(newConfig, readStatKey),
+        try: () => self.saveConfig(newConfig, expectedStatKey),
         catch: (error) => error,
       });
       // Backend-initiated config edits (for example gateway auth changes) use this signal

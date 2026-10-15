@@ -1746,6 +1746,22 @@ describe("Config", () => {
             ["/home/u/repo/", { workspaces: [row("ws-two")] }],
           ] as StoredPair[],
       ],
+      [
+        // #6595: the single-key check runs, but no id row shares the legacy row's path.
+        "one key with a legacy row on its own path",
+        () =>
+          [
+            [
+              "/home/u/repo",
+              {
+                workspaces: [
+                  row("ws-one"),
+                  { name: "legacy", path: path.join(config.srcDir, "repo", "legacy") },
+                ],
+              },
+            ],
+          ] as unknown as StoredPair[],
+      ],
     ] as const) {
       it(`reads no session metadata and lists no directory on a load with ${name}`, () => {
         writeProjects(stored());
@@ -1900,6 +1916,50 @@ describe("Config", () => {
         const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
         expect(rows?.map((w) => w.id)).toEqual([undefined, "stable-1"]);
         expect(config.getConfigLoadError()).toBeNull();
+      });
+
+      // #6595: the same legacy copy under ONE stored key (no alias group).
+      function writeSingleKeyLegacyAndIdRows(checkout: string, id: string): void {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              [
+                "/home/u/repo",
+                {
+                  workspaces: [
+                    { name: "x", path: checkout },
+                    { id, name: "x", path: checkout },
+                  ],
+                },
+              ],
+            ],
+          })
+        );
+      }
+
+      it("keeps one row and backs up the bytes for a legacy copy under one key", async () => {
+        const checkout = checkoutPath();
+        const id = config.generateLegacyId("/home/u/repo", checkout);
+        writeSingleKeyLegacyAndIdRows(checkout, id);
+        const original = fs.readFileSync(path.join(tempDir, "config.json"));
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          expect(await savedIdsOnCheckout(checkout)).toEqual([id]);
+          const backups = aliasConflictBackups();
+          expect(backups).toHaveLength(1);
+          expect(fs.readFileSync(backups[0])).toEqual(original);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
+      it("keeps both rows under one key when the legacy row resolves to another id", () => {
+        const checkout = checkoutPath();
+        writeSingleKeyLegacyAndIdRows(checkout, "stable-1");
+        const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+        expect(rows?.filter((w) => w.path === checkout)).toHaveLength(2);
+        expect(aliasConflictBackups()).toHaveLength(0);
       });
 
       it("keeps both rows when the legacy row resolves to another id", async () => {
