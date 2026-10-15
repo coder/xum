@@ -3,7 +3,11 @@ import * as path from "node:path";
 
 import { describe, expect, it } from "bun:test";
 
-import type { BashToolResult, FileReadToolResult } from "@/common/types/tools";
+import type {
+  AgentSkillReadFileToolResult,
+  BashToolResult,
+  FileReadToolResult,
+} from "@/common/types/tools";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { createAgentSkillReadFileTool } from "./agent_skill_read_file";
 import { createBashTool } from "./bash";
@@ -48,6 +52,14 @@ async function fileRead(config: ToolConfiguration, filePath: string) {
   return result;
 }
 
+async function skillReadFile(config: ToolConfiguration, filePath: string) {
+  const tool = createAgentSkillReadFileTool(config);
+  return (await tool.execute!(
+    { name: "demo", filePath },
+    mockToolCallOptions
+  )) as AgentSkillReadFileToolResult;
+}
+
 async function bashNote(config: ToolConfiguration, script: string) {
   const tool = createBashTool(config);
   const result = (await tool.execute!(
@@ -78,10 +90,7 @@ describe("skill file hint", () => {
     const nested = await fileRead(config, path.join(skillDir, "templates", "long.md"));
     expect(nested.note).toContain('(name: "demo", filePath: "templates/long.md")');
 
-    const whole = await createAgentSkillReadFileTool(config).execute!(
-      { name: "demo", filePath: "playbooks/long.md" },
-      mockToolCallOptions
-    );
+    const whole = await skillReadFile(config, "playbooks/long.md");
     expect(whole).toMatchObject({ success: true, content: `1\t# Playbook\n2\t${LONG_LINE}\n3\t` });
   });
 
@@ -151,12 +160,9 @@ describe("skill file hint", () => {
     const inside = await bashNote(config, `head -c 6000 '${skillDir}/SKILL.md'; echo done`);
     expect(inside).toContain("per-line limit");
     expect(inside).toContain('agent_skill_read_file (name: "demo", filePath: "SKILL.md")');
-    const whole = await createAgentSkillReadFileTool(config).execute!(
-      { name: "demo", filePath: "SKILL.md" },
-      mockToolCallOptions
-    );
+    const whole = await skillReadFile(config, "SKILL.md");
     expect(whole).toMatchObject({ success: true });
-    expect((whole as { content: string }).content).toContain(`\t${LONG_LINE}`);
+    expect(whole.success && whole.content).toContain(`\t${LONG_LINE}`);
 
     const escaped = skillDir.replaceAll(" ", "\\ ");
     const viaEscape = await bashNote(config, `head -c 6000 ${escaped}/playbooks/long.md`);
