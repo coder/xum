@@ -218,8 +218,9 @@ export class McpAppResultStore {
       // Under the same lock (#6611): a concurrent record's prune must not run between this
       // write and this prune. Best effort: the record is stored, so a failed prune must not make
       // the caller (openSettingsApp) refuse it. The next record prunes again.
-      await this.prune(dir, name).catch((error: unknown) => {
-        log.debug("[MCP Apps] Failed to prune tool results", { workspaceId, error });
+      // Warn, not debug (#6611): a prune that keeps failing lets the folder grow unseen.
+      await this.prune(workspaceId, dir, name).catch((error: unknown) => {
+        log.warn("[MCP Apps] Failed to prune tool results", { workspaceId, error });
       });
       return true;
     });
@@ -417,9 +418,10 @@ export class McpAppResultStore {
   /**
    * Drop the oldest records past the cap. Never `keep` (the record just written) and never a file
    * whose stat fails: its age is unknown, and a record that counts as stored must survive a
-   * restart. Callers hold the session dir's target lock (writeRecord).
+   * restart. Callers hold the session dir's target lock (writeRecord). A dropped record also
+   * leaves the memory cache (#6611), so get() does not return it until a restart.
    */
-  private async prune(dir: string, keep: string) {
+  private async prune(workspaceId: string, dir: string, keep: string) {
     const names = (await fs.readdir(dir)).filter((name) => name.endsWith(".json"));
     const excess = names.length - MCP_APP_RESULT_MAX_PER_WORKSPACE;
     if (excess <= 0) return;
@@ -438,6 +440,18 @@ export class McpAppResultStore {
     withTimes.sort((a, b) => a.mtimeMs - b.mtimeMs);
     for (const { name } of withTimes.slice(0, excess)) {
       await fs.rm(path.join(dir, name), { force: true });
+      this.forget(workspaceId, name);
+    }
+  }
+
+  /** Drop the memory cache entry whose record file is `fileName` (at most MEMORY_MAX_ENTRIES). */
+  private forget(workspaceId: string, fileName: string) {
+    for (const [key, record] of this.memory) {
+      if (
+        key === `${workspaceId}\0${record.toolCallId}` &&
+        fileNameFor(record.toolCallId) === fileName
+      )
+        this.memory.delete(key);
     }
   }
 }

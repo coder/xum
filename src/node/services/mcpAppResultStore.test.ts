@@ -76,6 +76,36 @@ describe("McpAppResultStore", () => {
     expect(files).toHaveLength(MCP_APP_RESULT_MAX_PER_WORKSPACE);
   });
 
+  test("a pruned record leaves the memory cache and refuses widget state", async () => {
+    using tmp = new DisposableTempDir("mcp-app-store");
+    const store = new McpAppResultStore((id) => path.join(tmp.path, id));
+    const ids = Array.from({ length: MCP_APP_RESULT_MAX_PER_WORKSPACE + 1 }, (_, i) => `c${i}`);
+    const bindings = new Map<string, string>();
+    for (const id of ids) {
+      await store.record("ws", entry(id));
+      const record = await store.get("ws", id);
+      if (record === null) throw new Error("expected the record");
+      bindings.set(id, mcpAppWidgetStateBindingOf(record));
+    }
+    const dir = path.join(tmp.path, "ws", MCP_APP_RESULT_DIR);
+    const onDisk = new Set(await fs.readdir(dir));
+    const pruned = ids.filter(
+      (id) => !onDisk.has(`${createHash("sha256").update(id).digest("hex").slice(0, 40)}.json`)
+    );
+    expect(pruned).toHaveLength(1);
+    // get() agrees with the disk: the pruned record is gone now, not only after a restart.
+    expect(await store.get("ws", pruned[0])).toBeNull();
+    // A late widget state write of its view is refused and does not write the record back.
+    const binding = bindings.get(pruned[0]) ?? "";
+    expect(
+      await store.setWidgetState("ws", pruned[0], binding, { n: 1 }).then(
+        () => "written",
+        (error: unknown) => String(error)
+      )
+    ).toContain("record is gone");
+    expect(await fs.readdir(dir)).toHaveLength(MCP_APP_RESULT_MAX_PER_WORKSPACE);
+  });
+
   test("pruning never deletes the record it just wrote", async () => {
     using tmp = new DisposableTempDir("mcp-app-store");
     const sessionDir = (id: string) => path.join(tmp.path, id);
