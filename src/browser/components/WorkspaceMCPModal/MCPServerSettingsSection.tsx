@@ -119,7 +119,9 @@ export const MCPServerSettingsSection = React.forwardRef<
   };
 
   // Every control is disabled while a save is in flight (`saving`): the response replaces the
-  // draft, so an edit made meanwhile would be lost silently.
+  // draft, so an edit made meanwhile would be lost silently. A tool run locks them too: a
+  // writing run re-reads the settings when it ends, which replaces the draft the same way.
+  const locked = saving || runningTools > 0;
   const renderControl = (name: string, schema: MCPSettingSchema) => {
     const value = getOwn(draft, name);
     const label = `${schema.title} setting`;
@@ -129,7 +131,7 @@ export const MCPServerSettingsSection = React.forwardRef<
           checked={value === true}
           onCheckedChange={(checked) => setValue(name, checked)}
           aria-label={label}
-          disabled={saving}
+          disabled={locked}
         />
       );
     if (schema.type === "string" && schema.enum !== undefined) {
@@ -144,7 +146,7 @@ export const MCPServerSettingsSection = React.forwardRef<
           }))}
           onChange={(next) => setValue(name, options[Number(next)] ?? "")}
           aria-label={label}
-          disabled={saving}
+          disabled={locked}
           className="w-40 max-w-full"
         />
       );
@@ -155,7 +157,7 @@ export const MCPServerSettingsSection = React.forwardRef<
           value={typeof value === "string" ? value : ""}
           onChange={(event) => setValue(name, event.target.value)}
           aria-label={label}
-          disabled={saving}
+          disabled={locked}
           className="w-40 max-w-full"
         />
       );
@@ -172,7 +174,7 @@ export const MCPServerSettingsSection = React.forwardRef<
           setValue(name, event.target.value.trim() === "" ? NaN : Number(event.target.value));
         }}
         aria-label={label}
-        disabled={saving}
+        disabled={locked}
         className="w-28 max-w-full"
       />
     );

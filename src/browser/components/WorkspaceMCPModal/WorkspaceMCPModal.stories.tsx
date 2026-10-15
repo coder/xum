@@ -79,6 +79,8 @@ interface WorkspaceMCPStoryOptions {
   settingsToolRuns?: Array<{ toolName: string; confirmed: boolean }>;
   settingsToolRunGate?: { promise: Promise<void> };
   settingsToolRunSets?: Record<string, Record<string, string | number | boolean>>;
+  settingsToolRunErrors?: string[];
+  settingsRestartAfterFirstRead?: string[];
   /** MCP Apps views by view key (a settings app action opens `settings:<server>:<tool>`). */
   mcpAppViews?: Record<string, McpAppView>;
   testGate?: { promise: Promise<void> };
@@ -164,6 +166,8 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
     mcpSettingsToolRuns: options.settingsToolRuns,
     mcpSettingsToolRunGate: options.settingsToolRunGate,
     mcpSettingsToolRunSets: new Map(Object.entries(options.settingsToolRunSets ?? {})),
+    mcpSettingsToolRunErrors: new Set(options.settingsToolRunErrors ?? []),
+    mcpSettingsRestartAfterFirstRead: new Set(options.settingsRestartAfterFirstRead ?? []),
     ...(options.mcpAppViews ? { mcpApps: { views: options.mcpAppViews } } : {}),
     mcpTestGate: options.testGate,
   });
@@ -753,6 +757,8 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
     await expect(section.getByRole("button", { name: "Run Reset parts" })).toBeDisabled();
     // The dialog's Save closes it, so it waits too.
     await expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled();
+    // A writing run re-reads the settings when it ends: an edit made meanwhile would be lost.
+    await expect(section.getByLabelText("Default zoom setting")).toBeDisabled();
     toolActionGate.resolve();
     await expect(section.findByText("cad.library finished")).resolves.toBeInTheDocument();
     await waitFor(() =>
@@ -855,6 +861,41 @@ export const WorkspaceMCPServerSettingsStaleReadOnlyFlag: Story = {
   },
 };
 
+let restartRuns: Array<{ toolName: string; confirmed: boolean }> = [];
+/**
+ * The server restarted after the dialog read it, and its new instance has Part library as
+ * writable. The row does not take that flag: the run carries the old instance's token, so a
+ * confirmation would only lead to a refused run.
+ */
+export const WorkspaceMCPServerSettingsStaleFlagOtherInstance: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    restartRuns = [];
+    return renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settings: { cad: CAD_SETTINGS_LIBRARY_WRITES },
+      settingsStaleFirstRead: { cad: CAD_SETTINGS },
+      settingsRestartAfterFirstRead: ["cad"],
+      settingsToolRuns: restartRuns,
+    });
+  },
+  play: async ({ canvasElement }) => {
+    const dialog = await findWorkspaceMCPDialog(canvasElement);
+    const section = within(await within(dialog).findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    const run = await section.findByRole("button", { name: "Run Part library" });
+    await userEvent.click(run);
+    await expect(
+      section.findByText("'Part library' runs only after a confirmation")
+    ).resolves.toBeInTheDocument();
+    await waitFor(() => expect(run).toBeEnabled());
+    await userEvent.click(run);
+    await waitFor(() => expect(run).toBeEnabled());
+    await expect(page.queryByText("Run Part library?")).toBeNull();
+    await expect(restartRuns).toHaveLength(0);
+  },
+};
+
 /**
  * The backend checks the SAVED tool allowlist: while the dialog has an unsaved allowlist edit
  * for the server, its tool actions do not run.
@@ -923,7 +964,8 @@ export const WorkspaceMCPServerSettingsAppViewRetry: Story = {
 const rereadReads: string[][] = [];
 /**
  * A tool that can write (Reset parts) changes the server's settings: the dialog reads them
- * again and shows the new values, and the run's result stays. A read-only run reads nothing.
+ * again and shows the new values, and the run's result stays. It reads them even when the tool
+ * reports an error (it can fail after it wrote). A read-only run reads nothing.
  */
 export const WorkspaceMCPServerSettingsRereadAfterWrite: Story = {
   parameters: { pixel: PIXEL_DISABLED },
@@ -933,6 +975,7 @@ export const WorkspaceMCPServerSettingsRereadAfterWrite: Story = {
       ...settingsStoryOptions(),
       settingsReads: rereadReads,
       settingsToolRunSets: { "cad.reset": { zoom: 1 } },
+      settingsToolRunErrors: ["cad.reset"],
     });
   },
   play: async ({ canvasElement }) => {

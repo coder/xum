@@ -108,15 +108,20 @@ export function subscribeSettingsToolWrites(
   return () => writeListeners.delete(listener);
 }
 
-/** A tool that can write ran on `serverName`: the mounted dialogs read its settings again. */
+/**
+ * A tool that can write ran on `serverName`: the mounted dialogs read its settings again. With
+ * no dialog of the workspace open, `readWithoutDialog` reads them: the backend's read refreshes
+ * the settings cache that plugin hooks use, which otherwise keeps the pre-run values.
+ */
 export async function publishSettingsToolWrite(
   workspaceId: string,
-  serverName: string
+  serverName: string,
+  readWithoutDialog: () => Promise<unknown>
 ): Promise<void> {
   const rereads = [...writeListeners]
     .filter((listener) => listener.workspaceId === workspaceId)
     .map((listener) => listener.reread(serverName));
-  await Promise.allSettled(rereads);
+  await Promise.allSettled(rereads.length > 0 ? rereads : [readWithoutDialog()]);
 }
 
 /** One server's runs (NO_SERVER_RUNS when it has none). */

@@ -36,10 +36,14 @@ test("a writing run's end reaches the dialogs of its workspace only", async () =
     reread.push("other");
     return Promise.resolve();
   });
-  await publishSettingsToolWrite("ws-write", "cad");
+  const readWithoutDialog = () => {
+    reread.push("backend");
+    return Promise.resolve();
+  };
+  await publishSettingsToolWrite("ws-write", "cad", readWithoutDialog);
   stop();
-  // A closed dialog no longer reads.
-  await publishSettingsToolWrite("ws-write", "cad");
+  // No dialog of the workspace is open: the backend still reads (it refreshes its caches).
+  await publishSettingsToolWrite("ws-write", "cad", readWithoutDialog);
   other();
-  expect(reread).toEqual(["cad"]);
+  expect(reread).toEqual(["cad", "backend"]);
 });
