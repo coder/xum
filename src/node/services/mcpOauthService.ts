@@ -1342,14 +1342,35 @@ export class McpOauthService {
     saved: boolean,
     input: { serverUrl: string; flowGeneration?: number }
   ): void {
-    if (saved && input.flowGeneration !== undefined)
-      this.insufficientScopes.delete(input.serverUrl);
+    if (!saved || input.flowGeneration === undefined) return;
+    this.insufficientScopes.delete(input.serverUrl);
+    this.signInSavedAt.set(input.serverUrl, performance.now());
   }
 
-  /** Records a 403 `insufficient_scope` answer (scopes are already sanitized). */
-  recordInsufficientScope(input: { serverUrl: string; scopes: string[] }): void {
+  /** When each credential key's last interactive sign-in was saved (`performance.now()`). */
+  private readonly signInSavedAt = new Map<string, number>();
+
+  /**
+   * Records a 403 `insufficient_scope` answer (scopes are already sanitized). A request that
+   * started before the last interactive sign-in answered for the old tokens: it must not bring
+   * the prompt back against the new ones (#6739).
+   */
+  recordInsufficientScope(input: {
+    serverUrl: string;
+    scopes: string[];
+    /** When the refused request started, on the `performance.now()` clock. */
+    requestStartedAt?: number;
+  }): void {
     const key = normalizeServerUrlForComparison(input.serverUrl);
-    if (key) this.insufficientScopes.set(key, input.scopes);
+    if (!key) return;
+    const savedAt = this.signInSavedAt.get(key);
+    if (
+      input.requestStartedAt !== undefined &&
+      savedAt !== undefined &&
+      input.requestStartedAt < savedAt
+    )
+      return;
+    this.insufficientScopes.set(key, input.scopes);
   }
 
   /**
