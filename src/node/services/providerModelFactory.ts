@@ -8,7 +8,7 @@ export {
 } from "@/common/utils/providers/baseUrl";
 import assert from "node:assert";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type {
@@ -1174,16 +1174,23 @@ function createGoogleVertexModelEffect(
 }
 
 async function isUsableKeyFile(filePath: string): Promise<boolean> {
+  let reason: string;
   try {
-    const parsed: unknown = JSON.parse(await readFile(filePath, "utf8"));
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
+    // Check the type before reading: reading a FIFO blocks until a writer
+    // appears, and reading a device such as /dev/zero never ends.
+    if (!(await stat(filePath)).isFile()) {
+      reason = "not a regular file";
+    } else if (isPlainObject(JSON.parse(await readFile(filePath, "utf8")))) {
+      return true;
+    } else {
+      reason = "not a JSON object";
+    }
   } catch (error) {
     // Only the failure kind: fs messages carry the path, JSON errors quote the file.
-    log.warn("Google Vertex AI service account key file is unusable", {
-      reason: error instanceof SyntaxError ? "invalid JSON" : "unreadable",
-    });
-    return false;
+    reason = error instanceof SyntaxError ? "invalid JSON" : "unreadable";
   }
+  log.warn("Google Vertex AI service account key file is unusable", { reason });
+  return false;
 }
 
 /**

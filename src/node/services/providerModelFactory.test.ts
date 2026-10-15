@@ -16,6 +16,7 @@ import { xai } from "@ai-sdk/xai";
 import { z } from "zod";
 import { Cause, Effect, Exit, Option } from "effect";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
+import { execFileSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import * as fs from "fs";
 import * as os from "os";
@@ -1611,6 +1612,18 @@ describe("ProviderModelFactory Google Vertex AI", () => {
     { name: "a JSON array", prepare: (keyFilename: string) => writeFile(keyFilename, "[]") },
     { name: "JSON null", prepare: (keyFilename: string) => writeFile(keyFilename, "null") },
     { name: "a JSON string", prepare: (keyFilename: string) => writeFile(keyFilename, '"key"') },
+    // POSIX only: Windows has no mkfifo. Reading a FIFO with no writer blocks forever.
+    ...(process.platform === "win32"
+      ? []
+      : [
+          {
+            name: "a FIFO",
+            prepare: (keyFilename: string) => {
+              execFileSync("mkfifo", [keyFilename]);
+              return Promise.resolve();
+            },
+          },
+        ]),
   ])(
     "fails a service account key file that is $name before sending a request",
     async ({ prepare }) => {
