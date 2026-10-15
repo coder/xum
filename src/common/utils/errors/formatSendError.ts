@@ -20,6 +20,30 @@ export interface FormattedError {
   resolutionHint?: string; // e.g., "Open Settings → Providers and add an API key"
 }
 
+export interface CredentialSetupCopy extends Required<FormattedError> {
+  title: string;
+}
+
+/**
+ * Setup copy for `api_key_not_found` on providers where "add an API key" would
+ * point users at the wrong setting. Google Vertex AI authenticates with Google
+ * Cloud credentials by default (an API key only selects express mode), so it
+ * needs a Project instead. Returns undefined for API-key providers.
+ */
+export function getCredentialSetupCopy(provider: string): CredentialSetupCopy | undefined {
+  if (provider !== "google-vertex") {
+    return undefined;
+  }
+  const displayName = getProviderDisplayName(provider);
+  return {
+    title: `${displayName} Not Configured`,
+    message: `${displayName} is not configured.`,
+    resolutionHint:
+      `Open Settings → Providers and set a Project for ${displayName} (authenticated with ` +
+      `Google Cloud credentials or a readable service account key file), or an express mode API key.`,
+  };
+}
+
 /**
  * Format a SendMessageError into a user-friendly message
  * Returns both the message and an optional command suggestion
@@ -27,6 +51,10 @@ export interface FormattedError {
 export function formatSendMessageError(error: SendMessageError): FormattedError {
   switch (error.type) {
     case "api_key_not_found": {
+      const setupCopy = getCredentialSetupCopy(error.provider);
+      if (setupCopy) {
+        return { message: setupCopy.message, resolutionHint: setupCopy.resolutionHint };
+      }
       const displayName = getProviderDisplayName(error.provider);
       return {
         message: `API key not found for ${displayName}.`,

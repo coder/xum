@@ -8,6 +8,7 @@ import { createAssistantMessageId } from "./messageIds";
 import {
   formatPluginBlockedMessage,
   formatSendMessageError as formatSendMessageErrorForDisplay,
+  getCredentialSetupCopy,
 } from "@/common/utils/errors/formatSendError";
 
 const getProviderDisplayName = (provider: string): string =>
@@ -53,6 +54,13 @@ export const formatSendMessageError = (
 ): { message: string; errorType: StreamErrorType } => {
   switch (error.type) {
     case "api_key_not_found": {
+      const setupCopy = getCredentialSetupCopy(error.provider);
+      if (setupCopy) {
+        return {
+          message: `${setupCopy.message} ${setupCopy.resolutionHint}`,
+          errorType: "authentication",
+        };
+      }
       const displayName = getProviderDisplayName(error.provider);
       return {
         message: `API key not configured for ${displayName}. Please add your API key in settings.`,
