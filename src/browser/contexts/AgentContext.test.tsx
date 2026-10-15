@@ -306,8 +306,13 @@ describe("AgentContext", () => {
     // A component review approves a plugin agent while the initial load is still pending.
     act(() => publishAgentPluginsMutated());
     await waitFor(() => expect(answers).toHaveLength(2));
-    await act(async () => answers[1]([EXEC_AGENT, REVIEW_PROJECT_AGENT]));
-    await act(async () => answers[0]([EXEC_AGENT]));
+    answers[1]([EXEC_AGENT, REVIEW_PROJECT_AGENT]);
+    await waitFor(() =>
+      expect(contextValue?.agents.map((agent) => agent.id)).toEqual(["exec", "review"])
+    );
+    // The older answer arrives last; flush its continuation before checking.
+    answers[0]([EXEC_AGENT]);
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
 
     expect(contextValue?.agents.map((agent) => agent.id)).toEqual(["exec", "review"]);
   });
