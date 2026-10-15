@@ -759,6 +759,28 @@ describe("long-context tiers chosen per request", () => {
       }
     });
 
+    test("a last step with a malformed count prices the turn as one request", () => {
+      // The earlier steps average over the threshold, so a valid last step would take the
+      // mid-turn-compaction branch.
+      const usage = turnUsage([step({ inputTokens: 400_000 })]);
+      const oneRequest = createDisplayUsage(usage, MODEL)!;
+
+      for (const contextUsage of [
+        { inputTokens: 50_000, outputTokens: "bad" },
+        { inputTokens: 50_000, cachedInputTokens: -10 },
+      ]) {
+        const priced = createDisplayUsage(
+          usage,
+          MODEL,
+          undefined,
+          undefined,
+          readTurnSteps({ contextUsage, stepStartPartIndices: [0, 1, 2] })
+        )!;
+
+        expect(totalCost(priced)).toBeCloseTo(totalCost(oneRequest), 12);
+      }
+    });
+
     test("a recorded per-request share wins over the last-step estimate", () => {
       const steps = [step({ inputTokens: 80_000 }), step({ inputTokens: 130_000 })];
       const usage = createDisplayUsage(

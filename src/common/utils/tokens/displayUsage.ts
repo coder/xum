@@ -148,8 +148,8 @@ function estimateLongContextTokens(
   steps: TurnSteps
 ): LongContextTokens | undefined {
   const lastStep = readUsageTokens(steps.lastStepUsage, steps.lastStepProviderMetadata);
+  if (!Object.values(lastStep).every(isTokenCount)) return undefined;
   const lastPrompt = getPromptTokens(lastStep);
-  if (!Number.isFinite(lastPrompt)) return undefined;
   const summedPrompt = getPromptTokens(tokens);
   const stepCount = Math.max(1, steps.stepCount ?? 1);
   const totals = toLongContextTokens(tokens);
