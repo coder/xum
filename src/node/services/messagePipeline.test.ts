@@ -979,7 +979,7 @@ describe("step boundaries in built provider requests", () => {
   // Live 400s (F31): the rebuild appended a tool's image after the whole assistant row, while
   // every in-turn step puts it right after its own tool result. Every provider builds through
   // this path, so check each one: same media, in step order, never raw base64 in a tool result
-  // (the context-budget preflight and compaction input measure this output).
+  // (the context-budget preflight and continuous compaction read this output).
   for (const provider of SUPPORTED_PROVIDERS) {
     it(`puts tool media right after its step's tool result (${provider})`, async () => {
       const png =

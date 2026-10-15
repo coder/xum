@@ -8,6 +8,7 @@ import {
   MAX_IMAGE_DIMENSION,
 } from "@/common/constants/imageAttachments";
 import { expectContentOutputValue } from "./testToolOutputHelpers";
+import { createOmittedToolAttachmentText } from "./toolResultAttachments";
 import { extractToolMediaAsUserMessages } from "./extractToolMediaAsUserMessages";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "./extractToolMediaAsUserMessagesFromModelMessages";
 
@@ -540,6 +541,59 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
         "user",
       ]);
     });
+  });
+
+  // mcpToModelOutput keeps MCP images inside the tool result as `file` parts, which this
+  // extraction leaves in place. They still count toward the request-wide cap, oldest evicted
+  // first, or a screenshot loop could replay more images than the provider accepts.
+  it("evicts the oldest MCP images kept inside tool results at the cap", async () => {
+    const mcpCall = (index: number): ModelMessage[] => [
+      {
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: `call-${index}`, toolName: "shot", input: {} }],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: `call-${index}`,
+            toolName: "shot",
+            output: {
+              type: "content",
+              value: [
+                { type: "text", text: `shot ${index}` },
+                {
+                  type: "file",
+                  mediaType: "image/png",
+                  data: { type: "data", data: `png-${index}` },
+                },
+              ],
+            },
+          } as unknown as ToolResultPart,
+        ],
+      },
+    ];
+    const total = MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST + 2;
+    const messages = Array.from({ length: total }, (_, i) => mcpCall(i)).flat();
+
+    const result = await extractToolMediaAsUserMessagesFromModelMessages(messages);
+
+    const values = result
+      .filter((message) => message.role === "tool")
+      .map((message) => JSON.stringify(message.content));
+    expect(values.filter((value) => value.includes('"type":"file"'))).toHaveLength(
+      MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST
+    );
+    // The two oldest images are gone, with the cap note in their place.
+    for (const index of [0, 1]) {
+      expect(values[index]).not.toContain(`png-${index}`);
+      expect(values[index]).toContain(createOmittedToolAttachmentText(1));
+      expect(values[index]).toContain(`shot ${index}`);
+    }
+    expect(values[2]).toContain("png-2");
+    // A request at the cap is a fixed point, so every later step keeps the same prefix.
+    expect(await extractToolMediaAsUserMessagesFromModelMessages(result)).toEqual(result);
   });
 
   it("is a no-op when there is no media", async () => {

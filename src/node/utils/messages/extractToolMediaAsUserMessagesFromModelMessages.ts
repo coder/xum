@@ -33,52 +33,8 @@ type ToolResultOutput = ToolResultPart["output"];
 export async function extractToolMediaAsUserMessagesFromModelMessages(
   messages: ModelMessage[]
 ): Promise<ModelMessage[]> {
-  // Pass 1 — extract once per tool-result part. The request-wide media cap
-  // needs the TOTAL before any emission so the NEWEST attachments survive,
-  // and the extraction walk must not run twice per part (see the MuxMessage
-  // variant in extractToolMediaAsUserMessages.ts).
-  const extractionsByPart = new Map<
-    object,
-    NonNullable<ReturnType<typeof extractAttachmentsFromToolOutput>>
-  >();
-  let totalAttachments = 0;
-  // Existing media parts share the same per-request provider limits as new
-  // extractions (r31), but they split into two pools:
-  // - reserved: genuine user uploads (unmarked) — consume the allowance and
-  //   are never evicted.
-  // - synthetic tool media (marker from a prior history-level extraction) —
-  //   evictable oldest-first so a fresh screenshot from the current tool call
-  //   still reaches the model at saturation (r34).
-  let reservedMediaParts = 0;
-  const syntheticMediaParts: unknown[] = [];
-  for (const message of messages) {
-    if (!Array.isArray(message.content)) continue;
-    for (const part of message.content) {
-      const partType = (part as { type?: unknown }).type;
-      if (partType === "image" || partType === "file") {
-        if (isSyntheticToolMediaPart(part)) {
-          syntheticMediaParts.push(part);
-        } else {
-          reservedMediaParts++;
-        }
-      }
-    }
-    if (message.role !== "assistant" && message.role !== "tool") continue;
-    for (const part of message.content) {
-      if (part.type !== "tool-result") continue;
-      // Media an earlier step already inlined into a tool result (deferred
-      // server tool, see holdsDeferredProviderToolCall) stays where it is, so
-      // it reserves its share of the request-wide cap.
-      if (part.output.type === "content") {
-        reservedMediaParts += part.output.value.filter(isSyntheticToolMediaPart).length;
-      }
-      const extracted = extractAttachmentsFromToolOutput(part.output as unknown);
-      if (extracted == null) continue;
-      extractionsByPart.set(part, extracted);
-      totalAttachments += extracted.attachments.length;
-    }
-  }
-  if (extractionsByPart.size === 0) return messages;
+  const { extractionsByPart, totalAttachments, reservedMediaParts, syntheticMediaParts } =
+    collectToolMedia(messages);
 
   // Request-wide cap (r28 security): capture bounds bytes and per-container
   // parts, not distinct records, so a looped bridged media tool could
@@ -96,6 +52,7 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
   const capState = {
     omitRemaining: overBudget - evictedSyntheticParts.size,
   };
+  if (extractionsByPart.size === 0 && evictedSyntheticParts.size === 0) return messages;
 
   const result: ModelMessage[] = [];
 
@@ -131,7 +88,9 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
         }
         const extracted = extractionsByPart.get(part);
         if (extracted === undefined) {
-          return part;
+          const evicted = evictToolResultMedia(part, evictedSyntheticParts);
+          if (evicted !== part) changedMessage = true;
+          return evicted;
         }
 
         changedMessage = true;
@@ -259,6 +218,99 @@ async function createInlineMediaOutput(
  * bounded omission note (r34). Only parts identified by the pass-1 scan are
  * touched; genuine user uploads never enter the evicted set.
  */
+/**
+ * Pass 1 of extractToolMediaAsUserMessagesFromModelMessages: the tool-result parts to extract
+ * and the media the request already carries, split into the cap's pools.
+ */
+function collectToolMedia(messages: ModelMessage[]) {
+  // Pass 1 — extract once per tool-result part. The request-wide media cap
+  // needs the TOTAL before any emission so the NEWEST attachments survive,
+  // and the extraction walk must not run twice per part (see the MuxMessage
+  // variant in extractToolMediaAsUserMessages.ts).
+  const pools: ToolMediaPools = {
+    extractionsByPart: new Map(),
+    totalAttachments: 0,
+    reservedMediaParts: 0,
+    syntheticMediaParts: [],
+  };
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) collectMessageMedia(part, pools);
+    if (message.role !== "assistant" && message.role !== "tool") continue;
+    for (const part of message.content) {
+      if (part.type === "tool-result") collectToolResultMedia(part, pools);
+    }
+  }
+  return pools;
+}
+
+/**
+ * Existing media parts share the same per-request provider limits as new
+ * extractions (r31), but they split into two pools:
+ * - reserved: genuine user uploads (unmarked) — consume the allowance and
+ *   are never evicted.
+ * - synthetic tool media (marker from a prior history-level extraction) —
+ *   evictable oldest-first so a fresh screenshot from the current tool call
+ *   still reaches the model at saturation (r34).
+ */
+interface ToolMediaPools {
+  extractionsByPart: Map<object, NonNullable<ReturnType<typeof extractAttachmentsFromToolOutput>>>;
+  totalAttachments: number;
+  reservedMediaParts: number;
+  syntheticMediaParts: unknown[];
+}
+
+function collectMessageMedia(part: unknown, pools: ToolMediaPools): void {
+  const partType = (part as { type?: unknown }).type;
+  if (partType !== "image" && partType !== "file") return;
+  if (isSyntheticToolMediaPart(part)) {
+    pools.syntheticMediaParts.push(part);
+  } else {
+    pools.reservedMediaParts++;
+  }
+}
+
+function collectToolResultMedia(part: ToolResultPart, pools: ToolMediaPools): void {
+  // Media an earlier step already inlined into a tool result (deferred
+  // server tool, see holdsDeferredProviderToolCall) stays where it is, so
+  // it reserves its share of the request-wide cap.
+  if (part.output.type === "content") {
+    pools.reservedMediaParts += part.output.value.filter(isSyntheticToolMediaPart).length;
+  }
+  const extracted = extractAttachmentsFromToolOutput(part.output as unknown);
+  if (extracted == null) {
+    // MCP images stay inside the tool result (mcpToModelOutput), unmarked: evictable
+    // like synthetic tool media, or a screenshot loop could pass the provider's limit.
+    pools.syntheticMediaParts.push(...unmarkedToolResultMedia(part.output));
+    return;
+  }
+  pools.extractionsByPart.set(part, extracted);
+  pools.totalAttachments += extracted.attachments.length;
+}
+
+/** Media items a tool result carries inline without the synthetic marker (MCP images). */
+function unmarkedToolResultMedia(output: ToolResultOutput): unknown[] {
+  if (output.type !== "content") return [];
+  return output.value.filter((item) => {
+    const type = (item as { type?: unknown }).type;
+    return (
+      (type === "file" || type === "file-data" || type === "image-data") &&
+      !isSyntheticToolMediaPart(item)
+    );
+  });
+}
+
+/** Replaces evicted inline media of one tool result with one cap note (same part if none). */
+function evictToolResultMedia(part: ToolResultPart, evicted: ReadonlySet<unknown>): ToolResultPart {
+  if (evicted.size === 0 || part.output.type !== "content") return part;
+  const value = part.output.value;
+  const evictedHere = value.filter((item) => evicted.has(item)).length;
+  if (evictedHere === 0) return part;
+  const kept = value.filter((item) => !evicted.has(item));
+  const note = { type: "text" as const, text: createOmittedToolAttachmentText(evictedHere) };
+  return { ...part, output: { type: "content", value: [...kept, note] } };
+}
+
 function evictSyntheticMediaParts(
   message: Extract<ModelMessage, { role: "user" }>,
   evictedSyntheticParts: ReadonlySet<unknown>
