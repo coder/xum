@@ -995,6 +995,21 @@ const UpdateReviewPanel: React.FC<{
   );
 };
 
+/**
+ * The plugin list and the pending sign-out status (#6627). Opening the section retries the
+ * sign-outs, so the status is read after the list. When the record existed before the list and is
+ * gone after it, the list may still hold rows the fence hid: list once more.
+ */
+async function listWithSignOuts(api: NonNullable<ReturnType<typeof useAPI>["api"]>) {
+  const readStatus = () => api.agentPlugins.pendingSignOuts().catch(() => null);
+  const before = await readStatus();
+  let result = await api.agentPlugins.list();
+  const signOuts = await readStatus();
+  if (before !== null && before.kind !== "none" && signOuts?.kind === "none")
+    result = await api.agentPlugins.list();
+  return { result, signOuts };
+}
+
 /** How often the section re-reads a pending sign-out record (the backend retries every 30 s). */
 const PENDING_SIGN_OUT_POLL_MS = 30_000;
 
@@ -1269,9 +1284,7 @@ export const PluginsSettingsSection: React.FC = () => {
     // response resolving last would resurrect removed rows or old versions.
     const generation = ++listGenerationRef.current;
     try {
-      const result = await api.agentPlugins.list();
-      // Read after the list: opening the section retries the pending sign-outs first.
-      const signOuts = await api.agentPlugins.pendingSignOuts().catch(() => null);
+      const { result, signOuts } = await listWithSignOuts(api);
       if (generation !== listGenerationRef.current) {
         return; // A newer list request superseded this one.
       }
