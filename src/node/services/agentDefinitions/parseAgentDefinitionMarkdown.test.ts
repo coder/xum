@@ -159,7 +159,8 @@ Body
     });
 
     test("Claude tools and disallowedTools lists narrow the base's tools", () => {
-      // todo_sync and github_create_issue stand for MCP tools (`<server>_<tool>`).
+      // todo_sync and github_create_issue stand for MCP tools (`<server>_<tool>`), and so
+      // can url_context: MCP naming reserves only Xum's own tool names.
       const sample = [
         "file_read",
         "attach_file",
@@ -168,6 +169,7 @@ Body
         "bash_output",
         "task",
         "task_await",
+        "task_remove",
         "workflow_run",
         "web_fetch",
         "url_context",
@@ -176,6 +178,8 @@ Body
         "todo_sync",
         "memory",
         "github_create_issue",
+        "artifact",
+        "artifact_read",
       ];
       // Exec enables every tool; the mapped tools.remove patterns narrow it.
       const toolsOf = (frontmatter: string) => {
@@ -199,6 +203,15 @@ Body
         "todo_write",
         "todo_read",
       ]);
+      // A Claude tool grants only the Xum tools that do the same narrow job: Artifact
+      // publishes but does not read shelves, TaskCreate cannot get todo_write (it
+      // replaces the whole list), and provider-native names are never granted.
+      expect(toolsOf("name: a\ntools: Artifact, TaskCreate, Read")).toEqual([
+        "file_read",
+        "attach_file",
+        "artifact",
+      ]);
+      expect(toolsOf("name: a\ntools: WebFetch, WebSearch")).toEqual(["web_fetch"]);
       // A read-only Claude tool grants only the read-only Xum tool.
       expect(toolsOf("name: a\ntools: TaskList, Read")).toEqual([
         "file_read",
@@ -219,9 +232,13 @@ Body
         "attach_file",
         "task",
         "task_await",
+        "task_remove",
         "workflow_run",
+        "todo_sync",
         "memory",
         "github_create_issue",
+        "artifact",
+        "artifact_read",
       ]);
       // A denylist of tools Xum does not have removes nothing: the agent keeps Exec's tools.
       expect(parse("name: a\ndisallowedTools: Grep", "plugin").tools).toBeUndefined();
