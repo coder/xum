@@ -754,6 +754,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     reorderPinnedWorkspaces,
     refreshWorkspaceMetadata,
     pendingNewWorkspaceProject,
+    pendingNewWorkspaceSubProjectPath,
     pendingNewWorkspaceDraftId,
     workspaceDraftsByProject,
     workspaceDraftPromotionsByProject,
@@ -1988,27 +1989,49 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const hasProjectMenuTarget = projectMenuTargetPath !== null;
 
-  // useCallback for the keyboard effect's dependency list, not for memoization.
-  const addChatBesideSelection = useCallback(
-    (selection: WorkspaceSelection) => {
-      const meta = workspaceStore.getWorkspaceMetadata(selection.workspaceId);
+  // Ctrl+N and the collapsed sidebar's header New chat: beside the selected chat, else in the open
+  // draft page's project. useCallback for the effects' dependency lists, not for memoization.
+  const handleNewChat = useCallback(() => {
+    if (selectedWorkspace) {
+      // Sub-project workspaces share the parent worktree, so recover the child
+      // target from the live sidebar metadata before opening a sibling draft.
+      const meta = workspaceStore.getWorkspaceMetadata(selectedWorkspace.workspaceId);
       if (meta) {
         handleAddSiblingWorkspace(meta);
       } else {
-        handleAddWorkspace(selection.projectPath);
+        handleAddWorkspace(selectedWorkspace.projectPath);
       }
-    },
-    [workspaceStore, handleAddSiblingWorkspace, handleAddWorkspace]
-  );
+    } else if (pendingNewWorkspaceProject === SCRATCH_PROJECT_CONFIG_KEY) {
+      handleAddScratchWorkspace();
+    } else if (pendingNewWorkspaceProject) {
+      handleAddWorkspace(
+        pendingNewWorkspaceProject,
+        pendingNewWorkspaceSubProjectPath ?? undefined
+      );
+    }
+  }, [
+    selectedWorkspace,
+    pendingNewWorkspaceProject,
+    pendingNewWorkspaceSubProjectPath,
+    workspaceStore,
+    handleAddSiblingWorkspace,
+    handleAddScratchWorkspace,
+    handleAddWorkspace,
+  ]);
+
+  // The collapsed sidebar's New chat lives in the page headers (WorkspaceMenuBar and the draft
+  // pages), which ask this always-mounted sidebar to run it.
+  useEffect(() => {
+    window.addEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, handleNewChat);
+    return () => window.removeEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, handleNewChat);
+  }, [handleNewChat]);
 
   // Handle keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Sub-project workspaces share the parent worktree, so recover the child
-      // target from the live sidebar metadata before opening a sibling draft.
-      if (matchesKeybind(e, KEYBINDS.NEW_WORKSPACE) && selectedWorkspace) {
+      if (matchesKeybind(e, KEYBINDS.NEW_WORKSPACE)) {
         e.preventDefault();
-        addChatBesideSelection(selectedWorkspace);
+        handleNewChat();
       } else if (matchesKeybind(e, KEYBINDS.ARCHIVE_WORKSPACE) && selectedWorkspace) {
         e.preventDefault();
         void handleArchiveWorkspace(selectedWorkspace.workspaceId);
@@ -2040,7 +2063,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   }, [
     closeProjectContextMenu,
     selectedWorkspace,
-    addChatBesideSelection,
+    handleNewChat,
     handleArchiveWorkspace,
     setWorkspacePinned,
     movePinnedWorkspace,
@@ -2482,20 +2505,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       handleAddScratchWorkspace();
     }
   };
-
-  // The collapsed sidebar's "New chat" lives in the page header (WorkspaceMenuBar and the draft
-  // pages), which asks this always-mounted sidebar to run the same logic.
-  useEffect(() => {
-    const handler = () => {
-      if (selectedWorkspace) {
-        addChatBesideSelection(selectedWorkspace);
-      } else {
-        handleAddFlatWorkspace();
-      }
-    };
-    window.addEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, handler);
-    return () => window.removeEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, handler);
-  });
 
   const flatSidebarContent = (
     <div className="py-1">

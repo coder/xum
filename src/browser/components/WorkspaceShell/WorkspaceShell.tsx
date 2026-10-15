@@ -3,6 +3,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@/common/lib/utils";
 import { Button } from "../Button/Button";
 import { LazyFeature } from "../LazyFeature/LazyFeature";
+import { CollapsedSidebarHeaderBar } from "../SidebarCollapseButton/SidebarCollapseButton";
 import {
   LEFT_SIDEBAR_WIDTH_KEY,
   RIGHT_SIDEBAR_COLLAPSED_KEY,
@@ -230,16 +231,19 @@ const WorkspacePlaceholder: React.FC<{
   description?: string;
   className?: string;
   showAnimation?: boolean;
+  /** Set while the left sidebar is collapsed: the placeholder then carries its reopen control. */
+  onOpenLeftSidebar?: () => void;
 }> = (props) => (
   // `main`: the placeholder stands in for ChatPane, which holds the page's `main` landmark. Each
   // page needs exactly one (Lighthouse landmark-one-main, #5998).
   <main
     className={cn(
-      "relative flex flex-1 flex-row bg-surface-primary text-light overflow-x-auto overflow-y-hidden [@media(max-width:768px)]:flex-col",
+      "relative flex flex-1 flex-col bg-surface-primary text-light overflow-x-auto overflow-y-hidden",
       props.className
     )}
     style={{ containerType: "inline-size" }}
   >
+    {props.onOpenLeftSidebar && <CollapsedSidebarHeaderBar onToggle={props.onOpenLeftSidebar} />}
     <div className="pointer-events-none absolute right-[15px] bottom-[15px] left-[15px] z-[1000] [&>*]:pointer-events-auto">
       <ConnectionStatusToast wrap={false} />
     </div>
@@ -443,6 +447,9 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         title="Loading workspace..."
         showAnimation
         className={props.className}
+        onOpenLeftSidebar={
+          props.leftSidebarCollapsed ? props.onToggleLeftSidebarCollapsed : undefined
+        }
       />
     );
   }
@@ -453,6 +460,9 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         title="No Workspace Selected"
         description="Select a workspace from the sidebar to view and interact with Claude"
         className={props.className}
+        onOpenLeftSidebar={
+          props.leftSidebarCollapsed ? props.onToggleLeftSidebarCollapsed : undefined
+        }
       />
     );
   }

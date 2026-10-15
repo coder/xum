@@ -2,7 +2,7 @@ import React from "react";
 import { PanelLeft, SquarePen } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { cn } from "@/common/lib/utils";
@@ -48,9 +48,12 @@ export const SidebarCollapseButton: React.FC<SidebarCollapseButtonProps> = (prop
 
 /**
  * Page-header controls that stand in for the collapsed left sidebar: its toggle, its "New chat"
- * action, and a divider before the page's own header content.
+ * action, and (with `divider`) a line before the page's own header title.
  */
-export const CollapsedSidebarHeaderControls: React.FC<{ onToggle: () => void }> = (props) => (
+export const CollapsedSidebarHeaderControls: React.FC<{
+  onToggle: () => void;
+  divider?: boolean;
+}> = (props) => (
   <div className={cn("flex shrink-0 items-center gap-1", isDesktopMode() && "titlebar-no-drag")}>
     <SidebarCollapseButton collapsed onToggle={props.onToggle} className="mobile-menu-btn" />
     <Tooltip>
@@ -67,6 +70,23 @@ export const CollapsedSidebarHeaderControls: React.FC<{ onToggle: () => void }> 
       </TooltipTrigger>
       <TooltipContent>New chat ({formatKeybind(KEYBINDS.NEW_WORKSPACE)})</TooltipContent>
     </Tooltip>
-    <div aria-hidden className="bg-border-light mx-1.5 h-4 w-px" />
+    {props.divider && <div aria-hidden className="bg-border-light mx-1.5 h-4 w-px" />}
+  </div>
+);
+
+/**
+ * A header with only those controls, for workspace states without a header of their own (an
+ * incompatible workspace, the loading placeholder). The collapsed sidebar has no width, so without
+ * it a pointer user could not reopen the sidebar from these states.
+ */
+export const CollapsedSidebarHeaderBar: React.FC<{ onToggle: () => void }> = (props) => (
+  <div
+    className={cn(
+      "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2 [@media(max-width:768px)]:h-auto [@media(max-width:768px)]:py-2",
+      LEFT_SIDEBAR_TOGGLE_HOST_CLASS,
+      isDesktopMode() ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
+    )}
+  >
+    <CollapsedSidebarHeaderControls onToggle={props.onToggle} />
   </div>
 );

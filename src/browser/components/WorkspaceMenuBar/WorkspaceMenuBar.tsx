@@ -698,7 +698,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         )}
       >
         {leftSidebarCollapsed && (
-          <CollapsedSidebarHeaderControls onToggle={onToggleLeftSidebarCollapsed} />
+          <CollapsedSidebarHeaderControls onToggle={onToggleLeftSidebarCollapsed} divider />
         )}
         <WorkspaceHeaderTitle
           workspaceId={workspaceId}
