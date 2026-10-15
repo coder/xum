@@ -111,39 +111,56 @@ const keepContextRow = (message: MuxMessage) =>
 function placeRowsAfterTheTurnThatMissedThem(messages: MuxMessage[]): MuxMessage[] {
   let ordered: MuxMessage[] | undefined;
   for (let index = 0; index < messages.length; index++) {
-    const message = messages[index];
-    const requestSequence = message.metadata?.requestHistorySequence;
-    const sequence = message.metadata?.historySequence;
-    if (message.role !== "assistant" || requestSequence == null || sequence == null) {
-      ordered?.push(message);
-      continue;
-    }
-    // Late rows sit directly before the assistant row, since history is in sequence order.
-    // The walk stops at an assistant row, so it never reaches rows an earlier turn moved.
-    let lateStart = index;
-    while (lateStart > 0) {
-      const previous = messages[lateStart - 1];
-      const previousSequence = previous.metadata?.historySequence;
-      if (
-        previous.role === "assistant" ||
-        previousSequence == null ||
-        previousSequence <= requestSequence ||
-        previousSequence >= sequence
-      ) {
-        break;
-      }
-      lateStart--;
-    }
-    if (lateStart === index) {
-      ordered?.push(message);
+    const missedCount = countRowsTheRequestMissed(messages, index);
+    if (missedCount === 0) {
+      ordered?.push(messages[index]);
       continue;
     }
     ordered ??= messages.slice(0, index);
-    // Earlier iterations copied the late rows already; they are the tail of `ordered`.
-    const lateRows = ordered.splice(ordered.length - (index - lateStart));
-    ordered.push(message, ...lateRows);
+    // Earlier iterations copied the missed rows already; they are the tail of `ordered`.
+    const missedRows = ordered.splice(ordered.length - missedCount);
+    ordered.push(messages[index], ...missedRows);
   }
   return ordered ?? messages;
+}
+
+/** Rows directly before an assistant row that its request did not include (0 for other rows). */
+function countRowsTheRequestMissed(messages: MuxMessage[], index: number): number {
+  const { requestHistorySequence, historySequence } = messages[index].metadata ?? {};
+  if (
+    messages[index].role !== "assistant" ||
+    requestHistorySequence == null ||
+    historySequence == null
+  ) {
+    return 0;
+  }
+  // History is in sequence order, so the missed rows sit directly before the assistant row.
+  let count = 0;
+  while (
+    count < index &&
+    isRowAfterRequest(messages[index - count - 1], requestHistorySequence, historySequence)
+  ) {
+    count++;
+  }
+  return count;
+}
+
+/**
+ * A row between a request's history read and its assistant row. Assistant rows never count,
+ * so the walk stops before rows that an earlier turn already moved.
+ */
+function isRowAfterRequest(
+  row: MuxMessage,
+  requestHistorySequence: number,
+  assistantHistorySequence: number
+): boolean {
+  const sequence = row.metadata?.historySequence;
+  return (
+    row.role !== "assistant" &&
+    sequence != null &&
+    sequence > requestHistorySequence &&
+    sequence < assistantHistorySequence
+  );
 }
 
 /**
