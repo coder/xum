@@ -123,6 +123,29 @@ function rowText(row: MuxMessage): string {
 }
 
 /**
+ * The segment's frozen system tail and the rows recorded after it put back, or undefined
+ * before a freeze (see planVolatileSystemTail). `appliedTail` is the tail the model already reads: the last row put back, else the frozen
+ * one. Not the last record's: withRecordedRows can skip that row, and then the model never
+ * reads it (a reasoning-only partial the empty-row filter dropped when the row was recorded
+ * can come back between the user row and the row's assistant row on a thinking-on rebuild).
+ */
+function restoreFrozenSegment(
+  messages: MuxMessage[]
+): (Omit<VolatileSystemTailPlan, "appendedRow" | "record"> & { appliedTail: string }) | undefined {
+  const records = readSegmentRecords(messages);
+  const freeze = records.findLastIndex(([, record]) => record.placement === "system");
+  if (freeze < 0) return undefined;
+  const systemTail = records[freeze][1].text;
+  const restored = withRecordedRows(messages, new Map(records.slice(freeze + 1)));
+  return {
+    systemTail,
+    messages: restored.messages,
+    rowsText: restored.rowsText,
+    appliedTail: restored.lastTail ?? systemTail,
+  };
+}
+
+/**
  * Replay only: the turn envelope records the system tail the request SENT (the frozen one), so
  * the live tail comes from the planner's own rules. A recorded change names it, and without a
  * record it equals the tail the request already applied (or the sent tail itself, before any
@@ -156,20 +179,9 @@ export function planVolatileSystemTail(
 ): VolatileSystemTailPlan {
   if (!rowsSupported) return { systemTail: requestTail, messages, rowsText: "" };
   assert(requestTail !== "", "a volatile-tail row needs a non-empty tail");
-  const records = readSegmentRecords(messages);
-  const freeze = records.findLastIndex(([, record]) => record.placement === "system");
-  const restored =
-    freeze < 0
-      ? undefined
-      : {
-          systemTail: records[freeze][1].text,
-          ...withRecordedRows(messages, new Map(records.slice(freeze + 1))),
-        };
-  // The tail the model already reads: the last row put back, else the frozen one. Not the
-  // last record's: withRecordedRows can skip that row, and then the model never reads it.
-  const appliedTail = restored && (restored.lastTail ?? restored.systemTail);
+  const restored = restoreFrozenSegment(messages);
   const liveTail = replayedTurn
-    ? replayedLiveTail(appliedTail, requestTail, replayedTurn.record)
+    ? replayedLiveTail(restored?.appliedTail, requestTail, replayedTurn.record)
     : requestTail;
   // Segment start (or a history from before this rule), or a re-freeze below: send as before,
   // with no earlier rows, and freeze here.
@@ -180,11 +192,7 @@ export function planVolatileSystemTail(
     record: { text: liveTail, placement: "system" },
   };
   if (restored == null) return asBefore;
-  const withRows = {
-    systemTail: restored.systemTail,
-    messages: restored.messages,
-    rowsText: restored.rowsText,
-  };
+  const { appliedTail, ...withRows } = restored;
   if (liveTail === appliedTail) return withRows;
   // A row must follow a user message. Otherwise (a resume after an assistant row) send the new
   // tail as before, which re-freezes the segment at it.
