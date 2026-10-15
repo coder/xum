@@ -4,9 +4,9 @@ import { AgentSkillPackageSchema } from "@/common/orpc/schemas/agentSkill";
 import { MAX_FILE_CONTENT_SIZE } from "@/common/constants/attachments";
 import { extractLoadedSkillSnapshotsFromMessages } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import {
-  KERNEL_COMPACT_ARGS_CAP_BYTES,
   KERNEL_RETAINED_CONTAINER_MAX_PARTS,
   KERNEL_RETAINED_MEDIA_BUDGET_BYTES,
+  KERNEL_RETAINED_PATH_MAX_BYTES,
 } from "@/constants/kernelOutput";
 import {
   createCaptureSanitizerBudget,
@@ -214,16 +214,37 @@ describe("retainExemptKernelRecordResult", () => {
     });
 
     it("drops an oversized location value instead of cutting it", () => {
-      // A cut path would name the wrong directory.
-      const skillDir = "/home/user/.xum/skills/demo";
+      // A cut path would name the wrong directory. Paths past the 2 KiB args
+      // preview but within the path limit are valid and kept.
+      const skillDir = `/home/${"d".repeat(3000)}/skills/demo`;
       const retained = retainExemptKernelRecordResult("agent_skill_read", {
         success: true,
         skill,
         skillDir,
-        pluginRoot: "/p".repeat(KERNEL_COMPACT_ARGS_CAP_BYTES),
+        pluginRoot: "/p".repeat(KERNEL_RETAINED_PATH_MAX_BYTES),
       }) as { skillDir?: string; pluginRoot?: string };
       expect(retained?.pluginRoot).toBeUndefined();
       expect(retained?.skillDir).toBe(skillDir);
+    });
+
+    it("keeps the skill without its location when the location leaves no body budget", () => {
+      // Before the location fields were retained, this package fit (with a
+      // truncated body). The fields are optional: losing them must not lose
+      // the skill instructions.
+      const note = "\n\n[Skill body truncated at capture to fit the retained-record cap]";
+      const noteChars = JSON.stringify(note).length - 2;
+      const emptyBodySkill = { ...skill, body: "", pad: "" };
+      const overheadEmpty = JSON.stringify({ success: true, skill: emptyBodySkill }).length;
+      // Leaves 10 chars of body budget without the location fields.
+      const pad = "p".repeat(MAX_FILE_CONTENT_SIZE - overheadEmpty - noteChars - 10);
+      const retained = retainExemptKernelRecordResult("agent_skill_read", {
+        success: true,
+        skill: { ...skill, body: "B".repeat(MAX_FILE_CONTENT_SIZE), pad },
+        skillDir: "/home/user/.xum/skills/demo",
+      }) as { skillDir?: string; skill?: unknown };
+      expect(AgentSkillPackageSchema.safeParse(retained?.skill).success).toBe(true);
+      expect(retained?.skillDir).toBeUndefined();
+      expect(JSON.stringify(retained).length).toBeLessThanOrEqual(MAX_FILE_CONTENT_SIZE);
     });
   });
 
