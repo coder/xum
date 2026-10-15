@@ -14,11 +14,13 @@ import {
   serverConsentFingerprint,
   skillConsentFingerprint,
   workflowConsentFingerprint,
+  agentConsentFingerprint,
   type ComponentConsent,
 } from "./componentConsent";
 import { discoverAgentPluginAt, type AgentPluginScope } from "./discovery";
 import { getPluginDataPath, loadPluginMcpServers, resolvePluginInstanceId } from "./mcpConfig";
 import { listPluginWorkflowFiles } from "./workflowFiles";
+import { listPluginAgentFiles } from "./agentFiles";
 
 /** Valid managed registry row; tests override individual fields to exercise corruption. */
 export function createTestPluginInstallEntry(
@@ -63,7 +65,7 @@ export async function reviewedComponentConsent(args: {
       `reviewedComponentConsent: not a plugin: ${diagnostics.map((d) => d.message).join("; ")}`
     );
   }
-  const consent: ComponentConsent = { skills: {}, mcpServers: {}, workflows: {} };
+  const consent: ComponentConsent = { skills: {}, mcpServers: {}, workflows: {}, agents: {} };
   for (const skillsDir of plugin.skillsDirs ?? []) {
     for (const dirName of await fs.readdir(skillsDir)) {
       const directoryName = SkillNameSchema.safeParse(dirName);
@@ -106,6 +108,10 @@ export async function reviewedComponentConsent(args: {
     if (plugin.workflowsDir === undefined) break;
     const source = await fs.readFile(path.join(plugin.workflowsDir, file), "utf8");
     if (source.length > 0) consent.workflows[file] = workflowConsentFingerprint({ file, source });
+  }
+  // Agents (#6629), listed and parsed the way the install review does.
+  for (const agent of await listPluginAgentFiles(plugin.agentsDir)) {
+    consent.agents[agent.id] = agentConsentFingerprint(agent);
   }
   return consent;
 }

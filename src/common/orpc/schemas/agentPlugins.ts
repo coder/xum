@@ -215,7 +215,7 @@ export const AgentPluginUpdateCheckSchema = z.object({
  * match, so a component that changed after the review never gets consent.
  */
 export const AgentPluginComponentRefSchema = z.object({
-  kind: z.enum(["skills", "mcpServers", "workflows"]),
+  kind: z.enum(["skills", "mcpServers", "workflows", "agents"]),
   name: z.string(),
   fingerprint: z.string(),
 });

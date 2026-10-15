@@ -36,8 +36,6 @@ import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
 import type { Config } from "@/node/config";
-import { AgentIdSchema } from "@/common/schemas/ids";
-import { parseAgentDefinitionMarkdown } from "@/node/services/agentDefinitions/parseAgentDefinitionMarkdown";
 import {
   SkillNameSchema,
   resolveSkillAdvertise,
@@ -81,6 +79,7 @@ import {
   type AgentPluginInfo,
 } from "./discovery";
 import { listPluginWorkflowFiles } from "./workflowFiles";
+import { listPluginAgentFiles, type PluginAgentFile } from "./agentFiles";
 import { checkLogoImage } from "./imageHeader";
 import {
   consentForSelection,
@@ -88,6 +87,8 @@ import {
   isComponentConsented,
   recordReviewedComponents,
   isImportedComponent,
+  agentConsentDetail,
+  agentConsentFingerprint,
   workflowConsentDetail,
   workflowConsentFingerprint,
   serverConsentDetail,
@@ -353,7 +354,8 @@ function unreviewedRows(
   surface: {
     skills: Map<string, SurfaceSkill>;
     servers: Map<string, SurfaceServer>;
-    workflows: Map<string, SurfaceWorkflow>;
+    workflows: Map<string, SurfaceWhole>;
+    agents: Map<string, SurfaceWhole>;
   }
 ): AgentPluginCapabilityChange[] {
   return [
@@ -364,6 +366,7 @@ function unreviewedRows(
     ...[...surface.workflows].flatMap(([name, item]) =>
       unreviewedRow(entry, "workflows", name, item)
     ),
+    ...[...surface.agents].flatMap(([name, item]) => unreviewedRow(entry, "agents", name, item)),
   ];
 }
 
@@ -371,6 +374,7 @@ const COMPONENT_LABELS: Record<keyof ComponentConsent, string> = {
   skills: "Skill",
   mcpServers: "MCP server",
   workflows: "Workflow",
+  agents: "Agent",
 };
 
 function reviewedBefore(
@@ -387,7 +391,7 @@ function unreviewedRow(
   entry: AgentPluginInstallEntry,
   kind: keyof ComponentConsent,
   name: string,
-  item: SurfaceSkill | SurfaceServer | SurfaceWorkflow
+  item: SurfaceSkill | SurfaceServer | SurfaceWhole
 ): AgentPluginCapabilityChange[] {
   const imported = isImportedComponent(entry.importedComponents, kind, name);
   const fingerprint = item.consentFingerprint;
@@ -403,30 +407,29 @@ function unreviewedRow(
 }
 
 /**
- * Update rows for workflow scripts (#6629). A script executes, so a new or changed one needs a
- * review, and confirming the update records it. Removals apply without one.
+ * Update rows for workflow scripts and agents (#6629). A script executes and an agent's frontmatter
+ * sets its tools and runnability, so a new or changed one needs a review, and confirming the
+ * update records it. Removals apply without one.
  */
-function workflowChanges(
-  staged: ReadonlyMap<string, SurfaceWorkflow>,
-  /** The installed tree's surface; absent when it is missing or invalid (all staged is new). */
-  current: { workflows: ReadonlyMap<string, SurfaceWorkflow> } | undefined
+function wholeComponentChanges(
+  kind: "workflows" | "agents",
+  staged: ReadonlyMap<string, SurfaceWhole>,
+  /** The installed tree's components of this kind; absent when the tree is missing or invalid. */
+  current: ReadonlyMap<string, SurfaceWhole> | undefined
 ): AgentPluginCapabilityChange[] {
-  return [...staged].flatMap(([file, workflow]) => {
-    const component = {
-      kind: "workflows" as const,
-      name: file,
-      fingerprint: workflow.consentFingerprint,
-    };
-    const before = current?.workflows.get(file);
+  const label = COMPONENT_LABELS[kind].toLowerCase();
+  return [...staged].flatMap(([name, item]) => {
+    const component = { kind, name, fingerprint: item.consentFingerprint };
+    const before = current?.get(name);
     if (before === undefined) {
-      return [{ summary: `adds workflow '${file}'`, after: reviewText(workflow), component }];
+      return [{ summary: `adds ${label} '${name}'`, after: reviewText(item), component }];
     }
-    if (before.consentFingerprint === workflow.consentFingerprint) return [];
+    if (before.consentFingerprint === item.consentFingerprint) return [];
     return [
       {
-        summary: `changes workflow '${file}'`,
+        summary: `changes ${label} '${name}'`,
         before: reviewText(before),
-        after: reviewText(workflow),
+        after: reviewText(item),
         component,
       },
     ];
@@ -872,8 +875,20 @@ interface SurfaceSkill {
   consentDetail: () => string;
 }
 
-/** A workflow script (#6629): its source is code, so the review shows all of it. */
-interface SurfaceWorkflow {
+/** The consent view of one plugin agent (#6629). */
+function agentSurface(agent: PluginAgentFile): SurfaceWhole {
+  return {
+    consentFingerprint: agentConsentFingerprint(agent),
+    display: `Agent ${agent.id} (agents file ${agent.name})`,
+    consentDetail: () => agentConsentDetail(agent),
+  };
+}
+
+/**
+ * A component the picker does not select (#6629): a workflow script, whose review shows all of
+ * its source, or an agent, whose review shows its frontmatter.
+ */
+interface SurfaceWhole {
   consentFingerprint: string;
   display: string;
   consentDetail: () => string;
@@ -2203,9 +2218,10 @@ export class AgentPluginInstallService {
      * compared), display (the advertisement as the model sees it) }.
      */
     skills: Map<string, SurfaceSkill>;
-    agents: Map<string, string>;
+    /** agent ID → consent view (#6629): any frontmatter change is a change. */
+    agents: Map<string, SurfaceWhole>;
     /** file → consent view (#6629): any byte change of a script is a change. */
-    workflows: Map<string, SurfaceWorkflow>;
+    workflows: Map<string, SurfaceWhole>;
     components: Set<string>;
   }> {
     const hook = this.collectHook(plugin);
@@ -2218,10 +2234,9 @@ export class AgentPluginInstallService {
         consentDetail: skill.consentDetail,
       });
     }
-    const agents = new Map<string, string>();
-    for (const agent of await this.collectAgentFiles(plugin.agentsDir)) {
-      agents.set(agent.name, agent.fingerprint);
-    }
+    const agents = new Map(
+      (await listPluginAgentFiles(plugin.agentsDir)).map((agent) => [agent.id, agentSurface(agent)])
+    );
     const workflows = new Map(
       (await this.collectWorkflowScripts(plugin, warnings)).map((w) => [w.file, w] as const)
     );
@@ -2421,21 +2436,9 @@ export class AgentPluginInstallService {
     // Agent definitions: the description injects into the task tool's
     // model-visible prompt and runnable/base/policy change execution
     // privileges, so a changed definition behind an unchanged filename is
-    // gated exactly like an addition. The fingerprint is the key-sorted
-    // frontmatter JSON, which is also the most faithful thing to show.
-    for (const [agentName, fingerprint] of staged.agents) {
-      const currentFingerprint = current?.agents.get(agentName);
-      if (currentFingerprint === undefined) {
-        changes.push({ summary: `adds agent ${agentName}`, after: fingerprint });
-      } else if (currentFingerprint !== fingerprint) {
-        changes.push({
-          summary: `changes the definition of agent ${agentName}`,
-          before: currentFingerprint,
-          after: fingerprint,
-        });
-      }
-    }
-    changes.push(...workflowChanges(staged.workflows, current));
+    // gated exactly like an addition.
+    changes.push(...wholeComponentChanges("agents", staged.agents, current?.agents));
+    changes.push(...wholeComponentChanges("workflows", staged.workflows, current?.workflows));
     // Consent covered a specific component set; additions need a new preview.
     for (const component of staged.components) {
       if (!(current?.components.has(component) ?? false)) {
@@ -2454,10 +2457,10 @@ export class AgentPluginInstallService {
   private async collectWorkflowScripts(
     plugin: AgentPluginInfo,
     warnings: string[]
-  ): Promise<Array<SurfaceWorkflow & { file: string }>> {
+  ): Promise<Array<SurfaceWhole & { file: string }>> {
     const workflowsDir = plugin.workflowsDir;
     if (workflowsDir === undefined) return [];
-    const scripts: Array<SurfaceWorkflow & { file: string }> = [];
+    const scripts: Array<SurfaceWhole & { file: string }> = [];
     for (const file of await listPluginWorkflowFiles(workflowsDir)) {
       let source: string;
       try {
@@ -2485,84 +2488,6 @@ export class AgentPluginInstallService {
       });
     }
     return scripts;
-  }
-
-  /**
-   * Agent definition files (agents/*.md) for the consent preview, mirroring
-   * runtime discovery exactly (agentDefinitionsService): only REGULAR files
-   * (symlinks never load) whose basename parses as a valid agent ID AND
-   * whose CONTENT parses as a runtime-valid definition (size cap included).
-   * Filename-only fingerprinting would let an update repair a malformed
-   * agents/foo.md in place — identical component sets on both sides — and
-   * introduce a runnable agent without re-consent; the preview could
-   * likewise advertise an agent that never loads.
-   */
-  private async collectAgentFiles(
-    dir: string | undefined
-  ): Promise<Array<{ name: string; fingerprint: string }>> {
-    if (dir === undefined) {
-      return [];
-    }
-    let entries;
-    try {
-      entries = await fsPromises.readdir(dir, { withFileTypes: true });
-    } catch {
-      return [];
-    }
-    const agents: Array<{ name: string; fingerprint: string }> = [];
-    // Runtime discovery dedupes by normalized agent ID with the first
-    // successfully parsed file winning (discoverAgentDefinitions sets byId
-    // once per ID, in the same readdir enumeration order used here). Mirror
-    // that: on a case-sensitive filesystem agents/foo.md and agents/FOO.md
-    // are ONE loadable agent, so the preview must promise one row and the
-    // capability surface must not fingerprint a definition that never loads.
-    const seenAgentIds = new Set<string>();
-    for (const entry of entries) {
-      const agentIdParse = AgentIdSchema.safeParse(
-        path.parse(entry.name).name.trim().toLowerCase()
-      );
-      if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".md") || !agentIdParse.success) {
-        continue;
-      }
-      if (seenAgentIds.has(agentIdParse.data)) {
-        continue;
-      }
-      let frontmatter: unknown;
-      try {
-        const filePath = path.join(dir, entry.name);
-        const stat = await fsPromises.stat(filePath);
-        // Size-check BEFORE reading (mirroring runtime discovery): the parse
-        // below applies the same cap, but only after the whole file has been
-        // read and UTF-8-decoded — an untrusted repo pouring its checkout
-        // quota into one agents/*.md could stall the main process first.
-        if (stat.size > MAX_FILE_SIZE) {
-          continue;
-        }
-        const content = await fsPromises.readFile(filePath, "utf8");
-        // Throws on malformed frontmatter or oversized content — exactly the
-        // definitions runtime discovery would skip.
-        frontmatter = parseAgentDefinitionMarkdown({
-          content,
-          byteSize: stat.size,
-          plugin: { agentId: agentIdParse.data },
-        }).frontmatter;
-      } catch {
-        continue;
-      }
-      // Seen only AFTER a successful parse, mirroring runtime dedupe: when
-      // the enumeration-order winner is malformed (skipped above), the next
-      // same-ID file is the one that actually loads.
-      seenAgentIds.add(agentIdParse.data);
-      // Fingerprint the WHOLE parsed frontmatter (key-sorted so YAML
-      // reordering is not a change): description injects into the task
-      // tool's model-visible prompt, subagent.runnable/ui gate invocability,
-      // and base/tool policy change execution privileges. Any frontmatter
-      // change on an unchanged filename is re-consent territory; the BODY
-      // (system prompt) loads only on explicit invocation and rides the
-      // normal tree replacement like skill bodies.
-      agents.push({ name: entry.name, fingerprint: stableStringify(frontmatter) });
-    }
-    return agents.sort((a, b) => a.name.localeCompare(b.name));
   }
 
   /**
@@ -2899,7 +2824,7 @@ export class AgentPluginInstallService {
       const codexHooks = await loadPluginCodexHooks(plugin);
       warnings.push(...codexHooks.warnings);
       const openaiInterface = await interfaceSummary(plugin, warnings);
-      const agents = (await this.collectAgentFiles(plugin.agentsDir)).map((agent) => agent.name);
+      const agents = (await listPluginAgentFiles(plugin.agentsDir)).map((agent) => agent.name);
       const workflows = await listPluginWorkflowFiles(plugin.workflowsDir);
       const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
         name: command.name,
@@ -3740,6 +3665,12 @@ export class AgentPluginInstallService {
         mcpServers: fingerprints,
         workflows: Object.fromEntries(
           workflows.map((workflow) => [workflow.file, workflow.consentFingerprint])
+        ),
+        agents: Object.fromEntries(
+          (await listPluginAgentFiles(plugin.agentsDir)).map((agent) => [
+            agent.id,
+            agentConsentFingerprint(agent),
+          ])
         ),
       } satisfies ComponentConsent,
     };

@@ -110,6 +110,8 @@ export const AgentPluginInstallEntrySchema = z.object({
       // is reviewed, so each such plugin needs one review (no backfill). An older build strips
       // the key on read and keeps it on save (installService mergeRawConsent).
       workflows: z.record(z.string(), z.string()).default({}),
+      // Agents by ID (#6629), with the same upgrade rules as workflows.
+      agents: z.record(z.string(), z.string()).default({}),
     })
     .optional(),
   /** Reserved: per-plugin opt-in auto-update. Unused in v1 — updates are badge + manual. */

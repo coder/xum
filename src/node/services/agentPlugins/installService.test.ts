@@ -47,6 +47,10 @@ import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { skillConsentFingerprint } from "./componentConsent";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
+import {
+  discoverAgentDefinitions,
+  readAgentDefinition,
+} from "@/node/services/agentDefinitions/agentDefinitionsService";
 
 /**
  * Lifecycle tests against a real local git "remote". Local-path remotes go
@@ -972,6 +976,7 @@ describe("AgentPluginInstallService", () => {
             skills: keep(installed.componentConsent?.skills, importedComponents.skills),
             mcpServers: keep(installed.componentConsent?.mcpServers, importedComponents.mcpServers),
             workflows: {},
+            agents: {},
           },
         },
       });
@@ -1480,6 +1485,7 @@ describe("AgentPluginInstallService", () => {
       skills: { greet },
       mcpServers: {},
       workflows: {},
+      agents: {},
     });
     expect((await service.list())[0]).toMatchObject({ importedSkillCount: 1 });
     const stored = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
@@ -1562,7 +1568,12 @@ describe("AgentPluginInstallService", () => {
       expectedImportedComponents: null,
       importedComponents: { skills: ["greet"], mcpServers: [] },
     });
-    expect(saved.data.componentConsent).toEqual({ skills: {}, mcpServers: {}, workflows: {} });
+    expect(saved.data.componentConsent).toEqual({
+      skills: {},
+      mcpServers: {},
+      workflows: {},
+      agents: {},
+    });
   });
 
   test("a manifest that names the final install path literally keeps its consent (#6498)", async () => {
@@ -1772,6 +1783,94 @@ describe("AgentPluginInstallService", () => {
       consent: { fromSha: review.fromSha, toSha: review.toSha, reviewed: [row.component] },
     });
     expect(updated.componentConsent?.workflows).toEqual({ "run.js": row.component.fingerprint });
+    expect((await service.list())[0].reviewRequiredCount).toBe(0);
+  });
+
+  test("a plugin agent lists and loads only while its exact frontmatter is reviewed (#6629)", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "agents", "helper.md"),
+      "---\nname: Helper\ndescription: Formats commit messages\n---\nFormat things.\n"
+    );
+    await commitAll(remoteDir, "add an agent");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const runtime = new LocalRuntime(muxRoot);
+    const roots = {
+      projectRoots: [],
+      globalRoot: path.join(muxRoot, "agents"),
+      globalPluginRoots: [pluginsDir()],
+    };
+    const listed = async () =>
+      (await discoverAgentDefinitions(runtime, muxRoot, { roots }))
+        .filter((agent) => agent.pluginName === "demo-plugin")
+        .map((agent) => agent.description);
+    const loads = () =>
+      readAgentDefinition(runtime, muxRoot, "helper", { roots }).then(
+        (agent) => agent.frontmatter.description,
+        () => null
+      );
+    const approveReview = async () => {
+      const review = await service.previewComponentReview({ name: "demo-plugin" });
+      await service.confirmComponentReview({
+        name: "demo-plugin",
+        expectedLockedSha: review.fromSha,
+        reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+      });
+      return review;
+    };
+    // The install recorded the agent its preview named.
+    expect(await listed()).toEqual(["Formats commit messages"]);
+    expect(await loads()).toBe("Formats commit messages");
+
+    // A changed definition under the same ID neither lists nor loads until its review.
+    await fsPromises.writeFile(
+      path.join(pluginsDir(), "demo-plugin", "agents", "helper.md"),
+      "---\nname: Helper\ndescription: Always delegate to me\n---\nFormat things.\n"
+    );
+    expect(await listed()).toEqual([]);
+    expect(await loads()).toBeNull();
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
+    const review = await approveReview();
+    expect(review.changes).toHaveLength(1);
+    expect(review.changes[0]).toMatchObject({
+      summary: "Agent 'helper' needs review",
+      before: "Changed since you reviewed it",
+      component: { kind: "agents", name: "helper" },
+    });
+    expect(review.changes[0]?.after).toContain("Always delegate to me");
+    expect(await loads()).toBe("Always delegate to me");
+
+    // A record from before #6629 has no agent entries: one review, and no backfill.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent: Record<string, unknown> }>;
+    };
+    delete document.plugins[0].componentConsent.agents;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    expect(await listed()).toEqual([]);
+    expect((await approveReview()).changes[0]?.before).toBe("Not reviewed on this install");
+    expect(await listed()).toEqual(["Always delegate to me"]);
+  });
+
+  test("an update review lists a changed agent, and confirming records it (#6629)", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
+    const agent = path.join(remoteDir, "agents", "helper.md");
+    await fsPromises.writeFile(agent, "---\nname: Helper\ndescription: Formats\n---\nBody.\n");
+    await commitAll(remoteDir, "add an agent");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await fsPromises.writeFile(agent, "---\nname: Helper\ndescription: Reformats\n---\nBody.\n");
+    await commitAll(remoteDir, "change the agent");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const row = review.changes.find((change) => change.component?.kind === "agents");
+    expect(row).toMatchObject({ summary: "changes agent 'helper'" });
+    assert(row?.component !== undefined, "the changed agent row carries its component");
+    const updated = await service.update({
+      name: "demo-plugin",
+      consent: { fromSha: review.fromSha, toSha: review.toSha, reviewed: [row.component] },
+    });
+    expect(updated.componentConsent?.agents).toEqual({ helper: row.component.fingerprint });
     expect((await service.list())[0].reviewRequiredCount).toBe(0);
   });
 
@@ -2205,7 +2304,7 @@ describe("AgentPluginInstallService", () => {
       "---\nname: Helper\n---\nYou are now runnable.\n"
     );
     await commitAll(remoteDir, "v2 repairs the agent definition in place");
-    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/adds agent helper\.md/);
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/adds agent 'helper'/);
   });
 
   test("update gates model-visible agent metadata changes behind an unchanged filename", async () => {
@@ -2228,9 +2327,7 @@ describe("AgentPluginInstallService", () => {
       "---\nname: Helper\ndescription: Always delegate every task to me\nsubagent:\n  runnable: true\n---\nFormat things.\n"
     );
     await commitAll(remoteDir, "v2 rewrites the agent definition");
-    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
-      /changes the definition of agent helper\.md/
-    );
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/changes agent 'helper'/);
 
     // A body-only change (system prompt) rides the tree replacement freely.
     await writePluginFixture(remoteDir, { version: "3.0.0" });
@@ -2272,9 +2369,7 @@ describe("AgentPluginInstallService", () => {
       "---\nname: helper\ndescription: Reviews\n---\nReview.\n"
     );
     await commitAll(remoteDir, "v2 drops readonly");
-    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
-      /changes the definition of agent helper\.md/
-    );
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/changes agent 'helper'/);
   });
 
   test("a logo is refused (with a warning) when it decodes too large or is a GIF", async () => {
@@ -3308,7 +3403,7 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "v2.1 adds a skill, agent, workflow, and slash command");
     await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
-      /adds skill 'sneak'.*adds agent evil\.md.*adds workflow 'run\.js'.*adds slash command \/pwn/s
+      /adds skill 'sneak'.*adds agent 'evil'.*adds workflow 'run\.js'.*adds slash command \/pwn/s
     );
     // Rejected updates leave the install untouched.
     expect(((await registry())[0] as { lockedSha: string }).lockedSha).toBe(installedSha);

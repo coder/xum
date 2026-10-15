@@ -477,6 +477,7 @@ describe("agent_skill_list", () => {
         skills: { shared: "0".repeat(64), solo: "0".repeat(64) },
         mcpServers: {},
         workflows: {},
+        agents: {},
       });
       expect(await list()).toEqual({ shared: "fallback", free: "unmanaged" });
 

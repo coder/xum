@@ -1070,7 +1070,12 @@ describe("createAgentPluginsMcpProvider", () => {
       // An install from before #6498 has no records: its imported server does not start.
       expect(await loaded()).toEqual(["free"]);
       // A record for another definition under the same name is no consent either.
-      await saveConsent({ skills: {}, mcpServers: { srv: "0".repeat(64) }, workflows: {} });
+      await saveConsent({
+        skills: {},
+        mcpServers: { srv: "0".repeat(64) },
+        workflows: {},
+        agents: {},
+      });
       expect(await loaded()).toEqual(["free"]);
       await saveConsent(reviewed);
       expect(await loaded()).toEqual(["free", "srv"]);

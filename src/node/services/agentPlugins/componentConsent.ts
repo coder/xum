@@ -1,6 +1,6 @@
 /**
- * Component consent fingerprints (#6498, #6629). A managed plugin's skill, MCP server or workflow
- * script is bound to the fingerprint the user reviewed, not to its name: when a newer Xum parses
+ * Component consent fingerprints (#6498, #6629). A managed plugin's skill, MCP server, workflow
+ * script or agent is bound to the fingerprint the user reviewed, not to its name: when a newer Xum parses
  * more of an installed package (a Codex dialect field, an extra skills root), the component's
  * fingerprint changes and it needs a new review instead of loading under an approved name.
  *
@@ -239,22 +239,54 @@ export function workflowConsentDetail(args: WorkflowConsentInput): string {
   return `sha256 ${createHash("sha256").update(args.source).digest("hex")}\n\n${args.source}`;
 }
 
+interface AgentConsentInput {
+  /** The agent ID the runtime loads the definition under (the lowercased file stem). */
+  id: string;
+  /** The frontmatter as the runtime parses it (plugin format mapping applied). */
+  frontmatter: unknown;
+}
+
+/**
+ * The fingerprinted agent fields (#6629). Keyed by ID, not file name: the runtime lists an agent
+ * by its file name but loads it as `<id>.md`, which can differ in case. The body (the agent's
+ * system prompt) is not covered yet, the same as a skill body: #6617 decides for both, and
+ * covering it is one more field here (`bodySha256`).
+ */
+function agentConsentSubject(args: AgentConsentInput): { id: string; frontmatter: unknown } {
+  return { id: args.id, frontmatter: args.frontmatter };
+}
+
+/** Fingerprint of one plugin agent: its ID and its whole parsed frontmatter. */
+export function agentConsentFingerprint(args: AgentConsentInput): string {
+  return digest({ scheme: CONSENT_SCHEME, kind: "agent", ...agentConsentSubject(args) });
+}
+
+/** The reviewed agent fields as text. */
+export function agentConsentDetail(args: AgentConsentInput): string {
+  return stableStringify(agentConsentSubject(args));
+}
+
 /** Reviewed fingerprints of one install, by component name (registry `componentConsent`). */
 export interface ComponentConsent {
   skills: Record<string, string>;
   mcpServers: Record<string, string>;
   /** Workflow scripts by file name (#6629). Absent in records an older build wrote: none reviewed. */
   workflows: Record<string, string>;
+  /** Agents by ID (#6629). Absent in records an older build wrote: none reviewed. */
+  agents: Record<string, string>;
 }
 
 /** Every consent kind. A kind the component picker does not select is reviewed all-or-nothing. */
-export const CONSENT_KINDS = ["skills", "mcpServers", "workflows"] as const satisfies ReadonlyArray<
-  keyof ComponentConsent
->;
+export const CONSENT_KINDS = [
+  "skills",
+  "mcpServers",
+  "workflows",
+  "agents",
+] as const satisfies ReadonlyArray<keyof ComponentConsent>;
 
 /** The consent of an install without records (every install from before #6498): nothing reviewed. */
 export function noComponentConsent(): ComponentConsent {
-  return { skills: {}, mcpServers: {}, workflows: {} };
+  return { skills: {}, mcpServers: {}, workflows: {}, agents: {} };
 }
 
 /** True only when the user reviewed exactly this fingerprint. No record (every older install) means no. */
@@ -279,7 +311,8 @@ export function isImportedComponent(
   kind: keyof ComponentConsent,
   name: string
 ): boolean {
-  return kind === "workflows" || selection === undefined || selection[kind].includes(name);
+  if (kind !== "skills" && kind !== "mcpServers") return true;
+  return selection === undefined || selection[kind].includes(name);
 }
 
 /**
@@ -311,7 +344,8 @@ export function consentForSelection(args: {
   return {
     skills: records("skills"),
     mcpServers: records("mcpServers"),
-    workflows: unpickedRecords(args.shown.workflows, args.previous),
+    workflows: unpickedRecords(args.shown, args.previous, "workflows"),
+    agents: unpickedRecords(args.shown, args.previous, "agents"),
   };
 }
 
@@ -320,11 +354,12 @@ export function consentForSelection(args: {
  * showed, and a picker save keeps the old records (it showed none of them).
  */
 function unpickedRecords(
-  shown: Record<string, string>,
-  previous: { consent: ComponentConsent | undefined } | undefined
+  shown: ComponentConsent,
+  previous: { consent: ComponentConsent | undefined } | undefined,
+  kind: Exclude<keyof ComponentConsent, keyof ComponentSelection>
 ): Record<string, string> {
-  if (previous === undefined) return { ...shown };
-  return { ...previous.consent?.workflows };
+  if (previous === undefined) return { ...shown[kind] };
+  return { ...previous.consent?.[kind] };
 }
 
 /** A copy of every kind's records; none when there is no record (an install before #6498). */
@@ -334,6 +369,7 @@ function copyConsent(consent: ComponentConsent | undefined): ComponentConsent {
     skills: { ...consent?.skills },
     mcpServers: { ...consent?.mcpServers },
     workflows: { ...consent?.workflows },
+    agents: { ...consent?.agents },
   };
 }
 
@@ -429,4 +465,17 @@ export function isPluginWorkflowConsented(
 ): boolean {
   if (consent === undefined) return true;
   return getOwn(consent.workflows, args.file) === workflowConsentFingerprint(args);
+}
+
+/**
+ * The one load-time agent predicate (#6629): agent discovery and the definition read call it with
+ * the frontmatter they parsed, so an agent changed after its review is neither listed nor loaded.
+ * Unmanaged plugins have no records and always pass.
+ */
+export function isPluginAgentConsented(
+  consent: ComponentConsent | undefined,
+  args: AgentConsentInput
+): boolean {
+  if (consent === undefined) return true;
+  return getOwn(consent.agents, args.id) === agentConsentFingerprint(args);
 }

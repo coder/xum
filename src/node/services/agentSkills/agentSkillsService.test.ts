@@ -1655,6 +1655,7 @@ describe("agentSkillsService agent plugins", () => {
       skills: { shared: "0".repeat(64), solo: "0".repeat(64) },
       mcpServers: {},
       workflows: {},
+      agents: {},
     });
     expect(await state()).toEqual(unreviewed);
 

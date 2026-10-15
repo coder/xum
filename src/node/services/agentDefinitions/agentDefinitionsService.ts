@@ -45,6 +45,10 @@ import {
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
   type AgentPluginContainer,
 } from "@/node/services/agentPlugins/discovery";
+import {
+  isPluginAgentConsented,
+  type ComponentConsent,
+} from "@/node/services/agentPlugins/componentConsent";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 import { getBuiltInAgentDefinitions } from "./builtInAgentDefinitions";
@@ -157,6 +161,8 @@ interface AgentDefinitionScanCandidate {
   pluginRoot?: string;
   /** Agent Plugins only: contributing plugin name for descriptor attribution. */
   pluginName?: string;
+  /** Managed plugins only: the reviewed fingerprints (#6629). Unmanaged plugins have none. */
+  pluginConsent?: ComponentConsent;
 }
 
 /**
@@ -169,6 +175,8 @@ async function buildPluginAgentScanCandidates(args: {
   workspacePath: string;
   /** Project scope: plugin roots must stay inside the checkout (repo-symlink posture). */
   projectContainmentRoot?: string;
+  /** The Xum home that owns the plugin registry, so managed plugins carry consent (#6629). */
+  managedHome: string;
 }): Promise<AgentDefinitionScanCandidate[]> {
   if (args.containers.length === 0) {
     return [];
@@ -188,7 +196,9 @@ async function buildPluginAgentScanCandidates(args: {
     }
   }
 
-  const { plugins } = await discoverAgentPlugins(resolvedContainers);
+  const { plugins } = await discoverAgentPlugins(resolvedContainers, {
+    managedHome: await localRuntime.resolvePath(args.managedHome),
+  });
 
   const candidates: AgentDefinitionScanCandidate[] = [];
   for (const plugin of plugins) {
@@ -213,6 +223,7 @@ async function buildPluginAgentScanCandidates(args: {
       runtime: localRuntime,
       pluginRoot: plugin.rootPath,
       pluginName: plugin.name,
+      ...(plugin.componentConsent !== undefined ? { pluginConsent: plugin.componentConsent } : {}),
     });
   }
 
@@ -229,16 +240,21 @@ async function buildScanCandidates(
   workspacePath: string,
   roots: AgentDefinitionsRoots
 ): Promise<AgentDefinitionScanCandidate[]> {
+  // The registry lives in the Xum home above the global agents root (tilde form maps to the host
+  // home), as plugin skill discovery derives it.
+  const managedHome = path.dirname(roots.globalRoot);
   const projectPluginCandidates = await buildPluginAgentScanCandidates({
     containers: roots.projectPluginRoots ?? [],
     scope: "project",
     workspacePath,
     projectContainmentRoot: workspacePath,
+    managedHome,
   });
   const globalPluginCandidates = await buildPluginAgentScanCandidates({
     containers: roots.globalPluginRoots ?? [],
     scope: "global",
     workspacePath,
+    managedHome,
   });
 
   return [
@@ -333,6 +349,22 @@ function getAgentIdFromFilename(filename: string): AgentId | null {
   return idParsed.data;
 }
 
+/**
+ * The consent gate of plugin agents (#6629): discovery and the definition read check the
+ * frontmatter they parsed, so an agent changed after its review neither lists nor loads.
+ */
+function isPluginAgentReviewed(
+  candidate: Pick<AgentDefinitionScanCandidate, "pluginConsent" | "pluginName">,
+  agentId: AgentId,
+  frontmatter: unknown
+): boolean {
+  if (isPluginAgentConsented(candidate.pluginConsent, { id: agentId, frontmatter })) return true;
+  log.warn(
+    `Skipping agent '${agentId}' of plugin '${candidate.pluginName ?? "?"}': it has not been reviewed on this install. Open Settings → Plugins and select Review on the plugin.`
+  );
+  return false;
+}
+
 /** Plugin agents parse with the Claude Code / Cursor format mapping (pluginAgentFormat.ts). */
 function parseSource(
   pluginRoot: string | undefined,
@@ -356,7 +388,8 @@ async function readAgentDescriptorFromFile(
    * reads that as a capability removal, and the outside frontmatter would
    * otherwise control agent policy (runnable/base/tools).
    */
-  pluginRoot?: string
+  pluginRoot?: string,
+  pluginConsent?: ComponentConsent
 ): Promise<AgentDefinitionDescriptor | null> {
   let content: string;
   let byteSize: number;
@@ -409,6 +442,9 @@ async function readAgentDescriptorFromFile(
       byteSize,
       ...parseSource(pluginRoot, agentId),
     });
+    if (!isPluginAgentReviewed({ pluginConsent, pluginName }, agentId, parsed.frontmatter)) {
+      return null;
+    }
 
     const { selectable } = resolveAgentVisibility(parsed.frontmatter.ui);
 
@@ -526,7 +562,8 @@ export async function discoverAgentDefinitions(
         agentId,
         scan.scope,
         scan.pluginName,
-        scan.pluginRoot
+        scan.pluginRoot,
+        scan.pluginConsent
       );
       if (!descriptor) continue;
 
@@ -755,6 +792,7 @@ async function loadAgentDefinition(
         byteSize,
         ...parseSource(candidate.pluginRoot, agentId),
       });
+      if (!isPluginAgentReviewed(candidate, agentId, parsed.frontmatter)) continue;
 
       const pkg: AgentDefinitionPackage = {
         id: agentId,

@@ -139,16 +139,21 @@ describe("readPluginMcpPolicy", () => {
     expect(
       isPluginMcpServerAllowed(
         server,
-        await save({ skills: {}, mcpServers: { srv: "x" }, workflows: {} })
+        await save({ skills: {}, mcpServers: { srv: "x" }, workflows: {}, agents: {} })
       )
     ).toBe(false);
     expect(
       isPluginMcpServerAllowed(
         server,
-        await save({ skills: { srv: "reviewed" }, mcpServers: {}, workflows: {} })
+        await save({ skills: { srv: "reviewed" }, mcpServers: {}, workflows: {}, agents: {} })
       )
     ).toBe(false);
-    const reviewed = await save({ skills: {}, mcpServers: { srv: "reviewed" }, workflows: {} });
+    const reviewed = await save({
+      skills: {},
+      mcpServers: { srv: "reviewed" },
+      workflows: {},
+      agents: {},
+    });
     expect(isPluginMcpServerAllowed(server, reviewed)).toBe(true);
     // A consent change is a policy change, so running clients are rechecked.
     expect(reviewed).not.toEqual(unreviewed);
