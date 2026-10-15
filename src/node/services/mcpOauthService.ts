@@ -1358,15 +1358,23 @@ export class McpOauthService {
     if (input.scopes.length > 0 && input.scopes.every((scope) => granted.has(scope))) return;
     this.insufficientScopes.set(key, input.scopes);
     // Mounted Settings rows refresh on this signal: a 403 changes nothing they would otherwise see.
-    for (const listener of this.insufficientScopeListeners) listener();
+    for (const listener of this.insufficientScopeListeners) listener(key);
   }
 
-  private readonly insufficientScopeListeners = new Set<() => void>();
+  private readonly insufficientScopeListeners = new Set<(key: string) => void>();
 
-  /** Notifies when a refused request records a sign-in prompt (#6739); returns an unsubscribe. */
-  onInsufficientScope(listener: () => void): () => void {
+  /**
+   * Notifies with the credential key (the `serverUrl` of getAuthStatus) when a refused request
+   * records a sign-in prompt (#6739); returns an unsubscribe.
+   */
+  onInsufficientScope(listener: (key: string) => void): () => void {
     this.insufficientScopeListeners.add(listener);
     return () => this.insufficientScopeListeners.delete(listener);
+  }
+
+  /** The credential keys that have a sign-in prompt now (replayed to a new subscriber). */
+  insufficientScopeKeys(): string[] {
+    return [...this.insufficientScopes.keys()];
   }
 
   /**

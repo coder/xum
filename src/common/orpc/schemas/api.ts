@@ -782,10 +782,13 @@ const MCPOAuthPendingServerSchema = z
 
 // MCP OAuth
 export const mcpOauth = {
-  /** Ticks when a refused request records a sign-in prompt (#6739): re-read the auth status. */
+  /**
+   * The credential key (`serverUrl` of getAuthStatus) each time a refused request records a
+   * sign-in prompt (#6739), after the keys that have one at attach time: re-read that row.
+   */
   onInsufficientScope: {
     input: z.void(),
-    output: eventIterator(z.void()),
+    output: eventIterator(z.string()),
   },
   startDesktopFlow: {
     input: z
