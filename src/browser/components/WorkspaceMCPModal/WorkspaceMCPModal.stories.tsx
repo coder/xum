@@ -80,6 +80,7 @@ interface WorkspaceMCPStoryOptions {
   settingsToolRunGate?: { promise: Promise<void> };
   settingsToolRunSets?: Record<string, Record<string, string | number | boolean>>;
   settingsToolRunErrors?: string[];
+  settingsToolRunFailures?: string[];
   settingsRestartAfterFirstRead?: string[];
   /** MCP Apps views by view key (a settings app action opens `settings:<server>:<tool>`). */
   mcpAppViews?: Record<string, McpAppView>;
@@ -167,6 +168,7 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
     mcpSettingsToolRunGate: options.settingsToolRunGate,
     mcpSettingsToolRunSets: new Map(Object.entries(options.settingsToolRunSets ?? {})),
     mcpSettingsToolRunErrors: new Set(options.settingsToolRunErrors ?? []),
+    mcpSettingsToolRunFailures: new Set(options.settingsToolRunFailures ?? []),
     mcpSettingsRestartAfterFirstRead: new Set(options.settingsRestartAfterFirstRead ?? []),
     ...(options.mcpAppViews ? { mcpApps: { views: options.mcpAppViews } } : {}),
     mcpTestGate: options.testGate,
@@ -962,6 +964,23 @@ export const WorkspaceMCPServerSettingsAppViewRetry: Story = {
 };
 
 const rereadReads: string[][] = [];
+
+/** Shared play: a read-only run reads nothing; Reset parts (it writes zoom 1) reads again. */
+async function exerciseRereadAfterWrite(canvasElement: HTMLElement, resetText: string) {
+  const modal = within(await findWorkspaceMCPDialog(canvasElement));
+  const section = within(await modal.findByTestId("mcp-server-settings"));
+  const page = within(canvasElement.ownerDocument.body);
+  await userEvent.click(await section.findByRole("button", { name: "Run Part library" }));
+  await expect(section.findByText("cad.library finished")).resolves.toBeInTheDocument();
+  await expect(rereadReads).toHaveLength(1);
+  await userEvent.click(section.getByRole("button", { name: "Run Reset parts" }));
+  await userEvent.click(await page.findByRole("button", { name: "Run" }));
+  // The re-read remounts the section: query it again.
+  await waitFor(() => expect(modal.getByLabelText("Default zoom setting")).toHaveValue(1));
+  await expect(rereadReads).toEqual([["cad"], ["cad"]]);
+  await expect(modal.findByText(resetText)).resolves.toBeInTheDocument();
+}
+
 /**
  * A tool that can write (Reset parts) changes the server's settings: the dialog reads them
  * again and shows the new values, and the run's result stays. It reads them even when the tool
@@ -978,20 +997,23 @@ export const WorkspaceMCPServerSettingsRereadAfterWrite: Story = {
       settingsToolRunErrors: ["cad.reset"],
     });
   },
-  play: async ({ canvasElement }) => {
-    const modal = within(await findWorkspaceMCPDialog(canvasElement));
-    const section = within(await modal.findByTestId("mcp-server-settings"));
-    const page = within(canvasElement.ownerDocument.body);
-    await userEvent.click(await section.findByRole("button", { name: "Run Part library" }));
-    await expect(section.findByText("cad.library finished")).resolves.toBeInTheDocument();
-    await expect(rereadReads).toHaveLength(1);
-    await userEvent.click(section.getByRole("button", { name: "Run Reset parts" }));
-    await userEvent.click(await page.findByRole("button", { name: "Run" }));
-    // The re-read remounts the section: query it again.
-    await waitFor(() => expect(modal.getByLabelText("Default zoom setting")).toHaveValue(1));
-    await expect(rereadReads).toEqual([["cad"], ["cad"]]);
-    await expect(modal.findByText("cad.reset finished")).resolves.toBeInTheDocument();
+  play: async ({ canvasElement }) => exerciseRereadAfterWrite(canvasElement, "cad.reset finished"),
+};
+
+/** The run fails after the dispatch (a disconnect after the write): the dialog reads again. */
+export const WorkspaceMCPServerSettingsRereadAfterFailedWrite: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    rereadReads.length = 0;
+    return renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settingsReads: rereadReads,
+      settingsToolRunSets: { "cad.reset": { zoom: 1 } },
+      settingsToolRunFailures: ["cad.reset"],
+    });
   },
+  play: async ({ canvasElement }) =>
+    exerciseRereadAfterWrite(canvasElement, "cad.reset disconnected"),
 };
 
 const appWriteReads: string[][] = [];

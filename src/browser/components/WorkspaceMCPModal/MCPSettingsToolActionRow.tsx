@@ -189,7 +189,7 @@ interface ToolActionTarget {
 
 /** A run's outcome: its text result or opened view, and whether the tool may have written. */
 type ToolActionOutcome =
-  | { success: false; error: string }
+  | { success: false; error: string; wrote: boolean }
   | {
       success: true;
       result: SettingsToolRunResult | null;
@@ -209,20 +209,17 @@ async function callToolAction(
     const response = await api.mcp.settings.openApp(request);
     // The open (or the app's own calls) can change the settings, but a re-read now would
     // remount the section and close the app modal: closeApp re-reads instead.
+    // A failed open shows no app, and its tool call can have written before the failure.
     return response.success
       ? { success: true, result: null, view: response.data, wrote: false }
-      : response;
+      : { ...response, wrote: confirmed };
   }
   const response = await api.mcp.settings.runTool(request);
+  // A tool can write and then report an error, or fail after the dispatch (a disconnect): every
+  // confirmed run counts as a write.
   return response.success
-    ? {
-        success: true,
-        result: response.data,
-        view: null,
-        // A tool can report an error after it wrote: every confirmed run counts.
-        wrote: confirmed,
-      }
-    : response;
+    ? { success: true, result: response.data, view: null, wrote: confirmed }
+    : { ...response, wrote: confirmed };
 }
 
 /** A settings read only for the backend's settings caches (no dialog shows it). */
@@ -298,10 +295,9 @@ async function settleOutcome(
   openApp: (view: MCPSettingsAppView) => void,
   rereadSettings: () => Promise<void>
 ): Promise<SettingsToolRunResult | null> {
-  if (!outcome.success) return { text: outcome.error, isError: true };
-  if (outcome.view !== null) openApp(outcome.view);
+  if (outcome.success && outcome.view !== null) openApp(outcome.view);
   if (outcome.wrote) await rereadSettings();
-  return outcome.result;
+  return outcome.success ? outcome.result : { text: outcome.error, isError: true };
 }
 
 /**

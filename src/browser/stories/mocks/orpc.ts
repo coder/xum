@@ -370,6 +370,8 @@ export interface MockORPCClientOptions {
   mcpSettingsToolRunSets?: Map<string, Record<string, MCPSettingValue>>;
   /** Tools whose runs report an MCP error (`isError`) after they wrote their values. */
   mcpSettingsToolRunErrors?: Set<string>;
+  /** Tools whose runs fail (a disconnect after the dispatch) after they wrote their values. */
+  mcpSettingsToolRunFailures?: Set<string>;
   /** Servers that restart after their first settings read: later reads have a new instanceToken. */
   mcpSettingsRestartAfterFirstRead?: Set<string>;
   /** When set, mcp.test waits for this promise (stories hold a Fetch Tools in flight). */
@@ -528,6 +530,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpSettingsToolRunGate,
     mcpSettingsToolRunSets,
     mcpSettingsToolRunErrors,
+    mcpSettingsToolRunFailures,
     mcpSettingsRestartAfterFirstRead,
     mcpTestGate,
     mcpIcons = new Map<string, string>(),
@@ -1543,6 +1546,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           mcpSettingsToolRuns?.push({ toolName: input.toolName, confirmed: input.confirmed });
           await gated?.promise;
           applyMockSettingsToolRunSet(input);
+          if (mcpSettingsToolRunFailures?.has(input.toolName) === true)
+            return { success: false, error: `${input.toolName} disconnected` };
           return {
             success: true,
             data: {
