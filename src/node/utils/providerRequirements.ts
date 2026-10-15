@@ -155,6 +155,15 @@ function hasNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+/** A saved config string wins over its env vars (the user's explicit choice). */
+function resolveConfigOrEnv(
+  configValue: unknown,
+  envKeys: string[] | undefined,
+  env: Record<string, string | undefined>
+): string | undefined {
+  return hasNonEmptyString(configValue) ? configValue.trim() : resolveEnv(envKeys, env);
+}
+
 function hasCredentialPair(accessKeyId: unknown, secretAccessKey: unknown): boolean {
   return hasNonEmptyString(accessKeyId) && hasNonEmptyString(secretAccessKey);
 }
@@ -269,6 +278,15 @@ function resolveBaseUrl(
 
   const envBaseUrl = resolveEnv(PROVIDER_ENV_VARS[provider]?.baseUrl, env);
   return envBaseUrl ? { baseUrlResolved: envBaseUrl, baseUrlSource: "env" } : {};
+}
+
+/** Once a provider is configured, its resolved base URL becomes the runtime one. */
+function withActiveBaseUrl(
+  baseUrlInfo: Pick<ResolvedCredentials, "baseUrlResolved" | "baseUrlSource">
+): Pick<ResolvedCredentials, "baseUrl" | "baseUrlResolved" | "baseUrlSource"> {
+  return baseUrlInfo.baseUrlResolved
+    ? { ...baseUrlInfo, baseUrl: baseUrlInfo.baseUrlResolved }
+    : baseUrlInfo;
 }
 
 /**
@@ -444,15 +462,12 @@ export function resolveProviderCredentials(
   const organization = configOrganization ?? resolveEnv(envMapping?.organization, env);
 
   if (apiKeyResult.kind === "resolved") {
-    const configuredBaseUrlInfo = baseUrlInfo.baseUrlResolved
-      ? { ...baseUrlInfo, baseUrl: baseUrlInfo.baseUrlResolved }
-      : baseUrlInfo;
     return {
       isConfigured: true,
       apiKey: apiKeyResult.apiKey,
       organization,
       apiKeySource: apiKeyResult.source,
-      ...configuredBaseUrlInfo,
+      ...withActiveBaseUrl(baseUrlInfo),
     };
   }
 
@@ -474,17 +489,11 @@ function resolveGoogleVertexCredentials(
     { apiKey: config.apiKey, apiKeyFile: config.apiKeyFile },
     { envApiKeys: envMapping?.apiKey, env, fileErrors: "ignore" }
   );
-  const project = hasNonEmptyString(config.project)
-    ? config.project.trim()
-    : resolveEnv(envMapping?.project, env);
+  const project = resolveConfigOrEnv(config.project, envMapping?.project, env);
   const location =
-    (hasNonEmptyString(config.location)
-      ? config.location.trim()
-      : resolveEnv(envMapping?.location, env)) ?? GOOGLE_VERTEX_DEFAULT_LOCATION;
+    resolveConfigOrEnv(config.location, envMapping?.location, env) ??
+    GOOGLE_VERTEX_DEFAULT_LOCATION;
   const baseUrlInfo = resolveBaseUrl("google-vertex", config, env);
-  const configuredBaseUrlInfo = baseUrlInfo.baseUrlResolved
-    ? { ...baseUrlInfo, baseUrl: baseUrlInfo.baseUrlResolved }
-    : baseUrlInfo;
 
   if (apiKeyResult.kind === "resolved") {
     return {
@@ -493,16 +502,20 @@ function resolveGoogleVertexCredentials(
       apiKeySource: apiKeyResult.source,
       project,
       location,
-      ...configuredBaseUrlInfo,
+      ...withActiveBaseUrl(baseUrlInfo),
     };
   }
-  if (project) {
-    const keyFilename = hasNonEmptyString(config.keyFilename)
-      ? expandHomePath(config.keyFilename.trim())
-      : undefined;
-    return { isConfigured: true, project, location, keyFilename, ...configuredBaseUrlInfo };
+  if (!project) {
+    return { isConfigured: false, missingRequirement: "project", ...baseUrlInfo };
   }
-  return { isConfigured: false, missingRequirement: "project", ...baseUrlInfo };
+  const keyFilename = resolveConfigOrEnv(config.keyFilename, undefined, env);
+  return {
+    isConfigured: true,
+    project,
+    location,
+    keyFilename: keyFilename != null ? expandHomePath(keyFilename) : undefined,
+    ...withActiveBaseUrl(baseUrlInfo),
+  };
 }
 
 /**

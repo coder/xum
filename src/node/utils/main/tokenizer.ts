@@ -76,12 +76,19 @@ function normalizeModelKey(modelName: string): ModelName | null {
  * Resolves a model string to a ModelName, falling back to a similar model if unknown.
  * Optionally logs a warning when falling back.
  */
-function resolveModelName(modelString: string): ModelName {
+const GOOGLE_VERTEX_MODEL_PREFIX = "google-vertex:";
+
+/** Canonical model string keyed for tokenizer lookup. */
+function normalizeTokenizerModelString(modelString: string): string {
   const canonical = normalizeToCanonical(modelString);
   // Vertex AI serves the Gemini API's models, so it shares their tokenizers.
-  const normalized = canonical.startsWith("google-vertex:")
-    ? `google:${canonical.slice("google-vertex:".length)}`
+  return canonical.startsWith(GOOGLE_VERTEX_MODEL_PREFIX)
+    ? `google:${canonical.slice(GOOGLE_VERTEX_MODEL_PREFIX.length)}`
     : canonical;
+}
+
+function resolveModelName(modelString: string): ModelName {
+  const normalized = normalizeTokenizerModelString(modelString);
   let modelName = normalizeModelKey(normalized);
 
   if (!modelName) {

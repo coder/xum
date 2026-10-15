@@ -104,6 +104,19 @@ function buildCustomProviderConfigInfo(config: BaseProviderConfig): ProviderConf
   };
 }
 
+/** Vertex settings for the UI: the service-account key file path is reported only as set/unset. */
+function googleVertexCredentialStatus(config: {
+  project?: unknown;
+  location?: unknown;
+  keyFilename?: unknown;
+}): NonNullable<ProviderConfigInfo["googleVertex"]> {
+  return {
+    project: typeof config.project === "string" ? config.project : undefined,
+    location: typeof config.location === "string" ? config.location : undefined,
+    keyFilenameSet: typeof config.keyFilename === "string" && config.keyFilename.trim() !== "",
+  };
+}
+
 const DENIED_KEY_PATH_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
 
 type CustomProviderMutationResult<T> = Result<T, CustomProviderMutationError>;
@@ -498,12 +511,7 @@ export class ProviderService {
       }
 
       if (provider === "google-vertex") {
-        providerInfo.googleVertex = {
-          project: typeof config.project === "string" ? config.project : undefined,
-          location: typeof config.location === "string" ? config.location : undefined,
-          keyFilenameSet:
-            typeof config.keyFilename === "string" && config.keyFilename.trim() !== "",
-        };
+        providerInfo.googleVertex = googleVertexCredentialStatus(config);
       }
 
       // Coder-specific fields: deployment URL + OAuth connection status.

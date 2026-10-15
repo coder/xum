@@ -1131,6 +1131,35 @@ export function requestEndpoint(requestUrl: string): string {
 /**
  * Get fetch function for provider - use custom if provided, otherwise unlimited timeout default
  */
+/** Google Vertex AI: ADC by default, express mode when an API key resolves. */
+function createGoogleVertexModelEffect(
+  providerConfig: ProviderConfig,
+  modelId: string
+): Effect.Effect<Result<LanguageModel, SendMessageError>> {
+  return Effect.gen(function* () {
+    const creds = resolveProviderCredentials("google-vertex", providerConfig);
+    if (!creds.isConfigured) {
+      return Err({ type: "api_key_not_found", provider: "google-vertex" });
+    }
+    const { createVertex } = yield* Effect.promise(async () =>
+      PROVIDER_REGISTRY["google-vertex"]()
+    );
+    // Pass only explicit SDK settings: Xum resolved config and env already,
+    // so the SDK must not reread env. An empty apiKey keeps ADC selected
+    // (the SDK falls back to GOOGLE_VERTEX_API_KEY only when undefined).
+    const provider = createVertex({
+      apiKey: creds.apiKey ?? "",
+      project: creds.project,
+      location: creds.location,
+      ...(creds.keyFilename != null && { googleAuthOptions: { keyFilename: creds.keyFilename } }),
+      ...(creds.baseUrl != null && { baseURL: creds.baseUrl }),
+      headers: providerConfig.headers,
+      fetch: getProviderFetch(providerConfig),
+    });
+    return Ok(provider(modelId));
+  });
+}
+
 function getProviderFetch(providerConfig: ProviderConfig): typeof fetch {
   if (typeof providerConfig.fetch !== "function") {
     return defaultFetchWithUnlimitedTimeout;
@@ -2700,30 +2729,8 @@ export class ProviderModelFactory {
           return Ok(provider(modelId));
         }
 
-        // Handle Google Vertex AI provider
         if (providerName === "google-vertex") {
-          const creds = resolveProviderCredentials("google-vertex", providerConfig);
-          if (!creds.isConfigured) {
-            return Err({ type: "api_key_not_found", provider: providerName });
-          }
-          const { createVertex } = yield* Effect.promise(async () =>
-            PROVIDER_REGISTRY["google-vertex"]()
-          );
-          // Pass only explicit SDK settings: Xum resolved config and env already,
-          // so the SDK must not reread env. An empty apiKey keeps ADC selected
-          // (the SDK falls back to GOOGLE_VERTEX_API_KEY only when undefined).
-          const provider = createVertex({
-            apiKey: creds.apiKey ?? "",
-            project: creds.project,
-            location: creds.location,
-            ...(creds.keyFilename != null && {
-              googleAuthOptions: { keyFilename: creds.keyFilename },
-            }),
-            ...(creds.baseUrl != null && { baseURL: creds.baseUrl }),
-            headers: providerConfig.headers,
-            fetch: getProviderFetch(providerConfig),
-          });
-          return Ok(provider(modelId));
+          return yield* createGoogleVertexModelEffect(providerConfig, modelId);
         }
 
         // Handle Xum Gateway provider

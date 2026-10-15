@@ -354,6 +354,46 @@ function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo):
   ];
 }
 
+type ProviderStatusReader<T> = (providerConfig: ProviderConfigInfo) => T | undefined;
+
+// Provider-specific settings the backend reports in a nested status object,
+// keyed by `${provider}.${field}`.
+const NESTED_FIELD_VALUES = new Map<string, ProviderStatusReader<string>>([
+  ["bedrock.region", (info) => info.aws?.region],
+  ["bedrock.profile", (info) => info.aws?.profile],
+  ["google-vertex.project", (info) => info.googleVertex?.project],
+  ["google-vertex.location", (info) => info.googleVertex?.location],
+]);
+
+// Secrets are never sent to the UI, only whether each one is set.
+const NESTED_SECRET_SET_FLAGS = new Map<string, ProviderStatusReader<boolean>>([
+  ["bedrock.bearerToken", (info) => info.aws?.bearerTokenSet],
+  ["bedrock.accessKeyId", (info) => info.aws?.accessKeyIdSet],
+  ["bedrock.secretAccessKey", (info) => info.aws?.secretAccessKeySet],
+  ["google-vertex.keyFilename", (info) => info.googleVertex?.keyFilenameSet],
+]);
+
+function getProviderFieldValue(
+  provider: string,
+  field: string,
+  providerConfig: ProviderConfigInfo
+): string | undefined {
+  const readNested = NESTED_FIELD_VALUES.get(`${provider}.${field}`);
+  if (readNested) return readNested(providerConfig);
+  // Standard fields like baseUrl
+  const value = providerConfig[field as keyof ProviderConfigInfo];
+  return typeof value === "string" ? value : undefined;
+}
+
+function isProviderSecretSet(
+  provider: string,
+  field: string,
+  providerConfig: ProviderConfigInfo
+): boolean {
+  if (field === "apiKey") return providerConfig.apiKeySet ?? false;
+  return NESTED_SECRET_SET_FLAGS.get(`${provider}.${field}`)?.(providerConfig) ?? false;
+}
+
 /**
  * URLs to create/manage API keys for each provider.
  */
@@ -1676,20 +1716,7 @@ export function ProvidersSection() {
 
   const getFieldValue = (provider: string, field: string): string | undefined => {
     const providerConfig = config?.[provider];
-    if (!providerConfig) return undefined;
-
-    // For bedrock, check aws nested object for region/profile
-    if (provider === "bedrock" && (field === "region" || field === "profile")) {
-      return field === "region" ? providerConfig.aws?.region : providerConfig.aws?.profile;
-    }
-
-    if (provider === "google-vertex" && (field === "project" || field === "location")) {
-      return providerConfig.googleVertex?.[field];
-    }
-
-    // For standard fields like baseUrl
-    const value = providerConfig[field as keyof typeof providerConfig];
-    return typeof value === "string" ? value : undefined;
+    return providerConfig ? getProviderFieldValue(provider, field, providerConfig) : undefined;
   };
 
   const getFieldDisplayValue = (provider: string, field: string): string | undefined => {
@@ -1709,29 +1736,9 @@ export function ProvidersSection() {
   const isFieldSet = (provider: string, field: string, fieldConfig: FieldConfig): boolean => {
     const providerConfig = config?.[provider];
     if (!providerConfig) return false;
-
-    if (fieldConfig.type === "secret") {
-      // For apiKey, we have apiKeySet from the sanitized config
-      if (field === "apiKey") return providerConfig.apiKeySet ?? false;
-
-      // For AWS secrets, check the aws nested object
-      if (provider === "bedrock" && providerConfig.aws) {
-        const { aws } = providerConfig;
-        switch (field) {
-          case "bearerToken":
-            return aws.bearerTokenSet ?? false;
-          case "accessKeyId":
-            return aws.accessKeyIdSet ?? false;
-          case "secretAccessKey":
-            return aws.secretAccessKeySet ?? false;
-        }
-      }
-      if (provider === "google-vertex" && field === "keyFilename") {
-        return providerConfig.googleVertex?.keyFilenameSet ?? false;
-      }
-      return false;
-    }
-    return !!getFieldValue(provider, field);
+    return fieldConfig.type === "secret"
+      ? isProviderSecretSet(provider, field, providerConfig)
+      : !!getProviderFieldValue(provider, field, providerConfig);
   };
 
   const markCustomProviderFieldTouched = (field: keyof typeof customProviderTouchedFields) => {

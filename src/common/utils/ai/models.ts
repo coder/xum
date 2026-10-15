@@ -88,13 +88,18 @@ export function isGoogleFamilyProvider(provider: string): provider is "google" |
   return provider === "google" || provider === "google-vertex";
 }
 
-function sdkProviderOptionsNamespace(provider: string): string {
-  // Meta reuses the OpenAI Responses adapter. Saved provider extras must reach
-  // that SDK namespace too, not just the built-in reasoning options.
-  if (provider === "meta") return "openai";
+// Providers whose SDK reads providerOptions from a namespace other than the
+// provider name. Saved provider extras must reach that namespace too, not just
+// the built-in reasoning options.
+const SDK_PROVIDER_OPTIONS_NAMESPACES: ReadonlyMap<string, string> = new Map([
+  // Meta reuses the OpenAI Responses adapter.
+  ["meta", "openai"],
   // Vertex Gemini models read `googleVertex` first, then `vertex`, then `google`.
-  if (provider === "google-vertex") return "googleVertex";
-  return provider;
+  ["google-vertex", "googleVertex"],
+]);
+
+function sdkProviderOptionsNamespace(provider: string): string {
+  return SDK_PROVIDER_OPTIONS_NAMESPACES.get(provider) ?? provider;
 }
 
 /**
