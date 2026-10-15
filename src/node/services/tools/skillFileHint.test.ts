@@ -161,6 +161,8 @@ describe("skill file hint", () => {
     const escaped = skillDir.replaceAll(" ", "\\ ");
     const viaEscape = await bashNote(config, `head -c 6000 ${escaped}/playbooks/long.md`);
     expect(viaEscape).toContain('(name: "demo", filePath: "playbooks/long.md")');
+    const viaFragments = await bashNote(config, `head -c 6000 '${skillDir}'/"playbooks"/long.md`);
+    expect(viaFragments).toContain('(name: "demo", filePath: "playbooks/long.md")');
 
     const outside = await bashNote(config, `head -c 6000 "${tmp.path}/plain.md"`);
     expect(outside).toContain("per-line limit");

@@ -38,6 +38,9 @@ const MAX_SKILL_ANCESTORS = 4;
  */
 const MAX_BASH_PATH_TOKENS = 3;
 const SKILLS_SEGMENT_RE = /(^|\/)skills\//;
+const SHELL_WORD_RE = /(?:'[^']*'|"(?:\\.|[^"\\])*"|\\.|[^\s'"`;|&<>()\\])+/g;
+/** A quoted fragment or a backslash escape; plain characters do not match. */
+const SHELL_FRAGMENT_RE = /'([^']*)'|"((?:\\.|[^"\\])*)"|\\./g;
 
 function formatSkillFileHint(location: SkillFileLocation): string {
   const name = JSON.stringify(location.skillName);
@@ -68,9 +71,15 @@ export async function skillFileBashHint(
   config: ToolConfiguration,
   script: string
 ): Promise<string> {
-  // A quoted or backslash-escaped operand is one token, so a path with spaces stays whole.
-  const operands = [...script.matchAll(/'([^']*)'|"([^"]*)"|((?:\\.|[^\s'"`;|&<>()\\])+)/g)].map(
-    (match) => match[1] ?? match[2] ?? match[3].replace(/\\(.)/g, "$1")
+  // Shell words: adjacent quoted, escaped and plain fragments form one word
+  // ('/a b'/SKILL.md), so a path with spaces stays whole.
+  const words = script.match(SHELL_WORD_RE) ?? [];
+  const operands = words.map((word) =>
+    word.replace(
+      SHELL_FRAGMENT_RE,
+      (fragment: string, single?: string, double?: string) =>
+        single ?? double?.replace(/\\(.)/g, "$1") ?? fragment.slice(1)
+    )
   );
   const tokens = new Set(
     operands.filter((token) => SKILLS_SEGMENT_RE.test(token) && !/[$*?]/.test(token))
