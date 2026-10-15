@@ -28,6 +28,7 @@ import {
   type MCPGetPromptResult,
   type MCPPrompt,
   type MCPRawCallToolResult,
+  PROMPT_LIST_TIMEOUT_MS,
 } from "@/node/services/mcpClient";
 import {
   MCP_SETTINGS_WORKSPACE_META_KEY,
@@ -608,6 +609,11 @@ type ResolvedTransport = "stdio" | "http" | "sse";
 
 /** How long a served tool call waits for a publication's enablement repair before failing closed. */
 const PENDING_REPAIR_WAIT_MS = 10_000;
+/**
+ * Bounds one send's wait for first prompt lists (awaitFirstPromptLists): two prompts/list
+ * timeouts, the worst case of the earlier two-round wait.
+ */
+const FIRST_PROMPT_LIST_WAIT_MS = 2 * PROMPT_LIST_TIMEOUT_MS;
 /**
  * ONE deadline for a served tool call's complete authorization gate: every
  * wait in it (repair waits, disk re-reads, re-serves, lock acquisition, epoch
@@ -2627,9 +2633,11 @@ export class MCPServerManager {
 
   /**
    * Send-path prompt freshness is stale-while-revalidate: prompts/list can
-   * hang for its full timeout on servers that ignore prompt requests, and a
-   * message send must never wait on it. Streams serve the cached catalog and
-   * the refreshed one lands for the next stream.
+   * hang for its full timeout on servers that ignore prompt requests, so a
+   * send does not wait on a refresh of a listed catalog. Streams serve the
+   * cached catalog and the refreshed one lands for the next stream. The one
+   * exception is an instance that never listed: the send waits for its first
+   * list, bounded and abortable (see awaitFirstPromptLists).
    */
   private refreshInstancePromptsInBackground(entry: WorkspaceServers): void {
     if (entry.promptRefreshInFlight !== undefined) {
@@ -2736,7 +2744,7 @@ export class MCPServerManager {
   /**
    * Wait for the first prompts/list of the workspace's served instances. Returns true when the
    * serve that just ran used a catalog that was never listed (`unlistedAtServe`, or found now),
-   * so the caller must serve again.
+   * so the caller must serve again, unless `signal` (the send's Stop) aborted.
    *
    * Sends serve a cached entry's prompts stale-while-revalidate. An entry started without a
    * prompt list (an MCP App entry point warm-up, a prompt dispatch) has an empty catalog, which
@@ -2746,20 +2754,49 @@ export class MCPServerManager {
    */
   private async awaitFirstPromptLists(
     workspaceId: string,
-    unlistedAtServe: boolean
+    unlistedAtServe: boolean,
+    signal: AbortSignal | undefined
   ): Promise<boolean> {
     // The serve's own background refresh can settle before this check runs.
     if (!unlistedAtServe && !this.hasUnlistedPromptInstances(workspaceId)) return false;
-    // Share the entry's deduped background refresh with every concurrent send. A refresh that
-    // was already in flight covers only the instances it started with, so a second round lists
-    // an instance added since then.
-    for (let round = 0; round < 2 && this.hasUnlistedPromptInstances(workspaceId); round++) {
-      const entry = this.workspaceServers.get(workspaceId);
-      if (entry === undefined) break;
-      this.refreshInstancePromptsInBackground(entry);
-      await entry.promptRefreshInFlight;
+    // A deadline, not a round count: overlapping warm-ups can keep adding unlisted instances
+    // (#6599). Stop ends the wait too.
+    const deadline = Date.now() + FIRST_PROMPT_LIST_WAIT_MS;
+    const attempted = new Set<MCPServerInstance>();
+    for (
+      let round = this.joinFirstPromptListRound(workspaceId, attempted, deadline);
+      round !== undefined;
+      round = this.joinFirstPromptListRound(workspaceId, attempted, deadline)
+    ) {
+      const timeoutMs = deadline - Date.now();
+      if ((await raceWithAbortAndTimeout(round, { signal, timeoutMs })).kind === "aborted") break;
     }
-    return true;
+    // A stopped send needs no second serve.
+    return signal?.aborted !== true;
+  }
+
+  /**
+   * Share the entry's deduped background refresh with every concurrent send, and return it, or
+   * undefined when no instance is left to wait for or `deadline` passed. A refresh that was
+   * already in flight covers only the instances it started with, so the next round lists an
+   * instance added since then. An instance that a refresh this send started did not list (it
+   * closed or cannot list) is not waited for again, so rounds cannot spin.
+   */
+  private joinFirstPromptListRound(
+    workspaceId: string,
+    attempted: Set<MCPServerInstance>,
+    deadline: number
+  ): Promise<void> | undefined {
+    const entry = this.workspaceServers.get(workspaceId);
+    if (entry === undefined || Date.now() >= deadline) return undefined;
+    const eligible = [...this.promptEligibleInstances(entry).values()];
+    const waiting = eligible.filter((instance) => !this.promptListSettledInstances.has(instance));
+    if (waiting.every((instance) => attempted.has(instance))) return undefined;
+    if (entry.promptRefreshInFlight === undefined) {
+      for (const instance of eligible) attempted.add(instance);
+    }
+    this.refreshInstancePromptsInBackground(entry);
+    return entry.promptRefreshInFlight;
   }
 
   /**
@@ -3238,20 +3275,24 @@ export class MCPServerManager {
     options: MCPWorkspaceRequestOptions,
     readSignal?: AbortSignal
   ): Promise<MCPToolsForWorkspaceResult> {
-    return this.serveWithFirstPromptLists(options.workspaceId, () =>
-      this.runWithStablePluginEpoch(() => this.ensureWorkspaceServers(options, true, readSignal))
+    return this.serveWithFirstPromptLists(
+      options.workspaceId,
+      () =>
+        this.runWithStablePluginEpoch(() => this.ensureWorkspaceServers(options, true, readSignal)),
+      readSignal
     );
   }
 
   /** Run `serve`, and again after awaitFirstPromptLists waited, so the result has the catalog. */
   private async serveWithFirstPromptLists(
     workspaceId: string,
-    serve: () => Promise<MCPToolsForWorkspaceResult>
+    serve: () => Promise<MCPToolsForWorkspaceResult>,
+    signal: AbortSignal | undefined
   ): Promise<MCPToolsForWorkspaceResult> {
     const unlistedAtServe = this.hasUnlistedPromptInstances(workspaceId);
     const stopEpoch = this.workspaceStopEpochs.get(workspaceId) ?? 0;
     const result = await serve();
-    if (!(await this.awaitFirstPromptLists(workspaceId, unlistedAtServe))) return result;
+    if (!(await this.awaitFirstPromptLists(workspaceId, unlistedAtServe, signal))) return result;
     // A removal-style stop since the first serve began owns the workspace: never start its
     // servers again. Return what the first serve returned, as before the wait existed.
     if ((this.workspaceStopEpochs.get(workspaceId) ?? 0) !== stopEpoch) return result;

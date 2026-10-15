@@ -74,7 +74,7 @@ const RESOURCE_READ_TIMEOUT_MS = 30_000;
 /** tools/call issued by an MCP Apps view (not by the model). */
 const APP_TOOL_CALL_TIMEOUT_MS = 120_000;
 // One hung server must not stall the whole slash/inline prompt catalog.
-const PROMPT_LIST_TIMEOUT_MS = 10_000;
+export const PROMPT_LIST_TIMEOUT_MS = 10_000;
 
 export interface MCPHttpTransportConfig {
   type: "http" | "sse";

@@ -2608,6 +2608,79 @@ describe("MCPServerManager", () => {
     ]);
   });
 
+  // #6599: a fixed two-round wait returned while a third warm-up's server was still unlisted.
+  test("servers added by overlapping warm-ups during the first-list wait are all listed", async () => {
+    const request = workspaceRequest("ws-overlapping-warmups");
+    const names = ["a", "b", "c"] as const;
+    const config = (count: number) =>
+      Object.fromEntries(
+        names.slice(0, count).map((name) => [name, stdioConfig(`cmd-ovl-${name}`)])
+      );
+    // The first list of A and of B waits for the test, so a warm-up can land meanwhile.
+    const firstLists = new Map(names.map((name) => [name, Promise.withResolvers<void>()]));
+    const releases = new Map(names.map((name) => [name, Promise.withResolvers<void>()]));
+    for (const name of names) {
+      let calls = 0;
+      servers.serve(`cmd-ovl-${name}`, {
+        listPrompts: async () => {
+          calls += 1;
+          if (calls === 1 && name !== "c") {
+            firstLists.get(name)!.resolve();
+            await releases.get(name)!.promise;
+          }
+          return [{ name: `${name}-prompt` }];
+        },
+      });
+    }
+    configService.listServers.mockResolvedValue(config(1));
+    await manager.warmWorkspaceServers(request);
+
+    const sending = manager.getToolsForWorkspace(request);
+    await firstLists.get("a")!.promise;
+    configService.listServers.mockResolvedValue(config(2));
+    await manager.warmWorkspaceServers(request);
+    releases.get("a")!.resolve();
+    await firstLists.get("b")!.promise;
+    configService.listServers.mockResolvedValue(config(3));
+    await manager.warmWorkspaceServers(request);
+    releases.get("b")!.resolve();
+    const served = await sending;
+
+    expect(served.promptDescriptors.map((prompt) => prompt.promptName).sort()).toEqual([
+      "a-prompt",
+      "b-prompt",
+      "c-prompt",
+    ]);
+  });
+
+  test("Stop ends the first-list wait of a send", async () => {
+    const request = workspaceRequest("ws-stop-first-list");
+    configService.listServers.mockResolvedValue({ cmd: stdioConfig("cmd-stop-first-list") });
+    const listing = Promise.withResolvers<void>();
+    // A list that never settles (a server that ignores prompt requests, 10 s timeout live).
+    servers.serve("cmd-stop-first-list", {
+      listPrompts: () => {
+        listing.resolve();
+        return new Promise<Array<{ name: string }>>(() => undefined);
+      },
+    });
+    await manager.warmWorkspaceServers(request);
+    const controller = new AbortController();
+
+    const sending = manager.getToolsForWorkspace(request, { signal: controller.signal });
+    await listing.promise;
+    controller.abort();
+    const outcome = await Promise.race([
+      sending.then(
+        () => "settled",
+        () => "settled"
+      ),
+      Bun.sleep(2_000).then(() => "still waiting"),
+    ]);
+
+    expect(outcome).toBe("settled");
+  });
+
   test("overlapping opens of one entry point keep the newest open's result", async () => {
     using tmp = new DisposableTempDir("mcp-apps-entry-order");
     const store = new McpAppResultStore((id) => path.join(tmp.path, id));
