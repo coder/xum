@@ -93,7 +93,7 @@ function getToolDuration(events: WorkspaceChatMessage[], toolName: string): numb
 }
 
 // Diagnostics for #6588: CI runs jest with --silent, so a hung step left no trace. Each step of
-// the env-var test is bounded; on a timeout the step trace and the backend's recent log entries
+// these tests is bounded; on a timeout the step trace and the backend's recent log entries
 // go to stderr (not console, which --silent drops).
 const backendLog: LogEntry[] = [];
 let stopBackendLog: (() => void) | null = null;
@@ -124,7 +124,28 @@ async function boundedStep<T>(name: string, ms: number, fn: () => Promise<T>): P
     stepTrace.push(`${new Date().toISOString()} end ${name} (${Date.now() - start} ms)`);
   }
 }
-const __step = <T>(name: string, fn: () => Promise<T>) => boundedStep(name, 40_000, fn);
+
+const currentTest = () => expect.getState().currentTestName ?? "?";
+const bounded =
+  <A extends unknown[], R>(label: string, ms: number, fn: (...args: A) => Promise<R>) =>
+  (...args: A): Promise<R> =>
+    boundedStep(`${currentTest()} :: ${label}`, ms, () => fn(...args));
+const createTestEnvironmentB = bounded("createTestEnvironment", 20_000, createTestEnvironment);
+const createTempGitRepoB = bounded("createTempGitRepo", 20_000, createTempGitRepo);
+const setupProvidersB = bounded("setupProviders", 20_000, setupProviders);
+const sendMessageAndWaitB = bounded("sendMessageAndWait", 45_000, sendMessageAndWait);
+const cleanupTempGitRepoB = bounded("cleanupTempGitRepo", 20_000, cleanupTempGitRepo);
+const cleanupTestEnvironmentB = bounded("cleanupTestEnvironment", 20_000, cleanupTestEnvironment);
+const createWorkspaceWithInitB = async (...args: Parameters<typeof createWorkspaceWithInit>) => {
+  const created = await boundedStep(`${currentTest()} :: createWorkspaceWithInit`, 45_000, () =>
+    createWorkspaceWithInit(...args)
+  );
+  return {
+    ...created,
+    cleanup: () =>
+      boundedStep(`${currentTest()} :: cleanup (workspace.remove)`, 30_000, created.cleanup),
+  };
+};
 
 // Skip all tests if TEST_INTEGRATION is not set
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -204,12 +225,12 @@ describeIntegration("Runtime Bash Execution", () => {
       runTest(
         "should execute simple bash command",
         async () => {
-          const env = await createTestEnvironment();
-          const tempGitRepo = await createTempGitRepo();
+          const env = await createTestEnvironmentB();
+          const tempGitRepo = await createTempGitRepoB();
 
           try {
             // Setup provider
-            await setupProviders(env, {
+            await setupProvidersB(env, {
               anthropic: {
                 apiKey: getApiKey("ANTHROPIC_API_KEY"),
               },
@@ -218,7 +239,7 @@ describeIntegration("Runtime Bash Execution", () => {
             // Create workspace
             const branchName = generateBranchName("bash-simple");
             const runtimeConfig = getRuntimeConfig(branchName);
-            const { workspaceId, cleanup } = await createWorkspaceWithInit(
+            const { workspaceId, cleanup } = await createWorkspaceWithInitB(
               env,
               tempGitRepo,
               branchName,
@@ -229,7 +250,7 @@ describeIntegration("Runtime Bash Execution", () => {
 
             try {
               // Ask AI to run a simple command
-              const events = await sendMessageAndWait(
+              const events = await sendMessageAndWaitB(
                 env,
                 workspaceId,
                 'Use the bash tool with args: { script: "echo Hello World", timeout_secs: 30, run_in_background: false, display_name: "echo-hello" }. Do not spawn a sub-agent.',
@@ -259,8 +280,8 @@ describeIntegration("Runtime Bash Execution", () => {
               await cleanup();
             }
           } finally {
-            await cleanupTempGitRepo(tempGitRepo);
-            await cleanupTestEnvironment(env);
+            await cleanupTempGitRepoB(tempGitRepo);
+            await cleanupTestEnvironmentB(env);
           }
         },
         type === "ssh" ? TEST_TIMEOUT_SSH_MS : TEST_TIMEOUT_LOCAL_MS
@@ -269,50 +290,38 @@ describeIntegration("Runtime Bash Execution", () => {
       runTest(
         "should handle bash command with environment variables",
         async () => {
-          const env = await __step(`${type} env:createTestEnvironment`, () =>
-            createTestEnvironment()
-          );
-          const tempGitRepo = await __step(`${type} env:createTempGitRepo`, () =>
-            createTempGitRepo()
-          );
+          const env = await createTestEnvironmentB();
+          const tempGitRepo = await createTempGitRepoB();
 
           try {
             // Setup provider
-            await __step(`${type} env:setupProviders`, () =>
-              setupProviders(env, {
-                anthropic: {
-                  apiKey: getApiKey("ANTHROPIC_API_KEY"),
-                },
-              })
-            );
+            await setupProvidersB(env, {
+              anthropic: {
+                apiKey: getApiKey("ANTHROPIC_API_KEY"),
+              },
+            });
 
             // Create workspace
             const branchName = generateBranchName("bash-env");
             const runtimeConfig = getRuntimeConfig(branchName);
-            const { workspaceId, cleanup } = await __step(
-              `${type} env:createWorkspaceWithInit`,
-              () =>
-                createWorkspaceWithInit(
-                  env,
-                  tempGitRepo,
-                  branchName,
-                  runtimeConfig,
-                  true, // waitForInit
-                  type === "ssh"
-                )
+            const { workspaceId, cleanup } = await createWorkspaceWithInitB(
+              env,
+              tempGitRepo,
+              branchName,
+              runtimeConfig,
+              true, // waitForInit
+              type === "ssh"
             );
 
             try {
               // Ask AI to run command that sets and uses env var
-              const events = await __step(`${type} env:sendMessageAndWait`, () =>
-                sendMessageAndWait(
-                  env,
-                  workspaceId,
-                  'Use the bash tool with args: { script: "export TEST_VAR=test123 && echo Value:$TEST_VAR", timeout_secs: 30, run_in_background: false, display_name: "env-var" }. Do not spawn a sub-agent.',
-                  HAIKU_MODEL,
-                  BASH_ONLY,
-                  streamTimeoutMs
-                )
+              const events = await sendMessageAndWaitB(
+                env,
+                workspaceId,
+                'Use the bash tool with args: { script: "export TEST_VAR=test123 && echo Value:$TEST_VAR", timeout_secs: 30, run_in_background: false, display_name: "env-var" }. Do not spawn a sub-agent.',
+                HAIKU_MODEL,
+                BASH_ONLY,
+                streamTimeoutMs
               );
 
               // Verify the env var value appears in the bash tool output.
@@ -336,11 +345,11 @@ describeIntegration("Runtime Bash Execution", () => {
               });
               expect(bashCall).toBeDefined();
             } finally {
-              await __step(`${type} env:cleanup(remove)`, () => cleanup());
+              await cleanup();
             }
           } finally {
-            await __step(`${type} env:cleanupTempGitRepo`, () => cleanupTempGitRepo(tempGitRepo));
-            await __step(`${type} env:cleanupTestEnvironment`, () => cleanupTestEnvironment(env));
+            await cleanupTempGitRepoB(tempGitRepo);
+            await cleanupTestEnvironmentB(env);
           }
         },
         type === "ssh" ? TEST_TIMEOUT_SSH_MS : TEST_TIMEOUT_LOCAL_MS
@@ -352,12 +361,12 @@ describeIntegration("Runtime Bash Execution", () => {
       runStdinTest(
         "should not hang on commands that read stdin without input",
         async () => {
-          const env = await createTestEnvironment();
-          const tempGitRepo = await createTempGitRepo();
+          const env = await createTestEnvironmentB();
+          const tempGitRepo = await createTempGitRepoB();
 
           try {
             // Setup provider
-            await setupProviders(env, {
+            await setupProvidersB(env, {
               anthropic: {
                 apiKey: getApiKey("ANTHROPIC_API_KEY"),
               },
@@ -366,7 +375,7 @@ describeIntegration("Runtime Bash Execution", () => {
             // Create workspace
             const branchName = generateBranchName("bash-stdin");
             const runtimeConfig = getRuntimeConfig(branchName);
-            const { workspaceId, cleanup } = await createWorkspaceWithInit(
+            const { workspaceId, cleanup } = await createWorkspaceWithInitB(
               env,
               tempGitRepo,
               branchName,
@@ -379,7 +388,7 @@ describeIntegration("Runtime Bash Execution", () => {
               // Test command that pipes a file through a stdin-reading command (grep)
               // This would hang forever if stdin.close() was used instead of stdin.abort()
               // Regression test for: https://github.com/coder/mux/issues/503
-              const events = await sendMessageAndWait(
+              const events = await sendMessageAndWaitB(
                 env,
                 workspaceId,
                 'Use the bash tool with args: { script: "echo testdata > /tmp/test.txt && cat /tmp/test.txt | grep test", timeout_secs: 30, run_in_background: false, display_name: "stdin-grep" }. Do not spawn a sub-agent.',
@@ -416,8 +425,8 @@ describeIntegration("Runtime Bash Execution", () => {
               await cleanup();
             }
           } finally {
-            await cleanupTempGitRepo(tempGitRepo);
-            await cleanupTestEnvironment(env);
+            await cleanupTempGitRepoB(tempGitRepo);
+            await cleanupTestEnvironmentB(env);
           }
         },
         type === "ssh" ? TEST_TIMEOUT_SSH_MS : TEST_TIMEOUT_LOCAL_MS
@@ -426,12 +435,12 @@ describeIntegration("Runtime Bash Execution", () => {
       runTest(
         "should not hang on grep | head pattern over SSH",
         async () => {
-          const env = await createTestEnvironment();
-          const tempGitRepo = await createTempGitRepo();
+          const env = await createTestEnvironmentB();
+          const tempGitRepo = await createTempGitRepoB();
 
           try {
             // Setup provider
-            await setupProviders(env, {
+            await setupProvidersB(env, {
               anthropic: {
                 apiKey: getApiKey("ANTHROPIC_API_KEY"),
               },
@@ -440,7 +449,7 @@ describeIntegration("Runtime Bash Execution", () => {
             // Create workspace
             const branchName = generateBranchName("bash-grep-head");
             const runtimeConfig = getRuntimeConfig(branchName);
-            const { workspaceId, cleanup } = await createWorkspaceWithInit(
+            const { workspaceId, cleanup } = await createWorkspaceWithInitB(
               env,
               tempGitRepo,
               branchName,
@@ -452,7 +461,7 @@ describeIntegration("Runtime Bash Execution", () => {
             try {
               // Test grep | head pattern - this historically hangs over SSH
               // This is a regression test for the bash hang issue
-              const events = await sendMessageAndWait(
+              const events = await sendMessageAndWaitB(
                 env,
                 workspaceId,
                 'Use the bash tool with args: { script: "for i in {1..1000}; do echo "terminal bench line $i" >> testfile.txt; done && grep -n "terminal bench" testfile.txt | head -n 200", timeout_secs: 60, run_in_background: false, display_name: "grep-head" }. Do not spawn a sub-agent.',
@@ -493,8 +502,8 @@ describeIntegration("Runtime Bash Execution", () => {
               await cleanup();
             }
           } finally {
-            await cleanupTempGitRepo(tempGitRepo);
-            await cleanupTestEnvironment(env);
+            await cleanupTempGitRepoB(tempGitRepo);
+            await cleanupTestEnvironmentB(env);
           }
         },
         type === "ssh" ? TEST_TIMEOUT_SSH_MS : TEST_TIMEOUT_LOCAL_MS
