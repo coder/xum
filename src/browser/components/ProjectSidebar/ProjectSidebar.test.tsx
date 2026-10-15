@@ -34,7 +34,6 @@ import * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as ExperimentsModule from "@/browser/hooks/useExperiments";
 import * as PopoverErrorHookModule from "@/browser/hooks/usePopoverError";
 import * as TooltipModule from "../Tooltip/Tooltip";
-import * as SidebarCollapseButtonModule from "../SidebarCollapseButton/SidebarCollapseButton";
 import * as ConfirmationModalModule from "../ConfirmationModal/ConfirmationModal";
 import * as ProjectDeleteConfirmationModalModule from "../ProjectDeleteConfirmationModal/ProjectDeleteConfirmationModal";
 import * as PopoverErrorModule from "../PopoverError/PopoverError";
@@ -650,9 +649,6 @@ function installProjectSidebarTestDoubles() {
   spyOn(TooltipModule, "TooltipContent").mockImplementation(
     (() => null) as unknown as typeof TooltipModule.TooltipContent
   );
-  spyOn(SidebarCollapseButtonModule, "SidebarCollapseButton").mockImplementation((() => (
-    <button type="button">toggle sidebar</button>
-  )) as unknown as typeof SidebarCollapseButtonModule.SidebarCollapseButton);
   spyOn(ConfirmationModalModule, "ConfirmationModal").mockImplementation(((props: {
     isOpen: boolean;
     title: string;

@@ -6,6 +6,7 @@ import { useWorkspaceContext, toWorkspaceSelection } from "./contexts/WorkspaceC
 import { useProjectContext } from "./contexts/ProjectContext";
 import type { WorkspaceSelection } from "./components/ProjectSidebar/ProjectSidebar";
 import { LeftSidebar } from "./components/LeftSidebar/LeftSidebar";
+import { leftSidebarToggleProps } from "./components/SidebarCollapseButton/SidebarCollapseButton";
 import { ProjectCreateModal } from "./components/ProjectCreateModal/ProjectCreateModal";
 import { MultiProjectWorkspaceCreateModal } from "./components/MultiProjectWorkspaceCreateModal/MultiProjectWorkspaceCreateModal";
 import type * as AIViewModule from "./components/AIView/AIView";
@@ -235,7 +236,7 @@ function RootRouteShell(props: {
         >
           <button
             type="button"
-            onClick={props.onToggleLeftSidebarCollapsed}
+            {...leftSidebarToggleProps(props.onToggleLeftSidebarCollapsed)}
             className={`border-border-medium bg-background-secondary text-foreground hover:bg-hover rounded-md border px-3 py-1.5 text-sm transition-colors ${isDesktopMode() ? "titlebar-no-drag" : ""}`}
             aria-label="Open sidebar menu"
           >

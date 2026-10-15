@@ -19,6 +19,26 @@ export const LEFT_SIDEBAR_TOGGLE_HOST_CLASS =
 
 const TOGGLE_SELECTOR = "[data-left-sidebar-toggle]";
 
+/**
+ * Props for every control that toggles the left sidebar. Toggling unmounts the pressed control and
+ * mounts the one in the other host. After keyboard activation (`detail === 0`: Enter or Space on
+ * the focused button), focus moves to that control so it does not fall to the body. Not after a
+ * click: focus would open its tooltip under the pointer.
+ */
+export function leftSidebarToggleProps(onToggle: () => void) {
+  return {
+    "data-left-sidebar-toggle": "",
+    onClick: (event: React.MouseEvent<HTMLElement>) => {
+      if (event.detail !== 0 || event.currentTarget !== document.activeElement) {
+        onToggle();
+        return;
+      }
+      flushSync(onToggle);
+      document.querySelector<HTMLElement>(TOGGLE_SELECTOR)?.focus({ preventScroll: true });
+    },
+  };
+}
+
 const ICON_BUTTON_CLASS = "text-muted hover:text-foreground h-6 w-6 shrink-0";
 
 interface SidebarCollapseButtonProps {
@@ -29,26 +49,13 @@ interface SidebarCollapseButtonProps {
 export const SidebarCollapseButton: React.FC<SidebarCollapseButtonProps> = (props) => {
   const label = props.collapsed ? "Open sidebar" : "Collapse sidebar";
 
-  const handleClick = (event: React.MouseEvent<HTMLButtonElement>) => {
-    // Toggling unmounts this button and mounts the one in the other host. After keyboard
-    // activation (`detail === 0`: Enter or Space on the focused button), hand focus to it so it
-    // does not fall to the body. Not after a click: focus would open its tooltip under the pointer.
-    if (event.detail !== 0 || event.currentTarget !== document.activeElement) {
-      props.onToggle();
-      return;
-    }
-    flushSync(props.onToggle);
-    document.querySelector<HTMLElement>(TOGGLE_SELECTOR)?.focus({ preventScroll: true });
-  };
-
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <Button
           variant="ghost"
           size="icon"
-          onClick={handleClick}
-          data-left-sidebar-toggle=""
+          {...leftSidebarToggleProps(props.onToggle)}
           // "menu": at phone widths the collapsed sidebar opens as a drawer.
           aria-label={props.collapsed ? "Open sidebar menu" : label}
           className={cn(

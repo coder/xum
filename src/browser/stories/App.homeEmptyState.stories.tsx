@@ -3,9 +3,12 @@
  * sidebar's "No projects" text and both "Add Project" buttons meet WCAG AA contrast in every
  * theme. Lighthouse measured the light theme's muted and secondary text at 2.9-3.8:1 before the
  * fixes.
+ *
+ * KeyboardSidebarToggle: the sidebar toggle unmounts with the sidebar's title bar, so after Enter
+ * focus must land on the page's reopen button, and from there back on the toggle.
  */
 
-import { expect, within } from "storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import { textContrast } from "@/browser/stories/helpers/contrast";
@@ -55,3 +58,23 @@ export const Light = contractStory("light");
 export const Dark = contractStory("dark");
 export const FlexokiLight = contractStory("flexoki-light");
 export const FlexokiDark = contractStory("flexoki-dark");
+
+export const KeyboardSidebarToggle: AppStory = {
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: () => <AppWithMocks setup={() => createMockORPCClient()} />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("Select or add a project to get started.", {}, { timeout: 15_000 });
+    (await canvas.findByRole("button", { name: "Collapse sidebar" })).focus();
+
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() =>
+      expect(document.activeElement).toBe(canvas.getByRole("button", { name: "Open sidebar menu" }))
+    );
+
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() =>
+      expect(document.activeElement).toBe(canvas.getByRole("button", { name: "Collapse sidebar" }))
+    );
+  },
+};
