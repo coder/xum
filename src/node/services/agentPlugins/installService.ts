@@ -299,7 +299,25 @@ interface ReviewTextSource {
 }
 
 function reviewText(item: ReviewTextSource): string {
-  return `${item.display}\n\nReviewed fields: ${item.consentDetail()}`;
+  return showInvisibleControls(`${item.display}\n\nReviewed fields: ${item.consentDetail()}`);
+}
+
+/**
+ * Bidi format and zero-width characters, which can make plugin text (a workflow's source, #6629)
+ * display reordered or hide part of it, while the fingerprint approves the raw bytes.
+ */
+const REVIEW_TEXT_CONTROLS = /[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/gu;
+
+/**
+ * Review text as the user reads it: each such character becomes a visible `<U+XXXX>` mark. The
+ * mark is not a JavaScript escape, so a literal `\u202e` in the source still reads differently
+ * from the character itself.
+ */
+function showInvisibleControls(text: string): string {
+  return text.replace(
+    REVIEW_TEXT_CONTROLS,
+    (char) => `<U+${char.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}>`
+  );
 }
 
 /**

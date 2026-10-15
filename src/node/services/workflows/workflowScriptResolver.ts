@@ -367,12 +367,22 @@ async function resolvePluginWorkflowScript(
  * on bytes whose review an update replaced, cannot resume. A plugin that is gone fails closed.
  */
 export async function assertStoredPluginWorkflowReviewed(
-  input: ResolveWorkflowScriptInput & { scriptPath: string; source: string }
+  input: ResolveWorkflowScriptInput & {
+    scriptPath: string;
+    source: string;
+    /** The discovery scope of the plugin the run started from (its descriptor's scope). */
+    scope: AgentPluginContainer["scope"];
+  }
 ): Promise<void> {
   const parsed = parsePluginWorkflowScriptPath(input.scriptPath);
   const plugins = await discoverWorkflowPlugins(input);
+  // Bound to the scope the run started in: a project plugin of the same name must not stand in
+  // for a managed global one (project plugins carry no consent, so it would pass any snapshot).
   const plugin = plugins.find(
-    (candidate) => candidate.name === parsed.pluginName && candidate.workflowsDir != null
+    (candidate) =>
+      candidate.name === parsed.pluginName &&
+      candidate.scope === input.scope &&
+      candidate.workflowsDir != null
   );
   if (plugin === undefined) {
     throw new Error(
