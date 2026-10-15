@@ -444,3 +444,60 @@ export const PinnedChatsCustomOrder: AppStory = {
     });
   },
 };
+
+/** The creation draft list's load failure (with Retry) or import warning, above the projects. */
+function draftListNoticeStory(
+  listCreation: ReturnType<typeof createMockORPCClient>["drafts"]["listCreation"],
+  expectVisible: (canvasElement: HTMLElement) => HTMLElement | null
+): AppStory {
+  return {
+    globals: { viewport: { value: "phone390", isRotated: false } },
+    parameters: { pixel: { matrix: { viewports: ["phone", "desktop"] } } },
+    render: () => (
+      <AppWithMocks
+        setup={() => {
+          // Keep the sidebar visible at the phone width (mobile shows a chat over it).
+          clearWorkspaceSelection();
+          collapseRightSidebar();
+          updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, false);
+          const workspaces = [
+            createWorkspace({ id: "ws-notice", name: "main", projectName: "my-app" }),
+          ];
+          expandProjects([PROJECT_PATH]);
+          const client = createMockORPCClient({
+            projects: groupWorkspacesByProject(workspaces),
+            workspaces,
+          });
+          client.drafts.listCreation = listCreation;
+          return client;
+        }}
+      />
+    ),
+    play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+      await waitFor(
+        () => {
+          if (!expectVisible(canvasElement)) throw new Error("Draft list notice not shown");
+        },
+        { timeout: 10_000 }
+      );
+    },
+  };
+}
+
+const draftListNotice = (canvasElement: HTMLElement) =>
+  canvasElement.querySelector<HTMLElement>('[aria-label="Projects"] [role="alert"]');
+
+export const DraftListLoadFailed = draftListNoticeStory(
+  () => Promise.reject(new Error("backend busy")),
+  (canvasElement) => draftListNotice(canvasElement)?.querySelector("button") ?? null
+);
+
+export const DraftImportWarning = draftListNoticeStory(
+  () =>
+    Promise.resolve({
+      drafts: [],
+      importError:
+        "1 older draft(s) were not imported: a newer draft differs, or the file could not be read. Their files are kept in /home/user/.xum/drafts. 1 older draft(s) were not imported because a newer draft differs. They stay in this browser.",
+    }),
+  draftListNotice
+);
