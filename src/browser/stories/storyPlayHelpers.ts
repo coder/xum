@@ -1,4 +1,4 @@
-import { userEvent, waitFor, within } from "@storybook/test";
+import { userEvent, waitFor, within } from "storybook/test";
 
 /**
  * Open Settings from the titlebar button and return the Settings dialog. The page behind the

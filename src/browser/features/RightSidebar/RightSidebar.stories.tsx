@@ -45,7 +45,7 @@ import {
   getRightSidebarLayoutKey,
 } from "@/common/constants/storage";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { ComponentType, CSSProperties, ReactNode } from "react";
 import { useEffect, useRef } from "react";
 import type { TabType } from "@/browser/types/rightSidebar";

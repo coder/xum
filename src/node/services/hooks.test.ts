@@ -346,40 +346,50 @@ describe("hooks", () => {
       expect(result.exitCode).toBe(0);
     });
 
-    test("a post-hook skipped because its tool call was aborted is not logged as an error", async () => {
-      const hookPath = path.join(tempDir, ".xum", "tool_post");
-      await fs.mkdir(path.dirname(hookPath), { recursive: true });
-      await fs.writeFile(hookPath, "#!/bin/bash\nexit 0");
-      await fs.chmod(hookPath, 0o755);
-      const context = {
-        tool: "test_tool",
-        toolInput: "{}",
-        workspaceId: "test-workspace",
-        projectDir: tempDir,
-        abortSignal: AbortSignal.abort(),
-      };
-      const logError = spyOn(log, "error").mockImplementation(() => undefined);
-      try {
-        // Cancelled tool call (user interrupt, memory intuition deadline): skipped hook.
-        const aborted = await runPostHook(runtime, hookPath, context, { success: true });
-        expect(aborted.success).toBe(false);
-        expect(logError).not.toHaveBeenCalled();
+    // Both hook runners share this contract; runPreHook is covered here too.
+    test.each([
+      [
+        "tool_pre",
+        (rt: LocalRuntime, hookPath: string, ctx: Parameters<typeof runPreHook>[2]) =>
+          runPreHook(rt, hookPath, ctx).then((r) => r.output),
+      ],
+      [
+        "tool_post",
+        (rt: LocalRuntime, hookPath: string, ctx: Parameters<typeof runPreHook>[2]) =>
+          runPostHook(rt, hookPath, ctx, { success: true }).then((r) => r.output),
+      ],
+    ] as const)(
+      "a %s hook skipped because its tool call was aborted is not logged as an error",
+      async (name, run) => {
+        const hookPath = path.join(tempDir, ".xum", name);
+        await fs.mkdir(path.dirname(hookPath), { recursive: true });
+        await fs.writeFile(hookPath, "#!/bin/bash\nexit 0");
+        await fs.chmod(hookPath, 0o755);
+        const context = {
+          tool: "test_tool",
+          toolInput: "{}",
+          workspaceId: "test-workspace",
+          projectDir: tempDir,
+          abortSignal: AbortSignal.abort(),
+        };
+        const logError = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          // Cancelled tool call (user interrupt, memory intuition deadline): skipped hook.
+          expect(await run(runtime, hookPath, context)).toContain("aborted");
+          expect(logError).not.toHaveBeenCalled();
 
-        // Any other failure to run the hook is still an error.
-        const failing = Object.create(runtime) as LocalRuntime;
-        failing.exec = () => Promise.reject(new Error("spawn failed"));
-        const failed = await runPostHook(
-          failing,
-          hookPath,
-          { ...context, abortSignal: undefined },
-          { success: true }
-        );
-        expect(failed.output).toContain("spawn failed");
-        expect(logError).toHaveBeenCalledTimes(1);
-      } finally {
-        logError.mockRestore();
+          // Any other failure to run the hook is still an error.
+          const failing = Object.create(runtime) as LocalRuntime;
+          failing.exec = () => Promise.reject(new Error("spawn failed"));
+          expect(await run(failing, hookPath, { ...context, abortSignal: undefined })).toContain(
+            "spawn failed"
+          );
+          expect(logError).toHaveBeenCalledTimes(1);
+        } finally {
+          logError.mockRestore();
+        }
       }
-    });
+    );
 
     test("pre- and post-hooks still run when a tool value contains NUL bytes", async () => {
       const writeHook = async (name: string) => {

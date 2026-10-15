@@ -682,6 +682,251 @@ describe("assemblePromptPayload", () => {
     }
   });
 
+  describe("volatile tail changes inside a context segment (mechanism 10)", () => {
+    const stable = "stable instructions";
+    const hot = (text: string) => `\n\n<hot_memories>${text}</hot_memories>`;
+    const opus = {
+      modelString: "anthropic:claude-opus-5-5",
+      providerForMessages: "anthropic",
+      routeProvider: "anthropic",
+    };
+    const answer = (id: string, placement: "system" | "row", text: string, extra = {}) =>
+      createMuxMessage(id, "assistant", `answer ${id}`, {
+        volatileSystemTail: { text, placement },
+        ...extra,
+      });
+    const withTail = (tail: string, history: MuxMessage[], route: object = opus) =>
+      assemble({
+        ...route,
+        history,
+        systemMessage: stable + tail,
+        volatileSystemSuffixLength: tail.length,
+      });
+    const roles = (payload: Awaited<ReturnType<typeof assemble>>) =>
+      payload.messages.map((message) =>
+        message.role === "system" && typeof message.content === "string"
+          ? message.content === stable
+            ? "system:stable"
+            : // The frozen tail keeps its "\n\n" separator; a mid-conversation row does not.
+              message.content.startsWith("\n\n")
+              ? `system:${message.content}`
+              : "system-row"
+          : message.role
+      );
+    const withoutMarkers = (messages: unknown[]) =>
+      JSON.stringify(messages, (key, value: unknown) =>
+        key === "cacheControl" ? undefined : value
+      ).replace(/,?"providerOptions":\{"anthropic":\{\}\}/g, "");
+
+    test("freezes the system tail and sends a change as a row the next turn repeats", async () => {
+      const u1 = createMuxMessage("u1", "user", "first");
+      const u2 = createMuxMessage("u2", "user", "second");
+      const start = await withTail(hot("A"), [u1]);
+      expect(start.volatileSystemTail).toEqual({ text: hot("A"), placement: "system" });
+
+      const history = [u1, answer("a1", "system", hot("A")), u2];
+      const changed = await withTail(hot("B"), history);
+      // The system tail stays A; B goes after the newest user row.
+      expect(roles(changed)).toEqual([
+        "system:stable",
+        `system:${hot("A")}`,
+        "user",
+        "assistant",
+        "user",
+        "system-row",
+      ]);
+      expect(JSON.stringify(changed.messages.at(-1))).toContain("<hot_memories>B</hot_memories>");
+      expect(changed.volatileSystemTail).toEqual({ text: hot("B"), placement: "row" });
+
+      // The next turn rebuilds the row in place and adds none for an unchanged tail.
+      const u3 = createMuxMessage("u3", "user", "third");
+      const next = await withTail(hot("B"), [...history, answer("a2", "row", hot("B")), u3]);
+      expect(next.volatileSystemTail).toBeUndefined();
+      expect(roles(next).filter((role) => role.startsWith("system")).length).toBe(3);
+      expect(withoutMarkers(next.messages.slice(0, changed.messages.length - 1))).toBe(
+        withoutMarkers(changed.messages.slice(0, -1))
+      );
+      expect(withoutMarkers([next.messages[changed.messages.length - 1]])).toBe(
+        withoutMarkers([changed.messages.at(-1)])
+      );
+    });
+
+    test("other models and an assistant-last history keep the old placement", async () => {
+      const history = [
+        createMuxMessage("u1", "user", "first"),
+        answer("a1", "system", hot("A")),
+        createMuxMessage("u2", "user", "second"),
+      ];
+      // A model without mid-conversation system rows: the records change nothing.
+      const sonnet45 = await withTail(hot("B"), history, {
+        modelString: "anthropic:claude-sonnet-4-5",
+        providerForMessages: "anthropic",
+        routeProvider: "anthropic",
+      });
+      expect(roles(sonnet45)).toEqual([
+        "system:stable",
+        `system:${hot("B")}`,
+        "user",
+        "assistant",
+        "user",
+      ]);
+      expect(sonnet45.volatileSystemTail).toBeUndefined();
+      // A route that converts the body on its side: unverified, so the old placement too.
+      const gateway = await withTail(hot("B"), history, {
+        modelString: "mux-gateway:anthropic/claude-opus-5-5",
+        providerForMessages: "anthropic",
+        routeProvider: "mux-gateway",
+      });
+      expect(roles(gateway).slice(0, 2)).toEqual(["system:stable", `system:${hot("B")}`]);
+      expect(gateway.volatileSystemTail).toBeUndefined();
+      const gemini = await withTail(hot("B"), history, {});
+      expect(gemini.system).toBe(stable + hot("B"));
+      expect(gemini.volatileSystemTail).toBeUndefined();
+
+      // Anthropic rejects a system row after an assistant row: send B as before and refreeze.
+      const resumed = await withTail(hot("B"), [
+        ...history,
+        createMuxMessage("a2", "assistant", "partial", { partial: true }),
+      ]);
+      expect(roles(resumed).slice(0, 2)).toEqual(["system:stable", `system:${hot("B")}`]);
+      expect(roles(resumed).filter((role) => role.startsWith("system")).length).toBe(2);
+      expect(resumed.volatileSystemTail).toEqual({ text: hot("B"), placement: "system" });
+    });
+
+    test("a re-freeze after an assistant-last resume drops the rows before it", async () => {
+      // Codex P1 (PRRT_kwDOPxxmWM6sqho9): row B says it replaces the earlier sections, so if
+      // it stayed after a re-freeze at C, the model would read B as the newer tail.
+      const history = [
+        createMuxMessage("u1", "user", "first"),
+        answer("a1", "system", hot("A")),
+        createMuxMessage("u2", "user", "second"),
+        answer("a2", "row", hot("B")),
+        createMuxMessage("u3", "user", "third"),
+        createMuxMessage("a3", "assistant", "partial", { partial: true }),
+      ];
+      const resumed = await withTail(hot("C"), history);
+      expect(resumed.volatileSystemTail).toEqual({ text: hot("C"), placement: "system" });
+      expect(roles(resumed).filter((role) => role.startsWith("system"))).toEqual([
+        "system:stable",
+        `system:${hot("C")}`,
+      ]);
+
+      // The next turn keeps the re-freeze: C stays in the system prompt and B does not return.
+      const next = await withTail(hot("C"), [
+        ...history.slice(0, -1),
+        answer("a3", "system", hot("C"), { partial: true }),
+        createMuxMessage("u4", "user", "fourth"),
+      ]);
+      expect(next.volatileSystemTail).toBeUndefined();
+      expect(roles(next).filter((role) => role.startsWith("system"))).toEqual([
+        "system:stable",
+        `system:${hot("C")}`,
+      ]);
+    });
+
+    test("a replay from the sent system content rebuilds the live request", async () => {
+      // PRRT_kwDOPxxmWM6srqjr: the envelope records what was sent (the frozen tail), so the
+      // replay derives the live tail from the turn's record, or from the segment's last tail.
+      const base = [
+        createMuxMessage("u1", "user", "first"),
+        answer("a1", "system", hot("A")),
+        createMuxMessage("u2", "user", "second"),
+      ];
+      const unchanged = [
+        ...base,
+        answer("a2", "row", hot("B")),
+        createMuxMessage("u3", "user", "x"),
+      ];
+      const cases = [
+        { history: base, live: hot("B") },
+        { history: unchanged, live: hot("B") },
+      ];
+      for (const { history, live } of cases) {
+        const sent = await withTail(live, history);
+        const replayed = await assemble({
+          ...opus,
+          history,
+          systemMessage: sent.sentSystem.message,
+          volatileSystemSuffixLength: sent.sentSystem.volatileSuffixLength,
+          replayedTurn: { record: sent.volatileSystemTail },
+        });
+        expect(sent.sentSystem.message).toBe(stable + hot("A"));
+        expect(JSON.stringify(replayed.messages)).toBe(JSON.stringify(sent.messages));
+      }
+    });
+
+    test("a compaction request sends the live tail with no rows", async () => {
+      // Codex P2 (PRRT_kwDOPxxmWM6srL1X): the compaction trim fits the history to the budget
+      // before the tail is planned, so rebuilt rows would add tokens the trim never counted.
+      const history = [
+        createMuxMessage("u1", "user", "first"),
+        answer("a1", "system", hot("A")),
+        createMuxMessage("u2", "user", "second"),
+        answer("a2", "row", hot("B")),
+        createMuxMessage("u3", "user", "third"),
+        answer("a3", "row", hot("C")),
+        createMuxMessage("u4", "user", "summarize"),
+      ];
+      const tail = hot("D");
+      const payload = await assemble({
+        ...opus,
+        history,
+        systemMessage: stable + tail,
+        volatileSystemSuffixLength: tail.length,
+        compactionInputBudgetTokens: 100_000,
+      });
+      expect(roles(payload).filter((role) => role.startsWith("system"))).toEqual([
+        "system:stable",
+        `system:${tail}`,
+      ]);
+      expect(payload.volatileSystemTail).toBeUndefined();
+    });
+
+    test("an empty or unsplittable tail turns the rows off for the request", async () => {
+      // Codex P2 (PRRT_kwDOPxxmWM6sqhpD): length 0 also means turnRequestBuilder could not
+      // split the tail off (middleware edited it), so its content may be in the stable part. A
+      // row there would claim the frozen sections are gone while they are still present.
+      const history = [
+        createMuxMessage("u1", "user", "first"),
+        answer("a1", "system", hot("A")),
+        createMuxMessage("u2", "user", "second"),
+        answer("a2", "row", hot("B")),
+        createMuxMessage("u3", "user", "third"),
+      ];
+      const prompt = `${stable}${hot("C")}\nappended by middleware`;
+      const payload = await assemble({
+        ...opus,
+        history,
+        systemMessage: prompt,
+        volatileSystemSuffixLength: 0,
+      });
+      expect(payload.messages[0]).toMatchObject({ role: "system", content: prompt });
+      expect(payload.messages.filter((message) => message.role === "system")).toHaveLength(1);
+      expect(payload.volatileSystemTail).toBeUndefined();
+    });
+
+    test("a compaction boundary starts a new segment with the live tail", async () => {
+      const boundary = createMuxMessage("boundary", "assistant", "Compacted summary", {
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+        // A record on the boundary row belongs to the request that compacted, not the segment.
+        volatileSystemTail: { text: hot("A"), placement: "system" },
+      });
+      const payload = await withTail(hot("B"), [
+        createMuxMessage("u1", "user", "first"),
+        answer("a1", "system", hot("A")),
+        createMuxMessage("u2", "user", "second"),
+        answer("a2", "row", hot("B")),
+        boundary,
+        createMuxMessage("u3", "user", "third"),
+      ]);
+      // Without the reset, B was the last tail sent: the request would keep A and add nothing.
+      expect(roles(payload)).toEqual(["system:stable", `system:${hot("B")}`, "assistant", "user"]);
+      expect(payload.volatileSystemTail).toEqual({ text: hot("B"), placement: "system" });
+    });
+  });
+
   test("injects an interrupted sentinel only when a partial assistant remains terminal", async () => {
     const partial = createMuxMessage("partial", "assistant", "working", { partial: true });
     const withoutFollowingUser = await assemble({

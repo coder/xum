@@ -255,6 +255,11 @@ export const MuxMessageSchema = z.object({
         .union([z.number().int().nonnegative(), z.literal("end")])
         .optional()
         .catch(undefined),
+      // Volatile system-tail record (MuxMetadata.volatileSystemTail); corrupt degrades to none.
+      volatileSystemTail: z
+        .object({ text: z.string(), placement: z.enum(["system", "row"]) })
+        .optional()
+        .catch(undefined),
       usage: z.any().optional(),
       contextUsage: z.any().optional(),
       providerMetadata: z.record(z.string(), z.unknown()).optional(),

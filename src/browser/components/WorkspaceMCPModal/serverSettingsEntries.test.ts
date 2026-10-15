@@ -3,8 +3,10 @@ import { getOwn } from "@/common/utils/getOwn";
 import type { MCPSettingsReadSnapshot, MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
 import {
   applySavedSettings,
+  hasUnsavedServerOverrides,
   settingsErrors,
   SettingsRequests,
+  withSettingsToolRuns,
   type ServerSettingsEntry,
 } from "./serverSettingsEntries";
 
@@ -62,4 +64,38 @@ test("validation errors keep a setting named __proto__", () => {
   const errors = settingsErrors(properties, draft);
   expect(Object.keys(errors)).toEqual(["__proto__"]);
   expect(getOwn(errors, "__proto__")).toBe("Proto must be at most 1 characters");
+});
+
+test("unsaved server overrides: the server's allowlist or enablement differs from the saved one", () => {
+  const saved = { toolAllowlist: { cad: ["a", "b"], lathe: ["x"] } };
+  expect(hasUnsavedServerOverrides(saved, saved, "cad")).toBe(false);
+  // Deselecting and selecting again reorders the list: it is the saved allowlist.
+  expect(
+    hasUnsavedServerOverrides(saved, { toolAllowlist: { cad: ["b", "a"], lathe: ["x"] } }, "cad")
+  ).toBe(false);
+  expect(
+    hasUnsavedServerOverrides(saved, { toolAllowlist: { cad: ["b"], lathe: ["x"] } }, "cad")
+  ).toBe(true);
+  expect(hasUnsavedServerOverrides(saved, { toolAllowlist: { lathe: ["x"] } }, "cad")).toBe(true);
+  // Another server's edit does not count for cad.
+  expect(hasUnsavedServerOverrides(saved, { toolAllowlist: { cad: ["a", "b"] } }, "cad")).toBe(
+    false
+  );
+  expect(hasUnsavedServerOverrides(saved, { ...saved, disabledServers: ["cad"] }, "cad")).toBe(
+    true
+  );
+  expect(
+    hasUnsavedServerOverrides({ enabledServers: ["cad"] }, { enabledServers: ["cad"] }, "cad")
+  ).toBe(false);
+});
+
+test("tool runs in flight count like saves: per server, until none runs", () => {
+  const runs = {
+    cad: { running: ["cad.reset"], results: {} },
+    lathe: { running: [], results: {} },
+  };
+  expect(withSettingsToolRuns({ cad: 1 }, runs, ["cad", "lathe"])).toEqual({ cad: 2 });
+  expect(withSettingsToolRuns({}, { lathe: runs.lathe }, ["lathe"])).toEqual({});
+  // A server the dialog no longer lists (removed from the config) does not block Save.
+  expect(withSettingsToolRuns({}, runs, ["lathe"])).toEqual({});
 });

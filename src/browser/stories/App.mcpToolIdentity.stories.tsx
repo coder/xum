@@ -1,5 +1,5 @@
 import type { ComponentType } from "react";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import type { MuxToolPart } from "@/common/types/message";
 import { appMeta, AppWithMocks, type AppStory } from "./meta";

@@ -2211,7 +2211,11 @@ export class AgentSession {
     assert(typeof listener === "function", "listener must be a function");
 
     const unsubscribe = this.onChatEvent(listener);
-    await this.replayHistory(listener);
+    // The caller never gets `unsubscribe` when the replay rejects, so release the listener here.
+    await this.replayHistory(listener).catch((error: unknown) => {
+      unsubscribe();
+      throw error;
+    });
 
     this.scheduleStartupRecovery();
 

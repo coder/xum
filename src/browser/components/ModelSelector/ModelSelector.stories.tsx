@@ -1,7 +1,7 @@
 import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
-import { within, userEvent, waitFor } from "@storybook/test";
+import { within, userEvent, waitFor } from "storybook/test";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 const meta = {

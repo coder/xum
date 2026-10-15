@@ -22,16 +22,29 @@ export function removeSentText(current: string, sent: string): string {
 }
 
 /**
- * The composer text after its own send took `sent`, the text it held at Enter (#6405). The
- * composer stays on from Enter, so keys typed before the take follow the sent text directly
- * ("first messagex", "first message  indented"). `typedAfterSend`: every edit since Enter kept
- * `sent` as the prefix (DraftStore.takeSendMark). Then exactly that prefix goes, and the keys
- * after it stay as typed. Otherwise the text was replaced or restored meanwhile, and only
- * removeSentText's whitespace rule applies: "yesterday" is not a copy of "yes".
+ * How a send's take finds its text in the composer (DraftStore.takeSendMark):
+ * "typed-after": every edit since Enter typed at the end, so the text is the sent text followed
+ * only by those keys (#6405). "edited": the user changed the text through the composer some other
+ * way since Enter (a selection replaced, an edit before the end, #6585). "unknown": anything else
+ * (no mark, or a restore or another window's push changed the text).
  */
-export function takeSentText(current: string, sent: string, typedAfterSend: boolean): string {
-  if (typedAfterSend && current.startsWith(sent)) return current.slice(sent.length);
-  return removeSentText(current, sent);
+export type SendTake = "typed-after" | "edited" | "unknown";
+
+/**
+ * The composer text after its own send took `sent`, the text it held at Enter. "typed-after":
+ * exactly the sent prefix goes, and the keys after it stay as typed ("first messagex" -> "x").
+ * "edited": nothing goes. What the composer holds is the user's own text now, also when it
+ * starts with the sent text (a select-all paste of "Fix the bug in parser.ts" over "Fix the
+ * bug"), so the sent text can stay visible: a duplicate beats a loss. "unknown": removeSentText's
+ * whitespace rule.
+ */
+export function takeSentText(current: string, sent: string, take: SendTake): string {
+  if (take === "unknown") return removeSentText(current, sent);
+  return take === "typed-after" ? withoutSentPrefix(current, sent) : current;
+}
+
+function withoutSentPrefix(current: string, sent: string): string {
+  return current.startsWith(sent) ? current.slice(sent.length) : removeSentText(current, sent);
 }
 
 /**

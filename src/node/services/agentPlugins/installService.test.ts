@@ -3112,8 +3112,8 @@ describe("AgentPluginInstallService", () => {
       expect(logouts).toBe(atStartup);
 
       // After it, overlapping requests start exactly one.
-      const now = Date.now();
-      const clock = spyOn(Date, "now").mockReturnValue(now + 31_000);
+      const now = performance.now();
+      const clock = spyOn(performance, "now").mockReturnValue(now + 31_000);
       try {
         await Promise.all([discovered(), discovered(), discovered()]);
         await settle();
@@ -3122,6 +3122,231 @@ describe("AgentPluginInstallService", () => {
         clock.mockRestore();
       }
       expect(await pendingSignOuts()).toEqual([serverUrl]);
+    });
+
+    test("a hung sign-out does not hang the section open, and keeps the record (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 20,
+      });
+      restarted.setMcpOauthService({
+        logout: () => new Promise<never>(() => undefined),
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      // The pass holds the plugin lock while logout() hangs: the section open waits for it.
+      expect(await restarted.list()).toBeDefined();
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+      expect(await discovered()).toBe(0);
+    });
+
+    test("the retry wait ignores a wall-clock jump (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      let logouts = 0;
+      restarted.setMcpOauthService({
+        logout: () => {
+          logouts++;
+          return Promise.resolve({ success: false, error: "offline" });
+        },
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      await internals.settledSignOutPasses();
+      const atStartup = logouts;
+      // The wall clock jumps a day back, while 31 s pass on the monotonic clock.
+      const wall = spyOn(Date, "now").mockReturnValue(Date.now() - 86_400_000);
+      const mono = spyOn(performance, "now").mockReturnValue(performance.now() + 31_000);
+      try {
+        await discovered();
+        await internals.settledSignOutPasses();
+        expect(logouts).toBe(atStartup + 1);
+      } finally {
+        wall.mockRestore();
+        mono.mockRestore();
+      }
+    });
+
+    test("component review names an unreadable sign-out record (#6627)", async () => {
+      const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      // A self-referencing link: stat fails with ELOOP, not ENOENT.
+      const record = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      await fsPromises.rm(record);
+      await fsPromises.symlink(record, record);
+      await expect(updater.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+        /cannot read the pending plugin sign-out record \(ELOOP\)/
+      );
+      // Still fail-closed.
+      expect(await discovered()).toBe(0);
+      // A record that can be stat'ed but not read names its read error too.
+      await fsPromises.rm(record);
+      await fsPromises.mkdir(record);
+      await expect(updater.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+        /cannot read the pending plugin sign-out record \(not a regular file\)/
+      );
+      await fsPromises.rm(record, { recursive: true });
+      // A FIFO would block a read: it is reported without reading it.
+      if (process.platform !== "win32") {
+        execFileSync("mkfifo", [record]);
+        await expect(updater.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+          /\(not a regular file\)/
+        );
+        await fsPromises.rm(record);
+      }
+      await failing.dispose();
+    });
+
+    test("a later pass waits for a timed-out logout instead of starting a second one (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 20,
+      });
+      let calls = 0;
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      restarted.setMcpOauthService({
+        logout: async () => {
+          calls++;
+          if (calls === 1) await released;
+          return { success: true };
+        },
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      await restarted.list();
+      await restarted.list();
+      await internals.settledSignOutPasses();
+      // The hung first call is still the only one, and the record stays until it settles.
+      expect(calls).toBe(1);
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+      release();
+      await released;
+      await restarted.list();
+      await internals.settledSignOutPasses();
+      expect(await pendingSignOuts()).toBeUndefined();
+    });
+
+    test("an update does not wait forever for a recovery logout that never settles (#6627)", async () => {
+      const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      let calls = 0;
+      updater.setMcpOauthService({
+        logout: () => {
+          calls++;
+          return new Promise<never>(() => undefined);
+        },
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      const internals = updater as unknown as {
+        deps: { reconciliationTimeoutMs?: number };
+        settledSignOutPasses: () => Promise<void>;
+      };
+      internals.deps.reconciliationTimeoutMs = 20;
+      await updater.list();
+      await internals.settledSignOutPasses();
+      expect(calls).toBe(1);
+      await writeServer("client-c");
+      const review = await updater.previewUpdate({ name: "demo-plugin" });
+      // The update finishes within the bound, starts no second logout, and keeps the URL pending.
+      await updater.update({
+        name: "demo-plugin",
+        consent: { fromSha: review.fromSha, toSha: review.toSha },
+      });
+      expect(calls).toBe(1);
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+    });
+
+    test("an update's waits for hung logouts share one deadline (#6627)", async () => {
+      const service = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 300,
+      });
+      service.setMcpOauthService({
+        logout: () => Promise.resolve({ success: true }),
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      const internals = service as unknown as {
+        inFlightSignOuts: Map<string, Promise<{ success: boolean }>>;
+        signOutAndSettle: (name: string, urls: string[]) => Promise<void>;
+      };
+      const hung = new Promise<never>(() => undefined);
+      const urls = ["https://a.example/mcp", "https://b.example/mcp", "https://c.example/mcp"];
+      for (const url of urls) internals.inFlightSignOuts.set(url, hung);
+      const started = performance.now();
+      await internals.signOutAndSettle("demo-plugin", urls);
+      // One 300 ms bound for the three, not 900 ms.
+      expect(performance.now() - started).toBeLessThan(600);
+    });
+
+    test("a pass starts no logout after its deadline (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      const urls = [serverUrl, "https://b.example/mcp", "https://c.example/mcp"];
+      await fsPromises.writeFile(file, JSON.stringify({ version: 1, urls }));
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 20,
+      });
+      const internals = restarted as unknown as {
+        settledSignOutPasses: () => Promise<void>;
+        reconciliationState: Promise<boolean>;
+      };
+      // Let the constructor's recovery settle, so the wiring below starts exactly one pass.
+      await internals.reconciliationState;
+      await internals.settledSignOutPasses();
+      let calls = 0;
+      restarted.setMcpOauthService({
+        // The first logout hangs past the deadline.
+        logout: () => {
+          calls++;
+          return new Promise<never>(() => undefined);
+        },
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      await internals.settledSignOutPasses();
+      // One pass: only the first URL was tried; the rest stay in the record untouched.
+      expect(calls).toBe(1);
+      expect(await pendingSignOuts()).toEqual(urls);
+    });
+
+    test("one pass signs out equivalent URL spellings once (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      await fsPromises.writeFile(
+        file,
+        JSON.stringify({ version: 1, urls: [serverUrl, `${serverUrl}/`] })
+      );
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 20,
+      });
+      let calls = 0;
+      restarted.setMcpOauthService({
+        logout: () => {
+          calls++;
+          return new Promise<never>(() => undefined);
+        },
+        // Both spellings are one stored sign-in.
+        credentialKey: (url: string) => url.replace(/\/$/, ""),
+      } as unknown as McpOauthService);
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      await internals.settledSignOutPasses();
+      expect(calls).toBe(1);
     });
 
     test("component review names a pending sign-out instead of changed files (#6627)", async () => {
@@ -5091,6 +5316,103 @@ describe("AgentPluginInstallService", () => {
     expect(doc.plugins[0].lockedSha).toBe(newSha);
     expect(doc.plugins[0].manifest?.version).toBe("9.9.9");
     expect(await pathExists(path.join(stagingDir(), "update-demo-plugin.json"))).toBe(false);
+  });
+
+  describe("recovery of a promoted-but-unrecorded update keeps the reviewed consent (#6589)", () => {
+    /**
+     * Install, change the skill upstream, review the update, and let the update die after the
+     * promote: the journal deletion and the registry write both fail. `editJournal` then
+     * rewrites the update journal before recovery runs.
+     */
+    async function crashAfterReviewedPromote(
+      description: string,
+      editJournal: (journal: Record<string, unknown>) => void
+    ): Promise<{ newSha: string; greetFingerprint: string }> {
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      await fsPromises.writeFile(
+        path.join(remoteDir, "skills", "greet", "SKILL.md"),
+        `---\nname: greet\ndescription: ${description}\n---\n\nSay hi.\n`
+      );
+      const newSha = await commitAll(remoteDir, `reword the skill: ${description}`);
+      const review = await service.previewUpdate({ name: "demo-plugin" });
+      const reviewed = review.changes.flatMap((change) =>
+        change.component ? [change.component] : []
+      );
+      const greet = reviewed.find((component) => component.name === "greet");
+      assert(greet !== undefined, "the review lists the changed skill");
+
+      const internals = service as unknown as {
+        consumeJournalFile: (journalPath: string) => Promise<void>;
+        writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
+      };
+      const consumeSpy = spyOn(internals, "consumeJournalFile").mockImplementationOnce(() =>
+        Promise.reject(new Error("EBUSY: resource busy"))
+      );
+      const writeSpy = spyOn(internals, "writeRegistry").mockImplementationOnce(() =>
+        Promise.reject(new Error("ENOSPC: no space left on device"))
+      );
+      try {
+        await expect(
+          service.update({
+            name: "demo-plugin",
+            consent: { fromSha: review.fromSha, toSha: review.toSha, reviewed },
+          })
+        ).rejects.toThrow(/ENOSPC/);
+      } finally {
+        consumeSpy.mockRestore();
+        writeSpy.mockRestore();
+      }
+      const journalPath = path.join(stagingDir(), "update-demo-plugin.json");
+      const journal = JSON.parse(await fsPromises.readFile(journalPath, "utf8")) as Record<
+        string,
+        unknown
+      >;
+      editJournal(journal);
+      await fsPromises.writeFile(journalPath, JSON.stringify(journal));
+      return { newSha, greetFingerprint: greet.fingerprint };
+    }
+
+    const registrySkills = async () =>
+      (
+        JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+          plugins: Array<{
+            lockedSha: string;
+            componentConsent?: { skills: Record<string, string> };
+          }>;
+        }
+      ).plugins[0];
+
+    test("a journal with the consent applies it", async () => {
+      const { newSha, greetFingerprint } = await crashAfterReviewedPromote(
+        "Greets people loudly",
+        () => undefined
+      );
+      const [item] = await service.list();
+      expect(item.reviewRequiredCount).toBe(0);
+      const entry = await registrySkills();
+      expect(entry.lockedSha).toBe(newSha);
+      expect(entry.componentConsent?.skills.greet).toBe(greetFingerprint);
+    });
+
+    test("a journal without the consent, or with a malformed one, still recovers and asks again", async () => {
+      // An older build wrote no consent field, and a damaged one must not count as consent.
+      for (const [description, edit] of [
+        ["Greets loudly", (journal: Record<string, unknown>) => delete journal.componentConsent],
+        [
+          "Greets softly",
+          (journal: Record<string, unknown>) => (journal.componentConsent = { skills: "x" }),
+        ],
+      ] as const) {
+        await fsPromises.rm(registryFile(), { force: true });
+        await fsPromises.rm(pluginsDir(), { recursive: true, force: true });
+        const { newSha } = await crashAfterReviewedPromote(description, edit);
+        const [item] = await service.list();
+        expect(item.reviewRequiredCount).toBe(1);
+        expect((await registrySkills()).lockedSha).toBe(newSha);
+        expect(await pathExists(path.join(stagingDir(), "update-demo-plugin.json"))).toBe(false);
+      }
+    });
   });
 
   test("a fresh install revokes global MCP consent left by a manually removed plugin", async () => {
