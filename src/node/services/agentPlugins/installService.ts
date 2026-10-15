@@ -382,10 +382,12 @@ function reviewText(item: ReviewTextSource): string {
 }
 
 /**
- * Bidi format and zero-width characters, which can make plugin text (a workflow's source, #6629)
- * display reordered or hide part of it, while the fingerprint approves the raw bytes.
+ * Characters that render invisibly or reorder text (#6629): every Unicode default-ignorable code
+ * point (zero-width and joiner characters, variation selectors such as U+FE0F, U+034F, tags) and
+ * the bidi controls. Several are valid in JavaScript identifiers, so without a mark `safe` and
+ * `safe` + U+FE0F would look the same in a review while the fingerprint approves other bytes.
  */
-const REVIEW_TEXT_CONTROLS = /[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/gu;
+const REVIEW_TEXT_CONTROLS = /[\p{Default_Ignorable_Code_Point}\u061c\u202a-\u202e\u2066-\u2069]/gu;
 
 /**
  * Review text as the user reads it: each such character becomes a visible `<U+XXXX>` mark. The
@@ -395,7 +397,7 @@ const REVIEW_TEXT_CONTROLS = /[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2064\u20
 function showInvisibleControls(text: string): string {
   return text.replace(
     REVIEW_TEXT_CONTROLS,
-    (char) => `<U+${char.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}>`
+    (char) => `<U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}>`
   );
 }
 
