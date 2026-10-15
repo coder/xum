@@ -116,17 +116,17 @@ export function registerCodexPluginHooks(
         async (ctx) => {
           using phase = startHookPhase(prompt, "UserPromptSubmit", registration, ctx.signal);
           for (const hook of prompt) {
-            const output = guardLeftUnrun(phase, hook, registration)
-              ? { blockReason: HOOK_DEADLINE_REASON }
-              : await invoke(
-                  hook,
-                  { ...promptEventFields(), prompt: ctx.text },
-                  "UserPromptSubmit",
-                  registration,
-                  parseUserPromptSubmitOutput,
-                  // A withdrawn send ends this call, and invoke skips the later ones.
-                  { cwd: ctx.cwd, abortSignal: phase.signal }
-                );
+            const output = await invokeInPhase(phase, hook, registration, { blockReason }, () =>
+              invoke(
+                hook,
+                { ...promptEventFields(), prompt: ctx.text },
+                "UserPromptSubmit",
+                registration,
+                parseUserPromptSubmitOutput,
+                // A withdrawn send ends this call, and invoke skips the later ones.
+                { cwd: ctx.cwd, abortSignal: phase.signal }
+              )
+            );
             if (output === null) continue;
             if (output.stopped === true || output.blockReason !== undefined) {
               ctx.blocked = {
@@ -208,12 +208,12 @@ async function runToolHooks(
     // Scoped to the hooks: the deadline must not run on into the tool call itself.
     using prePhase = startHookPhase(matchingPre, "PreToolUse", registration, ctx.abortSignal);
     for (const hook of matchingPre) {
-      const output = guardLeftUnrun(prePhase, hook, registration)
-        ? { denyReason: HOOK_DEADLINE_REASON }
-        : await invoke(hook, toolEvent(), "PreToolUse", registration, parsePreToolUseOutput, {
-            ...preCall,
-            abortSignal: prePhase.signal,
-          });
+      const output = await invokeInPhase(prePhase, hook, registration, { denyReason }, () =>
+        invoke(hook, toolEvent(), "PreToolUse", registration, parsePreToolUseOutput, {
+          ...preCall,
+          abortSignal: prePhase.signal,
+        })
+      );
       if (ctx.abortSignal?.aborted) break;
       if (output === null) continue;
       if (output.denyReason !== undefined) {
@@ -310,16 +310,16 @@ async function runPostToolHooks(
   const matching = post.filter((candidate) => matches(candidate, ctx.toolName, view));
   using phase = startHookPhase(matching, "PostToolUse", registration, call.abortSignal);
   for (const hook of matching) {
-    const output = guardLeftUnrun(phase, hook, registration)
-      ? { blockReason: HOOK_DEADLINE_REASON }
-      : await invoke(
-          hook,
-          { ...toolEvent(), tool_response: response },
-          "PostToolUse",
-          registration,
-          parsePostToolUseOutput,
-          { ...call, abortSignal: phase.signal }
-        );
+    const output = await invokeInPhase(phase, hook, registration, { blockReason }, () =>
+      invoke(
+        hook,
+        { ...toolEvent(), tool_response: response },
+        "PostToolUse",
+        registration,
+        parsePostToolUseOutput,
+        { ...call, abortSignal: phase.signal }
+      )
+    );
     if (output === null) continue;
     if (output.additionalContext !== undefined) notes.push(output.additionalContext);
     const hookFeedback = output.blockReason ?? output.stopFeedback;
@@ -495,6 +495,19 @@ interface HookPhase {
 
 const HOOK_DEADLINE_REASON =
   "the plugin's hooks ran out of time before every hook could check this.";
+const denyReason = HOOK_DEADLINE_REASON;
+const blockReason = HOOK_DEADLINE_REASON;
+
+/** `run` (one hook call), or `leftUnrun` for a guard the deadline left unrun (guardLeftUnrun). */
+async function invokeInPhase<T>(
+  phase: HookPhase,
+  hook: PluginHookDefinition,
+  registration: CodexHookRegistration,
+  leftUnrun: T,
+  run: () => Promise<T | null>
+): Promise<T | null> {
+  return guardLeftUnrun(phase, hook, registration) ? leftUnrun : run();
+}
 
 /**
  * After the deadline, a hook that could run but never started counts as a deny (PreToolUse) or
