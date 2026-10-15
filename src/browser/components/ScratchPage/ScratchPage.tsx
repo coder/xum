@@ -6,8 +6,11 @@ import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/const
 import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
 import { CREATION_COLUMN_MAX_WIDTH_CLASS } from "@/constants/layout";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
+import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import {
+  CollapsedSidebarHeaderControls,
+  LEFT_SIDEBAR_TOGGLE_HOST_CLASS,
+} from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
 import { ChatInput } from "@/browser/features/ChatInput";
@@ -84,16 +87,12 @@ export function ScratchPage(props: ScratchPageProps) {
             className={cn(
               "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2 [@media(max-width:768px)]:h-auto [@media(max-width:768px)]:py-2",
               // The collapsed left sidebar is zero-width: clear the macOS traffic lights.
-              props.leftSidebarCollapsed && "titlebar-safe-left titlebar-safe-left-gutter-2",
-              isDesktopMode() ? "h-10 titlebar-drag" : "h-8"
+              props.leftSidebarCollapsed && LEFT_SIDEBAR_TOGGLE_HOST_CLASS,
+              isDesktopMode() ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
             )}
           >
             {props.leftSidebarCollapsed && (
-              <SidebarCollapseButton
-                collapsed
-                onToggle={props.onToggleLeftSidebarCollapsed}
-                className="mobile-menu-btn"
-              />
+              <CollapsedSidebarHeaderControls onToggle={props.onToggleLeftSidebarCollapsed} />
             )}
           </div>
           {/* mobile-header-spacer keeps content below the fixed mobile header on touch devices. */}

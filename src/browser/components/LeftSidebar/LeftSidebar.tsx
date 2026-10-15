@@ -89,7 +89,12 @@ export function LeftSidebar(props: LeftSidebarProps) {
         )}
         style={{ width }}
       >
-        {!collapsed && <TitleBar onBeforeOpenSettings={handleBeforeOpenSettings} />}
+        {!collapsed && (
+          <TitleBar
+            onBeforeOpenSettings={handleBeforeOpenSettings}
+            onCollapseSidebar={onToggleCollapsed}
+          />
+        )}
         <ProjectSidebar
           {...projectSidebarProps}
           collapsed={collapsed}

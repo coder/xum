@@ -65,7 +65,10 @@ import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceT
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
 import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
-import { SidebarCollapseButton } from "../SidebarCollapseButton/SidebarCollapseButton";
+import {
+  CollapsedSidebarHeaderControls,
+  LEFT_SIDEBAR_TOGGLE_HOST_CLASS,
+} from "../SidebarCollapseButton/SidebarCollapseButton";
 import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
 import { useLiveAPI } from "@/browser/contexts/API";
 
@@ -679,7 +682,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         rightSidebarCollapsed && "titlebar-safe-right titlebar-safe-right-gutter-2",
         // The collapsed left sidebar is zero-width, so the header reaches the window's left edge
         // and must clear the macOS traffic lights / overlay controls itself.
-        leftSidebarCollapsed && "titlebar-safe-left titlebar-safe-left-gutter-2",
+        leftSidebarCollapsed && LEFT_SIDEBAR_TOGGLE_HOST_CLASS,
         // In desktop mode, make header draggable for window movement
         isDesktop && "titlebar-drag",
         // Keep header visible when iOS keyboard opens and causes scroll
@@ -695,11 +698,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         )}
       >
         {leftSidebarCollapsed && (
-          <SidebarCollapseButton
-            collapsed
-            onToggle={onToggleLeftSidebarCollapsed}
-            className="mobile-menu-btn"
-          />
+          <CollapsedSidebarHeaderControls onToggle={onToggleLeftSidebarCollapsed} />
         )}
         <WorkspaceHeaderTitle
           workspaceId={workspaceId}

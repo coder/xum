@@ -178,7 +178,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await waitFor(() => expect(sidebar).not.toBeVisible());
     await waitFor(() => expect(moreButton).toHaveFocus());
     await expect(chatPane.closest("[inert]")).toBeNull();
-    await expect(expandLeftSidebar.closest("[inert]")).toBeNull();
+    await expect(leftSidebar?.closest("[inert]")).toBeNull();
     // Opening the view expanded the sidebar (it was collapsed), so its panels stay mounted.
     await expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
 

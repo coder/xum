@@ -34,8 +34,11 @@ import { getDraftStore } from "@/browser/stores/DraftStore";
 import { trimArrayToChars } from "@/browser/utils/boundedPersistedValue";
 import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
+import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import {
+  CollapsedSidebarHeaderControls,
+  LEFT_SIDEBAR_TOGGLE_HOST_CLASS,
+} from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 
 interface ProjectPageProps {
   projectPath: string;
@@ -330,16 +333,12 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
             className={cn(
               "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2 [@media(max-width:768px)]:h-auto [@media(max-width:768px)]:py-2",
               // The collapsed left sidebar is zero-width: clear the macOS traffic lights.
-              leftSidebarCollapsed && "titlebar-safe-left titlebar-safe-left-gutter-2",
-              isDesktopMode() ? "h-10 titlebar-drag" : "h-8"
+              leftSidebarCollapsed && LEFT_SIDEBAR_TOGGLE_HOST_CLASS,
+              isDesktopMode() ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
             )}
           >
             {leftSidebarCollapsed && (
-              <SidebarCollapseButton
-                collapsed
-                onToggle={onToggleLeftSidebarCollapsed}
-                className="mobile-menu-btn"
-              />
+              <CollapsedSidebarHeaderControls onToggle={onToggleLeftSidebarCollapsed} />
             )}
           </div>
           {/* Scrollable content area. mobile-header-spacer keeps content below

@@ -35,6 +35,10 @@ import {
 } from "@/common/utils/ai/models";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { isConnectionLostError, isStreamFailure } from "@/browser/contexts/connectionLink";
+import {
+  LEFT_SIDEBAR_TOGGLE_HOST_CLASS,
+  SidebarCollapseButton,
+} from "../SidebarCollapseButton/SidebarCollapseButton";
 
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 
@@ -67,6 +71,7 @@ function getGitDescribe(version: unknown): string | undefined {
 
 interface TitleBarProps {
   onBeforeOpenSettings?: () => void;
+  onCollapseSidebar: () => void;
 }
 
 /** An offline update check fails fast; the next one after the reconnect runs as usual. */
@@ -193,17 +198,19 @@ export function TitleBar(props: TitleBarProps) {
   return (
     <div
       className={cn(
-        "bg-sidebar border-border-light font-primary text-muted titlebar-safe-left titlebar-safe-left-gutter-4 flex shrink-0 items-center justify-between border-b px-4 text-[11px] select-none",
+        "bg-sidebar border-border-light font-primary text-muted flex shrink-0 items-center justify-between border-b px-4 text-[11px] select-none",
+        LEFT_SIDEBAR_TOGGLE_HOST_CLASS,
         isDesktop ? DESKTOP_TITLEBAR_HEIGHT_CLASS : "h-8",
         // In desktop mode, make header draggable for window movement
         isDesktop && "titlebar-drag"
       )}
     >
+      <SidebarCollapseButton collapsed={false} onToggle={props.onCollapseSidebar} />
       <div
         // Desktop titlebar: this wrapper is `flex-1` (for version ellipsis) so it fills the gap.
         // Keep it draggable; apply `titlebar-no-drag` only to the interactive controls inside.
         className={cn(
-          "mr-4 flex min-w-0 flex-1",
+          "mr-4 ml-2 flex min-w-0 flex-1",
           leftInset > 0 ? "flex-col" : "items-center gap-2"
         )}
       >

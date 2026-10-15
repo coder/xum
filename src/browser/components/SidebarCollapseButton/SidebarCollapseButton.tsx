@@ -1,10 +1,20 @@
 import React from "react";
-import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { PanelLeft, SquarePen } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { cn } from "@/common/lib/utils";
+
+/**
+ * Hosts of the left sidebar toggle (the sidebar's TitleBar while expanded, page headers while
+ * collapsed) share this left padding and the titlebar height, so the icon stays put when the
+ * sidebar opens or closes.
+ */
+export const LEFT_SIDEBAR_TOGGLE_HOST_CLASS = "titlebar-safe-left titlebar-safe-left-gutter-4";
+
+const ICON_BUTTON_CLASS = "text-muted hover:text-foreground h-6 w-6 shrink-0";
 
 interface SidebarCollapseButtonProps {
   collapsed: boolean;
@@ -12,14 +22,8 @@ interface SidebarCollapseButtonProps {
   className?: string;
 }
 
-/**
- * Left sidebar toggle icon, mirroring the right sidebar's: the expanded sidebar's header shows it
- * as "Collapse sidebar", and page headers show it as the reopen affordance while the sidebar is
- * collapsed (at phone widths that opens the drawer, hence the "menu" label).
- */
 export const SidebarCollapseButton: React.FC<SidebarCollapseButtonProps> = (props) => {
   const label = props.collapsed ? "Open sidebar" : "Collapse sidebar";
-  const Icon = props.collapsed ? PanelLeftOpen : PanelLeftClose;
 
   return (
     <Tooltip>
@@ -28,14 +32,11 @@ export const SidebarCollapseButton: React.FC<SidebarCollapseButtonProps> = (prop
           variant="ghost"
           size="icon"
           onClick={props.onToggle}
+          // "menu": at phone widths the collapsed sidebar opens as a drawer.
           aria-label={props.collapsed ? "Open sidebar menu" : label}
-          className={cn(
-            "text-muted hover:text-foreground h-6 w-6 shrink-0",
-            isDesktopMode() && "titlebar-no-drag",
-            props.className
-          )}
+          className={cn(ICON_BUTTON_CLASS, isDesktopMode() && "titlebar-no-drag", props.className)}
         >
-          <Icon className="h-3.5 w-3.5" />
+          <PanelLeft className="h-3.5 w-3.5" />
         </Button>
       </TooltipTrigger>
       <TooltipContent>
@@ -44,3 +45,28 @@ export const SidebarCollapseButton: React.FC<SidebarCollapseButtonProps> = (prop
     </Tooltip>
   );
 };
+
+/**
+ * Page-header controls that stand in for the collapsed left sidebar: its toggle, its "New chat"
+ * action, and a divider before the page's own header content.
+ */
+export const CollapsedSidebarHeaderControls: React.FC<{ onToggle: () => void }> = (props) => (
+  <div className={cn("flex shrink-0 items-center gap-1", isDesktopMode() && "titlebar-no-drag")}>
+    <SidebarCollapseButton collapsed onToggle={props.onToggle} className="mobile-menu-btn" />
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={() => window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.NEW_CHAT_REQUESTED))}
+          aria-label="New chat"
+          className={ICON_BUTTON_CLASS}
+        >
+          <SquarePen className="h-3.5 w-3.5" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>New chat ({formatKeybind(KEYBINDS.NEW_WORKSPACE)})</TooltipContent>
+    </Tooltip>
+    <div aria-hidden className="bg-border-light mx-1.5 h-4 w-px" />
+  </div>
+);

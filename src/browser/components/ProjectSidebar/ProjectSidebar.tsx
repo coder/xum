@@ -83,7 +83,6 @@ import {
 } from "@/browser/utils/ui/pinnedReorder";
 import { isWorkspaceRowRendered } from "@/browser/utils/ui/workspaceDomNav";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
-import { SidebarCollapseButton } from "../SidebarCollapseButton/SidebarCollapseButton";
 import { ConfirmationModal } from "../ConfirmationModal/ConfirmationModal";
 import { useArchiveWorkspaceConfirmation } from "@/browser/hooks/useArchiveWorkspaceConfirmation";
 import { ProjectDeleteConfirmationModal } from "../ProjectDeleteConfirmationModal/ProjectDeleteConfirmationModal";
@@ -1989,6 +1988,19 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const hasProjectMenuTarget = projectMenuTargetPath !== null;
 
+  // useCallback for the keyboard effect's dependency list, not for memoization.
+  const addChatBesideSelection = useCallback(
+    (selection: WorkspaceSelection) => {
+      const meta = workspaceStore.getWorkspaceMetadata(selection.workspaceId);
+      if (meta) {
+        handleAddSiblingWorkspace(meta);
+      } else {
+        handleAddWorkspace(selection.projectPath);
+      }
+    },
+    [workspaceStore, handleAddSiblingWorkspace, handleAddWorkspace]
+  );
+
   // Handle keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -1996,12 +2008,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       // target from the live sidebar metadata before opening a sibling draft.
       if (matchesKeybind(e, KEYBINDS.NEW_WORKSPACE) && selectedWorkspace) {
         e.preventDefault();
-        const meta = workspaceStore.getWorkspaceMetadata(selectedWorkspace.workspaceId);
-        if (meta) {
-          handleAddSiblingWorkspace(meta);
-        } else {
-          handleAddWorkspace(selectedWorkspace.projectPath);
-        }
+        addChatBesideSelection(selectedWorkspace);
       } else if (matchesKeybind(e, KEYBINDS.ARCHIVE_WORKSPACE) && selectedWorkspace) {
         e.preventDefault();
         void handleArchiveWorkspace(selectedWorkspace.workspaceId);
@@ -2033,8 +2040,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   }, [
     closeProjectContextMenu,
     selectedWorkspace,
-    handleAddSiblingWorkspace,
-    handleAddWorkspace,
+    addChatBesideSelection,
     handleArchiveWorkspace,
     setWorkspacePinned,
     movePinnedWorkspace,
@@ -2477,6 +2483,20 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     }
   };
 
+  // The collapsed sidebar's "New chat" lives in the page header (WorkspaceMenuBar and the draft
+  // pages), which asks this always-mounted sidebar to run the same logic.
+  useEffect(() => {
+    const handler = () => {
+      if (selectedWorkspace) {
+        addChatBesideSelection(selectedWorkspace);
+      } else {
+        handleAddFlatWorkspace();
+      }
+    };
+    window.addEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, handler);
+    return () => window.removeEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, handler);
+  });
+
   const flatSidebarContent = (
     <div className="py-1">
       {renderCoalescedWorkspaceList(visiblePinnedFlatWorkspaces, flatRowsForDisplay, {
@@ -2579,47 +2599,44 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                     <XumLogo className="h-5 w-auto" aria-hidden="true" />
                   </button>
                 </div>
-                <div className="flex shrink-0 items-center gap-1">
-                  {flatSidebarEnabled ? (
-                    // Flat mode puts "New chat" (the frequent action) in the header and
-                    // shrinks "Add project" to a distinct folder icon so the two
-                    // header actions never show the same "+" glyph side by side.
-                    <div className="flex shrink-0 items-center gap-1">
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <button
-                            onClick={() => onAddProject()}
-                            aria-label="Add project"
-                            className="text-secondary hover:bg-hover hover:border-border-light flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent transition-all duration-200"
-                          >
-                            <FolderPlus className="h-4 w-4" strokeWidth={1.8} />
-                          </button>
-                        </TooltipTrigger>
-                        <TooltipContent>Add project</TooltipContent>
-                      </Tooltip>
-                      {/* text-muted at rest and the foreground on hover: text-secondary missed WCAG
+                {flatSidebarEnabled ? (
+                  // Flat mode puts "New chat" (the frequent action) in the header and
+                  // shrinks "Add project" to a distinct folder icon so the two
+                  // header actions never show the same "+" glyph side by side.
+                  <div className="flex shrink-0 items-center gap-1">
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          onClick={() => onAddProject()}
+                          aria-label="Add project"
+                          className="text-secondary hover:bg-hover hover:border-border-light flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent transition-all duration-200"
+                        >
+                          <FolderPlus className="h-4 w-4" strokeWidth={1.8} />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent>Add project</TooltipContent>
+                    </Tooltip>
+                    {/* text-muted at rest and the foreground on hover: text-secondary missed WCAG
                         AA in the dark themes, and on the hover background in every theme (#6010). */}
-                      <button
-                        onClick={handleAddFlatWorkspace}
-                        className="text-muted hover:text-foreground hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
-                      >
-                        <SquarePen className="h-3.5 w-3.5" strokeWidth={1.8} />
-                        <span>New chat</span>
-                      </button>
-                    </div>
-                  ) : (
                     <button
-                      onClick={() => onAddProject()}
-                      aria-label="Add project"
-                      // text-content-secondary: the light theme's text-secondary is 2.9:1 (#5950).
-                      className="text-content-secondary hover:bg-hover hover:text-foreground hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
+                      onClick={handleAddFlatWorkspace}
+                      className="text-muted hover:text-foreground hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
                     >
-                      <span className="text-base leading-none">+</span>
-                      <span>Add Project</span>
+                      <SquarePen className="h-3.5 w-3.5" strokeWidth={1.8} />
+                      <span>New chat</span>
                     </button>
-                  )}
-                  <SidebarCollapseButton collapsed={false} onToggle={onToggleCollapsed} />
-                </div>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => onAddProject()}
+                    aria-label="Add project"
+                    // text-content-secondary: the light theme's text-secondary is 2.9:1 (#5950).
+                    className="text-content-secondary hover:bg-hover hover:text-foreground hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
+                  >
+                    <span className="text-base leading-none">+</span>
+                    <span>Add Project</span>
+                  </button>
+                )}
               </div>
               <ScrollArea
                 className="flex-1"
