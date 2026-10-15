@@ -289,6 +289,21 @@ function compactionFollowUpOf(entry: QueueEntry) {
 }
 
 /**
+ * Preserve the first muxMetadata per entry (see the MessageQueue docblock for the rationale). A
+ * later add's reviews still go to `batchedReviews`, so a restore gives them back (a hook blocking
+ * the batch, Codex PRRT_kwDOPxxmWM6rZqyS).
+ */
+function recordAddMetadata(entry: QueueEntry, muxMetadata: unknown): void {
+  if (muxMetadata === undefined) return;
+  if (entry.muxMetadata === undefined) {
+    entry.muxMetadata = muxMetadata;
+    return;
+  }
+  const reviews = hasReviews(muxMetadata) ? (muxMetadata.reviews ?? []) : [];
+  if (reviews.length > 0) entry.batchedReviews = [...(entry.batchedReviews ?? []), ...reviews];
+}
+
+/**
  * One dispatchable unit in the queue. Plain follow-up messages batch into a single
  * entry (joined text, accumulated file parts); "special" sends (compaction requests,
  * agent-skill invocations, workspace-turn follow-ups, callback-carrying internal
@@ -898,14 +913,7 @@ export class MessageQueue {
       // authoredText describes this add only: it must not ride along as the entry's options.
       const { fileParts, authoredText, ...restOptions } = options;
 
-      // Preserve first muxMetadata per entry (see class docblock for rationale)
-      if (options.muxMetadata !== undefined && entry.muxMetadata === undefined) {
-        entry.muxMetadata = options.muxMetadata;
-      } else if (hasReviews(options.muxMetadata) && (options.muxMetadata.reviews?.length ?? 0) > 0) {
-        // The entry keeps only its first metadata: a later add's reviews must still come back
-        // on a restore (a hook blocking the batch, Codex PRRT_kwDOPxxmWM6rZqyS).
-        entry.batchedReviews = [...(entry.batchedReviews ?? []), ...(options.muxMetadata.reviews ?? [])];
-      }
+      recordAddMetadata(entry, options.muxMetadata);
       entry.latestOptions = restOptions;
 
       if (fileParts && fileParts.length > 0) {
