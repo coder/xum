@@ -17,6 +17,7 @@ const snapshot = (units: string): MCPSettingsReadSnapshot => ({
   warnings: [],
   droppedSettingCount: 0,
   instanceToken: "instance-1",
+  readId: "read-1",
 });
 
 test("settings requests: only a server's latest request in the current open applies", () => {

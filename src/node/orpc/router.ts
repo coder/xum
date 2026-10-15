@@ -1335,7 +1335,7 @@ export const router = (authToken?: string) => {
                 input.workspaceId,
                 input.serverName,
                 input.toolName,
-                input.instanceToken,
+                { instanceToken: input.instanceToken, readId: input.readId },
                 { confirmed: input.confirmed, signal }
               )
             )
@@ -1349,7 +1349,7 @@ export const router = (authToken?: string) => {
                 input.workspaceId,
                 input.serverName,
                 input.toolName,
-                input.instanceToken,
+                { instanceToken: input.instanceToken, readId: input.readId },
                 { confirmed: input.confirmed, signal }
               )
             )

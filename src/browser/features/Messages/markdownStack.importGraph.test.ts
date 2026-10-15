@@ -62,3 +62,17 @@ test("only the workspace page imports the Markdown stack statically", async () =
     expect(stackChains(await staticImportGraph(toPosix(path.join(SRC, entry))))).toEqual([]);
   }
 });
+
+// T3 (#5971): the tool cards (and motion/framer-motion and markdown-it with them) are a lazy chunk that
+// the workspace page loads only for chats with tool calls (see toolCardsStore).
+test("the workspace page loads the tool cards lazily", async () => {
+  const LAZY =
+    /\/(src\/browser\/features\/Tools\/Shared\/getToolComponent\.ts|node_modules\/(motion|markdown-it)\/)/;
+  const lazyIn = (parents: Map<string, string | null>) =>
+    [...parents.keys()].filter((file) => LAZY.test(file)).map((file) => path.relative(SRC, file));
+  const loader = "browser/features/Tools/Shared/toolCardsLoader.tsx";
+  // The walk must find them from the lazy entry, or a passing result proves nothing.
+  expect(lazyIn(await staticImportGraph(toPosix(path.join(SRC, loader)))).length).toBe(3);
+  const page = "browser/components/AIView/AIView.tsx";
+  expect(lazyIn(await staticImportGraph(toPosix(path.join(SRC, page))))).toEqual([]);
+});

@@ -3064,8 +3064,25 @@ describe("Config", () => {
       fs.symlinkSync(loopA, loopB);
       const link = path.join(tempDir, "config.json");
       fs.symlinkSync(loopA, link);
+      // Record the walk's symlink reads, so the test can tell the 40-link cap from an earlier stop.
+      const loopPaths = new Set([link, loopA, loopB]);
+      const linkReads: string[] = [];
+      const realReadlink = fs.readlinkSync;
+      const readlinkSpy = spyOn(fs, "readlinkSync").mockImplementation(((
+        target: fs.PathLike,
+        ...rest: unknown[]
+      ) => {
+        if (loopPaths.has(String(target))) linkReads.push(String(target));
+        return (realReadlink as (...args: unknown[]) => unknown)(target, ...rest);
+      }) as typeof fs.readlinkSync);
       // Without the link limit, resolving the loop never ends and this call hangs.
       const next = nextNotification(config);
+      readlinkSpy.mockRestore();
+      // Each walk starts at config.json and follows 40 links (the kernel's ELOOP bound) before
+      // it stops: config.json once, then 39 loop links.
+      const walks = linkReads.join("\n").split(link).slice(1);
+      expect(walks.length).toBeGreaterThan(0);
+      for (const walk of walks) expect(walk.split("\n").filter(Boolean)).toHaveLength(39);
       // The config dir watch still sees a real file that replaces the loop.
       const replacement = path.join(tempDir, "replacement.json");
       fs.writeFileSync(replacement, JSON.stringify({ projects: [], updateChannel: "nightly" }));

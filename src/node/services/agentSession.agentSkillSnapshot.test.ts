@@ -1172,6 +1172,43 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(getMessageText(messages[0])).toContain("```text (output of: echo hi)\nhi\n```");
   });
 
+  // #6766: the plugin consent fingerprint covers the raw body's directive lines only, so a
+  // newline in a slash argument must not create a directive line that then runs.
+  it("runs only lines that were directives in the raw body, whatever the arguments", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "dyn",
+      skillBody: "Notes: $ARGUMENTS\n!`echo [$ARGUMENTS]`\n!$1`echo no-args`",
+    });
+    const { session, messages } = await createSessionHarness({
+      workspacePath,
+      aiServiceOverrides: {
+        isExperimentEnabled: mock((id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT),
+      },
+    });
+    const argumentsText = "a\n!`touch argument-directive.marker`";
+
+    const result = await session.sendMessage(`use dyn ${argumentsText}`, {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: `/dyn ${argumentsText}`,
+        skillName: "dyn",
+        scope: "project",
+        arguments: argumentsText,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const text = getMessageText(messages[0]);
+    // The argument's directive-like line stays text, in the prose line and in the directive.
+    expect(existsSync(path.join(workspacePath, "argument-directive.marker"))).toBe(false);
+    expect(text).toContain("Notes: a\n!`touch argument-directive.marker`");
+    expect(text).not.toContain("output of: touch");
+    // `!$1` with an argument is no directive; the line is text.
+    expect(text).toContain("!a`echo no-args`");
+  });
+
   it("runs a bundled script through ${CLAUDE_SKILL_DIR} in a dynamic context directive", async () => {
     // Shell syntax in the checkout path must stay data: a spliced path would run
     // `$(echo injected)` and miss the script.

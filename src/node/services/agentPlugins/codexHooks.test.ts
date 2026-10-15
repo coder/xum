@@ -378,7 +378,7 @@ describe("loadPluginCodexHooks", () => {
 
   test("a Rust matcher that JavaScript would read differently drops its group", async () => {
     using tmp = new DisposableTempDir("codex-hooks-rust-only");
-    const refused = ["\\A(?:Bash|Edit)\\z", "^[[:alpha:]]+$", "^\\pL+$", "^[a-z&&[^x]]$"];
+    const refused = ["^\\pL+$", "^[[:alpha:]]+$", "^[a-z&&[^x]]$"];
     const plugin = await writePlugin(tmp.path, {
       "hooks/hooks.json": {
         hooks: {
@@ -395,7 +395,7 @@ describe("loadPluginCodexHooks", () => {
 
     expect(hooks.map((hook) => hook.matcher)).toEqual(["^mcp\\.\\x5f[a-z-]+$"]);
     expect(warnings).toHaveLength(refused.length);
-    expect(warnings[0]).toMatch(/not a valid regex \('\\A' means something else in JavaScript\)/);
+    expect(warnings[0]).toMatch(/not a valid regex \('\\p' means something else in JavaScript\)/);
     expect(warnings[1]).toMatch(/'\[' in a character class/);
   });
 
@@ -406,7 +406,7 @@ describe("loadPluginCodexHooks", () => {
       "hooks/hooks.json": {
         hooks: {
           PreToolUse: [
-            { matcher: "\\A(?:Bash|Edit)\\z", hooks: [scan] },
+            { matcher: "\\pL(?:Bash|Edit)", hooks: [scan] },
             { matcher: "^Bash$", hooks: [{ ...scan, tool: "bad_timeout", timeout: "ten" }] },
             { matcher: "^Bash$", hooks: [{ type: "mcp_tool", server: " ", tool: "blank_server" }] },
           ],
@@ -417,7 +417,7 @@ describe("loadPluginCodexHooks", () => {
     const { warnings } = await loadPluginCodexHooks(plugin);
 
     expect(warnings).toHaveLength(3);
-    expect(warnings[0]).toContain('ignoring its group "\\\\A(?:Bash|Edit)\\\\z"');
+    expect(warnings[0]).toContain('ignoring its group "\\\\pL(?:Bash|Edit)"');
     expect(warnings[1]).toContain(`('timeout' of tool "bad_timeout")`);
     expect(warnings[2]).toContain(`('server' of tool "blank_server")`);
   });
@@ -435,6 +435,36 @@ describe("loadPluginCodexHooks", () => {
       "Edit",
     ]);
     expect(matching("^mcp__.*", ["mcp__s__t", "x_mcp__"])).toEqual(["mcp__s__t"]);
+    // Rust-only syntax Xum translates (Codex PRRT_kwDOPxxmWM6rN8BF): `(?P<name>...)` groups and
+    // the `\A`/`\z` text anchors, which ignore the m flag as in Rust.
+    expect(matching("^(?P<tool>Bash|Edit)$", ["Bash", "Edit", "BashOutput"])).toEqual([
+      "Bash",
+      "Edit",
+    ]);
+    expect(matching("(?m)\\A(?:Bash|Edit)\\z", ["Bash", "Edit", "x\nBash", "Bash\nx"])).toEqual([
+      "Bash",
+      "Edit",
+    ]);
+    // Rust lets an anchor take a quantifier (Codex PRRT_kwDOPxxmWM6s35hr).
+    expect(matching("\\A+Bash\\z{1}", ["Bash", "xBash"])).toEqual(["Bash"]);
+    // A group name only one dialect accepts is refused (Codex PRRT_kwDOPxxmWM6s35ho).
+    for (const name of ["$", "a.b", "1a"]) {
+      expect(() => compileHookMatcher(`(?P<${name}>Bash)`)).toThrow(SyntaxError);
+    }
+    // Unicode names both accept pass (Codex PRRT_kwDOPxxmWM6s4Py1), a name used twice does not,
+    // also across alternatives and in `(?<name>` form (Codex PRRT_kwDOPxxmWM6s4Py9).
+    expect(matching("^(?P<é>Bash)$|^(?P<名>Edit)$", ["Bash", "Edit"])).toEqual(["Bash", "Edit"]);
+    for (const pattern of ["(?P<tool>Bash)|(?P<tool>Edit)", "(?P<tool>Bash)|(?<tool>Edit)"]) {
+      expect(() => compileHookMatcher(pattern)).toThrow(SyntaxError);
+    }
+    // A combining mark Rust counts as alphabetic (U+0345) passes (Codex PRRT_kwDOPxxmWM6s4vbi).
+    expect(matching("^(?P<a\u0345>Bash)$", ["Bash"])).toEqual(["Bash"]);
+    // Many unclosed openers are refused in linear time (Codex PRRT_kwDOPxxmWM6s4vbk).
+    const started = performance.now();
+    expect(() => compileHookMatcher("(?<".repeat(80_000))).toThrow(SyntaxError);
+    expect(performance.now() - started).toBeLessThan(500);
+    // An escaped backslash before `A` is a literal backslash and `A`, not an anchor.
+    expect(matching("^a\\\\A$", ["a\\A", "a"])).toEqual(["a\\A"]);
   });
 
   test("mcp_tool fields follow Codex: blank targets are dropped, a timeout below 1s becomes 1s", async () => {

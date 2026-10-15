@@ -335,18 +335,19 @@ import {
   mergeLoadedSkillSnapshots,
   stringifyAgentSkillFrontmatter,
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
-import { substituteSkillArguments } from "@/node/services/agentSkills/skillArguments";
+import { createSkillArgumentSubstituter } from "@/node/services/agentSkills/skillArguments";
 import {
   assertSkillDirectoryPlaceholdersResolved,
   prependSkillDirectoryNote,
   resolveSkillDirectory,
   skillDirectoryEnv,
-  substituteSkillDirectoryPlaceholdersOutsideDirectives,
+  substituteSkillDirectoryPlaceholders,
 } from "@/node/services/agentSkills/skillDirectory";
 import {
   injectSkillDynamicContext,
   SKILL_DYNAMIC_COMMAND_TIMEOUT_MS,
   SKILL_DYNAMIC_OUTPUT_CAP_BYTES,
+  substituteSkillBodyForDirectives,
 } from "@/node/services/agentSkills/skillDynamicContext";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import {
@@ -13754,10 +13755,6 @@ export class AgentSession {
         muxMetadata.skillName === ref.skillName
           ? (muxMetadata.arguments ?? "")
           : null;
-      const argumentBody =
-        slashArgumentText != null
-          ? substituteSkillArguments(skill.body, slashArgumentText).body
-          : skill.body;
       // ${CLAUDE_SKILL_DIR}/${CLAUDE_PLUGIN_ROOT} next: after arguments (Claude Code's
       // order), before dynamic context. Directive lines keep the placeholders and get
       // the values as env vars, so !`sh "${CLAUDE_SKILL_DIR}/x.sh"` runs the bundled
@@ -13765,10 +13762,16 @@ export class AgentSession {
       const skillDirectory = resolveSkillDirectory(resolved, runtime, {
         discoveredOutsideWorkspace: skillDiscoveryPath !== workspacePath,
       });
-      const substitutedBody = substituteSkillDirectoryPlaceholdersOutsideDirectives(
-        argumentBody,
-        skillDirectory
-      );
+      // Line by line, so only the raw body's directive lines can run (#6766): the plugin
+      // consent fingerprint covers those, and a slash argument with a newline must not add one.
+      const substituted = substituteSkillBodyForDirectives({
+        rawBody: skill.body,
+        substituteArguments:
+          slashArgumentText != null
+            ? createSkillArgumentSubstituter(slashArgumentText)
+            : (line) => line,
+        substituteText: (text) => substituteSkillDirectoryPlaceholders(text, skillDirectory),
+      });
 
       // Dynamic context injection (default-off experiment): replace whole-line
       // !`command` directives with their output. Ordering matters: it runs after
@@ -13780,7 +13783,8 @@ export class AgentSession {
       // path and never runs directives (it only substitutes skill directories).
       const injectedBody = await this.maybeInjectSkillDynamicContext({
         skillName: skill.frontmatter.name,
-        body: substitutedBody,
+        body: substituted.body,
+        runnableLines: substituted.runnableLines,
         runtime,
         workspacePath,
         env: skillDirectoryEnv(skillDirectory),
@@ -13849,6 +13853,8 @@ export class AgentSession {
   private async maybeInjectSkillDynamicContext(args: {
     skillName: string;
     body: string;
+    /** Lines that may run as directives (substituteSkillBodyForDirectives). */
+    runnableLines: ReadonlySet<number>;
     runtime: Runtime;
     workspacePath: string;
     /** Skill-directory variables for directive commands (skillDirectoryEnv). */
@@ -13861,6 +13867,7 @@ export class AgentSession {
     try {
       const result = await injectSkillDynamicContext({
         body: args.body,
+        runnableLines: args.runnableLines,
         // SECURITY AUDIT: this sink executes shell commands sourced from SKILL.md
         // bodies, which are repo-controlled and therefore attacker-controlled input
         // (any cloned repo can ship arbitrary skills). It is acceptable only because:

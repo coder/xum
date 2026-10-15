@@ -46,8 +46,6 @@ const keyOf = (target: McpAppWidgetStateTarget) =>
 
 /** The newest state this renderer saved per view instance, written or still in flight. */
 const latest = new Map<string, unknown>();
-/** The seed each view document was built with, by its nonce. */
-const documentSeeds = new Map<string, unknown>();
 /** States saved while Xum reconnected (no live client), per view instance. */
 const offline = new Map<string, { target: McpAppWidgetStateTarget; state: unknown }>();
 /** Per view instance: the write waiting behind the one in flight (null when none waits). */
@@ -64,19 +62,13 @@ function setBounded(map: Map<string, unknown>, key: string, value: unknown) {
 
 /**
  * The widget state a view document starts with: what this renderer saved last for the same
- * instance, else what the record holds. Fixed per document (`nonce`), so a later write does not
- * change, and so reload, a document that is already built.
+ * instance, else what the record holds. McpAppFrame reads it once per document (makeSeed in
+ * useMcpAppViewDocument), so a later write does not change, and so reload, a built document.
  */
-export function mcpAppWidgetStateSeed(
-  viewDocument: { nonce: string } | null,
-  target: McpAppWidgetStateTarget | null
-): unknown {
+export function mcpAppWidgetStateSeed(target: McpAppWidgetStateTarget | null): unknown {
   if (target === null) return null;
   const key = keyOf(target);
-  const seed = latest.has(key) ? latest.get(key) : target.stored;
-  if (viewDocument === null) return seed;
-  if (!documentSeeds.has(viewDocument.nonce)) setBounded(documentSeeds, viewDocument.nonce, seed);
-  return documentSeeds.get(viewDocument.nonce);
+  return latest.has(key) ? latest.get(key) : target.stored;
 }
 
 /** Keep a view's new widget state and write it to its record. A view without one keeps none. */
@@ -90,8 +82,8 @@ export function saveMcpAppWidgetState(
   setBounded(latest, key, state);
   if (api === null) {
     // Kept until a client is back (flushOfflineMcpAppWidgetStates); the newest state wins.
-    offline.delete(key);
-    offline.set(key, { target, state });
+    // Bounded like the other maps: past MAX_ENTRIES views, the oldest view's state goes (#6181).
+    setBounded(offline, key, { target, state });
     return;
   }
   offline.delete(key);
@@ -128,7 +120,7 @@ async function writeQueued(
       // unless a newer state is already waiting or kept.
       console.debug("[MCP Apps] widget state not stored:", getErrorMessage(error));
       if (queue.next === null && !offline.has(key))
-        offline.set(key, { target, state: write.state });
+        setBounded(offline, key, { target, state: write.state });
     }
     write = queue.next;
     queue.next = null;

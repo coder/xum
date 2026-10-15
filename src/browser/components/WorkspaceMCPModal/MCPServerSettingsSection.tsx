@@ -213,6 +213,7 @@ export const MCPServerSettingsSection = React.forwardRef<
                   workspaceId={props.workspaceId}
                   serverName={props.serverName}
                   instanceToken={props.snapshot.instanceToken}
+                  readId={props.snapshot.readId}
                   item={item}
                   running={toolRuns.running.includes(item.tool)}
                   result={getOwn(toolRuns.results, item.tool) ?? null}

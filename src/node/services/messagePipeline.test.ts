@@ -7,6 +7,9 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { createTestHistoryService } from "./testHistoryService";
 import { prepareMessagesForProvider, sanitizeAssistantModelMessages } from "./messagePipeline";
+import { SUPPORTED_PROVIDERS } from "@/common/constants/providers";
+import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
+import { createToolAttachmentSummaryText } from "@/node/utils/messages/toolResultAttachments";
 
 function isAssistantMessage(message: ModelMessage | undefined): message is AssistantModelMessage {
   return message?.role === "assistant";
@@ -972,6 +975,49 @@ describe("step boundaries in built provider requests", () => {
     const parallel = await build(history(twoSequentialCalls, [0, 3]));
     expect(shape(parallel)).toEqual(folded);
   });
+
+  // Live 400s (F31): the rebuild appended a tool's image after the whole assistant row, while
+  // every in-turn step puts it right after its own tool result. Every provider builds through
+  // this path, so check each one: same media, in step order, never raw base64 in a tool result
+  // (the context-budget preflight and continuous compaction read this output).
+  for (const provider of SUPPORTED_PROVIDERS) {
+    it(`puts tool media right after its step's tool result (${provider})`, async () => {
+      const png =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+      const parts: MuxMessage["parts"] = [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "attach_file",
+          state: "output-available",
+          input: { path: "a.png" },
+          output: {
+            type: "content",
+            value: [
+              { type: "text", text: "[Attachment prepared: a.png]" },
+              { type: "media", data: png, mediaType: "image/png", filename: "a.png" },
+            ],
+          },
+        },
+        { type: "text", text: "Done." },
+      ];
+      const result = await build(history(parts, [0, 1]), provider);
+      expect(shape(result)).toEqual([
+        'user("go")',
+        "assistant(call-1)",
+        "tool(call-1)",
+        `user(${JSON.stringify(createToolAttachmentSummaryText(1))},image)`,
+        'assistant("Done.")',
+        'user("continue")',
+      ]);
+      const toolMessage = result[2];
+      expect(JSON.stringify(toolMessage)).not.toContain(png);
+      expect(JSON.stringify(result[3])).toContain(png);
+      // StreamManager runs the same extraction again on every in-turn step (step 0 included),
+      // so the rebuilt prefix must already be its fixed point.
+      expect(await extractToolMediaAsUserMessagesFromModelMessages(result)).toEqual(result);
+    });
+  }
 });
 
 describe("prepareMessagesForProvider: MCP tool results", () => {
@@ -1093,6 +1139,40 @@ describe("prepareMessagesForProvider: MCP tool results", () => {
   });
 
   // Persisted output is unvalidated: one malformed MCP result must not fail every later send.
+  // A persisted MCP result with audio or SVG must not fail every later request: the replay
+  // replaces media no provider accepts, as the extraction it used to go through did.
+  const ONE_PIXEL_PNG =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+  it("replaces MCP media that no provider accepts on replay", async () => {
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString("base64");
+    const outputs = await replayedOutputs([
+      {
+        id: "call-1",
+        mcp: true,
+        output: {
+          type: "content",
+          value: [
+            { type: "media", data: "UklGRgAAAABXQVZF", mediaType: "audio/wav" },
+            { type: "media", data: svg, mediaType: "image/svg+xml" },
+            { type: "media", data: ONE_PIXEL_PNG, mediaType: "image/png" },
+            { type: "media", data: "bm90LWEtcG5n", mediaType: "image/png" },
+          ],
+        },
+      },
+    ]);
+    const serialized = JSON.stringify(outputs["call-1"]);
+    expect(serialized).not.toContain("UklGRgAAAABXQVZF");
+    expect(serialized).toContain("audio/wav is not supported");
+    expect(serialized).not.toContain('"mediaType":"image/svg+xml"');
+    expect(serialized).toContain("<svg");
+    // A supported image stays a file part, as the in-turn step sent it.
+    expect(serialized).toContain(ONE_PIXEL_PNG);
+    // Unreadable image bytes become a note instead of failing every later request.
+    expect(serialized).not.toContain("bm90LWEtcG5n");
+    expect(serialized).toContain("Image attachment omitted");
+  });
+
   it("replays a malformed MCP result as JSON instead of failing the request", async () => {
     const malformed = { content: [null] };
     const outputs = await replayedOutputs([

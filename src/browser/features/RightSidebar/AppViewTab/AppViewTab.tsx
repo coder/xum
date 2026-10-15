@@ -19,7 +19,11 @@ import {
 import { Notice } from "../ArtifactsTab/SourceText";
 import { withEntrypointScope } from "./mcpAppEntrypoints";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
-import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import {
+  KEYBINDS,
+  MODAL_DIALOG_OVERLAY_ATTRIBUTE,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
 import { refocusFallenFocus } from "@/browser/utils/ui/refocusFallenFocus";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 
@@ -159,6 +163,25 @@ export function AppViewTabPanel(props: {
   );
 }
 
+/** Marks a maximized app tab panel (a modal dialog that belongs to the right sidebar). */
+const MAXIMIZED_APP_PANEL_ATTRIBUTE = "data-maximized-app-panel";
+
+/**
+ * The maximized app tab panel inside `container`, when it is the only open modal. The panel is a
+ * modal dialog (aria-modal), so isDialogOpen() is true while it is up. The sidebar still owns it as
+ * its tab, so Cmd/Ctrl+W closes it (#6181). Any other open modal returns null: it keeps the keys.
+ */
+export function findOwnMaximizedAppPanel(container: Element | null): HTMLElement | null {
+  if (container == null) return null;
+  if (document.querySelector(`[${MODAL_DIALOG_OVERLAY_ATTRIBUTE}][data-state="open"]`)) return null;
+  const modals = document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]');
+  if (modals.length !== 1) return null;
+  const modal = modals[0];
+  return modal.hasAttribute(MAXIMIZED_APP_PANEL_ATTRIBUTE) && container.contains(modal)
+    ? modal
+    : null;
+}
+
 /**
  * The app tab's box, pinned over the window while maximized (#6165). Pinned in place, not moved
  * into a portal: a portal remounts the frame, which reloads the view and loses its state (the
@@ -190,12 +213,14 @@ function MaximizablePanel(props: {
       // the Artifacts fullscreen panel.
       role={maximized ? "dialog" : undefined}
       aria-modal={maximized ? true : undefined}
+      {...(maximized ? { [MAXIMIZED_APP_PANEL_ATTRIBUTE]: "" } : {})}
       // The Artifacts fullscreen shortcut toggles it while focus is in the panel (outside the
       // view's frame, which keeps its own keys); Escape restores it.
       onKeyDown={(event) => {
         if (matchesKeybind(event, KEYBINDS.TOGGLE_ARTIFACT_FULLSCREEN)) {
           event.preventDefault();
-          setMaximized(!maximized);
+          // A held key auto-repeats: toggle once per press, not on every repeat.
+          if (!event.repeat) setMaximized(!maximized);
         } else if (maximized && event.key === "Escape") {
           event.preventDefault();
           // The panel is not editable, so without this Escape-to-interrupt would also fire.

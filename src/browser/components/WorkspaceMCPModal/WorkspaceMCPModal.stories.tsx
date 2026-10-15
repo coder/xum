@@ -70,6 +70,8 @@ interface WorkspaceMCPStoryOptions {
   /** Servers the workspace already runs (the dialog reads their settings on open). */
   settingsConnected?: string[];
   settingsReads?: string[][];
+  /** Records the workspace of each settings read. */
+  settingsReadWorkspaces?: string[];
   settingsReadErrors?: Record<string, string>;
   settingsUpdateGate?: { promise: Promise<void> } | Array<{ promise: Promise<void> }>;
   settingsFirstReadGate?: { promise: Promise<void> };
@@ -159,6 +161,7 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
     ),
     mcpSettingsConnected: new Set(options.settingsConnected ?? []),
     mcpSettingsReads: options.settingsReads,
+    mcpSettingsReadWorkspaces: options.settingsReadWorkspaces,
     mcpSettingsReadErrors: new Map(Object.entries(options.settingsReadErrors ?? {})),
     mcpSettingsUpdateGate: options.settingsUpdateGate,
     mcpSettingsFirstReadGate: options.settingsFirstReadGate,
@@ -1054,6 +1057,142 @@ export const WorkspaceMCPServerSettingsRereadAfterApp: Story = {
     await waitFor(() => expect(page.queryByRole("dialog", { name: "Payment method" })).toBeNull());
     await waitFor(() => expect(modal.getByLabelText("Default zoom setting")).toHaveValue(1));
     await expect(appWriteReads).toEqual([["cad"], ["cad"]]);
+  },
+};
+
+/** Closes the story's workspace MCP dialog from outside, as a workspace switch unmounts it. */
+let unmountWorkspaceMCPModal: (() => void) | null = null;
+const OutsideClosedWorkspaceMCPModal: FC = () => {
+  const [open, setOpen] = useState(true);
+  unmountWorkspaceMCPModal = () => setOpen(false);
+  return open ? (
+    <WorkspaceMCPModal
+      workspaceId={WORKSPACE_ID}
+      projectPath={PROJECT_PATH}
+      open
+      onOpenChange={setOpen}
+    />
+  ) : null;
+};
+
+const appUnmountReads: string[][] = [];
+/**
+ * The app of a tool that can write is still open when its row unmounts (the dialog goes away
+ * without the app's close): Xum still reads the settings again, so the backend's settings cache
+ * (plugin hooks use it) does not keep the pre-app values.
+ */
+export const WorkspaceMCPServerSettingsRereadAfterAppUnmount: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    appUnmountReads.length = 0;
+    return (
+      <WorkspaceMCPModalStoryShell
+        setup={() =>
+          setupWorkspaceMCPModalStory({
+            ...settingsStoryOptions(),
+            settingsReads: appUnmountReads,
+            settingsToolRunSets: { "cad.payment": { zoom: 1 } },
+            mcpAppViews: {
+              "settings:cad:cad.payment": {
+                html: "<!doctype html><html><body><strong>Card form</strong></body></html>",
+                csp: {},
+                prefersBorder: null,
+                resultAvailable: true,
+                result: { content: [] },
+                invocation: null,
+              },
+            },
+          })
+        }
+      >
+        <OutsideClosedWorkspaceMCPModal />
+      </WorkspaceMCPModalStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await section.findByRole("button", { name: "Open Payment method" }));
+    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    const appDialog = await page.findByRole("dialog", { name: "Payment method" });
+    await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
+    await expect(appUnmountReads).toHaveLength(1);
+    unmountWorkspaceMCPModal?.();
+    await waitFor(() =>
+      expect(queryWorkspaceMCPDialog(canvasElement.ownerDocument)).not.toBeInTheDocument()
+    );
+    await waitFor(() => expect(appUnmountReads).toEqual([["cad"], ["cad"]]), { timeout: 5000 });
+  },
+};
+
+/** The menu bar's workspace MCP dialog: one modal that a workspace switch reuses (no key). */
+let switchWorkspaceMCPModal: ((workspaceId: string) => void) | null = null;
+const WorkspaceSwitchingMCPModal: FC = () => {
+  const [workspaceId, setWorkspaceId] = useState(WORKSPACE_ID);
+  switchWorkspaceMCPModal = setWorkspaceId;
+  return (
+    <WorkspaceMCPModal
+      workspaceId={workspaceId}
+      projectPath={PROJECT_PATH}
+      open
+      onOpenChange={() => undefined}
+    />
+  );
+};
+
+const appSwitchReadWorkspaces: string[] = [];
+/**
+ * A workspace switch while a writable app is open: the reused dialog renders the old row with
+ * the new workspace before it drops it. The re-read when the app goes away is the workspace
+ * whose app wrote, not the one switched to.
+ */
+export const WorkspaceMCPServerSettingsRereadAfterAppWorkspaceSwitch: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    appSwitchReadWorkspaces.length = 0;
+    return (
+      <WorkspaceMCPModalStoryShell
+        setup={() =>
+          setupWorkspaceMCPModalStory({
+            ...settingsStoryOptions(),
+            settingsReadWorkspaces: appSwitchReadWorkspaces,
+            settingsToolRunSets: { "cad.payment": { zoom: 1 } },
+            mcpAppViews: {
+              "settings:cad:cad.payment": {
+                html: "<!doctype html><html><body><strong>Card form</strong></body></html>",
+                csp: {},
+                prefersBorder: null,
+                resultAvailable: true,
+                result: { content: [] },
+                invocation: null,
+              },
+            },
+          })
+        }
+      >
+        <WorkspaceSwitchingMCPModal />
+      </WorkspaceMCPModalStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await section.findByRole("button", { name: "Open Payment method" }));
+    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    const appDialog = await page.findByRole("dialog", { name: "Payment method" });
+    await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
+    await expect(appSwitchReadWorkspaces).toEqual([WORKSPACE_ID]);
+    switchWorkspaceMCPModal?.("ws-switched-to");
+    const reads = (workspaceId: string) =>
+      appSwitchReadWorkspaces.filter((read) => read === workspaceId).length;
+    // The re-read of the workspace whose app wrote, and the switched-to dialog's own read.
+    await waitFor(() => expect(reads(WORKSPACE_ID)).toBe(2), { timeout: 5000 });
+    await waitFor(() => expect(reads("ws-switched-to")).toBeGreaterThan(0), { timeout: 5000 });
+    await modal.findByTestId("mcp-server-settings");
+    // No second, spurious re-read of the switched-to workspace for the old app.
+    await expect(reads("ws-switched-to")).toBe(1);
   },
 };
 
