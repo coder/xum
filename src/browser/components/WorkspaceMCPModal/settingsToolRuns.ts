@@ -105,15 +105,19 @@ export function forgetSettingsToolRuns(workspaceId: string): void {
 }
 
 /**
- * A metadata snapshot (a reconnect) lists every workspace the backend still has: drop the runs
- * of the others. Another Xum instance can remove a workspace while this renderer is offline.
- * An empty snapshot proves nothing: the backend lists none when its metadata read fails, so
- * it keeps every entry (WorkspaceContext treats an empty snapshot the same way).
+ * A metadata snapshot (a reconnect) lists the backend's active workspaces: drop the idle
+ * entries (results only) of the others. Another Xum instance can remove a workspace while this
+ * renderer is offline. A workspace with a run in flight keeps its entry: the snapshot leaves
+ * out archived workspaces too, and an unarchived one must still wait for its run. That run's
+ * end leaves only its result behind. An empty snapshot proves nothing: the backend lists none
+ * when its metadata read fails, so it keeps every entry (WorkspaceContext treats an empty
+ * snapshot the same way).
  */
 export function forgetSettingsToolRunsExcept(workspaceIds: ReadonlySet<string>): void {
   if (workspaceIds.size === 0) return;
-  for (const workspaceId of [...runsByWorkspace.keys()])
-    if (!workspaceIds.has(workspaceId)) forgetSettingsToolRuns(workspaceId);
+  for (const [workspaceId, servers] of [...runsByWorkspace])
+    if (!workspaceIds.has(workspaceId) && !Object.values(servers).some((r) => r.running.length > 0))
+      forgetSettingsToolRuns(workspaceId);
 }
 
 export function settingsToolRunsOf(workspaceId: string): WorkspaceSettingsToolRuns {

@@ -58,14 +58,24 @@ test("a writing run's end reaches the dialogs of its workspace only", async () =
   expect(reread).toEqual(["cad", "backend"]);
 });
 
-test("a metadata snapshot drops the runs of workspaces it no longer lists", () => {
+test("a metadata snapshot drops the idle entries of workspaces it no longer lists", () => {
   const kept = startSettingsToolRun("ws-listed", "cad", "cad.reset");
-  startSettingsToolRun("ws-deleted-elsewhere", "cad", "cad.reset");
+  startSettingsToolRun(
+    "ws-deleted-elsewhere",
+    "cad",
+    "cad.reset"
+  )({ text: "done", isError: false });
+  // An archived workspace is not in the snapshot either: its run in flight stays.
+  const archived = startSettingsToolRun("ws-archived", "cad", "cad.reset");
   // An empty snapshot can mean a failed metadata read: it drops nothing.
   forgetSettingsToolRunsExcept(new Set());
-  expect(settingsToolRunsOf("ws-deleted-elsewhere").cad?.running).toEqual(["cad.reset"]);
+  expect(settingsToolRunsOf("ws-deleted-elsewhere").cad?.results).toEqual({
+    "cad.reset": { text: "done", isError: false },
+  });
   forgetSettingsToolRunsExcept(new Set(["ws-listed"]));
   expect(settingsToolRunsOf("ws-deleted-elsewhere")).toEqual({});
   expect(settingsToolRunsOf("ws-listed").cad?.running).toEqual(["cad.reset"]);
+  expect(settingsToolRunsOf("ws-archived").cad?.running).toEqual(["cad.reset"]);
   kept(null);
+  archived(null);
 });
