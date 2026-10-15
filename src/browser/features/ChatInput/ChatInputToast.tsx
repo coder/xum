@@ -101,7 +101,7 @@ export const ChatInputToast: React.FC<ChatInputToastProps> = ({
         <AlertTriangle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" />
         <div className="flex-1">
           {toast.title && <div className="mb-1.5 font-semibold">{toast.title}</div>}
-          <div className="text-light mt-1.5 max-h-[40vh] overflow-y-auto leading-[1.4]">
+          <div className="text-light mt-1.5 max-h-[25vh] overflow-y-auto leading-[1.4]">
             {toast.message}
           </div>
           {toast.solution && (
@@ -158,8 +158,9 @@ export const ChatInputToast: React.FC<ChatInputToastProps> = ({
       {/* Message on its own line */}
       {/* wrap-anywhere: a saved report path is one long unbroken token on narrow screens. The
           height cap scrolls a long message (a plugin hook notice in wide glyphs on a phone) and
-          keeps the dismiss button above it on screen (Codex PRRT_kwDOPxxmWM6rRJDd). */}
-      <div className="mt-1.5 max-h-[40vh] overflow-y-auto wrap-anywhere opacity-90">
+          keeps the dismiss button above it on screen (Codex PRRT_kwDOPxxmWM6rRJDd). 25vh: the
+          toast sits above the composer, whose draft can grow to half the screen. */}
+      <div className="mt-1.5 max-h-[25vh] overflow-y-auto wrap-anywhere opacity-90">
         {toast.message}
       </div>
     </div>

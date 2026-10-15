@@ -39,7 +39,7 @@ export const LongNoticeOnPhone: Story = {
   ),
   play: async ({ canvasElement }) => {
     const toast = within(canvasElement).getByRole("alert");
-    // The message is capped at 40vh: the whole toast fits in half the window.
+    // The message is capped at 25vh: the whole toast fits in half the window.
     await expect(toast.getBoundingClientRect().height).toBeLessThan(window.innerHeight / 2);
     const dismiss = within(toast).getByRole("button", { name: "Dismiss" });
     await expect(dismiss.getBoundingClientRect().bottom).toBeLessThan(window.innerHeight);
