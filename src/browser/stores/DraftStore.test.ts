@@ -717,6 +717,33 @@ describe("DraftStore", () => {
     expect(store.getText(scope)).toBe("");
   });
 
+  test("an edit during a waiting delete replaces the whole stored draft", async () => {
+    using tempDir = new TestTempDir("draft-store-delete-wait-edit");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    const store = createStore(client);
+    await store.whenReady();
+    let releaseReply: () => void = () => undefined;
+    control.updateReplyGate = new Promise<void>((resolve) => {
+      releaseReply = resolve;
+    });
+    store.setText(scope, "typed");
+    const written = store.flush(scope);
+    await waitFor(async () => (await service.get(scope)).text === "typed");
+    const deleted = store.deleteDraft(scope);
+    // The user adds an attachment while the delete waits: the draft is live again, without text.
+    store.setAttachments(scope, [image]);
+    releaseReply();
+    await written;
+    await deleted;
+    control.updateReplyGate = null;
+    await store.flush(scope);
+    const stored = await service.get(scope);
+    expect(stored.text).toBe("");
+    expect(stored.attachments.map(({ id }) => id)).toEqual([image.id]);
+    expect(store.getText(scope)).toBe("");
+  });
+
   test("becomes ready without a snapshot, and a late snapshot keeps typed text", async () => {
     using tempDir = new TestTempDir("draft-store-ready-timeout");
     const { service, client, control } = await createHarness(tempDir);

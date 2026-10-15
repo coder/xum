@@ -1658,7 +1658,8 @@ export class DraftStore {
       serverView: null,
       view: EMPTY_VIEW,
     };
-    if (this.pendingDeletes.delete(key)) {
+    // A delete still waiting for a write counts too: server state it skipped is not in the entry.
+    if (this.pendingDeletes.delete(key) || this.deletesAwaitingWrites.has(key)) {
       // Editing a scope whose delete is unconfirmed cancels that delete. Mark both fields
       // unconfirmed so the next write replaces the whole stored draft, not just the edited field.
       entry.textVersion = 1;
