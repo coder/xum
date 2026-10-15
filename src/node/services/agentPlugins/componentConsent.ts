@@ -1,9 +1,8 @@
 /**
  * Component consent fingerprints (#6498, #6629). A managed plugin's skill, MCP server or workflow
- * script is bound to the
- * fingerprint the user reviewed, not to its name: when a newer Xum parses more of an installed
- * package (a Codex dialect field, an extra skills root), the component's fingerprint changes and
- * it needs a new review instead of loading under an approved name.
+ * script is bound to the fingerprint the user reviewed, not to its name: when a newer Xum parses
+ * more of an installed package (a Codex dialect field, an extra skills root), the component's
+ * fingerprint changes and it needs a new review instead of loading under an approved name.
  *
  * The same functions run at review time (install, component picker, update, re-review) and at
  * load time, so the two cannot drift. Accepted limitations: a bare command resolves through PATH
