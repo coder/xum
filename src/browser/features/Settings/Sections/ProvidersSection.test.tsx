@@ -314,6 +314,26 @@ describe("ProvidersSection", () => {
     expect(within(vertexCard).getByText("Not set")).toBeTruthy();
   });
 
+  test("shows Google Vertex AI settings that come from env vars", async () => {
+    const view = renderProvidersSection({
+      "google-vertex": {
+        apiKeySet: false,
+        apiKeySource: "env",
+        isEnabled: true,
+        isConfigured: true,
+        googleVertex: { envProject: "env-project", keyFilenameSet: false },
+      },
+    });
+    const vertexButton = await view.findByRole("button", { name: /Google Vertex AI/ });
+
+    fireEvent.click(vertexButton);
+
+    const vertexCard = getProviderCard(vertexButton);
+    expect(within(vertexCard).getByText("env-project")).toBeTruthy();
+    // One note for the env project and one for the env express mode API key.
+    expect(within(vertexCard).getAllByText("Set by env vars.")).toHaveLength(2);
+  });
+
   test("persists API format changes for an existing custom provider", async () => {
     const view = renderProvidersSection();
     const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });

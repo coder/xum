@@ -67,6 +67,7 @@ import {
   isProviderAutoRouteEligible,
   resolveProviderCredentials,
   resolveCustomProviderCredentials,
+  resolveGoogleVertexEnvSettings,
 } from "@/node/utils/providerRequirements";
 import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
 import {
@@ -104,16 +105,28 @@ function buildCustomProviderConfigInfo(config: BaseProviderConfig): ProviderConf
   };
 }
 
-/** Vertex settings for the UI: the service-account key file path is reported only as set/unset. */
-function googleVertexCredentialStatus(config: {
-  project?: unknown;
-  location?: unknown;
-  keyFilename?: unknown;
-}): NonNullable<ProviderConfigInfo["googleVertex"]> {
+function nonBlankString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+}
+
+/**
+ * Vertex settings for the UI: the service-account key file path is reported only
+ * as set/unset. Blank saved values count as unset (runtime ignores them too), and
+ * env-sourced values are reported separately so Settings can show where they come from.
+ */
+function googleVertexCredentialStatus(
+  config: { project?: unknown; location?: unknown; keyFilename?: unknown },
+  env: Record<string, string | undefined>
+): NonNullable<ProviderConfigInfo["googleVertex"]> {
+  const project = nonBlankString(config.project);
+  const location = nonBlankString(config.location);
+  const envSettings = resolveGoogleVertexEnvSettings(env);
   return {
-    project: typeof config.project === "string" ? config.project : undefined,
-    location: typeof config.location === "string" ? config.location : undefined,
-    keyFilenameSet: typeof config.keyFilename === "string" && config.keyFilename.trim() !== "",
+    project,
+    location,
+    envProject: project == null ? envSettings.project : undefined,
+    envLocation: location == null ? envSettings.location : undefined,
+    keyFilenameSet: nonBlankString(config.keyFilename) != null,
   };
 }
 
@@ -511,7 +524,7 @@ export class ProviderService {
       }
 
       if (provider === "google-vertex") {
-        providerInfo.googleVertex = googleVertexCredentialStatus(config);
+        providerInfo.googleVertex = googleVertexCredentialStatus(config, process.env);
       }
 
       // Coder-specific fields: deployment URL + OAuth connection status.

@@ -386,6 +386,9 @@ export const AWSCredentialStatusSchema = z.object({
 export const GoogleVertexCredentialStatusSchema = z.object({
   project: z.string().optional(),
   location: z.string().optional(),
+  /** Values from GOOGLE_VERTEX_* env vars, set only when the config value is unset. */
+  envProject: z.string().optional(),
+  envLocation: z.string().optional(),
   /** Service-account key file path is never sent to the frontend, only whether one is set. */
   keyFilenameSet: z.boolean(),
 });

@@ -247,6 +247,18 @@ describe("resolveProviderCredentials - Google Vertex AI", () => {
       expected: { isConfigured: true, project: "saved-project", location: "europe-west4" },
     },
     {
+      name: "a lowercased location, since Vertex location IDs are lowercase",
+      config: { project: "my-project", location: " US-Central1 " },
+      env: {},
+      expected: { isConfigured: true, location: "us-central1" },
+    },
+    {
+      name: "unconfigured with a blank project",
+      config: { project: "   " },
+      env: {},
+      expected: { isConfigured: false, missingRequirement: "project" },
+    },
+    {
       name: "unconfigured without a project or API key, ignoring Gemini API keys",
       config: { location: "us-central1" },
       env: { GOOGLE_GENERATIVE_AI_API_KEY: "gemini-key", GOOGLE_API_KEY: "gemini-key" },

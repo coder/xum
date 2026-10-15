@@ -490,9 +490,11 @@ function resolveGoogleVertexCredentials(
     { envApiKeys: envMapping?.apiKey, env, fileErrors: "ignore" }
   );
   const project = resolveConfigOrEnv(config.project, envMapping?.project, env);
-  const location =
-    resolveConfigOrEnv(config.location, envMapping?.location, env) ??
-    GOOGLE_VERTEX_DEFAULT_LOCATION;
+  // Vertex location IDs are lowercase ("us-central1"); "US" would build a
+  // nonexistent "US-aiplatform" host.
+  const location = (
+    resolveConfigOrEnv(config.location, envMapping?.location, env) ?? GOOGLE_VERTEX_DEFAULT_LOCATION
+  ).toLowerCase();
   const baseUrlInfo = resolveBaseUrl("google-vertex", config, env);
 
   if (apiKeyResult.kind === "resolved") {
@@ -515,6 +517,18 @@ function resolveGoogleVertexCredentials(
     location,
     keyFilename: keyFilename != null ? expandHomePath(keyFilename) : undefined,
     ...withActiveBaseUrl(baseUrlInfo),
+  };
+}
+
+/** Vertex project/location from env vars only, so Settings can show env-sourced values. */
+export function resolveGoogleVertexEnvSettings(env: Record<string, string | undefined>): {
+  project?: string;
+  location?: string;
+} {
+  const envMapping = PROVIDER_ENV_VARS["google-vertex"];
+  return {
+    project: resolveEnv(envMapping?.project, env),
+    location: resolveEnv(envMapping?.location, env),
   };
 }
 

@@ -8,6 +8,7 @@ export {
 } from "@/common/utils/providers/baseUrl";
 import assert from "node:assert";
 import { createHash } from "node:crypto";
+import { access, constants as fsConstants } from "node:fs/promises";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type {
@@ -1138,6 +1139,13 @@ function createGoogleVertexModelEffect(
     if (!creds.isConfigured) {
       return Err({ type: "api_key_not_found", provider: "google-vertex" });
     }
+    // google-auth-library reads the key file only at request time, and its
+    // ENOENT (with the path) surfaced as a retryable API error. Fail here
+    // instead, with a non-retryable configuration error.
+    const { keyFilename } = creds;
+    if (keyFilename != null && !(yield* Effect.promise(() => isReadableFile(keyFilename)))) {
+      return Err({ type: "api_key_not_found", provider: "google-vertex" });
+    }
     const { createVertex } = yield* Effect.promise(async () =>
       PROVIDER_REGISTRY["google-vertex"]()
     );
@@ -1153,8 +1161,27 @@ function createGoogleVertexModelEffect(
       headers: providerConfig.headers,
       fetch: getProviderFetch(providerConfig),
     });
-    return Ok(provider(modelId));
+    try {
+      return Ok(provider(modelId));
+    } catch (error) {
+      // The SDK rejects some model IDs synchronously (e.g. tuned endpoints/...
+      // models with an express mode API key). That is deterministic for this
+      // model string, so report it as a non-retryable model error.
+      return Err({ type: "invalid_model_string", message: getErrorMessage(error) });
+    }
   });
+}
+
+async function isReadableFile(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath, fsConstants.R_OK);
+    return true;
+  } catch (error) {
+    log.warn("Google Vertex AI service account key file is not readable", {
+      error: getErrorMessage(error),
+    });
+    return false;
+  }
 }
 
 /**

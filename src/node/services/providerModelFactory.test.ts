@@ -1559,9 +1559,11 @@ describe("ProviderModelFactory Google Vertex AI", () => {
   });
 
   it("uses ADC with the project, the default global location, and the key file", async () => {
-    await withTempConfig(async (_config, factory, _oauth, store) => {
+    await withTempConfig(async (config, factory, _oauth, store) => {
+      const keyFilename = path.join(config.rootDir, "sa.json");
+      await writeFile(keyFilename, "{}");
       store.saveProvidersConfig({
-        "google-vertex": { project: "my-project", keyFilename: "/keys/sa.json" },
+        "google-vertex": { project: "my-project", keyFilename },
       });
       const originalRegistry = PROVIDER_REGISTRY["google-vertex"];
       let authOptions: GoogleVertexProviderSettings["googleAuthOptions"];
@@ -1588,7 +1590,7 @@ describe("ProviderModelFactory Google Vertex AI", () => {
       try {
         const calls = await sendOnce(factory, "google-vertex:gemini-2.5-flash");
 
-        expect(authOptions).toEqual({ keyFilename: "/keys/sa.json" });
+        expect(authOptions).toEqual({ keyFilename });
         expect(calls).toHaveLength(1);
         expect(calls[0].url).toBe(
           "https://aiplatform.googleapis.com/v1beta1/projects/my-project/locations/global/publishers/google/models/gemini-2.5-flash:generateContent"
@@ -1599,6 +1601,34 @@ describe("ProviderModelFactory Google Vertex AI", () => {
       } finally {
         PROVIDER_REGISTRY["google-vertex"] = originalRegistry;
       }
+    });
+  });
+
+  it("fails a missing service account key file before sending a request", async () => {
+    await withTempConfig(async (config, factory, _oauth, store) => {
+      store.saveProvidersConfig({
+        "google-vertex": {
+          project: "my-project",
+          keyFilename: path.join(config.rootDir, "missing-sa.json"),
+        },
+      });
+
+      // A non-retryable configuration error, not a request-time ENOENT that
+      // auto-retry repeats and that echoes the key file path into the chat.
+      expect(await factory.createModel("google-vertex:gemini-2.5-flash")).toEqual({
+        success: false,
+        error: { type: "api_key_not_found", provider: "google-vertex" },
+      });
+    });
+  });
+
+  it("reports a tuned model with an express mode API key as an invalid model", async () => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ "google-vertex": { apiKey: "vertex-key" } });
+
+      const result = await factory.createModel("google-vertex:endpoints/1234567890");
+
+      expect(result).toMatchObject({ success: false, error: { type: "invalid_model_string" } });
     });
   });
 

@@ -365,6 +365,12 @@ const NESTED_FIELD_VALUES = new Map<string, ProviderStatusReader<string>>([
   ["google-vertex.location", (info) => info.googleVertex?.location],
 ]);
 
+// Values resolved from env vars, shown when the config value is unset.
+const NESTED_ENV_FIELD_VALUES = new Map<string, ProviderStatusReader<string>>([
+  ["google-vertex.project", (info) => info.googleVertex?.envProject],
+  ["google-vertex.location", (info) => info.googleVertex?.envLocation],
+]);
+
 // Secrets are never sent to the UI, only whether each one is set.
 const NESTED_SECRET_SET_FLAGS = new Map<string, ProviderStatusReader<boolean>>([
   ["bedrock.bearerToken", (info) => info.aws?.bearerTokenSet],
@@ -392,6 +398,33 @@ function isProviderSecretSet(
 ): boolean {
   if (field === "apiKey") return providerConfig.apiKeySet ?? false;
   return NESTED_SECRET_SET_FLAGS.get(`${provider}.${field}`)?.(providerConfig) ?? false;
+}
+
+/**
+ * Where a field's value comes from when it is not saved in config. The API key
+ * note renders here only for providers without a "Get API Key" link, which
+ * already shows it.
+ */
+function getFieldSourceNote(params: {
+  field: string;
+  fieldValue: string | undefined;
+  fieldDisplayValue: string | undefined;
+  fieldIsSet: boolean;
+  hasKeyUrl: boolean;
+  providerInfo: ProviderConfigInfo | undefined;
+}): string | null {
+  const { field, providerInfo } = params;
+  if (field === "apiKey") {
+    if (params.hasKeyUrl || params.fieldIsSet) return null;
+    if (providerInfo?.apiKeySource === "file") return "Set by API key file.";
+    return providerInfo?.apiKeySource === "env" ? "Set by env vars." : null;
+  }
+  if (field === "baseUrl") {
+    return providerInfo?.baseUrlSource === "env" && providerInfo.baseUrlResolved
+      ? "Set by env vars."
+      : null;
+  }
+  return !params.fieldValue && params.fieldDisplayValue ? "Set by env vars." : null;
 }
 
 /**
@@ -1721,11 +1754,14 @@ export function ProvidersSection() {
 
   const getFieldDisplayValue = (provider: string, field: string): string | undefined => {
     const fieldValue = getFieldValue(provider, field);
+    const providerConfig = config?.[provider];
     if (field !== "baseUrl") {
-      return fieldValue;
+      return (
+        fieldValue ??
+        (providerConfig && NESTED_ENV_FIELD_VALUES.get(`${provider}.${field}`)?.(providerConfig))
+      );
     }
 
-    const providerConfig = config?.[provider];
     if (providerConfig?.baseUrlSource && typeof providerConfig.baseUrlResolved === "string") {
       return providerConfig.baseUrlResolved;
     }
@@ -2343,6 +2379,14 @@ export function ProvidersSection() {
                         const fieldValue = getFieldValue(provider, fieldConfig.key);
                         const fieldDisplayValue = getFieldDisplayValue(provider, fieldConfig.key);
                         const fieldIsSet = isFieldSet(provider, fieldConfig.key, fieldConfig);
+                        const fieldSourceNote = getFieldSourceNote({
+                          field: fieldConfig.key,
+                          fieldValue,
+                          fieldDisplayValue,
+                          fieldIsSet,
+                          hasKeyUrl: !!providerKeyUrl,
+                          providerInfo,
+                        });
                         const showOpenAIBaseUrlHint =
                           fieldConfig.key === "baseUrl" &&
                           provider === "openai" &&
@@ -2413,8 +2457,9 @@ export function ProvidersSection() {
                               </div>
                             ) : (
                               <>
-                                <div className="flex items-center justify-between">
-                                  <span className="text-foreground flex items-center gap-1 font-mono text-xs">
+                                <div className="flex items-center justify-between gap-2">
+                                  {/* min-w-0 + break-all: long values (Base URLs) wrap instead of pushing the buttons off-screen on narrow widths. */}
+                                  <span className="text-foreground flex min-w-0 items-center gap-1 font-mono text-xs break-all">
                                     {fieldConfig.type === "secret"
                                       ? fieldIsSet
                                         ? "••••••••"
@@ -2423,7 +2468,7 @@ export function ProvidersSection() {
                                           : "Not set"
                                       : (fieldDisplayValue ?? "Default")}
                                   </span>
-                                  <div className="flex gap-2">
+                                  <div className="flex shrink-0 gap-2">
                                     {(fieldConfig.type === "text"
                                       ? !!fieldValue
                                       : fieldConfig.type === "secret" && fieldIsSet) && (
@@ -2448,11 +2493,9 @@ export function ProvidersSection() {
                                     </Button>
                                   </div>
                                 </div>
-                                {fieldConfig.key === "baseUrl" &&
-                                  config?.[provider]?.baseUrlSource === "env" &&
-                                  config?.[provider]?.baseUrlResolved && (
-                                    <div className="text-muted mt-1 text-xs">Set by env vars.</div>
-                                  )}
+                                {fieldSourceNote && (
+                                  <div className="text-muted mt-1 text-xs">{fieldSourceNote}</div>
+                                )}
                               </>
                             )}
                             {showOpenAIBaseUrlHint && (

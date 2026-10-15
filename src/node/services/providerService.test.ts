@@ -76,6 +76,8 @@ const PROVIDER_ENV_KEYS = [
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "ANTHROPIC_BASE_URL",
+  "GOOGLE_VERTEX_PROJECT",
+  "GOOGLE_VERTEX_LOCATION",
 ] as const;
 
 function withProviderEnv(
@@ -268,6 +270,24 @@ describe("ProviderService.getConfig", () => {
       const serialized = JSON.stringify(vertexConfig);
       expect(serialized).not.toContain("vertex-secret-key");
       expect(serialized).not.toContain("vertex-sa.json");
+    });
+  });
+
+  it("reports blank saved Google Vertex AI values as unset and env values separately", () => {
+    withProviderEnv({ GOOGLE_VERTEX_PROJECT: "env-project", GOOGLE_VERTEX_LOCATION: "us" }, () => {
+      withTempConfig((config, service) => {
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+          "google-vertex": { project: "   ", location: "europe-west4", keyFilename: "  " },
+        });
+
+        expect(service.getConfig()["google-vertex"]?.googleVertex).toEqual({
+          project: undefined,
+          location: "europe-west4",
+          envProject: "env-project",
+          envLocation: undefined,
+          keyFilenameSet: false,
+        });
+      });
     });
   });
 
