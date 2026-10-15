@@ -73,9 +73,12 @@ interface WorkspaceMCPStoryOptions {
   settingsReadErrors?: Record<string, string>;
   settingsUpdateGate?: { promise: Promise<void> } | Array<{ promise: Promise<void> }>;
   settingsFirstReadGate?: { promise: Promise<void> };
+  /** Per server: what its first settings read returns (an older catalog than `settings`). */
+  settingsStaleFirstRead?: Record<string, MCPSettingsSnapshot>;
   settingsAfterSave?: Record<string, MCPSettingsSnapshot>;
   settingsToolRuns?: Array<{ toolName: string; confirmed: boolean }>;
   settingsToolRunGate?: { promise: Promise<void> };
+  settingsToolRunSets?: Record<string, Record<string, string | number | boolean>>;
   /** MCP Apps views by view key (a settings app action opens `settings:<server>:<tool>`). */
   mcpAppViews?: Record<string, McpAppView>;
   testGate?: { promise: Promise<void> };
@@ -156,9 +159,11 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
     mcpSettingsReadErrors: new Map(Object.entries(options.settingsReadErrors ?? {})),
     mcpSettingsUpdateGate: options.settingsUpdateGate,
     mcpSettingsFirstReadGate: options.settingsFirstReadGate,
+    mcpSettingsStaleFirstRead: new Map(Object.entries(options.settingsStaleFirstRead ?? {})),
     mcpSettingsAfterUpdate: new Map(Object.entries(options.settingsAfterSave ?? {})),
     mcpSettingsToolRuns: options.settingsToolRuns,
     mcpSettingsToolRunGate: options.settingsToolRunGate,
+    mcpSettingsToolRunSets: new Map(Object.entries(options.settingsToolRunSets ?? {})),
     ...(options.mcpAppViews ? { mcpApps: { views: options.mcpAppViews } } : {}),
     mcpTestGate: options.testGate,
   });
@@ -735,7 +740,7 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
   },
   play: async ({ canvasElement }) => {
     const dialog = await findWorkspaceMCPDialog(canvasElement);
-    const section = within(await within(dialog).findByTestId("mcp-server-settings"));
+    let section = within(await within(dialog).findByTestId("mcp-server-settings"));
     const page = within(canvasElement.ownerDocument.body);
     // The spec's display name (the tool's title), not the raw tool name.
     await userEvent.click(await section.findByRole("button", { name: "Run Part library" }));
@@ -761,7 +766,9 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
     await expect(toolActionRuns).toHaveLength(1);
     await userEvent.click(section.getByRole("button", { name: "Run Reset parts" }));
     await userEvent.click(await page.findByRole("button", { name: "Run" }));
-    await expect(section.findByText("cad.reset finished")).resolves.toBeInTheDocument();
+    // A tool that can write: the dialog reads the settings again, which remounts the section.
+    await expect(within(dialog).findByText("cad.reset finished")).resolves.toBeInTheDocument();
+    section = within(within(dialog).getByTestId("mcp-server-settings"));
     await expect(toolActionRuns[1]).toEqual({ toolName: "cad.reset", confirmed: true });
 
     // An unsaved edit blocks the runs: the tool would see the saved settings, not the draft.
@@ -794,6 +801,54 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
     await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(page.queryByRole("dialog", { name: "Payment method" })).toBeNull());
     await expect(within(dialog).getByTestId("mcp-server-settings")).toBeInTheDocument();
+  },
+};
+
+/** CAD_SETTINGS with Part library (cad.library) no longer read-only. */
+const CAD_SETTINGS_LIBRARY_WRITES: MCPSettingsSnapshot = {
+  ...CAD_SETTINGS,
+  layout: CAD_SETTINGS.layout.map((group) => ({
+    ...group,
+    items: group.items.map((item) =>
+      item.kind === "tool" && item.tool === "cad.library" && item.action
+        ? { ...item, action: { ...item.action, readOnly: false } }
+        : item
+    ),
+  })),
+};
+
+let staleFlagRuns: Array<{ toolName: string; confirmed: boolean }> = [];
+/**
+ * The server dropped Part library's readOnlyHint after the dialog read it (tools/list_changed).
+ * The backend refuses the unconfirmed run; the row learns the new flag, asks, and runs it. The
+ * next click asks first.
+ */
+export const WorkspaceMCPServerSettingsStaleReadOnlyFlag: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    staleFlagRuns = [];
+    return renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settings: { cad: CAD_SETTINGS_LIBRARY_WRITES },
+      settingsStaleFirstRead: { cad: CAD_SETTINGS },
+      settingsToolRuns: staleFlagRuns,
+    });
+  },
+  play: async ({ canvasElement }) => {
+    const dialog = await findWorkspaceMCPDialog(canvasElement);
+    const section = within(await within(dialog).findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await section.findByRole("button", { name: "Run Part library" }));
+    await expect(page.findByText("Run Part library?")).resolves.toBeInTheDocument();
+    await userEvent.click(page.getByRole("button", { name: "Run" }));
+    // The confirmed run can write, so the dialog reads the settings again (a new section).
+    await expect(within(dialog).findByText("cad.library finished")).resolves.toBeInTheDocument();
+    await expect(staleFlagRuns).toEqual([{ toolName: "cad.library", confirmed: true }]);
+
+    await userEvent.click(within(dialog).getByRole("button", { name: "Run Part library" }));
+    await userEvent.click(await page.findByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(page.queryByText("Run Part library?")).not.toBeInTheDocument());
+    await expect(staleFlagRuns).toHaveLength(1);
   },
 };
 
@@ -859,6 +914,37 @@ export const WorkspaceMCPServerSettingsAppViewRetry: Story = {
     await userEvent.click(reload);
     await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
     await expect(retryViewRuns).toHaveLength(1);
+  },
+};
+
+const rereadReads: string[][] = [];
+/**
+ * A tool that can write (Reset parts) changes the server's settings: the dialog reads them
+ * again and shows the new values, and the run's result stays. A read-only run reads nothing.
+ */
+export const WorkspaceMCPServerSettingsRereadAfterWrite: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    rereadReads.length = 0;
+    return renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settingsReads: rereadReads,
+      settingsToolRunSets: { "cad.reset": { zoom: 1 } },
+    });
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await section.findByRole("button", { name: "Run Part library" }));
+    await expect(section.findByText("cad.library finished")).resolves.toBeInTheDocument();
+    await expect(rereadReads).toHaveLength(1);
+    await userEvent.click(section.getByRole("button", { name: "Run Reset parts" }));
+    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    // The re-read remounts the section: query it again.
+    await waitFor(() => expect(modal.getByLabelText("Default zoom setting")).toHaveValue(1));
+    await expect(rereadReads).toEqual([["cad"], ["cad"]]);
+    await expect(modal.findByText("cad.reset finished")).resolves.toBeInTheDocument();
   },
 };
 

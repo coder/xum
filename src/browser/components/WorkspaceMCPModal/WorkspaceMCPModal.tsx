@@ -629,6 +629,9 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                               overrides,
                               name
                             )}
+                            rereadSettings={() =>
+                              readServerSettings([name], true, settingsRequests.current())
+                            }
                             refreshing={isLoadingTools === true}
                           />
                         </div>

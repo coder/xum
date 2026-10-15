@@ -354,12 +354,20 @@ export interface MockORPCClientOptions {
   /** When set, the first settings read takes its values, then waits for this promise. */
   mcpSettingsFirstReadGate?: { promise: Promise<void> };
   /**
+   * Per server: the snapshot its first read returns, instead of `mcpSettings` (a catalog the
+   * server changed after the dialog read it). Runs and opens check `mcpSettings`, like the
+   * backend's refreshed catalog: a tool without `readOnly` there needs `confirmed`.
+   */
+  mcpSettingsStaleFirstRead?: Map<string, MCPSettingsSnapshot>;
+  /**
    * Records every settings tool action run or app open. A run returns "<tool> finished"; an app
    * opens the view `settings:<server>:<tool>` (`ui://<server>/<tool>`) of `mcpApps.views`.
    */
   mcpSettingsToolRuns?: Array<{ toolName: string; confirmed: boolean }>;
   /** When set, the first settings tool run waits for this promise (a run held in flight). */
   mcpSettingsToolRunGate?: { promise: Promise<void> };
+  /** Per tool name: the setting values a run of it writes on the server (a reset, an import). */
+  mcpSettingsToolRunSets?: Map<string, Record<string, MCPSettingValue>>;
   /** When set, mcp.test waits for this promise (stories hold a Fetch Tools in flight). */
   mcpTestGate?: { promise: Promise<void> };
   /** Session icon registry for mcp.icon - maps iconRef to a PNG data URL (unknown refs resolve null) */
@@ -511,8 +519,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpSettingsUpdateGate,
     mcpSettingsAfterUpdate,
     mcpSettingsFirstReadGate,
+    mcpSettingsStaleFirstRead,
     mcpSettingsToolRuns,
     mcpSettingsToolRunGate,
+    mcpSettingsToolRunSets,
     mcpTestGate,
     mcpIcons = new Map<string, string>(),
     mcpOauthAuthStatus = new Map<string, MCPOAuthAuthStatus>(),
@@ -1445,7 +1455,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             mcpSettingsConnected.add(serverName);
             const readError = mcpSettingsReadErrors?.get(serverName);
             if (readError !== undefined) return { success: false, error: readError };
-            const snapshot = mcpSettings?.get(serverName);
+            const stale = mcpSettingsStaleFirstRead?.get(serverName);
+            mcpSettingsStaleFirstRead?.delete(serverName);
+            const snapshot = stale ?? mcpSettings?.get(serverName);
             return {
               success: true,
               data:
@@ -1484,12 +1496,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           };
         },
         openApp: (input: { serverName: string; toolName: string; confirmed: boolean }) => {
+          const refusal = mockSettingsToolRefusal(mcpSettings, input);
+          if (refusal !== null) return Promise.resolve({ success: false, error: refusal });
           mcpSettingsToolRuns?.push({ toolName: input.toolName, confirmed: input.confirmed });
           // The backend titles the view with the action's display name.
-          const action = mcpSettings
-            ?.get(input.serverName)
-            ?.layout.flatMap((group) => group.items)
-            .find((item) => item.kind === "tool" && item.tool === input.toolName);
+          const action = mockSettingsToolItem(mcpSettings, input);
           return Promise.resolve({
             success: true,
             data: {
@@ -1498,15 +1509,21 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
               // A plugin server's label, as the backend gives one (it differs from the key).
               serverLabel: `cad-plugin · ${input.serverName}`,
               toolName: input.toolName,
-              title: (action?.kind === "tool" ? action.action?.title : undefined) ?? input.toolName,
+              title: action?.action?.title ?? input.toolName,
               resourceUri: `ui://${input.serverName}/${input.toolName}`,
             },
           });
         },
-        runTool: async (input: { toolName: string; confirmed: boolean }) => {
+        runTool: async (input: { serverName: string; toolName: string; confirmed: boolean }) => {
+          const refusal = mockSettingsToolRefusal(mcpSettings, input);
+          if (refusal !== null) return { success: false, error: refusal };
           const gated = mcpSettingsToolRuns?.length === 0 ? mcpSettingsToolRunGate : undefined;
           mcpSettingsToolRuns?.push({ toolName: input.toolName, confirmed: input.confirmed });
           await gated?.promise;
+          const stored = mcpSettings?.get(input.serverName);
+          const set = mcpSettingsToolRunSets?.get(input.toolName);
+          if (stored !== undefined && set !== undefined)
+            stored.values = { ...stored.values, ...set };
           return {
             success: true,
             data: { text: `${input.toolName} finished`, isError: false },
@@ -2681,6 +2698,27 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     },
   } as unknown as APIClient;
+}
+
+/** The layout tool item of a settings tool action, in the server's current mock settings. */
+function mockSettingsToolItem(
+  settings: Map<string, MCPSettingsSnapshot> | undefined,
+  input: { serverName: string; toolName: string }
+) {
+  for (const group of settings?.get(input.serverName)?.layout ?? [])
+    for (const item of group.items)
+      if (item.kind === "tool" && item.tool === input.toolName) return item;
+  return undefined;
+}
+
+/** The backend's confirmation rule: a tool that is not read-only runs only when confirmed. */
+function mockSettingsToolRefusal(
+  settings: Map<string, MCPSettingsSnapshot> | undefined,
+  input: { serverName: string; toolName: string; confirmed: boolean }
+): string | null {
+  const action = mockSettingsToolItem(settings, input)?.action;
+  if (action === undefined || action.readOnly || input.confirmed) return null;
+  return `'${action.title}' runs only after a confirmation`;
 }
 
 /** The mock's settings servers never restart: one instance token per server name. */
