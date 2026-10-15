@@ -116,15 +116,17 @@ export function registerCodexPluginHooks(
         async (ctx) => {
           using phase = startHookPhase(prompt, "UserPromptSubmit", registration, ctx.signal);
           for (const hook of prompt) {
-            const output = await invoke(
-              hook,
-              { ...promptEventFields(), prompt: ctx.text },
-              "UserPromptSubmit",
-              registration,
-              parseUserPromptSubmitOutput,
-              // A withdrawn send ends this call, and invoke skips the later ones.
-              { cwd: ctx.cwd, abortSignal: phase.signal }
-            );
+            const output = guardLeftUnrun(phase, hook, registration)
+              ? { blockReason: HOOK_DEADLINE_REASON }
+              : await invoke(
+                  hook,
+                  { ...promptEventFields(), prompt: ctx.text },
+                  "UserPromptSubmit",
+                  registration,
+                  parseUserPromptSubmitOutput,
+                  // A withdrawn send ends this call, and invoke skips the later ones.
+                  { cwd: ctx.cwd, abortSignal: phase.signal }
+                );
             if (output === null) continue;
             if (output.stopped === true || output.blockReason !== undefined) {
               ctx.blocked = {
@@ -206,14 +208,12 @@ async function runToolHooks(
     // Scoped to the hooks: the deadline must not run on into the tool call itself.
     using prePhase = startHookPhase(matchingPre, "PreToolUse", registration, ctx.abortSignal);
     for (const hook of matchingPre) {
-      const output = await invoke(
-        hook,
-        toolEvent(),
-        "PreToolUse",
-        registration,
-        parsePreToolUseOutput,
-        { ...preCall, abortSignal: prePhase.signal }
-      );
+      const output = guardLeftUnrun(prePhase, hook, registration)
+        ? { denyReason: HOOK_DEADLINE_REASON }
+        : await invoke(hook, toolEvent(), "PreToolUse", registration, parsePreToolUseOutput, {
+            ...preCall,
+            abortSignal: prePhase.signal,
+          });
       if (ctx.abortSignal?.aborted) break;
       if (output === null) continue;
       if (output.denyReason !== undefined) {
@@ -310,14 +310,16 @@ async function runPostToolHooks(
   const matching = post.filter((candidate) => matches(candidate, ctx.toolName, view));
   using phase = startHookPhase(matching, "PostToolUse", registration, call.abortSignal);
   for (const hook of matching) {
-    const output = await invoke(
-      hook,
-      { ...toolEvent(), tool_response: response },
-      "PostToolUse",
-      registration,
-      parsePostToolUseOutput,
-      { ...call, abortSignal: phase.signal }
-    );
+    const output = guardLeftUnrun(phase, hook, registration)
+      ? { blockReason: HOOK_DEADLINE_REASON }
+      : await invoke(
+          hook,
+          { ...toolEvent(), tool_response: response },
+          "PostToolUse",
+          registration,
+          parsePostToolUseOutput,
+          { ...call, abortSignal: phase.signal }
+        );
     if (output === null) continue;
     if (output.additionalContext !== undefined) notes.push(output.additionalContext);
     const hookFeedback = output.blockReason ?? output.stopFeedback;
@@ -449,34 +451,66 @@ function matches(hook: PluginHookDefinition, toolName: string, view: CodexToolVi
  * One deadline for a plugin's matching hooks on one event: the longest of their timeouts. Codex
  * runs them at once, so together they never take longer. Xum runs them in order (a rewrite feeds
  * the next hook), and without this, stalled hooks added up to minutes (Codex
- * PRRT_kwDOPxxmWM6rb-Tl). Once it passes, invoke skips the rest, which fail open. `signal` (a
- * cancel) ends the phase too.
+ * PRRT_kwDOPxxmWM6rb-Tl). A hook still running at the deadline fails open, as at its own timeout.
+ * A guard that never got to run must not let the call through (a slow earlier hook would skip a
+ * later deny; Codex PRRT_kwDOPxxmWM6s3_e8): see guardLeftUnrun. `signal` (a cancel) ends the phase
+ * too.
  */
 function startHookPhase(
   hooks: PluginHookDefinition[],
   eventName: HookEventName,
   registration: CodexHookRegistration,
   signal?: AbortSignal
-): { signal: AbortSignal | undefined; [Symbol.dispose]: () => void } {
+): HookPhase {
   const timeouts = hooks.flatMap((hook) =>
     hook.handler.type === "mcp_tool"
       ? [effectiveHookTimeoutSeconds(hook.handler.timeoutSeconds)]
       : []
   );
-  if (timeouts.length === 0) return { signal, [Symbol.dispose]: () => undefined };
+  if (timeouts.length === 0) {
+    return { signal, expired: () => false, [Symbol.dispose]: () => undefined };
+  }
   const deadline = new AbortController();
   const seconds = Math.max(...timeouts);
   const timer = setTimeout(() => {
     deadline.abort();
     log.warn(
-      `Plugin hooks: '${registration.pluginName}' ${eventName} hooks passed their shared ${seconds}s deadline; the unfinished ones fail open`,
+      `Plugin hooks: '${registration.pluginName}' ${eventName} hooks passed their shared ${seconds}s deadline; the hooks that did not start block`,
       { workspaceId: registration.workspaceId }
     );
   }, seconds * 1000);
   return {
     signal: signal ? AbortSignal.any([deadline.signal, signal]) : deadline.signal,
+    expired: () => deadline.signal.aborted,
     [Symbol.dispose]: () => clearTimeout(timer),
   };
+}
+
+interface HookPhase {
+  signal: AbortSignal | undefined;
+  /** The shared deadline passed (not a cancel). */
+  expired: () => boolean;
+  [Symbol.dispose]: () => void;
+}
+
+const HOOK_DEADLINE_REASON =
+  "the plugin's hooks ran out of time before every hook could check this.";
+
+/**
+ * After the deadline, a hook that could run but never started counts as a deny (PreToolUse) or
+ * block (PostToolUse, UserPromptSubmit), as an input too large to check does. One whose server or
+ * tool is off fails open like any unavailable hook. Stop has no guard and does not use this.
+ */
+function guardLeftUnrun(
+  phase: HookPhase,
+  hook: PluginHookDefinition,
+  registration: CodexHookRegistration
+): boolean {
+  if (!phase.expired() || hook.handler.type !== "mcp_tool") return false;
+  return registration.deps.canCallPluginTool({
+    server: hook.handler.server,
+    tool: hook.handler.tool,
+  });
 }
 
 async function invoke<T extends { systemMessage?: string; invalid?: string }>(

@@ -421,7 +421,47 @@ describe("PreToolUse", () => {
     const started = performance.now();
     const ctx = await runTool(spine, "bash", {});
     expect(performance.now() - started).toBeLessThan(300);
-    expect(ctx.executed).toBe(true); // a stalled hook fails open
+    // The first hook fails open at the deadline. The guards that never ran must not let the call
+    // through, or a slow hook would skip a later deny (Codex PRRT_kwDOPxxmWM6s3_e8).
+    expect(ctx.executed).toBe(false);
+    expect(ctx.blocked?.result).toEqual({
+      error:
+        "Tool call blocked by plugin 'guard' hook: the plugin's hooks ran out of time before every hook could check this.",
+    });
+  });
+
+  test("a hook that did not start before the deadline blocks a tool result and a prompt", async () => {
+    const stalledThenAllow = () => [
+      hook("PostToolUse", { timeoutSeconds: 0.05 }),
+      hook("PostToolUse", { timeoutSeconds: 0.05 }),
+    ];
+    const post = setup(stalledThenAllow(), () => new Promise(() => undefined));
+    const ctx = await runTool(post.spine, "bash", {});
+    expect(ctx.executed).toBe(true);
+    expect(ctx.result).toEqual({
+      error:
+        "[plugin:guard] the plugin's hooks ran out of time before every hook could check this.",
+    });
+
+    const prompt = setup(
+      [
+        hook("UserPromptSubmit", { timeoutSeconds: 0.05 }),
+        hook("UserPromptSubmit", { timeoutSeconds: 0.05 }),
+      ],
+      () => new Promise(() => undefined)
+    );
+    const outcome = await runMessageSendHooks(prompt.spine, workspaceId, {
+      text: "hi",
+      origin: "user",
+      canBlock: true,
+    });
+    expect(outcome).toMatchObject({ kind: "blocked", pluginName: "guard" });
+
+    // A hook whose server is off fails open, as any unavailable hook does.
+    const off = setup(stalledThenAllow(), () => new Promise(() => undefined));
+    off.deps.canCallPluginTool = () => false;
+    const offCtx = await runTool(off.spine, "bash", {});
+    expect(offCtx.result).toEqual({ ran: {} });
   });
 
   test("the shared deadline ends with the hooks, not with the tool call", async () => {
