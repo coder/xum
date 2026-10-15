@@ -1319,13 +1319,10 @@ export const agentPlugins = {
   /** Settings → Plugins: the list and the pending sign-out record in one call (#6627). */
   listForSettings: {
     input: z.void(),
-    output: ResultSchema(
-      z.object({
-        items: z.array(AgentPluginListItemSchema),
-        pendingSignOuts: AgentPluginPendingSignOutsSchema,
-      }),
-      z.string()
-    ),
+    output: z.object({
+      list: ResultSchema(z.array(AgentPluginListItemSchema), z.string()),
+      pendingSignOuts: AgentPluginPendingSignOutsSchema,
+    }),
   },
   /** The pending sign-out record that keeps managed plugins closed (#6627). */
   pendingSignOuts: {

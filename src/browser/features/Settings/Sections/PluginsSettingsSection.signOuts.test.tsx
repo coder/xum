@@ -41,8 +41,8 @@ test("a failed re-list keeps the pending sign-out notice", async () => {
     calls++;
     return calls === 1
       ? Promise.resolve({
-          success: true as const,
-          data: { items: [row(false)], pendingSignOuts: record },
+          list: { success: true as const, data: [row(false)] },
+          pendingSignOuts: record,
         })
       : Promise.reject(new Error("backend restarting"));
   };

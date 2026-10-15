@@ -1390,13 +1390,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       containerLocation: () => Promise.resolve("~/.mux/plugins"),
       listForSettings: () =>
         Promise.resolve({
-          success: true as const,
-          data: {
-            items: agentPluginsMock?.items ?? [],
-            pendingSignOuts: (pluginSignOutsCleared
-              ? undefined
-              : agentPluginsMock?.pendingSignOuts) ?? { kind: "none" as const },
-          },
+          list: { success: true as const, data: agentPluginsMock?.items ?? [] },
+          pendingSignOuts: (pluginSignOutsCleared
+            ? undefined
+            : agentPluginsMock?.pendingSignOuts) ?? { kind: "none" as const },
         }),
       pendingSignOuts: () =>
         Promise.resolve(

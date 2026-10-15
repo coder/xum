@@ -3625,7 +3625,8 @@ describe("AgentPluginInstallService", () => {
       await internals.settledSignOutPasses();
       expect(logouts).toBe(atStart + 1);
       expect(fenced.pendingSignOuts).toMatchObject({ kind: "pending", lastError: "offline" });
-      expect(fenced.items.find((item) => item.name === "demo-plugin")?.present).not.toBe(true);
+      const rows = (listed: typeof fenced) => (listed.list.success ? listed.list.data : []);
+      expect(rows(fenced).find((item) => item.name === "demo-plugin")?.present).not.toBe(true);
       // Within the 30 s wait, a status read starts no retry.
       expect((await restarted.pendingSignOutStatus()).kind).toBe("pending");
       await internals.settledSignOutPasses();
@@ -3634,7 +3635,13 @@ describe("AgentPluginInstallService", () => {
       fail = false;
       const cleared = await restarted.listForSettings();
       expect(cleared.pendingSignOuts).toEqual({ kind: "none" });
-      expect(cleared.items.find((item) => item.name === "demo-plugin")?.present).toBe(true);
+      expect(rows(cleared).find((item) => item.name === "demo-plugin")?.present).toBe(true);
+      // A failed list still returns the record: its notice holds the recovery control.
+      await fsPromises.writeFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "{ not json");
+      spyOn(restarted, "list").mockRejectedValueOnce(new Error("registry unreadable"));
+      const failed = await restarted.listForSettings();
+      expect(failed.list).toEqual({ success: false, error: "registry unreadable" });
+      expect(failed.pendingSignOuts.kind).toBe("broken");
       await oauth.dispose();
     });
 

@@ -4564,20 +4564,17 @@ export class AgentPluginInstallService {
    * after it, the list may hold the rows the record hid during its scan: list once more.
    */
   async listForSettings(): Promise<{
-    items: AgentPluginListItem[];
+    list: Awaited<ReturnType<AgentPluginInstallService["listResult"]>>;
     pendingSignOuts: AgentPluginPendingSignOuts;
   }> {
     const before = await this.currentSignOutStatus();
-    let items = await this.list();
+    // A failed list must not hide the record: its notice holds the recovery control.
+    let list = await this.listResult();
     // Report the list's retry when it is quick; a slow logout shows on the next refresh.
     await waitForPendingSignOuts(this.settledSignOutPasses(), STATUS_RETRY_WAIT_MS);
     const pendingSignOuts = await this.currentSignOutStatus();
-    if (before.kind !== "none" && pendingSignOuts.kind === "none") items = await this.list();
-    return { items, pendingSignOuts };
-  }
-
-  listForSettingsResult() {
-    return this.captureResult(() => this.listForSettings());
+    if (before.kind !== "none" && pendingSignOuts.kind === "none") list = await this.listResult();
+    return { list, pendingSignOuts };
   }
 
   /** The record as it is now, without starting a pass. Never throws. */

@@ -1491,13 +1491,13 @@ export const PluginsSettingsSection: React.FC = () => {
       if (generation !== listGenerationRef.current) {
         return; // A newer list request superseded this one.
       }
-      if (result.success) {
-        setItems(result.data.items);
-        setPendingSignOuts(result.data.pendingSignOuts);
+      setPendingSignOuts(result.pendingSignOuts);
+      if (result.list.success) {
+        setItems(result.list.data);
         setError(null);
       } else {
         setItems([]);
-        setError(result.error);
+        setError(result.list.error);
       }
     } catch (err) {
       if (generation === listGenerationRef.current) {

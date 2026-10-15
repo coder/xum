@@ -1453,7 +1453,7 @@ export const router = (authToken?: string) => {
       listForSettings: t
         .input(schemas.agentPlugins.listForSettings.input)
         .output(schemas.agentPlugins.listForSettings.output)
-        .handler(({ context }) => context.agentPluginInstallService.listForSettingsResult()),
+        .handler(({ context }) => context.agentPluginInstallService.listForSettings()),
       pendingSignOuts: t
         .input(schemas.agentPlugins.pendingSignOuts.input)
         .output(schemas.agentPlugins.pendingSignOuts.output)
