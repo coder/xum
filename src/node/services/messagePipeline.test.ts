@@ -1095,7 +1095,12 @@ describe("prepareMessagesForProvider: MCP tool results", () => {
   // Persisted output is unvalidated: one malformed MCP result must not fail every later send.
   it("replays a malformed MCP result as JSON instead of failing the request", async () => {
     const malformed = { content: [null] };
-    const outputs = await replayedOutputs([{ id: "mcp-call", output: malformed, mcp: true }]);
+    const outputs = await replayedOutputs([
+      { id: "mcp-call", output: malformed, mcp: true },
+      // A completed part without an output: the request still gets a JSON value.
+      { id: "mcp-missing", output: undefined, mcp: true },
+    ]);
     expect(outputs["mcp-call"]).toMatchObject({ type: "json", value: malformed });
+    expect(outputs["mcp-missing"]).toEqual({ type: "json", value: null });
   });
 });

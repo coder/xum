@@ -15,7 +15,8 @@ interface McpReplayOutput {
 function defaultModelOutput(output: unknown): ModelOutput {
   return typeof output === "string"
     ? { type: "text", value: output }
-    : { type: "json", value: output as never };
+    : // A missing output (corrupted row) sends JSON null, as the SDK's own conversion does.
+      { type: "json", value: (output ?? null) as never };
 }
 
 /**
@@ -24,6 +25,7 @@ function defaultModelOutput(output: unknown): ModelOutput {
  * so one bad history line cannot fail every later request.
  */
 function replayMcpModelOutput(output: unknown): ModelOutput {
+  if (output === undefined) return defaultModelOutput(output);
   try {
     return mcpToModelOutput({ output });
   } catch (error) {
