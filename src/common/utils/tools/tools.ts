@@ -185,6 +185,8 @@ export interface ToolConfiguration {
   overflow_policy?: "truncate" | "tmpfile";
   /** Background process manager for bash tool (optional, AI-only) */
   backgroundProcessManager?: BackgroundProcessManager;
+  /** Live session queue decision, shared with stream boundaries; never cached by process managers. */
+  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   /** When true, restrict edits to the plan file (plan agent behavior). */
   planFileOnly?: boolean;
   /** Plan file path - only this file can be edited when planFileOnly is true. */

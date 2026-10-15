@@ -148,6 +148,22 @@ export class WorktreeRuntime extends LocalBaseRuntime {
     return this.worktreeManager.renameWorkspace(projectPath, oldName, newName, trusted, options);
   }
 
+  async renameWorkspaceBranch(
+    projectPath: string,
+    workspaceName: string,
+    oldBranchName: string,
+    newBranchName: string,
+    trusted?: boolean
+  ): Promise<{ success: true } | { success: false; error: string }> {
+    return this.worktreeManager.renameWorkspaceBranch(
+      projectPath,
+      workspaceName,
+      oldBranchName,
+      newBranchName,
+      trusted
+    );
+  }
+
   async canDeleteWorkspaceWithoutForce(
     projectPath: string,
     workspaceName: string,

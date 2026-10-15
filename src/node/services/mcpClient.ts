@@ -404,6 +404,24 @@ function reportToolsListChanged(
   return changes.dispose;
 }
 
+/** What one tools/list showed, for the handle's lookups. */
+interface ListedCatalog {
+  /** Which tools/list call (in start order) produced it. */
+  listing: number;
+  /** Every listed tool (hidden ones included) -> its `_meta.ui`, if any. */
+  tools: Map<string, MCPToolUi | undefined>;
+  entrypoints: readonly MCPAppEntrypointTool[];
+  settingsActions: Map<string, MCPSettingsToolAction>;
+}
+
+/**
+ * The catalog to keep after a listing answers (#6611): overlapping listings (relistTools, a
+ * send) can answer out of order, and a late, older response must not overwrite a newer catalog.
+ */
+function newerCatalog(current: ListedCatalog, answered: ListedCatalog): ListedCatalog {
+  return answered.listing > current.listing ? answered : current;
+}
+
 export async function createMCPClient(config: MCPClientConfig): Promise<MCPClientHandle> {
   const mcpApps = config.mcpApps === true;
   const client = new Client(CLIENT_INFO, {
@@ -420,10 +438,14 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         }
       : {}),
   });
-  // Every tool of the latest listing (hidden ones included) -> its `_meta.ui`, if any.
-  let listedTools = new Map<string, MCPToolUi | undefined>();
-  let listedEntrypoints: readonly MCPAppEntrypointTool[] = [];
-  let listedSettingsActions = new Map<string, MCPSettingsToolAction>();
+  let catalog: ListedCatalog = {
+    listing: 0,
+    tools: new Map(),
+    entrypoints: [],
+    settingsActions: new Map(),
+  };
+  // tools/list calls started; `catalog.listing` is the newest one applied (newerCatalog).
+  let listingsStarted = 0;
 
   if (config.onUncaughtError) {
     const onUncaughtError = config.onUncaughtError;
@@ -451,6 +473,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
 
   const handle: MCPClientHandle = {
     tools: async () => {
+      const listing = ++listingsStarted;
       const listResult = await client.listTools();
       assert(Array.isArray(listResult.tools), "MCP tools/list result must carry a tools array");
 
@@ -530,9 +553,8 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         if (ui !== undefined) toolUiByTool.set(tool, ui);
         tools[definition.name] = tool;
       }
-      listedTools = listed;
-      listedEntrypoints = entrypoints;
-      listedSettingsActions = settingsActions;
+      // Its tools still go to its caller, even when a newer listing's catalog stays.
+      catalog = newerCatalog(catalog, { listing, tools: listed, entrypoints, settingsActions });
       return tools;
     },
     prompts: (options) => listServerPrompts(client, options?.signal),
@@ -552,9 +574,9 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       const discover = client.getDiscoverResult();
       return discover !== undefined ? { kind: "modern", discover } : { kind: "legacy" };
     },
-    toolUi: (name) => listedTools.get(name),
-    hasTool: (name) => listedTools.has(name),
-    appEntrypoints: () => listedEntrypoints,
+    toolUi: (name) => catalog.tools.get(name),
+    hasTool: (name) => catalog.tools.has(name),
+    appEntrypoints: () => catalog.entrypoints,
     callToolForApp: (name, args, options) => {
       assert(mcpApps, "callToolForApp requires an MCP Apps connection");
       return client.callTool(
@@ -588,12 +610,12 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         }
       );
     },
-    settingsToolAction: (name) => listedSettingsActions.get(name),
+    settingsToolAction: (name) => catalog.settingsActions.get(name),
     relistTools: async () => {
       await handle.tools();
     },
     callSettingsActionTool: (name, meta, options) => {
-      assert(listedSettingsActions.has(name), "callSettingsActionTool only calls listed tools");
+      assert(catalog.settingsActions.has(name), "callSettingsActionTool only calls listed tools");
       // The spec's layout tool accepts `{}`.
       return client.callTool(
         { name, arguments: {}, _meta: meta },

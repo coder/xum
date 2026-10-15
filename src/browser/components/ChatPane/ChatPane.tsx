@@ -107,10 +107,7 @@ import { useReviews } from "@/browser/hooks/useReviews";
 import { ReviewsBanner } from "../ReviewsBanner/ReviewsBanner";
 import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
-import {
-  useBackgroundBashActions,
-  useBackgroundBashError,
-} from "@/browser/contexts/BackgroundBashContext";
+import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import {
   buildEditingStateFromDisplayed,
@@ -192,6 +189,15 @@ type ReviewsState = ReturnType<typeof useReviews>;
 // When unlocked (manual reading) we drop this so the browser anchors to an onscreen
 // row and preserves the reading position while off-screen content above settles.
 const TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE = { overflowAnchor: "none" } as const;
+
+/**
+ * Jump to bottom (also every send and edit) brings a detached slice (#4961 F20: its newest rows
+ * unmounted under the mounted-row cap) back to the live tail first.
+ */
+function jumpToLiveTail(isDetached: boolean, resetToLatest: () => void, jumpToBottom: () => void) {
+  if (isDetached) resetToLatest();
+  jumpToBottom();
+}
 // The sentinel is the sole anchor candidate while locked.
 const TRANSCRIPT_BOTTOM_SENTINEL_STYLE = { overflowAnchor: "auto" } as const;
 // The composer dock is normal scroll content (sticky to the scrollport bottom),
@@ -361,7 +367,6 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const aggregator = useWorkspaceAggregator(workspaceId);
   const workspaceUsage = useWorkspaceUsage(workspaceId);
   const reviews = useReviews(workspaceId);
-  const { autoBackgroundOnSend } = useBackgroundBashActions();
   const { clearError: clearBackgroundBashError } = useBackgroundBashError();
 
   // Transcript-only workspaces preserve historical chat and usage after the worktree is deleted,
@@ -613,10 +618,12 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // skeleton. Handing it no rows keeps it idle; the real transcript then starts tail-first.
   const {
     fromIndex: revealFromIndex,
+    isDetached: isTranscriptDetached,
     isFullyRevealed,
     isRevealPaused,
     revealMore,
     revealThrough,
+    resetToLatest,
   } = useBoundedTranscriptReveal({
     workspaceId,
     messages: showTranscriptHydrationPlaceholder ? EMPTY_TRANSCRIPT : deferredMessages,
@@ -844,7 +851,10 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [handleScrollContainerKeyDown, isComposerDockEvent]
   );
 
-  const handleJumpToBottom = jumpToBottom;
+  const handleJumpToBottom = useCallback(
+    () => jumpToLiveTail(isTranscriptDetached, resetToLatest, jumpToBottom),
+    [isTranscriptDetached, resetToLatest, jumpToBottom]
+  );
 
   // Handler to navigate (scroll) to a specific message by historyId
   const handleNavigateToMessage = useCallback(
@@ -1134,22 +1144,6 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     handleJumpToBottom();
   }, [handleJumpToBottom]);
 
-  const handleMessageSent = useCallback(
-    (dispatchMode: QueueDispatchMode = "tool-end") => {
-      // Only background foreground bashes for "tool-end" sends (Enter).
-      // "turn-end" sends (Ctrl/Cmd+Enter) let the stream finish naturally —
-      // backgrounding would disrupt a foreground bash the user wants to complete.
-      if (dispatchMode === "tool-end") {
-        autoBackgroundOnSend();
-      }
-
-      // Slash-command send paths still report after backend success; keep this
-      // harmless duplicate pin so those paths also re-arm auto-scroll.
-      handleJumpToBottom();
-    },
-    [autoBackgroundOnSend, handleJumpToBottom]
-  );
-
   const handleClearHistory = useCallback(
     async (percentage = 1.0) => {
       // Clearing acts on the transcript the user sees. The only caller is the /clear slash
@@ -1203,9 +1197,12 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Reset transcript scroll ownership when switching workspaces. `jumpToBottom` both re-arms
   // the ref-backed auto-scroll flag and pins any cached rows before paint; if rows are still
   // hydrating, the next content resize owns the tail instead of showing the prior workspace's state.
+  // The stable `jumpToBottom`, not `handleJumpToBottom`: a switch restarts the reveal at the latest
+  // rows anyway, and an effect keyed on `handleJumpToBottom` would also re-run (and relock) on
+  // every render where its identity changes, or whenever the slice detaches (#6678 review).
   useLayoutEffect(() => {
-    handleJumpToBottom();
-  }, [hasLoadedTranscriptRows, handleJumpToBottom, workspaceId]);
+    jumpToBottom();
+  }, [hasLoadedTranscriptRows, jumpToBottom, workspaceId]);
 
   const shouldShowStreamingBarrier = isStreamStarting || canInterrupt;
   // An armed background bash monitor means the turn ended but the agent will be
@@ -1754,7 +1751,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       onContextSwitchDismiss={handleContextSwitchDismiss}
                       onModelChange={handleModelChange}
                       onMessageSendStarted={handleMessageSendStarted}
-                      onMessageSent={handleMessageSent}
+                      onMessageSent={handleJumpToBottom}
                       onResetContext={handleResetContext}
                       onTruncateHistory={handleClearHistory}
                       editingMessage={editingMessage}

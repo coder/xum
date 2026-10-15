@@ -80,6 +80,17 @@ export class ChatHarness {
     fireEvent.click(sendButton);
   }
 
+  async startHeldToolTurn(label: string): Promise<void> {
+    // Foreground Bash belongs to a live turn; an idle send bypasses queued input.
+    await this.send(`[mock:tool:parallel-step] ${label}`);
+    await waitFor(
+      () => {
+        expect(workspaceStore.getWorkspaceSidebarState(this.workspaceId).canInterrupt).toBe(true);
+      },
+      { timeout: 30_000 }
+    );
+  }
+
   async expectTranscriptContains(needle: string | RegExp, timeoutMs = 30_000): Promise<void> {
     await waitFor(
       () => {

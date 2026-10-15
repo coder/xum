@@ -565,15 +565,23 @@ describe("bash_output tool", () => {
 
     const tool = createBashOutputTool(config);
 
-    // Queue a message after 200ms
-    setTimeout(() => manager.setMessageQueued("test-workspace", true), 200);
+    // Change the live queue decision only after this output wait has sampled it.
+    let queued = false;
+    const waiting = Promise.withResolvers<void>();
+    config.hasQueuedMessages = () => {
+      waiting.resolve();
+      return queued;
+    };
 
     // Call with long timeout - should be interrupted by queued message
     const start = Date.now();
-    const result = (await tool.execute!(
+    const resultPromise = tool.execute!(
       { process_id: spawnResult.processId, timeout_secs: 30 },
       mockToolCallOptions
-    )) as BashOutputToolResult;
+    ) as Promise<BashOutputToolResult>;
+    await waiting.promise;
+    queued = true;
+    const result = await resultPromise;
     const elapsed = Date.now() - start;
 
     expect(result.success).toBe(true);
@@ -582,11 +590,9 @@ describe("bash_output tool", () => {
       expect(result.output).toBe("(waiting interrupted)");
       // Should have returned quickly after queued message, not waiting full 30s
       expect(elapsed).toBeLessThan(1000);
-      expect(elapsed).toBeGreaterThan(150); // At least waited until message was queued
     }
 
     // Cleanup
-    manager.setMessageQueued("test-workspace", false);
     await manager.terminate(spawnResult.processId, { monitorDisposition: "discard" });
     await manager.cleanup("test-workspace");
     tempDir[Symbol.dispose]();

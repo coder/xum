@@ -2211,7 +2211,11 @@ export class AgentSession {
     assert(typeof listener === "function", "listener must be a function");
 
     const unsubscribe = this.onChatEvent(listener);
-    await this.replayHistory(listener);
+    // The caller never gets `unsubscribe` when the replay rejects, so release the listener here.
+    await this.replayHistory(listener).catch((error: unknown) => {
+      unsubscribe();
+      throw error;
+    });
 
     this.scheduleStartupRecovery();
 
@@ -10481,8 +10485,6 @@ export class AgentSession {
         this.midStreamCompactionPending || this.contextController.isApplying();
       if (this.coordinator.editBlocked() || continuousApplyPending) {
         this.queuedProviderToolEndAbortInFlight = false;
-        // Clear the queued-message signal while the edit flow owns the next dispatch.
-        this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
         // Do not dispatch stream-end follow-ups while the edit flow is waiting
         // for IDLE; truncation must run before any synthetic turn resumes.
       } else {
@@ -11286,14 +11288,8 @@ export class AgentSession {
     // A newly authored manual turn replaces a resume still waiting on preflight I/O.
     if ((internal?.acceptanceOrigin ?? "manual") === "manual") this.pendingResumeIntent?.abort();
     this.emitQueuedMessageChanged();
-    // Signal to bash_output that it should return early to process queued messages
-    // only for tool-end dispatches. Return the same mode so the caller's foreground
-    // task waits follow the entry that will actually run, not a withdrawn FIFO head.
+    // Foreground task waits follow the entry that can actually run, not a withdrawn head.
     const nextDispatchableMode = this.messageQueue.getNextDispatchableMode();
-    this.backgroundProcessManager.setMessageQueued(
-      this.workspaceId,
-      nextDispatchableMode === "tool-end"
-    );
     // Undefined only if the entry just added is itself withdrawn; WorkspaceService.sendMessage
     // refuses those before enqueue, so null keeps its "nothing pending was queued" meaning.
     return nextDispatchableMode ?? null;
@@ -11305,7 +11301,6 @@ export class AgentSession {
     const callbackSets = this.messageQueue.getClearCallbacks();
     this.messageQueue.clear();
     this.emitQueuedMessageChanged();
-    this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
     for (const callbacks of callbackSets) {
       this.notifyQueuedMessageCleared(callbacks, cancelReason);
     }
@@ -11319,12 +11314,6 @@ export class AgentSession {
     }
 
     this.emitQueuedMessageChanged();
-    // Only the FIFO head can dispatch next; later hidden entries must not pull an earlier
-    // user-authored turn-end entry forward to a step boundary.
-    this.backgroundProcessManager.setMessageQueued(
-      this.workspaceId,
-      this.messageQueue.getNextDispatchableMode() === "tool-end"
-    );
     return true;
   }
 
@@ -11364,10 +11353,6 @@ export class AgentSession {
       return 0;
     }
     this.emitQueuedMessageChanged();
-    this.backgroundProcessManager.setMessageQueued(
-      this.workspaceId,
-      this.messageQueue.getNextDispatchableMode() === "tool-end"
-    );
     // Supersession is not withdrawal: a sub-agent progress report dropped because its child's
     // terminal outcome arrived carries workspace-turn continuation callbacks that would settle
     // this session's still-active delegated turn as interrupted (see
@@ -11400,10 +11385,6 @@ export class AgentSession {
       return false;
     }
     this.emitQueuedMessageChanged();
-    this.backgroundProcessManager.setMessageQueued(
-      this.workspaceId,
-      this.messageQueue.getNextDispatchableMode() === "tool-end"
-    );
     this.notifyQueuedMessageCleared(callbacks, cancelReason);
     return true;
   }
@@ -11535,8 +11516,23 @@ export class AgentSession {
   }
 
   hasQueuedMessages(dispatchMode?: "tool-end" | "turn-end"): boolean {
-    const nextMode = this.messageQueue.getNextDispatchableMode();
-    return nextMode != null && (dispatchMode == null || nextMode === dispatchMode);
+    // Input ownership survives admission refusal until the drain moves it to held input.
+    if (dispatchMode == null) {
+      return this.messageQueue.hasManualUserInput() || this.messageQueue.hasDispatchableEntries();
+    }
+    return (
+      !this.queueDispatchBlocked() && this.messageQueue.getNextDispatchableMode() === dispatchMode
+    );
+  }
+
+  /** Edit/compaction/Stop own the next dispatch; tools and queue drains share those barriers. */
+  private queueDispatchBlocked(): boolean {
+    return (
+      this.coordinator.closing ||
+      this.coordinator.editBlocked() ||
+      this.midStreamCompactionPending ||
+      this.isStopInProgress()
+    );
   }
 
   /** Queued intra-tree agent peer messages awaiting dispatch (peer-message queue cap input). */
@@ -11576,17 +11572,12 @@ export class AgentSession {
       if (continuationMetadata == null) {
         return true;
       }
-      return options?.promoteAheadOfHiddenTurnEnd === true
-        ? !this.messageQueue.hasAllWorkspaceTurnContinuationsAheadOfPromotedToolEnd(
-            continuationMetadata.taskHandleId,
-            continuationMetadata.ownerWorkspaceId,
-            continuationMetadata.turnId
-          )
-        : !this.messageQueue.hasAllWorkspaceTurnContinuations(
-            continuationMetadata.taskHandleId,
-            continuationMetadata.ownerWorkspaceId,
-            continuationMetadata.turnId
-          );
+      return !this.messageQueue.hasAllWorkspaceTurnContinuations(
+        continuationMetadata.taskHandleId,
+        continuationMetadata.ownerWorkspaceId,
+        continuationMetadata.turnId,
+        options
+      );
     }
 
     return false;
@@ -12125,6 +12116,14 @@ export class AgentSession {
     // Every queue mutation publishes here, so successor withdrawal is recorded before observers
     // (TaskService deferral reconciliation) read the receipt for this notification.
     this.settleWithdrawnQueueCutReceipts();
+    // Human and agent input share delivery, even without a mounted renderer.
+    if (this.hasQueuedMessages("tool-end")) {
+      for (const toolCallId of this.backgroundProcessManager.getForegroundToolCallIds(
+        this.workspaceId
+      )) {
+        this.backgroundProcessManager.sendToBackground(toolCallId);
+      }
+    }
     this.emitChatEvent(this.queuedMessageChangedEvent());
     // A queue mutation may remove the last blocker of goal advancement: a withdrawn, refused
     // or removed entry never streams, so its turn end never re-evaluates.
@@ -12190,19 +12189,12 @@ export class AgentSession {
     trigger: QueueDrainTrigger = "terminal",
     stopAdmission?: CompactionStopAdmission
   ): void {
-    if (
-      this.coordinator.closing ||
-      this.coordinator.editBlocked() ||
-      this.midStreamCompactionPending
-    )
-      return;
     // Stop-cascade barrier: hold queued entries (do not dequeue or consume them) while the
     // workspace's stop latch is held; the cascade's single clearQueue owns their removal.
-    if (this.isStopInProgress()) return;
+    if (this.queueDispatchBlocked()) return;
     using _dispatch = this.coordinator.enterExecution();
     const candidate = this.messageQueue.peekNext();
     if (candidate == null) {
-      this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
       return;
     }
     // Report-decision hold: the stream that just ended may still be deciding whether it carried
@@ -12317,10 +12309,6 @@ export class AgentSession {
           internal?.refreshCompactionAdmission?.(admission, fresh.data);
         }
       }
-      this.backgroundProcessManager.setMessageQueued(
-        this.workspaceId,
-        this.messageQueue.getNextDispatchableMode() === "tool-end"
-      );
       return this.sendMessage(message, options, {
         acceptanceOrigin: attempt.acceptanceOrigin,
         ...internal,

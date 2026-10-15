@@ -28,7 +28,11 @@ import type {
 } from "@ai-sdk/provider";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
-import { filterOrphanedMcpPromptSnapshots, type MuxMessage } from "@/common/types/message";
+import {
+  filterOrphanedMcpPromptSnapshots,
+  type MuxMessage,
+  type VolatileSystemTailRecord,
+} from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
@@ -64,6 +68,11 @@ export interface ReplayRequestInputs {
   anthropicCacheTtl?: AnthropicCacheTtl | null;
   /** Volatile system tail length from the turn-envelope row (absent = one block). */
   systemPromptVolatileSuffixLength?: number;
+  /**
+   * The turn's MuxMetadata.volatileSystemTail. The envelope records the system tail the
+   * request sent (frozen inside a segment), so the rebuild derives the live tail from this.
+   */
+  volatileSystemTail?: VolatileSystemTailRecord;
   /**
    * Resolved wire provider name from the turn-envelope row. Falls back to
    * name-canonicalization of the model string when absent (legacy envelopes) —
@@ -225,6 +234,7 @@ export async function buildReplayRequest(inputs: ReplayRequestInputs): Promise<R
     history: requestMessages,
     systemMessage: inputs.systemPrompt,
     volatileSystemSuffixLength: inputs.systemPromptVolatileSuffixLength,
+    replayedTurn: { record: inputs.volatileSystemTail },
     modelString: inputs.modelString,
     routeProvider: inputs.routeProvider,
     providerForMessages: wireProviderName,

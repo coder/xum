@@ -8,7 +8,11 @@ import type { ContextWindowIds } from "./contextWindowRollover";
 import * as path from "node:path";
 
 import assert from "@/common/utils/assert";
-import { isTokenBudgetInternalMessage, type MuxMessage } from "@/common/types/message";
+import {
+  isTokenBudgetInternalMessage,
+  type MuxMessage,
+  type VolatileSystemTailRecord,
+} from "@/common/types/message";
 import {
   getHistoryItemId,
   isHiddenFromSessionHistory,
@@ -82,6 +86,10 @@ import {
   type AnthropicCacheTtl,
 } from "@/common/utils/ai/cacheStrategy";
 import { prepareMessagesForProvider } from "./messagePipeline";
+import {
+  acceptsVolatileSystemTailRow,
+  planVolatileSystemTail,
+} from "@/node/utils/messages/volatileSystemTail";
 import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
 const keepContextRow = (message: MuxMessage) =>
@@ -163,11 +171,34 @@ export function measureVolatileSystemSuffix(
   return end > 0 ? systemMessage.length - end : 0;
 }
 
+/**
+ * measureVolatileSystemSuffix, but 0 unless every present section ends the message intact. A
+ * partial split means middleware edited or appended text, so part of the volatile content sits
+ * in the stable part, and the volatile-tail rows (mechanism 10) must not run on the rest.
+ */
+export function measureWholeVolatileSystemSuffix(
+  systemMessage: string,
+  sections: ReadonlyArray<string | null | undefined>
+): number {
+  const length = measureVolatileSystemSuffix(systemMessage, sections);
+  const whole = sections.reduce((sum, section) => sum + (section?.length ?? 0), 0);
+  return length === whole ? length : 0;
+}
+
 export interface PromptPayload {
   providerRequestMessages: MuxMessage[];
   messages: ModelMessage[];
   system: Instructions | undefined;
   tools: Record<string, Tool> | undefined;
+  /** For this turn's assistant row (MuxMetadata.volatileSystemTail); undefined records nothing. */
+  volatileSystemTail?: VolatileSystemTailRecord;
+  /**
+   * The system content this request sends (prompt-cache mechanism 10): the stable part plus
+   * the tail it actually carries (frozen inside a segment), its volatile length, and the text of
+   * the tail rows in the messages. The turn envelope, debug views and system token count must
+   * describe this, not the live system message.
+   */
+  sentSystem: { message: string; volatileSuffixLength: number; rowsText: string };
 }
 
 export interface AssemblePromptPayloadOptions {
@@ -215,6 +246,11 @@ export interface AssemblePromptPayloadOptions {
    * transform (mergeConsecutiveUserMessages) merges it into the start of that user message.
    */
   requestContextMessage?: MuxMessage;
+  /**
+   * Replay only: `systemMessage` is the system content the turn sent (its envelope), and this
+   * holds the turn's own MuxMetadata.volatileSystemTail, so the planner can derive the live tail.
+   */
+  replayedTurn?: { record?: VolatileSystemTailRecord };
 }
 
 /**
@@ -316,6 +352,51 @@ async function historyShareOfBudget(
   return Math.max(1, budgetTokens - contextTokens);
 }
 
+/**
+ * The system prompt split into its cached stable block and the volatile tail, and where the
+ * tail goes: a tail change inside a segment becomes a system row instead of a system edit
+ * (prompt-cache mechanism 10, volatileSystemTail.ts).
+ */
+function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMessage[]) {
+  const volatileLength = options.volatileSystemSuffixLength ?? 0;
+  assert(
+    Number.isSafeInteger(volatileLength) &&
+      volatileLength >= 0 &&
+      (volatileLength === 0 || volatileLength < options.systemMessage.length),
+    "volatileSystemSuffixLength must leave a non-empty stable system prefix"
+  );
+  const stableSystem = options.systemMessage.slice(
+    0,
+    options.systemMessage.length - volatileLength
+  );
+  const cachedSystemMessage = createCachedSystemMessage(
+    stableSystem,
+    options.modelString,
+    options.anthropicCacheTtl,
+    options.providersConfig
+  );
+  // Length 0 means no volatile sections, or a tail the caller could not split off (middleware
+  // edited it; turnRequestBuilder passes 0 then). Either way this request sends as before and
+  // records nothing: a row could only claim that sections still in the prompt are gone.
+  // A compaction request (it has a budget) does the same: the trim already fitted `history`
+  // to its budget, so rows added now could exceed it. Its system prompt is the compact
+  // agent's, so no cached prefix is lost, and its summary starts a new segment anyway.
+  const tailPlan = planVolatileSystemTail(
+    history,
+    options.systemMessage.slice(stableSystem.length),
+    volatileLength > 0 &&
+      options.compactionInputBudgetTokens == null &&
+      cachedSystemMessage != null &&
+      acceptsVolatileSystemTailRow(
+        options.modelString,
+        options.routeProvider,
+        options.providersConfig
+      ),
+    options.replayedTurn
+  );
+  return { stableSystem, cachedSystemMessage, tailPlan };
+}
+
 export async function assemblePromptPayload(
   options: AssemblePromptPayloadOptions
 ): Promise<PromptPayload> {
@@ -339,15 +420,23 @@ export async function assemblePromptPayload(
     options.modelString,
     options.requestContextMessage
   );
+  const { stableSystem, cachedSystemMessage, tailPlan } = planSystemPrompt(
+    options,
+    providerRequestMessages
+  );
+  const historyWithSentinel = addInterruptedSentinel(
+    insertRequestContextMessage(
+      options.tagHistoryItemIds === true
+        ? tagUserRowsWithHistoryItemIds(tailPlan.messages)
+        : tailPlan.messages,
+      options.requestContextMessage
+    )
+  );
   let messages = await prepareMessagesForProvider({
-    messagesWithSentinel: addInterruptedSentinel(
-      insertRequestContextMessage(
-        options.tagHistoryItemIds === true
-          ? tagUserRowsWithHistoryItemIds(providerRequestMessages)
-          : providerRequestMessages,
-        options.requestContextMessage
-      )
-    ),
+    // The new row goes last, after the newest user row and its request context.
+    messagesWithSentinel: tailPlan.appendedRow
+      ? [...historyWithSentinel, tailPlan.appendedRow]
+      : historyWithSentinel,
     replayReceiptMessages: prepared.activeContextMessages,
     effectiveAgentId: options.effectiveAgentId,
     toolNamesForSentinel: options.toolNamesForSentinel,
@@ -365,28 +454,9 @@ export async function assemblePromptPayload(
       : options.deferLoadingToolNames,
   });
   let system: Instructions | undefined = options.systemMessage;
-  const volatileLength = options.volatileSystemSuffixLength ?? 0;
-  assert(
-    Number.isSafeInteger(volatileLength) &&
-      volatileLength >= 0 &&
-      (volatileLength === 0 || volatileLength < options.systemMessage.length),
-    "volatileSystemSuffixLength must leave a non-empty stable system prefix"
-  );
-  const stableSystem = options.systemMessage.slice(
-    0,
-    options.systemMessage.length - volatileLength
-  );
   // Uncached trailing block: the stable block keeps the cache breakpoint.
   const volatileRows: SystemModelMessage[] =
-    volatileLength > 0
-      ? [{ role: "system", content: options.systemMessage.slice(stableSystem.length) }]
-      : [];
-  const cachedSystemMessage = createCachedSystemMessage(
-    stableSystem,
-    options.modelString,
-    options.anthropicCacheTtl,
-    options.providersConfig
-  );
+    tailPlan.systemTail.length > 0 ? [{ role: "system", content: tailPlan.systemTail }] : [];
   if (cachedSystemMessage) {
     // Anthropic requires the cached system row in messages and no separate system parameter.
     messages = [cachedSystemMessage, ...volatileRows, ...messages];
@@ -413,6 +483,12 @@ export async function assemblePromptPayload(
     providerRequestMessages,
     messages,
     system,
+    ...(tailPlan.record != null ? { volatileSystemTail: tailPlan.record } : {}),
+    sentSystem: {
+      message: stableSystem + tailPlan.systemTail,
+      volatileSuffixLength: stableSystem === options.systemMessage ? 0 : tailPlan.systemTail.length,
+      rowsText: tailPlan.rowsText,
+    },
     tools: options.tools
       ? applyCacheControlToTools(
           options.tools,

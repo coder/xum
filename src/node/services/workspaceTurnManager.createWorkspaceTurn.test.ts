@@ -112,6 +112,44 @@ describe("WorkspaceTurnManager", () => {
     });
   });
 
+  test("createWorkspaceTurn bases a worktree owner's new workspace on the branch its checkout is on", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
+      workspaceName: "workspace-1",
+    });
+    initGitRepo(projectPath);
+    // An auto-named worktree: workspace.create renamed only its branch, so its name is no branch.
+    const ownerCheckout = path.join(rootDir, "src", "workspace-1");
+    execSync(`git worktree add -b sidebar-k3m9 "${ownerCheckout}"`, {
+      cwd: projectPath,
+      stdio: "ignore",
+    });
+    await config.editConfig((cfg) => {
+      const owner = cfg.projects.get(projectPath)?.workspaces.find((ws) => ws.id === parentId);
+      if (owner == null) throw new Error("the owner must exist");
+      owner.path = ownerCheckout;
+      owner.runtimeConfig = { type: "worktree", srcBaseDir: path.join(rootDir, "src") };
+      return cfg;
+    });
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace });
+    const { taskService } = createWorkspaceTurnManagerHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Summarize the repo",
+      title: "Workspace turn",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(true);
+    const createCall = createWorkspace.mock.calls[0] as unknown[];
+    expect(createCall[2]).toBe("sidebar-k3m9");
+  });
+
   test("createWorkspaceTurn creates delegated targets without default unrelated-messaging consent", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);

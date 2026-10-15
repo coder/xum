@@ -129,12 +129,16 @@ const RULES: Record<FieldKind, string> = {
  * embeddings/overrides, isolates) and the zero-width characters (U+200B, U+2060, U+FEFF, soft
  * hyphen). All of them are invisible, so they can make a displayed plugin or developer name look
  * like another, or a label look blank (#6162). The Hangul fillers (U+115F, U+1160, U+3164, U+FFA0)
- * are letters (Lo) that render as nothing, so they spoof a name the same way (#6560).
+ * are letters (Lo) that render as nothing, so they spoof a name the same way (#6560). U+034F
+ * (combining grapheme joiner), U+17B4 and U+17B5 (Khmer inherent vowels) and U+2800 (braille
+ * blank) also render as nothing or a blank (#6660).
  * `longDescription` may break lines with \n only.
  */
+// The three combining marks stay outside the class: in a class they would combine with the
+// character before them (no-misleading-character-class).
 const UNSAFE_TEXT =
   // eslint-disable-next-line no-control-regex -- the control characters are the point
-  /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\p{Cf}\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u115f\u1160\u3164\uffa0]/u;
+  /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\p{Cf}\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u115f\u1160\u3164\uffa0\u2800]|\u034f|\u17b4|\u17b5/u;
 /** Scripts in which ZWNJ changes how letters join or form conjuncts (Persian, Indic). */
 const ZWNJ_SCRIPTS =
   "\\p{Script=Arabic}\\p{Script=Syriac}\\p{Script=Devanagari}\\p{Script=Bengali}\\p{Script=Gurmukhi}" +
@@ -153,6 +157,14 @@ const SHAPING_MARK = `(?=[${ZWNJ_SCRIPTS}])\\p{Mn}`;
  * joining controls), as in the half-form क्‍ष, and only before a letter of the same script.
  * Anywhere else it changes nothing on screen, so it could make two names look alike.
  */
+/** Tag characters of a string: U+E0000 plus each ASCII code point. */
+const tags = (ascii: string): string =>
+  [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+/** The three RGI subdivision flags: black flag, region tags, cancel tag. */
+const RGI_SUBDIVISION_FLAGS = new RegExp(
+  `\u{1f3f4}(?:${["gbeng", "gbsct", "gbwls"].map(tags).join("|")})\u{e007f}`,
+  "gu"
+);
 const VIRAMA_SCRIPTS: ReadonlyArray<[script: string, virama: string]> = [
   ["Devanagari", "\\u094d"],
   ["Bengali", "\\u09cd"],
@@ -175,8 +187,11 @@ const VIRAMA_SCRIPTS: ReadonlyArray<[script: string, virama: string]> = [
  *   either side (UTS #39 allows transparent characters there), as in Persian.
  * - ZWJ (U+200D) after a letter, its marks and a virama of an Indic script, before a letter of
  *   the same script (VIRAMA_SCRIPTS).
- * - Tag characters in a subdivision flag: U+1F3F4, 2 to 7 tag digits or lowercase tag letters,
- *   then U+E007F (the Unicode tag sequence form for regions such as gbsct).
+ * - ZWJ in the pre-Unicode-5.1 Malayalam chillu: one of the five consonants that have one (ṇa,
+ *   na, ra, la, ḷa), a virama, then ZWJ before a non-letter or the end of the text (#6660).
+ * - Tag characters in one of the three RGI subdivision flags (England, Scotland, Wales): U+1F3F4,
+ *   the tags of gbeng, gbsct or gbwls, then U+E007F. Fonts render only these, so any other
+ *   payload shows as a plain black flag and could make two names look alike (#6653).
  * - VS15/VS16 (U+FE0E, U+FE0F) after an emoji, and VS16 in a keycap (digit, VS16, U+20E3).
  * The ZWJ rule runs first and keeps the emoji's VS16, which the selector rule then removes.
  */
@@ -198,7 +213,8 @@ const ALLOWED_FORMAT_SEQUENCES: ReadonlyArray<[RegExp, string]> = [
     ),
     "$1",
   ]),
-  [/\u{1f3f4}[\u{e0030}-\u{e0039}\u{e0061}-\u{e007a}]{2,7}\u{e007f}/gu, "\u{1f3f4}"],
+  [/([\u0d23\u0d28\u0d30\u0d32\u0d33]\u0d4d)\u200d(?=[^\p{L}\p{M}]|$)/gu, "$1"],
+  [RGI_SUBDIVISION_FLAGS, "\u{1f3f4}"],
   [/(\p{Extended_Pictographic})(?:\ufe0e|\ufe0f)/gu, "$1"],
   [/([0-9#*])\ufe0f(?=\u20e3)/gu, "$1"],
 ];

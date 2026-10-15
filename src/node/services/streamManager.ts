@@ -57,7 +57,12 @@ import type {
 } from "@/common/types/stream";
 
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
-import type { MuxMetadata, MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
+import type {
+  MuxMetadata,
+  MuxMessage,
+  PersistedToolModelUsage,
+  VolatileSystemTailRecord,
+} from "@/common/types/message";
 import { hasTokenUsage, MODEL_FALLBACK_REFUSAL_TOOL_NAME } from "@/common/types/message";
 import {
   findFirstReasoningPartIndexInTrailingRun,
@@ -475,7 +480,24 @@ interface StepMessageTracker {
   anthropicThinkingStripStep?: number;
   /** True once this turn holds the Anthropic thinking-repair receipt (reads initialMetadata). */
   hasAnthropicReplayReceipt?: () => boolean;
+  /** After a step-0 rebuild: the row's tail record and system token count follow it. */
+  recordVolatileSystemTail: (rebuilt: {
+    volatileSystemTail?: VolatileSystemTailRecord;
+    systemMessageTokens?: number;
+  }) => void;
 }
+/** The row metadata after a step-0 rebuild: its tail record and system token count follow it. */
+function withRebuiltSystemMetadata(
+  metadata: Partial<MuxMetadata> | undefined,
+  rebuilt: { volatileSystemTail?: VolatileSystemTailRecord; systemMessageTokens?: number }
+): Partial<MuxMetadata> {
+  return {
+    ...metadata,
+    volatileSystemTail: rebuilt.volatileSystemTail,
+    systemMessageTokens: rebuilt.systemMessageTokens ?? metadata?.systemMessageTokens,
+  };
+}
+
 interface StreamRequestConfig {
   stopCause?: StreamStopCause;
   cacheEnabled?: boolean;
@@ -3290,10 +3312,8 @@ export class StreamManager {
           appliedLevel != null
         ) {
           try {
-            const rebuilt = await request.rebuildFirstStepForThinkingLevel(
-              appliedLevel,
-              thinkingOverride
-            );
+            const { messages: rebuilt, ...rebuiltSystem } =
+              await request.rebuildFirstStepForThinkingLevel(appliedLevel, thinkingOverride);
             const receiptApplied = applyTurnReplayReceipt(stepTracker, rebuilt);
             // A retry's step 0 can rebuild this row's earlier steps too: what it stripped
             // is gone from here on, so the receipt's point moves to this step.
@@ -3306,6 +3326,9 @@ export class StreamManager {
             );
             if (stepTracker) {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
+              // The rebuilt request decides which volatile-tail rows the row recorded, and
+              // what its system content (tail rows included) costs.
+              stepTracker.recordVolatileSystemTail(rebuiltSystem);
             }
             // onStepMessages fired above with the pre-rebuild transcript;
             // re-notify so consumers track the
@@ -3474,7 +3497,11 @@ export class StreamManager {
       maxOutputTokens,
       runtime,
     } = options;
-    const stepTracker: StepMessageTracker = { workspaceId: options.workspaceId };
+    // The tail hook is wired to streamInfo below, once it exists.
+    const stepTracker: StepMessageTracker = {
+      workspaceId: options.workspaceId,
+      recordVolatileSystemTail: () => undefined,
+    };
     const metadataModel = this.resolveMetadataModel(modelString, options.providersConfigSnapshot);
     const request = this.buildStreamRequestConfig({
       ...options,
@@ -3563,6 +3590,9 @@ export class StreamManager {
     // Single source for same-turn rebuilds: the receipt lives on initialMetadata (#5886).
     stepTracker.hasAnthropicReplayReceipt = () =>
       streamInfo.initialMetadata?.anthropicThinkingReplay === "off";
+    stepTracker.recordVolatileSystemTail = (rebuilt) => {
+      streamInfo.initialMetadata = withRebuiltSystemMetadata(streamInfo.initialMetadata, rebuilt);
+    };
 
     // Mid-turn thinking override: route applied levels into this stream's
     // metadata (partials, stream-end, final assistant message). Wired before
@@ -4441,6 +4471,14 @@ export class StreamManager {
       };
     }
 
+    // Before any await: the stream may already be preparing its first step, and a step-0
+    // thinking rebuild there records a newer volatile-tail plan (recordVolatileSystemTail),
+    // which must win over the patch's baseline. That rebuild always runs after an await.
+    streamInfo.initialMetadata = {
+      ...streamInfo.initialMetadata,
+      ...prepared.data.initialMetadataPatch,
+    };
+
     // The fallback stream exists now; durable side effects describing this
     // request identity (superseding turn envelope) may be recorded.
     await prepared.data.onStreamConstructed?.();
@@ -4482,10 +4520,9 @@ export class StreamManager {
       streamInfo.thinkingLevel = prepared.data.thinkingLevel;
     }
     // Final stream-end metadata spreads initialMetadata, so route attribution
-    // corrections and the fallback record propagate automatically.
+    // corrections (the patch, applied above) and the fallback record propagate automatically.
     streamInfo.initialMetadata = {
       ...streamInfo.initialMetadata,
-      ...prepared.data.initialMetadataPatch,
       modelFallback: {
         requestedModel: fallbackState.requestedModel,
         refusedModels: [...fallbackState.refusedModels],
