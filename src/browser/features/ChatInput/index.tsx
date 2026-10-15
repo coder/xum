@@ -221,7 +221,11 @@ import {
   type SendOutcome,
 } from "@/browser/stores/DraftStore";
 import { useComposerTypingLock } from "./useComposerTypingLock";
-import { useReportCreationSendBlocked } from "./useReportCreationSendBlocked";
+import {
+  isSendBlocked,
+  useReportCreationSendBlocked,
+  type CreationSendBlockers,
+} from "./useReportCreationSendBlocked";
 import { assert } from "@/common/utils/assert";
 import { acceptedSendIds, isEditSendAccepted } from "./sendAcceptance";
 import { createSendId } from "@/common/utils/drafts";
@@ -299,12 +303,19 @@ function preventDefault(event: React.DragEvent): void {
   event.preventDefault();
 }
 
-/** A locked composer starts no file read from a paste or drop: its result would land after the lock. */
-function fileInputHandlers<Paste, Drop>(
+/**
+ * A locked composer starts no file read from a paste or drop (its result would land after the
+ * lock), and its attachments show without remove buttons (a removal would miss a moving body).
+ */
+function attachmentInputHandlers<Paste, Drop, Remove>(
   locked: boolean,
-  handlers: { onPaste: Paste; onDrop: Drop }
-): { onPaste: Paste | undefined; onDrop: Drop | typeof preventDefault } {
-  return locked ? { onPaste: undefined, onDrop: preventDefault } : handlers;
+  handlers: { onPaste: Paste; onDrop: Drop; onRemove: Remove }
+): {
+  onPaste: Paste | undefined;
+  onDrop: Drop | typeof preventDefault;
+  onRemove: Remove | undefined;
+} {
+  return locked ? { onPaste: undefined, onDrop: preventDefault, onRemove: undefined } : handlers;
 }
 
 /**
@@ -910,8 +921,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
   const sendInFlightBlocksInput =
     variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
+  const draftMoving = useIsMovingCreationDraft(draftScope);
   const creationLocks = creationInputLocks({
-    draftMoving: useIsMovingCreationDraft(draftScope),
+    draftMoving,
     sendInFlight: isSendInFlight,
     sendInFlightBlocksInput,
   });
@@ -925,7 +937,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   });
   const sendLocksTyping = typingLock.locksTyping;
   const composerLocked = !editingMessageForUi && (disabled || sendLocksTyping);
-  const fileInput = fileInputHandlers(composerLocked, { onPaste: handlePaste, onDrop: handleDrop });
+  const attachmentInput = attachmentInputHandlers(composerLocked, {
+    onPaste: handlePaste,
+    onDrop: handleDrop,
+    onRemove: handleRemoveAttachment,
+  });
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
@@ -1019,17 +1035,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     creationState.branchLoad !== "loaded" &&
     creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
   const isProcessingAttachments = processingAttachmentCount > 0;
-  // #6423: the same blockers as canSend below, so "Run /init" is off whenever Send is.
-  useReportCreationSendBlocked(
-    {
-      disabled,
-      sendInFlight: sendInFlightBlocksInput,
-      processingAttachments: isProcessingAttachments,
-      coderPresetsLoading,
-      branchesNotLoaded: creationBranchesLoading,
-    },
-    props
-  );
+  // #6423: canSend below checks the same blockers, so "Run /init" is off whenever Send is.
+  const sendBlockers: CreationSendBlockers = {
+    disabled,
+    sendInFlight: sendInFlightBlocksInput,
+    processingAttachments: isProcessingAttachments,
+    coderPresetsLoading,
+    branchesNotLoaded: creationBranchesLoading,
+    draftMoving,
+  };
+  useReportCreationSendBlocked(sendBlockers, props);
   const hasSendableDraft = hasTypedText || hasImages || hasReviews;
   // Workspace sends/edits mutate history relative to the visible transcript, so they wait for
   // the onChat replay to finish; the creation composer has no transcript to catch up with.
@@ -1047,11 +1062,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const editPreconditionInvalidated = editingMessageForUi?.preconditionInvalidated === true;
   const canSend =
     hasSendableDraft &&
-    !disabled &&
-    !sendInFlightBlocksInput &&
-    !isProcessingAttachments &&
-    !coderPresetsLoading &&
-    !creationBranchesLoading &&
+    !isSendBlocked(sendBlockers) &&
     !transcriptBlocksSend &&
     !editPreconditionInvalidated;
   const runningGoalActive =
@@ -2326,7 +2337,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       pushToast({ type: "error", message: transcriptBarrierMessage(liveApiRef.current == null) });
       return;
     }
-    if (!canSend) {
+    // The live store too: a send racing the move's start (before this render) would take the
+    // body the move gives to the destination.
+    if (!canSend || getDraftStore().isMovingCreationDraft(draftScope)) {
       return;
     }
     if (!draft.payloadsLoaded) {
@@ -3457,12 +3470,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                         .catch(() => undefined);
                     }}
                     onKeyDown={handleKeyDown}
-                    onPaste={fileInput.onPaste}
+                    onPaste={attachmentInput.onPaste}
                     onKeyUp={composerSuggestions.handleCursorActivity}
                     onMouseUp={composerSuggestions.handleCursorActivity}
                     onSelect={composerSuggestions.handleCursorActivity}
                     onDragOver={handleDragOver}
-                    onDrop={fileInput.onDrop}
+                    onDrop={attachmentInput.onDrop}
                     onEscapeInNormalMode={handleEscapeInNormalMode}
                     suppressKeys={
                       composerSuggestions.isVisible ? COMMAND_SUGGESTION_KEYS : undefined
@@ -3505,7 +3518,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               )}
             </div>
 
-            <ChatAttachments attachments={attachments} onRemove={handleRemoveAttachment} />
+            <ChatAttachments attachments={attachments} onRemove={attachmentInput.onRemove} />
 
             <div className="flex flex-col gap-0.5" data-component="ChatModeToggles">
               {/* Editing indicator - workspace only */}

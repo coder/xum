@@ -17,6 +17,13 @@ export interface CreationSendBlockers {
   coderPresetsLoading: boolean;
   /** The branch list is loading or failed, for a runtime that needs a trunk (#6033, #6055). */
   branchesNotLoaded: boolean;
+  /** The draft is moving to another draft (see DraftStore.isMovingCreationDraft). */
+  draftMoving: boolean;
+}
+
+/** Whether any blocker turns Send off. */
+export function isSendBlocked(blockers: CreationSendBlockers): boolean {
+  return Object.values(blockers).some(Boolean);
 }
 
 /**
@@ -32,7 +39,7 @@ export function useReportCreationSendBlocked(
 ): void {
   // Only the creation variant reports; a workspace composer has no such page.
   const report = props.variant === "creation" ? props.onCreationSendBlockedChange : undefined;
-  const blocked = Object.values(blockers).some(Boolean);
+  const blocked = isSendBlocked(blockers);
   useEffect(() => {
     report?.(blocked);
   }, [blocked, report]);

@@ -540,11 +540,21 @@ describeIntegration("Draft workspace behavior", () => {
         await held;
         return await moveCreation(...args);
       });
+    const creates = jest.spyOn(env.services.workspaceService, "create");
+    const sendButton = () =>
+      view.container.querySelector<HTMLButtonElement>('button[aria-label="Send message"]');
+    const removeButton = () =>
+      view.container.querySelector<HTMLButtonElement>('button[aria-label="Remove attachment"]');
 
     try {
-      await waitFor(() => expect(composerText(view.container)).toBe("typed on the project page"), {
-        timeout: 10_000,
-      });
+      await waitFor(
+        () => {
+          expect(composerText(view.container)).toBe("typed on the project page");
+          expect(sendButton()?.disabled).toBe(false);
+          expect(removeButton()).not.toBeNull();
+        },
+        { timeout: 10_000 }
+      );
       fireEvent.click(opened.newSubProjectChat);
       await waitFor(() => expect(moveSpy).toHaveBeenCalled(), { timeout: 10_000 });
       // An edit made now would miss the moved body, and the moved draft would open without it.
@@ -568,6 +578,11 @@ describeIntegration("Draft workspace behavior", () => {
       });
       expect(reads).not.toHaveBeenCalled();
       reads.mockRestore();
+      // A send now would create a workspace from the body the move gives to the listed draft, and
+      // a removed attachment would be missing from the moved body.
+      expect(sendButton()?.disabled).toBe(true);
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(removeButton()).toBeNull();
       release();
       const [draftId] = await waitForDraftCount(projectPath, 1);
       const listedScope: DraftScope = { kind: "creation", projectPath, draftId };
@@ -586,8 +601,10 @@ describeIntegration("Draft workspace behavior", () => {
       expect((await env.orpc.drafts.getList()).entries.map((entry) => entry.draftId)).toEqual([
         draftId,
       ]);
+      expect(creates).not.toHaveBeenCalled();
     } finally {
       release();
+      creates.mockRestore();
       moveSpy.mockRestore();
       await Promise.all(createdScopes.map((scope) => getDraftStore().deleteDraft(scope)));
       await env.orpc.projects.remove({ projectPath: opened.subProjectPath });
