@@ -249,8 +249,8 @@ export const DraftEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("deleted"), scope: DraftScopeSchema, revision: DraftRevisionSchema }),
 ]);
 
-/** Mirrors ParsedRuntime (checked at compile time in creationDrafts.ts). */
-export const ParsedRuntimeSchema = z.discriminatedUnion("mode", [
+/** Mirrors ParsedRuntime (src/common/types/runtime.ts). */
+const ParsedRuntimeSchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("local") }),
   z.object({ mode: z.literal("worktree") }),
   z.object({

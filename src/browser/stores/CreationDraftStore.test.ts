@@ -1,3 +1,4 @@
+import * as fs from "fs/promises";
 import * as path from "path";
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import { ORPCError } from "@orpc/client";
@@ -8,6 +9,7 @@ import type {
   CreationDraftUpdateInput,
   DraftAttachment,
 } from "@/common/orpc/schemas/drafts";
+import { getDraftScopeId, getInputKey, getWorkspaceNameStateKey } from "@/common/constants/storage";
 import { DRAFT_STORE_READY_TIMEOUT_MS } from "@/constants/drafts";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { Config } from "@/node/config";
@@ -15,6 +17,7 @@ import { Config } from "@/node/config";
 import {
   CreationDraftRejectedError,
   CreationDraftService,
+  creationDraftImportId,
 } from "@/node/services/creationDraftService";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { TestTempDir } from "@/node/services/tools/testHelpers";
@@ -40,18 +43,24 @@ afterEach(() => {
   cleanupDom?.();
 });
 
-async function createHarness(tempDir: TestTempDir) {
+async function createHarness(
+  tempDir: TestTempDir,
+  options?: { seed?: (config: Config) => Promise<void>; failLegacyImport?: string }
+) {
   const config = new Config(path.join(tempDir.path, "xum-home"));
   await config.editConfig((cfg) => {
     cfg.projects.set(PROJECT_A, { workspaces: [] });
     cfg.projects.set(PROJECT_B, { workspaces: [] });
     return cfg;
   });
+  await options?.seed?.(config);
   const service = new CreationDraftService(config);
   const control = {
     updates: [] as CreationDraftUpdateInput[],
     updateGate: Promise.resolve(),
     failUpdates: 0,
+    /** Saves the backend applies whose reply is then lost. */
+    loseUpdateReplies: 0,
     readError: null as Error | null,
     readGate: Promise.resolve(),
   };
@@ -70,14 +79,22 @@ async function createHarness(tempDir: TestTempDir) {
         control.failUpdates--;
         throw new Error("connection lost");
       }
-      return service.update(input).catch((error: unknown) => {
+      const reply = await service.update(input).catch((error: unknown) => {
         throw error instanceof CreationDraftRejectedError
           ? new ORPCError("BAD_REQUEST", { message: error.message })
           : error;
       });
+      if (control.loseUpdateReplies > 0) {
+        control.loseUpdateReplies--;
+        throw new Error("connection lost");
+      }
+      return reply;
     },
     deleteCreation: ({ scope }: { scope: CreationDraftScope }) => service.delete(scope.draftId),
-    importLegacyCreation: (input: CreationDraftImportLegacyInput) => service.importLegacy(input),
+    importLegacyCreation: async (input: CreationDraftImportLegacyInput) => {
+      if (input.legacyDraftId === options?.failLegacyImport) throw new Error("connection lost");
+      return service.importLegacy(input);
+    },
   };
   const newClient = () => createTestApiClient({ drafts });
   const store = new CreationDraftStore();
@@ -255,5 +272,78 @@ describe("CreationDraftStore", () => {
     store.update("fresh", { text: "first edit" });
     await store.flush("fresh");
     expect(store.getDraftsByProject()[PROJECT_B]?.map((draft) => draft.draftId)).toEqual(["fresh"]);
+  });
+
+  test("a draft whose save was sent is deleted on the backend even when the reply was lost", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-lost-reply");
+    const harness = await createHarness(tempDir);
+    const { store, control, service } = harness;
+    control.loseUpdateReplies = 1;
+    const id = store.create(PROJECT_A, null, { text: "sent" });
+    await waitFor(() => store.getView(id).saveError !== null);
+    expect(await service.get(id)).not.toBeNull();
+
+    await store.delete(id);
+    expect(await service.get(id)).toBeNull();
+
+    // A draft never sent has no record: deleting it offline is local only.
+    const local = store.create(PROJECT_A, null);
+    store.setClient(null);
+    await store.delete(local);
+    expect(store.getView(local).draft).toBeNull();
+  });
+
+  test("imports old browser drafts before listing, and keeps the keys of those it could not import", async () => {
+    using tempDir = new TestTempDir("creation-store-legacy-import");
+    const named = getDraftScopeId(PROJECT_A, "named");
+    const conflicting = getDraftScopeId(PROJECT_A, "conflicting");
+    const failing = getDraftScopeId(PROJECT_B, "failing");
+    window.localStorage.setItem(
+      getWorkspaceNameStateKey(named),
+      JSON.stringify({ autoGenerate: false, manualName: "typed-name" })
+    );
+    window.localStorage.setItem(getInputKey(conflicting), JSON.stringify("older text"));
+    window.localStorage.setItem(getInputKey(failing), JSON.stringify("not imported yet"));
+    const harness = await createHarness(tempDir, {
+      failLegacyImport: "failing",
+      seed: async (config) => {
+        const seeding = new CreationDraftService(config);
+        await seeding.update({
+          scope: { kind: "creation", draftId: creationDraftImportId(PROJECT_A, "conflicting") },
+          projectPath: PROJECT_A,
+          text: "newer text",
+        });
+        // An old backend body that differs from its newer record: the backend's own warning.
+        await seeding.update({
+          scope: { kind: "creation", draftId: creationDraftImportId(PROJECT_B, "old") },
+          projectPath: PROJECT_B,
+          text: "newer body",
+        });
+        const oldDir = path.join(config.rootDir, "drafts", "project-b");
+        await fs.mkdir(oldDir, { recursive: true });
+        await fs.writeFile(
+          path.join(oldDir, "old.json"),
+          JSON.stringify({ projectPath: PROJECT_B, draftId: "old", text: "older body" })
+        );
+      },
+    });
+    const { store, service } = harness;
+    await waitFor(() => store.getListState().status === "ready");
+
+    const namedId = creationDraftImportId(PROJECT_A, "named");
+    expect((await service.get(namedId))?.manualName).toBe("typed-name");
+    expect(store.getDraftsByProject()[PROJECT_A]?.map((draft) => draft.draftId)).toContain(namedId);
+    expect(window.localStorage.getItem(getWorkspaceNameStateKey(named))).toBeNull();
+    // A conflicting or failed import keeps its keys, and the newer record.
+    expect(window.localStorage.getItem(getInputKey(conflicting))).not.toBeNull();
+    expect(window.localStorage.getItem(getInputKey(failing))).not.toBeNull();
+    expect((await service.get(creationDraftImportId(PROJECT_A, "conflicting")))?.text).toBe(
+      "newer text"
+    );
+    // Both warnings show: the backend's and this browser's.
+    const backendError = (await service.list()).importError;
+    expect(backendError).not.toBeNull();
+    expect(store.getListState().importError).toContain(backendError);
+    expect(store.getListState().importError).not.toBe(backendError);
   });
 });

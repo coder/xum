@@ -30,11 +30,6 @@ export function summarizeCreationDraft(draft: CreationDraft): CreationDraftSumma
   };
 }
 
-/** UTF-8 size of a whole creation draft record, compared against MAX_DRAFT_JSON_BYTES. */
-export function creationDraftJsonBytes(draft: CreationDraft): number {
-  return utf8ByteLength(JSON.stringify(draft));
-}
-
 /** The draft's execution choices, unless they were made for another project (then none). */
 export function ownExecution(draft: CreationDraft): CreationDraftExecution | null {
   return draft.execution?.projectPath === draft.projectPath ? draft.execution : null;

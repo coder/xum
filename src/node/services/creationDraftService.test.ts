@@ -1,6 +1,7 @@
+import cjsFs from "fs";
 import * as fs from "fs/promises";
 import * as path from "path";
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { Config } from "@/node/config";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import type { CreationDraftScope, DraftAttachment } from "@/common/orpc/schemas/drafts";
@@ -111,10 +112,25 @@ describe("CreationDraftService", () => {
     expect(await refusal({ projectPath: "/projects/unknown" })).toBeInstanceOf(
       CreationDraftRejectedError
     );
-    // A deleted draft is not recreated by a save without a project.
-    expect(await refusal({ text: "late" }, "gone")).toBeInstanceOf(CreationDraftRejectedError);
     expect(await fs.readFile(recordFile("d1"), "utf-8")).toBe(before);
+
+    // A deleted draft: a late save without a project is refused, one with a project recreates it.
+    await service.update({ scope: scope("gone"), projectPath: PROJECT_A, text: "sent" });
+    await service.delete("gone");
+    expect(await refusal({ text: "late" }, "gone")).toBeInstanceOf(CreationDraftRejectedError);
     expect(await exists(recordFile("gone"))).toBe(false);
+    await service.update({ scope: scope("gone"), projectPath: PROJECT_A, text: "late" });
+    expect(await exists(recordFile("gone"))).toBe(true);
+
+    // The stored project must still be registered, even for a save that moves the draft away.
+    await config.editConfig((cfg) => {
+      cfg.projects.delete(PROJECT_B);
+      return cfg;
+    });
+    expect(await refusal({ projectPath: PROJECT_A, text: "after removal" })).toBeInstanceOf(
+      CreationDraftRejectedError
+    );
+    expect(await fs.readFile(recordFile("d1"), "utf-8")).toBe(before);
   });
 
   it("refuses a record over the size cap and keeps the last complete file", async () => {
@@ -122,8 +138,10 @@ describe("CreationDraftService", () => {
     const { config, recordFile } = await createHarness(tempDir);
     const service = new CreationDraftService(config);
     await service.update({ scope: scope("d1"), projectPath: PROJECT_A, text: "small" });
+    const smallFileBytes = (await fs.stat(recordFile("d1"))).size;
 
-    const huge = "x".repeat(MAX_DRAFT_JSON_BYTES);
+    // One byte over the cap as written, file version included.
+    const huge = "x".repeat(MAX_DRAFT_JSON_BYTES + 1 - smallFileBytes + "small".length);
     expect(
       await service.update({ scope: scope("d1"), text: huge }).catch((error: unknown) => error)
     ).toBeInstanceOf(Error);
@@ -164,6 +182,21 @@ describe("CreationDraftService one-way import", () => {
     return files;
   }
 
+  const UNOWNED_ROW = {
+    projectPath: "/projects/removed",
+    draftId: "kept",
+    subProjectPath: null,
+    createdAt: 7,
+  };
+
+  async function readOldList(oldRoot: string): Promise<unknown> {
+    return (
+      JSON.parse(await fs.readFile(path.join(oldRoot, "list.json"), "utf-8")) as {
+        entries: unknown;
+      }
+    ).entries;
+  }
+
   it("imports listed, default, body-only, empty and name-only drafts without id collisions", async () => {
     using tempDir = new TestTempDir("creation-drafts-import");
     const { config, oldRoot } = await createHarness(tempDir);
@@ -172,6 +205,7 @@ describe("CreationDraftService one-way import", () => {
       [
         { projectPath: PROJECT_A, draftId: "listed", subProjectPath: null, createdAt: 5 },
         { projectPath: PROJECT_A, draftId: "empty", subProjectPath: null, createdAt: 6 },
+        UNOWNED_ROW,
       ],
       [
         { projectPath: PROJECT_A, draftId: "listed", text: "listed text" },
@@ -198,10 +232,84 @@ describe("CreationDraftService one-way import", () => {
     expect(list.drafts).toHaveLength(5);
     expect(list.importError).toBeNull();
     for (const file of files) expect(await exists(file)).toBe(false);
+    // Only imported rows leave the old list (an unregistered project's row stays).
+    expect(await readOldList(oldRoot)).toEqual([UNOWNED_ROW]);
 
     // Idempotent: a restart imports nothing twice.
     const restarted = await new CreationDraftService(config).list();
     expect(restarted.drafts).toHaveLength(5);
+  });
+
+  it("keeps an old draft's body and list row until its record is saved", async () => {
+    using tempDir = new TestTempDir("creation-drafts-import-write-failure");
+    const { config, oldRoot } = await createHarness(tempDir);
+    const row = { projectPath: PROJECT_A, draftId: "listed", subProjectPath: null, createdAt: 5 };
+    const [oldFile] = await writeOld(
+      oldRoot,
+      [row],
+      [{ projectPath: PROJECT_A, draftId: "listed", text: "keep me" }]
+    );
+    // Every record write fails (at its atomic rename).
+    const recordsDir = path.join(config.rootDir, "creation-drafts");
+    const realRename = cjsFs.rename.bind(cjsFs);
+    const renameSpy = spyOn(cjsFs, "rename").mockImplementation(((
+      from: cjsFs.PathLike,
+      to: cjsFs.PathLike,
+      callback: cjsFs.NoParamCallback
+    ) => {
+      if (path.dirname(String(to)) === recordsDir) {
+        callback(Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" }));
+        return;
+      }
+      realRename(from, to, callback);
+    }) as typeof cjsFs.rename);
+    let failed: Awaited<ReturnType<CreationDraftService["list"]>>;
+    try {
+      failed = await new CreationDraftService(config).list();
+    } finally {
+      renameSpy.mockRestore();
+    }
+    expect(failed.importError).not.toBeNull();
+    expect(await exists(oldFile)).toBe(true);
+    expect(await readOldList(oldRoot)).toEqual([row]);
+
+    const service = new CreationDraftService(config);
+    expect((await service.list()).importError).toBeNull();
+    expect((await service.get(creationDraftImportId(PROJECT_A, "listed")))?.text).toBe("keep me");
+  });
+
+  it("keeps the old drafts and loads the records when the old dir cannot be read", async () => {
+    using tempDir = new TestTempDir("creation-drafts-import-unreadable");
+    const { config, oldRoot } = await createHarness(tempDir);
+    await new CreationDraftService(config).update({
+      scope: scope("new"),
+      projectPath: PROJECT_A,
+      text: "new",
+    });
+    const [oldFile] = await writeOld(
+      oldRoot,
+      [],
+      [{ projectPath: PROJECT_A, draftId: "d", text: "old" }]
+    );
+    const realReaddir = fs.readdir.bind(fs);
+    const readdirSpy = spyOn(fs, "readdir").mockImplementation((async (
+      ...args: Parameters<typeof fs.readdir>
+    ) => {
+      if (path.resolve(String(args[0])) === path.resolve(oldRoot)) {
+        throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      }
+      return realReaddir(...args);
+    }) as typeof fs.readdir);
+    let list: Awaited<ReturnType<CreationDraftService["list"]>>;
+    try {
+      list = await new CreationDraftService(config).list();
+    } finally {
+      readdirSpy.mockRestore();
+    }
+
+    expect(list.drafts.map((draft) => draft.draftId)).toEqual(["new"]);
+    expect(list.importError).not.toBeNull();
+    expect(await exists(oldFile)).toBe(true);
   });
 
   it("keeps old content that differs from an existing record, with a visible error", async () => {
@@ -222,9 +330,24 @@ describe("CreationDraftService one-way import", () => {
       [{ projectPath: PROJECT_A, draftId: "d", text: "edited after downgrade" }]
     );
     const service = new CreationDraftService(config);
+    // The first load fails after its import ran; the retried load imports (and counts) again.
+    const recordsDir = path.join(config.rootDir, "creation-drafts");
+    const realReaddir = fs.readdir.bind(fs);
+    const readdirSpy = spyOn(fs, "readdir").mockImplementation((async (
+      ...args: Parameters<typeof fs.readdir>
+    ) => {
+      if (path.resolve(String(args[0])) === path.resolve(recordsDir)) {
+        readdirSpy.mockRestore();
+        throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" });
+      }
+      return realReaddir(...args);
+    }) as typeof fs.readdir);
+    expect(await service.list().catch((error: unknown) => error)).toBeInstanceOf(Error);
+    readdirSpy.mockRestore();
     const list = await service.list();
     expect((await service.get(id))?.text).toBe("edited after upgrade");
     expect(list.importError).not.toBeNull();
+    expect(list.importError).toBe((await new CreationDraftService(config).list()).importError);
     expect(await exists(oldFile)).toBe(true);
   });
 });

@@ -22,7 +22,6 @@ import {
   type DraftAttachment,
 } from "@/common/orpc/schemas/drafts";
 import {
-  creationDraftJsonBytes,
   draftTooLargeMessage,
   sanitizeDraft,
   stripStagedDraftAttachments,
@@ -314,7 +313,14 @@ export class CreationDraftService {
   }
 
   private async load(): Promise<void> {
-    await this.importOldDrafts();
+    this.importProblems = 0;
+    try {
+      await this.importOldDrafts();
+    } catch (error) {
+      // Old files go only after their record is saved, so they all stay; the records still load.
+      this.importProblems++;
+      log.warn("Could not import the old creation drafts", { error });
+    }
     const summaries = new Map<string, CreationDraftSummary>();
     for (const name of await readDirNames(this.root)) {
       if (!name.endsWith(".json")) continue;
@@ -323,7 +329,7 @@ export class CreationDraftService {
         const record = await this.readRecord(id);
         if (record) summaries.set(id, summarizeCreationDraft(record));
       } catch (error) {
-        // One unreadable file must not hide the others; opening it shows the error.
+        // One unreadable file must not hide the others; opening it fails the same way.
         log.warn(`Skipping unreadable creation draft ${name}`, { error });
       }
     }
@@ -366,13 +372,11 @@ export class CreationDraftService {
 
   /** Atomic replace: a failed write leaves the last complete file. */
   private async writeRecord(record: CreationDraft): Promise<void> {
-    const bytes = creationDraftJsonBytes(record);
+    const json = JSON.stringify({ version: RECORD_FILE_VERSION, ...record });
+    const bytes = Buffer.byteLength(json, "utf8");
     if (bytes > MAX_DRAFT_JSON_BYTES) throw new Error(draftTooLargeMessage(bytes));
     await fs.mkdir(this.root, { recursive: true });
-    await writeFileAtomic(
-      this.filePathFor(record.id),
-      JSON.stringify({ version: RECORD_FILE_VERSION, ...record })
-    );
+    await writeFileAtomic(this.filePathFor(record.id), json);
     this.summaries?.set(record.id, summarizeCreationDraft(record));
   }
 
@@ -384,10 +388,7 @@ export class CreationDraftService {
    */
   private async importOldDrafts(): Promise<void> {
     const listFile = path.join(this.oldRoot, OLD_LIST_FILE_NAME);
-    const listRaw = (await readJsonFile(listFile).catch((error: unknown) => {
-      log.warn("Could not read the old creation draft list", { error });
-      return null;
-    })) as { entries?: unknown } | null;
+    const listRaw = (await readJsonFile(listFile)) as { entries?: unknown } | null;
     const listEntries = Array.isArray(listRaw?.entries) ? (listRaw.entries as unknown[]) : [];
     const drafts = oldListedDrafts(listEntries);
     await this.readOldBodies(drafts);

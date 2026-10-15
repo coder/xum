@@ -20,8 +20,8 @@ export const MAX_DRAFT_JSON_BYTES = 40 * 1024 * 1024;
 export const DRAFT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
 /**
- * Draft id older builds gave a project's default creation composer. Only the one-way import of
- * their drafts reads it: creation drafts no longer have a reserved id.
+ * Draft id older builds gave a project's default creation composer. Only code reading their
+ * drafts or storage keys uses it: creation drafts no longer have a reserved id.
  */
 export const DEFAULT_CREATION_DRAFT_ID = "default";
 

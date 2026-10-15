@@ -71,6 +71,8 @@ interface Entry {
   load: CreationDraftLoad;
   /** Whether the backend holds a record: until then, a save sends every field (a create). */
   persisted: boolean;
+  /** A save was sent: the backend may hold a record even when the reply was lost. */
+  sent: boolean;
   /** Changed fields not sent yet. */
   pending: CreationDraftPatch;
   /** Never rejects (save records its error). */
@@ -288,6 +290,8 @@ export class CreationDraftStore {
     this.listState = { ...this.listState, status: "loading" };
     this.recomputeList();
     const run = async () => {
+      // Before the list, so it includes what this imports.
+      const legacyError = await this.importLegacyDrafts(client);
       const list = await client.drafts.listCreation();
       if (this.listedClient !== client) return;
       this.summaries = new Map(list.drafts.map((summary) => [summary.draftId, summary]));
@@ -296,8 +300,8 @@ export class CreationDraftStore {
         if (entry.draft && entry.persisted)
           this.summaries.set(id, summarizeCreationDraft(entry.draft));
       }
-      const legacyError = await this.importLegacyDrafts(client);
-      this.listState = { status: "ready", importError: list.importError ?? legacyError };
+      const errors = [list.importError, legacyError].filter((error) => error !== null);
+      this.listState = { status: "ready", importError: errors.join(" ") || null };
       this.recomputeList();
     };
     run().catch((error: unknown) => {
@@ -331,12 +335,6 @@ export class CreationDraftStore {
         counts[await importLegacyDraft(client, scopeId)]++;
       } catch (error) {
         console.warn("Failed to import a legacy creation draft; will retry on next start:", error);
-      }
-    }
-    if (counts.imported > 0) {
-      const list = await client.drafts.listCreation();
-      for (const summary of list.drafts) {
-        if (!this.summaries.has(summary.draftId)) this.summaries.set(summary.draftId, summary);
       }
     }
     return counts.conflict > 0
@@ -494,6 +492,7 @@ export class CreationDraftStore {
     const patch = entry.persisted ? entry.pending : all;
     entry.pending = {};
     entry.saving = true;
+    entry.sent = true;
     this.recompute(id, entry);
     try {
       if (!this.client) throw new Error("Not connected.");
@@ -529,9 +528,10 @@ export class CreationDraftStore {
     this.recomputeList();
     // Let a save in flight land first, so it cannot recreate the file after the delete.
     await entry?.inFlight;
-    if (!entry || entry.persisted) {
-      await this.client?.drafts.deleteCreation({ scope: { kind: "creation", draftId: id } });
-    }
+    // A draft never sent has no record; offline, its delete is local only.
+    if (entry && !entry.persisted && !entry.sent) return;
+    if (!this.client) throw new Error("Not connected.");
+    await this.client.drafts.deleteCreation({ scope: { kind: "creation", draftId: id } });
   }
 
   /** Drop local state of a removed project's drafts (the backend deletes their records). */
@@ -561,6 +561,7 @@ export class CreationDraftStore {
       },
       load,
       persisted,
+      sent: false,
       pending: {},
       inFlight: null,
       saving: false,
