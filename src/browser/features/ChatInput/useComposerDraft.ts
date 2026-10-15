@@ -141,7 +141,7 @@ function useComposerDraftSource(options: UseComposerDraftOptions) {
       // after the debounce. A failure keeps the change in the store, which retries it.
       getDraftStore()
         .flush(scope)
-        .catch(() => undefined);
+        .catch((error: unknown) => console.warn("Failed to save a draft on leaving it:", error));
     };
   }, [variant, workspaceId, creationDraftId]);
   return {

@@ -55,6 +55,8 @@ const pendingDraft = () => getCreationDraftStore().getView(creationDraftId).draf
 const savedWorkspaceDraftText = new Map<string, string>();
 /** Set to make the backend refuse workspace draft writes (a failed hand-off save). */
 let failWorkspaceDraftSaves = false;
+/** Holds creation draft saves (a slow flush at Send). */
+let creationSaveGate: Promise<void> | null = null;
 const draftBackend = createTestApiClient({
   drafts: {
     subscribe: (_input: void, opts?: { signal?: AbortSignal }) =>
@@ -81,15 +83,17 @@ const draftBackend = createTestApiClient({
     },
     delete: () => Promise.resolve({ revision: Date.now() }),
     listCreation: () => Promise.resolve({ drafts: [], importError: null }),
-    updateCreation: (input) =>
-      Promise.resolve({
+    updateCreation: async (input) => {
+      await creationSaveGate;
+      return {
         draftId: input.scope.draftId,
         projectPath: input.projectPath ?? TEST_PROJECT_PATH,
         subProjectPath: null,
         createdAt: 0,
         manualName: input.manualName ?? "",
         preview: "",
-      }),
+      };
+    },
     deleteCreation: () => Promise.resolve(),
   },
 });
@@ -705,6 +709,7 @@ describe("useCreationWorkspace", () => {
     getCreationDraftStore().forgetProject(TEST_PROJECT_PATH);
     savedWorkspaceDraftText.clear();
     failWorkspaceDraftSaves = false;
+    creationSaveGate = null;
     getDraftStore().setClient(draftBackend);
     await getDraftStore().whenReady();
     getCreationDraftStore().setClient(draftBackend);
@@ -1033,6 +1038,53 @@ describe("useCreationWorkspace", () => {
 
     // Thinking is workspace-scoped, but this test doesn't set a project-scoped thinking preference.
     expect(pendingDraft()).toBeNull();
+  });
+
+  // Send waits for the draft to save: the composer is frozen from the start, and a second Send
+  // meanwhile creates nothing (a second workspace).
+  test("handleSend is frozen while the draft saves and refuses a second Send", async () => {
+    const { workspaceApi } = setupWindow({
+      listBranches: mock(
+        (): Promise<BranchListResult> =>
+          Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+      ),
+      sendMessage: mock(
+        (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+          Promise.resolve({ success: true as const, data: {} })
+      ),
+      create: mock(
+        (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+          Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+      ),
+    });
+    draftSettingsState = createDraftSettingsHarness({ selectedRuntime: { mode: "worktree" } });
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+    const save = Promise.withResolvers<void>();
+    creationSaveGate = save.promise;
+    getCreationDraftStore().update(creationDraftId, { text: "launch workspace" });
+
+    // Two Enters before a render: both see the same (not yet sending) hook.
+    const handleSend = getHook().handleSend;
+    let first: Promise<CreationSendResult> | undefined;
+    let second: Promise<CreationSendResult> | undefined;
+    act(() => {
+      first = handleSend("launch workspace");
+      second = handleSend("launch workspace");
+    });
+    expect(getHook().isSending).toBe(true);
+    await act(async () => {
+      save.resolve();
+      await first;
+    });
+
+    expect(await second).toEqual({ success: false });
+    expect(await first).toEqual({ success: true });
+    expect(workspaceApi.create.mock.calls.length).toBe(1);
   });
 
   test("handleSend uses a typed manual name as the branch and title", async () => {

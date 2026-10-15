@@ -979,7 +979,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     props.kind !== "scratch" &&
     creationState.branchLoad !== "loaded" &&
     creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
-  const isProcessingAttachments = processingAttachmentCount > 0;
+  // A creation Send takes one snapshot of the draft: a file still being read, or speech still
+  // being transcribed, would land after it.
+  const isProcessingAttachments =
+    processingAttachmentCount > 0 || (variant === "creation" && voiceInput.state !== "idle");
   const creationDraftNotSaved = variant === "creation" && draft.saveError !== null;
   // #6423: the same blockers as canSend below, so "Run /init" is off whenever Send is.
   useReportCreationSendBlocked(

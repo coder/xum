@@ -419,7 +419,7 @@ export function useCreationWorkspace({
     };
   }, [trustPrompt]);
 
-  const handleSend = useCallback(
+  const handleSendOnce = useCallback(
     async (
       messageText: string,
       fileParts?: FilePart[],
@@ -435,6 +435,11 @@ export function useCreationWorkspace({
       if ((!messageText.trim() && !hasSendableAttachments) || isSending || !liveApi) {
         return { success: false };
       }
+
+      // Frozen from here (editor and project selector) until the send settles: the save, the name
+      // and the create all use the draft as it is now.
+      setIsSending(true);
+      setToast(null);
 
       // Send creates from the saved draft: wait for every local change (a failed save stops it,
       // keeping the draft).
@@ -507,9 +512,6 @@ export function useCreationWorkspace({
               timestamp: Date.now(),
             })
           : null;
-
-      setIsSending(true);
-      setToast(null);
 
       let createdWorkspaceId: string | null = null;
 
@@ -989,6 +991,21 @@ export function useCreationWorkspace({
       providersConfig,
     ]
   );
+  // `isSending` lags a render: a second Send before it lands would create a second workspace.
+  const sendingRef = useRef(false);
+  const handleSend: typeof handleSendOnce = async (...args) => {
+    if (sendingRef.current) return { success: false };
+    sendingRef.current = true;
+    let result: CreationSendResult = { success: false };
+    try {
+      result = await handleSendOnce(...args);
+      return result;
+    } finally {
+      sendingRef.current = false;
+      // A created workspace navigates away still frozen; any other outcome unfreezes.
+      if (!result.success) setIsSending(false);
+    }
+  };
 
   const trustDialog = trustPrompt
     ? createElement(ConfirmationModal, {
