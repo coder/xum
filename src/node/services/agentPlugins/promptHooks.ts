@@ -127,7 +127,7 @@ function capContextEntries(
 /** turn.stop reply text is cut to this length. */
 const TURN_STOP_TEXT_MAX_CHARS = 16 * 1024;
 /** A continuation prompt is a new user row; longer prompts are cut. */
-const TURN_STOP_PROMPT_MAX_CHARS = 32_000;
+export const TURN_STOP_PROMPT_MAX_CHARS = 32_000;
 
 /** `halted`: a consumer said `continue: false`, so nothing (not even Xum's own nudges) continues. */
 export type TurnStopHookOutcome =

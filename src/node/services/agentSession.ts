@@ -30,6 +30,7 @@ import {
   lastAssistantText,
   type MessageSendHookInput,
   type MessageSendHookOutcome,
+  TURN_STOP_PROMPT_MAX_CHARS,
   type TurnStopHookOutcome,
 } from "./agentPlugins/promptHooks";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
@@ -10714,9 +10715,11 @@ export class AgentSession {
           parts: payload.parts,
         })
       : null;
+    // The cap again on the joined prompt: todo items have no length limit.
     return [hookOutcome.kind === "continue" ? hookOutcome.prompt : null, todoNudge]
       .filter((text): text is string => text != null)
-      .join("\n\n");
+      .join("\n\n")
+      .slice(0, TURN_STOP_PROMPT_MAX_CHARS);
   }
 
   /** The ending stream's provenance for a turn.stop continuation (read before its reset). */

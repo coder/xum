@@ -11,6 +11,7 @@ import { EventEmitter } from "events";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import type { TodoItem } from "@/common/types/tools";
 import { getTodoFilePath } from "@/node/services/todos/todoStorage";
+import { TURN_STOP_PROMPT_MAX_CHARS } from "./agentPlugins/promptHooks";
 import { Ok } from "@/common/types/result";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { AgentSessionAIService } from "./agentSession";
@@ -773,6 +774,20 @@ describe("todo turn-end nudge", () => {
     const nudged = (await userTexts(h)).filter((text) => text.includes("Verify the fix"));
     expect(nudged).toHaveLength(1);
     expect(nudged[0]).toContain("Run the failing tests again.");
+  });
+
+  test("the merged continuation prompt keeps the continuation size cap", async () => {
+    addConsumer(keepGoing);
+    const { h } = await setup({ parts: todoWriteThenReply });
+    // Todo items have no length limit.
+    await writeTodos(h, [{ content: "x".repeat(TURN_STOP_PROMPT_MAX_CHARS), status: "pending" }]);
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    const [, continuation] = await userTexts(h);
+    expect(continuation).toStartWith("Run the failing tests again.");
+    expect(continuation.length).toBe(TURN_STOP_PROMPT_MAX_CHARS);
   });
 
   test.each([
