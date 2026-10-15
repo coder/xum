@@ -3192,6 +3192,62 @@ describe("MCPServerManager", () => {
     ).toEqual(["board", "tray"]);
   });
 
+  // #6181: the allowlist is a security boundary. A re-list after tools/list_changed replaces the
+  // held catalog; the tools the allowlist excludes must stay hidden from the model and from the
+  // entry point list.
+  test("a re-list after tools/list_changed keeps the tools the allowlist excludes hidden", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-relist-allowlist");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-relist-allowlist") });
+    const entry = (toolName: string) => ({
+      toolName,
+      title: toolName,
+      resourceUri: `ui://x/${toolName}`,
+      types: ["global" as const],
+    });
+    let served: Record<string, Tool> = { show: testTool() };
+    let listed: string[] = [];
+    servers.serve("apps-relist-allowlist", {
+      era: "modern",
+      listTools: () => {
+        listed = Object.keys(served);
+        return Promise.resolve(served);
+      },
+      apps: {
+        hasTool: () => true,
+        toolUi: () => undefined,
+        appEntrypoints: () => listed.map(entry),
+      },
+    });
+    const request = workspaceRequest("ws-relist-allowlist", {
+      overrides: { toolAllowlist: { apps: ["show"] } },
+      overridesAuthoritative: true,
+    });
+    expect(Object.keys((await manager.getToolsForWorkspace(request)).tools)).toEqual(["apps_show"]);
+
+    // The server adds a tool and announces tools/list_changed; listing entry points re-lists.
+    served = { show: testTool(), secret: testTool() };
+    const [config] = (mcpSdk.createMCPClient as unknown as ReturnType<typeof mock>).mock.calls.at(
+      -1
+    ) as [mcpSdk.MCPClientConfig];
+    config.onToolsListChanged?.();
+    const entrypoints = await manager.listMcpAppEntrypoints(request.workspaceId);
+    expect(listed).toEqual(["show", "secret"]);
+    expect(entrypoints.map((e) => e.toolName)).toEqual(["show"]);
+    // The model's tools after the re-list: still only the allowed one.
+    expect(Object.keys((await manager.getToolsForWorkspace(request)).tools)).toEqual(["apps_show"]);
+    const excluded = await manager
+      .openMcpAppEntrypoint(request.workspaceId, "apps", "secret", "global")
+      .then(
+        () => null,
+        (error: unknown) => error
+      );
+    expect(excluded).toBeInstanceOf(Error);
+  });
+
   test("a stalled tools/list refresh does not hold back listing or opening entry points", async () => {
     using tmp = new DisposableTempDir("mcp-apps-entry-stall");
     manager.setMcpApps({

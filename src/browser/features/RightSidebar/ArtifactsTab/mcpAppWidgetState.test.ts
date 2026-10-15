@@ -68,7 +68,7 @@ describe("MCP App widget state", () => {
     await flush();
     // The frame unmounted and mounted again before the write landed: getView still has n: 0.
     const remounted = mcpAppWidgetStateTarget("ws-remount", "c1", loadedView("r10", { n: 0 }));
-    expect(mcpAppWidgetStateSeed({ nonce: "doc-2" }, remounted)).toEqual({ n: 5 });
+    expect(mcpAppWidgetStateSeed(remounted)).toEqual({ n: 5 });
     writes[0].settle(true);
   });
 
@@ -78,16 +78,7 @@ describe("MCP App widget state", () => {
       secret: true,
     });
     const reused = mcpAppWidgetStateTarget("ws-reuse", "c1", loadedView("r20"));
-    expect(mcpAppWidgetStateSeed({ nonce: "doc-reuse" }, reused)).toBeNull();
-  });
-
-  test("a document keeps the seed it was built with, so later writes do not reload it", () => {
-    const { api } = deferredApi();
-    const target = mcpAppWidgetStateTarget("ws-doc", "c1", loadedView("r10", { n: 1 }));
-    expect(mcpAppWidgetStateSeed({ nonce: "doc-a" }, target)).toEqual({ n: 1 });
-    saveMcpAppWidgetState(api, target, { n: 2 });
-    expect(mcpAppWidgetStateSeed({ nonce: "doc-a" }, target)).toEqual({ n: 1 });
-    expect(mcpAppWidgetStateSeed({ nonce: "doc-b" }, target)).toEqual({ n: 2 });
+    expect(mcpAppWidgetStateSeed(reused)).toBeNull();
   });
 
   test("a write made while Xum reconnects is sent once a client is back", async () => {
@@ -104,6 +95,22 @@ describe("MCP App widget state", () => {
     flushOfflineMcpAppWidgetStates(api);
     await flush();
     expect(writes).toHaveLength(1);
+  });
+
+  // #6181: the offline map keeps one state per view instance; like the other maps it is bounded.
+  test("offline states are bounded: the oldest views' states go first", async () => {
+    const count = 70;
+    for (let i = 0; i < count; i++) {
+      const target = mcpAppWidgetStateTarget("ws-many-offline", `c${i}`, loadedView(`r${i}`));
+      saveMcpAppWidgetState(null, target, { i });
+    }
+    const { api, writes } = deferredApi();
+    flushOfflineMcpAppWidgetStates(api);
+    await flush();
+    const sent = writes.map((w) => (w.state as { i: number }).i);
+    expect(sent).toHaveLength(64);
+    expect(sent[0]).toBe(count - 64);
+    for (const write of writes) write.settle(true);
   });
 
   test("a write lost to a dropped connection is sent again with the next client", async () => {
@@ -126,6 +133,6 @@ describe("MCP App widget state", () => {
     expect(target).toBeNull();
     saveMcpAppWidgetState(api, target, { n: 1 });
     expect(writes).toEqual([]);
-    expect(mcpAppWidgetStateSeed({ nonce: "doc-none" }, target)).toBeNull();
+    expect(mcpAppWidgetStateSeed(target)).toBeNull();
   });
 });

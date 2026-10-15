@@ -342,10 +342,6 @@ type CollectedPluginSkill = AgentPluginPreviewSkill & {
  * imitate it.
  */
 /**
- * The raw registry consent with this build's kinds replaced. A newer build may store more kinds,
- * and a save on this build must keep them (downgrade round-trip).
- */
-/**
  * The consent an update journal carries (#6589). Absent in journals from older builds, and a
  * malformed value is not consent: both return undefined, so recovery keeps the old records and
  * the changed components ask for review again (fails closed).
@@ -357,16 +353,33 @@ function journalComponentConsent(
   return parsed.success ? parsed.data : undefined;
 }
 
+/**
+ * The raw registry consent with this build's kinds replaced. A newer build may store more kinds,
+ * and a save on this build must keep them (downgrade round-trip).
+ */
 function mergeRawConsent(raw: unknown, consent: ComponentConsent): Record<string, unknown> {
   return { ...(isPlainObject(raw) ? raw : {}), ...consent };
 }
 
-/** The registry patch for recovered consent: none when the journal carried none. */
+/**
+ * The registry patch for recovered consent: none when the journal carried none. Records merge per
+ * component, and the journal's win (#6698). The registry can gain records between the crash and
+ * the recovery (setComponents for a newly selected component), and replacing them would ask for
+ * those reviews again. A record for the same name fingerprints the same promoted tree, so it
+ * agrees with the journal's.
+ */
 function recoveredConsentPatch(
   raw: unknown,
   consent: ComponentConsent | undefined
 ): { componentConsent?: Record<string, unknown> } {
-  return consent === undefined ? {} : { componentConsent: mergeRawConsent(raw, consent) };
+  if (consent === undefined) return {};
+  const current = isPlainObject(raw) ? raw : {};
+  const merged = Object.entries(consent).map(([kind, records]) => {
+    const earlier = current[kind];
+    return [kind, { ...(isPlainObject(earlier) ? earlier : {}), ...records }] as const;
+  });
+  // Like mergeRawConsent: kinds this build does not know stay as stored.
+  return { componentConsent: { ...current, ...Object.fromEntries(merged) } };
 }
 
 function skillChangeSummary(current: SurfaceSkill, staged: SurfaceSkill, name: string): string {
@@ -430,6 +443,17 @@ function showInvisibleControls(text: string): string {
  * (fails closed) instead of truncating text the user would approve.
  */
 const MAX_REVIEW_TEXT_CHARS = 1_000_000;
+
+/**
+ * The install preview and the component picker list every directive command, and install records
+ * consent for them, so the list is bounded like a review and never cut (#6766). Only responses
+ * that list the commands check it: one oversized plugin must not break the plugin list.
+ */
+function assertDirectivesFit(skills: ReadonlyArray<{ name: string; directives?: string[] }>): void {
+  assertReviewFits(
+    skills.map((skill) => ({ summary: skill.name, after: (skill.directives ?? []).join("\n") }))
+  );
+}
 
 function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void {
   const size = changes.reduce(
@@ -3047,6 +3071,7 @@ export class AgentPluginInstallService {
       await this.assertNoCollision(plugin.name);
 
       const skills = await this.collectSkillsFromRoots(plugin, warnings);
+      assertDirectivesFit(skills);
       const { previews: mcpServers } = await this.collectMcpServers(
         plugin,
         targetPath,
@@ -3340,14 +3365,9 @@ export class AgentPluginInstallService {
     journalPath: string,
     document: Record<string, unknown>
   ): Promise<void> {
-    const tempPath = `${journalPath}.${randomBytes(8).toString("hex")}.tmp`;
-    await fsPromises.writeFile(tempPath, JSON.stringify(document));
-    try {
-      await fsPromises.rename(tempPath, journalPath);
-    } catch (error) {
-      await fsPromises.rm(tempPath, { force: true }).catch(() => undefined);
-      throw error;
-    }
+    // writeFileAtomic fsyncs the temp file before the rename and the directory after it, so after
+    // a power loss the journal is the old one or the whole new one, never empty (#6698).
+    await writeFileAtomic(journalPath, JSON.stringify(document));
   }
 
   /**
@@ -4083,6 +4103,7 @@ export class AgentPluginInstallService {
     const { fingerprints, ...inventory } = await this.readInstalledComponents(entry);
     assert(fingerprints !== undefined, "installed inventory carries consent fingerprints");
     if ((await gate.confirm()).length > 0) throw componentsChangedError();
+    assertDirectivesFit(inventory.skills);
     return inventory;
   }
 
