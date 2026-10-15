@@ -380,12 +380,16 @@ function reviewText(item: ReviewTextSource): string {
 }
 
 /**
- * Characters that render invisibly or reorder text (#6629): every Unicode default-ignorable code
- * point (zero-width and joiner characters, variation selectors such as U+FE0F, U+034F, tags) and
- * the bidi controls. Several are valid in JavaScript identifiers, so without a mark `safe` and
- * `safe` + U+FE0F would look the same in a review while the fingerprint approves other bytes.
+ * Characters that render invisibly, reorder text or break lines unseen (#6629): every Unicode
+ * default-ignorable code point (zero-width and joiner characters, variation selectors such as
+ * U+FE0F, U+034F, tags), the bidi controls, every control character except tab and LF, a CR not
+ * followed by LF, and U+2028/U+2029. Several are valid in JavaScript identifiers, so without a
+ * mark `safe` and `safe` + U+FE0F look the same. A lone CR, U+2028 and U+2029 end a `//` comment
+ * in JavaScript, but the browser draws them as nothing or a space, so code after one would read
+ * as comment text in the review while the fingerprint approves it.
  */
-const REVIEW_TEXT_CONTROLS = /[\p{Default_Ignorable_Code_Point}\u061c\u202a-\u202e\u2066-\u2069]/gu;
+const REVIEW_TEXT_CONTROLS =
+  /[\p{Default_Ignorable_Code_Point}\u061c\u202a-\u202e\u2066-\u2069\u2028\u2029\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]|\r(?!\n)/gu;
 
 /**
  * Review text as the user reads it: each such character becomes a visible `<U+XXXX>` mark. The
