@@ -658,6 +658,7 @@ export class DraftStore {
   private resubscribeAttempt = 0;
   /** A real snapshot was applied: writes may go out (they could clobber unseen data before). */
   private hydrated = false;
+  private snapshotCurrent = false;
   /** Composers may render: hydrated, or the first subscription failed (self-heal). */
   private ready = false;
   private resolveReady: () => void = () => undefined;
@@ -703,6 +704,20 @@ export class DraftStore {
   /** A real snapshot was applied (ready can also mean the wait for one timed out). */
   isHydrated(): boolean {
     return this.hydrated;
+  }
+
+  /**
+   * The running subscription has applied its snapshot. Unlike `hydrated`, false again from each
+   * (re)subscription until its snapshot: cached views may be stale until then.
+   */
+  hasCurrentSnapshot(): boolean {
+    return this.snapshotCurrent;
+  }
+
+  private setSnapshotCurrent(current: boolean): void {
+    if (this.snapshotCurrent === current) return;
+    this.snapshotCurrent = current;
+    for (const listener of this.readyListeners) listener();
   }
 
   subscribeReady = (listener: () => void): (() => void) => {
@@ -1892,6 +1907,7 @@ export class DraftStore {
     this.subscription = controller;
     const { signal } = controller;
     this.forgetServerViews();
+    this.setSnapshotCurrent(false);
     if (!this.ready && !this.readyTimer) {
       // Startup must never hang on drafts (a subscription that never yields, a stuck legacy
       // import): let composers render after a bound. Writes still wait for hydration, and a late
@@ -1923,6 +1939,7 @@ export class DraftStore {
             // scan is cheap.
             await this.migrateLegacyDrafts(client);
             this.markHydrated();
+            if (!signal.aborted) this.setSnapshotCurrent(true);
             for (const entry of this.entries.values()) this.scheduleFlush(entry);
             for (const key of [...this.pendingDeletes.keys()]) {
               this.sendDelete(key, 0).catch(() => undefined);
@@ -2403,6 +2420,12 @@ export function useCreationDraftsByProject(): CreationDraftsByProject {
 export function useDraftStoreHydrated(): boolean {
   const store = getDraftStore();
   return useSyncExternalStore(store.subscribeReady, () => store.isHydrated());
+}
+
+/** True while the running subscription has applied its snapshot (see hasCurrentSnapshot). */
+export function useDraftStoreSnapshotCurrent(): boolean {
+  const store = getDraftStore();
+  return useSyncExternalStore(store.subscribeReady, () => store.hasCurrentSnapshot());
 }
 
 /** True once drafts are hydrated (or hydration failed and the app must not wait for it). */

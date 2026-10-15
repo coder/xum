@@ -165,6 +165,33 @@ describe("useWorkspaceName draft state", () => {
     expect(getDraftStore().getView(SCOPE).nameState).toBeNull();
   });
 
+  // After a reconnect the cached draft may be stale until the new subscription's snapshot: a
+  // name generated for it would be an unsaved edit and outrank the backend's name.
+  test("waits for a replacement client's snapshot before generating a name", async () => {
+    const snapshot = Promise.withResolvers<void>();
+    getDraftStore().setClient(
+      createTestApiClient({
+        drafts: {
+          ...draftBackend.drafts,
+          subscribe: async (input: void, opts?: { signal?: AbortSignal }) => {
+            await snapshot.promise;
+            return draftBackend.drafts.subscribe(input, opts);
+          },
+        },
+      })
+    );
+    const view = renderWorkspaceName("fix the sidebar");
+    await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    expect(generateMock).toHaveBeenCalledTimes(0);
+
+    await act(async () => {
+      snapshot.resolve();
+      await snapshot.promise;
+    });
+    await waitFor(() => expect(view.result.current.name).toBe("quotes-a1b2"));
+    expect(generateMock).toHaveBeenCalledTimes(1);
+  });
+
   test("another window's name edit replaces the shown name", async () => {
     const view = renderWorkspaceName("");
     act(() => view.result.current.setAutoGenerate(false));

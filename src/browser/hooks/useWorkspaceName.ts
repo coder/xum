@@ -4,7 +4,7 @@ import {
   draftStoreScopeKey,
   getDraftStore,
   useDraft,
-  useDraftStoreHydrated,
+  useDraftStoreSnapshotCurrent,
   type DraftStoreScope,
 } from "@/browser/stores/DraftStore";
 import type { WorkspaceIdentity, WorkspaceNamePersistedState } from "@/common/orpc/schemas/drafts";
@@ -161,8 +161,9 @@ export function getDisplayTitleFromPersistedState(
 }
 
 /**
- * Before the drafts load, a backend draft's stored name is unknown: a name generated against the
- * empty default would replace it once saved.
+ * Before the drafts load, and after a reconnect until the new subscription's snapshot, a backend
+ * draft's stored name is unknown: a name generated against the cached (or empty default) state
+ * would be an unsaved edit and replace the backend's name once saved.
  */
 function isBackendDraft(scope: DraftStoreScope | null): boolean {
   return scope !== null && scope.kind !== "pending";
@@ -172,7 +173,7 @@ function isBackendDraft(scope: DraftStoreScope | null): boolean {
 function useWorkspaceNameStorage(scope: DraftStoreScope | null) {
   // Always subscribe, but only *use* the draft when a scope is provided.
   const draft = useDraft(scope ?? NO_DRAFT_SCOPE);
-  const hydrated = useDraftStoreHydrated();
+  const snapshotCurrent = useDraftStoreSnapshotCurrent();
   const [localState, setLocalState] = useState<WorkspaceNamePersistedState>(
     DEFAULT_WORKSPACE_NAME_STATE
   );
@@ -206,7 +207,7 @@ function useWorkspaceNameStorage(scope: DraftStoreScope | null) {
     setStoredIn,
     currentScope,
     scopeKey: scope === null ? null : draftStoreScopeKey(scope),
-    canAutoGenerate: hydrated || !isBackendDraft(scope),
+    canAutoGenerate: snapshotCurrent || !isBackendDraft(scope),
   };
 }
 
