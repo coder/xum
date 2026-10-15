@@ -1859,6 +1859,28 @@ describe("AgentPluginInstallService", () => {
     await expect(resume("wfr_unreviewed")).rejects.toThrow("has not been reviewed on this install");
   });
 
+  test("review labels show a bidi control in a workflow file name; the identity stays raw (#6629)", async () => {
+    const file = "evil\u202esj.js";
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
+    await fsPromises.writeFile(path.join(remoteDir, "workflows", file), "export default {};\n");
+    await commitAll(remoteDir, "add a workflow with a bidi control in its name");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.workflows).toEqual(["evil<U+202E>sj.js"]);
+    expect(preview.reviewedComponents.map((row) => row.name)).toEqual(["evil<U+202E>sj.js"]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await fsPromises.writeFile(
+      path.join(pluginsDir(), "demo-plugin", "workflows", file),
+      "export default { changed: true };\n"
+    );
+    const review = await service.previewComponentReview({ name: "demo-plugin" });
+    expect(review.changes.map((change) => change.summary)).toEqual([
+      "Workflow 'evil<U+202E>sj.js' needs review",
+    ]);
+    // The consent record is keyed by the raw name the runtime resolves.
+    expect(review.changes[0]?.component?.name).toBe(file);
+  });
+
   test("an update review lists a changed workflow script, and confirming records it (#6629)", async () => {
     await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
     const script = path.join(remoteDir, "workflows", "run.js");
