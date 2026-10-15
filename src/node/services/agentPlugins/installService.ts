@@ -402,6 +402,37 @@ function unreviewedRow(
   ];
 }
 
+/**
+ * Update rows for workflow scripts (#6629). A script executes, so a new or changed one needs a
+ * review, and confirming the update records it. Removals apply without one.
+ */
+function workflowChanges(
+  staged: ReadonlyMap<string, SurfaceWorkflow>,
+  /** The installed tree's surface; absent when it is missing or invalid (all staged is new). */
+  current: { workflows: ReadonlyMap<string, SurfaceWorkflow> } | undefined
+): AgentPluginCapabilityChange[] {
+  return [...staged].flatMap(([file, workflow]) => {
+    const component = {
+      kind: "workflows" as const,
+      name: file,
+      fingerprint: workflow.consentFingerprint,
+    };
+    const before = current?.workflows.get(file);
+    if (before === undefined) {
+      return [{ summary: `adds workflow '${file}'`, after: reviewText(workflow), component }];
+    }
+    if (before.consentFingerprint === workflow.consentFingerprint) return [];
+    return [
+      {
+        summary: `changes workflow '${file}'`,
+        before: reviewText(before),
+        after: reviewText(workflow),
+        component,
+      },
+    ];
+  });
+}
+
 /** Every component of an inventory: what a legacy import-all entry (no selection) imports. */
 function fullSelection(
   inventory: Pick<AgentPluginComponents, "skills" | "mcpServers">
@@ -2191,10 +2222,9 @@ export class AgentPluginInstallService {
     for (const agent of await this.collectAgentFiles(plugin.agentsDir)) {
       agents.set(agent.name, agent.fingerprint);
     }
-    const workflows = new Map<string, SurfaceWorkflow>();
-    for (const workflow of await this.collectWorkflowScripts(plugin, warnings)) {
-      workflows.set(workflow.file, workflow);
-    }
+    const workflows = new Map(
+      (await this.collectWorkflowScripts(plugin, warnings)).map((w) => [w.file, w] as const)
+    );
     const components = new Set<string>([
       ...(plugin.manifest.contributes?.slashCommands ?? []).map(
         (command) => `slash command /${command.name}`
@@ -2405,30 +2435,7 @@ export class AgentPluginInstallService {
         });
       }
     }
-    // Workflow scripts execute (#6629): a new or changed script needs a review, and confirming
-    // the update records it.
-    for (const [file, workflow] of staged.workflows) {
-      const currentWorkflow = current?.workflows.get(file);
-      const component = {
-        kind: "workflows" as const,
-        name: file,
-        fingerprint: workflow.consentFingerprint,
-      };
-      if (currentWorkflow === undefined) {
-        changes.push({
-          summary: `adds workflow '${file}'`,
-          after: reviewText(workflow),
-          component,
-        });
-      } else if (currentWorkflow.consentFingerprint !== workflow.consentFingerprint) {
-        changes.push({
-          summary: `changes workflow '${file}'`,
-          before: reviewText(currentWorkflow),
-          after: reviewText(workflow),
-          component,
-        });
-      }
-    }
+    changes.push(...workflowChanges(staged.workflows, current));
     // Consent covered a specific component set; additions need a new preview.
     for (const component of staged.components) {
       if (!(current?.components.has(component) ?? false)) {

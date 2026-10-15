@@ -329,13 +329,7 @@ async function resolvePluginWorkflowScript(
   } catch (error) {
     throw new Error(`Plugin workflow script not readable: ${getErrorMessage(error)}`);
   }
-  // The consent gate (#6629) checks the source it is about to run, so a script changed after its
-  // review cannot run. Listing goes through this resolver too, so it hides the script as well.
-  if (!isPluginWorkflowConsented(plugin.componentConsent, { file: parsed.relativePath, source })) {
-    throw new Error(
-      `Plugin workflow '${parsed.relativePath}' has not been reviewed on this install, so it does not run. Open Settings → Plugins and select Review on plugin '${plugin.name}'.`
-    );
-  }
+  assertWorkflowReviewed(plugin, parsed.relativePath, source);
   return buildResolvedScript({
     requestedScriptPath: input.scriptPath,
     canonicalScriptPath: `${PLUGIN_SCRIPT_PATH_PREFIX}${plugin.name}/${parsed.relativePath}`,
@@ -346,6 +340,17 @@ async function resolvePluginWorkflowScript(
     relativePath: parsed.relativePath,
     resolvedPath,
   });
+}
+
+/**
+ * The consent gate (#6629): it checks the source the resolver is about to run, so a script changed
+ * after its review cannot run. Listing goes through the resolver too, so it hides the script.
+ */
+function assertWorkflowReviewed(plugin: AgentPluginInfo, file: string, source: string): void {
+  if (isPluginWorkflowConsented(plugin.componentConsent, { file, source })) return;
+  throw new Error(
+    `Plugin workflow '${file}' has not been reviewed on this install, so it does not run. Open Settings → Plugins and select Review on plugin '${plugin.name}'.`
+  );
 }
 
 function parsePluginWorkflowScriptPath(scriptPath: string): {

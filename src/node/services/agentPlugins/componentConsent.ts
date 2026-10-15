@@ -288,12 +288,29 @@ export function consentForSelection(args: {
   return {
     skills: records("skills"),
     mcpServers: records("mcpServers"),
-    // Not in the picker: an install records every workflow its preview showed, and a picker save
-    // keeps the old records (it showed no workflow).
-    workflows:
-      args.previous !== undefined
-        ? { ...args.previous.consent?.workflows }
-        : { ...args.shown.workflows },
+    workflows: unpickedRecords(args.shown.workflows, args.previous),
+  };
+}
+
+/**
+ * Records of a kind the picker does not select (#6629): an install records every one its preview
+ * showed, and a picker save keeps the old records (it showed none of them).
+ */
+function unpickedRecords(
+  shown: Record<string, string>,
+  previous: { consent: ComponentConsent | undefined } | undefined
+): Record<string, string> {
+  if (previous === undefined) return { ...shown };
+  return { ...previous.consent?.workflows };
+}
+
+/** A copy of every kind's records; none when there is no record (an install before #6498). */
+function copyConsent(consent: ComponentConsent | undefined): ComponentConsent {
+  // Spread, never assigned: a component named `__proto__` must stay an own key.
+  return {
+    skills: { ...consent?.skills },
+    mcpServers: { ...consent?.mcpServers },
+    workflows: { ...consent?.workflows },
   };
 }
 
@@ -314,11 +331,7 @@ export function recordReviewedComponents(args: {
   current: readonly ComponentRef[];
   reviewed: readonly ComponentRef[];
 }): ComponentConsent {
-  const next: ComponentConsent = {
-    skills: { ...args.previous?.skills },
-    mcpServers: { ...args.previous?.mcpServers },
-    workflows: { ...args.previous?.workflows },
-  };
+  const next = copyConsent(args.previous);
   // One lookup per component: a plugin can have thousands of them.
   const refKey = (ref: ComponentRef) => JSON.stringify([ref.kind, ref.name, ref.fingerprint]);
   const shown = new Set(args.reviewed.map(refKey));
