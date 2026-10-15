@@ -73,15 +73,17 @@ function applyMcpAppsUpgradeDefault(overrides: Map<ExperimentId, boolean>): void
 }
 
 /**
- * Before a write changes Artifacts, store the MCP Apps value it derives today: turning Artifacts
- * on must not turn MCP Apps on, and turning it off must not turn them off. The read already
- * derived "on", so a missing entry here means "off".
+ * After a write to Artifacts or MCP Apps, store an MCP Apps entry, so the upgrade default never
+ * applies again: turning Artifacts on must not turn MCP Apps on, turning it off must not turn
+ * them off, and clearing the MCP Apps override must stay "off" after a restart. The read already
+ * derived "on" where it applies, so a missing entry here means "off".
  */
 function freezeMcpAppsUpgradeDefault(
   overrides: Map<ExperimentId, boolean>,
-  changing: ExperimentId
+  changed: ExperimentId
 ): void {
-  if (changing === EXPERIMENT_IDS.ARTIFACTS && !overrides.has(EXPERIMENT_IDS.MCP_APPS)) {
+  const relevant = changed === EXPERIMENT_IDS.ARTIFACTS || changed === EXPERIMENT_IDS.MCP_APPS;
+  if (relevant && !overrides.has(EXPERIMENT_IDS.MCP_APPS)) {
     overrides.set(EXPERIMENT_IDS.MCP_APPS, false);
   }
 }
@@ -169,10 +171,10 @@ export class ExperimentsService {
       // Merge the individual mutation into current disk state. A stale sibling
       // changing an unrelated flag must never restore withdrawn Design consent.
       const next = await readOverridesFile(this.overridesFilePath);
-      freezeMcpAppsUpgradeDefault(next, experimentId);
       const value = this.isExperimentSupported(experimentId) ? enabled : null;
       if (value == null) next.delete(experimentId);
       else next.set(experimentId, value);
+      freezeMcpAppsUpgradeDefault(next, experimentId);
       await lease.assertStillOwned();
       await this.writeOverridesToDisk(next);
       // A successful acknowledgement means the change survives a restart.

@@ -150,6 +150,17 @@ describe("ExperimentsService", () => {
       expect(restarted.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(false);
     });
 
+    test("clearing the MCP Apps override keeps them off after a restart", async () => {
+      await writeFile({ [EXPERIMENT_IDS.ARTIFACTS]: true });
+      const s = service();
+      await s.initialize();
+      await s.setOverride(EXPERIMENT_IDS.MCP_APPS, null);
+      expect(s.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(false);
+      const restarted = service();
+      await restarted.initialize();
+      expect(restarted.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(false);
+    });
+
     test("an explicit MCP Apps choice wins over the derived default", async () => {
       await writeFile({ [EXPERIMENT_IDS.ARTIFACTS]: true, [EXPERIMENT_IDS.MCP_APPS]: false });
       const s = service();
