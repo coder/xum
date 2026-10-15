@@ -57,6 +57,7 @@ const savedWorkspaceDraftText = new Map<string, string>();
 let failWorkspaceDraftSaves = false;
 /** Holds creation draft saves (a slow flush at Send). */
 let creationSaveGate: Promise<void> | null = null;
+let failCreationSaves = false;
 const draftBackend = createTestApiClient({
   drafts: {
     subscribe: (_input: void, opts?: { signal?: AbortSignal }) =>
@@ -85,6 +86,7 @@ const draftBackend = createTestApiClient({
     listCreation: () => Promise.resolve({ drafts: [], importError: null }),
     updateCreation: async (input) => {
       await creationSaveGate;
+      if (failCreationSaves) throw new Error("draft save refused");
       return {
         draftId: input.scope.draftId,
         projectPath: input.projectPath ?? TEST_PROJECT_PATH,
@@ -710,6 +712,7 @@ describe("useCreationWorkspace", () => {
     savedWorkspaceDraftText.clear();
     failWorkspaceDraftSaves = false;
     creationSaveGate = null;
+    failCreationSaves = false;
     getDraftStore().setClient(draftBackend);
     await getDraftStore().whenReady();
     getCreationDraftStore().setClient(draftBackend);
@@ -1077,6 +1080,7 @@ describe("useCreationWorkspace", () => {
       second = handleSend("launch workspace");
     });
     expect(getHook().isSending).toBe(true);
+    expect(workspaceApi.create.mock.calls.length).toBe(0);
     await act(async () => {
       save.resolve();
       await first;
@@ -1085,6 +1089,34 @@ describe("useCreationWorkspace", () => {
     expect(await second).toEqual({ success: false });
     expect(await first).toEqual({ success: true });
     expect(workspaceApi.create.mock.calls.length).toBe(1);
+  });
+
+  test("a failed draft save stops the Send and keeps the draft", async () => {
+    const { workspaceApi } = setupWindow({
+      listBranches: mock(
+        (): Promise<BranchListResult> =>
+          Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+      ),
+    });
+    draftSettingsState = createDraftSettingsHarness({ selectedRuntime: { mode: "worktree" } });
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+    failCreationSaves = true;
+    getCreationDraftStore().update(creationDraftId, { text: "launch workspace" });
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend("launch workspace");
+    });
+
+    expect(result).toEqual({ success: false });
+    expect(workspaceApi.create.mock.calls.length).toBe(0);
+    expect(pendingDraft()?.text).toBe("launch workspace");
+    expect(getHook().isSending).toBe(false);
   });
 
   test("handleSend uses a typed manual name as the branch and title", async () => {
@@ -2090,6 +2122,7 @@ describe("useCreationWorkspace", () => {
     const handleSendResult = await (handleSendPromise as unknown as Promise<CreationSendResult>);
     expect(handleSendResult).toEqual({ success: false });
     expect(workspaceApi.create.mock.calls.length).toBe(0);
+    expect(pendingDraft()?.text).toBe("creation draft");
   });
 
   test("sends the global default agent when the project agent is unset", async () => {
@@ -2670,6 +2703,7 @@ describe("useCreationWorkspace", () => {
     await waitFor(() => expect(getHook().toast?.message).toBe("backend exploded"));
     await waitFor(() => expect(getHook().isSending).toBe(false));
     expect(updatePersistedStateCalls).toEqual([]);
+    expect(pendingDraft()?.text).toBe("creation draft");
   });
 });
 
