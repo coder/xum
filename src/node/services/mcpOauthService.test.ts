@@ -969,12 +969,12 @@ describe("McpOauthService OAuth flows", () => {
     });
     const flowId = "caller-flow-id-0123456789";
     const listen = Server.prototype.listen;
-    let listener: Server | undefined;
+    const listeners: Server[] = [];
     const bind = spyOn(Server.prototype, "listen").mockImplementationOnce(function (
       this: Server,
       ...args: unknown[]
     ) {
-      listener = this;
+      listeners.push(this);
       // The Cancel lands after the lookup's check and before the bind completes.
       void service.cancelDesktopFlow(flowId);
       return (listen as (...a: unknown[]) => Server).apply(this, args);
@@ -984,7 +984,8 @@ describe("McpOauthService OAuth flows", () => {
         success: false,
         error: "OAuth flow cancelled",
       });
-      expect(listener?.listening).toBe(false);
+      expect(listeners).toHaveLength(1);
+      expect(listeners[0]?.listening).toBe(false);
       expect(await service.waitForDesktopFlow(flowId)).toEqual({
         success: false,
         error: "OAuth flow not found",
