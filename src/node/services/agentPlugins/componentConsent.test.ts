@@ -116,7 +116,7 @@ describe("skillConsentFingerprint", () => {
 
 describe("isComponentConsented", () => {
   test("only an own record with the same fingerprint counts", () => {
-    const consent = { skills: { foo: "aa" }, mcpServers: { echo: "bb" } };
+    const consent = { skills: { foo: "aa" }, mcpServers: { echo: "bb" }, workflows: {} };
     expect(isComponentConsented(consent, "skills", "foo", "aa")).toBe(true);
     expect(isComponentConsented(consent, "skills", "foo", "bb")).toBe(false);
     expect(isComponentConsented(consent, "mcpServers", "foo", "aa")).toBe(false);
@@ -127,12 +127,16 @@ describe("isComponentConsented", () => {
 });
 
 describe("consentForSelection", () => {
-  const shown = { skills: { a: "a2", b: "b2" }, mcpServers: { s: "s2" } };
+  const shown = {
+    skills: { a: "a2", b: "b2" },
+    mcpServers: { s: "s2" },
+    workflows: { "w.js": "w2" },
+  };
 
-  test("install records every selected component it showed", () => {
+  test("install records every selected component it showed, and every workflow", () => {
     expect(
       consentForSelection({ selection: { skills: ["a"], mcpServers: ["s", "gone"] }, shown })
-    ).toEqual({ skills: { a: "a2" }, mcpServers: { s: "s2" } });
+    ).toEqual({ skills: { a: "a2" }, mcpServers: { s: "s2" }, workflows: { "w.js": "w2" } });
   });
 
   test("a picker save records only newly added components", () => {
@@ -142,17 +146,22 @@ describe("consentForSelection", () => {
       previous: {
         selection: { skills: ["a"], mcpServers: ["s"] },
         // `a` was reviewed at an older fingerprint. `s` was never reviewed.
-        consent: { skills: { a: "a1", dropped: "x" }, mcpServers: {} },
+        consent: { skills: { a: "a1", dropped: "x" }, mcpServers: {}, workflows: { "w.js": "w1" } },
       },
     });
-    // `a` keeps its old record and `s` stays without one: the picker did not review them.
-    expect(consent).toEqual({ skills: { a: "a1", b: "b2" }, mcpServers: {} });
+    // `a` keeps its old record and `s` stays without one: the picker did not review them. The
+    // picker shows no workflow (#6629), so the workflow keeps its old record too.
+    expect(consent).toEqual({
+      skills: { a: "a1", b: "b2" },
+      mcpServers: {},
+      workflows: { "w.js": "w1" },
+    });
   });
 
   test("a component named __proto__ stays an own record", () => {
     const consent = consentForSelection({
       selection: { skills: [], mcpServers: ["__proto__"] },
-      shown: { skills: {}, mcpServers: Object.fromEntries([["__proto__", "p1"]]) },
+      shown: { skills: {}, mcpServers: Object.fromEntries([["__proto__", "p1"]]), workflows: {} },
     });
     expect(Object.hasOwn(consent.mcpServers, "__proto__")).toBe(true);
     expect(isComponentConsented(consent, "mcpServers", "__proto__", "p1")).toBe(true);
@@ -164,27 +173,33 @@ describe("consentForSelection", () => {
       shown,
       previous: { selection: { skills: ["a", "b"], mcpServers: ["s"] }, consent: undefined },
     });
-    expect(consent).toEqual({ skills: {}, mcpServers: {} });
+    expect(consent).toEqual({ skills: {}, mcpServers: {}, workflows: {} });
   });
 });
 
 describe("recordReviewedComponents", () => {
   test("records only components shown at the fingerprint the backend still sees", () => {
     const next = recordReviewedComponents({
-      previous: { skills: { a: "a1", kept: "k1" }, mcpServers: {} },
+      previous: { skills: { a: "a1", kept: "k1" }, mcpServers: {}, workflows: { "old.js": "o1" } },
       current: [
         { kind: "skills", name: "a", fingerprint: "a2" },
+        { kind: "workflows", name: "w.js", fingerprint: "w2" },
         { kind: "mcpServers", name: "s", fingerprint: "s3" },
         { kind: "skills", name: "late", fingerprint: "l2" },
       ],
       reviewed: [
         { kind: "skills", name: "a", fingerprint: "a2" },
+        { kind: "workflows", name: "w.js", fingerprint: "w2" },
         // Shown at s2, but the server changed again before confirm.
         { kind: "mcpServers", name: "s", fingerprint: "s2" },
         // Shown under the other kind.
         { kind: "mcpServers", name: "late", fingerprint: "l2" },
       ],
     });
-    expect(next).toEqual({ skills: { a: "a2", kept: "k1" }, mcpServers: {} });
+    expect(next).toEqual({
+      skills: { a: "a2", kept: "k1" },
+      mcpServers: {},
+      workflows: { "old.js": "o1", "w.js": "w2" },
+    });
   });
 });

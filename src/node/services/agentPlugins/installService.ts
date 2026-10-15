@@ -80,12 +80,16 @@ import {
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "./discovery";
+import { listPluginWorkflowFiles } from "./workflowFiles";
 import { checkLogoImage } from "./imageHeader";
 import {
   consentForSelection,
   countUnreviewed,
   isComponentConsented,
   recordReviewedComponents,
+  isImportedComponent,
+  workflowConsentDetail,
+  workflowConsentFingerprint,
   serverConsentDetail,
   serverConsentFingerprint,
   skillConsentDetail,
@@ -346,12 +350,19 @@ function consentAfterReview(
  */
 function unreviewedRows(
   entry: AgentPluginInstallEntry,
-  surface: { skills: Map<string, SurfaceSkill>; servers: Map<string, SurfaceServer> }
+  surface: {
+    skills: Map<string, SurfaceSkill>;
+    servers: Map<string, SurfaceServer>;
+    workflows: Map<string, SurfaceWorkflow>;
+  }
 ): AgentPluginCapabilityChange[] {
   return [
     ...[...surface.skills].flatMap(([name, item]) => unreviewedRow(entry, "skills", name, item)),
     ...[...surface.servers].flatMap(([name, item]) =>
       unreviewedRow(entry, "mcpServers", name, item)
+    ),
+    ...[...surface.workflows].flatMap(([name, item]) =>
+      unreviewedRow(entry, "workflows", name, item)
     ),
   ];
 }
@@ -359,6 +370,7 @@ function unreviewedRows(
 const COMPONENT_LABELS: Record<keyof ComponentConsent, string> = {
   skills: "Skill",
   mcpServers: "MCP server",
+  workflows: "Workflow",
 };
 
 function reviewedBefore(
@@ -373,11 +385,11 @@ function reviewedBefore(
 
 function unreviewedRow(
   entry: AgentPluginInstallEntry,
-  kind: "skills" | "mcpServers",
+  kind: keyof ComponentConsent,
   name: string,
-  item: SurfaceSkill | SurfaceServer
+  item: SurfaceSkill | SurfaceServer | SurfaceWorkflow
 ): AgentPluginCapabilityChange[] {
-  const imported = entry.importedComponents?.[kind].includes(name) ?? true;
+  const imported = isImportedComponent(entry.importedComponents, kind, name);
   const fingerprint = item.consentFingerprint;
   if (!imported || isComponentConsented(entry.componentConsent, kind, name, fingerprint)) return [];
   return [
@@ -826,6 +838,13 @@ interface SurfaceSkill {
   consentFingerprint: string;
   display: string;
   /** Every fingerprinted field as text, built on demand for a review row (see reviewText). */
+  consentDetail: () => string;
+}
+
+/** A workflow script (#6629): its source is code, so the review shows all of it. */
+interface SurfaceWorkflow {
+  consentFingerprint: string;
+  display: string;
   consentDetail: () => string;
 }
 
@@ -2154,6 +2173,8 @@ export class AgentPluginInstallService {
      */
     skills: Map<string, SurfaceSkill>;
     agents: Map<string, string>;
+    /** file → consent view (#6629): any byte change of a script is a change. */
+    workflows: Map<string, SurfaceWorkflow>;
     components: Set<string>;
   }> {
     const hook = this.collectHook(plugin);
@@ -2170,8 +2191,11 @@ export class AgentPluginInstallService {
     for (const agent of await this.collectAgentFiles(plugin.agentsDir)) {
       agents.set(agent.name, agent.fingerprint);
     }
+    const workflows = new Map<string, SurfaceWorkflow>();
+    for (const workflow of await this.collectWorkflowScripts(plugin, warnings)) {
+      workflows.set(workflow.file, workflow);
+    }
     const components = new Set<string>([
-      ...(await this.collectComponentFiles(plugin.workflowsDir, ".js")).map((f) => `workflow ${f}`),
       ...(plugin.manifest.contributes?.slashCommands ?? []).map(
         (command) => `slash command /${command.name}`
       ),
@@ -2211,7 +2235,7 @@ export class AgentPluginInstallService {
         });
       }
     }
-    return { hook, servers, skills, agents, components };
+    return { hook, servers, skills, agents, workflows, components };
   }
 
   /**
@@ -2381,6 +2405,30 @@ export class AgentPluginInstallService {
         });
       }
     }
+    // Workflow scripts execute (#6629): a new or changed script needs a review, and confirming
+    // the update records it.
+    for (const [file, workflow] of staged.workflows) {
+      const currentWorkflow = current?.workflows.get(file);
+      const component = {
+        kind: "workflows" as const,
+        name: file,
+        fingerprint: workflow.consentFingerprint,
+      };
+      if (currentWorkflow === undefined) {
+        changes.push({
+          summary: `adds workflow '${file}'`,
+          after: reviewText(workflow),
+          component,
+        });
+      } else if (currentWorkflow.consentFingerprint !== workflow.consentFingerprint) {
+        changes.push({
+          summary: `changes workflow '${file}'`,
+          before: reviewText(currentWorkflow),
+          after: reviewText(workflow),
+          component,
+        });
+      }
+    }
     // Consent covered a specific component set; additions need a new preview.
     for (const component of staged.components) {
       if (!(current?.components.has(component) ?? false)) {
@@ -2392,31 +2440,44 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * Executable workflow scripts (workflows/*.js) for the consent preview,
-   * mirroring the runtime lister (workflowScriptDiscovery: top-level files
-   * AND symlinks with the matching extension, sorted). These activate after
-   * install, so consent must name them.
+   * Executable workflow scripts (workflows/*.js), read as the runtime resolver reads them (the
+   * shared lister, the root-checked capped read) so the consent fingerprint matches what can run
+   * (#6629). A script the runtime cannot read or run is reported and skipped.
    */
-  private async collectComponentFiles(
-    dir: string | undefined,
-    extension: string
-  ): Promise<string[]> {
-    if (dir === undefined) {
-      return [];
+  private async collectWorkflowScripts(
+    plugin: AgentPluginInfo,
+    warnings: string[]
+  ): Promise<Array<SurfaceWorkflow & { file: string }>> {
+    const workflowsDir = plugin.workflowsDir;
+    if (workflowsDir === undefined) return [];
+    const scripts: Array<SurfaceWorkflow & { file: string }> = [];
+    for (const file of await listPluginWorkflowFiles(workflowsDir)) {
+      let source: string;
+      try {
+        source = (
+          await readPluginFileWithinRootCapped({
+            filePath: path.join(workflowsDir, file),
+            pluginRoot: plugin.rootPath,
+            maxBytes: MAX_FILE_SIZE,
+            label: "plugin workflow script",
+          })
+        ).content;
+      } catch (error) {
+        warnings.push(
+          `Workflow '${file}' cannot be read and will not run: ${getErrorMessage(error)}`
+        );
+        continue;
+      }
+      if (source.length === 0) continue;
+      const input = { file, source };
+      scripts.push({
+        file,
+        consentFingerprint: workflowConsentFingerprint(input),
+        display: `Workflow script workflows/${file}`,
+        consentDetail: () => workflowConsentDetail(input),
+      });
     }
-    try {
-      const entries = await fsPromises.readdir(dir, { withFileTypes: true });
-      return entries
-        .filter(
-          (entry) =>
-            (entry.isFile() || entry.isSymbolicLink()) &&
-            entry.name.toLowerCase().endsWith(extension)
-        )
-        .map((entry) => entry.name)
-        .sort((a, b) => a.localeCompare(b));
-    } catch {
-      return [];
-    }
+    return scripts;
   }
 
   /**
@@ -2832,7 +2893,7 @@ export class AgentPluginInstallService {
       warnings.push(...codexHooks.warnings);
       const openaiInterface = await interfaceSummary(plugin, warnings);
       const agents = (await this.collectAgentFiles(plugin.agentsDir)).map((agent) => agent.name);
-      const workflows = await this.collectComponentFiles(plugin.workflowsDir, ".js");
+      const workflows = await listPluginWorkflowFiles(plugin.workflowsDir);
       const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
         name: command.name,
         ...(command.description !== undefined ? { description: command.description } : {}),
@@ -3653,6 +3714,7 @@ export class AgentPluginInstallService {
   ) {
     const warnings: string[] = [];
     const skills = await this.collectSkillsFromRoots(plugin, warnings);
+    const workflows = await this.collectWorkflowScripts(plugin, warnings);
     const { previews: mcpServers, fingerprints } = await this.collectMcpServers(
       { ...plugin, importedComponents: undefined },
       finalTargetPath,
@@ -3669,6 +3731,9 @@ export class AgentPluginInstallService {
       fingerprints: {
         skills: Object.fromEntries(skills.map((skill) => [skill.name, skill.consentFingerprint])),
         mcpServers: fingerprints,
+        workflows: Object.fromEntries(
+          workflows.map((workflow) => [workflow.file, workflow.consentFingerprint])
+        ),
       } satisfies ComponentConsent,
     };
   }

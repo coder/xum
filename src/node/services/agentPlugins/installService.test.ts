@@ -970,6 +970,7 @@ describe("AgentPluginInstallService", () => {
           componentConsent: {
             skills: keep(installed.componentConsent?.skills, importedComponents.skills),
             mcpServers: keep(installed.componentConsent?.mcpServers, importedComponents.mcpServers),
+            workflows: {},
           },
         },
       });
@@ -1474,7 +1475,11 @@ describe("AgentPluginInstallService", () => {
       relativeDir: "skills/greet",
       frontmatter: { name: "greet", description: "Greets people" },
     });
-    expect(installed.componentConsent).toEqual({ skills: { greet }, mcpServers: {} });
+    expect(installed.componentConsent).toEqual({
+      skills: { greet },
+      mcpServers: {},
+      workflows: {},
+    });
     expect((await service.list())[0]).toMatchObject({ importedSkillCount: 1 });
     const stored = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
       plugins: Array<{ componentConsent?: unknown }>;
@@ -1556,7 +1561,7 @@ describe("AgentPluginInstallService", () => {
       expectedImportedComponents: null,
       importedComponents: { skills: ["greet"], mcpServers: [] },
     });
-    expect(saved.data.componentConsent).toEqual({ skills: {}, mcpServers: {} });
+    expect(saved.data.componentConsent).toEqual({ skills: {}, mcpServers: {}, workflows: {} });
   });
 
   test("a manifest that names the final install path literally keeps its consent (#6498)", async () => {

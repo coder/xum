@@ -295,6 +295,7 @@ describe("MCPServerManager", () => {
         const consent = {
           skills: {},
           mcpServers: Object.fromEntries(names.map((name) => [name, consentFingerprint(name)])),
+          workflows: {},
         };
         await fs.writeFile(
           `${registryPath}.tmp`,

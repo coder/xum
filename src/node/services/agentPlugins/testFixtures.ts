@@ -13,10 +13,12 @@ import {
 import {
   serverConsentFingerprint,
   skillConsentFingerprint,
+  workflowConsentFingerprint,
   type ComponentConsent,
 } from "./componentConsent";
 import { discoverAgentPluginAt, type AgentPluginScope } from "./discovery";
 import { getPluginDataPath, loadPluginMcpServers, resolvePluginInstanceId } from "./mcpConfig";
+import { listPluginWorkflowFiles } from "./workflowFiles";
 
 /** Valid managed registry row; tests override individual fields to exercise corruption. */
 export function createTestPluginInstallEntry(
@@ -41,7 +43,7 @@ export function createTestPluginInstallEntry(
 }
 
 /**
- * The consent records an install review stores for every skill and MCP server of the plugin at
+ * The consent records an install review stores for every skill, MCP server and workflow of the plugin at
  * `pluginDir` (#6498): a managed registry row without them loads none of its components. Built
  * with the production plugin discovery, SKILL.md parse and MCP loader, so a test row matches what
  * the load-time gate recomputes. `pluginDir` is the lexical path inside its container.
@@ -61,7 +63,7 @@ export async function reviewedComponentConsent(args: {
       `reviewedComponentConsent: not a plugin: ${diagnostics.map((d) => d.message).join("; ")}`
     );
   }
-  const consent: ComponentConsent = { skills: {}, mcpServers: {} };
+  const consent: ComponentConsent = { skills: {}, mcpServers: {}, workflows: {} };
   for (const skillsDir of plugin.skillsDirs ?? []) {
     for (const dirName of await fs.readdir(skillsDir)) {
       const directoryName = SkillNameSchema.safeParse(dirName);
@@ -98,6 +100,12 @@ export async function reviewedComponentConsent(args: {
       if (info.plugin === undefined) throw new Error("plugin server info must carry provenance");
       consent.mcpServers[info.plugin.serverName] = serverConsentFingerprint(info, paths);
     }
+  }
+  // Workflow scripts (#6629), read the way the resolver reads them.
+  for (const file of await listPluginWorkflowFiles(plugin.workflowsDir)) {
+    if (plugin.workflowsDir === undefined) break;
+    const source = await fs.readFile(path.join(plugin.workflowsDir, file), "utf8");
+    if (source.length > 0) consent.workflows[file] = workflowConsentFingerprint({ file, source });
   }
   return consent;
 }

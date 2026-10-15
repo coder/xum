@@ -1,5 +1,6 @@
 /**
- * Component consent fingerprints (#6498). A managed plugin's skill or MCP server is bound to the
+ * Component consent fingerprints (#6498, #6629). A managed plugin's skill, MCP server or workflow
+ * script is bound to the
  * fingerprint the user reviewed, not to its name: when a newer Xum parses more of an installed
  * package (a Codex dialect field, an extra skills root), the component's fingerprint changes and
  * it needs a new review instead of loading under an approved name.
@@ -190,15 +191,47 @@ export function skillConsentDetail(args: SkillConsentInput): string {
   return stableStringify(skillConsentSubject(args));
 }
 
+interface WorkflowConsentInput {
+  /** The script's file name in the plugin's workflows directory (top level only). */
+  file: string;
+  /** The script source exactly as the runtime reads it. */
+  source: string;
+}
+
+/**
+ * Fingerprint of one plugin workflow script (#6629): its file name and the digest of its source.
+ * A script executes, so any byte change needs a new review.
+ */
+export function workflowConsentFingerprint(args: WorkflowConsentInput): string {
+  return digest({
+    scheme: CONSENT_SCHEME,
+    kind: "workflow",
+    file: args.file,
+    sourceSha256: createHash("sha256").update(args.source).digest("hex"),
+  });
+}
+
+/** The reviewed workflow as text: the whole script, which is what the record approves. */
+export function workflowConsentDetail(args: WorkflowConsentInput): string {
+  return `sha256 ${createHash("sha256").update(args.source).digest("hex")}\n\n${args.source}`;
+}
+
 /** Reviewed fingerprints of one install, by component name (registry `componentConsent`). */
 export interface ComponentConsent {
   skills: Record<string, string>;
   mcpServers: Record<string, string>;
+  /** Workflow scripts by file name (#6629). Absent in records an older build wrote: none reviewed. */
+  workflows: Record<string, string>;
 }
+
+/** Every consent kind. A kind the component picker does not select is reviewed all-or-nothing. */
+export const CONSENT_KINDS = ["skills", "mcpServers", "workflows"] as const satisfies ReadonlyArray<
+  keyof ComponentConsent
+>;
 
 /** The consent of an install without records (every install from before #6498): nothing reviewed. */
 export function noComponentConsent(): ComponentConsent {
-  return { skills: {}, mcpServers: {} };
+  return { skills: {}, mcpServers: {}, workflows: {} };
 }
 
 /** True only when the user reviewed exactly this fingerprint. No record (every older install) means no. */
@@ -211,9 +244,19 @@ export function isComponentConsented(
   return consent !== undefined && getOwn(consent[kind], name) === fingerprint;
 }
 
+/** The kinds the component picker selects; the other kinds are imported whole. */
 export interface ComponentSelection {
   skills: string[];
   mcpServers: string[];
+}
+
+/** Whether an install imports a component: the picker selects skills and servers only. */
+export function isImportedComponent(
+  selection: ComponentSelection | undefined,
+  kind: keyof ComponentConsent,
+  name: string
+): boolean {
+  return kind === "workflows" || selection === undefined || selection[kind].includes(name);
 }
 
 /**
@@ -230,7 +273,7 @@ export function consentForSelection(args: {
   previous?: { selection: ComponentSelection; consent: ComponentConsent | undefined };
 }): ComponentConsent {
   // Built from entries, never by assignment: a component named `__proto__` must stay an own key.
-  const records = (kind: keyof ComponentConsent): Record<string, string> =>
+  const records = (kind: keyof ComponentSelection): Record<string, string> =>
     Object.fromEntries(
       args.selection[kind].flatMap((name) => {
         const kept = args.previous?.selection[kind].includes(name) === true;
@@ -242,7 +285,16 @@ export function consentForSelection(args: {
         return fingerprint !== undefined ? [[name, fingerprint] as const] : [];
       })
     );
-  return { skills: records("skills"), mcpServers: records("mcpServers") };
+  return {
+    skills: records("skills"),
+    mcpServers: records("mcpServers"),
+    // Not in the picker: an install records every workflow its preview showed, and a picker save
+    // keeps the old records (it showed no workflow).
+    workflows:
+      args.previous !== undefined
+        ? { ...args.previous.consent?.workflows }
+        : { ...args.shown.workflows },
+  };
 }
 
 export interface ComponentRef {
@@ -265,6 +317,7 @@ export function recordReviewedComponents(args: {
   const next: ComponentConsent = {
     skills: { ...args.previous?.skills },
     mcpServers: { ...args.previous?.mcpServers },
+    workflows: { ...args.previous?.workflows },
   };
   // One lookup per component: a plugin can have thousands of them.
   const refKey = (ref: ComponentRef) => JSON.stringify([ref.kind, ref.name, ref.fingerprint]);
@@ -285,9 +338,9 @@ export function countUnreviewed(args: {
   consent: ComponentConsent | undefined;
 }): number {
   let count = 0;
-  for (const kind of ["skills", "mcpServers"] as const) {
+  for (const kind of CONSENT_KINDS) {
     for (const [name, fingerprint] of Object.entries(args.current[kind])) {
-      const imported = args.selection === undefined || args.selection[kind].includes(name);
+      const imported = isImportedComponent(args.selection, kind, name);
       if (imported && !isComponentConsented(args.consent, kind, name, fingerprint)) count++;
     }
   }
@@ -327,4 +380,17 @@ export function isPluginSkillConsented(
     frontmatter,
   });
   return getOwn(gate.consented, frontmatter.name) === fingerprint;
+}
+
+/**
+ * The one load-time workflow predicate (#6629): the resolver calls it with the source it is about
+ * to run, so a script changed after its review cannot run. Unmanaged plugins have no records and
+ * always pass.
+ */
+export function isPluginWorkflowConsented(
+  consent: ComponentConsent | undefined,
+  args: WorkflowConsentInput
+): boolean {
+  if (consent === undefined) return true;
+  return getOwn(consent.workflows, args.file) === workflowConsentFingerprint(args);
 }

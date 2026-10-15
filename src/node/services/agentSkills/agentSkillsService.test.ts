@@ -1651,7 +1651,11 @@ describe("agentSkillsService agent plugins", () => {
     // An install from before #6498 (no records) and a record for another fingerprint load nothing.
     await saveConsent();
     expect(await state()).toEqual(unreviewed);
-    await saveConsent({ skills: { shared: "0".repeat(64), solo: "0".repeat(64) }, mcpServers: {} });
+    await saveConsent({
+      skills: { shared: "0".repeat(64), solo: "0".repeat(64) },
+      mcpServers: {},
+      workflows: {},
+    });
     expect(await state()).toEqual(unreviewed);
 
     await saveConsent(reviewed);

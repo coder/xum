@@ -1,10 +1,9 @@
-import * as fsPromises from "node:fs/promises";
-
 import type { AgentSkillDescriptor, SkillName } from "@/common/types/agentSkill";
 import type { AvailableWorkflow } from "@/common/types/workflow";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
+import { listPluginWorkflowFiles } from "@/node/services/agentPlugins/workflowFiles";
 import { getBuiltInSkillDescriptors } from "@/node/services/agentSkills/builtInSkillDefinitions";
 import type { SkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { log } from "@/node/services/log";
@@ -128,7 +127,7 @@ export async function discoverWorkflowScripts(
       if (seenPluginNames.has(plugin.name)) continue;
       seenPluginNames.add(plugin.name);
 
-      for (const fileName of await listWorkflowScriptFiles(plugin.workflowsDir)) {
+      for (const fileName of await listPluginWorkflowFiles(plugin.workflowsDir)) {
         await tryPush(available, `plugin://${plugin.name}/${fileName}`);
       }
     }
@@ -138,17 +137,4 @@ export async function discoverWorkflowScripts(
 
   available.sort((a, b) => a.descriptor.name.localeCompare(b.descriptor.name));
   return available;
-}
-
-/** Top-level *.js entries of a plugin workflows/ dir (host-local, sorted). */
-async function listWorkflowScriptFiles(workflowsDir: string): Promise<string[]> {
-  try {
-    const entries = await fsPromises.readdir(workflowsDir, { withFileTypes: true });
-    return entries
-      .filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && entry.name.endsWith(".js"))
-      .map((entry) => entry.name)
-      .sort((a, b) => a.localeCompare(b));
-  } catch {
-    return [];
-  }
 }

@@ -13,6 +13,7 @@ import {
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "@/node/services/agentPlugins/discovery";
+import { isPluginWorkflowConsented } from "@/node/services/agentPlugins/componentConsent";
 import { isValidAgentPluginName } from "@/node/services/agentPlugins/manifest";
 import {
   getDefaultAgentSkillsRoots,
@@ -327,6 +328,13 @@ async function resolvePluginWorkflowScript(
     ).content;
   } catch (error) {
     throw new Error(`Plugin workflow script not readable: ${getErrorMessage(error)}`);
+  }
+  // The consent gate (#6629) checks the source it is about to run, so a script changed after its
+  // review cannot run. Listing goes through this resolver too, so it hides the script as well.
+  if (!isPluginWorkflowConsented(plugin.componentConsent, { file: parsed.relativePath, source })) {
+    throw new Error(
+      `Plugin workflow '${parsed.relativePath}' has not been reviewed on this install, so it does not run. Open Settings → Plugins and select Review on plugin '${plugin.name}'.`
+    );
   }
   return buildResolvedScript({
     requestedScriptPath: input.scriptPath,

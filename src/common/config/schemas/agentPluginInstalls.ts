@@ -106,6 +106,10 @@ export const AgentPluginInstallEntrySchema = z.object({
     .object({
       skills: z.record(z.string(), z.string()),
       mcpServers: z.record(z.string(), z.string()),
+      // Workflow scripts by file name (#6629). Absent in a record from before #6629: no workflow
+      // is reviewed, so each such plugin needs one review (no backfill). An older build strips
+      // the key on read and keeps it on save (installService mergeRawConsent).
+      workflows: z.record(z.string(), z.string()).default({}),
     })
     .optional(),
   /** Reserved: per-plugin opt-in auto-update. Unused in v1 — updates are badge + manual. */
