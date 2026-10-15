@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { userEvent, waitFor, within } from "storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";

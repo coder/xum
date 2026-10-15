@@ -1,4 +1,4 @@
-import { fireEvent, userEvent, waitFor } from "@storybook/test";
+import { fireEvent, userEvent, waitFor } from "storybook/test";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { PIXEL_DUAL_THEME, appMeta, AppWithMocks } from "@/browser/stories/meta.js";
 import {

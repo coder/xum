@@ -1,5 +1,5 @@
 import { isPixel } from "@coder/pixel-storybook/storyapi";
-import { waitFor, within } from "@storybook/test";
+import { waitFor, within } from "storybook/test";
 
 import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
@@ -281,9 +281,8 @@ Blue/green cutover with automatic rollback on auth-error spikes.
 
     const canvas = within(canvasElement);
     const toc = await canvas.findByTestId("plan-toc-nav");
-    // Explicit timeout: preview.tsx's configure({ asyncUtilTimeout }) targets the
-    // storybook/test module, not this @storybook/test import, so waitFor would
-    // otherwise give up after 1s while the container query settles on loaded CI runners.
+    // Explicit timeout, above preview.tsx's 5 s default: the container query can settle late on
+    // loaded CI runners.
     await waitFor(
       () => {
         // Fail if the pinned viewport no longer reveals the full sticky ToC.

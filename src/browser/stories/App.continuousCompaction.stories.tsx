@@ -1,4 +1,4 @@
-import { expect, within } from "@storybook/test";
+import { expect, within } from "storybook/test";
 
 import { createMuxMessage } from "@/common/types/message";
 import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";

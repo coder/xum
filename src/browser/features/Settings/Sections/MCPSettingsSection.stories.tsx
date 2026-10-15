@@ -7,7 +7,7 @@ import type { ClaudeDesignStatus } from "@/common/orpc/schemas/claudeDesign";
 import { useEffect, useRef } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
+import { expect, fn, userEvent, waitFor, within } from "storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";

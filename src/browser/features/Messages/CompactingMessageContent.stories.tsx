@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { fn } from "@storybook/test";
+import { fn } from "storybook/test";
 import type { ReactNode } from "react";
 import { StreamingBarrierView } from "@/browser/features/Messages/ChatBarrier/StreamingBarrierView";
 import { CompactingMessageContent } from "@/browser/features/Messages/CompactingMessageContent";

@@ -1,5 +1,5 @@
 import { wrapAsyncIterator } from "@orpc/shared";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getDefaultRightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";

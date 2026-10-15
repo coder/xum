@@ -1,5 +1,5 @@
 import type { ComponentType } from "react";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { userEvent, waitFor, within } from "storybook/test";
 import { PIXEL_DUAL_THEME, appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
 import { createGitStatusExecutor } from "@/browser/stories/helpers/git";
 import {

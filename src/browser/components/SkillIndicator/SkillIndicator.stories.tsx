@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { userEvent, waitFor, within } from "storybook/test";
 import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import { SkillIndicator } from "./SkillIndicator.js";
 
