@@ -8,6 +8,8 @@ import assert from "node:assert/strict";
 // Playwright. All other stories run exactly as before.
 const HOVER_STORY_PREFIX = "app-primarybuttoncontrast--";
 const hoverReady = new WeakSet<object>();
+// Enough for the Narrow story's strip at the shortest swipe seen (about 60 px per swipe).
+const MAX_TOUCH_SWIPES = 12;
 
 const config: TestRunnerConfig = {
   async preVisit(page, context) {
@@ -65,7 +67,11 @@ const config: TestRunnerConfig = {
         const before = await row.evaluate((el) => el.scrollLeft);
         // Wait for native scroll completion: a tap during inertial scrolling cancels the
         // scroll instead of selecting the tab, especially under parallel CI load.
-        for (let swipe = 0; swipe < 4; swipe++) {
+        // Swipe until the last tab is reachable. How far one swipe scrolls depends on the
+        // runner: Chromium adds a fling only when the moves arrive fast. Without one, the phone
+        // width needed all four swipes of the old fixed count, so one disturbed swipe failed the
+        // check (#6476). A strip that does not pan still fails at its first swipe: no scrollend.
+        for (let swipe = 0; swipe < MAX_TOUCH_SWIPES; swipe++) {
           const point = await row.evaluate((el) => {
             const r = el.getBoundingClientRect();
             for (const tab of Array.from(el.querySelectorAll('[role="tab"]')).reverse()) {
