@@ -267,18 +267,17 @@ function namingBasisOf(target: DraftStoreScope | null): NamingBasis | null {
   return { text, attachmentCount, nameState };
 }
 
-function isSameNameState(
-  a: WorkspaceNamePersistedState | null,
-  b: WorkspaceNamePersistedState | null
-): boolean {
-  if (a === null || b === null) return a === b;
-  return (
-    a.generatedIdentity?.name === b.generatedIdentity?.name &&
-    a.generatedIdentity?.title === b.generatedIdentity?.title &&
-    a.manualName === b.manualName &&
-    a.autoGenerate === b.autoGenerate &&
-    a.lastGeneratedFor === b.lastGeneratedFor
-  );
+/** Compares name states by value: a snapshot or push replaces the objects with equal copies. */
+function nameStateKey(state: WorkspaceNamePersistedState | null): string {
+  if (state === null) return "null";
+  const { generatedIdentity: identity, manualName, autoGenerate, lastGeneratedFor } = state;
+  return JSON.stringify([
+    identity?.name,
+    identity?.title,
+    manualName,
+    autoGenerate,
+    lastGeneratedFor,
+  ]);
 }
 
 /**
@@ -294,7 +293,7 @@ function holdsNamingBasis(target: DraftStoreScope | null, basis: NamingBasis | n
   return (
     view.text === basis.text &&
     view.attachmentCount === basis.attachmentCount &&
-    isSameNameState(view.nameState, basis.nameState)
+    nameStateKey(view.nameState) === nameStateKey(basis.nameState)
   );
 }
 
