@@ -8,7 +8,7 @@ export {
 } from "@/common/utils/providers/baseUrl";
 import assert from "node:assert";
 import { createHash } from "node:crypto";
-import { access, constants as fsConstants } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type {
@@ -1139,11 +1139,12 @@ function createGoogleVertexModelEffect(
     if (!creds.isConfigured) {
       return Err({ type: "api_key_not_found", provider: "google-vertex" });
     }
-    // google-auth-library reads the key file only at request time, and its
-    // ENOENT (with the path) surfaced as a retryable API error. Fail here
-    // instead, with a non-retryable configuration error.
+    // google-auth-library parses the key file only at request time, where a
+    // missing file, a directory or invalid JSON surfaced as a retried request
+    // error whose text echoed the path or the file's first characters. Fail
+    // here instead, with a non-retryable configuration error.
     const { keyFilename } = creds;
-    if (keyFilename != null && !(yield* Effect.promise(() => isReadableFile(keyFilename)))) {
+    if (keyFilename != null && !(yield* Effect.promise(() => isUsableKeyFile(keyFilename)))) {
       return Err({ type: "api_key_not_found", provider: "google-vertex" });
     }
     const { createVertex } = yield* Effect.promise(async () =>
@@ -1172,13 +1173,14 @@ function createGoogleVertexModelEffect(
   });
 }
 
-async function isReadableFile(filePath: string): Promise<boolean> {
+async function isUsableKeyFile(filePath: string): Promise<boolean> {
   try {
-    await access(filePath, fsConstants.R_OK);
-    return true;
+    const parsed: unknown = JSON.parse(await readFile(filePath, "utf8"));
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
   } catch (error) {
-    log.warn("Google Vertex AI service account key file is not readable", {
-      error: getErrorMessage(error),
+    // Only the failure kind: fs messages carry the path, JSON errors quote the file.
+    log.warn("Google Vertex AI service account key file is unusable", {
+      reason: error instanceof SyntaxError ? "invalid JSON" : "unreadable",
     });
     return false;
   }

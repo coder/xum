@@ -16,7 +16,7 @@ import { xai } from "@ai-sdk/xai";
 import { z } from "zod";
 import { Cause, Effect, Exit, Option } from "effect";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
-import { writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -1604,23 +1604,27 @@ describe("ProviderModelFactory Google Vertex AI", () => {
     });
   });
 
-  it("fails a missing service account key file before sending a request", async () => {
-    await withTempConfig(async (config, factory, _oauth, store) => {
-      store.saveProvidersConfig({
-        "google-vertex": {
-          project: "my-project",
-          keyFilename: path.join(config.rootDir, "missing-sa.json"),
-        },
-      });
+  it.each([
+    { name: "missing", prepare: (_keyFilename: string) => Promise.resolve() },
+    { name: "a directory", prepare: (keyFilename: string) => mkdir(keyFilename) },
+    { name: "not JSON", prepare: (keyFilename: string) => writeFile(keyFilename, "-----BEGIN") },
+  ])(
+    "fails a service account key file that is $name before sending a request",
+    async ({ prepare }) => {
+      await withTempConfig(async (config, factory, _oauth, store) => {
+        const keyFilename = path.join(config.rootDir, "sa.json");
+        await prepare(keyFilename);
+        store.saveProvidersConfig({ "google-vertex": { project: "my-project", keyFilename } });
 
-      // A non-retryable configuration error, not a request-time ENOENT that
-      // auto-retry repeats and that echoes the key file path into the chat.
-      expect(await factory.createModel("google-vertex:gemini-2.5-flash")).toEqual({
-        success: false,
-        error: { type: "api_key_not_found", provider: "google-vertex" },
+        // A non-retryable configuration error, not a request-time auth error that
+        // auto-retry repeats and that echoes the path or file contents into the chat.
+        expect(await factory.createModel("google-vertex:gemini-2.5-flash")).toEqual({
+          success: false,
+          error: { type: "api_key_not_found", provider: "google-vertex" },
+        });
       });
-    });
-  });
+    }
+  );
 
   it("reports a tuned model with an express mode API key as an invalid model", async () => {
     await withTempConfig(async (_config, factory, _oauth, store) => {

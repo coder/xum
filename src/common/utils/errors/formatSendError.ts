@@ -40,7 +40,7 @@ export function getCredentialSetupCopy(provider: string): CredentialSetupCopy | 
     message: `${displayName} is not configured.`,
     resolutionHint:
       `Open Settings → Providers and set a Project for ${displayName} (authenticated with ` +
-      `Google Cloud credentials or a readable service account key file), or an express mode API key.`,
+      `Google Cloud credentials or a valid service account key file), or an express mode API key.`,
   };
 }
 
