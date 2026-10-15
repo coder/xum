@@ -64,6 +64,32 @@ describe("serverConsentFingerprint", () => {
     );
   });
 
+  test("plugin provenance is identity, not launch input: it never changes the fingerprint", () => {
+    // Every provenance field is excluded (#6630). A server with provenance must hash exactly like
+    // the same server without it, so stored consent records stay valid.
+    const provenance = {
+      pluginName: "demo",
+      serverName: "echo",
+      sourceScope: "global" as const,
+      sourceLocation: "plugins/demo",
+      componentPolicy: { registryPath: "/home/plugins.json", name: "demo" },
+      consentFingerprint: "abc",
+    };
+    for (const server of [stdio, remote]) {
+      const bare = serverConsentFingerprint(server, roots);
+      expect(serverConsentFingerprint({ ...server, plugin: provenance }, roots)).toBe(bare);
+      const renamed = {
+        pluginName: "other",
+        serverName: "other",
+        sourceScope: "project" as const,
+        sourceLocation: ".xum/plugins/other",
+        componentPolicy: { registryPath: "/elsewhere.json", name: "other" },
+        consentFingerprint: "def",
+      };
+      expect(serverConsentFingerprint({ ...server, plugin: renamed }, roots)).toBe(bare);
+    }
+  });
+
   test("any launch-relevant change gives a new fingerprint", () => {
     const fp = serverConsentFingerprint(stdio, roots);
     const variants: MCPStdioServerInfo[] = [

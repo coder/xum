@@ -16,6 +16,7 @@ import type {
   MCPHttpServerInfo,
   MCPServerInfo,
   MCPServerOAuthConfig,
+  MCPServerPluginProvenance,
   MCPStdioServerInfo,
 } from "@/common/types/mcp";
 import { getOwn } from "@/common/utils/getOwn";
@@ -30,7 +31,8 @@ type FieldRule = "include" | "exclude" | "presence";
 /**
  * Every server field, by name. A new field is a compile error here until someone decides, so a
  * parser widening changes the fingerprint (fails closed) instead of slipping past it. Excluded:
- * fields the user or the UI owns (`disabled`, `toolAllowlist` only narrows), and provenance.
+ * fields the user or the UI owns (`disabled`, `toolAllowlist` only narrows). `plugin` has its own
+ * table (PROVENANCE_FIELDS), applied in serverConsentSubject.
  */
 const STDIO_FIELDS: Record<keyof MCPStdioServerInfo, FieldRule> = {
   transport: "include",
@@ -42,7 +44,7 @@ const STDIO_FIELDS: Record<keyof MCPStdioServerInfo, FieldRule> = {
   cwd: "include",
   disabled: "exclude",
   toolAllowlist: "exclude",
-  plugin: "exclude",
+  plugin: "exclude", // per field: PROVENANCE_FIELDS
   configLayer: "exclude",
 };
 const HTTP_FIELDS: Record<keyof MCPHttpServerInfo, FieldRule> = {
@@ -53,8 +55,21 @@ const HTTP_FIELDS: Record<keyof MCPHttpServerInfo, FieldRule> = {
   managed: "include",
   disabled: "exclude",
   toolAllowlist: "exclude",
-  plugin: "exclude",
+  plugin: "exclude", // per field: PROVENANCE_FIELDS
   configLayer: "exclude",
+};
+/**
+ * Plugin provenance, field by field (#6630). Each one says which plugin and install the server
+ * comes from, not what it launches, so none is in the fingerprint today. A new provenance field
+ * is a compile error here: decide whether it changes launch behavior before it ships.
+ */
+const PROVENANCE_FIELDS: Record<keyof MCPServerPluginProvenance, FieldRule> = {
+  pluginName: "exclude", // identity: the registry row, not the launch
+  serverName: "exclude", // identity: the consent record's key
+  sourceScope: "exclude", // where the plugin was found
+  sourceLocation: "exclude", // display text for the install location
+  componentPolicy: "exclude", // which registry row gates the server
+  consentFingerprint: "exclude", // this function's own output
 };
 /**
  * `clientSecretSource` says where Xum rereads the secret, so its value is not behavior. Whether a
@@ -139,7 +154,16 @@ function serverConsentSubject(info: MCPServerInfo, paths: ConsentPaths): unknown
           ...pick(info, HTTP_FIELDS),
           ...(info.oauth !== undefined ? { oauth: pick(info.oauth, OAUTH_FIELDS) } : {}),
         };
-  return normalizeValue(server, paths);
+  return normalizeValue({ ...server, ...provenanceSubject(info) }, paths);
+}
+
+/**
+ * The included provenance fields, under `plugin`, only when there are any. None is included
+ * today, so the key stays absent and existing consent records keep matching.
+ */
+function provenanceSubject(info: MCPServerInfo): { plugin?: Partial<Record<string, unknown>> } {
+  const picked = info.plugin === undefined ? {} : pick(info.plugin, PROVENANCE_FIELDS);
+  return Object.keys(picked).length > 0 ? { plugin: picked } : {};
 }
 
 /** Fingerprint of everything a plugin MCP server launches or connects with. */
