@@ -1594,4 +1594,40 @@ describe("DraftStore", () => {
     expect(await moved).toBe(false);
     expect(store.getView(source).text).toBe("draft, theirs");
   });
+
+  // A name or other edit made on a stale view would go out after the reconnect and replace newer
+  // data: the cached views are stale from the moment the subscription ends, not from the resubscribe.
+  test("the snapshot stops being current when its subscription ends or stops", async () => {
+    const end = Promise.withResolvers<void>();
+    let subscribes = 0;
+    const client = createTestApiClient({
+      drafts: {
+        subscribe: (_input: void, opts?: { signal?: AbortSignal }) =>
+          Promise.resolve(
+            (async function* (): AsyncGenerator<DraftEvent> {
+              // Only the first subscription ends on its own; the resubscribe stays open.
+              const ended = ++subscribes === 1 ? end.promise : new Promise<void>(() => undefined);
+              yield { type: "snapshot", drafts: [], list: { entries: [], revision: 0 } };
+              await Promise.race([
+                ended,
+                new Promise<void>((resolve) => {
+                  opts?.signal?.addEventListener("abort", () => resolve(), { once: true });
+                }),
+              ]);
+            })()
+          ),
+      },
+    });
+    const store = createStore(client);
+    await waitFor(() => store.hasCurrentSnapshot());
+
+    end.resolve();
+    await waitFor(() => !store.hasCurrentSnapshot(), 100);
+    // Before the resubscribe (its delay is longer than this wait), not by it.
+    expect(subscribes).toBe(1);
+
+    await waitFor(() => store.hasCurrentSnapshot());
+    store.setClient(null);
+    expect(store.hasCurrentSnapshot()).toBe(false);
+  });
 });

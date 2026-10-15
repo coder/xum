@@ -797,8 +797,8 @@ export class DraftStore {
   }
 
   /**
-   * The running subscription has applied its snapshot. Unlike `hydrated`, false again from each
-   * (re)subscription until its snapshot: cached views may be stale until then.
+   * The running subscription has applied its snapshot. Unlike `hydrated`, false again from the
+   * moment a subscription stops or ends until the next one's snapshot: cached views may be stale.
    */
   hasCurrentSnapshot(): boolean {
     return this.snapshotCurrent;
@@ -2171,7 +2171,11 @@ export class DraftStore {
           this.markReady();
         }
       } finally {
-        if (this.subscription === controller) this.subscription = null;
+        if (this.subscription === controller) {
+          this.subscription = null;
+          // The views miss every change from here until the resubscribe's snapshot.
+          this.setSnapshotCurrent(false);
+        }
         if (!signal.aborted && this.client === client) {
           const delay = retryDelayMs(this.resubscribeAttempt++);
           this.resubscribeTimer = setTimeout(() => {
@@ -2210,6 +2214,7 @@ export class DraftStore {
     this.clearReadyTimer();
     this.subscription?.abort();
     this.subscription = null;
+    this.setSnapshotCurrent(false);
     if (this.resubscribeTimer) {
       clearTimeout(this.resubscribeTimer);
       this.resubscribeTimer = null;

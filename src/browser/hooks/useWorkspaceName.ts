@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { useAPI } from "@/browser/contexts/API";
+import { CONNECTION_LOST_MESSAGE, isConnectionLostError } from "@/browser/contexts/connectionLink";
 import {
   draftStoreScopeKey,
   getDraftStore,
@@ -207,8 +208,39 @@ function useWorkspaceNameStorage(scope: DraftStoreScope | null) {
     setStoredIn,
     currentScope,
     scopeKey: scope === null ? null : draftStoreScopeKey(scope),
+    snapshotCurrent,
     canAutoGenerate: snapshotCurrent || !isBackendDraft(scope),
   };
+}
+
+/**
+ * A lost connection is not a naming failure: no name (not even the fallback) is stored, since it
+ * would be an unsaved edit over the stale view and replace a name another window set meanwhile.
+ * The debounce names the draft again after the reconnect's snapshot if it still needs a name; a
+ * waiting submit gets null and stops with the reason.
+ */
+function settleFailedGeneration(
+  error: unknown,
+  forMessage: string,
+  storeIdentity: (identity: WorkspaceIdentity) => void,
+  setError: (error: WorkspaceNameUIError | null) => void
+): WorkspaceIdentity | null {
+  if (isConnectionLostError(error)) {
+    setError({ kind: "transport", message: CONNECTION_LOST_MESSAGE });
+    return null;
+  }
+  const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
+  storeIdentity(fallbackIdentity);
+  setError(null);
+  return fallbackIdentity;
+}
+
+/** The reason a lost connection stopped naming is stale once the reconnect's snapshot is in. */
+function currentNameError(
+  error: WorkspaceNameUIError | null,
+  snapshotCurrent: boolean
+): WorkspaceNameUIError | null {
+  return error?.kind === "transport" && snapshotCurrent ? null : error;
 }
 
 /**
@@ -252,8 +284,15 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
   const { api } = useAPI();
   const candidates = useMemo(() => buildNameGenCandidates(userModel), [userModel]);
 
-  const { stored, setStored, setStoredIn, currentScope, scopeKey, canAutoGenerate } =
-    useWorkspaceNameStorage(scope);
+  const {
+    stored,
+    setStored,
+    setStoredIn,
+    currentScope,
+    scopeKey,
+    snapshotCurrent,
+    canAutoGenerate,
+  } = useWorkspaceNameStorage(scope);
 
   const { generatedIdentity, manualName, autoGenerate, lastGeneratedFor } = stored;
 
@@ -382,15 +421,13 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         setError(null);
         safeResolve(fallbackIdentity);
         return fallbackIdentity;
-      } catch {
+      } catch (error) {
         if (requestId !== requestIdRef.current) {
           return null;
         }
-        const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
-        storeIdentity(fallbackIdentity);
-        setError(null);
-        safeResolve(fallbackIdentity);
-        return fallbackIdentity;
+        const identity = settleFailedGeneration(error, forMessage, storeIdentity, setError);
+        safeResolve(identity);
+        return identity;
       } finally {
         if (requestId === requestIdRef.current) {
           setIsGenerating(false);
@@ -573,7 +610,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       autoGenerate,
       error: manualNameValidationError
         ? { kind: "validation", message: manualNameValidationError }
-        : error,
+        : currentNameError(error, snapshotCurrent),
       setAutoGenerate: handleSetAutoGenerate,
       setName: setNameManual,
       waitForGeneration,
@@ -585,6 +622,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       isGenerating,
       autoGenerate,
       error,
+      snapshotCurrent,
       manualNameValidationError,
       handleSetAutoGenerate,
       setNameManual,
