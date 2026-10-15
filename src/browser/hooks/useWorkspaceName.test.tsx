@@ -192,6 +192,100 @@ describe("useWorkspaceName draft state", () => {
     expect(generateMock).toHaveBeenCalledTimes(1);
   });
 
+  // A request in flight when the client is replaced may answer before the new snapshot: its name
+  // would be an unsaved edit over a cached view and replace the new backend's stored name.
+  test("drops a name that arrives while a replacement client's snapshot is pending", async () => {
+    const generation = Promise.withResolvers<Awaited<ReturnType<typeof generateMock>>>();
+    generateMock.mockImplementationOnce(() => generation.promise);
+    const view = renderWorkspaceName("fix the sidebar");
+    await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(1));
+
+    const snapshot = Promise.withResolvers<void>();
+    // One act: the reply lands after the reconnect but before React re-renders and runs effects.
+    await act(async () => {
+      getDraftStore().setClient(
+        createTestApiClient({
+          drafts: {
+            ...draftBackend.drafts,
+            subscribe: async (input: void, opts?: { signal?: AbortSignal }) => {
+              await snapshot.promise;
+              return draftBackend.drafts.subscribe(input, opts);
+            },
+          },
+        })
+      );
+      generation.resolve({
+        success: true as const,
+        data: { name: "stale-a1b2", title: "Stale name", modelUsed: "test:model" },
+      });
+      await generation.promise;
+    });
+    expect(getDraftStore().getView(SCOPE).nameState).toBeNull();
+
+    await act(async () => {
+      snapshot.resolve();
+      await snapshot.promise;
+    });
+    await waitFor(() => expect(view.result.current.name).toBe("quotes-a1b2"));
+    expect(generateMock).toHaveBeenCalledTimes(2);
+  });
+
+  // The replacement backend already named the draft for this message, so nothing regenerates
+  // (and nothing else cancels): the old request's late reply must not replace that name.
+  test("drops a reply that a reconnect made stale, also after the new snapshot", async () => {
+    const generation = Promise.withResolvers<Awaited<ReturnType<typeof generateMock>>>();
+    generateMock.mockImplementationOnce(() => generation.promise);
+    renderWorkspaceName("fix the sidebar");
+    await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(1));
+
+    const backendName = {
+      generatedIdentity: { name: "backend-k3m9", title: "Backend name" },
+      manualName: "",
+      autoGenerate: true,
+      lastGeneratedFor: "fix the sidebar",
+    };
+    act(() =>
+      getDraftStore().setClient(
+        createTestApiClient({
+          drafts: {
+            ...draftBackend.drafts,
+            subscribe: (_input: void, opts?: { signal?: AbortSignal }) =>
+              Promise.resolve(
+                (async function* (): AsyncGenerator<DraftEvent> {
+                  yield {
+                    type: "snapshot",
+                    drafts: [
+                      {
+                        scope: SCOPE,
+                        text: "",
+                        attachments: [],
+                        nameState: backendName,
+                        revision: ++revision,
+                      },
+                    ],
+                    list: { entries: [], revision: 0 },
+                  };
+                  await new Promise<void>((resolve) => {
+                    opts?.signal?.addEventListener("abort", () => resolve(), { once: true });
+                  });
+                })()
+              ),
+          },
+        })
+      )
+    );
+    await waitFor(() => expect(getDraftStore().hasCurrentSnapshot()).toBe(true));
+    await act(async () => {
+      generation.resolve({
+        success: true as const,
+        data: { name: "stale-a1b2", title: "Stale name", modelUsed: "test:model" },
+      });
+      await generation.promise;
+    });
+    expect(getDraftStore().getView(SCOPE).nameState).toEqual(backendName);
+    expect(generateMock).toHaveBeenCalledTimes(1);
+  });
+
   test("another window's name edit replaces the shown name", async () => {
     const view = renderWorkspaceName("");
     act(() => view.result.current.setAutoGenerate(false));

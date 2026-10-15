@@ -212,11 +212,12 @@ function useWorkspaceNameStorage(scope: DraftStoreScope | null) {
 }
 
 /**
- * A request that settles after unmount, or while its draft moves, must not write the draft's
- * name. After unmount the draft may have been discarded (navigation unmounts its composer), and
- * the write would bring its body back. A move takes the draft's body, so a name written to the
- * source then would keep a draft holding only the name behind; the destination's composer names
- * the moved draft.
+ * A request that settles after unmount, while its draft moves, or while a backend draft waits for
+ * a reconnect's snapshot must not write the draft's name. After unmount the draft may have been
+ * discarded (navigation unmounts its composer), and the write would bring its body back. A move
+ * takes the draft's body, so a name written to the source then would keep a draft holding only
+ * the name behind; the destination's composer names the moved draft. Before the snapshot the name
+ * would be an unsaved edit over a stale view and replace the backend's stored name.
  */
 function storeGeneratedIdentity(
   mountedRef: { current: boolean },
@@ -230,6 +231,7 @@ function storeGeneratedIdentity(
 ): void {
   if (!mountedRef.current) return;
   if (target !== null && getDraftStore().isMovingCreationDraft(target)) return;
+  if (isBackendDraft(target) && !getDraftStore().hasCurrentSnapshot()) return;
   setStoredIn(target, (prev) => ({
     ...prev,
     generatedIdentity: identity,
@@ -398,6 +400,12 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     },
     [api, setStoredIn, candidates]
   );
+
+  // A reconnect makes the cached draft stale until its snapshot: a request already in flight
+  // must not name it (storeGeneratedIdentity also refuses a reply that lands before this runs).
+  useEffect(() => {
+    if (!canAutoGenerate) cancelPendingGeneration();
+  }, [canAutoGenerate, cancelPendingGeneration]);
 
   // Debounced generation effect
   useEffect(() => {
