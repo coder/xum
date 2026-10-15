@@ -182,6 +182,9 @@ export async function pendingSignOutsRecordState(
   containerPath: string
 ): Promise<{ kind: "absent" } | { kind: "present" } | { kind: "unreadable"; code: string }> {
   try {
+    // Not a regular file (a FIFO would block readFile): unreadable, without reading it.
+    if (!(await fsPromises.stat(pendingSignOutsPath(containerPath))).isFile())
+      return { kind: "unreadable", code: "not a regular file" };
     await fsPromises.readFile(pendingSignOutsPath(containerPath));
     return { kind: "present" };
   } catch (error) {

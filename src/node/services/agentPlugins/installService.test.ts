@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import assert from "@/common/utils/assert";
@@ -2725,9 +2726,17 @@ describe("AgentPluginInstallService", () => {
       await fsPromises.rm(record);
       await fsPromises.mkdir(record);
       await expect(updater.getComponents({ name: "demo-plugin" })).rejects.toThrow(
-        /cannot read the pending plugin sign-out record \(EISDIR\)/
+        /cannot read the pending plugin sign-out record \(not a regular file\)/
       );
       await fsPromises.rm(record, { recursive: true });
+      // A FIFO would block a read: it is reported without reading it.
+      if (process.platform !== "win32") {
+        execFileSync("mkfifo", [record]);
+        await expect(updater.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+          /\(not a regular file\)/
+        );
+        await fsPromises.rm(record);
+      }
       await failing.dispose();
     });
 
@@ -2816,6 +2825,49 @@ describe("AgentPluginInstallService", () => {
       await restarted.list();
       await internals.settledSignOutPasses();
       expect(await pendingSignOuts()).toBeUndefined();
+    });
+
+    test("an update's sign-out waits for a timed-out recovery logout of the same server (#6627)", async () => {
+      const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const events: string[] = [];
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      let calls = 0;
+      updater.setMcpOauthService({
+        logout: async () => {
+          const call = ++calls;
+          events.push(`start ${call}`);
+          if (call === 1) await released;
+          events.push(`end ${call}`);
+          return { success: true };
+        },
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      const internals = updater as unknown as {
+        deps: { reconciliationTimeoutMs?: number };
+        settledSignOutPasses: () => Promise<void>;
+      };
+      internals.deps.reconciliationTimeoutMs = 20;
+      // A section open's pass times out on the hung logout; the call keeps running.
+      await updater.list();
+      await internals.settledSignOutPasses();
+      expect(events).toEqual(["start 1"]);
+      // The next update changes the sign-in again: its sign-out must not overlap the hung call.
+      await writeServer("client-c");
+      const review = await updater.previewUpdate({ name: "demo-plugin" });
+      const updating = updater.update({
+        name: "demo-plugin",
+        consent: { fromSha: review.fromSha, toSha: review.toSha },
+      });
+      // Without the fence the update signs out at once and finishes while the first call hangs.
+      const early = await raceWithAbortAndTimeout(updating, { timeoutMs: 2_000 });
+      expect(early.kind).toBe("timeout");
+      expect(events).toEqual(["start 1"]);
+      release();
+      await updating;
+      expect(events.slice(0, 3)).toEqual(["start 1", "end 1", "start 2"]);
     });
 
     test("component review names a pending sign-out instead of changed files (#6627)", async () => {
