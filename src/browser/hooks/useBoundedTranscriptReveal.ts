@@ -105,10 +105,10 @@ interface RevealState {
    */
   endRows: readonly string[];
   /**
-   * The start row while it heads a tail bundle larger than the cap, scanned up to the newest row
-   * (#6678 review): the next render scans only the rows after that, not the whole bundle. An
-   * in-place change that makes a cut inside it safe is missed, so the bundle stays mounted (more
-   * rows, never hidden ones) until a row after it is a safe cut.
+   * The start row while it heads a bundle larger than the cap, scanned up to the slice end (the
+   * newest row, or a detached end) (#6678 review): the next render scans only the rows appended
+   * after it, not the whole bundle. A change that makes a cut inside it safe is missed, so the
+   * bundle stays mounted (more rows, never hidden ones) until a row after it is a safe cut.
    */
   tailBundleHeadId: string | null;
 }
@@ -196,20 +196,22 @@ function resolveSliceEnd(
     "maxMountedRows must be an integer holding an automatic reveal budget plus a chunk"
   );
   let to = storedSliceEnd(state, messages, isSafeCut);
-  if (to - fromIndex > max) to = cappedEnd(fromIndex, max, length, isSafeCut, bundleScanFrom);
+  if (to - fromIndex > max) to = cappedEnd(fromIndex, to, max, length, isSafeCut, bundleScanFrom);
   return to > fromIndex ? to : nearestSafeCutAtOrAfter(fromIndex + 1, length, isSafeCut);
 }
 
 /** The end of a slice over the cap; a known bundle (`tailBundleHeadId`) skips its scanned rows. */
 function cappedEnd(
   fromIndex: number,
+  to: number,
   max: number,
   length: number,
   isSafeCut: IsSafeCut,
   bundleScanFrom: number
 ): number {
+  // `to` is a safe cut, so a detached end at or before the scanned rows ends the scan at once.
   if (bundleScanFrom > fromIndex + 1) {
-    return nearestSafeCutAtOrAfter(bundleScanFrom, length, isSafeCut);
+    return nearestSafeCutAtOrAfter(Math.min(bundleScanFrom, to), length, isSafeCut);
   }
   return nearestSafeCutAtOrBefore(fromIndex + max, length, isSafeCut);
 }
@@ -229,9 +231,9 @@ function endedState(
   const bundleScanFrom = knownBundle ? appendedFrom : fromIndex + 1;
   const toIndex = resolveSliceEnd(state, messages, fromIndex, max, isSafeCut, bundleScanFrom);
   const sliced = withSliceEnd(state, messages, toIndex);
-  // Past the cap at the tail means no safe cut after the start: one bundle, scanned to the end.
-  const overCapTail = max !== undefined && toIndex === length && length - fromIndex > max;
-  const tailBundleHeadId = overCapTail ? headId : null;
+  // Past the cap means no safe cut between the start and the end: one bundle, scanned to the end.
+  const overCap = max !== undefined && toIndex - fromIndex > max;
+  const tailBundleHeadId = overCap ? headId : null;
   if (sliced.tailBundleHeadId === tailBundleHeadId) return { toIndex, state: sliced };
   return { toIndex, state: { ...sliced, tailBundleHeadId } };
 }

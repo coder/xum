@@ -817,31 +817,47 @@ describe("useBoundedTranscriptReveal", () => {
       }
     });
 
-    test("appends into a tail bundle larger than the cap keep its start; a new bundle moves it", () => {
-      // Rows up to 1,000 are safe cuts; later rows are one bundle until a "cut" row arrives.
-      let props = { messages: rows(LONG) };
-      let calls = 0;
-      const isSafeCut = (i: number) => {
-        calls += 1;
-        return i <= 1000 || props.messages[i]?.id.startsWith("cut") === true;
-      };
-      const frames = manualFrames();
-      const view = renderHook(() =>
-        useBoundedTranscriptReveal({ workspaceId: "ws", isSafeCut, maxMountedRows: MAX, ...props })
-      );
-      while (frames.hasPending()) act(() => frames.flush());
-      expect(view.result.current).toMatchObject({ fromIndex: 1000, toIndex: LONG });
-      for (const id of ["new-0", "new-1", "cut-0", "new-2"]) {
-        props = { messages: [...props.messages, { id }] };
-        calls = 0;
-        view.rerender();
-        expect(view.result.current.toIndex).toBe(props.messages.length);
-        // Measured: an append into the bundle (LONG - 1,000 rows) checks only the new rows (it
-        // took 10,005 checks before); the safe cut that moves the start costs one cap.
-        expect(calls).toBeLessThan(id === "cut-0" ? MAX + 10 : 10);
+    test.each([true, false])(
+      "appends into a tail bundle larger than the cap scan only new rows (followsTail %p)",
+      (followsTail) => {
+        // Rows up to 1,000 are safe cuts; later rows are one bundle until a "cut" row arrives.
+        let props = { messages: rows(LONG) };
+        let calls = 0;
+        const isSafeCut = (i: number) => {
+          calls += 1;
+          return i <= 1000 || props.messages[i]?.id.startsWith("cut") === true;
+        };
+        const frames = manualFrames();
+        const view = renderHook(() =>
+          useBoundedTranscriptReveal({
+            workspaceId: "ws",
+            isSafeCut,
+            maxMountedRows: MAX,
+            followsTail,
+            ...props,
+          })
+        );
+        while (frames.hasPending()) act(() => frames.flush());
+        expect(view.result.current).toMatchObject({ fromIndex: 1000, toIndex: LONG });
+        const cutIndex = LONG + 2;
+        const afterCut = ["new-2", "new-3", "new-4", "new-5", "new-6", "new-7"];
+        for (const id of ["new-0", "new-1", "cut-0", ...afterCut]) {
+          props = { messages: [...props.messages, { id }] };
+          calls = 0;
+          view.rerender();
+          // Following, the "cut-0" row heads the new tail. Scrolled up (#6680 round 2), the
+          // slice detaches at it and keeps the bundle.
+          const detachedAtCut = !followsTail && props.messages.length > cutIndex;
+          expect(view.result.current).toMatchObject({
+            fromIndex: followsTail && props.messages.length > cutIndex ? cutIndex : 1000,
+            toIndex: detachedAtCut ? cutIndex : props.messages.length,
+          });
+          // Measured: an append into the bundle (LONG - 1,000 rows) checks only the new rows (it
+          // took 10,005 checks before); the safe cut that moves the start costs one cap.
+          expect(calls).toBeLessThan(followsTail && id === "cut-0" ? MAX + 10 : 10);
+        }
       }
-      expect(view.result.current.fromIndex).toBe(LONG + 2); // The "cut-0" row heads the tail.
-    });
+    );
 
     // F20 PR3a-2: each edit is ONE update through the real aggregator's delete, reconcile or
     // page path. Row i has historySequence SEQ + i (one displayed row per user message). Every
@@ -1033,6 +1049,29 @@ describe("useBoundedTranscriptReveal", () => {
           act(() => slice.reveal().revealNewer());
         }
         expect(slice.mountedIds().at(-1)).toBe(slice.props().messages.at(-1)!.id);
+      });
+
+      // #6680 round 3 check: an edit truncates the tail and appends the edited row in one update.
+      // The previous newest row is gone, so the reveal restarts at the new tail even while a
+      // scrolled-up reader holds the slice: it never stays on rows unrelated to the new tail.
+      test("a replaced tail restarts at the new tail even while the reader is scrolled up", () => {
+        const slice = renderOnAggregator(MAX);
+        slice.readBack();
+        slice.setProps({ followsTail: false });
+        const editFrom = LONG - TRANSCRIPT_REVEAL_CHUNK_ROWS;
+        slice.update(() => {
+          slice.aggregator.handleDeleteMessage({
+            type: "delete",
+            historySequences: Array.from({ length: LONG - editFrom }, (_, i) => SEQ + editFrom + i),
+          });
+          slice.aggregator.addMessage(slice.message("edited", SEQ + editFrom));
+        });
+        const fresh = renderSlice(MAX, alwaysSafe, slice.props().messages).reveal();
+        expect(slice.reveal()).toMatchObject({
+          fromIndex: fresh.fromIndex,
+          toIndex: fresh.toIndex,
+        });
+        expect(slice.mountedIds().at(-1)).toBe("edited");
       });
 
       test("without a cap, the same stream renders as on main", () => {
