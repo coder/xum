@@ -150,6 +150,7 @@ export const PROVIDER_DEFINITIONS = {
   },
   "google-vertex": {
     displayName: "Google Vertex AI",
+    // Node-only; browser bundles alias it to src/common/mocks/googleVertexStub.ts.
     import: () => import("@ai-sdk/google-vertex"),
     factoryName: "createVertex",
     requiresApiKey: false, // Google ADC by default; an API key selects express mode
