@@ -560,7 +560,9 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     ? createHttpTransport(config.transport)
     : config.transport;
 
-  await client.connect(transport, config.prior !== undefined ? { prior: config.prior } : {});
+  await withCleanScopeError(
+    client.connect(transport, config.prior !== undefined ? { prior: config.prior } : {})
+  );
   const settings = parseMCPSettingsCapability(client.getServerCapabilities());
   // Only the host reads and writes settings: hiding the tools keeps the model
   // from changing what the user configured.
@@ -651,14 +653,16 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     },
     prompts: (options) => listServerPrompts(client, options?.signal),
     getPrompt: (name, args, options) =>
-      client.getPrompt(
-        { name, arguments: args },
-        {
-          // Prompt expansion blocks send preparation, so use a shorter timeout than
-          // tool calls and honor send cancellation.
-          timeout: PROMPT_GET_TIMEOUT_MS,
-          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-        }
+      withCleanScopeError(
+        client.getPrompt(
+          { name, arguments: args },
+          {
+            // Prompt expansion blocks send preparation, so use a shorter timeout than
+            // tool calls and honor send cancellation.
+            timeout: PROMPT_GET_TIMEOUT_MS,
+            ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+          }
+        )
       ),
     negotiatedProtocolVersion: () => client.getNegotiatedProtocolVersion(),
     serverInfo: () => client.getServerVersion(),

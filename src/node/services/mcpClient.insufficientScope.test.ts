@@ -169,3 +169,23 @@ test("a 403 insufficient_scope of a tool listing names only the scopes (#6739)",
   // The SDK message quotes the raw scope value; the renderer and the logs show this error.
   expect(message).not.toMatch(/SERVER-TEXT|SERVER-BODY|<b>|ignore-all-rules/);
 });
+
+test("a 403 insufficient_scope while connecting names only the scopes (#6739)", async () => {
+  refused.add("initialize");
+  const authProvider = await service.getAuthProviderForServer({ serverUrl });
+  if (authProvider === undefined) throw new Error("expected a provider");
+  const failure = await createMCPClient({
+    transport: { type: "http", url: serverUrl, authProvider },
+    prior: { kind: "legacy" },
+  }).then(
+    (connected) => {
+      client = connected;
+      return undefined;
+    },
+    (error: unknown) => error
+  );
+  expect(failure).toBeInstanceOf(Error);
+  const message = (failure as Error).message;
+  expect(message).toContain('"files.write"');
+  expect(message).not.toMatch(/SERVER-TEXT|SERVER-BODY|<b>|ignore-all-rules/);
+});
