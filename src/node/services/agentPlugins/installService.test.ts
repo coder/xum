@@ -1718,14 +1718,15 @@ describe("AgentPluginInstallService", () => {
     await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
     await fsPromises.writeFile(
       path.join(remoteDir, "workflows", "run.js"),
-      "export const meta = { name: 'run' };\n"
+      "export const meta = { name: 'run' }; // \u202e\n"
     );
     await commitAll(remoteDir, "add a workflow");
     const preview = await service.preview({ input: remoteDir });
-    // The preview shows the script that install approves.
+    // The preview shows the script that install approves, with a bidi control made visible.
     expect(preview.reviewedComponents).toHaveLength(1);
     expect(preview.reviewedComponents[0]).toMatchObject({ kind: "workflows", name: "run.js" });
-    expect(preview.reviewedComponents[0]?.detail).toContain("name: 'run'");
+    expect(preview.reviewedComponents[0]?.detail).toContain("name: 'run' }; // <U+202E>");
+    expect(preview.reviewedComponents[0]?.detail).not.toContain("\u202e");
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
     const resolve = () =>
       resolveWorkflowScript({
@@ -1803,6 +1804,16 @@ describe("AgentPluginInstallService", () => {
         args: {},
         now: "2026-10-15T00:00:00.000Z",
       });
+    // A trusted project ships a plugin of the same name: it must not stand in for the managed one.
+    const projectPlugins = path.join(muxRoot, "project", ".xum", "plugins");
+    await fsPromises.mkdir(projectPlugins, { recursive: true });
+    await fsPromises.cp(
+      path.join(pluginsDir(), "demo-plugin"),
+      path.join(projectPlugins, "demo-plugin"),
+      {
+        recursive: true,
+      }
+    );
     const workflows = new WorkflowService({
       archiveAdmission: { getWorkflowArchiveRefusal: () => null },
       runStore,
@@ -1817,11 +1828,12 @@ describe("AgentPluginInstallService", () => {
           ...stored,
           runtime: new LocalRuntime(muxRoot),
           workspacePath: muxRoot,
-          projectTrusted: false,
+          projectTrusted: true,
           roots: {
             projectRoot: "",
             globalRoot: path.join(muxRoot, "skills"),
             universalRoot: "",
+            projectPluginRoots: [projectPlugins],
             globalPluginRoots: [pluginsDir()],
           },
         }),
@@ -1984,6 +1996,47 @@ describe("AgentPluginInstallService", () => {
 
     await fsPromises.rm(path.join(agentsDir, "Reviewer.md"));
     expect(await loads()).toBe("Reviews code");
+  });
+
+  test("an update that renames an agent file or adds a same-ID file needs a review (#6629)", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
+    const definition = "---\nname: Helper\ndescription: Formats\n---\nBody.\n";
+    await fsPromises.writeFile(path.join(remoteDir, "agents", "helper.md"), definition);
+    await commitAll(remoteDir, "add an agent");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // Same frontmatter under another file name: the runtime opens another file, so it is a change.
+    await fsPromises.rm(path.join(remoteDir, "agents", "helper.md"));
+    await fsPromises.writeFile(path.join(remoteDir, "agents", "Helper.md"), definition);
+    await commitAll(remoteDir, "rename the agent file");
+    const renamed = await service.previewUpdate({ name: "demo-plugin" });
+    const row = renamed.changes.find((change) => change.component?.kind === "agents");
+    expect(row).toMatchObject({ summary: "changes agent 'helper'" });
+    assert(row?.component !== undefined, "the renamed agent row carries its component");
+    await service.update({
+      name: "demo-plugin",
+      consent: { fromSha: renamed.fromSha, toSha: renamed.toSha, reviewed: [row.component] },
+    });
+    // The definition read opens the real file name, so the renamed agent loads.
+    const roots = {
+      projectRoots: [],
+      globalRoot: path.join(muxRoot, "agents"),
+      globalPluginRoots: [pluginsDir()],
+    };
+    const loaded = await readAgentDefinition(new LocalRuntime(muxRoot), muxRoot, "helper", {
+      roots,
+    });
+    expect(loaded.frontmatter.description).toBe("Formats");
+
+    // A second file that claims the ID makes the agent stop loading: the review says so.
+    await fsPromises.writeFile(path.join(remoteDir, "agents", "helper.md"), definition);
+    await commitAll(remoteDir, "add a same-ID file");
+    if ((await fsPromises.readdir(path.join(remoteDir, "agents"))).length < 2) return;
+    const collided = await service.previewUpdate({ name: "demo-plugin" });
+    expect(collided.changes.map((change) => change.summary)).toContain(
+      "agent 'helper' will not load: more than one file claims its ID"
+    );
   });
 
   test("an update review lists a changed agent, and confirming records it (#6629)", async () => {

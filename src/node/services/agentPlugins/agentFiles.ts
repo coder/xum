@@ -7,7 +7,7 @@ import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 
 export interface PluginAgentFile {
   /** The file name in the agents directory. */
-  name: string;
+  file: string;
   /** The agent ID the runtime loads it under. */
   id: string;
   /** The parsed frontmatter (plugin format mapping applied), as the runtime parses it. */
@@ -27,19 +27,14 @@ export interface PluginAgentFile {
 export async function listPluginAgentFiles(
   dir: string | undefined,
   /** Receives one warning per agent refused because two files claim its ID. */
-  warnings: string[] = []
+  warnings: string[] = [],
+  /** Receives the IDs of those refused agents. */
+  ambiguousIds?: Set<string>
 ): Promise<PluginAgentFile[]> {
-  if (dir === undefined) {
-    return [];
-  }
-  let entries;
-  try {
-    entries = await fsPromises.readdir(dir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  const names = entries.flatMap((entry) => (entry.isFile() ? [entry.name] : []));
+  if (dir === undefined) return [];
+  const names = await readAgentFileNames(dir);
   const ambiguous = ambiguousPluginAgentIds(names, warnings);
+  for (const agentId of ambiguous) ambiguousIds?.add(agentId);
   const agents: PluginAgentFile[] = [];
   for (const name of names) {
     const agentId = pluginAgentIdOf(name);
@@ -50,9 +45,19 @@ export async function listPluginAgentFiles(
     if (frontmatter === undefined) {
       continue;
     }
-    agents.push({ name, id: agentId, frontmatter });
+    agents.push({ file: name, id: agentId, frontmatter });
   }
-  return agents.sort((a, b) => a.name.localeCompare(b.name));
+  return agents.sort((a, b) => a.file.localeCompare(b.file));
+}
+
+/** The regular files of an agents directory; none when it is unreadable. */
+async function readAgentFileNames(dir: string): Promise<string[]> {
+  try {
+    const entries = await fsPromises.readdir(dir, { withFileTypes: true });
+    return entries.flatMap((entry) => (entry.isFile() ? [entry.name] : []));
+  } catch {
+    return [];
+  }
 }
 
 /** The agent ID a plugin file loads under: a `.md` file with a valid ID stem, lowercased. */
