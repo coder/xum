@@ -218,14 +218,29 @@ function monotonicNow(): number {
 /**
  * Whether logout() succeeded before the pass deadline. A late or hung logout counts as failed:
  * the URL stays in the record, and a later pass retries it (logout is idempotent).
+ *
+ * A late logout keeps running. A later pass waits for that same call instead of starting a
+ * second one, so the record stays until the original call settles: a second logout could
+ * otherwise clear the record while the first one still runs and later deletes a new sign-in.
  */
 async function signedOutBefore(
   oauth: Pick<McpOauthService, "logout">,
   serverUrl: string,
-  deadline: number
+  deadline: number,
+  inFlight: Map<string, Promise<{ success: boolean }>>
 ): Promise<boolean> {
+  let call = inFlight.get(serverUrl);
+  if (call === undefined) {
+    const started = oauth.logout({ serverUrl });
+    call = started;
+    inFlight.set(serverUrl, started);
+    const forget = () => {
+      if (inFlight.get(serverUrl) === started) inFlight.delete(serverUrl);
+    };
+    started.then(forget, forget);
+  }
   const timeoutMs = Math.max(0, deadline - monotonicNow());
-  const settled = await raceWithAbortAndTimeout(oauth.logout({ serverUrl }), { timeoutMs });
+  const settled = await raceWithAbortAndTimeout(call, { timeoutMs });
   if (settled.kind === "ok") return settled.value.success;
   log.warn("A pending plugin MCP sign-out timed out", { timeoutMs });
   return false;
@@ -4041,7 +4056,8 @@ export class AgentPluginInstallService {
       const deadline = monotonicNow() + this.recoveryTimeoutMs;
       const left: string[] = [];
       for (const serverUrl of await this.readPendingSignOuts()) {
-        if (!(await signedOutBefore(oauth, serverUrl, deadline))) left.push(serverUrl);
+        if (!(await signedOutBefore(oauth, serverUrl, deadline, this.inFlightSignOuts)))
+          left.push(serverUrl);
       }
       await this.writePendingSignOuts(left);
       return left.length > 0;
@@ -4111,6 +4127,8 @@ export class AgentPluginInstallService {
   }
 
   private pendingSignOutPass: Promise<void> | undefined;
+  /** Logouts a pass started that have not settled yet (see signedOutBefore). */
+  private readonly inFlightSignOuts = new Map<string, Promise<{ success: boolean }>>();
   /** See startPendingSignOutPass. On the monotonic clock: a wall-clock jump must not move it. */
   private pendingSignOutRetryAtMs = 0;
   /** See signOutPassRunning. */
