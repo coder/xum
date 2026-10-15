@@ -107,8 +107,11 @@ export function forgetSettingsToolRuns(workspaceId: string): void {
 /**
  * A metadata snapshot (a reconnect) lists every workspace the backend still has: drop the runs
  * of the others. Another Xum instance can remove a workspace while this renderer is offline.
+ * An empty snapshot proves nothing: the backend lists none when its metadata read fails, so
+ * it keeps every entry (WorkspaceContext treats an empty snapshot the same way).
  */
 export function forgetSettingsToolRunsExcept(workspaceIds: ReadonlySet<string>): void {
+  if (workspaceIds.size === 0) return;
   for (const workspaceId of [...runsByWorkspace.keys()])
     if (!workspaceIds.has(workspaceId)) forgetSettingsToolRuns(workspaceId);
 }

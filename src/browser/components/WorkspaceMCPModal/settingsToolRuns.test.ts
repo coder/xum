@@ -61,6 +61,9 @@ test("a writing run's end reaches the dialogs of its workspace only", async () =
 test("a metadata snapshot drops the runs of workspaces it no longer lists", () => {
   const kept = startSettingsToolRun("ws-listed", "cad", "cad.reset");
   startSettingsToolRun("ws-deleted-elsewhere", "cad", "cad.reset");
+  // An empty snapshot can mean a failed metadata read: it drops nothing.
+  forgetSettingsToolRunsExcept(new Set());
+  expect(settingsToolRunsOf("ws-deleted-elsewhere").cad?.running).toEqual(["cad.reset"]);
   forgetSettingsToolRunsExcept(new Set(["ws-listed"]));
   expect(settingsToolRunsOf("ws-deleted-elsewhere")).toEqual({});
   expect(settingsToolRunsOf("ws-listed").cad?.running).toEqual(["cad.reset"]);
