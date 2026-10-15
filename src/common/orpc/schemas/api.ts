@@ -1316,6 +1316,17 @@ export const agentPlugins = {
       z.object({ success: z.literal(false), error: z.string() }),
     ]),
   },
+  /** Settings → Plugins: the list and the pending sign-out record in one call (#6627). */
+  listForSettings: {
+    input: z.void(),
+    output: ResultSchema(
+      z.object({
+        items: z.array(AgentPluginListItemSchema),
+        pendingSignOuts: AgentPluginPendingSignOutsSchema,
+      }),
+      z.string()
+    ),
+  },
   /** The pending sign-out record that keeps managed plugins closed (#6627). */
   pendingSignOuts: {
     input: z.void(),

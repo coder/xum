@@ -3600,6 +3600,44 @@ describe("AgentPluginInstallService", () => {
       });
     });
 
+    test("Settings lists the plugins and the record in one call, with one sign-out attempt (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      let logouts = 0;
+      let fail = true;
+      restarted.setMcpOauthService({
+        logout: (input: { serverUrl: string }) => {
+          logouts++;
+          return fail ? Promise.resolve({ success: false, error: "offline" }) : oauth.logout(input);
+        },
+        credentialKey: (url: string) => oauth.credentialKey(url),
+      } as unknown as McpOauthService);
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      await internals.settledSignOutPasses();
+      // A failing sign-out: the record stays, and the refresh made one attempt (the section open).
+      const atStart = logouts;
+      const fenced = await restarted.listForSettings();
+      await internals.settledSignOutPasses();
+      expect(logouts).toBe(atStart + 1);
+      expect(fenced.pendingSignOuts).toMatchObject({ kind: "pending", lastError: "offline" });
+      expect(fenced.items.find((item) => item.name === "demo-plugin")?.present).not.toBe(true);
+      // Within the 30 s wait, a status read starts no retry.
+      expect((await restarted.pendingSignOutStatus()).kind).toBe("pending");
+      await internals.settledSignOutPasses();
+      expect(logouts).toBe(atStart + 1);
+      // The retry clears the record during the list: the call lists once more and shows the row.
+      fail = false;
+      const cleared = await restarted.listForSettings();
+      expect(cleared.pendingSignOuts).toEqual({ kind: "none" });
+      expect(cleared.items.find((item) => item.name === "demo-plugin")?.present).toBe(true);
+      await oauth.dispose();
+    });
+
     test("Settings reads the pending, the failed and the corrupt record (#6627)", async () => {
       const { failing, result } = await updateWithFailingSignOut(stopStub);
       await result;

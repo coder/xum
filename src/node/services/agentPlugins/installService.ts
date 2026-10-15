@@ -4554,6 +4554,34 @@ export class AgentPluginInstallService {
     this.startPendingSignOutPass({ retryNow: false });
     // Report the retry's result when it is quick; a slow logout is reported on the next read.
     await waitForPendingSignOuts(this.settledSignOutPasses(), STATUS_RETRY_WAIT_MS);
+    return this.currentSignOutStatus();
+  }
+
+  /**
+   * The plugin list and the pending sign-out record for Settings → Plugins, in one call (#6627).
+   * The record reads start no sign-out pass: only the list's section-open recovery retries, so
+   * one refresh makes at most one attempt. When the record existed before the list and is gone
+   * after it, the list may hold the rows the record hid during its scan: list once more.
+   */
+  async listForSettings(): Promise<{
+    items: AgentPluginListItem[];
+    pendingSignOuts: AgentPluginPendingSignOuts;
+  }> {
+    const before = await this.currentSignOutStatus();
+    let items = await this.list();
+    // Report the list's retry when it is quick; a slow logout shows on the next refresh.
+    await waitForPendingSignOuts(this.settledSignOutPasses(), STATUS_RETRY_WAIT_MS);
+    const pendingSignOuts = await this.currentSignOutStatus();
+    if (before.kind !== "none" && pendingSignOuts.kind === "none") items = await this.list();
+    return { items, pendingSignOuts };
+  }
+
+  listForSettingsResult() {
+    return this.captureResult(() => this.listForSettings());
+  }
+
+  /** The record as it is now, without starting a pass. Never throws. */
+  private async currentSignOutStatus(): Promise<AgentPluginPendingSignOuts> {
     const record = await pendingSignOutsRecordState(this.containerDir);
     if (record.kind === "absent") {
       // An old record's failure must not describe the next one.

@@ -1450,6 +1450,10 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.agentPluginInstallService.setComponentsResult(input)
         ),
+      listForSettings: t
+        .input(schemas.agentPlugins.listForSettings.input)
+        .output(schemas.agentPlugins.listForSettings.output)
+        .handler(({ context }) => context.agentPluginInstallService.listForSettingsResult()),
       pendingSignOuts: t
         .input(schemas.agentPlugins.pendingSignOuts.input)
         .output(schemas.agentPlugins.pendingSignOuts.output)

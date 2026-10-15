@@ -1157,54 +1157,28 @@ const UpdateReviewPanel: React.FC<{
   );
 };
 
-/**
- * The plugin list and the pending sign-out status (#6627). Opening the section retries the
- * sign-outs, so the status is read after the list. When the record existed before the list and is
- * gone after it, the list may still hold rows the fence hid: list once more.
- */
-async function listWithSignOuts(api: NonNullable<ReturnType<typeof useAPI>["api"]>) {
-  const readStatus = () => api.agentPlugins.pendingSignOuts().catch(() => null);
-  const before = await readStatus();
-  let result = await api.agentPlugins.list();
-  const signOuts = await readStatus();
-  if (before !== null && before.kind !== "none" && signOuts?.kind === "none")
-    result = await api.agentPlugins.list();
-  return { result, signOuts };
-}
-
-/** How often the section re-reads a pending sign-out record (the backend retries every 30 s). */
+/** How often the section re-lists while a pending sign-out record shows (the backend retries every 30 s). */
 const PENDING_SIGN_OUT_POLL_MS = 30_000;
 
 /**
- * The pending sign-out record (#6627). The section sets it after each list. A background pass
- * (the discovery gate retries every 30 s) can clear or change the record without any section
- * action, so the hook re-reads it while the notice shows.
+ * Re-lists the section while the pending sign-out notice shows (#6627). A background pass (the
+ * discovery gate retries every 30 s) can clear or change the record without any section action.
+ * Each re-list returns the list and the record together, so a failed one changes neither, and
+ * the polling goes on.
  */
-function usePendingSignOuts(
-  api: ReturnType<typeof useAPI>["api"],
-  /** Re-lists the plugins: rows read while the record fenced discovery show as missing. */
-  onCleared: () => void
-): [AgentPluginPendingSignOuts | null, (status: AgentPluginPendingSignOuts | null) => void] {
-  const [status, setStatus] = useState<AgentPluginPendingSignOuts | null>(null);
+function usePollWhileSignOutsPending(
+  status: AgentPluginPendingSignOuts | null,
+  relist: () => void
+): void {
   const shown = status !== null && status.kind !== "none";
-  // The interval reads the latest callback (the section's refresh is a plain handler).
-  const onClearedRef = useRef(onCleared);
-  onClearedRef.current = onCleared;
+  // The interval calls the latest callback (the section's refresh is a plain handler).
+  const relistRef = useRef(relist);
+  relistRef.current = relist;
   useEffect(() => {
-    if (!api || !shown) return;
-    // Each read also lets the backend retry the sign-out (at most every 30 s).
-    const timer = setInterval(() => {
-      api.agentPlugins.pendingSignOuts().then(
-        (next) => {
-          setStatus(next);
-          if (next.kind === "none") onClearedRef.current();
-        },
-        () => undefined
-      );
-    }, PENDING_SIGN_OUT_POLL_MS);
+    if (!shown) return;
+    const timer = setInterval(() => relistRef.current(), PENDING_SIGN_OUT_POLL_MS);
     return () => clearInterval(timer);
-  }, [api, shown]);
-  return [status, setStatus];
+  }, [shown]);
 }
 
 /**
@@ -1460,7 +1434,8 @@ export const PluginsSettingsSection: React.FC = () => {
   const [containerLocation, setContainerLocation] = useState<string | null>(null);
   // The record that keeps managed plugins closed after a failed post-update sign-out (#6627).
   // Lazy: `refresh` is declared below.
-  const [pendingSignOuts, setPendingSignOuts] = usePendingSignOuts(api, () => void refresh());
+  const [pendingSignOuts, setPendingSignOuts] = useState<AgentPluginPendingSignOuts | null>(null);
+  usePollWhileSignOutsPending(pendingSignOuts, () => void refresh());
   // Palette intents (keyboard rule: install/uninstall/update need keyboard
   // paths). The initializer covers palette → fresh mount; the subscription
   // below covers commands invoked while this section is already on screen
@@ -1510,13 +1485,15 @@ export const PluginsSettingsSection: React.FC = () => {
     // response resolving last would resurrect removed rows or old versions.
     const generation = ++listGenerationRef.current;
     try {
-      const { result, signOuts } = await listWithSignOuts(api);
+      // One call returns the list and the record it was read with (#6627). A failed call keeps
+      // the last record, so its notice and the polling stay.
+      const result = await api.agentPlugins.listForSettings();
       if (generation !== listGenerationRef.current) {
         return; // A newer list request superseded this one.
       }
-      setPendingSignOuts(signOuts);
       if (result.success) {
-        setItems(result.data);
+        setItems(result.data.items);
+        setPendingSignOuts(result.data.pendingSignOuts);
         setError(null);
       } else {
         setItems([]);
