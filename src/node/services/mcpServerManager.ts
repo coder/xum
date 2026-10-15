@@ -5228,8 +5228,8 @@ export class MCPServerManager {
     /** `noStart`: read only a running instance; never start or restart the server. */
     options?: { signal?: AbortSignal; timeoutMs?: number; noStart?: boolean }
   ): Promise<MCPSettingsReadSnapshot | null> {
-    // The catalog refresh after the read shares this deadline (#6611).
-    const deadline = options?.timeoutMs !== undefined ? Date.now() + options.timeoutMs : undefined;
+    // The catalog refresh after the read shares the read's deadline (#6611).
+    const startedAt = Date.now();
     const noSettings = Symbol("no settings");
     let source: { instance: MCPServerInstance; requestId: number } | undefined;
     const snapshot = await this.invokeServerOperation(
@@ -5264,10 +5264,8 @@ export class MCPServerManager {
         workspaceId,
         serverName,
         snapshot.layout,
-        {
-          signal: options?.signal,
-          deadline,
-        }
+        options,
+        startedAt
       ),
     };
     // The hash covers what this read returns (its layout carries the tool actions), the same
@@ -5280,25 +5278,24 @@ export class MCPServerManager {
    * The layout with each tool item's action (see settingsToolAction). The catalog is refreshed
    * first, as before a dispatch (refreshSettingsActionTools, so a legacy catalog is re-listed
    * too): after tools/list_changed the held catalog would show a new tool as unavailable and
-   * keep a removed one runnable. Bounded by MCP_APP_CATALOG_REFRESH_TIMEOUT_MS and the read's
-   * own `deadline` (#6611). Unlike a dispatch, a refresh that fails or times out keeps the held
-   * catalog: the dispatch refreshes again and refuses on a stale one.
+   * keep a removed one runnable. Bounded by the read's own deadline (#6611, see
+   * settingsCatalogRefreshBudgetMs). Unlike a dispatch, a refresh that fails or times out keeps
+   * the held catalog: the dispatch refreshes again and refuses on a stale one.
    */
   private async withSettingsToolActions(
     instance: MCPServerInstance,
     workspaceId: string,
     serverName: string,
     layout: MCPSettingsGroup[],
-    options: { signal: AbortSignal | undefined; deadline: number | undefined }
+    options: { signal?: AbortSignal; timeoutMs?: number } | undefined,
+    readStartedAt: number
   ): Promise<MCPSettingsGroup[]> {
-    if (layout.some((group) => group.items.some((item) => item.kind === "tool"))) {
-      const left =
-        options.deadline !== undefined ? Math.max(1, options.deadline - Date.now()) : Infinity;
-      await raceWithAbortAndTimeout(this.refreshSettingsActionTools(instance), {
-        ...(options.signal !== undefined ? { signal: options.signal } : {}),
-        timeoutMs: Math.min(MCP_APP_CATALOG_REFRESH_TIMEOUT_MS, left),
-      });
-    }
+    if (layout.some((group) => group.items.some((item) => item.kind === "tool")))
+      await this.refreshSettingsActionToolsWithin(
+        instance,
+        options?.signal,
+        settingsCatalogRefreshBudgetMs(readStartedAt, options)
+      );
     return layout.map((group) => ({
       ...group,
       items: group.items.map((item) => {
@@ -5364,12 +5361,25 @@ export class MCPServerManager {
   ): Promise<void> {
     const instance = this.workspaceServers.get(workspaceId)?.instances.get(serverName);
     if (instance === undefined || instance.isClosed) return;
+    const refreshed = await this.refreshSettingsActionToolsWithin(
+      instance,
+      signal,
+      MCP_APP_CATALOG_REFRESH_TIMEOUT_MS
+    );
+    if (!refreshed) throw new Error(`Could not refresh ${serverName}'s tools; try again`);
+  }
+
+  /** refreshSettingsActionTools, bounded: false when it failed, timed out or was aborted. */
+  private async refreshSettingsActionToolsWithin(
+    instance: MCPServerInstance,
+    signal: AbortSignal | undefined,
+    timeoutMs: number
+  ): Promise<boolean> {
     const refreshed = await raceWithAbortAndTimeout(this.refreshSettingsActionTools(instance), {
       ...(signal !== undefined ? { signal } : {}),
-      timeoutMs: MCP_APP_CATALOG_REFRESH_TIMEOUT_MS,
+      timeoutMs,
     });
-    if (refreshed.kind !== "ok" || !refreshed.value)
-      throw new Error(`Could not refresh ${serverName}'s tools; try again`);
+    return refreshed.kind === "ok" && refreshed.value;
   }
 
   /**
@@ -8455,6 +8465,20 @@ export class MCPServerManager {
       signal.removeEventListener("abort", onAbort);
     }
   }
+}
+
+/**
+ * How long a settings read's catalog refresh may take: MCP_APP_CATALOG_REFRESH_TIMEOUT_MS, and
+ * no longer than the read's own deadline leaves (at least 1 ms), so a read near its limit does
+ * not run about 2 s past it (#6611).
+ */
+function settingsCatalogRefreshBudgetMs(
+  readStartedAt: number,
+  options: { timeoutMs?: number } | undefined
+): number {
+  if (options?.timeoutMs === undefined) return MCP_APP_CATALOG_REFRESH_TIMEOUT_MS;
+  const left = Math.max(1, readStartedAt + options.timeoutMs - Date.now());
+  return Math.min(MCP_APP_CATALOG_REFRESH_TIMEOUT_MS, left);
 }
 
 function assertSettingsAppStored(stored: boolean, title: string): void {
