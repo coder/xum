@@ -77,6 +77,7 @@ import {
 import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { CreationProjectSelect } from "./CreationProjectSelect";
+import { changeCreationDraftProject, projectRuntimeEnablement } from "./creationDraftProject";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { useComputerUse } from "@/browser/hooks/useComputerUse";
 import { AgentModePicker } from "@/browser/components/AgentModePicker/AgentModePicker";
@@ -812,15 +813,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const openModelSelector = useCallback(() => {
     modelSelectorRef.current?.open();
   }, []);
-  const hasCreationRuntimeOverrides =
-    creationProject?.runtimeOverridesEnabled === true ||
-    Boolean(creationProject?.runtimeEnablement) ||
-    creationProject?.defaultRuntime !== undefined;
   // Keep workspace creation in sync with Settings → Runtimes project overrides.
   const creationRuntimeEnablement =
-    variant === "creation" && hasCreationRuntimeOverrides
-      ? normalizeRuntimeEnablement(creationProject?.runtimeEnablement)
+    variant === "creation"
+      ? projectRuntimeEnablement(creationProject, runtimeEnablement)
       : runtimeEnablement;
+  // A project change keeps the same draft (and editor); only its project fields change.
+  const changeCreationProject = (scope: string) => {
+    if (!creationDraftId) return beginWorkspaceCreation(scope);
+    beginWorkspaceCreation(
+      changeCreationDraftProject(creationDraftId, scope, userProjects, runtimeEnablement),
+      creationDraftId
+    );
+  };
   const [hasAttemptedCreateSend, setHasAttemptedCreateSend] = useState(false);
 
   // Creation-specific state (hook always called, but only used when variant === "creation")
@@ -926,7 +931,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           // routes (deep link to a sub-project, or sidebar "+") collapse here.
           selectedProjectPath: creationSubProjectPath ?? props.projectPath,
           userProjects,
-          onSelectedProjectPathChange: beginWorkspaceCreation,
+          onSelectedProjectPathChange: changeCreationProject,
           projectName: props.projectName,
           nameState: creationState.nameState,
           runtimeAvailabilityState: creationState.runtimeAvailabilityState,
@@ -3364,7 +3369,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               <CreationProjectSelect
                 selected={SCRATCH_PROJECT_CONFIG_KEY}
                 userProjects={userProjects}
-                onChange={beginWorkspaceCreation}
+                onChange={changeCreationProject}
+                disabled={isSendInFlight}
               />
             </div>
           )}

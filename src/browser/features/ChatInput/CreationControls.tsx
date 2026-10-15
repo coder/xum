@@ -686,6 +686,7 @@ function CreationControlsContent(props: CreationControlsProps) {
               selected={selected}
               userProjects={props.userProjects}
               onChange={props.onSelectedProjectPathChange}
+              disabled={props.disabled}
             />
           );
         })()}

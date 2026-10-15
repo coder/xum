@@ -111,12 +111,18 @@ describe("CreationDraftStore", () => {
     using tempDir = new TestTempDir("creation-store-move");
     const harness = await createHarness(tempDir);
     const { store } = harness;
-    const id = store.create(PROJECT_A, null, { persist: true });
+    await waitFor(() => store.getListState().status === "ready");
+    // The bare project route's blank draft.
+    const id = store.draftIdForProject(PROJECT_A);
+    store.open(id, PROJECT_A);
+    await waitFor(() => store.getView(id).load.status === "ready");
     store.update(id, { text: "fix it", attachments: [image], manualName: "my-name" });
     await store.flush(id);
 
     store.update(id, { projectPath: PROJECT_B, subProjectPath: null });
     await store.flush(id);
+    // Moved away, it is no longer A's blank draft: opening A starts another one.
+    expect(store.draftIdForProject(PROJECT_A)).not.toBe(id);
 
     const reloaded = await reopen(harness, id, PROJECT_A);
     expect(reloaded.getView(id).draft).toMatchObject({

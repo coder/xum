@@ -273,6 +273,12 @@ export class CreationDraftStore {
     return id;
   }
 
+  private releaseBlankId(id: string): void {
+    for (const [projectPath, blankId] of this.blankIds) {
+      if (blankId === id) this.blankIds.delete(projectPath);
+    }
+  }
+
   retryList(): void {
     if (this.client) this.loadList(this.client);
   }
@@ -424,6 +430,8 @@ export class CreationDraftStore {
     if (!entry?.draft) return;
     entry.draft = { ...entry.draft, ...patch };
     entry.pending = { ...entry.pending, ...patch };
+    // A blank draft moved to another project is no longer its old project's blank draft.
+    if (patch.projectPath !== undefined) this.releaseBlankId(id);
     // An edit may correct a refused save: try again with it.
     entry.saveError = null;
     entry.retryOnReconnect = false;
