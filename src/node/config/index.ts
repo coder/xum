@@ -1787,9 +1787,11 @@ export class Config {
       log.debug("Config dir not created for the config file watcher", { error });
     }
     this.startConfigFileWatchers();
-    // Without a watch, writeConfigFileTracked retries after this process's next save.
-    if (this.configFileWatchers.length === 0) return;
+    // Set without a watch too: the read that starts one later then reports the edits since.
     this.notifiedConfigFileStamp = baseline;
+    // Without a watch, the next read of a changed config.json or this process's next save
+    // retries.
+    if (this.configFileWatchers.length === 0) return;
     // Relink-aware: the link can also change between the realpath read and the root watch.
     this.handleConfigFileEventWithRelink();
   }
@@ -1832,13 +1834,9 @@ export class Config {
   private watchConfigDir(dir: string, fileNames: ReadonlySet<string>): fs.FSWatcher | null {
     let watcher: fs.FSWatcher;
     try {
-      watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
-        // A delivered event shows the watches work, so the next error may rebuild them again.
-        this.configFileWatchRetryStamps.error = null;
-        // Some platforms omit the filename; treat that as a possible config.json change.
-        if (filename != null && !fileNames.has(filename)) return;
-        this.handleConfigFileEventWithRelink();
-      });
+      watcher = fs.watch(dir, { persistent: false }, (_event, filename) =>
+        this.handleConfigDirEvent(dir, fileNames, filename)
+      );
     } catch (error) {
       log.debug("Config file watcher not started", { dir, error });
       return null;
@@ -1850,6 +1848,7 @@ export class Config {
       // each dir that still resolves (a vanished dir moves to an existing ancestor), and
       // the stamp check after it reports an edit made while the watch was down.
       this.watchedConfigFileDirsKey = null;
+      this.configFileWatchErrorDir = dir;
       this.retryIncompleteConfigFileWatch("error");
     });
     return watcher;
@@ -1863,6 +1862,8 @@ export class Config {
     read: null,
     error: null,
   };
+  /** The dir of the last watch that raised an error (see the watch callback). */
+  private configFileWatchErrorDir: string | null = null;
 
   /**
    * Rebuilds a watch set with a failed watch, at most once per config.json stamp and trigger.
@@ -1872,10 +1873,35 @@ export class Config {
    * No timer: until the stamp changes, a retry would see no new edit to report.
    */
   private retryIncompleteConfigFileWatch(trigger: "read" | "error"): void {
-    if (this.watchedConfigFileDirsKey !== null || this.configFileWatchers.length === 0) return;
+    if (!this.configFileWatchIncomplete()) return;
     const stamp = this.configFileStamp();
     if (stamp === this.configFileWatchRetryStamps[trigger]) return;
     this.configFileWatchRetryStamps[trigger] = stamp;
+    this.handleConfigFileEventWithRelink();
+  }
+
+  /**
+   * A listener needs a watch that is missing: one failed to start or raised an error. An
+   * empty set with listeners counts too: every watch failed to start.
+   */
+  private configFileWatchIncomplete(): boolean {
+    if (this.configFileWatchStopped || this.emitter.listenerCount("configChanged") === 0) {
+      return false;
+    }
+    return this.configFileWatchers.length === 0 || this.watchedConfigFileDirsKey === null;
+  }
+
+  /** An event from the watch on `dir`, which covers the entries in `fileNames`. */
+  private handleConfigDirEvent(
+    dir: string,
+    fileNames: ReadonlySet<string>,
+    filename: string | null
+  ): void {
+    // An event from the replacement of the failed watch shows it works, so its next error
+    // may rebuild again. An event from another dir proves nothing about it.
+    if (dir === this.configFileWatchErrorDir) this.configFileWatchRetryStamps.error = null;
+    // Some platforms omit the filename; treat that as a possible config.json change.
+    if (filename != null && !fileNames.has(filename)) return;
     this.handleConfigFileEventWithRelink();
   }
 

@@ -2773,10 +2773,51 @@ describe("Config", () => {
       }
     });
 
+    it("starts the watches on a read of a changed config.json after every watch failed", async () => {
+      const realWatch = fs.watch;
+      let failing = true;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (failing) {
+          throw Object.assign(new Error("ENOSPC: inotify watch limit reached"), { code: "ENOSPC" });
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
+      try {
+        await config.setUpdateChannel("npm");
+        let notified = Promise.withResolvers<void>();
+        let notifications = 0;
+        const unsubscribe = config.onConfigChanged(() => {
+          notifications += 1;
+          notified.resolve();
+        });
+        failing = false;
+        // No await until the read: no watch exists that could report this edit.
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({ projects: [], updateChannel: "nightly" })
+        );
+        expect(config.getUpdateChannel()).toBe("nightly");
+        expect(notifications).toBe(1);
+        // The started watch sees the next save.
+        notified = Promise.withResolvers<void>();
+        await new Config(tempDir).setUpdateChannel("npm");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("npm");
+      } finally {
+        debugSpy.mockRestore();
+        watchSpy.mockRestore();
+      }
+    });
+
     it("rebuilds the watches once per config.json change for an error every new watch raises", () => {
       const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
       const target = path.join(targetDir, "config.json");
       const watchers = new Map<string, fs.FSWatcher>();
+      const listeners = new Map<string, (event: string, filename: string) => void>();
       let watchCalls = 0;
       const realWatch = fs.watch;
       const watchSpy = spyOn(fs, "watch").mockImplementation(((
@@ -2785,6 +2826,14 @@ describe("Config", () => {
         watchCalls += 1;
         const watcher = realWatch(...args);
         watchers.set(fs.realpathSync(String(args[0])), watcher);
+        // Config passes (dir, options, listener); the typed overloads end at two parameters.
+        const listener: unknown = (args as unknown[])[2];
+        if (typeof listener === "function") {
+          listeners.set(
+            fs.realpathSync(String(args[0])),
+            listener as (event: string, filename: string) => void
+          );
+        }
         return watcher;
       }) as typeof fs.watch);
       const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
@@ -2815,6 +2864,14 @@ describe("Config", () => {
         expect(recovered).toBeGreaterThan(reread);
         failTargetWatch();
         expect(watchCalls).toBe(recovered);
+        // An unrelated event in another watched dir proves nothing about the failed watch.
+        listeners.get(fs.realpathSync(tempDir))?.("rename", "unrelated.txt");
+        failTargetWatch();
+        expect(watchCalls).toBe(recovered);
+        // An event from the target dir's own watch shows it works: its next error rebuilds.
+        listeners.get(fs.realpathSync(targetDir))?.("rename", "unrelated.txt");
+        failTargetWatch();
+        expect(watchCalls).toBeGreaterThan(recovered);
         unsubscribe();
       } finally {
         debugSpy.mockRestore();
