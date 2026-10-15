@@ -67,14 +67,6 @@ function getScopeId(workspaceId: string | undefined, projectPath: string | undef
   return workspaceId ?? (projectPath ? getProjectScopeId(projectPath) : GLOBAL_SCOPE_ID);
 }
 
-function isSameFetch(
-  current: { projectPath: string | undefined; workspaceId: string | undefined },
-  projectPath: string | undefined,
-  workspaceId: string | undefined
-): boolean {
-  return current.projectPath === projectPath && current.workspaceId === workspaceId;
-}
-
 function coerceAgentId(value: unknown): string {
   return normalizeAgentId(value, WORKSPACE_DEFAULTS.agentId);
 }
@@ -146,11 +138,16 @@ function AgentProviderWithState(props: {
   const fetchParamsRef = useRef({
     projectPath: props.projectPath,
     workspaceId: props.workspaceId,
+    generation: 0,
   });
 
   const fetchAgents = useCallback(
     async (projectPath: string | undefined, workspaceId: string | undefined) => {
-      fetchParamsRef.current = { projectPath, workspaceId };
+      // Each fetch takes the next generation, and only the latest one commits. Two fetches of the
+      // same scope can overlap (a plugin-mutation refresh during the initial load, #6629), and an
+      // older answer must not replace a newer one.
+      const generation = fetchParamsRef.current.generation + 1;
+      fetchParamsRef.current = { projectPath, workspaceId, generation };
 
       if (!api || (!projectPath && !workspaceId)) {
         if (isMountedRef.current) {
@@ -165,7 +162,7 @@ function AgentProviderWithState(props: {
 
       try {
         const result = await api.agents.list({ projectPath, workspaceId });
-        if (isSameFetch(fetchParamsRef.current, projectPath, workspaceId) && isMountedRef.current) {
+        if (fetchParamsRef.current.generation === generation && isMountedRef.current) {
           setAgents(result);
           setAgentBases(getScopeId(workspaceId, projectPath), result);
           setLoadFailed(false);
@@ -174,7 +171,7 @@ function AgentProviderWithState(props: {
       } catch (error) {
         // A lost connection (or the reconnect that replaced the client) is no load failure.
         if (isConnectionLostError(error)) return;
-        if (isSameFetch(fetchParamsRef.current, projectPath, workspaceId) && isMountedRef.current) {
+        if (fetchParamsRef.current.generation === generation && isMountedRef.current) {
           setAgents([]);
           setAgentBases(getScopeId(workspaceId, projectPath), []);
           setLoadFailed(true);
