@@ -1,48 +1,45 @@
 import React from "react";
+import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { Button } from "@/browser/components/Button/Button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
+import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { cn } from "@/common/lib/utils";
 
 interface SidebarCollapseButtonProps {
   collapsed: boolean;
   onToggle: () => void;
-  /** Optional keyboard shortcut to show in tooltip */
-  shortcut?: string;
+  className?: string;
 }
 
 /**
- * Collapse/expand toggle button for the left sidebar.
- * Renders at the bottom of the sidebar with « » chevrons.
+ * Left sidebar toggle icon, mirroring the right sidebar's: the expanded sidebar's header shows it
+ * as "Collapse sidebar", and page headers show it as the reopen affordance while the sidebar is
+ * collapsed (at phone widths that opens the drawer, hence the "menu" label).
  */
-export const SidebarCollapseButton: React.FC<SidebarCollapseButtonProps> = ({
-  collapsed,
-  onToggle,
-  shortcut,
-}) => {
-  const chevron = collapsed ? "»" : "«";
-
-  const label = collapsed ? "Expand sidebar" : "Collapse sidebar";
+export const SidebarCollapseButton: React.FC<SidebarCollapseButtonProps> = (props) => {
+  const label = props.collapsed ? "Open sidebar" : "Collapse sidebar";
+  const Icon = props.collapsed ? PanelLeftOpen : PanelLeftClose;
 
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <button
-          onClick={onToggle}
-          aria-label={label}
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={props.onToggle}
+          aria-label={props.collapsed ? "Open sidebar menu" : label}
           className={cn(
-            collapsed
-              ? "text-muted hover:bg-hover hover:text-foreground flex w-full flex-1 cursor-pointer items-center justify-center bg-transparent p-0 text-xs transition-all duration-200"
-              : "text-muted border-dark hover:bg-hover hover:text-foreground mt-auto flex h-6 w-full cursor-pointer items-center justify-center border-t border-none bg-transparent p-0 text-xs transition-all duration-200",
-            // globals.css removes outlines, so keyboard focus needs its own ring (#5688). Inset,
-            // because the sidebar clips anything drawn outside the button.
-            "focus-visible:ring-accent focus-visible:ring-1 focus-visible:ring-inset"
+            "text-muted hover:text-foreground h-6 w-6 shrink-0",
+            isDesktopMode() && "titlebar-no-drag",
+            props.className
           )}
         >
-          {chevron}
-        </button>
+          <Icon className="h-3.5 w-3.5" />
+        </Button>
       </TooltipTrigger>
-      <TooltipContent align="center">
-        {label}
-        {shortcut && ` (${shortcut})`}
+      <TooltipContent>
+        {label} ({formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)})
       </TooltipContent>
     </Tooltip>
   );

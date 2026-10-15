@@ -47,10 +47,7 @@ import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appVie
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { CODER_RUNTIME_PLACEHOLDER, type RuntimeConfig } from "@/common/types/runtime";
 import { Err, Ok, type Result } from "@/common/types/result";
-import {
-  NARROW_VIEWPORT_MAX_WIDTH_PX,
-  WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
-} from "@/constants/layout";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
 // The consent dialog integration test renders the REAL modal inside the menu bar. Radix
 // Dialog portals do not render in happy-dom, so the shell is inlined (same double as the
@@ -1193,12 +1190,23 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     shell.remove();
   });
 
-  it("applies the collapsed-left-sidebar inset immediately from props", () => {
-    const view = render(<WorkspaceMenuBar {...defaultProps} leftSidebarCollapsed />);
-
-    expect(view.getByTestId("workspace-menu-bar").style.paddingLeft).toBe(
-      `${WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX}px`
+  it("shows the left sidebar reopen button and clears the titlebar only while it is collapsed", () => {
+    const onToggle = mock(() => undefined);
+    const view = render(
+      <WorkspaceMenuBar
+        {...defaultProps}
+        leftSidebarCollapsed
+        onToggleLeftSidebarCollapsed={onToggle}
+      />
     );
+
+    expect(view.getByTestId("workspace-menu-bar").classList).toContain("titlebar-safe-left");
+    fireEvent.click(view.getByRole("button", { name: "Open sidebar menu" }));
+    expect(onToggle).toHaveBeenCalledTimes(1);
+
+    view.rerender(<WorkspaceMenuBar {...defaultProps} leftSidebarCollapsed={false} />);
+    expect(view.getByTestId("workspace-menu-bar").classList).not.toContain("titlebar-safe-left");
+    expect(view.queryByRole("button", { name: "Open sidebar menu" })).toBeNull();
   });
 
   it("opens the archive confirmation modal when preflight finds untracked files", async () => {

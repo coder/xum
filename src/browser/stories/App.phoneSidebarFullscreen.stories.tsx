@@ -154,8 +154,8 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     // Everything behind the view is inert, not just the chat: the left sidebar and the footer
     // sit outside the chat pane.
     await expect(chatPane.closest("[inert]")).not.toBeNull();
-    const expandLeftSidebar = canvas.getByRole("button", { name: "Expand sidebar", hidden: true });
-    await expect(expandLeftSidebar.closest("[inert]")).not.toBeNull();
+    const leftSidebar = canvasElement.querySelector("[data-testid='left-sidebar']");
+    await expect(leftSidebar?.closest("[inert]")).not.toBeNull();
     // Focus moves into the view and stays there. The closing menu returns focus to the More
     // button on a timer, which must not win: the inert chat pane cannot take focus. Check again
     // after that timer had its turn.

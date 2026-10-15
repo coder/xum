@@ -7,7 +7,6 @@ import {
   BellOff,
   Ellipsis,
   Info,
-  Menu,
   PanelRightOpen,
   Pencil,
 } from "lucide-react";
@@ -66,6 +65,7 @@ import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceT
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
 import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
+import { SidebarCollapseButton } from "../SidebarCollapseButton/SidebarCollapseButton";
 import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
 import { useLiveAPI } from "@/browser/contexts/API";
 
@@ -74,11 +74,7 @@ import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import {
-  NARROW_VIEWPORT_MAX_WIDTH_PX,
-  RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
-  WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
-} from "@/constants/layout";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX, RIGHT_SIDEBAR_DEFAULT_COLLAPSED } from "@/constants/layout";
 import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
@@ -108,10 +104,6 @@ interface WorkspaceMenuBarProps {
 }
 
 import { useArchiveWorkspaceConfirmation } from "@/browser/hooks/useArchiveWorkspaceConfirmation";
-
-const COLLAPSED_LEFT_SIDEBAR_MENU_BAR_STYLE = {
-  paddingLeft: `${WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX}px`,
-} as const;
 
 function setWorkspaceNotifyOnResponse(workspaceId: string, enabled: boolean): void {
   updateUserPreferences({
@@ -685,14 +677,14 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         // A collapsed right sidebar floats below the header, so the header reaches the window's
         // right edge and must clear the titlebar overlay controls itself.
         rightSidebarCollapsed && "titlebar-safe-right titlebar-safe-right-gutter-2",
+        // The collapsed left sidebar is zero-width, so the header reaches the window's left edge
+        // and must clear the macOS traffic lights / overlay controls itself.
+        leftSidebarCollapsed && "titlebar-safe-left titlebar-safe-left-gutter-2",
         // In desktop mode, make header draggable for window movement
         isDesktop && "titlebar-drag",
         // Keep header visible when iOS keyboard opens and causes scroll
         "mobile-sticky-header"
       )}
-      // Apply the collapsed-left-sidebar inset from props so the workspace header starts in
-      // the correct position on the very first paint instead of waiting for a later root-attr sync.
-      style={leftSidebarCollapsed ? COLLAPSED_LEFT_SIDEBAR_MENU_BAR_STYLE : undefined}
     >
       <div
         className={cn(
@@ -703,20 +695,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         )}
       >
         {leftSidebarCollapsed && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={onToggleLeftSidebarCollapsed}
-                aria-label="Open sidebar menu"
-                className="mobile-menu-btn text-muted hover:text-foreground hidden h-6 w-6 shrink-0"
-              >
-                <Menu className="h-3.5 w-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Open sidebar ({formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)})</TooltipContent>
-          </Tooltip>
+          <SidebarCollapseButton
+            collapsed
+            onToggle={onToggleLeftSidebarCollapsed}
+            className="mobile-menu-btn"
+          />
         )}
         <WorkspaceHeaderTitle
           workspaceId={workspaceId}

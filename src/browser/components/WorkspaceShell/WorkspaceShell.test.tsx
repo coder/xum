@@ -227,7 +227,7 @@ describe("estimateWorkspaceShellFallbackWidthPx", () => {
         leftSidebarCollapsed: true,
         persistedLeftSidebarWidthPx: 360,
       })
-    ).toBe(1420);
+    ).toBe(1440);
   });
 
   it("falls back to the default left sidebar width for malformed persisted values", () => {

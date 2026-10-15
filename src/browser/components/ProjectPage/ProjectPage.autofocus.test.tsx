@@ -175,7 +175,7 @@ describe("ProjectPage", () => {
     const baseProps = {
       projectPath: "/projects/demo",
       projectName: "demo",
-      leftSidebarCollapsed: true,
+      leftSidebarCollapsed: false,
       onToggleLeftSidebarCollapsed: () => undefined,
       onWorkspaceCreated: () => undefined,
     };

@@ -4,7 +4,6 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { LEFT_SIDEBAR_COLLAPSED_WIDTH_PX, LEFT_SIDEBAR_DEFAULT_WIDTH_PX } from "@/constants/layout";
 import ProjectSidebar from "../ProjectSidebar/ProjectSidebar";
 import { TitleBar } from "../TitleBar/TitleBar";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 
 interface LeftSidebarProps {
@@ -38,7 +37,6 @@ export function LeftSidebar(props: LeftSidebarProps) {
     onStartResize,
     ...projectSidebarProps
   } = props;
-  const isDesktop = isDesktopMode();
   // Match the CSS gate for the mobile "overlay" sidebar (width-only, any pointer
   // type); we don't show a drag handle in that mode since CSS pins the width. Subscribed, so a
   // window resized into the overlay width also gets the drawer's Escape handling.
@@ -85,12 +83,9 @@ export function LeftSidebar(props: LeftSidebarProps) {
           "h-full bg-sidebar border-r border-border flex flex-col shrink-0 overflow-hidden relative z-20",
           !isResizing && "transition-[width] duration-200",
           "mobile-sidebar",
-          collapsed && "mobile-sidebar-collapsed",
-          // In desktop mode when collapsed, start border below titlebar height (32px)
-          // so it aligns with titlebar bottom edge and doesn't cut through traffic lights
-          isDesktop &&
-            collapsed &&
-            "border-r-0 after:absolute after:right-0 after:top-8 after:bottom-0 after:w-px after:bg-border"
+          // Collapsed, the sidebar is zero-width (no strip, like the right sidebar): page headers
+          // carry the reopen button instead.
+          collapsed && "mobile-sidebar-collapsed border-r-0"
         )}
         style={{ width }}
       >

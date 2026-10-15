@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { Menu } from "lucide-react";
 import { getArchivedWorkspacesExpandedKey } from "@/common/constants/storage";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -8,6 +7,7 @@ import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
 import { CREATION_COLUMN_MAX_WIDTH_CLASS } from "@/constants/layout";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
 import { ChatInput } from "@/browser/features/ChatInput";
@@ -17,7 +17,6 @@ import { ConfigureProvidersPrompt } from "@/browser/components/ConfigureProvider
 import { ConfiguredProvidersBar } from "@/browser/components/ConfiguredProvidersBar/ConfiguredProvidersBar";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { ArchivedWorkspaces } from "@/browser/components/ArchivedWorkspaces/ArchivedWorkspaces";
-import { Button } from "@/browser/components/Button/Button";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 
 interface ScratchPageProps {
@@ -84,22 +83,17 @@ export function ScratchPage(props: ScratchPageProps) {
           <div
             className={cn(
               "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2 [@media(max-width:768px)]:h-auto [@media(max-width:768px)]:py-2",
+              // The collapsed left sidebar is zero-width: clear the macOS traffic lights.
+              props.leftSidebarCollapsed && "titlebar-safe-left titlebar-safe-left-gutter-2",
               isDesktopMode() ? "h-10 titlebar-drag" : "h-8"
             )}
           >
             {props.leftSidebarCollapsed && (
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={props.onToggleLeftSidebarCollapsed}
-                aria-label="Open sidebar menu"
-                className={cn(
-                  "hidden mobile-menu-btn h-6 w-6 shrink-0 text-muted hover:text-foreground",
-                  isDesktopMode() && "titlebar-no-drag"
-                )}
-              >
-                <Menu className="h-4 w-4" />
-              </Button>
+              <SidebarCollapseButton
+                collapsed
+                onToggle={props.onToggleLeftSidebarCollapsed}
+                className="mobile-menu-btn"
+              />
             )}
           </div>
           {/* mobile-header-spacer keeps content below the fixed mobile header on touch devices. */}

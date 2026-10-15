@@ -50,7 +50,7 @@ async function openFirstProjectCreationView(storyRoot: HTMLElement): Promise<voi
       // <html> (set by App.tsx) which works for both desktop (width-based)
       // and mobile (transform-based) collapse modes.
       if (document.documentElement.dataset.leftSidebarCollapsed === "true") {
-        const expandBtn = storyRoot.querySelector<HTMLElement>("[aria-label='Expand sidebar']");
+        const expandBtn = storyRoot.querySelector<HTMLElement>("[aria-label='Open sidebar menu']");
         if (expandBtn) expandBtn.click();
         throw new Error("Sidebar collapsed – expanding…");
       }
