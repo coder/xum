@@ -14,6 +14,7 @@ import type {
   DraftAttachment,
   DraftEvent,
   DraftListEntry,
+  DraftMoveCreationInput,
   DraftScope,
 } from "@/common/orpc/schemas/drafts";
 import { DraftService } from "./draftService";
@@ -1474,6 +1475,92 @@ describe("DraftService moveCreation", () => {
     expect((await service.get(source)).text).toBe("");
     expect((await service.getList()).entries).toEqual([
       { projectPath: otherProject, draftId: "dst", subProjectPath: "sub", createdAt: 1 },
+    ]);
+  });
+
+  /**
+   * A first attempt that wrote the destination body and then failed to delete the source (as a
+   * crash at that point would leave it), and the snapshot that relists that body.
+   */
+  async function failSourceDelete(service: DraftService, move: DraftMoveCreationInput) {
+    const sourceFile = `${move.source.draftId}.json`;
+    const realUnlink = fs.unlink.bind(fs);
+    const unlinkSpy = spyOn(fs, "unlink").mockImplementation((async (
+      ...args: Parameters<typeof fs.unlink>
+    ) => {
+      if (path.basename(String(args[0])) === sourceFile) {
+        throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" });
+      }
+      return realUnlink(...args);
+    }) as typeof fs.unlink);
+    let failed: unknown;
+    try {
+      await service.moveCreation(move).catch((error: unknown) => (failed = error));
+    } finally {
+      unlinkSpy.mockRestore();
+    }
+    expect(failed).toBeInstanceOf(Error);
+    await service.getSnapshotEvent();
+  }
+
+  async function sourceDeleteFailedMove(tempDir: TestTempDir) {
+    const harness = await createMoveHarness(tempDir);
+    const { projectPath, otherProject, service } = harness;
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    const written = await service.update({
+      scope: source,
+      text: "moving",
+      attachments: [image],
+      nameState,
+    });
+    const dest = { kind: "creation" as const, projectPath: otherProject, draftId: "dst" };
+    const move = {
+      source,
+      sourceRevision: written.revision,
+      dest,
+      subProjectPath: "sub",
+      createdAt: 7,
+    };
+    await failSourceDelete(service, move);
+    expect((await service.get(dest)).text).toBe("moving");
+    expect((await service.get(source)).text).toBe("moving");
+    return { ...harness, source, dest, move };
+  }
+
+  it("refuses a retry over a relisted destination that was edited since", async () => {
+    using tempDir = new TestTempDir("drafts-move-dest-edited");
+    const { service, source, dest, move } = await sourceDeleteFailedMove(tempDir);
+    // Another window edits the relisted destination before the client retries.
+    await service.update({ scope: dest, text: "moving, edited elsewhere" });
+
+    let refused: unknown;
+    await service.moveCreation(move).catch((error: unknown) => (refused = error));
+
+    expect(refused).toBeInstanceOf(Error);
+    expect((await service.get(dest)).text).toBe("moving, edited elsewhere");
+    expect(await service.get(source)).toMatchObject({
+      text: "moving",
+      attachments: [image],
+      nameState,
+    });
+  });
+
+  it("finishes a retry over the destination body its earlier attempt wrote", async () => {
+    using tempDir = new TestTempDir("drafts-move-dest-unedited");
+    const { otherProject, service, source, dest, move } = await sourceDeleteFailedMove(tempDir);
+
+    const reply = await service.moveCreation(move);
+
+    expect(reply).toMatchObject({ result: "moved", dest: { text: "moving", nameState } });
+    expect((await service.get(source)).text).toBe("");
+    expect(await service.get(dest)).toMatchObject({
+      text: "moving",
+      attachments: [image],
+      nameState,
+    });
+    expect((await service.getList()).entries).toEqual([
+      { projectPath: otherProject, draftId: "dst", subProjectPath: "sub", createdAt: 7 },
     ]);
   });
 

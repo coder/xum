@@ -625,10 +625,11 @@ export class DraftService extends EventEmitter {
    * body (text, attachments, name state) and row together, then the source goes. Under both
    * projects' dir locks, then the list lock (the class comment's order). A crash loses no content:
    * after the destination body, that body is unlisted (the next snapshot relists it) next to the
-   * intact source; after the source body's delete, the destination is still relisted that way,
-   * and a listed source stays as an empty row. A retry after a lost reply finds the destination
-   * listed (a real row) and answers "moved", whatever the source holds by then. An unowned
-   * destination throws, so the client keeps the source.
+   * intact source, and a retry finishes the move only while that body still equals the source;
+   * after the source body's delete, the destination is still relisted that way, and a listed
+   * source stays as an empty row. A retry after a lost reply finds the destination listed (a real
+   * row) and answers "moved", whatever the source holds by then. An unowned destination throws,
+   * so the client keeps the source.
    */
   async moveCreation(input: DraftMoveCreationInput): Promise<DraftMoveCreationOutput> {
     const { source, dest } = input;
@@ -673,10 +674,20 @@ export class DraftService extends EventEmitter {
     if (stored.pendingSends.length > 0) {
       throw new Error("Draft move refused: the source draft has pending sends");
     }
+    // A destination body here is an earlier attempt's write whose source delete failed (the id is
+    // fresh), relisted by a snapshot since. Equal to the source, it is that write: the move
+    // finishes. Otherwise another window edited it, or the source changed since that write; a
+    // retry cannot tell which, so it refuses and both drafts stay, rather than drop either edit.
+    const written = await this.load(dest);
+    if (written !== null && canonicalJson(written) !== canonicalJson(stored)) {
+      throw new Error("Draft move refused: the destination draft differs from the source");
+    }
     // The bodies are written under the list lock, after its version check: a list this version
     // must not rewrite (a downgrade) refuses the move before the source goes.
     return this.listMoved(input, async () => {
-      if (!isStoredDraftEmpty(stored)) await this.persist(dest, this.filePathFor(dest), stored);
+      if (written === null && !isStoredDraftEmpty(stored)) {
+        await this.persist(dest, this.filePathFor(dest), stored);
+      }
       // Before the list write: writing a missing or damaged list relists every unlisted body.
       await this.persist(source, this.filePathFor(source), emptyStoredDraft());
     });
