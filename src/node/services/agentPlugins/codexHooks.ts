@@ -507,18 +507,34 @@ function escapeStep(pattern: string, index: number, inClass: boolean): SyntaxSte
  * decimal digits or `_` (Rust rejects `$`, JavaScript rejects `.`, `[` and `]`).
  */
 function textStep(pattern: string, index: number): SyntaxStep {
-  const group = /^\(\?(P?)<(?![=!])([^>]*)>/.exec(pattern.slice(index));
-  if (group !== null) {
-    if (!/^[\p{L}_][\p{L}\p{Nd}_]*$/u.test(group[2])) {
+  if (pattern.startsWith("(?", index)) {
+    // Sticky and bounded, so a file of unclosed openers is read once, not once per opener (Codex
+    // PRRT_kwDOPxxmWM6s4vbk). A longer name is refused.
+    GROUP_OPENER.lastIndex = index;
+    const group = GROUP_OPENER.exec(pattern);
+    if (group !== null) return groupStep(group[1] === "P", group[2]);
+    if (/^\(\?P?<(?![=!])/.test(pattern.slice(index, index + 4))) {
       return { text: "", length: 0, refused: "this '(?P<name>' group name" };
     }
-    const length = group[1] === "P" ? 4 : 3;
-    return { text: "(?<", length, groupName: group[2] };
   }
   if (pattern[index] !== "[") return { text: pattern[index], length: 1 };
   const open = pattern[index + 1] === "^" ? "[^" : "[";
   if (pattern[index + open.length] === "]") return { text: "", length: 0, refused: "'[]...]'" };
   return { text: open, length: open.length, inClass: true };
+}
+
+const GROUP_OPENER = /\(\?(P?)<(?![=!])([^>]{0,128})>/y;
+
+/**
+ * Rust's capture-name rule (a letter or `_`, then letters, numbers, `_`, `.`, `[` or `]`, with
+ * Unicode's Alphabetic and Numeric properties; Codex PRRT_kwDOPxxmWM6s4vbi). JavaScript then
+ * enforces its side when it compiles the pattern: it rejects `.`, `[` and `]`.
+ */
+function groupStep(rustOnlyForm: boolean, name: string): SyntaxStep {
+  if (!/^[\p{Alphabetic}_][\p{Alphabetic}\p{N}_.[\]]*$/u.test(name)) {
+    return { text: "", length: 0, refused: "this '(?P<name>' group name" };
+  }
+  return { text: "(?<", length: rustOnlyForm ? 4 : 3, groupName: name };
 }
 
 /** Inside a class: nested classes and set operators are refused, `]` closes it. */
@@ -533,7 +549,8 @@ function classStep(pattern: string, index: number): SyntaxStep {
 
 /** The escape at `index`: `\` and one character, plus the hex digits of `\xhh` and `\uhhhh`. */
 function readEscape(pattern: string, index: number): string {
-  const hex = /^\\(?:x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4})/.exec(pattern.slice(index));
+  // A bounded slice: an escape is at most 6 characters, and each escape is read once.
+  const hex = /^\\(?:x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4})/.exec(pattern.slice(index, index + 6));
   return hex?.[0] ?? pattern.slice(index, index + 2);
 }
 

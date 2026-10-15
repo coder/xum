@@ -457,6 +457,12 @@ describe("loadPluginCodexHooks", () => {
     for (const pattern of ["(?P<tool>Bash)|(?P<tool>Edit)", "(?P<tool>Bash)|(?<tool>Edit)"]) {
       expect(() => compileHookMatcher(pattern)).toThrow(SyntaxError);
     }
+    // A combining mark Rust counts as alphabetic (U+0345) passes (Codex PRRT_kwDOPxxmWM6s4vbi).
+    expect(matching("^(?P<a\u0345>Bash)$", ["Bash"])).toEqual(["Bash"]);
+    // Many unclosed openers are refused in linear time (Codex PRRT_kwDOPxxmWM6s4vbk).
+    const started = performance.now();
+    expect(() => compileHookMatcher("(?<".repeat(80_000))).toThrow(SyntaxError);
+    expect(performance.now() - started).toBeLessThan(500);
     // An escaped backslash before `A` is a literal backslash and `A`, not an anchor.
     expect(matching("^a\\\\A$", ["a\\A", "a"])).toEqual(["a\\A"]);
   });
