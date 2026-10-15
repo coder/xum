@@ -1777,22 +1777,7 @@ export class DraftStore {
             await this.migrateLegacyDrafts(client);
             // A replaced run must not open writes for the client after it (#6542).
             if (signal.aborted || this.client !== client) break;
-            this.snapshotClient = client;
-            this.hydrated = true;
-            this.markReady();
-            for (const entry of this.entries.values()) this.scheduleFlush(entry);
-            for (const key of [...this.pendingDeletes.keys()]) {
-              this.sendDelete(key, 0).catch(() => undefined);
-            }
-            for (const [key, pending] of this.pendingListPuts) {
-              if (pending.confirmedRevision === null) this.startListPut(key, pending);
-            }
-            // Load and every reconnect (a new subscription): resolve every pending send.
-            for (const entry of this.entries.values()) {
-              if (entry.scope.kind === "workspace" && entry.pendingSends.length > 0) {
-                this.triggerSendResolution(entry.scope.workspaceId, { afterStop: true });
-              }
-            }
+            this.openWrites(client);
           } else if (event.type === "list") {
             // Pushes that trail a newer snapshot are stale.
             if (event.revision > this.serverListRevision) this.applyList(event);
@@ -1824,6 +1809,26 @@ export class DraftStore {
       }
     };
     run().catch((error: unknown) => console.error("Draft subscription failed:", error));
+  }
+
+  /** `client`'s snapshot (and legacy import) applied: its writes may go out, held ones first. */
+  private openWrites(client: APIClient): void {
+    this.snapshotClient = client;
+    this.hydrated = true;
+    this.markReady();
+    for (const entry of this.entries.values()) this.scheduleFlush(entry);
+    for (const key of [...this.pendingDeletes.keys()]) {
+      this.sendDelete(key, 0).catch(() => undefined);
+    }
+    for (const [key, pending] of this.pendingListPuts) {
+      if (pending.confirmedRevision === null) this.startListPut(key, pending);
+    }
+    // Load and every reconnect (a new subscription): resolve every pending send.
+    for (const entry of this.entries.values()) {
+      if (entry.scope.kind === "workspace" && entry.pendingSends.length > 0) {
+        this.triggerSendResolution(entry.scope.workspaceId, { afterStop: true });
+      }
+    }
   }
 
   /**
