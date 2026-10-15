@@ -3,7 +3,7 @@ import type { FileReadToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { resolvePathWithinCwd, validateFileSize } from "./fileCommon";
-import { findSkillFileForPath, formatSkillFileHint } from "./skillFileHint";
+import { skillFileReadNote } from "./skillFileHint";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -151,8 +151,8 @@ export const createFileReadTool: ToolFactory = (config: ToolConfiguration) => {
         // Join lines with newlines
         const content = numberedLines.join("\n");
 
-        // Only a cut line pays for the skill lookup, so plain reads do no extra I/O.
-        const skillFile = cutLongLine ? await findSkillFileForPath(config, resolvedPath) : null;
+        // A cut skill file names the agent_skill_read_file call that returns it whole.
+        const skillNote = await skillFileReadNote(config, resolvedPath, cutLongLine);
 
         // Return file info and content
         return {
@@ -162,7 +162,7 @@ export const createFileReadTool: ToolFactory = (config: ToolConfiguration) => {
           lines_read: numberedLines.length,
           content,
           ...(pathWarning && { warning: pathWarning }),
-          ...(skillFile != null && { note: formatSkillFileHint(skillFile) }),
+          ...skillNote,
         };
       } catch (error) {
         // Handle specific errors

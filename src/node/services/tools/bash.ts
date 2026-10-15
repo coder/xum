@@ -36,7 +36,7 @@ import {
 } from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
-import { findSkillFileInScript, formatSkillFileHint } from "./skillFileHint";
+import { skillFileBashHint } from "./skillFileHint";
 import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
 
 const CAT_FILE_READ_NOTICE =
@@ -1692,10 +1692,8 @@ ${scriptWithEnv}`;
           await writerInstance.write(encoder.encode(fullOutput));
           await writerInstance.close();
 
-          // A script that reads a skill file by path gets the call that
-          // returns it whole; filtering it would drop the cut lines.
-          const skillFile = await findSkillFileInScript(config, script);
-          const skillFileHint = skillFile != null ? `${formatSkillFileHint(skillFile)}\n\n` : "";
+          // A script that reads a skill file by path gets the call that returns it whole.
+          const skillFileHint = await skillFileBashHint(config, script);
           const noticeBase = `[OUTPUT OVERFLOW - ${overflowReason ?? "unknown reason"}]
 
 Full output (${lines.length} lines) saved to ${overflowPath}
