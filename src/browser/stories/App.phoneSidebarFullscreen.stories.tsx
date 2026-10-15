@@ -8,7 +8,7 @@
  * is the Pixel capture of the open view at the phone viewport.
  */
 import { wrapAsyncIterator } from "@orpc/shared";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { ComponentType } from "react";
 
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -84,8 +84,8 @@ function setup(layout: RightSidebarLayoutState = LAYOUT, workspaceId = WORKSPACE
     ],
   });
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
-  // Collapsed on a wide layout earlier: opening the full-screen view expands it.
-  updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+  // Start without a preference: the default is collapsed, but the phone view must still open.
+  updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
   updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
   // The Browser tool polls for sessions; this story has none.
   client.browser = {
@@ -149,6 +149,8 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
       "true"
     );
     await within(sidebar).findByText(RUN_NAME);
+    // The view closes from its header, so its strip has no collapse button.
+    await expect(within(sidebar).queryByRole("button", { name: "Collapse sidebar" })).toBeNull();
     // Everything behind the view is inert, not just the chat: the left sidebar and the footer
     // sit outside the chat pane.
     await expect(chatPane.closest("[inert]")).not.toBeNull();
@@ -249,6 +251,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
       await waitFor(() => expect(sidebar).not.toHaveClass("right-sidebar-fullscreen"));
       await expect(sidebar).toBeVisible();
       await expect(within(sidebar).queryByRole("button", { name: "Close sidebar" })).toBeNull();
+      await expect(within(sidebar).getByRole("button", { name: "Collapse sidebar" })).toBeVisible();
     }
   },
 };

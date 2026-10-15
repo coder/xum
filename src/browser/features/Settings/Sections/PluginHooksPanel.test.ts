@@ -14,6 +14,14 @@ describe("describePluginHookHandler", () => {
     );
   });
 
+  test("names a hook's status message, so a change there is visible in the review", () => {
+    // Codex PRRT_kwDOPxxmWM6rQdyp: the status message is part of the hash.
+    const handler = { type: "mcp_tool" as const, server: "s", tool: "t", input: {} };
+    expect(describePluginHookHandler({ ...handler, statusMessage: "Scanning…" })).toContain(
+      'status "Scanning…"'
+    );
+  });
+
   test("shows the timeout that applies, not a huge parsed value", () => {
     const handler = { type: "mcp_tool" as const, server: "s", tool: "t", input: {} };
     const capped = describePluginHookHandler({ ...handler, timeoutSeconds: 2 ** 64 });
@@ -22,7 +30,7 @@ describe("describePluginHookHandler", () => {
     expect(describePluginHookHandler({ ...handler, timeoutSeconds: 5 })).toContain("timeout 5s");
   });
 
-  test("an omitted timeout reads as the runner default, not a number", () => {
+  test("an omitted timeout reads as the runner default, apart from a declared one", () => {
     const handler = { type: "mcp_tool" as const, server: "s", tool: "t", input: {} };
     const summary = describePluginHookHandler(handler);
     expect(summary).not.toContain("undefined");

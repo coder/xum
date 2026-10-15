@@ -12,8 +12,9 @@
  * counted (P8). Records and refusal texts carry no body, header value or key (P9).
  *
  * A `net` front owns the job's socket and pipes each connection to the HTTP server, which listens
- * on a socket in a private folder of its own. Bun 1.3.12's node:http server never reports a
- * connection whose request headers do not complete, so only the front can bound those: at most
+ * on a socket in a private folder of its own. node:http does not close a connection whose request
+ * headers never complete (Bun 1.4.3 kept one open past a 300 ms headersTimeout, measured), and
+ * Bun 1.3.12 did not even report it, so only the front can bound those: at most
  * MAX_CONNECTIONS, each destroyed twice the call deadline after it was accepted (an absolute
  * limit that no byte resets), and all destroyed by close(). Every response says
  * `connection: close`, so a client that behaves opens a new connection per call and never meets
@@ -223,8 +224,8 @@ export async function startProxy(options: ProxyOptions) {
         else json.push(chunk);
         if (!res.write(chunk)) await once(res, "drain", { signal: abort.signal });
       }
-      // Not awaited: the cost depends on the upstream answer, and Bun 1.3.12 never finishes an
-      // end() to a client that went away.
+      // Not awaited: the cost depends on the upstream answer, and an end() to a client that went
+      // away never finishes (Bun 1.3.12, Bun 1.4.3 and Node 22, measured).
       res.end();
       if (status !== 200 || abort.signal.aborted) return;
       if (sse) usage = parser.stopped && !parser.lowered ? parser.usage : undefined;
@@ -273,13 +274,10 @@ export async function startProxy(options: ProxyOptions) {
     if (calls.size >= MAX_IN_FLIGHT) return refuse(429, "concurrency: too many calls in flight");
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), deadlineMs);
-    // A client that goes away before the response ends aborts the call. Bun 1.3.12's node:http
-    // never reports that (no 'close', writes still succeed; Bun 1.4.2 does), so there the call
-    // runs on to its upstream end, its deadline or close(), and holds its slot until then.
-    // Bun.serve does report it, but it drops duplicate headers, which P2 must see.
-    // Removal trigger: the Bun bump that #4958 blocks. With it, make proxy.test.ts's "a client
-    // that goes away" test strict again (the call aborts and keeps its full reservation) and
-    // run it on the new Bun. On this host Bun 1.3.13 still misses the disconnect; 1.4.2 sees it.
+    // A client that goes away before the response ends aborts the call, which then keeps its
+    // full reservation (proxy.test.ts, "a client that goes away"). Bun 1.3.12's node:http never
+    // reported the disconnect, so this needs Bun 1.4 or later. Bun.serve reports it too, but it
+    // drops duplicate headers, which P2 must see.
     res.on("close", () => res.writableFinished || abort.abort());
     abort.signal.addEventListener("abort", () => res.destroy(), { once: true });
     const call = { abort, done: Promise.resolve() };
@@ -290,8 +288,8 @@ export async function startProxy(options: ProxyOptions) {
     calls.add(call);
   });
   // Not in a mounted folder: the container must reach the HTTP server only through the front.
-  // A unix socket path holds at most 107 bytes on Linux. Bun 1.3.12 binds longer ones (measured),
-  // but Node binds a cut-off path without an error. In a privateParent the names are short:
+  // A unix socket path holds at most 107 bytes on Linux. Bun 1.4.3 refuses a longer one with
+  // EINVAL, but Node binds a cut-off path without an error (both measured). In a privateParent the names are short:
   // `<parent>/h-XXXXXX/s` is as long as the launcher's `<job folder>/proxy/sock`, so the inner
   // socket never needs a longer path than the job socket (a long TMPDIR, such as a CI runner's).
   const inner = fs.mkdtempSync(
@@ -302,7 +300,8 @@ export async function startProxy(options: ProxyOptions) {
   const innerPath = path.join(inner, "s");
   const pipes = new Set<net.Socket>();
   const front = net.createServer((outer) => {
-    // Deferred: Bun 1.3.12 ignores a destroy() inside the connection handler itself.
+    // Deferred: Bun 1.3.12 was seen to ignore a destroy() inside the connection handler itself.
+    // A simple probe did not reproduce that on Bun 1.3.12 or 1.4.3. The deferral costs nothing.
     if (closed || pipes.size >= MAX_CONNECTIONS) return void setImmediate(() => outer.destroy());
     const peer = net.connect(innerPath);
     // Twice the call deadline, so the call deadline of a request sent at once answers first.

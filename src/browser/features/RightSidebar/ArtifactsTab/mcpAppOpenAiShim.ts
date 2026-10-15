@@ -26,8 +26,10 @@
  * Each lifecycle message is cached as a copy, so a widget that mutates its globals does not
  * change what its client is replayed. The shim leaves teardown replies to that client.
  * Members without a standard equivalent warn once; their Promises reject and nothing throws.
- * setWidgetState updates window.openai.widgetState in this page only: the state
- * lasts as long as the frame (a collapsed card or a move to the tab starts with null). Optional
+ * setWidgetState updates window.openai.widgetState at once and sends the state to the host
+ * (xum/widget-state, the newest of a burst at most every 100 ms), which stores it in the view's
+ * result record. The next document of the same
+ * view instance (a remount, a move to the tab, an app restart) starts with it (#6178). Optional
  * extensions Xum lacks (uploadFile, selectFiles, getFileDownloadUrl, requestCheckout,
  * requestModal, setOpenInAppUrl) are absent, so `if (window.openai?.selectFiles)` takes the
  * view's fallback.
@@ -45,6 +47,12 @@ export interface McpAppOpenAiSeed {
   platform: string;
   /** The inline cap; null in a panel, whose frame is as tall as its container. */
   maxHeight: number | null;
+  /**
+   * The state this view instance last stored with setWidgetState (mcpAppWidgetState.ts), or
+   * null. The only seed value that comes from the view: it is the view's own data, read back by
+   * the same instance.
+   */
+  widgetState?: unknown;
 }
 
 export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
@@ -58,7 +66,11 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
     locale: seed.locale,
     platform: seed.platform,
     ...(seed.maxHeight != null ? { containerDimensions: { maxHeight: seed.maxHeight } } : {}),
-  })
+    widgetState: seed.widgetState,
+  });
+  // SECURITY AUDIT: the seed as a JS string literal (JSON.stringify of the JSON text), escaped as
+  // described above, so neither "</script>" nor U+2028/U+2029 can end the script or the literal.
+  const seedString = JSON.stringify(seedJson)
     .replace(/</g, "\\u003c")
     .replace(/\u2028/g, "\\u2028")
     .replace(/\u2029/g, "\\u2029");
@@ -101,12 +113,37 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
     toolResponseMetadata: null,
     widgetState: null
   };
-  var seeded = fromHostContext(${seedJson});
+  // Parsed, not a JS literal: a "__proto__" key in the widget state stays an own property.
+  var seedValues = JSON.parse(${seedString});
+  var seeded = fromHostContext(seedValues);
   for (var seedKey in seeded) globals[seedKey] = seeded[seedKey];
+  // JSON drops an undefined seed: the Apps SDK's "no state" is null.
+  globals.widgetState = seedValues.widgetState === undefined ? null : seedValues.widgetState;
   setLang(globals.locale);
 
   function post(message) {
     send.call(parentWindow, message, "*");
+  }
+  // xum/widget-state: the first state of a burst goes out at once (a collapse right after one
+  // call must not drop it), later ones at most every WIDGET_STATE_INTERVAL_MS with the newest
+  // state, so a slider drag stays under the document channel's rate limit.
+  var WIDGET_STATE_INTERVAL_MS = 100;
+  var widgetStateTimer = null;
+  var widgetStatePending = false;
+  var widgetStateNewest = null;
+  function sendWidgetState(value) {
+    widgetStateNewest = value;
+    if (widgetStateTimer !== null) {
+      widgetStatePending = true;
+      return;
+    }
+    post({ jsonrpc: "2.0", method: "xum/widget-state", params: { state: value } });
+    widgetStateTimer = setTimer(function () {
+      widgetStateTimer = null;
+      if (!widgetStatePending) return;
+      widgetStatePending = false;
+      sendWidgetState(widgetStateNewest);
+    }, WIDGET_STATE_INTERVAL_MS);
   }
   // Every message the view posts goes through here; the shim's own posts do not.
   try {
@@ -283,7 +320,9 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
       request("ui/open-link", { url: String((args && args.href) || "") }).catch(function () {});
     },
     setWidgetState: function (state) {
-      setGlobals({ widgetState: state === undefined ? null : state });
+      var value = state === undefined ? null : state;
+      setGlobals({ widgetState: value });
+      sendWidgetState(value);
       return Promise.resolve();
     }
   };

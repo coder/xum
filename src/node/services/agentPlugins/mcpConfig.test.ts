@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { describe, expect, spyOn, test } from "bun:test";
 
 import type { MCPStdioServerInfo } from "@/common/types/mcp";
+import assert from "@/common/utils/assert";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { Config } from "@/node/config";
@@ -12,7 +13,8 @@ import { MCPConfigService } from "@/node/services/mcpConfigService";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
 import { log } from "@/node/services/log";
 import { readPluginMcpPolicy } from "./registry";
-import { createTestPluginInstallEntry } from "./testFixtures";
+import type { ComponentConsent } from "./componentConsent";
+import { createTestPluginInstallEntry, reviewedComponentConsent } from "./testFixtures";
 import type { AgentPluginInfo } from "./discovery";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import {
@@ -97,7 +99,9 @@ describe("loadPluginMcpServers", () => {
     // Reserved variables are appended last so configured env cannot shadow them.
     expect(Object.keys(info.env ?? {}).slice(-2)).toEqual(["PLUGIN_ROOT", "PLUGIN_DATA"]);
     expect(info.cwd).toBe(plugin.rootPath);
-    expect(info.plugin).toEqual({
+    const { consentFingerprint, ...provenance } = info.plugin ?? {};
+    expect(consentFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(provenance).toEqual({
       pluginName: "demo",
       serverName: "everything",
       sourceScope: "global",
@@ -229,19 +233,196 @@ describe("loadPluginMcpServers", () => {
     }
   });
 
+  test("a server named __proto__ is skipped: its consent could not be stored (#6534)", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    // JSON.parse makes `__proto__` an own key, as reading the file does.
+    const config = JSON.parse(
+      '{"__proto__": {"command": "node"}, "local": {"command": "node"}}'
+    ) as Record<string, unknown>;
+    const plugin = await makePlugin(tmp.path, "proto", config, { fileName: ".mcp.json" });
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    expect(Object.values(servers).map((s) => s.plugin?.serverName)).toEqual(["local"]);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0].message).toContain("server '__proto__'");
+  });
+
   test("the Codex dialect infers stdio from a command and accepts a flat server map", async () => {
     using tmp = new DisposableTempDir("plugin-mcp");
     const plugin = await makePlugin(
       tmp.path,
       "flat",
-      { local: { command: "node", args: ["server.js"] } },
+      {
+        local: { command: "node", args: ["server.js"] },
+        // Codex's plugin parser infers streamable HTTP from a url without a type.
+        remote: { url: "https://a.example.com/mcp" },
+      },
       { fileName: ".mcp.json" }
     );
     const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
     expect(diagnostics).toEqual([]);
     expect(Object.values(servers).map((s) => [s.plugin?.serverName, s.transport])).toEqual([
       ["local", "stdio"],
+      ["remote", "http"],
     ]);
+  });
+
+  test("the Codex dialect forwards only the host variables that env_vars names", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const plugin = await makePlugin(
+      tmp.path,
+      "env-vars",
+      {
+        mcpServers: {
+          // Codex accepts a bare name or { name, source } (codex-rs config mcp_types.rs).
+          named: {
+            command: "node",
+            // Codex's `source` is an Option<String>: null means unset, like an omitted source.
+            env_vars: [
+              "API_TOKEN",
+              { name: "REGION", source: "local" },
+              { name: "ZONE", source: null },
+            ],
+          },
+          // Codex reads null as an absent optional list (serde Option), on any transport.
+          nullList: { command: "node", env_vars: null },
+          nullRemote: { url: "https://b.example.com/mcp", env_vars: null },
+          notList: { command: "node", env_vars: "API_TOKEN" },
+          // Codex refuses source "remote" for a plugin that runs in the local environment.
+          remoteSource: { command: "node", env_vars: [{ name: "X", source: "remote" }] },
+          reserved: { command: "node", env_vars: ["PLUGIN_DATA"] },
+          badName: { command: "node", env_vars: ["A=B"] },
+          // Codex rejects env_vars on a streamable HTTP server.
+          http: { url: "https://a.example.com/mcp", env_vars: ["API_TOKEN"] },
+        },
+      },
+      { fileName: ".mcp.json" }
+    );
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    const infos = Object.values(servers);
+    expect(
+      infos.map((s) => [s.plugin?.serverName, s.transport === "stdio" ? s.forwardEnv : s.url])
+    ).toEqual([
+      ["named", ["API_TOKEN", "REGION", "ZONE"]],
+      ["nullList", undefined],
+      ["nullRemote", "https://b.example.com/mcp"],
+    ]);
+    // Only names: no host value is read at load time.
+    expect(Object.keys((infos[0] as MCPStdioServerInfo).env ?? {})).toEqual([
+      "PLUGIN_ROOT",
+      "PLUGIN_DATA",
+    ]);
+    expect(diagnostics.map((d) => [d.severity, /server '(\w+)'/.exec(d.message)?.[1]])).toEqual([
+      ["error", "notList"],
+      ["error", "remoteSource"],
+      ["error", "reserved"],
+      ["error", "badName"],
+      ["error", "http"],
+    ]);
+  });
+
+  test("a Codex stdio server says that its OAuth settings and loader variables are unused or risky", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const plugin = await makePlugin(
+      tmp.path,
+      "stdio-notes",
+      {
+        mcpServers: {
+          // Xum reads OAuth only for remote servers (#6646): say so, with or without env_vars.
+          withEnv: {
+            command: "node",
+            env_vars: ["API_TOKEN"],
+            oauth: { client_id: "c" },
+            scopes: ["read"],
+          },
+          withoutEnv: { command: "node", oauth_resource: "https://r.example.com" },
+          // These names change how the server process loads code: flag them in the review.
+          loaders: {
+            command: "node",
+            env_vars: ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS", "API_TOKEN"],
+          },
+          plain: { command: "node", env_vars: ["API_TOKEN"] },
+        },
+      },
+      { fileName: ".mcp.json" }
+    );
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    expect(Object.values(servers).map((s) => s.plugin?.serverName)).toEqual([
+      "withEnv",
+      "withoutEnv",
+      "loaders",
+      "plain",
+    ]);
+    const notes = diagnostics.map((d) => [d.severity, /server '(\w+)'/.exec(d.message)?.[1]]);
+    expect(notes).toEqual([
+      ["warning", "withEnv"],
+      ["warning", "withoutEnv"],
+      ["warning", "loaders"],
+    ]);
+    expect(diagnostics[0].message).toContain("oauth, scopes");
+    expect(diagnostics[1].message).toContain("oauth_resource");
+    expect(diagnostics[2].message).toContain("LD_PRELOAD, DYLD_INSERT_LIBRARIES, NODE_OPTIONS");
+    expect(diagnostics[2].message).not.toContain("API_TOKEN");
+  });
+
+  test("on Windows, reserved and duplicate env names compare without case", async () => {
+    // Windows env names are case-insensitive (#6646): plugin_data would shadow PLUGIN_DATA.
+    const original = Object.getOwnPropertyDescriptor(process, "platform");
+    assert(original !== undefined, "process.platform must be an own property");
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const plugin = await makePlugin(
+      tmp.path,
+      "win-env",
+      {
+        mcpServers: {
+          forwardReserved: { command: "node", env_vars: ["plugin_data"] },
+          envReserved: { command: "node", env: { Plugin_Root: "x" } },
+          duplicates: { command: "node", env_vars: ["API_TOKEN", "api_token"] },
+          // node_options is NODE_OPTIONS on Windows, so the review must name it.
+          loader: { command: "node", env_vars: ["node_options"] },
+        },
+      },
+      { fileName: ".mcp.json" }
+    );
+    const load = async (platform: NodeJS.Platform) => {
+      Object.defineProperty(process, "platform", { ...original, value: platform });
+      try {
+        return await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+      } finally {
+        Object.defineProperty(process, "platform", original);
+      }
+    };
+    const windows = await load("win32");
+    expect(
+      Object.values(windows.servers).map((s) => [
+        s.plugin?.serverName,
+        s.transport === "stdio" ? s.forwardEnv : undefined,
+      ])
+    ).toEqual([
+      ["duplicates", ["API_TOKEN"]],
+      ["loader", ["node_options"]],
+    ]);
+    expect(
+      windows.diagnostics.map((d) => [d.severity, /server '(\w+)'/.exec(d.message)?.[1]])
+    ).toEqual([
+      ["error", "forwardReserved"],
+      ["error", "envReserved"],
+      ["warning", "loader"],
+    ]);
+    // Elsewhere names are case-sensitive, so these are ordinary variables.
+    const linux = await load("linux");
+    expect(
+      Object.values(linux.servers).map((s) => [
+        s.plugin?.serverName,
+        s.transport === "stdio" ? s.forwardEnv : undefined,
+      ])
+    ).toEqual([
+      ["forwardReserved", ["plugin_data"]],
+      ["envReserved", undefined],
+      ["duplicates", ["API_TOKEN", "api_token"]],
+      ["loader", ["node_options"]],
+    ]);
+    // There node_options is not NODE_OPTIONS: no loader warning.
+    expect(linux.diagnostics.some((d) => d.message.includes("server 'loader'"))).toBe(false);
   });
 
   test("the Codex dialect maps streamable_http spellings and resolves a relative cwd", async () => {
@@ -288,11 +469,13 @@ describe("loadPluginMcpServers", () => {
       mcpDoc({
         http: { type: "http", url: "https://a.example.com" },
         oauth: { type: "streamable-http", url: "https://a.example.com", oauth: {} },
+        untyped: { url: "https://a.example.com" },
+        envVars: { ...STDIO_ENTRY, env_vars: ["API_TOKEN"] },
       })
     );
     const { servers, diagnostics } = await loadPluginMcpServers(dialect, { xumHome: tmp.path });
     expect(servers).toEqual({});
-    expect(diagnostics.map((d) => d.severity)).toEqual(["error", "error"]);
+    expect(diagnostics.map((d) => d.severity)).toEqual(["error", "error", "error", "error"]);
   });
 
   test("skips remote entries with configured headers (redirect conformance) with a warning", async () => {
@@ -886,7 +1069,13 @@ describe("createAgentPluginsMcpProvider", () => {
           registryPath,
           JSON.stringify({
             plugins: [
-              createTestPluginInstallEntry("managed", { skills: [], mcpServers: ["allowed"] }),
+              createTestPluginInstallEntry(
+                "managed",
+                { skills: [], mcpServers: ["allowed"] },
+                await reviewedComponentConsent({
+                  pluginDir: path.join(xumHome, "plugins", "managed"),
+                })
+              ),
             ],
           })
         );
@@ -948,6 +1137,65 @@ describe("createAgentPluginsMcpProvider", () => {
     }
   );
 
+  test("a managed server loads only as the definition the user reviewed (#6498)", async () => {
+    using home = new DisposableTempDir("plugin-mcp-consent");
+    await withHomeDir(home.path, async () => {
+      const xumHome = path.join(home.path, ".xum");
+      const container = path.join(xumHome, "plugins");
+      await writeDiscoverablePlugin(container, "managed", mcpDoc({ srv: STDIO_ENTRY }));
+      await writeDiscoverablePlugin(
+        path.join(home.path, ".agents", "plugins"),
+        "unmanaged",
+        mcpDoc({ free: STDIO_ENTRY })
+      );
+      const registryPath = path.join(xumHome, "plugins.json");
+      const saveConsent = (componentConsent?: ComponentConsent) =>
+        fs.writeFile(
+          registryPath,
+          JSON.stringify({
+            plugins: [
+              createTestPluginInstallEntry(
+                "managed",
+                { skills: [], mcpServers: ["srv"] },
+                componentConsent
+              ),
+            ],
+          })
+        );
+      const provider = createAgentPluginsMcpProvider({ xumHome });
+      // The provider drops a managed server whose registration the policy does not allow.
+      const loaded = async () =>
+        Object.values(await provider({ trusted: false }))
+          .map((info) => info.plugin?.serverName)
+          .sort();
+      await saveConsent();
+      const reviewed = await reviewedComponentConsent({
+        pluginDir: path.join(container, "managed"),
+      });
+
+      // An install from before #6498 has no records: its imported server does not start.
+      expect(await loaded()).toEqual(["free"]);
+      // A record for another definition under the same name is no consent either.
+      await saveConsent({
+        skills: {},
+        mcpServers: { srv: "0".repeat(64) },
+        workflows: {},
+        agents: {},
+        slashCommands: {},
+      });
+      expect(await loaded()).toEqual(["free"]);
+      await saveConsent(reviewed);
+      expect(await loaded()).toEqual(["free", "srv"]);
+      // A change the parser sees (here: args) under the reviewed name needs a new review.
+      await writeDiscoverablePlugin(
+        container,
+        "managed",
+        mcpDoc({ srv: { ...STDIO_ENTRY, args: ["-y", "another-server"] } })
+      );
+      expect(await loaded()).toEqual(["free"]);
+    });
+  });
+
   test("an escaped project alias does not discard its distinct valid global MCP registration", async () => {
     using home = new DisposableTempDir("plugin-provider-outward-home");
     using project = new DisposableTempDir("plugin-provider-outward-project");
@@ -963,7 +1211,11 @@ describe("createAgentPluginsMcpProvider", () => {
         path.join(xumHome, "plugins.json"),
         JSON.stringify({
           plugins: [
-            createTestPluginInstallEntry("managed", { skills: [], mcpServers: ["allowed"] }),
+            createTestPluginInstallEntry(
+              "managed",
+              { skills: [], mcpServers: ["allowed"] },
+              await reviewedComponentConsent({ pluginDir: path.join(owner, "managed") })
+            ),
           ],
         })
       );

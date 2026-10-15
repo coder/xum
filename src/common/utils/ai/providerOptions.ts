@@ -28,6 +28,7 @@ import {
   anthropicSupportsNativeXhigh,
   ANTHROPIC_THINKING_BUDGETS,
   GEMINI_THINKING_BUDGETS,
+  GEMINI_THINKING_LEVELS,
   getOpenAIReasoningEffort,
   isGpt6LunaModel,
   grokSupportsNativeXhigh,
@@ -373,6 +374,42 @@ function anthropicThinkingBlockBindingAvailable(
 }
 
 /**
+ * Block-binding eligibility on every route: the direct Anthropic API (checked by
+ * anthropicThinkingBlockBindingAvailable), or the `coder` route to an
+ * anthropic-typed AI Gateway instance. The Coder AI Gateway forwards the beta
+ * header and block_binding to such an instance's upstream (its Bedrock path
+ * converts or strips both together). Live probe through dogfood (2026-10-15):
+ * Opus/Sonnet/Haiku 5.5 and Fable 5.1 drop the stale block (200) instead of
+ * a 400, and adding block_binding keeps the prompt cache. Without it, every
+ * prefix change, such as an app restart that changes the MCP tool list, costs
+ * each conversation a rejected request and a retry.
+ */
+function anthropicBlockBindingRouteAvailable(
+  modelString: string,
+  routeProvider: ProviderName | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  muxProviderOptions: MuxProviderOptions | undefined
+): boolean {
+  if (routeProvider !== "coder") {
+    return anthropicThinkingBlockBindingAvailable(
+      modelString,
+      routeProvider,
+      providersConfig,
+      muxProviderOptions
+    );
+  }
+  // The backend's `providers.anthropic.disableBetaFeatures` (ZDR) is authoritative for
+  // Coder Anthropic instances too (the coder provider has no opt-out of its own), and
+  // a persisted request `false` must not override it: check both sources, as the
+  // direct route does.
+  return (
+    providersConfig?.anthropic?.disableBetaFeatures !== true &&
+    muxProviderOptions?.anthropic?.disableBetaFeatures !== true &&
+    anthropicTypedCoderRoute(modelString, providersConfig)
+  );
+}
+
+/**
  * Route-aware eligibility for Anthropic's `thinking: { type: "between_tools" }`.
  * It needs no beta header but must reach the API verbatim, which only
  * @ai-sdk/anthropic 4.0.67+ does: the direct `anthropic` route (a base URL proxy
@@ -399,7 +436,22 @@ export function anthropicBetweenToolsRouteAvailable(
       !isCustomProviderConfig(anthropicConfig)
     );
   }
-  if (routeProvider !== "coder" || isCustomProviderConfig(providersConfig?.coder)) {
+  return routeProvider === "coder" && anthropicTypedCoderRoute(modelString, providersConfig);
+}
+
+/**
+ * Whether a Claude model on the `coder` route reaches an instance whose type is
+ * exactly "anthropic": a bedrock-typed instance also speaks the Anthropic wire,
+ * but its upstream is Bedrock, and any other or unknown type may reject fields.
+ */
+function anthropicTypedCoderRoute(
+  modelString: string,
+  providersConfig: ProvidersConfigMap | null | undefined
+): boolean {
+  if (
+    !resolveOptionsCanonicalModel(modelString, providersConfig).startsWith("anthropic:") ||
+    isCustomProviderConfig(providersConfig?.coder)
+  ) {
     return false;
   }
   // A model routed onto Coder from its canonical id (anthropic:x) goes to the
@@ -553,7 +605,7 @@ export function buildProviderOptions(
       // rejecting the whole request.
       const blockBinding =
         anthropicBindsThinkingToPrefix(capabilityModel) &&
-        anthropicThinkingBlockBindingAvailable(
+        anthropicBlockBindingRouteAvailable(
           modelString,
           routeProvider,
           providersConfig,
@@ -771,7 +823,7 @@ export function buildProviderOptions(
   // Build Google-specific options
   if (formatProvider === "google") {
     const capBareModelName = capModelName.split("/").at(-1) ?? capModelName;
-    const usesGeminiThinkingLevelConfig = capBareModelName.includes("gemini-3");
+    const usesGeminiThinkingLevelConfig = /gemini-[34]/.test(capBareModelName);
     const isGeminiFlashThinkingModel = isGeminiFlashThinkingLevelModelName(capBareModelName);
     let thinkingConfig: GoogleGenerativeAIProviderOptions["thinkingConfig"];
 
@@ -791,8 +843,7 @@ export function buildProviderOptions(
       if (usesGeminiThinkingLevelConfig) {
         // Policy enforcement should clamp to valid Google levels before this adapter runs.
         // Avoid leaking xhigh/max to Google if a caller bypasses policy.
-        thinkingConfig.thinkingLevel =
-          effectiveThinking === "xhigh" || effectiveThinking === "max" ? "high" : effectiveThinking;
+        thinkingConfig.thinkingLevel = GEMINI_THINKING_LEVELS[effectiveThinking];
       } else {
         // Gemini 2.5 uses thinkingBudget
         const budget = GEMINI_THINKING_BUDGETS[effectiveThinking];

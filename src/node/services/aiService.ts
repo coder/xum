@@ -98,6 +98,7 @@ import {
 import { formatHotMemoriesBlock } from "@/node/services/memoryHotSet";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 
+import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
@@ -558,7 +559,7 @@ export class AIService extends EventEmitter {
   /** Run the turn.stop prompt-hook chain for one finished turn (fail-open). */
   async runTurnStopHooks(
     workspaceId: string,
-    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">
+    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "model">
   ): Promise<TurnStopHookOutcome> {
     const cwd = eventSpine.hasMiddlewareFor("turn.stop", workspaceId)
       ? await this.resolvePromptHookCwd(workspaceId)
@@ -1179,6 +1180,24 @@ export class AIService extends EventEmitter {
     }
 
     return Ok(this.lastLlmRequestByWorkspace.get(workspaceId) ?? null);
+  }
+
+  /**
+   * Wired to WorkspaceService "metadata" events (like ComputerUseService): a removed (null) or
+   * archived workspace drops its in-memory request-building state, so it does not grow for the
+   * whole app run. An un-archived workspace rebuilds that state on its next send.
+   */
+  handleWorkspaceMetadata(event: {
+    workspaceId: string;
+    metadata: { archivedAt?: string; unarchivedAt?: string } | null;
+  }): void {
+    if (
+      event.metadata != null &&
+      !isWorkspaceArchived(event.metadata.archivedAt, event.metadata.unarchivedAt)
+    ) {
+      return;
+    }
+    this.turnRequestBuilder.forgetWorkspace(event.workspaceId);
   }
 
   async deleteWorkspace(workspaceId: string): Promise<Result<void>> {

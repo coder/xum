@@ -17,6 +17,7 @@ import { log } from "@/node/services/log";
 import { discoverWorkflowScripts } from "@/node/services/workflows/workflowScriptDiscovery";
 
 import { joinPathLike } from "@/node/services/hooks";
+import { isPluginSlashCommandConsented } from "./componentConsent";
 import { discoverWorkspaceAgentPlugins, type AgentPluginInfo } from "./discovery";
 
 /**
@@ -253,13 +254,16 @@ export async function buildWorkspaceComposition(
 
   // The loading path (collectPluginSlashCommands) applies the same first-wins
   // rule; here every declaration is listed so duplicate names show up as shadowed.
+  // An unreviewed managed command is not offered (#6629), so it neither wins nor shadows.
   const slashCommands = markShadowed(
     plugins.flatMap((plugin) =>
-      (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
-        name: command.name,
-        source: `plugin:${plugin.name}`,
-        ...(command.description !== undefined ? { description: command.description } : {}),
-      }))
+      (plugin.manifest.contributes?.slashCommands ?? [])
+        .filter((command) => isPluginSlashCommandConsented(plugin.componentConsent, command))
+        .map((command) => ({
+          name: command.name,
+          source: `plugin:${plugin.name}`,
+          ...(command.description !== undefined ? { description: command.description } : {}),
+        }))
     )
   );
 

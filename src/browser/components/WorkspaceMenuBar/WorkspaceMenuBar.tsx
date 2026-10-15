@@ -73,9 +73,10 @@ import { useWorkspaceActions, useWorkspaceContext } from "@/browser/contexts/Wor
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
-import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { addWindowListenerWhile, stopKeyboardPropagation } from "@/browser/utils/events";
 import {
   NARROW_VIEWPORT_MAX_WIDTH_PX,
+  RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
   WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
 } from "@/constants/layout";
 import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
@@ -158,6 +159,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const isArchiving = archivingWorkspaceIds.has(workspaceId);
   const { workspaceMetadata } = useWorkspaceContext();
   const artifactsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const mcpAppsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MCP_APPS);
   const openTerminalPopout = useOpenTerminal();
   const openInEditor = useOpenInEditor();
   const runtimeStatus = useRuntimeStatus(workspaceId);
@@ -205,10 +207,14 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const forkError = usePopoverError();
   const stopRuntimeError = usePopoverError();
 
-  const [rightSidebarCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
-    // This state is toggled from RightSidebar, so we need cross-component updates.
-    listener: true,
-  });
+  const [rightSidebarCollapsed] = usePersistedState<boolean>(
+    RIGHT_SIDEBAR_COLLAPSED_KEY,
+    RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
+    {
+      // This state is toggled from RightSidebar, so we need cross-component updates.
+      listener: true,
+    }
+  );
 
   // Notification on response toggle (workspace-level) - defaults to disabled
   const notifyOnResponse =
@@ -403,10 +409,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // openArtifact() (chat cards, file cards, Review, palette) and "Open in tab" on an MCP Apps
   // tool card: while the sidebar is hidden, they show their tab full-screen (RightSidebar
   // handles the same events on wider layouts).
+  // Each event listens only while its own experiment is on (MCP Apps are independent, #6760).
   useEffect(() => {
-    if (!artifactsExperimentEnabled) {
-      return;
-    }
     const handler = (event: Event) => {
       const detail = (event as CustomEvent<{ workspaceId: string }>).detail;
       if (detail?.workspaceId !== workspaceId || !isTimelineSidebarHidden()) {
@@ -423,13 +427,27 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       }
       openSidebarTab(appViewTabFor(detail.toolCallId), activeElement());
     };
-    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
-    window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
+    const removeAppView = addWindowListenerWhile(
+      mcpAppsExperimentEnabled,
+      CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
+      appViewHandler
+    );
+    const removeArtifact = addWindowListenerWhile(
+      artifactsExperimentEnabled,
+      CUSTOM_EVENTS.OPEN_ARTIFACT,
+      handler
+    );
     return () => {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
+      removeAppView();
+      removeArtifact();
     };
-  }, [artifactsExperimentEnabled, isTimelineSidebarHidden, openSidebarTab, workspaceId]);
+  }, [
+    artifactsExperimentEnabled,
+    mcpAppsExperimentEnabled,
+    isTimelineSidebarHidden,
+    openSidebarTab,
+    workspaceId,
+  ]);
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
@@ -875,6 +893,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           loadedSkills={loadedSkills}
           availableSkills={listInvocableSkills(skillList)}
           invalidSkills={skillList.invalidSkills}
+          skillWarnings={skillList.skillWarnings}
           unavailableSources={skillList.unavailableSources}
           skillLoadErrors={skillLoadErrors}
           loading={!skillListLoaded}

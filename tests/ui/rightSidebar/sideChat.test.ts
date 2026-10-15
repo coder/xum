@@ -21,7 +21,7 @@ import { collectAllTabsWithTabset, dockTabToEdge } from "@/browser/utils/rightSi
 import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import { makeSideChatTabType } from "@/browser/types/rightSidebar";
 
-import { getRightSidebarLayoutKey } from "@/common/constants/storage";
+import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import { updatePersistedState, readPersistedState } from "@/browser/hooks/usePersistedState";
 import { collectAllTabs, type RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { getRetryBarrierDerivation } from "@/browser/components/ChatPane/retryBarrierDerivation";
@@ -136,7 +136,9 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
   test("the launcher opens idle independent side chats without submitting the main draft or stopping its stream", async () => {
     const app = await createAppHarness({
       branchPrefix: "side-launcher",
-      beforeRender: (workspaceId) =>
+      beforeRender: (workspaceId) => {
+        // This test exercises the expanded launcher's panes, not the collapsed overview.
+        updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
         updatePersistedState(getRightSidebarLayoutKey(workspaceId), {
           version: 1,
           openTabsOnly: true,
@@ -152,7 +154,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
               { type: "tabset", id: "other-pane", tabs: ["costs"], activeTab: "costs" },
             ],
           },
-        }),
+        });
+      },
     });
     const service = app.env.services.toORPCContext().workspaceService;
     const send = jest.spyOn(service, "sendMessage");
@@ -232,7 +235,10 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
   }, 90_000);
 
   test("the launcher prevents duplicate requests and remains usable after creation fails", async () => {
-    const app = await createAppHarness({ branchPrefix: "side-launcher-retry" });
+    const app = await createAppHarness({
+      branchPrefix: "side-launcher-retry",
+      beforeRender: () => updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false),
+    });
     const service = app.env.services.toORPCContext().workspaceService;
     const create = jest.spyOn(service, "createSideChat");
     let rejectCreation!: (error: Error) => void;
@@ -747,6 +753,15 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
     const service = app.env.services.toORPCContext().workspaceService;
     const interruptSpy = jest.spyOn(service, "interruptStream");
     const collectors: ReturnType<typeof createStreamCollector>[] = [];
+    // Two live streams make React log thousands of "not wrapped in act(...)" warnings. Without
+    // --silent (CI passes it, a local run does not), jest builds and source-maps a stack for
+    // each one, which kept the event loop busy for most of the second stream's 10 s start
+    // budget (#6464). Drop only those warnings; every other console.error still prints.
+    const realError = console.error.bind(console);
+    const errorSpy = jest.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      if (typeof args[0] === "string" && args[0].includes("not wrapped in act(")) return;
+      realError(...args);
+    });
     try {
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const firstId = await waitForSideChatId(app);
@@ -754,13 +769,17 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
         timeout: 10_000,
       });
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
-      const secondId = await waitFor(async () => {
-        const sideChats = (await app.env.orpc.workspace.list()).filter(
-          (ws) => ws.sideChatParentWorkspaceId === app.workspaceId
-        );
-        expect(sideChats).toHaveLength(2);
-        return sideChats.find((ws) => ws.id !== firstId)!.id;
-      });
+      // Creating a side chat is backend work that can pass the default one-second budget (#6375).
+      const secondId = await waitFor(
+        async () => {
+          const sideChats = (await app.env.orpc.workspace.list()).filter(
+            (ws) => ws.sideChatParentWorkspaceId === app.workspaceId
+          );
+          expect(sideChats).toHaveLength(2);
+          return sideChats.find((ws) => ws.id !== firstId)!.id;
+        },
+        { timeout: 10_000 }
+      );
       // Registration precedes the open-tab event; dock only after that event selects the second.
       await waitFor(() => expect(getSidePane(app, secondId)).not.toBeNull(), { timeout: 10_000 });
       act(() => {
@@ -821,6 +840,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
     } finally {
       for (const collector of collectors) collector.stop();
       interruptSpy.mockRestore();
+      errorSpy.mockRestore();
       await app.dispose();
     }
   }, 90_000);

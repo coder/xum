@@ -6,7 +6,7 @@
  */
 
 import { wrapAsyncIterator } from "@orpc/shared";
-import { expect, fn, userEvent, within, waitFor } from "@storybook/test";
+import { expect, fn, userEvent, within, waitFor } from "storybook/test";
 import type { ComponentType } from "react";
 
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";

@@ -103,3 +103,15 @@ export function listInvocableSkills(
   qualified.sort((a, b) => a.name.localeCompare(b.name));
   return [...result.skills, ...qualified];
 }
+
+/**
+ * User-facing menu description for a skill (composer slash menu, ACP commands). A display
+ * name (SKILL.md `name` that is not the ID) labels the entry; the command stays the ID.
+ */
+export function formatSkillMenuDescription(
+  skill: { description: string; displayName?: string },
+  scopeLabel: string
+): string {
+  const label = skill.displayName ? `${skill.displayName}: ` : "";
+  return `${label}${skill.description} (${scopeLabel})`;
+}

@@ -204,7 +204,12 @@ export async function generateWorkspaceIdentity(
   /** Optional conversation turns context used for regenerate-title prompts. */
   conversationContext?: string,
   /** Optional most recent user message; included as additional context only — not given precedence over older turns. */
-  latestUserMessage?: string
+  latestUserMessage?: string,
+  /**
+   * Stops the request in flight (a deadline, or the workspace went away). Later candidates then
+   * fail at once without a request, since their fetch starts with the signal already aborted.
+   */
+  abortSignal?: AbortSignal
 ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> {
   if (candidates.length === 0) {
     return Err({ type: "unknown", raw: "No model candidates provided for name generation" });
@@ -214,8 +219,14 @@ export async function generateWorkspaceIdentity(
   // chat model so honoring naming settings does not displace the last fallback.
   const maxAttempts = Math.min(candidates.length, 4);
 
-  // Track the last classified error to return if all candidates fail
+  // The last classified error, returned if all candidates fail. A failed request explains the
+  // outcome better than a later candidate skipped before any request (often a provider the user
+  // never set up), so a skip is reported only when no request failed.
   let lastError: NameGenerationError | null = null;
+  let lastSkipError: NameGenerationError = {
+    type: "configuration",
+    raw: "No working model candidates were available for name generation.",
+  };
 
   for (let i = 0; i < maxAttempts; i++) {
     const candidate = candidates[i];
@@ -239,7 +250,7 @@ export async function generateWorkspaceIdentity(
       agentInitiated: true,
     });
     if (!modelResult.success) {
-      lastError = mapModelCreationError(modelResult.error, modelString);
+      lastSkipError = mapModelCreationError(modelResult.error, modelString);
       log.debug(`Name generation: skipping ${modelString} (${modelResult.error.type})`);
       continue;
     }
@@ -299,6 +310,7 @@ export async function generateWorkspaceIdentity(
       const currentStream = streamText({
         model: pinned.model,
         prompt: buildWorkspaceIdentityPrompt(message, conversationContext, latestUserMessage),
+        abortSignal,
         // Same route/wire receipt as model creation; also pins thinking off
         // explicitly for fallbacks (some providers default to medium otherwise).
         providerOptions: providerOptions as Parameters<typeof streamText>[0]["providerOptions"],
@@ -358,12 +370,7 @@ export async function generateWorkspaceIdentity(
     }
   }
 
-  return Err(
-    lastError ?? {
-      type: "configuration",
-      raw: "No working model candidates were available for name generation.",
-    }
-  );
+  return Err(lastError ?? lastSkipError);
 }
 
 /**

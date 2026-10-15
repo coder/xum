@@ -17,11 +17,20 @@ export const TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS = 2 * 60 * 1000;
 export const WORKTREE_DELETE_GIT_TIMEOUT_MS = 60 * 1000;
 
 /**
- * Bounds the best-effort `git fetch origin <trunk>` before a local worktree is added. A Git
- * credential helper (for example Coder's askpass waiting on missing external auth) can block the
- * fetch indefinitely; after this deadline creation continues from the local trunk.
+ * Bounds the best-effort `git fetch origin <trunk>` of a local worktree creation (before the
+ * worktree is added, or before the checkout of one whose files are populated after it is
+ * announced). A Git credential helper (for example Coder's askpass waiting on missing external
+ * auth) can block the fetch indefinitely; after this deadline creation continues from the refs
+ * it already has.
  */
 export const WORKTREE_CREATE_FETCH_TIMEOUT_MS = 15 * 1000;
+
+/**
+ * Bounds the backend's naming of a worktree workspace created before its name existed: the init
+ * hook waits for the name to rename the branch, so a slow or unreachable naming model must not
+ * hold setup longer than an origin fetch can.
+ */
+export const WORKSPACE_NAME_GENERATION_TIMEOUT_MS = 15 * 1000;
 
 /**
  * Bounds backup Git calls that can hang on a blackholed remote, while leaving room for a

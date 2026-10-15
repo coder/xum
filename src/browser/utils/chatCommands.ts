@@ -1578,7 +1578,7 @@ export interface CreateWorkspaceOptions {
   projectPath: string;
   /**
    * Workspace branch name. When omitted, the backend auto-generates one
-   * (e.g., "workspace-1", "workspace-2") so /new can mirror /fork's
+   * (e.g., "calm-otters-sing") so /new can mirror /fork's
    * seamless creation flow.
    */
   workspaceName?: string;

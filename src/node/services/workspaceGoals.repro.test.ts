@@ -428,12 +428,9 @@ describe("workspace goals: heartbeat races", () => {
             // Target assertion: no heartbeat turn starts once the heartbeat is off (the code's
             // queued entry had no settings check and dispatched at the drain point).
             expect(await heartbeatRows()).toBe(0);
-            // Turned off in this process, the queued heartbeat is dropped at once, so a tool-end
-            // heartbeat does not soft-stop the running turn only to be refused. Another backend's
-            // change is seen only at the drain, after the soft stop.
-            expect(stoppedTurn).toBe(
-              whenBusy === "tool-end" && change === "disable from another backend"
-            );
+            // Live admission checks refuse even another backend's disabled heartbeat before
+            // cutting the current tool; rejecting a wake must not interrupt useful work.
+            expect(stoppedTurn).toBe(false);
             expect(recorded("heartbeat.dispatched")).toHaveLength(0);
             expect(skipReasons).toEqual(["heartbeat_disabled"]);
             // The heartbeat held the goal's stream-end slot; with it gone the goal advances once:

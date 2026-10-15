@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { useEffect, useRef, type ReactNode } from "react";
 import { APIProvider } from "@/browser/contexts/API";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
@@ -976,7 +976,7 @@ export const FullscreenKeepsFocusWhenViewerSwaps: Story = {
   },
 };
 
-// MCP Apps view (artifacts experiment) in its app tab (no longer in Artifacts): a fake server
+// MCP Apps view (mcp-apps experiment) in its app tab (no longer in Artifacts): a fake server
 // view implementing the spec handshake.
 // The frame is opaque-origin, so the play test reads progress from the heights the view
 // reports: 321px only after initialize -> initialized -> tool-input -> tool-result, then
@@ -1161,6 +1161,81 @@ export const McpAppViewPhone: Story = {
   ...PHONE,
   render: () => renderMcpAppView(),
   play: ({ canvasElement }) => playMcpAppView(canvasElement),
+};
+
+/**
+ * #6165: Maximize pins the app tab over the whole window (the spec's fullscreen), with the same
+ * frame (no reload), and Restore returns it to the sidebar. Play only (shared Pixel cap).
+ */
+export const McpAppViewMaximized: Story = {
+  ...LAPTOP,
+  render: () => renderMcpAppView(),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = await canvas.findByTestId("mcp-app-frame");
+    const panel = canvas.getByTestId("app-view-tab-panel");
+    const sidebarWidth = panel.getBoundingClientRect().width;
+    await userEvent.click(canvas.getByRole("button", { name: "Maximize view" }));
+    await waitFor(() => expect(panel.getBoundingClientRect().width).toBe(window.innerWidth));
+    await expect(canvas.getByTestId("mcp-app-frame")).toBe(frame);
+    await userEvent.click(canvas.getByRole("button", { name: "Restore view" }));
+    await waitFor(() => expect(panel.getBoundingClientRect().width).toBe(sidebarWidth));
+    await expect(canvas.getByTestId("mcp-app-frame")).toBe(frame);
+  },
+};
+
+// A tab whose view failed to load offers Reload. The mock has no view for the call at first (the
+// load fails); the play adds it and presses Reload, which remounts the frame.
+const RELOAD_TOOL_CALL_ID = "call-weather-reload";
+const reloadViews: Record<string, McpAppView> = {};
+function renderMcpAppViewReload() {
+  delete reloadViews[RELOAD_TOOL_CALL_ID];
+  openMcpAppViewTab(WORKSPACE_ID, {
+    toolCallId: RELOAD_TOOL_CALL_ID,
+    serverName: "weather",
+    resourceUri: "ui://weather/view.html",
+    toolName: "show_weather",
+    label: "Show weather",
+    arguments: { city: "Berlin" },
+    cancelled: false,
+    failed: false,
+  });
+  return (
+    <APIProvider client={createMockORPCClient({ mcpApps: { views: reloadViews } })}>
+      {/* Pinned to a phone's sidebar width: the test runner plays at desktop size. */}
+      <div data-testid="phone-width" className="bg-sidebar h-screen" style={{ width: 358 }}>
+        <AppViewTabPanel
+          workspaceId={WORKSPACE_ID}
+          toolCallId={RELOAD_TOOL_CALL_ID}
+          onClose={() => undefined}
+        />
+      </div>
+    </APIProvider>
+  );
+}
+/** Failed load, then Reload: Play only (the stack adds no Pixel snapshots, shared cap). */
+export const McpAppViewReloadPhone: Story = {
+  ...PHONE,
+  render: () => renderMcpAppViewReload(),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText(/No view for call-weather-reload/);
+    const reload = canvas.getByRole("button", { name: "Reload" });
+    // The button stays inside the narrow tab.
+    const tab = canvas.getByTestId("phone-width").getBoundingClientRect();
+    await expect(reload.getBoundingClientRect().right).toBeLessThanOrEqual(tab.right);
+    reloadViews[RELOAD_TOOL_CALL_ID] = {
+      html: "<p>Berlin</p>",
+      csp: {},
+      prefersBorder: null,
+      resultAvailable: true,
+      result: { content: [{ type: "text", text: "Berlin: 18°C" }] },
+      approvalProjectPath: "/repo",
+      invocation: null,
+    };
+    await userEvent.click(reload);
+    await canvas.findByTestId("mcp-app-frame");
+  },
 };
 
 // A view that declares https domains asks once per server; until then it runs on the base policy.

@@ -2,7 +2,12 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { describe, expect, spyOn, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { readPluginComponentImports, readPluginMcpPolicy } from "./registry";
+import type { MCPServerPluginProvenance } from "@/common/types/mcp";
+import {
+  isPluginMcpServerAllowed,
+  readPluginComponentImports,
+  readPluginMcpPolicy,
+} from "./registry";
 import { createTestPluginInstallEntry } from "./testFixtures";
 
 const legacy = createTestPluginInstallEntry("demo");
@@ -107,6 +112,72 @@ describe("readPluginMcpPolicy", () => {
       createTestPluginInstallEntry("other", { skills: [], mcpServers: ["b"] }),
     ]);
     expect(await readPluginMcpPolicy(registryPath)).not.toEqual(before);
+  });
+
+  test("a managed server is allowed only for its reviewed fingerprint (#6498)", async () => {
+    using tmp = new DisposableTempDir("mcp-policy-consent");
+    await fs.mkdir(path.join(tmp.path, "plugins"));
+    const registryPath = path.join(tmp.path, "plugins.json");
+    const save = async (componentConsent?: Parameters<typeof createTestPluginInstallEntry>[2]) => {
+      await readRows(registryPath, [
+        createTestPluginInstallEntry("demo", { skills: [], mcpServers: ["srv"] }, componentConsent),
+      ]);
+      return readPluginMcpPolicy(registryPath);
+    };
+    const unreviewed = await save();
+    const server: MCPServerPluginProvenance = {
+      pluginName: "demo",
+      serverName: "srv",
+      sourceScope: "global",
+      sourceLocation: "plugins/demo",
+      componentPolicy: { registryPath: unreviewed.registryPath, name: "demo" },
+      consentFingerprint: "reviewed",
+    };
+    // An imported name without a record (every install from before #6498) does not start.
+    expect(isPluginMcpServerAllowed(server, unreviewed)).toBe(false);
+    // Neither does a record for another fingerprint, or a skill record of the same name.
+    expect(
+      isPluginMcpServerAllowed(
+        server,
+        await save({
+          skills: {},
+          mcpServers: { srv: "x" },
+          workflows: {},
+          agents: {},
+          slashCommands: {},
+        })
+      )
+    ).toBe(false);
+    expect(
+      isPluginMcpServerAllowed(
+        server,
+        await save({
+          skills: { srv: "reviewed" },
+          mcpServers: {},
+          workflows: {},
+          agents: {},
+          slashCommands: {},
+        })
+      )
+    ).toBe(false);
+    const reviewed = await save({
+      skills: {},
+      mcpServers: { srv: "reviewed" },
+      workflows: {},
+      agents: {},
+      slashCommands: {},
+    });
+    expect(isPluginMcpServerAllowed(server, reviewed)).toBe(true);
+    // A consent change is a policy change, so running clients are rechecked.
+    expect(reviewed).not.toEqual(unreviewed);
+    // A server whose load computed no fingerprint never matches.
+    expect(isPluginMcpServerAllowed({ ...server, consentFingerprint: undefined }, reviewed)).toBe(
+      false
+    );
+    // Unmanaged servers (no install owner) are not gated.
+    expect(isPluginMcpServerAllowed({ ...server, componentPolicy: undefined }, unreviewed)).toBe(
+      true
+    );
   });
 
   test("owner retarget during the registry read cannot authorize the old canonical owner", async () => {

@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { DndContext, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
 import { arrayMove, SortableContext, horizontalListSortingStrategy } from "@dnd-kit/sortable";
 import { useState } from "react";
@@ -37,7 +37,7 @@ const METADATA: WorkspaceMetadataContextValue = {
   loadError: null,
 };
 
-function StripFixture(props: { width: number }) {
+function StripFixture(props: { width: number; collapsible: boolean }) {
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
   const [selected, setSelected] = useState<TabType>("new");
   const [closed, setClosed] = useState<TabType[]>([]);
@@ -120,6 +120,7 @@ function StripFixture(props: { width: number }) {
                 items={items}
                 tabsetId="fixture"
                 onAddNewTab={() => setSelected("new")}
+                onCollapseSidebar={props.collapsible ? () => undefined : undefined}
               />
             </SortableContext>
           </DndContext>
@@ -200,11 +201,63 @@ async function checkStableControls(canvasElement: HTMLElement) {
   await expect(canvas.getAllByText(LONG_TITLE).length).toBeGreaterThanOrEqual(2);
 }
 
+/** "+" follows the last tab; tabs that overflow scroll in their row without pushing it away. */
+async function checkNewTabButton(canvasElement: HTMLElement, overflowing: boolean) {
+  const canvas = within(canvasElement);
+  const row = canvas.getByRole("tablist");
+  const tabs = within(row).getAllByRole("tab");
+  const plusButton = canvas.getByRole("button", { name: "New tab" });
+  const plus = plusButton.getBoundingClientRect();
+  const rowRect = row.getBoundingClientRect();
+  await expect(row.scrollWidth > row.clientWidth).toBe(overflowing);
+  await expect(plus.left - rowRect.right).toBeGreaterThanOrEqual(0);
+  await expect(plus.left - rowRect.right).toBeLessThanOrEqual(8);
+  await expect(plus.right).toBeLessThanOrEqual(row.parentElement!.getBoundingClientRect().right);
+  const hit = document.elementFromPoint(plus.left + plus.width / 2, plus.top + plus.height / 2);
+  await expect(hit != null && plusButton.contains(hit)).toBe(true);
+  if (!overflowing) {
+    await expect(rowRect.right - tabs[tabs.length - 1].getBoundingClientRect().right).toBeLessThan(
+      1
+    );
+  }
+}
+
 export const Narrow: Story = {
-  args: { width: 300 },
-  play: async ({ canvasElement }) => checkStableControls(canvasElement),
+  // No collapse button, like the phone full-screen strip (the test-runner swipes this one at
+  // phone width, see .storybook/test-runner.ts).
+  args: { width: 300, collapsible: false },
+  play: async ({ canvasElement }) => {
+    await checkStableControls(canvasElement);
+    await checkNewTabButton(canvasElement, true);
+  },
 };
 export const Wide: Story = {
-  args: { width: 900 },
-  play: async ({ canvasElement }) => checkStableControls(canvasElement),
+  // Wide enough for every tab beside "+" and the collapse button.
+  args: { width: 1000, collapsible: true },
+  play: async ({ canvasElement }) => {
+    await checkStableControls(canvasElement);
+    await checkNewTabButton(canvasElement, false);
+    // The collapse button holds the strip's right end, past the free space after "+".
+    const canvas = within(canvasElement);
+    const plus = canvas.getByRole("button", { name: "New tab" }).getBoundingClientRect();
+    const collapse = canvas
+      .getByRole("button", { name: "Collapse sidebar" })
+      .getBoundingClientRect();
+    const strip = canvas.getByRole("tablist").parentElement!.getBoundingClientRect();
+    await expect(collapse.left - plus.right).toBeGreaterThan(8);
+    await expect(strip.right - collapse.right).toBeLessThanOrEqual(9);
+  },
+};
+export const Cramped: Story = {
+  // A split pane at its minimum width (15% of a 300 px sidebar) has no room for both buttons.
+  args: { width: 45, collapsible: true },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const collapse = canvas
+      .getByRole("button", { name: "Collapse sidebar" })
+      .getBoundingClientRect();
+    const strip = canvas.getByRole("tablist").parentElement!.getBoundingClientRect();
+    await expect(collapse.left).toBeGreaterThanOrEqual(strip.left);
+    await expect(collapse.right).toBeLessThanOrEqual(strip.right);
+  },
 };

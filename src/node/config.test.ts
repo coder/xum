@@ -1188,6 +1188,50 @@ describe("Config", () => {
     });
   });
 
+  // #6485: on Windows, an id-less legacy row's checkout path uses backslashes. The old session
+  // layout keys its metadata by the checkout basename, so the lookup must split on "\\" too. The
+  // backend helper reads process.platform once at import, so the Windows cases run on Windows
+  // only (CI's "Test / Windows" job runs this describe).
+  describe("legacy rows with a Windows checkout path", () => {
+    const onWindows = process.platform === "win32" ? it : it.skip;
+    const offWindows = process.platform === "win32" ? it.skip : it;
+
+    function seedBasenameLayout(projectPath: string, checkout: string, id: string): void {
+      // The old layout: sessions/<checkout basename>/metadata.json names the stable id.
+      const dir = path.join(config.sessionsDir, "feature-x");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "metadata.json"), JSON.stringify({ id, projectPath }));
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ projects: [[projectPath, { workspaces: [{ path: checkout }] }]] })
+      );
+    }
+
+    const winProject = "C:\\Users\\u\\repo";
+    const winCheckout = "C:\\Users\\u\\.xum\\src\\repo\\feature-x";
+
+    onWindows(
+      "resolves the stable id from the basename metadata in the metadata build",
+      async () => {
+        seedBasenameLayout(winProject, winCheckout, "stable-1");
+        const metadata = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+        expect(metadata.map((meta) => meta.id)).toEqual(["stable-1"]);
+      }
+    );
+
+    onWindows("finds the workspace by the stable id from the basename metadata", () => {
+      seedBasenameLayout(winProject, winCheckout, "stable-1");
+      expect(config.findWorkspace("stable-1")?.workspacePath).toBe(winCheckout);
+    });
+
+    // POSIX keeps today's basename: the helper splits only on "/" off Windows.
+    offWindows("keeps the POSIX basename lookup unchanged", () => {
+      const posixCheckout = "/home/u/.xum/src/repo/feature-x";
+      seedBasenameLayout("/home/u/repo", posixCheckout, "stable-2");
+      expect(config.findWorkspace("stable-2")?.workspacePath).toBe(posixCheckout);
+    });
+  });
+
   // Stored keys that normalize to the same project path ("aliases", e.g. "/repo" and "/repo/").
   // The loader used to build `new Map(pairs)`, so the last alias silently replaced the others
   // and the next save dropped their workspace rows.
@@ -1588,6 +1632,46 @@ describe("Config", () => {
       }
     );
 
+    // #6595: the logged-signature set holds at most 16 per file and drops the oldest first, so
+    // a content that comes back after 16 newer failures logs again.
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "logs a failed backup again once 16 newer contents pushed it out of the set",
+      () => {
+        // 17 distinct conflicting contents: same rows, a different title on the shared id.
+        const content = (index: number): StoredPair[] => [
+          ["/home/u/repo", { workspaces: [row("ws-same", { title: "first" }), row("ws-one")] }],
+          [
+            "/home/u/repo/",
+            { workspaces: [row("ws-same", { title: `v${index}` }), row("ws-two")] },
+          ],
+        ];
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        const logged = () =>
+          errorSpy.mock.calls.filter(([message]) => String(message).includes("the backup of"))
+            .length;
+        // config.json must exist before the dir turns read-only: later writes replace it in place.
+        writeProjects(content(0));
+        fs.chmodSync(tempDir, 0o500);
+        try {
+          for (let index = 0; index < 17; index++) {
+            writeProjects(content(index));
+            config.loadConfigOrDefault();
+          }
+          expect(logged()).toBe(17);
+          // Content 16 is still in the set; content 0 was dropped as the oldest.
+          writeProjects(content(16));
+          config.loadConfigOrDefault();
+          expect(logged()).toBe(17);
+          writeProjects(content(0));
+          config.loadConfigOrDefault();
+          expect(logged()).toBe(18);
+        } finally {
+          fs.chmodSync(tempDir, 0o700);
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
     (process.getuid?.() === 0 ? it.skip : it)(
       "logs a failed backup again after a load without the conflict ends the failure",
       () => {
@@ -1661,6 +1745,22 @@ describe("Config", () => {
             ["/home/u/repo", { workspaces: [row("ws-one")] }],
             ["/home/u/repo/", { workspaces: [row("ws-two")] }],
           ] as StoredPair[],
+      ],
+      [
+        // #6595: the single-key check runs, but no id row shares the legacy row's path.
+        "one key with a legacy row on its own path",
+        () =>
+          [
+            [
+              "/home/u/repo",
+              {
+                workspaces: [
+                  row("ws-one"),
+                  { name: "legacy", path: path.join(config.srcDir, "repo", "legacy") },
+                ],
+              },
+            ],
+          ] as unknown as StoredPair[],
       ],
     ] as const) {
       it(`reads no session metadata and lists no directory on a load with ${name}`, () => {
@@ -1754,6 +1854,39 @@ describe("Config", () => {
         });
       }
 
+      // #6595: a legacy metadata.json that parses but names no id leaves the row's identity
+      // unknown, so the merge keeps both rows.
+      it("keeps both rows when the legacy metadata.json names no id", () => {
+        const checkout = checkoutPath();
+        const dir = path.join(
+          config.sessionsDir,
+          config.generateLegacyId("/home/u/repo", checkout)
+        );
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, "metadata.json"), "{}");
+        writeLegacyAndIdRows(checkout, config.generateLegacyId("/home/u/repo", checkout));
+        const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+        expect(rows?.filter((w) => w.path === checkout)).toHaveLength(2);
+        expect(aliasConflictBackups()).toHaveLength(0);
+      });
+
+      // #6595: only the old layout's sessions/<checkout basename>/metadata.json exists and names
+      // the id row's id: the legacy row is that workspace, so the merge keeps one row.
+      it("keeps one row when only the basename metadata.json names the id row's id", async () => {
+        const checkout = checkoutPath();
+        const dir = path.join(config.sessionsDir, path.basename(checkout));
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, "metadata.json"), JSON.stringify({ id: "stable-1" }));
+        writeLegacyAndIdRows(checkout, "stable-1");
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          expect(await savedIdsOnCheckout(checkout)).toEqual(["stable-1"]);
+          expect(aliasConflictBackups()).toHaveLength(1);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
       it("keeps both rows when the two legacy metadata files name different ids", () => {
         const checkout = checkoutPath();
         writeLegacyMetadata(checkout, "stable-1");
@@ -1783,6 +1916,50 @@ describe("Config", () => {
         const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
         expect(rows?.map((w) => w.id)).toEqual([undefined, "stable-1"]);
         expect(config.getConfigLoadError()).toBeNull();
+      });
+
+      // #6595: the same legacy copy under ONE stored key (no alias group).
+      function writeSingleKeyLegacyAndIdRows(checkout: string, id: string): void {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              [
+                "/home/u/repo",
+                {
+                  workspaces: [
+                    { name: "x", path: checkout },
+                    { id, name: "x", path: checkout },
+                  ],
+                },
+              ],
+            ],
+          })
+        );
+      }
+
+      it("keeps one row and backs up the bytes for a legacy copy under one key", async () => {
+        const checkout = checkoutPath();
+        const id = config.generateLegacyId("/home/u/repo", checkout);
+        writeSingleKeyLegacyAndIdRows(checkout, id);
+        const original = fs.readFileSync(path.join(tempDir, "config.json"));
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          expect(await savedIdsOnCheckout(checkout)).toEqual([id]);
+          const backups = aliasConflictBackups();
+          expect(backups).toHaveLength(1);
+          expect(fs.readFileSync(backups[0])).toEqual(original);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
+      it("keeps both rows under one key when the legacy row resolves to another id", () => {
+        const checkout = checkoutPath();
+        writeSingleKeyLegacyAndIdRows(checkout, "stable-1");
+        const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+        expect(rows?.filter((w) => w.path === checkout)).toHaveLength(2);
+        expect(aliasConflictBackups()).toHaveLength(0);
       });
 
       it("keeps both rows when the legacy row resolves to another id", async () => {
@@ -2494,6 +2671,483 @@ describe("Config", () => {
         watchSpy.mockRestore();
         fs.rmSync(dirA, { recursive: true, force: true });
         fs.rmSync(dirB, { recursive: true, force: true });
+      }
+    });
+
+    /** Replace a symlink atomically, as a dotfiles manager does. */
+    function repointLink(link: string, target: string): void {
+      fs.symlinkSync(target, `${link}.tmp`);
+      fs.renameSync(`${link}.tmp`, link);
+    }
+
+    it("notifies when the missing target of a dangling config.json symlink appears", async () => {
+      const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      try {
+        // Neither the target nor its folder exists yet.
+        const target = path.join(targetRoot, "dotfiles", "xum.json");
+        fs.symlinkSync(target, path.join(tempDir, "config.json"));
+        const next = nextNotification(config);
+        fs.mkdirSync(path.dirname(target));
+        fs.writeFileSync(target, JSON.stringify({ projects: [], updateChannel: "nightly" }));
+        await next.promise;
+        next.unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(targetRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("follows a repointed symlinked folder in the config.json target path", async () => {
+      const dotfiles = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-dotfiles-"));
+      try {
+        for (const [name, updateChannel] of [
+          ["a", undefined],
+          ["b", "npm"],
+        ] as const) {
+          fs.mkdirSync(path.join(dotfiles, name));
+          fs.writeFileSync(
+            path.join(dotfiles, name, "xum.json"),
+            JSON.stringify({ projects: [], updateChannel })
+          );
+        }
+        const current = path.join(dotfiles, "current");
+        fs.symlinkSync(path.join(dotfiles, "a"), current);
+        fs.symlinkSync(path.join(current, "xum.json"), path.join(tempDir, "config.json"));
+        let notified = Promise.withResolvers<void>();
+        const unsubscribe = config.onConfigChanged(() => notified.resolve());
+        // Only `current` changes: config.json and both target folders stay as they were.
+        repointLink(current, path.join(dotfiles, "b"));
+        await notified.promise;
+        expect(config.getUpdateChannel()).toBe("npm");
+        notified = Promise.withResolvers<void>();
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(dotfiles, { recursive: true, force: true });
+      }
+    });
+
+    it("follows a second relink that lands while the watches are reinstalled", async () => {
+      const dirs = ["a", "b", "c1", "c2"].map((name) =>
+        fs.mkdtempSync(path.join(os.tmpdir(), `mux-test-target-${name}-`))
+      );
+      const [dirA, dirB, dirC1, dirC2] = dirs;
+      const link = path.join(tempDir, "config.json");
+      // A second link in dirB: dirB gets its first watch in the reinstall, so a repoint of
+      // this link before that watch exists produces no event at all.
+      const innerLink = path.join(dirB, "link.json");
+      const realWatch = fs.watch;
+      // Armed after the first setup: the second relink belongs to the reinstall.
+      let armed = false;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (armed && fs.realpathSync(String(args[0])) === fs.realpathSync(dirB)) {
+          armed = false;
+          repointLink(innerLink, path.join(dirC2, "config.json"));
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      try {
+        for (const dir of [dirA, dirC1, dirC2]) {
+          fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ projects: [] }));
+        }
+        fs.symlinkSync(path.join(dirC1, "config.json"), innerLink);
+        fs.symlinkSync(path.join(dirA, "config.json"), link);
+        let notified = Promise.withResolvers<void>();
+        const unsubscribe = config.onConfigChanged(() => notified.resolve());
+        armed = true;
+        repointLink(link, innerLink);
+        await notified.promise;
+        expect(armed).toBe(false);
+        notified = Promise.withResolvers<void>();
+        // The save lands in dirC2: only a watch on dirC2 sees it.
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        watchSpy.mockRestore();
+        for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps watching after the target folder's watch fails", async () => {
+      const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-a-"));
+      const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-b-"));
+      const link = path.join(tempDir, "config.json");
+      const watchers = new Map<string, fs.FSWatcher>();
+      const realWatch = fs.watch;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        const watcher = realWatch(...args);
+        watchers.set(fs.realpathSync(String(args[0])), watcher);
+        return watcher;
+      }) as typeof fs.watch);
+      const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
+      try {
+        fs.writeFileSync(path.join(dirA, "config.json"), JSON.stringify({ projects: [] }));
+        fs.writeFileSync(
+          path.join(dirB, "config.json"),
+          JSON.stringify({ projects: [], updateChannel: "npm" })
+        );
+        fs.symlinkSync(path.join(dirA, "config.json"), link);
+        let notified = Promise.withResolvers<void>();
+        const unsubscribe = config.onConfigChanged(() => notified.resolve());
+        const targetWatcher = watchers.get(fs.realpathSync(dirA));
+        if (!targetWatcher) throw new Error("expected a watch on the target dir");
+        // A transient failure: the link and dirA stay as they were.
+        targetWatcher.emit("error", new Error("EPERM: operation not permitted"));
+        // The save lands in dirA, so only a reopened watch on dirA sees it.
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await notified.promise;
+        expect(config.getUpdateChannel()).toBe("nightly");
+        // The config dir watch still follows a relink.
+        notified = Promise.withResolvers<void>();
+        repointLink(link, path.join(dirB, "config.json"));
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("npm");
+      } finally {
+        debugSpy.mockRestore();
+        watchSpy.mockRestore();
+        fs.rmSync(dirA, { recursive: true, force: true });
+        fs.rmSync(dirB, { recursive: true, force: true });
+      }
+    });
+
+    it("logs a throwing listener's error on another process's edit and still notifies the rest", async () => {
+      await config.setUpdateChannel("npm");
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      // Subscribed first, so an unguarded emit would stop before the next listener.
+      const unsubscribeThrowing = config.onConfigChanged(() => {
+        throw new Error("listener failed");
+      });
+      const next = nextNotification(config);
+      try {
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await next.promise;
+        expect(errorSpy).toHaveBeenCalled();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        next.unsubscribe();
+        unsubscribeThrowing();
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("keeps the listener guard for another process's edit deferred by a batch", async () => {
+      await config.setUpdateChannel("npm");
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      const unsubscribeThrowing = config.onConfigChanged(() => {
+        throw new Error("listener failed");
+      });
+      const next = nextNotification(config);
+      // The watcher reads the stamp right before it notifies, in the same callback.
+      const realStamp = config.configFileStamp.bind(config);
+      const stampRead = Promise.withResolvers<void>();
+      const stampSpy = spyOn(config, "configFileStamp").mockImplementation(() => {
+        const stamp = realStamp();
+        stampRead.resolve();
+        return stamp;
+      });
+      try {
+        // The batch makes no edit of its own, so its flush carries only the foreign edit.
+        await config.withDeferredChangeNotifications(async () => {
+          await new Config(tempDir).setUpdateChannel("nightly");
+          await stampRead.promise;
+        });
+        await next.promise;
+        expect(errorSpy).toHaveBeenCalled();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        stampSpy.mockRestore();
+        next.unsubscribe();
+        unsubscribeThrowing();
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("keeps the listener guard for a batch that holds an own edit and a foreign edit", async () => {
+      await config.setUpdateChannel("npm");
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      const unsubscribeThrowing = config.onConfigChanged(() => {
+        throw new Error("listener failed");
+      });
+      const next = nextNotification(config);
+      // The watcher reads the stamp right before it notifies, in the same callback.
+      const realStamp = config.configFileStamp.bind(config);
+      const seenStamps = new Set<string>();
+      let stampSeen = Promise.withResolvers<void>();
+      const stampSpy = spyOn(config, "configFileStamp").mockImplementation(() => {
+        const stamp = realStamp();
+        seenStamps.add(stamp);
+        stampSeen.resolve();
+        return stamp;
+      });
+      try {
+        await config.withDeferredChangeNotifications(async () => {
+          await config.setUpdateChannel("nightly");
+          await new Config(tempDir).setUpdateChannel("npm");
+          const foreignStamp = realStamp();
+          while (!seenStamps.has(foreignStamp)) {
+            await stampSeen.promise;
+            stampSeen = Promise.withResolvers<void>();
+          }
+        });
+        await next.promise;
+        expect(errorSpy).toHaveBeenCalled();
+        expect(config.getUpdateChannel()).toBe("npm");
+      } finally {
+        stampSpy.mockRestore();
+        next.unsubscribe();
+        unsubscribeThrowing();
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("retries a failed folder watch on a read of a changed config.json", async () => {
+      const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      const target = path.join(targetDir, "config.json");
+      const realWatch = fs.watch;
+      let failing = true;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (failing && fs.realpathSync(String(args[0])) === fs.realpathSync(targetDir)) {
+          throw Object.assign(new Error("ENOSPC: inotify watch limit reached"), { code: "ENOSPC" });
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
+      try {
+        fs.writeFileSync(target, JSON.stringify({ projects: [] }));
+        fs.symlinkSync(target, path.join(tempDir, "config.json"));
+        let notified = Promise.withResolvers<void>();
+        let notifications = 0;
+        const unsubscribe = config.onConfigChanged(() => {
+          notifications += 1;
+          notified.resolve();
+        });
+        failing = false;
+        // No await until the read: no event from the config dir watch can retry the watch.
+        fs.writeFileSync(target, JSON.stringify({ projects: [], updateChannel: "nightly" }));
+        expect(config.getUpdateChannel()).toBe("nightly");
+        expect(notifications).toBe(1);
+        // The retried watch on targetDir sees the next save there.
+        notified = Promise.withResolvers<void>();
+        await new Config(tempDir).setUpdateChannel("npm");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("npm");
+      } finally {
+        debugSpy.mockRestore();
+        watchSpy.mockRestore();
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    });
+
+    it("starts the watches on a read of a changed config.json after every watch failed", async () => {
+      const realWatch = fs.watch;
+      let failing = true;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (failing) {
+          throw Object.assign(new Error("ENOSPC: inotify watch limit reached"), { code: "ENOSPC" });
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
+      try {
+        await config.setUpdateChannel("npm");
+        let notified = Promise.withResolvers<void>();
+        let notifications = 0;
+        const unsubscribe = config.onConfigChanged(() => {
+          notifications += 1;
+          notified.resolve();
+        });
+        failing = false;
+        // No await until the read: no watch exists that could report this edit.
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({ projects: [], updateChannel: "nightly" })
+        );
+        expect(config.getUpdateChannel()).toBe("nightly");
+        expect(notifications).toBe(1);
+        // The started watch sees the next save.
+        notified = Promise.withResolvers<void>();
+        await new Config(tempDir).setUpdateChannel("npm");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("npm");
+      } finally {
+        debugSpy.mockRestore();
+        watchSpy.mockRestore();
+      }
+    });
+
+    it("rebuilds the watches once per config.json change for an error every new watch raises", () => {
+      const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      const target = path.join(targetDir, "config.json");
+      const watchers = new Map<string, fs.FSWatcher>();
+      const listeners = new Map<string, (event: string, filename: string) => void>();
+      let watchCalls = 0;
+      const realWatch = fs.watch;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        watchCalls += 1;
+        const watcher = realWatch(...args);
+        watchers.set(fs.realpathSync(String(args[0])), watcher);
+        // Config passes (dir, options, listener); the typed overloads end at two parameters.
+        const listener: unknown = (args as unknown[])[2];
+        if (typeof listener === "function") {
+          listeners.set(
+            fs.realpathSync(String(args[0])),
+            listener as (event: string, filename: string) => void
+          );
+        }
+        return watcher;
+      }) as typeof fs.watch);
+      const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
+      const failTargetWatch = () => {
+        const watcher = watchers.get(fs.realpathSync(targetDir));
+        if (!watcher) throw new Error("expected a watch on the target dir");
+        watcher.emit("error", new Error("EPERM: operation not permitted"));
+      };
+      try {
+        fs.writeFileSync(target, JSON.stringify({ projects: [] }));
+        fs.symlinkSync(target, path.join(tempDir, "config.json"));
+        const unsubscribe = config.onConfigChanged(() => undefined);
+        const started = watchCalls;
+        failTargetWatch();
+        const rebuilt = watchCalls;
+        expect(rebuilt).toBeGreaterThan(started);
+        // The new watch fails the same way. config.json did not change, so no rebuild.
+        failTargetWatch();
+        expect(watchCalls).toBe(rebuilt);
+        // A read of the changed file rebuilds once more.
+        fs.writeFileSync(target, JSON.stringify({ projects: [], updateChannel: "nightly" }));
+        expect(config.getUpdateChannel()).toBe("nightly");
+        const reread = watchCalls;
+        expect(reread).toBeGreaterThan(rebuilt);
+        // The read's retry does not use up the error's: an error of the new watch rebuilds once.
+        failTargetWatch();
+        const recovered = watchCalls;
+        expect(recovered).toBeGreaterThan(reread);
+        failTargetWatch();
+        expect(watchCalls).toBe(recovered);
+        // An unrelated event in another watched dir proves nothing about the failed watch.
+        listeners.get(fs.realpathSync(tempDir))?.("rename", "unrelated.txt");
+        failTargetWatch();
+        expect(watchCalls).toBe(recovered);
+        // An event from the target dir's own watch shows it works: its next error rebuilds.
+        listeners.get(fs.realpathSync(targetDir))?.("rename", "unrelated.txt");
+        failTargetWatch();
+        expect(watchCalls).toBeGreaterThan(recovered);
+        unsubscribe();
+      } finally {
+        debugSpy.mockRestore();
+        watchSpy.mockRestore();
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    });
+
+    it("stops resolving a config.json symlink loop at the link limit", async () => {
+      const loopA = path.join(tempDir, "loop-a");
+      const loopB = path.join(tempDir, "loop-b");
+      fs.symlinkSync(loopB, loopA);
+      fs.symlinkSync(loopA, loopB);
+      const link = path.join(tempDir, "config.json");
+      fs.symlinkSync(loopA, link);
+      // Without the link limit, resolving the loop never ends and this call hangs.
+      const next = nextNotification(config);
+      // The config dir watch still sees a real file that replaces the loop.
+      const replacement = path.join(tempDir, "replacement.json");
+      fs.writeFileSync(replacement, JSON.stringify({ projects: [], updateChannel: "nightly" }));
+      fs.renameSync(replacement, link);
+      await next.promise;
+      next.unsubscribe();
+      expect(config.getUpdateChannel()).toBe("nightly");
+    });
+
+    it("follows a config.json path through a symlink to the filesystem root", async () => {
+      const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      try {
+        const target = path.join(targetDir, "config.json");
+        fs.writeFileSync(target, JSON.stringify({ projects: [] }));
+        const { root } = path.parse(target);
+        const rootLink = path.join(tempDir, "root");
+        fs.symlinkSync(root, rootLink);
+        // config.json -> root/<target without the root>: the walk goes on from the root.
+        fs.symlinkSync(
+          path.join(rootLink, target.slice(root.length)),
+          path.join(tempDir, "config.json")
+        );
+        const next = nextNotification(config);
+        // The save lands in targetDir: only a watch there sees it.
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await next.promise;
+        next.unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    });
+
+    it("retries a target folder watch that failed to start", async () => {
+      const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      const realWatch = fs.watch;
+      let failed = false;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (!failed && fs.realpathSync(String(args[0])) === fs.realpathSync(targetDir)) {
+          failed = true;
+          throw Object.assign(new Error("ENOSPC: inotify watch limit reached"), { code: "ENOSPC" });
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
+      try {
+        fs.writeFileSync(path.join(targetDir, "config.json"), JSON.stringify({ projects: [] }));
+        fs.symlinkSync(path.join(targetDir, "config.json"), path.join(tempDir, "config.json"));
+        const next = nextNotification(config);
+        expect(failed).toBe(true);
+        // The save lands in targetDir: only a retried watch there sees it.
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await next.promise;
+        next.unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        debugSpy.mockRestore();
+        watchSpy.mockRestore();
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    });
+
+    it("notifies when a file in a dangling target's folder path is replaced by the folder", async () => {
+      const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      try {
+        const current = path.join(targetRoot, "current");
+        fs.writeFileSync(current, "not a folder");
+        fs.symlinkSync(path.join(current, "xum.json"), path.join(tempDir, "config.json"));
+        const next = nextNotification(config);
+        fs.rmSync(current);
+        fs.mkdirSync(current);
+        fs.writeFileSync(
+          path.join(current, "xum.json"),
+          JSON.stringify({ projects: [], updateChannel: "nightly" })
+        );
+        await next.promise;
+        next.unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(targetRoot, { recursive: true, force: true });
       }
     });
 

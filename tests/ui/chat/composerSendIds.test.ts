@@ -107,6 +107,42 @@ describe("idempotent composer sends", () => {
     for (const store of reloaded.splice(0)) store.setClient(null);
   });
 
+  // #6542, #6748: after a reconnect, draft writes wait for the new connection's snapshot. A send
+  // in that window waits for it, as a send before the first snapshot waits on a cold start: no
+  // row, no error, and the composer keeps the text until the send takes it. Then it goes out once.
+  test("a send before a reconnect's snapshot waits for it, then goes out once", async () => {
+    const app = await createAppHarness({ branchPrefix: "send-ids-reconnect-hold" });
+    const draftService = app.env.services.draftService;
+    const realSnapshot = draftService.getSnapshotEvent.bind(draftService);
+    let releaseSnapshot: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    const spy = jest.spyOn(draftService, "getSnapshotEvent").mockImplementation(async () => {
+      await gate;
+      return realSnapshot();
+    });
+    try {
+      // A reconnect: a new client object for the same backend.
+      getDraftStore().setClient(new Proxy(app.env.orpc, {}));
+      await app.chat.send("held message");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(await userRows(app, "held message")).toBe(0);
+      expect(app.view.container.textContent ?? "").not.toContain("Draft save failed");
+
+      releaseSnapshot();
+      await app.chat.expectTranscriptContains("Mock response: held message", WAIT.timeout);
+      await app.chat.expectStreamComplete();
+      await waitFor(async () => expect(await pendingIds(app)).toEqual([]), WAIT);
+      expect(await userRows(app, "held message")).toBe(1);
+      expect(await app.chat.getInputValue()).toBe("");
+    } finally {
+      releaseSnapshot();
+      spy.mockRestore();
+      await app.dispose();
+    }
+  }, 120_000);
+
   test("a send accepted before an Err reply is not put back", async () => {
     const app = await createAppHarness({ branchPrefix: "send-ids-accepted-err" });
     const held = holdFirstSend(app, async (realSend, args) => {

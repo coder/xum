@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { findFirstViewFont, firstViewFontPreload } from "./staticAssets";
+import { deferAppModules, findFirstViewFont, firstViewFontPreload } from "./staticAssets";
 
 // Shaped like the built CSS: Vite minifies it, so family names and URLs carry no quotes.
 const BUILT_CSS =
@@ -31,5 +31,33 @@ describe("firstViewFontPreload", () => {
       '<link rel="preload" as="font" type="font/woff2" crossorigin href="./Geist-Variable-C_ya05Eu.woff2" />'
     );
     expect(firstViewFontPreload(undefined)).toBe("");
+  });
+});
+
+// T3 C step 2 (plan section 5.6, PR 4b): the served "/" loads the app after the static first-run
+// view paints, so the server moves Vite's module tags into the early script's list. Catches a
+// missed or reordered tag, a tag left in <head> (the app would load at once), and a guess when the
+// page has no single module script.
+describe("deferAppModules", () => {
+  const head = (tags: string) =>
+    `<html><head>\n    <title>xum</title>\n${tags}    <link rel="stylesheet" crossorigin href="./API-CCCCCCCC.css">\n  </head><body></body></html>`;
+  const SCRIPT = `    <script type="module" crossorigin src="./main-AAAAAAAA.js"></script>\n`;
+  const PRELOADS =
+    `    <link rel="modulepreload" crossorigin href="./API-BBBBBBBB.js">\n` +
+    `    <link rel="modulepreload" crossorigin href="./ThemeContext-DDDDDDDD.js">\n`;
+
+  test("moves the module script and the modulepreloads, in order, out of the page", () => {
+    expect(deferAppModules(head(SCRIPT + PRELOADS))).toEqual({
+      html: head(""),
+      modules: {
+        script: "./main-AAAAAAAA.js",
+        preload: ["./API-BBBBBBBB.js", "./ThemeContext-DDDDDDDD.js"],
+      },
+    });
+  });
+
+  test("returns null unless the page has exactly one module script", () => {
+    expect(deferAppModules(head(PRELOADS))).toBeNull();
+    expect(deferAppModules(head(SCRIPT + SCRIPT + PRELOADS))).toBeNull();
   });
 });

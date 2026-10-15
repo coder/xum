@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { userEvent, waitFor, within } from "storybook/test";
 import { type ReactNode, useEffect, useMemo } from "react";
 import { APIProvider } from "@/browser/contexts/API";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";

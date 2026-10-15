@@ -4,7 +4,11 @@ import * as path from "node:path";
 
 import { describe, expect, it, spyOn } from "bun:test";
 
-import { createTestPluginInstallEntry } from "@/node/services/agentPlugins/testFixtures";
+import {
+  createTestPluginInstallEntry,
+  reviewedComponentConsent,
+} from "@/node/services/agentPlugins/testFixtures";
+import type { ComponentConsent } from "@/node/services/agentPlugins/componentConsent";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { AgentSkillListToolResult } from "@/common/types/tools";
@@ -62,7 +66,7 @@ async function writePlugin(
   containerPath: string,
   pluginName: string,
   skills: Array<{ name: string; description: string }>
-): Promise<void> {
+): Promise<string> {
   const pluginDir = path.join(containerPath, pluginName);
   await fs.mkdir(pluginDir, { recursive: true });
   await fs.writeFile(
@@ -78,6 +82,7 @@ async function writePlugin(
       description: skill.description,
     });
   }
+  return pluginDir;
 }
 
 describe("agent_skill_list", () => {
@@ -381,7 +386,7 @@ describe("agent_skill_list", () => {
     await withHomeDir(homeDir.path, async () => {
       await withMuxRoot(xumHomeDir.path, async () => {
         const container = path.join(xumHomeDir.path, "plugins");
-        await writePlugin(container, "a-managed", [
+        const pluginDir = await writePlugin(container, "a-managed", [
           { name: "selected", description: "selected plugin skill" },
           { name: "skipped", description: "managed skill" },
           { name: "hidden", description: "not imported" },
@@ -389,13 +394,14 @@ describe("agent_skill_list", () => {
         await writePlugin(container, "z-unmanaged", [
           { name: "skipped", description: "fallback skill" },
         ]);
+        const consent = await reviewedComponentConsent({ pluginDir });
         const saveSelection = (skills: string[] | null) =>
           fs.writeFile(
             path.join(xumHomeDir.path, "plugins.json"),
             JSON.stringify({
               plugins: [
                 {
-                  ...createTestPluginInstallEntry("a-managed"),
+                  ...createTestPluginInstallEntry("a-managed", undefined, consent),
                   importedComponents: { skills, mcpServers: [] },
                 },
               ],
@@ -433,6 +439,60 @@ describe("agent_skill_list", () => {
     });
   });
 
+  it("lists a managed plugin skill only under the frontmatter the user reviewed (#6498)", async () => {
+    using home = new TestTempDir("test-agent-skill-list-consent");
+    await withHomeDir(home.path, async () => {
+      const container = path.join(home.path, "plugins");
+      const managedDir = await writePlugin(container, "a-managed", [
+        { name: "shared", description: "managed" },
+        { name: "solo", description: "managed only" },
+      ]);
+      await writePlugin(container, "b-unmanaged", [
+        { name: "shared", description: "fallback" },
+        { name: "free", description: "unmanaged" },
+      ]);
+      const saveConsent = (componentConsent?: ComponentConsent) =>
+        fs.writeFile(
+          path.join(home.path, "plugins.json"),
+          JSON.stringify({
+            plugins: [createTestPluginInstallEntry("a-managed", undefined, componentConsent)],
+          })
+        );
+      const tool = createAgentSkillListTool(
+        createTestToolConfig(home.path, {
+          workspaceId: GLOBAL_WORKSPACE_ID,
+          xumScope: { type: "global", xumHome: home.path },
+        })
+      );
+      const list = async () => {
+        const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+        if (!result.success) throw new Error(result.error);
+        return Object.fromEntries(result.skills.map((skill) => [skill.name, skill.description]));
+      };
+
+      // No records (an install from before #6498), or a record for another fingerprint: not listed.
+      await saveConsent();
+      expect(await list()).toEqual({ shared: "fallback", free: "unmanaged" });
+      await saveConsent({
+        skills: { shared: "0".repeat(64), solo: "0".repeat(64) },
+        mcpServers: {},
+        workflows: {},
+        agents: {},
+        slashCommands: {},
+      });
+      expect(await list()).toEqual({ shared: "fallback", free: "unmanaged" });
+
+      await saveConsent(await reviewedComponentConsent({ pluginDir: managedDir }));
+      expect(await list()).toEqual({ shared: "managed", solo: "managed only", free: "unmanaged" });
+
+      // A frontmatter change under the same name needs a new review.
+      await writeSkill(path.join(managedDir, "skills"), "shared", {
+        description: "run every tool",
+      });
+      expect(await list()).toEqual({ shared: "fallback", solo: "managed only", free: "unmanaged" });
+    });
+  });
+
   it.each([
     [".xum", false],
     [".mux", false],
@@ -448,7 +508,7 @@ describe("agent_skill_list", () => {
       if (aliasHome) await fs.symlink(physicalHome, xumHome, "dir");
       await withHomeDir(home.path, async () => {
         await withMuxRoot(xumHome, async () => {
-          await writePlugin(path.join(xumHome, "plugins"), "managed", [
+          const pluginDir = await writePlugin(path.join(xumHome, "plugins"), "managed", [
             { name: "allowed", description: "imported" },
             { name: "blocked", description: "not imported" },
           ]);
@@ -460,7 +520,11 @@ describe("agent_skill_list", () => {
             registryPath,
             JSON.stringify({
               plugins: [
-                createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+                createTestPluginInstallEntry(
+                  "managed",
+                  { skills: ["allowed"], mcpServers: [] },
+                  await reviewedComponentConsent({ pluginDir })
+                ),
               ],
             })
           );
@@ -1003,6 +1067,45 @@ describe("agent_skill_list", () => {
       }
     });
   });
+  // The display name is user-facing only: plugin model-visible fields are
+  // consent-fingerprinted, so this model-facing list must not carry it.
+  it("lists a display-name skill under its directory name without the display name", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-list-display-name");
+    const skillDir = path.join(tempDir.path, ".agents", "skills", "poteto-mode");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      "---\nname: Poteto Mode\ndescription: pstack router\n---\nBody\n",
+      "utf-8"
+    );
+    const xumScope = {
+      type: "project" as const,
+      xumHome: tempDir.path,
+      projectRoot: tempDir.path,
+    };
+    // host-local reads SKILL.md itself; runtime authority goes through discovery.
+    const configs = (["host-local", "runtime"] as const).map((projectStorageAuthority) =>
+      createTestToolConfig(tempDir.path, {
+        workspaceId: "regular-workspace",
+        xumScope: { ...xumScope, projectStorageAuthority },
+      })
+    );
+
+    await withHomeDir(tempDir.path, async () => {
+      for (const config of configs) {
+        const result = (await createAgentSkillListTool(config).execute!(
+          { includeUnadvertised: true },
+          mockToolCallOptions
+        )) as AgentSkillListToolResult;
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const skill = getSkill(result.skills, "poteto-mode");
+        expect(skill.description).toBe("pstack router");
+        expect("displayName" in skill).toBe(false);
+      }
+    });
+  });
+
   describe("split-root (project-runtime)", () => {
     it("routes through project-runtime when runtime is non-local", async () => {
       using tempDir = new TestTempDir("test-agent-skill-list-split-root-project-runtime");

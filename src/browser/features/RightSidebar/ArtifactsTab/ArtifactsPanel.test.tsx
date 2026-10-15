@@ -1549,6 +1549,36 @@ describe("ArtifactsPanel", () => {
     expect(escapeReachedWindowUnhandled).toBe(true);
   });
 
+  test("a held annotate shortcut toggles annotate mode once", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    await view.findByRole("button", { name: "Annotate" });
+    // Holding the key: one press, then auto-repeated keydowns (#6347).
+    const pressed = () =>
+      view
+        .getByRole("button", { name: /^(Annotate|Stop annotating)$/ })
+        .getAttribute("aria-pressed");
+    fireEvent.keyDown(panel, { key: "c" });
+    expect(pressed()).toBe("true");
+    for (let i = 0; i < 2; i++) {
+      fireEvent.keyDown(panel, { key: "c", repeat: true });
+      expect(pressed()).toBe("true");
+    }
+    // The next press after release toggles again.
+    fireEvent.keyDown(panel, { key: "c" });
+    expect(pressed()).toBe("false");
+  });
+
   test("annotate mode survives a sidebar tab switch and stays per workspace", async () => {
     fake = createFakeArtifactsApi(
       {

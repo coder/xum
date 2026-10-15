@@ -1022,6 +1022,12 @@ export interface PluginHookContextEntry {
  * chain order (the requested model is always the first entry). The effective
  * (answering) model is recorded separately as the message's `model`.
  */
+/** MuxMetadata.volatileSystemTail: where a turn sent the volatile system tail, and its text. */
+export interface VolatileSystemTailRecord {
+  text: string;
+  placement: "system" | "row";
+}
+
 export interface ModelFallbackRecord {
   requestedModel: string;
   refusedModels: string[];
@@ -1096,6 +1102,14 @@ export interface MuxMetadata {
    * loses it.
    */
   anthropicThinkingReplayFromStep?: number | "end";
+  /**
+   * The volatile system-prompt tail (hot memories, MCP warning, context-window ids) this
+   * turn's request sent (prompt-cache mechanism 10). "system": at the end of the system
+   * prompt, where it stays frozen for the rest of the context segment. "row": as a
+   * mid-conversation system row right before this row, because the tail changed inside the
+   * segment. See src/node/utils/messages/volatileSystemTail.ts.
+   */
+  volatileSystemTail?: VolatileSystemTailRecord;
   // Last step's provider metadata (for context window cache display)
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)

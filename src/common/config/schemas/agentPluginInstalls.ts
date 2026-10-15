@@ -42,9 +42,9 @@ export const AgentPluginGitSourceSchema = z.object({
    */
   refType: z.enum(["branch", "tag", "commit"]),
   /**
-   * Repo-relative directory of the plugin for monorepo installs. Parsed and
-   * persisted from day one so the descriptor grammar is stable, but v1
-   * rejects subpath installs (sparse-checkout staging lands in v2).
+   * Repo-relative directory of the plugin for monorepo installs (normalized
+   * `a/b/c`). Only this folder is fetched (sparse checkout) and installed as
+   * the plugin root; updates track the same folder at the new commit.
    */
   subpath: z.string().optional(),
 });
@@ -63,6 +63,20 @@ export const AgentPluginImportedComponentsSchema = z.object({
   mcpServers: z.array(z.string()),
 });
 export type AgentPluginImportedComponents = z.infer<typeof AgentPluginImportedComponentsSchema>;
+
+/** Reviewed fingerprints by component name (see `componentConsent` below). */
+export const AgentPluginComponentConsentSchema = z.object({
+  skills: z.record(z.string(), z.string()),
+  mcpServers: z.record(z.string(), z.string()),
+  // Workflow scripts by file name (#6629). Absent in a record from before #6629: no workflow
+  // is reviewed, so each such plugin needs one review (no backfill). An older build strips
+  // the key on read and keeps it on save (installService mergeRawConsent).
+  workflows: z.record(z.string(), z.string()).default({}),
+  // Agents by ID (#6629), with the same upgrade rules as workflows.
+  agents: z.record(z.string(), z.string()).default({}),
+  // Slash commands by name (#6629), with the same upgrade rules as workflows.
+  slashCommands: z.record(z.string(), z.string()).default({}),
+});
 
 export const AgentPluginInstallEntrySchema = z.object({
   /**
@@ -94,6 +108,15 @@ export const AgentPluginInstallEntrySchema = z.object({
     })
     .optional(),
   importedComponents: AgentPluginImportedComponentsSchema.optional(),
+  /**
+   * Reviewed fingerprint of each imported component, by name (#6498). A component loads only when
+   * its current fingerprint matches, so a newer build that parses more of the package cannot load
+   * a changed component under an approved name. Top-level, not under importedComponents: older
+   * builds spread importedComponents on save and would keep a nested record stale. Absent on
+   * older installs, which then need a review (no backfill). `z.record` drops a `__proto__` key on
+   * parse, so the plugin MCP loader refuses that server name (mcpConfig.ts checkServerEntryShape).
+   */
+  componentConsent: AgentPluginComponentConsentSchema.optional(),
   /** Reserved: per-plugin opt-in auto-update. Unused in v1 — updates are badge + manual. */
   autoUpdate: z.boolean().optional(),
 });

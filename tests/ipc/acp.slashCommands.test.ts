@@ -53,6 +53,18 @@ describe("ACP slash command support", () => {
     );
   });
 
+  it("labels a display-name skill in the ACP command list but keeps its ID as the command", () => {
+    const [command] = buildAcpAvailableCommands([
+      {
+        name: "poteto-mode",
+        displayName: "Poteto Mode",
+        description: "poteto's style",
+        scope: "global",
+      },
+    ]).filter((candidate) => candidate.name === "poteto-mode");
+    expect(command?.description.startsWith("Poteto Mode")).toBe(true);
+  });
+
   it("builds ACP available command list with server commands and user-invocable skills", () => {
     const availableCommands = buildAcpAvailableCommands(skills);
     const commandNames = availableCommands.map((command) => command.name);

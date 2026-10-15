@@ -1,4 +1,6 @@
+import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { getOwn } from "@/common/utils/getOwn";
+import { serverSettingsToolRuns, type ServerSettingsToolRuns } from "./settingsToolRuns";
 import {
   validateMCPSettingValue,
   type MCPSettingsReadSnapshot,
@@ -76,6 +78,34 @@ export function settingsErrors(
   return errors;
 }
 
+/**
+ * Whether the dialog's Save waits: it closes the dialog, which would drop the result of an
+ * overrides save, a settings save, or a tool run still in flight (`savingSettings` counts both:
+ * withSettingsToolRuns).
+ */
+export function isDialogSaveBlocked(saving: boolean, savingSettings: Record<string, number>) {
+  return saving || Object.keys(savingSettings).length > 0;
+}
+
+/**
+ * Saves in flight per server plus each server's settings tool runs (settingsToolRuns). Both
+ * block Refresh Tools: a refresh remounts the section, which would drop a run's result while
+ * the tool still runs (the user could run a writing tool twice). The runs live outside the
+ * dialog, so a run started before a reopen still counts. Only `listedServers` count: the run of
+ * a server removed from the config can hang until its timeout, and must not block Save.
+ */
+export function withSettingsToolRuns(
+  savingSettings: Record<string, number>,
+  toolRuns: Readonly<Record<string, ServerSettingsToolRuns>>,
+  listedServers: readonly string[]
+): Record<string, number> {
+  let counts = savingSettings;
+  for (const serverName of listedServers)
+    for (const _tool of serverSettingsToolRuns(toolRuns, serverName).running)
+      counts = countSettingsSave(counts, serverName, 1);
+  return counts;
+}
+
 /** Saves in flight per server, after one starts (+1) or settles (-1). A server at 0 has no key. */
 export function countSettingsSave(
   counts: Record<string, number>,
@@ -85,4 +115,27 @@ export function countSettingsSave(
   const next = (getOwn(counts, serverName) ?? 0) + delta;
   const { [serverName]: _previous, ...rest } = counts;
   return next > 0 ? { ...rest, [serverName]: next } : rest;
+}
+
+/**
+ * Whether the dialog changed `serverName`'s workspace overrides (enablement or tool allowlist)
+ * since they were saved. The backend checks a settings tool action against the SAVED allowlist,
+ * so a tool the user deselected but did not save yet would still run.
+ */
+export function hasUnsavedServerOverrides(
+  saved: WorkspaceMCPOverrides,
+  current: WorkspaceMCPOverrides,
+  serverName: string
+): boolean {
+  const listed = (list: string[] | undefined) => list?.includes(serverName) === true;
+  // Toggling a tool off and on appends it again: order does not count.
+  const allowlist = (overrides: WorkspaceMCPOverrides) => {
+    const tools = getOwn(overrides.toolAllowlist ?? {}, serverName);
+    return tools === undefined ? null : JSON.stringify([...tools].sort());
+  };
+  return (
+    listed(saved.enabledServers) !== listed(current.enabledServers) ||
+    listed(saved.disabledServers) !== listed(current.disabledServers) ||
+    allowlist(saved) !== allowlist(current)
+  );
 }

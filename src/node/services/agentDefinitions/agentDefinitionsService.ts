@@ -45,6 +45,11 @@ import {
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
   type AgentPluginContainer,
 } from "@/node/services/agentPlugins/discovery";
+import {
+  isPluginAgentConsented,
+  type ComponentConsent,
+} from "@/node/services/agentPlugins/componentConsent";
+import { ambiguousPluginAgentIds, pluginAgentIdOf } from "@/node/services/agentPlugins/agentFiles";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 import { getBuiltInAgentDefinitions } from "./builtInAgentDefinitions";
@@ -157,6 +162,8 @@ interface AgentDefinitionScanCandidate {
   pluginRoot?: string;
   /** Agent Plugins only: contributing plugin name for descriptor attribution. */
   pluginName?: string;
+  /** Managed plugins only: the reviewed fingerprints (#6629). Unmanaged plugins have none. */
+  pluginConsent?: ComponentConsent | undefined;
 }
 
 /**
@@ -169,6 +176,8 @@ async function buildPluginAgentScanCandidates(args: {
   workspacePath: string;
   /** Project scope: plugin roots must stay inside the checkout (repo-symlink posture). */
   projectContainmentRoot?: string;
+  /** The Xum home that owns the plugin registry, so managed plugins carry consent (#6629). */
+  managedHome: string;
 }): Promise<AgentDefinitionScanCandidate[]> {
   if (args.containers.length === 0) {
     return [];
@@ -188,7 +197,9 @@ async function buildPluginAgentScanCandidates(args: {
     }
   }
 
-  const { plugins } = await discoverAgentPlugins(resolvedContainers);
+  const { plugins } = await discoverAgentPlugins(resolvedContainers, {
+    managedHome: await localRuntime.resolvePath(args.managedHome),
+  });
 
   const candidates: AgentDefinitionScanCandidate[] = [];
   for (const plugin of plugins) {
@@ -213,6 +224,7 @@ async function buildPluginAgentScanCandidates(args: {
       runtime: localRuntime,
       pluginRoot: plugin.rootPath,
       pluginName: plugin.name,
+      pluginConsent: plugin.componentConsent,
     });
   }
 
@@ -229,16 +241,21 @@ async function buildScanCandidates(
   workspacePath: string,
   roots: AgentDefinitionsRoots
 ): Promise<AgentDefinitionScanCandidate[]> {
+  // The registry lives in the Xum home above the global agents root (tilde form maps to the host
+  // home), as plugin skill discovery derives it.
+  const managedHome = path.dirname(roots.globalRoot);
   const projectPluginCandidates = await buildPluginAgentScanCandidates({
     containers: roots.projectPluginRoots ?? [],
     scope: "project",
     workspacePath,
     projectContainmentRoot: workspacePath,
+    managedHome,
   });
   const globalPluginCandidates = await buildPluginAgentScanCandidates({
     containers: roots.globalPluginRoots ?? [],
     scope: "global",
     workspacePath,
+    managedHome,
   });
 
   return [
@@ -255,6 +272,43 @@ async function buildScanCandidates(
     },
     ...globalPluginCandidates,
   ];
+}
+
+/** Logs each refusal of `ambiguousPluginAgentIds` and returns the IDs. */
+function warnAmbiguousPluginAgents(fileNames: readonly string[]): Set<string> {
+  const warnings: string[] = [];
+  const ambiguous = ambiguousPluginAgentIds(fileNames, warnings);
+  for (const warning of warnings) log.warn(warning);
+  return ambiguous;
+}
+
+/** A plugin agents dir without the IDs two files claim (#6629). Other roots keep first-wins. */
+function withoutAmbiguousPluginAgents(
+  scan: Pick<AgentDefinitionScanCandidate, "pluginRoot">,
+  fileNames: string[]
+): string[] {
+  if (scan.pluginRoot == null) return fileNames;
+  const ambiguous = warnAmbiguousPluginAgents(fileNames);
+  return fileNames.filter((name) => !ambiguous.has(pluginAgentIdOf(name) ?? ""));
+}
+
+/**
+ * The file the definition read of a plugin agent opens (#6629): the one file of its agents dir
+ * that claims the ID, under its real name (`Helper.md` for ID `helper`), and contained in the
+ * plugin. Discovery lists the same name, so both paths fingerprint the same bytes and file name.
+ * Null when no single contained file claims the ID.
+ */
+async function resolvePluginAgentFile(args: {
+  pluginRoot: string;
+  agentsDir: string;
+  agentId: AgentId;
+}): Promise<string | null> {
+  const names = await listAgentFilesFromLocalFs(args.agentsDir);
+  const ambiguous = warnAmbiguousPluginAgents(names);
+  const name = names.find((candidate) => pluginAgentIdOf(candidate) === args.agentId);
+  if (name === undefined || ambiguous.has(args.agentId)) return null;
+  const filePath = path.join(args.agentsDir, name);
+  return (await isPluginAgentContained({ ...args, filePath })) ? filePath : null;
 }
 
 /**
@@ -333,6 +387,41 @@ function getAgentIdFromFilename(filename: string): AgentId | null {
   return idParsed.data;
 }
 
+/** Plugin agents parse with the Claude Code / Cursor format mapping (pluginAgentFormat.ts). */
+function parseSource(
+  pluginRoot: string | undefined,
+  agentId: AgentId
+): { plugin?: { agentId: string } } {
+  return pluginRoot != null ? { plugin: { agentId } } : {};
+}
+
+/**
+ * Parse one agent file. A managed plugin agent must also match its review (#6629): discovery and
+ * the definition read both parse through here, so an agent changed after its review neither lists
+ * nor loads. It throws like an invalid definition, which both callers skip.
+ */
+function parseAgentFile(
+  args: { content: string; byteSize: number; agentId: AgentId; filePath: string },
+  candidate: Pick<AgentDefinitionScanCandidate, "pluginRoot" | "pluginName" | "pluginConsent">
+) {
+  const parsed = parseAgentDefinitionMarkdown({
+    content: args.content,
+    byteSize: args.byteSize,
+    ...parseSource(candidate.pluginRoot, args.agentId),
+  });
+  const consentInput = {
+    id: args.agentId,
+    file: path.basename(args.filePath),
+    frontmatter: parsed.frontmatter,
+  };
+  if (!isPluginAgentConsented(candidate.pluginConsent, consentInput)) {
+    throw new Error(
+      `Agent '${args.agentId}' of plugin '${candidate.pluginName ?? "?"}' has not been reviewed on this install. Open Settings → Plugins and select Review on the plugin.`
+    );
+  }
+  return parsed;
+}
+
 async function readAgentDescriptorFromFile(
   runtime: Runtime,
   filePath: string,
@@ -348,7 +437,8 @@ async function readAgentDescriptorFromFile(
    * reads that as a capability removal, and the outside frontmatter would
    * otherwise control agent policy (runnable/base/tools).
    */
-  pluginRoot?: string
+  pluginRoot?: string,
+  pluginConsent?: ComponentConsent
 ): Promise<AgentDefinitionDescriptor | null> {
   let content: string;
   let byteSize: number;
@@ -396,7 +486,10 @@ async function readAgentDescriptorFromFile(
   }
 
   try {
-    const parsed = parseAgentDefinitionMarkdown({ content, byteSize });
+    const parsed = parseAgentFile(
+      { content, byteSize, agentId, filePath },
+      { pluginRoot, pluginName, pluginConsent }
+    );
 
     const { selectable } = resolveAgentVisibility(parsed.frontmatter.ui);
 
@@ -481,10 +574,12 @@ export async function discoverAgentDefinitions(
       continue;
     }
 
-    const filenames =
+    const filenames = withoutAmbiguousPluginAgents(
+      scan,
       scan.runtime instanceof RemoteRuntime
         ? await listAgentFilesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
-        : await listAgentFilesFromLocalFs(resolvedRoot);
+        : await listAgentFilesFromLocalFs(resolvedRoot)
+    );
 
     for (const filename of filenames) {
       const agentId = getAgentIdFromFilename(filename);
@@ -514,7 +609,8 @@ export async function discoverAgentDefinitions(
         agentId,
         scan.scope,
         scan.pluginName,
-        scan.pluginRoot
+        scan.pluginRoot,
+        scan.pluginConsent
       );
       if (!descriptor) continue;
 
@@ -696,15 +792,16 @@ async function loadAgentDefinition(
       continue;
     }
 
-    const filePath = candidate.runtime.normalizePath(`${agentId}.md`, resolvedRoot);
+    let filePath = candidate.runtime.normalizePath(`${agentId}.md`, resolvedRoot);
 
     if (candidate.pluginRoot != null) {
-      const contained = await isPluginAgentContained({
+      const pluginFile = await resolvePluginAgentFile({
         pluginRoot: candidate.pluginRoot,
-        filePath,
+        agentsDir: resolvedRoot,
         agentId,
       });
-      if (!contained) continue;
+      if (pluginFile === null) continue;
+      filePath = pluginFile;
     }
 
     try {
@@ -738,7 +835,7 @@ async function loadAgentDefinition(
         content = await readFileString(candidate.runtime, filePath, abortSignal);
         byteSize = stat.size;
       }
-      const parsed = parseAgentDefinitionMarkdown({ content, byteSize });
+      const parsed = parseAgentFile({ content, byteSize, agentId, filePath }, candidate);
 
       const pkg: AgentDefinitionPackage = {
         id: agentId,

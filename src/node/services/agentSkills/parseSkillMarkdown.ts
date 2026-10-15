@@ -16,6 +16,8 @@ export class AgentSkillParseError extends Error {
 export interface ParsedSkillMarkdown {
   frontmatter: AgentSkillFrontmatter;
   body: string;
+  /** Raw frontmatter `name` when allowDisplayName replaced it with the directory name. */
+  displayName?: string;
 }
 
 function assertObject(value: unknown, message: string): asserts value is Record<string, unknown> {
@@ -35,6 +37,53 @@ function assertValidSkillPaths(frontmatter: AgentSkillFrontmatter): void {
   }
 }
 
+// A display name is a single line of 1-64 characters. SKILL.md is repository-controlled
+// and the name renders in the UI and in diagnostics, so reject every control (C0, DEL,
+// C1), format (bidi overrides, zero-width) and line/paragraph separator character.
+const DISPLAY_NAME_MAX_LENGTH = 64;
+const CONTROL_CHARACTER_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
+function qualifyDisplayName(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > DISPLAY_NAME_MAX_LENGTH) return undefined;
+  if (CONTROL_CHARACTER_PATTERN.test(trimmed)) return undefined;
+  return trimmed;
+}
+
+/**
+ * Swap a qualifying non-ID `name` for the directory name (see allowDisplayName).
+ * `displayField` is spread into the result, so the key is absent when unused.
+ */
+function applyDisplayName(
+  raw: Record<string, unknown>,
+  input: { directoryName?: SkillName; allowDisplayName?: boolean }
+): { frontmatterInput: Record<string, unknown>; displayField: { displayName?: string } } {
+  const unchanged = { frontmatterInput: raw, displayField: {} };
+  if (!input.allowDisplayName || !input.directoryName || raw.name === input.directoryName) {
+    return unchanged;
+  }
+  const displayName = qualifyDisplayName(raw.name);
+  if (displayName === undefined) return unchanged;
+  return {
+    frontmatterInput: { ...raw, name: input.directoryName },
+    displayField: { displayName },
+  };
+}
+
+/**
+ * The frontmatter that plugin skill consent fingerprints (#6498). allowDisplayName moved the raw
+ * `name` out of `frontmatter`, so add it back as `displayName`: a changed display name is
+ * user-visible text and needs a new review. Skills without a display name keep their fingerprint.
+ */
+export function skillConsentFrontmatter(
+  parsed: ParsedSkillMarkdown
+): AgentSkillFrontmatter & { displayName?: string } {
+  return parsed.displayName === undefined
+    ? parsed.frontmatter
+    : { ...parsed.frontmatter, displayName: parsed.displayName };
+}
+
 /**
  * Parse a SKILL.md file into validated frontmatter + markdown body.
  *
@@ -46,6 +95,14 @@ export function parseSkillMarkdown(input: {
   content: string;
   byteSize: number;
   directoryName?: SkillName;
+  /**
+   * Discovered skills only (project, global, plugin roots): when the frontmatter `name`
+   * differs from the directory name, load the skill under the directory name and return
+   * the raw `name` as `displayName`. Skills from other harnesses need this, e.g. pstack's
+   * `name: Poteto Mode`; Cursor and Claude Code take the skill ID from the folder.
+   * Built-in skills and agent_skill_write stay strict.
+   */
+  allowDisplayName?: boolean;
 }): ParsedSkillMarkdown {
   if (input.byteSize > MAX_FILE_SIZE) {
     const sizeMB = (input.byteSize / (1024 * 1024)).toFixed(2);
@@ -85,7 +142,8 @@ export function parseSkillMarkdown(input: {
 
   assertObject(raw, "SKILL.md YAML frontmatter must be a mapping/object.");
 
-  const parsed = AgentSkillFrontmatterSchema.safeParse(raw);
+  const { frontmatterInput, displayField } = applyDisplayName(raw, input);
+  const parsed = AgentSkillFrontmatterSchema.safeParse(frontmatterInput);
   if (!parsed.success) {
     throw new AgentSkillParseError(
       `Invalid SKILL.md frontmatter: ${formatZodIssues(parsed.error.issues)}`
@@ -100,5 +158,5 @@ export function parseSkillMarkdown(input: {
     );
   }
 
-  return { frontmatter: parsed.data, body };
+  return { frontmatter: parsed.data, body, ...displayField };
 }

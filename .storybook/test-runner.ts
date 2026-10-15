@@ -8,6 +8,9 @@ import assert from "node:assert/strict";
 // Playwright. All other stories run exactly as before.
 const HOVER_STORY_PREFIX = "app-primarybuttoncontrast--";
 const hoverReady = new WeakSet<object>();
+// The Narrow story's strip scrolls up to 621 px, and the shortest swipe seen moved it 56 px:
+// 16 swipes cover it with room to spare.
+const MAX_TOUCH_SWIPES = 16;
 
 const config: TestRunnerConfig = {
   async preVisit(page, context) {
@@ -18,6 +21,31 @@ const config: TestRunnerConfig = {
     await page.exposeFunction("__storybookUnhover", () => page.mouse.move(0, 0));
   },
   async postVisit(page, context) {
+    if (context.id === "app-rightsidebar-stable-tab-controls--wide") {
+      if (page.context().browser()?.browserType().name() !== "chromium") return;
+      // A tablet (coarse pointer above the phone breakpoint) gets no global 44px button floor,
+      // so the collapse button must size itself for touch. Plays cannot emulate the pointer.
+      const client = await page.context().newCDPSession(page);
+      const viewport = page.viewportSize();
+      try {
+        await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+        await page.setViewportSize({ width: 1200, height: 900 });
+        await page.waitForFunction(() => matchMedia("(pointer: coarse)").matches, undefined, {
+          timeout: 5000,
+        });
+        const box = await page.getByRole("button", { name: "Collapse sidebar" }).boundingBox();
+        if (!box) throw new Error("Collapse sidebar button is missing");
+        assert(
+          box.width >= 44 && box.height >= 44,
+          `Collapse target is ${box.width}x${box.height}`
+        );
+      } finally {
+        await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+        await client.detach();
+        if (viewport) await page.setViewportSize(viewport);
+      }
+      return;
+    }
     if (context.id !== "app-rightsidebar-stable-tab-controls--narrow") return;
     if (page.context().browser()?.browserType().name() !== "chromium") return;
     // Story plays dispatch synthetic events: only browser input can exercise native touch
@@ -40,7 +68,11 @@ const config: TestRunnerConfig = {
         const before = await row.evaluate((el) => el.scrollLeft);
         // Wait for native scroll completion: a tap during inertial scrolling cancels the
         // scroll instead of selecting the tab, especially under parallel CI load.
-        for (let swipe = 0; swipe < 4; swipe++) {
+        // Swipe until the last tab is reachable. How far one swipe scrolls depends on the
+        // runner: Chromium adds a fling only when the moves arrive fast. Without one, the phone
+        // width needed all four swipes of the old fixed count, so one disturbed swipe failed the
+        // check (#6476). A strip that does not pan still fails at its first swipe: no scrollend.
+        for (let swipe = 0; swipe < MAX_TOUCH_SWIPES; swipe++) {
           const point = await row.evaluate((el) => {
             const r = el.getBoundingClientRect();
             for (const tab of Array.from(el.querySelectorAll('[role="tab"]')).reverse()) {

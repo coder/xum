@@ -1,11 +1,12 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { PIXEL_DISABLED } from "@/browser/stories/meta";
 import { createMockORPCClient, type MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
 import type {
@@ -15,6 +16,7 @@ import type {
 } from "@/common/orpc/schemas/agentPlugins";
 
 import { PluginsSettingsSection } from "./PluginsSettingsSection";
+import { publishPluginsSectionIntent } from "./pluginsSectionIntents";
 
 /** 1x1 PNG: the backend sends logos as data URLs, never paths. */
 const LOGO_DATA_URL =
@@ -417,7 +419,11 @@ export const AddPluginConsentPreview: Story = {
               interface: OPENAI_INTERFACE,
             },
             skills: [
-              { name: "grill", description: "Stress-test a plan before committing to it." },
+              {
+                name: "grill",
+                description: "Stress-test a plan before committing to it.",
+                directives: ["git log --oneline -5"],
+              },
               { name: "grill-lite", description: "A gentler grilling for small changes." },
             ],
             mcpServers: [
@@ -430,6 +436,14 @@ export const AddPluginConsentPreview: Story = {
             agents: ["grill-master.md"],
             workflows: ["grill-report.js"],
             slashCommands: [{ name: "grill", description: "Grill the current plan" }],
+            reviewedComponents: [
+              {
+                kind: "workflows",
+                name: "grill-report.js",
+                detail:
+                  "Workflow script workflows/grill-report.js\n\nReviewed fields: sha256 3f2a…\n\nexport const meta = { name: 'grill-report' };",
+              },
+            ],
             codexHooks: GRILL_HOOKS.hooks.map(({ review: _review, ...hook }) => hook),
             warnings: ["Unknown top-level field 'hooks' ignored"],
             targetPath: "~/.mux/plugins/grill",
@@ -456,7 +470,9 @@ export const AddPluginConsentPreview: Story = {
     await canvas.findByText("Agents (1)");
     await canvas.findByText(/grill-master\.md/);
     await canvas.findByText("Workflows (1)");
-    await canvas.findByText(/grill-report\.js/);
+    await canvas.findAllByText(/grill-report\.js/);
+    // The workflow install approves is shown with its reviewed fields (#6629).
+    await canvas.findByText(/Reviewed definitions \(1\)/);
     await canvas.findByText("Slash commands (1)");
     await canvas.findByText("/grill");
     await canvas.findByText("hooks.json hooks (3)");
@@ -465,6 +481,13 @@ export const AddPluginConsentPreview: Story = {
     await canvas.findByText(/Unknown top-level field 'hooks' ignored/);
     await canvas.findByRole("button", { name: /Install/ });
     await expectInterfaceAsText(canvasElement);
+    // The muted-tone chips reach WCAG AA in every theme; dark muted text on their tint was
+    // 4.06:1 (#6544).
+    const chips = () => [
+      ...canvas.getAllByText("Interactive"),
+      ...canvas.getAllByText(/^branch · /),
+    ];
+    await expect(textsBelowAaInThemes(chips).join("\n")).toBe("");
   },
 };
 
@@ -503,6 +526,7 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
             agents: [],
             workflows: [],
             slashCommands: [],
+            reviewedComponents: [],
             codexHooks: [],
             warnings: [],
             targetPath: `~/.mux/plugins/${MAX_LENGTH_NAME}`,
@@ -799,5 +823,323 @@ export const ThemedLogoLight: Story = {
     if (sources.some((source) => source !== DARK_DISC_LOGO)) {
       throw new Error("Light theme must show the light logo");
     }
+  },
+};
+
+/** A post-update sign-out that failed: Settings names the servers and the last error (#6627). */
+const PENDING_SIGN_OUT_URL =
+  "https://mcp.example-identity-provider-with-a-long-host-name.com/tenants/acme-production/mcp";
+
+/**
+ * Pending sign-out (#6627) at phone width: the notice names the server and the last error, and
+ * the long URL wraps inside it. Out of Pixel snapshots (snapshot budget); the play checks it.
+ */
+export const PendingSignOutPhoneViewport: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell
+      options={{
+        agentPlugins: {
+          items: [MANAGED_ITEM],
+          pendingSignOuts: {
+            kind: "pending",
+            servers: [PENDING_SIGN_OUT_URL],
+            lastError: "Failed to write OAuth store: disk full",
+          },
+        },
+      }}
+    >
+      {/* Fixed phone width so the overflow check holds in the CI test-runner too (AGENTS.md). */}
+      <div style={{ width: 375 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const notice = await canvas.findByText(/Managed plugins are unavailable to agents until/);
+    await canvas.findByText(/Last attempt: Failed to write OAuth store: disk full/);
+    if (!notice.textContent?.includes(PENDING_SIGN_OUT_URL)) {
+      throw new Error("The notice must name the server to sign out of");
+    }
+    const box = notice.closest("[role='status']");
+    if (!(box instanceof HTMLElement) || box.scrollWidth > box.clientWidth + 1) {
+      throw new Error("The pending sign-out notice overflows at phone width");
+    }
+  },
+};
+
+/** The backend's reason for a broken record; the notice shows it as given. */
+const BROKEN_SIGN_OUT_REASON =
+  "The pending plugin sign-out record (~/.mux/plugin-sign-outs-pending.json) is corrupt or from another Xum version. Sign out of the plugin's MCP servers in Settings → MCP, then delete the file.";
+
+/** A corrupt record (#6627): only the user can clear it, so the notice gives the steps. */
+export const BrokenSignOutRecord: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell
+      options={{
+        agentPlugins: {
+          items: [MANAGED_ITEM],
+          pendingSignOuts: {
+            kind: "broken",
+            reason: BROKEN_SIGN_OUT_REASON,
+          },
+        },
+      }}
+    >
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    // The broken-record branch renders a status notice that carries the backend's reason as
+    // given (compared with the mock's value, not with copy).
+    await waitFor(
+      () => {
+        const notices = canvas.queryAllByRole("status");
+        if (!notices.some((notice) => notice.textContent?.includes(BROKEN_SIGN_OUT_REASON))) {
+          throw new Error("The broken sign-out notice must show the backend's reason");
+        }
+      },
+      { timeout: 5000 }
+    );
+  },
+};
+
+/** A plugin installed before #6498: its components have no consent records yet. */
+function componentReviewOptions(): MockORPCClientOptions {
+  const item: AgentPluginListItem = { ...MANAGED_ITEM, reviewRequiredCount: 2 };
+  return {
+    agentPlugins: {
+      items: [item],
+      componentReview: {
+        name: item.name,
+        fromSha: item.lockedSha ?? "",
+        toSha: item.lockedSha ?? "",
+        changes: [
+          {
+            summary: "Skill 'grilling' needs review",
+            before: "Not reviewed on this install",
+            after: "Grill the user about a plan or decision.",
+            component: { kind: "skills", name: "grilling", fingerprint: "a".repeat(64) },
+          },
+          {
+            summary: "MCP server 'planner' needs review",
+            before: "Changed since you reviewed it",
+            after:
+              "node ~/.mux/plugins/grill/servers/planner-with-a-very-long-entry-point.js --stdio",
+            component: { kind: "mcpServers", name: "planner", fingerprint: "b".repeat(64) },
+          },
+        ],
+        warnings: [],
+      },
+    },
+  };
+}
+
+async function approveComponents(canvasElement: HTMLElement): Promise<HTMLElement> {
+  const canvas = within(canvasElement);
+  // The row badge and the section notice name the state and the action.
+  await canvas.findByText("needs review");
+  await canvas.findByText(/Select Review on each plugin marked "needs review"/);
+  await userEvent.click(
+    await canvas.findByRole("button", { name: /^Review components of grill$/ })
+  );
+  await canvas.findByText(/Skill 'grilling' needs review/);
+  await canvas.findByText("Changed since you reviewed it");
+  return canvas.findByRole("button", { name: /Approve components/ });
+}
+
+/**
+ * Component review (#6498): the update review panel lists the plugin's unreviewed skills and MCP
+ * servers, and approving clears the badge and the notice.
+ */
+export const ComponentReview: Story = {
+  // Out of Pixel snapshots (snapshot budget, like HooksReview). The play checks the flow.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell options={componentReviewOptions()}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await approveComponents(canvasElement));
+    await canvas.findByText("Plans, **grilled** <b>hard</b>");
+    if (canvas.queryByText("needs review") !== null) {
+      throw new Error("Approving the review must clear the needs-review badge");
+    }
+    if (canvas.queryByText(/Select Review on each plugin/) !== null) {
+      throw new Error("Approving the review must clear the notice");
+    }
+  },
+};
+
+/** Phone width (390 px): the notice, the badge and the review rows wrap inside the card. */
+export const ComponentReviewPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={componentReviewOptions()}>
+      {/* Fixed phone width so the play's overflow assertion holds in the CI test-runner too. */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const approve = await approveComponents(canvasElement);
+    const card = approve.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) throw new Error("Component review card not found");
+    if (card.scrollWidth > card.clientWidth + 1) {
+      throw new Error("Component review overflows its card at phone width");
+    }
+  },
+};
+
+/** Records the reconnected client's calls, so the play can wait for its list refresh. */
+const reconnectCalls = { list: 0, preview: 0 };
+
+/**
+ * A palette intent that arrived before the section mounted, and a Reconnect button that swaps the
+ * API client the way APIProvider does on a WebSocket reconnect.
+ */
+const ReconnectingShell: FC<{ children: ReactNode }> = (props) => {
+  const [client, setClient] = useState<APIClient>(() => {
+    // Buffered: the section consumes it on mount (pluginsSectionIntents).
+    publishPluginsSectionIntent({ type: "review-components", name: MANAGED_ITEM.name });
+    return createMockORPCClient(componentReviewOptions());
+  });
+  const reconnect = () => {
+    const next = createMockORPCClient(componentReviewOptions());
+    const list = next.agentPlugins.list.bind(next.agentPlugins);
+    const preview = next.agentPlugins.previewComponentReview.bind(next.agentPlugins);
+    next.agentPlugins.list = (...args: Parameters<typeof list>) => {
+      reconnectCalls.list++;
+      return list(...args);
+    };
+    next.agentPlugins.previewComponentReview = (...args: Parameters<typeof preview>) => {
+      reconnectCalls.preview++;
+      return preview(...args);
+    };
+    setClient(next);
+  };
+  return (
+    <ThemeProvider>
+      <TooltipProvider>
+        <button type="button" onClick={reconnect}>
+          Reconnect
+        </button>
+        <APIProvider client={client}>{props.children}</APIProvider>
+      </TooltipProvider>
+    </ThemeProvider>
+  );
+};
+
+/**
+ * #6609: a palette "Review Plugin Components" intent opens its review once. After the user
+ * cancels it, an API reconnect must not reopen it.
+ */
+export const ComponentReviewIntentNotReplayedOnReconnect: Story = {
+  // Out of Pixel snapshots (snapshot budget). The play checks the behavior.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <ReconnectingShell>
+      <PluginsSettingsSection />
+    </ReconnectingShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    reconnectCalls.list = 0;
+    reconnectCalls.preview = 0;
+    await canvas.findByText(/Skill 'grilling' needs review/);
+    await userEvent.click(canvas.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => {
+      if (canvas.queryByText(/Skill 'grilling' needs review/) !== null) {
+        throw new Error("Cancel must close the review");
+      }
+    });
+
+    await userEvent.click(canvas.getByRole("button", { name: "Reconnect" }));
+    await waitFor(() => {
+      if (reconnectCalls.list === 0)
+        throw new Error("The reconnected client must refresh the list");
+    });
+    // The replay ran right after that refresh (one macrotask covers the promise chain).
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (reconnectCalls.preview !== 0) {
+      throw new Error("A reconnect must not replay the palette review intent");
+    }
+    if (canvas.queryByText(/Skill 'grilling' needs review/) !== null) {
+      throw new Error("A reconnect must not reopen the cancelled review");
+    }
+  },
+};
+
+/**
+ * The section mounts while Xum reconnects: `api` still holds the detached client, whose calls
+ * fail. A Connect button then provides the live client.
+ */
+const MountWhileReconnectingShell: FC<{ children: ReactNode }> = (props) => {
+  const [live, setLive] = useState<APIClient | null>(null);
+  const [stale] = useState<APIClient>(() => {
+    publishPluginsSectionIntent({ type: "review-components", name: MANAGED_ITEM.name });
+    const client = createMockORPCClient(componentReviewOptions());
+    const offline = () => Promise.reject(new Error("connection lost"));
+    client.agentPlugins.list = offline;
+    client.agentPlugins.previewComponentReview = offline;
+    return client;
+  });
+  return (
+    <ThemeProvider>
+      <TooltipProvider>
+        <button
+          type="button"
+          onClick={() => setLive(createMockORPCClient(componentReviewOptions()))}
+        >
+          Connect
+        </button>
+        {/* One provider for both states, so the section stays mounted across the reconnect. */}
+        <APIContext.Provider
+          value={{
+            ...(live !== null
+              ? { status: "connected", api: live }
+              : { status: "reconnecting", api: stale, attempt: 1 }),
+            error: null,
+            authenticate: () => undefined,
+            retry: () => undefined,
+          }}
+        >
+          {props.children}
+        </APIContext.Provider>
+      </TooltipProvider>
+    </ThemeProvider>
+  );
+};
+
+/**
+ * #6609 review: a palette intent that arrives while Xum reconnects waits for the live client.
+ * Consuming it on the detached client would lose it, because that client's calls fail.
+ */
+export const ComponentReviewIntentWaitsForLiveConnection: Story = {
+  // Out of Pixel snapshots (snapshot budget). The play checks the behavior.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <MountWhileReconnectingShell>
+      <PluginsSettingsSection />
+    </MountWhileReconnectingShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: "Connect" }));
+    await canvas.findByText(/Skill 'grilling' needs review/);
   },
 };

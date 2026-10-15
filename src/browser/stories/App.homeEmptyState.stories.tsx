@@ -5,7 +5,7 @@
  * fixes.
  */
 
-import { expect, within } from "@storybook/test";
+import { expect, within } from "storybook/test";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import { textContrast } from "@/browser/stories/helpers/contrast";

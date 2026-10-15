@@ -1,4 +1,5 @@
 import assert from "@/common/utils/assert";
+import { substituteSkillArguments } from "./skillArguments";
 
 /**
  * Dynamic context injection for agent skills (Claude Code-compatible).
@@ -51,6 +52,30 @@ const SKILL_DYNAMIC_DIRECTIVE_RE = /^\s*!`([^`]+)`\s*$/;
 /** Whether `line` is a whole-line !`command` directive (it would run when injection is on). */
 export function isSkillDynamicDirectiveLine(line: string): boolean {
   return SKILL_DYNAMIC_DIRECTIVE_RE.test(line);
+}
+
+/** The command of a directive line, or undefined for any other line. */
+function directiveCommand(line: string): string | undefined {
+  return SKILL_DYNAMIC_DIRECTIVE_RE.exec(line)?.[1];
+}
+
+/**
+ * The commands of a body's directive lines, in order, as injectSkillDynamicContext would run
+ * them (both split on \n and match with directiveCommand). The plugin consent fingerprint covers
+ * these (#6617), so it and the runner must agree on what a directive is.
+ *
+ * The runner sees the body after slash-argument substitution, where a missing argument becomes
+ * an empty string. So a line such as !$1`cmd` is a directive when the user gives no argument, and
+ * it counts here with the command it runs then. A placeholder inside a command stays as written:
+ * the user supplies its value. Every line counts, also past MAX_SKILL_DYNAMIC_COMMANDS: which
+ * lines fall under the cap depends on the arguments, so a cut could skip a command that runs.
+ */
+export function skillDynamicDirectiveCommands(body: string): string[] {
+  return body.split("\n").flatMap((line) => {
+    const command =
+      directiveCommand(line) ?? directiveCommand(substituteSkillArguments(line, "").body);
+    return command === undefined ? [] : [command];
+  });
 }
 
 export interface SkillDynamicExecResult {
@@ -149,14 +174,13 @@ export async function injectSkillDynamicContext(args: {
   let injected = false;
 
   for (const line of lines) {
-    const match = SKILL_DYNAMIC_DIRECTIVE_RE.exec(line);
-    if (!match) {
+    const command = directiveCommand(line);
+    if (command === undefined) {
       outputLines.push(line);
       continue;
     }
 
     injected = true;
-    const command = match[1];
 
     if (executedCount >= MAX_SKILL_DYNAMIC_COMMANDS) {
       // Over the cap: keep the literal directive and explain why it did not run.

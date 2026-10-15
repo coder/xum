@@ -79,6 +79,7 @@ import {
   McpAppApproveDomainsRequestSchema,
   McpAppEntrypointSchema,
   McpAppModelContextRequestSchema,
+  McpAppWidgetStateRequestSchema,
   McpAppOpenEntrypointRequestSchema,
   McpAppViewDomainsSchema,
   McpAppResourceReadRequestSchema,
@@ -189,6 +190,9 @@ import {
   MCPSettingsReadInputSchema,
   MCPSettingsReadSnapshotSchema,
   MCPSettingsUpdateParamsSchema,
+  MCPSettingsRunToolParamsSchema,
+  MCPSettingsRunToolResultSchema,
+  MCPSettingsOpenAppResultSchema,
   MCPSetEnabledGlobalParamsSchema,
   MCPSetEnabledParamsSchema,
   MCPSetToolAllowlistGlobalParamsSchema,
@@ -205,8 +209,10 @@ import {
   AgentPluginInstallEntrySchema,
   AgentPluginInstallPreviewSchema,
   AgentPluginComponentsSchema,
+  AgentPluginComponentRefSchema,
   AgentPluginHooksSchema,
   AgentPluginListItemSchema,
+  AgentPluginPendingSignOutsSchema,
   AgentPluginUpdateCheckSchema,
   AgentPluginUpdateConsentSchema,
   AgentPluginUpdateReviewSchema,
@@ -782,6 +788,8 @@ export const mcpOauth = {
         projectPath: z.string().optional(),
         serverName: z.string(),
         pendingServer: MCPOAuthPendingServerSchema.optional(),
+        // Caller-generated so Cancel can name the flow while the start runs (#6565).
+        flowId: z.string().optional(),
       })
       .strict(),
     output: ResultSchema(
@@ -812,6 +820,8 @@ export const mcpOauth = {
         projectPath: z.string().optional(),
         serverName: z.string(),
         pendingServer: MCPOAuthPendingServerSchema.optional(),
+        // Caller-generated so Cancel can name the flow while the start runs (#6565).
+        flowId: z.string().optional(),
       })
       .strict(),
     output: ResultSchema(
@@ -845,6 +855,7 @@ export const mcpOauth = {
       hasRefreshToken: z.boolean(),
       scope: z.string().optional(),
       updatedAtMs: z.number().optional(),
+      insufficientScopes: z.array(z.string()).optional(),
     }),
   },
   logout: {
@@ -1019,6 +1030,7 @@ export const projects = {
           projectPath: z.string(),
           serverName: z.string(),
           pendingServer: MCPOAuthPendingServerSchema.optional(),
+          flowId: z.string().optional(),
         })
         .strict(),
       output: ResultSchema(
@@ -1049,6 +1061,7 @@ export const projects = {
           projectPath: z.string(),
           serverName: z.string(),
           pendingServer: MCPOAuthPendingServerSchema.optional(),
+          flowId: z.string().optional(),
         })
         .strict(),
       output: ResultSchema(
@@ -1086,6 +1099,7 @@ export const projects = {
         hasRefreshToken: z.boolean(),
         scope: z.string().optional(),
         updatedAtMs: z.number().optional(),
+        insufficientScopes: z.array(z.string()).optional(),
       }),
     },
     logout: {
@@ -1166,6 +1180,16 @@ export const mcp = {
       input: MCPSettingsUpdateParamsSchema,
       /** The snapshot the server shows after the update (its schema can change). */
       output: ResultSchema(MCPSettingsReadSnapshotSchema, z.string()),
+    },
+    /** Run a layout tool action (a regular tool) and return its text result. */
+    runTool: {
+      input: MCPSettingsRunToolParamsSchema,
+      output: ResultSchema(MCPSettingsRunToolResultSchema, z.string()),
+    },
+    /** Open a layout tool action's MCP App: call the tool and store its view record. */
+    openApp: {
+      input: MCPSettingsRunToolParamsSchema,
+      output: ResultSchema(MCPSettingsOpenAppResultSchema, z.string()),
     },
   },
   configureDesign: {
@@ -1282,6 +1306,11 @@ export const agentPlugins = {
       z.object({ success: z.literal(false), error: z.string() }),
     ]),
   },
+  /** The pending sign-out record that keeps managed plugins closed (#6627). */
+  pendingSignOuts: {
+    input: z.void(),
+    output: AgentPluginPendingSignOutsSchema,
+  },
   /** Display path of the ACTIVE managed plugin container (config-derived root; never hardcode it in UI). */
   containerLocation: {
     input: z.void(),
@@ -1319,6 +1348,26 @@ export const agentPlugins = {
       consent: AgentPluginUpdateConsentSchema.nullish(),
     }),
     output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
+  },
+  /**
+   * Component review of the installed tree (#6498): every imported skill or MCP server whose
+   * current fingerprint the user has not reviewed, in the update review shape (fromSha = toSha).
+   */
+  previewComponentReview: {
+    input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginUpdateReviewSchema, z.string()),
+  },
+  /** Record consent for the reviewed components that still match the installed tree. */
+  confirmComponentReview: {
+    input: z.object({
+      name: z.string(),
+      expectedLockedSha: z.string(),
+      reviewed: z.array(AgentPluginComponentRefSchema),
+    }),
+    output: ResultSchema(
+      z.object({ entry: AgentPluginInstallEntrySchema, cleanupWarning: z.string().optional() }),
+      z.string()
+    ),
   },
 };
 
@@ -1526,7 +1575,7 @@ export const artifacts = {
 };
 
 /**
- * MCP Apps views in the Artifacts tab (artifacts experiment): the view resource plus the
+ * MCP Apps views in the Artifacts tab (mcp-apps experiment): the view resource plus the
  * host-only tool result, and tools/call and resources/read issued by a view.
  */
 export const mcpApps = {
@@ -1556,6 +1605,14 @@ export const mcpApps = {
     ),
   },
   listViewDomains: { input: z.void(), output: z.array(McpAppViewDomainsSchema) },
+  /**
+   * Every project's approvals with the revision of this read, newer than every list committed
+   * before it: the live follow of mounted views re-reads after each config change (#6181).
+   */
+  readViewDomains: {
+    input: z.void(),
+    output: z.object({ revision: z.number(), approvals: z.array(McpAppViewDomainsSchema) }),
+  },
   /** Mounted views of the server in this renderer reload under the narrower policy. */
   revokeViewDomains: {
     input: McpAppViewDomainsSchema.pick({ projectPath: true, serverName: true }),
@@ -1564,6 +1621,11 @@ export const mcpApps = {
   /** ui/update-model-context of a view; used by the workspace's next requests. */
   updateModelContext: {
     input: McpAppModelContextRequestSchema,
+    output: ResultSchema(z.object({}), z.string()),
+  },
+  /** window.openai.setWidgetState of a view; kept in its result record (#6178). */
+  setWidgetState: {
+    input: McpAppWidgetStateRequestSchema,
     output: ResultSchema(z.object({}), z.string()),
   },
   /** Entry points of the servers enabled in the workspace (starts them like prompt discovery). */
@@ -1730,9 +1792,8 @@ export const workspace = {
     input: z.object({
       projectPath: z.string(),
       /**
-       * Workspace branch name. When omitted, the backend auto-generates a name
-       * based on the trunk branch (e.g., "main-1", "main-2"), similar to how
-       * /fork derives a name from the parent workspace.
+       * Workspace branch name. When omitted, the backend picks a free random
+       * Docker-style name such as "calm-otters-sing" (as /new does).
        */
       branchName: z.string().optional(),
       /** Trunk branch to fork from - only required for worktree/SSH runtimes, ignored for local */
@@ -1752,6 +1813,25 @@ export const workspace = {
        * rendered in the UI). Used by orchestration callers for stable identity.
        */
       tags: z.record(WorkspaceTagKeySchema, z.string()).optional(),
+      /**
+       * Name the workspace in the backend after it is announced, so creation does not wait for
+       * the naming model: it opens under a random name, gets the generated title when it arrives,
+       * and its git branch is renamed before the init hook runs (the directory and workspace
+       * name stay). Worktree runtime only; omit `branchName` and `title`.
+       */
+      nameGeneration: z
+        .object({
+          /** The message to name the workspace after. */
+          message: z.string(),
+          /** Caller fallback models, as for nameGeneration.generate. */
+          candidates: z.array(z.string()),
+          /**
+           * The creation form's nameGeneration.generate request for this message, running or
+           * finished: its result names the workspace instead of a second model call.
+           */
+          draftNamingId: z.string().optional(),
+        })
+        .optional(),
     }),
     output: z.discriminatedUnion("success", [
       z.object({ success: z.literal(true), metadata: FrontendWorkspaceMetadataSchema }),
@@ -2725,6 +2805,9 @@ export const workspace = {
 };
 
 export type WorkspaceSendMessageOutput = z.infer<typeof workspace.sendMessage.output>;
+export type WorkspaceNameGenerationRequest = NonNullable<
+  z.infer<typeof workspace.create.input>["nameGeneration"]
+>;
 export type ArchiveLossyUntrackedFilesConfirmation = z.infer<
   typeof ArchiveLossyUntrackedFilesConfirmationSchema
 >;
@@ -2956,6 +3039,11 @@ export const nameGeneration = {
        * first, then these; gateway routing is resolved in createModel.
        */
       candidates: z.array(z.string()),
+      /**
+       * Set by the creation form, unique per request: a workspace.create that hands this request
+       * off (nameGeneration.draftNamingId) takes its result over.
+       */
+      draftNamingId: z.string().optional(),
     }),
     output: ResultSchema(
       z.object({

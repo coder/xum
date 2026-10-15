@@ -58,9 +58,11 @@ import {
   getMcpAppView,
   getMcpAppViewRecords,
   readMcpAppServerResource,
+  setMcpAppWidgetState,
   updateMcpAppModelContext,
   approveMcpAppViewDomains,
   listMcpAppViewDomains,
+  readMcpAppViewDomains,
   revokeMcpAppViewDomains,
 } from "@/node/services/mcpAppsOperations";
 import {
@@ -125,8 +127,6 @@ import { Err, Ok } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import { normalizeAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
 import { AutoModelRouterTag } from "@/node/services/di/tags";
-
-import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
 
 import {
   createAuthMiddleware,
@@ -1326,6 +1326,34 @@ export const router = (authToken?: string) => {
               )
             )
           ),
+        runTool: t
+          .input(schemas.mcp.settings.runTool.input)
+          .output(schemas.mcp.settings.runTool.output)
+          .handler(({ context, input, signal }) =>
+            runMcpSettingsRoute(context, input.workspaceId, signal, () =>
+              context.mcpServerManager.runSettingsTool(
+                input.workspaceId,
+                input.serverName,
+                input.toolName,
+                input.instanceToken,
+                { confirmed: input.confirmed, signal }
+              )
+            )
+          ),
+        openApp: t
+          .input(schemas.mcp.settings.openApp.input)
+          .output(schemas.mcp.settings.openApp.output)
+          .handler(({ context, input, signal }) =>
+            runMcpSettingsRoute(context, input.workspaceId, signal, () =>
+              context.mcpServerManager.openSettingsApp(
+                input.workspaceId,
+                input.serverName,
+                input.toolName,
+                input.instanceToken,
+                { confirmed: input.confirmed, signal }
+              )
+            )
+          ),
       },
       designStatus: t
         .input(schemas.mcp.designStatus.input)
@@ -1421,6 +1449,10 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.agentPluginInstallService.setComponentsResult(input)
         ),
+      pendingSignOuts: t
+        .input(schemas.agentPlugins.pendingSignOuts.input)
+        .output(schemas.agentPlugins.pendingSignOuts.output)
+        .handler(({ context }) => context.agentPluginInstallService.pendingSignOutStatus()),
       containerLocation: t
         .input(schemas.agentPlugins.containerLocation.input)
         .output(schemas.agentPlugins.containerLocation.output)
@@ -1447,6 +1479,18 @@ export const router = (authToken?: string) => {
             name: input.name,
             consent: input.consent ?? undefined,
           })
+        ),
+      previewComponentReview: t
+        .input(schemas.agentPlugins.previewComponentReview.input)
+        .output(schemas.agentPlugins.previewComponentReview.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.previewComponentReviewResult(input)
+        ),
+      confirmComponentReview: t
+        .input(schemas.agentPlugins.confirmComponentReview.input)
+        .output(schemas.agentPlugins.confirmComponentReview.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.confirmComponentReviewResult(input)
         ),
     },
     mcpOauth: {
@@ -1707,16 +1751,7 @@ export const router = (authToken?: string) => {
       generate: t
         .input(schemas.nameGeneration.generate.input)
         .output(schemas.nameGeneration.generate.output)
-        .handler(async ({ context, input }) => {
-          // Pre-creation naming has no workspace yet: the configured naming
-          // agent (model + thinking) still leads; the caller's models only fill
-          // in after the built-in fallbacks.
-          const candidates = await context.workspaceService.getWorkspaceNamingCandidates(
-            undefined,
-            input.candidates
-          );
-          return generateWorkspaceIdentity(input.message, candidates, context.aiService);
-        }),
+        .handler(({ context, input }) => context.workspaceService.generateDraftIdentity(input)),
     },
     coder: {
       getInfo: t
@@ -1829,6 +1864,10 @@ export const router = (authToken?: string) => {
         .input(schemas.mcpApps.updateModelContext.input)
         .output(schemas.mcpApps.updateModelContext.output)
         .handler(({ context, input }) => updateMcpAppModelContext(context, input)),
+      setWidgetState: t
+        .input(schemas.mcpApps.setWidgetState.input)
+        .output(schemas.mcpApps.setWidgetState.output)
+        .handler(({ context, input }) => setMcpAppWidgetState(context, input)),
       approveViewDomains: t
         .input(schemas.mcpApps.approveViewDomains.input)
         .output(schemas.mcpApps.approveViewDomains.output)
@@ -1837,6 +1876,10 @@ export const router = (authToken?: string) => {
         .input(schemas.mcpApps.listViewDomains.input)
         .output(schemas.mcpApps.listViewDomains.output)
         .handler(({ context }) => listMcpAppViewDomains(context)),
+      readViewDomains: t
+        .input(schemas.mcpApps.readViewDomains.input)
+        .output(schemas.mcpApps.readViewDomains.output)
+        .handler(({ context }) => readMcpAppViewDomains(context)),
       revokeViewDomains: t
         .input(schemas.mcpApps.revokeViewDomains.input)
         .output(schemas.mcpApps.revokeViewDomains.output)

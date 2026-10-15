@@ -1,4 +1,4 @@
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { appMeta, AppWithMocks, type AppStory } from "./meta";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
@@ -32,6 +32,7 @@ const preview: AgentPluginInstallPreview = {
   agents: ["reviewer.md"],
   workflows: ["review.js"],
   slashCommands: [{ name: "review-status", description: "Summarize review status" }],
+  reviewedComponents: [],
   codexHooks: [],
   hook: { path: "hooks.js", toolGrants: ["file_read"] },
   warnings: [],

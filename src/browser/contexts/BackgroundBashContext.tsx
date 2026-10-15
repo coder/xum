@@ -6,7 +6,6 @@ import { useBackgroundBashStoreRaw } from "@/browser/stores/BackgroundBashStore"
 interface BackgroundBashActions {
   terminate: (processId: string) => void;
   sendToBackground: (toolCallId: string) => void;
-  autoBackgroundOnSend: () => void;
 }
 
 const BackgroundBashActionsContext = createContext<BackgroundBashActions | undefined>(undefined);
@@ -51,9 +50,6 @@ export const BackgroundBashProvider: React.FC<BackgroundBashProviderProps> = (pr
           if (!isLive(workspaceId)) return;
           error.showError(`send-to-background-${toolCallId}`, err.message);
         });
-      },
-      autoBackgroundOnSend: () => {
-        store.autoBackgroundOnSend(props.workspaceId);
       },
     };
   }, [connectionKey, error, props.workspaceId, store]);

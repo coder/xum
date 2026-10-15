@@ -266,7 +266,8 @@ export function getDevcontainerStatusChip(
     case "stopped":
       return {
         label: "Devcontainer Stopped",
-        className: "bg-muted/50 text-muted-foreground",
+        // The /50 muted tint left even foreground text at 4.17:1 in flexoki-dark (#6544).
+        className: "bg-muted/15 text-foreground",
       };
     default:
       return null;

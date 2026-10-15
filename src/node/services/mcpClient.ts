@@ -1,5 +1,6 @@
 import {
   Client,
+  InsufficientScopeError,
   SSEClientTransport,
   StreamableHTTPClientTransport,
   type OAuthClientProvider,
@@ -12,6 +13,7 @@ import {
   advertisedMCPSettingsToolNames,
   parseMCPSettingsCapability,
   type MCPSettingsCapability,
+  type MCPSettingsToolAction,
 } from "@/common/utils/mcpSettings";
 import {
   isModelVisibleTool,
@@ -73,7 +75,7 @@ const RESOURCE_READ_TIMEOUT_MS = 30_000;
 /** tools/call issued by an MCP Apps view (not by the model). */
 const APP_TOOL_CALL_TIMEOUT_MS = 120_000;
 // One hung server must not stall the whole slash/inline prompt catalog.
-const PROMPT_LIST_TIMEOUT_MS = 10_000;
+export const PROMPT_LIST_TIMEOUT_MS = 10_000;
 
 export interface MCPHttpTransportConfig {
   type: "http" | "sse";
@@ -82,6 +84,11 @@ export interface MCPHttpTransportConfig {
   /** Custom fetch (e.g. WWW-Authenticate capture during server tests). */
   fetch?: typeof fetch;
   authProvider?: OAuthClientProvider;
+  /**
+   * Called with the sanitized scope names when the server refuses a tool call with 403
+   * `insufficient_scope` (#6622). The stored tokens stay: tools that need less keep working.
+   */
+  onInsufficientScope?: (scopes: string[]) => void;
 }
 
 /**
@@ -109,7 +116,7 @@ export interface MCPClientConfig {
    */
   prior?: PriorDiscovery;
   /**
-   * MCP Apps host support (artifacts experiment, read at connect time): announce the
+   * MCP Apps host support (mcp-apps experiment, read at connect time): announce the
    * `io.modelcontextprotocol/ui` extension, keep tool `_meta.ui`, and leave tools whose
    * visibility lacks "model" out of tools(). When false the client behaves exactly as before.
    */
@@ -205,6 +212,22 @@ export interface MCPClientHandle {
     meta: Record<string, unknown>,
     options?: { signal?: AbortSignal; timeoutMs?: number }
   ): Promise<MCPRawCallToolResult>;
+  /**
+   * A tool of the latest tools() listing as a settings layout tool action (hidden tools
+   * included, settings tools excluded). Undefined when the listing has no such tool.
+   */
+  settingsToolAction(name: string): MCPSettingsToolAction | undefined;
+  /**
+   * Re-list the server's tools (tools/list), so settingsToolAction reflects the current catalog.
+   * Settings actions call it before a dispatch on a connection without another refresh.
+   */
+  relistTools(): Promise<void>;
+  /** tools/call for a settings layout tool action, with the spec's `{}` arguments. */
+  callSettingsActionTool(
+    name: string,
+    meta: Record<string, unknown>,
+    options?: { signal?: AbortSignal }
+  ): Promise<MCPRawCallToolResult>;
   close(): Promise<void>;
 }
 
@@ -217,6 +240,64 @@ function isHttpTransportConfig(
   transport: Transport | MCPHttpTransportConfig
 ): transport is MCPHttpTransportConfig {
   return "type" in transport && (transport.type === "http" || transport.type === "sse");
+}
+
+/**
+ * Scope names Xum repeats to the agent and in Settings. Narrower than RFC 6749 §3.3 (which also
+ * allows markup and quotes): real scopes are names, URLs and URNs (`files.write`,
+ * `api://app/.default`, `https://www.googleapis.com/auth/drive`). Other tokens are dropped.
+ */
+const SCOPE_TOKEN = /^[A-Za-z0-9._:/~+-]{1,200}$/;
+const MAX_REPORTED_SCOPES = 20;
+
+/** The scope names of a 403 `insufficient_scope` challenge, without any other server text. */
+export function insufficientScopeNames(requiredScope: string | undefined): string[] {
+  return (requiredScope ?? "")
+    .split(/\s+/)
+    .filter((token) => SCOPE_TOKEN.test(token))
+    .slice(0, MAX_REPORTED_SCOPES);
+}
+
+/**
+ * The error a refused tool call reports to the agent (#6622). For 403 `insufficient_scope` it
+ * names only the scopes: the SDK error also carries the server's `error_description`, which is
+ * server-controlled text and must not reach the model.
+ */
+function toolCallError(
+  error: unknown,
+  onInsufficientScope: ((scopes: string[]) => void) | undefined
+): unknown {
+  if (!(error instanceof InsufficientScopeError)) return error;
+  const scopes = insufficientScopeNames(error.requiredScope);
+  onInsufficientScope?.(scopes);
+  const needed =
+    scopes.length > 0 ? `the OAuth scope "${scopes.join(" ")}"` : "more OAuth permissions";
+  return new Error(
+    `The MCP server refused this tool call: it needs ${needed}. The user must sign in to this MCP server again and grant it.`
+  );
+}
+
+/** An agent's tool call; a 403 `insufficient_scope` becomes toolCallError's message. */
+async function callModelTool(
+  client: Client,
+  call: { name: string; arguments: Record<string, unknown> },
+  signal: AbortSignal | undefined,
+  onInsufficientScope: ((scopes: string[]) => void) | undefined
+): Promise<MCPRawCallToolResult> {
+  try {
+    return await client.callTool(call, {
+      timeout: SDK_TOOL_CALL_TIMEOUT_MS,
+      ...(signal !== undefined ? { signal } : {}),
+    });
+  } catch (error) {
+    throw toolCallError(error, onInsufficientScope);
+  }
+}
+
+function insufficientScopeHandler(
+  transport: MCPClientConfig["transport"]
+): ((scopes: string[]) => void) | undefined {
+  return isHttpTransportConfig(transport) ? transport.onInsufficientScope : undefined;
 }
 
 function createHttpTransport(config: MCPHttpTransportConfig): Transport {
@@ -234,6 +315,10 @@ function createHttpTransport(config: MCPHttpTransportConfig): Transport {
     requestInit,
     ...(config.fetch !== undefined ? { fetch: config.fetch } : {}),
     ...(config.authProvider !== undefined ? { authProvider: config.authProvider } : {}),
+    // The SDK default ("reauthorize") reaches the background provider's interactive redirect,
+    // which deletes the stored tokens and signs every tool of the server out. Throw instead, so
+    // only the refused call fails and Settings → MCP prompts a sign-in (#6622).
+    onInsufficientScope: "throw" as const,
   };
 
   // Custom headers in requestInit are merged into every request by both
@@ -245,12 +330,36 @@ function createHttpTransport(config: MCPHttpTransportConfig): Transport {
 }
 
 /**
+ * Record one tools/list entry as a settings layout tool action. The title follows the settings
+ * spec's display name order with the same cleaning as entry point titles; a tool whose name
+ * cleans to nothing is left out.
+ */
+function addSettingsToolAction(
+  actions: Map<string, MCPSettingsToolAction>,
+  definition: Awaited<ReturnType<Client["listTools"]>>["tools"][number],
+  ui: MCPToolUi | undefined
+): void {
+  const title = mcpAppEntrypointTitle(
+    [definition.title, definition.annotations?.title],
+    definition.name
+  );
+  if (title === undefined) return;
+  actions.set(definition.name, {
+    title,
+    readOnly: definition.annotations?.readOnlyHint === true,
+    // Parsed even without MCP Apps (where `ui` is undefined): an app tool must not run as a
+    // regular tool without its view (the manager gives it no action then).
+    opensApp: (ui ?? parseMCPToolUiMeta(definition._meta))?.resourceUri !== undefined,
+  });
+}
+
+/**
  * MCP CallToolResult -> AI SDK tool-result output for the model.
  *
  * Mirrors @ai-sdk/mcp's mcpToModelOutput so model-visible tool results stay
  * identical across the SDK swap.
  */
-function mcpToModelOutput({
+export function mcpToModelOutput({
   output,
 }: {
   output: unknown;
@@ -363,8 +472,32 @@ function reportToolsListChanged(
   return changes.dispose;
 }
 
+/** What one tools/list showed, for the handle's lookups. */
+interface ListedCatalog {
+  /** Which tools/list call (in start order) produced it. */
+  listing: number;
+  /** Every listed tool (hidden ones included) -> its `_meta.ui`, if any. */
+  tools: Map<string, MCPToolUi | undefined>;
+  entrypoints: readonly MCPAppEntrypointTool[];
+  settingsActions: Map<string, MCPSettingsToolAction>;
+}
+
+/**
+ * The catalog to keep after a listing answers (#6611): overlapping listings (relistTools, a
+ * send) can answer out of order, and a late, older response must not overwrite a newer catalog.
+ */
+function newerCatalog(current: ListedCatalog, answered: ListedCatalog): ListedCatalog {
+  return answered.listing > current.listing ? answered : current;
+}
+
 export async function createMCPClient(config: MCPClientConfig): Promise<MCPClientHandle> {
   const mcpApps = config.mcpApps === true;
+  const onInsufficientScope = insufficientScopeHandler(config.transport);
+  // App, hook and settings calls report a refused scope the same way as model tools (#6622).
+  const callAnyTool = (...args: Parameters<Client["callTool"]>) =>
+    client.callTool(...args).catch((error: unknown) => {
+      throw toolCallError(error, onInsufficientScope);
+    });
   const client = new Client(CLIENT_INFO, {
     versionNegotiation: {
       mode: "auto",
@@ -379,9 +512,14 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         }
       : {}),
   });
-  // Every tool of the latest listing (hidden ones included) -> its `_meta.ui`, if any.
-  let listedTools = new Map<string, MCPToolUi | undefined>();
-  let listedEntrypoints: readonly MCPAppEntrypointTool[] = [];
+  let catalog: ListedCatalog = {
+    listing: 0,
+    tools: new Map(),
+    entrypoints: [],
+    settingsActions: new Map(),
+  };
+  // tools/list calls started; `catalog.listing` is the newest one applied (newerCatalog).
+  let listingsStarted = 0;
 
   if (config.onUncaughtError) {
     const onUncaughtError = config.onUncaughtError;
@@ -409,18 +547,21 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
 
   const handle: MCPClientHandle = {
     tools: async () => {
+      const listing = ++listingsStarted;
       const listResult = await client.listTools();
       assert(Array.isArray(listResult.tools), "MCP tools/list result must carry a tools array");
 
       const tools: Record<string, Tool> = {};
       const listed = new Map<string, MCPToolUi | undefined>();
       const entrypoints: MCPAppEntrypointTool[] = [];
+      const settingsActions = new Map<string, MCPSettingsToolAction>();
       for (const definition of listResult.tools) {
         // Settings tools are host-only: left out of the listing too, so an MCP App view
         // cannot call them through callToolForApp (hasTool is false for them).
         if (settingsTools.has(definition.name)) continue;
         const ui = mcpApps ? parseMCPToolUiMeta(definition._meta) : undefined;
         listed.set(definition.name, ui);
+        addSettingsToolAction(settingsActions, definition, ui);
         // Read before the visibility filter below: entry points ignore visibility.
         if (ui?.resourceUri !== undefined) {
           const { types, skippedFile } = parseMCPAppEntrypoints(definition._meta);
@@ -470,15 +611,11 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
           } as JSONSchema7),
           execute: async (args: unknown, options: { abortSignal?: AbortSignal }) => {
             options.abortSignal?.throwIfAborted();
-            return await client.callTool(
-              {
-                name: definition.name,
-                arguments: args as Record<string, unknown>,
-              },
-              {
-                timeout: SDK_TOOL_CALL_TIMEOUT_MS,
-                ...(options.abortSignal !== undefined ? { signal: options.abortSignal } : {}),
-              }
+            return await callModelTool(
+              client,
+              { name: definition.name, arguments: args as Record<string, unknown> },
+              options.abortSignal,
+              onInsufficientScope
             );
           },
           toModelOutput: mcpToModelOutput,
@@ -486,8 +623,8 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         if (ui !== undefined) toolUiByTool.set(tool, ui);
         tools[definition.name] = tool;
       }
-      listedTools = listed;
-      listedEntrypoints = entrypoints;
+      // Its tools still go to its caller, even when a newer listing's catalog stays.
+      catalog = newerCatalog(catalog, { listing, tools: listed, entrypoints, settingsActions });
       return tools;
     },
     prompts: (options) => listServerPrompts(client, options?.signal),
@@ -507,12 +644,12 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       const discover = client.getDiscoverResult();
       return discover !== undefined ? { kind: "modern", discover } : { kind: "legacy" };
     },
-    toolUi: (name) => listedTools.get(name),
-    hasTool: (name) => listedTools.has(name),
-    appEntrypoints: () => listedEntrypoints,
+    toolUi: (name) => catalog.tools.get(name),
+    hasTool: (name) => catalog.tools.has(name),
+    appEntrypoints: () => catalog.entrypoints,
     callToolForApp: (name, args, options) => {
       assert(mcpApps, "callToolForApp requires an MCP Apps connection");
-      return client.callTool(
+      return callAnyTool(
         { name, arguments: args },
         {
           timeout: APP_TOOL_CALL_TIMEOUT_MS,
@@ -521,7 +658,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       );
     },
     callToolForHook: (name, args, options) =>
-      client.callTool({ name, arguments: args }, { signal: options.signal }),
+      callAnyTool({ name, arguments: args }, { signal: options.signal }),
     readResource: (uri, options) => {
       assert(mcpApps, "readResource requires an MCP Apps connection");
       return client.readResource(
@@ -535,12 +672,24 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     settingsCapability: () => settings,
     callSettingsTool: (name, args, meta, options) => {
       assert(settingsTools.has(name), "callSettingsTool only calls the advertised settings tools");
-      return client.callTool(
+      return callAnyTool(
         { name, arguments: args, _meta: meta },
         {
           timeout: options?.timeoutMs ?? APP_TOOL_CALL_TIMEOUT_MS,
           ...(options?.signal !== undefined ? { signal: options.signal } : {}),
         }
+      );
+    },
+    settingsToolAction: (name) => catalog.settingsActions.get(name),
+    relistTools: async () => {
+      await handle.tools();
+    },
+    callSettingsActionTool: (name, meta, options) => {
+      assert(catalog.settingsActions.has(name), "callSettingsActionTool only calls listed tools");
+      // The spec's layout tool accepts `{}`.
+      return callAnyTool(
+        { name, arguments: {}, _meta: meta },
+        { ...options, timeout: APP_TOOL_CALL_TIMEOUT_MS }
       );
     },
     close: () => {

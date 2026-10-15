@@ -1,6 +1,6 @@
 import React from "react";
 import { formatQualifiedSkillName } from "@/common/utils/agentSkills/skillLookupName";
-import { AlertTriangle, Check, CloudOff, EyeOff, XCircle } from "lucide-react";
+import { AlertTriangle, Check, CloudOff, EyeOff, Info, XCircle } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { SkillIcon } from "@/browser/components/icons/SkillIcon/SkillIcon";
 import { HoverClickPopover } from "@/browser/components/HoverClickPopover/HoverClickPopover";
@@ -22,6 +22,8 @@ interface SkillIndicatorProps {
   availableSkills: InvocableSkill[];
   /** Skills that were discovered but couldn't be loaded (SKILL.md parse errors, etc.) */
   invalidSkills?: AgentSkillIssue[];
+  /** Loaded skills with a non-fatal problem (e.g. a display name); not counted as errors */
+  skillWarnings?: AgentSkillIssue[];
   /** Skills roots that could not be read (e.g. the SSH host did not answer) */
   unavailableSources?: AgentSkillUnavailableSource[];
   /** Runtime skill load failures (agent_skill_read returned an error) */
@@ -42,6 +44,7 @@ interface SkillsPopoverContentProps {
   loadedSkills: LoadedSkill[];
   availableSkills: InvocableSkill[];
   invalidSkills: AgentSkillIssue[];
+  skillWarnings?: AgentSkillIssue[];
   unavailableSources: AgentSkillUnavailableSource[];
   skillLoadErrors: SkillLoadError[];
 }
@@ -61,6 +64,56 @@ function getLoadedSkillNames(
   }
   return names;
 }
+
+/** A display name (SKILL.md `name` that is not the ID) leads; the ID follows, muted. */
+const SkillRowName: React.FC<{ skill: InvocableSkill }> = (props) => {
+  if (props.skill.displayName == null) return <>{props.skill.name}</>;
+  return (
+    <>
+      {props.skill.displayName}
+      <span className="text-muted-foreground ml-1 font-normal">{props.skill.name}</span>
+    </>
+  );
+};
+
+function formatWarningCount(warnings: AgentSkillIssue[] | undefined): string[] {
+  const count = warnings?.length ?? 0;
+  if (count === 0) return [];
+  return [`${count} warning${count === 1 ? "" : "s"}`];
+}
+
+const SkillWarningsSection: React.FC<{ warnings?: AgentSkillIssue[] }> = (props) => {
+  if (props.warnings == null || props.warnings.length === 0) return null;
+  return (
+    <div className="border-separator-light border-t pt-2">
+      <div className="text-muted-foreground flex items-center gap-1 text-[10px] font-medium tracking-wider uppercase">
+        <Info className="h-3 w-3" />
+        Skill warnings
+      </div>
+      <div className="mt-1.5 flex flex-col gap-1">
+        {props.warnings.map((warning) => (
+          <div
+            key={`${warning.scope}:${warning.directoryName}:${warning.displayPath}`}
+            className="flex items-start gap-1.5"
+          >
+            <div className="bg-muted-foreground/30 mt-1.5 h-1 w-1 shrink-0 rounded-full" />
+            <div className="flex min-w-0 flex-col gap-0.5">
+              <span className="text-xs font-medium">{warning.directoryName}</span>
+              <span className="text-muted-foreground text-[11px] leading-snug break-words">
+                {warning.message}
+              </span>
+              {warning.hint && (
+                <span className="text-muted-foreground text-[11px] leading-snug break-words">
+                  Hint: {warning.hint}
+                </span>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
 
 const SkillsPopoverContent: React.FC<SkillsPopoverContentProps> = (props) => {
   const loadedSkillNames = getLoadedSkillNames(props.loadedSkills, props.availableSkills);
@@ -105,7 +158,7 @@ const SkillsPopoverContent: React.FC<SkillsPopoverContentProps> = (props) => {
                         isLoaded ? "text-foreground" : "text-muted-foreground"
                       )}
                     >
-                      {skill.name}
+                      <SkillRowName skill={skill} />
                       {isUnadvertised && (
                         <EyeOff
                           className="text-muted-foreground ml-1 inline h-3 w-3"
@@ -170,6 +223,7 @@ const SkillsPopoverContent: React.FC<SkillsPopoverContentProps> = (props) => {
           </div>
         </div>
       )}
+      <SkillWarningsSection warnings={props.skillWarnings} />
       {props.unavailableSources.length > 0 && (
         <div className="border-separator-light border-t pt-2">
           <div className="text-danger-soft flex items-center gap-1 text-[10px] font-medium tracking-wider uppercase">
@@ -250,6 +304,8 @@ export const SkillIndicator: React.FC<SkillIndicatorProps> = (props) => {
   if (invalidCount > 0) {
     ariaLabelParts.push(`${invalidCount} invalid`);
   }
+  // Warnings are non-fatal: announced here and listed in the popover, never in the error badge.
+  ariaLabelParts.push(...formatWarningCount(props.skillWarnings));
   if (unavailableCount > 0) {
     ariaLabelParts.push(
       `${unavailableCount} unavailable source${unavailableCount === 1 ? "" : "s"}`
@@ -268,6 +324,7 @@ export const SkillIndicator: React.FC<SkillIndicatorProps> = (props) => {
           loadedSkills={props.loadedSkills}
           availableSkills={props.availableSkills}
           invalidSkills={props.invalidSkills ?? []}
+          skillWarnings={props.skillWarnings}
           unavailableSources={props.unavailableSources ?? []}
           skillLoadErrors={props.skillLoadErrors ?? []}
         />

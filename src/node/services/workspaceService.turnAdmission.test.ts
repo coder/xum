@@ -82,7 +82,7 @@ describe("WorkspaceService task-attempt admission fence", () => {
       cleanup: mock(() => Promise.resolve()),
       hasRunningBackgroundProcesses: mock(() => false),
       hasOrphanedRunningBackgroundProcesses: mock(() => Promise.resolve(false)),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     }) as unknown as BackgroundProcessManager;
     const aiEmitter = new EventEmitter();
     let streaming = false;

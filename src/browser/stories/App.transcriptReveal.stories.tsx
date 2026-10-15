@@ -8,7 +8,7 @@
  * A transcript above the automatic rows budget pauses there; "Load older messages" mounts more.
  */
 import type { ComponentType } from "react";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { APIClient } from "@/browser/contexts/API";
 import type { ChatMuxMessage } from "@/common/orpc/types";
 import {

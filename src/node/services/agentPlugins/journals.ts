@@ -104,7 +104,10 @@ export async function containerHasUnreconciledJournals(containerPath: string): P
  * that overlap the scan.
  */
 export interface ContainerMutationState {
-  /** Fail-closed: an unreadable staging root reports true. */
+  /**
+   * Recovery journals, or a pending post-update sign-out (#6122). Fail-closed: an unreadable
+   * staging root or record reports true.
+   */
   hasJournals: boolean;
   /**
    * Epoch token; `undefined` when the epoch file has never been written (a
@@ -140,8 +143,57 @@ export async function readContainerMutationState(
   containerPath: string
 ): Promise<ContainerMutationState> {
   const stagingRoot = path.join(path.dirname(containerPath), STAGING_DIR_NAME);
-  const hasJournals = await containerHasUnreconciledJournals(containerPath);
+  const hasJournals = (
+    await Promise.all([
+      containerHasUnreconciledJournals(containerPath),
+      containerHasPendingSignOuts(containerPath),
+    ])
+  ).includes(true);
   return { hasJournals, epoch: await readMutationEpochToken(stagingRoot) };
+}
+
+/**
+ * Credential URLs that plugin updates still have to sign out (#6122), next to the container.
+ * While the record exists, every discovery gate (also headless processes that never build the
+ * install service) keeps the managed container closed: a plugin server must not connect with
+ * its old sign-in's tokens.
+ */
+export const PENDING_SIGN_OUTS_FILE_NAME = "plugin-sign-outs-pending.json";
+
+/** One stat. Fail-closed: a record that cannot be stat'ed counts as pending. */
+export async function containerHasPendingSignOuts(containerPath: string): Promise<boolean> {
+  try {
+    await fsPromises.stat(pendingSignOutsPath(containerPath));
+    return true;
+  } catch (error) {
+    return !hasErrorCode(error, "ENOENT");
+  }
+}
+
+function pendingSignOutsPath(containerPath: string): string {
+  return path.join(path.dirname(containerPath), PENDING_SIGN_OUTS_FILE_NAME);
+}
+
+/**
+ * The record's state for a diagnostic (#6627). It reads the file, because a record that can be
+ * stat'ed but not read (a directory, missing read permission) still fails every sign-out pass.
+ */
+export async function pendingSignOutsRecordState(
+  containerPath: string
+): Promise<{ kind: "absent" } | { kind: "present" } | { kind: "unreadable"; code: string }> {
+  try {
+    // Not a regular file (a FIFO would block readFile): unreadable, without reading it.
+    if (!(await fsPromises.stat(pendingSignOutsPath(containerPath))).isFile())
+      return { kind: "unreadable", code: "not a regular file" };
+    await fsPromises.readFile(pendingSignOutsPath(containerPath));
+    return { kind: "present" };
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return { kind: "absent" };
+    // fs errors come from another realm under the Jest VM: read `code` without instanceof.
+    const code: unknown =
+      typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+    return { kind: "unreadable", code: typeof code === "string" ? code : "unknown error" };
+  }
 }
 
 /**

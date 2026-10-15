@@ -1,4 +1,4 @@
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { ComponentType } from "react";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";

@@ -97,6 +97,10 @@ export const DynamicToolPartPendingSchema = MuxToolPartBase.extend({
 const DynamicToolPartAvailableSchema = MuxToolPartBase.extend({
   state: z.literal("output-available"),
   output: z.unknown(),
+  // Model-only notes the in-turn result carried (`__mux_notifications`), kept out of `output`
+  // so the transcript never shows them. The request build attaches them again: see
+  // readModelOnlyToolNotifications.
+  modelOnlyNotifications: z.array(z.string()).optional().catch(undefined),
   nestedCalls: z.array(NestedToolCallSchema).optional(),
 });
 const DynamicToolPartRedactedSchema = MuxToolPartBase.extend({
@@ -249,6 +253,11 @@ export const MuxMessageSchema = z.object({
       // A corrupt point degrades to the strip-all receipt, which is always valid.
       anthropicThinkingReplayFromStep: z
         .union([z.number().int().nonnegative(), z.literal("end")])
+        .optional()
+        .catch(undefined),
+      // Volatile system-tail record (MuxMetadata.volatileSystemTail); corrupt degrades to none.
+      volatileSystemTail: z
+        .object({ text: z.string(), placement: z.enum(["system", "row"]) })
         .optional()
         .catch(undefined),
       usage: z.any().optional(),

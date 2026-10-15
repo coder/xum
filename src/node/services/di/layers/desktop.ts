@@ -791,6 +791,8 @@ export const DesktopWiringLive: Layer.Layer<
     setSshPromptService(sshPromptService);
     setSSH2SshPromptService(sshPromptService);
 
+    workspaceService.on("metadata", (event) => aiService.handleWorkspaceMetadata(event));
+
     // Backend timing stats.
     aiService.on("stream-start", (data: StreamStartEvent) =>
       sessionTimingService.handleStreamStart(data)

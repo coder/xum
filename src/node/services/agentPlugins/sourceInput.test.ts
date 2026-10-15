@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { isFullCommitSha, parseAgentPluginSourceInput } from "./sourceInput";
+import {
+  isFullCommitSha,
+  normalizeAgentPluginSubpath,
+  parseAgentPluginSourceInput,
+} from "./sourceInput";
 
 describe("parseAgentPluginSourceInput", () => {
   // Shorthand expansion depends on SSH-agent presence; pin it for determinism.
@@ -45,6 +49,25 @@ describe("parseAgentPluginSourceInput", () => {
       url: "https://github.com/coder/mux.git",
       ref: "main",
       subpath: "plugins/demo",
+    });
+  });
+
+  test("normalizes the shorthand subpath and rejects escapes before anything is fetched", () => {
+    expect(parseAgentPluginSourceInput("cursor/plugins/pstack/@main")).toEqual({
+      url: "https://github.com/cursor/plugins.git",
+      ref: "main",
+      subpath: "pstack",
+    });
+    expect(() => parseAgentPluginSourceInput("cursor/plugins/../x")).toThrow(
+      /not a valid plugin subpath/
+    );
+    // An inner empty segment is a typo (not an absolute subpath); one
+    // trailing slash on owner/repo still means a root install.
+    for (const typo of ["cursor/plugins/a//b", "cursor/plugins//pstack"]) {
+      expect(() => parseAgentPluginSourceInput(typo)).toThrow(/not a git URL or owner\/repo/);
+    }
+    expect(parseAgentPluginSourceInput("cursor/plugins/")).toEqual({
+      url: "https://github.com/cursor/plugins.git",
     });
   });
 
@@ -128,6 +151,40 @@ describe("parseAgentPluginSourceInput", () => {
     expect(() => parseAgentPluginSourceInput("./relative/path")).toThrow(/relative path/);
     expect(() => parseAgentPluginSourceInput("coder/mux@")).toThrow(/must not be empty/);
     expect(() => parseAgentPluginSourceInput("-bad/owner")).toThrow(/not a valid owner\/repo/);
+  });
+});
+
+describe("normalizeAgentPluginSubpath", () => {
+  test("accepts repo-relative folders, trimming whitespace and one trailing slash", () => {
+    expect(normalizeAgentPluginSubpath("pstack")).toBe("pstack");
+    expect(normalizeAgentPluginSubpath(" packages/demo/ ")).toBe("packages/demo");
+    expect(normalizeAgentPluginSubpath("a/.github/b-c_d.e")).toBe("a/.github/b-c_d.e");
+  });
+
+  test.each([
+    ["", /must not be empty/],
+    ["/", /must not be empty/],
+    ["/abs/path", /absolute path/],
+    ["~/plugins", /absolute path/],
+    ["C:/plugins", /absolute path/],
+    ["..", /not a valid plugin subpath/],
+    ["../x", /not a valid plugin subpath/],
+    ["a/../../x", /not a valid plugin subpath/],
+    ["./x", /not a valid plugin subpath/],
+    ["a//b", /not a valid plugin subpath/],
+    ["a/b//", /not a valid plugin subpath/],
+    [".git", /\.git folder/],
+    ["a/.GIT/hooks", /\.git folder/],
+    ["a\\b", /not allowed/],
+    ["a*", /not allowed/],
+    ["a/[b]", /not allowed/],
+    ["!a", /not allowed/],
+    ["#a", /not allowed/],
+    ["a\u0000b", /control characters/],
+    ["a\nb", /control characters/],
+    ["a /b", /whitespace/],
+  ])("rejects %j", (input, message) => {
+    expect(() => normalizeAgentPluginSubpath(input)).toThrow(message);
   });
 });
 

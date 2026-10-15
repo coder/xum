@@ -39,6 +39,12 @@ export function newMcpAppDocumentNonce(): string {
  * view script, so no view script holds the real parent window or a listener ahead of it. A
  * `pagehide` (the document unloads: it navigated away) is announced over the port, so the host
  * can close the frame early. That is cleanup only: the port already keeps the next page out.
+ *
+ * Escape, or Shift+F outside a text field, that the view did not handle (no preventDefault,
+ * read once every listener ran) is announced as `exit`:
+ * keys inside the frame never reach the app, and a maximized app tab (#6165) restores on it.
+ * The view's script can post `exit` without a key press too, so the host only ever restores on
+ * it, never maximizes.
  */
 export function mcpAppDocumentChannelScript(nonce: string): string {
   assert(/^[0-9a-f]+$/.test(nonce), "MCP App document nonce must be hex");
@@ -54,6 +60,22 @@ export function mcpAppDocumentChannelScript(nonce: string): string {
     port.onmessage = function (event) {
       dispatch(new MessageEventCtor("message", { data: event.data, source: port }));
     };
+    window.addEventListener("keydown", function (event) {
+      // The innermost target: an input inside an open shadow root retargets event.target to
+      // its host element.
+      var target = typeof event.composedPath === "function" ? event.composedPath()[0] || event.target : event.target;
+      var editable = !!target && target.nodeType === 1 && (target.isContentEditable ||
+        target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT");
+      var plain = !event.ctrlKey && !event.metaKey && !event.altKey;
+      var exit = event.key === "Escape" || (plain && event.shiftKey && !editable &&
+        (event.key === "F" || event.key === "f"));
+      if (!exit) return;
+      // After the view's own listeners (also window-level ones added later): setTimeout reads
+      // the event's final defaultPrevented, as the Artifacts bridge does. Not a timing guess.
+      window.setTimeout(function () {
+        if (!event.defaultPrevented) send({ ${MCP_APP_DOCUMENT_MARKER}: 1, type: "exit" });
+      }, 0);
+    });
     window.addEventListener("pagehide", function () {
       send({ ${MCP_APP_DOCUMENT_MARKER}: 1, type: "leave" });
     }, true);
@@ -62,7 +84,7 @@ export function mcpAppDocumentChannelScript(nonce: string): string {
   })();`;
 }
 
-function isAnnouncement(data: unknown, type: "open" | "leave"): boolean {
+function isAnnouncement(data: unknown, type: "open" | "leave" | "exit"): boolean {
   return (
     typeof data === "object" &&
     data !== null &&
@@ -70,6 +92,18 @@ function isAnnouncement(data: unknown, type: "open" | "leave"): boolean {
     (data as { type?: unknown }).type === type
   );
 }
+
+/** Which document-side announcement `data` is, or null for a view message. */
+function announcementOf(data: unknown): "leave" | "exit" | null {
+  if (isAnnouncement(data, "leave")) return "leave";
+  return isAnnouncement(data, "exit") ? "exit" : null;
+}
+
+/** What the receiver does for each document-side announcement. */
+const ANNOUNCED: Record<"leave" | "exit", (receiver: McpAppDocumentReceiver) => void> = {
+  leave: (receiver) => receiver.leave(),
+  exit: (receiver) => receiver.exit?.(),
+};
 
 /** The port of `event` when it is the open announcement of the document with `nonce`. */
 function openedPort(event: Pick<MessageEvent, "data" | "ports">, nonce: string) {
@@ -82,6 +116,8 @@ export interface McpAppDocumentReceiver {
   message: (data: unknown) => void;
   /** The document unloaded (it navigated away). */
   leave: () => void;
+  /** Escape or Shift+F inside the view, which the view did not handle. Only ever restores. */
+  exit?: () => void;
 }
 
 export interface McpAppDocumentChannel {
@@ -136,9 +172,10 @@ class DocumentChannel implements McpAppDocumentChannel {
   private receive(data: unknown): void {
     const receiver = this.closed ? null : this.receiver;
     if (receiver == null) return;
-    // Not rate limited: the unload must close the frame even after a burst. It can only close
-    // the view's own frame.
-    if (isAnnouncement(data, "leave")) receiver.leave();
+    // Announcements are not rate limited: the unload must close the frame even after a burst,
+    // and either one can only close or restore the view's own frame.
+    const announced = announcementOf(data);
+    if (announced !== null) ANNOUNCED[announced](receiver);
     else if (this.allowMessage()) receiver.message(data);
   }
 }

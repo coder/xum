@@ -25,7 +25,7 @@ import { formatHeartbeatIntervalShort, HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/c
 import { useAppConfig } from "@/browser/stores/AppConfigStore";
 import { SIDE_CHAT_INITIAL_TITLE } from "@/constants/workspaceDefaults";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
-import { useOptionalAPI } from "@/browser/contexts/API";
+import { useOptionalAPI, type APIClient } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import {
   formatGoalBudgetSummary,
@@ -41,7 +41,7 @@ import { isAbortError } from "@/browser/utils/isAbortError";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { makeSideChatTabType, type TabType } from "@/browser/types/rightSidebar";
 import { openArtifact } from "./ArtifactsTab/openArtifact";
-import { appViewDetails, useMcpAppViews } from "./ArtifactsTab/mcpAppViewsStore";
+import { appViewDetails, keepMcpAppViewRef, useMcpAppViews } from "./ArtifactsTab/mcpAppViewsStore";
 import { appViewTabFor } from "./AppViewTab/appViewTabs";
 import { TAB_ICONS } from "./Tabs/tabIcons";
 
@@ -62,8 +62,10 @@ interface RightSidebarOverviewProps {
   /** Start a side chat; absent where side chats cannot start (a side chat itself). */
   onNewSideChat?: () => void;
   creatingSideChat: boolean;
-  /** The Artifacts experiment is on, so the card lists the newest outputs. */
+  /** The Artifacts experiment is on, so the card lists the newest artifact files. */
   artifactsEnabled: boolean;
+  /** The MCP Apps experiment is on, so the card lists the newest MCP App views. */
+  mcpAppsEnabled: boolean;
   /** Agent-flagged review hunks the user has not read (the Review tab's attention cue). */
   unreadAssisted: number;
 }
@@ -258,9 +260,13 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
         </OverviewSection>
       )}
 
-      {props.artifactsEnabled && (
-        <OverviewOutputs workspaceId={props.workspaceId} onOpenTab={props.onOpenTab} />
-      )}
+      {/* Renders nothing while both experiments are off: no files and no app views. */}
+      <OverviewOutputs
+        workspaceId={props.workspaceId}
+        onOpenTab={props.onOpenTab}
+        showFiles={props.artifactsEnabled}
+        showAppViews={props.mcpAppsEnabled}
+      />
 
       {showSideChats && (
         <OverviewSection
@@ -379,48 +385,108 @@ const OverviewStats: React.FC<{ workspaceId: string; onOpen: () => void }> = (pr
 };
 
 /**
+ * App view rows of the Outputs list: all once More revealed them, otherwise at least one when
+ * there are any, so files never push the newest app result out.
+ */
+function overviewAppRows(appViews: number, files: number, revealed: boolean): number {
+  if (revealed) return appViews;
+  if (appViews === 0) return 0;
+  return Math.min(appViews, Math.max(1, OVERVIEW_MAX_LIST_ROWS - files));
+}
+
+/**
  * The Artifacts tab's newest files and app views. Listed once when the card shows, then again
  * after the agent's file edits; the card is a glance, so it skips the tab's polling.
  */
-const OverviewOutputs: React.FC<{
-  workspaceId: string;
-  onOpenTab: (tab: TabType) => void;
-}> = (props) => {
+const NO_APP_VIEWS: ReturnType<typeof useMcpAppViews> = [];
+
+/**
+ * The workspace's newest artifact files for the Outputs card, refreshed after file-modifying
+ * tools. With Artifacts off (#6760: MCP Apps can be on alone) it lists nothing, also no listing
+ * from before the toggle.
+ */
+function useOverviewArtifactFiles(workspaceId: string, enabled: boolean): ArtifactFilesListing {
   const api = useOptionalAPI()?.api ?? null;
-  const appViews = useMcpAppViews(props.workspaceId);
-  const [files, setFiles] = React.useState<readonly ArtifactEntry[]>([]);
-  // The backend capped its walk (entry limit, depth, unreadable folders): more files exist than
-  // `files` holds, so the "more" row cannot give an exact count.
-  const [filesTruncated, setFilesTruncated] = React.useState(false);
+  const [listing, setListing] = React.useState<ArtifactFilesListing>(EMPTY_LISTING);
   const [refreshTick, setRefreshTick] = React.useState(0);
+  // Drop the listing when Artifacts turns off (React's reset-on-prop-change pattern, no effect),
+  // so turning it back on never shows files from before the toggle while the new read runs.
+  const [listedWhileEnabled, setListedWhileEnabled] = React.useState(enabled);
+  if (listedWhileEnabled !== enabled) {
+    setListedWhileEnabled(enabled);
+    setListing(EMPTY_LISTING);
+  }
 
   React.useEffect(() => {
-    if (api == null) return;
+    if (api == null || !enabled) return;
     const controller = new AbortController();
-    api.artifacts
-      .list({ workspaceId: props.workspaceId }, { signal: controller.signal })
-      .then((result) => {
-        if (controller.signal.aborted) return;
-        // A failed listing hides the section; the Artifacts tab reports the error.
-        const listing = result.success && result.data.available ? result.data : null;
-        setFiles(listing?.entries ?? []);
-        setFilesTruncated(listing?.truncated === true);
-      })
-      .catch((error: unknown) => {
-        if (isAbortError(error) || controller.signal.aborted) return;
-        setFiles([]);
-        setFilesTruncated(false);
-      });
+    // readArtifactFilesListing never rejects; the second handler only satisfies the promise lint.
+    readArtifactFilesListing(api, workspaceId, controller.signal).then(
+      (next) => {
+        if (next != null) setListing(next);
+      },
+      () => undefined
+    );
     return () => controller.abort();
-  }, [api, props.workspaceId, refreshTick]);
+  }, [api, enabled, workspaceId, refreshTick]);
 
   React.useEffect(
     () =>
       workspaceStore.subscribeFileModifyingTool(
         () => setRefreshTick((tick) => tick + 1),
-        props.workspaceId
+        workspaceId
       ),
-    [props.workspaceId]
+    [workspaceId]
+  );
+
+  return enabled ? listing : EMPTY_LISTING;
+}
+
+interface ArtifactFilesListing {
+  files: readonly ArtifactEntry[];
+  /**
+   * The backend capped its walk (entry limit, depth, unreadable folders): more files exist than
+   * `files` holds, so the "more" row cannot give an exact count.
+   */
+  truncated: boolean;
+}
+
+const EMPTY_LISTING: ArtifactFilesListing = { files: [], truncated: false };
+
+/** One listing for the Outputs card; null once aborted, so a stale read never lands. */
+async function readArtifactFilesListing(
+  api: APIClient,
+  workspaceId: string,
+  signal: AbortSignal
+): Promise<ArtifactFilesListing | null> {
+  try {
+    const result = await api.artifacts.list({ workspaceId }, { signal });
+    if (signal.aborted) return null;
+    // A failed listing hides the section; the Artifacts tab reports the error.
+    if (!result.success || !result.data.available) return EMPTY_LISTING;
+    return { files: result.data.entries, truncated: result.data.truncated === true };
+  } catch (error) {
+    return isAbortError(error) || signal.aborted ? null : EMPTY_LISTING;
+  }
+}
+
+const OverviewOutputs: React.FC<{
+  workspaceId: string;
+  onOpenTab: (tab: TabType) => void;
+  /** Artifact files (artifacts experiment). */
+  showFiles: boolean;
+  /** MCP App views (mcp-apps experiment, independent of Artifacts). */
+  showAppViews: boolean;
+}> = (props) => {
+  const allAppViews = useMcpAppViews(props.workspaceId);
+  const appViews = props.showAppViews ? allAppViews : NO_APP_VIEWS;
+  // The Artifacts tab lists only files, so More reveals hidden app views here (like side chats):
+  // the first view it revealed, null until then. An ID, not a row index: newer views arrive at
+  // the top, and an index would then point a later render's focus at another row.
+  const [revealedViewId, setRevealedViewId] = React.useState<string | null>(null);
+  const { files, truncated: filesTruncated } = useOverviewArtifactFiles(
+    props.workspaceId,
+    props.showFiles
   );
 
   // Several calls of one MCP app tool share a label, so each row carries the call's detail
@@ -430,16 +496,15 @@ const OverviewOutputs: React.FC<{
   // app result is never pushed out by files, each kind keeps at least one of the capped rows
   // when it has any. A file opens in the Artifacts tab; an app view in its own app tab (Artifacts
   // lists only files). Either tab gets focus (the activated row unmounts as the sidebar expands).
-  const appRows =
-    appViews.length === 0
-      ? 0
-      : Math.min(appViews.length, Math.max(1, OVERVIEW_MAX_LIST_ROWS - files.length));
-  const fileRows = Math.min(files.length, OVERVIEW_MAX_LIST_ROWS - appRows);
+  const appRows = overviewAppRows(appViews.length, files.length, revealedViewId != null);
+  const fileRows = Math.min(files.length, Math.max(0, OVERVIEW_MAX_LIST_ROWS - appRows));
+  const hiddenAppViews = appViews.length - appRows;
   const shown: Array<{
     key: string;
     Icon: LucideIcon;
     label: string;
     sub?: string | null;
+    focusOnMount?: boolean;
     open: () => void;
   }> = [
     ...files.slice(0, fileRows).map((file) => {
@@ -461,7 +526,15 @@ const OverviewOutputs: React.FC<{
       Icon: TAB_ICONS.artifacts,
       label: view.label,
       sub: details[index] || null,
-      open: () => props.onOpenTab(appViewTabFor(view.toolCallId)),
+      // The first row the More row revealed takes focus, as for side chats.
+      focusOnMount: view.toolCallId === revealedViewId,
+      // The view's ref is kept, as by the tool card and the palette, so the tab still resolves
+      // after compaction drops the call from the loaded transcript. The tab opens through the
+      // card's onOpenTab, which also moves focus into it (the activated row unmounts).
+      open: () => {
+        keepMcpAppViewRef(props.workspaceId, view);
+        props.onOpenTab(appViewTabFor(view.toolCallId));
+      },
     })),
   ];
   // A truncated walk can end before reaching any file (only a too-deep or unreadable folder), yet
@@ -476,13 +549,18 @@ const OverviewOutputs: React.FC<{
           Icon={output.Icon}
           label={output.label}
           sub={output.sub}
+          focusOnMount={output.focusOnMount}
           onClick={output.open}
         />
       ))}
       <MoreRow
         count={files.length + appViews.length - shown.length}
         atLeast={filesTruncated}
-        onClick={() => props.onOpenTab("artifacts")}
+        onClick={() =>
+          hiddenAppViews > 0
+            ? setRevealedViewId(appViews[appRows].toolCallId)
+            : props.onOpenTab("artifacts")
+        }
       />
     </OverviewSection>
   );

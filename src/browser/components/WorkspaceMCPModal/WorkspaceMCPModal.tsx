@@ -19,7 +19,10 @@ import { useMCPTestCache } from "@/browser/hooks/useMCPTestCache";
 import {
   applySavedSettings,
   countSettingsSave,
+  hasUnsavedServerOverrides,
+  isDialogSaveBlocked,
   SettingsRequests,
+  withSettingsToolRuns,
   type ServerSettingsEntry,
   type SettingsRequestScope,
 } from "./serverSettingsEntries";
@@ -27,6 +30,11 @@ import {
   MCPServerSettingsSection,
   type MCPServerSettingsSectionHandle,
 } from "./MCPServerSettingsSection";
+import {
+  clearSettingsToolResults,
+  subscribeSettingsToolWrites,
+  useSettingsToolRuns,
+} from "./settingsToolRuns";
 import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import {
   MCPServerIdentityBadge,
@@ -67,6 +75,8 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   // State for project servers and workspace overrides
   const [servers, setServers] = useState<Record<string, MCPServerInfo>>({});
   const [overrides, setOverrides] = useState<WorkspaceMCPOverrides>({});
+  // The overrides as loaded (saved): a settings tool action waits while a server's differ.
+  const [savedOverrides, setSavedOverrides] = useState<WorkspaceMCPOverrides>({});
   // Revision of the loaded overrides snapshot. Saves pass it back so the
   // backend can reject stale snapshots (e.g. after a plugin uninstall pruned
   // this workspace's plugin: keys while the dialog was open).
@@ -94,6 +104,13 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   // would take a newer request ID, could show the pre-save values, and drop the save's result.
   // A count, not a flag: a save started after a reopen can overlap one from before it.
   const [savingSettings, setSavingSettings] = useState<Record<string, number>>({});
+  // Settings tool action runs in flight, also those started before a reopen. Refresh Tools and
+  // Save wait for them: a refresh remounts the section, and Save closes the dialog.
+  const busySettings = withSettingsToolRuns(
+    savingSettings,
+    useSettingsToolRuns(workspaceId),
+    Object.keys(servers)
+  );
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   // Mounted settings sections by server name (ref callbacks drop unmounted ones).
@@ -163,6 +180,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
       // Settings from an earlier open are stale: the server persists them and
       // may have changed (or a save in that open replaced them).
       setServerSettings({});
+      clearSettingsToolResults(workspaceId);
       setLoading(true);
       setError(null);
       try {
@@ -173,7 +191,9 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
           api.workspace.mcp.get({ workspaceId }),
         ]);
         setServers(projectServers ?? {});
-        setOverrides(workspaceOverrides.overrides ?? {});
+        const loadedOverrides = workspaceOverrides.overrides ?? {};
+        setOverrides(loadedOverrides);
+        setSavedOverrides(loadedOverrides);
         setOverridesRevision(workspaceOverrides.revision);
         // A later open began meanwhile (this load is stale): that open reads its own settings.
         if (settingsScope !== settingsRequests.current()) return;
@@ -182,9 +202,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
         // dialog renders now and each section appears when its read lands.
         savedEnabledServers.current = new Set(
           Object.entries(projectServers ?? {})
-            .filter(([name, info]) =>
-              isServerEnabledFor(workspaceOverrides.overrides ?? {}, name, info.disabled)
-            )
+            .filter(([name, info]) => isServerEnabledFor(loadedOverrides, name, info.disabled))
             .map(([name]) => name)
         );
         void readServerSettingsRef.current([...savedEnabledServers.current], true, settingsScope);
@@ -197,6 +215,11 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
 
     void loadData();
   }, [open, api, projectPath, workspaceId, settingsRequests]);
+
+  // A tool that can write (a reset, an import) may have changed a server's settings: read them
+  // again (the backend's read refreshes its settings caches too). The run can have started in
+  // an earlier mount of this dialog, so its end reaches whichever dialog is open now.
+  useSettingsToolWriteRereads(open, workspaceId, readServerSettings, settingsRequests);
 
   // Fetch/refresh tools for a server
   const fetchTools = useCallback(
@@ -463,7 +486,10 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                 <Button variant="ghost" onClick={() => onOpenChange(false)}>
                   Cancel
                 </Button>
-                <Button onClick={() => void handleSave()} disabled={saving}>
+                <Button
+                  onClick={() => void handleSave()}
+                  disabled={isDialogSaveBlocked(saving, busySettings)}
+                >
                   {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
                   Save
                 </Button>
@@ -556,7 +582,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                           className="shrink-0"
                           onClick={() => void fetchTools(name)}
                           disabled={
-                            isLoadingTools === true || getOwn(savingSettings, name) !== undefined
+                            isLoadingTools === true || getOwn(busySettings, name) !== undefined
                           }
                         >
                           {isLoadingTools ? (
@@ -611,6 +637,11 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                             serverName={name}
                             snapshot={entry.snapshot}
                             beginSave={() => beginSettingsSave(name)}
+                            unsavedOverrides={hasUnsavedServerOverrides(
+                              savedOverrides,
+                              overrides,
+                              name
+                            )}
                             refreshing={isLoadingTools === true}
                           />
                         </div>
@@ -626,6 +657,28 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
     </Dialog>
   );
 };
+
+/** While the dialog is open, `reread` runs after each writing settings tool run of the workspace. */
+function useSettingsToolWriteRereads(
+  open: boolean,
+  workspaceId: string,
+  readServerSettings: (
+    serverNames: string[],
+    onOpen: boolean,
+    scope: SettingsRequestScope
+  ) => Promise<void>,
+  settingsRequests: SettingsRequests
+) {
+  // No ref: the listener keeps the read of the render that subscribed it, so it always reads
+  // `workspaceId` (a ref updated at render time could hold the next workspace's read while the
+  // old subscription still runs).
+  useEffect(() => {
+    if (!open) return;
+    return subscribeSettingsToolWrites(workspaceId, (serverName) =>
+      readServerSettings([serverName], true, settingsRequests.current())
+    );
+  }, [open, workspaceId, readServerSettings, settingsRequests]);
+}
 
 /** A server's settings note when no snapshot is shown: a failed read, or a server not running. */
 function ServerSettingsNote(props: {

@@ -17,6 +17,11 @@ export { AgentPluginGitSourceSchema, AgentPluginInstallEntrySchema };
 export const AgentPluginPreviewSkillSchema = z.object({
   name: z.string(),
   description: z.string().optional(),
+  /**
+   * Commands of the body's directive lines, invisible characters escaped (#6617). They run when
+   * the user invokes the skill, so the review shows them. Absent when there are none.
+   */
+  directives: z.array(z.string()).optional(),
 });
 
 export const AgentPluginPreviewMcpServerSchema = z.object({
@@ -140,6 +145,15 @@ export const AgentPluginManifestSummarySchema = z.object({
  * Everything a user consents to before anything is written: the resolved
  * source + SHA, the manifest, every skill, and every MCP server command line.
  */
+/** The component kinds with consent records (#6498, #6629). */
+export const AgentPluginComponentKindSchema = z.enum([
+  "skills",
+  "mcpServers",
+  "workflows",
+  "agents",
+  "slashCommands",
+]);
+
 export const AgentPluginInstallPreviewSchema = z.object({
   source: AgentPluginGitSourceSchema,
   /** Commit SHA the preview was computed from; install verifies it gets the same tree. */
@@ -160,6 +174,18 @@ export const AgentPluginInstallPreviewSchema = z.object({
   workflows: z.array(z.string()),
   /** Composer slash commands the manifest contributes. */
   slashCommands: z.array(AgentPluginPreviewSlashCommandSchema),
+  /**
+   * The reviewed fields of each component that install records consent for besides skills and MCP
+   * servers (#6629), so the preview shows everything the record approves.
+   */
+  reviewedComponents: z.array(
+    z.object({
+      kind: AgentPluginComponentKindSchema,
+      /** Display form: invisible and bidi controls shown as `<U+XXXX>`, never an identity. */
+      name: z.string(),
+      detail: z.string(),
+    })
+  ),
   /** Manifest warnings + component diagnostics from validating the staged clone. */
   warnings: z.array(z.string()),
   /** Final install directory (~/.mux/plugins/<name>). */
@@ -183,11 +209,33 @@ export const AgentPluginListItemSchema = z.object({
   importedComponents: AgentPluginImportedComponentsSchema.optional(),
   importedSkillCount: z.number().int().nonnegative().optional(),
   importedMcpServerCount: z.number().int().nonnegative().optional(),
+  /**
+   * Managed rows: imported skills and MCP servers whose current fingerprint the user has not
+   * reviewed (#6498). They do not load until a component review confirms them.
+   */
+  reviewRequiredCount: z.number().int().nonnegative().optional(),
   interface: AgentPluginInterfaceSummarySchema.optional(),
   /** Available counts include components not yet imported. */
   skillCount: z.number().int().nonnegative(),
   mcpServerCount: z.number().int().nonnegative(),
 });
+
+/**
+ * The pending plugin sign-out record (#6122): sign-outs that an update could not finish. While
+ * it exists, every discovery gate keeps managed plugins closed. `broken`: the record is corrupt,
+ * from another version, or unreadable, and only the user can clear it.
+ */
+export const AgentPluginPendingSignOutsSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("none") }),
+  z.object({
+    kind: z.literal("pending"),
+    /** Credential URLs still to sign out. */
+    servers: z.array(z.string()),
+    /** Why the last attempt left them, when one ran in this process. */
+    lastError: z.string().optional(),
+  }),
+  z.object({ kind: z.literal("broken"), reason: z.string() }),
+]);
 
 export const AgentPluginUpdateCheckSchema = z.object({
   name: z.string(),
@@ -204,10 +252,23 @@ export const AgentPluginUpdateCheckSchema = z.object({
  * human-readable value on each side so the user can judge the change instead
  * of only being told that something changed; additions have no `before`.
  */
+/**
+ * One imported skill or MCP server at the consent fingerprint a review showed (#6498). The
+ * renderer sends the shown refs back on confirm, and the backend records only refs that still
+ * match, so a component that changed after the review never gets consent.
+ */
+export const AgentPluginComponentRefSchema = z.object({
+  kind: AgentPluginComponentKindSchema,
+  name: z.string(),
+  fingerprint: z.string(),
+});
+
 export const AgentPluginCapabilityChangeSchema = z.object({
   summary: z.string(),
   before: z.string().optional(),
   after: z.string().optional(),
+  /** Set for a skill or MCP server change: what confirming the review approves. */
+  component: AgentPluginComponentRefSchema.optional(),
 });
 
 /** Ties an update confirmation to the exact trees the user reviewed. */
@@ -216,6 +277,11 @@ export const AgentPluginUpdateConsentSchema = z.object({
   fromSha: z.string(),
   /** Commit the review staged; update installs exactly this commit. */
   toSha: z.string(),
+  /**
+   * The component changes the review showed. Only these get consent records. Without it, every
+   * changed component needs a component review after the update (fails closed).
+   */
+  reviewed: z.array(AgentPluginComponentRefSchema).optional(),
 });
 
 /**
@@ -235,6 +301,7 @@ export const AgentPluginUpdateReviewSchema = z.object({
 });
 
 export type AgentPluginCapabilityChange = z.infer<typeof AgentPluginCapabilityChangeSchema>;
+export type AgentPluginComponentRef = z.infer<typeof AgentPluginComponentRefSchema>;
 export type AgentPluginUpdateConsent = z.infer<typeof AgentPluginUpdateConsentSchema>;
 export type AgentPluginUpdateReview = z.infer<typeof AgentPluginUpdateReviewSchema>;
 export type AgentPluginPreviewSkill = z.infer<typeof AgentPluginPreviewSkillSchema>;
@@ -248,6 +315,7 @@ export type AgentPluginHooks = z.infer<typeof AgentPluginHooksSchema>;
 export type AgentPluginManifestSummary = z.infer<typeof AgentPluginManifestSummarySchema>;
 export type AgentPluginInstallPreview = z.infer<typeof AgentPluginInstallPreviewSchema>;
 export type AgentPluginListItem = z.infer<typeof AgentPluginListItemSchema>;
+export type AgentPluginPendingSignOuts = z.infer<typeof AgentPluginPendingSignOutsSchema>;
 export type AgentPluginUpdateCheck = z.infer<typeof AgentPluginUpdateCheckSchema>;
 
 /**

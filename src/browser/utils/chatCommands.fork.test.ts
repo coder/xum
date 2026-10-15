@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getDraftStore, resetDraftStoreForTests } from "@/browser/stores/DraftStore";
 import { createTestApiClient } from "@/browser/testUtils";
 import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
 import { toDraftAttachmentMetadata } from "@/common/utils/drafts";
@@ -38,6 +38,7 @@ let cleanupDom: (() => void) | undefined;
 
 beforeEach(() => {
   cleanupDom = installDom();
+  resetDraftStoreForTests();
 });
 
 afterEach(() => {
@@ -51,12 +52,18 @@ describe("forkWorkspace", () => {
     let savedText = "";
     let revision = 0;
     let textSeenByFork: string | undefined;
+    let markSnapshotApplied: () => void = () => undefined;
+    const snapshotApplied = new Promise<void>((resolve) => {
+      markSnapshotApplied = resolve;
+    });
     const client = createTestApiClient({
       drafts: {
         subscribe: (_input: void, opts?: { signal?: AbortSignal }) =>
           Promise.resolve(
             (async function* (): AsyncGenerator<DraftEvent> {
               yield { type: "snapshot", drafts: [], list: { entries: [], revision: 0 } };
+              // The store asks for the next event only once it has applied the snapshot.
+              markSnapshotApplied();
               await new Promise<void>((resolve) =>
                 opts?.signal?.addEventListener("abort", () => resolve(), { once: true })
               );
@@ -81,7 +88,9 @@ describe("forkWorkspace", () => {
     });
     const store = getDraftStore();
     store.setClient(client);
-    await store.whenReady();
+    // Not whenReady(): an earlier file in the same bun process can leave the shared store ready
+    // for another client, and writes wait for this client's snapshot.
+    await snapshotApplied;
     // Typed just now: still inside the store's write debounce.
     store.setText({ kind: "workspace", workspaceId: SOURCE_ID }, "typed just before forking");
 

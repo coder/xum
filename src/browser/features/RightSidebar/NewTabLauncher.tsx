@@ -32,7 +32,7 @@ interface NewTabLauncherProps {
    */
   autoFocus: boolean;
   onAutoFocusConsumed: () => void;
-  /** MCP App entry points of the workspace's enabled servers (artifacts experiment). */
+  /** MCP App entry points of the workspace's enabled servers (mcp-apps experiment). */
   entrypoints?: readonly McpAppEntrypoint[];
   /**
    * Open (or focus) an entry point's app tab; resolves to an error message or null. The open

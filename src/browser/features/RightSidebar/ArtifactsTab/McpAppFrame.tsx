@@ -1,8 +1,8 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { X } from "lucide-react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { Maximize2, Minimize2, X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI, type APIClient } from "@/browser/contexts/API";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
@@ -25,15 +25,30 @@ import {
 } from "./mcpAppDocumentChannel";
 import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
 import {
+  flushOfflineMcpAppWidgetStates,
+  mcpAppWidgetStateSeed,
+  mcpAppWidgetStateTarget,
+  saveMcpAppWidgetState,
+} from "./mcpAppWidgetState";
+import {
   createMcpAppHost,
+  declaresFullscreenOnly,
   type McpAppConsentRequest,
+  type McpAppDisplayMode,
   type McpAppHost,
   type McpAppHostContext,
 } from "./mcpAppHost";
-import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
+import {
+  isMcpAppViewHosted,
+  setMcpAppViewFullscreenOnly,
+  openMcpAppViewTab,
+  reloadMcpAppView,
+  type McpAppViewRef,
+} from "./mcpAppViewsStore";
 import {
   newestMcpAppViewDomains,
   publishMcpAppViewDomains,
+  useFollowMcpAppViewDomains,
   useMcpAppViewDomains,
 } from "./mcpAppViewDomainsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
@@ -121,15 +136,54 @@ function consentText(request: McpAppConsentRequest): [string, string, string] {
   }
 }
 
-function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
+/** The server as the user sees it: a plugin server's "<plugin> · <server>" label, when known. */
+function viewServerLabel(view: McpAppViewRef): string {
+  return view.serverLabel ?? mcpServerDisplayName(view.serverName);
+}
+
+/** Calls `callback` when the host passed one (an optional panel prop). */
+function runIfSet(callback: (() => void) | undefined): void {
+  callback?.();
+}
+
+/** Maximizes the app tab over the window, or restores it (#6165). None without a toggle. */
+function MaximizeViewButton(props: { maximized?: boolean; onToggle?: () => void }) {
+  if (props.onToggle == null) return null;
+  const maximized = props.maximized === true;
+  const label = maximized ? "Restore view" : "Maximize view";
+  const Icon = maximized ? Minimize2 : Maximize2;
+  return (
+    <TooltipIfPresent tooltip={label}>
+      <button
+        type="button"
+        aria-label={label}
+        aria-pressed={maximized}
+        onClick={props.onToggle}
+        className="text-muted hover:text-foreground focus-visible:ring-accent flex h-5 w-5 items-center justify-center rounded focus-visible:ring-1"
+      >
+        <Icon className="h-3.5 w-3.5" />
+      </button>
+    </TooltipIfPresent>
+  );
+}
+
+function McpAppViewHeader(props: {
+  serverName: string;
+  serverLabel: string;
+  onClose: () => void;
+  /** Whether the tab is maximized over the window; undefined when the host offers no maximize. */
+  maximized?: boolean;
+  onToggleMaximized?: () => void;
+}) {
   return (
     <div className="border-border-light flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-[11px]">
       <span className="text-muted min-w-0 flex-1 truncate">
         App view from{" "}
         <TooltipIfPresent tooltip={props.serverName}>
-          <span className="text-foreground">{mcpServerDisplayName(props.serverName)}</span>
+          <span className="text-foreground">{props.serverLabel}</span>
         </TooltipIfPresent>
       </span>
+      <MaximizeViewButton maximized={props.maximized} onToggle={props.onToggleMaximized} />
       <TooltipIfPresent tooltip="Close view">
         <button
           type="button"
@@ -145,7 +199,7 @@ function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
 }
 
 /**
- * An MCP Apps view (artifacts experiment) in its app tab or tool card: the server's ui:// HTML in the
+ * An MCP Apps view (mcp-apps experiment) in its app tab or tool card: the server's ui:// HTML in the
  * same sandbox as HTML artifacts, talking JSON-RPC to the host (mcpAppHost.ts).
  *
  * SECURITY AUDIT: a single opaque-origin srcdoc iframe (sandbox exactly "allow-scripts", never
@@ -361,6 +415,27 @@ function useContainerDimensionsUpdates(hostRef: { current: McpAppHost | null }, 
   };
 }
 
+/**
+ * Runs an accepted display-mode move of a view (setDisplayMode): fullscreen opens or focuses
+ * its tab, any other mode (inline) closes the tab so its expanded card takes the view back.
+ */
+function moveViewTo(
+  mode: McpAppDisplayMode,
+  input: { workspaceId: string; view: McpAppViewRef; onClose?: () => void }
+) {
+  if (mode === "fullscreen") {
+    openMcpAppViewTab(input.workspaceId, input.view);
+    return;
+  }
+  // The user collapsed the card during the teardown wait: closing the tab would leave the view
+  // without a frame. It stays in its tab and loads again (it was torn down).
+  if (!isMcpAppViewHosted(input.workspaceId, input.view.toolCallId, "card")) {
+    reloadMcpAppView(input.workspaceId, input.view.toolCallId);
+    return;
+  }
+  input.onClose?.();
+}
+
 /** The domain prompt's text: the origins, and the project that keeps the approval. */
 function DomainsPromptText(props: { origins: readonly string[]; projectPath: string | null }) {
   return (
@@ -373,6 +448,50 @@ function DomainsPromptText(props: { origins: readonly string[]; projectPath: str
           {" "}
           (for project {PlatformPaths.getProjectName(props.projectPath)})
         </span>
+      )}
+    </div>
+  );
+}
+
+/** Hands a frame's close sequence to its host (McpAppFrame `closeRef`) while it is mounted. */
+function useExposedClose(
+  closeRef: { current: (() => void) | null } | undefined,
+  close: () => void
+): void {
+  useEffect(() => {
+    if (closeRef === undefined) return;
+    closeRef.current = close;
+    return () => {
+      closeRef.current = null;
+    };
+  });
+}
+
+/**
+ * A view that could not be shown. A failed load (an error) can be retried where the host
+ * offers Reload (its app tab remounts the frame); a missing view cannot.
+ */
+function McpAppViewUnavailable(props: {
+  header: ReactNode;
+  inline: boolean;
+  error: string | null;
+  onReload?: () => void;
+}) {
+  return (
+    <div className="flex min-h-0 flex-col">
+      {props.header}
+      <div className="text-danger p-4 text-xs">
+        {props.inline ? null : "This view is no longer available. "}
+        {props.error ?? "The view could not be loaded."}
+      </div>
+      {props.onReload != null && props.error != null && (
+        <button
+          type="button"
+          onClick={props.onReload}
+          className="border-border-light focus-visible:ring-accent mx-4 self-start rounded border px-2 py-0.5 text-xs focus-visible:ring-1"
+        >
+          Reload
+        </button>
       )}
     </div>
   );
@@ -403,12 +522,42 @@ function useCloseDiscardedDocumentChannel(
   }, [viewDocument, frameMounted]);
 }
 
+/** The widget state a view document starts with; null before the view loaded. */
+function widgetStateSeedOf(
+  workspaceId: string,
+  loaded: Loaded | null,
+  viewDocument: { nonce: string } | null
+): unknown {
+  if (loaded === null) return null;
+  const target = mcpAppWidgetStateTarget(workspaceId, loaded.toolCallId, loaded.view);
+  return mcpAppWidgetStateSeed(viewDocument, target);
+}
+
+/** Widget states saved while Xum reconnected go out with the new client (mcpAppWidgetState.ts). */
+function useFlushOfflineWidgetStates(liveApi: APIClient | null) {
+  useEffect(() => {
+    if (liveApi) flushOfflineMcpAppWidgetStates(liveApi);
+  }, [liveApi]);
+}
+
 export function McpAppFrame(props: {
   workspaceId: string;
   view: McpAppViewRef;
   variant?: McpAppFrameVariant;
   /** Panel only: closes the panel's host (its app tab). */
   onClose?: () => void;
+  /** Panel only: Escape or Shift+F inside the view (mcpAppDocumentChannel.ts): restore only. */
+  onExitKey?: () => void;
+  /** Panel only: whether its tab is maximized over the window (#6165), and the toggle. */
+  maximized?: boolean;
+  onToggleMaximized?: () => void;
+  /** Panel only: loads the view again (its tab remounts the frame), offered when loading failed. */
+  onReload?: () => void;
+  /**
+   * Panel only: receives the frame's close sequence (the view's teardown, then onClose), so a
+   * host's own dismissal (a modal's Escape or outside click) closes the view the same way.
+   */
+  closeRef?: { current: (() => void) | null };
 }) {
   const inline = props.variant === "inline";
   const { api } = useAPI();
@@ -436,6 +585,7 @@ export function McpAppFrame(props: {
   useEffect(() => {
     apiRef.current = liveApi;
   }, [liveApi]);
+  useFlushOfflineWidgetStates(liveApi);
   // Fetched once per tool call: a reconnect must not fetch it again (a failed refetch replaced a
   // working view with an error). A failed fetch is retried with the next client.
   const viewLoaded = loaded?.toolCallId === toolCallId && loaded.view != null;
@@ -468,6 +618,8 @@ export function McpAppFrame(props: {
   const approvalProjectPath = current?.view?.approvalProjectPath ?? null;
   // An approval or revoke of this server committed after this view's read applies here too.
   const published = useMcpAppViewDomains(approvalProjectPath, boundServerName);
+  // A Revoke in another window or Xum process narrows this view while it stays mounted.
+  useFollowMcpAppViewDomains(approvalProjectPath, boundServerName);
   const approved = newestMcpAppViewDomains(published, current?.view);
   const grant = current?.view ? grantMcpAppCsp(current.view.csp, approved) : null;
   // Only a view with a result record can be approved (the record binds its server), and only
@@ -519,22 +671,36 @@ export function McpAppFrame(props: {
   const documentKey = mcpAppViewDocumentKey(current, grant);
   const guard = useFrameNavigationGuard(documentKey);
   const { navigatedRef, leave: leaveDocument } = guard;
-  // The window.openai globals start with this host context (useMcpAppViewDocument).
+  // The window.openai globals start with this host context (useMcpAppViewDocument), and with
+  // this view instance's last widget state (mcpAppWidgetState.ts).
   const viewDocument = useMcpAppViewDocument(documentKey, guard.frameKey, () => ({
     theme,
     displayMode: inline ? "inline" : "fullscreen",
     locale: navigator.language,
     platform: hostPlatform(),
     maxHeight: inline ? inlineMaxHeight() : null,
+    widgetState: widgetStateSeedOf(workspaceId, current, null),
   }));
   const srcDoc = buildMcpAppViewSrcDoc(current, grant, viewDocument);
 
   // Values the long-lived host reads at message time.
-  const latest = useRef({ theme, view, result: current?.view ?? null, onClose: props.onClose });
+  const latest = useRef({
+    theme,
+    view,
+    result: current?.view ?? null,
+    onClose: props.onClose,
+    onExitKey: props.onExitKey,
+  });
   // A layout effect ahead of the host's: a view that initializes at once must get this render's
   // result (onInitialized reads it).
   useLayoutEffect(() => {
-    latest.current = { theme, view, result: current?.view ?? null, onClose: props.onClose };
+    latest.current = {
+      theme,
+      view,
+      result: current?.view ?? null,
+      onClose: props.onClose,
+      onExitKey: props.onExitKey,
+    };
   });
 
   // A layout effect: the listener must be in place before the frame's preamble announces its
@@ -599,6 +765,13 @@ export function McpAppFrame(props: {
         return result.data;
       },
       // Bound like callTool: the backend attributes the context to the view's result record.
+      // Through the latest client and loaded view; the write outlives this frame.
+      saveWidgetState: (state) =>
+        saveMcpAppWidgetState(
+          apiRef.current,
+          mcpAppWidgetStateTarget(workspaceId, toolCallId, latest.current.result),
+          state
+        ),
       updateModelContext: async (text) => {
         const client = apiRef.current;
         if (client == null) throw new Error("Xum is reconnecting. Try again once it is back.");
@@ -646,15 +819,24 @@ export function McpAppFrame(props: {
       // Inline only while the card is expanded in the loaded transcript: a collapsed (or
       // unloaded) card mounts no inline instance, so closing the tab would lose the view.
       // The host runs the move later; skip it once this instance is gone (closed meanwhile).
+      // A view that declared fullscreen but not inline is not hosted inline (#6181): marked,
+      // its cards show the "Open in tab" notice instead of a frame (mcpAppViewsStore.ts), so a
+      // card instance that learns it unmounts, and the user opens the view in its tab. A later
+      // declaration with inline clears the mark. A list-less initialize (the window.openai
+      // shim's) says nothing about the modes, so it keeps the mark of an earlier mount.
+      onViewDisplayModes: (modes) => {
+        if (modes === undefined) return;
+        setMcpAppViewFullscreenOnly(workspaceId, toolCallId, declaresFullscreenOnly(modes));
+      },
       setDisplayMode: (mode) => {
         if (mode === "inline" && !isMcpAppViewHosted(workspaceId, toolCallId, "card")) return null;
         return () => {
           if (hostRef.current !== host) return;
-          if (mode === "fullscreen") {
-            openMcpAppViewTab(workspaceId, latest.current.view);
-            return;
-          }
-          latest.current.onClose?.();
+          moveViewTo(mode, {
+            workspaceId,
+            view: latest.current.view,
+            onClose: latest.current.onClose,
+          });
         };
       },
       log: (message, data) =>
@@ -668,6 +850,7 @@ export function McpAppFrame(props: {
         if (!navigatedRef.current) void host.handleMessage(data);
       },
       leave: leaveDocument,
+      exit: () => runIfSet(latest.current.onExitKey),
     });
     const handler = (event: MessageEvent) => {
       const frameWindow = navigatedRef.current ? null : frameRef.current?.contentWindow;
@@ -705,21 +888,34 @@ export function McpAppFrame(props: {
     await hostRef.current?.teardown("closed");
     props.onClose?.();
   };
+  useExposedClose(props.closeRef, () => void close());
 
   const header = inline ? null : (
-    <McpAppViewHeader serverName={serverName} onClose={() => void close()} />
+    <McpAppViewHeader
+      serverName={serverName}
+      serverLabel={viewServerLabel(view)}
+      onClose={() => void close()}
+      maximized={props.maximized}
+      onToggleMaximized={props.onToggleMaximized}
+    />
   );
 
-  if (current == null) return <Notice>Loading…</Notice>;
-  if (current.view == null || srcDoc == null || grant == null) {
+  // A panel keeps its Close header while it loads: a hung load must stay closable.
+  if (current == null)
     return (
       <div className="flex min-h-0 flex-col">
         {header}
-        <div className="text-danger p-4 text-xs">
-          {inline ? null : "This view is no longer available. "}
-          {current.error ?? "The view could not be loaded."}
-        </div>
+        <Notice>Loading…</Notice>
       </div>
+    );
+  if (current.view == null || srcDoc == null || grant == null) {
+    return (
+      <McpAppViewUnavailable
+        header={header}
+        inline={inline}
+        error={current.error}
+        onReload={props.onReload}
+      />
     );
   }
   return (

@@ -5,6 +5,7 @@ import * as path from "path";
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { existsSync } from "fs";
+import { execFileSync } from "node:child_process";
 import { Config, type ProjectsConfig, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import type { TaskService } from "@/node/services/taskService";
@@ -2023,6 +2024,66 @@ describe("TaskService", () => {
       forkSpy.mockRestore();
     }
   }, 20_000);
+
+  test.each(["single", "many"] as const)(
+    "%s: a task sharing an auto-named worktree parent records the branch its checkout is on",
+    async (mode) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = await createTestProject(rootDir);
+      const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+      const runtime = createRuntime(runtimeConfig, { projectPath });
+      await runtime.createWorkspace({
+        projectPath,
+        branchName: "workspace-1",
+        trunkBranch: "main",
+        directoryName: "workspace-1",
+        initLogger: createNullInitLogger(),
+      });
+      // workspace.create renames an auto-named workspace's branch only; its name stays.
+      execFileSync("git", ["branch", "-m", "workspace-1", "sidebar-k3m9"], { cwd: projectPath });
+      const parentId = "1111111111";
+      const childTaskId = "2222222222";
+      stubStableIds(config, [childTaskId]);
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          {
+            path: runtime.getWorkspacePath(projectPath, "workspace-1"),
+            id: parentId,
+            name: "workspace-1",
+            createdAt: new Date().toISOString(),
+            runtimeConfig,
+          },
+        ],
+        testTaskSettings()
+      );
+      const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
+        () => Promise.resolve(undefined)
+      );
+      try {
+        const { workspaceService } = createWorkspaceServiceMocks();
+        const { taskService } = createTaskServiceHarness(config, { workspaceService });
+        const args = {
+          parentWorkspaceId: parentId,
+          kind: "agent" as const,
+          agentType: "explore",
+          prompt: "read-only analysis",
+          title: "Test task",
+          isolation: "none" as const,
+        };
+        const result =
+          mode === "single" ? await taskService.create(args) : await taskService.createMany([args]);
+
+        expect(result.success).toBe(true);
+        // The review panel's base for this task's checkout.
+        expect(findWorkspaceInConfig(config, childTaskId)?.taskTrunkBranch).toBe("sidebar-k3m9");
+      } finally {
+        runBackgroundInitSpy.mockRestore();
+      }
+    },
+    20_000
+  );
 
   async function setUpSharedChild(
     childFields: Partial<WorkspaceConfigEntry> = { taskStatus: "reported" }

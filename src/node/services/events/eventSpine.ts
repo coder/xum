@@ -55,8 +55,17 @@ export interface ObserverEventMap {
 // ---------------------------------------------------------------------------
 
 /** Host execution context a tool runs in (shell hooks need all of these). */
+/** The model turn a tool call belongs to, as plugin hooks see it (Codex `turn_id`, `model`). */
+export interface HookTurn {
+  /** The turn's assistant message ID. */
+  turnId: string;
+  model: string;
+}
+
 export interface ToolExecutionHost {
   runtime: Runtime;
+  /** Absent for calls outside a model turn. */
+  turn?: HookTurn;
   /** Runtime temp dir for hook scratch files (paths in the runtime's context). */
   runtimeTempDir: string;
   /** Working directory where hooks are discovered. */
@@ -68,6 +77,11 @@ export interface ToolExecutionHost {
 
 export interface ToolExecuteContext {
   readonly toolName: string;
+  /**
+   * The call's ID (Codex `tool_use_id`): the AI SDK `toolCallId`, or a generated one for a
+   * host-side call that has none, so a PreToolUse and its PostToolUse share it.
+   */
+  readonly toolCallId?: string;
   /** Mutable before the terminal runs: middleware may rewrite tool args. */
   args: unknown;
   readonly host: ToolExecutionHost;
@@ -165,6 +179,8 @@ export interface TurnStopContext {
   readonly messageId: string;
   /** The workspace path (Codex common field `cwd`), when Xum could resolve it. */
   readonly cwd?: string;
+  /** The model the turn streamed with (Codex common field `model`). */
+  readonly model?: string;
   /** The reply's trailing text, or null when the turn ended on a tool call or without text. */
   readonly lastAssistantMessage: string | null;
   /** True when Stop already continued this turn (Codex stop_hook_active). */
@@ -203,6 +219,8 @@ interface Registration {
  * Per isolated point: snapshot what a consumer may change, and return its undo. The arrays and
  * their entries are copied: a consumer can also remove earlier entries or change them in place
  * before it throws, and an undo by length alone would then leave holes for the later readers.
+ * Cost: O(n) per consumer, where n is the number of entries so far. Nothing bounds n except
+ * what consumers push (the context cap applies after the chain, in runMessageSendHooks).
  */
 const ISOLATED_CONSUMERS = {
   "message.send": (ctx: MessageSendContext) => {

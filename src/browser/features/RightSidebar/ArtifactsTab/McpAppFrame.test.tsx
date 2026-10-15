@@ -14,7 +14,13 @@ import assert from "@/common/utils/assert";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
-import { markMcpAppViewHosted, type McpAppViewRef } from "./mcpAppViewsStore";
+import {
+  markMcpAppViewHosted,
+  setMcpAppViewFullscreenOnly,
+  useMcpAppViewFullscreenOnly,
+  useMcpAppViewReloadKey,
+  type McpAppViewRef,
+} from "./mcpAppViewsStore";
 
 // The card's display values: the aggregated tool name and the pre-sanitization arguments.
 const VIEW: McpAppViewRef = {
@@ -41,6 +47,12 @@ let getViewGate: Promise<void> | null = null;
 // Backend commit revisions. Never reset: the approval store outlives a test and keeps the list
 // with the newest revision.
 let revision = Date.now() * 1000;
+// The view's stored widget state and its record binding (getView), and the writes it gets.
+let widgetState: unknown = null;
+let widgetStateBinding: string | null = null;
+let widgetStateWrites: Array<{ binding: string; state: unknown }> = [];
+// When set, setWidgetState answers only once it settles (a write in flight).
+let widgetStateWriteGate: Promise<void> | null = null;
 let toolCalls: Array<{
   serverName: string;
   toolName: string;
@@ -63,6 +75,8 @@ function serverApi(): TestApiOverrides<APIClient> {
             result: { content: [] },
             invocation,
             approvalProjectPath,
+            widgetState,
+            widgetStateBinding,
             // Read now, like the backend: newer than every list published so far.
             approvedDomainsRevision: ++revision,
           },
@@ -83,6 +97,13 @@ function serverApi(): TestApiOverrides<APIClient> {
           success: true as const,
           data: { approvedDomains: input.origins, revision: ++revision },
         });
+      },
+      setWidgetState: (input: { binding: string; state: unknown }) => {
+        widgetStateWrites.push({ binding: input.binding, state: input.state });
+        return (widgetStateWriteGate ?? Promise.resolve()).then(() => ({
+          success: true as const,
+          data: {},
+        }));
       },
       callTool: (input: {
         serverName: string;
@@ -152,6 +173,13 @@ interface Posted {
   params?: unknown;
   result?: unknown;
   error?: { code: number };
+}
+
+/** The window.openai shim's seed in a view srcdoc (a JSON string the shim parses). */
+function openAiSeedOf(srcdoc: string | null): unknown {
+  const literal = /JSON\.parse\(("(?:[^"\\]|\\.)*")\)/.exec(srcdoc ?? "")?.[1];
+  assert(literal != null, "the srcdoc has no window.openai seed");
+  return JSON.parse(JSON.parse(literal) as string) as unknown;
 }
 
 /** Every message the host posted into the view document. */
@@ -255,6 +283,10 @@ describe("McpAppFrame", () => {
     approveFails = null;
     approvalProjectPath = "/repo";
     approveDeferred = null;
+    widgetState = null;
+    widgetStateBinding = null;
+    widgetStateWrites = [];
+    widgetStateWriteGate = null;
     getViewGate = null;
     toolCalls = [];
     // Desktop mode by default: the preload bridge exists (isDesktopMode). Browser tests delete it.
@@ -499,6 +531,33 @@ describe("McpAppFrame", () => {
       )
     );
     expect(view.queryByRole("button", { name: "Not now" })).toBeNull();
+  });
+
+  test("widget state is stored for the view instance, and a remount starts with the latest", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    widgetState = { step: 2 };
+    widgetStateBinding = `record-${++revision}`;
+    let landWrite = () => undefined as void;
+    widgetStateWriteGate = new Promise<void>((resolve) => (landWrite = resolve));
+    const first = await renderFrame();
+    expect(openAiSeedOf(first.frame.getAttribute("srcdoc"))).toMatchObject({
+      widgetState: { step: 2 },
+    });
+    postFromView(first.frame, {
+      jsonrpc: "2.0",
+      method: "xum/widget-state",
+      params: { state: { step: 3 } },
+    });
+    await waitFor(() => expect(widgetStateWrites).toHaveLength(1));
+    // The card collapses while the write is in flight, and opens again before it lands. The
+    // record still holds step 2, but the new document starts with step 3.
+    first.view.unmount();
+    const second = await renderFrame();
+    expect(openAiSeedOf(second.frame.getAttribute("srcdoc"))).toMatchObject({
+      widgetState: { step: 3 },
+    });
+    landWrite();
+    expect(widgetStateWrites).toEqual([{ binding: widgetStateBinding, state: { step: 3 } }]);
   });
 
   test("the view is bound to the recorded tool call, not the card", async () => {
@@ -1039,7 +1098,7 @@ describe("McpAppFrame host strips", () => {
     const view = render(tree, { wrapper: Wrapper });
     const frame = await view.findByTestId("mcp-app-frame");
     const srcdoc = frame.getAttribute("srcdoc") ?? "";
-    expect(srcdoc).toContain('"theme":"dark","displayMode":"inline"');
+    expect(openAiSeedOf(srcdoc)).toMatchObject({ theme: "dark", displayMode: "inline" });
     // A resize (or theme change) must not rebuild, and so reload, the view document.
     Object.defineProperty(window, "innerHeight", { value: 333, configurable: true });
     await act(async () => {
@@ -1067,7 +1126,7 @@ describe("McpAppFrame host strips", () => {
       await Promise.resolve();
     });
     const frame = await view.findByTestId("mcp-app-frame");
-    expect(frame.getAttribute("srcdoc")).toContain('"theme":"light"');
+    expect(openAiSeedOf(frame.getAttribute("srcdoc"))).toMatchObject({ theme: "light" });
     getViewGate = null;
   });
 
@@ -1168,6 +1227,152 @@ describe("McpAppFrame host strips", () => {
       const params = changed?.params as { containerDimensions?: { maxHeight?: number } };
       expect(params?.containerDimensions?.maxHeight).toBe(400);
     });
+  });
+
+  // A view that declared only fullscreen is not hosted in its tool card: the card declines it
+  // (its notice replaces the frame), and no tab opens without the user.
+  test("a card instance marks a fullscreen-only view and opens no tab by itself", async () => {
+    const opened: string[] = [];
+    const onOpen = (e: Event) =>
+      opened.push((e as CustomEvent<{ toolCallId: string }>).detail.toolCallId);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
+    let isFullscreenOnly = () => false;
+    function FullscreenOnlyProbe() {
+      const marked = useMcpAppViewFullscreenOnly("ws-card-only", "call-1");
+      isFullscreenOnly = () => marked;
+      return null;
+    }
+    try {
+      const view = render(
+        <>
+          <McpAppFrame workspaceId="ws-card-only" view={VIEW} variant="inline" />
+          <FullscreenOnlyProbe />
+        </>,
+        { wrapper: Wrapper }
+      );
+      const frame = await findOpenFrame(view);
+      const posted = capturePosted(frame);
+      // A hybrid view: the window.openai shim's handshake comes first, with no list.
+      postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+      await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+      expect(isFullscreenOnly()).toBe(false);
+      // Then its own client declares fullscreen only.
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "ui/initialize",
+        params: { appCapabilities: { availableDisplayModes: ["fullscreen"] } },
+      });
+      await waitFor(() => expect(isFullscreenOnly()).toBe(true));
+      await tick();
+      expect(opened).toEqual([]);
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
+    }
+  });
+
+  // A view marked by an earlier mount, opened in its tab: the shim's list-less handshake comes
+  // first there. It must not clear the mark, or closing the tab would host the view inline.
+  test("a list-less handshake keeps an earlier mount's fullscreen-only mark", async () => {
+    setMcpAppViewFullscreenOnly("ws-kept", "call-1", true);
+    let isFullscreenOnly = () => false;
+    function FullscreenOnlyProbe() {
+      const marked = useMcpAppViewFullscreenOnly("ws-kept", "call-1");
+      isFullscreenOnly = () => marked;
+      return null;
+    }
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws-kept" view={VIEW} />
+        <FullscreenOnlyProbe />
+      </>,
+      { wrapper: Wrapper }
+    );
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+    expect(isFullscreenOnly()).toBe(true);
+  });
+
+  // E.g. "Open in tab" on a collapsed card: the view first initializes in its tab. Its card must
+  // not host it inline later either, until a newer document declares inline.
+  test("a tab instance marks a fullscreen-only view at once; a declaration with inline clears it", async () => {
+    let isFullscreenOnly = () => false;
+    function FullscreenOnlyProbe() {
+      const marked = useMcpAppViewFullscreenOnly("ws-tab-only", "call-1");
+      isFullscreenOnly = () => marked;
+      return null;
+    }
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws-tab-only" view={VIEW} />
+        <FullscreenOnlyProbe />
+      </>,
+      { wrapper: Wrapper }
+    );
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    const initialize = (id: number, modes: string[]) => {
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id,
+        method: "ui/initialize",
+        params: { appCapabilities: { availableDisplayModes: modes } },
+      });
+    };
+    initialize(1, ["fullscreen"]);
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+    expect(isFullscreenOnly()).toBe(true);
+    initialize(2, ["inline", "fullscreen"]);
+    await waitFor(() => expect(posted.some((m) => m.id === 2)).toBe(true));
+    expect(isFullscreenOnly()).toBe(false);
+  });
+
+  // The user can collapse the card during the teardown wait: the tab must not close then.
+  test("an inline move whose card is gone by the move keeps the view in its tab", async () => {
+    let closed = 0;
+    let reloads: number[] = [];
+    function ReloadProbe() {
+      reloads = [...reloads, useMcpAppViewReloadKey("ws", "call-1")];
+      return null;
+    }
+    const unmarkCard = markMcpAppViewHosted("ws", "call-1", "card");
+    let cardMarked = true;
+    try {
+      const view = render(
+        <>
+          <McpAppFrame workspaceId="ws" view={VIEW} onClose={() => closed++} />
+          <ReloadProbe />
+        </>,
+        { wrapper: Wrapper }
+      );
+      const frame = await findOpenFrame(view);
+      const posted = capturePosted(frame);
+      postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "ui/request-display-mode",
+        params: { mode: "inline" },
+      });
+      const teardown = await waitFor(() => {
+        const message = posted.find((m) => m.method === "ui/resource-teardown");
+        if (message === undefined) throw new Error("no teardown yet");
+        return message;
+      });
+      unmarkCard();
+      cardMarked = false;
+      const before = reloads.at(-1) ?? 0;
+      postFromView(frame, { jsonrpc: "2.0", id: teardown.id, result: {} });
+      // The torn-down view loads again in its tab instead.
+      await waitFor(() => expect(reloads.at(-1)).toBe(before + 1));
+      expect(closed).toBe(0);
+    } finally {
+      if (cardMarked) unmarkCard();
+    }
   });
 
   test("fullscreen from the card moves the view to its tab; inline from the tab closes it", async () => {

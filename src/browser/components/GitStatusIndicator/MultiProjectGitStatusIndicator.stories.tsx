@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { userEvent, waitFor, within } from "storybook/test";
 import { useEffect, useMemo } from "react";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";

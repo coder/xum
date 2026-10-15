@@ -65,6 +65,37 @@ describe("withHooks", () => {
     expect(seen[0]?.schema).toMatchObject({ properties: { input: { type: "string" } } });
   });
 
+  test("hands the call ID and the turn to tool.execute middleware, or generates an ID", async () => {
+    // Codex PRRT_kwDOPxxmWM6rPqzT: hooks get `tool_use_id`, `turn_id` and `model`.
+    const seen: Array<Pick<ToolExecuteContext, "toolCallId"> & { turn: unknown }> = [];
+    const unregister = eventSpine.useBefore(
+      "tool.execute",
+      (ctx) => {
+        seen.push({ toolCallId: ctx.toolCallId, turn: ctx.host.turn });
+      },
+      { workspaceId: "turn-ws" }
+    );
+    try {
+      const turn = { turnId: "assistant-1", model: "openai:gpt-4o" };
+      const wrapped = withHooks(
+        "test_tool",
+        createTestTool((args) => Promise.resolve({ output: args.input })),
+        { runtime, cwd: tempDir, runtimeTempDir: tempDir, workspaceId: "turn-ws", turn }
+      );
+      await wrapped.execute!({ input: "hi" }, { toolCallId: "call-1" } as never);
+      await wrapped.execute!({ input: "hi" }, {} as never);
+    } finally {
+      unregister();
+    }
+
+    expect(seen[0]).toEqual({
+      toolCallId: "call-1",
+      turn: { turnId: "assistant-1", model: "openai:gpt-4o" },
+    });
+    // A host-side call without an SDK call ID still gets one, for its Pre and Post hooks alike.
+    expect(seen[1]?.toolCallId).toMatch(/^xum-hook-call-/);
+  });
+
   test("executes tool directly when no hook exists", async () => {
     const baseTool = createTestTool((args) =>
       Promise.resolve({ output: `processed: ${args.input}` })

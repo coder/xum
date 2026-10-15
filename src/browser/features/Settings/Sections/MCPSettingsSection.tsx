@@ -63,6 +63,8 @@ import {
 import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import { KebabMenu, type KebabMenuItem } from "@/browser/components/KebabMenu/KebabMenu";
 import { getErrorMessage } from "@/common/utils/errors";
+import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
+import { createOAuthFlowId } from "@/browser/utils/oauth/flowId";
 
 /** Expand/collapse header shared by the editable and read-only tool sections. */
 const ToolsDisclosureButton: React.FC<{
@@ -253,14 +255,6 @@ const PluginToolListSection: React.FC<{ tools: string[]; testedAt: number }> = (
 
 type MCPOAuthLoginStatus = "idle" | "starting" | "waiting" | "completing" | "success" | "error";
 
-interface MCPOAuthAuthStatus {
-  serverUrl?: string;
-  isLoggedIn: boolean;
-  hasRefreshToken: boolean;
-  scope?: string;
-  updatedAtMs?: number;
-}
-
 type MCPOAuthAPI = NonNullable<ReturnType<typeof useAPI>["api"]>["mcpOauth"];
 
 /**
@@ -425,19 +419,25 @@ function useMCPOAuthLogin(input: {
         return;
       }
 
+      // Generated here and stored before the start RPC: the start can stall on discovery, and
+      // Cancel must reach the flow meanwhile (the backend refuses a flow cancelled while it
+      // was starting) (#6565).
+      const startFlowId = createOAuthFlowId();
+      setFlowId(startFlowId);
       setLoginStatus("starting");
 
       const startResult =
         loginFlowMode === "desktop"
-          ? await mcpOauthApi.startDesktopFlow({ serverName, pendingServer })
-          : await mcpOauthApi.startServerFlow({ serverName, pendingServer });
+          ? await mcpOauthApi.startDesktopFlow({ serverName, pendingServer, flowId: startFlowId })
+          : await mcpOauthApi.startServerFlow({ serverName, pendingServer, flowId: startFlowId });
 
       if (attempt !== loginAttemptRef.current) {
+        // A newer attempt replaced this one; Cancel is idempotent if it already ran.
         if (startResult.success) {
           if (loginFlowMode === "desktop") {
-            void mcpOauthApi.cancelDesktopFlow({ flowId: startResult.data.flowId });
+            void mcpOauthApi.cancelDesktopFlow({ flowId: startFlowId });
           } else {
-            void mcpOauthApi.cancelServerFlow({ flowId: startResult.data.flowId });
+            void mcpOauthApi.cancelServerFlow({ flowId: startFlowId });
           }
         }
         return;
@@ -637,6 +637,23 @@ const MCPOAuthRequiredCallout: React.FC<{
   return <MCPOAuthRequiredCalloutView login={login} disabledReason={props.disabledReason} />;
 };
 
+/**
+ * A sign-in prompt after the server refused a tool call with 403 `insufficient_scope` (#6622).
+ * The tokens stay, so tools that need less keep working. The scopes are sanitized names.
+ */
+const InsufficientScopePrompt: React.FC<{ status: MCPOAuthAuthStatus | null }> = (props) => {
+  // The backend reports scopes only while the server is signed in.
+  const scopes = props.status?.insufficientScopes;
+  if (scopes === undefined) return null;
+  const named = scopes.length > 0 ? `: ${scopes.join(" ")}` : "";
+  return (
+    <p role="status" className="text-warning mt-1 text-xs break-words">
+      This server refused a tool call and asks for more permissions{named}. Choose Re-login and
+      grant them on the sign-in page.
+    </p>
+  );
+};
+
 const RemoteMCPOAuthSection: React.FC<{
   serverName: string;
   transport: Exclude<MCPServerTransport, "stdio">;
@@ -747,84 +764,87 @@ const RemoteMCPOAuthSection: React.FC<{
   }, [api, cancelLogin, refreshAuthStatus, url]);
 
   return (
-    <div className="mt-1 flex items-center justify-between gap-2">
-      <div className="flex min-w-0 items-center gap-2 text-xs">
-        <span className="text-foreground font-medium">OAuth</span>
-        <span className="text-content-secondary truncate">
-          {authStatusText}
-          {updatedAtText}
-        </span>
+    <div>
+      <div className="mt-1 flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2 text-xs">
+          <span className="text-foreground font-medium">OAuth</span>
+          <span className="text-content-secondary truncate">
+            {authStatusText}
+            {updatedAtText}
+          </span>
 
-        {oauthDebugErrors.length > 0 && (
-          <details className="group inline-block">
-            <summary className="text-content-secondary hover:text-foreground cursor-pointer list-none text-[11px] underline-offset-2 group-open:underline">
-              Details
-            </summary>
-            <div className="border-border-medium bg-background-secondary mt-1 space-y-1 rounded-md border px-2 py-1 text-xs">
-              {oauthDebugErrors.map((entry) => (
-                <div key={entry.label} className="text-destructive break-words">
-                  <span className="font-medium">{entry.label}:</span> {entry.message}
-                </div>
-              ))}
-            </div>
-          </details>
-        )}
-      </div>
-
-      {oauthActionsAvailable && (
-        <div className="flex shrink-0 items-center gap-1">
-          {loginInProgress ? (
-            <>
-              <Button variant="outline" size="sm" className="h-7 px-2" disabled>
-                <Loader2 className="h-3 w-3 animate-spin" />
-                {isLoggedIn ? "Re-login" : "Login"}
-              </Button>
-
-              <Button variant="ghost" size="sm" className="h-7 px-2" onClick={cancelLogin}>
-                Cancel
-              </Button>
-            </>
-          ) : isLoggedIn ? (
-            <>
-              {logoutInProgress && <Loader2 className="text-muted h-3 w-3 animate-spin" />}
-              <KebabMenu
-                className="h-7 w-7 px-0 text-xs"
-                items={
-                  [
-                    {
-                      label: reloginMenuLabel,
-                      onClick: () => {
-                        void startLogin();
-                      },
-                      disabled: logoutInProgress,
-                    },
-                    {
-                      label: logoutInProgress ? "Logging out..." : "Logout",
-                      onClick: () => {
-                        void logout();
-                      },
-                      disabled: logoutInProgress,
-                    },
-                  ] satisfies KebabMenuItem[]
-                }
-              />
-            </>
-          ) : (
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 px-2"
-              onClick={() => {
-                void startLogin();
-              }}
-              disabled={logoutInProgress}
-            >
-              <LogIn />
-              {loginButtonLabel}
-            </Button>
+          {oauthDebugErrors.length > 0 && (
+            <details className="group inline-block">
+              <summary className="text-content-secondary hover:text-foreground cursor-pointer list-none text-[11px] underline-offset-2 group-open:underline">
+                Details
+              </summary>
+              <div className="border-border-medium bg-background-secondary mt-1 space-y-1 rounded-md border px-2 py-1 text-xs">
+                {oauthDebugErrors.map((entry) => (
+                  <div key={entry.label} className="text-destructive break-words">
+                    <span className="font-medium">{entry.label}:</span> {entry.message}
+                  </div>
+                ))}
+              </div>
+            </details>
           )}
         </div>
-      )}
+
+        {oauthActionsAvailable && (
+          <div className="flex shrink-0 items-center gap-1">
+            {loginInProgress ? (
+              <>
+                <Button variant="outline" size="sm" className="h-7 px-2" disabled>
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  {isLoggedIn ? "Re-login" : "Login"}
+                </Button>
+
+                <Button variant="ghost" size="sm" className="h-7 px-2" onClick={cancelLogin}>
+                  Cancel
+                </Button>
+              </>
+            ) : isLoggedIn ? (
+              <>
+                {logoutInProgress && <Loader2 className="text-muted h-3 w-3 animate-spin" />}
+                <KebabMenu
+                  className="h-7 w-7 px-0 text-xs"
+                  items={
+                    [
+                      {
+                        label: reloginMenuLabel,
+                        onClick: () => {
+                          void startLogin();
+                        },
+                        disabled: logoutInProgress,
+                      },
+                      {
+                        label: logoutInProgress ? "Logging out..." : "Logout",
+                        onClick: () => {
+                          void logout();
+                        },
+                        disabled: logoutInProgress,
+                      },
+                    ] satisfies KebabMenuItem[]
+                  }
+                />
+              </>
+            ) : (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2"
+                onClick={() => {
+                  void startLogin();
+                }}
+                disabled={logoutInProgress}
+              >
+                <LogIn />
+                {loginButtonLabel}
+              </Button>
+            )}
+          </div>
+        )}
+      </div>
+      <InsufficientScopePrompt status={authStatus} />
     </div>
   );
 };

@@ -41,6 +41,7 @@ const RESTART_RULES: Record<string, RestartRule> = {
   "src/browser/features/ChatInput/index.tsx": "effect-deps",
   "src/browser/features/Memory/MemoryBrowser.tsx": "effect-deps",
   "src/browser/features/RightSidebar/AppViewTab/mcpAppEntrypoints.ts": "effect-deps",
+  "src/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore.ts": "effect-deps",
   "src/browser/features/RightSidebar/DevToolsTab/useDevToolsSubscription.ts": "effect-deps",
   "src/browser/features/RightSidebar/Workflows/useWorkflowRuns.ts": "effect-deps",
   "src/browser/features/Settings/Sections/BackupSection.tsx": "effect-deps",

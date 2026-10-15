@@ -66,3 +66,46 @@ describe("SkillIndicator plugin skill names", () => {
     expect(view.getByRole("button").getAttribute("aria-label")).toContain("1 of 1 skill loaded");
   });
 });
+
+describe("SkillIndicator skill warnings", () => {
+  let cleanupDom: (() => void) | null = null;
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("announces warnings without turning the badge into an error count", () => {
+    const skill = {
+      name: "poteto-mode",
+      displayName: "Poteto Mode",
+      description: "Router",
+      scope: "global" as const,
+    };
+    const view = render(
+      <TooltipProvider>
+        <SkillIndicator
+          loadedSkills={[skill]}
+          availableSkills={[skill]}
+          skillWarnings={[
+            {
+              directoryName: "poteto-mode",
+              scope: "global",
+              displayPath: "/skills/poteto-mode/SKILL.md",
+              message: "display name",
+            },
+          ]}
+        />
+      </TooltipProvider>
+    );
+    const button = view.getByRole("button");
+    expect(button.getAttribute("aria-label")).toBe("1 of 1 skill loaded, 1 warning");
+    // The badge keeps showing the loaded count in its normal (non-danger) style.
+    const badge = button.querySelector("span > span");
+    expect(badge?.textContent).toBe("1");
+    expect(badge?.className).not.toContain("bg-danger");
+  });
+});

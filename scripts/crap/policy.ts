@@ -1,13 +1,15 @@
 // Pure CRAP gate rules: compare a base and a head snapshot of
 // crapper_report.py rows. check.ts does the git and scorer I/O.
 import {
+  CRAP_TAX_SEVERITY,
   CRAP_TAX_STAGE,
-  NEW_FUNCTION_MAX_SCORE,
+  GROWTH_MAX_CC_WITHOUT_COVERAGE,
   NEW_FUNCTION_ON_NET_DECREASE,
   RELIEF_MAX_CRAP,
-  TAX_WITHOUT_COVERAGE,
+  floorAllowsGrowth,
   moveRelief,
   netExtractionRelief,
+  newFunctionMax,
   reliefAllowsCrap,
   type Severity,
 } from "./thresholds";
@@ -121,32 +123,47 @@ function compare(
     base,
     message: `${where(head)}: ${message}`,
   });
-  if (head.complexity > base.complexity) {
-    return finding(
-      "floor-cc",
-      "violation",
-      `CC ${base.complexity} -> ${head.complexity} (must not grow)`
-    );
-  }
+  const floor = floorBreach(base, head);
+  if (floor) return finding(floor.rule, "violation", floor.message);
   const baseCrap = base.crap;
   const headCrap = head.crap;
   const scored = baseCrap !== null && headCrap !== null;
-  if (scored && headCrap > baseCrap) {
-    return finding("floor-crap", "violation", `CRAP ${baseCrap} -> ${headCrap} (must not grow)`);
-  }
   const baseScore = scored ? baseCrap : base.complexity;
   const headScore = scored ? headCrap : head.complexity;
   if (baseScore > CRAP_TAX_STAGE && headScore >= baseScore && touched(head, changed)) {
     const unit = scored ? "CRAP" : "CC";
-    const severity = scored ? "violation" : TAX_WITHOUT_COVERAGE;
     const change = headScore === baseScore ? "unchanged" : `-> ${headScore}`;
-    const ask =
-      severity === "violation"
-        ? `above ${CRAP_TAX_STAGE}, must end lower`
-        : "consider shrinking it";
-    return finding("crap-tax", severity, `touched hotspot, ${unit} ${baseScore} ${change}: ${ask}`);
+    return finding(
+      "crap-tax",
+      CRAP_TAX_SEVERITY,
+      `touched hotspot, ${unit} ${baseScore} ${change}: consider shrinking it`
+    );
   }
   return null;
+}
+
+/**
+ * The floor: growth (CC, or CRAP with coverage on both sides) is a violation
+ * only when the head ends above the growth line (floorAllowsGrowth). A CC gain
+ * reports floor-cc, a CRAP gain at equal or lower CC floor-crap.
+ */
+function floorBreach(
+  base: FunctionRow,
+  head: FunctionRow
+): { rule: "floor-cc" | "floor-crap"; message: string } | null {
+  const grewCc = head.complexity > base.complexity;
+  const grewCrap = base.crap !== null && head.crap !== null && head.crap > base.crap;
+  if (!(grewCc || grewCrap) || floorAllowsGrowth(head.complexity, head.crap)) return null;
+  const line =
+    head.crap === null
+      ? `head CC above ${GROWTH_MAX_CC_WITHOUT_COVERAGE}`
+      : `head CRAP ${head.crap} above ${CRAP_TAX_STAGE}`;
+  return grewCc
+    ? {
+        rule: "floor-cc",
+        message: `CC ${base.complexity} -> ${head.complexity} (${line}: must not grow)`,
+      }
+    : { rule: "floor-crap", message: `CRAP ${base.crap} -> ${head.crap} (${line}: must not grow)` };
 }
 
 /** CC that kept functions lost, and the decision points of the new functions. */
@@ -205,7 +222,8 @@ function judgeNew(
 ): Finding | null {
   const unit = head.crap === null ? "CC" : "CRAP";
   const score = head.crap ?? head.complexity;
-  if (score <= NEW_FUNCTION_MAX_SCORE) return null;
+  const max = newFunctionMax(head.crap);
+  if (score <= max) return null;
   const granted = relief(head, totals, moves);
   return {
     rule: "new-function",
@@ -213,7 +231,7 @@ function judgeNew(
     key,
     head,
     base: null,
-    message: `${where(head)}: new function ${unit} ${score} (max ${NEW_FUNCTION_MAX_SCORE}${granted ? `, ${granted.note}` : ""})`,
+    message: `${where(head)}: new function ${unit} ${score} (max ${max}${granted ? `, ${granted.note}` : ""})`,
   };
 }
 
@@ -231,8 +249,8 @@ function judgeNew(
  * Only the head counts: missing hits only lower coverage, so a base score is
  * no lower than the real one and a head above it still regressed. The relief
  * applies only when the same rules raise no violation on the head at full
- * coverage (CRAP = CC), so a finding that CC alone proves, and floor-cc, keep
- * their verdict.
+ * coverage (CRAP = CC), so a finding that CC alone proves keeps its verdict:
+ * for example a CC gain to a head CC above CRAP_TAX_STAGE.
  */
 function coverageRelief(
   finding: Finding,

@@ -18,6 +18,7 @@ import { extractToolMediaAsUserMessages } from "@/node/utils/messages/extractToo
 import { sanitizeAnthropicPdfFilenames } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import { convertDataUriFilePartsForSdk } from "@/node/utils/messages/convertDataUriFilePartsForSdk";
 import { insertStepStartPartsForSdk } from "@/node/utils/messages/insertStepStartPartsForSdk";
+import { prepareMcpReplay } from "@/node/services/mcpModelOutput";
 import { planAnthropicThinkingStrip } from "@/node/utils/messages/anthropicThinkingReplay";
 import { attachReasoningReplayMetadata } from "@/node/utils/messages/reasoningProviderOptions";
 import type { MuxMessage } from "@/common/types/message";
@@ -211,7 +212,9 @@ export async function prepareMessagesForProvider(
   // Restore each assistant row's step boundaries, so the rebuild splits messages where the
   // in-turn steps did (prompt-cache prefix). Last: every transform above keeps assistant parts
   // 1:1, so the persisted stepStartPartIndices still point at the right parts.
-  const messagesWithStepStarts = insertStepStartPartsForSdk(thinkingStrip.messages);
+  // MCP results replay through the toModelOutput their in-turn step used (parts stay 1:1).
+  const mcpReplay = prepareMcpReplay(thinkingStrip.messages);
+  const messagesWithStepStarts = insertStepStartPartsForSdk(mcpReplay.messages);
 
   // --- Convert to ModelMessage format ---
 
@@ -221,6 +224,7 @@ export async function prepareMessagesForProvider(
     // Drop unfinished tool calls (input-streaming/input-available) so downstream
     // transforms only see tool calls that actually produced outputs.
     ignoreIncompleteToolCalls: true,
+    tools: mcpReplay.tools,
   });
 
   // --- ModelMessage-level transforms ---

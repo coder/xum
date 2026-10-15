@@ -86,6 +86,8 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
+// process.platform-based: the common helper reads navigator, which Node 20 lacks (#6485).
+import { PlatformPaths as NodePlatformPaths } from "@/node/utils/paths.main";
 import { sharesPlanDirectory } from "@/common/utils/planStorage";
 import { stableStringify } from "@/common/utils/stableStringify";
 import type { RuntimeConfig } from "@/common/types/runtime";
@@ -1090,6 +1092,28 @@ function readLegacyMetadataId(file: string): string | null | undefined {
   }
 }
 
+/**
+ * One stored key can also hold an id-less legacy row next to its migrated copy (a hand edit or
+ * another tool; Xum's own migration fills in the id on the same row). Drop the legacy copy the
+ * same way as in an alias group (#6595). Gated on an id-less row with a string path, so a
+ * migrated project pays one in-memory pass on a cold load and no file access.
+ */
+function dropSingleKeyLegacyCopies(
+  key: string,
+  entry: StoredProjectEntry,
+  conflicts: ProjectAliasConflict[],
+  resolveLegacyId: (projectPath: string, workspace: Workspace) => string | undefined
+): void {
+  const workspaces = entry.config.workspaces;
+  if (!workspaces.some((workspace) => !workspace.id && typeof workspace.path === "string")) return;
+  const conflictingIds = dropLegacyDuplicateRows(workspaces, (workspace) =>
+    resolveLegacyId(key, workspace)
+  );
+  if (conflictingIds.length > 0) {
+    conflicts.push({ path: key, storedKeys: [entry.storedKey], conflictingIds });
+  }
+}
+
 /** An alias group whose merge kept one of two different rows for the same workspace. */
 interface ProjectAliasConflict {
   path: string;
@@ -1120,6 +1144,7 @@ function buildProjectsFromStoredEntries(
   for (const [key, group] of groups) {
     if (group.length === 1) {
       projects.set(key, group[0].config);
+      dropSingleKeyLegacyCopies(key, group[0], conflicts, resolveLegacyId);
       continue;
     }
     const storedKeys = group.map((entry) => entry.storedKey);
@@ -1527,6 +1552,97 @@ interface WorkspaceMetadataBuildOptions extends WorkspaceMetadataOptions {
   degraded?: { value: boolean };
 }
 
+/** Symlinks a config.json watch follows before it stops, like the kernel's ELOOP bound. */
+const CONFIG_FILE_WATCH_MAX_LINKS = 40;
+/** Watch reinstalls one event does while config.json keeps changing; the next event retries. */
+const CONFIG_FILE_WATCH_MAX_REINSTALLS = 8;
+/** Separators in a symlink's text: Windows also accepts "/", POSIX allows a backslash in names. */
+const LINK_TEXT_SEPARATOR = path.sep === "\\" ? /[\\/]/ : /\//;
+
+/**
+ * The dirs a config.json watch needs, each with the entry names that matter there. Watch dirs,
+ * not files: atomic saves rename a temp file over the target, and a file watch follows the old
+ * inode. The walk resolves the path one entry at a time, as realpath does, and watches:
+ * - the parent of every symlink on the way (repointing a link changes only its parent dir),
+ * - the target's dir (writeFileAtomic renames over a symlink's target, not the link),
+ * - for a missing entry (a dangling link), its nearest existing ancestor, so its creation
+ *   shows up as an event.
+ */
+function configFileWatchDirs(configFile: string): Map<string, Set<string>> {
+  const dirs = new Map<string, Set<string>>();
+  const watch = (dir: string, name: string) =>
+    dirs.set(dir, (dirs.get(dir) ?? new Set<string>()).add(name));
+  const absolute = path.resolve(configFile);
+  // `resolved` never contains a symlink, so ".." can drop its last entry, as the kernel does.
+  let resolved = path.parse(absolute).root;
+  const pending = absolute.slice(resolved.length).split(path.sep);
+  let links = 0;
+  for (let name = pending.shift(); name !== undefined; name = pending.shift()) {
+    if (name === "..") {
+      resolved = path.dirname(resolved);
+      continue;
+    }
+    const entry = path.join(resolved, name);
+    const stat = walkableEntryStat(entry, pending.length > 0);
+    if (stat === null) {
+      watch(resolved, name);
+      return dirs;
+    }
+    if (!stat.isSymbolicLink()) {
+      resolved = entry;
+      continue;
+    }
+    watch(resolved, name);
+    links += 1;
+    if (links > CONFIG_FILE_WATCH_MAX_LINKS) return dirs;
+    const step = symlinkWalkStep(entry, resolved);
+    if (step === null) return dirs;
+    resolved = step.from;
+    pending.unshift(...step.entries);
+  }
+  watch(path.dirname(resolved), path.basename(resolved));
+  return dirs;
+}
+
+/**
+ * The entry's stat when the walk can go on through it, else null. With entries left, a file
+ * in a folder's place counts as missing: a watch on the file would follow its inode, and the
+ * folder that replaces it would go unseen.
+ */
+function walkableEntryStat(entry: string, entriesLeft: boolean): fs.Stats | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(entry);
+  } catch {
+    return null;
+  }
+  const walkable = !entriesLeft || stat.isDirectory() || stat.isSymbolicLink();
+  return walkable ? stat : null;
+}
+
+/** Where a path walk goes on from a symlink: the dir its text starts from, and its entries. */
+function symlinkWalkStep(
+  link: string,
+  linkParent: string
+): { from: string; entries: string[] } | null {
+  let text: string;
+  try {
+    text = fs.readlinkSync(link);
+  } catch {
+    return null;
+  }
+  const root = path.isAbsolute(text) ? path.parse(text).root : "";
+  const entries = text
+    .slice(root.length)
+    .split(LINK_TEXT_SEPARATOR)
+    .filter((name) => name !== "" && name !== ".");
+  return { from: root === "" ? linkParent : root, entries };
+}
+
+function configFileWatchDirsKey(dirs: ReadonlyMap<string, ReadonlySet<string>>): string {
+  return JSON.stringify(Array.from(dirs, ([dir, names]) => [dir, Array.from(names)]));
+}
+
 export class Config {
   readonly rootDir: string;
   readonly sessionsDir: string;
@@ -1672,8 +1788,8 @@ export class Config {
    */
   private notifiedConfigFileStamp = "missing";
 
-  /** The resolved config.json path the target-dir watch follows (see startConfigFileWatchers). */
-  private watchedConfigFileTarget: string | null = null;
+  /** configFileWatchDirsKey of the dirs the open watches cover (see startConfigFileWatchers). */
+  private watchedConfigFileDirsKey: string | null = null;
 
   /** Set by stopWatchingConfigFile: a disposed backend never watches again. */
   private configFileWatchStopped = false;
@@ -1696,64 +1812,122 @@ export class Config {
       log.debug("Config dir not created for the config file watcher", { error });
     }
     this.startConfigFileWatchers();
-    // Without a watch, writeConfigFileTracked retries after this process's next save.
-    if (this.configFileWatchers.length === 0) return;
+    // Set without a watch too: the read that starts one later then reports the edits since.
     this.notifiedConfigFileStamp = baseline;
+    // Without a watch, the next read of a changed config.json or this process's next save
+    // retries.
+    if (this.configFileWatchers.length === 0) return;
     // Relink-aware: the link can also change between the realpath read and the root watch.
     this.handleConfigFileEventWithRelink();
   }
 
-  private startConfigFileWatchers(): void {
-    // Watch directories, not the file: atomic saves rename a temp file over config.json, and
-    // a file watch follows the old inode. writeFileAtomic renames over a symlink's target, so
-    // a symlinked config.json also needs its target's directory.
-    const realFile = this.realConfigFilePath();
-    this.watchedConfigFileTarget = realFile;
-    // Names per dir: a link to a sibling file shares the root dir with config.json itself.
-    const targets = new Map([[this.rootDir, new Set([path.basename(this.configFile)])]]);
-    const targetDir = path.dirname(realFile);
-    targets.set(targetDir, (targets.get(targetDir) ?? new Set()).add(path.basename(realFile)));
-    for (const [dir, fileNames] of targets) {
+  private startConfigFileWatchers(dirs = configFileWatchDirs(this.configFile)): void {
+    let complete = true;
+    for (const [dir, fileNames] of dirs) {
       const watcher = this.watchConfigDir(dir, fileNames);
       if (watcher) this.configFileWatchers.push(watcher);
+      else complete = false;
     }
+    // A dir whose watch failed to start is retried by the next relink check (the next event)
+    // or by the next read of a changed config.json (retryIncompleteConfigFileWatch).
+    this.watchedConfigFileDirsKey = complete ? configFileWatchDirsKey(dirs) : null;
   }
 
   /** A config.json event: re-resolve a replaced symlink first, so the watch follows it. */
   private handleConfigFileEventWithRelink(): void {
-    if (this.realConfigFilePath() !== this.watchedConfigFileTarget) {
-      // Keep the notified stamp: the new target's bytes still count as a change below.
-      this.closeConfigFileWatcher();
-      this.startConfigFileWatchers();
-    }
+    this.followConfigFileRelinks();
     this.handleConfigFileEvent();
   }
 
-  private realConfigFilePath(): string {
-    try {
-      return fs.realpathSync(this.configFile);
-    } catch {
-      return this.configFile;
+  /** Moves the watches to the dirs config.json resolves through now. */
+  private followConfigFileRelinks(): void {
+    // A relink that lands while the watches are reinstalled can reach no watch, so resolve
+    // again until the watched dirs match the links.
+    // A watch that failed to start gets one retry per check, not one per loop pass.
+    let tried: string | null = null;
+    for (let reinstalls = 0; reinstalls < CONFIG_FILE_WATCH_MAX_REINSTALLS; reinstalls += 1) {
+      const dirs = configFileWatchDirs(this.configFile);
+      const key = configFileWatchDirsKey(dirs);
+      if (key === this.watchedConfigFileDirsKey || key === tried) return;
+      tried = key;
+      // Keep the notified stamp: the new target's bytes still count as a change.
+      this.closeConfigFileWatcher();
+      this.startConfigFileWatchers(dirs);
     }
   }
 
   private watchConfigDir(dir: string, fileNames: ReadonlySet<string>): fs.FSWatcher | null {
     let watcher: fs.FSWatcher;
     try {
-      watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
-        // Some platforms omit the filename; treat that as a possible config.json change.
-        if (filename != null && !fileNames.has(filename)) return;
-        this.handleConfigFileEventWithRelink();
-      });
+      watcher = fs.watch(dir, { persistent: false }, (_event, filename) =>
+        this.handleConfigDirEvent(dir, fileNames, filename)
+      );
     } catch (error) {
       log.debug("Config file watcher not started", { dir, error });
       return null;
     }
     watcher.on("error", (error) => {
       log.debug("Config file watcher stopped", { dir, error });
-      if (this.configFileWatchers.includes(watcher)) this.closeConfigFileWatcher();
+      if (!this.configFileWatchers.includes(watcher)) return;
+      // Rebuild the set instead of closing every watch for good: the relink check reopens
+      // each dir that still resolves (a vanished dir moves to an existing ancestor), and
+      // the stamp check after it reports an edit made while the watch was down.
+      this.watchedConfigFileDirsKey = null;
+      this.configFileWatchErrorDir = dir;
+      this.retryIncompleteConfigFileWatch("error");
     });
     return watcher;
+  }
+
+  /**
+   * The config.json stamp of the last retry each trigger started. Separate per trigger: a
+   * read that repaired the set must not hold back the rebuild for a later watcher error.
+   */
+  private readonly configFileWatchRetryStamps: Record<"read" | "error", string | null> = {
+    read: null,
+    error: null,
+  };
+  /** The dir of the last watch that raised an error (see the watch callback). */
+  private configFileWatchErrorDir: string | null = null;
+
+  /**
+   * Rebuilds a watch set with a failed watch, at most once per config.json stamp and trigger.
+   * A read retries a watch that failed to start, so the retry needs no event from another
+   * watch. The error bound stops an error that every new watch raises from rebuilding the set
+   * at the pace of the OS errors: the next rebuild waits for a watch event or a changed stamp.
+   * No timer: until the stamp changes, a retry would see no new edit to report.
+   */
+  private retryIncompleteConfigFileWatch(trigger: "read" | "error"): void {
+    if (!this.configFileWatchIncomplete()) return;
+    const stamp = this.configFileStamp();
+    if (stamp === this.configFileWatchRetryStamps[trigger]) return;
+    this.configFileWatchRetryStamps[trigger] = stamp;
+    this.handleConfigFileEventWithRelink();
+  }
+
+  /**
+   * A listener needs a watch that is missing: one failed to start or raised an error. An
+   * empty set with listeners counts too: every watch failed to start.
+   */
+  private configFileWatchIncomplete(): boolean {
+    if (this.configFileWatchStopped || this.emitter.listenerCount("configChanged") === 0) {
+      return false;
+    }
+    return this.configFileWatchers.length === 0 || this.watchedConfigFileDirsKey === null;
+  }
+
+  /** An event from the watch on `dir`, which covers the entries in `fileNames`. */
+  private handleConfigDirEvent(
+    dir: string,
+    fileNames: ReadonlySet<string>,
+    filename: string | null
+  ): void {
+    // An event from the replacement of the failed watch shows it works, so its next error
+    // may rebuild again. An event from another dir proves nothing about it.
+    if (dir === this.configFileWatchErrorDir) this.configFileWatchRetryStamps.error = null;
+    // Some platforms omit the filename; treat that as a possible config.json change.
+    if (filename != null && !fileNames.has(filename)) return;
+    this.handleConfigFileEventWithRelink();
   }
 
   private closeConfigFileWatcher(): void {
@@ -1804,11 +1978,13 @@ export class Config {
     // file is not an edit to announce: a listener reading it would see defaults.
     if (stamp === "missing" || stamp === this.notifiedConfigFileStamp) return;
     this.notifiedConfigFileStamp = stamp;
-    this.notifyConfigChanged();
+    this.notifyConfigChangedByAnotherProcess();
   }
 
   private deferredChangeNotificationDepth = 0;
   private changeNotificationPending = false;
+  /** A foreign edit's notification deferred by a batch: its flush keeps the listener guard. */
+  private foreignChangeNotificationPending = false;
 
   /** Flush config changes once after the outermost operation, including partial failures. */
   async withDeferredChangeNotifications<T>(operation: () => Promise<T>): Promise<T> {
@@ -1817,11 +1993,22 @@ export class Config {
       return await operation();
     } finally {
       this.deferredChangeNotificationDepth -= 1;
-      if (this.deferredChangeNotificationDepth === 0 && this.changeNotificationPending) {
-        this.changeNotificationPending = false;
-        this.notifyConfigChanged();
-      }
+      if (this.deferredChangeNotificationDepth === 0) this.flushDeferredChangeNotification();
     }
+  }
+
+  /**
+   * A batch with only own edits notifies as an own save does. A batch with a foreign edit
+   * keeps the listener guard of notifyConfigChangedByAnotherProcess.
+   */
+  private flushDeferredChangeNotification(): void {
+    const own = this.changeNotificationPending;
+    const foreign = this.foreignChangeNotificationPending;
+    this.changeNotificationPending = false;
+    this.foreignChangeNotificationPending = false;
+    // A foreign edit has no caller to throw to, so it keeps the guard even next to an own edit.
+    if (foreign) this.notifyConfigChangedByAnotherProcess();
+    else if (own) this.notifyConfigChanged();
   }
 
   private notifyConfigChanged(): void {
@@ -1831,6 +2018,25 @@ export class Config {
       return;
     }
     this.emitter.emit("configChanged");
+  }
+
+  /**
+   * An own save's notification lets a listener's throw reach the caller of the save. Another
+   * backend's edit arrives in an fs.watch callback with no caller, where a throw would be an
+   * uncaught exception: log it and still notify the other listeners.
+   */
+  private notifyConfigChangedByAnotherProcess(): void {
+    if (this.deferredChangeNotificationDepth > 0) {
+      this.foreignChangeNotificationPending = true;
+      return;
+    }
+    for (const listener of this.emitter.listeners("configChanged")) {
+      try {
+        (listener as () => void)();
+      } catch (error) {
+        log.error("Config change listener failed", { error });
+      }
+    }
   }
 
   /**
@@ -2119,8 +2325,7 @@ export class Config {
   }
 
   /** The beforeRename check for a save, or undefined when the save has no read to compare. */
-  private unchangedConfigCheck(expectedStatKey: string | undefined) {
-    if (expectedStatKey === undefined) return undefined;
+  private unchangedConfigCheck(expectedStatKey: string): () => void {
     return () => this.assertConfigFileUnchanged(expectedStatKey);
   }
 
@@ -2204,7 +2409,11 @@ export class Config {
     if (key !== undefined && this.configSnapshot?.key === key) {
       return this.configSnapshot.config;
     }
-    return this.readConfigOrDefault(options, key);
+    const config = this.readConfigOrDefault(options, key);
+    // A changed file: retry a failed watch after the read, so a listener it notifies reads
+    // the snapshot this read stored.
+    this.retryIncompleteConfigFileWatch("read");
+    return config;
   }
 
   private readConfigOrDefault(
@@ -2390,9 +2599,9 @@ export class Config {
    */
   private resolveLegacyRowId(projectPath: string, workspace: Workspace): string | undefined {
     const legacyId = this.generateLegacyId(projectPath, workspace.path);
-    // The same basename expression as buildWorkspaceMetadata (#6485 tracks its Windows gap).
-    const basename =
-      workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+    // The same basename as buildWorkspaceMetadata and findWorkspace; PlatformPaths also splits on
+    // "\\" on Windows, where checkout paths use backslashes (#6485).
+    const basename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
     const ids = new Set<string | undefined>();
     for (const candidate of basename === legacyId ? [legacyId] : [legacyId, basename]) {
       const id = readLegacyMetadataId(path.join(this.sessionsDir, candidate, "metadata.json"));
@@ -2920,9 +3129,10 @@ export class Config {
    */
   /**
    * `expectedStatKey`: the stat key of the bytes the edit read. The save then fails without
-   * writing when config.json no longer has it. Undefined skips the check.
+   * writing when config.json no longer has it. Required, so no save path can skip the check
+   * (#6595).
    */
-  private saveConfig(config: ProjectsConfig, expectedStatKey?: string): Promise<void> {
+  private saveConfig(config: ProjectsConfig, expectedStatKey: string): Promise<void> {
     return Effect.runPromise(this.saveConfigEffect(config, expectedStatKey));
   }
 
@@ -2933,7 +3143,7 @@ export class Config {
    */
   private saveConfigEffect(
     config: LegacyAdvisorProjectsConfig,
-    expectedStatKey?: string
+    expectedStatKey: string
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -3773,8 +3983,11 @@ export class Config {
       // Route through the saveConfig Promise facade (not saveConfigEffect) so test
       // spies on saveConfig keep intercepting the serialized write. A failed save rejects
       // the edit and skips the change notification below (#4444).
+      // transform() always runs before write and records the key.
+      const expectedStatKey = readStatKey;
+      assert(expectedStatKey !== undefined, "config edit saved without a fresh read");
       yield* Effect.tryPromise({
-        try: () => self.saveConfig(newConfig, readStatKey),
+        try: () => self.saveConfig(newConfig, expectedStatKey),
         catch: (error) => error,
       });
       // Backend-initiated config edits (for example gateway auth changes) use this signal
@@ -4226,8 +4439,7 @@ export class Config {
       // LEGACY FORMAT: Fall back to metadata.json and legacy ID for unmigrated workspaces
       if (!workspace.id) {
         // Extract workspace basename (could be stable ID or legacy name)
-        const workspaceBasename =
-          workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+        const workspaceBasename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
 
         // Try loading metadata with basename as ID (works for old workspaces)
         const metadataPath = path.join(
@@ -4520,8 +4732,7 @@ export class Config {
           tags: storedWorkspace.tags ? { ...storedWorkspace.tags } : undefined,
         };
         // Extract workspace basename from path (could be stable ID or legacy name)
-        const workspaceBasename =
-          workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+        const workspaceBasename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
 
         // Captured BEFORE any in-memory migration mutates workspace.id: the queued
         // replay must retarget by persisted identity, never by path alone — paths are

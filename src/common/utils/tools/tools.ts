@@ -70,6 +70,7 @@ import { createWorkflowRunTool } from "@/node/services/tools/workflow_run";
 import { createWorkflowResumeTool } from "@/node/services/tools/workflow_resume";
 import { createAgentReportTool } from "@/node/services/tools/agent_report";
 import { wrapWithInitWait } from "@/node/services/tools/wrapWithInitWait";
+import type { HookTurn } from "@/node/services/events/eventSpine";
 import { deriveToolHookConfig, withHooks } from "@/node/services/tools/withHooks";
 import { log } from "@/node/services/log";
 import {
@@ -160,6 +161,8 @@ export interface WorkflowServiceScriptInput {
 export interface ToolConfiguration {
   /** Working directory for command execution - actual path in runtime's context (local or remote) */
   cwd: string;
+  /** The model turn plugin tool hooks report (Codex `turn_id`, `model`); see HookConfig.turn. */
+  hookTurn?: HookTurn;
   /** Runtime environment for executing commands and file operations */
   runtime: Runtime;
   /** Project roots in this workspace (single- or multi-project context for tool descriptions) */
@@ -182,6 +185,8 @@ export interface ToolConfiguration {
   overflow_policy?: "truncate" | "tmpfile";
   /** Background process manager for bash tool (optional, AI-only) */
   backgroundProcessManager?: BackgroundProcessManager;
+  /** Live session queue decision, shared with stream boundaries; never cached by process managers. */
+  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   /** When true, restrict edits to the plan file (plan agent behavior). */
   planFileOnly?: boolean;
   /** Plan file path - only this file can be edited when planFileOnly is true. */
@@ -233,8 +238,7 @@ export interface ToolConfiguration {
   taskService?: TaskService;
   workspaceTurnManager?: WorkspaceTurnManager;
   /**
-   * Catalog for the models_list tool: the models selectable under the current
-   * configuration (same pipeline as the composer picker), in task.model form.
+   * Catalog for the models_list tool, in task.model form; picker hiding does not apply.
    * Re-reads live config on every call — no cache. Absent in contexts without a
    * backend config (tests, refinement), where the tool reports unavailability.
    */

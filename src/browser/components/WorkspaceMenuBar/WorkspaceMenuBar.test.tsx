@@ -827,6 +827,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     it('"Open in tab" shows the view\'s own app tab, openArtifact() the Artifacts tab', () => {
       narrow();
       setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+      setTestExperiment(EXPERIMENT_IDS.MCP_APPS, true);
       const { shown } = renderRecording();
       act(() => {
         window.dispatchEvent(
@@ -839,6 +840,21 @@ describe("WorkspaceMenuBar archive confirmations", () => {
         );
       });
       expect(shown).toEqual([appViewTabFor("call-1"), "artifacts"]);
+    });
+
+    it('with MCP Apps off, "Open in tab" shows nothing, even with Artifacts on (#6760)', () => {
+      narrow();
+      setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+      const { shown } = renderRecording();
+      act(() => {
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId: "call-1" })
+        );
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.OPEN_ARTIFACT, { workspaceId, path: "report.md" })
+        );
+      });
+      expect(shown).toEqual(["artifacts"]);
     });
 
     it("leave keys alone while the sidebar is visible or a modal is open", () => {
