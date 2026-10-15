@@ -7,6 +7,7 @@ import {
   useDraft,
   useDraftStoreSnapshotCurrent,
   type DraftStoreScope,
+  type DraftView,
 } from "@/browser/stores/DraftStore";
 import type { WorkspaceIdentity, WorkspaceNamePersistedState } from "@/common/orpc/schemas/drafts";
 import type { NameGenerationError } from "@/common/types/errors";
@@ -213,6 +214,11 @@ function useWorkspaceNameStorage(scope: DraftStoreScope | null) {
   };
 }
 
+const CONNECTION_LOST_NAME_ERROR: WorkspaceNameUIError = {
+  kind: "transport",
+  message: CONNECTION_LOST_MESSAGE,
+};
+
 /**
  * A lost connection is not a naming failure: no name (not even the fallback) is stored, since it
  * would be an unsaved edit over the stale view and replace a name another window set meanwhile.
@@ -226,7 +232,7 @@ function settleFailedGeneration(
   setError: (error: WorkspaceNameUIError | null) => void
 ): WorkspaceIdentity | null {
   if (isConnectionLostError(error)) {
-    setError({ kind: "transport", message: CONNECTION_LOST_MESSAGE });
+    setError(CONNECTION_LOST_NAME_ERROR);
     return null;
   }
   const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
@@ -243,15 +249,71 @@ function currentNameError(
   return error?.kind === "transport" && snapshotCurrent ? null : error;
 }
 
+/** A backend draft's cached view is trusted only once the running subscription's snapshot is in. */
+function canTrustDraftView(target: DraftStoreScope | null): boolean {
+  return !isBackendDraft(target) || getDraftStore().hasCurrentSnapshot();
+}
+
+/** What a name request started from. */
+interface NamingBasis {
+  hadContent: boolean;
+  nameState: WorkspaceNamePersistedState | null;
+}
+
+/**
+ * Text, or attachments (an attachment-only draft is named from their file names). Whether there
+ * is any, not what: edits that keep the message (a pasted screenshot) keep the reply.
+ */
+function hasDraftContent(view: DraftView): boolean {
+  return view.text.trim().length > 0 || view.attachmentCount > 0;
+}
+
+/** Null without a draft scope: only the hook writes its component-local name state. */
+function namingBasisOf(target: DraftStoreScope | null): NamingBasis | null {
+  if (target === null) return null;
+  const view = getDraftStore().getView(target);
+  return { hadContent: hasDraftContent(view), nameState: view.nameState };
+}
+
+/** Compares name states by value: a snapshot or push replaces the objects with equal copies. */
+function nameStateKey(state: WorkspaceNamePersistedState | null): string {
+  if (state === null) return "null";
+  const { generatedIdentity: identity, manualName, autoGenerate, lastGeneratedFor } = state;
+  return JSON.stringify([
+    identity?.name,
+    identity?.title,
+    manualName,
+    autoGenerate,
+    lastGeneratedFor,
+  ]);
+}
+
+/**
+ * A reply may name its draft only if the draft still holds content (another window's delete
+ * empties it) and the name state the request started from (another window's name, a reconnect's
+ * snapshot), whatever the path that changed them. A message change needs no check here: it
+ * cancels the request, and a reply that lands before that is for the older message, which the
+ * debounce then names again.
+ */
+function holdsNamingBasis(target: DraftStoreScope | null, basis: NamingBasis | null): boolean {
+  if (target === null || basis === null) return true;
+  const view = getDraftStore().getView(target);
+  return (
+    (hasDraftContent(view) || !basis.hadContent) &&
+    nameStateKey(view.nameState) === nameStateKey(basis.nameState)
+  );
+}
+
 /**
  * A request that settles after unmount must not write the draft's name: the draft may have been
  * discarded (navigation unmounts its composer), and the write would bring its body back. Nor while
- * a backend draft waits for a reconnect's snapshot: the name would be an unsaved edit over a stale
- * view and replace the backend's stored name.
+ * a backend draft waits for a reconnect's snapshot (the view it would be checked against may be
+ * stale), nor when the draft changed since the request started (holdsNamingBasis).
  */
 function storeGeneratedIdentity(
   mountedRef: { current: boolean },
   target: DraftStoreScope | null,
+  basis: NamingBasis | null,
   setStoredIn: (
     target: DraftStoreScope | null,
     update: (prev: WorkspaceNamePersistedState) => WorkspaceNamePersistedState
@@ -260,7 +322,7 @@ function storeGeneratedIdentity(
   forMessage: string
 ): void {
   if (!mountedRef.current) return;
-  if (isBackendDraft(target) && !getDraftStore().hasCurrentSnapshot()) return;
+  if (!canTrustDraftView(target) || !holdsNamingBasis(target, basis)) return;
   setStoredIn(target, (prev) => ({
     ...prev,
     generatedIdentity: identity,
@@ -363,8 +425,9 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       }
 
       const requestId = ++requestIdRef.current;
+      const basis = namingBasisOf(target);
       const storeIdentity = (identity: WorkspaceIdentity) =>
-        storeGeneratedIdentity(mountedRef, target, setStoredIn, identity, forMessage);
+        storeGeneratedIdentity(mountedRef, target, basis, setStoredIn, identity, forMessage);
       setIsGenerating(true);
       setError(null);
 
@@ -530,6 +593,13 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       // The manual name doubles as the display title; users who type a custom
       // name expect to see exactly that in the sidebar.
       return { name: name.trim(), title: name.trim() };
+    }
+    // After a reconnect, until its snapshot, the draft's name and message may be stale: a request
+    // started from them could only name it wrongly. The send stops and says why; it works again
+    // once the snapshot is in (currentNameError then hides the reason).
+    if (!canTrustDraftView(currentScope())) {
+      setError(CONNECTION_LOST_NAME_ERROR);
+      return null;
     }
 
     // Always wait for generation to complete on the full message.
