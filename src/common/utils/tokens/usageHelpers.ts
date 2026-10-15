@@ -108,12 +108,12 @@ function isTokenCount(value: unknown): value is number {
  * the last step only, so {@link accumulateProviderMetadata} sums the 1h share of a
  * multi-step turn into `cacheCreation1hInputTokens`, which wins when present.
  * Rows from older builds carry only the last step's split, which is exact when it
- * covers the whole `cacheWriteTokens`. When it does not and the last step wrote only
- * 1h, all of the turn's writes price as 1h: the gateway's per-request ledger showed
+ * covers the whole `cacheWriteTokens`. When it covers part of it and the last step wrote
+ * only 1h, all of the turn's writes price as 1h: the gateway's per-request ledger showed
  * 98% of Opus cache writes were 1h. This is a deliberate tradeoff: Anthropic server
  * tools can still write at 5m even with a 1h TTL configured, and those writes are
- * over-priced. Any other split (a 5m or mixed last step) and no split (other
- * providers) return 0, which keeps the 5m price.
+ * over-priced. Any other split (a 5m or mixed last step, or one larger than the turn's
+ * writes) and no split (other providers) return 0, which keeps the 5m price.
  */
 export function getAnthropicCacheWrite1hTokens(
   providerMetadata: Record<string, unknown> | undefined,
@@ -132,7 +132,7 @@ export function getAnthropicCacheWrite1hTokens(
   const split = readCacheWriteSplit(anthropic?.usage?.cache_creation);
   if (split === undefined || split.oneHour === 0) return 0;
   if (split.oneHour + split.fiveMinute === cacheWriteTokens) return split.oneHour;
-  return split.fiveMinute === 0 ? cacheWriteTokens : 0;
+  return split.fiveMinute === 0 && split.oneHour < cacheWriteTokens ? cacheWriteTokens : 0;
 }
 
 interface RawCacheWriteSplit {

@@ -8,6 +8,7 @@
 import { getModelStats, type ModelStats } from "./modelStats";
 import { readReportedServiceTier, withServiceTierPricing } from "./serviceTierPricing";
 import { isPlainObject } from "@/common/utils/isPlainObject";
+import { isTrustedStepStartList } from "@/common/utils/messages/stepStartPartIndices";
 import {
   addLongContextTokens,
   clampLongContextTokens,
@@ -101,7 +102,7 @@ export interface TurnSteps {
   lastStepUsage: AiSdkUsageLike;
   /** The last step's provider metadata (`metadata.contextProviderMetadata`). */
   lastStepProviderMetadata?: Record<string, unknown>;
-  /** The number of steps (`metadata.stepStartPartIndices`); absent counts as one. */
+  /** The number of steps (`metadata.stepStartPartIndices`); absent or corrupted counts as one. */
   stepCount?: number;
 }
 
@@ -111,10 +112,14 @@ function isTokenCount(value: unknown): value is number {
 
 /** The turn's step record from persisted message metadata, which is not schema-validated. */
 export function readTurnSteps(metadata: {
+  compacted?: unknown;
   contextUsage?: unknown;
   contextProviderMetadata?: unknown;
   stepStartPartIndices?: unknown;
 }): TurnSteps | undefined {
+  // A compaction summary keeps its compaction request's usage, but its contextUsage is the
+  // post-compaction context estimate (CompactionHandler), not a step of that request.
+  if (metadata.compacted !== undefined && metadata.compacted !== false) return undefined;
   // A last step without a valid prompt count cannot place the turn's tier; the summed usage
   // then prices as one request.
   if (!isPlainObject(metadata.contextUsage) || !isTokenCount(metadata.contextUsage.inputTokens)) {
@@ -125,10 +130,20 @@ export function readTurnSteps(metadata: {
     ...(isPlainObject(metadata.contextProviderMetadata) && {
       lastStepProviderMetadata: metadata.contextProviderMetadata,
     }),
-    ...(Array.isArray(metadata.stepStartPartIndices) && {
+    ...(isTrustedStepStartList(metadata.stepStartPartIndices) && {
       stepCount: metadata.stepStartPartIndices.length,
     }),
   };
+}
+
+/**
+ * The last step's tokens; undefined when a count is malformed, or when its prompt exceeds the
+ * turn's: the last step is one of the turn's requests, so that record is corrupted.
+ */
+function readLastStepTokens(steps: TurnSteps, tokens: UsageTokens): UsageTokens | undefined {
+  const lastStep = readUsageTokens(steps.lastStepUsage, steps.lastStepProviderMetadata);
+  if (!Object.values(lastStep).every(isTokenCount)) return undefined;
+  return getPromptTokens(lastStep) > getPromptTokens(tokens) ? undefined : lastStep;
 }
 
 /**
@@ -140,15 +155,15 @@ export function readTurnSteps(metadata: {
  * threshold take their share of every token class. On the gateway's per-request ledger
  * (Sept 15 to Oct 14) this came within 2% per model and the compaction rule was exact, while
  * pricing only the last step long was 13-67% low and the whole turn 6-58% high. Undefined
- * when the last step's counts are malformed.
+ * when the last step's counts are malformed or its prompt exceeds the turn's.
  */
 function estimateLongContextTokens(
   threshold: number,
   tokens: UsageTokens,
   steps: TurnSteps
 ): LongContextTokens | undefined {
-  const lastStep = readUsageTokens(steps.lastStepUsage, steps.lastStepProviderMetadata);
-  if (!Object.values(lastStep).every(isTokenCount)) return undefined;
+  const lastStep = readLastStepTokens(steps, tokens);
+  if (lastStep === undefined) return undefined;
   const lastPrompt = getPromptTokens(lastStep);
   const summedPrompt = getPromptTokens(tokens);
   const stepCount = Math.max(1, steps.stepCount ?? 1);

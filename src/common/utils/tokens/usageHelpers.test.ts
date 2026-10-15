@@ -395,6 +395,10 @@ describe("Anthropic 1h-TTL cache-write share", () => {
     expect(getAnthropicCacheWrite1hTokens(oldRow(2_000, 0), 9_000)).toBe(0);
   });
 
+  test("keeps the 5m price when the last step wrote more 1h than the whole turn", () => {
+    expect(getAnthropicCacheWrite1hTokens(oldRow(0, 10_000), 9_000)).toBe(0);
+  });
+
   test("a malformed 5m share keeps the 5m price instead of scaling the 1h share", () => {
     const malformed = (fiveMinute: unknown) => ({
       anthropic: {

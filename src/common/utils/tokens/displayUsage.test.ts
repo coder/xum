@@ -781,6 +781,63 @@ describe("long-context tiers chosen per request", () => {
       }
     });
 
+    test("a compaction summary prices its compaction request as one request", () => {
+      // The summary row keeps the request's usage but records the post-compaction context
+      // estimate as contextUsage, which is no step of that request.
+      const request = step({ inputTokens: 150_000 });
+      const priced = createDisplayUsage(
+        turnUsage([request]),
+        MODEL,
+        undefined,
+        undefined,
+        readTurnSteps({ compacted: "user", contextUsage: step({ inputTokens: 12_000 }).usage })
+      )!;
+
+      expect(totalCost(priced)).toBeCloseTo(totalCost(priceRequests([request])), 12);
+    });
+
+    test("a last step with a larger prompt than the whole turn prices the turn as one request", () => {
+      const request = step({ inputTokens: 80_000 });
+      const priced = createDisplayUsage(
+        turnUsage([request]),
+        MODEL,
+        undefined,
+        undefined,
+        readTurnSteps({ contextUsage: step({ inputTokens: 150_000 }).usage })
+      )!;
+
+      expect(totalCost(priced)).toBeCloseTo(totalCost(priceRequests([request])), 12);
+    });
+
+    test("counts steps only from a trusted step list", () => {
+      const priceWithList = (steps: Step[], stepStartPartIndices: unknown) =>
+        createDisplayUsage(
+          turnUsage(steps),
+          MODEL,
+          undefined,
+          undefined,
+          readTurnSteps({ contextUsage: steps[steps.length - 1].usage, stepStartPartIndices })
+        )!;
+      const compaction = [120_000, 150_000, 30_000].map((inputTokens) => step({ inputTokens }));
+      expect(totalCost(priceWithList(compaction, [0, 2, 5]))).toBeCloseTo(
+        totalCost(priceRequests(compaction)),
+        12
+      );
+
+      // A corrupted list must not split a one-request turn into steps.
+      const oneRequest = [step({ inputTokens: 130_000 })];
+      for (const stepStartPartIndices of [
+        ["bad", "bad", "bad"],
+        [1, 2, 3],
+        [0, 0, 0],
+      ]) {
+        expect(totalCost(priceWithList(oneRequest, stepStartPartIndices))).toBeCloseTo(
+          totalCost(priceRequests(oneRequest)),
+          12
+        );
+      }
+    });
+
     test("a recorded per-request share wins over the last-step estimate", () => {
       const steps = [step({ inputTokens: 80_000 }), step({ inputTokens: 130_000 })];
       const usage = createDisplayUsage(
