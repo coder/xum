@@ -454,7 +454,7 @@ function translateRustSyntax(pattern: string): { source: string; refused?: strin
   let inClass = false;
   let source = "";
   for (let i = 0; i < pattern.length; ) {
-    const step =
+    const step: SyntaxStep =
       pattern[i] === "\\"
         ? escapeStep(pattern, i, inClass)
         : inClass
