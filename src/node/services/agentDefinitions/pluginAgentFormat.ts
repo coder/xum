@@ -73,7 +73,8 @@ const CLAUDE_TOOLS: Readonly<Record<string, ClaudeToolMapping>> = {
   Edit: EDIT,
   Write: EDIT,
   MultiEdit: EDIT,
-  NotebookEdit: EDIT,
+  // NotebookEdit edits only notebook cells; Xum's edit tools change any file.
+  NotebookEdit: denyOnly(EDIT.deny),
   Bash: same(BASH_TOOLS),
   // url_context (Gemini) and web_search/google_search/x_search are provider-native
   // tools. MCP naming reserves only Xum's own tool names, so an MCP tool can

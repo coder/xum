@@ -264,6 +264,8 @@ Body
         "name: a\ntools: AskUserQuestion",
         // Xum's heartbeat tool also creates schedules, so CronList cannot grant it.
         "name: a\ntools: CronList",
+        // NotebookEdit edits only notebook cells; Xum's edit tools change any file.
+        "name: a\ntools: NotebookEdit",
       ]) {
         expect(() => parse(frontmatter, "plugin")).toThrow(AgentDefinitionParseError);
       }
