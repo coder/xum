@@ -419,9 +419,7 @@ const REWRITE_NOTE_MAX_CHARS = 2000;
 function rewriteNote(args: unknown): string {
   const text = JSON.stringify(args) ?? String(args);
   const shown =
-    text.length > REWRITE_NOTE_MAX_CHARS
-      ? `${text.slice(0, REWRITE_NOTE_MAX_CHARS)} [cut]`
-      : text;
+    text.length > REWRITE_NOTE_MAX_CHARS ? `${text.slice(0, REWRITE_NOTE_MAX_CHARS)} [cut]` : text;
   return `Rewrote this tool call's input to: ${shown}`;
 }
 
