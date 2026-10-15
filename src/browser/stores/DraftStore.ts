@@ -1652,6 +1652,7 @@ export class DraftStore {
     if (from.kind !== "creation") return false;
     const key = draftScopeKey(from);
     this.movingCreationDrafts.set(key, (this.movingCreationDrafts.get(key) ?? 0) + 1);
+    this.notify(key);
     try {
       const sourceRow = this.getCreationDraftsByProject()[from.projectPath]?.find(
         ({ draftId }) => draftId === from.draftId
@@ -1666,8 +1667,9 @@ export class DraftStore {
   }
 
   /**
-   * Whether a move of this creation draft waits for the backend. An edit made meanwhile is not in
-   * the moved body, so the source then stays as a draft of its own (see applyMoved).
+   * Whether a move of this creation draft waits for the backend. Its composer takes no input
+   * meanwhile (useIsMovingCreationDraft): an edit made then is not in the moved body, so the source
+   * would stay as a draft of its own (see applyMoved).
    */
   isMovingCreationDraft(scope: DraftStoreScope): boolean {
     return scope.kind === "creation" && this.movingCreationDrafts.has(draftScopeKey(scope));
@@ -1677,6 +1679,7 @@ export class DraftStore {
     const remaining = (this.movingCreationDrafts.get(key) ?? 1) - 1;
     if (remaining > 0) this.movingCreationDrafts.set(key, remaining);
     else this.movingCreationDrafts.delete(key);
+    this.notify(key);
   }
 
   /** The move, again after a failure: a lost reply's retry answers "moved" (the move is idempotent). */
@@ -2535,6 +2538,15 @@ export function useDraft(scope: DraftStoreScope): DraftView {
   return useSyncExternalStore(
     (listener) => store.subscribe(scope, listener),
     () => store.getView(scope)
+  );
+}
+
+/** Whether this creation draft is moving (see DraftStore.isMovingCreationDraft). */
+export function useIsMovingCreationDraft(scope: DraftStoreScope): boolean {
+  const store = getDraftStore();
+  return useSyncExternalStore(
+    (listener) => store.subscribe(scope, listener),
+    () => store.isMovingCreationDraft(scope)
   );
 }
 

@@ -215,7 +215,11 @@ import {
   useComposerAttachments,
 } from "./useComposerAttachments";
 import { useComposerDraft } from "./useComposerDraft";
-import { getDraftStore, type SendOutcome } from "@/browser/stores/DraftStore";
+import {
+  getDraftStore,
+  useIsMovingCreationDraft,
+  type SendOutcome,
+} from "@/browser/stores/DraftStore";
 import { useComposerTypingLock } from "./useComposerTypingLock";
 import {
   isSendBlocked,
@@ -298,6 +302,11 @@ async function forEachProviderConfigChange(
  * Why a send waits for the transcript. Offline the transcript cannot catch up until the
  * reconnect, so the toast says that instead of "still loading".
  */
+/** A drop on a locked composer: nothing is read, and the page does not open the file. */
+function preventDefault(event: React.DragEvent): void {
+  event.preventDefault();
+}
+
 function transcriptBarrierMessage(offline: boolean): string {
   return offline ? CONNECTION_LOST_MESSAGE : TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE;
 }
@@ -876,15 +885,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
   const sendInFlightBlocksInput =
     variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
+  // While its creation draft moves to another draft, the composer takes no input: an edit made
+  // then is not in the moved body, and the moved draft opens without it.
+  const draftMoving = useIsMovingCreationDraft(draftScope);
   // #6259: typing stays on once a send has taken its draft; submission waits for it to settle.
   const typingLock = useComposerTypingLock({
     variant,
     sendingCount,
     isStreamStarting,
-    creationLocksTyping: sendInFlightBlocksInput,
+    creationLocksTyping: sendInFlightBlocksInput || draftMoving,
     inputRef,
   });
   const sendLocksTyping = typingLock.locksTyping;
+  const composerLocked = !editingMessageForUi && (disabled || sendLocksTyping);
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
@@ -932,7 +945,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           sshHostFallback: creationState.sshHostFallback,
           defaultRuntimeMode: creationState.defaultRuntimeMode,
           onSelectedRuntimeChange: creationState.setSelectedRuntime,
-          disabled: isSendInFlight,
+          disabled: isSendInFlight || draftMoving,
           projectPath: creationParentProjectPath,
           // Surface the actually-targeted project (possibly a sub-project) to
           // the dropdown so the trigger label reflects what the user picked,
@@ -1837,8 +1850,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Voice input: command palette toggle + global recording keybinds
   useEffect(() => {
-    // Unscoped palette event: only the main composer starts recording (see paneScope).
-    if (!voiceInput.shouldShowUI || paneScope !== "main") return;
+    // Unscoped palette event: only the main composer starts recording (see paneScope). A locked
+    // composer starts none, like its disabled voice button.
+    if (!voiceInput.shouldShowUI || paneScope !== "main" || composerLocked) return;
 
     const handleToggle = () => {
       if (!voiceInput.isAvailable) {
@@ -1855,7 +1869,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     return () => {
       window.removeEventListener(CUSTOM_EVENTS.TOGGLE_VOICE_INPUT, handleToggle as EventListener);
     };
-  }, [voiceInput, pushToast, voiceInputUnavailableMessage, paneScope]);
+  }, [voiceInput, pushToast, voiceInputUnavailableMessage, paneScope, composerLocked]);
 
   // Auto-focus chat input when workspace changes (workspace only).
   const workspaceIdForFocus = variant === "workspace" ? props.workspaceId : null;
@@ -3425,18 +3439,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                         .catch(() => undefined);
                     }}
                     onKeyDown={handleKeyDown}
-                    onPaste={handlePaste}
+                    // A locked composer starts no file read: its result would land after the lock.
+                    onPaste={composerLocked ? undefined : handlePaste}
                     onKeyUp={composerSuggestions.handleCursorActivity}
                     onMouseUp={composerSuggestions.handleCursorActivity}
                     onSelect={composerSuggestions.handleCursorActivity}
                     onDragOver={handleDragOver}
-                    onDrop={handleDrop}
+                    onDrop={composerLocked ? preventDefault : handleDrop}
                     onEscapeInNormalMode={handleEscapeInNormalMode}
                     suppressKeys={
                       composerSuggestions.isVisible ? COMMAND_SUGGESTION_KEYS : undefined
                     }
                     placeholder={placeholder}
-                    disabled={!editingMessageForUi && (disabled || sendLocksTyping)}
+                    disabled={composerLocked}
                     aria-label={editingMessageForUi ? "Edit message" : "Message"}
                     // No aria-expanded: the textbox role does not allow it (#5951), and a
                     // textarea cannot take role="combobox" without screen readers treating
