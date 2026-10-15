@@ -26,21 +26,26 @@ Without coverage, scores are CC. With `--coverage <lcov>`, scores are CRAP.
 ## Reading a finding
 
 ```
-VIOLATION floor-cc     src/x.ts:10-25 normalizeAgentId: CC 3 -> 4 (must not grow)
+VIOLATION floor-cc     src/x.ts:10-25 route: CC 30 -> 31 (head CRAP 31 above 30: must not grow)
 ```
 
-| Rule           | Meaning                                                                          |
-| -------------- | -------------------------------------------------------------------------------- |
-| `floor-cc`     | An existing function gained CC.                                                  |
-| `floor-crap`   | With coverage on both sides, an existing function gained CRAP.                   |
-| `new-function` | A new function (or a renamed one, or one moved to another file) is above 8.      |
-| `crap-tax`     | You touched a function whose base score is above 30, and its score did not drop. |
+| Rule           | Meaning                                                                                  |
+| -------------- | ---------------------------------------------------------------------------------------- |
+| `floor-cc`     | An existing function gained CC and ends above the growth line.                           |
+| `floor-crap`   | With coverage on both sides, an existing function gained CRAP and ends above CRAP 30.    |
+| `new-function` | A new function (or a renamed one, or one moved to another file) is above CRAP 15 (CC 8). |
+| `crap-tax`     | A warning: you touched a function whose base score is above 30, and it did not drop.     |
 
-- A `crap-tax` finding without coverage on both sides is a warning: a comment
-  or one-line fix in a hotspot passes, with a nudge to shrink it.
+- The growth line is CRAP 30 with coverage, CC 10 without. An existing function
+  may grow while its head stays at or below the line. Above it, CC and CRAP
+  must not grow. A reduction always passes, at any size, so a hotspot can
+  shrink one step at a time.
+- The new-function limit is CRAP 15 with coverage and CC 8 without.
+- `crap-tax` is always a warning: a comment or one-line fix in a hotspot
+  passes, with a nudge to shrink it.
 - When the changed files' total CC drops, `new-function` findings are warnings
   (net-extraction relief): splitting a hotspot is allowed even if one piece is
-  still above 8.
+  still above the limit.
 - Moving a step out of a function raises the total CC by 1. Such a move is
   also a warning (move relief) when the kept functions lost at least as much
   CC as the new functions hold decision points (CC − 1 each), and the new
@@ -58,7 +63,8 @@ VIOLATION floor-cc     src/x.ts:10-25 normalizeAgentId: CC 3 -> 4 (must not grow
 2. Test it. Coverage lowers CRAP, so this repairs only reports with coverage
    (`--coverage <lcov>`, the CI job's new-function findings). The hook and a
    plain `make crap-check` score CC alone: tests cannot clear their `floor-cc`
-   or `new-function` findings, so shrink the function instead. A test must
+   or `new-function` findings, so shrink the function instead (or keep it at
+   CC 10 or less). A test must
    assert behavior that would fail if the code broke.
 
 ## Anti-gaming rules

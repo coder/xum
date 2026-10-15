@@ -3,25 +3,58 @@
 
 export type Severity = "violation" | "warning";
 
-/** A new function must stay at or below this: CC without coverage data, CRAP with it. */
-export const NEW_FUNCTION_MAX_SCORE = 8;
+/**
+ * A new function must stay at or below this CRAP when coverage scores it.
+ * CRAP 15 lets a CC 15 function in with full tests, or a small one with few.
+ */
+export const NEW_FUNCTION_MAX_CRAP = 15;
 
 /**
- * CRAP tax stage: a touched function whose base score is above this must end
- * lower than its base score. Later waves lower the stage as hotspots shrink.
+ * A new function must stay at or below this CC when no coverage scores it
+ * (the commit hook, `make crap-check` without --coverage).
+ */
+export const NEW_FUNCTION_MAX_CC = 8;
+
+/** The new-function limit for a row: CRAP with coverage data, CC without. */
+export function newFunctionMax(crap: number | null): number {
+  return crap === null ? NEW_FUNCTION_MAX_CC : NEW_FUNCTION_MAX_CRAP;
+}
+
+/**
+ * CRAP tax stage: a touched function whose base score is above this gets a
+ * warning unless it ends lower than its base score. It is also the floor's
+ * growth line (floorAllowsGrowth). Later waves lower the stage as hotspots
+ * shrink.
  */
 export const CRAP_TAX_STAGE = 30;
 
 /**
- * Severity of a CRAP tax finding when the base or head snapshot has no
- * coverage for the function, so the tax compares CC instead of CRAP. A warning
- * lets a comment or one-line fix in a legacy hotspot through, with a nudge.
+ * The floor's growth line when no coverage scores the head (CRAP unknown): an
+ * existing function may grow while its head CC stays at or below this.
  */
-export const TAX_WITHOUT_COVERAGE: Severity = "warning";
+export const GROWTH_MAX_CC_WITHOUT_COVERAGE = 10;
+
+/**
+ * Floor: an existing function may grow (CC or CRAP) while its head stays at or
+ * below the line: CRAP_TAX_STAGE with coverage, GROWTH_MAX_CC_WITHOUT_COVERAGE
+ * without. Above the line it must not grow. A reduction is always allowed.
+ * This lets small functions change freely and still stops hotspots growing.
+ */
+export function floorAllowsGrowth(headCc: number, headCrap: number | null): boolean {
+  return headCrap === null ? headCc <= GROWTH_MAX_CC_WITHOUT_COVERAGE : headCrap <= CRAP_TAX_STAGE;
+}
+
+/**
+ * Severity of every CRAP tax finding, with or without coverage. A touched
+ * hotspot that did not shrink only gets a nudge, so a comment or one-line fix
+ * in a legacy hotspot goes through. Defusing hotspots is gradual: the floor
+ * stops them growing, and any reduction passes.
+ */
+export const CRAP_TAX_SEVERITY: Severity = "warning";
 
 /**
  * Net-extraction relief: refactors split a CC 140 function into new pieces,
- * and one piece can still be above NEW_FUNCTION_MAX_SCORE. When the changed
+ * and one piece can still be above the new-function limit. When the changed
  * files' total CC drops, new-function findings get this severity instead of a
  * violation. The floor and the CRAP tax are unchanged.
  */
