@@ -36,7 +36,11 @@ import { attachModelOnlyToolNotifications } from "@/common/utils/tools/internalT
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import type { HistoryService } from "./historyService";
 import { wrapFetchWithAnthropicCacheControl } from "./providerModelFactory";
+import { mcpToModelOutput } from "./mcpModelOutput";
+import { wrapMCPTools } from "./mcpServerManager";
 import { createStreamManagerForTests } from "./streamManager.testHarness";
+import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
+import { withExecutionScope } from "./tools/withExecutionScope";
 import { createTestHistoryService } from "./testHistoryService";
 import { expectReproFailure } from "@/node/utils/repro.testHarness";
 import { assemblePromptPayload } from "./turnContextAssembler";
@@ -305,9 +309,15 @@ async function runTurn(
   if (!placeholder.success) throw new Error(placeholder.error);
   nextSequence = historySequence + 1;
 
-  const streamManager = createStreamManagerForTests(historyService);
+  const streamManager = createStreamManagerForTests(historyService, {
+    toolCallDisplayRegistry: displayRegistry,
+  });
   const before = anthropic.bodies.length;
   anthropic.script(steps);
+  // As turnRequestBuilder does: the tools carry the stream's scope, so MCP wrappers can publish
+  // the display data that StreamManager persists as `mcpServer`.
+  const streamToken = streamManager.generateStreamToken();
+  const executionScope = { workspaceId: WORKSPACE_ID, messageId, token: streamToken };
   const started = await streamManager.startStream({
     workspaceId: WORKSPACE_ID,
     messageId,
@@ -315,7 +325,9 @@ async function runTurn(
     modelString: MODEL_STRING,
     messages: payload.messages,
     system: payload.system,
-    tools: payload.tools,
+    tools: payload.tools && withExecutionScope(payload.tools, executionScope),
+    providedStreamToken: streamToken,
+    executionScope,
     providerOptions: { anthropic: { thinking: { type: "adaptive" } } },
     historySequence,
     thinkingLevel: "high",
@@ -386,6 +398,41 @@ const divergesAt = (index: number) => ({
   received: String(index),
 });
 
+/** Display data the real MCP wrapper publishes for each call; runTurn's StreamManager reads it. */
+const displayRegistry = new ToolCallDisplayRegistry();
+
+/**
+ * An MCP tool as mcpServerManager builds it: the client's raw tool (mcpToModelOutput) inside
+ * the real wrapMCPTools, optionally inside the model-only notification wrapper of tools.ts.
+ */
+function mcpTool(name: string, notes: string[] = []): Tool {
+  const raw = tool({
+    description: `${name} tool`,
+    inputSchema: z.object({ script: z.string() }),
+    execute: () =>
+      Promise.resolve({ content: [{ type: "text", text: "page body" }], isError: false }),
+    toModelOutput: mcpToModelOutput,
+  });
+  const wrapped = wrapMCPTools(
+    { [name]: raw },
+    {
+      display: {
+        connection: { key: "notion", transport: "http", origin: "https://mcp.example.com" },
+        identity: { name: "Notion MCP", version: "1.0.0" },
+        registry: displayRegistry,
+      },
+    }
+  )[name];
+  const execute = wrapped.execute;
+  if (execute === undefined) throw new Error("expected an executable MCP tool");
+  const reminded: Tool = {
+    ...wrapped,
+    execute: async (input, options) =>
+      attachModelOnlyToolNotifications(await execute(input, options), notes),
+  };
+  return reminded;
+}
+
 const plainTool = (name: string) =>
   tool({
     description: `${name} tool`,
@@ -426,31 +473,28 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
   });
 
   // mcpClient.ts gives every MCP tool a toModelOutput (mcpToModelOutput) that turns the
-  // CallToolResult into `content` text parts in-turn. The rebuild calls
-  // convertToModelMessages without tools (messagePipeline.ts), so the persisted output
-  // replays through the SDK's default JSON encoding instead.
-  test("MCP-style toModelOutput results keep the prefix", async () => {
-    const mcpLike = tool({
-      description: "notion_fetch tool",
-      inputSchema: z.object({ script: z.string() }),
-      execute: () =>
-        Promise.resolve({ content: [{ type: "text", text: "page body" }], isError: false }),
-      toModelOutput: ({ output }) => {
-        const result = output as { content: Array<{ type: string; text: string }> };
-        return {
-          type: "content",
-          value: result.content.map((part) => ({ type: "text" as const, text: part.text })),
-        };
-      },
+  // CallToolResult into `content` text parts in-turn. The rebuild used to call
+  // convertToModelMessages without tools, so the persisted output replayed through the SDK's
+  // default JSON encoding instead. It now applies mcpToModelOutput to every persisted part with
+  // `mcpServer` (the display snapshot the real MCP wrapper publishes), so the bytes match.
+  test("MCP toModelOutput results keep the prefix", async () => {
+    await expectNextTurnExtendsLastStep({
+      tools: { notion_fetch: mcpTool("notion_fetch"), probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("notion_fetch", "call-1"),
     });
-    await expectReproFailure(
-      () =>
-        expectNextTurnExtendsLastStep({
-          tools: { notion_fetch: mcpLike, probe: plainTool("probe") },
-          firstTurn: toolThenTextTurn("notion_fetch", "call-1"),
-        }),
-      divergesAt(2)
-    );
+  });
+
+  // The model-only notes (#6658) ride on the MCP result too. In-turn, mcpToModelOutput reads
+  // only `content`, so the notes never reach the model. The rebuild re-attaches them before the
+  // same conversion, which must drop them the same way.
+  test("MCP results with model-only notifications keep the prefix", async () => {
+    const reminded = mcpTool("notion_fetch", [
+      "<notification>\nIt's been 5 tool calls since you last updated the TODO list.\n</notification>",
+    ]);
+    await expectNextTurnExtendsLastStep({
+      tools: { notion_fetch: reminded, probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("notion_fetch", "call-1"),
+    });
   });
 
   // The rebuild (applyToolOutputRedaction) used to cut every string over 12,000 chars while

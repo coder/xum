@@ -7,6 +7,7 @@ import {
   type Transport,
 } from "@modelcontextprotocol/client";
 import { dynamicTool, jsonSchema, type JSONSchema7, type Tool } from "ai";
+import { mcpToModelOutput } from "./mcpModelOutput";
 import assert from "@/common/utils/assert";
 import {
   advertisedMCPSettingsToolNames,
@@ -283,74 +284,6 @@ function addSettingsToolAction(
     // regular tool without its view (the manager gives it no action then).
     opensApp: (ui ?? parseMCPToolUiMeta(definition._meta))?.resourceUri !== undefined,
   });
-}
-
-/**
- * MCP CallToolResult -> AI SDK tool-result output for the model.
- *
- * Mirrors @ai-sdk/mcp's mcpToModelOutput so model-visible tool results stay
- * identical across the SDK swap.
- */
-function mcpToModelOutput({
-  output,
-}: {
-  output: unknown;
-}): ReturnType<NonNullable<Tool["toModelOutput"]>> {
-  const result = output as {
-    type?: string;
-    value?: Array<Record<string, unknown> & { type?: string }>;
-    content?: Array<Record<string, unknown> & { type?: string }>;
-  };
-  // mcpServerManager's wrapMCPTools runs transformMCPResult over execute
-  // results first — the single conversion layer for MCP binary content
-  // (image/audio/blob resources, size guard included) — producing Xum's
-  // canonical { type: "content", value: [text | media] } shape. Map its
-  // media parts to model-output file parts here.
-  if (
-    result &&
-    typeof result === "object" &&
-    result.type === "content" &&
-    Array.isArray(result.value)
-  ) {
-    return {
-      type: "content",
-      value: result.value.map((part) => {
-        if (
-          part.type === "media" &&
-          typeof part.data === "string" &&
-          typeof part.mediaType === "string"
-        ) {
-          return {
-            type: "file" as const,
-            mediaType: part.mediaType,
-            data: { type: "data" as const, data: part.data },
-          };
-        }
-        if (part.type === "text" && typeof part.text === "string") {
-          return { type: "text" as const, text: part.text };
-        }
-        return { type: "text" as const, text: JSON.stringify(part) };
-      }),
-    };
-  }
-  if (!result || typeof result !== "object" || !Array.isArray(result.content)) {
-    return { type: "json", value: result as never };
-  }
-  // Untransformed MCP results (no binary payloads; see transformMCPResult):
-  // text and text-resource parts only in practice.
-  const convertedContent = result.content.map((part) => {
-    if (part.type === "text" && typeof part.text === "string") {
-      return { type: "text" as const, text: part.text };
-    }
-    if (part.type === "resource" && part.resource && typeof part.resource === "object") {
-      const resource = part.resource as { uri?: string; text?: string };
-      if (typeof resource.text === "string") {
-        return { type: "text" as const, text: resource.text };
-      }
-    }
-    return { type: "text" as const, text: JSON.stringify(part) };
-  });
-  return { type: "content", value: convertedContent };
 }
 
 /** List a connected server's prompts; a server without the prompts capability has none. */

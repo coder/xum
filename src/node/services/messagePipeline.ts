@@ -18,6 +18,7 @@ import { extractToolMediaAsUserMessages } from "@/node/utils/messages/extractToo
 import { sanitizeAnthropicPdfFilenames } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import { convertDataUriFilePartsForSdk } from "@/node/utils/messages/convertDataUriFilePartsForSdk";
 import { insertStepStartPartsForSdk } from "@/node/utils/messages/insertStepStartPartsForSdk";
+import { mcpReplayTools } from "@/node/services/mcpModelOutput";
 import { planAnthropicThinkingStrip } from "@/node/utils/messages/anthropicThinkingReplay";
 import { attachReasoningReplayMetadata } from "@/node/utils/messages/reasoningProviderOptions";
 import type { MuxMessage } from "@/common/types/message";
@@ -221,6 +222,8 @@ export async function prepareMessagesForProvider(
     // Drop unfinished tool calls (input-streaming/input-available) so downstream
     // transforms only see tool calls that actually produced outputs.
     ignoreIncompleteToolCalls: true,
+    // MCP results replay through the same toModelOutput their in-turn step used.
+    tools: mcpReplayTools(thinkingStrip.messages),
   });
 
   // --- ModelMessage-level transforms ---
