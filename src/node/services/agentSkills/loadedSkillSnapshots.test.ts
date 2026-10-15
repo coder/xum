@@ -237,7 +237,7 @@ describe("extractLoadedSkillSnapshotsFromMessages", () => {
     ]);
 
     expect(snapshots).toHaveLength(1);
-    const lines = snapshots[0]!.body.split("\n");
+    const lines = snapshots[0].body.split("\n");
     expect(lines[0]).toContain(`\`${skillDir}\``);
     expect(lines).toContain("Tool body");
   });
