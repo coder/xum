@@ -445,6 +445,12 @@ describe("loadPluginCodexHooks", () => {
       "Bash",
       "Edit",
     ]);
+    // Rust lets an anchor take a quantifier (Codex PRRT_kwDOPxxmWM6s35hr).
+    expect(matching("\\A+Bash\\z{1}", ["Bash", "xBash"])).toEqual(["Bash"]);
+    // A group name only one dialect accepts is refused (Codex PRRT_kwDOPxxmWM6s35ho).
+    for (const name of ["$", "a.b", "1a"]) {
+      expect(() => compileHookMatcher(`(?P<${name}>Bash)`)).toThrow(SyntaxError);
+    }
     // An escaped backslash before `A` is a literal backslash and `A`, not an anchor.
     expect(matching("^a\\\\A$", ["a\\A", "a"])).toEqual(["a\\A"]);
   });

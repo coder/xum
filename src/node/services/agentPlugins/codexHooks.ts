@@ -437,8 +437,9 @@ export function compileHookMatcher(pattern: string): RegExp {
 
 /** Rust escapes outside a class with a JavaScript equivalent (the anchors ignore the m flag). */
 const TRANSLATED_ESCAPES: Readonly<Record<string, string>> = {
-  "\\A": "(?<![\\s\\S])",
-  "\\z": "(?![\\s\\S])",
+  // Wrapped in a group: Rust lets an anchor take a quantifier (`\A+`), JavaScript a lookaround not.
+  "\\A": "(?:(?<![\\s\\S]))",
+  "\\z": "(?:(?![\\s\\S]))",
 };
 
 /**
@@ -488,9 +489,18 @@ function escapeStep(pattern: string, index: number, inClass: boolean): SyntaxSte
   return { text: translated ?? escape, length: escape.length };
 }
 
-/** Outside a class: `(?P<` becomes `(?<`, and `[` opens a class (with its `^`). */
+/**
+ * Outside a class: `(?P<name>` becomes `(?<name>`, and `[` opens a class (with its `^`). Only a
+ * name both dialects accept is translated: Rust rejects `$`, JavaScript rejects `.`, `[` and `]`.
+ */
 function textStep(pattern: string, index: number): SyntaxStep {
-  if (pattern.startsWith("(?P<", index)) return { text: "(?<", length: 4 };
+  if (pattern.startsWith("(?P<", index)) {
+    const name = /^\(\?P<([^>]*)>/.exec(pattern.slice(index));
+    if (name === null || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name[1])) {
+      return { text: "", length: 0, refused: "this '(?P<name>' group name" };
+    }
+    return { text: "(?<", length: 4 };
+  }
   if (pattern[index] !== "[") return { text: pattern[index], length: 1 };
   const open = pattern[index + 1] === "^" ? "[^" : "[";
   if (pattern[index + open.length] === "]") return { text: "", length: 0, refused: "'[]...]'" };
