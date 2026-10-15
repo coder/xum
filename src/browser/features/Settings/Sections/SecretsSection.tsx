@@ -158,9 +158,15 @@ function isSaveDisabled(state: {
   return state.actionsDisabled || state.offline || state.reading;
 }
 
+/** The rows are read-only while a save runs and while offline. */
+function areRowsLocked(saving: boolean, offline: boolean): boolean {
+  return saving || offline;
+}
+
 export const SecretsSection: React.FC = () => {
   const { api } = useAPI();
-  // Offline, edited rows stay on screen, but Save is disabled: it could not reach the server.
+  // Offline, the rows stay on screen read-only (as in Tasks): Save could not reach the server,
+  // and leaving the section would discard an edit made now.
   const offline = useLiveAPI() == null;
   const { userProjects } = useProjectContext();
   const { secretsProjectPath, setSecretsProjectPath } = useSettings();
@@ -243,6 +249,7 @@ export const SecretsSection: React.FC = () => {
   // The scope and project (JSON) whose loaded secrets are shown; null while none are.
   const shownSecretsKeyRef = useRef<string | null>(null);
   const actionsDisabled = !isDirty || saving || loading;
+  const rowsLocked = areRowsLocked(saving, offline);
 
   const sortedGlobalSecretKeys = globalSecretKeys
     .slice()
@@ -678,7 +685,7 @@ export const SecretsSection: React.FC = () => {
                   onChange={(e) => updateSecretKey(index, e.target.value)}
                   placeholder="SECRET_NAME"
                   aria-label="Secret key"
-                  disabled={saving}
+                  disabled={rowsLocked}
                   spellCheck={false}
                   className="bg-modal-bg border-border-medium focus:border-accent placeholder:text-dim text-foreground w-full rounded border px-2.5 py-1.5 font-mono text-[13px] focus:outline-none disabled:opacity-50"
                 />
@@ -697,7 +704,7 @@ export const SecretsSection: React.FC = () => {
 
                       updateSecretValueKind(index, value);
                     }}
-                    disabled={saving}
+                    disabled={rowsLocked}
                   >
                     <SelectTrigger
                       className="border-border-medium bg-modal-bg hover:bg-hover h-[34px] w-[100px] px-2.5 text-[13px]"
@@ -720,7 +727,7 @@ export const SecretsSection: React.FC = () => {
                   <Select
                     value={referencedKey || undefined}
                     onValueChange={(value) => updateSecretValue(index, { secret: value })}
-                    disabled={saving}
+                    disabled={rowsLocked}
                   >
                     <SelectTrigger
                       className="border-border-medium bg-modal-bg hover:bg-hover h-[34px] w-full px-2.5 font-mono text-[13px]"
@@ -749,7 +756,7 @@ export const SecretsSection: React.FC = () => {
                     onChange={(e) => updateSecretValue(index, e.target.value)}
                     placeholder="secret value"
                     aria-label="Secret value"
-                    disabled={saving}
+                    disabled={rowsLocked}
                     spellCheck={false}
                     className="bg-modal-bg border-border-medium focus:border-accent placeholder:text-dim text-foreground w-full rounded border px-2.5 py-1.5 font-mono text-[13px] focus:outline-none disabled:opacity-50"
                   />
@@ -775,7 +782,7 @@ export const SecretsSection: React.FC = () => {
                       size="sm"
                       checked={!!secret.injectAll}
                       onCheckedChange={(checked) => updateSecretInjectAll(index, checked)}
-                      disabled={saving}
+                      disabled={rowsLocked}
                       aria-label="Inject into all projects"
                       title="Inject into all projects"
                     />
@@ -785,7 +792,7 @@ export const SecretsSection: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => removeSecret(index)}
-                  disabled={saving}
+                  disabled={rowsLocked}
                   className="text-danger-light border-danger-light hover:bg-danger-light/10 cursor-pointer rounded border bg-transparent px-2.5 py-1.5 text-[13px] transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-50"
                   aria-label="Remove secret"
                 >
@@ -799,7 +806,7 @@ export const SecretsSection: React.FC = () => {
 
       <button
         onClick={addSecret}
-        disabled={saving || (scope === "project" && !currentProjectPath)}
+        disabled={rowsLocked || (scope === "project" && !currentProjectPath)}
         className="text-muted border-border-medium hover:bg-hover hover:border-border-darker hover:text-foreground w-full cursor-pointer rounded border border-dashed bg-transparent px-3 py-2 text-[13px] transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-50"
       >
         + Add Secret

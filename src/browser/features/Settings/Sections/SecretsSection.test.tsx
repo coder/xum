@@ -168,6 +168,29 @@ describe.each([...GAP_MODES])("SecretsSection across a reconnect (%s)", (mode) =
     harness.reconnect();
     await waitFor(() => expect(save.disabled).toBe(false));
   });
+
+  // Offline the rows are read-only (as in Tasks): an edit could not be saved, and leaving the
+  // section would discard it. The shown values stay, and the controls return on reconnect.
+  test("disables the row inputs and add/remove while offline, keeping the values", async () => {
+    const view = renderSecrets();
+    const keyField = (await waitFor(() => view.getByDisplayValue("OLD_KEY"))) as HTMLInputElement;
+    const valueField = view.getByDisplayValue("old") as HTMLInputElement;
+    const remove = view.getByRole("button", { name: "Remove secret" }) as HTMLButtonElement;
+    const add = view.getByRole("button", { name: "+ Add Secret" }) as HTMLButtonElement;
+    const controls = [keyField, valueField, remove, add];
+    expect(controls.map((control) => control.disabled)).toEqual([false, false, false, false]);
+
+    await harness.drop();
+    await settle();
+    expect(controls.map((control) => control.disabled)).toEqual([true, true, true, true]);
+    expect(keyField.value).toBe("OLD_KEY");
+    expect(valueField.value).toBe("old");
+
+    harness.reconnect();
+    await waitFor(() =>
+      expect(controls.map((control) => control.disabled)).toEqual([false, false, false, false])
+    );
+  });
 });
 
 // The Secrets and MCP sections offer the global secret keys as {secret:"KEY"} references.

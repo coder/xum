@@ -11,6 +11,7 @@ import { ClaudeDesignCard } from "./ClaudeDesignCard";
 import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useGlobalSecretKeys } from "./SecretsSection";
 import {
   Trash2,
@@ -861,12 +862,33 @@ function ToolSearchSetting() {
   );
 }
 
+/** The error to show for a failed list load. A lost connection is none: the reconnect reloads. */
+function describeListFailure(err: unknown): string | null {
+  if (isConnectionLostError(err)) return null;
+  return err instanceof Error ? err.message : "Failed to load MCP servers";
+}
+
+/**
+ * "Loading servers…" shows until the first list: later loads keep the rows. A first load cut off
+ * by a lost connection reports no error, so the placeholder stays (not "No MCP servers").
+ */
+function isFirstListLoad(state: {
+  loading: boolean;
+  listLoaded: boolean;
+  error: string | null;
+}): boolean {
+  if (state.listLoaded) return false;
+  return state.loading || state.error == null;
+}
+
 export const MCPSettingsSection: React.FC = () => {
   const design = useClaudeDesign();
   const refreshRequest = useRef({ id: 0 });
   const { api } = useAPI();
   const [servers, setServers] = useState<Record<string, MCPServerInfo>>({});
   const [loading, setLoading] = useState(false);
+  // True once a list has loaded. Later loads keep it on screen until they answer.
+  const [listLoaded, setListLoaded] = useState(false);
   // Global secrets (used for {secret:"KEY"} header values).
   const [globalSecretKeys] = useGlobalSecretKeys(api);
   const [error, setError] = useState<string | null>(null);
@@ -916,20 +938,23 @@ export const MCPSettingsSection: React.FC = () => {
   const [editing, setEditing] = useState<EditableServer | null>(null);
   const [savingEdit, setSavingEdit] = useState(false);
 
+  // Stale-while-revalidate: a reload (a reconnect brings a new client) keeps the shown rows and
+  // their branding until it answers. "Loading servers…" shows only before the first list.
   const refresh = useCallback(async () => {
     if (!api) return;
     const request = ++refreshRequest.current.id;
-    loadGeneration.current += 1;
-    setBranding({});
     setLoading(true);
     try {
       const mcpResult = await api.mcp.list({});
       if (request !== refreshRequest.current.id) return;
+      loadGeneration.current += 1;
+      setBranding({});
       setServers(mcpResult ?? {});
+      setListLoaded(true);
       setError(null);
     } catch (err) {
-      if (request === refreshRequest.current.id)
-        setError(err instanceof Error ? err.message : "Failed to load MCP servers");
+      const failure = describeListFailure(err);
+      if (request === refreshRequest.current.id && failure != null) setError(failure);
     } finally {
       if (request === refreshRequest.current.id) setLoading(false);
     }
@@ -1348,8 +1373,10 @@ export const MCPSettingsSection: React.FC = () => {
         )}
 
         {/* Server list */}
-        <div className="space-y-2">
-          {loading ? (
+        {/* A load in flight (a reconnect, a removal) locks the kept rows: an edit begun on a stale
+            row would overwrite the configuration the load brings. */}
+        <fieldset disabled={loading} className="min-w-0 space-y-2">
+          {isFirstListLoad({ loading, listLoaded, error }) ? (
             <div className="text-content-secondary flex items-center gap-2 py-4 text-sm">
               <Loader2 className="h-4 w-4 animate-spin" />
               Loading servers…
@@ -1660,7 +1687,7 @@ export const MCPSettingsSection: React.FC = () => {
               );
             })
           )}
-        </div>
+        </fieldset>
         <McpAppViewDomainsSection
           entries={unlistedMcpAppViewDomains(viewDomains.entries, servers)}
           onRevoke={(e) => void viewDomains.revoke(e)}

@@ -7,7 +7,7 @@ import { UPDATE_CHANNEL_LABELS } from "@/constants/updateChannels";
 import XumLogoDark from "@/browser/assets/logos/xum-logo-dark.svg?react";
 import XumLogoLight from "@/browser/assets/logos/xum-logo-light.svg?react";
 import { useTheme } from "@/browser/contexts/ThemeContext";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useAboutDialog } from "@/browser/contexts/AboutDialogContext";
 import { Button } from "@/browser/components/Button/Button";
 import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/Dialog";
@@ -102,6 +102,9 @@ function parseVersionInfo(version: unknown): { gitDescribe: string; buildTime: s
 export function AboutDialog() {
   const { isOpen, close } = useAboutDialog();
   const { api } = useAPI();
+  // While Xum reconnects, `api` is the kept client: the shown update state stays, but its calls
+  // fail at once. The actions use the live client and are disabled offline (null).
+  const liveApi = useLiveAPI();
   const { theme } = useTheme();
   const XumLogo = theme === "dark" || theme.endsWith("-dark") ? XumLogoDark : XumLogoLight;
   const { gitDescribe, buildTime } = parseVersionInfo(VERSION satisfies unknown);
@@ -184,14 +187,14 @@ export function AboutDialog() {
   const isRestarting = updateStatus.type === "restarting";
 
   const handleChannelChange = (next: UpdateChannel) => {
-    if (!api || next === channel || channelLoading) {
+    if (!liveApi || next === channel || channelLoading) {
       return;
     }
 
     // Invalidate any in-flight getChannel() request so late responses cannot overwrite user intent.
     channelRequestTokenRef.current += 1;
     setChannelLoading(true);
-    api.update
+    liveApi.update
       .setChannel({ channel: next })
       .then(() => setChannel(next))
       .catch(console.error)
@@ -199,12 +202,12 @@ export function AboutDialog() {
   };
 
   const handleCheckForUpdates = () => {
-    if (!api) {
+    if (!liveApi) {
       return;
     }
 
     setPendingAction("check");
-    api.update
+    liveApi.update
       .check({ source: "manual" })
       .catch(console.error)
       // Clear pending if the backend no-ops (e.g. a check is already running) and emits no status event.
@@ -212,12 +215,12 @@ export function AboutDialog() {
   };
 
   const handleDownload = () => {
-    if (!api) {
+    if (!liveApi) {
       return;
     }
 
     setPendingAction("download");
-    api.update
+    liveApi.update
       .download(undefined)
       .catch(console.error)
       .finally(() => setPendingAction((prev) => (prev === "download" ? null : prev)));
@@ -225,13 +228,13 @@ export function AboutDialog() {
 
   const installPending = pendingAction === "install" || pendingAction === "force-install";
   const handleInstall = (options?: { force: boolean }) => {
-    if (!api) {
+    if (!liveApi) {
       return;
     }
 
     const action = options?.force ? "force-install" : "install";
     setPendingAction(action);
-    api.update
+    liveApi.update
       .install(options)
       .catch(console.error)
       .finally(() => setPendingAction((prev) => (prev === action ? null : prev)));
@@ -269,7 +272,9 @@ export function AboutDialog() {
           ) : !canUseUpdateApi ? (
             <div className="text-muted text-xs">Connecting to update service…</div>
           ) : (
-            <>
+            // Offline the actions are disabled (a click could not reach the server). The fieldset
+            // disables every control inside, so each action needs no extra gate.
+            <fieldset disabled={liveApi == null} className="min-w-0 space-y-3">
               {channel !== null && (
                 <div className="space-y-2">
                   <div className="flex flex-wrap items-center gap-2">
@@ -469,7 +474,7 @@ export function AboutDialog() {
                   </div>
                 </div>
               )}
-            </>
+            </fieldset>
           )}
 
           <a

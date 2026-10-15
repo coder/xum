@@ -1,6 +1,10 @@
 import { useCallback } from "react";
-import { useAPI } from "@/browser/contexts/API";
-import { getAppConfigStore, useAppConfig } from "@/browser/stores/AppConfigStore";
+import { useLiveAPI, type APIClient } from "@/browser/contexts/API";
+import {
+  getAppConfigStore,
+  useAppConfig,
+  type AppConfigStore,
+} from "@/browser/stores/AppConfigStore";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
 import {
   DEFAULT_ROUTE_PRIORITY,
@@ -29,6 +33,35 @@ function getRouteDisplayName(route: string): string {
   }
 
   return route;
+}
+
+/**
+ * Shows the route change at once and writes it. Offline (no live client) nothing happens: an
+ * optimistic route would look saved until the next config load. The callers' other offline
+ * edits are no-ops too (ModelsSection, ProvidersSection).
+ */
+function saveRoutePreferences(
+  api: APIClient | null,
+  store: AppConfigStore,
+  priority: string[],
+  overrides: Record<string, string>
+): void {
+  if (!api?.config?.updateRoutePreferences) {
+    return;
+  }
+
+  store.updateOptimistically({ routePriority: priority, routeOverrides: overrides });
+  api.config
+    .updateRoutePreferences({
+      routePriority: priority,
+      routeOverrides: overrides,
+    })
+    .catch(() => {
+      // The optimistic update landed in the shared singleton store, so a
+      // failed write must re-fetch or the stale route survives navigation
+      // (same recovery as useMinThinkingLevels).
+      void store.refresh();
+    });
 }
 
 export interface RoutingState {
@@ -68,7 +101,9 @@ export interface RoutingState {
 }
 
 export function useRouting(): RoutingState {
-  const { api } = useAPI();
+  // The live client only: offline (the last client kept while reconnecting, or none) the write
+  // cannot reach the server, so a route change is refused rather than shown as saved.
+  const api = useLiveAPI();
   const { config: providersConfig } = useProvidersConfig();
   // Shared AppConfigStore (one fetch + one onConfigChanged subscription per
   // app session) instead of per-mount fetches: surfaces render one picker per
@@ -88,33 +123,10 @@ export function useRouting(): RoutingState {
   // resolution never offer a gateway route the backend rejects at send time.
   const { isGatewayModelAccessible, resolveGatewayModelId } = createGatewayRouting(providersConfig);
 
-  const persistRoutePreferences = useCallback(
-    (priority: string[], overrides: Record<string, string>) => {
-      if (!api?.config?.updateRoutePreferences) {
-        return;
-      }
-
-      api.config
-        .updateRoutePreferences({
-          routePriority: priority,
-          routeOverrides: overrides,
-        })
-        .catch(() => {
-          // The optimistic update landed in the shared singleton store, so a
-          // failed write must re-fetch or the stale route survives navigation
-          // (same recovery as useMinThinkingLevels).
-          void store.refresh();
-        });
-    },
-    [api, store]
-  );
-
   const setRoutePreferences = useCallback(
-    (priority: string[], overrides: Record<string, string>) => {
-      store.updateOptimistically({ routePriority: priority, routeOverrides: overrides });
-      persistRoutePreferences(priority, overrides);
-    },
-    [persistRoutePreferences, store]
+    (priority: string[], overrides: Record<string, string>) =>
+      saveRoutePreferences(api, store, priority, overrides),
+    [api, store]
   );
 
   const setRoutePriority = useCallback(

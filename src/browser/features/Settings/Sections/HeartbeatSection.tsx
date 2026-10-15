@@ -58,6 +58,18 @@ function forgetLostEdit(
   }
 }
 
+/**
+ * After a save succeeded, drop the edit mark only if the user did not type again since `nonce`:
+ * the newer text is still unsaved, and a reload after a reconnect must not replace it.
+ */
+function forgetSavedEdit(
+  nonce: number,
+  nonceRef: { current: number },
+  editedSinceLoadRef: { current: boolean }
+): void {
+  if (nonce === nonceRef.current) editedSinceLoadRef.current = false;
+}
+
 export function HeartbeatSection() {
   const { api } = useAPI();
   // Offline the fields are disabled: a save could not reach the server.
@@ -160,7 +172,11 @@ export function HeartbeatSection() {
       )
       .then(() => {
         setHeartbeatDefaultPromptLoadedOk(true);
-        heartbeatDefaultPromptEditedSinceLoadRef.current = false;
+        forgetSavedEdit(
+          nonce,
+          heartbeatDefaultPromptLoadNonceRef,
+          heartbeatDefaultPromptEditedSinceLoadRef
+        );
       })
       .catch((error: unknown) => {
         // Best-effort persistence.
@@ -189,6 +205,12 @@ export function HeartbeatSection() {
       return;
     }
     const nonce = heartbeatDefaultIntervalLoadNonceRef.current;
+    const onSaved = () =>
+      forgetSavedEdit(
+        nonce,
+        heartbeatDefaultIntervalLoadNonceRef,
+        heartbeatDefaultIntervalEditedSinceLoadRef
+      );
     const onSaveError = (error: unknown) =>
       forgetLostEdit(
         error,
@@ -211,7 +233,7 @@ export function HeartbeatSection() {
           .then(() => liveApi.config.updateHeartbeatDefaultIntervalMs({ intervalMs: null }))
           .then(() => {
             setHeartbeatDefaultIntervalLoadedOk(true);
-            heartbeatDefaultIntervalEditedSinceLoadRef.current = false;
+            onSaved();
           })
           // Best-effort.
           .catch(onSaveError);
@@ -235,7 +257,7 @@ export function HeartbeatSection() {
       )
       .then(() => {
         setHeartbeatDefaultIntervalLoadedOk(true);
-        heartbeatDefaultIntervalEditedSinceLoadRef.current = false;
+        onSaved();
       })
       // Best-effort persistence.
       .catch(onSaveError);
