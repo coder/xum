@@ -11,6 +11,9 @@ import {
 import { NOW } from "../src/browser/stories/storyTime";
 import { updatePersistedState } from "../src/browser/hooks/usePersistedState";
 import { configure } from "storybook/test";
+// Tool cards load lazily in the app (toolCardsStore); load them up front so snapshots never
+// catch a row before its card arrives.
+import "../src/browser/features/Tools/Shared/toolCardsLoader";
 
 // Signal Storybook runtime to modules that need to stabilize for visual snapshots
 // (e.g. the ChatInput placeholder tip carousel pins to its lead tip so

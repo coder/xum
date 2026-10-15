@@ -1,3 +1,4 @@
+import "../../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
