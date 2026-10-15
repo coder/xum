@@ -1,10 +1,16 @@
 import { useState } from "react";
 import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
-import { useDraftStoreHydrated } from "@/browser/stores/DraftStore";
+import {
+  useDraftStoreHydrated,
+  useIsMovingCreationDraft,
+  type DraftStoreScope,
+} from "@/browser/stores/DraftStore";
 import type { CreationDraftAgent } from "@/browser/utils/creationDraftCarry";
 import type { ParsedRuntime } from "@/common/types/runtime";
 
 interface CreationDraftMoveSource {
+  /** The composer's draft. */
+  draftScope: DraftStoreScope;
   /** The composer's owning project. */
   projectPath: string;
   /** The composer route's draft id (none, blank, invalid or reserved: the default draft). */
@@ -28,8 +34,12 @@ export function useCreationDraftMove(source: CreationDraftMoveSource) {
   const hydrated = useDraftStoreHydrated();
   // The move waits for the backend; meanwhile the draft must not move again or be sent (the
   // send would take content the move has already given to the destination).
-  const [moving, setMoving] = useState(false);
+  const [selectorMoving, setMoving] = useState(false);
+  // A promotion moves the draft too. The selector's own move stays `moving` until it opened the
+  // destination, after the store's move ended.
+  const moving = useIsMovingCreationDraft(source.draftScope) || selectorMoving;
   return {
+    /** The draft is moving: its composer takes no input and sends nothing meanwhile. */
     moving,
     // The move waits for whatever is still on its way into the draft: the drafts themselves
     // (composers may render before they load, and an unloaded draft would move as an empty one),

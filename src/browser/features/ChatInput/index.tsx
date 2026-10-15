@@ -216,11 +216,7 @@ import {
   useComposerAttachments,
 } from "./useComposerAttachments";
 import { useComposerDraft } from "./useComposerDraft";
-import {
-  getDraftStore,
-  useIsMovingCreationDraft,
-  type SendOutcome,
-} from "@/browser/stores/DraftStore";
+import { getDraftStore, type SendOutcome } from "@/browser/stores/DraftStore";
 import { useComposerTypingLock } from "./useComposerTypingLock";
 import {
   isSendBlocked,
@@ -917,8 +913,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
   const sendInFlightBlocksInput =
     variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
+  const creationDraftMove = useCreationDraftMove({
+    draftScope,
+    projectPath: creationParentProjectPath,
+    draftId: creationPendingDraftId,
+    runtimePick: creationState.explicitRuntimePick,
+    agent: currentAgent,
+    sendInFlight: isSendInFlight,
+    processingAttachmentCount,
+    voiceInputActive: voiceInput.state !== "idle",
+    agentsLoaded,
+  });
   const creationLocks = creationInputLocks({
-    draftMoving: useIsMovingCreationDraft(draftScope),
+    draftMoving: creationDraftMove.moving,
     sendInFlight: isSendInFlight,
     sendInFlightBlocksInput,
   });
@@ -947,17 +954,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     coderConfig: currentRuntime.mode === "ssh" ? (currentRuntime.coder ?? null) : null,
     onCoderConfigChange: handleCoderConfigChange,
     coderInfoRefreshPolicy: variant === "creation" ? "mount-and-focus" : "mount-only",
-  });
-
-  const creationDraftMove = useCreationDraftMove({
-    projectPath: creationParentProjectPath,
-    draftId: creationPendingDraftId,
-    runtimePick: creationState.explicitRuntimePick,
-    agent: currentAgent,
-    sendInFlight: isSendInFlight,
-    processingAttachmentCount,
-    voiceInputActive: voiceInput.state !== "idle",
-    agentsLoaded,
   });
 
   const creationRuntimeError =

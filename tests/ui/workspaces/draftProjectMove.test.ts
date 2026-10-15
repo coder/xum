@@ -627,29 +627,43 @@ describeIntegration("Creation project selector moves the draft", () => {
     }
   }, 90_000);
 
-  test("send waits until the draft has moved", async () => {
-    const { view, cleanupDom, a, b } = await openTwoProjects();
+  test("send and input wait until the draft has moved", async () => {
+    const { view, cleanupDom, a, b } = await openTwoProjects(
+      withTranscription(getSharedEnv().orpc)
+    );
     const { container } = view;
+    const restoreVoice = installVoiceCapture(new Promise<MediaStream>(() => undefined));
     const move = holdBackendMove();
-    const sendButton = () =>
-      container.querySelector<HTMLButtonElement>('button[aria-label="Send message"]');
+    const button = (label: string) =>
+      container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+    const inputs = () => ({
+      send: button("Send message")?.disabled,
+      textarea: container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message"]')
+        ?.disabled,
+      attach: button("Attach file")?.disabled,
+      voice: button("Voice input")?.disabled,
+    });
     try {
       await openProjectCreationView(view, a);
       const draftId = await onlyDraftId(a);
       getDraftStore().setText(creationScope(a, draftId), "sent after the move");
-      await waitFor(() => expect(sendButton()?.disabled).toBe(false), WAIT);
+      const enabled = { send: false, textarea: false, attach: false, voice: false };
+      await waitFor(() => expect(inputs()).toEqual(enabled), WAIT);
 
       await startMoveTo(container, path.basename(b));
       await waitFor(() => expect(move.calls()).toBeGreaterThan(0), WAIT);
 
-      // The backend may already have given the draft to B: a send now would leave it there too.
-      expect(sendButton()?.disabled).toBe(true);
+      // The backend may already have given the draft to B: a send now would leave it there too,
+      // and typing, a file read or a recording would land in A's draft after the move.
+      expect(inputs()).toEqual({ send: true, textarea: true, attach: true, voice: true });
       move.release();
       await waitFor(() => expect(projectSelectorLabel(container)).toBe(path.basename(b)), WAIT);
+      await waitFor(() => expect(inputs()).toEqual(enabled), WAIT);
     } finally {
       move.release();
       move.restore();
       await cleanupView(view, cleanupDom);
+      restoreVoice();
     }
   }, 90_000);
 
