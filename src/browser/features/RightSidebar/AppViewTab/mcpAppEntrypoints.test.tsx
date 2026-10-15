@@ -448,6 +448,164 @@ describe("MCP App entry points", () => {
     }
   });
 
+  // #6181: a failed re-list says nothing about the entry point, so its open tab keeps its view.
+  test("an opened entry point keeps its view when a re-list fails", async () => {
+    let fail = false;
+    let release: (() => void) | null = null;
+    const client = createTestApiClient({
+      mcpApps: {
+        listEntrypoints: () =>
+          new Promise<McpAppEntrypoint[]>((resolve, reject) => {
+            release = () =>
+              fail ? reject(new Error("backend busy")) : resolve([entrypoint("Library")]);
+          }),
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    try {
+      const viewKey = entrypoint("Library").viewKey;
+      const { result } = renderHook(
+        () => {
+          useLoadMcpAppEntrypoints("ws-relist-fails", true);
+          return useMcpAppView("ws-relist-fails", viewKey);
+        },
+        { wrapper }
+      );
+      const list = renderHook(() => useMcpAppEntrypoints("ws-relist-fails"), { wrapper }).result;
+      await waitFor(() => expect(release).not.toBeNull());
+      act(() => release?.());
+      await waitFor(() => expect(result.current).toMatchObject({ toolCallId: viewKey }));
+      const shown = result.current;
+
+      release = null;
+      fail = true;
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(release).not.toBeNull());
+      expect(list.current).toBeUndefined();
+      act(() => release?.());
+      // The failed listing settled (the launcher shows none), and the tab kept its view.
+      await waitFor(() => expect(list.current).toEqual([]));
+      expect(result.current).toBe(shown);
+    } finally {
+      restore();
+    }
+  });
+
+  // #6181: one open after a failed re-list is no full list, so it retires no other entry point.
+  test("an open after a failed re-list keeps the other entry points' views", async () => {
+    const library = entrypoint("Library");
+    const board = {
+      ...entrypoint("Board"),
+      toolName: "cad.board",
+      resourceUri: "ui://cad/board",
+      viewKey: "entrypoint:cad:cad.board:global",
+    };
+    let fail = false;
+    const client = createTestApiClient({
+      mcpApps: {
+        listEntrypoints: () =>
+          fail ? Promise.reject(new Error("backend busy")) : Promise.resolve([library, board]),
+        openEntrypoint: () => Promise.resolve({ success: true as const, data: library }),
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    try {
+      const { result } = renderHook(
+        () => {
+          useLoadMcpAppEntrypoints("ws-open-after-fail", true);
+          return {
+            list: useMcpAppEntrypoints("ws-open-after-fail"),
+            board: useMcpAppView("ws-open-after-fail", board.viewKey),
+          };
+        },
+        { wrapper }
+      );
+      await waitFor(() => expect(result.current.list).toHaveLength(2));
+      const shown = result.current.board;
+      expect(shown).toMatchObject({ toolCallId: board.viewKey });
+      fail = true;
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(result.current.list).toEqual([]));
+      await act(async () => {
+        expect(await openMcpAppEntrypoint(client, "ws-open-after-fail", library)).toBeNull();
+      });
+      expect(result.current.board).toBe(shown);
+    } finally {
+      restore();
+    }
+  });
+
+  // An entry point that a successful list retired, then opened after a failed re-list.
+  test("an open after a failed re-list brings back an entry point an earlier list retired", async () => {
+    const library = entrypoint("Library");
+    let listing: () => Promise<McpAppEntrypoint[]> = () => Promise.resolve([library]);
+    const client = createTestApiClient({
+      mcpApps: {
+        listEntrypoints: () => listing(),
+        openEntrypoint: () => Promise.resolve({ success: true as const, data: library }),
+        // No current record: each open runs the tool again.
+        getViewRecords: (input: { toolCallIds: string[] }) =>
+          Promise.resolve({
+            success: true as const,
+            data: input.toolCallIds.map((toolCallId) => ({ toolCallId, view: null })),
+          }),
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    try {
+      const { result } = renderHook(
+        () => {
+          useLoadMcpAppEntrypoints("ws-reopen-retired", true);
+          return {
+            list: useMcpAppEntrypoints("ws-reopen-retired"),
+            view: useMcpAppView("ws-reopen-retired", library.viewKey),
+          };
+        },
+        { wrapper }
+      );
+      await waitFor(() =>
+        expect(result.current.view).toMatchObject({ toolCallId: library.viewKey })
+      );
+      // A list without it retires it; then a re-list fails.
+      listing = () => Promise.resolve([]);
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(result.current.view).toBeNull());
+      listing = () => Promise.reject(new Error("backend busy"));
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(result.current.list).toEqual([]));
+      await act(async () => {
+        expect(await openMcpAppEntrypoint(client, "ws-reopen-retired", library)).toBeNull();
+      });
+      expect(result.current.view).toMatchObject({ toolCallId: library.viewKey });
+
+      // The same while the failing re-list is still pending when the open completes.
+      listing = () => Promise.resolve([]);
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(result.current.view).toBeNull());
+      let reject: () => void = () => undefined;
+      listing = () => new Promise((_resolve, fail) => (reject = () => fail(new Error("busy"))));
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(result.current.list).toBeUndefined());
+      await act(async () => {
+        expect(await openMcpAppEntrypoint(client, "ws-reopen-retired", library)).toBeNull();
+      });
+      act(() => reject());
+      await waitFor(() => expect(result.current.list).toEqual([]));
+      expect(result.current.view).toMatchObject({ toolCallId: library.viewKey });
+    } finally {
+      restore();
+    }
+  });
+
   test("with the experiment off the list settles empty, so a restored tab stops loading", async () => {
     const client = createTestApiClient({ mcpApps: { getViewRecords: viewRecords([]) } });
     const wrapper = (props: { children: React.ReactNode }) => (
@@ -621,6 +779,42 @@ describe("MCP App entry points", () => {
         </APIProvider>
       );
       expect(label.container.textContent).toBe("App view");
+    } finally {
+      restore();
+    }
+  });
+
+  // #6181: a failed listing says nothing about the entry point, unlike a list that lacks it:
+  // the loader lists again, and a restored tab gets its view then.
+  test("after a restart, a failed listing is retried and the tab gets its view", async () => {
+    const target = entrypoint("Library");
+    let calls = 0;
+    const client = createTestApiClient({
+      mcpApps: {
+        listEntrypoints: () => {
+          calls += 1;
+          return calls === 1
+            ? Promise.reject(new Error("backend busy"))
+            : Promise.resolve([target]);
+        },
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    try {
+      const { result } = renderHook(
+        () => {
+          useLoadMcpAppEntrypoints("ws-list-retried", true);
+          return useMcpAppView("ws-list-retried", target.viewKey);
+        },
+        { wrapper }
+      );
+      await waitFor(() => expect(result.current).toMatchObject({ toolCallId: target.viewKey }), {
+        timeout: 3_000,
+      });
+      expect(calls).toBe(2);
     } finally {
       restore();
     }

@@ -104,8 +104,9 @@ export interface WorkflowServiceOptions {
   evaluationAdapter?: WorkflowEvaluationPort;
   resolveWorkflowScript?: (scriptPath: string) => Promise<ResolvedWorkflowScript>;
   /**
-   * The consent gate for a stored plugin run (#6629, `assertStoredPluginWorkflowReviewed`): resume
-   * admission checks the snapshotted source with it. Absent ⇒ plugin runs never resume.
+   * The consent gate for a stored plugin or skill run (#6629, #6777,
+   * `assertStoredPluginWorkflowReviewed`): resume admission checks the snapshotted source with it.
+   * Absent ⇒ plugin and non-built-in skill runs never resume.
    */
   assertStoredPluginWorkflowReviewed?: (stored: {
     scriptPath: string;
@@ -208,6 +209,21 @@ function isThisProcessIncarnation(starter: WorkflowRunStarterRecord): boolean {
     !differs(starter.identity.bootId, self.bootId) &&
     !differs(starter.identity.pidNs, self.pidNs)
   );
+}
+
+/**
+ * The source kind of a stored run. A record from before `sourceKind` existed omits it (the schema
+ * accepts that shape), so its script path decides: a legacy `plugin://` or `skill://` run must
+ * still pass resume admission (#6777).
+ */
+function storedRunSourceKind(
+  sourceKind: WorkflowRunRecord["workflow"]["sourceKind"],
+  scriptPath: string | undefined
+): WorkflowRunRecord["workflow"]["sourceKind"] {
+  if (sourceKind !== undefined) return sourceKind;
+  if (scriptPath?.startsWith("plugin://")) return "plugin";
+  if (scriptPath?.startsWith("skill://")) return "skill";
+  return undefined;
 }
 
 export class WorkflowService {
@@ -919,19 +935,21 @@ export class WorkflowService {
   }
 
   /**
-   * Resume admission for a stored run (#6629): a plugin run continues the source snapshotted at
-   * start, never the current file, so that snapshot must still match the plugin's consent record.
-   * Fails closed when this service has no gate.
+   * Resume admission for a stored run (#6629): a plugin or skill run continues the source
+   * snapshotted at start, never the current file, so that snapshot must still match the plugin's
+   * consent record. Skill runs count too (#6777): a managed plugin skill's `workflow.js` has a
+   * record. Built-in skills ship with Xum and pass. Fails closed when this service has no gate.
    */
   private async assertStoredRunReviewed(
     run: Pick<WorkflowRunRecord, "workflow" | "source">
   ): Promise<void> {
-    if (run.workflow.sourceKind !== "plugin") return;
-    const gate = this.assertStoredPluginWorkflowReviewed;
+    const { scope } = run.workflow;
     const scriptPath = run.workflow.canonicalScriptPath ?? run.workflow.sourcePath;
-    const scope = run.workflow.scope;
+    const sourceKind = storedRunSourceKind(run.workflow.sourceKind, scriptPath);
+    if (sourceKind !== "plugin" && (sourceKind !== "skill" || scope === "built-in")) return;
+    const gate = this.assertStoredPluginWorkflowReviewed;
     if (gate === undefined || scriptPath === undefined || scope === "built-in") {
-      throw new Error("Xum cannot check this plugin workflow's consent, so the run cannot resume");
+      throw new Error("Xum cannot check this workflow's consent, so the run cannot resume");
     }
     await gate({ scriptPath, source: run.source, scope });
   }

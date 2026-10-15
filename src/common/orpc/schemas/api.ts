@@ -1270,6 +1270,8 @@ export const agentPlugins = {
       source: AgentPluginGitSourceSchema,
       /** SHA from the preview the user consented to. */
       expectedSha: z.string(),
+      /** `consentDigest` of that preview: install refuses other components (#6777). */
+      expectedConsentDigest: z.string(),
       importedComponents: AgentPluginImportedComponentsSchema.optional(),
     }),
     output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),

@@ -6,7 +6,6 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import { toPosixPath } from "@/node/utils/paths";
 
 import type { ResolvedAgentSkill } from "./agentSkillsService";
-import { isSkillDynamicDirectiveLine } from "./skillDynamicContext";
 
 /**
  * Where a skill's bundled files live, as seen by `bash` in the workspace.
@@ -169,25 +168,6 @@ export function substituteSkillDirectoryPlaceholders(body: string, dir: SkillDir
     if (name === "CLAUDE_SKILL_DIR") return dir.skillDir;
     return dir.pluginRoot ?? match;
   });
-}
-
-/**
- * Substitute the placeholders everywhere except whole-line !`command`
- * directives. A directive is shell code: a spliced path containing `$()`,
- * backticks or quotes would be reparsed as shell syntax. Directives get the
- * values as environment variables instead (see skillDirectoryEnv), so the
- * shell expands `"${CLAUDE_SKILL_DIR}"` itself and the path stays one word.
- */
-export function substituteSkillDirectoryPlaceholdersOutsideDirectives(
-  body: string,
-  dir: SkillDirectory
-): string {
-  return body
-    .split("\n")
-    .map((line) =>
-      isSkillDynamicDirectiveLine(line) ? line : substituteSkillDirectoryPlaceholders(line, dir)
-    )
-    .join("\n");
 }
 
 /** Environment for directive commands: the placeholder names with their values. */

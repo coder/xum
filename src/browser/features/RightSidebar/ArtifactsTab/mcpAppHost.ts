@@ -308,6 +308,40 @@ export function declaresFullscreenOnly(declared: readonly string[] | undefined):
 }
 
 /**
+ * ui/resource-teardown; resolves when the view replies or after the bounded wait. A view that
+ * never sent initialized gets none: the spec lets a host send requests only after it, and such a
+ * view has nothing set up to tear down (#6181). Resolves at once then.
+ */
+function requestTeardown(input: {
+  initialized: boolean;
+  /** Sent also before initialized: the caller needs its reply as a delivery barrier. */
+  barrier: boolean;
+  id: string;
+  pending: Map<string, (ok: boolean) => void>;
+  post: (message: unknown) => void;
+  reason: string;
+}): Promise<void> {
+  if (!input.initialized && !input.barrier) return Promise.resolve();
+  const { id, pending } = input;
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      resolve();
+    }, MCP_APP_TEARDOWN_TIMEOUT_MS);
+    pending.set(id, () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    input.post({
+      jsonrpc: "2.0",
+      id,
+      method: "ui/resource-teardown",
+      params: { reason: input.reason },
+    });
+  });
+}
+
+/**
  * The view's declared display modes after a ui/initialize, told to the frame. A later initialize
  * without a list (the window.openai shim's, mcpAppOpenAiShim.ts) keeps the view's own
  * declaration: it must not widen the modes the view is told about.
@@ -377,26 +411,15 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   const notify = (method: string, params: unknown) =>
     options.postToView({ jsonrpc: "2.0", method, params });
 
-  /** ui/resource-teardown; resolves when the view replies or after the bounded wait. */
-  const teardown = (reason: string): Promise<void> => {
-    const id = `host-${nextHostRequestId++}`;
-    return new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        pendingHostRequests.delete(id);
-        resolve();
-      }, MCP_APP_TEARDOWN_TIMEOUT_MS);
-      pendingHostRequests.set(id, () => {
-        clearTimeout(timer);
-        resolve();
-      });
-      options.postToView({
-        jsonrpc: "2.0",
-        id,
-        method: "ui/resource-teardown",
-        params: { reason },
-      });
+  const teardown = (reason: string, barrier = false): Promise<void> =>
+    requestTeardown({
+      initialized,
+      barrier,
+      id: `host-${nextHostRequestId++}`,
+      pending: pendingHostRequests,
+      post: options.postToView,
+      reason,
     });
-  };
 
   async function handleRequest(id: string | number, method: string, params: unknown) {
     switch (method) {
@@ -523,7 +546,10 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         // The move unmounts this instance, and a frame removed before a queued postMessage
         // runs never gets it. The teardown reply comes after the view handled the mode reply
         // (messages arrive in order), and the view must get a teardown before it goes anyway.
-        await teardown("display-mode");
+        // Also before initialized (the window.openai shim posts its first request-display-mode
+        // right after its initialize): the teardown reply is the barrier that proves the view
+        // got its mode reply before the move removes the frame.
+        await teardown("display-mode", true);
         move();
         return;
       }

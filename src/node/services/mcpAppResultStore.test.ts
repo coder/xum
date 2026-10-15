@@ -106,6 +106,23 @@ describe("McpAppResultStore", () => {
     expect(await fs.readdir(dir)).toHaveLength(MCP_APP_RESULT_MAX_PER_WORKSPACE);
   });
 
+  // #6181: the state is written before the age is restored. A failed utimes must not leave the
+  // cache with the old state (the next document would seed it).
+  test("a failed utimes after a widget-state write still caches the new state", async () => {
+    using tmp = new DisposableTempDir("mcp-app-store");
+    const store = new McpAppResultStore((id) => path.join(tmp.path, id));
+    await store.record("ws", entry("c1"));
+    const record = await store.get("ws", "c1");
+    if (record === null) throw new Error("expected the record");
+    const utimes = spyOn(fs, "utimes").mockRejectedValueOnce(new Error("EPERM"));
+    try {
+      await store.setWidgetState("ws", "c1", mcpAppWidgetStateBindingOf(record), { step: 3 });
+    } finally {
+      utimes.mockRestore();
+    }
+    expect((await store.get("ws", "c1"))?.widgetState).toEqual({ step: 3 });
+  });
+
   test("a read that overlaps the prune of its record does not cache it", async () => {
     using tmp = new DisposableTempDir("mcp-app-store");
     const sessionDir = (id: string) => path.join(tmp.path, id);

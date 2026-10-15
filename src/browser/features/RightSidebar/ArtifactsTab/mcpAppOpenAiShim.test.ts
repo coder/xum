@@ -11,6 +11,7 @@ import { createMcpAppHost, type McpAppConsentRequest } from "./mcpAppHost";
 import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
 
 interface OpenAi {
+  toolInput: unknown;
   toolOutput: unknown;
   toolResponseMetadata: unknown;
   widgetState: unknown;
@@ -62,6 +63,8 @@ async function runView(
     silentHost?: boolean;
     /** Runs once the host posted the lifecycle, before the view received any of it. */
     afterLifecyclePosted?: (win: ViewWindow) => void;
+    /** Only tool-input after the handshake: the test sends the rest itself. */
+    inputOnly?: boolean;
   } = {}
 ) {
   const win = new Window({
@@ -138,6 +141,7 @@ async function runView(
     onSizeChanged: () => undefined,
     onInitialized: () => {
       host.sendToolInput({ count: 2 });
+      if (options.inputOnly) return;
       host.sendToolResult({ structuredContent: { dice: [3, 5] }, _meta: { seed: 7 } });
       options.afterLifecyclePosted?.(win);
     },
@@ -366,6 +370,18 @@ describe("window.openai shim", () => {
     });
     await settle();
     expect(received).toEqual(["ui/notifications/tool-input", "ui/notifications/tool-result"]);
+  });
+
+  // #6181: the client's ui/initialize falls between tool-input and tool-result. The shim
+  // replays tool-input, and tool-result must still come after it.
+  test("a client that connects inside the lifecycle gets tool-input before tool-result", async () => {
+    const t = await runView("window.openai.toolInput;", { inputOnly: true });
+    expect(t.win.openai.toolInput).toEqual({ count: 2 });
+    const received = connectStandardClient(t);
+    t.host.sendToolResult({ structuredContent: { dice: [3, 5] } });
+    await settle();
+    expect(received).toEqual(["ui/notifications/tool-input", "ui/notifications/tool-result"]);
+    expect(t.win.openai.toolOutput).toEqual({ dice: [3, 5] });
   });
 
   test("a widget that mutates toolOutput does not change what its own client is replayed", async () => {

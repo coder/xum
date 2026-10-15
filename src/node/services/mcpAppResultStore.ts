@@ -275,7 +275,11 @@ export class McpAppResultStore {
       // not push a newer view's record out.
       const { atime, mtime } = await fs.stat(filePath);
       await writeFileAtomic(filePath, JSON.stringify(file));
-      await fs.utimes(filePath, atime, mtime);
+      // Best effort: the state is stored. A failed utimes only makes the record look newer to
+      // prune(), and must not skip the cache update below (#6181).
+      await fs.utimes(filePath, atime, mtime).catch((error: unknown) => {
+        log.debug("[MCP Apps] Could not keep the record's age", { workspaceId, error });
+      });
       const { widgetState: _old, ...known } = read.record;
       // Parsed back from its JSON, so memory holds exactly what the file holds.
       return stateJson === null ? known : { ...known, widgetState: file.widgetState };

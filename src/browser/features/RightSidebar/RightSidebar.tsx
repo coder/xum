@@ -129,7 +129,12 @@ import {
   type TerminalSessionCreateOptions,
 } from "@/browser/utils/terminal";
 import { SideChatTabTitle } from "./Tabs/TabLabels";
-import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTab/AppViewTab";
+import {
+  AppViewTabLabel,
+  AppViewTabPanel,
+  AppViewTabTooltip,
+  findOwnMaximizedAppPanel,
+} from "./AppViewTab/AppViewTab";
 import {
   appViewTabToolCallId,
   liveAppViewTabs,
@@ -1081,6 +1086,27 @@ export function useDesktopAvailable(
   return desktopAvailable;
 }
 
+/**
+ * Where Cmd/Ctrl+W closes a tab: the maximized app panel's pane; else the pane holding keyboard
+ * focus, when focus is in this sidebar; else (tabsetId undefined) the focused pane. Null when an
+ * open modal keeps the keys. A maximized app tab is a modal dialog, but it is this sidebar's tab,
+ * so the shortcut closes it (#6181).
+ */
+function closeTabTarget(
+  container: HTMLElement | null,
+  eventTarget: EventTarget | null
+): { tabsetId: string | undefined } | null {
+  const maximizedPanel = findOwnMaximizedAppPanel(container);
+  if (isDialogOpen() && maximizedPanel == null) return null;
+  const keyTarget = maximizedPanel ?? eventTarget;
+  const inSidebar = keyTarget instanceof Element && container?.contains(keyTarget) === true;
+  return {
+    tabsetId: inSidebar
+      ? keyTarget.closest<HTMLElement>("[data-tabset-id]")?.dataset.tabsetId
+      : undefined,
+  };
+}
+
 const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   workspaceId,
   workspacePath,
@@ -1927,14 +1953,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       if (!matchesKeybind(e, KEYBINDS.CLOSE_TAB)) return;
       // Always prevent platform default (Cmd/Ctrl+W closes window), even during dialogs.
       e.preventDefault();
-      if (isDialogOpen()) return;
-
-      // The pane holding keyboard focus, when focus is in this sidebar; else the focused pane.
       const container = sidebarContainerRef.current;
-      const targetTabsetId =
-        e.target instanceof Element && container?.contains(e.target)
-          ? e.target.closest<HTMLElement>("[data-tabset-id]")?.dataset.tabsetId
-          : undefined;
+      const target = closeTabTarget(container, e.target);
+      if (target == null) return;
+      const targetTabsetId = target.tabsetId;
       const focusedTabset = findTabset(layout.root, targetTabsetId ?? layout.focusedTabsetId);
       if (focusedTabset?.type !== "tabset") return;
 

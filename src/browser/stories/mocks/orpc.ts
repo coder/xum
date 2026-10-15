@@ -342,6 +342,8 @@ export interface MockORPCClientOptions {
   mcpSettingsConnected?: Set<string>;
   /** Every mcp.settings.read call's server names, in order (stories assert batching). */
   mcpSettingsReads?: string[][];
+  /** Records the workspace of each settings read (the order of mcpSettingsReads). */
+  mcpSettingsReadWorkspaces?: string[];
   /** Servers whose settings read fails with this message. */
   mcpSettingsReadErrors?: Map<string, string>;
   /**
@@ -524,6 +526,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpSettings,
     mcpSettingsConnected = new Set<string>(),
     mcpSettingsReads,
+    mcpSettingsReadWorkspaces,
     mcpSettingsReadErrors,
     mcpSettingsUpdateGate,
     mcpSettingsAfterUpdate,
@@ -1475,9 +1478,14 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcp: {
       settings: {
         // A copy, like IPC: a dialog that keeps an old read must not see later updates.
-        read: async (input: { serverNames: string[]; ifConnected?: boolean }) => {
+        read: async (input: {
+          workspaceId: string;
+          serverNames: string[];
+          ifConnected?: boolean;
+        }) => {
           const first = (mcpSettingsReadCount += 1) === 1;
           mcpSettingsReads?.push(input.serverNames);
+          mcpSettingsReadWorkspaces?.push(input.workspaceId);
           const readOne = (serverName: string) => {
             if (input.ifConnected === true && !mcpSettingsConnected.has(serverName))
               return { success: true, data: { notConnected: true } };
@@ -1492,7 +1500,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
               data:
                 snapshot === undefined
                   ? null
-                  : { ...structuredClone(snapshot), instanceToken: readToken(serverName) },
+                  : {
+                      ...structuredClone(snapshot),
+                      instanceToken: readToken(serverName),
+                      readId: `mock-read-${serverName}`,
+                    },
             };
           };
           const result = Object.fromEntries(input.serverNames.map((name) => [name, readOne(name)]));
@@ -1521,6 +1533,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             data: {
               ...structuredClone(snapshot),
               instanceToken: mockSettingsToken(input.serverName),
+              readId: `mock-read-${input.serverName}`,
             },
           };
         },
