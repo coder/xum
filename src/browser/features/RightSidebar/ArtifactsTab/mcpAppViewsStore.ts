@@ -10,11 +10,7 @@ import { MCP_APP_VIEW_RECORDS_MAX_IDS } from "@/common/utils/mcpApps";
 import { getNestedToolStatus } from "@/browser/features/Tools/Shared/toolStatus";
 import type { McpAppEntrypoint, McpAppViewRecord } from "@/common/orpc/schemas/mcpApps";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
-import {
-  mcpAppEntrypointListFailed,
-  mcpAppEntrypointViewOf,
-  useMcpAppEntrypointView,
-} from "../AppViewTab/mcpAppEntrypoints";
+import { mcpAppEntrypointViewOf, useMcpAppEntrypointView } from "../AppViewTab/mcpAppEntrypoints";
 
 /**
  * MCP Apps views (mcp-apps experiment), per workspace, for app tabs and the command palette:
@@ -313,16 +309,10 @@ function flushViewRecordLookups() {
  * The tool call view a result record describes, or null without one. An entry point's record
  * outlives its entry point, and only the entry point list shows that view (the list lacked it,
  * or it would not be looked up): its tab is unavailable, also after a restart, when no retired
- * key remembers it. Only a failed listing, which says nothing about the entry point, lets its
- * record stand in (#6181).
+ * key remembers it.
  */
-function toolCallViewOfRecord(
-  workspaceId: string,
-  toolCallId: string,
-  view: McpAppViewRecord
-): McpAppViewRef | null {
-  if (view === null) return null;
-  if (view.entrypoint === true && !mcpAppEntrypointListFailed(workspaceId)) return null;
+function toolCallViewOfRecord(toolCallId: string, view: McpAppViewRecord): McpAppViewRef | null {
+  if (view === null || view.entrypoint === true) return null;
   return {
     toolCallId,
     serverName: view.serverName,
@@ -351,7 +341,7 @@ function requestViewRecords(api: APIClient, workspaceId: string, toolCallIds: st
       const found: McpAppViewRef[] = [];
       for (const { toolCallId, view } of result.data) {
         if (!toolCallIds.includes(toolCallId)) continue;
-        const ref = toolCallViewOfRecord(workspaceId, toolCallId, view);
+        const ref = toolCallViewOfRecord(toolCallId, view);
         if (ref === null) {
           recordLookups.set(lookupKey(workspaceId, toolCallId), "missing");
           continue;
