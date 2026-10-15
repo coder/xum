@@ -1338,16 +1338,16 @@ export class McpOauthService {
   private readonly insufficientScopes = new Map<string, string[]>();
 
   /** A new interactive sign-in asked for the scopes again: the prompt starts over (#6622). */
-  private endInsufficientScopePrompt(
-    saved: boolean,
-    input: { serverUrl: string; flowGeneration?: number }
-  ): void {
-    if (!saved || input.flowGeneration === undefined) return;
+  private endInsufficientScopePrompt(input: { serverUrl: string; flowGeneration?: number }): void {
+    if (input.flowGeneration === undefined) return;
     this.insufficientScopes.delete(input.serverUrl);
     this.signInSavedAt.set(input.serverUrl, performance.now());
   }
 
-  /** When each credential key's last interactive sign-in was saved (`performance.now()`). */
+  /**
+   * When each credential key's last interactive sign-in became visible to tool calls (its tokens
+   * entered the in-memory store), on the `performance.now()` clock.
+   */
   private readonly signInSavedAt = new Map<string, number>();
 
   /**
@@ -2522,12 +2522,14 @@ export class McpOauthService {
       creds.serverUrl = input.serverUrl;
       creds.tokens = { ...input.tokens, ...refreshedScope(input), ...legacyBinding };
       creds.updatedAtMs = Date.now();
+      // Calls that start from here on read the new tokens (#6739): end the prompt now, so a
+      // report from one of them is kept, and one from an older call is dropped.
+      this.endInsufficientScopePrompt(input);
 
       await this.persistStoreLocked(store);
       return true;
     });
     rejectDroppedFlowSave(saved, input.flowGeneration);
-    this.endInsufficientScopePrompt(saved, input);
   }
 
   /** A stale flow's write, or a refresh's back-stamp of a client another sign-in replaced. */
