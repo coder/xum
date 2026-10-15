@@ -478,19 +478,26 @@ describe("PreToolUse", () => {
       const ctx = await runTool(spine, "bash", { script: "x" }, toolSchema);
       expect(ctx.result).toMatchObject({ ran: expected });
     }
-    // The recorded call keeps the model's input, so the result notes what ran instead
-    // (Codex PRRT_kwDOPxxmWM6rb-TX). A long input is cut in the note.
-    const noted = setup([hook("PreToolUse")], () => rewrite("allow", { command: "ls" }));
+    // The recorded call keeps the model's input, so the result notes that a hook changed it
+    // (Codex PRRT_kwDOPxxmWM6rb-TX). The note names the fields, never a value: a hook may inject
+    // a secret, and the note reaches the model provider and chat.jsonl.
+    const secret = "SECRET-TOKEN-123";
+    const noted = setup([hook("PreToolUse")], () =>
+      rewrite("allow", { command: `curl -H 'Authorization: ${secret}' x` })
+    );
     const notedCtx = await runTool(noted.spine, "bash", { script: "x" }, schema);
-    expect(notedCtx.result).toEqual({
-      ran: { script: "ls" },
-      hook_output: `[plugin:guard] Rewrote this tool call's input to: {"script":"ls"}`,
-    });
-    const long = setup([hook("PreToolUse")], () => rewrite("allow", { command: "y".repeat(5000) }));
-    const longCtx = await runTool(long.spine, "bash", { script: "x" }, schema);
-    const longNote = (longCtx.result as { hook_output: string }).hook_output;
-    expect(longNote.endsWith(" [cut]")).toBe(true);
-    expect(longNote.length).toBeLessThan(2100);
+    const note = (notedCtx.result as { hook_output: string }).hook_output;
+    expect(note).toBe("[plugin:guard] Rewrote this tool call's input (fields: script).");
+    // A later hook that denies the rewritten call: its result carries the note, no value either.
+    const denyAfter = setup([hook("PreToolUse"), hook("PreToolUse")], () =>
+      denyAfter.calls.length === 1
+        ? rewrite("allow", { command: `echo ${secret}` })
+        : rewrite("deny", undefined)
+    );
+    const deniedCtx = await runTool(denyAfter.spine, "bash", { script: "x" }, schema);
+    expect(deniedCtx.executed).toBe(false);
+    expect(JSON.stringify(deniedCtx.blocked?.result)).not.toContain(secret);
+    expect(JSON.stringify(deniedCtx.blocked?.result)).toContain("(fields: script)");
     // A rewrite that does not match the schema is denied too: the guard allowed only the
     // rewritten call (Codex PRRT_kwDOPxxmWM6rb3ih).
     for (const [output, toolSchema] of [

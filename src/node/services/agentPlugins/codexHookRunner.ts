@@ -19,6 +19,7 @@
  * as the around-middleware unwinds, so in reverse plugin order (Codex promises no order at all).
  */
 import assert from "node:assert";
+import { isDeepStrictEqual } from "node:util";
 import type {
   EventSpine,
   ToolExecuteContext,
@@ -220,11 +221,8 @@ async function runToolHooks(
       return;
     }
     if (output.updatedInput !== undefined) {
-      await applyUpdatedInput(ctx, output.updatedInput, view, registration, hook);
+      await applyUpdatedInput(ctx, output.updatedInput, view, registration, hook, notes);
       if (ctx.blocked) return;
-      // The recorded tool call keeps the model's input (replay must resend its exact bytes), so
-      // the note on the result records what the hook changed (Codex PRRT_kwDOPxxmWM6rb-TX).
-      notes.push(rewriteNote(ctx.args));
     }
     if (output.additionalContext !== undefined) notes.push(output.additionalContext);
   }
@@ -375,7 +373,8 @@ async function applyUpdatedInput(
   updatedInput: unknown,
   view: CodexToolView,
   registration: CodexHookRegistration,
-  hook: PluginHookDefinition
+  hook: PluginHookDefinition,
+  notes: string[]
 ): Promise<void> {
   // A Codex-shaped rewrite (Bash `command`) maps back to Xum's names before the schema check.
   const updated = view.fromCodexInput(updatedInput, ctx.args);
@@ -410,17 +409,33 @@ async function applyUpdatedInput(
     };
     return;
   }
+  const note = rewriteNote(schema, ctx.args, parsed.value);
+  if (note !== undefined) notes.push(note);
   ctx.args = parsed.value;
 }
 
-/** A rewritten input longer than this is cut in its note, so the hook's own context still fits. */
-const REWRITE_NOTE_MAX_CHARS = 2000;
+/**
+ * The recorded tool call keeps the model's input (replay must resend its exact bytes), so a note
+ * on the result says that a hook changed it (Codex PRRT_kwDOPxxmWM6rb-TX). It names the changed
+ * fields only, never their values: a hook may inject a secret (a token in `script`) or redact one,
+ * and the note goes to the model provider and into chat.jsonl. The names come from the tool's
+ * schema, not from the hook's output, so a hook cannot put text into the note.
+ */
+function rewriteNote(schema: unknown, before: unknown, after: unknown): string | undefined {
+  if (isDeepStrictEqual(before, after)) return undefined;
+  const properties = isPlainObject(schema) ? schema.properties : undefined;
+  const fields = (isPlainObject(properties) ? Object.keys(properties) : []).filter(
+    (key) =>
+      /^[A-Za-z0-9_.-]{1,64}$/.test(key) &&
+      !isDeepStrictEqual(fieldOf(before, key), fieldOf(after, key))
+  );
+  return fields.length > 0
+    ? `Rewrote this tool call's input (fields: ${fields.join(", ")}).`
+    : "Rewrote this tool call's input.";
+}
 
-function rewriteNote(args: unknown): string {
-  const text = JSON.stringify(args) ?? String(args);
-  const shown =
-    text.length > REWRITE_NOTE_MAX_CHARS ? `${text.slice(0, REWRITE_NOTE_MAX_CHARS)} [cut]` : text;
-  return `Rewrote this tool call's input to: ${shown}`;
+function fieldOf(value: unknown, key: string): unknown {
+  return isPlainObject(value) ? value[key] : undefined;
 }
 
 /**
