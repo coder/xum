@@ -1716,6 +1716,10 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "add a workflow");
     const preview = await service.preview({ input: remoteDir });
+    // The preview shows the script that install approves.
+    expect(preview.reviewedComponents).toHaveLength(1);
+    expect(preview.reviewedComponents[0]).toMatchObject({ kind: "workflows", name: "run.js" });
+    expect(preview.reviewedComponents[0]?.detail).toContain("name: 'run'");
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
     const resolve = () =>
       resolveWorkflowScript({
@@ -1798,6 +1802,10 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "add an agent");
     const preview = await service.preview({ input: remoteDir });
+    // The preview shows the frontmatter that install approves.
+    expect(preview.reviewedComponents).toHaveLength(1);
+    expect(preview.reviewedComponents[0]).toMatchObject({ kind: "agents", name: "helper" });
+    expect(preview.reviewedComponents[0]?.detail).toContain("Formats commit messages");
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
     const runtime = new LocalRuntime(muxRoot);
     const roots = {
@@ -1936,6 +1944,10 @@ describe("AgentPluginInstallService", () => {
     await writeManifest(remoteDir, "Run the release checklist.");
     await commitAll(remoteDir, "add a slash command");
     const preview = await service.preview({ input: remoteDir });
+    // The preview shows the expansion that install approves.
+    expect(preview.reviewedComponents).toHaveLength(1);
+    expect(preview.reviewedComponents[0]).toMatchObject({ kind: "slashCommands", name: "ship" });
+    expect(preview.reviewedComponents[0]?.detail).toContain("Run the release checklist.");
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
     const offered = async () => {
       const { plugins } = await discoveryModule.discoverWorkspaceAgentPlugins({

@@ -295,7 +295,12 @@ function skillConsentFields(args: Parameters<typeof skillConsentFingerprint>[0])
  * review records the fingerprint, which covers fields the summary omits (a header, an OAuth scope,
  * a frontmatter key), so the user must see all of them to approve what is recorded.
  */
-function reviewText(item: { display: string; consentDetail: () => string }): string {
+interface ReviewTextSource {
+  display: string;
+  consentDetail: () => string;
+}
+
+function reviewText(item: ReviewTextSource): string {
   return `${item.display}\n\nReviewed fields: ${item.consentDetail()}`;
 }
 
@@ -441,6 +446,23 @@ function wholeComponentChanges(
       },
     ];
   });
+}
+
+/**
+ * The preview rows of the components that install records consent for besides skills and MCP
+ * servers (#6629), with the text a component review would show. Bounded like a review: over the
+ * bound, the preview fails closed.
+ */
+function reviewedComponentRows(
+  groups: ReadonlyArray<
+    readonly [AgentPluginComponentRef["kind"], ReadonlyArray<readonly [string, ReviewTextSource]>]
+  >
+): AgentPluginInstallPreview["reviewedComponents"] {
+  const rows = groups.flatMap(([kind, items]) =>
+    items.map(([name, item]) => ({ kind, name, detail: reviewText(item) }))
+  );
+  assertReviewFits(rows.map((row) => ({ summary: row.name, after: row.detail })));
+  return rows;
 }
 
 /** Every component of an inventory: what a legacy import-all entry (no selection) imports. */
@@ -2841,10 +2863,17 @@ export class AgentPluginInstallService {
       const codexHooks = await loadPluginCodexHooks(plugin);
       warnings.push(...codexHooks.warnings);
       const openaiInterface = await interfaceSummary(plugin, warnings);
-      const agents = (await listPluginAgentFiles(plugin.agentsDir, warnings)).map(
-        (agent) => agent.name
-      );
+      const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
+      const agents = agentFiles.map((agent) => agent.name);
       const workflows = await listPluginWorkflowFiles(plugin.workflowsDir);
+      const reviewedComponents = reviewedComponentRows([
+        [
+          "workflows",
+          (await this.collectWorkflowScripts(plugin, warnings)).map((w) => [w.file, w]),
+        ],
+        ["agents", agentFiles.map((agent) => [agent.id, agentSurface(agent)])],
+        ["slashCommands", [...slashCommandSurface(plugin)]],
+      ]);
       const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
         name: command.name,
         ...(command.description !== undefined ? { description: command.description } : {}),
@@ -2878,6 +2907,7 @@ export class AgentPluginInstallService {
         agents,
         workflows,
         slashCommands,
+        reviewedComponents,
         warnings,
         targetPath: shortenHome(targetPath),
       };
