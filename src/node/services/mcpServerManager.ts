@@ -34,6 +34,7 @@ import {
   boundMCPSettingsToolResult,
   MAX_MCP_SETTINGS_TOOL_RESULT,
   filterMCPSettingValues,
+  MCP_SETTINGS_READ_TIMEOUT_MS,
   parseMCPSettingsReadResult,
   validateMCPSettingValue,
   type MCPSettingValue,
@@ -5280,7 +5281,8 @@ export class MCPServerManager {
    * too): after tools/list_changed the held catalog would show a new tool as unavailable and
    * keep a removed one runnable. Bounded by the read's own deadline (#6611, see
    * settingsCatalogRefreshBudgetMs). Unlike a dispatch, a refresh that fails or times out keeps
-   * the held catalog: the dispatch refreshes again and refuses on a stale one.
+   * the held catalog: the dispatch refreshes again and refuses on a stale one. Its actions then
+   * ask for a confirmation (knownWritability): a held "read-only" flag can be stale.
    */
   private async withSettingsToolActions(
     instance: MCPServerInstance,
@@ -5290,18 +5292,21 @@ export class MCPServerManager {
     options: { signal?: AbortSignal; timeoutMs?: number } | undefined,
     readStartedAt: number
   ): Promise<MCPSettingsGroup[]> {
-    if (layout.some((group) => group.items.some((item) => item.kind === "tool")))
-      await this.refreshSettingsActionToolsWithin(
+    const refreshed =
+      !layout.some((group) => group.items.some((item) => item.kind === "tool")) ||
+      (await this.refreshSettingsActionToolsWithin(
         instance,
         options?.signal,
         settingsCatalogRefreshBudgetMs(readStartedAt, options)
-      );
+      ));
     return layout.map((group) => ({
       ...group,
       items: group.items.map((item) => {
         if (item.kind !== "tool") return item;
         const action = this.settingsToolAction(instance, workspaceId, serverName, item.tool);
-        return action === undefined ? item : { ...item, action };
+        return action === undefined
+          ? item
+          : { ...item, action: knownWritability(action, refreshed) };
       }),
     }));
   }
@@ -5692,8 +5697,10 @@ export class MCPServerManager {
     instanceToken: string,
     options?: { signal?: AbortSignal }
   ): Promise<MCPSettingsReadSnapshot> {
-    // Validate against a fresh read: the renderer's schema can be stale.
-    const prior = await this.readSettings(workspaceId, serverName, options);
+    // Validate against a fresh read: the renderer's schema can be stale. Each read has the
+    // dialog's read deadline (#6611), so a hung server fails the save instead of holding it.
+    const readOptions = { ...options, timeoutMs: MCP_SETTINGS_READ_TIMEOUT_MS };
+    const prior = await this.readSettings(workspaceId, serverName, readOptions);
     if (prior === null) throw new Error(`MCP server '${serverName}' has no settings`);
     // Another instance (restarted or replaced since the dialog read): the save still lands when
     // it shows the schema the dialog validated against, else the user must reopen.
@@ -5707,7 +5714,7 @@ export class MCPServerManager {
       prior.instanceToken
     );
     try {
-      const after = await this.readSettings(workspaceId, serverName, options);
+      const after = await this.readSettings(workspaceId, serverName, readOptions);
       if (after !== null) return after;
     } catch (error) {
       // The update landed: report it as saved with the schema from before.
@@ -8522,6 +8529,18 @@ export class MCPServerManager {
       signal.removeEventListener("abort", onAbort);
     }
   }
+}
+
+/**
+ * A settings action as the dialog shows it. When the catalog refresh did not finish, the held
+ * flag can be stale (a tool that became writable still reads as read-only), so the action asks
+ * for a confirmation (#6611). The dispatch refreshes again either way.
+ */
+function knownWritability(
+  action: MCPSettingsToolAction,
+  refreshed: boolean
+): MCPSettingsToolAction {
+  return refreshed ? action : { ...action, readOnly: false };
 }
 
 /**

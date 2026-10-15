@@ -1,6 +1,7 @@
 import { log } from "@/node/services/log";
 import {
   MAX_MCP_SETTINGS_TOOL_RESULT,
+  MCP_SETTINGS_READ_TIMEOUT_MS,
   type MCPSettingValue,
   type MCPSettingsToolAction,
 } from "@/common/utils/mcpSettings";
@@ -1249,8 +1250,9 @@ describe("MCPServerManager", () => {
       fakeTimers.advanceTimersByTime(100);
       await flush();
       expect(seen.settled).toBe(true);
-      // The held catalog decorates the layout, as before.
-      expect((await snapshot)?.layout[0]?.items[0]).toMatchObject({ action: { readOnly: true } });
+      // The refresh did not finish, so the tool's writability is unknown: it asks for a
+      // confirmation instead of showing the held catalog's read-only flag.
+      expect((await snapshot)?.layout[0]?.items[0]).toMatchObject({ action: { readOnly: false } });
     } finally {
       fakeTimers.useRealTimers();
       setSystemTime();
@@ -1386,6 +1388,116 @@ describe("MCPServerManager", () => {
     await manager.getToolsForWorkspace(request);
     await manager.readSettings(workspaceId, "cad");
     expect(await run("reset")).toContain("Reopen");
+  });
+
+  test("a settings read whose legacy re-list fails asks for a confirmation", async () => {
+    // A legacy-era server and no MCP Apps. The held catalog says "reset" is read-only, but the
+    // re-list that would confirm it fails, so the dialog must not trust that flag.
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-read-relist-fail") });
+    let relistFails = false;
+    servers.serve("settings-read-relist-fail", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [{ kind: "group", title: "Parts", items: [{ kind: "tool", tool: "reset" }] }],
+            },
+          }),
+        settingsToolAction: (name) =>
+          name === "reset" ? { title: "Reset", readOnly: true, opensApp: false } : undefined,
+        relistTools: () =>
+          relistFails ? Promise.reject(new Error("tools/list failed")) : Promise.resolve(),
+        callSettingsActionTool: () => Promise.resolve({ content: [] }),
+      },
+    });
+    const workspaceId = "settings-read-relist-fail-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const action = async () =>
+      (await manager.readSettings(workspaceId, "cad"))?.layout[0]?.items[0];
+    // A completed re-list keeps the server's flag.
+    expect(await action()).toMatchObject({ action: { readOnly: true } });
+    // A failed one keeps the layout and the action, but never shows it as read-only.
+    relistFails = true;
+    expect(await action()).toEqual({
+      kind: "tool",
+      tool: "reset",
+      action: { title: "Reset", readOnly: false, opensApp: false },
+    });
+  });
+
+  test("a settings tool dispatch before any settings read is refused", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-actions-unread") });
+    const runs: string[] = [];
+    servers.serve("settings-actions-unread", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [{ kind: "group", title: "Parts", items: [{ kind: "tool", tool: "reset" }] }],
+            },
+          }),
+        settingsToolAction: (name) =>
+          name === "reset" ? { title: "Reset", readOnly: true, opensApp: false } : undefined,
+        callSettingsActionTool: (name) => {
+          runs.push(name);
+          return Promise.resolve({ content: [] });
+        },
+      },
+    });
+    const workspaceId = "settings-actions-unread-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    // No read has seen this instance, so no token can name it: a crafted call is refused.
+    const refusal = await manager
+      .runSettingsTool(workspaceId, "cad", "reset", "never-read", { confirmed: true })
+      .then(() => "ran")
+      .catch((error: unknown) => String(error));
+    expect(refusal).toContain("Reopen the dialog");
+    expect(runs).toEqual([]);
+  });
+
+  test("a settings save reads with the dialog's read deadline", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-save-deadline") });
+    const readTimeouts: Array<number | undefined> = [];
+    servers.serve("settings-save-deadline", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: (name, args, meta, options) => {
+          if (name === "s.read") readTimeouts.push(options?.timeoutMs);
+          return Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: { units: { type: "string", title: "Units" } } },
+              values: { units: "in" },
+            },
+          });
+        },
+      },
+    });
+    const workspaceId = "settings-save-deadline-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const read = await manager.readSettings(workspaceId, "cad", {
+      timeoutMs: MCP_SETTINGS_READ_TIMEOUT_MS,
+    });
+    if (read === null) throw new Error("expected settings");
+    await manager.saveSettings(workspaceId, "cad", { units: "mm" }, read.instanceToken);
+    // The dialog's read, then the save's fresh read and its read after the update: each has the
+    // same bound, so a hung server fails the save at the read deadline.
+    expect(readTimeouts).toEqual([
+      MCP_SETTINGS_READ_TIMEOUT_MS,
+      MCP_SETTINGS_READ_TIMEOUT_MS,
+      MCP_SETTINGS_READ_TIMEOUT_MS,
+    ]);
   });
 
   test("settings: a server counts as connected only once the workspace started it", async () => {
