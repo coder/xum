@@ -428,7 +428,7 @@ function unreviewedRow(
   if (!imported || isComponentConsented(entry.componentConsent, kind, name, fingerprint)) return [];
   return [
     {
-      summary: `${COMPONENT_LABELS[kind]} '${name}' needs review`,
+      summary: `${COMPONENT_LABELS[kind]} '${showInvisibleControls(name)}' needs review`,
       before: reviewedBefore(entry.componentConsent, kind, name),
       after: reviewText(item),
       component: { kind, name, fingerprint },
@@ -452,12 +452,18 @@ function wholeComponentChanges(
     const component = { kind, name, fingerprint: item.consentFingerprint };
     const before = current?.get(name);
     if (before === undefined) {
-      return [{ summary: `adds ${label} '${name}'`, after: reviewText(item), component }];
+      return [
+        {
+          summary: `adds ${label} '${showInvisibleControls(name)}'`,
+          after: reviewText(item),
+          component,
+        },
+      ];
     }
     if (before.consentFingerprint === item.consentFingerprint) return [];
     return [
       {
-        summary: `changes ${label} '${name}'`,
+        summary: `changes ${label} '${showInvisibleControls(name)}'`,
         before: reviewText(before),
         after: reviewText(item),
         component,
@@ -477,7 +483,11 @@ function reviewedComponentRows(
   >
 ): AgentPluginInstallPreview["reviewedComponents"] {
   const rows = groups.flatMap(([kind, items]) =>
-    items.map(([name, item]) => ({ kind, name, detail: reviewText(item) }))
+    items.map(([name, item]) => ({
+      kind,
+      name: showInvisibleControls(name),
+      detail: reviewText(item),
+    }))
   );
   assertReviewFits(rows.map((row) => ({ summary: row.name, after: row.detail })));
   return rows;
@@ -948,7 +958,7 @@ function ambiguousAgentChanges(
   return [...staged]
     .filter((agentId) => !(current?.has(agentId) ?? false))
     .map((agentId) => ({
-      summary: `agent '${agentId}' will not load: more than one file claims its ID`,
+      summary: `agent '${showInvisibleControls(agentId)}' will not load: more than one file claims its ID`,
     }));
 }
 
@@ -2559,7 +2569,7 @@ export class AgentPluginInstallService {
         ).content;
       } catch (error) {
         warnings.push(
-          `Workflow '${file}' cannot be read and will not run: ${getErrorMessage(error)}`
+          `Workflow '${showInvisibleControls(file)}' cannot be read and will not run: ${getErrorMessage(error)}`
         );
         continue;
       }
@@ -2910,8 +2920,11 @@ export class AgentPluginInstallService {
       warnings.push(...codexHooks.warnings);
       const openaiInterface = await interfaceSummary(plugin, warnings);
       const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
-      const agents = agentFiles.map((agent) => agent.file);
-      const workflows = await listPluginWorkflowFiles(plugin.workflowsDir);
+      // Display only: the names a user reads before Install show invisible controls (#6629).
+      const agents = agentFiles.map((agent) => showInvisibleControls(agent.file));
+      const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
+        showInvisibleControls
+      );
       const reviewedComponents = reviewedComponentRows([
         [
           "workflows",
