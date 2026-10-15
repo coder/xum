@@ -23,7 +23,7 @@ import { WORKSPACE_VIEW_TREE_JSON } from "./workspaceFirstViewChrome";
 export type WorkspaceViewMode = "fetch" | "embed" | "off";
 
 /** Default per branch: proto/t3-c4-p2-fetch says "fetch", proto/t3-c4-p2-embed says "embed". */
-const BRANCH_DEFAULT: WorkspaceViewMode = "fetch";
+const BRANCH_DEFAULT: WorkspaceViewMode = "embed";
 
 /** Read once at server start. XUM_PROTO_P2_VIEW=fetch|embed|off overrides the branch default. */
 export function readWorkspaceViewMode(env: NodeJS.ProcessEnv): WorkspaceViewMode {
