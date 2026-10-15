@@ -2,7 +2,6 @@ import React from "react";
 
 import { cn } from "@/common/lib/utils";
 import { getArchivedWorkspacesExpandedKey } from "@/common/constants/storage";
-import { isWorktreeRuntime } from "@/common/types/runtime";
 import type {
   FrontendWorkspaceMetadata,
   WorkspaceRemovalDescendant,
@@ -43,7 +42,9 @@ import { useOptimisticBatchLRU } from "@/browser/hooks/useOptimisticBatchLRU";
 import { sessionCostCache } from "@/browser/utils/sessionCostCache";
 import {
   expandHistorySelection,
+  getCheckoutOwnerIds,
   getHistoryRowCost,
+  keepListedSelection,
   partitionArchivedHistoryRows,
   sumKnownCosts,
 } from "./archivedHistoryRows";
@@ -68,15 +69,6 @@ interface BulkOperationState {
   errors: string[];
   /** What forced removals left behind (#5143); kept in the dialog so Done does not clear it. */
   warnings?: string[];
-}
-
-function canDeleteManagedWorktree(workspace: FrontendWorkspaceMetadata): boolean {
-  return (
-    isWorktreeRuntime(workspace.runtimeConfig) &&
-    workspace.transcriptOnly !== true &&
-    // isolation:none tasks reuse an ancestor checkout, so they do not own local worktree state.
-    workspace.taskIsolation !== "none"
-  );
 }
 
 /** Group workspaces by time period for timeline display */
@@ -367,7 +359,9 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   const removeWarning = usePopoverError(null);
 
   // Bulk selection state
-  const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
+  const [rawSelectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
+  // Act only on listed rows: a selected row can fold away when another window archives its parent.
+  const selectedIds = keepListedSelection(rawSelectedIds, historyRows);
   const [lastClickedId, setLastClickedId] = React.useState<string | null>(null);
   const [bulkOperation, setBulkOperation] = React.useState<BulkOperationState | null>(null);
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = React.useState(false);
@@ -630,15 +624,11 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
     }
   };
 
-  const handleBulkDeleteWorktree = async () => {
+  const handleBulkDeleteWorktree = async (idsToDeleteWorktree: string[]) => {
     if (!liveApi) {
       return;
     }
 
-    const idsToDeleteWorktree = Array.from(selectedIds).filter((id) => {
-      const workspace = workspaces.find((candidate) => candidate.id === id);
-      return workspace ? canDeleteManagedWorktree(workspace) : false;
-    });
     if (idsToDeleteWorktree.length === 0) {
       return;
     }
@@ -797,9 +787,15 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   };
 
   const hasSelection = selectedIds.size > 0;
-  const hasBulkDeleteWorktreeSelection = workspaces.some(
-    (workspace) => selectedIds.has(workspace.id) && canDeleteManagedWorktree(workspace)
-  );
+  // Folded sub-agents keep their own checkouts (archive keeps worktrees by default), so removing a
+  // row's checkout covers theirs too.
+  const bulkCheckoutIds = getCheckoutOwnerIds(bulkDeleteIds, workspaces);
+  const hasBulkDeleteWorktreeSelection = bulkCheckoutIds.length > 0;
+  // A row alone keeps the inline flow; with folded checkouts it uses the progress dialog.
+  const handleRowDeleteWorktree = (rowId: string, checkoutIds: string[], anchorEl: HTMLElement) =>
+    checkoutIds.length === 1 && checkoutIds[0] === rowId
+      ? handleDeleteWorktree(rowId, anchorEl)
+      : handleBulkDeleteWorktree(checkoutIds);
   const allFilteredSelected =
     filteredWorkspaces.length > 0 && filteredWorkspaces.every((w) => selectedIds.has(w.id));
 
@@ -915,7 +911,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <button
-                          onClick={() => void handleBulkDeleteWorktree()}
+                          onClick={() => void handleBulkDeleteWorktree(bulkCheckoutIds)}
                           className="text-muted rounded p-1 transition-colors hover:bg-white/10 hover:text-orange-300"
                           aria-label="Remove local checkouts for selected"
                         >
@@ -1018,7 +1014,10 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
                             ? workspace.name
                             : undefined;
                         const displayTitle = workspace.title ?? workspace.name;
-                        const canDeleteWorktree = canDeleteManagedWorktree(workspace);
+                        const rowCheckoutIds = getCheckoutOwnerIds(
+                          expandHistorySelection([workspace.id], foldedByRowId),
+                          workspaces
+                        );
                         const isDeletingWorktree = deleteWorktreeIds.has(workspace.id);
 
                         return (
@@ -1082,12 +1081,16 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
                                 </TooltipTrigger>
                                 <TooltipContent>Restore to sidebar</TooltipContent>
                               </Tooltip>
-                              {canDeleteWorktree && (
+                              {rowCheckoutIds.length > 0 && (
                                 <Tooltip>
                                   <TooltipTrigger asChild>
                                     <button
                                       onClick={(event) =>
-                                        void handleDeleteWorktree(workspace.id, event.currentTarget)
+                                        void handleRowDeleteWorktree(
+                                          workspace.id,
+                                          rowCheckoutIds,
+                                          event.currentTarget
+                                        )
                                       }
                                       disabled={isProcessing}
                                       className="text-muted rounded p-1.5 transition-colors hover:bg-white/10 hover:text-orange-300 disabled:opacity-50"

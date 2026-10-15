@@ -487,6 +487,55 @@ describe("ArchivedWorkspaces", () => {
     expect(removeWorkspaceMock.mock.calls.every((call) => call[1]?.force === true)).toBe(true);
   });
 
+  test("a selected row that folds under a newly archived parent leaves the selection", async () => {
+    const parent = createWorkspace({ id: "parent", name: "parent" });
+    const child = createWorkspace({ id: "child", name: "child", parentWorkspaceId: parent.id });
+    const props = {
+      projectPath: parent.projectPath,
+      projectName: parent.projectName,
+      onWorkspacesChanged: onWorkspacesChangedMock,
+    };
+
+    const view = render(<ArchivedWorkspaces {...props} workspaces={[child]} />);
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    fireEvent.click(await waitFor(() => view.getByLabelText("Select child")));
+    expect(view.getByText("1 selected")).toBeTruthy();
+
+    // Another window archives the parent: the child folds into it and must not stay selected.
+    view.rerender(<ArchivedWorkspaces {...props} workspaces={[parent, child]} />);
+    expect(view.queryByText("1 selected")).toBeNull();
+    expect(view.queryByLabelText("Delete selected")).toBeNull();
+  });
+
+  test("a row's checkout removal covers its folded sub-agents' checkouts", async () => {
+    const parent = createWorkspace({
+      id: "parent",
+      name: "parent",
+      runtimeConfig: { type: "local" },
+    });
+    const child = createWorkspace({ id: "child", name: "child", parentWorkspaceId: parent.id });
+
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={parent.projectPath}
+        projectName={parent.projectName}
+        workspaces={[parent, child]}
+        onWorkspacesChanged={onWorkspacesChangedMock}
+      />
+    );
+
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    // The parent owns no checkout, but its folded worktree sub-agent does.
+    fireEvent.click(
+      await waitFor(() => view.getByLabelText("Remove local checkout for workspace parent"))
+    );
+
+    await waitFor(() => {
+      expect(deleteWorktreeMock).toHaveBeenCalledTimes(1);
+    });
+    expect(deleteWorktreeMock).toHaveBeenCalledWith({ workspaceId: child.id });
+  });
+
   test("Shift-click acknowledges reported descendants without a confirmation", async () => {
     const workspace = createWorkspace({ id: "parent", name: "parent" });
     const descendants = [

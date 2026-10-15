@@ -1,3 +1,4 @@
+import { isWorktreeRuntime } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 
 export interface ArchivedHistoryRows {
@@ -109,4 +110,33 @@ export function expandHistorySelection(
     for (const folded of foldedByRowId.get(id) ?? []) ids.add(folded.id);
   }
   return Array.from(ids);
+}
+
+/** The selection limited to listed rows, so a row that folded away is never acted on unseen. */
+export function keepListedSelection(
+  selectedIds: ReadonlySet<string>,
+  rows: readonly FrontendWorkspaceMetadata[]
+): Set<string> {
+  return new Set(rows.filter((row) => selectedIds.has(row.id)).map((row) => row.id));
+}
+
+export function canDeleteManagedWorktree(workspace: FrontendWorkspaceMetadata): boolean {
+  return (
+    isWorktreeRuntime(workspace.runtimeConfig) &&
+    workspace.transcriptOnly !== true &&
+    // isolation:none tasks reuse an ancestor checkout, so they do not own local worktree state.
+    workspace.taskIsolation !== "none"
+  );
+}
+
+/** The ids, in order, whose workspace owns a managed local checkout. */
+export function getCheckoutOwnerIds(
+  ids: readonly string[],
+  workspaces: readonly FrontendWorkspaceMetadata[]
+): string[] {
+  const byId = new Map(workspaces.map((workspace) => [workspace.id, workspace] as const));
+  return ids.filter((id) => {
+    const workspace = byId.get(id);
+    return workspace != null && canDeleteManagedWorktree(workspace);
+  });
 }
