@@ -100,6 +100,7 @@ test("overlapping tool listings: a late, older tools/list response keeps the new
   await client.tools();
   // Two re-lists overlap. The first one's response arrives last and still lacks "reset", as
   // the server listed it before a tools/list_changed.
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- called with each client as `this`
   const realListTools = Client.prototype.listTools;
   const firstHeld = Promise.withResolvers<void>();
   let calls = 0;
