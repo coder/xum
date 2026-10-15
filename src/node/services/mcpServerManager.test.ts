@@ -1472,7 +1472,7 @@ describe("MCPServerManager", () => {
       tools: { draw: testTool() },
       settings: {
         settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
-        callSettingsTool: (name, args, meta, options) => {
+        callSettingsTool: (name, _args, _meta, options) => {
           if (name === "s.read") readTimeouts.push(options?.timeoutMs);
           return Promise.resolve({
             content: [],
