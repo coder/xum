@@ -3103,7 +3103,7 @@ describe("AgentPluginInstallService", () => {
       await expect(restarted.signOutPluginServers()).rejects.toThrow(/another Xum version/);
       expect(await pathExists(file)).toBe(true);
       // An unmanaged tree whose directory name is not a managed-plugin name does not block it.
-      const handMade = path.join(pluginsDir(), "hand_made");
+      const handMade = path.join(pluginsDir(), ".hand_made");
       await fsPromises.mkdir(handMade);
       await fsPromises.writeFile(
         path.join(handMade, "plugin.json"),

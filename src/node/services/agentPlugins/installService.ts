@@ -4529,9 +4529,11 @@ export class AgentPluginInstallService {
 
   /** One plugin tree's remote MCP server URLs; throws when the tree's servers cannot be read. */
   private async pluginTreeServerUrls(dirName: string): Promise<string[]> {
-    // Plugin trees are directories (or links to one); skip stray files such as .DS_Store.
+    // Plugin trees are directories (or links to one), dot-prefixed names included, as discovery
+    // scans them. Skip stray files such as .DS_Store and dangling links: neither loads.
     const pluginDir = path.join(this.containerDir, dirName);
-    if (dirName.startsWith(".") || !(await fsPromises.stat(pluginDir)).isDirectory()) return [];
+    const stat = await fsPromises.stat(pluginDir).catch(() => null);
+    if (stat?.isDirectory() !== true) return [];
     // A server this scan cannot read can load later, after a repair, with its old sign-in:
     // the list must be complete before the record goes.
     const { plugin, diagnostics } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
