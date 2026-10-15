@@ -300,12 +300,19 @@ function preventDefault(event: React.DragEvent): void {
   event.preventDefault();
 }
 
-/** A locked composer starts no file read from a paste or drop: its result would land after the lock. */
-function fileInputHandlers<Paste, Drop>(
+/**
+ * A locked composer starts no file read from a paste or drop (its result would land after the
+ * lock), and its attachments show without remove buttons (a removal would miss a moving body).
+ */
+function attachmentInputHandlers<Paste, Drop, Remove>(
   locked: boolean,
-  handlers: { onPaste: Paste; onDrop: Drop }
-): { onPaste: Paste | undefined; onDrop: Drop | typeof preventDefault } {
-  return locked ? { onPaste: undefined, onDrop: preventDefault } : handlers;
+  handlers: { onPaste: Paste; onDrop: Drop; onRemove: Remove }
+): {
+  onPaste: Paste | undefined;
+  onDrop: Drop | typeof preventDefault;
+  onRemove: Remove | undefined;
+} {
+  return locked ? { onPaste: undefined, onDrop: preventDefault, onRemove: undefined } : handlers;
 }
 
 /**
@@ -939,7 +946,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   });
   const sendLocksTyping = typingLock.locksTyping;
   const composerLocked = !editingMessageForUi && (disabled || sendLocksTyping);
-  const fileInput = fileInputHandlers(composerLocked, { onPaste: handlePaste, onDrop: handleDrop });
+  const attachmentInput = attachmentInputHandlers(composerLocked, {
+    onPaste: handlePaste,
+    onDrop: handleDrop,
+    onRemove: handleRemoveAttachment,
+  });
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
@@ -2336,7 +2347,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       pushToast({ type: "error", message: transcriptBarrierMessage(liveApiRef.current == null) });
       return;
     }
-    if (!canSend) {
+    // The live store too: a send racing the move's start (before this render) would take the
+    // body the move gives to the destination.
+    if (!canSend || getDraftStore().isMovingCreationDraft(draftScope)) {
       return;
     }
     if (!draft.payloadsLoaded) {
@@ -3468,12 +3481,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                         .catch(() => undefined);
                     }}
                     onKeyDown={handleKeyDown}
-                    onPaste={fileInput.onPaste}
+                    onPaste={attachmentInput.onPaste}
                     onKeyUp={composerSuggestions.handleCursorActivity}
                     onMouseUp={composerSuggestions.handleCursorActivity}
                     onSelect={composerSuggestions.handleCursorActivity}
                     onDragOver={handleDragOver}
-                    onDrop={fileInput.onDrop}
+                    onDrop={attachmentInput.onDrop}
                     onEscapeInNormalMode={handleEscapeInNormalMode}
                     suppressKeys={
                       composerSuggestions.isVisible ? COMMAND_SUGGESTION_KEYS : undefined
@@ -3516,7 +3529,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               )}
             </div>
 
-            <ChatAttachments attachments={attachments} onRemove={handleRemoveAttachment} />
+            <ChatAttachments attachments={attachments} onRemove={attachmentInput.onRemove} />
 
             <div className="flex flex-col gap-0.5" data-component="ChatModeToggles">
               {/* Editing indicator - workspace only */}

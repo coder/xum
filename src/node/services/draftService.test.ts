@@ -1477,6 +1477,58 @@ describe("DraftService moveCreation", () => {
     ]);
   });
 
+  it("finishes an attempt whose list write failed after the source was deleted", async () => {
+    using tempDir = new TestTempDir("drafts-move-list-write-failed");
+    const { config, projectPath, otherProject, service } = await createMoveHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    const written = await service.update({ scope: source, text: "moving", nameState });
+    const dest = { kind: "creation" as const, projectPath: otherProject, draftId: "dst" };
+    const move = {
+      source,
+      sourceRevision: written.revision,
+      dest,
+      subProjectPath: "sub",
+      createdAt: 7,
+    };
+    // The attempt wrote the destination body and deleted the source, then its list write failed
+    // (as a crash at that point would leave it).
+    const listFile = path.join(config.rootDir, "drafts", "list.json");
+    const realRename = cjsFs.rename.bind(cjsFs);
+    const renameSpy = spyOn(cjsFs, "rename").mockImplementation(((
+      from: cjsFs.PathLike,
+      to: cjsFs.PathLike,
+      callback: cjsFs.NoParamCallback
+    ) => {
+      if (String(to) === listFile) {
+        callback(Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" }));
+        return;
+      }
+      realRename(from, to, callback);
+    }) as typeof cjsFs.rename);
+    let failed: unknown;
+    try {
+      await service.moveCreation(move).catch((error: unknown) => (failed = error));
+    } finally {
+      renameSpy.mockRestore();
+    }
+    expect(failed).toBeInstanceOf(Error);
+    expect((await service.get(source)).text).toBe("");
+    // A snapshot relists the destination body with a synthesized row.
+    await service.getSnapshotEvent();
+
+    // The client retries with the revision it confirmed.
+    const reply = await service.moveCreation(move);
+
+    expect(reply).toMatchObject({
+      result: "moved",
+      dest: { text: "moving", nameState },
+    });
+    expect((await service.getList()).entries).toEqual([
+      { projectPath: otherProject, draftId: "dst", subProjectPath: "sub", createdAt: 7 },
+    ]);
+  });
+
   it("refuses an unowned destination and keeps the source", async () => {
     using tempDir = new TestTempDir("drafts-move-unowned");
     const { projectPath, service } = await createMoveHarness(tempDir);
