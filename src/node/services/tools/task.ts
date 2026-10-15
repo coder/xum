@@ -32,9 +32,12 @@ import { getErrorMessage } from "@/common/utils/errors";
 import {
   coerceThinkingLevel,
   parseThinkingInput,
+  THINKING_LEVELS,
   type ParsedThinkingInput,
   type ThinkingLevel,
 } from "@/common/types/thinking";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import type { AvailableModel } from "@/common/types/tools";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { coerceNonEmptyString } from "@/node/services/taskUtils";
 
@@ -124,6 +127,80 @@ function buildParentRuntimeAiSettings(
   };
 }
 
+// `<base>[-<thinking level>][-fast]`; the lazy base leaves both suffixes to the groups.
+const EFFORT_SLUG_PATTERN = new RegExp(`^(.+?)(?:-(${THINKING_LEVELS.join("|")}))?(?:-fast)?$`);
+
+/**
+ * Map a `<model>-<effort>[-fast]` slug (pstack's form, e.g. `claude-opus-5-5-xhigh`,
+ * `grok-4.7-xhigh-fast`) to a known model ID plus thinking level. The base must be a
+ * Xum alias or a known provider model ID. Xum has no per-task speed mode, so `-fast`
+ * runs the same model at standard speed. Returns null when the slug does not map.
+ */
+function mapEffortSlug(raw: string): { model: string; effort?: ThinkingLevel } | null {
+  const match = EFFORT_SLUG_PATTERN.exec(raw.trim().toLowerCase());
+  if (match == null) return null;
+  const [, base, effortToken] = match;
+  const effort = THINKING_LEVELS.find((level) => level === effortToken);
+  const model =
+    normalizeModelInput(base).model ??
+    Object.values(KNOWN_MODELS).find((known) => known.providerModelId === base)?.id;
+  return model == null ? null : { model, effort };
+}
+
+/** The configured-model catalog, or undefined when this context has none or it throws. */
+function readAvailableModels(
+  listAvailableModels: (() => AvailableModel[]) | undefined
+): AvailableModel[] | undefined {
+  try {
+    return listAvailableModels?.();
+  } catch (error) {
+    // Same policy as models_list: log on the Node side. Without a catalog a mapped slug
+    // is accepted like any provider:model string, which is never availability-checked.
+    log.error("[task tool] failed to compute the model catalog", { error });
+    return undefined;
+  }
+}
+
+/** Error suffix naming the configured models, so a caller can retry with a valid one. */
+function formatAvailableModels(available: AvailableModel[] | undefined): string {
+  if (available == null || available.length === 0) return ".";
+  const MAX_LISTED = 30;
+  const names = available.map((entry) => entry.aliases[0] ?? entry.model);
+  const more = names.length > MAX_LISTED ? `, +${names.length - MAX_LISTED} more` : "";
+  return `. Configured: ${names.slice(0, MAX_LISTED).join(", ")}${more} (see models_list).`;
+}
+
+/**
+ * Resolve a task `model` input: an alias or `provider:model` as the UI does, else a
+ * skill's `<model>-<effort>[-fast]` slug. Throws when neither resolves.
+ */
+function resolveTaskModel(
+  raw: string,
+  listAvailableModels: (() => AvailableModel[]) | undefined
+): { modelString: string; thinkingLevel?: ThinkingLevel } {
+  const normalized = normalizeModelInput(raw).model;
+  if (normalized != null) return { modelString: normalized };
+  // Skills written for other harnesses (e.g. pstack for Cursor) name models as
+  // `<model>-<effort>[-fast]` slugs. Map them so a skill's per-role routing works
+  // unedited, instead of failing or silently inheriting the parent's model.
+  const slug = mapEffortSlug(raw);
+  const available = readAvailableModels(listAvailableModels);
+  // A slug is a translation guess, so it must land on a model this host can run.
+  // Otherwise reject at launch with the configured models: pstack retries with the
+  // closest valid option from this error, rather than starting a child that fails.
+  if (slug == null || (available != null && !available.some((m) => m.model === slug.model))) {
+    throw new Error(
+      `task tool: ${slug == null ? "invalid" : "unavailable"} model "${raw}". ` +
+        `Provide a known alias, a "provider:model" string, or "<model>-<effort>"` +
+        formatAvailableModels(available)
+    );
+  }
+  return {
+    modelString: slug.model,
+    ...(slug.effort != null ? { thinkingLevel: slug.effort } : {}),
+  };
+}
+
 /**
  * Parse the optional `model`/`thinking` overrides supplied on a task launch,
  * reusing the exact parsing the UI uses (`normalizeModelInput` for model alias
@@ -135,20 +212,17 @@ function buildParentRuntimeAiSettings(
  * Exported so the models_list tests can prove every advertised model/alias/level
  * is accepted by exactly this parser.
  */
-export function parseTaskAiOverrides(args: { model?: string | null; thinking?: string | null }): {
+export function parseTaskAiOverrides(
+  args: { model?: string | null; thinking?: string | null },
+  listAvailableModels?: () => AvailableModel[]
+): {
   modelString?: string;
   thinkingLevel?: ParsedThinkingInput;
 } {
   const overrides: { modelString?: string; thinkingLevel?: ParsedThinkingInput } = {};
 
   if (args.model != null) {
-    const normalized = normalizeModelInput(args.model);
-    if (normalized.model == null) {
-      throw new Error(
-        `task tool: invalid model "${args.model}". Provide a known alias or a "provider:model" string.`
-      );
-    }
-    overrides.modelString = normalized.model;
+    Object.assign(overrides, resolveTaskModel(args.model, listAvailableModels));
   }
 
   if (args.thinking != null) {
@@ -455,7 +529,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
 
       // Explicit per-launch model/thinking overrides. Omitted by default so delegated work
       // inherits the parent's live settings unless the caller requests an override.
-      const aiOverrides = parseTaskAiOverrides({ model, thinking });
+      const aiOverrides = parseTaskAiOverrides({ model, thinking }, config.listAvailableModels);
 
       const workspaceId = requireWorkspaceId(config, "task");
       const taskService = requireTaskService(config, "task");

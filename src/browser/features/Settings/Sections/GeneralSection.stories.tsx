@@ -1,7 +1,7 @@
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { DEFAULT_TERMINAL_BADGE_CONFIG } from "@/common/constants/storage";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { within } from "@storybook/test";
+import { within } from "storybook/test";
 import { GeneralSection } from "./GeneralSection.js";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils.js";
 

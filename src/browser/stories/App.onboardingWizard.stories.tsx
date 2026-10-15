@@ -5,7 +5,7 @@
  * which use the text-only accent token (#5946, #6449).
  */
 
-import { expect, waitFor, within } from "@storybook/test";
+import { expect, waitFor, within } from "storybook/test";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import { textContrast } from "@/browser/stories/helpers/contrast";

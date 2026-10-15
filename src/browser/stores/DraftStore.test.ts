@@ -60,7 +60,12 @@ function createClient(service: DraftService) {
     updateGate: null as Promise<void> | null,
     getGate: null as Promise<void> | null,
     subscribeGate: null as Promise<void> | null,
+    /** Holds `importLegacyList` (the start of the legacy import that follows a snapshot). */
+    importListGate: null as Promise<void> | null,
+    listImports: 0,
     updates: 0,
+    /** Snapshots the store finished handling (it asks for the next event only after that). */
+    snapshotsHandled: 0,
   };
   const drafts = {
     list: () => service.list(),
@@ -108,6 +113,8 @@ function createClient(service: DraftService) {
     }: {
       entries: Parameters<DraftService["importLegacyList"]>[0];
     }) => {
+      control.listImports++;
+      await control.importListGate;
       if (control.failListImports > 0) {
         control.failListImports--;
         throw new Error("list import failed");
@@ -130,6 +137,7 @@ function createClient(service: DraftService) {
             const next = queue.shift();
             if (next) {
               yield next;
+              if (next.type === "snapshot") control.snapshotsHandled++;
               continue;
             }
             await new Promise<void>((resolve) => {
@@ -924,7 +932,8 @@ describe("DraftStore", () => {
     }
     const next = createClient(service);
     store.setClient(next.client);
-    await waitFor(() => next.control.updates === 0 && store.isHydrated());
+    await waitFor(() => next.control.snapshotsHandled > 0);
+    expect(next.control.updates).toBe(0);
 
     store.setText(WS_SCOPE, "typed after the switch");
     await store.flush(WS_SCOPE);
@@ -933,10 +942,11 @@ describe("DraftStore", () => {
     expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
   });
 
-  // #6438, review round 3: an edit saved to a new backend before its snapshot arrived. That
-  // reply was compared with the old backend's view, lost to it, and the old text came back. Each
-  // subscription start forgets the old views, so the reply is taken as it comes.
-  test("an edit saved to a new backend before its snapshot keeps the typed text", async () => {
+  // #6438, review round 3, and #6542: an edit saved to a new backend before its snapshot was
+  // compared with the old backend's view, lost to it, and the old text came back. And the write
+  // went to a backend whose drafts the store had not seen. Now no write goes out in that window,
+  // and the edit is saved once the snapshot arrives.
+  test("an edit waits for a new backend's snapshot before it is saved, and keeps the typed text", async () => {
     using tempDir = new TestTempDir("draft-store-new-backend-early-write");
     const { config, client } = await createHarness(tempDir);
     const store = createStore(client);
@@ -960,19 +970,63 @@ describe("DraftStore", () => {
     store.setClient(next.client);
 
     store.setText(WS_SCOPE, "typed after the switch");
-    await store.flush(WS_SCOPE);
-    expect(next.control.updates).toBeGreaterThan(0);
+    expect(await flushError(store)).toContain("drafts are not loaded");
+    expect(next.control.updates).toBe(0);
     expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
+    // Other readers still see the drafts as loaded (the WorkspaceContext draft GC).
+    expect(store.isHydrated()).toBe(true);
 
     releaseSnapshot();
-    await waitFor(() => store.isHydrated());
+    await waitFor(() => next.control.snapshotsHandled > 0);
     await store.flush(WS_SCOPE);
+    expect(next.control.updates).toBeGreaterThan(0);
     expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
     expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
     store.setText(WS_SCOPE, "typed later");
     await store.flush(WS_SCOPE);
     expect(store.getText(WS_SCOPE)).toBe("typed later");
     expect((await service.get(WS_SCOPE)).text).toBe("typed later");
+  });
+
+  // #6542: the old subscription's run resumed after its legacy import and opened writes for the
+  // client after it, so an edit reached the new backend before that backend's snapshot.
+  test("a client swap during the old subscription's legacy import keeps writes off the new backend", async () => {
+    using oldDir = new TestTempDir("draft-store-swap-during-import");
+    using newDir = new TestTempDir("draft-store-swap-target");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    // A reconnect whose snapshot is followed by a legacy list import (an older build's key): the
+    // old run awaits importLegacyList after its snapshot.
+    seedLegacyKey(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {
+      [old.projectPath]: [{ draftId: "legacy-a", section: null, createdAt: 1 }],
+    });
+    let releaseImport: () => void = () => undefined;
+    old.control.importListGate = new Promise<void>((resolve) => {
+      releaseImport = resolve;
+    });
+    store.setClient(null);
+    store.setClient(old.client);
+    await waitFor(() => old.control.listImports > 0);
+    store.setText(WS_SCOPE, "typed during the import");
+
+    const next = await createHarness(newDir);
+    let releaseSnapshot: () => void = () => undefined;
+    next.control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(next.client);
+    releaseImport();
+    // The old run resumes after its import (it removes the legacy key once the backend took the
+    // list); it must not open writes for the new client.
+    await waitFor(() => listPersistedKeys(WORKSPACE_DRAFTS_BY_PROJECT_KEY).length === 0);
+    expect(await flushError(store)).toContain("drafts are not loaded");
+    expect(next.control.updates).toBe(0);
+
+    releaseSnapshot();
+    await waitFor(() => next.control.snapshotsHandled > 0);
+    await store.flush(WS_SCOPE);
+    expect((await next.service.get(WS_SCOPE)).text).toBe("typed during the import");
   });
 
   // #6438: forgetting the views on a reconnect must not touch what the composer shows.
@@ -990,11 +1044,12 @@ describe("DraftStore", () => {
     control.subscribeGate = new Promise<void>((resolve) => {
       releaseSnapshot = resolve;
     });
+    const handled = control.snapshotsHandled;
     store.setClient(client);
     const view = store.getView(WS_SCOPE);
     expect([view.text, view.attachments.map(({ id }) => id)]).toEqual(["saved text", ["img-1"]]);
     releaseSnapshot();
-    await waitFor(() => store.isHydrated());
+    await waitFor(() => control.snapshotsHandled > handled);
     expect(store.getText(WS_SCOPE)).toBe("saved text");
   });
 
@@ -1010,10 +1065,11 @@ describe("DraftStore", () => {
     control.failUpdates = 100;
     store.setText(WS_SCOPE, "unsaved typing");
     expect(await flushError(store)).toContain("update failed");
+    const handled = control.snapshotsHandled;
     store.setClient(null);
     store.setClient(client);
     // The snapshot still holds the saved text.
-    await waitFor(() => store.isHydrated());
+    await waitFor(() => control.snapshotsHandled > handled);
     expect(store.getText(WS_SCOPE)).toBe("unsaved typing");
     control.failUpdates = 0;
     await store.flush(WS_SCOPE);
@@ -1043,11 +1099,12 @@ describe("DraftStore", () => {
       releaseSnapshot = resolve;
     });
     store.setClient(next.client);
-    // The old backend answers before the new one's snapshot.
+    // The old backend answers before the new one's snapshot: nothing is written there yet.
     release();
     await inFlight;
+    expect(next.control.updates).toBe(0);
     releaseSnapshot();
-    await waitFor(() => store.isHydrated());
+    await waitFor(() => next.control.snapshotsHandled > 0);
     await store.flush(WS_SCOPE);
     expect((await next.service.get(WS_SCOPE)).text).toBe("typed during the switch");
 

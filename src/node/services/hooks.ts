@@ -642,7 +642,7 @@ export async function runPreHook(
       exitCode: result.exitCode ?? -1,
     };
   } catch (err) {
-    log.error("[hooks] Pre-hook execution failed", { hookPath, error: err });
+    logHookFailure("Pre-hook", hookPath, err, context.abortSignal);
     return {
       allowed: false,
       output: `Pre-hook failed: ${getErrorMessage(err)}`,
@@ -756,25 +756,30 @@ export async function runPostHook(
       exitCode: result.exitCode ?? -1,
     };
   } catch (err) {
-    return postHookFailure(hookPath, err, context.abortSignal);
+    logHookFailure("Post-hook", hookPath, err, context.abortSignal);
+    return {
+      success: false,
+      output: `Post-hook failed: ${getErrorMessage(err)}`,
+      exitCode: -1,
+    };
   } finally {
     await cleanup();
   }
 }
 
-function postHookFailure(
+function logHookFailure(
+  phase: "Pre-hook" | "Post-hook",
   hookPath: string,
   err: unknown,
   abortSignal: AbortSignal | undefined
-): PostHookResult {
+): void {
   // A cancelled tool call (user interrupt, memory intuition deadline) aborts its
-  // post-hook before or during exec. That is expected, so it is not an error.
+  // hook before or during exec. That is expected, so it is not an error.
   if (abortSignal?.aborted) {
-    log.debug("[hooks] Post-hook skipped: tool call aborted", { hookPath, error: err });
+    log.debug(`[hooks] ${phase} skipped: tool call aborted`, { hookPath, error: err });
   } else {
-    log.error("[hooks] Post-hook execution failed", { hookPath, error: err });
+    log.error(`[hooks] ${phase} execution failed`, { hookPath, error: err });
   }
-  return { success: false, output: `Post-hook failed: ${getErrorMessage(err)}`, exitCode: -1 };
 }
 
 /** Helper to prepare tool input (write to file if large) */

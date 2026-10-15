@@ -15,6 +15,7 @@ import type { NameGenerationError } from "@/common/types/errors";
 import type { WorkspaceNameGenerationRequest } from "@/common/orpc/schemas/api";
 import { formatNameGenerationError } from "@/common/utils/errors/formatNameGenerationError";
 import * as gitModule from "@/node/git";
+import * as humanIdModule from "human-id";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import type { WorkspaceService } from "./workspaceService";
 import * as workspaceTitleGenerator from "./workspaceTitleGenerator";
@@ -187,7 +188,7 @@ describe("create() with nameGeneration", () => {
       generateIdentity.mockImplementation(() => naming.promise);
 
       const created = await createNamed(c.awaitMaterialization);
-      expect(created.name).toMatch(/^workspace-\d+$/);
+      expect(created.name).toMatch(/^[a-z]+(-[a-z]+)+$/);
       expect(entry(created.id)?.pendingAutoTitle).toBe(true);
       expect(entry(created.id)?.title).toBeUndefined();
 
@@ -312,15 +313,16 @@ describe("create() with nameGeneration", () => {
 
   test("a creation that attached to an existing branch keeps that branch", async () => {
     generateIdentity.mockResolvedValue(GENERATED);
-    git(projectPath, "branch", "workspace-1");
+    git(projectPath, "branch", "calm-otters-sing");
     // The provisional name is picked while the branch listing fails, so it is a taken one.
     spyOn(gitModule, "listLocalBranches").mockRejectedValueOnce(new Error("listing failed"));
+    spyOn(humanIdModule, "humanId").mockReturnValue("calm-otters-sing");
 
     const created = await createNamed();
     await harness.initStateManager.waitForInit(created.id);
 
-    expect(created.name).toBe("workspace-1");
-    expect(await readObserved(created.path)).toBe("workspace-1 workspace-1");
+    expect(created.name).toBe("calm-otters-sing");
+    expect(await readObserved(created.path)).toBe("calm-otters-sing calm-otters-sing");
     expect(branchExists(projectPath, "sidebar-k3m9")).toBe(false);
   }, 30_000);
 

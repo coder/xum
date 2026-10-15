@@ -1,5 +1,5 @@
 import type { ComponentType } from "react";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { IntuitionToolResult } from "@/common/types/tools";
 import {
   EMPTY_INTUITION,

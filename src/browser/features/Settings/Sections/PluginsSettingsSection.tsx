@@ -11,7 +11,7 @@ import {
   TriangleAlert,
   XCircle,
 } from "lucide-react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { Button } from "@/browser/components/Button/Button";
@@ -1206,6 +1206,25 @@ function confirmMessage(
   return result.success ? result.data.cleanupWarning : result.error;
 }
 
+/**
+ * The section's initial palette intent, handed out once. The mount effect reruns on every API
+ * reconnect (APIProvider makes a new client), and replaying the intent would reopen a review the
+ * user already cancelled (#6609). Only an attempt on a live connection consumes it: while Xum
+ * reconnects, `api` can still hold the detached client, whose calls fail, and the live client
+ * that replaces it must still get the intent.
+ */
+function useInitialIntentOnce(
+  liveApi: ReturnType<typeof useLiveAPI>,
+  initialIntent: PluginsSectionIntent | null
+): () => PluginsSectionIntent | null {
+  const consumedRef = useRef(false);
+  return () => {
+    if (!liveApi || consumedRef.current) return null;
+    consumedRef.current = true;
+    return initialIntent;
+  };
+}
+
 function useComponentReview(deps: ComponentReviewDeps) {
   const [review, setReview] = useState<AgentPluginUpdateReview | null>(null);
   const open = (name: string) =>
@@ -1377,11 +1396,14 @@ export const PluginsSettingsSection: React.FC = () => {
     }
   };
 
+  const takeInitialIntent = useInitialIntentOnce(useLiveAPI(), initialIntent);
+
   // Approved update policy: passive check on section open + explicit button only.
   useEffect(() => {
     // A palette review intent opens after the first list refresh: the refresh clears the shared
     // error, so a concurrent preview failure would vanish without an explanation.
-    void refresh().finally(() => componentReview.openFromIntent(initialIntent));
+    const intent = takeInitialIntent();
+    void refresh().finally(() => componentReview.openFromIntent(intent));
     void checkForUpdates();
     void api?.agentPlugins.containerLocation().then(setContainerLocation, () => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fetch on mount / API reconnect only; refresh/checkForUpdates are plain handlers (compiler-memoized), not inputs

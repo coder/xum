@@ -130,10 +130,6 @@ interface WorkspaceHeaderTitleInputProps {
 }
 
 /**
- * Enter or leaving the field saves, Escape cancels. A failed save keeps the edit open and shows
- * the error under the field.
- */
-/**
  * A save whose field is gone reports in the shared toast: its error popover unmounted with the
  * field, and the workspace keeps its old title (#6434).
  */
@@ -149,9 +145,10 @@ function reportSaveError(
 }
 
 /**
- * The field unmounts with the edit still open when the selected workspace changes under it: the
- * header is reused across workspaces. Save the typed text then, as leaving the field does
- * (#6434). The save's phase guard skips it when the field's blur already saved.
+ * A field that unmounts with a changed draft saves it, as leaving the field does. This runs on
+ * every unmount, and matters most when the selected workspace changes under the open field: the
+ * header is reused across workspaces (#6434). The save's phase guard skips it when the field's
+ * blur already saved.
  */
 function useSaveOnUnmount(
   mountedRef: React.MutableRefObject<boolean>,
@@ -214,6 +211,10 @@ function useTitleDraft(props: WorkspaceHeaderTitleInputProps) {
   return { draft, setDraft, titleError, inputRef, save, cancel };
 }
 
+/**
+ * Enter or leaving the field saves, Escape cancels. A failed save keeps the edit open and shows
+ * the error under the field.
+ */
 function WorkspaceHeaderTitleInput(props: WorkspaceHeaderTitleInputProps) {
   const { draft, setDraft, titleError, inputRef, save, cancel } = useTitleDraft(props);
 

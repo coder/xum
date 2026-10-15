@@ -10,7 +10,7 @@
  */
 
 import type { ComponentType } from "react";
-import { waitFor } from "@storybook/test";
+import { waitFor } from "storybook/test";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getPinnedTodoExpandedKey } from "@/common/constants/storage";
