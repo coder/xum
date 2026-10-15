@@ -80,6 +80,24 @@ describe("readOpenAIMcpAuth", () => {
     expect(result.ignored).toEqual(["type: api_key (no plugin API key storage)"]);
   });
 
+  test("an invalid headerName for custom_header names the real problem and drops the scheme", () => {
+    // Host is reserved (#6646): the old warning said "needs headerScheme custom_header".
+    for (const headerName of ["Host", "X Key", 7]) {
+      const result = readOpenAIMcpAuth(
+        withAuth({ type: "api_key", headerScheme: "custom_header", headerName })
+      );
+      expect(result.auth).toEqual({ type: "api_key" });
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain("must be a valid HTTP header name");
+    }
+    // A valid name with another scheme still says what the name needs.
+    const bearer = readOpenAIMcpAuth(
+      withAuth({ type: "api_key", headerScheme: "bearer", headerName: "X-Key" })
+    );
+    expect(bearer.auth).toEqual({ type: "api_key", headerScheme: "bearer" });
+    expect(bearer.warnings).toEqual([expect.stringContaining("needs headerScheme custom_header")]);
+  });
+
   test("an http endpoint override is kept only for a loopback host", () => {
     const result = readOpenAIMcpAuth(
       withAuth({
