@@ -37,6 +37,12 @@ import {
 import type { RuntimeConfig } from "../../../src/common/types/runtime";
 import type { TestEnvironment } from "../setup";
 import { sshConnectionPool } from "../../../src/node/runtime/sshConnectionPool";
+import {
+  describeSsh,
+  initOutputLines,
+  runWatchedSshTest,
+  type SshStepContext,
+} from "../sshStepWatchdog";
 import { ssh2ConnectionPool } from "../../../src/node/runtime/SSH2ConnectionPool";
 import type { WorkspaceChatMessage } from "../../../src/common/orpc/types";
 import type { ToolPolicy } from "../../../src/common/utils/tools/toolPolicy";
@@ -156,53 +162,21 @@ describeIntegration("Runtime Bash Execution", () => {
       // SSH tests run serially to avoid Docker container overload
       const runTest = getTestRunner(type);
 
-      // #6588: an ssh test here ran into jest's 120 s limit in the merge queue, and that message
-      // does not say which step hung. Each ssh test now waits for init-end with its own budget
-      // and records its current step; a watchdog fails it before jest's limit with that step,
-      // the last init lines and the SSH pool's health.
+      // #6588: each ssh test waits for init-end with its own budget and runs under the shared
+      // step watchdog (sshStepWatchdog.ts).
       const SSH_INIT_BUDGET_MS = 40_000;
       const SSH_WATCHDOG_MS = TEST_TIMEOUT_SSH_MS - 10_000;
-      interface StepContext {
-        step: string;
-        initLines: string[];
-      }
-      const describeSsh = (ctx: StepContext): string => {
-        const health =
-          sshConfig &&
-          sshConnectionPool.getConnectionHealth({
-            host: "testuser@localhost",
-            port: sshConfig.port,
-            identityFile: sshConfig.privateKeyPath,
-          });
-        return (
-          `Last init lines: ${JSON.stringify(ctx.initLines.slice(-5))}. ` +
-          // CI runs the default OpenSSH transport. The SSH2 pool exposes no health to read.
-          `OpenSSH pool: ${JSON.stringify(health ?? null)}`
-        );
-      };
       /** Runs an ssh test body under the watchdog; local tests run unchanged. */
-      const watched = (body: (ctx: StepContext) => Promise<void>) => async (): Promise<void> => {
-        const ctx: StepContext = { step: "setup", initLines: [] };
-        if (type !== "ssh") return body(ctx);
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const watchdog = new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            const where = `still in step "${ctx.step}" after ${SSH_WATCHDOG_MS} ms`;
-            reject(new Error(`ssh test ${where} (#6588). ${describeSsh(ctx)}`));
-          }, SSH_WATCHDOG_MS);
-        });
-        try {
-          await Promise.race([body(ctx), watchdog]);
-        } finally {
-          clearTimeout(timer);
-        }
+      const watched = (body: (ctx: SshStepContext) => Promise<void>) => async (): Promise<void> => {
+        if (type !== "ssh") return body({ step: "setup", initLines: () => [] });
+        await runWatchedSshTest(SSH_WATCHDOG_MS, () => sshConfig, body);
       };
       /** Creates the workspace; for ssh, init-end must arrive within its budget. */
       const createWorkspace = async (
         env: TestEnvironment,
         repo: string,
         branchName: string,
-        ctx: StepContext
+        ctx: SshStepContext
       ) => {
         ctx.step = "create workspace";
         const created = await createWorkspaceWithInit(
@@ -216,13 +190,11 @@ describeIntegration("Runtime Bash Execution", () => {
         ctx.step = "wait for init-end";
         const collector = createStreamCollector(env.orpc, created.workspaceId);
         collector.start();
+        ctx.initLines = () => initOutputLines(collector);
         try {
           const end = await collector.waitForEvent("init-end", SSH_INIT_BUDGET_MS);
-          ctx.initLines = collector
-            .getEvents()
-            .flatMap((e) => ("type" in e && e.type === "init-output" ? [e.line] : []));
           if (end == null) {
-            const message = `ssh init did not end within ${SSH_INIT_BUDGET_MS} ms (#6588). ${describeSsh(ctx)}`;
+            const message = `ssh init did not end within ${SSH_INIT_BUDGET_MS} ms (#6588). ${describeSsh(sshConfig, ctx)}`;
             // The caller never gets `cleanup` on this path, so remove the workspace here. Bounded:
             // a removal that hangs too must not hide the init message behind the watchdog.
             await Promise.race([
