@@ -3290,14 +3290,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   function createOverviewHarness(xumHomePath: string) {
     const metadata = createLocalWorkspaceMetadata("tool-search-overview", xumHomePath);
     const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
-    const fixture = {
-      stubTool,
-      mcpTools: {
-        tracker_list_issues: { ...stubTool, description: NATIVE_DEFERRAL_DESCRIPTION },
-      } as Record<string, Tool>,
-      /** MCP tools a model does not get (like a request.assemble hook filtering by model). */
-      hiddenByModel: {} as Record<string, readonly string[]>,
+    const mcpTools: Record<string, Tool> = {
+      tracker_list_issues: { ...stubTool, description: NATIVE_DEFERRAL_DESCRIPTION },
     };
+    /** MCP tools a model does not get (like a request.assemble hook filtering by model). */
+    const hiddenByModel: Record<string, readonly string[]> = {};
+    const fixture = { stubTool, mcpTools, hiddenByModel };
     const harness = createHarness(xumHomePath, metadata, { useRequestedModelString: true });
     harness.getToolsForModelSpy.mockImplementation((model, config) => {
       const hidden = new Set(fixture.hiddenByModel[model] ?? []);
