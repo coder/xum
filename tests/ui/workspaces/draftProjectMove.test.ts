@@ -352,16 +352,24 @@ describeIntegration("Creation project selector moves the draft", () => {
         (text) => text.startsWith("Local")
       );
 
+      const gets = jest.spyOn(getSharedEnv().services.draftService, "get");
       await moveDraftTo(container, path.basename(b));
 
       const movedDraftId = await onlyDraftId(b);
       await waitFor(() => {
         expect(textareaValue(container)).toBe("move me");
+        expect(container.textContent).toContain(ATTACHMENT.filename);
         expect(container.querySelector<HTMLInputElement>("#workspace-name")?.value).toBe(
           "moved-name"
         );
         expect(runtimeSelector(container)?.textContent).toContain("Local");
       }, WAIT);
+      // The moved attachments show at once: the source's loaded payloads came along, so the
+      // destination loads none.
+      expect(
+        gets.mock.calls.filter(([scope]) => "projectPath" in scope && scope.projectPath === b)
+      ).toEqual([]);
+      gets.mockRestore();
       expect(readScopeAgentId(getProjectScopeId(b))).toBe("plan");
       expect(getWorkspaceAiSelection(getProjectScopeId(b)).model).toBe(KNOWN_MODELS.HAIKU.id);
       expect(getAutoRouting(getProjectScopeId(b), "model")).toBe(false);
