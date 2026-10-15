@@ -4,7 +4,10 @@
 # Strip only the observed help text: a heading alone must not hide a finding
 # added inside the details section, or a second section appended after it.
 def codex_without_help:
-  sub("^### 🛡️ Codex Security Review( · _Automatically triggered_)?\n\n"; "")
+  # Since 2026-10-15 Codex starts verdicts with one receipt marker. Strip only
+  # one, before the heading, so a second marker still blocks.
+  sub("^<!-- codex-review-receipt:v1 -->\n\n"; "")
+  | sub("^### 🛡️ Codex Security Review( · _Automatically triggered_)?\n\n"; "")
   | rtrimstr("\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n"
     + "[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n"
     + "- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\n"
@@ -44,9 +47,24 @@ def codex_summary_status($bot; $head; $resolved):
     (.body | codex_without_help) as $body
     | if $body | startswith(codex_summary_marker) then
         (try (
-          ($body | split("\n") | map(select(length > 0))) as $lines
+          ($body | split("\n") | map(select(length > 0))) as $all
+          # Since 2026-10-15 Codex may add a review-state line before the security line.
+          | (if $all[1] | startswith("<!-- codex-review-state:v1 ")
+              then [($all[1] | capture("^<!-- codex-review-state:v1 (?<payload>.*) -->$").payload | fromjson)]
+              else [] end) as $state
+          | ([$all[0]] + $all[(1 + ($state | length)):]) as $lines
           | ($lines[1] | capture("^<!-- codex-security-review:v1 (?<payload>.*) -->$").payload | fromjson) as $security
+          | ([$state[] | .code_review, .security_review]) as $reviews
           | if $lines[0] == codex_summary_marker
+            # Unknown state fields or statuses could be findings. has_any_findings
+            # stays true after findings are resolved, so it is not used.
+            and ($state | all(type == "object" and (keys == ["code_review", "security_review"])))
+            and ($reviews | all(type == "object"
+              and keys == ["commit_sha", "has_any_findings", "has_unresolved_findings", "status"]
+              and (.commit_sha | test("^[0-9a-f]{40}$"))
+              and (.has_any_findings | type == "boolean" or type == "null")
+              and (.has_unresolved_findings == false or .has_unresolved_findings == null)
+              and (.status == "completed" or .status == "running")))
             # Unknown security fields or statuses could be authoritative findings.
             # In particular, do not interpret an enabled security merge gate here.
             and ($security | type == "object"
@@ -79,6 +97,7 @@ def codex_summary_status($bot; $head; $resolved):
             ))
             then (if $security.status == "running" or ($lines[2:] | any(test(codex_running_row)))
                      or $security.headSha != $head
+                     or ($reviews | any(.status == "running" or .commit_sha != $head))
                   then "running" else "completed" end)
             else null
             end
