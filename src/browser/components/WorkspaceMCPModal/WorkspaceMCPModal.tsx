@@ -215,12 +215,9 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   // A tool that can write (a reset, an import) may have changed a server's settings: read them
   // again (the backend's read refreshes its settings caches too). The run can have started in
   // an earlier mount of this dialog, so its end reaches whichever dialog is open now.
-  useEffect(() => {
-    if (!open) return;
-    return subscribeSettingsToolWrites(workspaceId, (serverName) =>
-      readServerSettingsRef.current([serverName], true, settingsRequests.current())
-    );
-  }, [open, workspaceId, settingsRequests]);
+  useSettingsToolWriteRereads(open, workspaceId, (serverName) =>
+    readServerSettingsRef.current([serverName], true, settingsRequests.current())
+  );
 
   // Fetch/refresh tools for a server
   const fetchTools = useCallback(
@@ -658,6 +655,21 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
     </Dialog>
   );
 };
+
+/** While the dialog is open, `reread` runs after each writing settings tool run of the workspace. */
+function useSettingsToolWriteRereads(
+  open: boolean,
+  workspaceId: string,
+  reread: (serverName: string) => Promise<void>
+) {
+  // Ref: the subscription follows the dialog's open state, not each render's callback.
+  const rereadRef = useRef(reread);
+  rereadRef.current = reread;
+  useEffect(() => {
+    if (!open) return;
+    return subscribeSettingsToolWrites(workspaceId, (serverName) => rereadRef.current(serverName));
+  }, [open, workspaceId]);
+}
 
 /** A server's settings note when no snapshot is shown: a failed read, or a server not running. */
 function ServerSettingsNote(props: {
