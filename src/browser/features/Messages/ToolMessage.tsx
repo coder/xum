@@ -3,7 +3,8 @@ import type { DisplayedMessage } from "@/common/types/message";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { BashOutputGroupInfo } from "@/browser/utils/messages/messageUtils";
 import type { TaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
-import { getToolComponent } from "../Tools/Shared/getToolComponent";
+import { useToolCards } from "../Tools/Shared/toolCardsStore";
+import { ToolCardFallback } from "../Tools/Shared/ToolCardsLoad";
 import {
   HookOutputDisplay,
   extractHookOutput,
@@ -36,8 +37,17 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
 }) => {
   const { toolName, args, result, status, toolCallId } = message;
 
+  // The cards load lazily (see toolCardsStore). The outer div stays across the swap.
+  const cards = useToolCards();
+  if (!cards) {
+    return (
+      <div className={className}>
+        <ToolCardFallback toolName={toolName} status={status} />
+      </div>
+    );
+  }
   // Get the component from the registry (validates args, falls back to GenericToolCall)
-  const ToolComponent = getToolComponent(toolName, args, result);
+  const ToolComponent = cards.getToolComponent(toolName, args, result);
 
   // Compute tool-specific extras
   const groupPosition =

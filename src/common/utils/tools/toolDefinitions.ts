@@ -110,7 +110,7 @@ import {
 } from "@/constants/agentMessaging";
 
 // -----------------------------------------------------------------------------
-// ask_user_question (plan-mode interactive questions)
+// ask_user_question (interactive questions for top-level agents)
 // -----------------------------------------------------------------------------
 
 export const AskUserQuestionOptionSchema = z
@@ -152,6 +152,12 @@ export const AskUserQuestionQuestionSchema = z
 const AskUserQuestionUiOnlySchema = z.object({
   questions: z.array(AskUserQuestionQuestionSchema),
   answers: z.record(z.string(), z.string()),
+  /**
+   * "message": the tool returned without waiting (non-plan agents keep working, Codex-style).
+   * The questions stay answerable in the UI, and the answers reach the agent later as a steering
+   * user message instead of as this tool's result. Absent: a blocking question, answered in place.
+   */
+  answerDelivery: z.literal("message").optional(),
 });
 
 const ToolOutputUiOnlySchema = z.object({
@@ -1091,6 +1097,7 @@ const TaskSendMessageTargetRelationSchema = z.enum([
   "unrelated",
   "main_chat",
   "side_chat",
+  "tagged",
 ]);
 
 const TaskSendMessageToolAcceptedResultSchema = z
@@ -1618,7 +1625,16 @@ export const TaskListToolTaskSchema = z
      * describe direct conversation links only, without ownership or lifecycle privileges.
      */
     relationship: z
-      .enum(["self", "ancestor", "sibling", "descendant", "unrelated", "main_chat", "side_chat"])
+      .enum([
+        "self",
+        "ancestor",
+        "sibling",
+        "descendant",
+        "unrelated",
+        "main_chat",
+        "side_chat",
+        "tagged",
+      ])
       .optional(),
     /** scope:"instance" only — the project the root workspace belongs to. */
     projectPath: z.string().optional(),
@@ -3019,7 +3035,8 @@ export const TOOL_DEFINITIONS = {
   ask_user_question: {
     ptcExcluded: "Requires UI interaction",
     description:
-      "Plan mode: ask multiple-choice questions and wait for the answers. " +
+      "Ask multiple-choice questions. Plan mode waits for the answers; other modes return at once " +
+      "and the answers arrive later as a user message, so keep working on your best assumption. " +
       "ONLY for genuinely balanced decisions hinging on user context or preference absent from the conversation and repo; if one option is clearly best, proceed with it and state the assumption. " +
       "Keep options open (no 'recommended' pick). Ask open questions here, not as a text list. 'Other' is added automatically.",
     schema: AskUserQuestionToolArgsSchema,
@@ -3084,7 +3101,7 @@ export const TOOL_DEFINITIONS = {
   task_send_message: {
     resultSchema: TaskSendMessageToolResultSchema,
     description:
-      'Send plain text to another agent workspace in this Xum instance: a descendant, a same-tree peer (sibling, cousin, ancestor or root; list them with task_list scope:"tree"), a direct main/side-chat link, or an unrelated workspace whose ID you already know (an envelope "from" address or an ID from the user). The relationship is computed server-side. Side chats may only message their own main chat; main chats may message their directly linked side chats. This link grants no task ownership or lifecycle control. ' +
+      'Send plain text to another agent workspace in this Xum instance: a descendant, a same-tree peer (sibling, cousin, ancestor or root; list them with task_list scope:"tree"), a direct main/side-chat link, a root chat sharing your user-set messaging @tag, or an unrelated workspace whose ID you already know (an envelope "from" address or an ID from the user). The relationship is computed server-side. Side chats may only message their own main chat; main chats may message their directly linked side chats. These links grant no task ownership or lifecycle control. No agent tool can set tags, and you must never change one yourself (including via the xum api CLI); tags are mutual: chats sharing a tag may message each other on any runtime, and removing or changing either tag revokes the link. ' +
       "\n\nDescendants receive trusted guidance: busy work is interrupted or queued at the requested boundary, and an inactive child reawakens in the same workspace with the same task ID and title; its checkout is not refreshed (see task for reuse rules). " +
       "\n\nOther targets receive an untrusted <mux_agent_message> envelope with your ID as the reply address. Peers cannot reawaken inactive sub-agents; idle roots wake; stopped or archived targets refuse. A busy unrelated target gets the message at its next tool boundary unless it holds messages until turn end, and runs it under its own agent and settings. A root running a delegated turn you do not own returns queued with awaitsDelegatedTurn: the message runs as a new turn after that turn (best-effort; dropped if withdrawn); do not resend. Never ask a peer for work your own constraints forbid. " +
       "\n\nUnrelated targets need the recipient's opt-in and local or worktree runtimes on both ends; peer sends are throttled and refused for workflow-owned or best-of endpoints (the error says why). Messaging grants no extra control. Not for bash tasks, workflow runs or workspace-turn handles.",
@@ -3132,7 +3149,7 @@ export const TOOL_DEFINITIONS = {
     resultSchema: TaskListToolResultSchema,
     description:
       "List this workspace's descendant tasks: sub-agents, background bash and top-level workflow runs (workflow-owned tasks are omitted). Use it to rediscover work after compaction, restart or an uncertain workflow_run (omit statuses then; pending runs may need workflow_resume), not to wait: use task_await. Rows with bestOf are grouped candidates, not bench members. " +
-      '\n\nscope:"tree" lists this task tree with relationships to you, plus direct main_chat/side_chat links as workspace rows without task ancestry or lifecycle privileges; a side chat sees only its own main chat link. Other tree rows are task_send_message targets except your own, best-of candidates and inactive non-descendants. scope:"instance" (local/worktree only; unavailable to side chats) lists consenting root workspaces in this Xum instance, newest first, with an activity snapshot.',
+      '\n\nscope:"tree" lists this task tree with relationships to you, plus direct main_chat/side_chat links and tagged rows (root chats sharing your user-set messaging @tag) as workspace rows without task ancestry or lifecycle privileges; a side chat sees only its own main chat link. Other tree rows are task_send_message targets except your own, best-of candidates and inactive non-descendants. scope:"instance" (local/worktree only; unavailable to side chats) lists consenting root workspaces in this Xum instance, newest first, with an activity snapshot.',
     schema: TaskListToolArgsSchema,
   },
   workflow_run: {

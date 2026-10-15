@@ -5918,6 +5918,57 @@ describe("Config", () => {
       expect(row()).toMatchObject({ title: "Renamed", taskTerminalFailure: marker });
     });
 
+    it("keeps the messaging-tag revocation generation through reload and a metadata write", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              id: "tagged",
+              name: "tagged",
+              path: projectPath,
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              messagingTag: "research",
+              messagingTagGeneration: "gen-1",
+            },
+          ],
+        });
+        return cfg;
+      });
+      const reloaded = new Config(tempDir);
+      const row = () =>
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      // The tag publishes on metadata; its server-owned generation never does.
+      const [metadata] = await reloaded.getAllWorkspaceMetadata();
+      expect(metadata.messagingTag).toBe("research");
+      await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
+      expect(row()).toMatchObject({
+        title: "Renamed",
+        messagingTag: "research",
+        messagingTagGeneration: "gen-1",
+      });
+    });
+
+    it("publishes the config messaging tag for an id-less legacy workspace with metadata.json", async () => {
+      const projectPath = path.join(tempDir, "repo");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [{ path: projectPath, messagingTag: "research" }],
+        });
+        return cfg;
+      });
+      const sessionDir = path.join(config.sessionsDir, "repo");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      // A stale or absent legacy-file tag must never override the config value.
+      fs.writeFileSync(
+        path.join(sessionDir, "metadata.json"),
+        JSON.stringify({ id: "legacy-tag", name: "legacy-tag", messagingTag: "stale" })
+      );
+      const [metadata] = await config.getAllWorkspaceMetadata();
+      expect(metadata).toMatchObject({ id: "legacy-tag", messagingTag: "research" });
+    });
+
     it("keeps a parent's reservation tombstones through reload and a metadata write", async () => {
       const projectPath = path.join(tempDir, "project");
       await config.editConfig((cfg) => {

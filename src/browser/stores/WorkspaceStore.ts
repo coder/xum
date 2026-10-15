@@ -1,4 +1,8 @@
 import assert from "@/common/utils/assert";
+import {
+  requestToolCards,
+  requestToolCardsForRows,
+} from "@/browser/features/Tools/Shared/toolCardsStore";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
@@ -1157,6 +1161,8 @@ export class WorkspaceStore {
     ) => void
   > = {
     "stream-start": (workspaceId, aggregator, data) => {
+      // A stream can call tools: load the lazy cards before its first tool row mounts.
+      requestToolCards();
       applyWorkspaceChatEventToAggregator(aggregator, data);
       if (this.onModelUsed) {
         this.onModelUsed((data as { model: string }).model);
@@ -3117,6 +3123,7 @@ export class WorkspaceStore {
         );
       }
 
+      requestToolCardsForRows(historicalMessages);
       if (historicalMessages.length > 0) {
         aggregator.loadHistoricalMessages(historicalMessages, false, {
           mode: "append",
@@ -5539,7 +5546,9 @@ export class WorkspaceStore {
       const transient = this.assertChatTransientState(workspaceId);
 
       if (!transient.caughtUp) {
-        // Buffer historical XumMessages
+        // Buffer historical XumMessages. A tool call starts the lazy cards' download, which
+        // then runs in parallel with the rest of the replay.
+        requestToolCardsForRows([data]);
         transient.historicalMessages.push(data);
       } else {
         // Process live events immediately (after history loaded)

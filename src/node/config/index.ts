@@ -98,6 +98,7 @@ import {
 } from "@/common/schemas/project";
 import {
   getValidAgentMessageDispatchMode,
+  getValidMessagingTag,
   getValidUnrelatedWorkspaceConsent,
 } from "@/common/orpc/schemas/workspace";
 import {
@@ -4786,6 +4787,8 @@ export class Config {
               unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
                 workspace.unrelatedWorkspaceConsent
               ),
+              // Fail closed: a corrupted/invalid tag publishes as absent (untagged).
+              messagingTag: getValidMessagingTag(workspace.messagingTag),
               agentMessageDispatchMode: getValidAgentMessageDispatchMode(
                 workspace.agentMessageDispatchMode
               ),
@@ -5068,7 +5071,12 @@ export class Config {
               });
             }
 
-            workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
+            // The messaging tag lives only in config (legacy metadata.json predates it), so
+            // overlay the validated config value or a tag write would publish stale metadata.
+            workspaceMetadata.push({
+              ...this.addPathsToMetadata(metadata, workspace.path),
+              messagingTag: getValidMessagingTag(workspace.messagingTag),
+            });
             metadataFound = true;
           }
 
@@ -5095,6 +5103,8 @@ export class Config {
               unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
                 workspace.unrelatedWorkspaceConsent
               ),
+              // Fail closed: a corrupted/invalid tag publishes as absent (untagged).
+              messagingTag: getValidMessagingTag(workspace.messagingTag),
               agentMessageDispatchMode: getValidAgentMessageDispatchMode(
                 workspace.agentMessageDispatchMode
               ),
@@ -5179,6 +5189,7 @@ export class Config {
             unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
               workspace.unrelatedWorkspaceConsent
             ),
+            messagingTag: getValidMessagingTag(workspace.messagingTag),
             agentMessageDispatchMode: getValidAgentMessageDispatchMode(
               workspace.agentMessageDispatchMode
             ),
@@ -5413,6 +5424,7 @@ export class Config {
         unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
           metadata.unrelatedWorkspaceConsent
         ),
+        messagingTag: getValidMessagingTag(metadata.messagingTag),
         agentMessageDispatchMode: getValidAgentMessageDispatchMode(
           metadata.agentMessageDispatchMode
         ),
@@ -5460,6 +5472,9 @@ export class Config {
           pendingRemoval: existing.pendingRemoval,
           pendingArchive: existing.pendingArchive,
           unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
+          // Server-owned and unpublished on metadata: a round trip must not drop it,
+          // or in-flight tagged sends would read a spurious revocation.
+          messagingTagGeneration: existing.messagingTagGeneration,
           delegatedCreation: existing.delegatedCreation,
           // Monotone (#5174): a metadata round trip never un-marks a migrated plan.
           remotePlanMigrated: existing.remotePlanMigrated,

@@ -1686,6 +1686,61 @@ describe("MessageQueue", () => {
       expect(dispatched.options != null && "authoredText" in dispatched.options).toBe(false);
     });
 
+    it("restores the reviews of every batched add, behind a /compact too", () => {
+      // Codex PRRT_kwDOPxxmWM6rZqyS: the entry keeps only its first add's metadata, so a later
+      // review-only send lost its reviews when a hook blocked the batch and it was restored.
+      const first = { filePath: "src/a.ts", lineRange: "1", selectedCode: "a()", userNote: "1" };
+      const second = { filePath: "src/b.ts", lineRange: "2", selectedCode: "b()", userNote: "2" };
+      const options = { model: "claude-3-5-sonnet-20241022", agentId: "exec" };
+      queue.add("Summarize the conversation.", {
+        ...options,
+        agentId: "compact",
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      });
+      queue.add("<review>2</review>", {
+        ...options,
+        muxMetadata: { type: "normal", reviews: [second] },
+        authoredText: "",
+      });
+      expect(queue.getInputForRestore()?.reviews).toEqual([second]);
+
+      queue.clear();
+      queue.add("<review>1</review>", {
+        ...options,
+        muxMetadata: { type: "normal", reviews: [first] },
+        authoredText: "",
+      });
+      queue.add("<review>2</review>", {
+        ...options,
+        muxMetadata: { type: "normal", reviews: [second] },
+        authoredText: "",
+      });
+      expect(queue.getInputForRestore()?.reviews).toEqual([first, second]);
+      expect(queue.getInputsForRestore()[0]?.reviews).toEqual([first, second]);
+      // A held re-send carries them in its metadata too (Codex PRRT_kwDOPxxmWM6s3RUw), also
+      // behind a first add whose metadata has no reviews.
+      expect(queue.getRestorableManualSends()[0]?.options.muxMetadata).toEqual({
+        type: "normal",
+        reviews: [first, second],
+      });
+      // A dispatch carries them too (Codex PRRT_kwDOPxxmWM6s3-n2).
+      expect(queue.dequeueNext().options?.muxMetadata).toEqual({
+        type: "normal",
+        reviews: [first, second],
+      });
+      queue.clear();
+      queue.add("plain", { ...options, muxMetadata: { type: "normal" } });
+      queue.add("<review>2</review>", {
+        ...options,
+        muxMetadata: { type: "normal", reviews: [second] },
+        authoredText: "",
+      });
+      expect(queue.getRestorableManualSends()[0]?.options.muxMetadata).toEqual({
+        type: "normal",
+        reviews: [second],
+      });
+    });
+
     it("restores a /compact follow-up's attachments and review notes from its compaction metadata", () => {
       // Codex P1 (PRRT_kwDOPxxmWM6r_ubq): prepareCompactionMessage keeps them only under
       // parsed.followUpContent; a message.send block that restores the entry must give them back.

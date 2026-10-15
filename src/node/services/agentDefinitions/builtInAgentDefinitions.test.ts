@@ -6,7 +6,9 @@ import { FALLBACK_AGENTS } from "@/browser/features/Settings/Sections/TasksSecti
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import { createDesktopTools } from "@/node/services/tools/desktopTools";
 import { createTestToolConfig, TestTempDir } from "@/node/services/tools/testHelpers";
+import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { getBuiltInAgentDefinitions } from "./builtInAgentDefinitions";
+import { resolveToolPolicyForAgent } from "./resolveToolPolicy";
 
 describe("built-in agent definitions", () => {
   test("Settings fallback inventory mirrors built-ins, including hidden agents", () => {
@@ -114,5 +116,20 @@ describe("built-in agent definitions", () => {
     const explore = byId.get("explore");
     expect(explore).toBeTruthy();
     expect(explore?.frontmatter.tools?.remove ?? []).toContain("task_apply_git_patch");
+  });
+
+  test("exec can ask the user questions at top level but not as a sub-agent", () => {
+    const exec = getBuiltInAgentDefinitions().find((pkg) => pkg.id === "exec");
+    expect(exec).toBeTruthy();
+    const agents = [{ tools: exec?.frontmatter.tools }];
+
+    const resolveNames = (isSubagent: boolean) =>
+      applyToolPolicyToNames(
+        ["ask_user_question", "propose_plan"],
+        resolveToolPolicyForAgent({ agents, isSubagent, disableTaskToolsForDepth: false })
+      );
+
+    expect(resolveNames(false)).toEqual(["ask_user_question"]);
+    expect(resolveNames(true)).toEqual([]);
   });
 });

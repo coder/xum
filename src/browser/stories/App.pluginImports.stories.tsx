@@ -32,6 +32,7 @@ const preview: AgentPluginInstallPreview = {
   agents: ["reviewer.md"],
   workflows: ["review.js"],
   slashCommands: [{ name: "review-status", description: "Summarize review status" }],
+  consentDigest: "c".repeat(64),
   reviewedComponents: [],
   codexHooks: [],
   hook: { path: "hooks.js", toolGrants: ["file_read"] },

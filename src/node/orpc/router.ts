@@ -1356,7 +1356,7 @@ export const router = (authToken?: string) => {
                 input.workspaceId,
                 input.serverName,
                 input.toolName,
-                input.instanceToken,
+                { instanceToken: input.instanceToken, readId: input.readId },
                 { confirmed: input.confirmed, signal }
               )
             )
@@ -1370,7 +1370,7 @@ export const router = (authToken?: string) => {
                 input.workspaceId,
                 input.serverName,
                 input.toolName,
-                input.instanceToken,
+                { instanceToken: input.instanceToken, readId: input.readId },
                 { confirmed: input.confirmed, signal }
               )
             )
@@ -2282,6 +2282,12 @@ export const router = (authToken?: string) => {
         .output(schemas.workspace.setUnrelatedWorkspaceConsent.output)
         .handler(({ context, input }) =>
           context.workspaceService.setUnrelatedWorkspaceConsent(input.workspaceId, input.enabled)
+        ),
+      setMessagingTag: t
+        .input(schemas.workspace.setMessagingTag.input)
+        .output(schemas.workspace.setMessagingTag.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.setMessagingTag(input.workspaceId, input.tag)
         ),
       setAgentMessageDispatchMode: t
         .input(schemas.workspace.setAgentMessageDispatchMode.input)

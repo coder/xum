@@ -554,12 +554,13 @@ function parseSkillWorkflowScriptPath(scriptPath: string): {
 }
 
 function normalizeRelativeWorkflowPath(filePath: string, scheme: "skill" | "plugin"): string {
-  if (isAbsolutePathAny(filePath) || filePath.startsWith("~")) {
-    throw new Error(`Invalid ${scheme} workflow path (must be relative): ${filePath}`);
-  }
-
   const normalized = path.posix.normalize(filePath.replaceAll("\\", "/"));
   const stripped = normalized.startsWith("./") ? normalized.slice(2) : normalized;
+  // On the normalized path, so `./~run.js` is refused like `~run.js`: the workflow lister
+  // (workflowFiles.ts isResolvableWorkflowName) drops such names, and the two must agree (#6777).
+  if (isAbsolutePathAny(filePath) || stripped.startsWith("~")) {
+    throw new Error(`Invalid ${scheme} workflow path (must be relative): ${filePath}`);
+  }
   if (stripped === "" || stripped === "." || stripped.endsWith("/")) {
     throw new Error(`${scheme}:// workflow script paths must include a relative .js file path`);
   }

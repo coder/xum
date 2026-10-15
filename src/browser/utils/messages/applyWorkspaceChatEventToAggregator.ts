@@ -120,9 +120,9 @@ function dispatchMuxGatewaySessionExpired(): void {
  * - "ignored": event does not affect the aggregator
  */
 /**
- * A hook's systemMessage can be up to 16 KiB, but the chat-input toast has no height limit or
- * scrolling and an error toast stays until dismissed: a long one covers the chat and pushes its
- * dismiss control off screen. Show only the start of it.
+ * A hook's systemMessage can be up to 16 KiB, and an error toast stays until dismissed: show only
+ * the start of it. ChatInputToast also caps the message's height, since 500 wide glyphs still wrap
+ * to many lines on a phone.
  */
 const PLUGIN_HOOK_NOTICE_MAX_CHARS = 500;
 

@@ -414,62 +414,143 @@ function quoteForWarning(value: unknown): string {
  * - A list of names (only letters, digits, `_` and `|`, e.g. `Bash|Edit`) matches one of the
  *   names exactly, not as a substring.
  * - A leading inline-flag group of `i`, `m` and `s` (e.g. `(?i)`, `(?is)`) becomes RegExp flags.
- * Rust-only syntax is not translated. JavaScript rejects some of it: inline flags after the start
- * or negated (`(?-i)`), the `x`, `U`, `u` and `R` flags, and `(?P<name>...)`. It would accept the
- * rest and read it differently, so a guard would silently miss the tools it targets; Xum refuses
- * that syntax instead (see rustOnlySyntax). Either way the group is dropped with a warning.
+ * - `(?P<name>...)` becomes `(?<name>...)`, and the `\A`/`\z` text anchors become lookarounds that
+ *   ignore the m flag, as Rust's do (Codex PRRT_kwDOPxxmWM6rN8BF).
+ * Other Rust-only syntax is not translated. JavaScript rejects some of it: inline flags after the
+ * start or negated (`(?-i)`), and the `x`, `U`, `u` and `R` flags. It would accept the rest and
+ * read it differently, so a guard would silently miss the tools it targets; Xum refuses that
+ * syntax instead (see translateRustSyntax). Either way the group is dropped with a warning.
  * Callers handle match-all ("*", "" or no matcher) first. Throws a SyntaxError for a pattern
  * Xum cannot compile.
  */
 export function compileHookMatcher(pattern: string): RegExp {
   if (/^[A-Za-z0-9_|]+$/.test(pattern)) return new RegExp(`^(?:${pattern})$`);
-  const rustOnly = rustOnlySyntax(pattern);
-  if (rustOnly !== undefined) {
-    throw new SyntaxError(`${rustOnly} means something else in JavaScript`);
+  const translated = translateRustSyntax(pattern);
+  if (translated.refused !== undefined) {
+    throw new SyntaxError(`${translated.refused} means something else in JavaScript`);
   }
-  const flags = /^\(\?([ims]+)\)/.exec(pattern);
-  if (flags === null) return new RegExp(pattern);
-  return new RegExp(pattern.slice(flags[0].length), [...new Set(flags[1])].join(""));
+  const source = translated.source;
+  const flags = /^\(\?([ims]+)\)/.exec(source);
+  if (flags === null) return new RegExp(source);
+  return new RegExp(source.slice(flags[0].length), [...new Set(flags[1])].join(""));
 }
 
+/** Rust escapes outside a class with a JavaScript equivalent (the anchors ignore the m flag). */
+const TRANSLATED_ESCAPES: Readonly<Record<string, string>> = {
+  // Wrapped in a group: Rust lets an anchor take a quantifier (`\A+`), JavaScript a lookaround not.
+  "\\A": "(?:(?<![\\s\\S]))",
+  "\\z": "(?:(?![\\s\\S]))",
+};
+
 /**
- * The first construct that Rust `regex` and a JavaScript RegExp (without the `u` flag) both
- * accept but read differently, or undefined:
+ * The pattern with the translatable Rust syntax rewritten (see compileHookMatcher), or the first
+ * construct that Rust `regex` and a JavaScript RegExp (without the `u` flag) both accept but read
+ * differently:
  * - an escaped letter or `<`/`>` that JavaScript reads as a literal: `\A` and `\z` anchors,
  *   `\pL` and `\p{...}` classes, `\x{...}`, `\u{...}`, `\U...`, `\b{start}`, `\<`, `\>`;
  * - inside a class, `[` (a nested or POSIX class such as `[[:alpha:]]`), the set operators
  *   `&&`, `--` and `~~`, and a leading `]` (a literal in Rust, an empty class in JavaScript).
  */
-function rustOnlySyntax(pattern: string): string | undefined {
+function translateRustSyntax(pattern: string): { source: string; refused?: string } {
   let inClass = false;
-  for (let i = 0; i < pattern.length; i++) {
-    const char = pattern[i];
-    if (char === "\\") {
-      const escape = readEscape(pattern, i);
-      if (!isSameEscape(escape)) return `'${escape}'`;
-      if (/^\\[bB]$/.test(escape) && pattern[i + 2] === "{") return `'${escape}{...}'`;
-      i += escape.length - 1;
-      continue;
-    }
-    if (!inClass) {
-      if (char !== "[") continue;
-      inClass = true;
-      if (pattern[i + 1] === "^") i++;
-      if (pattern[i + 1] === "]") return "'[]...]'";
-      continue;
-    }
-    const pair = pattern.slice(i, i + 2);
-    if (char === "[" || pair === "&&" || pair === "--" || pair === "~~") {
-      return `'${char === "[" ? char : pair}' in a character class`;
-    }
-    if (char === "]") inClass = false;
+  let source = "";
+  const names = new Set<string>();
+  for (let i = 0; i < pattern.length; ) {
+    const step: SyntaxStep =
+      pattern[i] === "\\"
+        ? escapeStep(pattern, i, inClass)
+        : inClass
+          ? classStep(pattern, i)
+          : textStep(pattern, i);
+    const refused = step.refused ?? claimGroupName(names, step.groupName);
+    if (refused !== undefined) return { source, refused };
+    source += step.text;
+    i += step.length;
+    inClass = step.inClass ?? inClass;
   }
+  return { source };
+}
+
+/** One step of translateRustSyntax: the text it emits, the characters it read, a class change. */
+interface SyntaxStep {
+  text: string;
+  length: number;
+  inClass?: boolean;
+  refused?: string;
+  /** The name of a named group this step opens. */
+  groupName?: string;
+}
+
+/** Rust rejects a group name used twice, also across alternatives (JavaScript accepts that). */
+function claimGroupName(names: Set<string>, name: string | undefined): string | undefined {
+  if (name === undefined) return undefined;
+  if (names.has(name)) return "a group name used twice";
+  names.add(name);
   return undefined;
+}
+
+function escapeStep(pattern: string, index: number, inClass: boolean): SyntaxStep {
+  const escape = readEscape(pattern, index);
+  const translated = inClass ? undefined : TRANSLATED_ESCAPES[escape];
+  if (translated === undefined && !isSameEscape(escape)) {
+    return { text: "", length: 0, refused: `'${escape}'` };
+  }
+  if (/^\\[bB]$/.test(escape) && pattern[index + 2] === "{") {
+    return { text: "", length: 0, refused: `'${escape}{...}'` };
+  }
+  return { text: translated ?? escape, length: escape.length };
+}
+
+/**
+ * Outside a class: `(?P<name>` becomes `(?<name>` (both dialects read `(?<name>`), and `[` opens a
+ * class (with its `^`). Only a name both dialects accept passes: a letter or `_`, then letters,
+ * decimal digits or `_` (Rust rejects `$`, JavaScript rejects `.`, `[` and `]`).
+ */
+function textStep(pattern: string, index: number): SyntaxStep {
+  if (pattern.startsWith("(?", index)) {
+    // Sticky and bounded, so a file of unclosed openers is read once, not once per opener (Codex
+    // PRRT_kwDOPxxmWM6s4vbk). A longer name is refused.
+    GROUP_OPENER.lastIndex = index;
+    const group = GROUP_OPENER.exec(pattern);
+    if (group !== null) return groupStep(group[1] === "P", group[2]);
+    if (/^\(\?P?<(?![=!])/.test(pattern.slice(index, index + 4))) {
+      return { text: "", length: 0, refused: "this '(?P<name>' group name" };
+    }
+  }
+  if (pattern[index] !== "[") return { text: pattern[index], length: 1 };
+  const open = pattern[index + 1] === "^" ? "[^" : "[";
+  if (pattern[index + open.length] === "]") return { text: "", length: 0, refused: "'[]...]'" };
+  return { text: open, length: open.length, inClass: true };
+}
+
+const GROUP_OPENER = /\(\?(P?)<(?![=!])([^>]{0,128})>/y;
+
+/**
+ * Rust's capture-name rule (a letter or `_`, then letters, numbers, `_`, `.`, `[` or `]`, with
+ * Unicode's Alphabetic and Numeric properties; Codex PRRT_kwDOPxxmWM6s4vbi). JavaScript then
+ * enforces its side when it compiles the pattern: it rejects `.`, `[` and `]`.
+ */
+function groupStep(rustOnlyForm: boolean, name: string): SyntaxStep {
+  if (!/^[\p{Alphabetic}_][\p{Alphabetic}\p{N}_.[\]]*$/u.test(name)) {
+    return { text: "", length: 0, refused: "this '(?P<name>' group name" };
+  }
+  return { text: "(?<", length: rustOnlyForm ? 4 : 3, groupName: name };
+}
+
+/** Inside a class: nested classes and set operators are refused, `]` closes it. */
+function classStep(pattern: string, index: number): SyntaxStep {
+  const char = pattern[index];
+  const pair = pattern.slice(index, index + 2);
+  if (char === "[" || pair === "&&" || pair === "--" || pair === "~~") {
+    return { text: "", length: 0, refused: `'${char === "[" ? char : pair}' in a character class` };
+  }
+  return { text: char, length: 1, ...(char === "]" ? { inClass: false } : {}) };
 }
 
 /** The escape at `index`: `\` and one character, plus the hex digits of `\xhh` and `\uhhhh`. */
 function readEscape(pattern: string, index: number): string {
-  const hex = /^\\(?:x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4})/.exec(pattern.slice(index));
+  // A bounded slice: an escape is at most 6 characters, and each escape is read once.
+  const hex = /^\\(?:x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4})/.exec(pattern.slice(index, index + 6));
   return hex?.[0] ?? pattern.slice(index, index + 2);
 }
 

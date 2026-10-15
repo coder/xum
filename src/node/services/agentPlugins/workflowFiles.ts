@@ -15,10 +15,21 @@ export async function listPluginWorkflowFiles(workflowsDir: string | undefined):
     return entries
       .filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && entry.name.endsWith(".js"))
       .map((entry) => entry.name)
+      .filter(isResolvableWorkflowName)
       .sort((a, b) => a.localeCompare(b));
   } catch {
     return [];
   }
+}
+
+/**
+ * Whether `plugin://<plugin>/<name>` resolves to this top-level file (#6777). The resolver's
+ * normalizeRelativeWorkflowPath refuses a name that starts with `~` and reads `\` as a path
+ * separator, so the script would be nested and refused. Listing such a name would add a review
+ * row for a script that never runs.
+ */
+function isResolvableWorkflowName(name: string): boolean {
+  return !name.startsWith("~") && !name.includes("\\");
 }
 
 /** The entry a `skill://<skill>` workflow runs (workflowScriptDiscovery's launcher entry). */

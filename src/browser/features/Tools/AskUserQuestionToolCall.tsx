@@ -4,6 +4,7 @@ import { AlertTriangle, Check } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import { useLiveAPI } from "@/browser/contexts/API";
+import { useNonBlockingQuestionAnswers } from "@/browser/features/Tools/AskUserQuestion/useNonBlockingQuestionAnswers";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
@@ -34,6 +35,11 @@ import type {
   ToolErrorResult,
 } from "@/common/types/tools";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
+import {
+  ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE,
+  type AskUserQuestionSelection,
+  isAsyncAskUserQuestionOutput,
+} from "@/common/utils/tools/askUserQuestionSummary";
 import { getErrorMessage } from "@/common/utils/errors";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 
@@ -136,6 +142,29 @@ function parsePrefilledAnswer(question: AskUserQuestionQuestion, answer: string)
   return { selected, otherText: otherParts.join(", ") };
 }
 
+/**
+ * The card's picks as 1-based option numbers plus the user's own text. A non-blocking answer is
+ * built from these, never from the flattened answer string, where a label plus Other text can
+ * read like another label.
+ */
+function buildAnswerSelections(
+  questions: readonly AskUserQuestionQuestion[],
+  draftAnswers: Record<string, DraftAnswer>
+): AskUserQuestionSelection[] {
+  return questions.map((q) => {
+    const draft = draftAnswers[q.question];
+    if (!draft || !isQuestionAnswered(q, draft)) {
+      return { optionNumbers: [], otherText: "" };
+    }
+    return {
+      optionNumbers: draft.selected
+        .map((label) => q.options.findIndex((option) => option.label === label) + 1)
+        .filter((optionNumber) => optionNumber > 0),
+      otherText: draft.selected.includes(OTHER_VALUE) ? draft.otherText : "",
+    };
+  });
+}
+
 function isQuestionAnswered(_question: AskUserQuestionQuestion, draft: DraftAnswer): boolean {
   if (draft.selected.length === 0) {
     return false;
@@ -216,6 +245,63 @@ function AutoResizeTextarea(props: {
   );
 }
 
+/**
+ * A finished question: the submitted answers, one row per question with the picked options'
+ * descriptions, or a note when a non-blocking question left the agent's context unanswered.
+ */
+function AnsweredQuestions(props: {
+  result: { questions: AskUserQuestionQuestion[]; answers: Record<string, string> } | null;
+  closedUnanswered: boolean;
+}): JSX.Element | null {
+  const result = props.result;
+  if (result == null) {
+    return props.closedUnanswered ? (
+      <div className="text-muted text-[11px] italic">
+        Not answered. {ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE}
+      </div>
+    ) : null;
+  }
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="text-secondary text-[10px] tracking-wide uppercase">User answered</div>
+      {Object.entries(result.answers).map(([question, answer]) => {
+        const questionDef = result.questions.find((q) => q.question === question);
+        // Parse answer labels (could be comma-separated for multi-select)
+        const answerLabels = answer.split(",").map((s) => s.trim());
+        const descriptions = questionDef ? getDescriptionsForLabels(questionDef, answerLabels) : [];
+        const header = questionDef?.header ?? question;
+
+        return (
+          <div
+            key={question}
+            className="bg-code-bg flex flex-col gap-0.5 rounded border border-white/5 px-2.5 py-1.5"
+          >
+            <div className="text-secondary text-[10px] tracking-wide uppercase">{header}</div>
+            <div className="text-foreground text-sm leading-snug">{answer}</div>
+            {descriptions.length > 0 && (
+              <div className="text-muted-foreground text-[11px] italic">
+                {descriptions.join("; ")}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Copy that differs between blocking (Plan) and non-blocking (Exec) questions. */
+const ANSWERING_HINTS = {
+  blocking: {
+    header: "Answer below, or type a message in chat to cancel.",
+    footer: "Tip: type a message in chat to cancel these questions.",
+  },
+  nonBlocking: {
+    header: "The agent keeps working; your answers reach it after its current step.",
+    footer: "Your answers are sent to the agent as a message.",
+  },
+} as const;
+
 export function AskUserQuestionToolCall(props: {
   args: AskUserQuestionToolArgs;
   result: AskUserQuestionToolResult | null;
@@ -223,14 +309,6 @@ export function AskUserQuestionToolCall(props: {
   toolCallId: string;
   workspaceId?: string;
 }): JSX.Element {
-  // A live, blocking question must never be hidden behind a collapsed "tools"
-  // preference, so force it open while executing. forceExpanded only overrides the
-  // initial seed; once answered the row follows the sticky preference like any tool.
-  const { expanded, toggleExpanded } = useToolExpansion(false, {
-    forceExpanded: props.status === "executing",
-  });
-  const statusDisplay = getStatusDisplay(props.status);
-
   const argsAnswers = props.args.answers ?? {};
 
   // Restore from cache if available (survives workspace switches)
@@ -239,7 +317,6 @@ export function AskUserQuestionToolCall(props: {
   const [activeIndex, setActiveIndex] = useState(() => cachedState?.activeIndex ?? 0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
-
   const workspaceStore = useWorkspaceStoreRaw();
   const workspaceState = useSyncExternalStore(
     (listener) => {
@@ -263,6 +340,29 @@ export function AskUserQuestionToolCall(props: {
       }
     }
   );
+
+  // Codex-style questions (non-plan agents) returned without waiting: the tool is complete, but
+  // the questions stay answerable until they are answered from this card or an answer message
+  // for this tool call is in history.
+  const isAsyncQuestion = isAsyncAskUserQuestionOutput(props.result);
+  const nonBlocking = useNonBlockingQuestionAnswers({
+    enabled: isAsyncQuestion,
+    workspaceId: props.workspaceId,
+    toolCallId: props.toolCallId,
+    questions: props.args.questions,
+    transcript: workspaceState?.messages,
+  });
+  const isAnswering = props.status === "executing" || nonBlocking.isOpen;
+  const answeringHints = isAsyncQuestion ? ANSWERING_HINTS.nonBlocking : ANSWERING_HINTS.blocking;
+
+  // A question awaiting answers must never be hidden behind a collapsed "tools"
+  // preference, so force it open while answerable. forceExpanded only overrides the
+  // initial seed; once answered the row follows the sticky preference like any tool.
+  const { expanded, toggleExpanded } = useToolExpansion(false, {
+    forceExpanded: isAnswering,
+  });
+  const statusDisplay = getStatusDisplay(props.status);
+
   const autoRetryRollbackWorkspaceIdRef = useRef<string | null>(null);
   const autoRetryRollbackPendingRef = useRef(false);
   const autoRetryRollbackArmedRef = useRef(false);
@@ -392,13 +492,13 @@ export function AskUserQuestionToolCall(props: {
 
   // Sync draft state to cache so it survives workspace switches
   useEffect(() => {
-    if (props.status === "executing") {
+    if (isAnswering) {
       draftStateCache.set(props.toolCallId, { draftAnswers, activeIndex });
     } else {
-      // Clean up cache when tool completes
+      // Clean up cache once the questions are answered (or the tool failed)
       draftStateCache.delete(props.toolCallId);
     }
-  }, [props.toolCallId, props.status, draftAnswers, activeIndex]);
+  }, [props.toolCallId, isAnswering, draftAnswers, activeIndex]);
 
   const resultUnwrapped = useMemo(() => {
     if (!props.result) {
@@ -410,9 +510,11 @@ export function AskUserQuestionToolCall(props: {
 
   const uiOnlyPayload = getToolOutputUiOnly(resultUnwrapped)?.ask_user_question;
 
-  const successResult =
+  const toolResultPayload =
     uiOnlyPayload ??
     (resultUnwrapped && isAskUserQuestionPayload(resultUnwrapped) ? resultUnwrapped : null);
+  // A non-blocking question's tool result carries no answers; they come from the answer message.
+  const successResult = isAsyncQuestion ? nonBlocking.answered : toolResultPayload;
 
   const errorResult =
     resultUnwrapped && isToolErrorResult(resultUnwrapped) ? resultUnwrapped : null;
@@ -431,10 +533,10 @@ export function AskUserQuestionToolCall(props: {
 
   // Focus submit button when reaching summary so Enter submits
   useEffect(() => {
-    if (props.status === "executing" && isOnSummary) {
+    if (isAnswering && isOnSummary) {
       submitButtonRef.current?.focus();
     }
-  }, [isOnSummary, props.status]);
+  }, [isOnSummary, isAnswering]);
 
   const currentQuestion = isOnSummary
     ? null
@@ -474,6 +576,18 @@ export function AskUserQuestionToolCall(props: {
       const errorMessage = getErrorMessage(error);
       setSubmitError(errorMessage);
       setIsSubmitting(false);
+      return;
+    }
+
+    if (isAsyncQuestion) {
+      nonBlocking
+        .send(buildAnswerSelections(props.args.questions, draftAnswers), answers)
+        .finally(() => {
+          setIsSubmitting(false);
+        })
+        .then(setSubmitError, (error: unknown) => {
+          setSubmitError(getErrorMessage(error));
+        });
       return;
     }
 
@@ -577,10 +691,8 @@ export function AskUserQuestionToolCall(props: {
         <ToolIcon toolName="ask_user_question" />
         <div className="flex min-w-0 flex-1 flex-col">
           <ToolName>{title}</ToolName>
-          {props.status === "executing" && (
-            <div className="text-secondary text-[10px] leading-tight">
-              Answer below, or type a message in chat to cancel.
-            </div>
+          {isAnswering && (
+            <div className="text-secondary text-[10px] leading-tight">{answeringHints.header}</div>
           )}
         </div>
         <StatusIndicator status={props.status}>{statusDisplay}</StatusIndicator>
@@ -589,7 +701,7 @@ export function AskUserQuestionToolCall(props: {
       {expanded && (
         <ToolDetails>
           <div className="flex flex-col gap-3">
-            {props.status === "executing" && (
+            {isAnswering && (
               <div className="flex flex-col gap-3">
                 <div className="flex flex-wrap items-center gap-1.5">
                   {props.args.questions.map((q, idx) => {
@@ -848,52 +960,21 @@ export function AskUserQuestionToolCall(props: {
               </div>
             )}
 
-            {props.status !== "executing" && (
+            {!isAnswering && (
               <div className="flex flex-col gap-2">
-                {successResult && (
-                  <div className="flex flex-col gap-1.5">
-                    <div className="text-secondary text-[10px] tracking-wide uppercase">
-                      User answered
-                    </div>
-                    {Object.entries(successResult.answers).map(([question, answer]) => {
-                      const questionDef = successResult.questions.find(
-                        (q) => q.question === question
-                      );
-                      // Parse answer labels (could be comma-separated for multi-select)
-                      const answerLabels = answer.split(",").map((s) => s.trim());
-                      const descriptions = questionDef
-                        ? getDescriptionsForLabels(questionDef, answerLabels)
-                        : [];
-                      const header = questionDef?.header ?? question;
-
-                      return (
-                        <div
-                          key={question}
-                          className="bg-code-bg flex flex-col gap-0.5 rounded border border-white/5 px-2.5 py-1.5"
-                        >
-                          <div className="text-secondary text-[10px] tracking-wide uppercase">
-                            {header}
-                          </div>
-                          <div className="text-foreground text-sm leading-snug">{answer}</div>
-                          {descriptions.length > 0 && (
-                            <div className="text-muted-foreground text-[11px] italic">
-                              {descriptions.join("; ")}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
+                <AnsweredQuestions
+                  result={successResult}
+                  closedUnanswered={nonBlocking.closedUnanswered}
+                />
 
                 {errorResult && <ErrorBox>{errorResult.error}</ErrorBox>}
               </div>
             )}
 
-            {props.status === "executing" && (
+            {isAnswering && (
               <div className="flex items-center justify-between gap-3 border-t border-white/5 pt-2">
                 <div className="text-muted min-w-0 flex-1 text-[10px] italic">
-                  Tip: type a message in chat to cancel these questions.
+                  {answeringHints.footer}
                 </div>
                 {isOnSummary ? (
                   <Button

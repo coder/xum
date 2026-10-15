@@ -586,6 +586,7 @@ const AddPluginPanel: React.FC<{
       const result = await api.agentPlugins.install({
         source: preview.source,
         expectedSha: preview.lockedSha,
+        expectedConsentDigest: preview.consentDigest,
         importedComponents: selected,
       });
       if (result.success) {

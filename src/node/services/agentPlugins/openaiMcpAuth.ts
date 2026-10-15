@@ -301,7 +301,10 @@ export function isReservedPluginEnvName(name: string): boolean {
  * env_vars names that change how the server process loads code. A plugin already runs code
  * of its choice, so they are not refused, but the review names them (defense in depth, #6646).
  */
-const LOADER_ENV_NAME = /^(?:LD_PRELOAD|LD_LIBRARY_PATH|DYLD_.*|NODE_OPTIONS)$/;
+// BASH_ENV names a file that bash runs first: stdio servers start through `bash -c` (#6713).
+// ENV is not listed: only interactive shells read it, and `bash -c` is not interactive.
+const LOADER_ENV_NAME =
+  /^(?:LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|DYLD_.*|NODE_OPTIONS|NODE_PATH|PYTHONPATH|BASH_ENV)$/;
 
 /** A Codex `env_vars` item (codex-rs config mcp_types.rs `McpServerEnvVar`): its name, if valid. */
 function codexEnvVarName(item: unknown): string | undefined {

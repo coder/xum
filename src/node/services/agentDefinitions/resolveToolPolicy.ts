@@ -62,9 +62,9 @@ function matchesSubagentHardDeniedTool(pattern: string): boolean {
  * 2. Runtime restrictions (subagent limits, depth limits) applied last
  *
  * Example: ask (base: exec)
- * - exec has add: [.*], remove: [propose_plan, ask_user_question]
+ * - exec has add: [.*], remove: [propose_plan]
  * - ask has remove: [file_edit_.*]
- * - Result: deny-all → enable .* → disable propose_plan → disable ask_user_question → disable file_edit_.*
+ * - Result: deny-all → enable .* → disable propose_plan → disable file_edit_.*
  *
  * Subagent completion tool is mode-dependent:
  * - plan-like subagents: enable `propose_plan`, disable `agent_report`

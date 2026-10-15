@@ -20,7 +20,7 @@ import { StreamErrorMessage } from "./StreamErrorMessage";
 import { CompactionBoundaryMessage } from "./CompactionBoundaryMessage";
 import { HistoryHiddenMessage } from "./HistoryHiddenMessage";
 import { InitMessage } from "./InitMessage";
-import { ProposePlanToolCall } from "../Tools/ProposePlanToolCall";
+import { LazyProposePlanToolCall } from "../Tools/Shared/ToolCardsLoad";
 import { removeEphemeralMessage, useStreamingMessageDelta } from "@/browser/stores/WorkspaceStore";
 import { TranscriptMessageBoundary, TranscriptQuoteRoot } from "./TranscriptQuoteBoundary";
 
@@ -210,7 +210,7 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
         break;
       case "plan-display":
         renderedMessage = (
-          <ProposePlanToolCall
+          <LazyProposePlanToolCall
             args={{}}
             isEphemeralPreview={true}
             content={message.content}
