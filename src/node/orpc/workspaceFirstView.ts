@@ -204,22 +204,25 @@ export function workspaceViewEarlyScript(mode: "fetch" | "embed"): string {
     }
     return frag;
   };
+  // formatTimestamp (src/browser/utils/ui/dateTime.ts): "8:13 PM" today, else "Oct 23, 8:13 PM", en-US.
+  // Written out by hand: the first Intl formatter costs tens of ms at 4x CPU (ICU setup).
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const stamp = (ts) => {
     if (ts == null) return "";
-    const d = new Date(ts), now = new Date();
-    const today = d.toDateString() === now.toDateString();
-    return d.toLocaleTimeString("en-US", today
-      ? { hour: "numeric", minute: "2-digit", hour12: true }
-      : { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+    const d = new Date(ts), h = d.getHours();
+    const time = ((h % 12) || 12) + ":" + String(d.getMinutes()).padStart(2, "0") + " " + (h < 12 ? "AM" : "PM");
+    return d.toDateString() === new Date().toDateString() ? time : MONTHS[d.getMonth()] + " " + d.getDate() + ", " + time;
   };
   const draw = (data) => {
     performance.mark("xum-pre-ws:start");
     const rows = () => {
+      performance.mark("xum-pre-ws:rows");
       const f = document.createDocumentFragment();
       for (const r of data.rows) f.append(build(r.role === "user" ? T.user : T.assistant, false, {
         md: () => markdown(r.text),
         ts: () => document.createTextNode(stamp(r.ts)),
       }));
+      performance.measure("xum-pre-ws:rows", "xum-pre-ws:rows");
       return f;
     };
     const root = el("div", { id: ${JSON.stringify(WORKSPACE_VIEW_ID)}, inert: "", style: "position:fixed;inset:0;z-index:1500;overflow:hidden" });
@@ -230,10 +233,16 @@ export function workspaceViewEarlyScript(mode: "fetch" | "embed"): string {
     }));
     performance.mark("xum-pre-ws:built");
     document.body.appendChild(root);
-    const scroller = root.querySelector('[class*="@container/transcript"]');
-    if (scroller) scroller.scrollTop = scroller.scrollHeight; // the live app opens at the bottom
     performance.measure("xum-pre-ws:build", "xum-pre-ws:start", "xum-pre-ws:built");
     performance.measure("xum-pre-ws:render", "xum-pre-ws:start");
+  };
+  // The live app opens at the bottom. In the first frame, not in the build task: the layout this
+  // read forces is the one the frame needs anyway, and the build task stays short.
+  const scrollToBottom = () => {
+    performance.mark("xum-pre-ws:layout");
+    const scroller = view()?.querySelector('[class*="@container/transcript"]');
+    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+    performance.measure("xum-pre-ws:layout", "xum-pre-ws:layout");
   };
   const handoff = (lastId) => {
     const done = () => {
@@ -254,7 +263,7 @@ export function workspaceViewEarlyScript(mode: "fetch" | "embed"): string {
       if (loaded) return;
       try { draw(data); } catch (error) { view()?.remove(); console.error("workspace view:", error); return loadApp(); }
       handoff(data.rows[data.rows.length - 1].id);
-      requestAnimationFrame(() => requestAnimationFrame(loadApp));
+      requestAnimationFrame(() => { scrollToBottom(); requestAnimationFrame(loadApp); });
     };
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", go);
     else go();
