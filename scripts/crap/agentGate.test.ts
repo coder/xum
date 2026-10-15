@@ -314,7 +314,7 @@ test("the project tool_post runs the user's tool_post once, last, and passes its
     { script: "git commit -am x" }
   );
   expect(reported.status).toBe(3);
-  expect(reported.out).toContain("VIOLATION floor-cc     src/route.ts:1-5 route: CC 2 -> 5");
+  expect(reported.out).toContain("VIOLATION floor-cc     src/route.ts:1-12 route: CC 9 -> 12");
   expect(reported.out).toEndWith("user tool_post [] [] [git commit -am x]\n");
 }, 60_000);
 
