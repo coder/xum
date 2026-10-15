@@ -12,6 +12,12 @@ import { createOmittedToolAttachmentText } from "./toolResultAttachments";
 import { extractToolMediaAsUserMessages } from "./extractToolMediaAsUserMessages";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "./extractToolMediaAsUserMessagesFromModelMessages";
 
+/** A real PNG: the extraction replaces unreadable image bytes with a note. */
+async function pngBase64(width: number): Promise<string> {
+  const image = sharp({ create: { width, height: 10, channels: 3, background: "red" } });
+  return (await image.png().toBuffer()).toString("base64");
+}
+
 describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
   it("rewrites attach_file image output for prepareStep messages", async () => {
     const base64 = (
@@ -547,6 +553,9 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
   // extraction leaves in place. They still count toward the request-wide cap, oldest evicted
   // first, or a screenshot loop could replay more images than the provider accepts.
   it("evicts the oldest MCP images kept inside tool results at the cap", async () => {
+    const total = MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST + 2;
+    // Distinct widths keep every image's bytes distinct.
+    const pngs = await Promise.all(Array.from({ length: total }, (_, i) => pngBase64(i + 1)));
     const mcpCall = (index: number): ModelMessage[] => [
       {
         role: "assistant",
@@ -566,7 +575,7 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
                 {
                   type: "file",
                   mediaType: "image/png",
-                  data: { type: "data", data: `png-${index}` },
+                  data: { type: "data", data: pngs[index] },
                 },
               ],
             },
@@ -574,7 +583,6 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
         ],
       },
     ];
-    const total = MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST + 2;
     const messages = Array.from({ length: total }, (_, i) => mcpCall(i)).flat();
 
     const result = await extractToolMediaAsUserMessagesFromModelMessages(messages);
@@ -587,12 +595,54 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
     );
     // The two oldest images are gone, with the cap note in their place.
     for (const index of [0, 1]) {
-      expect(values[index]).not.toContain(`png-${index}`);
+      expect(values[index]).not.toContain(pngs[index]);
       expect(values[index]).toContain(createOmittedToolAttachmentText(1));
       expect(values[index]).toContain(`shot ${index}`);
     }
-    expect(values[2]).toContain("png-2");
+    expect(values[2]).toContain(pngs[2]);
     // A request at the cap is a fixed point, so every later step keeps the same prefix.
+    expect(await extractToolMediaAsUserMessagesFromModelMessages(result)).toEqual(result);
+  });
+
+  // MCP images skip extraction, so the request must still resize oversized ones and replace
+  // unreadable ones, or a persisted bad screenshot fails every later request.
+  it("self-heals MCP images kept inside tool results", async () => {
+    const valid = await pngBase64(10);
+    const oversized = await pngBase64(9001);
+    const mcpImage = (data: string) => ({
+      type: "file",
+      mediaType: "image/png",
+      data: { type: "data", data },
+    });
+    const messages: ModelMessage[] = [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-mcp",
+            toolName: "mcp__shots__take",
+            output: {
+              type: "content",
+              value: [mcpImage(valid), mcpImage(oversized), mcpImage("bm90LWEtcG5n")],
+            },
+          } as unknown as ToolResultPart,
+        ],
+      },
+    ];
+
+    const result = await extractToolMediaAsUserMessagesFromModelMessages(messages);
+
+    const part = (result[0] as Extract<ModelMessage, { role: "tool" }>).content[0];
+    if (part.type !== "tool-result") throw new Error("Expected tool-result part");
+    const [kept, resized, unreadable] = expectContentOutputValue(part.output);
+    // A valid image keeps its bytes, so the in-turn step and the rebuild send the same prefix.
+    expect(kept).toEqual(mcpImage(valid));
+    const resizedData = (resized as { data: { data: string } }).data.data;
+    const metadata = await sharp(Buffer.from(resizedData, "base64")).metadata();
+    expect(metadata.width).toBe(MAX_IMAGE_DIMENSION);
+    expect(unreadable).toMatchObject({ type: "text" });
+    expect((unreadable as { text: string }).text).toContain("Image attachment omitted");
     expect(await extractToolMediaAsUserMessagesFromModelMessages(result)).toEqual(result);
   });
 
@@ -619,8 +669,9 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
     const older = Array.from({ length: MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST }, (_, i) =>
       attach(i)
     ).flat();
+    const latestPng = await pngBase64(10);
     const latestMcp = call(MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST, [
-      { type: "file", mediaType: "image/png", data: { type: "data", data: "latest-mcp" } },
+      { type: "file", mediaType: "image/png", data: { type: "data", data: latestPng } },
     ]);
 
     const serialized = JSON.stringify(
@@ -628,7 +679,7 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
     );
 
     // The newest image (the MCP screenshot) stays; the oldest extraction is omitted instead.
-    expect(serialized).toContain("latest-mcp");
+    expect(serialized).toContain(latestPng);
     expect(serialized).not.toContain("JVBERi0AAA");
     expect(serialized).toContain("JVBERi1AAA");
   });

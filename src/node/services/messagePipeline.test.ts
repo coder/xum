@@ -1141,6 +1141,9 @@ describe("prepareMessagesForProvider: MCP tool results", () => {
   // Persisted output is unvalidated: one malformed MCP result must not fail every later send.
   // A persisted MCP result with audio or SVG must not fail every later request: the replay
   // replaces media no provider accepts, as the extraction it used to go through did.
+  const ONE_PIXEL_PNG =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
   it("replaces MCP media that no provider accepts on replay", async () => {
     const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString("base64");
     const outputs = await replayedOutputs([
@@ -1152,7 +1155,8 @@ describe("prepareMessagesForProvider: MCP tool results", () => {
           value: [
             { type: "media", data: "UklGRgAAAABXQVZF", mediaType: "audio/wav" },
             { type: "media", data: svg, mediaType: "image/svg+xml" },
-            { type: "media", data: "iVBORw0KGgo=", mediaType: "image/png" },
+            { type: "media", data: ONE_PIXEL_PNG, mediaType: "image/png" },
+            { type: "media", data: "bm90LWEtcG5n", mediaType: "image/png" },
           ],
         },
       },
@@ -1163,7 +1167,10 @@ describe("prepareMessagesForProvider: MCP tool results", () => {
     expect(serialized).not.toContain('"mediaType":"image/svg+xml"');
     expect(serialized).toContain("<svg");
     // A supported image stays a file part, as the in-turn step sent it.
-    expect(serialized).toContain("iVBORw0KGgo=");
+    expect(serialized).toContain(ONE_PIXEL_PNG);
+    // Unreadable image bytes become a note instead of failing every later request.
+    expect(serialized).not.toContain("bm90LWEtcG5n");
+    expect(serialized).toContain("Image attachment omitted");
   });
 
   it("replays a malformed MCP result as JSON instead of failing the request", async () => {

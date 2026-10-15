@@ -1,5 +1,6 @@
 import type { FilePart, ImagePart, ModelMessage, TextPart, ToolResultPart } from "ai";
 import { MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST } from "@/common/constants/imageAttachments";
+import { isRasterAttachmentMediaType } from "@/node/utils/attachments/resizeRasterImageAttachment";
 import { sanitizeAnthropicDocumentFilename } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import {
   coalesceAttachmentPlaceholders,
@@ -47,7 +48,11 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
   const budget = Math.max(0, MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST - reservedMediaParts);
   const overBudget = Math.max(0, syntheticMediaParts.length + totalAttachments - budget);
   const { evictedSyntheticParts, omittedByPart } = planMediaCap(pools.order, overBudget);
-  if (extractionsByPart.size === 0 && evictedSyntheticParts.size === 0) return messages;
+  const nothingToRewrite =
+    extractionsByPart.size === 0 &&
+    evictedSyntheticParts.size === 0 &&
+    pools.inlineToolResultMedia === 0;
+  if (nothingToRewrite) return messages;
 
   const result: ModelMessage[] = [];
 
@@ -83,9 +88,9 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
         }
         const extracted = extractionsByPart.get(part);
         if (extracted === undefined) {
-          const evicted = evictToolResultMedia(part, evictedSyntheticParts);
-          if (evicted !== part) changedMessage = true;
-          return evicted;
+          const prepared = await prepareInlineToolResultMedia(part, evictedSyntheticParts);
+          if (prepared !== part) changedMessage = true;
+          return prepared;
         }
 
         changedMessage = true;
@@ -208,11 +213,6 @@ async function createInlineMediaOutput(
 }
 
 /**
- * Replaces evicted synthetic tool-media parts in a user message with one
- * bounded omission note (r34). Only parts identified by the pass-1 scan are
- * touched; genuine user uploads never enter the evicted set.
- */
-/**
  * Pass 1 of extractToolMediaAsUserMessagesFromModelMessages: the tool-result parts to extract
  * and the media the request already carries, split into the cap's pools.
  */
@@ -226,6 +226,7 @@ function collectToolMedia(messages: ModelMessage[]) {
     totalAttachments: 0,
     reservedMediaParts: 0,
     syntheticMediaParts: [],
+    inlineToolResultMedia: 0,
     order: [],
   };
   for (const message of messages) {
@@ -253,6 +254,8 @@ interface ToolMediaPools {
   totalAttachments: number;
   reservedMediaParts: number;
   syntheticMediaParts: unknown[];
+  /** Media items tool results carry inline without the synthetic marker (MCP images). */
+  inlineToolResultMedia: number;
   /** Evictable media and extractions in message order, oldest first (see planMediaCap). */
   order: Array<{ key: object; count: number; extraction: boolean }>;
 }
@@ -298,7 +301,9 @@ function collectToolResultMedia(part: ToolResultPart, pools: ToolMediaPools): vo
   if (extracted == null) {
     // MCP images stay inside the tool result (mcpToModelOutput), unmarked: evictable
     // like synthetic tool media, or a screenshot loop could pass the provider's limit.
-    addEvictableMedia(pools, unmarkedToolResultMedia(part.output));
+    const inlineMedia = unmarkedToolResultMedia(part.output);
+    pools.inlineToolResultMedia += inlineMedia.length;
+    addEvictableMedia(pools, inlineMedia);
     return;
   }
   pools.extractionsByPart.set(part, extracted);
@@ -318,17 +323,72 @@ function unmarkedToolResultMedia(output: ToolResultOutput): object[] {
   });
 }
 
-/** Replaces evicted inline media of one tool result with one cap note (same part if none). */
-function evictToolResultMedia(part: ToolResultPart, evicted: ReadonlySet<unknown>): ToolResultPart {
-  if (evicted.size === 0 || part.output.type !== "content") return part;
+/**
+ * Replaces evicted inline media of one tool result with one cap note and prepares the rest for
+ * the provider (same part if nothing changes). MCP images skip extraction, so this is their
+ * only self-healing: the MuxMessage-level extraction that once ran on replay resized oversized
+ * images and replaced unreadable ones. The in-turn step and the rebuild both run it, so a
+ * provider-ready image keeps the same bytes in both.
+ */
+async function prepareInlineToolResultMedia(
+  part: ToolResultPart,
+  evicted: ReadonlySet<unknown>
+): Promise<ToolResultPart> {
+  if (part.output.type !== "content") return part;
   const value = part.output.value;
-  const evictedHere = value.filter((item) => evicted.has(item)).length;
-  if (evictedHere === 0) return part;
-  const kept = value.filter((item) => !evicted.has(item));
+  const kept = await Promise.all(
+    value.filter((item) => !evicted.has(item)).map(prepareInlineRasterItem)
+  );
+  const evictedHere = value.length - kept.length;
+  if (evictedHere === 0 && kept.every((item, index) => item === value[index])) return part;
   const note = { type: "text" as const, text: createOmittedToolAttachmentText(evictedHere) };
-  return { ...part, output: { type: "content", value: [...kept, note] } };
+  return {
+    ...part,
+    output: { type: "content", value: evictedHere > 0 ? [...kept, note] : kept },
+  };
 }
 
+/**
+ * Resizes an oversized inline raster (prepareExtractedToolAttachmentForProvider) or replaces
+ * unreadable bytes with its note. Returns the same item when it is provider-ready already.
+ */
+async function prepareInlineRasterItem(item: ContentOutputItem): Promise<ContentOutputItem> {
+  const raster = inlineRaster(item);
+  if (raster == null) return item;
+  const prepared = await prepareExtractedToolAttachmentForProvider(raster);
+  if (prepared.type === "text") return { type: "text", text: prepared.text };
+  const { data, mediaType } = prepared.attachment;
+  if (data === raster.data && mediaType === raster.mediaType) return item;
+  // Same item shape (see inlineRaster), new bytes.
+  const rewritten: Record<string, unknown> = {
+    ...item,
+    mediaType,
+    data: raster.nested ? { type: "data", data } : data,
+  };
+  return rewritten as ContentOutputItem;
+}
+
+/** The base64 raster an unmarked inline media item carries, or null for anything else. */
+function inlineRaster(
+  item: ContentOutputItem
+): { data: string; mediaType: string; nested: boolean } | null {
+  if (isSyntheticToolMediaPart(item)) return null;
+  const record = item as { mediaType?: unknown; data?: unknown };
+  if (typeof record.mediaType !== "string" || !isRasterAttachmentMediaType(record.mediaType)) {
+    return null;
+  }
+  // mcpToModelOutput emits `file` parts with `{ type: "data", data }`; older shapes hold the
+  // base64 string directly.
+  const nested = (record.data as { type?: unknown } | null)?.type === "data";
+  const data = nested ? (record.data as { data?: unknown }).data : record.data;
+  return typeof data === "string" ? { data, mediaType: record.mediaType, nested } : null;
+}
+
+/**
+ * Replaces evicted synthetic tool-media parts in a user message with one
+ * bounded omission note (r34). Only parts identified by the pass-1 scan are
+ * touched; genuine user uploads never enter the evicted set.
+ */
 function evictSyntheticMediaParts(
   message: Extract<ModelMessage, { role: "user" }>,
   evictedSyntheticParts: ReadonlySet<unknown>
