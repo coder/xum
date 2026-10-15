@@ -29,6 +29,11 @@ export interface BoundedTranscriptRevealArgs<Row extends RevealRow> {
   rowWeight?: (index: number) => number;
   /** Opt-in cap on mounted rows (#4961 F20), at least one automatic budget plus a chunk. */
   maxMountedRows?: number;
+  /**
+   * Whether appends past the cap move the start up (default true). False while the reader has
+   * scrolled away from the bottom: the slice detaches instead, so the row being read stays.
+   */
+  followsTail?: boolean;
 }
 
 export interface BoundedTranscriptReveal {
@@ -99,6 +104,13 @@ interface RevealState {
    * at most `maxMountedRows` of them, so a step costs O(cap), not O(transcript) (#6676 review).
    */
   endRows: readonly string[];
+  /**
+   * The start row while it heads a tail bundle larger than the cap, scanned up to the newest row
+   * (#6678 review): the next render scans only the rows after that, not the whole bundle. An
+   * in-place change that makes a cut inside it safe is missed, so the bundle stays mounted (more
+   * rows, never hidden ones) until a row after it is a safe cut.
+   */
+  tailBundleHeadId: string | null;
 }
 
 /**
@@ -173,7 +185,9 @@ function resolveSliceEnd(
   messages: readonly RevealRow[],
   fromIndex: number,
   max: number | undefined,
-  isSafeCut: IsSafeCut
+  isSafeCut: IsSafeCut,
+  /** No safe cut lies in (fromIndex, bundleScanFrom): see `tailBundleHeadId`. */
+  bundleScanFrom: number
 ): number {
   const length = messages.length;
   if (max === undefined) return length;
@@ -182,9 +196,44 @@ function resolveSliceEnd(
     "maxMountedRows must be an integer holding an automatic reveal budget plus a chunk"
   );
   let to = storedSliceEnd(state, messages, isSafeCut);
-  const fitted = nearestSafeCutAtOrBefore(fromIndex + max, length, isSafeCut);
-  if (to - fromIndex > max) to = fitted;
+  if (to - fromIndex > max) to = cappedEnd(fromIndex, max, length, isSafeCut, bundleScanFrom);
   return to > fromIndex ? to : nearestSafeCutAtOrAfter(fromIndex + 1, length, isSafeCut);
+}
+
+/** The end of a slice over the cap; a known bundle (`tailBundleHeadId`) skips its scanned rows. */
+function cappedEnd(
+  fromIndex: number,
+  max: number,
+  length: number,
+  isSafeCut: IsSafeCut,
+  bundleScanFrom: number
+): number {
+  if (bundleScanFrom > fromIndex + 1) {
+    return nearestSafeCutAtOrAfter(bundleScanFrom, length, isSafeCut);
+  }
+  return nearestSafeCutAtOrBefore(fromIndex + max, length, isSafeCut);
+}
+
+/** The slice end, and `state` with it and with the head of an oversized tail bundle stored. */
+function endedState(
+  state: RevealState,
+  messages: readonly RevealRow[],
+  fromIndex: number,
+  max: number | undefined,
+  isSafeCut: IsSafeCut,
+  appendedFrom: number
+): { toIndex: number; state: RevealState } {
+  const length = messages.length;
+  const headId = fromIndex < length ? messages[fromIndex].id : null;
+  const knownBundle = headId !== null && headId === state.tailBundleHeadId;
+  const bundleScanFrom = knownBundle ? appendedFrom : fromIndex + 1;
+  const toIndex = resolveSliceEnd(state, messages, fromIndex, max, isSafeCut, bundleScanFrom);
+  const sliced = withSliceEnd(state, messages, toIndex);
+  // Past the cap at the tail means no safe cut after the start: one bundle, scanned to the end.
+  const overCapTail = max !== undefined && toIndex === length && length - fromIndex > max;
+  const tailBundleHeadId = overCapTail ? headId : null;
+  if (sliced.tailBundleHeadId === tailBundleHeadId) return { toIndex, state: sliced };
+  return { toIndex, state: { ...sliced, tailBundleHeadId } };
 }
 
 /** `state` with its end fields set for a slice ending at `to` (null at the tail). */
@@ -321,22 +370,56 @@ function vanishedStartFallback(
   return storedSliceEnd(state, messages, isSafeCut) - mountedBefore;
 }
 
+interface TailAppend {
+  from: number;
+  /** Index of the first row this render appended (the length when nothing was appended). */
+  appendedFrom: number;
+  max: number | undefined;
+  appended: boolean;
+  /** The caller's `followsTail`: false while the reader is scrolled away from the bottom. */
+  follows: boolean;
+}
+
+/** Whether this render's append may move the start: attached, no walk, the reader at the bottom. */
+function followsAppend(state: RevealState, tail: TailAppend): boolean {
+  return (
+    tail.appended && tail.follows && state.endMessageId === null && state.targetMessageId === null
+  );
+}
+
+/**
+ * Attached past the cap before this append means `from` heads a tail bundle larger than the cap.
+ * Rows appended into that bundle keep it: O(appended rows), not a rescan (#6678 review).
+ */
+function keepsOversizedTail(
+  messages: readonly RevealRow[],
+  tail: TailAppend,
+  isSafeCut: IsSafeCut
+) {
+  const length = messages.length;
+  return (
+    tail.max !== undefined &&
+    tail.appendedFrom - tail.from > tail.max &&
+    nearestSafeCutAtOrAfter(tail.appendedFrom, length, isSafeCut) === length
+  );
+}
+
 /**
  * Where an attached slice starts after an append (F20 PR3a-3): appends that push it over the cap
  * unmount its OLDEST rows, so a streaming reply stays mounted. Walks (a target is set) and
  * detached slices keep their start: there the cap trims the newest rows instead. A tail bundle
- * larger than the cap mounts alone.
+ * larger than the cap mounts alone. A reader scrolled up (`followsTail` false) keeps the start.
  */
 function tailFollowingStart(
   state: RevealState,
   messages: readonly RevealRow[],
-  from: number,
-  max: number | undefined,
+  tail: TailAppend,
   isSafeCut: IsSafeCut
 ): number {
+  const { from, max } = tail;
   const length = messages.length;
-  const attached = state.endMessageId === null && state.targetMessageId === null;
-  if (max === undefined || !attached || length - from <= max) return from;
+  if (max === undefined || !followsAppend(state, tail) || length - from <= max) return from;
+  if (keepsOversizedTail(messages, tail, isSafeCut)) return from;
   const cut = nearestSafeCutAtOrAfter(length - max, length, isSafeCut);
   return cut < length ? cut : nearestSafeCutAtOrBefore(length - 1, length, isSafeCut);
 }
@@ -430,6 +513,7 @@ function startState<Row extends RevealRow>(
     endMessageId: null,
     endIndexHint: 0,
     endRows: [],
+    tailBundleHeadId: null,
   };
   const cut = nextStepCut(length, TRANSCRIPT_REVEAL_TAIL_ROWS, inputs);
   if (cut === 0) return { ...base, anchorMessageId: null, anchorIndexHint: 0 };
@@ -481,6 +565,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   const length = args.messages.length;
   const newestMessageId = length > 0 ? args.messages[length - 1].id : null;
   let restart = transcriptKey(current) !== transcriptKey(args);
+  let appendedFrom = length;
   if (!restart && newestMessageId !== current.newestMessageId) {
     // The tail moved. Rows after the previous newest row are the appended suffix; a previous
     // newest row that is gone means the tail was replaced. An empty transcript that filled
@@ -494,6 +579,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       previousNewestIndex === -1
         ? true
         : exceedsOneStep(previousNewestIndex + 1, length, stepInputs);
+    appendedFrom = previousNewestIndex + 1;
   }
   let appended = false;
   if (restart) {
@@ -534,18 +620,19 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
     );
   }
   const max = args.maxMountedRows;
-  if (appended)
-    fromIndex = tailFollowingStart(current, args.messages, fromIndex, max, args.isSafeCut);
+  const follows = args.followsTail !== false;
+  const tail = { from: fromIndex, appendedFrom, max, appended, follows };
+  fromIndex = tailFollowingStart(current, args.messages, tail, args.isSafeCut);
   const started = withStartAt(current, args.messages, fromIndex);
   if (started !== current) {
     current = started;
     setState(current);
   }
   assert(fromIndex >= 0 && fromIndex <= length, "reveal boundary must stay within the transcript");
-  const toIndex = resolveSliceEnd(current, args.messages, fromIndex, max, args.isSafeCut);
-  const sliced = withSliceEnd(current, args.messages, toIndex);
-  if (sliced !== current) {
-    current = sliced;
+  const ended = endedState(current, args.messages, fromIndex, max, args.isSafeCut, appendedFrom);
+  const toIndex = ended.toIndex;
+  if (ended.state !== current) {
+    current = ended.state;
     setState(current);
   }
 

@@ -599,7 +599,7 @@ describe("useBoundedTranscriptReveal", () => {
 
     function renderSlice(maxMountedRows?: number, isSafeCut = bundled, messages = rows(LONG)) {
       const frames = manualFrames();
-      let props = { workspaceId: "ws", messages, maxMountedRows, isSafeCut };
+      let props = { workspaceId: "ws", messages, maxMountedRows, isSafeCut, followsTail: true };
       const renders: Array<{ from: number; to: number }> = [];
       const view = renderHook(() => {
         const reveal = useBoundedTranscriptReveal(props);
@@ -770,6 +770,32 @@ describe("useBoundedTranscriptReveal", () => {
       expect(reveal().toIndex).toBeLessThan(LONG);
     });
 
+    test("appends into a tail bundle larger than the cap keep its start; a new bundle moves it", () => {
+      // Rows up to 1,000 are safe cuts; later rows are one bundle until a "cut" row arrives.
+      let props = { messages: rows(LONG) };
+      let calls = 0;
+      const isSafeCut = (i: number) => {
+        calls += 1;
+        return i <= 1000 || props.messages[i]?.id.startsWith("cut") === true;
+      };
+      const frames = manualFrames();
+      const view = renderHook(() =>
+        useBoundedTranscriptReveal({ workspaceId: "ws", isSafeCut, maxMountedRows: MAX, ...props })
+      );
+      while (frames.hasPending()) act(() => frames.flush());
+      expect(view.result.current).toMatchObject({ fromIndex: 1000, toIndex: LONG });
+      for (const id of ["new-0", "new-1", "cut-0", "new-2"]) {
+        props = { messages: [...props.messages, { id }] };
+        calls = 0;
+        view.rerender();
+        expect(view.result.current.toIndex).toBe(props.messages.length);
+        // Measured: an append into the bundle (LONG - 1,000 rows) checks only the new rows (it
+        // took 10,005 checks before); the safe cut that moves the start costs one cap.
+        expect(calls).toBeLessThan(id === "cut-0" ? MAX + 10 : 10);
+      }
+      expect(view.result.current.fromIndex).toBe(LONG + 2); // The "cut-0" row heads the tail.
+    });
+
     // F20 PR3a-2: each edit is ONE update through the real aggregator's delete, reconcile or
     // page path. Row i has historySequence SEQ + i (one displayed row per user message). Every
     // cut is safe: the index-based `bundled` would move bundle edges when rows above them go.
@@ -924,6 +950,42 @@ describe("useBoundedTranscriptReveal", () => {
         });
         expect(slice.reveal().toIndex - slice.reveal().fromIndex).toBe(cap);
         expect(slice.frames.hasPending()).toBe(false);
+      });
+
+      // F20 PR3a-3b: a reader scrolled up mid-stream keeps the rows they read.
+      test("with followsTail off, streamed rows past the cap detach the slice instead", () => {
+        const cap = TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS;
+        const slice = renderOnAggregator(cap);
+        slice.runFrames();
+        const { fromIndex } = slice.reveal();
+        const readRow = slice.props().messages[fromIndex].id;
+        slice.setProps({ followsTail: false });
+        streamReply(slice, () => {
+          expect(slice.reveal().fromIndex).toBe(fromIndex);
+          expect(slice.mountedIds()).toContain(readRow);
+        });
+        expect(slice.reveal().isDetached).toBe(true);
+        // Jump to bottom: the newest streamed row mounts again.
+        act(() => slice.reveal().resetToLatest());
+        expect(slice.mountedIds().at(-1)).toBe(slice.props().messages.at(-1)!.id);
+      });
+
+      // Walk-append decision: a Load-older walk does not follow the tail (the reader asked for
+      // older rows), so it ends detached; Show newer still reaches every streamed row.
+      test("rows streamed during a Load-older walk stay reachable after it ends", () => {
+        const slice = renderOnAggregator(MAX);
+        slice.runFrames();
+        act(() => slice.reveal().revealMore());
+        slice.runFrames();
+        act(() => slice.reveal().revealMore()); // Crosses the cap: a walk to a target row.
+        act(() => slice.frames.flush());
+        streamReply(slice, () => undefined);
+        slice.runFrames();
+        expect(slice.reveal()).toMatchObject({ isDetached: true, isRevealPaused: true });
+        for (let press = 0; press < 20 && slice.reveal().isDetached; press += 1) {
+          act(() => slice.reveal().revealNewer());
+        }
+        expect(slice.mountedIds().at(-1)).toBe(slice.props().messages.at(-1)!.id);
       });
 
       test("without a cap, the same stream renders as on main", () => {
