@@ -571,6 +571,7 @@ export class SSHConnectionPool {
       });
 
       let timedOut = false;
+      let spawnFailed = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
 
       const cleanup = () => {
@@ -602,7 +603,9 @@ export class SSHConnectionPool {
 
       proc.on("close", (code) => {
         cleanup();
-        if (timedOut) return; // Already handled by the timeout
+        // Already handled by the timeout, or by the error handler (Node still emits close after a
+        // spawn error, with a negative code).
+        if (timedOut || spawnFailed) return;
 
         if (code === 0) {
           this.markHealthyByKey(key);
@@ -611,9 +614,11 @@ export class SSHConnectionPool {
           resolve();
         } else {
           const error = stderr.trim() || `SSH probe failed with code ${code ?? "unknown"}`;
-          // Remove the socket before the failure becomes visible, so no next probe reuses it.
+          // Only ssh's own exit status says something about the master, not a signal.
+          const exited = code != null && code > 0;
+          // Retire the master before the failure becomes visible, so no next probe reuses it.
           const fail = async () => {
-            await removeFailedControlSocket(controlPath);
+            if (exited) await retireFailedControlMaster(config.host, controlPath);
             this.markFailedByKey(key, error);
             reject(new Error(error));
           };
@@ -623,6 +628,7 @@ export class SSHConnectionPool {
 
       proc.on("error", (err) => {
         cleanup();
+        spawnFailed = true;
         const error = `SSH probe spawn error: ${err.message}`;
         this.markFailedByKey(key, error);
         reject(new Error(error));
@@ -631,26 +637,53 @@ export class SSHConnectionPool {
   }
 }
 
+/** Bounds `ssh -O stop`: a master that accepts the connection but never answers. */
+const CONTROL_STOP_TIMEOUT_MS = 5_000;
+
 /**
  * After an SSH outage, a ControlMaster can stay alive while it fails every session it serves at
  * once (exit 255, nothing on stderr), so every later probe through its socket failed the same way
  * and acquireConnection waited out its whole budget (#6588). After a probe through `controlPath`
- * exits nonzero, remove that socket: the next probe (after the usual backoff) starts a fresh
- * master. Only an exit status removes it. Our own timeout says nothing about the master, since a
- * slow network looks the same.
+ * exits nonzero, retire that master: the next probe (after the usual backoff) starts a fresh one.
+ * Only an exit status retires it. Our own timeout says nothing about the master, since a slow
+ * network looks the same.
  *
- * Safe for anyone else on this socket, another Xum process included: unlinking only drops the
- * path. The old master and the sessions it already serves keep running until they end, and the
- * next connection with ControlMaster=auto starts a new master at the same path.
+ * `ssh -O stop` makes the master remove its socket and stop listening. Its sessions, another Xum
+ * process's included, keep running, and it exits when they end. Unlinking the socket ourselves
+ * is not enough: OpenSSH removes its ControlPath again when it exits, which would delete the
+ * replacement master's socket. Only a master that does not answer the stop request has its socket
+ * removed directly.
  */
-async function removeFailedControlSocket(controlPath: string): Promise<void> {
+async function retireFailedControlMaster(host: string, controlPath: string): Promise<void> {
   try {
     if (!(await fs.lstat(controlPath)).isSocket()) return;
-    await fs.unlink(controlPath);
-    log.debug(`Removed ControlPath ${controlPath} after a failed SSH probe`);
   } catch {
-    // No socket there (no master yet, or already gone): nothing to remove.
+    return; // No socket there (no master yet, or already gone): nothing to retire.
   }
+  if (await stopControlMaster(host, controlPath)) {
+    log.debug(`Stopped the ControlMaster at ${controlPath} after a failed SSH probe`);
+    return;
+  }
+  await fs.unlink(controlPath).catch(() => undefined);
+  log.debug(`Removed ControlPath ${controlPath} after a failed SSH probe`);
+}
+
+/** Resolves whether the master at `controlPath` took the stop request. */
+function stopControlMaster(host: string, controlPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const proc = spawn("ssh", ["-O", "stop", "-o", `ControlPath=${controlPath}`, host], {
+      stdio: "ignore",
+    });
+    const timer = setTimeout(() => proc.kill("SIGKILL"), CONTROL_STOP_TIMEOUT_MS);
+    proc.on("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      resolve(code === 0);
+    });
+  });
 }
 
 /**

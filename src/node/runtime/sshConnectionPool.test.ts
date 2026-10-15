@@ -933,8 +933,13 @@ describe.skipIf(process.platform === "win32")("SSHConnectionPool stale ControlPa
   /**
    * A live socket at a short ControlPath (the old master), and an `ssh` on PATH that acts on
    * `whileSocket` while that socket exists and prints "ok" once it is gone (a fresh master).
+   * `ssh -O stop` removes the socket when `stop` is "answers", like OpenSSH's master, and fails
+   * when it is "no answer".
    */
-  async function setup(whileSocket: "fail" | "succeed" | "hang") {
+  async function setup(
+    whileSocket: "fail" | "succeed" | "hang",
+    stop: "answers" | "no answer" = "answers"
+  ) {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-cp-"));
     const controlPath = path.join(dir, "cm-0");
     const master = net.createServer();
@@ -943,12 +948,14 @@ describe.skipIf(process.platform === "win32")("SSHConnectionPool stale ControlPa
     const onSocket = { fail: "exit 255", succeed: "echo ok; exit 0", hang: "exec sleep 30" }[
       whileSocket
     ];
+    const onStop = stop === "answers" ? 'rm -f "$cp"; exit 0' : "exit 255";
     await fs.writeFile(
       path.join(dir, "ssh"),
       [
         "#!/bin/sh",
-        `echo call >> '${calls}'`,
+        `echo "$1 $2" >> '${calls}'`,
         'cp=""; for a in "$@"; do case "$a" in ControlPath=*) cp=${a#ControlPath=};; esac; done',
+        `if [ "$1" = "-O" ]; then ${onStop}; fi`,
         `if [ -S "$cp" ]; then ${onSocket}; fi`,
         "echo ok",
         "",
@@ -964,33 +971,40 @@ describe.skipIf(process.platform === "win32")("SSHConnectionPool stale ControlPa
     };
     const socketExists = async () =>
       (await fs.lstat(controlPath).catch(() => null))?.isSocket() === true;
-    const callCount = async () =>
-      (await fs.readFile(calls, "utf8").catch(() => "")).split("\n").filter(Boolean).length;
-    return { controlPath, socketExists, callCount };
+    /** First two arguments of each ssh call: "-T -p…" for a probe, "-O stop" for a stop. */
+    const callLog = async () =>
+      (await fs.readFile(calls, "utf8").catch(() => "")).split("\n").filter(Boolean);
+    return { dir, controlPath, socketExists, callLog };
   }
 
   const config: SSHRuntimeConfig = { host: "stale.test", srcBaseDir: "/work" };
+  const isStop = (call: string) => call === "-O stop";
 
-  test("a probe failure through a live master's socket heals on the next probe", async () => {
-    const { controlPath, socketExists, callCount } = await setup("fail");
-    const pool = new SSHConnectionPool();
-    await pool.acquireConnection(config, { timeoutMs: 5_000, maxWaitMs: 8_000, controlPath });
-    expect(await callCount()).toBe(2);
-    expect(await socketExists()).toBe(false);
-    expect(pool.getConnectionHealth(config)?.status).toBe("healthy");
-  }, 15_000);
+  test.each(["answers", "no answer"] as const)(
+    "a probe failure through a live master's socket heals on the next probe (stop %s)",
+    async (stop) => {
+      const { controlPath, socketExists, callLog } = await setup("fail", stop);
+      const pool = new SSHConnectionPool();
+      await pool.acquireConnection(config, { timeoutMs: 5_000, maxWaitMs: 8_000, controlPath });
+      // A failed probe, the stop request, then a probe that starts a fresh master.
+      expect((await callLog()).map(isStop)).toEqual([false, true, false]);
+      expect(await socketExists()).toBe(false);
+      expect(pool.getConnectionHealth(config)?.status).toBe("healthy");
+    },
+    15_000
+  );
 
   test("a healthy master's socket is never removed", async () => {
-    const { controlPath, socketExists, callCount } = await setup("succeed");
+    const { controlPath, socketExists, callLog } = await setup("succeed");
     const pool = new SSHConnectionPool();
     await pool.acquireConnection(config, { timeoutMs: 5_000, maxWaitMs: 0, controlPath });
-    expect(await callCount()).toBe(1);
+    expect(await callLog()).toHaveLength(1);
     expect(await socketExists()).toBe(true);
   });
 
   // Our own deadline says nothing about the master: a slow network looks the same.
   test("a probe that hits our timeout leaves the socket", async () => {
-    const { controlPath, socketExists } = await setup("hang");
+    const { controlPath, socketExists, callLog } = await setup("hang");
     const pool = new SSHConnectionPool();
     const error = await pool
       .acquireConnection(config, { timeoutMs: 300, maxWaitMs: 0, controlPath })
@@ -999,6 +1013,29 @@ describe.skipIf(process.platform === "win32")("SSHConnectionPool stale ControlPa
         (e: unknown) => e
       );
     expect(String(error)).toContain("SSH probe timed out");
+    expect((await callLog()).some(isStop)).toBe(false);
+    expect(await socketExists()).toBe(true);
+  });
+
+  // Node emits close after a spawn error too; that close must not count as an ssh exit.
+  test("a probe whose ssh cannot start leaves the socket", async () => {
+    const { dir, controlPath, socketExists } = await setup("fail");
+    const shimPath = process.env.PATH;
+    process.env.PATH = path.join(dir, "no-such-dir");
+    const pool = new SSHConnectionPool();
+    const error = await pool
+      .acquireConnection(config, { timeoutMs: 5_000, maxWaitMs: 0, controlPath })
+      .then(
+        () => null,
+        (e: unknown) => e
+      )
+      .finally(() => {
+        process.env.PATH = shimPath;
+      });
+    expect(String(error)).toContain("spawn error");
+    // A negative check: the close that follows the error runs after the rejection. Give it far
+    // longer than a retire takes (a few ms) before looking at the socket.
+    await new Promise((resolve) => setTimeout(resolve, 300));
     expect(await socketExists()).toBe(true);
   });
 });
