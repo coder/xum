@@ -32,6 +32,7 @@ import {
   getDraftStore,
   type DraftStoreScope,
 } from "@/browser/stores/DraftStore";
+import * as attachmentsHandling from "@/browser/utils/attachmentsHandling";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type {
   DraftAttachment,
@@ -518,6 +519,78 @@ describeIntegration("Draft workspace behavior", () => {
     } finally {
       await Promise.all(createdScopes.map((scope) => getDraftStore().deleteDraft(scope)));
       await env.orpc.projects.remove({ projectPath: subProjectPath });
+      await cleanupView(view, cleanupDom);
+      await fs.rm(subProjectDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("the default composer takes no input while its draft is promoted", async () => {
+    const subProjectDir = path.join(getSharedRepoPath(), `promote-lock-sub-${Date.now()}`);
+    await fs.mkdir(subProjectDir, { recursive: true });
+    const opened = await openPromotion(subProjectDir);
+    const { env, view, cleanupDom, projectPath, defaultScope } = opened;
+    const createdScopes: DraftScope[] = [defaultScope];
+    const draftService = env.services.draftService;
+    const moveCreation = draftService.moveCreation.bind(draftService);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const moveSpy = jest
+      .spyOn(draftService, "moveCreation")
+      .mockImplementation(async (...args: Parameters<typeof moveCreation>) => {
+        await held;
+        return await moveCreation(...args);
+      });
+
+    try {
+      await waitFor(() => expect(composerText(view.container)).toBe("typed on the project page"), {
+        timeout: 10_000,
+      });
+      fireEvent.click(opened.newSubProjectChat);
+      await waitFor(() => expect(moveSpy).toHaveBeenCalled(), { timeout: 10_000 });
+      // An edit made now would miss the moved body, and the moved draft would open without it.
+      const textarea = await waitFor(
+        () => {
+          const locked = view.container.querySelector<HTMLTextAreaElement>(
+            'textarea[aria-label="Message"]'
+          );
+          expect(locked?.disabled).toBe(true);
+          expect(view.container.querySelector<HTMLInputElement>("#workspace-name")?.disabled).toBe(
+            true
+          );
+          return locked!;
+        },
+        { timeout: 10_000 }
+      );
+      // A dropped file is not read: the read would land in the default draft after the move.
+      const reads = jest.spyOn(attachmentsHandling, "processAttachmentFiles");
+      fireEvent.drop(textarea, {
+        dataTransfer: { files: [new File(["x"], "note.txt", { type: "text/plain" })], types: [] },
+      });
+      expect(reads).not.toHaveBeenCalled();
+      reads.mockRestore();
+      release();
+      const [draftId] = await waitForDraftCount(projectPath, 1);
+      const listedScope: DraftScope = { kind: "creation", projectPath, draftId };
+      createdScopes.push(listedScope);
+      await waitFor(() => expect(composerText(view.container)).toBe("typed on the project page"), {
+        timeout: 10_000,
+      });
+      expect(await env.orpc.drafts.get({ scope: listedScope })).toMatchObject({
+        text: "typed on the project page",
+        attachments: [IMAGE],
+        nameState: NAME_STATE,
+      });
+      const source = await env.orpc.drafts.get({ scope: defaultScope });
+      expect(source.text).toBe("");
+      expect(source.nameState).toBeUndefined();
+      expect((await env.orpc.drafts.getList()).entries.map((entry) => entry.draftId)).toEqual([
+        draftId,
+      ]);
+    } finally {
+      release();
+      moveSpy.mockRestore();
+      await Promise.all(createdScopes.map((scope) => getDraftStore().deleteDraft(scope)));
+      await env.orpc.projects.remove({ projectPath: opened.subProjectPath });
       await cleanupView(view, cleanupDom);
       await fs.rm(subProjectDir, { recursive: true, force: true });
     }

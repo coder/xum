@@ -683,6 +683,8 @@ export class DraftStore {
   private readonly pendingDeletes = new Map<string, DraftScope>();
   /** Deletes waiting for a write or list put to land (see deleteDraft). */
   private readonly waitingDeletes = new Set<string>();
+  /** Creation drafts with moves waiting for the backend, by key: how many (see moveCreationDraft). */
+  private readonly movingCreationDrafts = new Map<string, number>();
   /**
    * The creation draft list (sidebar rows), owned by the backend (drafts/list.json). The view
    * overlays puts the list has not reflected yet and hides pending deletes.
@@ -1635,13 +1637,36 @@ export class DraftStore {
   async moveCreationDraft(from: DraftStoreScope, to: DraftListEntry): Promise<boolean> {
     // The pending scope (no project yet) is memory-only: nothing to move on the backend.
     if (from.kind !== "creation") return false;
-    const sourceRow = this.getCreationDraftsByProject()[from.projectPath]?.find(
-      ({ draftId }) => draftId === from.draftId
-    );
-    const sent = await this.sendMoveWithRetries(from, to, hasContent(this.getView(from)));
-    if (sent === null) return false;
-    this.applyMoved(from, to, sent, sourceRow);
-    return true;
+    const key = draftScopeKey(from);
+    this.movingCreationDrafts.set(key, (this.movingCreationDrafts.get(key) ?? 0) + 1);
+    this.notify(key);
+    try {
+      const sourceRow = this.getCreationDraftsByProject()[from.projectPath]?.find(
+        ({ draftId }) => draftId === from.draftId
+      );
+      const sent = await this.sendMoveWithRetries(from, to, hasContent(this.getView(from)));
+      if (sent === null) return false;
+      this.applyMoved(from, to, sent, sourceRow);
+      return true;
+    } finally {
+      this.endMoving(key);
+    }
+  }
+
+  /**
+   * Whether a move of this creation draft waits for the backend. Its composer takes no input
+   * meanwhile (useIsMovingCreationDraft): an edit made then is not in the moved body, so the source
+   * would stay as a draft of its own (see applyMoved).
+   */
+  isMovingCreationDraft(scope: DraftStoreScope): boolean {
+    return scope.kind === "creation" && this.movingCreationDrafts.has(draftScopeKey(scope));
+  }
+
+  private endMoving(key: string): void {
+    const remaining = (this.movingCreationDrafts.get(key) ?? 1) - 1;
+    if (remaining > 0) this.movingCreationDrafts.set(key, remaining);
+    else this.movingCreationDrafts.delete(key);
+    this.notify(key);
   }
 
   /** The move, again after a failure: a lost reply's retry answers "moved" (the move is idempotent). */
@@ -2500,6 +2525,15 @@ export function useDraft(scope: DraftStoreScope): DraftView {
   return useSyncExternalStore(
     (listener) => store.subscribe(scope, listener),
     () => store.getView(scope)
+  );
+}
+
+/** Whether this creation draft is moving (see DraftStore.isMovingCreationDraft). */
+export function useIsMovingCreationDraft(scope: DraftStoreScope): boolean {
+  const store = getDraftStore();
+  return useSyncExternalStore(
+    (listener) => store.subscribe(scope, listener),
+    () => store.isMovingCreationDraft(scope)
   );
 }
 
