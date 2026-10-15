@@ -2825,6 +2825,39 @@ describe("AgentPluginInstallService", () => {
       expect(performance.now() - started).toBeLessThan(600);
     });
 
+    test("a pass starts no logout after its deadline (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      const urls = [serverUrl, "https://b.example/mcp", "https://c.example/mcp"];
+      await fsPromises.writeFile(file, JSON.stringify({ version: 1, urls }));
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 20,
+      });
+      const internals = restarted as unknown as {
+        settledSignOutPasses: () => Promise<void>;
+        reconciliationState: Promise<boolean>;
+      };
+      // Let the constructor's recovery settle, so the wiring below starts exactly one pass.
+      await internals.reconciliationState;
+      await internals.settledSignOutPasses();
+      let calls = 0;
+      restarted.setMcpOauthService({
+        // The first logout hangs past the deadline.
+        logout: () => {
+          calls++;
+          return new Promise<never>(() => undefined);
+        },
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      await internals.settledSignOutPasses();
+      // One pass: only the first URL was tried; the rest stay in the record untouched.
+      expect(calls).toBe(1);
+      expect(await pendingSignOuts()).toEqual(urls);
+    });
+
     test("one pass signs out equivalent URL spellings once (#6627)", async () => {
       const { failing, result } = await updateWithFailingSignOut(stopStub);
       await result;

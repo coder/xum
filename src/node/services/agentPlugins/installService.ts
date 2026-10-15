@@ -229,6 +229,9 @@ async function signedOutBefore(
   deadline: number,
   inFlight: Map<string, Promise<{ success: boolean }>>
 ): Promise<boolean> {
+  // Past the pass deadline: start nothing more. The URL stays in the record for the next pass.
+  // Under 1 ms counts as past: timers have 1 ms resolution and can fire that much early.
+  if (deadline - monotonicNow() < 1) return false;
   // Keyed by credential: `/mcp` and `/mcp/` are one stored sign-in, so one logout.
   const key = oauth.credentialKey(serverUrl) ?? serverUrl;
   let call = inFlight.get(key);
