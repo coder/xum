@@ -1238,8 +1238,32 @@ describe("MCPServerManager", () => {
         callSettingsActionTool: () => Promise.resolve({ content: [] }),
       },
     });
+    // The same server after a restart, now showing the older layout again.
+    servers.serve("settings-actions-overlap-b", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [
+                { kind: "group", title: "Parts", items: [{ kind: "tool", tool: "library" }] },
+              ],
+            },
+          }),
+        settingsToolAction: (name) =>
+          name === "library" || name === "reset"
+            ? { title: name, readOnly: true, opensApp: false }
+            : undefined,
+        callSettingsActionTool: () => Promise.resolve({ content: [] }),
+      },
+    });
     const workspaceId = "settings-actions-overlap-ws";
-    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const request = workspaceRequest(workspaceId);
+    await manager.getToolsForWorkspace(request);
     const older = manager.readSettings(workspaceId, "cad");
     while (reads.length < 1) await new Promise((resolve) => setImmediate(resolve));
     const newer = manager.readSettings(workspaceId, "cad");
@@ -1257,6 +1281,12 @@ describe("MCPServerManager", () => {
     // The dialog shows the newer read: its tool runs, and the older layout's tool does not.
     expect(await run("reset")).toBe("ran");
     expect(await run("library")).toContain("settings do not offer 'library'");
+    // The schema hash describes the same (newer) read: after a restart whose read shows the
+    // older layout, the dialog's token no longer matches, so "reset" cannot run there.
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-actions-overlap-b") });
+    await manager.getToolsForWorkspace(request);
+    await manager.readSettings(workspaceId, "cad");
+    expect(await run("reset")).toContain("Reopen");
   });
 
   test("settings: a server counts as connected only once the workspace started it", async () => {

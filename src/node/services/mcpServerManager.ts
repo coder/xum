@@ -5613,17 +5613,16 @@ export class MCPServerManager {
     requestId: number
   ): void {
     const key = settingsSchemaKey(workspaceId, serverName, instanceToken);
-    // Each read overwrites its token's hash: the latest schema of an instance is the one a save
-    // validated against (the dialog shows that read).
+    // Each newer read overwrites its token's hash and tools together: the latest schema of an
+    // instance is the one a save validated against (the dialog shows that read). An older read
+    // that settles last changes neither (#6611), so both always describe the same read.
+    if ((this.settingsLayoutTools.get(key)?.requestId ?? 0) > requestId) return;
     this.settingsSchemaHashes.delete(key);
     this.settingsSchemaHashes.set(key, settingsSchemaHash(snapshot));
-    this.settingsLayoutTools.set(
-      key,
-      newerLayoutTools(this.settingsLayoutTools.get(key), {
-        requestId,
-        tools: settingsLayoutToolNames(snapshot.layout),
-      })
-    );
+    this.settingsLayoutTools.set(key, {
+      requestId,
+      tools: settingsLayoutToolNames(snapshot.layout),
+    });
     if (this.settingsSchemaHashes.size > MAX_REMEMBERED_SETTINGS_SCHEMAS) {
       const oldest = this.settingsSchemaHashes.keys().next().value;
       if (oldest !== undefined) {
@@ -8543,14 +8542,6 @@ function settingsSchemaKey(workspaceId: string, serverName: string, token: strin
 interface SettingsLayoutTools {
   requestId: number;
   tools: ReadonlySet<string>;
-}
-
-/** The newer of two reads' layout tools (by request ID): the dialog shows the newer read. */
-function newerLayoutTools(
-  known: SettingsLayoutTools | undefined,
-  read: SettingsLayoutTools
-): SettingsLayoutTools {
-  return known !== undefined && known.requestId > read.requestId ? known : read;
 }
 
 /** The tools a settings layout offers (its tool items). */
