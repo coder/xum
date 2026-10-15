@@ -8,8 +8,9 @@ import assert from "node:assert/strict";
 // Playwright. All other stories run exactly as before.
 const HOVER_STORY_PREFIX = "app-primarybuttoncontrast--";
 const hoverReady = new WeakSet<object>();
-// Enough for the Narrow story's strip at the shortest swipe seen (about 60 px per swipe).
-const MAX_TOUCH_SWIPES = 12;
+// The Narrow story's strip scrolls up to 621 px, and the shortest swipe seen moved it 56 px:
+// 16 swipes cover it with room to spare.
+const MAX_TOUCH_SWIPES = 16;
 
 const config: TestRunnerConfig = {
   async preVisit(page, context) {
