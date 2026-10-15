@@ -4441,8 +4441,7 @@ export class AgentPluginInstallService {
       const record = await pendingSignOutsRecordState(this.containerDir);
       if (record.kind === "absent") return;
       // Read only a regular file: readFile on a FIFO blocks while this holds the lock.
-      const recorded =
-        record.kind === "present" ? await this.readPendingSignOuts().catch(() => []) : [];
+      const recorded = record.kind === "present" ? await this.recordedUrlsForRecovery() : [];
       await this.signOutEach(oauth, [...recorded, ...(await this.installedPluginServerUrls())]);
       // Sign out first, delete last (see parsePendingSignOuts). A non-regular record (a
       // directory) is Xum's own path too: remove it whole, or the fence never opens.
@@ -4452,6 +4451,31 @@ export class AgentPluginInstallService {
       this.pendingSignOutLastError = undefined;
       this.pendingSignOutRetryAtMs = 0;
     });
+  }
+
+  /**
+   * The URLs a regular-file record names, for the recovery. A corrupt record names none. A record
+   * of another version still names its `urls` when they read as strings. One that does not keeps
+   * the fence: it can name a URL that no current plugin tree has (an update changed it), and
+   * deleting it would leave that sign-in in place.
+   */
+  private async recordedUrlsForRecovery(): Promise<string[]> {
+    const file = this.pendingSignOutsFile;
+    let record: unknown;
+    try {
+      record = JSON.parse(await fsPromises.readFile(file, "utf-8"));
+    } catch (error) {
+      if (error instanceof SyntaxError) return [];
+      throw error;
+    }
+    const fields =
+      typeof record === "object" && record !== null ? (record as Record<string, unknown>) : {};
+    const urls = fields.urls;
+    if (Array.isArray(urls) && urls.every((url) => typeof url === "string")) return urls;
+    if (fields.version === undefined || fields.version === 1) return [];
+    throw new Error(
+      `The pending plugin sign-out record (${shortenHome(file)}) is from another Xum version, and this version cannot read its sign-outs. Open Xum in that version to finish them.`
+    );
   }
 
   /** Signs out of each credential once, within one pass deadline; throws on the first failure. */
@@ -4491,6 +4515,9 @@ export class AgentPluginInstallService {
     // (discovery returns null, sometimes without a diagnostic) is incomplete too.
     const { plugin, diagnostics } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
     if (plugin === null) throw new Error(`Xum cannot read the manifest of plugin '${dirName}'.`);
+    // A declared MCP file that is missing resolves without a diagnostic: restored, it loads.
+    if (plugin.mcpConfigPath === undefined && plugin.manifest.contributes?.mcp !== undefined)
+      throw new Error(`Xum cannot read the MCP file that plugin '${dirName}' declares.`);
     // Without an MCP file, a discovery error can be the MCP path itself. With one, a discovery
     // error names another component (a skill, a hook), and only the MCP diagnostics decide.
     const loaded =
@@ -4498,7 +4525,9 @@ export class AgentPluginInstallService {
         ? { servers: {}, diagnostics }
         : await loadPluginMcpServers(plugin, {
             xumHome: this.config.rootDir,
-            instanceId: this.instanceIdFor(dirName),
+            // From the lexical path, as discovery does: an unmanaged tree's directory name need
+            // not be a valid managed-plugin name.
+            instanceId: computePluginInstanceId(pluginDir),
           });
     const error = loaded.diagnostics.find((d) => d.severity === "error");
     if (error !== undefined)

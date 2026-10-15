@@ -3094,6 +3094,30 @@ describe("AgentPluginInstallService", () => {
       expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
       expect(await pathExists(file)).toBe(false);
       expect(await discovered()).toBe(1);
+      // A record of a newer version whose sign-outs this version cannot read stays: it can name
+      // a URL that no current plugin tree has.
+      await fsPromises.writeFile(
+        file,
+        JSON.stringify({ version: 2, signOuts: [{ url: serverUrl }] })
+      );
+      await expect(restarted.signOutPluginServers()).rejects.toThrow(/another Xum version/);
+      expect(await pathExists(file)).toBe(true);
+      // An unmanaged tree whose directory name is not a managed-plugin name does not block it.
+      const handMade = path.join(pluginsDir(), "hand_made");
+      await fsPromises.mkdir(handMade);
+      await fsPromises.writeFile(
+        path.join(handMade, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "hand-made",
+          version: "1.0.0",
+        })
+      );
+      await fsPromises.copyFile(mcpFile, path.join(handMade, "mcp.json"));
+      // A newer record that still names its URLs is finished like a current one.
+      await fsPromises.writeFile(file, JSON.stringify({ version: 2, urls: [serverUrl] }));
+      await restarted.signOutPluginServers();
+      expect(await pathExists(file)).toBe(false);
       // A directory at the record path is removed too, or the fence would never open.
       await fsPromises.mkdir(path.join(file, "junk"), { recursive: true });
       await restarted.signOutPluginServers();
