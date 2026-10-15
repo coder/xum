@@ -2109,6 +2109,8 @@ const FileReadSuccessResultSchema = z.object({
         "Line numbers are not part of the actual file content."
     ),
   warning: z.string().optional(),
+  /** Set when a cut line belongs to a skill file: names the agent_skill_read_file call. */
+  note: z.string().optional(),
 });
 
 const FileReadErrorResultSchema = z.object({
