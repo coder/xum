@@ -2614,6 +2614,29 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         },
       },
       {
+        // Keyboard path for the broken sign-out record notice (#6627): the record fences the
+        // plugin servers, so Settings → MCP has no Logout for them.
+        id: CommandIds.pluginsSignOutServers(),
+        title: "Sign Out of Plugin MCP Servers",
+        subtitle: "Recover from a broken pending sign-out record",
+        section: section.settings,
+        keywords: ["plugin", "mcp", "sign out", "logout", "pending", "record"],
+        run: async () => {
+          const result = await p.api?.agentPlugins.signOutPluginServers();
+          if (!result) return;
+          if (!result.success) {
+            showCommandFeedbackToast({ type: "error", message: result.error });
+            return;
+          }
+          publishPluginsSectionIntent({ type: "refresh" });
+          publishAgentPluginsMutated();
+          showCommandFeedbackToast({
+            type: "success",
+            message: "Signed out of the plugin MCP servers.",
+          });
+        },
+      },
+      {
         id: CommandIds.pluginsUpdateAll(),
         title: "Update All Plugins",
         subtitle: "Apply pending plugin updates",

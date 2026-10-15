@@ -4454,8 +4454,11 @@ export class AgentPluginInstallService {
           throw new Error(`Could not sign out of ${serverUrl}: ${failure}`);
         done.add(key);
       }
-      // Sign out first, delete last (see parsePendingSignOuts).
-      await this.writePendingSignOuts([]);
+      // Sign out first, delete last (see parsePendingSignOuts). A non-regular record (a
+      // directory) is Xum's own path too: remove it whole, or the fence never opens.
+      if (record.kind === "unreadable")
+        await fsPromises.rm(this.pendingSignOutsFile, { recursive: true, force: true });
+      else await this.writePendingSignOuts([]);
       this.pendingSignOutLastError = undefined;
       this.pendingSignOutRetryAtMs = 0;
     });
@@ -4469,16 +4472,26 @@ export class AgentPluginInstallService {
     });
     const urls: string[] = [];
     for (const dirName of dirs) {
-      const { plugin } = await discoverAgentPluginAt({
-        pluginDir: path.join(this.containerDir, dirName),
+      // Plugin trees are directories (or links to one); skip stray files such as .DS_Store.
+      const pluginDir = path.join(this.containerDir, dirName);
+      if (dirName.startsWith(".") || !(await fsPromises.stat(pluginDir)).isDirectory()) continue;
+      const { plugin, diagnostics } = await discoverAgentPluginAt({
+        pluginDir,
         scope: "global",
       });
-      if (plugin?.mcpConfigPath === undefined) continue;
-      const { servers } = await loadPluginMcpServers(plugin, {
-        xumHome: this.config.rootDir,
-        instanceId: this.instanceIdFor(dirName),
-      });
-      for (const info of Object.values(servers))
+      const loaded =
+        plugin?.mcpConfigPath === undefined
+          ? { servers: {}, diagnostics: [] }
+          : await loadPluginMcpServers(plugin, {
+              xumHome: this.config.rootDir,
+              instanceId: this.instanceIdFor(dirName),
+            });
+      // A server this scan cannot read can load later, after a repair, with its old sign-in:
+      // the list must be complete before the record goes.
+      const error = [...diagnostics, ...loaded.diagnostics].find((d) => d.severity === "error");
+      if (error !== undefined)
+        throw new Error(`Xum cannot read the MCP servers of plugin '${dirName}': ${error.message}`);
+      for (const info of Object.values(loaded.servers))
         if (info.transport !== "stdio") urls.push(info.url);
     }
     return urls;

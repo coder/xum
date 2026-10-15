@@ -3068,6 +3068,13 @@ describe("AgentPluginInstallService", () => {
       const oauth = new McpOauthService(config, new MCPConfigService(config));
       restarted.setMcpOauthService(oauth);
       await restarted.list();
+      // A plugin whose servers this scan cannot read keeps the record: it can load later.
+      const mcpFile = path.join(pluginsDir(), "demo-plugin", "mcp.json");
+      const mcpJson = await fsPromises.readFile(mcpFile, "utf-8");
+      await fsPromises.writeFile(mcpFile, "{ not json");
+      await expect(restarted.signOutPluginServers()).rejects.toThrow(/demo-plugin/);
+      expect(await pathExists(file)).toBe(true);
+      await fsPromises.writeFile(mcpFile, mcpJson);
       // The record names no usable URL, so the servers come from the installed plugin trees.
       spyOn(oauth, "logout").mockResolvedValueOnce({ success: false, error: "disk full" });
       await expect(restarted.signOutPluginServers()).rejects.toThrow(/disk full/);
@@ -3081,6 +3088,10 @@ describe("AgentPluginInstallService", () => {
       expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
       expect(await pathExists(file)).toBe(false);
       expect(await discovered()).toBe(1);
+      // A directory at the record path is removed too, or the fence would never open.
+      await fsPromises.mkdir(path.join(file, "junk"), { recursive: true });
+      await restarted.signOutPluginServers();
+      expect(await pathExists(file)).toBe(false);
       await oauth.dispose();
     });
 
