@@ -645,6 +645,12 @@ export class DraftService extends EventEmitter {
       if (!(await this.hasOwner(dest))) {
         throw new Error(`Draft move refused: project ${dest.projectPath} is not configured`);
       }
+      // Before the revision check: this move's earlier attempt deleted the source, and a crash or
+      // a failed list write left its destination body without a real row (the id is fresh, so
+      // only this move writes that body). Its list write finishes the move.
+      if (await this.isMoveListWritePending(stored, dest)) {
+        return this.listMoved(input, async () => undefined);
+      }
       const revision = this.getRevision(draftScopeKey(source));
       // Only a client that knows of no stored source moves a missing one: after a confirmed
       // revision, a missing source was deleted or moved away meanwhile (`present` tells it apart
@@ -667,18 +673,37 @@ export class DraftService extends EventEmitter {
     if (stored.pendingSends.length > 0) {
       throw new Error("Draft move refused: the source draft has pending sends");
     }
+    // The bodies are written under the list lock, after its version check: a list this version
+    // must not rewrite (a downgrade) refuses the move before the source goes.
+    return this.listMoved(input, async () => {
+      if (!isStoredDraftEmpty(stored)) await this.persist(dest, this.filePathFor(dest), stored);
+      // Before the list write: writing a missing or damaged list relists every unlisted body.
+      await this.persist(source, this.filePathFor(source), emptyStoredDraft());
+    });
+  }
+
+  /** Whether the source is gone and the destination body exists: the move's list write is due. */
+  private async isMoveListWritePending(
+    stored: StoredDraft | null,
+    dest: CreationScope
+  ): Promise<boolean> {
+    return stored === null && (await this.load(dest)) !== null;
+  }
+
+  /** The move's list write, after `writeBodies` under the list lock: the destination's real row. */
+  private async listMoved(
+    input: DraftMoveCreationInput,
+    writeBodies: () => Promise<void>
+  ): Promise<DraftMoveCreationOutput> {
+    const { source, dest } = input;
     const row: DraftListEntry = {
       projectPath: dest.projectPath,
       draftId: dest.draftId,
       subProjectPath: input.subProjectPath,
       createdAt: input.createdAt,
     };
-    // The bodies are written under the list lock, after its version check: a list this version
-    // must not rewrite (a downgrade) refuses the move before the source goes.
     const listRevision = await this.mutateList(async (entries) => {
-      if (!isStoredDraftEmpty(stored)) await this.persist(dest, this.filePathFor(dest), stored);
-      // Before the list write: writing a missing or damaged list relists every unlisted body.
-      await this.persist(source, this.filePathFor(source), emptyStoredDraft());
+      await writeBodies();
       // The destination may hold a synthesized row: its body's relisting after a crashed attempt.
       return [
         ...entries.filter(
