@@ -110,6 +110,7 @@ import {
   isDialogOpen,
   isEditableElement,
   paneHandlesKeyEvent,
+  type ChatPaneScope,
 } from "@/browser/utils/ui/keybinds";
 import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import {
@@ -300,6 +301,37 @@ async function forEachProviderConfigChange(
 /** A drop on a locked composer: nothing is read, and the page does not open the file. */
 function preventDefault(event: React.DragEvent): void {
   event.preventDefault();
+}
+
+/** A locked composer starts no file read from a paste or drop: its result would land after the lock. */
+function fileInputHandlers<Paste, Drop>(
+  locked: boolean,
+  handlers: { onPaste: Paste; onDrop: Drop }
+): { onPaste: Paste | undefined; onDrop: Drop | typeof preventDefault } {
+  return locked ? { onPaste: undefined, onDrop: preventDefault } : handlers;
+}
+
+/**
+ * While its creation draft moves to another draft, the composer takes no input, as during a
+ * creation send: an edit made then is not in the moved body, and the moved draft opens without it.
+ */
+function creationInputLocks(input: {
+  draftMoving: boolean;
+  sendInFlight: boolean;
+  sendInFlightBlocksInput: boolean;
+}): { typing: boolean; controls: boolean } {
+  return {
+    typing: input.sendInFlightBlocksInput || input.draftMoving,
+    controls: input.sendInFlight || input.draftMoving,
+  };
+}
+
+/**
+ * The palette's unscoped voice toggle: only the main composer starts recording (see paneScope),
+ * and a locked composer starts none, like its disabled voice button.
+ */
+function paletteTogglesVoice(shown: boolean, paneScope: ChatPaneScope, locked: boolean): boolean {
+  return shown && paneScope === "main" && !locked;
 }
 
 function transcriptBarrierMessage(offline: boolean): string {
@@ -878,19 +910,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
   const sendInFlightBlocksInput =
     variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
-  // While its creation draft moves to another draft, the composer takes no input: an edit made
-  // then is not in the moved body, and the moved draft opens without it.
-  const draftMoving = useIsMovingCreationDraft(draftScope);
+  const creationLocks = creationInputLocks({
+    draftMoving: useIsMovingCreationDraft(draftScope),
+    sendInFlight: isSendInFlight,
+    sendInFlightBlocksInput,
+  });
   // #6259: typing stays on once a send has taken its draft; submission waits for it to settle.
   const typingLock = useComposerTypingLock({
     variant,
     sendingCount,
     isStreamStarting,
-    creationLocksTyping: sendInFlightBlocksInput || draftMoving,
+    creationLocksTyping: creationLocks.typing,
     inputRef,
   });
   const sendLocksTyping = typingLock.locksTyping;
   const composerLocked = !editingMessageForUi && (disabled || sendLocksTyping);
+  const fileInput = fileInputHandlers(composerLocked, { onPaste: handlePaste, onDrop: handleDrop });
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
@@ -927,7 +962,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           sshHostFallback: creationState.sshHostFallback,
           defaultRuntimeMode: creationState.defaultRuntimeMode,
           onSelectedRuntimeChange: creationState.setSelectedRuntime,
-          disabled: isSendInFlight || draftMoving,
+          disabled: creationLocks.controls,
           projectPath: creationParentProjectPath,
           // Surface the actually-targeted project (possibly a sub-project) to
           // the dropdown so the trigger label reflects what the user picked,
@@ -1836,9 +1871,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Voice input: command palette toggle + global recording keybinds
   useEffect(() => {
-    // Unscoped palette event: only the main composer starts recording (see paneScope). A locked
-    // composer starts none, like its disabled voice button.
-    if (!voiceInput.shouldShowUI || paneScope !== "main" || composerLocked) return;
+    if (!paletteTogglesVoice(voiceInput.shouldShowUI, paneScope, composerLocked)) return;
 
     const handleToggle = () => {
       if (!voiceInput.isAvailable) {
@@ -3424,13 +3457,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                         .catch(() => undefined);
                     }}
                     onKeyDown={handleKeyDown}
-                    // A locked composer starts no file read: its result would land after the lock.
-                    onPaste={composerLocked ? undefined : handlePaste}
+                    onPaste={fileInput.onPaste}
                     onKeyUp={composerSuggestions.handleCursorActivity}
                     onMouseUp={composerSuggestions.handleCursorActivity}
                     onSelect={composerSuggestions.handleCursorActivity}
                     onDragOver={handleDragOver}
-                    onDrop={composerLocked ? preventDefault : handleDrop}
+                    onDrop={fileInput.onDrop}
                     onEscapeInNormalMode={handleEscapeInNormalMode}
                     suppressKeys={
                       composerSuggestions.isVisible ? COMMAND_SUGGESTION_KEYS : undefined
