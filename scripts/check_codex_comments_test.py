@@ -243,7 +243,10 @@ else:
         unresolved = '"has_unresolved_findings":false'
         for case, changed, expected in (
             ("observed", body, 0),
-            ("null findings", body.replace(unresolved, '"has_unresolved_findings":null'), 0),
+            # Codex sends null while a review runs; a completed review must say false.
+            ("completed, null findings", body.replace(unresolved, '"has_unresolved_findings":null', 1), 1),
+            ("running, null findings", body.replace(
+                unresolved + ',"status":"completed"}', '"has_unresolved_findings":null,"status":"running"}', 1), 10),
             ("code unresolved", body.replace(unresolved, '"has_unresolved_findings":true', 1), 1),
             ("security unresolved", body.replace(
                 '"has_unresolved_findings":false,"status":"completed"}}',

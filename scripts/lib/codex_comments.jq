@@ -63,7 +63,9 @@ def codex_summary_status($bot; $head; $resolved):
               and keys == ["commit_sha", "has_any_findings", "has_unresolved_findings", "status"]
               and (.commit_sha | test("^[0-9a-f]{40}$"))
               and (.has_any_findings | type == "boolean" or type == "null")
-              and (.has_unresolved_findings == false or .has_unresolved_findings == null)
+              # Codex sends null only while a review runs; a completed one must say false.
+              and (.has_unresolved_findings == false
+                or (.has_unresolved_findings == null and .status == "running"))
               and (.status == "completed" or .status == "running")))
             # Unknown security fields or statuses could be authoritative findings.
             # In particular, do not interpret an enabled security merge gate here.
