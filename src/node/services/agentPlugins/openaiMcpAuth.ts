@@ -349,7 +349,8 @@ function uniqueEnvNames(names: readonly string[]): string[] {
 
 /** The review warning for forwarded names that change how the server loads code. */
 function loaderWarnings(names: readonly string[]): { warnings?: string[] } {
-  const loaders = names.filter((name) => LOADER_ENV_NAME.test(name));
+  // By collision key: on Windows node_options is NODE_OPTIONS.
+  const loaders = names.filter((name) => LOADER_ENV_NAME.test(envNameKey(name)));
   if (loaders.length === 0) return {};
   return {
     warnings: [`'env_vars' forwards ${loaders.join(", ")}, which change how the server loads code`],

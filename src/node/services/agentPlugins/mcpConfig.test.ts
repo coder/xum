@@ -377,6 +377,8 @@ describe("loadPluginMcpServers", () => {
           forwardReserved: { command: "node", env_vars: ["plugin_data"] },
           envReserved: { command: "node", env: { Plugin_Root: "x" } },
           duplicates: { command: "node", env_vars: ["API_TOKEN", "api_token"] },
+          // node_options is NODE_OPTIONS on Windows, so the review must name it.
+          loader: { command: "node", env_vars: ["node_options"] },
         },
       },
       { fileName: ".mcp.json" }
@@ -395,12 +397,16 @@ describe("loadPluginMcpServers", () => {
         s.plugin?.serverName,
         s.transport === "stdio" ? s.forwardEnv : undefined,
       ])
-    ).toEqual([["duplicates", ["API_TOKEN"]]]);
+    ).toEqual([
+      ["duplicates", ["API_TOKEN"]],
+      ["loader", ["node_options"]],
+    ]);
     expect(
       windows.diagnostics.map((d) => [d.severity, /server '(\w+)'/.exec(d.message)?.[1]])
     ).toEqual([
       ["error", "forwardReserved"],
       ["error", "envReserved"],
+      ["warning", "loader"],
     ]);
     // Elsewhere names are case-sensitive, so these are ordinary variables.
     const linux = await load("linux");
@@ -413,7 +419,10 @@ describe("loadPluginMcpServers", () => {
       ["forwardReserved", ["plugin_data"]],
       ["envReserved", undefined],
       ["duplicates", ["API_TOKEN", "api_token"]],
+      ["loader", ["node_options"]],
     ]);
+    // There node_options is not NODE_OPTIONS: no loader warning.
+    expect(linux.diagnostics.some((d) => d.message.includes("server 'loader'"))).toBe(false);
   });
 
   test("the Codex dialect maps streamable_http spellings and resolves a relative cwd", async () => {
