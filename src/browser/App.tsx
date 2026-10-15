@@ -1172,13 +1172,11 @@ function AppInner() {
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_FAST_MODE)) {
         e.preventDefault();
         // Modals trap focus and hide the page behind them; don't change hidden page UI.
-        if (!isDialogOpen()) togglePremiumServiceTier("priority");
+        // A held chord would flip the tier once per repeat, leaving it timing-dependent.
+        if (!isDialogOpen() && !e.repeat) togglePremiumServiceTier("priority");
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ULTRAFAST_MODE)) {
         e.preventDefault();
-        // A held chord would flip the tier once per repeat, leaving it timing-dependent.
-        if (!isDialogOpen() && !e.repeat) {
-          togglePremiumServiceTier("ultrafast");
-        }
+        if (!isDialogOpen() && !e.repeat) togglePremiumServiceTier("ultrafast");
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_COMPUTER_USE) && computerUseAvailable) {
         e.preventDefault();
         // A held shortcut would race enable and disable requests and leave either state behind.
