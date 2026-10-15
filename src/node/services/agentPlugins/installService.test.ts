@@ -1875,6 +1875,67 @@ describe("AgentPluginInstallService", () => {
     await expect(resume("wfr_unreviewed")).rejects.toThrow("has not been reviewed on this install");
   });
 
+  test("a stored managed skill workflow run resumes only while its snapshot is reviewed (#6777)", async () => {
+    const source = "export default function workflow() { return {}; }\n";
+    await fsPromises.writeFile(path.join(remoteDir, "skills", "greet", "workflow.js"), source);
+    await commitAll(remoteDir, "add a skill workflow");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(muxRoot, "workflow-runs") });
+    const createSkillRun = (id: string, runSource: string, scope: "global" | "project") =>
+      runStore.createRun({
+        id,
+        workspaceId: "workspace-1",
+        workflow: {
+          name: "greet",
+          description: "Skill workflow",
+          scope,
+          sourcePath: "skill://greet/workflow.js",
+          canonicalScriptPath: "skill://greet/workflow.js",
+          sourceKind: "skill",
+          executable: true,
+        },
+        source: runSource,
+        args: {},
+        now: "2026-10-15T00:00:00.000Z",
+      });
+    const workflows = new WorkflowService({
+      archiveAdmission: { getWorkflowArchiveRefusal: () => null },
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      assertStoredPluginWorkflowReviewed: (stored) =>
+        assertStoredPluginWorkflowReviewed({
+          ...stored,
+          runtime: new LocalRuntime(muxRoot),
+          workspacePath: muxRoot,
+          projectTrusted: true,
+          roots: {
+            projectRoot: "",
+            globalRoot: path.join(muxRoot, "skills"),
+            universalRoot: "",
+            globalPluginRoots: [pluginsDir()],
+          },
+        }),
+      runnerId: "runner-6777",
+    });
+    const resume = (runId: string) =>
+      workflows.resumeRun({ workspaceId: "workspace-1", runId, projectTrusted: true });
+
+    await createSkillRun("wfr_reviewed", source, "global");
+    expect((await resume("wfr_reviewed")).status).toBe("completed");
+    // A snapshot whose bytes no review covers (a run started before #6629) fails closed.
+    await createSkillRun("wfr_unreviewed", `${source}// before the upgrade\n`, "global");
+    await expect(resume("wfr_unreviewed")).rejects.toThrow("has not been reviewed on this install");
+    // The run started from another scope, so the managed skill cannot vouch for its snapshot.
+    await createSkillRun("wfr_other_scope", source, "project");
+    await expect(resume("wfr_other_scope")).rejects.toThrow("cannot resume");
+  });
+
   test("review labels show a bidi control in a workflow file name; the identity stays raw (#6629)", async () => {
     const file = "evil\u202esj.js";
     await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
