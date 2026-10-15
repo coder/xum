@@ -189,6 +189,15 @@ type ReviewsState = ReturnType<typeof useReviews>;
 // When unlocked (manual reading) we drop this so the browser anchors to an onscreen
 // row and preserves the reading position while off-screen content above settles.
 const TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE = { overflowAnchor: "none" } as const;
+
+/**
+ * Jump to bottom (also every send and edit) brings a detached slice (#4961 F20: its newest rows
+ * unmounted under the mounted-row cap) back to the live tail first.
+ */
+function jumpToLiveTail(isDetached: boolean, resetToLatest: () => void, jumpToBottom: () => void) {
+  if (isDetached) resetToLatest();
+  jumpToBottom();
+}
 // The sentinel is the sole anchor candidate while locked.
 const TRANSCRIPT_BOTTOM_SENTINEL_STYLE = { overflowAnchor: "auto" } as const;
 // The composer dock is normal scroll content (sticky to the scrollport bottom),
@@ -609,7 +618,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // skeleton. Handing it no rows keeps it idle; the real transcript then starts tail-first.
   const {
     fromIndex: revealFromIndex,
-    toIndex: revealToIndex,
+    isDetached: isTranscriptDetached,
     isFullyRevealed,
     isRevealPaused,
     revealMore,
@@ -842,14 +851,10 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [handleScrollContainerKeyDown, isComposerDockEvent]
   );
 
-  // Jump to bottom (also every send and edit) brings a detached slice (#4961 F20: its newest rows
-  // unmounted under the mounted-row cap) back to the live tail first.
-  const isTranscriptDetached =
-    !showTranscriptHydrationPlaceholder && revealToIndex < deferredMessages.length;
-  const handleJumpToBottom = () => {
-    if (isTranscriptDetached) resetToLatest();
-    jumpToBottom();
-  };
+  const handleJumpToBottom = useCallback(
+    () => jumpToLiveTail(isTranscriptDetached, resetToLatest, jumpToBottom),
+    [isTranscriptDetached, resetToLatest, jumpToBottom]
+  );
 
   // Handler to navigate (scroll) to a specific message by historyId
   const handleNavigateToMessage = useCallback(

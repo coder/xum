@@ -49,6 +49,8 @@ export interface BoundedTranscriptReveal {
   revealThrough: (index: number) => void;
   /** Rows below toIndex may mount; below the length when detached (newest rows unmounted). */
   toIndex: number;
+  /** `toIndex` is below the length of the rows this hook was given. */
+  isDetached: boolean;
   /** Mounts up to one budget of newer rows; resetToLatest restarts tail-first, like a switch. */
   revealNewer: () => void;
   resetToLatest: () => void;
@@ -645,6 +647,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
     revealMore,
     revealThrough,
     toIndex,
+    isDetached: toIndex < length,
     revealNewer,
     resetToLatest,
   };
