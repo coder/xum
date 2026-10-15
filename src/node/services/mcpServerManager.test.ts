@@ -2137,7 +2137,9 @@ describe("MCPServerManager", () => {
   });
 
   test("settings app opens: an older open shares a newer open's failed write and fails too", async () => {
-    type ActionResult = { content: Array<{ type: "text"; text: string }> };
+    interface ActionResult {
+      content: Array<{ type: "text"; text: string }>;
+    }
     using tmp = new DisposableTempDir("mcp-settings-apps-race");
     const store = new McpAppResultStore((id) => path.join(tmp.path, id));
     manager.setMcpApps({ isEnabled: () => true, store });
