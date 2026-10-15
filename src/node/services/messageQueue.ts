@@ -315,6 +315,8 @@ interface QueueEntry {
   sendIdentities: Array<SendIdentity & { dedupeKey?: string }>;
   /** First muxMetadata added to this entry (never overwritten by later batched adds). */
   muxMetadata?: unknown;
+  /** Reviews of later adds, whose metadata the entry did not adopt (see muxMetadata). */
+  batchedReviews?: ReviewNoteData[];
   latestOptions?: SendMessageOptions;
   fileParts: FilePart[];
   /** Dedupe keys registered by addOnce for adds that landed in this entry. */
@@ -899,6 +901,10 @@ export class MessageQueue {
       // Preserve first muxMetadata per entry (see class docblock for rationale)
       if (options.muxMetadata !== undefined && entry.muxMetadata === undefined) {
         entry.muxMetadata = options.muxMetadata;
+      } else if (hasReviews(options.muxMetadata) && (options.muxMetadata.reviews?.length ?? 0) > 0) {
+        // The entry keeps only its first metadata: a later add's reviews must still come back
+        // on a restore (a hook blocking the batch, Codex PRRT_kwDOPxxmWM6rZqyS).
+        entry.batchedReviews = [...(entry.batchedReviews ?? []), ...(options.muxMetadata.reviews ?? [])];
       }
       entry.latestOptions = restOptions;
 
@@ -1046,6 +1052,7 @@ export class MessageQueue {
     const reviews = entries.flatMap((entry) => [
       ...(compactionFollowUpOf(entry)?.reviews ?? []),
       ...(hasReviews(entry.muxMetadata) ? (entry.muxMetadata.reviews ?? []) : []),
+      ...(entry.batchedReviews ?? []),
     ]);
     return reviews.length > 0 ? reviews : undefined;
   }
