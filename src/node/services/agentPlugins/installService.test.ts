@@ -3075,6 +3075,12 @@ describe("AgentPluginInstallService", () => {
       await expect(restarted.signOutPluginServers()).rejects.toThrow(/demo-plugin/);
       expect(await pathExists(file)).toBe(true);
       await fsPromises.writeFile(mcpFile, mcpJson);
+      // So does a tree without a manifest: restored later, it would load with the old sign-in.
+      const manifest = path.join(pluginsDir(), "demo-plugin", "plugin.json");
+      await fsPromises.rename(manifest, `${manifest}.moved`);
+      await expect(restarted.signOutPluginServers()).rejects.toThrow(/manifest of plugin/);
+      expect(await pathExists(file)).toBe(true);
+      await fsPromises.rename(`${manifest}.moved`, manifest);
       // The record names no usable URL, so the servers come from the installed plugin trees.
       spyOn(oauth, "logout").mockResolvedValueOnce({ success: false, error: "disk full" });
       await expect(restarted.signOutPluginServers()).rejects.toThrow(/disk full/);

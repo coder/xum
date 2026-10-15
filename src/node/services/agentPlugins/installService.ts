@@ -4486,23 +4486,28 @@ export class AgentPluginInstallService {
     // Plugin trees are directories (or links to one); skip stray files such as .DS_Store.
     const pluginDir = path.join(this.containerDir, dirName);
     if (dirName.startsWith(".") || !(await fsPromises.stat(pluginDir)).isDirectory()) return [];
+    // A server this scan cannot read can load later, after a repair, with its old sign-in:
+    // the list must be complete before the record goes. A tree without a readable manifest
+    // (discovery returns null, sometimes without a diagnostic) is incomplete too.
     const { plugin, diagnostics } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
+    if (plugin === null) throw new Error(`Xum cannot read the manifest of plugin '${dirName}'.`);
+    // Without an MCP file, a discovery error can be the MCP path itself. With one, a discovery
+    // error names another component (a skill, a hook), and only the MCP diagnostics decide.
     const loaded =
-      plugin?.mcpConfigPath === undefined
-        ? { servers: {}, diagnostics: [] }
+      plugin.mcpConfigPath === undefined
+        ? { servers: {}, diagnostics }
         : await loadPluginMcpServers(plugin, {
             xumHome: this.config.rootDir,
             instanceId: this.instanceIdFor(dirName),
           });
-    // A server this scan cannot read can load later, after a repair, with its old sign-in:
-    // the list must be complete before the record goes.
-    const error = [...diagnostics, ...loaded.diagnostics].find((d) => d.severity === "error");
+    const error = loaded.diagnostics.find((d) => d.severity === "error");
     if (error !== undefined)
       throw new Error(`Xum cannot read the MCP servers of plugin '${dirName}': ${error.message}`);
     return Object.values(loaded.servers).flatMap((info) =>
       info.transport === "stdio" ? [] : [info.url]
     );
   }
+
   /** Logouts a pass started that have not settled yet (see signOutFailure). */
   private readonly inFlightSignOuts = new Map<
     string,
