@@ -5267,7 +5267,7 @@ export class MCPServerManager {
     };
     // The hash covers what this read returns (its layout carries the tool actions), the same
     // object a save's fresh read is compared with (runSettingsSave).
-    this.rememberSettingsSchema(workspaceId, serverName, instanceToken, read);
+    this.rememberSettingsSchema(workspaceId, serverName, instanceToken, read, source.requestId);
     return { ...read, instanceToken };
   }
 
@@ -5449,7 +5449,7 @@ export class MCPServerManager {
     const offered = this.settingsLayoutTools.get(
       settingsSchemaKey(workspaceId, serverName, requestToken)
     );
-    return offered?.has(toolName) === true
+    return offered?.tools.has(toolName) === true
       ? null
       : new Error(`'${serverName}' settings do not offer '${toolName}'`);
   }
@@ -5578,10 +5578,11 @@ export class MCPServerManager {
    */
   private readonly settingsSchemaHashes = new Map<string, string>();
   /**
-   * The tools the layout of each token's latest read offered, under the same keys and bound as
+   * The tools the layout of each token's latest read offered (by request order, so an older read
+   * that settles last does not replace a newer layout), under the same keys and bound as
    * settingsSchemaHashes (settingsReadRefusal).
    */
-  private readonly settingsLayoutTools = new Map<string, ReadonlySet<string>>();
+  private readonly settingsLayoutTools = new Map<string, SettingsLayoutTools>();
 
   /**
    * Whether a request that names `requestToken` (the dialog's read) may act on this workspace
@@ -5608,14 +5609,21 @@ export class MCPServerManager {
     workspaceId: string,
     serverName: string,
     instanceToken: string,
-    snapshot: MCPSettingsSnapshot
+    snapshot: MCPSettingsSnapshot,
+    requestId: number
   ): void {
     const key = settingsSchemaKey(workspaceId, serverName, instanceToken);
     // Each read overwrites its token's hash: the latest schema of an instance is the one a save
     // validated against (the dialog shows that read).
     this.settingsSchemaHashes.delete(key);
     this.settingsSchemaHashes.set(key, settingsSchemaHash(snapshot));
-    this.settingsLayoutTools.set(key, settingsLayoutToolNames(snapshot.layout));
+    this.settingsLayoutTools.set(
+      key,
+      newerLayoutTools(this.settingsLayoutTools.get(key), {
+        requestId,
+        tools: settingsLayoutToolNames(snapshot.layout),
+      })
+    );
     if (this.settingsSchemaHashes.size > MAX_REMEMBERED_SETTINGS_SCHEMAS) {
       const oldest = this.settingsSchemaHashes.keys().next().value;
       if (oldest !== undefined) {
@@ -8529,6 +8537,20 @@ async function raceUntilAborted(work: Promise<unknown>, signals: AbortSignal[]):
 
 function settingsSchemaKey(workspaceId: string, serverName: string, token: string): string {
   return `${settingsSaveKey(workspaceId, serverName)}\0${token}`;
+}
+
+/** The tools one settings read's layout offered, and that read's request ID. */
+interface SettingsLayoutTools {
+  requestId: number;
+  tools: ReadonlySet<string>;
+}
+
+/** The newer of two reads' layout tools (by request ID): the dialog shows the newer read. */
+function newerLayoutTools(
+  known: SettingsLayoutTools | undefined,
+  read: SettingsLayoutTools
+): SettingsLayoutTools {
+  return known !== undefined && known.requestId > read.requestId ? known : read;
 }
 
 /** The tools a settings layout offers (its tool items). */

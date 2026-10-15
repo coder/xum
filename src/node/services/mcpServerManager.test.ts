@@ -1207,6 +1207,58 @@ describe("MCPServerManager", () => {
     expect(runs).toEqual(["library", "reset"]);
   });
 
+  test("settings tool actions: an older read that settles last does not replace the newer layout", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-actions-overlap") });
+    const reads: Array<{ tool: string; answer: () => void }> = [];
+    servers.serve("settings-actions-overlap", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          new Promise((resolve) => {
+            // The first read sees the old layout ("library"), the second the new one ("reset").
+            const tool = reads.length === 0 ? "library" : "reset";
+            reads.push({
+              tool,
+              answer: () =>
+                resolve({
+                  content: [],
+                  structuredContent: {
+                    schema: { type: "object", properties: {} },
+                    values: {},
+                    layout: [{ kind: "group", title: "Parts", items: [{ kind: "tool", tool }] }],
+                  },
+                }),
+            });
+          }),
+        settingsToolAction: (name) =>
+          name === "library" || name === "reset"
+            ? { title: name, readOnly: true, opensApp: false }
+            : undefined,
+        callSettingsActionTool: () => Promise.resolve({ content: [] }),
+      },
+    });
+    const workspaceId = "settings-actions-overlap-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const older = manager.readSettings(workspaceId, "cad");
+    while (reads.length < 1) await new Promise((resolve) => setImmediate(resolve));
+    const newer = manager.readSettings(workspaceId, "cad");
+    while (reads.length < 2) await new Promise((resolve) => setImmediate(resolve));
+    reads[1].answer();
+    const shown = await newer;
+    reads[0].answer();
+    await older;
+    if (shown === null) throw new Error("expected settings");
+    const run = (tool: string) =>
+      manager
+        .runSettingsTool(workspaceId, "cad", tool, shown.instanceToken, { confirmed: true })
+        .then(() => "ran")
+        .catch((error: unknown) => String(error));
+    // The dialog shows the newer read: its tool runs, and the older layout's tool does not.
+    expect(await run("reset")).toBe("ran");
+    expect(await run("library")).toContain("settings do not offer 'library'");
+  });
+
   test("settings: a server counts as connected only once the workspace started it", async () => {
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-connected") });
     servers.serve("settings-connected", { tools: { draw: testTool() } });
