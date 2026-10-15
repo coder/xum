@@ -1,4 +1,5 @@
 import assert from "@/common/utils/assert";
+import { substituteSkillArguments } from "./skillArguments";
 
 /**
  * Dynamic context injection for agent skills (Claude Code-compatible).
@@ -62,10 +63,17 @@ function directiveCommand(line: string): string | undefined {
  * The commands of a body's directive lines, in order, as injectSkillDynamicContext would run
  * them (both split on \n and match with directiveCommand). The plugin consent fingerprint covers
  * these (#6617), so it and the runner must agree on what a directive is.
+ *
+ * The runner sees the body after slash-argument substitution, where a missing argument becomes
+ * an empty string. So a line such as !$1`cmd` is a directive when the user gives no argument, and
+ * it counts here with the command it runs then. A placeholder inside a command stays as written:
+ * the user supplies its value. Every line counts, also past MAX_SKILL_DYNAMIC_COMMANDS: which
+ * lines fall under the cap depends on the arguments, so a cut could skip a command that runs.
  */
 export function skillDynamicDirectiveCommands(body: string): string[] {
   return body.split("\n").flatMap((line) => {
-    const command = directiveCommand(line);
+    const command =
+      directiveCommand(line) ?? directiveCommand(substituteSkillArguments(line, "").body);
     return command === undefined ? [] : [command];
   });
 }

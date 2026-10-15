@@ -236,11 +236,11 @@ export function skillReviewDirectives(body: string): string[] {
 }
 
 // Characters that render as nothing or look like another character: controls, format characters
-// (bidi overrides, zero-width), separators, private use, variation selectors and the blank
-// letters. The three combining marks stay outside the class: in a class they would combine
+// (bidi overrides, zero-width), separators, spaces other than U+0020 (a shell keeps U+00A0 inside
+// a word), private use, variation selectors and the blank letters. The three combining marks stay outside the class: in a class they would combine
 // with the character before them (no-misleading-character-class).
 const INVISIBLE_REVIEW_CHARACTER =
-  /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u115f\u1160\u3164\uffa0\u2800]|\u034f|\u17b4|\u17b5/gu;
+  /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000\p{Co}\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u115f\u1160\u3164\uffa0\u2800]|\u034f|\u17b4|\u17b5/gu;
 
 /**
  * Review text with each invisible character written as `\u{HEX}`, so a hidden character in a

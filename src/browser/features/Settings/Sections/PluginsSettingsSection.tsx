@@ -178,7 +178,7 @@ const SkillDirectives: React.FC<{ directives?: readonly string[] }> = (props) =>
   if (props.directives === undefined || props.directives.length === 0) return null;
   return (
     <span className="block">
-      <span className="text-muted block">Runs these commands when invoked:</span>
+      <span className="text-muted block">Can run these commands when invoked:</span>
       {props.directives.map((command, index) => (
         <code key={index} className="text-foreground block font-mono break-all whitespace-pre-wrap">
           {command}

