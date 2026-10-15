@@ -1371,6 +1371,16 @@ export class McpOauthService {
     )
       return;
     this.insufficientScopes.set(key, input.scopes);
+    // Mounted Settings rows refresh on this signal: a 403 changes nothing they would otherwise see.
+    for (const listener of this.insufficientScopeListeners) listener();
+  }
+
+  private readonly insufficientScopeListeners = new Set<() => void>();
+
+  /** Notifies when a refused request records a sign-in prompt (#6739); returns an unsubscribe. */
+  onInsufficientScope(listener: () => void): () => void {
+    this.insufficientScopeListeners.add(listener);
+    return () => this.insufficientScopeListeners.delete(listener);
   }
 
   /**

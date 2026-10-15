@@ -782,6 +782,11 @@ const MCPOAuthPendingServerSchema = z
 
 // MCP OAuth
 export const mcpOauth = {
+  /** Ticks when a refused request records a sign-in prompt (#6739): re-read the auth status. */
+  onInsufficientScope: {
+    input: z.void(),
+    output: eventIterator(z.void()),
+  },
   startDesktopFlow: {
     input: z
       .object({

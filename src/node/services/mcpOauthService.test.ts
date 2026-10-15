@@ -2061,6 +2061,8 @@ describe("McpOauthService OAuth flows", () => {
       oauth,
       async (serverUrl, result) => {
         expect(result.success).toBe(true);
+        let notified = 0;
+        const unsubscribe = service.onInsufficientScope(() => notified++);
         // Its 403 answered for the old tokens.
         service.recordInsufficientScope({
           serverUrl,
@@ -2079,6 +2081,9 @@ describe("McpOauthService OAuth flows", () => {
         expect((await service.getAuthStatus({ serverUrl, oauth })).insufficientScopes).toEqual([
           "admin",
         ]);
+        // Mounted Settings rows refresh on the recorded prompt only, not on the dropped one.
+        expect(notified).toBe(1);
+        unsubscribe();
       },
       () => {
         startedBefore = performance.now();

@@ -150,6 +150,7 @@ import {
   subscribeMetadata,
   subscribeOpenSettings,
   subscribeDesignExperiment,
+  subscribeMcpInsufficientScope,
   subscribePerfFlightRecorderStatus,
   subscribeComputerUseStatus,
   subscribeProviderConfig,
@@ -1494,6 +1495,10 @@ export const router = (authToken?: string) => {
         ),
     },
     mcpOauth: {
+      onInsufficientScope: t
+        .input(schemas.mcpOauth.onInsufficientScope.input)
+        .output(schemas.mcpOauth.onInsufficientScope.output)
+        .handler(({ context, signal }) => subscribeMcpInsufficientScope(context, signal)),
       startDesktopFlow: t
         .input(schemas.mcpOauth.startDesktopFlow.input)
         .output(schemas.mcpOauth.startDesktopFlow.output)

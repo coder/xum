@@ -221,6 +221,17 @@ export function subscribeProviderConfig(
   });
 }
 
+export function subscribeMcpInsufficientScope(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<undefined> {
+  return runtimeSubscription<undefined>(context, {
+    signal,
+    buffer: "latest",
+    subscribe: (emit) => context.mcpOauthService.onInsufficientScope(() => emit.push(undefined)),
+  });
+}
+
 export function subscribeDesignExperiment(
   context: ORPCContext,
   signal?: AbortSignal

@@ -874,6 +874,33 @@ function ToolSearchSetting() {
   );
 }
 
+/**
+ * Runs onChange for each recorded insufficient_scope prompt (#6739). A plain function because
+ * React Compiler cannot lower `for await` inside a component. The caller's cleanup must
+ * `return()` the iterator, so the backend subscription releases its listener.
+ */
+async function forEachInsufficientScope(
+  api: NonNullable<ReturnType<typeof useAPI>["api"]>,
+  signal: AbortSignal,
+  onIterator: (iterator: AsyncIterator<unknown>) => void,
+  onChange: () => void
+): Promise<void> {
+  try {
+    const subscribed = await api.mcpOauth.onInsufficientScope(undefined, { signal });
+    if (signal.aborted) {
+      void subscribed.return?.();
+      return;
+    }
+    onIterator(subscribed);
+    for await (const _ of subscribed) {
+      if (signal.aborted) break;
+      onChange();
+    }
+  } catch {
+    // Cancelled through the abort signal on cleanup.
+  }
+}
+
 export const MCPSettingsSection: React.FC = () => {
   const design = useClaudeDesign();
   const refreshRequest = useRef({ id: 0 });
@@ -903,6 +930,25 @@ export const MCPSettingsSection: React.FC = () => {
     Record<string, { serverInfo: MCPServerIdentity; icon?: string }>
   >({});
   const [mcpOauthRefreshNonce, setMcpOauthRefreshNonce] = useState(0);
+  // A refused tool call records a sign-in prompt in the backend only: re-read the mounted rows'
+  // auth status when one does (#6739).
+  useEffect(() => {
+    if (!api) return;
+    const abortController = new AbortController();
+    let iterator: AsyncIterator<unknown> | null = null;
+    void forEachInsufficientScope(
+      api,
+      abortController.signal,
+      (subscribed) => {
+        iterator = subscribed;
+      },
+      () => setMcpOauthRefreshNonce((nonce) => nonce + 1)
+    );
+    return () => {
+      abortController.abort();
+      void iterator?.return?.();
+    };
+  }, [api]);
   const viewDomains = useMcpAppViewDomains();
 
   interface EditableServer {
