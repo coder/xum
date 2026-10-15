@@ -124,6 +124,8 @@ interface CreationControlsProps {
   /** Stable project data passed by ChatInput so typing does not subscribe this form to broad contexts. */
   userProjects: Map<string, ProjectConfig>;
   onSelectedProjectPathChange: (path: string) => void;
+  /** The project waits for a send, and for input the composer is still reading. */
+  projectSelectDisabled: boolean;
   /** Project name to display as header */
   projectName: string;
   /** Workspace name/title generation state and actions */
@@ -686,7 +688,7 @@ function CreationControlsContent(props: CreationControlsProps) {
               selected={selected}
               userProjects={props.userProjects}
               onChange={props.onSelectedProjectPathChange}
-              disabled={props.disabled}
+              disabled={props.projectSelectDisabled}
             />
           );
         })()}
@@ -1127,6 +1129,7 @@ export function CreationControls(props: CreationControlsProps) {
       selectedProjectPath={props.selectedProjectPath}
       userProjects={props.userProjects}
       onSelectedProjectPathChange={props.onSelectedProjectPathChange}
+      projectSelectDisabled={props.projectSelectDisabled}
       projectName={props.projectName}
       nameState={nameState}
       runtimeAvailabilityState={props.runtimeAvailabilityState}

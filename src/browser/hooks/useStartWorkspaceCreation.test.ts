@@ -42,7 +42,6 @@ describe("persistWorkspaceCreationPrefill", () => {
     expect(draft?.text).toBe("Ship it");
     expect(draft?.ai.model).toBe("provider:model");
     expect(draft?.execution).toEqual({
-      projectPath,
       agent: null,
       runtime: null,
       trunkBranch: "main",

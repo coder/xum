@@ -1,7 +1,5 @@
-import * as fs from "fs/promises";
 import * as path from "path";
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
-import { ORPCError } from "@orpc/client";
 import { createTestApiClient } from "@/browser/testUtils";
 import type {
   CreationDraftImportLegacyInput,
@@ -14,11 +12,7 @@ import { DRAFT_STORE_READY_TIMEOUT_MS } from "@/constants/drafts";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { Config } from "@/node/config";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
-import {
-  CreationDraftRejectedError,
-  CreationDraftService,
-  creationDraftImportId,
-} from "@/node/services/creationDraftService";
+import { CreationDraftService, creationDraftImportId } from "@/node/services/creationDraftService";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { installDom } from "../../../tests/ui/dom";
@@ -64,7 +58,6 @@ async function createHarness(
     readError: null as Error | null,
     readGate: Promise.resolve(),
   };
-  // Like the router: a refusal is BAD_REQUEST, anything else is a transport-like failure.
   const drafts = {
     listCreation: () => service.list(),
     getCreation: async ({ scope }: { scope: CreationDraftScope }) => {
@@ -79,11 +72,7 @@ async function createHarness(
         control.failUpdates--;
         throw new Error("connection lost");
       }
-      const reply = await service.update(input).catch((error: unknown) => {
-        throw error instanceof CreationDraftRejectedError
-          ? new ORPCError("BAD_REQUEST", { message: error.message })
-          : error;
-      });
+      const reply = await service.update(input);
       if (control.loseUpdateReplies > 0) {
         control.loseUpdateReplies--;
         throw new Error("connection lost");
@@ -204,27 +193,6 @@ describe("CreationDraftStore", () => {
     expect((await reopen(harness, id, PROJECT_A)).getView(id).draft?.text).toBe("keep me");
   });
 
-  test("a refused save waits for a correction instead of retrying on reconnect", async () => {
-    using tempDir = new TestTempDir("creation-store-refusal");
-    const harness = await createHarness(tempDir);
-    const { store, control } = harness;
-    const id = store.create(PROJECT_A, null, { persist: true });
-    await store.flush(id);
-
-    // Choices made for another project (a stale window): the backend refuses them.
-    store.update(id, {
-      execution: { projectPath: PROJECT_B, agent: null, runtime: null, trunkBranch: null },
-    });
-    expect(String(await store.flush(id).catch((error: unknown) => error))).toContain(
-      "another project"
-    );
-    const attempts = control.updates.length;
-    store.setClient(harness.newClient());
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(control.updates.length).toBe(attempts);
-    expect(store.getView(id).saveError).not.toBeNull();
-  });
-
   test("a failed or timed-out read shows Retry and never an editable blank draft", async () => {
     using tempDir = new TestTempDir("creation-store-read-failure");
     const harness = await createHarness(tempDir);
@@ -274,7 +242,7 @@ describe("CreationDraftStore", () => {
     expect(store.getDraftsByProject()[PROJECT_B]?.map((draft) => draft.draftId)).toEqual(["fresh"]);
   });
 
-  test("a draft whose save was sent is deleted on the backend even when the reply was lost", async () => {
+  test("deleting a draft removes its record even when its save reply was lost", async () => {
     using tempDir = new TestTempDir("creation-store-delete-lost-reply");
     const harness = await createHarness(tempDir);
     const { store, control, service } = harness;
@@ -285,46 +253,29 @@ describe("CreationDraftStore", () => {
 
     await store.delete(id);
     expect(await service.get(id)).toBeNull();
-
-    // A draft never sent has no record: deleting it offline is local only.
-    const local = store.create(PROJECT_A, null);
-    store.setClient(null);
-    await store.delete(local);
-    expect(store.getView(local).draft).toBeNull();
+    expect(store.getView(id).draft).toBeNull();
   });
 
-  test("imports old browser drafts before listing, and keeps the keys of those it could not import", async () => {
+  test("imports old browser drafts before listing, and keeps the keys of a failed import", async () => {
     using tempDir = new TestTempDir("creation-store-legacy-import");
     const named = getDraftScopeId(PROJECT_A, "named");
-    const conflicting = getDraftScopeId(PROJECT_A, "conflicting");
+    const filled = getDraftScopeId(PROJECT_A, "filled");
     const failing = getDraftScopeId(PROJECT_B, "failing");
     window.localStorage.setItem(
       getWorkspaceNameStateKey(named),
       JSON.stringify({ autoGenerate: false, manualName: "typed-name" })
     );
-    window.localStorage.setItem(getInputKey(conflicting), JSON.stringify("older text"));
+    window.localStorage.setItem(getInputKey(filled), JSON.stringify("older text"));
     window.localStorage.setItem(getInputKey(failing), JSON.stringify("not imported yet"));
     const harness = await createHarness(tempDir, {
       failLegacyImport: "failing",
       seed: async (config) => {
-        const seeding = new CreationDraftService(config);
-        await seeding.update({
-          scope: { kind: "creation", draftId: creationDraftImportId(PROJECT_A, "conflicting") },
+        // The backend already imported this scope's old body: its record keeps that text.
+        await new CreationDraftService(config).update({
+          scope: { kind: "creation", draftId: creationDraftImportId(PROJECT_A, "filled") },
           projectPath: PROJECT_A,
           text: "newer text",
         });
-        // An old backend body that differs from its newer record: the backend's own warning.
-        await seeding.update({
-          scope: { kind: "creation", draftId: creationDraftImportId(PROJECT_B, "old") },
-          projectPath: PROJECT_B,
-          text: "newer body",
-        });
-        const oldDir = path.join(config.rootDir, "drafts", "project-b");
-        await fs.mkdir(oldDir, { recursive: true });
-        await fs.writeFile(
-          path.join(oldDir, "old.json"),
-          JSON.stringify({ projectPath: PROJECT_B, draftId: "old", text: "older body" })
-        );
       },
     });
     const { store, service } = harness;
@@ -334,16 +285,11 @@ describe("CreationDraftStore", () => {
     expect((await service.get(namedId))?.manualName).toBe("typed-name");
     expect(store.getDraftsByProject()[PROJECT_A]?.map((draft) => draft.draftId)).toContain(namedId);
     expect(window.localStorage.getItem(getWorkspaceNameStateKey(named))).toBeNull();
-    // A conflicting or failed import keeps its keys, and the newer record.
-    expect(window.localStorage.getItem(getInputKey(conflicting))).not.toBeNull();
-    expect(window.localStorage.getItem(getInputKey(failing))).not.toBeNull();
-    expect((await service.get(creationDraftImportId(PROJECT_A, "conflicting")))?.text).toBe(
+    expect((await service.get(creationDraftImportId(PROJECT_A, "filled")))?.text).toBe(
       "newer text"
     );
-    // Both warnings show: the backend's and this browser's.
-    const backendError = (await service.list()).importError;
-    expect(backendError).not.toBeNull();
-    expect(store.getListState().importError).toContain(backendError);
-    expect(store.getListState().importError).not.toBe(backendError);
+    expect(window.localStorage.getItem(getInputKey(filled))).toBeNull();
+    // A failed import keeps its keys for the next start.
+    expect(window.localStorage.getItem(getInputKey(failing))).not.toBeNull();
   });
 });

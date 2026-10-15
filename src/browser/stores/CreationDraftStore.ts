@@ -1,5 +1,4 @@
 import { useSyncExternalStore } from "react";
-import { ORPCError } from "@orpc/client";
 import type { APIClient } from "@/browser/contexts/API";
 import {
   listPersistedKeys,
@@ -24,7 +23,6 @@ import { coerceThinkingLevel } from "@/common/types/thinking";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   createDraftId,
-  ownExecution,
   sanitizeDraftAttachments,
   summarizeCreationDraft,
 } from "@/common/utils/drafts";
@@ -60,8 +58,8 @@ export interface CreationDraftView {
 export type CreationDraftPatch = Partial<Omit<CreationDraft, "id">>;
 
 export interface CreationDraftListState {
-  status: "loading" | "ready" | "failed";
-  importError: string | null;
+  /** A failed list counts as ready with no rows (logged; retried on reconnect). */
+  status: "loading" | "ready";
 }
 
 interface Entry {
@@ -71,8 +69,6 @@ interface Entry {
   load: CreationDraftLoad;
   /** Whether the backend holds a record: until then, a save sends every field (a create). */
   persisted: boolean;
-  /** A save was sent: the backend may hold a record even when the reply was lost. */
-  sent: boolean;
   /** Changed fields not sent yet. */
   pending: CreationDraftPatch;
   /** Never rejects (save records its error). */
@@ -80,13 +76,11 @@ interface Entry {
   saving: boolean;
   timer: ReturnType<typeof setTimeout> | null;
   saveError: string | null;
-  /** A transport failure: retried on reconnect (a refusal needs a correction or a reload). */
-  retryOnReconnect: boolean;
   view: CreationDraftView;
 }
 
 const SAVE_DEBOUNCE_MS = 300;
-const NO_EXECUTION_CHOICES: Omit<CreationDraftExecution, "projectPath"> = {
+const NO_EXECUTION_CHOICES: CreationDraftExecution = {
   agent: null,
   runtime: null,
   trunkBranch: null,
@@ -97,11 +91,6 @@ const LOADING_VIEW: CreationDraftView = {
   unsaved: false,
   saveError: null,
 };
-
-/** A backend refusal (validation, ownership, size): permanent until the draft changes. */
-function isRefusal(error: unknown): boolean {
-  return error instanceof ORPCError && error.code === "BAD_REQUEST";
-}
 
 /** Project defaults only seed a new draft; afterwards the draft owns its choices. */
 function seedAi(projectPath: string): CreationDraft["ai"] {
@@ -197,23 +186,15 @@ function readLegacyContent(scopeId: string) {
   return { text: readPersistedString(getInputKey(scopeId)) ?? "", attachments, manualName };
 }
 
-/** Import one old scope; its keys go unless a newer draft differs (or the call fails). */
-async function importLegacyDraft(
-  client: APIClient,
-  scopeId: string
-): Promise<"imported" | "conflict" | "skipped"> {
+/** Import one old scope; its keys (settings included) go once the backend took it. */
+async function importLegacyDraft(client: APIClient, scopeId: string): Promise<void> {
   const scope = parseLegacyScope(scopeId);
-  if (!scope) return "skipped";
+  if (!scope) return;
   const content = readLegacyContent(scopeId);
   const hasContent =
     content.text.length > 0 || content.attachments.length > 0 || content.manualName.length > 0;
-  const reply = hasContent
-    ? await client.drafts.importLegacyCreation({ ...scope, ...content })
-    : null;
-  if (reply?.result === "conflict") return "conflict";
-  // Imported, orphaned, or nothing to import: the old scope's settings keys go with it.
+  if (hasContent) await client.drafts.importLegacyCreation({ ...scope, ...content });
   deleteWorkspaceStorage(scopeId);
-  return reply ? "imported" : "skipped";
 }
 
 export class CreationDraftStore {
@@ -223,7 +204,7 @@ export class CreationDraftStore {
   private readonly listListeners = new Set<() => void>();
   private summaries = new Map<string, CreationDraftSummary>();
   private byProject: Record<string, CreationDraftSummary[]> = {};
-  private listState: CreationDraftListState = { status: "loading", importError: null };
+  private listState: CreationDraftListState = { status: "loading" };
   private listedClient: APIClient | null = null;
   private readonly blankIds = new Map<string, string>();
 
@@ -234,7 +215,7 @@ export class CreationDraftStore {
     this.loadList(client);
     for (const [id, entry] of this.entries) {
       if (entry.load.status === "loadFailed") this.retryLoad(id);
-      else if (entry.retryOnReconnect) this.flushInBackground(id);
+      else if (entry.saveError !== null) this.flushInBackground(id);
     }
   }
 
@@ -281,17 +262,13 @@ export class CreationDraftStore {
     }
   }
 
-  retryList(): void {
-    if (this.client) this.loadList(this.client);
-  }
-
   private loadList(client: APIClient): void {
     this.listedClient = client;
-    this.listState = { ...this.listState, status: "loading" };
+    this.listState = { status: "loading" };
     this.recomputeList();
     const run = async () => {
       // Before the list, so it includes what this imports.
-      const legacyError = await this.importLegacyDrafts(client);
+      await this.importLegacyDrafts(client);
       const list = await client.drafts.listCreation();
       if (this.listedClient !== client) return;
       this.summaries = new Map(list.drafts.map((summary) => [summary.draftId, summary]));
@@ -300,14 +277,14 @@ export class CreationDraftStore {
         if (entry.draft && entry.persisted)
           this.summaries.set(id, summarizeCreationDraft(entry.draft));
       }
-      const errors = [list.importError, legacyError].filter((error) => error !== null);
-      this.listState = { status: "ready", importError: errors.join(" ") || null };
+      this.listState = { status: "ready" };
       this.recomputeList();
     };
     run().catch((error: unknown) => {
+      // No rows: a new draft still works, and the next connection lists again.
       console.error("Failed to load creation drafts:", error);
       if (this.listedClient !== client) return;
-      this.listState = { ...this.listState, status: "failed" };
+      this.listState = { status: "ready" };
       this.recomputeList();
     });
   }
@@ -325,21 +302,16 @@ export class CreationDraftStore {
 
   /**
    * One-way import of pre-record renderer drafts (localStorage text, attachments and typed names
-   * of old creation scopes). Keys go only once the backend confirmed the import. Returns an error
-   * to show when an import conflicted with a newer draft (its keys stay).
+   * of old creation scopes). Keys go only once the backend confirmed the import.
    */
-  private async importLegacyDrafts(client: APIClient): Promise<string | null> {
-    const counts = { imported: 0, conflict: 0, skipped: 0 };
+  private async importLegacyDrafts(client: APIClient): Promise<void> {
     for (const scopeId of legacyScopeIds()) {
       try {
-        counts[await importLegacyDraft(client, scopeId)]++;
+        await importLegacyDraft(client, scopeId);
       } catch (error) {
         console.warn("Failed to import a legacy creation draft; will retry on next start:", error);
       }
     }
-    return counts.conflict > 0
-      ? `${counts.conflict} older draft(s) were not imported because a newer draft differs. They stay in this browser.`
-      : null;
   }
 
   // --- One draft ---
@@ -432,7 +404,6 @@ export class CreationDraftStore {
     if (patch.projectPath !== undefined) this.releaseBlankId(id);
     // An edit may correct a refused save: try again with it.
     entry.saveError = null;
-    entry.retryOnReconnect = false;
     this.recompute(id, entry);
     if (entry.timer) clearTimeout(entry.timer);
     entry.timer = setTimeout(() => {
@@ -441,20 +412,11 @@ export class CreationDraftStore {
     }, SAVE_DEBOUNCE_MS);
   }
 
-  /**
-   * Set execution choices. They are grouped with the project they were made for, so the backend
-   * refuses them for another project; choices made for a previous project are not kept.
-   */
-  updateExecution(id: string, patch: Partial<Omit<CreationDraftExecution, "projectPath">>): void {
+  /** Set execution choices (one group: a project change replaces it, changeCreationDraftProject). */
+  updateExecution(id: string, patch: Partial<CreationDraftExecution>): void {
     const draft = this.entries.get(id)?.draft;
     if (!draft) return;
-    this.update(id, {
-      execution: {
-        ...(ownExecution(draft) ?? NO_EXECUTION_CHOICES),
-        ...patch,
-        projectPath: draft.projectPath,
-      },
-    });
+    this.update(id, { execution: { ...(draft.execution ?? NO_EXECUTION_CHOICES), ...patch } });
   }
 
   /** Save now and wait until every local change is confirmed; rejects with the save error. */
@@ -492,7 +454,6 @@ export class CreationDraftStore {
     const patch = entry.persisted ? entry.pending : all;
     entry.pending = {};
     entry.saving = true;
-    entry.sent = true;
     this.recompute(id, entry);
     try {
       if (!this.client) throw new Error("Not connected.");
@@ -503,7 +464,6 @@ export class CreationDraftStore {
       entry.saving = false;
       entry.persisted = true;
       entry.saveError = null;
-      entry.retryOnReconnect = false;
       if (this.entries.get(id) !== entry) return;
       this.summaries.set(id, summarizeCreationDraft(entry.draft ?? draft));
       this.recomputeList();
@@ -513,7 +473,6 @@ export class CreationDraftStore {
       // Later edits win over the fields this save carried.
       entry.pending = { ...patch, ...entry.pending };
       entry.saveError = getErrorMessage(error);
-      entry.retryOnReconnect = !isRefusal(error);
     }
     this.recompute(id, entry);
   }
@@ -528,8 +487,6 @@ export class CreationDraftStore {
     this.recomputeList();
     // Let a save in flight land first, so it cannot recreate the file after the delete.
     await entry?.inFlight;
-    // A draft never sent has no record; offline, its delete is local only.
-    if (entry && !entry.persisted && !entry.sent) return;
     if (!this.client) throw new Error("Not connected.");
     await this.client.drafts.deleteCreation({ scope: { kind: "creation", draftId: id } });
   }
@@ -561,13 +518,11 @@ export class CreationDraftStore {
       },
       load,
       persisted,
-      sent: false,
       pending: {},
       inFlight: null,
       saving: false,
       timer: null,
       saveError: null,
-      retryOnReconnect: false,
       view: LOADING_VIEW,
     };
     entry.view = this.viewOf(entry);

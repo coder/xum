@@ -83,7 +83,7 @@ const draftBackend = createTestApiClient({
       });
     },
     delete: () => Promise.resolve({ revision: Date.now() }),
-    listCreation: () => Promise.resolve({ drafts: [], importError: null }),
+    listCreation: () => Promise.resolve({ drafts: [] }),
     updateCreation: async (input) => {
       await creationSaveGate;
       if (failCreationSaves) throw new Error("draft save refused");

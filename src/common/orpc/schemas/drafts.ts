@@ -271,12 +271,10 @@ const ParsedRuntimeSchema = z.discriminatedUnion("mode", [
 ]);
 
 /**
- * A creation draft's execution choices, grouped with the project they were made for: the backend
- * refuses a save whose `projectPath` is not the record's (a stale window's choices for another
- * project). Null fields (and a null group) fall back to the project's defaults.
+ * A creation draft's execution choices for its current project (a project change resets the
+ * project-specific ones). Null fields (and a null group) fall back to the project's defaults.
  */
 export const CreationDraftExecutionSchema = z.object({
-  projectPath: z.string().min(1),
   agent: z.object({ id: z.string().min(1), scope: AgentDefinitionScopeSchema }).nullable(),
   runtime: ParsedRuntimeSchema.nullable(),
   trunkBranch: z.string().nullable(),
@@ -331,8 +329,6 @@ export const CreationDraftSummarySchema = CreationDraftSchema.pick({
 
 export const CreationDraftListSchema = z.object({
   drafts: z.array(CreationDraftSummarySchema),
-  /** Old drafts the one-way import kept because a newer draft differs (their files stay). */
-  importError: z.string().nullable(),
 });
 
 /** Partial: omitted fields keep their stored value; only an explicit `projectPath` moves it. */
@@ -347,11 +343,6 @@ export const CreationDraftImportLegacyInputSchema = z.object({
   text: z.string().optional(),
   attachments: z.array(DraftAttachmentSchema).optional(),
   manualName: z.string().max(CREATION_DRAFT_NAME_MAX_CHARS).optional(),
-});
-
-export const CreationDraftImportLegacyOutputSchema = z.object({
-  /** "conflict": a newer draft differs; the caller keeps its legacy keys (and shows the error). */
-  result: z.enum(["imported", "conflict", "orphaned"]),
 });
 
 export type DraftScope = z.infer<typeof DraftScopeSchema>;

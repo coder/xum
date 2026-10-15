@@ -1,7 +1,6 @@
 import {
   DraftAttachmentSchema,
   type CreationDraft,
-  type CreationDraftExecution,
   type CreationDraftSummary,
   type Draft,
   type DraftAttachment,
@@ -28,11 +27,6 @@ export function summarizeCreationDraft(draft: CreationDraft): CreationDraftSumma
     manualName: draft.manualName,
     preview: draft.text.slice(0, 1000).trim().replace(/\s+/g, " ").slice(0, 200),
   };
-}
-
-/** The draft's execution choices, unless they were made for another project (then none). */
-export function ownExecution(draft: CreationDraft): CreationDraftExecution | null {
-  return draft.execution?.projectPath === draft.projectPath ? draft.execution : null;
 }
 
 /** A new creation draft id (matches DRAFT_ID_PATTERN: it becomes a backend file name). */

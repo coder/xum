@@ -145,7 +145,6 @@ import { isMultiProject } from "@/common/utils/multiProject";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
 import type { CreationDraftSummary } from "@/common/orpc/schemas/drafts";
-import { CreationDraftListNotice } from "./CreationDraftListNotice";
 import {
   MULTI_PROJECT_CONFIG_KEY,
   MULTI_PROJECT_SIDEBAR_SECTION_ID,
@@ -2496,7 +2495,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                   </button>
                 )}
               </div>
-              <CreationDraftListNotice />
               <ScrollArea
                 className="flex-1"
                 viewportRef={projectListScrollRef}

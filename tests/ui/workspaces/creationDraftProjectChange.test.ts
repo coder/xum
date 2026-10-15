@@ -128,7 +128,7 @@ describeIntegration("Creation draft project change", () => {
         attachments: [IMAGE],
         manualName: "my-branch",
         ai: { model: "anthropic:claude-sonnet-4-5" },
-        execution: { projectPath: pathB, agent: null, runtime: null, trunkBranch: null },
+        execution: { agent: null, runtime: null, trunkBranch: null },
       });
       expect(getWorkspaceDraftIds(pathA)).not.toContain(draftId);
       expect(getWorkspaceDraftIds(pathB)).toContain(draftId);
@@ -192,6 +192,42 @@ describeIntegration("Creation draft project change", () => {
       await waitFor(() => expect(model()).toBe("anthropic:claude-opus-4-1"));
     } finally {
       await env.orpc.config.updateAgentAiDefaults({ agentAiDefaults: {} });
+      await cleanupView(view, cleanupDom);
+    }
+  }, 60_000);
+
+  // Scratch opens another page (a new composer), which would drop a file still being read.
+  test("the project selector waits for a file being read", async () => {
+    const env = getSharedEnv();
+    const cleanupDom = setupTestDom();
+    const view = renderApp({ apiClient: env.orpc });
+    let releaseFile: () => void = () => undefined;
+    try {
+      const pathA = await addProjectViaUI(view, getSharedRepoPath());
+      await openProjectCreationView(view, pathA);
+      await waitForScope(view.container, pathA.split("/").pop() ?? pathA);
+      const selector = () =>
+        view.container.querySelector<HTMLButtonElement>('[data-testid="project-selector"]');
+      expect(selector()?.disabled).toBe(false);
+
+      const held = new Promise<void>((resolve) => {
+        releaseFile = () => resolve();
+      });
+      const file = new File(["bytes"], "held.bin", { type: "application/octet-stream" });
+      const read = file.arrayBuffer.bind(file);
+      file.arrayBuffer = async () => {
+        await held;
+        return read();
+      };
+      fireEvent.drop(messageTextarea(view.container), {
+        dataTransfer: { files: [file], types: ["Files"] },
+      });
+      await waitFor(() => expect(selector()?.disabled).toBe(true));
+
+      releaseFile();
+      await waitFor(() => expect(selector()?.disabled).toBe(false));
+    } finally {
+      releaseFile();
       await cleanupView(view, cleanupDom);
     }
   }, 60_000);

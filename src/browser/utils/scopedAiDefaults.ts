@@ -19,7 +19,6 @@ import {
   parseCreationDraftScopeId,
 } from "@/common/constants/storage";
 import { normalizeAgentId } from "@/common/utils/agentIds";
-import { ownExecution } from "@/common/utils/drafts";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 // Global defaults have no model, so a global model read is always undefined.
@@ -66,8 +65,7 @@ function readCreationDraftDefault<F extends ScopedAiField>(
     model: draft.ai.model,
     thinkingLevel: draft.ai.thinkingLevel,
     agentId:
-      ownExecution(draft)?.agent?.id ??
-      preferences.ai?.projectDefaults?.[draft.projectPath]?.agentId,
+      draft.execution?.agent?.id ?? preferences.ai?.projectDefaults?.[draft.projectPath]?.agentId,
   };
   return value[field];
 }

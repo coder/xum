@@ -147,7 +147,6 @@ import {
   DraftWriteOutputSchema,
   RemovedCreationDraftSchema,
   CreationDraftImportLegacyInputSchema,
-  CreationDraftImportLegacyOutputSchema,
   CreationDraftListSchema,
   CreationDraftSchema,
   CreationDraftScopeSchema,
@@ -3804,7 +3803,7 @@ export const drafts = {
     input: DraftResolveSendsInputSchema,
     output: DraftResolveSendsOutputSchema,
   },
-  /** Creation draft rows (metadata kept in backend memory) and any one-way import error. */
+  /** Creation draft rows (metadata kept in backend memory). */
   listCreation: {
     input: z.void(),
     output: CreationDraftListSchema,
@@ -3824,7 +3823,7 @@ export const drafts = {
   },
   importLegacyCreation: {
     input: CreationDraftImportLegacyInputSchema,
-    output: CreationDraftImportLegacyOutputSchema,
+    output: z.void(),
   },
   subscribe: {
     input: z.void(),

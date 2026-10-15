@@ -203,11 +203,11 @@ const buildRuntimeFromChoice = (choice: RuntimeChoice): ParsedRuntime => {
  */
 /**
  * The draft owns its choices; project defaults only fill what it has not chosen (undefined or
- * null). Execution choices made for another project are not this project's.
+ * null).
  */
-function useDraftChoices(draftId: string, projectPath: string) {
+function useDraftChoices(draftId: string) {
   const draft = useCreationDraft(draftId).draft;
-  const execution = draft?.execution?.projectPath === projectPath ? draft.execution : null;
+  const execution = draft?.execution ?? null;
   return { model: draft?.ai.model, agentId: execution?.agent?.id, execution };
 }
 
@@ -237,7 +237,7 @@ export function useDraftWorkspaceSettings(
   const globalDefaultAgentId =
     useUserPreferences((preferences) => preferences.ai?.globalDefaults?.agentId) ??
     WORKSPACE_DEFAULTS.agentId;
-  const choices = useDraftChoices(draftId, projectPath);
+  const choices = useDraftChoices(draftId);
   const execution = choices.execution;
   const projectAgentId = useUserPreferences(
     (preferences) => preferences.ai?.projectDefaults?.[projectPath]?.agentId

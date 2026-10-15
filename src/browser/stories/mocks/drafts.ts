@@ -141,7 +141,6 @@ export function createMockDraftsApi() {
       seedListedCreationDrafts();
       return Promise.resolve({
         drafts: [...creationDrafts.values()].map(summarizeCreationDraft),
-        importError: null,
       });
     },
     getCreation: (input: { scope: CreationDraftScope }) =>
@@ -160,7 +159,7 @@ export function createMockDraftsApi() {
         attachments: (input.attachments ?? []).filter((a) => a.kind !== "staged"),
         manualName: input.manualName ?? "",
       });
-      return Promise.resolve({ result: "imported" as const });
+      return Promise.resolve();
     },
     importLegacy: (input: DraftUpdateInput) => {
       if (drafts.has(draftScopeKey(input.scope))) {

@@ -47,8 +47,9 @@ const OLD_LIST_FILE_NAME = "list.json";
 export class CreationDraftRejectedError extends Error {}
 
 /**
- * Record id of an old creation scope. From the FULL scope: old ids were only unique per project
- * (every project had a "default" draft), so the id alone would collide.
+ * Record id of an old creation scope, from the FULL scope (old ids repeat across projects: every
+ * project had a "default" draft). One scope's old body file and its typed name (renderer
+ * localStorage) are imported separately and land in this one record.
  */
 export function creationDraftImportId(projectPath: string, legacyDraftId: string): string {
   const digest = createHash("sha256").update(JSON.stringify([projectPath, legacyDraftId]));
@@ -77,40 +78,19 @@ interface ImportedContent {
   manualName?: string;
 }
 
-/** What an old field adds to the record: nothing, a fill of the empty field, or null (differs). */
-type ImportFill = Partial<CreationDraft> | null;
-
-function importBody(
-  current: CreationDraft,
-  text: string,
-  attachments: CreationDraft["attachments"]
-): ImportFill {
-  if (text.length === 0 && attachments.length === 0) return {};
-  if (current.text.length === 0 && current.attachments.length === 0) return { text, attachments };
-  return JSON.stringify([current.text, current.attachments]) === JSON.stringify([text, attachments])
-    ? {}
-    : null;
-}
-
-function importName(current: CreationDraft, manualName: string): ImportFill {
-  if (manualName.length === 0 || current.manualName === manualName) return {};
-  return current.manualName.length === 0 ? { manualName } : null;
-}
-
-/**
- * Fill the empty content of `current` from an old draft. Null when a filled field holds something
- * else: the newer record wins and the old data is kept (never merged over, never dropped).
- */
-function mergeImported(current: CreationDraft, incoming: ImportedContent): CreationDraft | null {
-  // Staged attachments are worktree paths (a creation draft has none).
-  const attachments = stripStagedDraftAttachments(incoming.attachments ?? []);
-  const body = importBody(current, incoming.text ?? "", attachments);
-  const name = importName(
-    current,
-    incoming.manualName?.slice(0, CREATION_DRAFT_NAME_MAX_CHARS) ?? ""
-  );
-  if (body === null || name === null) return null;
-  return Object.keys({ ...body, ...name }).length > 0 ? { ...current, ...body, ...name } : current;
+/** Fill the record's empty fields from an old draft; a filled field keeps the record's value. */
+function withImported(current: CreationDraft, incoming: ImportedContent): CreationDraft {
+  const bodyEmpty = current.text.length === 0 && current.attachments.length === 0;
+  return {
+    ...current,
+    ...(bodyEmpty && {
+      text: incoming.text ?? "",
+      // Staged attachments are worktree paths (a creation draft has none).
+      attachments: stripStagedDraftAttachments(incoming.attachments ?? []),
+    }),
+    manualName:
+      current.manualName || (incoming.manualName?.slice(0, CREATION_DRAFT_NAME_MAX_CHARS) ?? ""),
+  };
 }
 
 /** The manual name an old body stored (a generated name is a preview: discarded). */
@@ -198,7 +178,6 @@ export class CreationDraftService {
   private readonly oldRoot: string;
   private summaries: Map<string, CreationDraftSummary> | null = null;
   private loading: Promise<void> | null = null;
-  private importProblems = 0;
 
   constructor(private readonly config: Config) {
     this.root = path.join(config.rootDir, RECORDS_DIR_NAME);
@@ -207,13 +186,7 @@ export class CreationDraftService {
 
   async list(): Promise<CreationDraftList> {
     const summaries = await this.ensureLoaded();
-    return {
-      drafts: [...summaries.values()],
-      importError:
-        this.importProblems > 0
-          ? `${this.importProblems} older draft(s) were not imported: a newer draft differs, or the file could not be read. Their files are kept in ${this.oldRoot}.`
-          : null,
-    };
+    return { drafts: [...summaries.values()] };
   }
 
   /** Null for a draft without a record (never saved, or deleted). */
@@ -239,27 +212,14 @@ export class CreationDraftService {
         throw new CreationDraftRejectedError("This draft was deleted. Reload to start a new one.");
       }
       const next = { ...base, ...patch, id: scope.draftId };
-      this.checkOwnership(current, next);
+      if (!this.isOwned(next.projectPath)) {
+        throw new CreationDraftRejectedError(`Project ${next.projectPath} is not registered.`);
+      }
       const parsed = CreationDraftSchema.safeParse(next);
       if (!parsed.success) throw new CreationDraftRejectedError("Invalid creation draft.");
       await this.writeRecord(parsed.data);
       return summarizeCreationDraft(parsed.data);
     });
-  }
-
-  /** Both the stored and the target project must be registered, and own the execution choices. */
-  private checkOwnership(current: CreationDraft | null, next: CreationDraft): void {
-    if (current && !this.isOwned(current.projectPath)) {
-      throw new CreationDraftRejectedError(`Project ${current.projectPath} was removed.`);
-    }
-    if (!this.isOwned(next.projectPath)) {
-      throw new CreationDraftRejectedError(`Project ${next.projectPath} is not registered.`);
-    }
-    if (next.execution !== null && next.execution.projectPath !== next.projectPath) {
-      throw new CreationDraftRejectedError(
-        "These workspace choices were made for another project. Reload the draft."
-      );
-    }
   }
 
   async delete(draftId: string): Promise<void> {
@@ -282,21 +242,16 @@ export class CreationDraftService {
   }
 
   /** One-way import of a renderer's pre-record draft text or typed name (localStorage). */
-  async importLegacy(
-    input: CreationDraftImportLegacyInput
-  ): Promise<{ result: "imported" | "conflict" | "orphaned" }> {
+  async importLegacy(input: CreationDraftImportLegacyInput): Promise<void> {
     await this.ensureLoaded();
-    if (!this.isOwned(input.projectPath)) return { result: "orphaned" };
+    // A removed project's draft has nowhere to go: the caller drops it.
+    if (!this.isOwned(input.projectPath)) return;
     const id = creationDraftImportId(input.projectPath, input.legacyDraftId);
-    return withTargetMutationLock(this.config.rootDir, this.filePathFor(id), async () => {
+    await withTargetMutationLock(this.config.rootDir, this.filePathFor(id), async () => {
       const current = await this.readRecord(id);
-      const merged = mergeImported(
-        current ?? emptyRecord(id, input.projectPath, Date.now()),
-        input
+      await this.writeRecord(
+        withImported(current ?? emptyRecord(id, input.projectPath, Date.now()), input)
       );
-      if (merged === null) return { result: "conflict" };
-      if (current === null || merged !== current) await this.writeRecord(merged);
-      return { result: "imported" };
     });
   }
 
@@ -313,12 +268,10 @@ export class CreationDraftService {
   }
 
   private async load(): Promise<void> {
-    this.importProblems = 0;
     try {
       await this.importOldDrafts();
     } catch (error) {
       // Old files go only after their record is saved, so they all stay; the records still load.
-      this.importProblems++;
       log.warn("Could not import the old creation drafts", { error });
     }
     const summaries = new Map<string, CreationDraftSummary>();
@@ -383,8 +336,8 @@ export class CreationDraftService {
   /**
    * One-way import of the old project-keyed drafts (`drafts/<projectHash>/<draftId>.json` bodies,
    * `drafts/list.json` rows): listed, default, body-only and empty listed drafts. Each becomes a
-   * record (creationDraftImportId) before its old files are removed; a newer record that differs
-   * keeps the old files (reported by `list`). No dual writes: an older build no longer sees them.
+   * record (creationDraftImportId) before its old files are removed. No dual writes: an older build no longer sees
+   * them.
    */
   private async importOldDrafts(): Promise<void> {
     const listFile = path.join(this.oldRoot, OLD_LIST_FILE_NAME);
@@ -412,7 +365,6 @@ export class CreationDraftService {
         try {
           await readOldBody(drafts, filePath, name);
         } catch (error) {
-          this.importProblems++;
           log.warn(`Could not read old creation draft ${filePath}`, { error });
         }
       }
@@ -426,32 +378,21 @@ export class CreationDraftService {
       try {
         // Drafts of unregistered projects stay where they are (an older build's GC owns them).
         if (!this.isOwned(draft.projectPath)) continue;
-        if (await this.importOldDraft(draft)) imported.add(key);
-        else this.importProblems++;
+        const id = creationDraftImportId(draft.projectPath, draft.draftId);
+        const current = await this.readRecord(id);
+        const base = current ?? {
+          ...emptyRecord(id, draft.projectPath, draft.createdAt),
+          subProjectPath: draft.subProjectPath,
+        };
+        await this.writeRecord(withImported(base, draft.content));
+        // Old files go only once the record is saved.
+        if (draft.bodyFile) await fs.rm(draft.bodyFile, { force: true });
+        imported.add(key);
       } catch (error) {
-        this.importProblems++;
         log.warn(`Could not import old creation draft ${draft.draftId}`, { error });
       }
     }
     return imported;
-  }
-
-  /** False: a newer record differs (the old draft stays). */
-  private async importOldDraft(draft: OldDraft): Promise<boolean> {
-    const id = creationDraftImportId(draft.projectPath, draft.draftId);
-    const current = await this.readRecord(id);
-    const merged = mergeImported(
-      current ?? {
-        ...emptyRecord(id, draft.projectPath, draft.createdAt),
-        subProjectPath: draft.subProjectPath,
-      },
-      draft.content
-    );
-    if (merged === null) return false;
-    if (current === null || merged !== current) await this.writeRecord(merged);
-    // Old files go only once the record is saved.
-    if (draft.bodyFile) await fs.rm(draft.bodyFile, { force: true });
-    return true;
   }
 }
 

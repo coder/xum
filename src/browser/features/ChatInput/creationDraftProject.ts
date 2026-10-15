@@ -7,7 +7,6 @@ import {
   type ParsedRuntime,
   type RuntimeEnablement,
 } from "@/common/types/runtime";
-import { ownExecution } from "@/common/utils/drafts";
 import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
 
 /** The runtimes a project's creation offers: its Settings → Runtimes overrides, else the global ones. */
@@ -45,11 +44,9 @@ function portableRuntime(
  */
 function choicesForTarget(
   execution: CreationDraftExecution | null,
-  targetProjectPath: string,
   enablement: RuntimeEnablement | null
 ): CreationDraftExecution {
   return {
-    projectPath: targetProjectPath,
     agent: portableAgent(execution?.agent),
     runtime: portableRuntime(execution?.runtime, enablement),
     trunkBranch: null,
@@ -78,8 +75,7 @@ export function changeCreationDraftProject(
     target.projectPath === draft.projectPath
       ? draft.execution
       : choicesForTarget(
-          ownExecution(draft),
-          target.projectPath,
+          draft.execution,
           targetConfig ? projectRuntimeEnablement(targetConfig, globalEnablement) : null
         );
   store.update(draftId, { ...target, execution });

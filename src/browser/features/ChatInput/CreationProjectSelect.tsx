@@ -15,7 +15,7 @@ interface CreationProjectSelectProps {
   selected: string;
   userProjects: Map<string, ProjectConfig>;
   onChange: (scope: string) => void;
-  /** Frozen while a Send is in flight. */
+  /** Frozen while a Send, a file read or a recording is in flight. */
   disabled?: boolean;
 }
 

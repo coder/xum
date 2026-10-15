@@ -619,13 +619,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   const { open } = useSettings();
   const { selectedWorkspace, beginWorkspaceCreation, workspaceMetadata } = useWorkspaceContext();
-  const {
-    agentId,
-    currentAgent,
-    agents,
-    loaded: agentsLoaded,
-    loadFailed: agentsLoadFailed,
-  } = useAgent();
+  const { agentId, currentAgent, agents, loaded: agentsLoaded } = useAgent();
 
   // Use current agent's uiColor, or neutral border until agents load
   const agentColor = currentAgent?.uiColor ?? "var(--color-border-light)";
@@ -893,6 +887,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     inputRef,
   });
   const sendLocksTyping = typingLock.locksTyping;
+  // A creation Send takes one snapshot of the draft: a file still being read, or speech still
+  // being transcribed, would land after it.
+  const isProcessingAttachments =
+    processingAttachmentCount > 0 || (variant === "creation" && voiceInput.state !== "idle");
+  // Moving to or from Scratch opens another page (a new composer), which would drop a file read
+  // or a recording still in progress, so the project waits for them.
+  const creationProjectLocked = isSendInFlight || isProcessingAttachments;
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
@@ -941,6 +942,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           selectedProjectPath: creationSubProjectPath ?? props.projectPath,
           userProjects,
           onSelectedProjectPathChange: changeCreationProject,
+          projectSelectDisabled: creationProjectLocked,
           projectName: props.projectName,
           nameState: creationState.nameState,
           runtimeAvailabilityState: creationState.runtimeAvailabilityState,
@@ -985,14 +987,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     props.kind !== "scratch" &&
     creationState.branchLoad !== "loaded" &&
     creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
-  // A creation Send takes one snapshot of the draft: a file still being read, or speech still
-  // being transcribed, would land after it.
-  const isProcessingAttachments =
-    processingAttachmentCount > 0 || (variant === "creation" && voiceInput.state !== "idle");
   const creationDraftNotSaved = variant === "creation" && draft.saveError !== null;
-  // A draft moved here sends with an agent resolved in this project's list (a failed list blocks
-  // until it reloads).
-  const creationAgentsNotLoaded = variant === "creation" && (!agentsLoaded || agentsLoadFailed);
   // #6423: the same blockers as canSend below, so "Run /init" is off whenever Send is.
   useReportCreationSendBlocked(
     {
@@ -1002,7 +997,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       coderPresetsLoading,
       branchesNotLoaded: creationBranchesLoading,
       draftNotSaved: creationDraftNotSaved,
-      agentsNotLoaded: creationAgentsNotLoaded,
     },
     props
   );
@@ -1029,7 +1023,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     !coderPresetsLoading &&
     !creationBranchesLoading &&
     !creationDraftNotSaved &&
-    !creationAgentsNotLoaded &&
     !transcriptBlocksSend &&
     !editPreconditionInvalidated;
   const runningGoalActive =
@@ -3405,7 +3398,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                 selected={SCRATCH_PROJECT_CONFIG_KEY}
                 userProjects={userProjects}
                 onChange={changeCreationProject}
-                disabled={isSendInFlight}
+                disabled={creationProjectLocked}
               />
             </div>
           )}
