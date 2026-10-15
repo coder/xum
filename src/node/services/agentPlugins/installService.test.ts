@@ -2696,13 +2696,13 @@ describe("AgentPluginInstallService", () => {
       path.join(remoteDir, "agents", "helper.md"),
       "---\nname: helper\ndescription: Reviews\nreadonly: true\n---\nReview.\n"
     );
-    // A Claude tool list is not translated yet: runtime skips the agent, so
-    // the preview must not promise it. disallowedTools (not `tools`) because
-    // the schema already rejects a string `tools`, so only the plugin mapping
-    // keeps this one out.
+    // A Xum-format agent with a Claude tool list: runtime skips it, so the
+    // preview must not promise it. disallowedTools (not `tools`) because the
+    // schema already rejects a string `tools`, so only the plugin mapping keeps
+    // this one out.
     await fsPromises.writeFile(
       path.join(remoteDir, "agents", "narrow.md"),
-      "---\nname: narrow\ndescription: Reads\ndisallowedTools: Write\n---\nRead.\n"
+      "---\nname: narrow\nbase: exec\ndisallowedTools: Write\n---\nRead.\n"
     );
     await commitAll(remoteDir, "adds foreign-format agents");
     const preview = await service.preview({ input: remoteDir });
@@ -2716,6 +2716,27 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "v2 drops readonly");
     await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/changes agent 'helper'/);
+  });
+
+  test("update gates a Claude Code agent change that widens its tools list", async () => {
+    // The mapped tools.remove patterns are part of the fingerprinted
+    // frontmatter, so dropping a disallowedTools entry asks for re-consent.
+    await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
+    const writeAgent = (disallowed: string) =>
+      fsPromises.writeFile(
+        path.join(remoteDir, "agents", "narrow.md"),
+        `---\nname: narrow\ndescription: Reads\ndisallowedTools: ${disallowed}\n---\nRead.\n`
+      );
+    await writeAgent("Write, Bash");
+    await commitAll(remoteDir, "adds a Claude Code agent with a denylist");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.agents).toEqual(["narrow.md"]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    await writeAgent("Write");
+    await commitAll(remoteDir, "v2 allows Bash");
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/changes agent 'narrow'/);
   });
 
   test("a logo is refused (with a warning) when it decodes too large or is a GIF", async () => {

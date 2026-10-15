@@ -748,9 +748,10 @@ const AddPluginPanel: React.FC<{
                 </span>{" "}
                 <span className="text-muted">
                   — become agent definitions. An agent in Claude Code or Cursor format (no Xum-only
-                  field such as base or tools) becomes a hidden sub-agent with Exec&apos;s tools. It
-                  can run shell commands, which can change any file. readonly: true removes only the
-                  file edit and task tools.
+                  field such as base) becomes a hidden sub-agent with Exec&apos;s tools, narrowed
+                  only by its Claude Code tools or disallowedTools list. Unless that list removes
+                  Bash, it can run shell commands, which can change any file. readonly: true removes
+                  only the file edit and task tools.
                 </span>
               </p>
             </div>
