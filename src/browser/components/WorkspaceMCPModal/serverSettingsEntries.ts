@@ -1,6 +1,6 @@
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { getOwn } from "@/common/utils/getOwn";
-import type { ServerSettingsToolRuns } from "./settingsToolRuns";
+import { serverSettingsToolRuns, type ServerSettingsToolRuns } from "./settingsToolRuns";
 import {
   validateMCPSettingValue,
   type MCPSettingsReadSnapshot,
@@ -101,7 +101,7 @@ export function withSettingsToolRuns(
 ): Record<string, number> {
   let counts = savingSettings;
   for (const serverName of listedServers)
-    for (const _tool of getOwn(toolRuns, serverName)?.running ?? [])
+    for (const _tool of serverSettingsToolRuns(toolRuns, serverName).running)
       counts = countSettingsSave(counts, serverName, 1);
   return counts;
 }

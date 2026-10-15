@@ -66,20 +66,28 @@ export function startSettingsToolRun(
   return (result) => {
     if (ended) return;
     ended = true;
-    // Forgotten (its workspace was removed): a late end must not bring the entry back.
-    const index = serverSettingsToolRuns(
-      settingsToolRunsOf(workspaceId),
-      serverName
-    ).running.indexOf(toolName);
-    if (index === -1) return;
-    update(workspaceId, serverName, (runs) => {
-      return {
-        running: runs.running.filter((_, i) => i !== index),
-        results:
-          result === null ? withoutResult(runs, toolName) : { ...runs.results, [toolName]: result },
-      };
-    });
+    endSettingsToolRun(workspaceId, serverName, toolName, result);
   };
+}
+
+/** One run of `toolName` ends: it leaves `running`, and its result (if any) shows. */
+function endSettingsToolRun(
+  workspaceId: string,
+  serverName: string,
+  toolName: string,
+  result: SettingsToolRunResult | null
+): void {
+  const runs = serverSettingsToolRuns(settingsToolRunsOf(workspaceId), serverName);
+  const index = runs.running.indexOf(toolName);
+  // Forgotten (its workspace was removed): a late end must not bring the entry back.
+  if (index === -1) return;
+  update(workspaceId, serverName, (current) => ({
+    running: current.running.filter((_, i) => i !== index),
+    results:
+      result === null
+        ? withoutResult(current, toolName)
+        : { ...current.results, [toolName]: result },
+  }));
 }
 
 /** A new dialog open starts without the results of earlier opens (runs in flight stay). */
