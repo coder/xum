@@ -1,3 +1,4 @@
+import assert from "@/common/utils/assert";
 import { log } from "@/node/services/log";
 import {
   MAX_MCP_SETTINGS_TOOL_RESULT,
@@ -11545,6 +11546,40 @@ describe("prepareStdioLaunch", () => {
         else process.env[name] = saved[index];
       });
       delete process.env.XUM_TEST_FWD_NOT_NAMED;
+    }
+  });
+
+  test("on Windows, a configured env key wins over a forwarded name that differs by case (#6713)", async () => {
+    const original = Object.getOwnPropertyDescriptor(process, "platform");
+    assert(original !== undefined, "process.platform must be an own property");
+    const saved = process.env.xum_test_fwd_case;
+    process.env.xum_test_fwd_case = "host";
+    const launch = (platform: NodeJS.Platform) => {
+      Object.defineProperty(process, "platform", { ...original, value: platform });
+      try {
+        return prepareStdioLaunch({
+          transport: "stdio",
+          command: "node",
+          args: [],
+          env: { XUM_TEST_FWD_CASE: "configured" },
+          forwardEnv: ["xum_test_fwd_case"],
+          disabled: false,
+        });
+      } finally {
+        Object.defineProperty(process, "platform", original);
+      }
+    };
+    try {
+      // Windows env names are case-insensitive: both keys would reach one variable.
+      expect((await launch("win32")).env).toEqual({ XUM_TEST_FWD_CASE: "configured" });
+      // Elsewhere they are two variables.
+      expect((await launch("linux")).env).toEqual({
+        xum_test_fwd_case: "host",
+        XUM_TEST_FWD_CASE: "configured",
+      });
+    } finally {
+      if (saved === undefined) delete process.env.xum_test_fwd_case;
+      else process.env.xum_test_fwd_case = saved;
     }
   });
 

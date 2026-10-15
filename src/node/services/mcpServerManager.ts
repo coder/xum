@@ -89,6 +89,7 @@ import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import type { AgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import { isMutationEpochUnreadable } from "@/node/services/agentPlugins/journals";
+import { envNameKey } from "@/node/services/agentPlugins/openaiMcpAuth";
 import { SecretsStore, type Config } from "@/node/config";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import { secretsToRecord } from "@/common/types/secrets";
@@ -1000,9 +1001,12 @@ function withForwardedHostEnv(
 ): Record<string, string> | undefined {
   // Own properties only: `constructor` would read an inherited function. Object.fromEntries
   // keeps a host variable named `__proto__`, which an assignment would drop.
+  // A configured key wins: on Windows names compare without case, so drop a forwarded name that
+  // matches one there, or both keys would reach the same variable (#6713).
+  const configured = new Set(Object.keys(env ?? {}).map(envNameKey));
   const forwarded = (forwardEnv ?? []).flatMap((name): Array<[string, string]> => {
     const value = Object.hasOwn(process.env, name) ? process.env[name] : undefined;
-    return typeof value === "string" ? [[name, value]] : [];
+    return typeof value === "string" && !configured.has(envNameKey(name)) ? [[name, value]] : [];
   });
   return forwarded.length > 0 ? { ...Object.fromEntries(forwarded), ...env } : env;
 }
