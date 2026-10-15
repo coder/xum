@@ -117,6 +117,47 @@ describe("ExperimentsService", () => {
     expect(listener).toHaveBeenCalledTimes(1);
   });
 
+  describe("MCP Apps upgrade default (#6760)", () => {
+    const service = () =>
+      new ExperimentsService({
+        telemetryService: createTelemetryService().telemetryService,
+        xumHome: tempDir,
+      });
+    const writeFile = (overrides: Record<string, boolean>) =>
+      fs.writeFile(path.join(tempDir, OVERRIDES_FILE), JSON.stringify({ version: 1, overrides }));
+
+    test("a file from before the split keeps MCP Apps on for Artifacts users", async () => {
+      await writeFile({ [EXPERIMENT_IDS.ARTIFACTS]: true });
+      const s = service();
+      await s.initialize();
+      expect(s.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(true);
+      // Turning Artifacts off afterwards leaves MCP Apps on, also after a restart.
+      await s.setOverride(EXPERIMENT_IDS.ARTIFACTS, false);
+      const restarted = service();
+      await restarted.initialize();
+      expect(restarted.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)).toBe(false);
+      expect(restarted.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(true);
+    });
+
+    test("turning Artifacts on later leaves MCP Apps off, also after a restart", async () => {
+      const s = service();
+      await s.initialize();
+      await s.setOverride(EXPERIMENT_IDS.ARTIFACTS, true);
+      expect(s.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(false);
+      const restarted = service();
+      await restarted.initialize();
+      expect(restarted.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)).toBe(true);
+      expect(restarted.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(false);
+    });
+
+    test("an explicit MCP Apps choice wins over the derived default", async () => {
+      await writeFile({ [EXPERIMENT_IDS.ARTIFACTS]: true, [EXPERIMENT_IDS.MCP_APPS]: false });
+      const s = service();
+      await s.initialize();
+      expect(s.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(false);
+    });
+  });
+
   test("experiments are disabled until the user sets an override", async () => {
     const { telemetryService } = createTelemetryService();
     const service = new ExperimentsService({ telemetryService, xumHome: tempDir });

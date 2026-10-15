@@ -1569,7 +1569,7 @@ export const artifacts = {
 };
 
 /**
- * MCP Apps views in the Artifacts tab (artifacts experiment): the view resource plus the
+ * MCP Apps views in the Artifacts tab (mcp-apps experiment): the view resource plus the
  * host-only tool result, and tools/call and resources/read issued by a view.
  */
 export const mcpApps = {

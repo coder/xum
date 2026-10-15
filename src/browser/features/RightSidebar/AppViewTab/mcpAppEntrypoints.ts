@@ -12,7 +12,7 @@ import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 import type { McpAppViewRef } from "../ArtifactsTab/mcpAppViewsStore";
 
 /**
- * MCP App entry points (`_meta["openai/ui"].entrypoints`, artifacts experiment) of the selected
+ * MCP App entry points (`_meta["openai/ui"].entrypoints`, mcp-apps experiment) of the selected
  * workspace, for the New tab launcher, the command palette and app tabs restored after a
  * reload. App mounts the loader once; every consumer reads this store.
  */

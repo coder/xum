@@ -116,7 +116,7 @@ export interface MCPClientConfig {
    */
   prior?: PriorDiscovery;
   /**
-   * MCP Apps host support (artifacts experiment, read at connect time): announce the
+   * MCP Apps host support (mcp-apps experiment, read at connect time): announce the
    * `io.modelcontextprotocol/ui` extension, keep tool `_meta.ui`, and leave tools whose
    * visibility lacks "model" out of tools(). When false the client behaves exactly as before.
    */

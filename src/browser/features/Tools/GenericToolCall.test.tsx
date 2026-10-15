@@ -102,7 +102,7 @@ describe("GenericToolCall MCP Apps view", () => {
   beforeEach(() => {
     cleanupDom = installDom();
     getViewCalls = 0;
-    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+    setTestExperiment(EXPERIMENT_IDS.MCP_APPS, true);
   });
   afterEach(() => {
     resetTestExperiments();
@@ -296,8 +296,10 @@ describe("GenericToolCall MCP Apps view", () => {
     expect(view.queryByTestId("mcp-app-frame")).toBeNull();
   });
 
-  test("with the experiment off, an app call renders like any other call", () => {
-    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, false);
+  test("with MCP Apps off, an app call renders like any other call, even with Artifacts on", () => {
+    // #6760: MCP Apps have their own experiment; Artifacts alone no longer shows views.
+    setTestExperiment(EXPERIMENT_IDS.MCP_APPS, false);
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
     const view = renderAppCall("completed");
     expect(view.getByText("Arguments")).toBeTruthy();
     expect(view.queryByTestId("mcp-app-frame")).toBeNull();

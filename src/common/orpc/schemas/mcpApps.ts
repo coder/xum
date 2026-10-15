@@ -10,7 +10,7 @@ import {
 } from "@/common/utils/mcpApps";
 
 /**
- * MCP Apps views in the Artifacts tab (artifacts experiment). The view HTML comes from the
+ * MCP Apps views in the Artifacts tab (mcp-apps experiment). The view HTML comes from the
  * server's resources/read; the tool result comes from the host-only side store, never from
  * chat history.
  */

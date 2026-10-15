@@ -8,7 +8,9 @@ import { McpAppViewRecordsRequestSchema } from "@/common/orpc/schemas/mcpApps";
 import { MCP_APP_VIEW_RECORDS_MAX_IDS } from "@/common/utils/mcpApps";
 import { McpAppResultStore, type McpAppResultRecord } from "./mcpAppResultStore";
 import { DisposableTempDir } from "./tempDir";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
+  callMcpAppTool,
   getMcpAppView,
   getMcpAppViewRecords,
   listMcpAppEntrypoints,
@@ -769,5 +771,35 @@ describe("MCP App entry points", () => {
       noWarm
     );
     expect(opened).toEqual({ success: false, error: "not connected" });
+  });
+});
+
+describe("MCP Apps experiment gate", () => {
+  test("Artifacts on and MCP Apps off: every view operation is refused", async () => {
+    const { ctx } = context(RECORD);
+    const gated = {
+      ...ctx,
+      // #6760: MCP Apps have their own experiment; Artifacts alone no longer enables them.
+      experimentsService: { isExperimentEnabled: (id: string) => id === EXPERIMENT_IDS.ARTIFACTS },
+    } as unknown as McpAppsContext;
+    const ws = "ws";
+    const calls: Array<() => Promise<unknown>> = [
+      () => getMcpAppView(gated, request(), undefined, () => Promise.resolve()),
+      () => getMcpAppViewRecords(gated, { workspaceId: ws, toolCallIds: ["call-1"] } as never),
+      () => callMcpAppTool(gated, { workspaceId: ws } as never),
+      () => listMcpAppEntrypoints(gated, ws, undefined, () => Promise.resolve()),
+      () =>
+        openMcpAppEntrypoint(gated, { workspaceId: ws } as never, undefined, () =>
+          Promise.resolve()
+        ),
+      () =>
+        readMcpAppServerResource(gated, { workspaceId: ws, serverName: "charts", uri: "ui://x" }),
+      () => updateMcpAppModelContext(gated, { workspaceId: ws } as never),
+      () => setMcpAppWidgetState(gated, { workspaceId: ws } as never),
+      () => approveMcpAppViewDomains(gated, { workspaceId: ws } as never),
+    ];
+    for (const call of calls) {
+      await expect(call()).rejects.toThrow("MCP Apps views are disabled");
+    }
   });
 });

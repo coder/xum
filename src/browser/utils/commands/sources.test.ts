@@ -2518,7 +2518,7 @@ test("app view entries tell several calls of one tool apart", () => {
     },
   });
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     selectedWorkspaceState: {
       messages: [call("a", { count: 2 }), call("b", { count: 4 }), call("c", { count: 4 })],
     } as unknown as WorkspaceState,
@@ -2553,7 +2553,7 @@ test("an app view with an open tab gets a Reload command that focuses its tab", 
     });
     updateRightSidebarLayout("w1", (state) => withAppViewTab(state, "open"));
     const actions = getActions({
-      artifactsEnabled: true,
+      mcpAppsEnabled: true,
       selectedWorkspaceState: {
         messages: [call("open"), call("closed")],
       } as unknown as WorkspaceState,
@@ -2575,7 +2575,7 @@ test("an app view with an open tab gets a Reload command that focuses its tab", 
 test("a plugin view's palette entry shows its server part and keeps the full key searchable", () => {
   const key = "plugin:0123456789abcdef:tray";
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     selectedWorkspaceState: {
       messages: [
         {
@@ -2614,7 +2614,7 @@ test("two plugin installs with one server name keep their instance markers apart
     },
   });
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     selectedWorkspaceState: {
       messages: [
         call("i1", "plugin:0123456789abcdef:tray"),
@@ -2644,7 +2644,7 @@ test("an MCP App entry point's palette entry shows its server label and opens it
   };
   const opened: unknown[] = [];
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     mcpAppEntrypoints: [entrypoint],
     api: createTestApiClient({
       mcpApps: {
@@ -2693,7 +2693,7 @@ test("a failed entry point open from the palette shows its error in a toast", as
     viewKey: "entrypoint:cad:cad.tray:global",
   };
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     mcpAppEntrypoints: [entrypoint],
     api: createTestApiClient({
       mcpApps: {
@@ -2727,7 +2727,7 @@ test("an entry point picked from the palette while disconnected says so in a toa
     viewKey: "entrypoint:cad:cad.tray:global",
   };
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     mcpAppEntrypoints: [entrypoint],
     api: null,
   });
@@ -2760,7 +2760,7 @@ test("an entry point with an open tab gets a Reload command that focuses its tab
   const [open, closed] = [entrypoint("cad.open"), entrypoint("cad.closed")];
   await withTestWindow(() => {
     updateRightSidebarLayout("w1", (state) => withAppViewTab(state, open.viewKey));
-    const actions = getActions({ artifactsEnabled: true, mcpAppEntrypoints: [open, closed] });
+    const actions = getActions({ mcpAppsEnabled: true, mcpAppEntrypoints: [open, closed] });
     expect(actions.some((a) => a.id === CommandIds.navReloadAppView(closed.viewKey))).toBe(false);
     const reload = actions.find((a) => a.id === CommandIds.navReloadAppView(open.viewKey));
     const focused: unknown[] = [];
@@ -2786,7 +2786,7 @@ test("a tool's global and thread entry points get palette commands that read dif
     viewKey: `entrypoint:cad:cad.board:${type}`,
   });
   const entrypoints = [entrypoint("global"), entrypoint("thread")];
-  const actions = getActions({ artifactsEnabled: true, mcpAppEntrypoints: entrypoints });
+  const actions = getActions({ mcpAppsEnabled: true, mcpAppEntrypoints: entrypoints });
   const shown = entrypoints.map((e) => {
     const action = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(e.viewKey));
     return [action?.title, action?.subtitle].join(" ");
@@ -2794,11 +2794,29 @@ test("a tool's global and thread entry points get palette commands that read dif
   expect(shown[0]).not.toBe(shown[1]);
 });
 
+test("entry point commands follow the MCP Apps experiment, not Artifacts (#6760)", () => {
+  const entrypoint = {
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName: "cad.board",
+    title: "Board",
+    resourceUri: "ui://cad/board",
+    type: "global" as const,
+    viewKey: "entrypoint:cad:cad.board:global",
+  };
+  const has = (flags: { artifactsEnabled: boolean; mcpAppsEnabled: boolean }) =>
+    getActions({ ...flags, mcpAppEntrypoints: [entrypoint] }).some(
+      (a) => a.id === CommandIds.navOpenAppEntrypoint(entrypoint.viewKey)
+    );
+  expect(has({ artifactsEnabled: true, mcpAppsEnabled: false })).toBe(false);
+  expect(has({ artifactsEnabled: false, mcpAppsEnabled: true })).toBe(true);
+});
+
 describe("Revoke MCP App View Domains…", () => {
   const stored = [
     { projectPath: "/repo/a", serverName: "charts", origins: ["https://api.example.com"] },
   ];
-  // Shown whatever the artifacts experiment: Settings lists stored approvals either way.
+  // Shown whatever the experiments: Settings lists stored approvals either way.
   const revokeAction = (api: APIClient, artifactsEnabled = false) =>
     getActions({ api, artifactsEnabled }).find(
       (action) => action.id === CommandIds.mcpAppsRevokeViewDomains()

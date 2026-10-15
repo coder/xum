@@ -122,6 +122,8 @@ function renderOverview(
   options: {
     canStartSideChat?: boolean;
     artifactsEnabled?: boolean;
+    /** Defaults to artifactsEnabled: most cases list files and app views together. */
+    mcpAppsEnabled?: boolean;
     unreadAssisted?: number;
     client?: APIClient;
     /** A workspace of its own, for app views: the session list of opened views has no reset. */
@@ -159,6 +161,7 @@ function renderOverview(
           }
           creatingSideChat={false}
           artifactsEnabled={options.artifactsEnabled ?? false}
+          mcpAppsEnabled={options.mcpAppsEnabled ?? options.artifactsEnabled ?? false}
           unreadAssisted={options.unreadAssisted ?? 0}
         />
       </TooltipProvider>
@@ -485,6 +488,53 @@ describe("RightSidebarOverview", () => {
     // card's onOpenTab, which moves focus into the opened tab.
     fireEvent.click(section.getByRole("button", { name: /Roll dice/ }));
     expect(opened).toEqual([appViewTabFor("call-new")]);
+  });
+
+  // #6760: each experiment gates its own rows.
+  test("lists files only with Artifacts on and app views only with MCP Apps on", async () => {
+    const client = createTestApiClient({
+      artifacts: {
+        list: () =>
+          Promise.resolve({
+            success: true as const,
+            data: {
+              available: true as const,
+              dir: "/a",
+              entries: [artifact("a.md", 1)],
+              truncated: false,
+            },
+          }),
+      },
+    });
+    const appsWorkspace = "ws-apps-gates";
+    openMcpAppViewTab(appsWorkspace, {
+      toolCallId: "call-gate",
+      serverName: "dice",
+      resourceUri: "ui://dice/roll",
+      toolName: "roll",
+      label: "Roll dice",
+      arguments: {},
+      cancelled: false,
+      failed: false,
+    });
+    const rows = async (artifactsEnabled: boolean, mcpAppsEnabled: boolean) => {
+      const { view } = renderOverview([workspace({ id: appsWorkspace })], {
+        artifactsEnabled,
+        mcpAppsEnabled,
+        client,
+        workspaceId: appsWorkspace,
+      });
+      const section = within(await view.findByRole("region", { name: "Outputs" }));
+      const labels = await waitFor(() => {
+        const found = section.getAllByRole("button").map((row) => row.textContent);
+        expect(found.length).toBeGreaterThan(0);
+        return found;
+      });
+      view.unmount();
+      return labels;
+    };
+    expect(await rows(true, false)).toEqual(["a.md"]);
+    expect(await rows(false, true)).toEqual(["Roll dice"]);
   });
 
   // A view from the transcript only: after compaction drops its call, the tab still needs the

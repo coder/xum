@@ -52,11 +52,11 @@ interface GenericToolCallProps {
 }
 
 /**
- * MCP Apps (artifacts experiment): whether this host can show the view of a call. Hosts
+ * MCP Apps (mcp-apps experiment): whether this host can show the view of a call. Hosts
  * without an Artifacts surface (VS Code) cannot.
  */
 function useMcpAppViewsSupported(): boolean {
-  const enabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const enabled = useExperimentValue(EXPERIMENT_IDS.MCP_APPS);
   const canOpen = useChatHostContext().uiSupport.artifactsPanel === "supported";
   return enabled && canOpen;
 }

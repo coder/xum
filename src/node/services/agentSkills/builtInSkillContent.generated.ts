@@ -9964,6 +9964,8 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "MCP servers that support [MCP Apps](https://github.com/modelcontextprotocol/ext-apps) can return a small interface with a tool result. Expand the tool card to use the app inside the card. App views do not appear in the Artifacts tab, which lists only files.",
       "",
+      "MCP Apps are a separate experiment. Turn on **MCP Apps** in Settings → Experiments. They do not need the Artifacts experiment. If you had Artifacts on before MCP Apps got their own experiment, Xum keeps MCP Apps on for you.",
+      "",
       "- **Open in tab** on the tool card opens the app in its own tab in the right sidebar, named after the tool and its server. If the app already has a tab, Xum selects it.",
       "- The command palette has an **Open App View** entry for each app in the workspace.",
       "- An app runs in one place at a time. While its tab is open, the tool card shows **Go to tab** instead. Close the tab to bring the app back to the card.",

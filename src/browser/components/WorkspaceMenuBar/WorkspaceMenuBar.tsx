@@ -159,6 +159,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const isArchiving = archivingWorkspaceIds.has(workspaceId);
   const { workspaceMetadata } = useWorkspaceContext();
   const artifactsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const mcpAppsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MCP_APPS);
   const openTerminalPopout = useOpenTerminal();
   const openInEditor = useOpenInEditor();
   const runtimeStatus = useRuntimeStatus(workspaceId);
@@ -408,8 +409,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // openArtifact() (chat cards, file cards, Review, palette) and "Open in tab" on an MCP Apps
   // tool card: while the sidebar is hidden, they show their tab full-screen (RightSidebar
   // handles the same events on wider layouts).
+  // Each event listens only while its own experiment is on (MCP Apps are independent, #6760).
   useEffect(() => {
-    if (!artifactsExperimentEnabled) {
+    if (!artifactsExperimentEnabled && !mcpAppsExperimentEnabled) {
       return;
     }
     const handler = (event: Event) => {
@@ -428,13 +430,23 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       }
       openSidebarTab(appViewTabFor(detail.toolCallId), activeElement());
     };
-    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
-    window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
+    if (mcpAppsExperimentEnabled) {
+      window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
+    }
+    if (artifactsExperimentEnabled) {
+      window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
+    }
     return () => {
       window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
       window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
     };
-  }, [artifactsExperimentEnabled, isTimelineSidebarHidden, openSidebarTab, workspaceId]);
+  }, [
+    artifactsExperimentEnabled,
+    mcpAppsExperimentEnabled,
+    isTimelineSidebarHidden,
+    openSidebarTab,
+    workspaceId,
+  ]);
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";

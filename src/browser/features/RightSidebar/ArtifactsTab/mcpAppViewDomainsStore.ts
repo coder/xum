@@ -4,7 +4,7 @@ import type { McpAppView, McpAppViewDomains } from "@/common/orpc/schemas/mcpApp
 import { getErrorMessage } from "@/common/utils/errors";
 
 /**
- * MCP Apps view-domain approvals this renderer changed (artifacts experiment), per project and
+ * MCP Apps view-domain approvals this renderer changed (mcp-apps experiment), per project and
  * server key, so one Allow (or Revoke) applies at once to every mounted view of that server,
  * not only the frame that asked. A frame uses an entry only when it is newer than the list its
  * own getView returned.

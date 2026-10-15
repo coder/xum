@@ -299,8 +299,10 @@ export interface BuildSourcesParams {
   onStartWorkspaceCreation: (projectPath: string) => void;
   onStartMultiProjectWorkspaceCreation: () => void;
   multiProjectWorkspacesEnabled: boolean;
-  /** artifacts experiment: gates "Open Artifacts", "Open File as Artifact…" and entry points. */
+  /** artifacts experiment: gates "Open Artifacts" and "Open File as Artifact…". */
   artifactsEnabled?: boolean;
+  /** mcp-apps experiment: gates the MCP App view and entry-point commands. */
+  mcpAppsEnabled?: boolean;
   /** The selected workspace's MCP App entry points; undefined until listed. */
   mcpAppEntrypoints?: readonly McpAppEntrypoint[];
   /** perfFlightRecorder experiment: gates "Report slowness". */
@@ -1084,13 +1086,6 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 keywords: ["artifacts", "preview", "versions"],
                 run: () => openArtifactsTab(wsId),
               },
-              // One per MCP App view of the workspace (transcript or opened this session): opens
-              // its tab or focuses the one it has, the keyboard path to "Open in tab".
-              // The subtitle carries each call's detail, so several calls of one tool differ.
-              ...appViewActions(wsId, p.selectedWorkspaceState?.messages ?? [], section.navigation),
-              // One per MCP App entry point of an enabled server: opens its app tab (calling
-              // the tool with {}) or focuses the one it has.
-              ...entrypointActions(p.api, wsId, p.mcpAppEntrypoints ?? [], section.navigation),
               {
                 id: CommandIds.navOpenFileAsArtifact(),
                 title: "Open File as Artifact…",
@@ -1116,6 +1111,17 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                   },
                 },
               },
+            ]
+          : []),
+        ...(p.mcpAppsEnabled === true
+          ? [
+              // One per MCP App view of the workspace (transcript or opened this session): opens
+              // its tab or focuses the one it has, the keyboard path to "Open in tab".
+              // The subtitle carries each call's detail, so several calls of one tool differ.
+              ...appViewActions(wsId, p.selectedWorkspaceState?.messages ?? [], section.navigation),
+              // One per MCP App entry point of an enabled server: opens its app tab (calling
+              // the tool with {}) or focuses the one it has.
+              ...entrypointActions(p.api, wsId, p.mcpAppEntrypoints ?? [], section.navigation),
             ]
           : []),
         {

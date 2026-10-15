@@ -3,7 +3,7 @@ import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { getErrorMessage } from "@/common/utils/errors";
 
 /**
- * window.openai widget state of MCP App views (artifacts experiment, #6178). The backend keeps
+ * window.openai widget state of MCP App views (mcp-apps experiment, #6178). The backend keeps
  * each view's state in its result record (McpAppResultStore.setWidgetState), so it survives a
  * collapse, a move to the tab and an app restart, and goes with the record.
  *

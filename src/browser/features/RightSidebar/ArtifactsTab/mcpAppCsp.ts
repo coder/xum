@@ -4,7 +4,7 @@ import { ARTIFACT_IN_PAGE_LINK_SCRIPT } from "./artifactBridge";
 import { mcpAppDocumentChannelScript } from "./mcpAppDocumentChannel";
 
 /**
- * CSP for MCP Apps views (artifacts experiment).
+ * CSP for MCP Apps views (mcp-apps experiment).
  *
  * Views run in the same sandbox as HTML artifacts (srcdoc, sandbox exactly "allow-scripts",
  * opaque origin), with this policy instead of the artifact one. The base is the spec's default
