@@ -117,6 +117,7 @@ function getToolDuration(events: WorkspaceChatMessage[], toolName: string): numb
 const backendLog: LogEntry[] = [];
 let stopBackendLog: (() => void) | null = null;
 const stepTrace: string[] = [];
+let sshStepsRan = false;
 async function boundedStep<T>(name: string, ms: number, fn: () => Promise<T>): Promise<T> {
   // The deadlines fit the SSH test timeout only. Local tests have a 25 s test timeout and a
   // 15 s stream timeout, so Jest ends a stuck local step before any of these deadlines; their
@@ -124,6 +125,7 @@ async function boundedStep<T>(name: string, ms: number, fn: () => Promise<T>): P
   if (!name.includes("Runtime: ssh")) {
     return fn();
   }
+  sshStepsRan = true;
   const start = Date.now();
   stepTrace.push(`${new Date(start).toISOString()} start ${name}`);
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -227,14 +229,15 @@ describeIntegration("Runtime Bash Execution", () => {
   afterAll(async () => {
     stopBackendLog?.();
     // Fail if the backend stopped using these pool instances: the cap would then do nothing.
+    // Checked after the fixture stops, so a failure leaks no container.
     const capCalls = sshWaitCaps.reduce((n, spy) => n + spy.mock.calls.length, 0);
     sshWaitCaps.forEach((spy) => spy.mockRestore());
-    if (sshConfig && capCalls === 0) {
-      throw new Error("SSH tests ran, but no SSH connection went through the capped pools");
-    }
     if (sshConfig) {
       console.log("Stopping SSH server container...");
       await stopSSHServer(sshConfig);
+    }
+    if (sshStepsRan && capCalls === 0) {
+      throw new Error("SSH tests ran, but no SSH connection went through the capped pools");
     }
   }, 30000);
 
