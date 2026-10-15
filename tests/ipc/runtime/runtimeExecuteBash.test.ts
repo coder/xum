@@ -39,6 +39,19 @@ import { ssh2ConnectionPool } from "../../../src/node/runtime/SSH2ConnectionPool
 import type { WorkspaceChatMessage } from "../../../src/common/orpc/types";
 import type { ToolPolicy } from "../../../src/common/utils/tools/toolPolicy";
 import { subscribeLogFeed, type LogEntry } from "../../../src/node/services/logBuffer";
+import { DEFAULT_SSH_MAX_WAIT_MS } from "../../../src/node/runtime/sshBackoff";
+
+// #6588: an SSH operation without a deadline waits through connection backoff for
+// DEFAULT_SSH_MAX_WAIT_MS (2 min in the product), which equals this file's SSH test timeout. A
+// test that hit it timed out with no hint of the step. A shorter wait in this test process turns
+// that into an SSH error (or a bounded-step failure below) well inside the test timeout.
+const TEST_SSH_MAX_WAIT_MS = 20_000;
+jest.mock("../../../src/node/runtime/sshBackoff", () => ({
+  ...jest.requireActual<typeof import("../../../src/node/runtime/sshBackoff")>(
+    "../../../src/node/runtime/sshBackoff"
+  ),
+  DEFAULT_SSH_MAX_WAIT_MS: 20_000,
+}));
 
 // Tool policy: Only allow the bash tool.
 const BASH_ONLY: ToolPolicy = [{ regex_match: "bash", action: "require" }];
@@ -92,9 +105,11 @@ function getToolDuration(events: WorkspaceChatMessage[], toolName: string): numb
   return -1;
 }
 
-// Diagnostics for #6588: CI runs jest with --silent, so a hung step left no trace. Each step of
-// these tests is bounded; on a timeout the step trace and the backend's recent log entries
-// go to stderr (not console, which --silent drops).
+// #6588: CI runs jest with --silent, so a hung step left no trace. Each step of these tests has
+// a deadline, and the deadlines of one test add up to less than TEST_TIMEOUT_SSH_MS even when a
+// step and the cleanup after it both hang. On a missed deadline the test fails with the step's
+// name, and the step trace and the backend's recent log entries go to stderr (not console,
+// which --silent drops).
 const backendLog: LogEntry[] = [];
 let stopBackendLog: (() => void) | null = null;
 const stepTrace: string[] = [];
@@ -130,20 +145,21 @@ const bounded =
   <A extends unknown[], R>(label: string, ms: number, fn: (...args: A) => Promise<R>) =>
   (...args: A): Promise<R> =>
     boundedStep(`${currentTest()} :: ${label}`, ms, () => fn(...args));
-const createTestEnvironmentB = bounded("createTestEnvironment", 20_000, createTestEnvironment);
-const createTempGitRepoB = bounded("createTempGitRepo", 20_000, createTempGitRepo);
-const setupProvidersB = bounded("setupProviders", 20_000, setupProviders);
-const sendMessageAndWaitB = bounded("sendMessageAndWait", 45_000, sendMessageAndWait);
-const cleanupTempGitRepoB = bounded("cleanupTempGitRepo", 20_000, cleanupTempGitRepo);
-const cleanupTestEnvironmentB = bounded("cleanupTestEnvironment", 20_000, cleanupTestEnvironment);
+const createTestEnvironmentB = bounded("createTestEnvironment", 10_000, createTestEnvironment);
+const createTempGitRepoB = bounded("createTempGitRepo", 10_000, createTempGitRepo);
+const setupProvidersB = bounded("setupProviders", 10_000, setupProviders);
+// Above the 25 s stream timeout inside sendMessageAndWait, so that error wins when it applies.
+const sendMessageAndWaitB = bounded("sendMessageAndWait", 35_000, sendMessageAndWait);
+const cleanupTempGitRepoB = bounded("cleanupTempGitRepo", 10_000, cleanupTempGitRepo);
+const cleanupTestEnvironmentB = bounded("cleanupTestEnvironment", 10_000, cleanupTestEnvironment);
 const createWorkspaceWithInitB = async (...args: Parameters<typeof createWorkspaceWithInit>) => {
-  const created = await boundedStep(`${currentTest()} :: createWorkspaceWithInit`, 45_000, () =>
+  const created = await boundedStep(`${currentTest()} :: createWorkspaceWithInit`, 30_000, () =>
     createWorkspaceWithInit(...args)
   );
   return {
     ...created,
     cleanup: () =>
-      boundedStep(`${currentTest()} :: cleanup (workspace.remove)`, 30_000, created.cleanup),
+      boundedStep(`${currentTest()} :: cleanup (workspace.remove)`, 15_000, created.cleanup),
   };
 };
 
@@ -174,6 +190,10 @@ describeIntegration("Runtime Bash Execution", () => {
   }, 60000);
 
   beforeAll(() => {
+    // Fail fast if the jest.mock above stops applying (for example after a module move).
+    if (DEFAULT_SSH_MAX_WAIT_MS !== TEST_SSH_MAX_WAIT_MS) {
+      throw new Error(`sshBackoff mock not applied: ${DEFAULT_SSH_MAX_WAIT_MS}`);
+    }
     // "debug" makes the backend keep debug entries too.
     const feed = subscribeLogFeed((event) => {
       if (event.type === "append") {
