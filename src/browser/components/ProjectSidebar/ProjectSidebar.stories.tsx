@@ -445,14 +445,34 @@ export const PinnedChatsCustomOrder: AppStory = {
   },
 };
 
+// Mirror Pixel's named `phone` and `desktop` viewports, so each story's globals pin locally the
+// width its Pixel variant snapshots (the preview's own options have neither width).
+const NOTICE_VIEWPORTS = {
+  phone: { key: "phone390", name: "Phone 390", width: "390px", height: "844px" },
+  desktop: { key: "desktop1900", name: "Desktop 1900", width: "1900px", height: "1000px" },
+} as const;
+
 /** The creation draft list's load failure (with Retry) or import warning, above the projects. */
 function draftListNoticeStory(
+  viewport: keyof typeof NOTICE_VIEWPORTS,
   listCreation: ReturnType<typeof createMockORPCClient>["drafts"]["listCreation"],
   expectVisible: (canvasElement: HTMLElement) => HTMLElement | null
 ): AppStory {
+  const pinned = NOTICE_VIEWPORTS[viewport];
   return {
-    globals: { viewport: { value: "phone390", isRotated: false } },
-    parameters: { pixel: { matrix: { viewports: ["phone", "desktop"] } } },
+    globals: { viewport: { value: pinned.key, isRotated: false } },
+    parameters: {
+      pixel: { matrix: { viewports: [viewport] } },
+      viewport: {
+        options: {
+          [pinned.key]: {
+            name: pinned.name,
+            styles: { width: pinned.width, height: pinned.height },
+            type: viewport === "phone" ? "mobile" : "desktop",
+          },
+        },
+      },
+    },
     render: () => (
       <AppWithMocks
         setup={() => {
@@ -487,17 +507,25 @@ function draftListNoticeStory(
 const draftListNotice = (canvasElement: HTMLElement) =>
   canvasElement.querySelector<HTMLElement>('[aria-label="Projects"] [role="alert"]');
 
-export const DraftListLoadFailed = draftListNoticeStory(
-  () => Promise.reject(new Error("backend busy")),
-  (canvasElement) => draftListNotice(canvasElement)?.querySelector("button") ?? null
-);
+const failedList = () => Promise.reject(new Error("backend busy"));
+const retryButton = (canvasElement: HTMLElement) =>
+  draftListNotice(canvasElement)?.querySelector<HTMLElement>("button") ?? null;
+const listWithImportWarning = () =>
+  Promise.resolve({
+    drafts: [],
+    importError:
+      "1 older draft(s) were not imported: a newer draft differs, or the file could not be read. Their files are kept in /home/user/.xum/drafts. 1 older draft(s) were not imported because a newer draft differs. They stay in this browser.",
+  });
 
-export const DraftImportWarning = draftListNoticeStory(
-  () =>
-    Promise.resolve({
-      drafts: [],
-      importError:
-        "1 older draft(s) were not imported: a newer draft differs, or the file could not be read. Their files are kept in /home/user/.xum/drafts. 1 older draft(s) were not imported because a newer draft differs. They stay in this browser.",
-    }),
+export const DraftListLoadFailedPhone = draftListNoticeStory("phone", failedList, retryButton);
+export const DraftListLoadFailedDesktop = draftListNoticeStory("desktop", failedList, retryButton);
+export const DraftImportWarningPhone = draftListNoticeStory(
+  "phone",
+  listWithImportWarning,
+  draftListNotice
+);
+export const DraftImportWarningDesktop = draftListNoticeStory(
+  "desktop",
+  listWithImportWarning,
   draftListNotice
 );
