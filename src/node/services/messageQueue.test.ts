@@ -1717,6 +1717,23 @@ describe("MessageQueue", () => {
       });
       expect(queue.getInputForRestore()?.reviews).toEqual([first, second]);
       expect(queue.getInputsForRestore()[0]?.reviews).toEqual([first, second]);
+      // A held re-send carries them in its metadata too (Codex PRRT_kwDOPxxmWM6s3RUw), also
+      // behind a first add whose metadata has no reviews.
+      expect(queue.getRestorableManualSends()[0]?.options.muxMetadata).toEqual({
+        type: "normal",
+        reviews: [first, second],
+      });
+      queue.clear();
+      queue.add("plain", { ...options, muxMetadata: { type: "normal" } });
+      queue.add("<review>2</review>", {
+        ...options,
+        muxMetadata: { type: "normal", reviews: [second] },
+        authoredText: "",
+      });
+      expect(queue.getRestorableManualSends()[0]?.options.muxMetadata).toEqual({
+        type: "normal",
+        reviews: [second],
+      });
     });
 
     it("restores a /compact follow-up's attachments and review notes from its compaction metadata", () => {

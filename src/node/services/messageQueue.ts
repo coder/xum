@@ -304,6 +304,20 @@ function recordAddMetadata(entry: QueueEntry, muxMetadata: unknown): void {
 }
 
 /**
+ * The entry's metadata with the batched adds' reviews added, for a held re-send: its transcript
+ * row shows review blocks from `muxMetadata.reviews` (Codex PRRT_kwDOPxxmWM6s3RUw). A /compact's
+ * metadata keeps its shape: its restore returns the reviews instead.
+ */
+function metadataWithBatchedReviews(entry: QueueEntry): unknown {
+  const batched = entry.batchedReviews ?? [];
+  const meta = entry.muxMetadata;
+  if (batched.length === 0 || isCompactionMetadata(meta) || typeof meta !== "object" || meta === null)
+    return meta;
+  const own = hasReviews(meta) ? (meta.reviews ?? []) : [];
+  return { ...meta, reviews: [...own, ...batched] };
+}
+
+/**
  * One dispatchable unit in the queue. Plain follow-up messages batch into a single
  * entry (joined text, accumulated file parts); "special" sends (compaction requests,
  * agent-skill invocations, workspace-turn follow-ups, callback-carrying internal
@@ -1415,7 +1429,7 @@ export class MessageQueue {
       message: entry.messages.join("\n"),
       options: {
         ...options,
-        muxMetadata: entry.muxMetadata,
+        muxMetadata: metadataWithBatchedReviews(entry),
         ...(entry.fileParts.length > 0 ? { fileParts: entry.fileParts } : {}),
         // Kept so a re-send that is queued and refused again is held with the same display text.
         ...(authoredText !== entry.messages.join("\n") ? { authoredText } : {}),
