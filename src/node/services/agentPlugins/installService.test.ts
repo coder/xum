@@ -1733,14 +1733,13 @@ describe("AgentPluginInstallService", () => {
     await expect(resolve()).rejects.toThrow("has not been reviewed on this install");
     expect((await service.list())[0].reviewRequiredCount).toBe(1);
     const review = await approveReview();
-    expect(review.changes).toEqual([
-      expect.objectContaining({
-        summary: "Workflow 'run.js' needs review",
-        before: "Changed since you reviewed it",
-        after: expect.stringContaining("name: 'other'"),
-        component: expect.objectContaining({ kind: "workflows", name: "run.js" }),
-      }),
-    ]);
+    expect(review.changes).toHaveLength(1);
+    expect(review.changes[0]).toMatchObject({
+      summary: "Workflow 'run.js' needs review",
+      before: "Changed since you reviewed it",
+      component: { kind: "workflows", name: "run.js" },
+    });
+    expect(review.changes[0]?.after).toContain("name: 'other'");
     expect((await resolve()).source).toContain("name: 'other'");
 
     // A record from before #6629 has no workflow entries: one review, and no backfill.
