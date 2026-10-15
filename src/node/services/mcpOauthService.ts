@@ -1346,16 +1346,10 @@ export class McpOauthService {
       this.insufficientScopes.delete(input.serverUrl);
   }
 
-  /**
-   * Records a 403 `insufficient_scope` answer (scopes are already sanitized). A late 403 can
-   * answer for tokens that a new sign-in already replaced (#6739). When the stored grant names
-   * every scope the server asked for, the new sign-in has them: the prompt has nothing to ask.
-   */
+  /** Records a 403 `insufficient_scope` answer (scopes are already sanitized). */
   recordInsufficientScope(input: { serverUrl: string; scopes: string[] }): void {
     const key = normalizeServerUrlForComparison(input.serverUrl);
     if (!key) return;
-    const granted = new Set((this.store?.entries[key]?.tokens?.scope ?? "").split(/\s+/));
-    if (input.scopes.length > 0 && input.scopes.every((scope) => granted.has(scope))) return;
     this.insufficientScopes.set(key, input.scopes);
     // Mounted Settings rows refresh on this signal: a 403 changes nothing they would otherwise see.
     for (const listener of this.insufficientScopeListeners) listener(key);
