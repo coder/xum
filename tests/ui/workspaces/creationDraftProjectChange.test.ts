@@ -150,4 +150,49 @@ describeIntegration("Creation draft project change", () => {
       await cleanupView(view, cleanupDom);
     }
   }, 60_000);
+
+  // The composer seeds a draft's AI from its agent's defaults once; a move (and the agent reset and
+  // list reload it brings) keeps what the draft holds, and only a user's agent pick applies them.
+  test("a project change keeps the draft's model over its agent's defaults", async () => {
+    const env = getSharedEnv();
+    await env.orpc.config.updateAgentAiDefaults({
+      agentAiDefaults: {
+        exec: { modelString: "openai:gpt-5" },
+        plan: { modelString: "anthropic:claude-opus-4-1" },
+      },
+    });
+    const cleanupDom = setupTestDom();
+    const view = renderApp({ apiClient: env.orpc });
+    try {
+      const pathA = await addProjectViaUI(view, getSharedRepoPath());
+      const labelB = (await addProjectViaUI(view, projectB)).split("/").pop() ?? projectB;
+      await openProjectCreationView(view, pathA);
+      await waitForScope(view.container, pathA.split("/").pop() ?? pathA);
+      const store = getCreationDraftStore();
+      fireEvent.change(messageTextarea(view.container), { target: { value: "keep my model" } });
+      const draftId = await waitFor(() => {
+        const id = getWorkspaceDraftIds(pathA).find(
+          (candidate) => store.getView(candidate).draft?.text === "keep my model"
+        );
+        if (!id) throw new Error("Typed draft not listed yet");
+        return id;
+      });
+      const model = () => store.getView(draftId).draft?.ai.model;
+      await waitFor(() => expect(model()).toBe("openai:gpt-5"));
+      const draft = store.getView(draftId).draft;
+      if (!draft) throw new Error("Draft not loaded");
+      store.update(draftId, { ai: { ...draft.ai, model: "anthropic:claude-sonnet-4-5" } });
+
+      await pickProject(view.container, labelB);
+      // Let B's agent list load (the sync waits for it).
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(model()).toBe("anthropic:claude-sonnet-4-5");
+
+      store.updateExecution(draftId, { agent: { id: "plan", scope: "built-in" } });
+      await waitFor(() => expect(model()).toBe("anthropic:claude-opus-4-1"));
+    } finally {
+      await env.orpc.config.updateAgentAiDefaults({ agentAiDefaults: {} });
+      await cleanupView(view, cleanupDom);
+    }
+  }, 60_000);
 });

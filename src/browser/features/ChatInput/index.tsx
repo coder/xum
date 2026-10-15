@@ -619,7 +619,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   const { open } = useSettings();
   const { selectedWorkspace, beginWorkspaceCreation, workspaceMetadata } = useWorkspaceContext();
-  const { agentId, currentAgent, agents } = useAgent();
+  const {
+    agentId,
+    currentAgent,
+    agents,
+    loaded: agentsLoaded,
+    loadFailed: agentsLoadFailed,
+  } = useAgent();
 
   // Use current agent's uiColor, or neutral border until agents load
   const agentColor = currentAgent?.uiColor ?? "var(--color-border-light)";
@@ -984,6 +990,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const isProcessingAttachments =
     processingAttachmentCount > 0 || (variant === "creation" && voiceInput.state !== "idle");
   const creationDraftNotSaved = variant === "creation" && draft.saveError !== null;
+  // A draft moved here sends with an agent resolved in this project's list (a failed list blocks
+  // until it reloads).
+  const creationAgentsNotLoaded = variant === "creation" && (!agentsLoaded || agentsLoadFailed);
   // #6423: the same blockers as canSend below, so "Run /init" is off whenever Send is.
   useReportCreationSendBlocked(
     {
@@ -993,6 +1002,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       coderPresetsLoading,
       branchesNotLoaded: creationBranchesLoading,
       draftNotSaved: creationDraftNotSaved,
+      agentsNotLoaded: creationAgentsNotLoaded,
     },
     props
   );
@@ -1019,6 +1029,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     !coderPresetsLoading &&
     !creationBranchesLoading &&
     !creationDraftNotSaved &&
+    !creationAgentsNotLoaded &&
     !transcriptBlocksSend &&
     !editPreconditionInvalidated;
   const runningGoalActive =
@@ -1083,6 +1094,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Only treat *real* agent changes as explicit (origin "agent"); everything else is "sync".
   const prevCreationAgentIdRef = useRef<string | null>(null);
   const prevCreationScopeIdRef = useRef<string | null>(null);
+  const prevCreationProjectRef = useRef<string | null>(null);
   // Creation variant: keep the project-scoped model/thinking in sync with global agent defaults
   // so switching agents uses the configured defaults (and respects "inherit" semantics).
   useEffect(() => {
@@ -1099,14 +1111,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     const normalizedAgentId = normalizeAgentId(agentId, "exec");
 
+    // Defaults come from the agent's base chain, which needs the list.
+    if (!agentsLoaded) return;
+    const isFirstSync = prevCreationScopeIdRef.current !== scopeId;
+    // A project change resets the agent automatically: that is no pick of the user's.
     const isExplicitAgentSwitch =
-      prevCreationAgentIdRef.current !== null &&
-      prevCreationScopeIdRef.current === scopeId &&
+      !isFirstSync &&
+      prevCreationProjectRef.current === creationParentProjectPath &&
       prevCreationAgentIdRef.current !== normalizedAgentId;
 
     // Update refs for the next run (even if no model changes).
     prevCreationAgentIdRef.current = normalizedAgentId;
     prevCreationScopeIdRef.current = scopeId;
+    prevCreationProjectRef.current = creationParentProjectPath;
+    // The draft owns its choices: after the composer seeds them, only the user's agent pick applies
+    // agent defaults over them (not a move, its agent reset or an agent list reload).
+    if (!isFirstSync && !isExplicitAgentSwitch) return;
 
     const existingModel = readScopedAiDefault(scopeId, "model") ?? fallbackModel;
     const existingThinking = readScopedAiDefault(scopeId, "thinkingLevel") ?? "off";
@@ -1141,7 +1161,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     if (existingReasoning !== resolvedReasoning) {
       markAiSelectionIntent(scopeId, "reasoningMode", resolvedReasoning);
     }
-  }, [agentAiDefaults, agentId, agents, creationDraftId, defaultModel, variant]);
+  }, [
+    agentAiDefaults,
+    agentId,
+    agents,
+    agentsLoaded,
+    creationDraftId,
+    creationParentProjectPath,
+    defaultModel,
+    variant,
+  ]);
 
   const chatDockColumnWidthClass = useChatDockColumnWidthClass();
 

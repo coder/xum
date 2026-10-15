@@ -19,6 +19,8 @@ export interface CreationSendBlockers {
   branchesNotLoaded: boolean;
   /** The creation draft's last save failed. */
   draftNotSaved: boolean;
+  /** The project's agents are loading or failed (a moved draft's agent resolves in them). */
+  agentsNotLoaded: boolean;
 }
 
 /**
