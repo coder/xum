@@ -264,8 +264,8 @@ export class CreationDraftStore {
 
   private loadList(client: APIClient): void {
     this.listedClient = client;
-    this.listState = { status: "loading" };
-    this.recomputeList();
+    // A reconnect refreshes the rows behind the shown ones: going back to "loading" would unmount
+    // the open composer (and its in-progress voice input or file reads).
     const run = async () => {
       // Before the list, so it includes what this imports.
       await this.importLegacyDrafts(client);

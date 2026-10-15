@@ -267,6 +267,17 @@ describe("CreationDraftStore", () => {
     expect(store.draftIdForProject(PROJECT_A)).toBe(blank);
   });
 
+  test("a reconnect keeps the list ready while it refreshes", async () => {
+    using tempDir = new TestTempDir("creation-store-reconnect-list");
+    const harness = await createHarness(tempDir);
+    const { store, control } = harness;
+    await waitFor(() => store.getListState().status === "ready");
+    control.listGate = new Promise(() => undefined);
+    store.setClient(harness.newClient());
+    await Promise.resolve();
+    expect(store.getListState().status).toBe("ready");
+  });
+
   test("an absent draft opens blank and its first edit lists it", async () => {
     using tempDir = new TestTempDir("creation-store-absent");
     const harness = await createHarness(tempDir);
