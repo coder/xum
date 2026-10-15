@@ -775,7 +775,7 @@ describe("useBoundedTranscriptReveal", () => {
     // cut is safe: the index-based `bundled` would move bundle edges when rows above them go.
     describe("detached budget on real aggregator updates", () => {
       const SEQ = 1000;
-      function renderOnAggregator(maxMountedRows: number) {
+      function renderOnAggregator(maxMountedRows: number | undefined) {
         const aggregator = new StreamingMessageAggregator(new Date().toISOString(), "ws");
         const message = (id: string, sequence: number) =>
           createMuxMessage(id, "user", id, { historySequence: sequence, timestamp: sequence });
@@ -872,6 +872,70 @@ describe("useBoundedTranscriptReveal", () => {
         // automatic reveal mounts the survivors chunk by chunk without a press.
         const main = [519, 459, 399, 339, 279, 219, 159, 99, 39, 0];
         expect(slice.renders).toEqual(main.map((from) => ({ from, to: 519 })));
+      });
+
+      /** One reply streams: two chunks of text deltas and tool calls, one update each. */
+      function streamReply(slice: ReturnType<typeof renderOnAggregator>, afterEach: () => void) {
+        const event = { workspaceId: "ws", messageId: "reply" };
+        slice.update(() =>
+          slice.aggregator.handleStreamStart({
+            ...event,
+            type: "stream-start",
+            historySequence: SEQ + LONG,
+            model: "anthropic:claude-test",
+            startTime: 1,
+          })
+        );
+        for (let call = 0; call < 2 * TRANSCRIPT_REVEAL_CHUNK_ROWS; call += 1) {
+          slice.update(() => {
+            slice.aggregator.handleStreamDelta({
+              ...event,
+              type: "stream-delta",
+              delta: `step ${call} `,
+              tokens: 1,
+              timestamp: call,
+            });
+            slice.aggregator.handleToolCallStart({
+              ...event,
+              type: "tool-call-start",
+              toolCallId: `call-${call}`,
+              toolName: "bash",
+              args: { script: `echo ${call}` },
+              tokens: 1,
+              timestamp: call,
+            });
+          });
+          afterEach();
+        }
+      }
+
+      // F20 PR3a-3: a reply streaming into an attached slice at the cap must stay mounted.
+      test("streamed rows past the cap unmount the oldest rows, never the newest", () => {
+        // The smallest cap: the reveal pauses about one chunk under it, attached. The aggregator
+        // shows a few dozen rows of one reply, enough to cross it.
+        const cap = TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS;
+        const slice = renderOnAggregator(cap);
+        slice.runFrames();
+        expect(slice.reveal().toIndex).toBe(LONG);
+        streamReply(slice, () => {
+          const { fromIndex, toIndex } = slice.reveal();
+          expect(toIndex).toBe(slice.props().messages.length);
+          expect(toIndex - fromIndex).toBeLessThanOrEqual(cap);
+        });
+        expect(slice.reveal().toIndex - slice.reveal().fromIndex).toBe(cap);
+        expect(slice.frames.hasPending()).toBe(false);
+      });
+
+      test("without a cap, the same stream renders as on main", () => {
+        const slice = renderOnAggregator(undefined);
+        slice.runFrames();
+        slice.renders.length = 0;
+        streamReply(slice, () => undefined);
+        // Captured on main 7ea2aa5220: the start never moves; the end follows the tail (two
+        // renders per update) until the aggregator stops adding rows for this reply.
+        const tail = Array.from({ length: 32 }, (_, i) => [4802 + 2 * i, 4802 + 2 * i]).flat();
+        const main = [4800, ...tail, ...Array<number>(176).fill(4865)];
+        expect(slice.renders).toEqual(main.map((to) => ({ from: 4280, to })));
       });
 
       test("a vanished navigation target pauses, and the start still re-anchors that render", () => {

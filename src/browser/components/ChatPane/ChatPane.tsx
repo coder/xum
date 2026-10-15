@@ -609,10 +609,12 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // skeleton. Handing it no rows keeps it idle; the real transcript then starts tail-first.
   const {
     fromIndex: revealFromIndex,
+    toIndex: revealToIndex,
     isFullyRevealed,
     isRevealPaused,
     revealMore,
     revealThrough,
+    resetToLatest,
   } = useBoundedTranscriptReveal({
     workspaceId,
     messages: showTranscriptHydrationPlaceholder ? EMPTY_TRANSCRIPT : deferredMessages,
@@ -840,7 +842,14 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [handleScrollContainerKeyDown, isComposerDockEvent]
   );
 
-  const handleJumpToBottom = jumpToBottom;
+  // Jump to bottom (also every send and edit) brings a detached slice (#4961 F20: its newest rows
+  // unmounted under the mounted-row cap) back to the live tail first.
+  const isTranscriptDetached =
+    !showTranscriptHydrationPlaceholder && revealToIndex < deferredMessages.length;
+  const handleJumpToBottom = () => {
+    if (isTranscriptDetached) resetToLatest();
+    jumpToBottom();
+  };
 
   // Handler to navigate (scroll) to a specific message by historyId
   const handleNavigateToMessage = useCallback(

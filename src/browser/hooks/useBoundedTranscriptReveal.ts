@@ -319,6 +319,41 @@ function vanishedStartFallback(
   return storedSliceEnd(state, messages, isSafeCut) - mountedBefore;
 }
 
+/**
+ * Where an attached slice starts after an append (F20 PR3a-3): appends that push it over the cap
+ * unmount its OLDEST rows, so a streaming reply stays mounted. Walks (a target is set) and
+ * detached slices keep their start: there the cap trims the newest rows instead. A tail bundle
+ * larger than the cap mounts alone.
+ */
+function tailFollowingStart(
+  state: RevealState,
+  messages: readonly RevealRow[],
+  from: number,
+  max: number | undefined,
+  isSafeCut: IsSafeCut
+): number {
+  const length = messages.length;
+  const attached = state.endMessageId === null && state.targetMessageId === null;
+  if (max === undefined || !attached || length - from <= max) return from;
+  const cut = nearestSafeCutAtOrAfter(length - max, length, isSafeCut);
+  return cut < length ? cut : nearestSafeCutAtOrBefore(length - 1, length, isSafeCut);
+}
+
+/** `state` with the start persisted at `from` (null at 0), so it cannot move forward again. */
+function withStartAt(
+  state: RevealState,
+  messages: readonly RevealRow[],
+  from: number
+): RevealState {
+  if (from === 0) {
+    return state.anchorMessageId === null
+      ? state
+      : { ...state, anchorMessageId: null, anchorIndexHint: 0 };
+  }
+  if (from >= messages.length || messages[from].id === state.anchorMessageId) return state;
+  return { ...state, anchorMessageId: messages[from].id, anchorIndexHint: from };
+}
+
 /** Largest safe cut at or before `index`, clamped to [0, length]; 0 is always safe. */
 function nearestSafeCutAtOrBefore(
   index: number,
@@ -458,10 +493,12 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
         ? true
         : exceedsOneStep(previousNewestIndex + 1, length, stepInputs);
   }
+  let appended = false;
   if (restart) {
     current = startState(args.workspaceId, args.messages, stepInputs, current.generation + 1);
     setState(current);
   } else if (current.newestMessageId !== newestMessageId) {
+    appended = true;
     current = { ...current, newestMessageId };
     setState(current);
   }
@@ -493,20 +530,16 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       length,
       args.isSafeCut
     );
-    if (fromIndex === 0) {
-      current = { ...current, anchorMessageId: null, anchorIndexHint: 0 };
-      setState(current);
-    } else if (fromIndex < length && args.messages[fromIndex].id !== current.anchorMessageId) {
-      current = {
-        ...current,
-        anchorMessageId: args.messages[fromIndex].id,
-        anchorIndexHint: fromIndex,
-      };
-      setState(current);
-    }
+  }
+  const max = args.maxMountedRows;
+  if (appended)
+    fromIndex = tailFollowingStart(current, args.messages, fromIndex, max, args.isSafeCut);
+  const started = withStartAt(current, args.messages, fromIndex);
+  if (started !== current) {
+    current = started;
+    setState(current);
   }
   assert(fromIndex >= 0 && fromIndex <= length, "reveal boundary must stay within the transcript");
-  const max = args.maxMountedRows;
   const toIndex = resolveSliceEnd(current, args.messages, fromIndex, max, args.isSafeCut);
   const sliced = withSliceEnd(current, args.messages, toIndex);
   if (sliced !== current) {
