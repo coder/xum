@@ -484,10 +484,26 @@ describeIntegration("Draft workspace behavior", () => {
     try {
       const updates = jest.spyOn(env.services.draftService, "update");
       const listPuts = jest.spyOn(env.services.draftService, "putListEntry");
+      const gets = jest.spyOn(env.services.draftService, "get");
       fireEvent.click(opened.newSubProjectChat);
       const [draftId] = await waitForDraftCount(projectPath, 1);
       const listedScope: DraftScope = { kind: "creation", projectPath, draftId };
       createdScopes.push(listedScope);
+      const isListed = (scope: DraftScope) =>
+        scope.kind === "creation" && scope.draftId === draftId;
+      await waitFor(
+        () => {
+          // The default draft shows empty again, so the composer showing the text is the listed one.
+          expect(getDraftStore().getView(defaultScope).text).toBe("");
+          expect(composerText(view.container)).toBe("typed on the project page");
+          expect(view.container.querySelectorAll('img[alt="Attached image"]')).toHaveLength(1);
+        },
+        { timeout: 10_000 }
+      );
+      // The moved attachments show at once: the default draft's loaded payloads came along, so
+      // the listed draft loads none.
+      expect(gets.mock.calls.filter(([scope]) => isListed(scope))).toEqual([]);
+      gets.mockRestore();
       await waitFor(
         async () => {
           const moved = await env.orpc.drafts.get({ scope: listedScope });
@@ -510,8 +526,6 @@ describeIntegration("Draft workspace behavior", () => {
         timeout: 10_000,
       });
       // One backend step moved the body and listed the row: no write or put of its own.
-      const isListed = (scope: DraftScope) =>
-        scope.kind === "creation" && scope.draftId === draftId;
       expect(updates.mock.calls.filter(([input]) => isListed(input.scope))).toEqual([]);
       expect(listPuts.mock.calls.filter(([entry]) => entry.draftId === draftId)).toEqual([]);
       updates.mockRestore();

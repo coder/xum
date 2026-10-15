@@ -286,16 +286,19 @@ interface MoveSourceMark {
   attachments: number;
   name: number;
   queued: number;
+  /** The flushed attachments, when their payloads were loaded (else none). */
+  loadedAttachments: readonly ChatAttachment[];
 }
 
 function markMoveSource(entry: Entry | undefined): MoveSourceMark {
-  if (!entry) return { entry, text: 0, attachments: 0, name: 0, queued: 0 };
+  if (!entry) return { entry, text: 0, attachments: 0, name: 0, queued: 0, loadedAttachments: [] };
   return {
     entry,
     text: entry.textVersion,
     attachments: entry.attachmentsVersion,
     name: entry.nameVersion,
     queued: entry.queuedAttachmentUpdates.length,
+    loadedAttachments: entry.payloadsLoaded ? entry.attachments : [],
   };
 }
 
@@ -519,6 +522,22 @@ function filePartsOf(send: PendingSend, attachments: readonly ChatAttachment[]):
 
 function sendRetryDelayMs(attempt: number): number {
   return Math.min(SEND_RETRY_BASE_MS * 2 ** attempt, SEND_RETRY_MAX_MS);
+}
+
+/**
+ * Payloads already at hand for the server's attachment list, so none need loading. An entry
+ * with an unconfirmed attachment change keeps its own.
+ */
+function seedLoadedAttachments(
+  entry: Entry,
+  loaded: readonly ChatAttachment[],
+  server: readonly DraftAttachmentMetadata[]
+): void {
+  if (isAttachmentsDirty(entry) || loaded.length === 0) return;
+  if (!matchesServerAttachments(loaded, server)) return;
+  entry.attachments = [...loaded];
+  entry.attachmentCount = loaded.length;
+  entry.payloadsLoaded = true;
 }
 
 /**
@@ -1801,7 +1820,12 @@ export class DraftStore {
     });
     this.settleList();
     // The moved content, another window's edits included (pushes may have created the entry).
-    this.applyWriteReply(this.getOrCreateEntry(dest), sent.reply.dest, ALL_FIELDS);
+    const destEntry = this.getOrCreateEntry(dest);
+    // The source's payloads as flushed, when they are the moved ones, so the destination shows
+    // its attachments at once instead of after a payload load (R7-SLOW-MOVE). Taken from the
+    // mark: the move's own change event may have emptied the source entry by now.
+    seedLoadedAttachments(destEntry, sent.mark.loadedAttachments, sent.reply.dest.attachments);
+    this.applyWriteReply(destEntry, sent.reply.dest, ALL_FIELDS);
   }
 
   /** Drop local state of a removed workspace (its session dir, and draft, are gone). */
@@ -2422,15 +2446,7 @@ export class DraftStore {
   ): void {
     const entry = this.getOrCreateEntry(scope);
     // The legacy payloads are at hand: when the stored attachments are those, none need loading.
-    if (
-      !isAttachmentsDirty(entry) &&
-      legacyAttachments.length > 0 &&
-      matchesServerAttachments(legacyAttachments, reply.attachments)
-    ) {
-      entry.attachments = [...legacyAttachments];
-      entry.attachmentCount = legacyAttachments.length;
-      entry.payloadsLoaded = true;
-    }
+    seedLoadedAttachments(entry, legacyAttachments, reply.attachments);
     this.applyWriteReply(entry, reply, ALL_FIELDS);
   }
 
