@@ -21,7 +21,8 @@ type WorkspaceSettingsToolRuns = Readonly<Record<string, ServerSettingsToolRuns>
  * MCP dialog unmounts its settings sections (the sidebar row even unmounts the dialog), and a
  * reopen used to forget a run still in flight: Run and Save settings were enabled while it ran.
  * Results live here too, so a section remounted by a reopen or re-read still shows the result.
- * Module-level and in memory only: a reload ends every run anyway.
+ * Module-level and in memory only: a reload ends every run anyway. A removed workspace's
+ * entries go with it (forgetSettingsToolRuns).
  */
 const runsByWorkspace = new Map<string, WorkspaceSettingsToolRuns>();
 const listeners = new Set<() => void>();
@@ -65,8 +66,13 @@ export function startSettingsToolRun(
   return (result) => {
     if (ended) return;
     ended = true;
+    // Forgotten (its workspace was removed): a late end must not bring the entry back.
+    const index = serverSettingsToolRuns(
+      settingsToolRunsOf(workspaceId),
+      serverName
+    ).running.indexOf(toolName);
+    if (index === -1) return;
     update(workspaceId, serverName, (runs) => {
-      const index = runs.running.indexOf(toolName);
       return {
         running: runs.running.filter((_, i) => i !== index),
         results:
@@ -82,6 +88,12 @@ export function clearSettingsToolResults(workspaceId: string): void {
   if (workspace === undefined) return;
   for (const serverName of Object.keys(workspace))
     update(workspaceId, serverName, (runs) => ({ running: runs.running, results: {} }));
+}
+
+/** The workspace was removed: drop its runs and results. */
+export function forgetSettingsToolRuns(workspaceId: string): void {
+  if (!runsByWorkspace.delete(workspaceId)) return;
+  for (const listener of listeners) listener();
 }
 
 export function settingsToolRunsOf(workspaceId: string): WorkspaceSettingsToolRuns {

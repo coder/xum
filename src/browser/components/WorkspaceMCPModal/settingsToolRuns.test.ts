@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import {
   clearSettingsToolResults,
+  forgetSettingsToolRuns,
   settingsToolRunsOf,
   startSettingsToolRun,
 } from "./settingsToolRuns";
@@ -22,4 +23,12 @@ test("settings tool runs: tracked per workspace and server until each run ends o
   expect(settingsToolRunsOf("ws-runs").cad).toEqual({ running: ["cad.reset"], results: {} });
   second(null);
   expect(settingsToolRunsOf("ws-runs")).toEqual({});
+});
+
+test("settings tool runs: a removed workspace's entries go, and a late run end does not return", () => {
+  const end = startSettingsToolRun("ws-removed", "cad", "cad.reset");
+  forgetSettingsToolRuns("ws-removed");
+  expect(settingsToolRunsOf("ws-removed")).toEqual({});
+  end({ text: "done", isError: false });
+  expect(settingsToolRunsOf("ws-removed")).toEqual({});
 });

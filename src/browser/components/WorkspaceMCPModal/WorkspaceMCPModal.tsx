@@ -102,7 +102,11 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   const [savingSettings, setSavingSettings] = useState<Record<string, number>>({});
   // Settings tool action runs in flight, also those started before a reopen. Refresh Tools and
   // Save wait for them: a refresh remounts the section, and Save closes the dialog.
-  const busySettings = withSettingsToolRuns(savingSettings, useSettingsToolRuns(workspaceId));
+  const busySettings = withSettingsToolRuns(
+    savingSettings,
+    useSettingsToolRuns(workspaceId),
+    Object.keys(servers)
+  );
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   // Mounted settings sections by server name (ref callbacks drop unmounted ones).
