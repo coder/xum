@@ -70,6 +70,8 @@ interface WorkspaceMCPStoryOptions {
   /** Servers the workspace already runs (the dialog reads their settings on open). */
   settingsConnected?: string[];
   settingsReads?: string[][];
+  /** Records the workspace of each settings read. */
+  settingsReadWorkspaces?: string[];
   settingsReadErrors?: Record<string, string>;
   settingsUpdateGate?: { promise: Promise<void> } | Array<{ promise: Promise<void> }>;
   settingsFirstReadGate?: { promise: Promise<void> };
@@ -159,6 +161,7 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
     ),
     mcpSettingsConnected: new Set(options.settingsConnected ?? []),
     mcpSettingsReads: options.settingsReads,
+    mcpSettingsReadWorkspaces: options.settingsReadWorkspaces,
     mcpSettingsReadErrors: new Map(Object.entries(options.settingsReadErrors ?? {})),
     mcpSettingsUpdateGate: options.settingsUpdateGate,
     mcpSettingsFirstReadGate: options.settingsFirstReadGate,
@@ -1120,6 +1123,71 @@ export const WorkspaceMCPServerSettingsRereadAfterAppUnmount: Story = {
       expect(queryWorkspaceMCPDialog(canvasElement.ownerDocument)).not.toBeInTheDocument()
     );
     await waitFor(() => expect(appUnmountReads).toEqual([["cad"], ["cad"]]), { timeout: 5000 });
+  },
+};
+
+/** The menu bar's workspace MCP dialog: one modal that a workspace switch reuses (no key). */
+let switchWorkspaceMCPModal: ((workspaceId: string) => void) | null = null;
+const WorkspaceSwitchingMCPModal: FC = () => {
+  const [workspaceId, setWorkspaceId] = useState(WORKSPACE_ID);
+  switchWorkspaceMCPModal = setWorkspaceId;
+  return (
+    <WorkspaceMCPModal
+      workspaceId={workspaceId}
+      projectPath={PROJECT_PATH}
+      open
+      onOpenChange={() => undefined}
+    />
+  );
+};
+
+const appSwitchReadWorkspaces: string[] = [];
+/**
+ * A workspace switch while a writable app is open: the reused dialog renders the old row with
+ * the new workspace before it drops it. The re-read when the app goes away is the workspace
+ * whose app wrote, not the one switched to.
+ */
+export const WorkspaceMCPServerSettingsRereadAfterAppWorkspaceSwitch: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    appSwitchReadWorkspaces.length = 0;
+    return (
+      <WorkspaceMCPModalStoryShell
+        setup={() =>
+          setupWorkspaceMCPModalStory({
+            ...settingsStoryOptions(),
+            settingsReadWorkspaces: appSwitchReadWorkspaces,
+            settingsToolRunSets: { "cad.payment": { zoom: 1 } },
+            mcpAppViews: {
+              "settings:cad:cad.payment": {
+                html: "<!doctype html><html><body><strong>Card form</strong></body></html>",
+                csp: {},
+                prefersBorder: null,
+                resultAvailable: true,
+                result: { content: [] },
+                invocation: null,
+              },
+            },
+          })
+        }
+      >
+        <WorkspaceSwitchingMCPModal />
+      </WorkspaceMCPModalStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await section.findByRole("button", { name: "Open Payment method" }));
+    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    const appDialog = await page.findByRole("dialog", { name: "Payment method" });
+    await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
+    await expect(appSwitchReadWorkspaces).toEqual([WORKSPACE_ID]);
+    switchWorkspaceMCPModal?.("ws-switched-to");
+    await waitFor(() => expect(appSwitchReadWorkspaces.slice(1)).toContain(WORKSPACE_ID), {
+      timeout: 5000,
+    });
   },
 };
 

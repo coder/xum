@@ -20,7 +20,11 @@ import type {
   MCPSettingsSnapshot,
   MCPSettingsToolAction,
 } from "@/common/utils/mcpSettings";
-import { publishSettingsToolWrite, type SettingsToolRunResult } from "./settingsToolRuns";
+import {
+  publishSettingsToolWrite,
+  startSettingsToolRun,
+  type SettingsToolRunResult,
+} from "./settingsToolRuns";
 
 interface MCPSettingsToolActionRowProps {
   workspaceId: string;
@@ -363,24 +367,26 @@ function useToolActionRun(
    * read counts as a run (the run store outlives the row), so Save waits for it.
    */
   const canWriteApp = app?.canWrite === true;
-  // The latest re-read, for the cleanup below: props.beginRun is a new function each render.
-  const rereadAfterApp = useRef<() => void>(() => undefined);
+  const { workspaceId, serverName } = props;
+  const toolName = props.item.tool;
+  // The open app's lifetime only: its close and the row's unmount end it, a re-render does not.
+  // The cleanup keeps the workspace and server of the render that opened the app: a reused
+  // dialog can render this row with a switched-to workspace before it drops the row, and the
+  // re-read belongs to the workspace whose app wrote. The run is the one `props.beginRun`
+  // starts (startSettingsToolRun), so a reopened dialog's Save waits for it.
   useEffect(() => {
-    rereadAfterApp.current = () => {
-      const endRun = props.beginRun();
+    if (!canWriteApp) return;
+    return () => {
+      const endRun = startSettingsToolRun(workspaceId, serverName, toolName);
       // publishSettingsToolWrite never rejects (it settles every read); the run ends either way.
-      writeSettled().then(
+      publishSettingsToolWrite(workspaceId, serverName, () =>
+        readSettingsWithoutDialog(api, workspaceId, serverName)
+      ).then(
         () => endRun(null),
         () => endRun(null)
       );
     };
-  });
-  // The open app's lifetime only: its close and the row's unmount end it, a re-render does not.
-  useEffect(() => {
-    if (!canWriteApp) return;
-    const reread = rereadAfterApp;
-    return () => reread.current();
-  }, [canWriteApp, app?.openCount]);
+  }, [canWriteApp, app?.openCount, api, workspaceId, serverName, toolName]);
   const closeApp = () => setApp(null);
   return { app, closeApp, run };
 }
