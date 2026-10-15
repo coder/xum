@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import {
   useDraftStoreHydrated,
@@ -38,6 +38,13 @@ export function useCreationDraftMove(source: CreationDraftMoveSource) {
   // A promotion moves the draft too. The selector's own move stays `moving` until it opened the
   // destination, after the store's move ended.
   const moving = useIsMovingCreationDraft(source.draftScope) || selectorMoving;
+  // The agent picker stays live during a move, so the carry reads the agent the composer shows
+  // once the draft moved (the composer stays mounted until then), as it reads model and thinking.
+  // Assigned in a layout effect: the move's continuation runs after the commit of a new pick.
+  const agentRef = useRef(source.agent);
+  useLayoutEffect(() => {
+    agentRef.current = source.agent;
+  });
   return {
     /** The draft is moving: its composer takes no input and sends nothing meanwhile. */
     moving,
@@ -62,7 +69,7 @@ export function useCreationDraftMove(source: CreationDraftMoveSource) {
         draftId: source.draftId,
         destination,
         runtimePick: source.runtimePick,
-        agent: source.agent,
+        getAgent: () => agentRef.current,
       })
         .catch((error: unknown) => console.warn("Failed to move the draft:", error))
         .finally(() => setMoving(false));

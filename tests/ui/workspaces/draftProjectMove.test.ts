@@ -823,6 +823,43 @@ describeIntegration("Creation project selector moves the draft", () => {
     }
   }, 90_000);
 
+  test("the agent picked while the draft moves is the one that moves", async () => {
+    // Global agents live in the Xum home: point it at a temporary one for this test.
+    const previousRoot = process.env.XUM_ROOT;
+    const xumRoot = await fs.mkdtemp(path.join(os.tmpdir(), "draft-move-global-agents-"));
+    process.env.XUM_ROOT = xumRoot;
+    for (const agentId of ["global-x", "global-y"]) {
+      const file = path.join(xumRoot, "agents", `${agentId}.md`);
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, `---\nname: ${agentId}\nbase: exec\n---\n\nA global agent.\n`);
+    }
+    const a = getSharedRepoPath();
+    const { view, cleanupDom, b } = await openTwoProjects();
+    const { container } = view;
+    const move = holdBackendMove();
+    try {
+      writeScopedAiDefault(getProjectScopeId(b), "agentId", "exec");
+      await openProjectCreationView(view, a);
+      await pickAgent(container, a, "global-x");
+
+      await startMoveTo(container, path.basename(b));
+      await waitFor(() => expect(move.calls()).toBeGreaterThan(0), WAIT);
+      // The agent picker stays live while the move waits for the backend.
+      await pickAgent(container, a, "global-y");
+      move.release();
+      await waitFor(() => expect(projectSelectorLabel(container)).toBe(path.basename(b)), WAIT);
+
+      expect(readScopeAgentId(getProjectScopeId(b))).toBe("global-y");
+    } finally {
+      move.release();
+      move.restore();
+      await cleanupView(view, cleanupDom);
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+      await fs.rm(xumRoot, { recursive: true, force: true });
+    }
+  }, 90_000);
+
   test("plan moves even from a project that defines its own plan agent", async () => {
     const a = getSharedRepoPath();
     // Every project has Plan and Exec: these move whatever their source definition.

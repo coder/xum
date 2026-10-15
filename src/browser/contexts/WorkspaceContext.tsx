@@ -275,8 +275,11 @@ export interface WorkspaceDraftMove {
   destination: string;
   /** Carried only between projects (Scratch has no runtime). */
   runtimePick: ParsedRuntime | null;
-  /** The source composer's agent: only an agent that every project has moves with the draft. */
-  agent: CreationDraftAgent | undefined;
+  /**
+   * The source composer's agent once the draft moved (the picker stays live during the move):
+   * only an agent that every project has moves with the draft.
+   */
+  getAgent: () => CreationDraftAgent | undefined;
 }
 
 /** The DraftStore scope of a creation composer's draft (no listed id: the project's default). */
@@ -337,7 +340,7 @@ async function moveDraftToProject(
   carryCreationAiSettings({
     sourceProjectPath: move.projectPath,
     destProjectPath: dest.projectPath,
-    agent: move.agent,
+    agent: move.getAgent(),
   });
   handOffCreationRuntime({
     sourceProjectPath: move.projectPath,
