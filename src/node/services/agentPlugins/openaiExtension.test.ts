@@ -193,7 +193,16 @@ describe("readOpenAIExtension", () => {
     const read = (iface: Record<string, unknown>) =>
       readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
     // A Devanagari half-form (ZWJ after a virama), and a mark after a Persian ZWNJ.
-    for (const text of ["\u0915\u094d\u200d\u0937", "\u0647\u200c\u0610\u0627"]) {
+    for (const text of [
+      "\u0915\u094d\u200d\u0937",
+      "\u0647\u200c\u0610\u0627",
+      // The three RGI subdivision flags (England, Wales; Scotland is tested above).
+      "\u{1f3f4}\u{e0067}\u{e0062}\u{e0065}\u{e006e}\u{e0067}\u{e007f}",
+      "\u{1f3f4}\u{e0067}\u{e0062}\u{e0077}\u{e006c}\u{e0073}\u{e007f}",
+      // The pre-Unicode-5.1 Malayalam chillu: letter, virama, ZWJ at a word end (#6660).
+      "\u0d28\u0d4d\u200d",
+      "\u0d05\u0d35\u0d7b\u0d28\u0d4d\u200d \u0d35\u0d28\u0d4d\u200d.",
+    ]) {
       const good = read({ ...validInterface, displayName: text, developerName: text });
       expect(good.warnings).toEqual([]);
       expect(good.extension?.interface?.displayName).toBe(text);
@@ -222,6 +231,18 @@ describe("readOpenAIExtension", () => {
       "Fig\uffa0ma",
       "Fig\u115fma",
       "Fig\u1160ma",
+      // Other characters that render as nothing or a blank (#6660).
+      "Fig\u034fma",
+      "Fig\u17b4ma",
+      "Fig\u17b5ma",
+      "Fig\u2800ma",
+      // Only the three RGI subdivision flags are allowed (#6653): a well-formed but unknown
+      // payload shows as a plain black flag where tags are not supported.
+      "\u{1f3f4}\u{e0061}\u{e0061}\u{e007f}",
+      "\u{1f3f4}\u{e0075}\u{e0073}\u{e0063}\u{e0061}\u{e007f}",
+      "\u{1f3f4}\u{e0067}\u{e0062}\u{e0073}\u{e0063}\u{e007f}",
+      // Malayalam ZWJ after a virama stays refused before a letter of another script.
+      "\u0d28\u0d4d\u200dA",
     ]) {
       expect(read({ ...validInterface, developerName: bad }).extension).toEqual({});
     }
@@ -232,17 +253,20 @@ describe("readOpenAIExtension", () => {
     // the string from each one: quadratic, about 50 ms per read on Bun and 200 ms on Node at the
     // 4000-character longDescription cap. Twenty reads keep that far above the bound, and the
     // linear rule far below it.
-    const marks = "\u0610".repeat(4000);
-    const extension = {
-      "com.openai": { interface: { ...validInterface, longDescription: marks } },
-    };
-    const started = performance.now();
-    for (let read = 0; read < 20; read++) {
-      expect(
-        readOpenAIExtension({ extensions: extension }).extension?.interface?.longDescription
-      ).toBe(marks);
+    // One shaping letter before the marks is the other worst case (#6660): every rule that starts
+    // at a letter runs over the whole mark run once.
+    for (const marks of ["\u0610".repeat(4000), "\u0628" + "\u0610".repeat(3999)]) {
+      const extension = {
+        "com.openai": { interface: { ...validInterface, longDescription: marks } },
+      };
+      const started = performance.now();
+      for (let read = 0; read < 20; read++) {
+        expect(
+          readOpenAIExtension({ extensions: extension }).extension?.interface?.longDescription
+        ).toBe(marks);
+      }
+      expect(performance.now() - started).toBeLessThan(250);
     }
-    expect(performance.now() - started).toBeLessThan(250);
   });
 
   test("a blank capability drops the capability list with a warning", () => {
