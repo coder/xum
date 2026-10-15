@@ -176,7 +176,8 @@ describeIntegration("Runtime Bash Execution", () => {
           });
         return (
           `Last init lines: ${JSON.stringify(ctx.initLines.slice(-5))}. ` +
-          `SSH pool: ${JSON.stringify(health ?? null)}`
+          // CI runs the default OpenSSH transport. The SSH2 pool exposes no health to read.
+          `OpenSSH pool: ${JSON.stringify(health ?? null)}`
         );
       };
       /** Runs an ssh test body under the watchdog; local tests run unchanged. */
