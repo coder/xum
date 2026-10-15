@@ -50,7 +50,11 @@ import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import type { SendMessageError } from "@/common/types/errors";
 import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
-import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
+import type {
+  MuxMessage,
+  MuxMessageMetadata,
+  VolatileSystemTailRecord,
+} from "@/common/types/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { createMuxMessage } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
@@ -611,6 +615,16 @@ export async function assembleBudgetCheckedPromptPayload(
     }
   }
   return { ...payload, contextBudgetLimit, contextBudgetEstimate };
+}
+
+/**
+ * The assistant row's tail record (MuxMetadata.volatileSystemTail). Absent records nothing, so
+ * a fallback attempt that only repeats the tail keeps the record the primary attempt wrote.
+ */
+function volatileSystemTailMetadata(record: VolatileSystemTailRecord | undefined): {
+  volatileSystemTail?: VolatileSystemTailRecord;
+} {
+  return record != null ? { volatileSystemTail: record } : {};
 }
 
 function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
@@ -3203,6 +3217,7 @@ export class TurnRequestBuilder {
           messages: finalMessages,
           system: attemptSystem,
           engineSystem: attemptPayload.system,
+          volatileSystemTail: attemptPayload.volatileSystemTail,
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
           contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
           ...compactionInputBudget,
@@ -3230,6 +3245,7 @@ export class TurnRequestBuilder {
               system: attemptSystem,
               systemMessageTokens: attemptSystemTokens,
               engineSystem: payload.system,
+              volatileSystemTail: payload.volatileSystemTail,
               messages: payload.messages,
               contextBudgetLimit: payload.contextBudgetLimit,
               contextBudgetEstimate: payload.contextBudgetEstimate,
@@ -3346,6 +3362,7 @@ export class TurnRequestBuilder {
         routedThroughGateway,
         systemMessageTokens,
         agentId: effectiveAgentId,
+        ...volatileSystemTailMetadata(primaryRequest.volatileSystemTail),
       });
 
       const appendResult = await this.dependencies.historyService.appendToHistory(
@@ -3633,6 +3650,7 @@ export class TurnRequestBuilder {
                       ? { routeProvider: nextRequest.routeProvider }
                       : {}),
                     systemMessageTokens: nextRequest.systemMessageTokens,
+                    ...volatileSystemTailMetadata(nextRequest.volatileSystemTail),
                   },
                 });
               },
@@ -3711,6 +3729,8 @@ export class TurnRequestBuilder {
           systemMessageTokens,
           timestamp: Date.now(),
           agentId: effectiveAgentId,
+          // Where this request sent the volatile system tail, so the next rebuild repeats it.
+          ...volatileSystemTailMetadata(primaryRequest.volatileSystemTail),
           ...(legacyModeForMetadata != null ? { mode: legacyModeForMetadata } : {}),
           routedThroughGateway,
           ...(routeProvider != null ? { routeProvider } : {}),

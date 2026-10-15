@@ -8,7 +8,11 @@ import type { ContextWindowIds } from "./contextWindowRollover";
 import * as path from "node:path";
 
 import assert from "@/common/utils/assert";
-import { isTokenBudgetInternalMessage, type MuxMessage } from "@/common/types/message";
+import {
+  isTokenBudgetInternalMessage,
+  type MuxMessage,
+  type VolatileSystemTailRecord,
+} from "@/common/types/message";
 import {
   getHistoryItemId,
   isHiddenFromSessionHistory,
@@ -82,6 +86,10 @@ import {
   type AnthropicCacheTtl,
 } from "@/common/utils/ai/cacheStrategy";
 import { prepareMessagesForProvider } from "./messagePipeline";
+import {
+  acceptsVolatileSystemTailRow,
+  planVolatileSystemTail,
+} from "@/node/utils/messages/volatileSystemTail";
 import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
 const keepContextRow = (message: MuxMessage) =>
@@ -168,6 +176,8 @@ export interface PromptPayload {
   messages: ModelMessage[];
   system: Instructions | undefined;
   tools: Record<string, Tool> | undefined;
+  /** For this turn's assistant row (MuxMetadata.volatileSystemTail); undefined records nothing. */
+  volatileSystemTail?: VolatileSystemTailRecord;
 }
 
 export interface AssemblePromptPayloadOptions {
@@ -339,15 +349,47 @@ export async function assemblePromptPayload(
     options.modelString,
     options.requestContextMessage
   );
-  let messages = await prepareMessagesForProvider({
-    messagesWithSentinel: addInterruptedSentinel(
-      insertRequestContextMessage(
-        options.tagHistoryItemIds === true
-          ? tagUserRowsWithHistoryItemIds(providerRequestMessages)
-          : providerRequestMessages,
-        options.requestContextMessage
+  const volatileLength = options.volatileSystemSuffixLength ?? 0;
+  assert(
+    Number.isSafeInteger(volatileLength) &&
+      volatileLength >= 0 &&
+      (volatileLength === 0 || volatileLength < options.systemMessage.length),
+    "volatileSystemSuffixLength must leave a non-empty stable system prefix"
+  );
+  const stableSystem = options.systemMessage.slice(
+    0,
+    options.systemMessage.length - volatileLength
+  );
+  const cachedSystemMessage = createCachedSystemMessage(
+    stableSystem,
+    options.modelString,
+    options.anthropicCacheTtl,
+    options.providersConfig
+  );
+  // A tail change inside a segment becomes a system row instead of a system edit (mechanism 10).
+  const tailPlan = planVolatileSystemTail(
+    providerRequestMessages,
+    options.systemMessage.slice(stableSystem.length),
+    cachedSystemMessage != null &&
+      acceptsVolatileSystemTailRow(
+        options.modelString,
+        options.routeProvider,
+        options.providersConfig
       )
-    ),
+  );
+  const historyWithSentinel = addInterruptedSentinel(
+    insertRequestContextMessage(
+      options.tagHistoryItemIds === true
+        ? tagUserRowsWithHistoryItemIds(tailPlan.messages)
+        : tailPlan.messages,
+      options.requestContextMessage
+    )
+  );
+  let messages = await prepareMessagesForProvider({
+    // The new row goes last, after the newest user row and its request context.
+    messagesWithSentinel: tailPlan.appendedRow
+      ? [...historyWithSentinel, tailPlan.appendedRow]
+      : historyWithSentinel,
     replayReceiptMessages: prepared.activeContextMessages,
     effectiveAgentId: options.effectiveAgentId,
     toolNamesForSentinel: options.toolNamesForSentinel,
@@ -365,28 +407,9 @@ export async function assemblePromptPayload(
       : options.deferLoadingToolNames,
   });
   let system: Instructions | undefined = options.systemMessage;
-  const volatileLength = options.volatileSystemSuffixLength ?? 0;
-  assert(
-    Number.isSafeInteger(volatileLength) &&
-      volatileLength >= 0 &&
-      (volatileLength === 0 || volatileLength < options.systemMessage.length),
-    "volatileSystemSuffixLength must leave a non-empty stable system prefix"
-  );
-  const stableSystem = options.systemMessage.slice(
-    0,
-    options.systemMessage.length - volatileLength
-  );
   // Uncached trailing block: the stable block keeps the cache breakpoint.
   const volatileRows: SystemModelMessage[] =
-    volatileLength > 0
-      ? [{ role: "system", content: options.systemMessage.slice(stableSystem.length) }]
-      : [];
-  const cachedSystemMessage = createCachedSystemMessage(
-    stableSystem,
-    options.modelString,
-    options.anthropicCacheTtl,
-    options.providersConfig
-  );
+    tailPlan.systemTail.length > 0 ? [{ role: "system", content: tailPlan.systemTail }] : [];
   if (cachedSystemMessage) {
     // Anthropic requires the cached system row in messages and no separate system parameter.
     messages = [cachedSystemMessage, ...volatileRows, ...messages];
@@ -413,6 +436,7 @@ export async function assemblePromptPayload(
     providerRequestMessages,
     messages,
     system,
+    ...(tailPlan.record != null ? { volatileSystemTail: tailPlan.record } : {}),
     tools: options.tools
       ? applyCacheControlToTools(
           options.tools,

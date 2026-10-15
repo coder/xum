@@ -89,6 +89,7 @@ import {
   resolveCompactionInputBudgetTokens,
 } from "./turnRequestBuilder";
 import * as messagePipeline from "./messagePipeline";
+import { createAnthropic } from "@ai-sdk/anthropic";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
@@ -369,6 +370,9 @@ function modelIdFromModelString(modelString: string): string {
 type ResolveAndCreateModelSpy = ReturnType<
   typeof spyOn<ProviderModelFactory, "resolveAndCreateModel">
 >;
+
+/** The real pipeline, before stubCommonStreamMessageDependencies replaces it. */
+const realPrepareMessagesForProvider = messagePipeline.prepareMessagesForProvider;
 
 function stubCommonStreamMessageDependencies(args: {
   service: AIService;
@@ -5960,6 +5964,148 @@ describe("AIService.streamMessage volatile system content (#5251)", () => {
         rows.map((row) => textOf(row)).join("")
       );
     }
+  });
+});
+
+describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  /** The Anthropic Messages body the SDK sends for one stream call (cache markers removed). */
+  async function wireBody(
+    call: TurnExecutionOptions
+  ): Promise<{ system: unknown; messages: unknown[] }> {
+    let body: { system?: unknown; messages?: unknown[] } | undefined;
+    const fetch = ((_url: unknown, init?: { body?: unknown }) => {
+      body = JSON.parse(String(init?.body), (key, value: unknown) =>
+        key === "cache_control" ? undefined : value
+      ) as typeof body;
+      return Promise.resolve(new Response("{}", { status: 400 }));
+    }) as unknown as typeof globalThis.fetch;
+    await generateText({
+      model: createAnthropic({ apiKey: "k", baseURL: "http://wire.invalid/v1", fetch })(
+        "claude-opus-5-5"
+      ),
+      system: call.system,
+      messages: call.messages,
+      allowSystemInMessages: true,
+      maxRetries: 0,
+    }).catch(() => undefined);
+    if (body?.messages == null) throw new Error("the provider SDK sent no request");
+    return { system: body.system, messages: body.messages };
+  }
+
+  it("sends a hot-memory change as a row that extends the previous request byte for byte", async () => {
+    using xumHome = new DisposableTempDir("ai-service-volatile-tail-row");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-volatile-tail-row";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(xumHome.path),
+      xumHome: xumHome.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (experimentId) =>
+        experimentId === EXPERIMENT_IDS.MEMORY || experimentId === EXPERIMENT_IDS.MEMORY_HOT_SET
+    );
+    const { config, historyService, initStateManager, streamManager, service } =
+      createBasicAIService(xumHome.path, { experimentsService });
+    const startStreamCalls: TurnExecutionOptions[] = [];
+    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub for memory availability gating
+    const stubTool: Tool = {} as never;
+    stubCommonStreamMessageDependencies({
+      service,
+      streamManager,
+      config,
+      historyService,
+      initStateManager,
+      metadata,
+      startStreamCalls,
+      allTools: { memory: stubTool },
+      useRequestedModelString: true,
+      routeProvider: "anthropic",
+    });
+    // The real request pipeline: the bytes below are what Anthropic receives.
+    spyOn(messagePipeline, "prepareMessagesForProvider").mockImplementation(
+      realPrepareMessagesForProvider
+    );
+    service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      config,
+      new MemoryMetaService(xumHome.path)
+    );
+    const stableSystem = "stable-system-prompt";
+    spyOn(turnContextAssembler, "buildStreamSystemContext").mockImplementation((contextArgs) => {
+      const hotMemoriesSection = contextArgs.hotMemoriesBlock
+        ? `\n\n${contextArgs.hotMemoriesBlock}`
+        : undefined;
+      return Promise.resolve({
+        instructionSources: contextArgs.instructionSources ?? { global: [], context: [] },
+        agentSystemPromptSections: ["test-agent-prompt"],
+        systemMessage: stableSystem + (hotMemoriesSection ?? ""),
+        hotMemoriesSection,
+        systemMessageTokens: 1,
+        agentDefinitions: undefined,
+        availableSkills: undefined,
+        ancestorPlanFilePaths: [],
+      });
+    });
+
+    // Each turn sends the persisted history; the previous answer carries its stream's record.
+    const history: MuxMessage[] = [];
+    const runTurn = async (user: string, hot: string) => {
+      history.push(createMuxMessage(`u-${history.length}`, "user", user));
+      const result = await service.streamMessage({
+        messages: [...history],
+        workspaceId,
+        modelString: KNOWN_MODELS.OPUS.id,
+        thinkingLevel: "high",
+        resolveMemoryContext: () =>
+          Promise.resolve({
+            indexEntries: [],
+            hotMemoriesBlock: `<hot_memories>${hot}</hot_memories>`,
+          }),
+      });
+      expect(result.success).toBe(true);
+      const call = startStreamCalls.at(-1)!;
+      history.push(
+        createMuxMessage(`a-${history.length}`, "assistant", `answer to ${user}`, {
+          ...(call.initialMetadata?.volatileSystemTail != null
+            ? { volatileSystemTail: call.initialMetadata.volatileSystemTail }
+            : {}),
+        })
+      );
+      return { call, body: await wireBody(call) };
+    };
+    const lastText = (body: { messages: unknown[] }) => JSON.stringify(body.messages.at(-1));
+    const extends_ = (previous: { messages: unknown[] }, next: { messages: unknown[] }) =>
+      JSON.stringify(next.messages.slice(0, previous.messages.length)) ===
+      JSON.stringify(previous.messages);
+
+    const first = await runTurn("first", "note v1");
+    expect(first.call.initialMetadata?.volatileSystemTail?.placement).toBe("system");
+    expect(JSON.stringify(first.body.system)).toContain("note v1");
+
+    const second = await runTurn("second", "note v2");
+    // System is unchanged, the history extends, and v2 goes after the newest user message.
+    expect(second.body.system).toEqual(first.body.system);
+    expect(extends_(first.body, second.body)).toBe(true);
+    expect(
+      second.body.messages
+        .slice(first.body.messages.length)
+        .map((m) => (m as { role: string }).role)
+    ).toEqual(["assistant", "user", "system"]);
+    expect(lastText(second.body)).toContain("note v2");
+    expect(JSON.stringify(second.body.messages.at(-2))).toContain("second");
+    expect(second.call.initialMetadata?.volatileSystemTail?.placement).toBe("row");
+
+    // An unchanged tail adds no row, and the next request still extends this one.
+    const third = await runTurn("third", "note v2");
+    expect(third.body.system).toEqual(first.body.system);
+    expect(extends_(second.body, third.body)).toBe(true);
+    expect((third.body.messages.at(-1) as { role: string }).role).toBe("user");
+    expect(third.call.initialMetadata?.volatileSystemTail).toBeUndefined();
   });
 });
 
