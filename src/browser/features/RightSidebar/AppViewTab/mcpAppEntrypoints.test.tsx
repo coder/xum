@@ -549,6 +549,12 @@ describe("MCP App entry points", () => {
       mcpApps: {
         listEntrypoints: () => listing(),
         openEntrypoint: () => Promise.resolve({ success: true as const, data: library }),
+        // No current record: each open runs the tool again.
+        getViewRecords: (input: { toolCallIds: string[] }) =>
+          Promise.resolve({
+            success: true as const,
+            data: input.toolCallIds.map((toolCallId) => ({ toolCallId, view: null })),
+          }),
       },
     });
     const wrapper = (props: { children: React.ReactNode }) => (
@@ -579,6 +585,21 @@ describe("MCP App entry points", () => {
       await act(async () => {
         expect(await openMcpAppEntrypoint(client, "ws-reopen-retired", library)).toBeNull();
       });
+      expect(result.current.view).toMatchObject({ toolCallId: library.viewKey });
+
+      // The same while the failing re-list is still pending when the open completes.
+      listing = () => Promise.resolve([]);
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(result.current.view).toBeNull());
+      let reject: () => void = () => undefined;
+      listing = () => new Promise((_resolve, fail) => (reject = () => fail(new Error("busy"))));
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(result.current.list).toBeUndefined());
+      await act(async () => {
+        expect(await openMcpAppEntrypoint(client, "ws-reopen-retired", library)).toBeNull();
+      });
+      act(() => reject());
+      await waitFor(() => expect(result.current.list).toEqual([]));
       expect(result.current.view).toMatchObject({ toolCallId: library.viewKey });
     } finally {
       restore();

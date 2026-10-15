@@ -115,12 +115,13 @@ function setMcpAppEntrypoints(
  * its place, so the launcher and palette rows do not move. Only a new key goes at the end.
  */
 function updateMcpAppEntrypoint(workspaceId: string, entrypoint: McpAppEntrypoint) {
+  // The opened entry point is back, also when an earlier list retired it: a later list that
+  // lacks it retires it again.
+  retiredKeys.delete(refKey(workspaceId, entrypoint.viewKey));
   const list = entrypointsByWorkspace.get(workspaceId);
   if (list === undefined) return;
   if (failedWorkspaces.has(workspaceId)) {
-    // One open is no full list: keep the failed state, so it retires no other entry point. The
-    // opened one is back, also when an earlier list retired it.
-    retiredKeys.delete(refKey(workspaceId, entrypoint.viewKey));
+    // One open is no full list: keep the failed state, so it retires no other entry point.
     entrypointsByWorkspace.set(workspaceId, withEntrypoint(list, entrypoint));
     emit();
     return;
