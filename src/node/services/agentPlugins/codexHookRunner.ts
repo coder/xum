@@ -114,6 +114,7 @@ export function registerCodexPluginHooks(
       spine.useBefore(
         "message.send",
         async (ctx) => {
+          using phase = startHookPhase(prompt, "UserPromptSubmit", registration, ctx.signal);
           for (const hook of prompt) {
             const output = await invoke(
               hook,
@@ -122,7 +123,7 @@ export function registerCodexPluginHooks(
               registration,
               parseUserPromptSubmitOutput,
               // A withdrawn send ends this call, and invoke skips the later ones.
-              { cwd: ctx.cwd, abortSignal: ctx.signal }
+              { cwd: ctx.cwd, abortSignal: phase.signal }
             );
             if (output === null) continue;
             if (output.stopped === true || output.blockReason !== undefined) {
@@ -150,6 +151,7 @@ export function registerCodexPluginHooks(
       spine.useBefore(
         "turn.stop",
         async (ctx) => {
+          using phase = startHookPhase(stop, "Stop", registration);
           for (const hook of stop) {
             const output = await invoke(
               hook,
@@ -161,7 +163,7 @@ export function registerCodexPluginHooks(
               "Stop",
               registration,
               parseStopOutput,
-              { cwd: ctx.cwd }
+              { cwd: ctx.cwd, abortSignal: phase.signal }
             );
             if (output === null) continue;
             if (output.halt !== undefined) haltTurn(ctx, output.halt, registration);
@@ -199,14 +201,16 @@ async function runToolHooks(
     tool_name: view.codexName ?? ctx.toolName,
     tool_input: view.toCodexInput(ctx.args),
   });
-  for (const hook of pre.filter((candidate) => matches(candidate, ctx.toolName, view))) {
+  const matchingPre = pre.filter((candidate) => matches(candidate, ctx.toolName, view));
+  using prePhase = startHookPhase(matchingPre, "PreToolUse", registration, ctx.abortSignal);
+  for (const hook of matchingPre) {
     const output = await invoke(
       hook,
       toolEvent(),
       "PreToolUse",
       registration,
       parsePreToolUseOutput,
-      preCall
+      { ...preCall, abortSignal: prePhase.signal }
     );
     if (ctx.abortSignal?.aborted) break;
     if (output === null) continue;
@@ -300,14 +304,16 @@ async function runPostToolHooks(
   // Codex's response shape for an aliased built-in (Bash: the output text).
   const response = view.toCodexResponse(toolResponseOf(ctx));
   const feedback: string[] = [];
-  for (const hook of post.filter((candidate) => matches(candidate, ctx.toolName, view))) {
+  const matching = post.filter((candidate) => matches(candidate, ctx.toolName, view));
+  using phase = startHookPhase(matching, "PostToolUse", registration, call.abortSignal);
+  for (const hook of matching) {
     const output = await invoke(
       hook,
       { ...toolEvent(), tool_response: response },
       "PostToolUse",
       registration,
       parsePostToolUseOutput,
-      call
+      { ...call, abortSignal: phase.signal }
     );
     if (output === null) continue;
     if (output.additionalContext !== undefined) notes.push(output.additionalContext);
@@ -434,6 +440,40 @@ function matches(hook: PluginHookDefinition, toolName: string, view: CodexToolVi
   if (hook.matcher === undefined) return true;
   const matcher = compileHookMatcher(hook.matcher);
   return matcher.test(toolName) || (view.codexName !== undefined && matcher.test(view.codexName));
+}
+
+/**
+ * One deadline for a plugin's matching hooks on one event: the longest of their timeouts. Codex
+ * runs them at once, so together they never take longer. Xum runs them in order (a rewrite feeds
+ * the next hook), and without this, stalled hooks added up to minutes (Codex
+ * PRRT_kwDOPxxmWM6rb-Tl). Once it passes, invoke skips the rest, which fail open. `signal` (a
+ * cancel) ends the phase too.
+ */
+function startHookPhase(
+  hooks: PluginHookDefinition[],
+  eventName: HookEventName,
+  registration: CodexHookRegistration,
+  signal?: AbortSignal
+): { signal: AbortSignal | undefined; [Symbol.dispose]: () => void } {
+  const timeouts = hooks.flatMap((hook) =>
+    hook.handler.type === "mcp_tool"
+      ? [effectiveHookTimeoutSeconds(hook.handler.timeoutSeconds)]
+      : []
+  );
+  if (timeouts.length === 0) return { signal, [Symbol.dispose]: () => undefined };
+  const deadline = new AbortController();
+  const seconds = Math.max(...timeouts);
+  const timer = setTimeout(() => {
+    deadline.abort();
+    log.warn(
+      `Plugin hooks: '${registration.pluginName}' ${eventName} hooks passed their shared ${seconds}s deadline; the unfinished ones fail open`,
+      { workspaceId: registration.workspaceId }
+    );
+  }, seconds * 1000);
+  return {
+    signal: signal ? AbortSignal.any([deadline.signal, signal]) : deadline.signal,
+    [Symbol.dispose]: () => clearTimeout(timer),
+  };
 }
 
 async function invoke<T extends { systemMessage?: string; invalid?: string }>(

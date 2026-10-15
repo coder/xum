@@ -412,6 +412,17 @@ describe("PreToolUse", () => {
     expect(ctx.blocked?.result).toEqual({ error: "Tool call interrupted while plugin hooks ran." });
   });
 
+  test("matching hooks share one deadline, so stalled hooks do not add up", async () => {
+    // Codex PRRT_kwDOPxxmWM6rb-Tl: five stalled hooks of 0.1 s each took 0.5 s in a row. Codex
+    // runs them at once, so together they take at most the longest timeout.
+    const stalled = Array.from({ length: 5 }, () => hook("PreToolUse", { timeoutSeconds: 0.1 }));
+    const { spine } = setup(stalled, () => new Promise(() => undefined));
+    const started = performance.now();
+    const ctx = await runTool(spine, "bash", {});
+    expect(performance.now() - started).toBeLessThan(300);
+    expect(ctx.executed).toBe(true); // a stalled hook fails open
+  });
+
   test("the event carries the session cwd", async () => {
     const { spine, calls } = setup([hook("PreToolUse", { input: { dir: "${cwd}" } })], () => null);
     await runTool(spine, "bash", {});
