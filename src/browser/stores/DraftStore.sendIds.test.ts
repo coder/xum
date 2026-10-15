@@ -992,16 +992,17 @@ describe("DraftStore idempotent sends", () => {
       );
     expect(outcome).toBe("refused");
     expect(store.getText(SCOPE)).toBe("hello");
-    // Before the new snapshot nothing is written: the backend still holds the send's take.
-    const saved = await store.flush(SCOPE).then(
+    // Before the new snapshot nothing is written: a save waits, and the backend still holds the
+    // send's take.
+    const saving = store.flush(SCOPE).then(
       () => "",
       (error: unknown) => String(error)
     );
-    expect(saved).toContain("drafts are not loaded");
     const before = await service.get(SCOPE);
     expect([before.text, before.pendingSends?.map(({ sendId }) => sendId)]).toEqual(["", ["s1"]]);
 
     releaseSnapshot();
+    expect(await saving).toBe("");
     await waitFor(() => hooks.snapshotsHandled > 1);
     await waitFor(async () => {
       const draft = await service.get(SCOPE);

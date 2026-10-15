@@ -236,7 +236,7 @@ interface Entry {
 }
 
 const FLUSH_DEBOUNCE_MS = 300;
-/** A write before the current client's snapshot: on a cold start and during a reconnect alike. */
+/** No snapshot of the current client: its wait timed out or failed (cold start or reconnect). */
 const DRAFTS_NOT_LOADED = "Draft save failed: drafts are not loaded";
 const RETRY_BASE_MS = 250;
 const RETRY_MAX_MS = 5_000;
@@ -260,6 +260,46 @@ function retryDelayMs(attempt: number): number {
 
 export function draftStoreScopeKey(scope: DraftStoreScope): string {
   return scope.kind === "pending" ? `pending:${scope.projectPath}` : draftScopeKey(scope);
+}
+
+/** A one-shot readiness signal (DraftStore.release); settling twice keeps the first outcome. */
+interface Release {
+  /** After setClient(null): no client to wait for, so waiters reject at once. */
+  readonly disconnected: boolean;
+  readonly promise: Promise<"ready" | "changed">;
+  readonly settled: boolean;
+  settle(outcome: "ready" | "changed"): void;
+}
+
+function createRelease(disconnected = false): Release {
+  let resolve: (outcome: "ready" | "changed") => void = () => undefined;
+  const promise = new Promise<"ready" | "changed">((res) => {
+    resolve = res;
+  });
+  const release = {
+    disconnected,
+    promise,
+    settled: false,
+    settle(outcome: "ready" | "changed") {
+      if (release.settled) return;
+      release.settled = true;
+      resolve(outcome);
+    },
+  };
+  return release;
+}
+
+/**
+ * Waits until the release that `current` returns is ready and still current: a replaced release
+ * hands the wait to the one after it. Rejects on a disconnected release (no client to wait for).
+ */
+async function awaitCurrentRelease(current: () => Release): Promise<void> {
+  for (;;) {
+    const release = current();
+    if (release.disconnected) throw new Error("Draft save failed: not connected");
+    const outcome = await release.promise;
+    if (outcome === "ready" && current() === release) return;
+  }
 }
 
 /** Marks the field versions a confirmed write sent as saved (only the fields it wrote). */
@@ -584,10 +624,13 @@ export class DraftStore {
   private snapshotClient: APIClient | null = null;
   /** Composers may render: hydrated, or the first subscription failed (self-heal). */
   private ready = false;
-  private resolveReady: () => void = () => undefined;
-  private readonly readyPromise = new Promise<void>((resolve) => {
-    this.resolveReady = resolve;
-  });
+  /**
+   * The current client's readiness: its snapshot opened writes, or the wait for it timed out or
+   * failed (self-heal), as for the first client on a cold start. whenReady, flush and beginSend
+   * wait for it, so after a reconnect they wait for the new client's snapshot instead of seeing
+   * an earlier client's readiness (#6748). Replaced (settled "changed") on every client change.
+   */
+  private release = createRelease();
 
   /** Delay before automatic send retry `attempt` (bounded backoff; injectable for tests). */
   private readonly sendRetryDelayMs: (attempt: number) => number;
@@ -612,6 +655,10 @@ export class DraftStore {
     // hold writes until its snapshot (canWrite). Edits stay in memory; the snapshot saves them.
     this.receiver = null;
     this.snapshotClient = null;
+    // Waiters follow the new client (whenReady).
+    const replaced = this.release;
+    this.release = createRelease(client === null);
+    replaced.settle("changed");
     // A retry scheduled for the old connection must not outlive it; the new connection's
     // snapshot resolves the entries again and re-arms retries.
     for (const tracking of this.sendTracking.values()) {
@@ -636,8 +683,13 @@ export class DraftStore {
     return () => this.readyListeners.delete(listener);
   };
 
+  /**
+   * Resolves once the current client is ready (see `release`). Before the first client it waits
+   * for one; it follows a client change while waiting, and rejects once the client is removed
+   * (setClient(null)).
+   */
   whenReady(): Promise<void> {
-    return this.readyPromise;
+    return awaitCurrentRelease(() => this.release);
   }
 
   subscribe = (scope: DraftStoreScope, listener: () => void): (() => void) => {
@@ -981,8 +1033,10 @@ export class DraftStore {
 
   /**
    * Resolves once the backend confirmed the scope's current text and attachments (the #4448
-   * restore ack waits for this). Rejects when a write fails or the drafts never hydrated; the
-   * change stays in memory and is retried.
+   * restore ack waits for this). Waits for the current client's snapshot like a cold start waits
+   * for the first one, also after a reconnect (#6748). Rejects when a write fails, the wait for
+   * the snapshot timed out or failed, or the client is removed meanwhile; the change stays in
+   * memory and is retried.
    */
   async flush(scope: DraftStoreScope): Promise<void> {
     if (scope.kind === "pending") return;
@@ -992,8 +1046,8 @@ export class DraftStore {
       clearTimeout(entry.flushTimer);
       entry.flushTimer = null;
     }
-    await this.readyPromise;
-    if (!this.hydrated) throw new Error(DRAFTS_NOT_LOADED);
+    await this.whenReady();
+    if (!this.canWrite(this.client)) throw new Error(DRAFTS_NOT_LOADED);
     // An attachment update waiting for the payloads is not saved yet: apply it (by loading them)
     // first, so this never confirms a draft without it. A failed load rejects.
     if (entry.queuedAttachmentUpdates.length > 0) await this.ensurePayloads(scope);
@@ -1011,7 +1065,7 @@ export class DraftStore {
     input: BeginSendInput
   ): Promise<void> {
     const key = draftScopeKey(scope);
-    await this.readyPromise;
+    await this.whenReady();
     const client = this.client;
     if (!this.canWrite(client)) throw new Error(DRAFTS_NOT_LOADED);
     const entry = this.getOrCreateEntry(scope);
@@ -1650,9 +1704,9 @@ export class DraftStore {
 
   private markReady(): void {
     this.clearReadyTimer();
+    this.release.settle("ready");
     if (this.ready) return;
     this.ready = true;
-    this.resolveReady();
     for (const listener of this.readyListeners) listener();
   }
 
@@ -1772,13 +1826,14 @@ export class DraftStore {
     this.subscription = controller;
     const { signal } = controller;
     this.forgetServerViews();
-    if (!this.ready && !this.readyTimer) {
-      // Startup must never hang on drafts (a subscription that never yields, a stuck legacy
-      // import): let composers render after a bound. Writes still wait for hydration, and a late
-      // snapshot never overwrites a field with an unconfirmed local change.
+    if (!this.release.settled && !this.readyTimer) {
+      // Startup (and a reconnect) must never hang on drafts (a subscription that never yields, a
+      // stuck legacy import): let composers render and waiting saves give up after a bound.
+      // Writes still wait for the snapshot, and a late snapshot never overwrites a field with an
+      // unconfirmed local change.
       this.readyTimer = setTimeout(() => {
         this.readyTimer = null;
-        if (this.ready) return;
+        if (this.release.settled) return;
         console.warn(
           `Drafts did not load within ${DRAFT_STORE_READY_TIMEOUT_MS} ms; continuing while they load`
         );
