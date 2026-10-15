@@ -824,6 +824,37 @@ describe("assemblePromptPayload", () => {
       ]);
     });
 
+    test("a replay from the sent system content rebuilds the live request", async () => {
+      // PRRT_kwDOPxxmWM6srqjr: the envelope records what was sent (the frozen tail), so the
+      // replay derives the live tail from the turn's record, or from the segment's last tail.
+      const base = [
+        createMuxMessage("u1", "user", "first"),
+        answer("a1", "system", hot("A")),
+        createMuxMessage("u2", "user", "second"),
+      ];
+      const unchanged = [
+        ...base,
+        answer("a2", "row", hot("B")),
+        createMuxMessage("u3", "user", "x"),
+      ];
+      const cases = [
+        { history: base, live: hot("B") },
+        { history: unchanged, live: hot("B") },
+      ];
+      for (const { history, live } of cases) {
+        const sent = await withTail(live, history);
+        const replayed = await assemble({
+          ...opus,
+          history,
+          systemMessage: sent.sentSystem.message,
+          volatileSystemSuffixLength: sent.sentSystem.volatileSuffixLength,
+          replayedTurn: { record: sent.volatileSystemTail },
+        });
+        expect(sent.sentSystem.message).toBe(stable + hot("A"));
+        expect(JSON.stringify(replayed.messages)).toBe(JSON.stringify(sent.messages));
+      }
+    });
+
     test("a compaction request sends the live tail with no rows", async () => {
       // Codex P2 (PRRT_kwDOPxxmWM6srL1X): the compaction trim fits the history to the budget
       // before the tail is planned, so rebuilt rows would add tokens the trim never counted.

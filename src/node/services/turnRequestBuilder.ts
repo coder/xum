@@ -237,6 +237,7 @@ import {
   measureWholeVolatileSystemSuffix,
   prepareProviderRequestMessages,
   removeIntuitionGuidance,
+  type PromptPayload,
   selectActiveContextMessages,
 } from "./turnContextAssembler";
 import { resolveContextWindowIds } from "./contextWindowRollover";
@@ -615,6 +616,26 @@ export async function assembleBudgetCheckedPromptPayload(
     }
   }
   return { ...payload, contextBudgetLimit, contextBudgetEstimate };
+}
+
+/**
+ * The sent system content (PromptPayload.sentSystem) with its token count. The tail rows exist
+ * only in the request, so their text counts as system: history sizing (continuous compaction,
+ * context estimates) adds this count to the rows it sizes itself.
+ */
+async function measureSentSystem(
+  sentSystem: PromptPayload["sentSystem"],
+  liveSystem: string,
+  liveTokens: number,
+  tokenizerFor: () => ReturnType<typeof getTokenizerForModel>
+): Promise<{ system: string; volatileLength: number; tokens: number }> {
+  const { message, volatileSuffixLength, rowsText } = sentSystem;
+  if (message === liveSystem && rowsText === "") {
+    return { system: message, volatileLength: volatileSuffixLength, tokens: liveTokens };
+  }
+  const tokenizer = await tokenizerFor();
+  const tokens = await tokenizer.countTokens(message + rowsText);
+  return { system: message, volatileLength: volatileSuffixLength, tokens };
 }
 
 /**
@@ -3138,10 +3159,17 @@ export class TurnRequestBuilder {
           compactionInputBudgetScale,
           compactionContextRetryAvailable === true
         );
+        // What the latest assembly sent as system content (prompt-cache mechanism 10: a frozen
+        // tail plus tail rows). The envelope, debug views and stored token count describe it.
+        let sent = {
+          system: attemptSystem,
+          volatileLength: attemptVolatileSystemSuffixLength,
+          tokens: attemptSystemTokens,
+        };
         // Shared by the initial build and thinking rebuilds so their assembly
         // inputs cannot drift apart mid-turn.
-        const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
-          assembleBudgetCheckedPromptPayload(
+        const assemblePayloadForThinkingLevel = async (level: ThinkingLevel) => {
+          const payload = await assembleBudgetCheckedPromptPayload(
             {
               history: options.sourceMessages,
               systemMessage: attemptSystem,
@@ -3173,6 +3201,14 @@ export class TurnRequestBuilder {
                 : (computeLoadedToolNames(toolSearchRuntime?.state) ?? [...firstStepToolNames]),
             }
           );
+          sent = await measureSentSystem(
+            payload.sentSystem,
+            attemptSystem,
+            attemptSystemTokens,
+            () => getTokenizerForModel(seed.rawModelString, seed.capabilityModelString)
+          );
+          return payload;
+        };
         const prepareMessagesForProviderStartedAt = Date.now();
         const attemptPayload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
         if (options.recordTimings) {
@@ -3189,8 +3225,8 @@ export class TurnRequestBuilder {
           await emitTurnEnvelope({
             journal: this.dependencies.durableEventJournalFor(workspaceId),
             workspaceId,
-            systemMessage: attemptSystem,
-            systemVolatileSuffixLength: attemptVolatileSystemSuffixLength,
+            systemMessage: sent.system,
+            systemVolatileSuffixLength: sent.volatileLength,
             tools: Object.fromEntries(
               Object.entries(attemptTools).filter(([name]) => firstStepToolNames.has(name))
             ),
@@ -3214,6 +3250,7 @@ export class TurnRequestBuilder {
           const rebuiltPayload = await assemblePayloadForThinkingLevel(level);
           return {
             messages: rebuiltPayload.messages,
+            systemMessageTokens: sent.tokens,
             volatileSystemTail: rowVolatileSystemTail(
               rebuiltPayload,
               options.partialContinuationMessage
@@ -3233,7 +3270,7 @@ export class TurnRequestBuilder {
           ...seed,
           providerRequestMessages: attemptProviderRequestMessages,
           messages: finalMessages,
-          system: attemptSystem,
+          system: sent.system,
           engineSystem: attemptPayload.system,
           volatileSystemTail: rowVolatileSystemTail(
             attemptPayload,
@@ -3242,7 +3279,7 @@ export class TurnRequestBuilder {
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
           contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
           ...compactionInputBudget,
-          systemMessageTokens: attemptSystemTokens,
+          systemMessageTokens: sent.tokens,
           tools: attemptTools,
           engineTools: attemptPayload.tools ?? attemptTools,
           toolNamesForSentinel,
@@ -3263,8 +3300,8 @@ export class TurnRequestBuilder {
             await renderContextWindowSection();
             const payload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
             return {
-              system: attemptSystem,
-              systemMessageTokens: attemptSystemTokens,
+              system: sent.system,
+              systemMessageTokens: sent.tokens,
               engineSystem: payload.system,
               volatileSystemTail: rowVolatileSystemTail(
                 payload,
@@ -3713,8 +3750,11 @@ export class TurnRequestBuilder {
           continue;
         }
         try {
-          ({ messages: streamFinalMessages, volatileSystemTail: streamVolatileSystemTail } =
-            await primaryRequest.rebuildMessagesForThinkingLevel(folded.effectiveLevel));
+          ({
+            messages: streamFinalMessages,
+            volatileSystemTail: streamVolatileSystemTail,
+            systemMessageTokens,
+          } = await primaryRequest.rebuildMessagesForThinkingLevel(folded.effectiveLevel));
         } catch (error) {
           if (error instanceof ContextBudgetExceededError) {
             runLanguageModelCleanup(modelResult.data.model);

@@ -93,6 +93,9 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
+import type { ThinkingLevel } from "@/common/types/thinking";
+import { buildReplayRequest } from "@/node/services/replay/replayRequestBuilder";
 import { MemoryService, projectMemoryDirName } from "@/node/services/memoryService";
 import * as toolAssembly from "./toolAssembly";
 import type {
@@ -6087,7 +6090,7 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
       expect(result.success).toBe(true);
       return startStreamCalls.at(-1)!;
     };
-    return { workspaceId, mcp, send };
+    return { workspaceId, mcp, send, service, config };
   }
 
   const hotTail = (text: string) => `\n\n<hot_memories>${text}</hot_memories>`;
@@ -6139,6 +6142,66 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
     expect(extends_(second.body, third.body)).toBe(true);
     expect((third.body.messages.at(-1) as { role: string }).role).toBe("user");
     expect(third.call.initialMetadata?.volatileSystemTail).toBeUndefined();
+  });
+
+  it("describes the system content it sent: envelope, replay, debug snapshot, token count", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6srqjr, PRRT_kwDOPxxmWM6srqjx): on a change the request sends
+    // the frozen tail A in the system prompt and B as a row. Every consumer of the request shape
+    // must see that, not the live system message (stable + B).
+    using xumHome = new DisposableTempDir("ai-service-volatile-tail-consumers");
+    const { send, service, config, workspaceId } = await setup(xumHome);
+    const history = [
+      createMuxMessage("u1", "user", "first"),
+      createMuxMessage("a1", "assistant", "answer", {
+        volatileSystemTail: { text: hotTail("note v1"), placement: "system" },
+      }),
+      createMuxMessage("u2", "user", "second"),
+    ];
+    const call = await send(history, "note v2");
+    expect(call.initialMetadata?.volatileSystemTail?.placement).toBe("row");
+    const leading = call.messages.slice(
+      0,
+      call.messages.findIndex((m) => m.role !== "system")
+    );
+    const textOf = (message: ModelMessage | undefined): string => {
+      if (typeof message?.content !== "string") throw new Error("expected a text system row");
+      return message.content;
+    };
+    const sentSystem = leading.map(textOf).join("");
+    expect(sentSystem).toBe(`stable-system-prompt${hotTail("note v1")}`);
+    const row = textOf(call.messages.at(-1));
+    expect(row).toContain("note v2");
+
+    const journal = new DurableEventJournal(path.join(config.sessionsDir, workspaceId));
+    const envelope = (await journal.read()).findLast((event) => event.kind === "turn-envelope");
+    if (envelope?.kind !== "turn-envelope") throw new Error("expected a turn envelope");
+    const envelopeSystem = await journal.blobs.getText(envelope.data.systemPromptHash);
+    expect(envelopeSystem).toBe(sentSystem);
+    const snapshot = service.debugGetLastLlmRequest(workspaceId);
+    expect(snapshot.success && snapshot.data?.systemMessage).toBe(sentSystem);
+
+    // The replay verifier rebuilds the same request from the envelope and the turn's record.
+    const rebuilt = await buildReplayRequest({
+      historyMessages: history,
+      systemPrompt: envelopeSystem!,
+      systemPromptVolatileSuffixLength: envelope.data.systemPromptVolatileSuffixLength,
+      volatileSystemTail: call.initialMetadata?.volatileSystemTail,
+      modelString: envelope.data.modelString,
+      thinkingLevel: envelope.data.thinkingLevel as ThinkingLevel,
+      effectiveAgentId: "exec",
+      toolNamesForSentinel: envelope.data.sentinelToolNames ?? [],
+      routeProvider: "anthropic",
+      wireProviderName: envelope.data.wireProviderName,
+      anthropicCacheTtl: envelope.data.anthropicCacheTtl === "1h" ? "1h" : undefined,
+      workspaceId,
+    });
+    expect(JSON.stringify(rebuilt.messages)).toBe(JSON.stringify(call.messages));
+
+    // The row lives only in the request, so it counts as system content.
+    const tokenizer = await getTokenizerForModel(KNOWN_MODELS.OPUS.id);
+    expect(call.initialMetadata?.systemMessageTokens).toBe(
+      await tokenizer.countTokens(sentSystem + row)
+    );
   });
 
   it("records the tail plan of the request a thinking-level fold sent", async () => {

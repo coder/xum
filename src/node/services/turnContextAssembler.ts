@@ -192,6 +192,13 @@ export interface PromptPayload {
   tools: Record<string, Tool> | undefined;
   /** For this turn's assistant row (MuxMetadata.volatileSystemTail); undefined records nothing. */
   volatileSystemTail?: VolatileSystemTailRecord;
+  /**
+   * The system content this request sends (prompt-cache mechanism 10): the stable part plus
+   * the tail it actually carries (frozen inside a segment), its volatile length, and the text of
+   * the tail rows in the messages. The turn envelope, debug views and system token count must
+   * describe this, not the live system message.
+   */
+  sentSystem: { message: string; volatileSuffixLength: number; rowsText: string };
 }
 
 export interface AssemblePromptPayloadOptions {
@@ -239,6 +246,11 @@ export interface AssemblePromptPayloadOptions {
    * transform (mergeConsecutiveUserMessages) merges it into the start of that user message.
    */
   requestContextMessage?: MuxMessage;
+  /**
+   * Replay only: `systemMessage` is the system content the turn sent (its envelope), and this
+   * holds the turn's own MuxMetadata.volatileSystemTail, so the planner can derive the live tail.
+   */
+  replayedTurn?: { record?: VolatileSystemTailRecord };
 }
 
 /**
@@ -379,7 +391,8 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
         options.modelString,
         options.routeProvider,
         options.providersConfig
-      )
+      ),
+    options.replayedTurn
   );
   return { stableSystem, cachedSystemMessage, tailPlan };
 }
@@ -471,6 +484,11 @@ export async function assemblePromptPayload(
     messages,
     system,
     ...(tailPlan.record != null ? { volatileSystemTail: tailPlan.record } : {}),
+    sentSystem: {
+      message: stableSystem + tailPlan.systemTail,
+      volatileSuffixLength: stableSystem === options.systemMessage ? 0 : tailPlan.systemTail.length,
+      rowsText: tailPlan.rowsText,
+    },
     tools: options.tools
       ? applyCacheControlToTools(
           options.tools,

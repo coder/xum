@@ -90,4 +90,6 @@ export type RebuildFirstStepForThinkingLevel = (
   messages: ModelMessage[];
   /** The rebuilt request's record for the turn's row (MuxMetadata.volatileSystemTail). */
   volatileSystemTail?: VolatileSystemTailRecord;
+  /** Its system content's token count, tail rows included (MuxMetadata.systemMessageTokens). */
+  systemMessageTokens?: number;
 }>;

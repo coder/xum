@@ -1571,9 +1571,13 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
           providerOptions: {},
         }),
         // History-based rebuild: still holds the earlier signed thinking. Its volatile-tail
-        // record (mechanism 10) replaces the one the turn started with.
+        // record (mechanism 10) and system token count replace the ones the turn started with.
         rebuildFirstStepForThinkingLevel: () =>
-          Promise.resolve({ messages: messages(), volatileSystemTail: rebuiltTail }),
+          Promise.resolve({
+            messages: messages(),
+            volatileSystemTail: rebuiltTail,
+            systemMessageTokens: 4321,
+          }),
       },
     });
 
@@ -1581,6 +1585,7 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
     const history = await historyService.getHistoryFromLatestBoundary("anthropic-receipt-rebuild");
     if (!history.success) throw new Error(history.error);
     expect(history.data.at(-1)?.metadata?.volatileSystemTail).toEqual(rebuiltTail);
+    expect(history.data.at(-1)?.metadata?.systemMessageTokens).toBe(4321);
     expect(thinkingOverrideState.applied).toBe("high");
     expect(requestBlockTypes).toHaveLength(2);
     expect(requestBlockTypes[1]).not.toContain("thinking");
