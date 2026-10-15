@@ -649,7 +649,7 @@ export class DraftService extends EventEmitter {
       // a failed list write left its destination body without a real row (the id is fresh, so
       // only this move writes that body). Its list write finishes the move.
       if (await this.isMoveListWritePending(stored, dest)) {
-        return this.listMoved(input, async () => undefined);
+        return this.listMoved(input, () => Promise.resolve());
       }
       const revision = this.getRevision(draftScopeKey(source));
       // Only a client that knows of no stored source moves a missing one: after a confirmed

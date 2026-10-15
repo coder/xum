@@ -3,6 +3,7 @@ import { startTransition, Suspense, type ReactNode } from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { installDom } from "../../../tests/ui/dom";
 import { APIProvider } from "@/browser/contexts/API";
+import { CONNECTION_LOST_MESSAGE, ConnectionLostError } from "@/browser/contexts/connectionLink";
 import { getDraftStore, type DraftStoreScope } from "@/browser/stores/DraftStore";
 import { createTestApiClient } from "@/browser/testUtils";
 import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
@@ -18,7 +19,12 @@ const generateMock = mock((_input: { draftNamingId?: string }) =>
 const api = createTestApiClient({ nameGeneration: { generate: generateMock } });
 
 const PROJECT = "/projects/name-state";
-const SCOPE: DraftStoreScope = { kind: "creation", projectPath: PROJECT, draftId: "draft-1" };
+// `satisfies`: the helpers below are hoisted, so a declared union type would not narrow there.
+const SCOPE = {
+  kind: "creation",
+  projectPath: PROJECT,
+  draftId: "draft-1",
+} satisfies DraftStoreScope;
 
 /** Events another window's writes would push to this one. */
 let pushEvent: (event: DraftEvent) => void = () => undefined;
@@ -58,6 +64,69 @@ const draftBackend = createTestApiClient({
       }),
   },
 });
+
+/** Settles when `opts.signal` aborts. */
+function aborted(opts?: { signal?: AbortSignal }): Promise<void> {
+  return new Promise<void>((resolve) => {
+    opts?.signal?.addEventListener("abort", () => resolve(), { once: true });
+  });
+}
+
+/** A connection whose socket can drop: the subscription then ends, and calls fail as lost. */
+function createDroppableClient() {
+  const dropped = Promise.withResolvers<void>();
+  let offline = false;
+  const client = createTestApiClient({
+    drafts: {
+      ...draftBackend.drafts,
+      subscribe: (_input: void, opts?: { signal?: AbortSignal }) =>
+        Promise.resolve(
+          (async function* (): AsyncGenerator<DraftEvent> {
+            yield { type: "snapshot", drafts: [], list: { entries: [], revision: 0 } };
+            await Promise.race([dropped.promise, aborted(opts)]);
+            if (!opts?.signal?.aborted) throw new ConnectionLostError();
+          })()
+        ),
+      update: (input: DraftUpdateInput) =>
+        offline ? Promise.reject(new ConnectionLostError()) : draftBackend.drafts.update(input),
+    },
+  });
+  return {
+    client,
+    drop: () => {
+      offline = true;
+      dropped.resolve();
+    },
+  };
+}
+
+/** The connection after a reconnect: its snapshot holds `nameState`; it records every update. */
+function createReconnectClient(nameState: DraftUpdateInput["nameState"]) {
+  const updates: DraftUpdateInput[] = [];
+  const client = createTestApiClient({
+    drafts: {
+      ...draftBackend.drafts,
+      subscribe: (_input: void, opts?: { signal?: AbortSignal }) =>
+        Promise.resolve(
+          (async function* (): AsyncGenerator<DraftEvent> {
+            yield {
+              type: "snapshot",
+              drafts: nameState
+                ? [{ scope: SCOPE, text: "", attachments: [], nameState, revision: ++revision }]
+                : [],
+              list: { entries: [], revision: 0 },
+            };
+            await aborted(opts);
+          })()
+        ),
+      update: (input: DraftUpdateInput) => {
+        updates.push(input);
+        return draftBackend.drafts.update(input);
+      },
+    },
+  });
+  return { client, updates };
+}
 
 function Wrapper(props: { children: ReactNode }) {
   return <APIProvider client={api}>{props.children}</APIProvider>;
@@ -284,6 +353,74 @@ describe("useWorkspaceName draft state", () => {
     });
     expect(getDraftStore().getView(SCOPE).nameState).toEqual(backendName);
     expect(generateMock).toHaveBeenCalledTimes(1);
+  });
+
+  // Remote UAT R7-NAME: window 1's held name reply fails when its socket drops, and window 2
+  // types a manual name meanwhile. A fallback name stored then would be an unsaved edit over
+  // window 1's stale view (no manual name), sent as the whole name state after the reconnect.
+  test("a name request lost with the connection leaves another window's newer name alone", async () => {
+    const w1 = createDroppableClient();
+    act(() => getDraftStore().setClient(w1.client));
+    await waitFor(() => expect(getDraftStore().hasCurrentSnapshot()).toBe(true));
+    const generation = Promise.withResolvers<Awaited<ReturnType<typeof generateMock>>>();
+    generateMock.mockImplementationOnce(() => generation.promise);
+    const view = renderWorkspaceName("fix the sidebar");
+    await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(1));
+    const waiter = view.result.current.waitForGeneration();
+
+    // The held reply fails first: the subscription has not noticed the drop yet.
+    await act(async () => {
+      generation.reject(new ConnectionLostError());
+      await generation.promise.catch(() => undefined);
+      w1.drop();
+    });
+    const waited = await waiter;
+    const errorWhileOffline = view.result.current.error;
+
+    const w2Name = {
+      generatedIdentity: null,
+      manualName: "w2-manual-held",
+      autoGenerate: false,
+      lastGeneratedFor: "",
+    };
+    const w2 = createReconnectClient(w2Name);
+    act(() => getDraftStore().setClient(w2.client));
+    await waitFor(() => expect(getDraftStore().hasCurrentSnapshot()).toBe(true));
+    await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+    await getDraftStore().flush(SCOPE);
+
+    expect(getDraftStore().getView(SCOPE).nameState).toEqual(w2Name);
+    expect(w2.updates.filter((update) => update.nameState != null)).toEqual([]);
+    expect(view.result.current.name).toBe("w2-manual-held");
+    expect(generateMock).toHaveBeenCalledTimes(1);
+    // A submit waiting on the lost request stops and says why; the reconnect clears that.
+    expect(waited).toBeNull();
+    expect(errorWhileOffline).toEqual({ kind: "transport", message: CONNECTION_LOST_MESSAGE });
+    expect(view.result.current.error).toBeNull();
+  });
+
+  test("names the draft again after the reconnect when the lost request left it unnamed", async () => {
+    const w1 = createDroppableClient();
+    act(() => getDraftStore().setClient(w1.client));
+    await waitFor(() => expect(getDraftStore().hasCurrentSnapshot()).toBe(true));
+    const generation = Promise.withResolvers<Awaited<ReturnType<typeof generateMock>>>();
+    generateMock.mockImplementationOnce(() => generation.promise);
+    const view = renderWorkspaceName("fix the sidebar");
+    await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(1));
+
+    // This time the subscription notices the drop before the reply fails.
+    await act(async () => {
+      w1.drop();
+      await waitFor(() => expect(getDraftStore().hasCurrentSnapshot()).toBe(false));
+      generation.reject(new ConnectionLostError());
+      await generation.promise.catch(() => undefined);
+    });
+    expect(getDraftStore().getView(SCOPE).nameState).toBeNull();
+
+    act(() => getDraftStore().setClient(createReconnectClient(undefined).client));
+    await waitFor(() => expect(view.result.current.name).toBe("quotes-a1b2"));
+    expect(generateMock).toHaveBeenCalledTimes(2);
+    expect(view.result.current.error).toBeNull();
   });
 
   test("another window's name edit replaces the shown name", async () => {
