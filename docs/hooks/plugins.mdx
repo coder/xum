@@ -146,17 +146,17 @@ In an MCP name, Xum replaces each character other than `[A-Za-z0-9_]` with `_`. 
 
 The hook's MCP tool returns its output as JSON text. Xum joins the text blocks of the result. If the result has no text, Xum reads `structuredContent`.
 
-| Event              | Output                                                                  | Effect                                                                                   |
-| ------------------ | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `PreToolUse`       | `hookSpecificOutput.permissionDecision: "deny"`, or `decision: "block"` | Xum blocks the call. The model sees the reason as the tool error.                        |
+| Event              | Output                                                                                  | Effect                                                                                   |
+| ------------------ | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `PreToolUse`       | `hookSpecificOutput.permissionDecision: "deny"`, or `decision: "block"`                 | Xum blocks the call. The model sees the reason as the tool error.                        |
 | `PreToolUse`       | `hookSpecificOutput.permissionDecision: "allow"` with `hookSpecificOutput.updatedInput` | Xum runs the call with the new input.                                                    |
-| `PostToolUse`      | `decision: "block"`, or `continue: false`                               | Xum replaces the tool result with the hook's feedback.                                   |
-| `UserPromptSubmit` | `decision: "block"` with `reason`, or `continue: false`                 | Xum does not send a message you wrote. See the note below the table.                     |
-| `UserPromptSubmit` | Plain text that does not start with `{` or `[`                          | Xum adds the text as context.                                                            |
-| `Stop`             | `decision: "block"` with `reason`                                       | The turn continues with `reason` as the next prompt, at most 3 times per message.        |
-| `Stop`             | `continue: false`                                                       | Xum ends the turn and shows `stopReason` to you.                                         |
-| All but `Stop`     | `hookSpecificOutput.additionalContext`                                  | Xum adds the text for the model. On tool events, it goes on the result as `hook_output`. |
-| Any event          | `systemMessage`                                                         | Xum shows the message to you. The model never sees it.                                   |
+| `PostToolUse`      | `decision: "block"`, or `continue: false`                                               | Xum replaces the tool result with the hook's feedback.                                   |
+| `UserPromptSubmit` | `decision: "block"` with `reason`, or `continue: false`                                 | Xum does not send a message you wrote. See the note below the table.                     |
+| `UserPromptSubmit` | Plain text that does not start with `{` or `[`                                          | Xum adds the text as context.                                                            |
+| `Stop`             | `decision: "block"` with `reason`                                                       | The turn continues with `reason` as the next prompt, at most 3 times per message.        |
+| `Stop`             | `continue: false`                                                                       | Xum ends the turn and shows `stopReason` to you.                                         |
+| All but `Stop`     | `hookSpecificOutput.additionalContext`                                                  | Xum adds the text for the model. On tool events, it goes on the result as `hook_output`. |
+| Any event          | `systemMessage`                                                                         | Xum shows the message to you. The model never sees it.                                   |
 
 A `UserPromptSubmit` block applies only to a message you send (typed, edited, queued, or plan-review feedback). Automatic sends (goal and task continuations, wakes, follow-ups) ignore every block, because their sender would retry the same message in a loop. They keep the hooks' context.
 
@@ -182,13 +182,13 @@ One case fails closed. If the filled `input` of a `PreToolUse` hook is over 64 K
 
 ### Size limits
 
-| Limit                                                              | Value             |
-| ------------------------------------------------------------------ | ----------------- |
+| Limit                                                                                                                  | Value             |
+| ---------------------------------------------------------------------------------------------------------------------- | ----------------- |
 | One text field of an output (`reason`, `permissionDecisionReason`, `stopReason`, `additionalContext`, `systemMessage`) | 16 KiB characters |
-| Joined tool-event context or `PostToolUse` feedback of one plugin on one call | 32 KiB characters |
-| All `UserPromptSubmit` context on one message, as rendered for the model | 64 KiB characters |
-| One `hooks.json` file                                              | 256 KiB           |
-| Hooks per plugin                                                   | 256               |
+| Joined tool-event context or `PostToolUse` feedback of one plugin on one call                                          | 32 KiB characters |
+| All `UserPromptSubmit` context on one message, as rendered for the model                                               | 64 KiB characters |
+| One `hooks.json` file                                                                                                  | 256 KiB           |
+| Hooks per plugin                                                                                                       | 256               |
 
 Xum cuts the joined tool-event text at 32 KiB and adds `[plugin hook context cut]`. On `UserPromptSubmit`, Xum drops the context entries after the 64 KiB cap.
 
