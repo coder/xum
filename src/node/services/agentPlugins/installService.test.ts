@@ -3122,6 +3122,33 @@ describe("AgentPluginInstallService", () => {
       await fsPromises.mkdir(path.join(file, "junk"), { recursive: true });
       await restarted.signOutPluginServers();
       expect(await pathExists(file)).toBe(false);
+      // A damaged current record keeps the URLs it can read: an uninstalled plugin's URL is in
+      // no tree, so the record is its only trace.
+      const logout = spyOn(oauth, "logout");
+      const oldUrl = "https://old.example/mcp";
+      await fsPromises.writeFile(file, JSON.stringify({ version: 1, urls: [oldUrl, 42] }));
+      await restarted.signOutPluginServers();
+      expect(logout.mock.calls.map(([args]) => args.serverUrl)).toContain(oldUrl);
+      logout.mockRestore();
+      // A directory that is not installed and has no manifest is skipped, as discovery skips it.
+      const marketplace = path.join(pluginsDir(), "marketplace");
+      await fsPromises.mkdir(marketplace);
+      await fsPromises.writeFile(path.join(marketplace, "marketplace.json"), "{}");
+      await fsPromises.writeFile(file, "{ not json");
+      await restarted.signOutPluginServers();
+      expect(await pathExists(file)).toBe(false);
+      // A tree that stat cannot reach (EACCES) can load after a repair: the record stays.
+      const locked = path.join(muxRoot, "locked");
+      await fsPromises.mkdir(path.join(locked, "tree"), { recursive: true });
+      await fsPromises.symlink(path.join(locked, "tree"), path.join(pluginsDir(), "linked"));
+      await fsPromises.chmod(locked, 0o000);
+      await fsPromises.writeFile(file, "{ not json");
+      try {
+        await expect(restarted.signOutPluginServers()).rejects.toThrow(/EACCES/);
+        expect(await pathExists(file)).toBe(true);
+      } finally {
+        await fsPromises.chmod(locked, 0o755);
+      }
       await oauth.dispose();
     });
 

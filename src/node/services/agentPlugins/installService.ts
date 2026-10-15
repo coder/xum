@@ -78,6 +78,7 @@ import {
   PluginGitPathError,
   setAgentPluginDiscoveryGate,
   type AgentPluginContainer,
+  type AgentPluginDiagnostic,
   type AgentPluginInfo,
 } from "./discovery";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
@@ -286,25 +287,39 @@ function recoveryUrls(record: unknown, file: string): string[] {
   const fields =
     typeof record === "object" && record !== null ? (record as Record<string, unknown>) : {};
   const urls = fields.urls;
-  if (Array.isArray(urls) && urls.every((url) => typeof url === "string")) return urls;
-  if (fields.version === undefined || fields.version === 1) return [];
+  const current = fields.version === undefined || fields.version === 1;
+  if (Array.isArray(urls)) {
+    // A damaged current record keeps the URLs it can still name: an uninstalled plugin's URL
+    // is in no tree, so the record is its only trace.
+    const readable = urls.filter((url): url is string => typeof url === "string");
+    if (current || readable.length === urls.length) return readable;
+  }
+  if (current) return [];
   throw new Error(
     `The pending plugin sign-out record (${file}) is from another Xum version, and this version cannot read its sign-outs. Open Xum in that version to finish them.`
   );
 }
 
 /**
- * Throws when a plugin tree's MCP servers can be missing from a scan (#6627): no readable
- * manifest (discovery returns null, sometimes without a diagnostic), or a declared MCP file that
- * is missing (it resolves without a diagnostic). Restored, either loads with the old sign-in.
+ * Throws when a plugin tree's MCP servers can be missing from a scan (#6627): an installed
+ * plugin without a readable manifest, or a declared MCP file that is missing (it resolves
+ * without a diagnostic). Restored, either loads with the old sign-in. A directory that is not
+ * installed and has no manifest is skipped, as discovery skips it (a Codex marketplace dir).
  */
-function assertMcpFileReadable(
+function pluginWithReadableMcp(
   dirName: string,
-  plugin: AgentPluginInfo | null
-): asserts plugin is AgentPluginInfo {
-  if (plugin === null) throw new Error(`Xum cannot read the manifest of plugin '${dirName}'.`);
+  scan: { plugin: AgentPluginInfo | null; diagnostics: readonly AgentPluginDiagnostic[] },
+  installed: boolean
+): AgentPluginInfo | null {
+  const { plugin } = scan;
+  if (plugin === null) {
+    if (installed || scan.diagnostics.some((d) => d.severity === "error"))
+      throw new Error(`Xum cannot read the manifest of plugin '${dirName}'.`);
+    return null;
+  }
   if (plugin.mcpConfigPath === undefined && plugin.manifest.contributes?.mcp !== undefined)
     throw new Error(`Xum cannot read the MCP file that plugin '${dirName}' declares.`);
+  return plugin;
 }
 
 /** Waits for the startup sign-out pass at most timeoutMs, then lets discovery go on. */
@@ -4522,22 +4537,32 @@ export class AgentPluginInstallService {
       if (hasErrorCode(error, "ENOENT")) return [];
       throw error;
     });
+    // Every registry name, unreadable entries included: their trees are installed plugins.
+    const { rawEntries } = await this.readRegistryDocument("strict");
+    const installed = new Set(rawEntries.map((entry) => this.rawEntryName(entry)));
     const urls: string[] = [];
-    for (const dirName of dirs) urls.push(...(await this.pluginTreeServerUrls(dirName)));
+    for (const dirName of dirs)
+      urls.push(...(await this.pluginTreeServerUrls(dirName, installed.has(dirName))));
     return urls;
   }
 
   /** One plugin tree's remote MCP server URLs; throws when the tree's servers cannot be read. */
-  private async pluginTreeServerUrls(dirName: string): Promise<string[]> {
+  private async pluginTreeServerUrls(dirName: string, installed: boolean): Promise<string[]> {
     // Plugin trees are directories (or links to one), dot-prefixed names included, as discovery
-    // scans them. Skip stray files such as .DS_Store and dangling links: neither loads.
+    // scans them. Skip stray files such as .DS_Store and dangling links: neither loads. Any other
+    // stat failure (EACCES, EIO) can hide a tree that loads after a repair: it keeps the record.
     const pluginDir = path.join(this.containerDir, dirName);
-    const stat = await fsPromises.stat(pluginDir).catch(() => null);
+    const stat = await fsPromises.stat(pluginDir).catch((error: unknown) => {
+      if (hasErrorCode(error, "ENOENT")) return null;
+      throw error;
+    });
     if (stat?.isDirectory() !== true) return [];
     // A server this scan cannot read can load later, after a repair, with its old sign-in:
     // the list must be complete before the record goes.
-    const { plugin, diagnostics } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
-    assertMcpFileReadable(dirName, plugin);
+    const scan = await discoverAgentPluginAt({ pluginDir, scope: "global" });
+    const { diagnostics } = scan;
+    const plugin = pluginWithReadableMcp(dirName, scan, installed);
+    if (plugin === null) return [];
     // Without an MCP file, a discovery error can be the MCP path itself. With one, a discovery
     // error names another component (a skill, a hook), and only the MCP diagnostics decide.
     const loaded =
