@@ -951,6 +951,47 @@ export const WorkspaceMCPServerSettingsRereadAfterWrite: Story = {
   },
 };
 
+const appWriteReads: string[][] = [];
+/**
+ * An MCP App of a tool that can write (Payment method) may change the settings: the dialog
+ * reads them again when the app closes, not while it is open (that would close it).
+ */
+export const WorkspaceMCPServerSettingsRereadAfterApp: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    appWriteReads.length = 0;
+    return renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settingsReads: appWriteReads,
+      settingsToolRunSets: { "cad.payment": { zoom: 1 } },
+      mcpAppViews: {
+        "settings:cad:cad.payment": {
+          html: "<!doctype html><html><body><strong>Card form</strong></body></html>",
+          csp: {},
+          prefersBorder: null,
+          resultAvailable: true,
+          result: { content: [] },
+          invocation: null,
+        },
+      },
+    });
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await section.findByRole("button", { name: "Open Payment method" }));
+    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    const appDialog = await page.findByRole("dialog", { name: "Payment method" });
+    await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
+    await expect(appWriteReads).toHaveLength(1);
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(page.queryByRole("dialog", { name: "Payment method" })).toBeNull());
+    await waitFor(() => expect(modal.getByLabelText("Default zoom setting")).toHaveValue(1));
+    await expect(appWriteReads).toEqual([["cad"], ["cad"]]);
+  },
+};
+
 /** The modal mounts only while open, like the sidebar row's settings dialog. */
 const RemountingWorkspaceMCPModal: FC = () => {
   const [open, setOpen] = useState(true);
