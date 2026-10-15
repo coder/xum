@@ -5572,6 +5572,25 @@ describe("AgentPluginInstallService", () => {
         }
       ).plugins[0];
 
+    test("recovery keeps a consent record added after the crash (#6698)", async () => {
+      // The update died after the promote. Before recovery, the user records consent for another
+      // component (setComponents). Recovery must add the journal's records, not replace these.
+      const { greetFingerprint } = await crashAfterReviewedPromote(
+        "Greets people warmly",
+        () => undefined
+      );
+      const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+        plugins: Array<{ componentConsent: { skills: Record<string, string> } }>;
+      };
+      const later = "f".repeat(64);
+      document.plugins[0].componentConsent.skills.later = later;
+      await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+
+      await service.list();
+      const entry = await registrySkills();
+      expect(entry.componentConsent?.skills).toEqual({ greet: greetFingerprint, later });
+    });
+
     test("a journal with the consent applies it", async () => {
       const { newSha, greetFingerprint } = await crashAfterReviewedPromote(
         "Greets people loudly",
