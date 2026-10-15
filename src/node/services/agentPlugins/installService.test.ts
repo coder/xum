@@ -1875,6 +1875,20 @@ describe("AgentPluginInstallService", () => {
     await expect(resume("wfr_unreviewed")).rejects.toThrow("has not been reviewed on this install");
   });
 
+  test("the preview lists only workflow names the resolver can run (#6777)", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
+    // The resolver refuses a name that starts with ~ and reads \ as a path separator, so a
+    // review row for either would approve a script that never runs.
+    const names = ["ok.js", "~run.js", ...(process.platform === "win32" ? [] : ["a\\b.js"])];
+    for (const name of names) {
+      await fsPromises.writeFile(path.join(remoteDir, "workflows", name), "1;\n");
+    }
+    await commitAll(remoteDir, "add workflows with names the resolver refuses");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.workflows).toEqual(["ok.js"]);
+    expect(preview.reviewedComponents.map((row) => row.name)).toEqual(["ok.js"]);
+  });
+
   test("review labels show a bidi control in a workflow file name; the identity stays raw (#6629)", async () => {
     const file = "evil\u202esj.js";
     await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });

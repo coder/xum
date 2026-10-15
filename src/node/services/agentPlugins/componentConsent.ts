@@ -22,6 +22,7 @@ import type {
 import { getOwn } from "@/common/utils/getOwn";
 import { stableStringify } from "@/common/utils/stableStringify";
 import { skillDynamicDirectiveCommands } from "@/node/services/agentSkills/skillDynamicContext";
+import type { AgentPluginSlashCommandContribution } from "./manifest";
 
 /** Bump when the fingerprint input changes: every record then needs a new review (fails closed). */
 const CONSENT_SCHEME = 1;
@@ -308,23 +309,18 @@ export function agentConsentDetail(args: AgentConsentInput): string {
   return stableStringify(agentConsentSubject(args));
 }
 
-interface SlashCommandConsentInput {
-  name: string;
-  description?: string;
-  /** The full text the command inserts on use. */
-  expansion: string;
-}
+/** One parsed manifest slash command (manifest.ts): name, description and expansion today. */
+type SlashCommandConsentInput = Readonly<AgentPluginSlashCommandContribution>;
 
-/** The fingerprinted slash command fields (#6629): the whole parsed contribution. */
+/**
+ * The fingerprinted slash command fields (#6629): the whole parsed contribution, copied, not
+ * picked, so a field the manifest type gains later counts too and fails closed (#6777).
+ */
 function slashCommandConsentSubject(args: SlashCommandConsentInput): SlashCommandConsentInput {
-  return {
-    name: args.name,
-    ...(args.description !== undefined ? { description: args.description } : {}),
-    expansion: args.expansion,
-  };
+  return { ...args };
 }
 
-/** Fingerprint of one plugin slash command: its name, description and expansion. */
+/** Fingerprint of one plugin slash command: every field of its parsed contribution. */
 export function slashCommandConsentFingerprint(args: SlashCommandConsentInput): string {
   return digest({
     scheme: CONSENT_SCHEME,
