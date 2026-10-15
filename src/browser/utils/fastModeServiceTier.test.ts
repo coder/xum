@@ -1,30 +1,15 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 
-import type { APIClient } from "@/browser/contexts/API";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
-  applyFastModeServiceTierChange,
-  applyFastModeToggle,
   getFastModeProvider,
-  getFastModeServiceTierChange,
   getFastModeUnavailableReason,
-  isFastModeActive,
+  resolveChatServiceTier,
+  toggleServiceTier,
   ultrafastModeAvailable,
 } from "./fastModeServiceTier";
 
-type ProviderConfigWriter = Pick<APIClient["providers"], "setProviderConfig">;
-
 const OPENAI_CONFIG = { apiKeySet: true, isEnabled: true, isConfigured: true };
-
-function createWriter() {
-  const setProviderConfig = mock((_input: unknown) =>
-    Promise.resolve({ success: true as const, data: undefined })
-  );
-  return {
-    providers: { setProviderConfig } as unknown as ProviderConfigWriter,
-    setProviderConfig,
-  };
-}
 
 describe("fast mode service tier", () => {
   test("says whether the model or its route lacks fast mode (#5753)", () => {
@@ -177,90 +162,6 @@ describe("fast mode service tier", () => {
     }
   });
 
-  test("restores flex from the shared provider config", () => {
-    expect(getFastModeServiceTierChange("openai", "priority", "flex")).toEqual({
-      apiValue: "flex",
-      serviceTier: "flex",
-      previousServiceTier: undefined,
-    });
-  });
-
-  test("persists the restore tier before enabling Fast mode", async () => {
-    const { providers, setProviderConfig } = createWriter();
-
-    const change = await applyFastModeServiceTierChange(providers, "openai", "flex");
-
-    expect(change).toEqual({
-      apiValue: "priority",
-      serviceTier: "priority",
-      previousServiceTier: "flex",
-    });
-    expect(setProviderConfig.mock.calls).toEqual([
-      [
-        {
-          provider: "openai",
-          keyPath: ["fastModePreviousServiceTier"],
-          value: "flex",
-        },
-      ],
-      [
-        {
-          provider: "openai",
-          keyPath: ["serviceTier"],
-          value: "priority",
-        },
-      ],
-    ]);
-  });
-
-  test("restores and clears the shared tier when disabling Fast mode", async () => {
-    const { providers, setProviderConfig } = createWriter();
-
-    const change = await applyFastModeServiceTierChange(providers, "openai", "priority", "default");
-
-    expect(change).toEqual({
-      apiValue: "default",
-      serviceTier: "default",
-      previousServiceTier: undefined,
-    });
-    expect(setProviderConfig.mock.calls).toEqual([
-      [
-        {
-          provider: "openai",
-          keyPath: ["serviceTier"],
-          value: "default",
-        },
-      ],
-      [
-        {
-          provider: "openai",
-          keyPath: ["fastModePreviousServiceTier"],
-          value: "",
-        },
-      ],
-    ]);
-  });
-
-  test("restores an unset tier with the backend removal value", async () => {
-    const { providers, setProviderConfig } = createWriter();
-
-    const change = await applyFastModeServiceTierChange(providers, "openai", "priority", "unset");
-
-    expect(change?.serviceTier).toBeUndefined();
-    expect(setProviderConfig.mock.calls[0]).toEqual([
-      {
-        provider: "openai",
-        keyPath: ["serviceTier"],
-        value: "",
-      },
-    ]);
-  });
-
-  test("uses provider-valid fallbacks for legacy priority config without a restore tier", () => {
-    expect(getFastModeServiceTierChange("openai", "priority").serviceTier).toBe("auto");
-    expect(getFastModeServiceTierChange("xai", "priority").serviceTier).toBe("default");
-  });
-
   test("offers Ultrafast only where the request path would send it", () => {
     const openai = { apiKeySet: true, isEnabled: true, isConfigured: true };
     const config = (extra: object = {}): ProvidersConfigMap => ({
@@ -306,103 +207,6 @@ describe("fast mode service tier", () => {
     }
     // Non-OpenAI Fast modes have no Ultrafast tier.
     expect(ultrafastModeAvailable("xai:grok-4.7", { providersConfig: null })).toBe(false);
-  });
-
-  test.each([
-    // [current, stored restore target, toggled tier] -> [new tier, new restore target]
-    [
-      "enables Ultrafast and remembers the base tier",
-      "flex",
-      undefined,
-      "ultrafast",
-      "ultrafast",
-      "flex",
-    ],
-    [
-      "turns Ultrafast off back to the base tier",
-      "ultrafast",
-      "flex",
-      "ultrafast",
-      "flex",
-      undefined,
-    ],
-    [
-      "switches Fast to Ultrafast keeping the base tier",
-      "priority",
-      "flex",
-      "ultrafast",
-      "ultrafast",
-      "flex",
-    ],
-    [
-      "switches Ultrafast to Fast keeping the base tier",
-      "ultrafast",
-      "unset",
-      "priority",
-      "priority",
-      "unset",
-    ],
-    // Ultrafast chosen in Settings is itself the base tier Fast mode returns to.
-    [
-      "keeps a Settings Ultrafast as Fast mode's restore target",
-      "ultrafast",
-      undefined,
-      "priority",
-      "priority",
-      "ultrafast",
-    ],
-    [
-      "returns to a Settings Ultrafast from Fast",
-      "priority",
-      "ultrafast",
-      "ultrafast",
-      "ultrafast",
-      undefined,
-    ],
-  ] as const)("%s", (_name, current, previous, target, serviceTier, previousServiceTier) => {
-    const change = getFastModeServiceTierChange("openai", current, previous, target);
-    expect(change.serviceTier).toBe(serviceTier);
-    expect(change.previousServiceTier).toBe(previousServiceTier);
-  });
-
-  test("persists Ultrafast's restore target before raising the tier", async () => {
-    const { providers, setProviderConfig } = createWriter();
-
-    const patch = await applyFastModeToggle(
-      providers,
-      "openai",
-      { ...OPENAI_CONFIG, serviceTier: "auto" },
-      "ultrafast"
-    );
-
-    expect(patch).toEqual({ serviceTier: "ultrafast", fastModePreviousServiceTier: "auto" });
-    expect(setProviderConfig.mock.calls.map(([input]) => input)).toEqual([
-      { provider: "openai", keyPath: ["fastModePreviousServiceTier"], value: "auto" },
-      { provider: "openai", keyPath: ["serviceTier"], value: "ultrafast" },
-    ]);
-  });
-
-  test("writes xAI fast mode to the xAI provider config", async () => {
-    const { providers, setProviderConfig } = createWriter();
-
-    await applyFastModeServiceTierChange(providers, "xai", "default");
-
-    expect(setProviderConfig.mock.calls).toEqual([
-      [
-        {
-          provider: "xai",
-          keyPath: ["fastModePreviousServiceTier"],
-          value: "default",
-        },
-      ],
-      [
-        {
-          provider: "xai",
-          keyPath: ["serviceTier"],
-          value: "priority",
-        },
-      ],
-    ]);
   });
 
   test("offers Anthropic Fast mode only for supported Opus models on the direct API", () => {
@@ -481,33 +285,29 @@ describe("fast mode service tier", () => {
     ).toBeNull();
   });
 
-  test("toggles Anthropic speed without touching service tiers", async () => {
-    const { providers, setProviderConfig } = createWriter();
-    const base = { apiKeySet: true, isEnabled: true, isConfigured: true };
-
-    expect(isFastModeActive("anthropic", base)).toBe(false);
-    const enabled = await applyFastModeToggle(providers, "anthropic", base);
-    expect(enabled).toEqual({ speed: "fast" });
-    expect(isFastModeActive("anthropic", { ...base, ...enabled })).toBe(true);
-    // A priority service tier on Anthropic config must not read as Fast mode.
-    expect(isFastModeActive("anthropic", { ...base, serviceTier: "priority" })).toBe(false);
-
-    const disabled = await applyFastModeToggle(providers, "anthropic", { ...base, speed: "fast" });
-    expect(disabled).toEqual({ speed: undefined });
-
-    expect(setProviderConfig.mock.calls).toEqual([
-      [{ provider: "anthropic", keyPath: ["speed"], value: "fast" }],
-      // Empty string removes the key; standard is the API default.
-      [{ provider: "anthropic", keyPath: ["speed"], value: "" }],
-    ]);
+  test("a chat's speed pick wins over every provider's default, so it survives model switches", () => {
+    const providersConfig: ProvidersConfigMap = {
+      openai: { ...OPENAI_CONFIG, serviceTier: "flex" },
+      xai: { ...OPENAI_CONFIG, serviceTier: "default" },
+      anthropic: { ...OPENAI_CONFIG, speed: "fast" },
+    };
+    // A pick made under one provider reads the same under the others.
+    for (const provider of ["openai", "xai", "anthropic"] as const) {
+      expect(resolveChatServiceTier(provider, "priority", providersConfig)).toBe("priority");
+      expect(resolveChatServiceTier(provider, "default", providersConfig)).toBe("default");
+    }
+    // Without a pick, the chat inherits the current provider's default.
+    expect(resolveChatServiceTier("openai", undefined, providersConfig)).toBe("flex");
+    expect(resolveChatServiceTier("xai", undefined, providersConfig)).toBe("default");
+    expect(resolveChatServiceTier("anthropic", undefined, providersConfig)).toBe("priority");
+    expect(resolveChatServiceTier("anthropic", undefined, {})).toBeUndefined();
   });
 
-  test("reports a failed Anthropic write so callers refresh", async () => {
-    const setProviderConfig = mock((_input: unknown) =>
-      Promise.resolve({ success: false as const, error: "denied" })
-    );
-    const providers = { setProviderConfig } as unknown as ProviderConfigWriter;
-
-    expect(await applyFastModeToggle(providers, "anthropic", undefined)).toBeNull();
+  test("turning an inherited Fast default off pins Standard on the chat", () => {
+    const providersConfig: ProvidersConfigMap = { anthropic: { ...OPENAI_CONFIG, speed: "fast" } };
+    const inherited = resolveChatServiceTier("anthropic", undefined, providersConfig);
+    expect(toggleServiceTier(inherited, "priority")).toBe("default");
+    expect(toggleServiceTier(undefined, "priority")).toBe("priority");
+    expect(toggleServiceTier("ultrafast", "priority")).toBe("priority");
   });
 });

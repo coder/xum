@@ -24,10 +24,9 @@ import { useComputerUse } from "./hooks/useComputerUse";
 import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
 import { openServerWindow } from "./utils/openServerWindow";
 import {
-  applyFastModeToggle,
   getFastModeProvider,
   getFastModeUnavailableReason,
-  isFastModeActive,
+  resolveChatServiceTier,
   setWorkspaceServiceTier,
   toggleServiceTier,
   type PremiumServiceTier,
@@ -613,11 +612,7 @@ function AppInner() {
 
   // Pro mode is Responses-only; the palette command hides under chatCompletions
   // and on non-passthrough routes (mirroring the send path's header gating).
-  const {
-    config: providersConfig,
-    refresh: refreshProvidersConfig,
-    updateOptimistically,
-  } = useProvidersConfig();
+  const { config: providersConfig } = useProvidersConfig();
   const routing = useRouting();
   const getRouteForModel = useCallback(
     (canonicalModel: string) => routing.resolveRoute(canonicalModel).route,
@@ -675,10 +670,14 @@ function AppInner() {
       providersConfig,
       resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
     });
-    return provider === "openai"
-      ? (getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier) ===
-          "priority"
-      : provider != null && isFastModeActive(provider, providersConfig[provider]);
+    return (
+      provider != null &&
+      resolveChatServiceTier(
+        provider,
+        getWorkspaceAiSelection(scopeId).serviceTier,
+        providersConfig
+      ) === "priority"
+    );
   }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
 
   // Plain function: React Compiler handles memoization.
@@ -692,12 +691,14 @@ function AppInner() {
         providersConfig,
         resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
       }) &&
-      (getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier) ===
-        "ultrafast"
+      resolveChatServiceTier(
+        "openai",
+        getWorkspaceAiSelection(scopeId).serviceTier,
+        providersConfig
+      ) === "ultrafast"
     );
   };
 
-  const fastModeToggleInFlightRef = useRef(false);
   // Native host computer use belongs to the selected workspace. Offer it only where the backend
   // accepts it: in the desktop app, for workspaces that run on this machine.
   const computerUse = useComputerUse(selectedWorkspace?.workspaceId ?? null);
@@ -709,17 +710,14 @@ function AppInner() {
     computerUse.status?.supported === true &&
     (isWorktreeRuntime(selectedRuntimeConfig) || isLocalProjectRuntime(selectedRuntimeConfig));
 
-  // OpenAI speed is scoped to the chat; other providers retain their existing Fast preferences.
+  // Speed is scoped to the chat for every provider, like its reasoning level.
   const togglePremiumServiceTier = useCallback(
-    async (targetServiceTier: PremiumServiceTier) => {
+    (targetServiceTier: PremiumServiceTier) => {
       const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
-      if (!liveApi || !scopeId || providersConfig == null || fastModeToggleInFlightRef.current)
-        return;
+      if (!liveApi || !scopeId || providersConfig == null) return;
 
       // Creation composers use the same project-scoped model preference as their selector,
       // so the global shortcut remains available before the first workspace exists.
-      // Serialize requests so a quick double press cannot compute two writes from stale config.
-      fastModeToggleInFlightRef.current = true;
       const model = getModelForWorkspace(scopeId);
       const availabilityOptions = {
         providersConfig,
@@ -730,7 +728,6 @@ function AppInner() {
         targetServiceTier === "ultrafast" &&
         !ultrafastModeAvailable(model, availabilityOptions)
       ) {
-        fastModeToggleInFlightRef.current = false;
         window.dispatchEvent(
           createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, {
             type: "error",
@@ -741,7 +738,6 @@ function AppInner() {
         return;
       }
       if (provider == null) {
-        fastModeToggleInFlightRef.current = false;
         // The shortcut used to do nothing here, so it looked broken (#5693). Say why instead.
         window.dispatchEvent(
           createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, {
@@ -756,29 +752,12 @@ function AppInner() {
         return;
       }
 
-      try {
-        if (provider === "openai") {
-          const current =
-            getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier;
-          setWorkspaceServiceTier(liveApi, scopeId, toggleServiceTier(current, targetServiceTier));
-          return;
-        }
-        const patch = await applyFastModeToggle(
-          liveApi.providers,
-          provider,
-          providersConfig[provider],
-          targetServiceTier
-        );
-        if (patch) {
-          updateOptimistically(provider, patch);
-        } else {
-          await refreshProvidersConfig();
-        }
-      } catch {
-        await refreshProvidersConfig();
-      } finally {
-        fastModeToggleInFlightRef.current = false;
-      }
+      const current = resolveChatServiceTier(
+        provider,
+        getWorkspaceAiSelection(scopeId).serviceTier,
+        providersConfig
+      );
+      setWorkspaceServiceTier(liveApi, scopeId, toggleServiceTier(current, targetServiceTier));
     },
     [
       liveApi,
@@ -786,9 +765,7 @@ function AppInner() {
       getModelForWorkspace,
       getRouteForModel,
       providersConfig,
-      refreshProvidersConfig,
       selectedWorkspace,
-      updateOptimistically,
     ]
   );
 
@@ -1195,12 +1172,12 @@ function AppInner() {
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_FAST_MODE)) {
         e.preventDefault();
         // Modals trap focus and hide the page behind them; don't change hidden page UI.
-        if (!isDialogOpen()) togglePremiumServiceTier("priority").catch(() => undefined);
+        if (!isDialogOpen()) togglePremiumServiceTier("priority");
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ULTRAFAST_MODE)) {
         e.preventDefault();
-        // A held chord would re-toggle once each write settles, leaving the tier timing-dependent.
+        // A held chord would flip the tier once per repeat, leaving it timing-dependent.
         if (!isDialogOpen() && !e.repeat) {
-          togglePremiumServiceTier("ultrafast").catch(() => undefined);
+          togglePremiumServiceTier("ultrafast");
         }
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_COMPUTER_USE) && computerUseAvailable) {
         e.preventDefault();

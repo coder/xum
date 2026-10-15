@@ -1,16 +1,12 @@
 import { isNonWorkspaceScopeId } from "@/common/constants/storage";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import type { APIClient } from "@/browser/contexts/API";
-import type {
-  FastModePreviousServiceTier,
-  ServiceTier,
-} from "@/common/config/schemas/providersConfig";
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
-import type { ProviderConfigInfo, ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { isGrokFrontierModel } from "@/common/types/thinking";
 import { anthropicFastModeAvailable } from "@/common/utils/ai/anthropicFastMode";
 import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/ai/models";
-import assert from "@/common/utils/assert";
 import {
   openaiModelSupportsServiceTier,
   openaiServiceTierAvailable,
@@ -22,29 +18,19 @@ import {
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
 export type FastModeProvider = "openai" | "xai" | "anthropic";
-/** Providers whose Fast mode is the priority service tier. */
-type ServiceTierFastModeProvider = Exclude<FastModeProvider, "anthropic">;
 /**
  * The premium service tiers the selector toggles: Fast (priority) and OpenAI's
- * Ultrafast. They are mutually exclusive and share one restore target.
+ * Ultrafast. They are mutually exclusive.
  */
 export type PremiumServiceTier = "priority" | "ultrafast";
-
-export interface FastModeServiceTierChange {
-  apiValue: ServiceTier | "";
-  serviceTier: ServiceTier | undefined;
-  previousServiceTier: FastModePreviousServiceTier | undefined;
-}
 
 export interface FastModeAvailabilityOptions {
   resolvedRouteProvider?: string | null;
   providersConfig?: ProvidersConfigMap | null;
 }
 
-type ProviderConfigWriter = Pick<APIClient["providers"], "setProviderConfig">;
-
 /**
- * OpenAI speed belongs to this chat, just like reasoning. Keep the pending pick for
+ * Speed belongs to this chat, just like reasoning. Keep the pending pick for
  * the next send and nudge an active turn without changing any other chat's default.
  * Creation scopes have no active turn yet; their first send carries the same choice.
  */
@@ -59,6 +45,23 @@ export function setWorkspaceServiceTier(
       // Best-effort: a transient IPC failure must not discard the next-send pick.
     });
   }
+}
+
+/**
+ * Speed belongs to the chat, like its reasoning level: the chat's own pick drives Fast mode
+ * for every provider, so switching the chat's model keeps its speed instead of adopting the
+ * new provider's setting. Only a chat without a pick inherits that provider's default.
+ * "priority" is the provider-agnostic Fast choice; the backend maps it to Anthropic `speed`.
+ */
+export function resolveChatServiceTier(
+  provider: FastModeProvider,
+  chatServiceTier: ServiceTier | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined
+): ServiceTier | undefined {
+  if (chatServiceTier != null) return chatServiceTier;
+  const providerConfig = providersConfig?.[provider];
+  if (provider === "anthropic") return providerConfig?.speed === "fast" ? "priority" : undefined;
+  return providerConfig?.serviceTier;
 }
 
 /** Turning a premium tier off must not re-inherit a premium provider default. */
@@ -145,152 +148,4 @@ export function getFastModeUnavailableReason(
   return getFastModeProvider(capabilityModel, { resolvedRouteProvider: "direct" })
     ? "route"
     : "model";
-}
-
-/**
- * Fast and Ultrafast modes are temporary premium-tier overrides. The restore target
- * lives in providers.jsonc so every browser origin and desktop client observes the
- * same state.
- */
-export function getFastModeServiceTierChange(
-  provider: ServiceTierFastModeProvider,
-  currentServiceTier: ServiceTier | undefined,
-  previousServiceTier?: FastModePreviousServiceTier,
-  targetServiceTier: PremiumServiceTier = "priority"
-): FastModeServiceTierChange {
-  if (currentServiceTier !== targetServiceTier) {
-    // Switching from the other premium mode keeps the original restore target, so
-    // turning either mode off returns to the tier the user had before both. Without a
-    // stored target, Ultrafast was picked in Settings and is itself the base tier to
-    // return to. A target equal to the requested tier is a restore, handled below.
-    const switchingPremiumMode =
-      currentServiceTier === "priority" ||
-      (currentServiceTier === "ultrafast" && previousServiceTier != null);
-    if (!switchingPremiumMode) {
-      return {
-        apiValue: targetServiceTier,
-        serviceTier: targetServiceTier,
-        previousServiceTier: currentServiceTier ?? "unset",
-      };
-    }
-    if (previousServiceTier !== targetServiceTier) {
-      return {
-        apiValue: targetServiceTier,
-        serviceTier: targetServiceTier,
-        previousServiceTier,
-      };
-    }
-  }
-
-  // Legacy OpenAI priority configs predate the restore field. xAI's only standard
-  // tier is default, so its equivalent fallback must not emit unsupported "auto".
-  const restoreServiceTier = previousServiceTier ?? (provider === "openai" ? "auto" : "default");
-  return {
-    apiValue: restoreServiceTier === "unset" ? "" : restoreServiceTier,
-    serviceTier: restoreServiceTier === "unset" ? undefined : restoreServiceTier,
-    previousServiceTier: undefined,
-  };
-}
-
-/**
- * OpenAI and xAI express Fast mode as the priority service tier; Anthropic uses a
- * separate `speed` preference because its own service_tier means something else.
- */
-export function isFastModeActive(
-  provider: FastModeProvider,
-  providerConfig: ProviderConfigInfo | undefined
-): boolean {
-  return provider === "anthropic"
-    ? providerConfig?.speed === "fast"
-    : providerConfig?.serviceTier === "priority";
-}
-
-export function isUltrafastModeActive(providerConfig: ProviderConfigInfo | undefined): boolean {
-  return providerConfig?.serviceTier === "ultrafast";
-}
-
-/**
- * Toggle Fast (or OpenAI Ultrafast) mode for the provider and return the persisted
- * config patch to apply optimistically, or null when a write failed (callers should refresh).
- */
-export async function applyFastModeToggle(
-  providers: ProviderConfigWriter,
-  provider: FastModeProvider,
-  providerConfig: ProviderConfigInfo | undefined,
-  targetServiceTier: PremiumServiceTier = "priority"
-): Promise<Partial<ProviderConfigInfo> | null> {
-  assert(
-    targetServiceTier === "priority" || provider === "openai",
-    "Ultrafast is an OpenAI-only service tier"
-  );
-  if (provider === "anthropic") {
-    const enable = providerConfig?.speed !== "fast";
-    // Standard is the API default, so disabling removes the key instead of
-    // persisting "standard" (keeps providers.jsonc minimal).
-    const result = await providers.setProviderConfig({
-      provider,
-      keyPath: ["speed"],
-      value: enable ? "fast" : "",
-    });
-    if (!result.success) return null;
-    return { speed: enable ? "fast" : undefined };
-  }
-
-  const change = await applyFastModeServiceTierChange(
-    providers,
-    provider,
-    providerConfig?.serviceTier,
-    providerConfig?.fastModePreviousServiceTier,
-    targetServiceTier
-  );
-  if (change == null) return null;
-  return {
-    serviceTier: change.serviceTier,
-    fastModePreviousServiceTier: change.previousServiceTier,
-  };
-}
-
-/** Persist the provider-specific restore target and service-tier override in a safe order. */
-export async function applyFastModeServiceTierChange(
-  providers: ProviderConfigWriter,
-  provider: ServiceTierFastModeProvider,
-  currentServiceTier: ServiceTier | undefined,
-  previousServiceTier?: FastModePreviousServiceTier,
-  targetServiceTier: PremiumServiceTier = "priority"
-): Promise<FastModeServiceTierChange | null> {
-  const change = getFastModeServiceTierChange(
-    provider,
-    currentServiceTier,
-    previousServiceTier,
-    targetServiceTier
-  );
-
-  // Persist a new restore target before raising the tier and clear it only after
-  // restoring, so a failed write never strands a premium tier without a way back.
-  if (change.previousServiceTier != null && change.previousServiceTier !== previousServiceTier) {
-    const rememberResult = await providers.setProviderConfig({
-      provider,
-      keyPath: ["fastModePreviousServiceTier"],
-      value: change.previousServiceTier ?? "unset",
-    });
-    if (!rememberResult.success) return null;
-  }
-
-  const tierResult = await providers.setProviderConfig({
-    provider,
-    keyPath: ["serviceTier"],
-    value: change.apiValue,
-  });
-  if (!tierResult.success) return null;
-
-  if (change.previousServiceTier == null) {
-    const clearResult = await providers.setProviderConfig({
-      provider,
-      keyPath: ["fastModePreviousServiceTier"],
-      value: "",
-    });
-    if (!clearResult.success) return null;
-  }
-
-  return change;
 }

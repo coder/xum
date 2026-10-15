@@ -117,10 +117,8 @@ import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { DEFAULT_ROUTE_PRIORITY, resolveRoute } from "@/common/routing";
 import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
 import {
-  applyFastModeToggle,
   getFastModeProvider,
-  isFastModeActive,
-  isUltrafastModeActive,
+  resolveChatServiceTier,
   setWorkspaceServiceTier,
   toggleServiceTier,
   ultrafastModeAvailable,
@@ -836,40 +834,26 @@ export async function processSlashCommand(
           );
         }
         const targetTier = parsed.mode === "fast" ? "priority" : "ultrafast";
-        let enabled: boolean;
-        if (provider === "openai") {
-          if (!scopeId) throw new Error("Workspace ID required");
-          // Async capability loading must not apply an old command to a newly selected agent.
-          if (
-            (env.variant === "workspace" && env.isCurrent?.() === false) ||
-            getWorkspaceAgentId(scopeId) !== selectedAgent ||
-            getWorkspaceAiSelection(scopeId).model !== selectedModel
-          ) {
-            return complete("restore-if-empty");
-          }
-          // Share the picker/shortcut's pending choice and next-step nudge, not a
-          // provider-wide write. Read after awaits so an intervening pick is respected.
-          const currentTier =
-            getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier;
-          const tier = toggleServiceTier(currentTier, targetTier);
-          setWorkspaceServiceTier(client, scopeId, tier);
-          enabled = tier === targetTier;
-        } else {
-          const patch = await applyFastModeToggle(
-            client.providers,
-            provider,
-            providersConfig[provider],
-            targetTier
-          );
-          if (!patch) throw new Error(`Failed to toggle ${label} mode`);
-          store.updateOptimistically(provider, patch);
-          if (store.getConfig() == null) await store.refresh();
-          const updatedConfig = { ...providersConfig[provider], ...patch };
-          enabled =
-            parsed.mode === "fast"
-              ? isFastModeActive(provider, updatedConfig)
-              : isUltrafastModeActive(updatedConfig);
+        if (!scopeId) throw new Error("Workspace ID required");
+        // Async capability loading must not apply an old command to a newly selected agent.
+        if (
+          (env.variant === "workspace" && env.isCurrent?.() === false) ||
+          getWorkspaceAgentId(scopeId) !== selectedAgent ||
+          getWorkspaceAiSelection(scopeId).model !== selectedModel
+        ) {
+          return complete("restore-if-empty");
         }
+        // Speed belongs to the chat for every provider, like its reasoning level: share the
+        // picker/shortcut's pending choice and next-step nudge, not a provider-wide write.
+        // Read after awaits so an intervening pick is respected.
+        const currentTier = resolveChatServiceTier(
+          provider,
+          getWorkspaceAiSelection(scopeId).serviceTier,
+          providersConfig
+        );
+        const tier = toggleServiceTier(currentTier, targetTier);
+        setWorkspaceServiceTier(client, scopeId, tier);
+        const enabled = tier === targetTier;
         return complete("consume", [
           showToast({
             id: Date.now().toString(),

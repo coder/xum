@@ -3113,7 +3113,8 @@ describe("ProviderModelFactory Anthropic Fast mode", () => {
   unsetEnvForEachTest("ANTHROPIC_BASE_URL");
   const sendOnce = async (
     anthropicConfig: Record<string, unknown>,
-    modelString: string
+    modelString: string,
+    chatServiceTier?: ServiceTier
   ): Promise<CapturedFetchCall> => {
     let captured: CapturedFetchCall | undefined;
     await withTempConfig(async (_config, factory, _oauth, store) => {
@@ -3121,7 +3122,10 @@ describe("ProviderModelFactory Anthropic Fast mode", () => {
       const { calls, fakeFetch } = createCapturingFetch();
       const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
       try {
-        const result = await factory.createModel(modelString);
+        const result = await factory.createModel(
+          modelString,
+          chatServiceTier != null ? { openai: { serviceTier: chatServiceTier } } : undefined
+        );
         if (!result.success) throw new Error(result.error.type);
         await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
           () => undefined
@@ -3157,6 +3161,97 @@ describe("ProviderModelFactory Anthropic Fast mode", () => {
     const call = await sendOnce(anthropicConfig, modelString);
     expect(parseSentBody(call)).not.toHaveProperty("speed");
     expect(betaHeader(call)).not.toContain("fast-mode-2026-02-01");
+  });
+
+  // Speed is the chat's choice, like reasoning: it follows the chat across models.
+  it("lets the chat's speed pick override the provider preference", async () => {
+    const fast = await sendOnce({}, "anthropic:claude-opus-5-5", "priority");
+    expect(parseSentBody(fast)).toMatchObject({ speed: "fast" });
+    expect(betaHeader(fast)).toContain("fast-mode-2026-02-01");
+
+    const standard = await sendOnce({ speed: "fast" }, "anthropic:claude-opus-5-5", "default");
+    expect(parseSentBody(standard)).not.toHaveProperty("speed");
+
+    const unsupported = await sendOnce({}, "anthropic:claude-opus-4-7", "priority");
+    expect(parseSentBody(unsupported)).not.toHaveProperty("speed");
+  });
+
+  it("applies a mid-turn chat speed change to the next call", async () => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ anthropic: { apiKey: "test-key" } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      const chat: { serviceTier?: ServiceTier } = {};
+      try {
+        const result = await factory.createModel("anthropic:claude-opus-5-5", undefined, {
+          getServiceTierOverride: () => chat.serviceTier,
+        });
+        if (!result.success) throw new Error(result.error.type);
+        const send = () =>
+          generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+            () => undefined
+          );
+        await send();
+        chat.serviceTier = "priority";
+        await send();
+        chat.serviceTier = "default";
+        await send();
+        expect(calls.map((call) => parseSentBody(call).speed)).toEqual([
+          undefined,
+          "fast",
+          undefined,
+        ]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+});
+
+describe("ProviderModelFactory xAI chat speed", () => {
+  const sentTiers = async (
+    xaiConfig: Record<string, unknown>,
+    modelString: string,
+    tiers: Array<ServiceTier | undefined>
+  ): Promise<unknown[]> => {
+    let sent: unknown[] = [];
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ xai: { apiKey: "test-key", ...xaiConfig } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      const chat: { serviceTier?: ServiceTier } = { serviceTier: tiers[0] };
+      try {
+        const result = await factory.createModel(modelString, undefined, {
+          getServiceTierOverride: () => chat.serviceTier,
+        });
+        if (!result.success) throw new Error(result.error.type);
+        for (const tier of tiers) {
+          chat.serviceTier = tier;
+          await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+            () => undefined
+          );
+        }
+        sent = calls.map((call) => parseSentBody(call).service_tier);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+    return sent;
+  };
+
+  it("follows the chat's pick per request over the provider tier", async () => {
+    expect(
+      await sentTiers({ serviceTier: "priority" }, "xai:grok-4.7", [
+        undefined,
+        "default",
+        "priority",
+        "ultrafast",
+      ])
+    ).toEqual(["priority", "default", "priority", "default"]);
+  });
+
+  it("keeps non-frontier Grok on the provider tier", async () => {
+    expect(await sentTiers({}, "xai:grok-code-fast-1", ["priority"])).toEqual([undefined]);
   });
 });
 

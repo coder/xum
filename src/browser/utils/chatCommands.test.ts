@@ -613,19 +613,30 @@ describe("processSlashCommand speed toggles", () => {
     }
   );
 
-  test.each([
-    ["anthropic:claude-opus-5-5", "anthropic", "speed", "fast"],
-    ["xai:grok-4.7", "xai", "serviceTier", "priority"],
-  ])("uses the native preference for %s", async (model, provider, key, value) => {
-    const { run, setProviderConfig } = setup(model);
+  test.each(["anthropic:claude-opus-5-5", "xai:grok-4.7"])(
+    "keeps %s speed on the chat instead of the provider",
+    async (model) => {
+      const { run, setProviderConfig, setActiveTurnServiceTier } = setup(model);
+      expectDisposition((await run("/fast")).result, "consume");
+      expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("priority");
+      expect(getWorkspaceAiSelection("other-chat").serviceTier).toBeUndefined();
+      expect(setActiveTurnServiceTier).toHaveBeenLastCalledWith({
+        workspaceId: "test-ws",
+        serviceTier: "priority",
+      });
+      expectDisposition((await run("/fast")).result, "consume");
+      expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("default");
+      expect(setProviderConfig).not.toHaveBeenCalled();
+    }
+  );
+
+  test("turns an inherited provider Fast default off for this chat only", async () => {
+    const { run, setProviderConfig } = setup("anthropic:claude-opus-5-5");
+    config.anthropic.speed = "fast";
     expectDisposition((await run("/fast")).result, "consume");
-    expect(setProviderConfig).toHaveBeenCalledWith({ provider, keyPath: [key], value });
-    expectDisposition((await run("/fast")).result, "consume");
-    expect(setProviderConfig).toHaveBeenLastCalledWith({
-      provider,
-      keyPath: [key === "speed" ? key : "fastModePreviousServiceTier"],
-      value: "",
-    });
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("default");
+    expect(config.anthropic.speed).toBe("fast");
+    expect(setProviderConfig).not.toHaveBeenCalled();
   });
 
   test.each([
@@ -655,12 +666,12 @@ describe("processSlashCommand speed toggles", () => {
     expect(setProviderConfig).not.toHaveBeenCalled();
   });
 
-  test("refreshes after a failed write and releases the toggle guard", async () => {
-    const { run, setProviderConfig } = setup("xai:grok-4.7");
-    setProviderConfig.mockRejectedValueOnce(new Error("write failed"));
+  test("refreshes after a failed config read and releases the toggle guard", async () => {
+    const { run, getConfig } = setup("xai:grok-4.7");
+    getConfig.mockRejectedValueOnce(new Error("read failed"));
     expectDisposition((await run("/fast")).result, "restore-if-empty");
     expect(store.refresh).toHaveBeenCalledTimes(1);
-    expect(store.updateOptimistically).not.toHaveBeenCalled();
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBeUndefined();
     expectDisposition((await run("/fast")).result, "consume");
   });
 

@@ -181,8 +181,7 @@ describeIntegration("Thinking selector", () => {
       }
       fireEvent.click(container.querySelector("[data-thinking-selector-trigger]")!);
 
-      // Workspace-scoped Pro state survives model switches; OpenAI fast mode remains
-      // in its provider config and becomes active again when returning to OpenAI.
+      // Workspace-scoped Pro and Fast state survive model switches, like the thinking level.
       await selectModel(container, harness.workspaceId, SOL_MODEL);
       menu = await openThinkingSelector(container);
       await expectPressed(within(menu).getByRole("button", { name: /Pro mode/i }), true);
@@ -207,7 +206,7 @@ describeIntegration("Thinking selector", () => {
       fireEvent.click(container.querySelector("[data-thinking-selector-trigger]")!);
 
       // Grok uses the same thinking selector with its native low/medium/high/xhigh
-      // ladder, while Fast mode writes xAI's priority tier instead of OpenAI's.
+      // ladder; its Fast toggle reads and writes the same chat speed as OpenAI's.
       await selectModel(container, harness.workspaceId, KNOWN_MODELS.GROK_47.id);
       menu = await openThinkingSelector(container);
       if (menu.querySelector('[data-component="ProModeToggle"]')) {
@@ -227,6 +226,12 @@ describeIntegration("Thinking selector", () => {
       if (!container.querySelector("[data-fast-mode-indicator]")) {
         throw new Error("Grok fast-mode indicator was not rendered");
       }
+      fireEvent.click(container.querySelector("[data-thinking-selector-trigger]")!);
+
+      // The chat's Fast pick follows it back to OpenAI instead of the provider's setting.
+      await selectModel(container, harness.workspaceId, SOL_MODEL);
+      menu = await openThinkingSelector(container);
+      await expectPressed(within(menu).getByRole("button", { name: /^Fast mode/i }), true);
     } finally {
       await harness.dispose();
     }
