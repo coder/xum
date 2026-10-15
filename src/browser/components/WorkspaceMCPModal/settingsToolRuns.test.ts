@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
   clearSettingsToolResults,
   forgetSettingsToolRuns,
+  forgetSettingsToolRunsExcept,
   publishSettingsToolWrite,
   subscribeSettingsToolWrites,
   settingsToolRunsOf,
@@ -55,4 +56,13 @@ test("a writing run's end reaches the dialogs of its workspace only", async () =
   await publishSettingsToolWrite("ws-write", "cad", readWithoutDialog);
   other();
   expect(reread).toEqual(["cad", "backend"]);
+});
+
+test("a metadata snapshot drops the runs of workspaces it no longer lists", () => {
+  const kept = startSettingsToolRun("ws-listed", "cad", "cad.reset");
+  startSettingsToolRun("ws-deleted-elsewhere", "cad", "cad.reset");
+  forgetSettingsToolRunsExcept(new Set(["ws-listed"]));
+  expect(settingsToolRunsOf("ws-deleted-elsewhere")).toEqual({});
+  expect(settingsToolRunsOf("ws-listed").cad?.running).toEqual(["cad.reset"]);
+  kept(null);
 });

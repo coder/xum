@@ -1,4 +1,7 @@
-import { forgetSettingsToolRuns } from "@/browser/components/WorkspaceMCPModal/settingsToolRuns";
+import {
+  forgetSettingsToolRuns,
+  forgetSettingsToolRunsExcept,
+} from "@/browser/components/WorkspaceMCPModal/settingsToolRuns";
 import {
   createContext,
   useCallback,
@@ -975,6 +978,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             arrivals.lastSnapshot = arrivals.count;
             arrivals.lastByWorkspaceId.clear();
             setWorkspaceMetadata(buildActiveWorkspaceMetadataMap(event.workspaces));
+            forgetSettingsToolRunsExcept(new Set(event.workspaces.map((w) => w.id)));
             setLoaded(true);
             setLoadError(null);
             if (!snapshotApplied) {
