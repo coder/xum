@@ -295,9 +295,17 @@ function sendTakeOf(mark: Entry["sendMark"], sent: string, text: string | undefi
   return mark.intact && mark.last === text ? "typed-after" : "unknown";
 }
 
-/** The sender's own take, for the backend to repeat on the same text (DraftBeginSendInput). */
-function localTakeField(take: SendTake, from: string, to: string): { localTake?: LocalTake } {
-  return take === "unknown" ? {} : { localTake: { from, to } };
+/**
+ * The sender's own take, for the backend to repeat on the same text (DraftBeginSendInput). The
+ * text goes once: as `text` when it is unsaved, else as `from`.
+ */
+function localTakeField(
+  take: SendTake,
+  from: string,
+  unsavedText: string | undefined
+): { localTake?: LocalTake } {
+  if (take === "unknown") return {};
+  return { localTake: { kind: take, ...(unsavedText === undefined ? { from } : {}) } };
 }
 
 function isTextDirty(entry: Entry): boolean {
@@ -1056,7 +1064,7 @@ export class DraftStore {
           pendingSend,
           attachments: input.attachments,
           ...(unsavedText !== undefined ? { text: unsavedText } : {}),
-          ...localTakeField(take, textBefore, textAfter),
+          ...localTakeField(take, textBefore, unsavedText),
           ...(basisSends.length > 0 ? { basisSends } : {}),
         });
         // A replaced backend's reply: the current one holds neither the removal nor the

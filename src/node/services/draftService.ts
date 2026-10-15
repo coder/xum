@@ -44,6 +44,7 @@ import {
   joinDraftText,
   removeDraftBlock,
   removeSentText,
+  takeSentText,
 } from "@/common/utils/composerDraftText";
 import {
   buildLegacyDraftText,
@@ -656,7 +657,7 @@ export class DraftService extends EventEmitter {
       }
       const merged = mergeWrite(current, { text: input.text }, basis, accepted);
       const next = storedDraftFrom(
-        visibleAfterTake(merged.visibleText, pendingSend.text, input.localTake),
+        visibleAfterTake(merged.visibleText, pendingSend.text, input),
         attachments,
         [...current.pendingSends, pendingSend]
       );
@@ -1316,6 +1317,14 @@ async function readDirNames(dir: string, options?: { dirsOnly: boolean }): Promi
  * applies only to the exact text it took from: any other text (another window's newer write)
  * keeps the whitespace rule.
  */
-function visibleAfterTake(visible: string, sent: string, localTake: LocalTake | undefined): string {
-  return localTake?.from === visible ? localTake.to : removeSentText(visible, sent);
+function visibleAfterTake(
+  visible: string,
+  sent: string,
+  input: { text?: string; localTake?: LocalTake }
+): string {
+  const take = input.localTake;
+  if (take === undefined || (take.from ?? input.text) !== visible) {
+    return removeSentText(visible, sent);
+  }
+  return takeSentText(visible, sent, take.kind);
 }

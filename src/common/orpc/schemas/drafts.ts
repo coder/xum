@@ -184,12 +184,14 @@ export const DraftBeginSendInputSchema = z.object({
    */
   text: z.string().optional(),
   /**
-   * #6405, #6585: the sender's own take of the sent text: from its visible text `from` to `to`
-   * (takeSentText with what the sender saw since Enter). The backend repeats it only when its
-   * visible text (after `text` is merged in) is exactly `from`. Otherwise it applies the
-   * whitespace rule (removeSentText).
+   * #6405, #6585: how the sender took the sent text (takeSentText with what it saw since Enter),
+   * from its visible text `from`, or `text` when `from` is absent (one copy of the text per
+   * request). The backend repeats that take only when its visible text (after `text` is merged
+   * in) is exactly that text. Otherwise it applies the whitespace rule (removeSentText).
    */
-  localTake: z.object({ from: z.string(), to: z.string() }).optional(),
+  localTake: z
+    .object({ kind: z.enum(["typed-after", "edited"]), from: z.string().optional() })
+    .optional(),
   /** As for drafts.update: the pending sends the sender's unsaved text was written against. */
   basisSends: z.array(BasisSendSchema).max(1000).optional(),
 });

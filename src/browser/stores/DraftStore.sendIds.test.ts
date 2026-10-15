@@ -5,7 +5,7 @@
  */
 import * as fs from "fs/promises";
 import * as path from "path";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestApiClient } from "@/browser/testUtils";
 import type { DraftAttachment, DraftEvent, PendingSend } from "@/common/orpc/schemas/drafts";
 import type { FilePart } from "@/common/orpc/types";
@@ -404,6 +404,32 @@ describe("DraftStore idempotent sends", () => {
       expect(await takeAfter([{ edited: "yes please" }], { flushFirst: true })).toEqual(kept);
       // Typing at the end afterwards does not make the edit typing.
       expect(await takeAfter([{ edited: "yes" }, "yes please"])).toEqual(kept);
+    });
+
+    // A draft near the size limit must still fit the request: the take adds no copy of it.
+    test("the request carries the composer text once, saved or not", async () => {
+      using tempDir = new TestTempDir("draft-sends-one-copy");
+      const { service, client } = await createHarness(tempDir);
+      const sent = spyOn(service, "beginSend");
+      const store = createStore(client);
+      await store.whenReady();
+      for (const flushFirst of [false, true]) {
+        store.setText(SCOPE, "yes");
+        store.markSendStart(SCOPE, "yes");
+        store.markSendEdited(SCOPE);
+        store.setText(SCOPE, "yes please");
+        if (flushFirst) await store.flush(SCOPE);
+        const send = pendingSend(`s-${flushFirst}`, "yes", RECEIVER);
+        await store.beginSend(SCOPE, {
+          sendId: send.sendId,
+          text: send.text,
+          attachments: [],
+          request: send.request,
+        });
+        const input = sent.mock.calls.at(-1)?.[0];
+        const copies = [input?.text, input?.localTake?.from].filter((text) => text !== undefined);
+        expect(copies).toEqual(["yes please"]);
+      }
     });
   });
 

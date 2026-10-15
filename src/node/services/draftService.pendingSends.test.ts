@@ -135,7 +135,7 @@ describe("DraftService pending sends", () => {
       pendingSend: pendingSend("s1", "first message"),
       attachments: [],
       text: "first messagex",
-      localTake: { from: "first messagex", to: "x" },
+      localTake: { kind: "typed-after" },
     });
     expect((await service.get(SCOPE)).text).toBe("x");
     expect((await readFile(file)).text).toBe("first message\n\nx");
@@ -159,7 +159,7 @@ describe("DraftService pending sends", () => {
       scope: SCOPE,
       pendingSend: pendingSend("s2", "yes"),
       attachments: [],
-      localTake: { from: "yesx", to: "x" },
+      localTake: { kind: "typed-after", from: "yesx" },
     });
     expect((await service.get(SCOPE)).text).toBe("yes, from the other window");
     // Saved and unchanged since: the prefix goes.
@@ -168,7 +168,7 @@ describe("DraftService pending sends", () => {
       scope: SCOPE,
       pendingSend: pendingSend("s3", "yes"),
       attachments: [],
-      localTake: { from: "yesx", to: "x" },
+      localTake: { kind: "typed-after", from: "yesx" },
     });
     expect((await service.get(SCOPE)).text).toBe("x");
   });
@@ -184,7 +184,7 @@ describe("DraftService pending sends", () => {
       pendingSend: pendingSend("s1", "Fix the bug"),
       attachments: [],
       text: pasted,
-      localTake: { from: pasted, to: pasted },
+      localTake: { kind: "edited" },
     });
     expect((await service.get(SCOPE)).text).toBe(pasted);
   });

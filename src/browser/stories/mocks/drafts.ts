@@ -7,7 +7,7 @@ import type {
   DraftUpdateInput,
   DraftWriteOutput,
 } from "@/common/orpc/schemas/drafts";
-import { removeSentText } from "@/common/utils/composerDraftText";
+import { removeSentText, takeSentText } from "@/common/utils/composerDraftText";
 import { draftScopeKey, summarizeDraft, toDraftAttachmentMetadata } from "@/common/utils/drafts";
 
 interface StoredDraft {
@@ -87,8 +87,8 @@ export function createMockDraftsApi() {
         write({
           scope: input.scope,
           text:
-            input.localTake?.from === visible
-              ? input.localTake.to
+            input.localTake && (input.localTake.from ?? input.text) === visible
+              ? takeSentText(visible, input.pendingSend.text, input.localTake.kind)
               : removeSentText(visible, input.pendingSend.text),
           attachments: (current?.attachments ?? []).filter(({ id }) => !taken.has(id)),
         })
