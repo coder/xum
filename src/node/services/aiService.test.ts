@@ -5996,8 +5996,8 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
     return { system: body.system, messages: body.messages };
   }
 
-  it("sends a hot-memory change as a row that extends the previous request byte for byte", async () => {
-    using xumHome = new DisposableTempDir("ai-service-volatile-tail-row");
+  /** A real TurnRequestBuilder and request pipeline on Opus 5.5 with a hot-memories tail. */
+  async function setup(xumHome: DisposableTempDir) {
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
     const workspaceId = "workspace-volatile-tail-row";
@@ -6052,12 +6052,28 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
       });
     });
 
-    // Each turn sends the persisted history; the previous answer carries its stream's record.
-    const history: MuxMessage[] = [];
-    const runTurn = async (user: string, hot: string) => {
-      history.push(createMuxMessage(`u-${history.length}`, "user", user));
+    const mcp = { failedServerNames: [] as string[] };
+    service.turnRequestBuilderBindings.mcpServerManager = {
+      listServers: () => Promise.resolve({}),
+      getToolsForWorkspace: () =>
+        Promise.resolve({
+          tools: {},
+          promptDescriptors: [],
+          stats: {
+            totalTools: 0,
+            activeServerCount: 1,
+            failedServerCount: mcp.failedServerNames.length,
+            failedServerNames: mcp.failedServerNames,
+          },
+        }),
+    } as unknown as MCPServerManager;
+    const send = async (
+      messages: MuxMessage[],
+      hot: string,
+      extra: Partial<Parameters<typeof service.streamMessage>[0]> = {}
+    ) => {
       const result = await service.streamMessage({
-        messages: [...history],
+        messages,
         workspaceId,
         modelString: KNOWN_MODELS.OPUS.id,
         thinkingLevel: "high",
@@ -6066,9 +6082,26 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
             indexEntries: [],
             hotMemoriesBlock: `<hot_memories>${hot}</hot_memories>`,
           }),
+        ...extra,
       });
       expect(result.success).toBe(true);
-      const call = startStreamCalls.at(-1)!;
+      return startStreamCalls.at(-1)!;
+    };
+    return { workspaceId, mcp, send };
+  }
+
+  const hotTail = (text: string) => `\n\n<hot_memories>${text}</hot_memories>`;
+  const systemRows = (call: TurnExecutionOptions) =>
+    call.messages.filter((message) => message.role === "system");
+
+  it("sends a hot-memory change as a row that extends the previous request byte for byte", async () => {
+    using xumHome = new DisposableTempDir("ai-service-volatile-tail-row");
+    const { send } = await setup(xumHome);
+    // Each turn sends the persisted history; the previous answer carries its stream's record.
+    const history: MuxMessage[] = [];
+    const runTurn = async (user: string, hot: string) => {
+      history.push(createMuxMessage(`u-${history.length}`, "user", user));
+      const call = await send([...history], hot);
       history.push(
         createMuxMessage(`a-${history.length}`, "assistant", `answer to ${user}`, {
           ...(call.initialMetadata?.volatileSystemTail != null
@@ -6106,6 +6139,76 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
     expect(extends_(second.body, third.body)).toBe(true);
     expect((third.body.messages.at(-1) as { role: string }).role).toBe("user");
     expect(third.call.initialMetadata?.volatileSystemTail).toBeUndefined();
+  });
+
+  it("records the tail plan of the request a thinking-level fold sent", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6sqho6): the level decides whether a reasoning-only row (and
+    // the tail row before it) is sent. At "high" row B replays before r0, so nothing changed;
+    // at "off" r0 is dropped, so the request appends B again and the row must record it.
+    using xumHome = new DisposableTempDir("ai-service-volatile-tail-fold");
+    const { send } = await setup(xumHome);
+    const history = [
+      createMuxMessage("u1", "user", "first"),
+      createMuxMessage("a1", "assistant", "answer", {
+        volatileSystemTail: { text: hotTail("A"), placement: "system" },
+      }),
+      createMuxMessage("u2", "user", "second"),
+      createMuxMessage(
+        "r0",
+        "assistant",
+        "",
+        { volatileSystemTail: { text: hotTail("B"), placement: "row" } },
+        [{ type: "reasoning", text: "thinking", signature: "sig-r0" }]
+      ),
+      createMuxMessage("u3", "user", "third"),
+    ];
+    const unfolded = await send(history, "B", { modelString: KNOWN_MODELS.HAIKU.id });
+    expect(unfolded.initialMetadata?.volatileSystemTail).toBeUndefined();
+    const folded = await send(history, "B", {
+      modelString: KNOWN_MODELS.HAIKU.id,
+      activeTurnThinkingOverride: { pending: "off" },
+    });
+    expect(folded.messages.at(-1)?.role).toBe("system");
+    expect(folded.initialMetadata?.volatileSystemTail).toEqual({
+      text: hotTail("B"),
+      placement: "row",
+    });
+    // The step-0 rebuild returns its record too, for StreamManager to apply.
+    const rebuilt = await unfolded.rebuildFirstStepForThinkingLevel!("off", {});
+    expect(rebuilt.volatileSystemTail).toEqual({ text: hotTail("B"), placement: "row" });
+  });
+
+  it("sends as before when middleware edited a volatile section", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6sqhpD): the edited hot memories end up in the stable part, and
+    // only the MCP warning still ends the prompt. A row with just the warning would tell the
+    // model the hot memories are gone.
+    using xumHome = new DisposableTempDir("ai-service-volatile-tail-middleware");
+    const { send, mcp, workspaceId } = await setup(xumHome);
+    const history = [
+      createMuxMessage("u1", "user", "first"),
+      createMuxMessage("a1", "assistant", "answer", {
+        volatileSystemTail: { text: hotTail("A"), placement: "system" },
+      }),
+      createMuxMessage("u2", "user", "second"),
+    ];
+    mcp.failedServerNames = ["alpha-server"];
+    const remove = eventSpine.useBefore(
+      "request.assemble",
+      (ctx: RequestAssembleContext) => {
+        ctx.systemMessage = ctx.systemMessage.replace("note v2", "note v2 (edited)");
+      },
+      { workspaceId }
+    );
+    try {
+      const call = await send(history, "note v2");
+      expect(systemRows(call)).toHaveLength(1);
+      const prompt = JSON.stringify(systemRows(call)[0]);
+      expect(prompt).toContain("note v2 (edited)");
+      expect(prompt).toContain("alpha-server");
+      expect(call.initialMetadata?.volatileSystemTail).toBeUndefined();
+    } finally {
+      remove();
+    }
   });
 });
 

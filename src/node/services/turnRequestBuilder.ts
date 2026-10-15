@@ -234,7 +234,7 @@ import {
   buildContextWindowSection,
   buildStreamSystemContext,
   formatMcpWarningSection,
-  measureVolatileSystemSuffix,
+  measureWholeVolatileSystemSuffix,
   prepareProviderRequestMessages,
   removeIntuitionGuidance,
   selectActiveContextMessages,
@@ -618,9 +618,18 @@ export async function assembleBudgetCheckedPromptPayload(
 }
 
 /**
- * The assistant row's tail record (MuxMetadata.volatileSystemTail). Absent records nothing, so
- * a fallback attempt that only repeats the tail keeps the record the primary attempt wrote.
+ * The tail record for the turn's assistant row: what this request sent, or, when a refusal
+ * fallback continues this turn's row and sends nothing new, the record the row already holds
+ * (the rows of its earlier request stay in place before it).
  */
+function rowVolatileSystemTail(
+  payload: { volatileSystemTail?: VolatileSystemTailRecord },
+  continuation: MuxMessage | undefined
+): VolatileSystemTailRecord | undefined {
+  return payload.volatileSystemTail ?? continuation?.metadata?.volatileSystemTail;
+}
+
+/** The assistant row's tail record (MuxMetadata.volatileSystemTail); absent records nothing. */
 function volatileSystemTailMetadata(record: VolatileSystemTailRecord | undefined): {
   volatileSystemTail?: VolatileSystemTailRecord;
 } {
@@ -3055,8 +3064,9 @@ export class TurnRequestBuilder {
             );
             attemptSystemTokens += await tokenizer.countTokens(section);
           }
-          // Re-measured on every render: the window section can change length.
-          attemptVolatileSystemSuffixLength = measureVolatileSystemSuffix(attemptSystem, [
+          // Re-measured on every render: the window section can change length. A tail that
+          // middleware edited is not split at all (no rows either, see planSystemPrompt).
+          attemptVolatileSystemSuffixLength = measureWholeVolatileSystemSuffix(attemptSystem, [
             systemContext.hotMemoriesSection,
             mcpWarningSection,
             section,
@@ -3198,17 +3208,25 @@ export class TurnRequestBuilder {
             mcpAppModelContextMessage: mcpAppContextMessage,
           });
         };
+        // The level decides which reasoning-only rows are sent, and with them the tail rows:
+        // a rebuild returns its own tail record for the turn's row.
         const rebuildMessagesForThinkingLevel = async (level: ThinkingLevel) => {
           const rebuiltPayload = await assemblePayloadForThinkingLevel(level);
-          return rebuiltPayload.messages;
+          return {
+            messages: rebuiltPayload.messages,
+            volatileSystemTail: rowVolatileSystemTail(
+              rebuiltPayload,
+              options.partialContinuationMessage
+            ),
+          };
         };
         const rebuildFirstStepForThinkingLevel: RebuildFirstStepForThinkingLevel = async (
           level,
           providerOptionsForEnvelope
         ) => {
-          const rebuiltMessages = await rebuildMessagesForThinkingLevel(level);
+          const rebuilt = await rebuildMessagesForThinkingLevel(level);
           await emitEnvelopeWith(level, providerOptionsForEnvelope);
-          return rebuiltMessages;
+          return rebuilt;
         };
 
         return {
@@ -3217,7 +3235,10 @@ export class TurnRequestBuilder {
           messages: finalMessages,
           system: attemptSystem,
           engineSystem: attemptPayload.system,
-          volatileSystemTail: attemptPayload.volatileSystemTail,
+          volatileSystemTail: rowVolatileSystemTail(
+            attemptPayload,
+            options.partialContinuationMessage
+          ),
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
           contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
           ...compactionInputBudget,
@@ -3245,7 +3266,10 @@ export class TurnRequestBuilder {
               system: attemptSystem,
               systemMessageTokens: attemptSystemTokens,
               engineSystem: payload.system,
-              volatileSystemTail: payload.volatileSystemTail,
+              volatileSystemTail: rowVolatileSystemTail(
+                payload,
+                options.partialContinuationMessage
+              ),
               messages: payload.messages,
               contextBudgetLimit: payload.contextBudgetLimit,
               contextBudgetEstimate: payload.contextBudgetEstimate,
@@ -3362,7 +3386,6 @@ export class TurnRequestBuilder {
         routedThroughGateway,
         systemMessageTokens,
         agentId: effectiveAgentId,
-        ...volatileSystemTailMetadata(primaryRequest.volatileSystemTail),
       });
 
       const appendResult = await this.dependencies.historyService.appendToHistory(
@@ -3650,7 +3673,8 @@ export class TurnRequestBuilder {
                       ? { routeProvider: nextRequest.routeProvider }
                       : {}),
                     systemMessageTokens: nextRequest.systemMessageTokens,
-                    ...volatileSystemTailMetadata(nextRequest.volatileSystemTail),
+                    // Exact: the fallback's request decides what the row recorded.
+                    volatileSystemTail: nextRequest.volatileSystemTail,
                   },
                 });
               },
@@ -3674,6 +3698,7 @@ export class TurnRequestBuilder {
       let streamThinkingLevel = effectiveThinkingLevel;
       let streamProviderOptions = mergedProviderOptions;
       let streamFinalMessages = finalMessages;
+      let streamVolatileSystemTail = primaryRequest.volatileSystemTail;
       while (activeTurnThinkingOverride?.pending != null) {
         const pendingPreparingLevel = activeTurnThinkingOverride.pending;
         activeTurnThinkingOverride.pending = undefined;
@@ -3688,9 +3713,8 @@ export class TurnRequestBuilder {
           continue;
         }
         try {
-          streamFinalMessages = await primaryRequest.rebuildMessagesForThinkingLevel(
-            folded.effectiveLevel
-          );
+          ({ messages: streamFinalMessages, volatileSystemTail: streamVolatileSystemTail } =
+            await primaryRequest.rebuildMessagesForThinkingLevel(folded.effectiveLevel));
         } catch (error) {
           if (error instanceof ContextBudgetExceededError) {
             runLanguageModelCleanup(modelResult.data.model);
@@ -3730,7 +3754,7 @@ export class TurnRequestBuilder {
           timestamp: Date.now(),
           agentId: effectiveAgentId,
           // Where this request sent the volatile system tail, so the next rebuild repeats it.
-          ...volatileSystemTailMetadata(primaryRequest.volatileSystemTail),
+          ...volatileSystemTailMetadata(streamVolatileSystemTail),
           ...(legacyModeForMetadata != null ? { mode: legacyModeForMetadata } : {}),
           routedThroughGateway,
           ...(routeProvider != null ? { routeProvider } : {}),

@@ -171,6 +171,20 @@ export function measureVolatileSystemSuffix(
   return end > 0 ? systemMessage.length - end : 0;
 }
 
+/**
+ * measureVolatileSystemSuffix, but 0 unless every present section ends the message intact. A
+ * partial split means middleware edited or appended text, so part of the volatile content sits
+ * in the stable part, and the volatile-tail rows (mechanism 10) must not run on the rest.
+ */
+export function measureWholeVolatileSystemSuffix(
+  systemMessage: string,
+  sections: ReadonlyArray<string | null | undefined>
+): number {
+  const length = measureVolatileSystemSuffix(systemMessage, sections);
+  const whole = sections.reduce((sum, section) => sum + (section?.length ?? 0), 0);
+  return length === whole ? length : 0;
+}
+
 export interface PromptPayload {
   providerRequestMessages: MuxMessage[];
   messages: ModelMessage[];
@@ -349,10 +363,14 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
     options.anthropicCacheTtl,
     options.providersConfig
   );
+  // Length 0 means no volatile sections, or a tail the caller could not split off (middleware
+  // edited it; turnRequestBuilder passes 0 then). Either way this request sends as before and
+  // records nothing: a row could only claim that sections still in the prompt are gone.
   const tailPlan = planVolatileSystemTail(
     history,
     options.systemMessage.slice(stableSystem.length),
-    cachedSystemMessage != null &&
+    volatileLength > 0 &&
+      cachedSystemMessage != null &&
       acceptsVolatileSystemTailRow(
         options.modelString,
         options.routeProvider,

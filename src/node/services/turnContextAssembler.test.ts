@@ -793,6 +793,60 @@ describe("assemblePromptPayload", () => {
       expect(resumed.volatileSystemTail).toEqual({ text: hot("B"), placement: "system" });
     });
 
+    test("a re-freeze after an assistant-last resume drops the rows before it", async () => {
+      // Codex P1 (PRRT_kwDOPxxmWM6sqho9): row B says it replaces the earlier sections, so if
+      // it stayed after a re-freeze at C, the model would read B as the newer tail.
+      const history = [
+        createMuxMessage("u1", "user", "first"),
+        answer("a1", "system", hot("A")),
+        createMuxMessage("u2", "user", "second"),
+        answer("a2", "row", hot("B")),
+        createMuxMessage("u3", "user", "third"),
+        createMuxMessage("a3", "assistant", "partial", { partial: true }),
+      ];
+      const resumed = await withTail(hot("C"), history);
+      expect(resumed.volatileSystemTail).toEqual({ text: hot("C"), placement: "system" });
+      expect(roles(resumed).filter((role) => role.startsWith("system"))).toEqual([
+        "system:stable",
+        `system:${hot("C")}`,
+      ]);
+
+      // The next turn keeps the re-freeze: C stays in the system prompt and B does not return.
+      const next = await withTail(hot("C"), [
+        ...history.slice(0, -1),
+        answer("a3", "system", hot("C"), { partial: true }),
+        createMuxMessage("u4", "user", "fourth"),
+      ]);
+      expect(next.volatileSystemTail).toBeUndefined();
+      expect(roles(next).filter((role) => role.startsWith("system"))).toEqual([
+        "system:stable",
+        `system:${hot("C")}`,
+      ]);
+    });
+
+    test("an empty or unsplittable tail turns the rows off for the request", async () => {
+      // Codex P2 (PRRT_kwDOPxxmWM6sqhpD): length 0 also means turnRequestBuilder could not
+      // split the tail off (middleware edited it), so its content may be in the stable part. A
+      // row there would claim the frozen sections are gone while they are still present.
+      const history = [
+        createMuxMessage("u1", "user", "first"),
+        answer("a1", "system", hot("A")),
+        createMuxMessage("u2", "user", "second"),
+        answer("a2", "row", hot("B")),
+        createMuxMessage("u3", "user", "third"),
+      ];
+      const prompt = `${stable}${hot("C")}\nappended by middleware`;
+      const payload = await assemble({
+        ...opus,
+        history,
+        systemMessage: prompt,
+        volatileSystemSuffixLength: 0,
+      });
+      expect(payload.messages[0]).toMatchObject({ role: "system", content: prompt });
+      expect(payload.messages.filter((message) => message.role === "system")).toHaveLength(1);
+      expect(payload.volatileSystemTail).toBeUndefined();
+    });
+
     test("a compaction boundary starts a new segment with the live tail", async () => {
       const boundary = createMuxMessage("boundary", "assistant", "Compacted summary", {
         compacted: "user",

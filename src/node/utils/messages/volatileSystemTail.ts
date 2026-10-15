@@ -1,4 +1,5 @@
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import assert from "@/common/utils/assert";
 import type { MuxMessage, VolatileSystemTailRecord } from "@/common/types/message";
 import { anthropicBindsThinkingToPrefix } from "@/common/types/thinking";
 import { findLatestContextBoundaryIndex } from "@/common/utils/messages/compactionBoundary";
@@ -61,10 +62,8 @@ function systemRow(id: string, tail: string): MuxMessage {
   return {
     id,
     role: "system",
-    // The tail starts with its own "\n\n" separator; an empty tail means every section is gone.
-    parts: [
-      { type: "text", text: ROW_HEADER + (tail === "" ? "\n\nNone are present now." : tail) },
-    ],
+    // The tail starts with its own "\n\n" separator (never empty: see planVolatileSystemTail).
+    parts: [{ type: "text", text: ROW_HEADER + tail }],
   };
 }
 
@@ -80,11 +79,11 @@ export interface VolatileSystemTailPlan {
 }
 
 /** The segment's recorded assistant rows (after the latest context boundary), in order. */
-function readSegmentRecords(messages: MuxMessage[]): Map<MuxMessage, VolatileSystemTailRecord> {
-  const records = new Map<MuxMessage, VolatileSystemTailRecord>();
+function readSegmentRecords(messages: MuxMessage[]): Array<[MuxMessage, VolatileSystemTailRecord]> {
+  const records: Array<[MuxMessage, VolatileSystemTailRecord]> = [];
   for (const message of messages.slice(findLatestContextBoundaryIndex(messages) + 1)) {
     const record = message.role === "assistant" ? readRecord(message) : undefined;
-    if (record != null) records.set(message, record);
+    if (record != null) records.push([message, record]);
   }
   return records;
 }
@@ -107,7 +106,13 @@ function withRecordedRows(
 /**
  * Where this request sends `liveTail`. `messages` are the rows the request sends (after the
  * boundary slice and the empty-row filter), so a dropped assistant row also drops its row.
- * Unsupported routes keep the old placement and ignore the records.
+ * Unsupported routes keep the old placement and ignore the records. Callers pass
+ * rowsSupported=false for an empty or unsplittable tail, so `liveTail` is never empty here.
+ *
+ * The latest "system" record freezes the segment, and only rows recorded after it apply: each
+ * says it replaces the earlier sections, so a row from before a re-freeze would override the
+ * newer system tail. A re-freeze already rewrites the history (the system prompt changed), so
+ * dropping those rows costs nothing more.
  */
 export function planVolatileSystemTail(
   messages: MuxMessage[],
@@ -115,18 +120,20 @@ export function planVolatileSystemTail(
   rowsSupported: boolean
 ): VolatileSystemTailPlan {
   if (!rowsSupported) return { systemTail: liveTail, messages };
+  assert(liveTail !== "", "a volatile-tail row needs a non-empty tail");
   const records = readSegmentRecords(messages);
-  const sent = [...records.values()];
-  const frozen = sent.findLast((record) => record.placement === "system")?.text;
-  const withRows = withRecordedRows(messages, records);
+  const freeze = records.findLastIndex(([, record]) => record.placement === "system");
+  // Segment start (or a history from before this rule), or a re-freeze below: send as before,
+  // with no earlier rows, and freeze here.
   const asBefore: VolatileSystemTailPlan = {
     systemTail: liveTail,
-    messages: withRows,
+    messages,
     record: { text: liveTail, placement: "system" },
   };
-  // Segment start (or a history from before this rule): send as before and freeze here.
-  if (frozen === undefined) return asBefore;
-  if (liveTail === sent.at(-1)?.text) return { systemTail: frozen, messages: withRows };
+  if (freeze < 0) return asBefore;
+  const frozen = records[freeze][1].text;
+  const withRows = withRecordedRows(messages, new Map(records.slice(freeze + 1)));
+  if (liveTail === records.at(-1)?.[1].text) return { systemTail: frozen, messages: withRows };
   // A row must follow a user message. Otherwise (a resume after an assistant row) send the new
   // tail as before, which re-freezes the segment at it.
   if (messages.at(-1)?.role !== "user") return asBefore;

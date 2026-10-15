@@ -812,7 +812,7 @@ describe("continuous prefix prepareStep and journal", () => {
       swap.prefix = await rebuildContinuousPrefix(swap.journal, workspaceId);
       const state: ActiveTurnThinkingOverride = { applied: "high" };
       const providerOptions = { anthropic: { thinking: { type: "enabled", budgetTokens: 1024 } } };
-      const rebuilt = mock(() => Promise.resolve(originalMessages));
+      const rebuilt = mock(() => Promise.resolve({ messages: originalMessages }));
       const { run, manager, swapState } = await startLiveTurn({
         requestOptions: {
           thinkingLevel: "high",

@@ -57,7 +57,12 @@ import type {
 } from "@/common/types/stream";
 
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
-import type { MuxMetadata, MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
+import type {
+  MuxMetadata,
+  MuxMessage,
+  PersistedToolModelUsage,
+  VolatileSystemTailRecord,
+} from "@/common/types/message";
 import { hasTokenUsage, MODEL_FALLBACK_REFUSAL_TOOL_NAME } from "@/common/types/message";
 import {
   findFirstReasoningPartIndexInTrailingRun,
@@ -473,6 +478,8 @@ interface StepMessageTracker {
   anthropicThinkingStripStep?: number;
   /** True once this turn holds the Anthropic thinking-repair receipt (reads initialMetadata). */
   hasAnthropicReplayReceipt?: () => boolean;
+  /** Replace the row's volatile-tail record (MuxMetadata.volatileSystemTail) after a rebuild. */
+  recordVolatileSystemTail: (record: VolatileSystemTailRecord | undefined) => void;
 }
 interface StreamRequestConfig {
   stopCause?: StreamStopCause;
@@ -3272,10 +3279,8 @@ export class StreamManager {
           appliedLevel != null
         ) {
           try {
-            const rebuilt = await request.rebuildFirstStepForThinkingLevel(
-              appliedLevel,
-              thinkingOverride
-            );
+            const { messages: rebuilt, volatileSystemTail } =
+              await request.rebuildFirstStepForThinkingLevel(appliedLevel, thinkingOverride);
             const receiptApplied = applyTurnReplayReceipt(stepTracker, rebuilt);
             // A retry's step 0 can rebuild this row's earlier steps too: what it stripped
             // is gone from here on, so the receipt's point moves to this step.
@@ -3288,6 +3293,8 @@ export class StreamManager {
             );
             if (stepTracker) {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
+              // The rebuilt request decides which volatile-tail rows the row recorded.
+              stepTracker.recordVolatileSystemTail(volatileSystemTail);
             }
             // onStepMessages fired above with the pre-rebuild transcript;
             // re-notify so consumers track the
@@ -3456,7 +3463,11 @@ export class StreamManager {
       maxOutputTokens,
       runtime,
     } = options;
-    const stepTracker: StepMessageTracker = { workspaceId: options.workspaceId };
+    // The tail hook is wired to streamInfo below, once it exists.
+    const stepTracker: StepMessageTracker = {
+      workspaceId: options.workspaceId,
+      recordVolatileSystemTail: () => undefined,
+    };
     const metadataModel = this.resolveMetadataModel(modelString, options.providersConfigSnapshot);
     const request = this.buildStreamRequestConfig({
       ...options,
@@ -3545,6 +3556,9 @@ export class StreamManager {
     // Single source for same-turn rebuilds: the receipt lives on initialMetadata (#5886).
     stepTracker.hasAnthropicReplayReceipt = () =>
       streamInfo.initialMetadata?.anthropicThinkingReplay === "off";
+    stepTracker.recordVolatileSystemTail = (volatileSystemTail) => {
+      streamInfo.initialMetadata = { ...streamInfo.initialMetadata, volatileSystemTail };
+    };
 
     // Mid-turn thinking override: route applied levels into this stream's
     // metadata (partials, stream-end, final assistant message). Wired before
