@@ -222,6 +222,9 @@ async function runToolHooks(
     if (output.updatedInput !== undefined) {
       await applyUpdatedInput(ctx, output.updatedInput, view, registration, hook);
       if (ctx.blocked) return;
+      // The recorded tool call keeps the model's input (replay must resend its exact bytes), so
+      // the note on the result records what the hook changed (Codex PRRT_kwDOPxxmWM6rb-TX).
+      notes.push(rewriteNote(ctx.args));
     }
     if (output.additionalContext !== undefined) notes.push(output.additionalContext);
   }
@@ -408,6 +411,18 @@ async function applyUpdatedInput(
     return;
   }
   ctx.args = parsed.value;
+}
+
+/** A rewritten input longer than this is cut in its note, so the hook's own context still fits. */
+const REWRITE_NOTE_MAX_CHARS = 2000;
+
+function rewriteNote(args: unknown): string {
+  const text = JSON.stringify(args) ?? String(args);
+  const shown =
+    text.length > REWRITE_NOTE_MAX_CHARS
+      ? `${text.slice(0, REWRITE_NOTE_MAX_CHARS)} [cut]`
+      : text;
+  return `Rewrote this tool call's input to: ${shown}`;
 }
 
 /**

@@ -393,7 +393,7 @@ describe("PreToolUse", () => {
     const ctx = await runTool(spine, "bash", { script: "rm -rf /" }, schema);
 
     expect(seen).toEqual([{ script: "safe" }]);
-    expect(ctx.result).toEqual({ ran: { script: "safe" } });
+    expect(ctx.result).toMatchObject({ ran: { script: "safe" } });
   });
 
   test("a cancel during a hook ends the hook call and the tool never starts", async () => {
@@ -476,8 +476,21 @@ describe("PreToolUse", () => {
     for (const [output, toolSchema, expected] of cases) {
       const { spine } = setup([hook("PreToolUse")], () => output);
       const ctx = await runTool(spine, "bash", { script: "x" }, toolSchema);
-      expect(ctx.result).toEqual({ ran: expected });
+      expect(ctx.result).toMatchObject({ ran: expected });
     }
+    // The recorded call keeps the model's input, so the result notes what ran instead
+    // (Codex PRRT_kwDOPxxmWM6rb-TX). A long input is cut in the note.
+    const noted = setup([hook("PreToolUse")], () => rewrite("allow", { command: "ls" }));
+    const notedCtx = await runTool(noted.spine, "bash", { script: "x" }, schema);
+    expect(notedCtx.result).toEqual({
+      ran: { script: "ls" },
+      hook_output: `[plugin:guard] Rewrote this tool call's input to: {"script":"ls"}`,
+    });
+    const long = setup([hook("PreToolUse")], () => rewrite("allow", { command: "y".repeat(5000) }));
+    const longCtx = await runTool(long.spine, "bash", { script: "x" }, schema);
+    const longNote = (longCtx.result as { hook_output: string }).hook_output;
+    expect(longNote.endsWith(" [cut]")).toBe(true);
+    expect(longNote.length).toBeLessThan(2100);
     // A rewrite that does not match the schema is denied too: the guard allowed only the
     // rewritten call (Codex PRRT_kwDOPxxmWM6rb3ih).
     for (const [output, toolSchema] of [
@@ -621,7 +634,7 @@ describe("Codex tool names", () => {
 
     // Only the command applies: the call keeps its other Xum arguments, and a hook cannot set a
     // Xum-only argument it never saw (Codex PRRT_kwDOPxxmWM6rPqzS).
-    expect(ctx.result).toEqual({ ran: { script: "echo rewritten", display_name: "Remove" } });
+    expect(ctx.result).toMatchObject({ ran: { script: "echo rewritten", display_name: "Remove" } });
   });
 });
 
@@ -1242,7 +1255,7 @@ describe("Codex output rules (output_parser.rs)", () => {
     );
     const schema = { type: "object", properties: { script: { type: "string" } } };
     const ctx = await runTool(spine, "bash", { script: "rm -rf /" }, schema);
-    expect(ctx.result).toEqual({ ran: { script: "safe" } });
+    expect(ctx.result).toMatchObject({ ran: { script: "safe" } });
   });
 
   test("PostToolUse continue: false replaces the result, and a nested caller gets no output", async () => {
