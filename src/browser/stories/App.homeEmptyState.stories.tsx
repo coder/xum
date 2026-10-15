@@ -13,15 +13,24 @@
  * ToggleClearsWindowControls: the collapsed sidebar has no width, so the toggle is the only
  * pointer way back and must start after the inset reserved for the macOS traffic lights; the
  * title bar's content must start after the toggle.
+ *
+ * RosettaBannerClearsToggle: with the sidebar collapsed, the fixed toggle bar sits over the top of
+ * the main column, where platform warning banners render; the warning must start after it.
+ *
+ * CollapsedTitleBarDrags: on desktop the collapsed root page still has a full-width window drag
+ * region: the fixed toggle bar is shrink-wrapped and its button is no-drag.
  */
 
 import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import { MAC_TRAFFIC_LIGHTS_INSET } from "@/browser/hooks/useDesktopTitlebar";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { ROSETTA_BANNER_DISMISSED_KEY } from "@/common/constants/storage";
 import { textContrast } from "@/browser/stories/helpers/contrast";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
+import { collapseLeftSidebar } from "./helpers/uiState";
 import { createMockORPCClient } from "./mocks/orpc";
 
 export default {
@@ -147,6 +156,65 @@ export const ToggleClearsWindowControls: AppStory = {
       );
     } finally {
       canvasElement.style.removeProperty("--titlebar-left-inset");
+    }
+  },
+};
+
+// Electron's preload bridge, as the banner and isDesktopMode() read it.
+const withDesktopApi = (api: Partial<NonNullable<typeof window.api>>) => () => {
+  const previousApi = window.api;
+  window.api = { platform: "darwin", versions: {}, ...previousApi, ...api };
+  return () => {
+    window.api = previousApi;
+  };
+};
+
+// Collapsed before the app renders, so no hover or focus leaves the toggle's tooltip on screen.
+const setupCollapsed = () => {
+  collapseLeftSidebar();
+  return createMockORPCClient();
+};
+
+const findCollapsedBar = async (canvasElement: HTMLElement) => {
+  const toggle = await findToggle(canvasElement, "Open sidebar menu");
+  const bar = toggle.closest<HTMLElement>("[data-testid='left-sidebar-toggle-bar']");
+  if (!bar) throw new Error("left sidebar toggle bar not found");
+  return bar;
+};
+
+export const RosettaBannerClearsToggle: AppStory = {
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  beforeEach: () => {
+    updatePersistedState(ROSETTA_BANNER_DISMISSED_KEY, null);
+    return withDesktopApi({ isRosetta: true })();
+  },
+  render: () => <AppWithMocks setup={setupCollapsed} />,
+  play: async ({ canvasElement }) => {
+    const bar = await findCollapsedBar(canvasElement);
+    const warning = await within(canvasElement).findByText(/running under Rosetta/i);
+    const icon = warning.parentElement?.querySelector("svg");
+    if (!icon) throw new Error("Rosetta warning icon not found");
+    await expect(icon.getBoundingClientRect().left).toBeGreaterThanOrEqual(
+      bar.getBoundingClientRect().right
+    );
+  },
+};
+
+export const CollapsedTitleBarDrags: AppStory = {
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  beforeEach: withDesktopApi({ isRosetta: false, getIsRosetta: () => Promise.resolve(false) }),
+  render: () => <AppWithMocks setup={setupCollapsed} />,
+  play: async ({ canvasElement }) => {
+    const bar = await findCollapsedBar(canvasElement);
+    const main = await within(canvasElement).findByRole("main");
+    const mainRect = main.getBoundingClientRect();
+    const barRect = bar.getBoundingClientRect();
+    // Points across the top strip, from past the bar to the main column's right edge.
+    const y = barRect.top + barRect.height / 2;
+    for (const x of [barRect.right + 8, (barRect.right + mainRect.right) / 2, mainRect.right - 8]) {
+      const hit = document.elementFromPoint(x, y);
+      await expect(hit?.closest(".titlebar-drag"), `drag region at x=${x}`).not.toBeNull();
+      await expect(hit?.closest(".titlebar-no-drag"), `no-drag at x=${x}`).toBeNull();
     }
   },
 };

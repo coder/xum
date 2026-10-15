@@ -113,6 +113,9 @@ export function firstRunViewHtml(gitDescribe: string): string {
         <div class="mobile-main-content flex min-w-0 flex-1 flex-col overflow-hidden">
           <div class="mobile-layout flex flex-1 overflow-hidden">
             <div class="bg-surface-primary flex flex-1 flex-col overflow-hidden">
+              <div class="bg-sidebar border-border-light flex shrink-0 items-center border-b [@media(max-width:768px)_and_(pointer:coarse)]:min-h-11 h-8" data-pre="c">
+                <div aria-hidden="true" class="left-sidebar-toggle-host titlebar-safe-left titlebar-safe-left-gutter-4 flex shrink-0 items-center gap-1 invisible"><button tabindex="-1" class="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium text-muted hover:text-foreground h-6 w-6 shrink-0 mobile-menu-btn"></button></div>
+              </div>
               <div class="flex flex-1 items-center justify-center px-6">
                 <p class="text-content-secondary text-sm">Select or add a project to get started.</p>
               </div>
