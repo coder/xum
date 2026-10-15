@@ -1197,9 +1197,12 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Reset transcript scroll ownership when switching workspaces. `jumpToBottom` both re-arms
   // the ref-backed auto-scroll flag and pins any cached rows before paint; if rows are still
   // hydrating, the next content resize owns the tail instead of showing the prior workspace's state.
+  // The stable `jumpToBottom`, not `handleJumpToBottom`: a switch restarts the reveal at the latest
+  // rows anyway, and an effect keyed on `handleJumpToBottom` would also re-run (and relock) on
+  // every render where its identity changes, or whenever the slice detaches (#6678 review).
   useLayoutEffect(() => {
-    handleJumpToBottom();
-  }, [hasLoadedTranscriptRows, handleJumpToBottom, workspaceId]);
+    jumpToBottom();
+  }, [hasLoadedTranscriptRows, jumpToBottom, workspaceId]);
 
   const shouldShowStreamingBarrier = isStreamStarting || canInterrupt;
   // An armed background bash monitor means the turn ended but the agent will be
