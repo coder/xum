@@ -129,7 +129,12 @@ import {
   type TerminalSessionCreateOptions,
 } from "@/browser/utils/terminal";
 import { SideChatTabTitle } from "./Tabs/TabLabels";
-import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTab/AppViewTab";
+import {
+  AppViewTabLabel,
+  AppViewTabPanel,
+  AppViewTabTooltip,
+  findOwnMaximizedAppPanel,
+} from "./AppViewTab/AppViewTab";
 import {
   appViewTabToolCallId,
   liveAppViewTabs,
@@ -1927,13 +1932,18 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       if (!matchesKeybind(e, KEYBINDS.CLOSE_TAB)) return;
       // Always prevent platform default (Cmd/Ctrl+W closes window), even during dialogs.
       e.preventDefault();
-      if (isDialogOpen()) return;
-
-      // The pane holding keyboard focus, when focus is in this sidebar; else the focused pane.
       const container = sidebarContainerRef.current;
+      // A maximized app tab is a modal dialog, but it is this sidebar's tab: the shortcut closes
+      // it (#6181). Any other modal keeps the keys.
+      const maximizedPanel = findOwnMaximizedAppPanel(container);
+      if (isDialogOpen() && maximizedPanel == null) return;
+
+      // The maximized panel's pane; else the pane holding keyboard focus, when focus is in this
+      // sidebar; else the focused pane.
+      const keyTarget = maximizedPanel ?? e.target;
       const targetTabsetId =
-        e.target instanceof Element && container?.contains(e.target)
-          ? e.target.closest<HTMLElement>("[data-tabset-id]")?.dataset.tabsetId
+        keyTarget instanceof Element && container?.contains(keyTarget)
+          ? keyTarget.closest<HTMLElement>("[data-tabset-id]")?.dataset.tabsetId
           : undefined;
       const focusedTabset = findTabset(layout.root, targetTabsetId ?? layout.focusedTabsetId);
       if (focusedTabset?.type !== "tabset") return;
