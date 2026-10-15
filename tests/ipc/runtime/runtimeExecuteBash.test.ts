@@ -114,6 +114,12 @@ const backendLog: LogEntry[] = [];
 let stopBackendLog: (() => void) | null = null;
 const stepTrace: string[] = [];
 async function boundedStep<T>(name: string, ms: number, fn: () => Promise<T>): Promise<T> {
+  // The deadlines fit the SSH test timeout only. Local tests have a 25 s test timeout and a
+  // 15 s stream timeout, so Jest ends a stuck local step before any of these deadlines; their
+  // steps run unbounded, as before. The test name comes from describe.each("Runtime: $type").
+  if (!name.includes("Runtime: ssh")) {
+    return fn();
+  }
   const start = Date.now();
   stepTrace.push(`${new Date(start).toISOString()} start ${name}`);
   let timer: ReturnType<typeof setTimeout> | undefined;
