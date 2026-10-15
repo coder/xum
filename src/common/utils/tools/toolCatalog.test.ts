@@ -491,8 +491,10 @@ describe("overview stability across MCP tool refetches", () => {
       overviewMemo: memo,
     });
     expect(prepared.state).toBeDefined();
+    const description = prepared.tools[TOOL_SEARCH_TOOL_NAME].description;
+    if (typeof description !== "string") throw new Error("Expected a string description");
     return {
-      description: prepared.tools[TOOL_SEARCH_TOOL_NAME].description,
+      description,
       catalog: prepared.state?.catalog ?? [],
     };
   }
