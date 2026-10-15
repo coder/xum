@@ -593,10 +593,13 @@ export const ProjectSettingsOAuthInsufficientScope: Story = {
   play: async ({ canvasElement }) => {
     const body = within(canvasElement.ownerDocument.body);
     await body.findByText(/Logged in/i);
-    const prompt = await body.findByText(/refused a tool call and asks for more permissions/);
-    await expect(prompt.textContent).toContain(
-      "https://www.googleapis.com/auth/drive.file files.write"
+    const scopes = "https://www.googleapis.com/auth/drive.file files.write";
+    // By role, not by copy: the prompt is the status line that names the scopes.
+    const prompt = (await body.findAllByRole("status")).find((el) =>
+      el.textContent?.includes(scopes)
     );
+    if (!prompt) throw new Error("The sign-in prompt must name the requested scopes");
+    await expect(prompt.textContent).toContain(scopes);
     await expect(prompt.scrollWidth).toBeLessThanOrEqual(prompt.clientWidth + 1);
   },
 };

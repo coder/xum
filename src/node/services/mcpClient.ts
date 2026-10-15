@@ -273,7 +273,7 @@ function toolCallError(
   const needed =
     scopes.length > 0 ? `the OAuth scope "${scopes.join(" ")}"` : "more OAuth permissions";
   return new Error(
-    `The MCP server refused this tool call: it needs ${needed}. The user must sign in to this server again in Settings → MCP and grant it.`
+    `The MCP server refused this tool call: it needs ${needed}. The user must sign in to this MCP server again and grant it.`
   );
 }
 
