@@ -7,7 +7,7 @@ export {
   normalizeOpenAICompatibleBaseURL,
 } from "@/common/utils/providers/baseUrl";
 import assert from "node:assert";
-import { createHash } from "node:crypto";
+import { createHash, createPrivateKey } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
@@ -1187,10 +1187,17 @@ async function isUsableKeyFile(filePath: string): Promise<boolean> {
       reason = "not a regular file";
     } else if (fileStat.size > MAX_CREDENTIAL_FILE_BYTES) {
       reason = "too large";
-    } else if (isPlainObject(JSON.parse(await readFile(filePath, "utf8")))) {
-      return true;
     } else {
-      reason = "not a JSON object";
+      const parsed: unknown = JSON.parse(await readFile(filePath, "utf8"));
+      if (!isPlainObject(parsed)) {
+        reason = "not a JSON object";
+      } else if (typeof parsed.private_key === "string" && !isPrivateKey(parsed.private_key)) {
+        // google-auth-library decodes the key only when it signs a token request, and
+        // that decoder error ("DECODER routines::unsupported") read as a retryable API error.
+        reason = "invalid private key";
+      } else {
+        return true;
+      }
     }
   } catch (error) {
     // Only the failure kind: fs messages carry the path, JSON errors quote the file.
@@ -1198,6 +1205,16 @@ async function isUsableKeyFile(filePath: string): Promise<boolean> {
   }
   log.warn("Google Vertex AI service account key file is unusable", { reason });
   return false;
+}
+
+function isPrivateKey(pem: string): boolean {
+  try {
+    createPrivateKey(pem);
+    return true;
+  } catch {
+    // Not logged: the caller logs only the failure kind.
+    return false;
+  }
 }
 
 /**

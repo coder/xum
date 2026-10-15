@@ -17,6 +17,7 @@ import { z } from "zod";
 import { Cause, Effect, Exit, Option } from "effect";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
 import { execFileSync } from "node:child_process";
+import { generateKeyPairSync } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import * as fs from "fs";
 import * as os from "os";
@@ -1573,7 +1574,20 @@ describe("ProviderModelFactory Google Vertex AI", () => {
     async ({ source }) => {
       await withTempConfig(async (config, factory, _oauth, store) => {
         const keyFilename = path.join(config.rootDir, "sa.json");
-        await writeFile(keyFilename, "{}");
+        // A real private key, so the up-front key file check must accept it.
+        const { privateKey } = generateKeyPairSync("rsa", {
+          modulusLength: 2048,
+          publicKeyEncoding: { type: "spki", format: "pem" },
+          privateKeyEncoding: { type: "pkcs8", format: "pem" },
+        });
+        await writeFile(
+          keyFilename,
+          JSON.stringify({
+            type: "service_account",
+            client_email: "xum@my-project.iam.gserviceaccount.com",
+            private_key: privateKey,
+          })
+        );
         if (source === "env") {
           process.env.GOOGLE_APPLICATION_CREDENTIALS = keyFilename;
         }
@@ -1628,6 +1642,17 @@ describe("ProviderModelFactory Google Vertex AI", () => {
     { name: "a JSON array", prepare: (keyFilename: string) => writeFile(keyFilename, "[]") },
     { name: "JSON null", prepare: (keyFilename: string) => writeFile(keyFilename, "null") },
     { name: "a JSON string", prepare: (keyFilename: string) => writeFile(keyFilename, '"key"') },
+    {
+      name: "a JSON object with a private_key that is not a key",
+      prepare: (keyFilename: string) =>
+        writeFile(
+          keyFilename,
+          JSON.stringify({
+            client_email: "xum@my-project.iam.gserviceaccount.com",
+            private_key: "not-a-pem",
+          })
+        ),
+    },
     // A JSON object, so only the size check rejects it.
     {
       name: "over the size cap",
