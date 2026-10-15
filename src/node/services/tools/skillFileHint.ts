@@ -31,8 +31,13 @@ interface SkillFileLocation {
 /** Skill files sit at most a few folders below SKILL.md (playbooks/, references/). */
 const MAX_SKILL_ANCESTORS = 4;
 
-/** At most this many path-like bash tokens are checked, so one overflow costs a few stats. */
-const MAX_BASH_PATH_TOKENS = 8;
+/**
+ * Bash checks at most this many operands, and only those with a `skills`
+ * folder segment (every default skill root has one). On SSH each stat is a
+ * remote command, so an overflow of a plain script must cost none.
+ */
+const MAX_BASH_PATH_TOKENS = 3;
+const SKILLS_SEGMENT_RE = /(^|\/)skills\//;
 
 function formatSkillFileHint(location: SkillFileLocation): string {
   const name = JSON.stringify(location.skillName);
@@ -63,14 +68,12 @@ export async function skillFileBashHint(
   config: ToolConfiguration,
   script: string
 ): Promise<string> {
-  // A quoted operand is one token, so a path with spaces stays whole.
-  const operands = [...script.matchAll(/'([^']*)'|"([^"]*)"|([^\s'"`;|&<>()]+)/g)].map(
-    (match) => match[1] ?? match[2] ?? match[3]
+  // A quoted or backslash-escaped operand is one token, so a path with spaces stays whole.
+  const operands = [...script.matchAll(/'([^']*)'|"([^"]*)"|((?:\\.|[^\s'"`;|&<>()\\])+)/g)].map(
+    (match) => match[1] ?? match[2] ?? match[3].replace(/\\(.)/g, "$1")
   );
   const tokens = new Set(
-    operands.filter(
-      (token) => token.includes("/") && !token.startsWith("-") && !/[$*?]/.test(token)
-    )
+    operands.filter((token) => SKILLS_SEGMENT_RE.test(token) && !/[$*?]/.test(token))
   );
   for (const token of [...tokens].slice(0, MAX_BASH_PATH_TOKENS)) {
     const location = await findSkillFileForPath(config, token);
@@ -92,7 +95,8 @@ async function findSkillFileForPath(
   const pathApi = config.runtime instanceof RemoteRuntime ? path.posix : path;
   // Lexical: `..` segments are resolved first, so `<skill>/../x` is outside.
   // Symlinks are checked by agent_skill_read_file's containment in skillOwnsFile.
-  const absPath = config.runtime.normalizePath(filePath, config.cwd);
+  // pathApi.normalize: remote normalizePath keeps `..` segments.
+  const absPath = pathApi.normalize(config.runtime.normalizePath(filePath, config.cwd));
   let dir = pathApi.dirname(absPath);
   for (let depth = 0; depth < MAX_SKILL_ANCESTORS; depth++) {
     if (await isFile(config.runtime, pathApi.join(dir, "SKILL.md"))) {

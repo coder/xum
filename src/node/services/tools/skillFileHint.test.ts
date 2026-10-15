@@ -158,6 +158,10 @@ describe("skill file hint", () => {
     expect(whole).toMatchObject({ success: true });
     expect((whole as { content: string }).content).toContain(`\t${LONG_LINE}`);
 
+    const escaped = skillDir.replaceAll(" ", "\\ ");
+    const viaEscape = await bashNote(config, `head -c 6000 ${escaped}/playbooks/long.md`);
+    expect(viaEscape).toContain('(name: "demo", filePath: "playbooks/long.md")');
+
     const outside = await bashNote(config, `head -c 6000 "${tmp.path}/plain.md"`);
     expect(outside).toContain("per-line limit");
     expect(outside).not.toContain("agent_skill_read_file");
