@@ -963,9 +963,10 @@ describe("DraftStore idempotent sends", () => {
     });
     expect(store.getText(SCOPE)).toBe("hello");
     expect(receiver.sends).toHaveLength(0);
+    // A reloaded window shows it once (its snapshot can trail the resolution's write).
     const reloaded = createStore(reconnect());
     await reloaded.whenReady();
-    expect(reloaded.getText(SCOPE)).toBe("hello");
+    await waitFor(() => reloaded.getText(SCOPE) === "hello");
     expect((await service.get(SCOPE)).text).toBe("hello");
     expect(store.getText(SCOPE)).toBe("hello");
   });
