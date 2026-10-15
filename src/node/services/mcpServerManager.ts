@@ -22,6 +22,7 @@ import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
 import {
   createMCPClient,
   getMCPToolUi,
+  type InsufficientScopeReporter,
   isModernEra,
   MCP_TOOL_CALL_TIMEOUT_MS,
   type MCPClientHandle,
@@ -8270,11 +8271,12 @@ export class MCPServerManager {
   private insufficientScopeOption(
     serverUrl: string,
     authProvider: unknown
-  ): { onInsufficientScope?: (scopes: string[]) => void } {
+  ): { onInsufficientScope?: InsufficientScopeReporter } {
     const oauthService = this.mcpOauthService;
     if (authProvider === undefined || oauthService == null) return {};
     return {
-      onInsufficientScope: (scopes) => oauthService.recordInsufficientScope({ serverUrl, scopes }),
+      onInsufficientScope: (scopes, requestStartedAt) =>
+        oauthService.recordInsufficientScope({ serverUrl, scopes, requestStartedAt }),
     };
   }
 

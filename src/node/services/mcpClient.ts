@@ -88,8 +88,15 @@ export interface MCPHttpTransportConfig {
    * Called with the sanitized scope names when the server refuses a tool call with 403
    * `insufficient_scope` (#6622). The stored tokens stay: tools that need less keep working.
    */
-  onInsufficientScope?: (scopes: string[]) => void;
+  onInsufficientScope?: InsufficientScopeReporter;
 }
+
+/**
+ * Reports a refused tool call's scopes, and when the call started on the monotonic clock
+ * (`performance.now()`): a call that started before a new sign-in answered for the old tokens
+ * (#6739).
+ */
+export type InsufficientScopeReporter = (scopes: string[], requestStartedAt: number) => void;
 
 /**
  * Timeout for the connect-time `server/discover` probe.
@@ -265,11 +272,12 @@ export function insufficientScopeNames(requiredScope: string | undefined): strin
  */
 function toolCallError(
   error: unknown,
-  onInsufficientScope: ((scopes: string[]) => void) | undefined
+  onInsufficientScope: InsufficientScopeReporter | undefined,
+  requestStartedAt: number
 ): unknown {
   if (!(error instanceof InsufficientScopeError)) return error;
   const scopes = insufficientScopeNames(error.requiredScope);
-  onInsufficientScope?.(scopes);
+  onInsufficientScope?.(scopes, requestStartedAt);
   return new Error(
     `The MCP server refused this tool call: it needs ${scopesNeeded(scopes)}. The user must sign in to this MCP server again and grant it.`
   );
@@ -302,21 +310,22 @@ async function callModelTool(
   client: Client,
   call: { name: string; arguments: Record<string, unknown> },
   signal: AbortSignal | undefined,
-  onInsufficientScope: ((scopes: string[]) => void) | undefined
+  onInsufficientScope: InsufficientScopeReporter | undefined
 ): Promise<MCPRawCallToolResult> {
+  const startedAt = performance.now();
   try {
     return await client.callTool(call, {
       timeout: SDK_TOOL_CALL_TIMEOUT_MS,
       ...(signal !== undefined ? { signal } : {}),
     });
   } catch (error) {
-    throw toolCallError(error, onInsufficientScope);
+    throw toolCallError(error, onInsufficientScope, startedAt);
   }
 }
 
 function insufficientScopeHandler(
   transport: MCPClientConfig["transport"]
-): ((scopes: string[]) => void) | undefined {
+): InsufficientScopeReporter | undefined {
   return isHttpTransportConfig(transport) ? transport.onInsufficientScope : undefined;
 }
 
@@ -516,10 +525,12 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
   const mcpApps = config.mcpApps === true;
   const onInsufficientScope = insufficientScopeHandler(config.transport);
   // App, hook and settings calls report a refused scope the same way as model tools (#6622).
-  const callAnyTool = (...args: Parameters<Client["callTool"]>) =>
-    client.callTool(...args).catch((error: unknown) => {
-      throw toolCallError(error, onInsufficientScope);
+  const callAnyTool = (...args: Parameters<Client["callTool"]>) => {
+    const startedAt = performance.now();
+    return client.callTool(...args).catch((error: unknown) => {
+      throw toolCallError(error, onInsufficientScope, startedAt);
     });
+  };
   const client = new Client(CLIENT_INFO, {
     versionNegotiation: {
       mode: "auto",
