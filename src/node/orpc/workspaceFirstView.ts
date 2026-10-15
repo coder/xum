@@ -6,8 +6,8 @@
  * script before the app JS loads (JS-after-paint, as #6600 does for "/"). Two data paths:
  * - "fetch": the script POSTs api/workspace/getInfo and api/workspace/getFullReplay itself.
  * - "embed": the server embeds a bounded tail in a `type="application/json"` script.
- * Mobile widths only (<= NARROW_VIEWPORT_MAX_WIDTH_PX, collapsed left sidebar): the chrome tree is
- * a capture of the live 412 px page (scripts/perf/protoP2Chrome.ts).
+ * Phones only (coarse pointer, <= 480 px, collapsed left sidebar): the chrome tree is a capture of
+ * the live 412 px touch page (scripts/perf/protoP2Chrome.ts).
  *
  * SECURITY AUDIT: transcript text is attacker-controlled (repo content, model and tool output).
  * The renderer builds every node with createElement/createElementNS and puts text only in text
@@ -17,7 +17,6 @@
  * through escapeJsonForHtmlScript (`<` as \u003c), so it cannot close its <script>.
  */
 import { AUTH_TOKEN_KEY, LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
-import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 import type { MuxMessage } from "@/common/types/message";
 import { WORKSPACE_VIEW_TREE_JSON } from "./workspaceFirstViewChrome";
 
@@ -31,6 +30,9 @@ export function readWorkspaceViewMode(env: NodeJS.ProcessEnv): WorkspaceViewMode
   const v = env.XUM_PROTO_P2_VIEW?.trim();
   return v === "fetch" || v === "embed" || v === "off" ? v : BRANCH_DEFAULT;
 }
+
+/** WorkspaceMenuBar's PHONE_HEADER_QUERY width: the layout the chrome tree was captured in. */
+const PHONE_MAX_WIDTH_PX = 480;
 
 export const WORKSPACE_VIEW_ID = "xum-pre-ws";
 export const WORKSPACE_VIEW_DATA_ID = "xum-pre-ws-data";
@@ -46,6 +48,8 @@ export interface WorkspaceViewRow {
   /** null: the row has parts the view cannot draw, so the script shows no view. */
   text: string | null;
   ts: number | null;
+  /** The raw model string, e.g. "anthropic:claude-sonnet-4-5". */
+  model: string | null;
 }
 
 export interface WorkspaceViewData {
@@ -68,6 +72,7 @@ export function toWorkspaceViewRows(messages: readonly MuxMessage[]): WorkspaceV
       role: m.role === "user" ? "user" : "assistant",
       text: drawable ? m.parts.map((p) => (p.type === "text" ? p.text : "")).join("") : null,
       ts: m.metadata?.timestamp ?? null,
+      model: m.metadata?.model ?? null,
     };
   });
 }
@@ -113,7 +118,10 @@ export function workspaceViewEarlyScript(mode: "fetch" | "embed"): string {
     else start();
   };
   const read = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
-  if (!m || document.visibilityState === "hidden" || innerWidth > ${NARROW_VIEWPORT_MAX_WIDTH_PX} ||
+  // The chrome tree is the phone layout (pointer: coarse, <= 480 px, WorkspaceMenuBar PHONE_HEADER_QUERY).
+  // Any other layout class (desktop, a narrow desktop window, a tablet) gets no view.
+  if (!m || document.visibilityState === "hidden" || innerWidth > ${PHONE_MAX_WIDTH_PX} ||
+      !matchMedia("(pointer: coarse)").matches ||
       read(${JSON.stringify(LEFT_SIDEBAR_COLLAPSED_KEY)}) === "false") return loadApp();
   document.addEventListener("visibilitychange", () => document.visibilityState === "hidden" && loadApp());
   const workspaceId = decodeURIComponent(m[1]);
@@ -213,6 +221,14 @@ export function workspaceViewEarlyScript(mode: "fetch" | "embed"): string {
     const time = ((h % 12) || 12) + ":" + String(d.getMinutes()).padStart(2, "0") + " " + (h < 12 ? "AM" : "PM");
     return d.toDateString() === new Date().toDateString() ? time : MONTHS[d.getMonth()] + " " + d.getDate() + ", " + time;
   };
+  // PROTOTYPE stand-in for formatModelStringForDisplay (src/common/utils/ai/modelDisplay.ts):
+  // "anthropic:claude-sonnet-4-5" -> "Sonnet 4.5", else the id after the provider. The captured icon
+  // is Anthropic's. Production: the tail procedure sends the server-formatted label and provider.
+  const modelLabel = (model) => {
+    const id = String(model ?? "").replace(/^[\\w-]+:/, "");
+    const c = /^claude-([a-z]+)-(\\d+)(?:-(\\d))?(?:-|$)/.exec(id);
+    return c ? c[1][0].toUpperCase() + c[1].slice(1) + " " + c[2] + (c[3] ? "." + c[3] : "") : id;
+  };
   const draw = (data) => {
     performance.mark("xum-pre-ws:start");
     const rows = () => {
@@ -221,6 +237,7 @@ export function workspaceViewEarlyScript(mode: "fetch" | "embed"): string {
       for (const r of data.rows) f.append(build(r.role === "user" ? T.user : T.assistant, false, {
         md: () => markdown(r.text),
         ts: () => document.createTextNode(stamp(r.ts)),
+        model: () => document.createTextNode(modelLabel(r.model)),
       }));
       performance.measure("xum-pre-ws:rows", "xum-pre-ws:rows");
       return f;
@@ -296,6 +313,7 @@ const FETCH_READ = `  const token = new URLSearchParams(location.search).get("to
           Array.isArray(m.parts) && m.parts.length > 0 && m.parts.every((p) => p.type === "text")
           ? m.parts.map((p) => p.text).join("") : null,
         ts: m.metadata?.timestamp ?? null,
+        model: m.metadata?.model ?? null,
       }));
       show({ workspaceId, title: info.title || info.name, project: info.projectName, rows });
     })

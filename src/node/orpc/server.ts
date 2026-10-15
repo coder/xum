@@ -263,7 +263,11 @@ function injectWorkspaceView(
   monoPreload: string
 ): string {
   const deferred = deferAppModules(html);
-  if (!deferred || !/<base\b[^>]*>/i.test(deferred.html)) return html;
+  // Before the first stylesheet: after <meta name="viewport">, so the early script's innerWidth is
+  // the device width (before that meta a mobile browser reports its 980 px default layout width),
+  // and before the CSS, so the script does not wait for it.
+  const stylesheet = /<link\b[^>]*rel="stylesheet"[^>]*>/i;
+  if (!deferred || !stylesheet.test(deferred.html)) return html;
   const list = escapeJsonForHtmlScript(deferred.modules);
   const embed =
     mode === "embed" && data
@@ -271,7 +275,7 @@ function injectWorkspaceView(
       : "";
   const head = `\n    <script type="application/json" id="${WORKSPACE_VIEW_MODULES_ID}">${list}</script>${embed}\n    <script>${WORKSPACE_VIEW_SCRIPTS[mode]}</script>`;
   return deferred.html
-    .replace(/<base\b[^>]*>/i, (base) => base + head)
+    .replace(stylesheet, (link) => head.trimStart() + "\n    " + link)
     .replace(/<\/head>/i, (end) => monoPreload + end);
 }
 

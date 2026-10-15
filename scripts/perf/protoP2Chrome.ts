@@ -19,7 +19,9 @@ const url = process.argv[2];
 if (!url) throw new Error("usage: protoP2Chrome.ts <seeded workspace url>");
 
 const browser = await chromium.launch({ executablePath: "/usr/bin/google-chrome" });
-const page = await browser.newPage({ viewport: { width: 412, height: 823 } });
+// Lighthouse mobile's emulation (412x823, DPR 1.75, touch): the live app picks its phone layout from
+// `(pointer: coarse)` and the width in JS (two-row header, wrapped meta rows, "Type a message...").
+const page = await browser.newPage({ viewport: { width: 412, height: 823 }, deviceScaleFactor: 1.75, isMobile: true, hasTouch: true });
 await page.goto(url);
 await page.waitForSelector('[data-testid=message-window][data-loaded="true"] [data-message-id]');
 await page.waitForTimeout(500);
@@ -28,7 +30,7 @@ const out = await page.evaluate(() => {
   type Node = string | { s: string } | [string, Record<string, string> | 0, ...Node[]];
   const SKIP =
     "[id^=DndDescribedBy],[id^=DndLiveRegion],#review-immersive-root,.mobile-hide-right-sidebar," +
-    "input[type=file],.sr-only,[data-model-display-tooltip]";
+    "input[type=file],.sr-only";
   // Ids, a11y and test hooks go: the copy is inert and must not duplicate live hooks.
   const DROP =
     /^(id|role|tabindex|title|for|name|aria-(?!hidden).*|data-testid|data-message-id|data-tutorial|data-state|data-autofocus-state|data-loaded|autocomplete|spellcheck)$/;
@@ -70,6 +72,7 @@ const out = await page.evaluate(() => {
     const el = [...document.querySelectorAll(sel)].at(-1)!.closest("[data-transcript-message]")!;
     setSlot(".markdown-content > div", [{ s: "md" }], el);
     setSlot("[data-message-timestamp]", [{ s: "ts" }], el);
+    setSlot("[data-model-display] > span.inline", [{ s: "model" }], el);
     return conv(el);
   };
   return {
