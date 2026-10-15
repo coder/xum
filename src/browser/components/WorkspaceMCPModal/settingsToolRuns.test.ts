@@ -37,11 +37,13 @@ test("settings tool runs: a removed workspace's entries go, and a late run end d
 
 test("a writing run's end reaches the dialogs of its workspace only", async () => {
   const reread: string[] = [];
-  const stop = subscribeSettingsToolWrites("ws-write", async (serverName) => {
+  const stop = subscribeSettingsToolWrites("ws-write", (serverName) => {
     reread.push(serverName);
+    return Promise.resolve();
   });
-  const other = subscribeSettingsToolWrites("ws-other", async () => {
+  const other = subscribeSettingsToolWrites("ws-other", () => {
     reread.push("other");
+    return Promise.resolve();
   });
   await publishSettingsToolWrite("ws-write", "cad");
   stop();
