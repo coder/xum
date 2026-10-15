@@ -1189,62 +1189,46 @@ describe("Config", () => {
   });
 
   // #6485: on Windows, an id-less legacy row's checkout path uses backslashes. The old session
-  // layout keys its metadata by the checkout basename, so the lookup must split on "\\" too.
+  // layout keys its metadata by the checkout basename, so the lookup must split on "\\" too. The
+  // backend helper reads process.platform once at import, so the Windows cases run on Windows
+  // only (CI's "Test / Windows" job runs this describe).
   describe("legacy rows with a Windows checkout path", () => {
-    // Restore the original property exactly (it can be an accessor), not just its value.
-    const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
-    const projectPath = "C:\\Users\\u\\repo";
-    const checkout = "C:\\Users\\u\\.xum\\src\\repo\\feature-x";
+    const onWindows = process.platform === "win32" ? it : it.skip;
+    const offWindows = process.platform === "win32" ? it.skip : it;
 
-    beforeEach(() => {
-      // PlatformPaths detects Windows through navigator.platform (see src/common/utils/paths.ts).
-      Object.defineProperty(globalThis, "navigator", {
-        value: { platform: "Win32" },
-        configurable: true,
-      });
+    function seedBasenameLayout(projectPath: string, checkout: string, id: string): void {
       // The old layout: sessions/<checkout basename>/metadata.json names the stable id.
       const dir = path.join(config.sessionsDir, "feature-x");
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(
-        path.join(dir, "metadata.json"),
-        JSON.stringify({ id: "stable-1", name: "feature-x", projectPath })
-      );
+      fs.writeFileSync(path.join(dir, "metadata.json"), JSON.stringify({ id, projectPath }));
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
         JSON.stringify({ projects: [[projectPath, { workspaces: [{ path: checkout }] }]] })
       );
+    }
+
+    const winProject = "C:\\Users\\u\\repo";
+    const winCheckout = "C:\\Users\\u\\.xum\\src\\repo\\feature-x";
+
+    onWindows(
+      "resolves the stable id from the basename metadata in the metadata build",
+      async () => {
+        seedBasenameLayout(winProject, winCheckout, "stable-1");
+        const metadata = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+        expect(metadata.map((meta) => meta.id)).toEqual(["stable-1"]);
+      }
+    );
+
+    onWindows("finds the workspace by the stable id from the basename metadata", () => {
+      seedBasenameLayout(winProject, winCheckout, "stable-1");
+      expect(config.findWorkspace("stable-1")?.workspacePath).toBe(winCheckout);
     });
 
-    afterEach(() => {
-      if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator);
-      else Reflect.deleteProperty(globalThis, "navigator");
-    });
-
-    it("resolves the stable id from the basename metadata in the metadata build", async () => {
-      const metadata = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
-      expect(metadata.map((meta) => meta.id)).toEqual(["stable-1"]);
-    });
-
-    // A POSIX path keeps today's basename: PlatformPaths splits only on "/" off Windows, and a
-    // trailing separator still gives "" as before (#6485 changes only the backslash case).
-    it("keeps the POSIX basename lookup unchanged", () => {
-      Object.defineProperty(globalThis, "navigator", {
-        value: { platform: "Linux x86_64" },
-        configurable: true,
-      });
-      const posixCheckout = "/home/u/.xum/src/repo/feature-y";
-      const dir = path.join(config.sessionsDir, "feature-y");
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, "metadata.json"), JSON.stringify({ id: "stable-2" }));
-      fs.writeFileSync(
-        path.join(tempDir, "config.json"),
-        JSON.stringify({ projects: [["/home/u/repo", { workspaces: [{ path: posixCheckout }] }]] })
-      );
+    // POSIX keeps today's basename: the helper splits only on "/" off Windows.
+    offWindows("keeps the POSIX basename lookup unchanged", () => {
+      const posixCheckout = "/home/u/.xum/src/repo/feature-x";
+      seedBasenameLayout("/home/u/repo", posixCheckout, "stable-2");
       expect(config.findWorkspace("stable-2")?.workspacePath).toBe(posixCheckout);
-    });
-
-    it("finds the workspace by the stable id from the basename metadata", () => {
-      expect(config.findWorkspace("stable-1")?.workspacePath).toBe(checkout);
     });
   });
 

@@ -668,6 +668,9 @@ jobs:
       - name: Verify Windows namespaced filesystem roots
         shell: pwsh
         run: bun test src/node/utils/pathUtils.test.ts -t "refuses Windows namespaced roots"
+      - name: Verify legacy workspace lookups on Windows checkout paths
+        shell: pwsh
+        run: bun test src/node/config.test.ts -t "legacy rows with a Windows checkout path"
       - name: Run Windows integration smoke tests
         shell: pwsh
         run: |
