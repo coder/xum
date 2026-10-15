@@ -39,16 +39,23 @@ const hasCurl = Bun.which("curl") != null;
 // web_fetch falls back to another address only on curl 8.7+ (it needs %{proxy_used}); older
 // curl, like the Ubuntu 22.04 CI runner's, keeps one attempt (#5977). Assert the real version.
 const curlFallsBack = (() => {
-  if (!hasCurl) return false;
+  // CI's extra run installs curl 8.7+ for these tests (#6414). There the variable means
+  // "curl 8.7+ must be on PATH": refuse to skip the real-curl suite (no curl, #6492) or to
+  // quietly test the single-attempt path (older curl) instead.
+  const requireFallback = process.env.XUM_WEB_FETCH_REQUIRE_CURL_FALLBACK === "1";
+  if (!hasCurl) {
+    if (requireFallback) {
+      throw new Error("XUM_WEB_FETCH_REQUIRE_CURL_FALLBACK=1 needs curl 8.7+, found no curl");
+    }
+    return false;
+  }
   const match = /^curl (\d+)\.(\d+)\./.exec(
     Bun.spawnSync(["curl", "-q", "--version"]).stdout.toString()
   );
   if (!match) throw new Error("could not read the curl version for the fallback tests");
   const [major, minor] = [Number(match[1]), Number(match[2])];
   const fallsBack = major > 8 || (major === 8 && minor >= 7);
-  // CI's extra run installs curl 8.7+ for these tests (#6414). Refuse to quietly test the
-  // single-attempt path there if that curl is not the one on PATH.
-  if (process.env.XUM_WEB_FETCH_REQUIRE_CURL_FALLBACK === "1" && !fallsBack) {
+  if (requireFallback && !fallsBack) {
     throw new Error(`XUM_WEB_FETCH_REQUIRE_CURL_FALLBACK=1 needs curl 8.7+, found ${match[0]}`);
   }
   return fallsBack;
