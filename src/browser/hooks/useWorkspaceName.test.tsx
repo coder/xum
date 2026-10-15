@@ -146,6 +146,25 @@ describe("useWorkspaceName draft state", () => {
     );
   });
 
+  // The user discarded the draft (navigation unmounts the composer) while its name was being
+  // generated: the late result must not write a name, which would bring the draft back.
+  test("a name generated after unmount is not written to the draft", async () => {
+    const generation = Promise.withResolvers<Awaited<ReturnType<typeof generateMock>>>();
+    generateMock.mockImplementationOnce(() => generation.promise);
+    const view = renderWorkspaceName("fix the sidebar");
+    await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(1));
+    view.unmount();
+
+    await act(async () => {
+      generation.resolve({
+        success: true as const,
+        data: { name: "sidebar-a1b2", title: "Fix sidebar", modelUsed: "test:model" },
+      });
+      await generation.promise;
+    });
+    expect(getDraftStore().getView(SCOPE).nameState).toBeNull();
+  });
+
   test("another window's name edit replaces the shown name", async () => {
     const view = renderWorkspaceName("");
     act(() => view.result.current.setAutoGenerate(false));

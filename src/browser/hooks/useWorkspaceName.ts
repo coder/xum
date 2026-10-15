@@ -211,6 +211,28 @@ function useWorkspaceNameStorage(scope: DraftStoreScope | null) {
 }
 
 /**
+ * A request that settles after unmount must not write the draft's name: the draft may have been
+ * discarded (navigation unmounts its composer), and the write would bring its body back.
+ */
+function storeGeneratedIdentity(
+  mountedRef: { current: boolean },
+  target: DraftStoreScope | null,
+  setStoredIn: (
+    target: DraftStoreScope | null,
+    update: (prev: WorkspaceNamePersistedState) => WorkspaceNamePersistedState
+  ) => void,
+  identity: WorkspaceIdentity,
+  forMessage: string
+): void {
+  if (!mountedRef.current) return;
+  setStoredIn(target, (prev) => ({
+    ...prev,
+    generatedIdentity: identity,
+    lastGeneratedFor: toStoredMessage(forMessage),
+  }));
+}
+
+/**
  * Hook for managing workspace name generation with debouncing.
  *
  * Automatically generates names as the user types their message,
@@ -280,6 +302,14 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     setError(null);
   }, [scopeKey, cancelPendingGeneration]);
 
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   const generateIdentity = useCallback(
     async (
       forMessage: string,
@@ -288,14 +318,10 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       if (!api || !forMessage.trim()) {
         return null;
       }
-      const setGenerated = (identity: WorkspaceIdentity) =>
-        setStoredIn(target, (prev) => ({
-          ...prev,
-          generatedIdentity: identity,
-          lastGeneratedFor: toStoredMessage(forMessage),
-        }));
 
       const requestId = ++requestIdRef.current;
+      const storeIdentity = (identity: WorkspaceIdentity) =>
+        storeGeneratedIdentity(mountedRef, target, setStoredIn, identity, forMessage);
       setIsGenerating(true);
       setError(null);
 
@@ -338,14 +364,14 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
             title: result.data.title,
           };
 
-          setGenerated(identity);
+          storeIdentity(identity);
 
           safeResolve(identity);
           return identity;
         }
 
         const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
-        setGenerated(fallbackIdentity);
+        storeIdentity(fallbackIdentity);
         setError(null);
         safeResolve(fallbackIdentity);
         return fallbackIdentity;
@@ -354,7 +380,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
           return null;
         }
         const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
-        setGenerated(fallbackIdentity);
+        storeIdentity(fallbackIdentity);
         setError(null);
         safeResolve(fallbackIdentity);
         return fallbackIdentity;
