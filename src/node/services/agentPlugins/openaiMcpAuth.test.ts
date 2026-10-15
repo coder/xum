@@ -95,7 +95,8 @@ describe("readOpenAIMcpAuth", () => {
       withAuth({ type: "api_key", headerScheme: "bearer", headerName: "X-Key" })
     );
     expect(bearer.auth).toEqual({ type: "api_key", headerScheme: "bearer" });
-    expect(bearer.warnings).toEqual([expect.stringContaining("needs headerScheme custom_header")]);
+    expect(bearer.warnings).toHaveLength(1);
+    expect(bearer.warnings[0]).toContain("needs headerScheme custom_header");
   });
 
   test("an http endpoint override is kept only for a loopback host", () => {
