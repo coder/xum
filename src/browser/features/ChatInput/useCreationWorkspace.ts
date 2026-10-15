@@ -235,15 +235,18 @@ async function resolveCreationName(input: {
   api: NonNullable<ReturnType<typeof useLiveAPI>>;
   manualName: string;
   message: string;
+  /** No typed text: the message is only the attached-files summary. */
+  attachmentOnly: boolean;
   canHandOff: boolean;
   candidates: string[];
 }): Promise<CreationName> {
   const manualName = input.manualName.trim();
   if (manualName) return { branchName: manualName, title: manualName };
   const { message, candidates } = input;
-  if (message.trim() && input.canHandOff) return { nameGeneration: { message, candidates } };
+  const generate = message.trim().length > 0 && !input.attachmentOnly;
+  if (generate && input.canHandOff) return { nameGeneration: { message, candidates } };
   let identity = buildFallbackWorkspaceIdentity(message);
-  if (message.trim()) {
+  if (generate) {
     try {
       const result = await input.api.nameGeneration.generate({ message, candidates });
       if (result.success) identity = result.data;
@@ -602,6 +605,7 @@ export function useCreationWorkspace({
           api: liveApi,
           manualName,
           message,
+          attachmentOnly: messageText.trim().length === 0,
           canHandOff: kind !== "scratch" && runtimeSelection.mode === RUNTIME_MODE.WORKTREE,
           candidates: userModel ? [userModel] : [],
         }).finally(() => setIsGeneratingName(false));

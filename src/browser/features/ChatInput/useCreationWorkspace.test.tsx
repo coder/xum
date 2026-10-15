@@ -1160,7 +1160,7 @@ describe("useCreationWorkspace", () => {
   });
 
   describe("names the workspace on Send", () => {
-    const setupPendingName = (selectedRuntime: ParsedRuntime) => {
+    const setupPendingName = (selectedRuntime: ParsedRuntime, message = "launch workspace") => {
       const generation = Promise.withResolvers<NameGenerationResult>();
       const nameGenerationMock = mock(
         (_args: NameGenerationArgs): Promise<NameGenerationResult> => generation.promise
@@ -1184,7 +1184,7 @@ describe("useCreationWorkspace", () => {
       const getHook = renderUseCreationWorkspace({
         projectPath: TEST_PROJECT_PATH,
         onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
-        message: "launch workspace",
+        message,
       });
       return { generation, nameGenerationMock, workspaceApi, getHook };
     };
@@ -1210,6 +1210,29 @@ describe("useCreationWorkspace", () => {
       });
       expect(createRequest?.branchName).toBeUndefined();
       expect(createRequest?.title).toBeUndefined();
+      expect(nameGenerationMock.mock.calls.length).toBe(0);
+    });
+
+    test("an attachment-only send gets the fallback name, with no generation", async () => {
+      const { nameGenerationMock, workspaceApi, getHook } = setupPendingName(
+        { mode: "worktree" },
+        "Attached files: shot.png"
+      );
+      await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+      const imagePart = {
+        type: "file" as const,
+        mediaType: "image/png",
+        url: "data:image/png;base64,iVBORw0KGgo=",
+        filename: "shot.png",
+      };
+      await act(async () => {
+        await getHook().handleSend("", [imagePart]);
+      });
+
+      const createRequest = workspaceApi.create.mock.calls[0]?.[0];
+      expect(createRequest?.branchName).toBe("attached-files-shot-png");
+      expect(createRequest?.nameGeneration).toBeUndefined();
       expect(nameGenerationMock.mock.calls.length).toBe(0);
     });
 
