@@ -1714,7 +1714,7 @@ describe("AgentPluginInstallService", () => {
     await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
     await fsPromises.writeFile(
       path.join(remoteDir, "workflows", "run.js"),
-      "export const meta = { name: 'run' }; // \u202e\n"
+      "export const meta = { name: 'run' }; // \u202e\nconst safe\ufe0f = 1;\n"
     );
     await commitAll(remoteDir, "add a workflow");
     const preview = await service.preview({ input: remoteDir });
@@ -1723,6 +1723,8 @@ describe("AgentPluginInstallService", () => {
     expect(preview.reviewedComponents[0]).toMatchObject({ kind: "workflows", name: "run.js" });
     expect(preview.reviewedComponents[0]?.detail).toContain("name: 'run' }; // <U+202E>");
     expect(preview.reviewedComponents[0]?.detail).not.toContain("\u202e");
+    // A variation selector is valid in an identifier and invisible, so it is marked too.
+    expect(preview.reviewedComponents[0]?.detail).toContain("const safe<U+FE0F> = 1;");
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
     const resolve = () =>
       resolveWorkflowScript({
