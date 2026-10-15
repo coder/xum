@@ -11,7 +11,7 @@ import {
   TriangleAlert,
   XCircle,
 } from "lucide-react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { Button } from "@/browser/components/Button/Button";
@@ -1076,16 +1076,17 @@ function confirmMessage(
 /**
  * The section's initial palette intent, handed out once. The mount effect reruns on every API
  * reconnect (APIProvider makes a new client), and replaying the intent would reopen a review the
- * user already cancelled (#6609). Only an API-backed attempt consumes it: without a client
- * nothing could open yet.
+ * user already cancelled (#6609). Only an attempt on a live connection consumes it: while Xum
+ * reconnects, `api` can still hold the detached client, whose calls fail, and the live client
+ * that replaces it must still get the intent.
  */
 function useInitialIntentOnce(
-  api: ReturnType<typeof useAPI>["api"],
+  liveApi: ReturnType<typeof useLiveAPI>,
   initialIntent: PluginsSectionIntent | null
 ): () => PluginsSectionIntent | null {
   const consumedRef = useRef(false);
   return () => {
-    if (!api || consumedRef.current) return null;
+    if (!liveApi || consumedRef.current) return null;
     consumedRef.current = true;
     return initialIntent;
   };
@@ -1262,7 +1263,7 @@ export const PluginsSettingsSection: React.FC = () => {
     }
   };
 
-  const takeInitialIntent = useInitialIntentOnce(api, initialIntent);
+  const takeInitialIntent = useInitialIntentOnce(useLiveAPI(), initialIntent);
 
   // Approved update policy: passive check on section open + explicit button only.
   useEffect(() => {

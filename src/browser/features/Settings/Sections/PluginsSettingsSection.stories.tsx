@@ -4,7 +4,7 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent, waitFor, within } from "@storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { PIXEL_DISABLED } from "@/browser/stories/meta";
 import { createMockORPCClient, type MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
@@ -977,5 +977,65 @@ export const ComponentReviewIntentNotReplayedOnReconnect: Story = {
     if (canvas.queryByText(/Skill 'grilling' needs review/) !== null) {
       throw new Error("A reconnect must not reopen the cancelled review");
     }
+  },
+};
+
+/**
+ * The section mounts while Xum reconnects: `api` still holds the detached client, whose calls
+ * fail. A Connect button then provides the live client.
+ */
+const MountWhileReconnectingShell: FC<{ children: ReactNode }> = (props) => {
+  const [live, setLive] = useState<APIClient | null>(null);
+  const [stale] = useState<APIClient>(() => {
+    publishPluginsSectionIntent({ type: "review-components", name: MANAGED_ITEM.name });
+    const client = createMockORPCClient(componentReviewOptions());
+    const offline = () => Promise.reject(new Error("connection lost"));
+    client.agentPlugins.list = offline;
+    client.agentPlugins.previewComponentReview = offline;
+    return client;
+  });
+  return (
+    <ThemeProvider>
+      <TooltipProvider>
+        <button
+          type="button"
+          onClick={() => setLive(createMockORPCClient(componentReviewOptions()))}
+        >
+          Connect
+        </button>
+        {/* One provider for both states, so the section stays mounted across the reconnect. */}
+        <APIContext.Provider
+          value={{
+            ...(live !== null
+              ? { status: "connected", api: live }
+              : { status: "reconnecting", api: stale, attempt: 1 }),
+            error: null,
+            authenticate: () => undefined,
+            retry: () => undefined,
+          }}
+        >
+          {props.children}
+        </APIContext.Provider>
+      </TooltipProvider>
+    </ThemeProvider>
+  );
+};
+
+/**
+ * #6609 review: a palette intent that arrives while Xum reconnects waits for the live client.
+ * Consuming it on the detached client would lose it, because that client's calls fail.
+ */
+export const ComponentReviewIntentWaitsForLiveConnection: Story = {
+  // Out of Pixel snapshots (snapshot budget). The play checks the behavior.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <MountWhileReconnectingShell>
+      <PluginsSettingsSection />
+    </MountWhileReconnectingShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: "Connect" }));
+    await canvas.findByText(/Skill 'grilling' needs review/);
   },
 };
