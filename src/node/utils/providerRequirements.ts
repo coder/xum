@@ -11,7 +11,11 @@ import { readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import {
+  GOOGLE_VERTEX_DEFAULT_LOCATION,
+  PROVIDER_DEFINITIONS,
+  type ProviderName,
+} from "@/common/constants/providers";
 import { TYPESAFE_API_KEY_ENV_VARS, TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
@@ -20,6 +24,7 @@ import type {
   BaseProviderConfig,
   BedrockProviderConfig,
   CoderProviderConfig,
+  GoogleVertexProviderConfig,
   MuxGatewayProviderConfig,
   OpenAIProviderConfig,
 } from "@/common/config/schemas/providersConfig";
@@ -41,6 +46,8 @@ export const PROVIDER_ENV_VARS: Partial<
       baseUrl?: string[];
       organization?: string[];
       region?: string[];
+      project?: string[];
+      location?: string[];
     }
   >
 > = {
@@ -82,6 +89,11 @@ export const PROVIDER_ENV_VARS: Partial<
   },
   bedrock: {
     region: ["AWS_REGION", "AWS_DEFAULT_REGION"],
+  },
+  "google-vertex": {
+    apiKey: ["GOOGLE_VERTEX_API_KEY"],
+    project: ["GOOGLE_VERTEX_PROJECT"],
+    location: ["GOOGLE_VERTEX_LOCATION"],
   },
 };
 
@@ -158,7 +170,8 @@ type ProviderSpecificCredentialFields = Partial<
   > &
     Pick<MuxGatewayProviderConfig, "couponCode" | "voucher"> &
     Pick<OpenAIProviderConfig, "organization"> &
-    Pick<CoderProviderConfig, "deploymentUrl"> & {
+    Pick<CoderProviderConfig, "deploymentUrl"> &
+    Pick<GoogleVertexProviderConfig, "project" | "location" | "keyFilename"> & {
       // Wider than the schema type: callers pass raw (unvalidated) config.
       coderOauth?: unknown;
     }
@@ -177,11 +190,14 @@ export type ProviderConfigRaw = Omit<ProviderConfig, "enabled" | "models"> & {
 export interface ResolvedCredentials {
   isConfigured: boolean;
   /** What's missing, if not configured (for error messages) */
-  missingRequirement?: "api_key" | "region" | "coupon_code" | "coder_login";
+  missingRequirement?: "api_key" | "region" | "coupon_code" | "coder_login" | "project";
 
   // Resolved credential values - aiService uses these directly
   apiKey?: string; // anthropic, openai, etc.
   region?: string; // bedrock
+  project?: string; // google-vertex (ADC mode)
+  location?: string; // google-vertex
+  keyFilename?: string; // google-vertex service-account key (home-expanded), ADC mode only
   couponCode?: string; // mux-gateway
   deploymentUrl?: string; // coder
   baseUrl?: string; // runtime value from config or env when API-key auth is active
@@ -373,6 +389,10 @@ export function resolveProviderCredentials(
       : { isConfigured: false, missingRequirement: "region" };
   }
 
+  if (provider === "google-vertex") {
+    return resolveGoogleVertexCredentials(config, env);
+  }
+
   // Xum Gateway: coupon code required (no env var support)
   if (provider === "mux-gateway") {
     const couponCode = config.couponCode ?? config.voucher;
@@ -437,6 +457,52 @@ export function resolveProviderCredentials(
   }
 
   return { isConfigured: false, missingRequirement: "api_key", ...baseUrlInfo };
+}
+
+/**
+ * Google Vertex AI: an API key selects express mode (project/location unused);
+ * otherwise Google Application Default Credentials authenticate and the SDK
+ * requires a project. Values are resolved here (config, then env) and passed
+ * explicitly so the SDK's own env reads cannot silently switch auth modes.
+ */
+function resolveGoogleVertexCredentials(
+  config: ProviderConfigRaw,
+  env: Record<string, string | undefined>
+): ResolvedCredentials {
+  const envMapping = PROVIDER_ENV_VARS["google-vertex"];
+  const apiKeyResult = resolveApiKeyCandidate(
+    { apiKey: config.apiKey, apiKeyFile: config.apiKeyFile },
+    { envApiKeys: envMapping?.apiKey, env, fileErrors: "ignore" }
+  );
+  const project = hasNonEmptyString(config.project)
+    ? config.project.trim()
+    : resolveEnv(envMapping?.project, env);
+  const location =
+    (hasNonEmptyString(config.location)
+      ? config.location.trim()
+      : resolveEnv(envMapping?.location, env)) ?? GOOGLE_VERTEX_DEFAULT_LOCATION;
+  const baseUrlInfo = resolveBaseUrl("google-vertex", config, env);
+  const configuredBaseUrlInfo = baseUrlInfo.baseUrlResolved
+    ? { ...baseUrlInfo, baseUrl: baseUrlInfo.baseUrlResolved }
+    : baseUrlInfo;
+
+  if (apiKeyResult.kind === "resolved") {
+    return {
+      isConfigured: true,
+      apiKey: apiKeyResult.apiKey,
+      apiKeySource: apiKeyResult.source,
+      project,
+      location,
+      ...configuredBaseUrlInfo,
+    };
+  }
+  if (project) {
+    const keyFilename = hasNonEmptyString(config.keyFilename)
+      ? expandHomePath(config.keyFilename.trim())
+      : undefined;
+    return { isConfigured: true, project, location, keyFilename, ...configuredBaseUrlInfo };
+  }
+  return { isConfigured: false, missingRequirement: "project", ...baseUrlInfo };
 }
 
 /**

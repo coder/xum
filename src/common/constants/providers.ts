@@ -22,6 +22,7 @@ export type ProviderName =
   | "anthropic"
   | "openai"
   | "google"
+  | "google-vertex"
   | "xai"
   | "meta"
   | "deepseek"
@@ -147,6 +148,13 @@ export const PROVIDER_DEFINITIONS = {
     requiresApiKey: true,
     kind: "direct",
   },
+  "google-vertex": {
+    displayName: "Google Vertex AI",
+    import: () => import("@ai-sdk/google-vertex"),
+    factoryName: "createVertex",
+    requiresApiKey: false, // Google ADC by default; an API key selects express mode
+    kind: "direct",
+  },
   xai: {
     displayName: "xAI",
     import: () => import("@ai-sdk/xai"),
@@ -252,6 +260,9 @@ export const PROVIDER_DEFINITIONS = {
     kind: "local",
   },
 } as const satisfies Record<ProviderName, ProviderDefinition>;
+
+/** Vertex serves Gemini 3.x from the global endpoint, so it is the default location. */
+export const GOOGLE_VERTEX_DEFAULT_LOCATION = "global";
 
 export const GATEWAY_PROVIDERS = Object.entries(PROVIDER_DEFINITIONS)
   .filter(([, def]) => def.kind === "gateway")

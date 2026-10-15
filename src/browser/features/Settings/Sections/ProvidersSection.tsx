@@ -28,7 +28,11 @@ import { CSS } from "@dnd-kit/utilities";
 
 import { createEditKeyHandler } from "@/browser/utils/ui/keybinds";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
-import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import {
+  GOOGLE_VERTEX_DEFAULT_LOCATION,
+  PROVIDER_DEFINITIONS,
+  type ProviderName,
+} from "@/common/constants/providers";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { ProviderIcon, ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import { getStoredAuthToken } from "@/browser/components/AuthTokenModal/AuthTokenModal";
@@ -266,6 +270,41 @@ function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo):
         label: "Secret Access Key",
         placeholder: "AWS Secret Access Key",
         type: "secret",
+        optional: true,
+      },
+    ];
+  }
+
+  if (provider === "google-vertex") {
+    // Google Application Default Credentials by default; an API key selects express mode.
+    return [
+      { key: "project", label: "Project", placeholder: "my-gcp-project", type: "text" },
+      {
+        key: "location",
+        label: "Location",
+        placeholder: GOOGLE_VERTEX_DEFAULT_LOCATION,
+        type: "text",
+        optional: true,
+      },
+      {
+        key: "keyFilename",
+        label: "Service account key file",
+        placeholder: "~/.config/gcloud/service-account.json",
+        type: "secret",
+        optional: true,
+      },
+      {
+        key: "apiKey",
+        label: "Express mode API key",
+        placeholder: "GOOGLE_VERTEX_API_KEY",
+        type: "secret",
+        optional: true,
+      },
+      {
+        key: "baseUrl",
+        label: "Base URL",
+        placeholder: "https://aiplatform.googleapis.com/v1/publishers/google",
+        type: "text",
         optional: true,
       },
     ];
@@ -1644,6 +1683,10 @@ export function ProvidersSection() {
       return field === "region" ? providerConfig.aws?.region : providerConfig.aws?.profile;
     }
 
+    if (provider === "google-vertex" && (field === "project" || field === "location")) {
+      return providerConfig.googleVertex?.[field];
+    }
+
     // For standard fields like baseUrl
     const value = providerConfig[field as keyof typeof providerConfig];
     return typeof value === "string" ? value : undefined;
@@ -1682,6 +1725,9 @@ export function ProvidersSection() {
           case "secretAccessKey":
             return aws.secretAccessKeySet ?? false;
         }
+      }
+      if (provider === "google-vertex" && field === "keyFilename") {
+        return providerConfig.googleVertex?.keyFilenameSet ?? false;
       }
       return false;
     }

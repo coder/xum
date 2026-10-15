@@ -77,7 +77,11 @@ function normalizeModelKey(modelName: string): ModelName | null {
  * Optionally logs a warning when falling back.
  */
 function resolveModelName(modelString: string): ModelName {
-  const normalized = normalizeToCanonical(modelString);
+  const canonical = normalizeToCanonical(modelString);
+  // Vertex AI serves the Gemini API's models, so it shares their tokenizers.
+  const normalized = canonical.startsWith("google-vertex:")
+    ? `google:${canonical.slice("google-vertex:".length)}`
+    : canonical;
   let modelName = normalizeModelKey(normalized);
 
   if (!modelName) {

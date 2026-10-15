@@ -55,6 +55,15 @@ export function sanitizeReasoningReplayMetadata(
     options.google = { thoughtSignature: googleThoughtSignature };
   }
 
+  // @ai-sdk/google-vertex writes response metadata under both `googleVertex` and
+  // `vertex`, and replays from `googleVertex` first; persist one canonical copy.
+  const vertexThoughtSignature =
+    nonEmptyString(asRecord(record.googleVertex)?.thoughtSignature) ??
+    nonEmptyString(asRecord(record.vertex)?.thoughtSignature);
+  if (vertexThoughtSignature) {
+    options.googleVertex = { thoughtSignature: vertexThoughtSignature };
+  }
+
   for (const provider of ["openai", "xai"] as const) {
     const meta = asRecord(record[provider]);
     if (!meta) continue;
@@ -102,6 +111,9 @@ export function mergeReasoningProviderOptions(
   }
   if (incoming.google) {
     merged.google = { ...existing.google, ...incoming.google };
+  }
+  if (incoming.googleVertex) {
+    merged.googleVertex = { ...existing.googleVertex, ...incoming.googleVertex };
   }
   for (const provider of ["openai", "xai"] as const) {
     if (!incoming[provider]) continue;

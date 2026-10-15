@@ -1193,8 +1193,11 @@ export async function getToolsForModel(
         break;
       }
 
-      case "google": {
+      case "google":
+      case "google-vertex": {
         if (supportsGoogleNativeToolsWithFunctionTools(modelId)) {
+          // @ai-sdk/google-vertex re-exports these same tool factories (tools are
+          // matched by id, not provider instance), so one import serves both.
           const { google } = await import("@ai-sdk/google");
           allTools = {
             ...baseTools,

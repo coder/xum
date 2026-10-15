@@ -10,6 +10,7 @@ import {
   type ModelMessage,
   type Tool,
 } from "ai";
+import type { GoogleVertexProviderSettings } from "@ai-sdk/google-vertex";
 import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
 import { xai } from "@ai-sdk/xai";
 import { z } from "zod";
@@ -1507,6 +1508,106 @@ describe("ProviderModelFactory Meta", () => {
       } finally {
         fetchSpy.mockRestore();
       }
+    });
+  });
+});
+
+describe("ProviderModelFactory Google Vertex AI", () => {
+  unsetEnvForEachTest("GOOGLE_VERTEX_API_KEY", "GOOGLE_VERTEX_PROJECT", "GOOGLE_VERTEX_LOCATION");
+
+  const sendOnce = async (
+    factory: ProviderModelFactory,
+    modelString: string
+  ): Promise<CapturedFetchCall[]> => {
+    const options = buildProviderOptions(modelString, "medium");
+    if (!("googleVertex" in options)) throw new Error("Vertex must use the googleVertex namespace");
+    const { calls, fakeFetch } = createCapturingFetch();
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+    try {
+      const result = await factory.createModel(modelString);
+      if (!result.success) throw new Error(result.error.type);
+      await generateText({
+        model: result.data,
+        prompt: "hello",
+        providerOptions: { googleVertex: options.googleVertex },
+        maxRetries: 0,
+      }).catch(() => undefined);
+      return calls;
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  };
+
+  it("sends express mode requests to the Vertex publisher path with the API key", async () => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({
+        "google-vertex": { apiKey: "vertex-key", project: "ignored-project" },
+      });
+
+      const calls = await sendOnce(factory, "google-vertex:gemini-2.5-flash");
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe(
+        "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-flash:generateContent"
+      );
+      expect(new Headers(calls[0].init.headers).get("x-goog-api-key")).toBe("vertex-key");
+      // Thinking options must land in the namespace the Vertex model reads.
+      expect(parseSentBody(calls[0])).toMatchObject({
+        generationConfig: { thinkingConfig: { includeThoughts: true } },
+      });
+    });
+  });
+
+  it("uses ADC with the project, the default global location, and the key file", async () => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({
+        "google-vertex": { project: "my-project", keyFilename: "/keys/sa.json" },
+      });
+      const originalRegistry = PROVIDER_REGISTRY["google-vertex"];
+      let authOptions: GoogleVertexProviderSettings["googleAuthOptions"];
+      PROVIDER_REGISTRY["google-vertex"] = async () => {
+        const module = await originalRegistry();
+        return {
+          ...module,
+          createVertex: (options?: GoogleVertexProviderSettings) => {
+            authOptions = options?.googleAuthOptions;
+            // Stand in for Google's credential lookup so no metadata server is contacted.
+            const authClient = {
+              getAccessToken: () => Promise.resolve({ token: "adc-token" }),
+            } as unknown as NonNullable<
+              GoogleVertexProviderSettings["googleAuthOptions"]
+            >["authClient"];
+            return module.createVertex({
+              ...options,
+              googleAuthOptions: { ...options?.googleAuthOptions, authClient },
+            });
+          },
+        };
+      };
+
+      try {
+        const calls = await sendOnce(factory, "google-vertex:gemini-2.5-flash");
+
+        expect(authOptions).toEqual({ keyFilename: "/keys/sa.json" });
+        expect(calls).toHaveLength(1);
+        expect(calls[0].url).toBe(
+          "https://aiplatform.googleapis.com/v1beta1/projects/my-project/locations/global/publishers/google/models/gemini-2.5-flash:generateContent"
+        );
+        const headers = new Headers(calls[0].init.headers);
+        expect(headers.get("authorization")).toBe("Bearer adc-token");
+        expect(headers.get("x-goog-api-key")).toBeNull();
+      } finally {
+        PROVIDER_REGISTRY["google-vertex"] = originalRegistry;
+      }
+    });
+  });
+
+  it("reports an unconfigured provider without a project or API key", async () => {
+    await withTempConfig(async (_config, factory) => {
+      expect(await factory.createModel("google-vertex:gemini-2.5-flash")).toEqual({
+        success: false,
+        error: { type: "api_key_not_found", provider: "google-vertex" },
+      });
     });
   });
 });

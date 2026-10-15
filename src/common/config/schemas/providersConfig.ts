@@ -68,6 +68,13 @@ export const BedrockProviderConfigSchema = BaseProviderConfigSchema.extend({
   secretAccessKey: z.string().optional(),
 });
 
+export const GoogleVertexProviderConfigSchema = BaseProviderConfigSchema.extend({
+  project: z.string().optional(),
+  location: z.string().optional(),
+  /** Service-account JSON key file; unset uses Google Application Default Credentials. */
+  keyFilename: z.string().optional(),
+});
+
 export const OpenRouterProviderConfigSchema = BaseProviderConfigSchema.extend({
   order: z.string().optional(),
   allow_fallbacks: z.boolean().optional(),
@@ -192,6 +199,7 @@ export const ProvidersConfigSchema = z
     meta: MetaProviderConfigSchema.optional(),
     "mux-gateway": MuxGatewayProviderConfigSchema.optional(),
     google: GoogleProviderConfigSchema.optional(),
+    "google-vertex": GoogleVertexProviderConfigSchema.optional(),
     deepseek: DeepSeekProviderConfigSchema.optional(),
     moonshotai: MoonshotAIProviderConfigSchema.optional(),
     zai: ZaiProviderConfigSchema.optional(),
@@ -204,6 +212,7 @@ export const ProvidersConfigSchema = z
 export type BaseProviderConfig = z.infer<typeof BaseProviderConfigSchema>;
 export type OpenAIProviderConfig = z.infer<typeof OpenAIProviderConfigSchema>;
 export type BedrockProviderConfig = z.infer<typeof BedrockProviderConfigSchema>;
+export type GoogleVertexProviderConfig = z.infer<typeof GoogleVertexProviderConfigSchema>;
 export type MuxGatewayProviderConfig = z.infer<typeof MuxGatewayProviderConfigSchema>;
 export type CoderProviderConfig = z.infer<typeof CoderProviderConfigSchema>;
 

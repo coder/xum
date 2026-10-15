@@ -623,6 +623,21 @@ describe("getToolsForModel", () => {
 
     expect(gemini35Tools.google_search).toBeDefined();
     expect(gemini35Tools.url_context).toBeDefined();
+
+    // Vertex AI serves the same Gemini models, so it gets the same native tools.
+    const vertexGemini35Tools = await getToolsForModel(
+      "google-vertex:gemini-3.5-flash",
+      {
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        workspaceId: "ws-1",
+      },
+      "ws-1",
+      initStateManager
+    );
+    expect(vertexGemini35Tools.google_search).toBeDefined();
+    expect(vertexGemini35Tools.url_context).toBeDefined();
   });
 
   test("adds xAI native web and X search tools for Grok 4.5", async () => {

@@ -383,6 +383,13 @@ export const AWSCredentialStatusSchema = z.object({
   secretAccessKeySet: z.boolean(),
 });
 
+export const GoogleVertexCredentialStatusSchema = z.object({
+  project: z.string().optional(),
+  location: z.string().optional(),
+  /** Service-account key file path is never sent to the frontend, only whether one is set. */
+  keyFilenameSet: z.boolean(),
+});
+
 export const ProviderConfigInfoSchema = z.object({
   apiKeySet: z.boolean(),
   /** Whether this provider is enabled for model requests */
@@ -424,6 +431,8 @@ export const ProviderConfigInfoSchema = z.object({
   codexOauthDefaultAuth: CodexOauthDefaultAuthSchema.optional(),
   /** AWS-specific fields (only present for bedrock provider) */
   aws: AWSCredentialStatusSchema.optional(),
+  /** Google Vertex AI-specific fields (only present for google-vertex provider) */
+  googleVertex: GoogleVertexCredentialStatusSchema.optional(),
   /** Xum Gateway-specific fields */
   couponCodeSet: z.boolean().optional(),
   /** Xum Gateway-specific: which models are enabled for gateway routing */

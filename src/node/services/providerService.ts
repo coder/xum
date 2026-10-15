@@ -361,6 +361,10 @@ export class ProviderService {
         bearerToken?: string;
         accessKeyId?: string;
         secretAccessKey?: string;
+        /** Google Vertex AI-only: GCP project, location, and service-account key file. */
+        project?: string;
+        location?: string;
+        keyFilename?: string;
         /** Persisted provider toggle: only `false` is stored; missing means enabled. */
         enabled?: unknown;
         /** OpenAI-only: stored Codex OAuth tokens (never sent to frontend). */
@@ -490,6 +494,15 @@ export class ProviderService {
           bearerTokenSet: !!config.bearerToken,
           accessKeyIdSet: !!config.accessKeyId,
           secretAccessKeySet: !!config.secretAccessKey,
+        };
+      }
+
+      if (provider === "google-vertex") {
+        providerInfo.googleVertex = {
+          project: typeof config.project === "string" ? config.project : undefined,
+          location: typeof config.location === "string" ? config.location : undefined,
+          keyFilenameSet:
+            typeof config.keyFilename === "string" && config.keyFilename.trim() !== "",
         };
       }
 

@@ -247,6 +247,30 @@ describe("ProviderService.getConfig", () => {
     });
   });
 
+  it("reports Google Vertex AI settings without exposing the API key or key file", () => {
+    withTempConfig((config, service) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        "google-vertex": {
+          apiKey: "vertex-secret-key",
+          keyFilename: "/secrets/vertex-sa.json",
+          project: "my-project",
+          location: "us-central1",
+        },
+      });
+
+      const vertexConfig = service.getConfig()["google-vertex"];
+
+      expect(vertexConfig).toMatchObject({
+        apiKeySet: true,
+        isConfigured: true,
+        googleVertex: { project: "my-project", location: "us-central1", keyFilenameSet: true },
+      });
+      const serialized = JSON.stringify(vertexConfig);
+      expect(serialized).not.toContain("vertex-secret-key");
+      expect(serialized).not.toContain("vertex-sa.json");
+    });
+  });
+
   it("reports legacy op:// API key references as not set", () => {
     withTempConfig((config, service) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
