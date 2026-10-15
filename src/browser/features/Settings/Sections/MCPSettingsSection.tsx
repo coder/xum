@@ -901,6 +901,30 @@ async function forEachInsufficientScope(
   }
 }
 
+/** Calls onTick each time the backend records an insufficient_scope prompt (#6739). */
+function useInsufficientScopeTicks(api: ReturnType<typeof useAPI>["api"], onTick: () => void) {
+  // The subscription calls the latest callback.
+  const onTickRef = useRef(onTick);
+  onTickRef.current = onTick;
+  useEffect(() => {
+    if (!api) return;
+    const abortController = new AbortController();
+    let iterator: AsyncIterator<unknown> | null = null;
+    void forEachInsufficientScope(
+      api,
+      abortController.signal,
+      (subscribed) => {
+        iterator = subscribed;
+      },
+      () => onTickRef.current()
+    );
+    return () => {
+      abortController.abort();
+      void iterator?.return?.();
+    };
+  }, [api]);
+}
+
 export const MCPSettingsSection: React.FC = () => {
   const design = useClaudeDesign();
   const refreshRequest = useRef({ id: 0 });
@@ -932,23 +956,7 @@ export const MCPSettingsSection: React.FC = () => {
   const [mcpOauthRefreshNonce, setMcpOauthRefreshNonce] = useState(0);
   // A refused tool call records a sign-in prompt in the backend only: re-read the mounted rows'
   // auth status when one does (#6739).
-  useEffect(() => {
-    if (!api) return;
-    const abortController = new AbortController();
-    let iterator: AsyncIterator<unknown> | null = null;
-    void forEachInsufficientScope(
-      api,
-      abortController.signal,
-      (subscribed) => {
-        iterator = subscribed;
-      },
-      () => setMcpOauthRefreshNonce((nonce) => nonce + 1)
-    );
-    return () => {
-      abortController.abort();
-      void iterator?.return?.();
-    };
-  }, [api]);
+  useInsufficientScopeTicks(api, () => setMcpOauthRefreshNonce((nonce) => nonce + 1));
   const viewDomains = useMcpAppViewDomains();
 
   interface EditableServer {
