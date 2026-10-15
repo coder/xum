@@ -361,6 +361,28 @@ async function resolvePluginWorkflowScript(
 }
 
 /**
+ * The consent gate for a stored plugin run (#6629). Resume, checkpoint retry and crash recovery
+ * run the source snapshotted in the run record and never reread the plugin file, so they check
+ * that snapshot against the plugin's current consent record. A run started before the upgrade, or
+ * on bytes whose review an update replaced, cannot resume. A plugin that is gone fails closed.
+ */
+export async function assertStoredPluginWorkflowReviewed(
+  input: ResolveWorkflowScriptInput & { scriptPath: string; source: string }
+): Promise<void> {
+  const parsed = parsePluginWorkflowScriptPath(input.scriptPath);
+  const plugins = await discoverWorkflowPlugins(input);
+  const plugin = plugins.find(
+    (candidate) => candidate.name === parsed.pluginName && candidate.workflowsDir != null
+  );
+  if (plugin === undefined) {
+    throw new Error(
+      `Plugin '${parsed.pluginName}' is no longer installed, so its workflow run cannot resume.`
+    );
+  }
+  assertWorkflowReviewed(plugin, parsed.relativePath, input.source);
+}
+
+/**
  * The consent gate (#6629): it checks the source the resolver is about to run, so a script changed
  * after its review cannot run. Listing goes through the resolver too, so it hides the script.
  */
