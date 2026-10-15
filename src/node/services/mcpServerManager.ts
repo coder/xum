@@ -5616,20 +5616,23 @@ export class MCPServerManager {
     // Each newer read overwrites its token's hash and tools together: the latest schema of an
     // instance is the one a save validated against (the dialog shows that read). An older read
     // that settles last changes neither (#6611), so both always describe the same read.
-    if ((this.settingsLayoutTools.get(key)?.requestId ?? 0) > requestId) return;
+    if (isNewerSettingsRead(this.settingsLayoutTools.get(key), requestId)) return;
     this.settingsSchemaHashes.delete(key);
     this.settingsSchemaHashes.set(key, settingsSchemaHash(snapshot));
     this.settingsLayoutTools.set(key, {
       requestId,
       tools: settingsLayoutToolNames(snapshot.layout),
     });
-    if (this.settingsSchemaHashes.size > MAX_REMEMBERED_SETTINGS_SCHEMAS) {
-      const oldest = this.settingsSchemaHashes.keys().next().value;
-      if (oldest !== undefined) {
-        this.settingsSchemaHashes.delete(oldest);
-        this.settingsLayoutTools.delete(oldest);
-      }
-    }
+    this.forgetOldestSettingsReadPastBound();
+  }
+
+  /** Bounds settingsSchemaHashes (and settingsLayoutTools with it): the oldest goes first. */
+  private forgetOldestSettingsReadPastBound(): void {
+    if (this.settingsSchemaHashes.size <= MAX_REMEMBERED_SETTINGS_SCHEMAS) return;
+    const oldest = this.settingsSchemaHashes.keys().next().value;
+    if (oldest === undefined) return;
+    this.settingsSchemaHashes.delete(oldest);
+    this.settingsLayoutTools.delete(oldest);
   }
 
   /**
@@ -8542,6 +8545,11 @@ function settingsSchemaKey(workspaceId: string, serverName: string, token: strin
 interface SettingsLayoutTools {
   requestId: number;
   tools: ReadonlySet<string>;
+}
+
+/** Whether `known` comes from a request newer than `requestId` (so it stays). */
+function isNewerSettingsRead(known: SettingsLayoutTools | undefined, requestId: number): boolean {
+  return known !== undefined && known.requestId > requestId;
 }
 
 /** The tools a settings layout offers (its tool items). */
