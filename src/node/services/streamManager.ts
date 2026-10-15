@@ -682,6 +682,11 @@ function isStreamTruncatedMessage(message: string): boolean {
   );
 }
 
+// Lowercased prefix that google-auth-library puts on every failure to read or parse
+// the GOOGLE_APPLICATION_CREDENTIALS file.
+const GOOGLE_ADC_ENV_FILE_ERROR_PREFIX =
+  "unable to read the credential file specified by the google_application_credentials environment variable";
+
 // OpenAI rejections of Cyber mode's access_programs.cyber value
 // (https://developers.openai.com/api/docs/guides/daybreak). OpenAI's own
 // message names the required program or approval level, so it is kept.
@@ -6313,6 +6318,13 @@ export class StreamManager {
 
       if (isStreamTruncatedMessage(message)) {
         return "stream_truncated";
+      }
+
+      // google-auth-library could not turn the GOOGLE_APPLICATION_CREDENTIALS file into
+      // a credential (Google Vertex AI). It reads the file locally, so a retry fails the
+      // same way, and the keyword rules below misread its text ("refresh_token").
+      if (message.startsWith(GOOGLE_ADC_ENV_FILE_ERROR_PREFIX)) {
+        return "authentication";
       }
 
       if (error.name === "AbortError" || message.includes("abort")) {

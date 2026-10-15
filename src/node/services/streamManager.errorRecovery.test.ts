@@ -1010,6 +1010,24 @@ describe("StreamManager - stream error classification", () => {
     expect(await errorTypeForStreamFailure(apiError)).toBe("model_not_found");
   });
 
+  // Google Vertex AI ADC: google-auth-library reads the GOOGLE_APPLICATION_CREDENTIALS
+  // file locally, so a retry fails the same way and auto-retry must stop.
+  test.each([
+    "The incoming JSON object does not contain a client_email field",
+    // On its own, "refresh_token" would read as a context window error.
+    "The incoming JSON object does not contain a refresh_token field",
+  ])(
+    "classifies an unusable GOOGLE_APPLICATION_CREDENTIALS file as authentication: %s",
+    async (reason) => {
+      const error = new Error(
+        "Unable to read the credential file specified by the GOOGLE_APPLICATION_CREDENTIALS " +
+          `environment variable: ${reason}`
+      );
+
+      expect(await errorTypeForStreamFailure(error)).toBe("authentication");
+    }
+  );
+
   describe("OpenAI Daybreak access program rejections", () => {
     // Built-in OpenAI provider with a custom base URL, the route that gets the
     // Responses base-URL hint on generic 400s.
