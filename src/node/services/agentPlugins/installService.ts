@@ -22,6 +22,7 @@ import type {
   AgentPluginHooks,
   AgentPluginInterfaceSummary,
   AgentPluginListItem,
+  AgentPluginPendingSignOuts,
   AgentPluginManifestSummary,
   AgentPluginPreviewHook,
   AgentPluginPreviewMcpServer,
@@ -37,8 +38,6 @@ import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
 import type { Config } from "@/node/config";
-import { AgentIdSchema } from "@/common/schemas/ids";
-import { parseAgentDefinitionMarkdown } from "@/node/services/agentDefinitions/parseAgentDefinitionMarkdown";
 import {
   SkillNameSchema,
   resolveSkillAdvertise,
@@ -81,16 +80,27 @@ import {
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "./discovery";
+import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
+import { listPluginAgentFiles, type PluginAgentFile } from "./agentFiles";
 import { checkLogoImage } from "./imageHeader";
 import {
   consentForSelection,
   countUnreviewed,
   isComponentConsented,
   recordReviewedComponents,
+  isImportedComponent,
+  agentConsentDetail,
+  agentConsentFingerprint,
+  slashCommandConsentDetail,
+  slashCommandConsentFingerprint,
+  workflowConsentDetail,
+  workflowConsentFingerprint,
   serverConsentDetail,
   serverConsentFingerprint,
   skillConsentDetail,
   skillConsentFingerprint,
+  skillReviewDirectives,
+  directivesField,
   type ComponentConsent,
 } from "./componentConsent";
 import type { OpenAIPluginInterface } from "./openaiExtension";
@@ -99,6 +109,7 @@ import {
   bumpContainerMutationEpoch,
   MUTATION_LOCK_FILE,
   containerHasPendingSignOuts,
+  pendingSignOutsRecordState,
   isJournalName,
   JOURNAL_PREFIXES,
   MUTATION_EPOCH_FILE,
@@ -207,8 +218,65 @@ const JOURNAL_RECONCILIATION_TIMEOUT_MS = 30_000;
  */
 const PENDING_SIGN_OUT_RETRY_MS = 30_000;
 
+/** How long a Settings status read waits for the retry it started. */
+const STATUS_RETRY_WAIT_MS = 5_000;
+
 const LS_REMOTE_TIMEOUT_MS = 30_000;
 const CLONE_TIMEOUT_MS = 120_000;
+
+/** Milliseconds on a monotonic clock (wall-clock changes do not move it). */
+function monotonicNow(): number {
+  return performance.now();
+}
+
+/**
+ * Why logout() did not succeed before the pass deadline, or undefined when it did. A late or
+ * hung logout counts as failed: the URL stays in the record, and a later pass retries it
+ * (logout is idempotent).
+ *
+ * A late logout keeps running. A later pass waits for that same call instead of starting a
+ * second one, so the record stays until the original call settles: a second logout could
+ * otherwise clear the record while the first one still runs and later deletes a new sign-in.
+ */
+async function signOutFailure(
+  oauth: Pick<McpOauthService, "logout" | "credentialKey">,
+  serverUrl: string,
+  deadline: number,
+  inFlight: Map<string, Promise<Awaited<ReturnType<McpOauthService["logout"]>>>>
+): Promise<string | undefined> {
+  // Past the pass deadline: start nothing more. The URL stays in the record for the next pass.
+  // Under 1 ms counts as past: timers have 1 ms resolution and can fire that much early.
+  if (deadline - monotonicNow() < 1) return "The sign-out pass ran out of time before this server.";
+  // Keyed by credential: `/mcp` and `/mcp/` are one stored sign-in, so one logout.
+  const key = oauth.credentialKey(serverUrl) ?? serverUrl;
+  let call = inFlight.get(key);
+  if (call === undefined) {
+    const started = oauth.logout({ serverUrl });
+    call = started;
+    inFlight.set(key, started);
+    const forget = () => {
+      if (inFlight.get(key) === started) inFlight.delete(key);
+    };
+    started.then(forget, forget);
+  }
+  const timeoutMs = Math.max(0, deadline - monotonicNow());
+  const settled = await raceWithAbortAndTimeout(call, { timeoutMs });
+  if (settled.kind === "ok") return settled.value.success ? undefined : settled.value.error;
+  log.warn("A pending plugin MCP sign-out timed out", { timeoutMs });
+  return `The sign-out did not finish within ${Math.round(timeoutMs / 1000)} s.`;
+}
+
+/**
+ * The Settings text for a sign-out record Xum cannot use (#6627). The parser's own errors
+ * already name the recovery step. A read error gets one here.
+ */
+function unusableRecordReason(error: unknown, file: string): string {
+  // fs errors come from another realm under the Jest VM: read `code` without instanceof.
+  const code: unknown =
+    typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  if (typeof code !== "string") return getErrorMessage(error);
+  return `Xum cannot read the pending plugin sign-out record (${file}): ${code}. Fix its permissions. Or: sign out of the plugin's MCP servers in Settings → MCP, then delete the file.`;
+}
 
 /** Waits for the startup sign-out pass at most timeoutMs, then lets discovery go on. */
 async function waitForPendingSignOuts(
@@ -217,6 +285,20 @@ async function waitForPendingSignOuts(
 ): Promise<void> {
   const settled = await raceWithAbortAndTimeout(pass, { timeoutMs });
   if (settled.kind === "timeout") log.warn("Pending plugin sign-outs timed out", { timeoutMs });
+}
+
+/** A component review that a pending or an unreadable sign-out record closed (#6627). */
+function pendingSignOutError(
+  record: { kind: "present" } | { kind: "unreadable"; code: string },
+  file: string
+): Error {
+  if (record.kind === "unreadable")
+    return new Error(
+      `Xum cannot read the pending plugin sign-out record (${record.code}). Plugin components are unavailable until Xum can read it: ${file}.`
+    );
+  return new Error(
+    "A plugin MCP sign-out from an update has not finished yet. Plugin components are unavailable until Xum finishes it; check the log for the reason."
+  );
 }
 
 function componentsChangedError(): Error {
@@ -260,10 +342,6 @@ type CollectedPluginSkill = AgentPluginPreviewSkill & {
  * imitate it.
  */
 /**
- * The raw registry consent with this build's kinds replaced. A newer build may store more kinds,
- * and a save on this build must keep them (downgrade round-trip).
- */
-/**
  * The consent an update journal carries (#6589). Absent in journals from older builds, and a
  * malformed value is not consent: both return undefined, so recovery keeps the old records and
  * the changed components ask for review again (fails closed).
@@ -275,16 +353,33 @@ function journalComponentConsent(
   return parsed.success ? parsed.data : undefined;
 }
 
+/**
+ * The raw registry consent with this build's kinds replaced. A newer build may store more kinds,
+ * and a save on this build must keep them (downgrade round-trip).
+ */
 function mergeRawConsent(raw: unknown, consent: ComponentConsent): Record<string, unknown> {
   return { ...(isPlainObject(raw) ? raw : {}), ...consent };
 }
 
-/** The registry patch for recovered consent: none when the journal carried none. */
+/**
+ * The registry patch for recovered consent: none when the journal carried none. Records merge per
+ * component, and the journal's win (#6698). The registry can gain records between the crash and
+ * the recovery (setComponents for a newly selected component), and replacing them would ask for
+ * those reviews again. A record for the same name fingerprints the same promoted tree, so it
+ * agrees with the journal's.
+ */
 function recoveredConsentPatch(
   raw: unknown,
   consent: ComponentConsent | undefined
 ): { componentConsent?: Record<string, unknown> } {
-  return consent === undefined ? {} : { componentConsent: mergeRawConsent(raw, consent) };
+  if (consent === undefined) return {};
+  const current = isPlainObject(raw) ? raw : {};
+  const merged = Object.entries(consent).map(([kind, records]) => {
+    const earlier = current[kind];
+    return [kind, { ...(isPlainObject(earlier) ? earlier : {}), ...records }] as const;
+  });
+  // Like mergeRawConsent: kinds this build does not know stay as stored.
+  return { componentConsent: { ...current, ...Object.fromEntries(merged) } };
 }
 
 function skillChangeSummary(current: SurfaceSkill, staged: SurfaceSkill, name: string): string {
@@ -309,8 +404,37 @@ function skillConsentFields(args: Parameters<typeof skillConsentFingerprint>[0])
  * review records the fingerprint, which covers fields the summary omits (a header, an OAuth scope,
  * a frontmatter key), so the user must see all of them to approve what is recorded.
  */
-function reviewText(item: { display: string; consentDetail: () => string }): string {
-  return `${item.display}\n\nReviewed fields: ${item.consentDetail()}`;
+interface ReviewTextSource {
+  display: string;
+  consentDetail: () => string;
+}
+
+function reviewText(item: ReviewTextSource): string {
+  return showInvisibleControls(`${item.display}\n\nReviewed fields: ${item.consentDetail()}`);
+}
+
+/**
+ * Characters that render invisibly, reorder text or break lines unseen (#6629): every Unicode
+ * default-ignorable code point (zero-width and joiner characters, variation selectors such as
+ * U+FE0F, U+034F, tags), the bidi controls, every control character except tab and LF, a CR not
+ * followed by LF, and U+2028/U+2029. Several are valid in JavaScript identifiers, so without a
+ * mark `safe` and `safe` + U+FE0F look the same. A lone CR, U+2028 and U+2029 end a `//` comment
+ * in JavaScript, but the browser draws them as nothing or a space, so code after one would read
+ * as comment text in the review while the fingerprint approves it.
+ */
+const REVIEW_TEXT_CONTROLS =
+  /[\p{Default_Ignorable_Code_Point}\u061c\u202a-\u202e\u2066-\u2069\u2028\u2029]|\r(?!\n)|(?![\t\n\r])\p{Cc}/gu;
+
+/**
+ * Review text as the user reads it: each such character becomes a visible `<U+XXXX>` mark. The
+ * mark is not a JavaScript escape, so a literal `\u202e` in the source still reads differently
+ * from the character itself.
+ */
+function showInvisibleControls(text: string): string {
+  return text.replace(
+    REVIEW_TEXT_CONTROLS,
+    (char) => `<U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}>`
+  );
 }
 
 /**
@@ -319,6 +443,17 @@ function reviewText(item: { display: string; consentDetail: () => string }): str
  * (fails closed) instead of truncating text the user would approve.
  */
 const MAX_REVIEW_TEXT_CHARS = 1_000_000;
+
+/**
+ * The install preview and the component picker list every directive command, and install records
+ * consent for them, so the list is bounded like a review and never cut (#6766). Only responses
+ * that list the commands check it: one oversized plugin must not break the plugin list.
+ */
+function assertDirectivesFit(skills: ReadonlyArray<{ name: string; directives?: string[] }>): void {
+  assertReviewFits(
+    skills.map((skill) => ({ summary: skill.name, after: (skill.directives ?? []).join("\n") }))
+  );
+}
 
 function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void {
   const size = changes.reduce(
@@ -336,16 +471,26 @@ function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void
 /** List row field: managed rows count imported components that need a review (#6498). */
 function reviewRequiredField(
   entry: AgentPluginInstallEntry | undefined,
-  fingerprints: ComponentConsent
+  fingerprints: ComponentConsent,
+  /** Agents two files claim (#6629): they do not load, and the review row says why. */
+  ambiguousAgentCount: number
 ): { reviewRequiredCount?: number } {
   if (entry === undefined) return {};
   return {
-    reviewRequiredCount: countUnreviewed({
-      current: fingerprints,
-      selection: entry.importedComponents,
-      consent: entry.componentConsent,
-    }),
+    reviewRequiredCount:
+      countUnreviewed({
+        current: fingerprints,
+        selection: entry.importedComponents,
+        consent: entry.componentConsent,
+      }) + ambiguousAgentCount,
   };
+}
+
+/** How many agent IDs of a plugin two files claim (#6629). */
+async function countAmbiguousAgents(plugin: Pick<AgentPluginInfo, "agentsDir">): Promise<number> {
+  const ambiguous = new Set<string>();
+  await listPluginAgentFiles(plugin.agentsDir, [], ambiguous);
+  return ambiguous.size;
 }
 
 /** Consent after a confirmed review: only the shown refs that still match get records. */
@@ -367,12 +512,25 @@ function consentAfterReview(
  */
 function unreviewedRows(
   entry: AgentPluginInstallEntry,
-  surface: { skills: Map<string, SurfaceSkill>; servers: Map<string, SurfaceServer> }
+  surface: {
+    skills: Map<string, SurfaceSkill>;
+    servers: Map<string, SurfaceServer>;
+    workflows: Map<string, SurfaceWhole>;
+    agents: Map<string, SurfaceWhole>;
+    slashCommands: Map<string, SurfaceWhole>;
+  }
 ): AgentPluginCapabilityChange[] {
   return [
     ...[...surface.skills].flatMap(([name, item]) => unreviewedRow(entry, "skills", name, item)),
     ...[...surface.servers].flatMap(([name, item]) =>
       unreviewedRow(entry, "mcpServers", name, item)
+    ),
+    ...[...surface.workflows].flatMap(([name, item]) =>
+      unreviewedRow(entry, "workflows", name, item)
+    ),
+    ...[...surface.agents].flatMap(([name, item]) => unreviewedRow(entry, "agents", name, item)),
+    ...[...surface.slashCommands].flatMap(([name, item]) =>
+      unreviewedRow(entry, "slashCommands", name, item)
     ),
   ];
 }
@@ -380,6 +538,9 @@ function unreviewedRows(
 const COMPONENT_LABELS: Record<keyof ComponentConsent, string> = {
   skills: "Skill",
   mcpServers: "MCP server",
+  workflows: "Workflow",
+  agents: "Agent",
+  slashCommands: "Slash command",
 };
 
 function reviewedBefore(
@@ -394,21 +555,78 @@ function reviewedBefore(
 
 function unreviewedRow(
   entry: AgentPluginInstallEntry,
-  kind: "skills" | "mcpServers",
+  kind: keyof ComponentConsent,
   name: string,
-  item: SurfaceSkill | SurfaceServer
+  item: SurfaceSkill | SurfaceServer | SurfaceWhole
 ): AgentPluginCapabilityChange[] {
-  const imported = entry.importedComponents?.[kind].includes(name) ?? true;
+  const imported = isImportedComponent(entry.importedComponents, kind, name);
   const fingerprint = item.consentFingerprint;
   if (!imported || isComponentConsented(entry.componentConsent, kind, name, fingerprint)) return [];
   return [
     {
-      summary: `${COMPONENT_LABELS[kind]} '${name}' needs review`,
+      summary: `${COMPONENT_LABELS[kind]} '${showInvisibleControls(name)}' needs review`,
       before: reviewedBefore(entry.componentConsent, kind, name),
       after: reviewText(item),
       component: { kind, name, fingerprint },
     },
   ];
+}
+
+/**
+ * Update rows for workflow scripts and agents (#6629). A script executes and an agent's frontmatter
+ * sets its tools and runnability, so a new or changed one needs a review, and confirming the
+ * update records it. Removals apply without one.
+ */
+function wholeComponentChanges(
+  kind: "workflows" | "agents" | "slashCommands",
+  staged: ReadonlyMap<string, SurfaceWhole>,
+  /** The installed tree's components of this kind; absent when the tree is missing or invalid. */
+  current: ReadonlyMap<string, SurfaceWhole> | undefined
+): AgentPluginCapabilityChange[] {
+  const label = COMPONENT_LABELS[kind].toLowerCase();
+  return [...staged].flatMap(([name, item]) => {
+    const component = { kind, name, fingerprint: item.consentFingerprint };
+    const before = current?.get(name);
+    if (before === undefined) {
+      return [
+        {
+          summary: `adds ${label} '${showInvisibleControls(name)}'`,
+          after: reviewText(item),
+          component,
+        },
+      ];
+    }
+    if (before.consentFingerprint === item.consentFingerprint) return [];
+    return [
+      {
+        summary: `changes ${label} '${showInvisibleControls(name)}'`,
+        before: reviewText(before),
+        after: reviewText(item),
+        component,
+      },
+    ];
+  });
+}
+
+/**
+ * The preview rows of the components that install records consent for besides skills and MCP
+ * servers (#6629), with the text a component review would show. Bounded like a review: over the
+ * bound, the preview fails closed.
+ */
+function reviewedComponentRows(
+  groups: ReadonlyArray<
+    readonly [AgentPluginComponentRef["kind"], ReadonlyArray<readonly [string, ReviewTextSource]>]
+  >
+): AgentPluginInstallPreview["reviewedComponents"] {
+  const rows = groups.flatMap(([kind, items]) =>
+    items.map(([name, item]) => ({
+      kind,
+      name: showInvisibleControls(name),
+      detail: reviewText(item),
+    }))
+  );
+  assertReviewFits(rows.map((row) => ({ summary: row.name, after: row.detail })));
+  return rows;
 }
 
 /** Every component of an inventory: what a legacy import-all entry (no selection) imports. */
@@ -850,6 +1068,78 @@ interface SurfaceSkill {
   consentDetail: () => string;
 }
 
+/** The consent views of a plugin's slash commands, by name (#6629). */
+function slashCommandSurface(plugin: AgentPluginInfo): Map<string, SurfaceWhole> {
+  return new Map(
+    (plugin.manifest.contributes?.slashCommands ?? []).map((command) => [
+      command.name,
+      {
+        consentFingerprint: slashCommandConsentFingerprint(command),
+        display: `Slash command /${command.name}`,
+        consentDetail: () => slashCommandConsentDetail(command),
+      },
+    ])
+  );
+}
+
+/**
+ * Update rows for agents that stop loading because a second file claims their ID (#6629). The
+ * agent drops out of the staged surface, which alone would read as a removal and apply without a
+ * review, so the user would never see why the agent is gone.
+ */
+function ambiguousAgentChanges(
+  staged: ReadonlySet<string>,
+  current: ReadonlySet<string> | undefined
+): AgentPluginCapabilityChange[] {
+  return [...staged]
+    .filter((agentId) => !(current?.has(agentId) ?? false))
+    .map((agentId) => ({
+      summary: `agent '${showInvisibleControls(agentId)}' will not load: more than one file claims its ID`,
+    }));
+}
+
+/** A workflow script's source as the runtime reads it; undefined (with a warning) when unreadable. */
+async function readWorkflowScriptForReview(
+  pluginRoot: string,
+  target: { file: string; filePath: string },
+  warnings: string[]
+): Promise<string | undefined> {
+  try {
+    return (
+      await readPluginFileWithinRootCapped({
+        filePath: target.filePath,
+        pluginRoot,
+        maxBytes: MAX_FILE_SIZE,
+        label: "plugin workflow script",
+      })
+    ).content;
+  } catch (error) {
+    warnings.push(
+      `Workflow '${showInvisibleControls(target.file)}' cannot be read and will not run: ${getErrorMessage(error)}`
+    );
+    return undefined;
+  }
+}
+
+/** The consent view of one plugin agent (#6629). */
+function agentSurface(agent: PluginAgentFile): SurfaceWhole {
+  return {
+    consentFingerprint: agentConsentFingerprint(agent),
+    display: `Agent ${agent.id} (agents file ${agent.file})`,
+    consentDetail: () => agentConsentDetail(agent),
+  };
+}
+
+/**
+ * A component the picker does not select (#6629): a workflow script, whose review shows all of
+ * its source, or an agent, whose review shows its frontmatter.
+ */
+interface SurfaceWhole {
+  consentFingerprint: string;
+  display: string;
+  consentDetail: () => string;
+}
+
 interface SurfaceServer {
   /** Update diff: the consent fingerprint plus the client-secret digest (#6498 review S2). */
   fingerprint: string;
@@ -896,9 +1186,12 @@ function parsePendingSignOuts(raw: string, file: string): string[] {
   const fields =
     typeof record === "object" && record !== null ? (record as Record<string, unknown>) : {};
   const value = fields.version === 1 ? fields.urls : undefined;
+  // Sign out first, delete last: every discovery gate checks only that this file exists
+  // (containerHasPendingSignOuts), so deleting it first lets an agent load the updated
+  // plugin and reuse the old grant before the user signs out.
   if (!Array.isArray(value) || !value.every((url) => typeof url === "string"))
     throw new Error(
-      `The pending plugin sign-out record (${shortenHome(file)}) is corrupt or from another Xum version. Sign out of the plugin MCP servers in Settings, then delete the file.`
+      `The pending plugin sign-out record (${shortenHome(file)}) is corrupt or from another Xum version. Sign out of the plugin's MCP servers in Settings → MCP, then delete the file.`
     );
   return value;
 }
@@ -2174,8 +2467,14 @@ export class AgentPluginInstallService {
      * compared), display (the advertisement as the model sees it) }.
      */
     skills: Map<string, SurfaceSkill>;
-    agents: Map<string, string>;
-    components: Set<string>;
+    /** agent ID → consent view (#6629): any frontmatter or file name change is a change. */
+    agents: Map<string, SurfaceWhole>;
+    /** IDs that two agent files claim: such an agent does not load (#6629). */
+    ambiguousAgents: Set<string>;
+    /** file → consent view (#6629): any byte change of a script is a change. */
+    workflows: Map<string, SurfaceWhole>;
+    /** name → consent view (#6629): the expansion is what the command inserts. */
+    slashCommands: Map<string, SurfaceWhole>;
   }> {
     const hook = this.collectHook(plugin);
     const readSecret = createSecretReader();
@@ -2187,16 +2486,16 @@ export class AgentPluginInstallService {
         consentDetail: skill.consentDetail,
       });
     }
-    const agents = new Map<string, string>();
-    for (const agent of await this.collectAgentFiles(plugin.agentsDir)) {
-      agents.set(agent.name, agent.fingerprint);
-    }
-    const components = new Set<string>([
-      ...(await this.collectComponentFiles(plugin.workflowsDir, ".js")).map((f) => `workflow ${f}`),
-      ...(plugin.manifest.contributes?.slashCommands ?? []).map(
-        (command) => `slash command /${command.name}`
-      ),
-    ]);
+    const ambiguousAgents = new Set<string>();
+    const agents = new Map(
+      (await listPluginAgentFiles(plugin.agentsDir, warnings, ambiguousAgents)).map((agent) => [
+        agent.id,
+        agentSurface(agent),
+      ])
+    );
+    const workflows = new Map(
+      (await this.collectWorkflowScripts(plugin, warnings)).map((w) => [w.file, w] as const)
+    );
     const servers = new Map<string, SurfaceServer>();
     if (plugin.mcpConfigPath !== undefined) {
       const { servers: infos, diagnostics } = await loadPluginMcpServers(plugin, {
@@ -2232,7 +2531,15 @@ export class AgentPluginInstallService {
         });
       }
     }
-    return { hook, servers, skills, agents, components };
+    return {
+      hook,
+      servers,
+      skills,
+      agents,
+      ambiguousAgents,
+      workflows,
+      slashCommands: slashCommandSurface(plugin),
+    };
   }
 
   /**
@@ -2388,134 +2695,53 @@ export class AgentPluginInstallService {
     // Agent definitions: the description injects into the task tool's
     // model-visible prompt and runnable/base/policy change execution
     // privileges, so a changed definition behind an unchanged filename is
-    // gated exactly like an addition. The fingerprint is the key-sorted
-    // frontmatter JSON, which is also the most faithful thing to show.
-    for (const [agentName, fingerprint] of staged.agents) {
-      const currentFingerprint = current?.agents.get(agentName);
-      if (currentFingerprint === undefined) {
-        changes.push({ summary: `adds agent ${agentName}`, after: fingerprint });
-      } else if (currentFingerprint !== fingerprint) {
-        changes.push({
-          summary: `changes the definition of agent ${agentName}`,
-          before: currentFingerprint,
-          after: fingerprint,
-        });
-      }
-    }
-    // Consent covered a specific component set; additions need a new preview.
-    for (const component of staged.components) {
-      if (!(current?.components.has(component) ?? false)) {
-        changes.push({ summary: `adds ${component}` });
-      }
-    }
+    // gated exactly like an addition.
+    changes.push(...wholeComponentChanges("agents", staged.agents, current?.agents));
+    changes.push(...ambiguousAgentChanges(staged.ambiguousAgents, current?.ambiguousAgents));
+    changes.push(...wholeComponentChanges("workflows", staged.workflows, current?.workflows));
+    changes.push(
+      ...wholeComponentChanges("slashCommands", staged.slashCommands, current?.slashCommands)
+    );
     assertReviewFits(changes);
     return changes;
   }
 
   /**
-   * Executable workflow scripts (workflows/*.js) for the consent preview,
-   * mirroring the runtime lister (workflowScriptDiscovery: top-level files
-   * AND symlinks with the matching extension, sorted). These activate after
-   * install, so consent must name them.
+   * Executable workflow scripts, read as the runtime resolver reads them (the shared lister, the
+   * root-checked capped read) so the consent fingerprint matches what can run (#6629): the
+   * top-level `workflows/*.js`, keyed by file name, and each skill's `workflow.js` (the `skill://`
+   * entry), keyed by its plugin-relative path. A script the runtime cannot read is reported and
+   * skipped.
    */
-  private async collectComponentFiles(
-    dir: string | undefined,
-    extension: string
-  ): Promise<string[]> {
-    if (dir === undefined) {
-      return [];
+  private async collectWorkflowScripts(
+    plugin: AgentPluginInfo,
+    warnings: string[]
+  ): Promise<Array<SurfaceWhole & { file: string }>> {
+    const targets = [
+      ...(await listPluginWorkflowFiles(plugin.workflowsDir)).map((file) => ({
+        file,
+        // listPluginWorkflowFiles lists nothing without a workflows dir.
+        filePath: path.join(plugin.workflowsDir ?? "", file),
+        display: `Workflow script workflows/${file}`,
+      })),
+      ...(await listPluginSkillScripts(plugin)).map((script) => ({
+        ...script,
+        display: `Skill workflow script ${script.file}`,
+      })),
+    ];
+    const scripts: Array<SurfaceWhole & { file: string }> = [];
+    for (const target of targets) {
+      const source = await readWorkflowScriptForReview(plugin.rootPath, target, warnings);
+      if (source === undefined || source.length === 0) continue;
+      const input = { file: target.file, source };
+      scripts.push({
+        file: target.file,
+        consentFingerprint: workflowConsentFingerprint(input),
+        display: target.display,
+        consentDetail: () => workflowConsentDetail(input),
+      });
     }
-    try {
-      const entries = await fsPromises.readdir(dir, { withFileTypes: true });
-      return entries
-        .filter(
-          (entry) =>
-            (entry.isFile() || entry.isSymbolicLink()) &&
-            entry.name.toLowerCase().endsWith(extension)
-        )
-        .map((entry) => entry.name)
-        .sort((a, b) => a.localeCompare(b));
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * Agent definition files (agents/*.md) for the consent preview, mirroring
-   * runtime discovery exactly (agentDefinitionsService): only REGULAR files
-   * (symlinks never load) whose basename parses as a valid agent ID AND
-   * whose CONTENT parses as a runtime-valid definition (size cap included).
-   * Filename-only fingerprinting would let an update repair a malformed
-   * agents/foo.md in place — identical component sets on both sides — and
-   * introduce a runnable agent without re-consent; the preview could
-   * likewise advertise an agent that never loads.
-   */
-  private async collectAgentFiles(
-    dir: string | undefined
-  ): Promise<Array<{ name: string; fingerprint: string }>> {
-    if (dir === undefined) {
-      return [];
-    }
-    let entries;
-    try {
-      entries = await fsPromises.readdir(dir, { withFileTypes: true });
-    } catch {
-      return [];
-    }
-    const agents: Array<{ name: string; fingerprint: string }> = [];
-    // Runtime discovery dedupes by normalized agent ID with the first
-    // successfully parsed file winning (discoverAgentDefinitions sets byId
-    // once per ID, in the same readdir enumeration order used here). Mirror
-    // that: on a case-sensitive filesystem agents/foo.md and agents/FOO.md
-    // are ONE loadable agent, so the preview must promise one row and the
-    // capability surface must not fingerprint a definition that never loads.
-    const seenAgentIds = new Set<string>();
-    for (const entry of entries) {
-      const agentIdParse = AgentIdSchema.safeParse(
-        path.parse(entry.name).name.trim().toLowerCase()
-      );
-      if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".md") || !agentIdParse.success) {
-        continue;
-      }
-      if (seenAgentIds.has(agentIdParse.data)) {
-        continue;
-      }
-      let frontmatter: unknown;
-      try {
-        const filePath = path.join(dir, entry.name);
-        const stat = await fsPromises.stat(filePath);
-        // Size-check BEFORE reading (mirroring runtime discovery): the parse
-        // below applies the same cap, but only after the whole file has been
-        // read and UTF-8-decoded — an untrusted repo pouring its checkout
-        // quota into one agents/*.md could stall the main process first.
-        if (stat.size > MAX_FILE_SIZE) {
-          continue;
-        }
-        const content = await fsPromises.readFile(filePath, "utf8");
-        // Throws on malformed frontmatter or oversized content — exactly the
-        // definitions runtime discovery would skip.
-        frontmatter = parseAgentDefinitionMarkdown({
-          content,
-          byteSize: stat.size,
-          plugin: { agentId: agentIdParse.data },
-        }).frontmatter;
-      } catch {
-        continue;
-      }
-      // Seen only AFTER a successful parse, mirroring runtime dedupe: when
-      // the enumeration-order winner is malformed (skipped above), the next
-      // same-ID file is the one that actually loads.
-      seenAgentIds.add(agentIdParse.data);
-      // Fingerprint the WHOLE parsed frontmatter (key-sorted so YAML
-      // reordering is not a change): description injects into the task
-      // tool's model-visible prompt, subagent.runnable/ui gate invocability,
-      // and base/tool policy change execution privileges. Any frontmatter
-      // change on an unchanged filename is re-consent territory; the BODY
-      // (system prompt) loads only on explicit invocation and rides the
-      // normal tree replacement like skill bodies.
-      agents.push({ name: entry.name, fingerprint: stableStringify(frontmatter) });
-    }
-    return agents.sort((a, b) => a.name.localeCompare(b.name));
+    return scripts;
   }
 
   /**
@@ -2629,7 +2855,10 @@ export class AgentPluginInstallService {
           ...skillConsentFields({
             relativeDir: path.relative(pluginRoot, path.join(skillsDir, dirName)),
             frontmatter: skillConsentFrontmatter(parsed),
+            body: parsed.body,
           }),
+          // The commands the skill can run when invoked (#6617): shown, then fingerprinted.
+          ...directivesField(skillReviewDirectives(parsed.body)),
           ...(parsed.frontmatter.description !== undefined
             ? { description: parsed.frontmatter.description }
             : {}),
@@ -2842,6 +3071,7 @@ export class AgentPluginInstallService {
       await this.assertNoCollision(plugin.name);
 
       const skills = await this.collectSkillsFromRoots(plugin, warnings);
+      assertDirectivesFit(skills);
       const { previews: mcpServers } = await this.collectMcpServers(
         plugin,
         targetPath,
@@ -2852,8 +3082,20 @@ export class AgentPluginInstallService {
       const codexHooks = await loadPluginCodexHooks(plugin);
       warnings.push(...codexHooks.warnings);
       const openaiInterface = await interfaceSummary(plugin, warnings);
-      const agents = (await this.collectAgentFiles(plugin.agentsDir)).map((agent) => agent.name);
-      const workflows = await this.collectComponentFiles(plugin.workflowsDir, ".js");
+      const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
+      // Display only: the names a user reads before Install show invisible controls (#6629).
+      const agents = agentFiles.map((agent) => showInvisibleControls(agent.file));
+      const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
+        showInvisibleControls
+      );
+      const reviewedComponents = reviewedComponentRows([
+        [
+          "workflows",
+          (await this.collectWorkflowScripts(plugin, warnings)).map((w) => [w.file, w]),
+        ],
+        ["agents", agentFiles.map((agent) => [agent.id, agentSurface(agent)])],
+        ["slashCommands", [...slashCommandSurface(plugin)]],
+      ]);
       const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
         name: command.name,
         ...(command.description !== undefined ? { description: command.description } : {}),
@@ -2887,6 +3129,7 @@ export class AgentPluginInstallService {
         agents,
         workflows,
         slashCommands,
+        reviewedComponents,
         warnings,
         targetPath: shortenHome(targetPath),
       };
@@ -3122,14 +3365,9 @@ export class AgentPluginInstallService {
     journalPath: string,
     document: Record<string, unknown>
   ): Promise<void> {
-    const tempPath = `${journalPath}.${randomBytes(8).toString("hex")}.tmp`;
-    await fsPromises.writeFile(tempPath, JSON.stringify(document));
-    try {
-      await fsPromises.rename(tempPath, journalPath);
-    } catch (error) {
-      await fsPromises.rm(tempPath, { force: true }).catch(() => undefined);
-      throw error;
-    }
+    // writeFileAtomic fsyncs the temp file before the rename and the directory after it, so after
+    // a power loss the journal is the old one or the whole new one, never empty (#6698).
+    await writeFileAtomic(journalPath, JSON.stringify(document));
   }
 
   /**
@@ -3678,6 +3916,7 @@ export class AgentPluginInstallService {
   ) {
     const warnings: string[] = [];
     const skills = await this.collectSkillsFromRoots(plugin, warnings);
+    const workflows = await this.collectWorkflowScripts(plugin, warnings);
     const { previews: mcpServers, fingerprints } = await this.collectMcpServers(
       { ...plugin, importedComponents: undefined },
       finalTargetPath,
@@ -3685,15 +3924,28 @@ export class AgentPluginInstallService {
       warnings
     );
     return {
-      skills: skills.map(({ name, description }) => ({
+      skills: skills.map(({ name, description, directives }) => ({
         name,
         ...(description !== undefined ? { description } : {}),
+        ...directivesField(directives),
       })),
       mcpServers,
       /** What this review showed, as consent fingerprints (#6498). Never sent to the renderer. */
       fingerprints: {
         skills: Object.fromEntries(skills.map((skill) => [skill.name, skill.consentFingerprint])),
         mcpServers: fingerprints,
+        workflows: Object.fromEntries(
+          workflows.map((workflow) => [workflow.file, workflow.consentFingerprint])
+        ),
+        agents: Object.fromEntries(
+          (await listPluginAgentFiles(plugin.agentsDir, warnings)).map((agent) => [
+            agent.id,
+            agentConsentFingerprint(agent),
+          ])
+        ),
+        slashCommands: Object.fromEntries(
+          [...slashCommandSurface(plugin)].map(([name, item]) => [name, item.consentFingerprint])
+        ),
       } satisfies ComponentConsent,
     };
   }
@@ -3851,6 +4103,7 @@ export class AgentPluginInstallService {
     const { fingerprints, ...inventory } = await this.readInstalledComponents(entry);
     assert(fingerprints !== undefined, "installed inventory carries consent fingerprints");
     if ((await gate.confirm()).length > 0) throw componentsChangedError();
+    assertDirectivesFit(inventory.skills);
     return inventory;
   }
 
@@ -3859,10 +4112,10 @@ export class AgentPluginInstallService {
    * file changed, and a refresh fails the same way until the sign-out finishes (#6627).
    */
   private async closedComponentReviewError(): Promise<Error> {
-    if (!(await this.hasPendingSignOuts())) return componentsChangedError();
-    return new Error(
-      "A plugin MCP sign-out from an update has not finished yet. Plugin components are unavailable until Xum finishes it; check the log for the reason."
-    );
+    const record = await pendingSignOutsRecordState(this.containerDir);
+    return record.kind === "absent"
+      ? componentsChangedError()
+      : pendingSignOutError(record, shortenHome(this.pendingSignOutsFile));
   }
 
   async setComponents(args: {
@@ -3941,6 +4194,11 @@ export class AgentPluginInstallService {
     }
   }
 
+  /** The bound of startup crash-recovery waits and of each sign-out pass. */
+  private get recoveryTimeoutMs(): number {
+    return this.deps.reconciliationTimeoutMs ?? JOURNAL_RECONCILIATION_TIMEOUT_MS;
+  }
+
   private get pendingSignOutsFile(): string {
     return path.join(this.config.rootDir, PENDING_SIGN_OUTS_FILE_NAME);
   }
@@ -3993,10 +4251,47 @@ export class AgentPluginInstallService {
   /** Signs out `urls` after an update; the ones that failed stay pending. */
   private async signOutAndSettle(name: string, urls: string[]): Promise<void> {
     const done: string[] = [];
+    // One deadline for every wait of this update: N hung logouts must not hold the lock N times.
+    const deadline = monotonicNow() + this.recoveryTimeoutMs;
     for (const serverUrl of urls) {
-      if (await this.signOutPluginServer(name, serverUrl)) done.push(serverUrl);
+      if (await this.signOutAfterInFlight(name, serverUrl, deadline)) done.push(serverUrl);
     }
     await this.forgetPendingSignOuts(done);
+  }
+
+  /**
+   * A timed-out recovery logout can still run: let it settle first, so two logouts never
+   * overlap and the earlier one cannot delete a sign-in made after the later one (#6627).
+   */
+  private async settleInFlightSignOut(
+    name: string,
+    serverUrl: string,
+    deadline: number
+  ): Promise<boolean> {
+    const key = this.mcpOauthService?.credentialKey(serverUrl) ?? serverUrl;
+    const call = this.inFlightSignOuts.get(key);
+    if (call === undefined) return true;
+    // Bounded: the update holds the plugin lock here, so a hung logout must not hold it forever.
+    // On timeout this sign-out counts as failed, and its URL stays in the pending record.
+    const settled = await raceWithAbortAndTimeout(
+      call.catch(() => undefined),
+      { timeoutMs: Math.max(0, deadline - monotonicNow()) }
+    );
+    if (settled.kind === "ok") return true;
+    log.warn("A plugin MCP sign-out waits for an earlier one that has not finished", {
+      plugin: name,
+    });
+    return false;
+  }
+
+  /** A sign-out that waits too long for an earlier one fails: its URL stays pending. */
+  private async signOutAfterInFlight(
+    name: string,
+    serverUrl: string,
+    deadline: number
+  ): Promise<boolean> {
+    if (!(await this.settleInFlightSignOut(name, serverUrl, deadline))) return false;
+    return this.signOutPluginServer(name, serverUrl);
   }
 
   private async signOutPluginServer(name: string, serverUrl: string): Promise<boolean> {
@@ -4012,17 +4307,27 @@ export class AgentPluginInstallService {
   /**
    * Finishes the sign-outs that an update recorded but could not complete (#6122). Runs with
    * crash recovery and from the discovery gate. Without the sign-in service it does nothing.
+   * Returns true when it tried, and sign-outs are left.
+   *
+   * The pass holds the plugin mutation lock, so it is bounded like journal recovery: a logout
+   * that does not settle in time counts as failed (#6627). Its URL stays in the record, and the
+   * lock is released, so a section open, an install or an update does not hang behind it.
    */
-  /** True when it tried, and sign-outs are left. */
   private async completePendingSignOuts(): Promise<boolean> {
     const oauth = this.mcpOauthService;
     if (oauth === undefined || !(await this.hasPendingSignOuts())) return false;
     return this.runExclusive(async () => {
+      const deadline = monotonicNow() + this.recoveryTimeoutMs;
       const left: string[] = [];
+      const failures: string[] = [];
       for (const serverUrl of await this.readPendingSignOuts()) {
-        if (!(await oauth.logout({ serverUrl })).success) left.push(serverUrl);
+        const failure = await signOutFailure(oauth, serverUrl, deadline, this.inFlightSignOuts);
+        if (failure === undefined) continue;
+        left.push(serverUrl);
+        failures.push(failure);
       }
       await this.writePendingSignOuts(left);
+      this.pendingSignOutLastError = failures[0];
       return left.length > 0;
     });
   }
@@ -4060,7 +4365,7 @@ export class AgentPluginInstallService {
 
   /** True while the gate's wait after a pass that left the record runs. */
   private signOutRetryWaits(retryNow: boolean): boolean {
-    return !retryNow && Date.now() < this.pendingSignOutRetryAtMs;
+    return !retryNow && monotonicNow() < this.pendingSignOutRetryAtMs;
   }
 
   /** Resolves once no pass runs, the passes that `retryNow` callers asked for included. */
@@ -4083,14 +4388,62 @@ export class AgentPluginInstallService {
     // A pass before the sign-in service is wired tries nothing, so it sets no wait.
     const left = await this.completePendingSignOuts().catch((error: unknown) => {
       // An unreadable record stays: it keeps discovery closed until the user deletes it.
-      log.warn("Could not finish pending plugin sign-outs", { error: getErrorMessage(error) });
+      this.pendingSignOutLastError = getErrorMessage(error);
+      log.warn("Could not finish pending plugin sign-outs", {
+        error: this.pendingSignOutLastError,
+      });
       return true;
     });
-    this.pendingSignOutRetryAtMs = left ? Date.now() + PENDING_SIGN_OUT_RETRY_MS : 0;
+    this.pendingSignOutRetryAtMs = left ? monotonicNow() + PENDING_SIGN_OUT_RETRY_MS : 0;
   }
 
   private pendingSignOutPass: Promise<void> | undefined;
-  /** See startPendingSignOutPass. */
+  /** Why the last pass left the record; shown in Settings (pendingSignOutStatus). */
+  private pendingSignOutLastError: string | undefined;
+
+  /**
+   * The pending sign-out record for Settings → Plugins (#6627). While it exists, managed plugins
+   * are unavailable to agents, so Settings names it and the recovery step. Never throws.
+   */
+  async pendingSignOutStatus(): Promise<AgentPluginPendingSignOuts> {
+    // Settings re-reads this while the notice shows: retry like the discovery gate does (at most
+    // once per PENDING_SIGN_OUT_RETRY_MS), so a fixed cause clears without an agent request.
+    this.startPendingSignOutPass({ retryNow: false });
+    // Report the retry's result when it is quick; a slow logout is reported on the next read.
+    await waitForPendingSignOuts(this.settledSignOutPasses(), STATUS_RETRY_WAIT_MS);
+    const record = await pendingSignOutsRecordState(this.containerDir);
+    if (record.kind === "absent") {
+      // An old record's failure must not describe the next one.
+      this.pendingSignOutLastError = undefined;
+      return { kind: "none" };
+    }
+    return this.readPendingSignOutStatus(record);
+  }
+
+  /** The status of an existing record (see pendingSignOutStatus). */
+  private async readPendingSignOutStatus(
+    record: { kind: "present" } | { kind: "unreadable"; code: string }
+  ): Promise<AgentPluginPendingSignOuts> {
+    const file = shortenHome(this.pendingSignOutsFile);
+    // A special file (a FIFO would block the read) is reported without reading it.
+    if (record.kind === "unreadable")
+      return { kind: "broken", reason: unusableRecordReason({ code: record.code }, file) };
+    let servers: string[];
+    try {
+      servers = await this.readPendingSignOuts();
+    } catch (error) {
+      return { kind: "broken", reason: unusableRecordReason(error, file) };
+    }
+    // An empty record still fences discovery while it exists (the next pass deletes it).
+    const lastError = this.pendingSignOutLastError;
+    return { kind: "pending", servers, ...(lastError !== undefined ? { lastError } : {}) };
+  }
+  /** Logouts a pass started that have not settled yet (see signOutFailure). */
+  private readonly inFlightSignOuts = new Map<
+    string,
+    Promise<Awaited<ReturnType<McpOauthService["logout"]>>>
+  >();
+  /** See startPendingSignOutPass. On the monotonic clock: a wall-clock jump must not move it. */
   private pendingSignOutRetryAtMs = 0;
   /** See signOutPassRunning. */
   private pendingSignOutRerun = false;
@@ -4195,7 +4548,7 @@ export class AgentPluginInstallService {
         importedMcpServerCount: inventory.mcpServers.filter(
           (server) => selection === undefined || selection.mcpServers.includes(server.serverName)
         ).length,
-        ...reviewRequiredField(entry, inventory.fingerprints),
+        ...reviewRequiredField(entry, inventory.fingerprints, await countAmbiguousAgents(plugin)),
       });
     }
 
@@ -5282,7 +5635,11 @@ export class AgentPluginInstallService {
       targetPath,
       warnings
     );
-    const changes = unreviewedRows(entry, surface);
+    // An agent a second file disabled after install has no fingerprint, so only this row shows it.
+    const changes = [
+      ...unreviewedRows(entry, surface),
+      ...ambiguousAgentChanges(surface.ambiguousAgents, undefined),
+    ];
     assertReviewFits(changes);
     return { changes, warnings };
   }

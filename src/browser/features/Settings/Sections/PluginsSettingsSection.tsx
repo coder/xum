@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { EXPERIMENT_IDS, EXPERIMENTS } from "@/common/constants/experiments";
 import {
   ArrowDownToLine,
   ArrowLeft,
@@ -11,7 +12,7 @@ import {
   TriangleAlert,
   XCircle,
 } from "lucide-react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { Button } from "@/browser/components/Button/Button";
@@ -23,6 +24,7 @@ import type {
   AgentPluginInstallPreview,
   AgentPluginInterfaceSummary,
   AgentPluginListItem,
+  AgentPluginPendingSignOuts,
   AgentPluginUpdateCheck,
   AgentPluginUpdateConsent,
   AgentPluginUpdateReview,
@@ -39,6 +41,8 @@ import {
   describePluginHookHandler,
   PLUGIN_HOOK_STATUS_NOTE,
   PluginHooksPanel,
+  cutReviewText,
+  kilobytes,
 } from "./PluginHooksPanel";
 
 /**
@@ -91,7 +95,8 @@ const Badge: React.FC<{
     className={cn(
       "rounded px-1.5 py-0.5 text-[10px] font-medium",
       props.wrap === true ? "max-w-full wrap-anywhere" : "whitespace-nowrap",
-      props.tone === "muted" && "bg-foreground/10 text-muted",
+      // Foreground text: muted text on this tint stayed below 4.5:1 even after #6544 raised the token.
+      props.tone === "muted" && "bg-foreground/10 text-foreground",
       props.tone === "accent" && "bg-accent/15 text-accent-text",
       props.tone === "warning" && "bg-warning/15 text-warning",
       props.tone === "error" && "bg-destructive/15 text-destructive"
@@ -170,6 +175,27 @@ const PluginInterfaceDetails: React.FC<{ info: AgentPluginInterfaceSummary }> = 
   );
 };
 
+/**
+ * #6617: a skill's directive commands run when the user invokes it, so the review shows them.
+ * The backend escapes invisible characters; React escapes the rest.
+ */
+const SkillDirectives: React.FC<{ directives?: readonly string[] }> = (props) => {
+  if (props.directives === undefined || props.directives.length === 0) return null;
+  return (
+    <span className="block">
+      <span className="text-muted block">
+        Runs these commands when invoked, only while the{" "}
+        {EXPERIMENTS[EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT].name} experiment is on:
+      </span>
+      {props.directives.map((command, index) => (
+        <code key={index} className="text-foreground block font-mono break-all whitespace-pre-wrap">
+          {command}
+        </code>
+      ))}
+    </span>
+  );
+};
+
 /** Only skills/MCP are selective; keep full-package consent below this shared chooser. */
 const ComponentChooser: React.FC<{
   inventory: Pick<AgentPluginComponents, "skills" | "mcpServers">;
@@ -183,10 +209,15 @@ const ComponentChooser: React.FC<{
       const label = group === "skills" ? "Skills" : "MCP servers";
       const entries =
         group === "skills"
-          ? props.inventory.skills.map((skill) => ({ name: skill.name, detail: skill.description }))
+          ? props.inventory.skills.map((skill) => ({
+              name: skill.name,
+              detail: skill.description,
+              directives: skill.directives,
+            }))
           : props.inventory.mcpServers.map((server) => ({
               name: server.serverName,
               detail: `${server.transport} · ${server.summary}`,
+              directives: undefined,
             }));
       const imported = props.imported?.[group] ?? [];
       const selectable = entries.map((entry) => entry.name);
@@ -224,7 +255,7 @@ const ComponentChooser: React.FC<{
             </Button>
           </div>
           {entries.length === 0 && <p className="text-muted text-xs">None available</p>}
-          {entries.map(({ name, detail }) => (
+          {entries.map(({ name, detail, directives }) => (
             <label key={name} className="flex items-start gap-2 text-xs">
               <Checkbox
                 aria-label={name}
@@ -244,6 +275,7 @@ const ComponentChooser: React.FC<{
                 {detail && (
                   <span className="text-muted block break-all whitespace-pre-wrap">{detail}</span>
                 )}
+                <SkillDirectives directives={directives} />
               </span>
             </label>
           ))}
@@ -762,6 +794,8 @@ const AddPluginPanel: React.FC<{
             </div>
           )}
 
+          <ReviewedDefinitions items={preview.reviewedComponents} />
+
           {preview.codexHooks.length > 0 && (
             <div>
               <h4 className="text-foreground mb-1 text-xs font-medium">
@@ -918,11 +952,148 @@ const REVIEW_PANEL_COPY: Record<
   },
   components: {
     intro: () =>
-      "These skills and MCP servers have not been reviewed on this install. Review them before you approve them:",
+      "These plugin components have not been reviewed on this install. Review them before you approve them:",
     commits: (review) => review.fromSha.slice(0, 12),
     confirm: "Approve components",
     busy: "Approving…",
   },
+};
+
+const REVIEWED_KIND_LABEL: Record<AgentPluginComponentRef["kind"], string> = {
+  skills: "Skill",
+  mcpServers: "MCP server",
+  workflows: "Workflow",
+  agents: "Agent",
+  slashCommands: "Slash command",
+};
+
+/**
+ * The exact definitions install approves besides skills and MCP servers (#6629). The consent
+ * record covers these fields, so the preview must show them before Install.
+ */
+const ReviewedDefinitions: React.FC<{
+  items: AgentPluginInstallPreview["reviewedComponents"];
+}> = (props) => {
+  if (props.items.length === 0) return null;
+  return (
+    <div>
+      <h4 className="text-foreground mb-1 text-xs font-medium">
+        Reviewed definitions ({props.items.length})
+      </h4>
+      <p className="text-muted mb-1 text-xs">
+        Installing approves these exact definitions. If one changes later, it does not load until
+        you review it again.
+      </p>
+      <ul className="space-y-1">
+        {props.items.map((item) => (
+          <li key={`${item.kind}:${item.name}`} className="text-xs">
+            <details>
+              <summary className="text-foreground cursor-pointer break-all">
+                {REVIEWED_KIND_LABEL[item.kind]} <span className="font-mono">{item.name}</span>
+              </summary>
+              <pre className="bg-modal-bg border-border-medium mt-1 max-h-64 overflow-auto rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
+                {item.detail}
+              </pre>
+            </details>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+};
+
+/** The keys of a review's texts that the panel shows cut (`<row>:before|after`). */
+function cutReviewTextKeys(review: AgentPluginUpdateReview): string[] {
+  return review.changes.flatMap((change, index) =>
+    (["before", "after"] as const).flatMap((field) => {
+      const text = change[field];
+      return text !== undefined && cutReviewText(text).cut ? [`${index}:${field}`] : [];
+    })
+  );
+}
+
+/**
+ * Which cut texts of a review the user expanded (#6629). Keys are valid only for the review object
+ * they were expanded in: a new review (same plugin, other rows) starts with nothing expanded.
+ */
+function useCutTextExpansion(review: AgentPluginUpdateReview) {
+  const [expansion, setExpansion] = useState<{
+    review: AgentPluginUpdateReview | null;
+    keys: ReadonlySet<string>;
+  }>({ review: null, keys: new Set() });
+  const keys = expansion.review === review ? expansion.keys : new Set<string>();
+  return {
+    isExpanded: (key: string) => keys.has(key),
+    mustExpand: cutReviewTextKeys(review).filter((key) => !keys.has(key)),
+    expand: (key: string) =>
+      setExpansion((previous) => ({
+        review,
+        keys: new Set(previous.review === review ? previous.keys : []).add(key),
+      })),
+  };
+}
+
+/** One review row: its summary and its before/after texts. */
+const ReviewChangeRow: React.FC<{
+  change: AgentPluginUpdateReview["changes"][number];
+  index: number;
+  isExpanded: (key: string) => boolean;
+  onExpand: (key: string) => void;
+}> = (props) => {
+  const fields = (["before", "after"] as const).flatMap((field) => {
+    const text = props.change[field];
+    return text !== undefined ? [{ field, text, key: `${props.index}:${field}` }] : [];
+  });
+  return (
+    <li className="text-xs">
+      <span className="text-foreground break-words">{props.change.summary}</span>
+      {fields.length > 0 && (
+        <dl className="mt-1 space-y-1">
+          {fields.map((item) => (
+            <ReviewTextField
+              key={item.field}
+              label={item.field === "before" ? "Before" : "After"}
+              text={item.text}
+              expanded={props.isExpanded(item.key)}
+              onExpand={() => props.onExpand(item.key)}
+            />
+          ))}
+        </dl>
+      )}
+    </li>
+  );
+};
+
+/**
+ * One before/after text of a review row (#6629). A long text is cut at the display bound, and the
+ * user must show all of it before confirming: a plugin can pad a definition and hide the part that
+ * matters after the cut.
+ */
+const ReviewTextField: React.FC<{
+  label: string;
+  text: string;
+  expanded: boolean;
+  onExpand: () => void;
+}> = (props) => {
+  const view = cutReviewText(props.text);
+  return (
+    <div className="flex gap-2">
+      <dt className="text-muted w-10 shrink-0 text-[11px]">{props.label}</dt>
+      <dd className="bg-modal-bg border-border-medium min-w-0 flex-1 rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
+        {view.cut && !props.expanded ? view.shown : props.text}
+        {view.cut && !props.expanded && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="mt-1 h-7 px-2 font-sans text-xs"
+            onClick={props.onExpand}
+          >
+            Show full text ({kilobytes(props.text)} KB)
+          </Button>
+        )}
+      </dd>
+    </div>
+  );
 };
 
 const UpdateReviewPanel: React.FC<{
@@ -934,6 +1105,8 @@ const UpdateReviewPanel: React.FC<{
   onCancel: () => void;
 }> = (props) => {
   const copy = REVIEW_PANEL_COPY[props.mode];
+  const expansion = useCutTextExpansion(props.review);
+  const mustExpand = expansion.mustExpand;
   return (
     <div className="border-border-medium bg-background-secondary mt-2 space-y-2 rounded-md border p-3">
       <p className="text-foreground text-xs">{copy.intro(props.review)}</p>
@@ -944,30 +1117,14 @@ const UpdateReviewPanel: React.FC<{
         </p>
       )}
       <ul className="space-y-2">
-        {props.review.changes.map((change) => (
-          <li key={change.summary} className="text-xs">
-            <span className="text-foreground break-words">{change.summary}</span>
-            {(change.before !== undefined || change.after !== undefined) && (
-              <dl className="mt-1 space-y-1">
-                {change.before !== undefined && (
-                  <div className="flex gap-2">
-                    <dt className="text-muted w-10 shrink-0 text-[11px]">Before</dt>
-                    <dd className="bg-modal-bg border-border-medium min-w-0 flex-1 rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
-                      {change.before}
-                    </dd>
-                  </div>
-                )}
-                {change.after !== undefined && (
-                  <div className="flex gap-2">
-                    <dt className="text-muted w-10 shrink-0 text-[11px]">After</dt>
-                    <dd className="bg-modal-bg border-border-medium min-w-0 flex-1 rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
-                      {change.after}
-                    </dd>
-                  </div>
-                )}
-              </dl>
-            )}
-          </li>
+        {props.review.changes.map((change, index) => (
+          <ReviewChangeRow
+            key={change.summary}
+            change={change}
+            index={index}
+            isExpanded={expansion.isExpanded}
+            onExpand={expansion.expand}
+          />
         ))}
       </ul>
       {props.review.warnings.length > 0 && (
@@ -981,8 +1138,13 @@ const UpdateReviewPanel: React.FC<{
         </div>
       )}
       <p className="text-muted text-[11px] break-all">{copy.commits(props.review)}</p>
+      {mustExpand.length > 0 && (
+        <p className="text-warning text-xs">
+          Show the full text of each cut definition to review it before you confirm.
+        </p>
+      )}
       <div className="flex gap-2">
-        <Button size="sm" onClick={props.onConfirm} disabled={props.busy}>
+        <Button size="sm" onClick={props.onConfirm} disabled={props.busy || mustExpand.length > 0}>
           {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
           {props.busy ? copy.busy : copy.confirm}
         </Button>
@@ -990,6 +1152,90 @@ const UpdateReviewPanel: React.FC<{
           Cancel
         </Button>
       </div>
+    </div>
+  );
+};
+
+/**
+ * The plugin list and the pending sign-out status (#6627). Opening the section retries the
+ * sign-outs, so the status is read after the list. When the record existed before the list and is
+ * gone after it, the list may still hold rows the fence hid: list once more.
+ */
+async function listWithSignOuts(api: NonNullable<ReturnType<typeof useAPI>["api"]>) {
+  const readStatus = () => api.agentPlugins.pendingSignOuts().catch(() => null);
+  const before = await readStatus();
+  let result = await api.agentPlugins.list();
+  const signOuts = await readStatus();
+  if (before !== null && before.kind !== "none" && signOuts?.kind === "none")
+    result = await api.agentPlugins.list();
+  return { result, signOuts };
+}
+
+/** How often the section re-reads a pending sign-out record (the backend retries every 30 s). */
+const PENDING_SIGN_OUT_POLL_MS = 30_000;
+
+/**
+ * The pending sign-out record (#6627). The section sets it after each list. A background pass
+ * (the discovery gate retries every 30 s) can clear or change the record without any section
+ * action, so the hook re-reads it while the notice shows.
+ */
+function usePendingSignOuts(
+  api: ReturnType<typeof useAPI>["api"],
+  /** Re-lists the plugins: rows read while the record fenced discovery show as missing. */
+  onCleared: () => void
+): [AgentPluginPendingSignOuts | null, (status: AgentPluginPendingSignOuts | null) => void] {
+  const [status, setStatus] = useState<AgentPluginPendingSignOuts | null>(null);
+  const shown = status !== null && status.kind !== "none";
+  // The interval reads the latest callback (the section's refresh is a plain handler).
+  const onClearedRef = useRef(onCleared);
+  onClearedRef.current = onCleared;
+  useEffect(() => {
+    if (!api || !shown) return;
+    // Each read also lets the backend retry the sign-out (at most every 30 s).
+    const timer = setInterval(() => {
+      api.agentPlugins.pendingSignOuts().then(
+        (next) => {
+          setStatus(next);
+          if (next.kind === "none") onClearedRef.current();
+        },
+        () => undefined
+      );
+    }, PENDING_SIGN_OUT_POLL_MS);
+    return () => clearInterval(timer);
+  }, [api, shown]);
+  return [status, setStatus];
+}
+
+/**
+ * Section notice while a post-update sign-out record exists (#6627). Every discovery gate keeps
+ * managed plugins closed until it is gone, and without this notice they only disappear.
+ */
+const PendingSignOutNotice: React.FC<{ status: AgentPluginPendingSignOuts | null }> = (props) => {
+  const status = props.status;
+  if (status === null || status.kind === "none") return null;
+  return (
+    <div
+      role="status"
+      className="bg-warning/10 text-warning mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm"
+    >
+      <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+      {status.kind === "broken" ? (
+        <span className="break-words">
+          Managed plugins are unavailable to agents. {status.reason}
+        </span>
+      ) : (
+        <span className="space-y-1 break-words">
+          <span className="block">
+            Managed plugins are unavailable to agents until Xum finishes signing out of a plugin MCP
+            server whose sign-in changed in an update
+            {status.servers.length > 0 ? `: ${status.servers.join(", ")}` : ""}. Xum retries on its
+            own and each time you open this section.
+          </span>
+          {status.lastError !== undefined && (
+            <span className="block">Last attempt: {status.lastError}</span>
+          )}
+        </span>
+      )}
     </div>
   );
 };
@@ -1004,10 +1250,11 @@ const ComponentReviewNotice: React.FC<{ items: AgentPluginListItem[] | null }> =
     >
       <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
       <span className="break-words">
-        Some plugins have skills or MCP servers that you have not reviewed on this install. Xum
-        loads a plugin component only after you approve its current version, so these do not load
-        until you review them. After an upgrade, each plugin needs this review once. Select Review
-        on each plugin marked &quot;needs review&quot; to approve them.
+        Some plugins have components (such as skills, MCP servers or workflow scripts) that you have
+        not reviewed on this install. Xum loads a plugin component only after you approve its
+        current version, so these do not load until you review them. After an upgrade, each plugin
+        needs this review once. Select Review on each plugin marked &quot;needs review&quot; to
+        approve them.
       </span>
     </div>
   );
@@ -1071,6 +1318,25 @@ function confirmMessage(
   result: { success: true; data: { cleanupWarning?: string } } | { success: false; error: string }
 ): string | undefined {
   return result.success ? result.data.cleanupWarning : result.error;
+}
+
+/**
+ * The section's initial palette intent, handed out once. The mount effect reruns on every API
+ * reconnect (APIProvider makes a new client), and replaying the intent would reopen a review the
+ * user already cancelled (#6609). Only an attempt on a live connection consumes it: while Xum
+ * reconnects, `api` can still hold the detached client, whose calls fail, and the live client
+ * that replaces it must still get the intent.
+ */
+function useInitialIntentOnce(
+  liveApi: ReturnType<typeof useLiveAPI>,
+  initialIntent: PluginsSectionIntent | null
+): () => PluginsSectionIntent | null {
+  const consumedRef = useRef(false);
+  return () => {
+    if (!liveApi || consumedRef.current) return null;
+    consumedRef.current = true;
+    return initialIntent;
+  };
 }
 
 function useComponentReview(deps: ComponentReviewDeps) {
@@ -1147,6 +1413,9 @@ export const PluginsSettingsSection: React.FC = () => {
   // Backend-provided container path: the root is config-derived (canonically
   // ~/.shux, possibly custom/legacy), so this copy must never hardcode it.
   const [containerLocation, setContainerLocation] = useState<string | null>(null);
+  // The record that keeps managed plugins closed after a failed post-update sign-out (#6627).
+  // Lazy: `refresh` is declared below.
+  const [pendingSignOuts, setPendingSignOuts] = usePendingSignOuts(api, () => void refresh());
   // Palette intents (keyboard rule: install/uninstall/update need keyboard
   // paths). The initializer covers palette → fresh mount; the subscription
   // below covers commands invoked while this section is already on screen
@@ -1196,10 +1465,11 @@ export const PluginsSettingsSection: React.FC = () => {
     // response resolving last would resurrect removed rows or old versions.
     const generation = ++listGenerationRef.current;
     try {
-      const result = await api.agentPlugins.list();
+      const { result, signOuts } = await listWithSignOuts(api);
       if (generation !== listGenerationRef.current) {
         return; // A newer list request superseded this one.
       }
+      setPendingSignOuts(signOuts);
       if (result.success) {
         setItems(result.data);
         setError(null);
@@ -1244,11 +1514,14 @@ export const PluginsSettingsSection: React.FC = () => {
     }
   };
 
+  const takeInitialIntent = useInitialIntentOnce(useLiveAPI(), initialIntent);
+
   // Approved update policy: passive check on section open + explicit button only.
   useEffect(() => {
     // A palette review intent opens after the first list refresh: the refresh clears the shared
     // error, so a concurrent preview failure would vanish without an explanation.
-    void refresh().finally(() => componentReview.openFromIntent(initialIntent));
+    const intent = takeInitialIntent();
+    void refresh().finally(() => componentReview.openFromIntent(intent));
     void checkForUpdates();
     void api?.agentPlugins.containerLocation().then(setContainerLocation, () => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fetch on mount / API reconnect only; refresh/checkForUpdates are plain handlers (compiler-memoized), not inputs
@@ -1462,6 +1735,7 @@ export const PluginsSettingsSection: React.FC = () => {
           </div>
         )}
 
+        <PendingSignOutNotice status={pendingSignOuts} />
         <ComponentReviewNotice items={items} />
 
         <div className="space-y-2">

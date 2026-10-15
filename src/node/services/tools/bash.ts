@@ -36,6 +36,7 @@ import {
 } from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
+import { skillFileBashHint } from "./skillFileHint";
 import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
 
 const CAT_FILE_READ_NOTICE =
@@ -1691,11 +1692,13 @@ ${scriptWithEnv}`;
           await writerInstance.write(encoder.encode(fullOutput));
           await writerInstance.close();
 
+          // A script that reads a skill file by path gets the call that returns it whole.
+          const skillFileHint = await skillFileBashHint(config, script);
           const noticeBase = `[OUTPUT OVERFLOW - ${overflowReason ?? "unknown reason"}]
 
 Full output (${lines.length} lines) saved to ${overflowPath}
 
-Use selective filtering tools (e.g. grep) to extract relevant information and continue your task
+${skillFileHint}Use selective filtering tools (e.g. grep) to extract relevant information and continue your task
 
 File will be automatically cleaned up when stream ends.`;
 

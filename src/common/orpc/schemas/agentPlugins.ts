@@ -17,6 +17,11 @@ export { AgentPluginGitSourceSchema, AgentPluginInstallEntrySchema };
 export const AgentPluginPreviewSkillSchema = z.object({
   name: z.string(),
   description: z.string().optional(),
+  /**
+   * Commands of the body's directive lines, invisible characters escaped (#6617). They run when
+   * the user invokes the skill, so the review shows them. Absent when there are none.
+   */
+  directives: z.array(z.string()).optional(),
 });
 
 export const AgentPluginPreviewMcpServerSchema = z.object({
@@ -140,6 +145,15 @@ export const AgentPluginManifestSummarySchema = z.object({
  * Everything a user consents to before anything is written: the resolved
  * source + SHA, the manifest, every skill, and every MCP server command line.
  */
+/** The component kinds with consent records (#6498, #6629). */
+export const AgentPluginComponentKindSchema = z.enum([
+  "skills",
+  "mcpServers",
+  "workflows",
+  "agents",
+  "slashCommands",
+]);
+
 export const AgentPluginInstallPreviewSchema = z.object({
   source: AgentPluginGitSourceSchema,
   /** Commit SHA the preview was computed from; install verifies it gets the same tree. */
@@ -160,6 +174,18 @@ export const AgentPluginInstallPreviewSchema = z.object({
   workflows: z.array(z.string()),
   /** Composer slash commands the manifest contributes. */
   slashCommands: z.array(AgentPluginPreviewSlashCommandSchema),
+  /**
+   * The reviewed fields of each component that install records consent for besides skills and MCP
+   * servers (#6629), so the preview shows everything the record approves.
+   */
+  reviewedComponents: z.array(
+    z.object({
+      kind: AgentPluginComponentKindSchema,
+      /** Display form: invisible and bidi controls shown as `<U+XXXX>`, never an identity. */
+      name: z.string(),
+      detail: z.string(),
+    })
+  ),
   /** Manifest warnings + component diagnostics from validating the staged clone. */
   warnings: z.array(z.string()),
   /** Final install directory (~/.mux/plugins/<name>). */
@@ -194,6 +220,23 @@ export const AgentPluginListItemSchema = z.object({
   mcpServerCount: z.number().int().nonnegative(),
 });
 
+/**
+ * The pending plugin sign-out record (#6122): sign-outs that an update could not finish. While
+ * it exists, every discovery gate keeps managed plugins closed. `broken`: the record is corrupt,
+ * from another version, or unreadable, and only the user can clear it.
+ */
+export const AgentPluginPendingSignOutsSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("none") }),
+  z.object({
+    kind: z.literal("pending"),
+    /** Credential URLs still to sign out. */
+    servers: z.array(z.string()),
+    /** Why the last attempt left them, when one ran in this process. */
+    lastError: z.string().optional(),
+  }),
+  z.object({ kind: z.literal("broken"), reason: z.string() }),
+]);
+
 export const AgentPluginUpdateCheckSchema = z.object({
   name: z.string(),
   status: z.enum(["up-to-date", "update-available", "tag-moved", "pinned", "error"]),
@@ -215,7 +258,7 @@ export const AgentPluginUpdateCheckSchema = z.object({
  * match, so a component that changed after the review never gets consent.
  */
 export const AgentPluginComponentRefSchema = z.object({
-  kind: z.enum(["skills", "mcpServers"]),
+  kind: AgentPluginComponentKindSchema,
   name: z.string(),
   fingerprint: z.string(),
 });
@@ -272,6 +315,7 @@ export type AgentPluginHooks = z.infer<typeof AgentPluginHooksSchema>;
 export type AgentPluginManifestSummary = z.infer<typeof AgentPluginManifestSummarySchema>;
 export type AgentPluginInstallPreview = z.infer<typeof AgentPluginInstallPreviewSchema>;
 export type AgentPluginListItem = z.infer<typeof AgentPluginListItemSchema>;
+export type AgentPluginPendingSignOuts = z.infer<typeof AgentPluginPendingSignOutsSchema>;
 export type AgentPluginUpdateCheck = z.infer<typeof AgentPluginUpdateCheckSchema>;
 
 /**

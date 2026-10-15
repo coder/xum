@@ -8,6 +8,7 @@ import * as ReactDndHtml5BackendModule from "react-dnd-html5-backend";
 import * as ReactColorfulModule from "react-colorful";
 import { installDom } from "../../../../tests/ui/dom";
 import { EXPANDED_PROJECTS_KEY } from "@/common/constants/storage";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
@@ -33,7 +34,6 @@ import * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as ExperimentsModule from "@/browser/hooks/useExperiments";
 import * as PopoverErrorHookModule from "@/browser/hooks/usePopoverError";
 import * as TooltipModule from "../Tooltip/Tooltip";
-import * as SidebarCollapseButtonModule from "../SidebarCollapseButton/SidebarCollapseButton";
 import * as ConfirmationModalModule from "../ConfirmationModal/ConfirmationModal";
 import * as ProjectDeleteConfirmationModalModule from "../ProjectDeleteConfirmationModal/ProjectDeleteConfirmationModal";
 import * as PopoverErrorModule from "../PopoverError/PopoverError";
@@ -649,9 +649,6 @@ function installProjectSidebarTestDoubles() {
   spyOn(TooltipModule, "TooltipContent").mockImplementation(
     (() => null) as unknown as typeof TooltipModule.TooltipContent
   );
-  spyOn(SidebarCollapseButtonModule, "SidebarCollapseButton").mockImplementation((() => (
-    <button type="button">toggle sidebar</button>
-  )) as unknown as typeof SidebarCollapseButtonModule.SidebarCollapseButton);
   spyOn(ConfirmationModalModule, "ConfirmationModal").mockImplementation(((props: {
     isOpen: boolean;
     title: string;
@@ -1136,6 +1133,49 @@ describe("ProjectSidebar flat chat list", () => {
       const createWorkspaceDraft = renderFlatSidebar(new Map());
 
       expect(createWorkspaceDraft).toHaveBeenCalledWith(SCRATCH_PROJECT_CONFIG_KEY, undefined);
+    });
+  });
+
+  // The collapsed sidebar's toggle bar New chat and Ctrl+N share one path; on a draft page nothing is
+  // selected, so both open another draft in the page's project.
+  describe("New chat without a selected chat", () => {
+    function renderOnDraftPage() {
+      const createWorkspaceDraft = mock(() => undefined);
+      mockWorkspaceActions({
+        createWorkspaceDraft,
+        pendingNewWorkspaceProject: "/projects/demo-project",
+        pendingNewWorkspaceSubProjectPath: "/projects/demo-project/features",
+        pendingNewWorkspaceDraftId: "draft-1",
+      });
+      render(
+        <ProjectSidebar
+          collapsed
+          onToggleCollapsed={() => undefined}
+          sortedWorkspacesByProject={new Map()}
+          workspaceRecency={{}}
+        />
+      );
+      return createWorkspaceDraft;
+    }
+
+    test("Ctrl+N opens a draft in the draft page's project", () => {
+      const createWorkspaceDraft = renderOnDraftPage();
+      fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(
+        "/projects/demo-project",
+        "/projects/demo-project/features"
+      );
+    });
+
+    test("the toggle bar's New chat request opens a draft in the draft page's project", () => {
+      const createWorkspaceDraft = renderOnDraftPage();
+      act(() => {
+        window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.NEW_CHAT_REQUESTED));
+      });
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(
+        "/projects/demo-project",
+        "/projects/demo-project/features"
+      );
     });
   });
 

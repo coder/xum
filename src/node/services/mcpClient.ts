@@ -1,5 +1,6 @@
 import {
   Client,
+  InsufficientScopeError,
   SSEClientTransport,
   StreamableHTTPClientTransport,
   type OAuthClientProvider,
@@ -74,7 +75,7 @@ const RESOURCE_READ_TIMEOUT_MS = 30_000;
 /** tools/call issued by an MCP Apps view (not by the model). */
 const APP_TOOL_CALL_TIMEOUT_MS = 120_000;
 // One hung server must not stall the whole slash/inline prompt catalog.
-const PROMPT_LIST_TIMEOUT_MS = 10_000;
+export const PROMPT_LIST_TIMEOUT_MS = 10_000;
 
 export interface MCPHttpTransportConfig {
   type: "http" | "sse";
@@ -83,6 +84,11 @@ export interface MCPHttpTransportConfig {
   /** Custom fetch (e.g. WWW-Authenticate capture during server tests). */
   fetch?: typeof fetch;
   authProvider?: OAuthClientProvider;
+  /**
+   * Called with the sanitized scope names when the server refuses a tool call with 403
+   * `insufficient_scope` (#6622). The stored tokens stay: tools that need less keep working.
+   */
+  onInsufficientScope?: (scopes: string[]) => void;
 }
 
 /**
@@ -110,7 +116,7 @@ export interface MCPClientConfig {
    */
   prior?: PriorDiscovery;
   /**
-   * MCP Apps host support (artifacts experiment, read at connect time): announce the
+   * MCP Apps host support (mcp-apps experiment, read at connect time): announce the
    * `io.modelcontextprotocol/ui` extension, keep tool `_meta.ui`, and leave tools whose
    * visibility lacks "model" out of tools(). When false the client behaves exactly as before.
    */
@@ -236,6 +242,64 @@ function isHttpTransportConfig(
   return "type" in transport && (transport.type === "http" || transport.type === "sse");
 }
 
+/**
+ * Scope names Xum repeats to the agent and in Settings. Narrower than RFC 6749 §3.3 (which also
+ * allows markup and quotes): real scopes are names, URLs and URNs (`files.write`,
+ * `api://app/.default`, `https://www.googleapis.com/auth/drive`). Other tokens are dropped.
+ */
+const SCOPE_TOKEN = /^[A-Za-z0-9._:/~+-]{1,200}$/;
+const MAX_REPORTED_SCOPES = 20;
+
+/** The scope names of a 403 `insufficient_scope` challenge, without any other server text. */
+export function insufficientScopeNames(requiredScope: string | undefined): string[] {
+  return (requiredScope ?? "")
+    .split(/\s+/)
+    .filter((token) => SCOPE_TOKEN.test(token))
+    .slice(0, MAX_REPORTED_SCOPES);
+}
+
+/**
+ * The error a refused tool call reports to the agent (#6622). For 403 `insufficient_scope` it
+ * names only the scopes: the SDK error also carries the server's `error_description`, which is
+ * server-controlled text and must not reach the model.
+ */
+function toolCallError(
+  error: unknown,
+  onInsufficientScope: ((scopes: string[]) => void) | undefined
+): unknown {
+  if (!(error instanceof InsufficientScopeError)) return error;
+  const scopes = insufficientScopeNames(error.requiredScope);
+  onInsufficientScope?.(scopes);
+  const needed =
+    scopes.length > 0 ? `the OAuth scope "${scopes.join(" ")}"` : "more OAuth permissions";
+  return new Error(
+    `The MCP server refused this tool call: it needs ${needed}. The user must sign in to this MCP server again and grant it.`
+  );
+}
+
+/** An agent's tool call; a 403 `insufficient_scope` becomes toolCallError's message. */
+async function callModelTool(
+  client: Client,
+  call: { name: string; arguments: Record<string, unknown> },
+  signal: AbortSignal | undefined,
+  onInsufficientScope: ((scopes: string[]) => void) | undefined
+): Promise<MCPRawCallToolResult> {
+  try {
+    return await client.callTool(call, {
+      timeout: SDK_TOOL_CALL_TIMEOUT_MS,
+      ...(signal !== undefined ? { signal } : {}),
+    });
+  } catch (error) {
+    throw toolCallError(error, onInsufficientScope);
+  }
+}
+
+function insufficientScopeHandler(
+  transport: MCPClientConfig["transport"]
+): ((scopes: string[]) => void) | undefined {
+  return isHttpTransportConfig(transport) ? transport.onInsufficientScope : undefined;
+}
+
 function createHttpTransport(config: MCPHttpTransportConfig): Transport {
   const url = new URL(config.url);
   // MCP server URLs are user-configured and already trusted to execute tools,
@@ -251,6 +315,10 @@ function createHttpTransport(config: MCPHttpTransportConfig): Transport {
     requestInit,
     ...(config.fetch !== undefined ? { fetch: config.fetch } : {}),
     ...(config.authProvider !== undefined ? { authProvider: config.authProvider } : {}),
+    // The SDK default ("reauthorize") reaches the background provider's interactive redirect,
+    // which deletes the stored tokens and signs every tool of the server out. Throw instead, so
+    // only the refused call fails and Settings → MCP prompts a sign-in (#6622).
+    onInsufficientScope: "throw" as const,
   };
 
   // Custom headers in requestInit are merged into every request by both
@@ -291,7 +359,7 @@ function addSettingsToolAction(
  * Mirrors @ai-sdk/mcp's mcpToModelOutput so model-visible tool results stay
  * identical across the SDK swap.
  */
-function mcpToModelOutput({
+export function mcpToModelOutput({
   output,
 }: {
   output: unknown;
@@ -424,6 +492,12 @@ function newerCatalog(current: ListedCatalog, answered: ListedCatalog): ListedCa
 
 export async function createMCPClient(config: MCPClientConfig): Promise<MCPClientHandle> {
   const mcpApps = config.mcpApps === true;
+  const onInsufficientScope = insufficientScopeHandler(config.transport);
+  // App, hook and settings calls report a refused scope the same way as model tools (#6622).
+  const callAnyTool = (...args: Parameters<Client["callTool"]>) =>
+    client.callTool(...args).catch((error: unknown) => {
+      throw toolCallError(error, onInsufficientScope);
+    });
   const client = new Client(CLIENT_INFO, {
     versionNegotiation: {
       mode: "auto",
@@ -537,15 +611,11 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
           } as JSONSchema7),
           execute: async (args: unknown, options: { abortSignal?: AbortSignal }) => {
             options.abortSignal?.throwIfAborted();
-            return await client.callTool(
-              {
-                name: definition.name,
-                arguments: args as Record<string, unknown>,
-              },
-              {
-                timeout: SDK_TOOL_CALL_TIMEOUT_MS,
-                ...(options.abortSignal !== undefined ? { signal: options.abortSignal } : {}),
-              }
+            return await callModelTool(
+              client,
+              { name: definition.name, arguments: args as Record<string, unknown> },
+              options.abortSignal,
+              onInsufficientScope
             );
           },
           toModelOutput: mcpToModelOutput,
@@ -579,7 +649,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     appEntrypoints: () => catalog.entrypoints,
     callToolForApp: (name, args, options) => {
       assert(mcpApps, "callToolForApp requires an MCP Apps connection");
-      return client.callTool(
+      return callAnyTool(
         { name, arguments: args },
         {
           timeout: APP_TOOL_CALL_TIMEOUT_MS,
@@ -588,7 +658,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       );
     },
     callToolForHook: (name, args, options) =>
-      client.callTool({ name, arguments: args }, { signal: options.signal }),
+      callAnyTool({ name, arguments: args }, { signal: options.signal }),
     readResource: (uri, options) => {
       assert(mcpApps, "readResource requires an MCP Apps connection");
       return client.readResource(
@@ -602,7 +672,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     settingsCapability: () => settings,
     callSettingsTool: (name, args, meta, options) => {
       assert(settingsTools.has(name), "callSettingsTool only calls the advertised settings tools");
-      return client.callTool(
+      return callAnyTool(
         { name, arguments: args, _meta: meta },
         {
           timeout: options?.timeoutMs ?? APP_TOOL_CALL_TIMEOUT_MS,
@@ -617,7 +687,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     callSettingsActionTool: (name, meta, options) => {
       assert(catalog.settingsActions.has(name), "callSettingsActionTool only calls listed tools");
       // The spec's layout tool accepts `{}`.
-      return client.callTool(
+      return callAnyTool(
         { name, arguments: {}, _meta: meta },
         { ...options, timeout: APP_TOOL_CALL_TIMEOUT_MS }
       );

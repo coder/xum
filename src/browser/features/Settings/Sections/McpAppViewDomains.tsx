@@ -8,7 +8,7 @@ import type { McpAppViewDomains } from "@/common/orpc/schemas/mcpApps";
 import { getErrorMessage } from "@/common/utils/errors";
 
 /**
- * MCP Apps (artifacts experiment): origins the user allowed each server's views to reach, per
+ * MCP Apps (mcp-apps experiment): origins the user allowed each server's views to reach, per
  * project (project config `mcpAppViewDomains`). Loaded once for the whole MCP section.
  */
 /** The last failed revoke, shown next to its entry. */

@@ -63,14 +63,23 @@ export function formatPluginHookInput(input: Record<string, unknown>): PluginHoo
   const compact = JSON.stringify(input);
   // Pretty-print only while even the deepest indentation keeps the text small.
   const full = compact.length <= 2048 ? JSON.stringify(input, null, 2) : compact;
-  if (full.length <= PLUGIN_HOOK_INPUT_DISPLAY_MAX_CHARS) return { shown: full, full: null };
+  const view = cutReviewText(full);
+  return { shown: view.shown, full: view.cut ? compact : null };
+}
+
+/**
+ * A review text as the renderer first shows it: cut at the display bound with a note. `cut` means
+ * the review must offer the full text before the user can approve it (#6629, as for hook input).
+ */
+export function cutReviewText(full: string): { shown: string; cut: boolean } {
+  if (full.length <= PLUGIN_HOOK_INPUT_DISPLAY_MAX_CHARS) return { shown: full, cut: false };
   let shown = full.slice(0, PLUGIN_HOOK_INPUT_DISPLAY_MAX_CHARS);
   // Never end on half of a surrogate pair.
   if (/[\uD800-\uDBFF]$/.test(shown)) shown = shown.slice(0, -1);
-  return { shown: `${shown}\n…truncated (${kilobytes(full)} KB)`, full: compact };
+  return { shown: `${shown}\n…truncated (${kilobytes(full)} KB)`, cut: true };
 }
 
-function kilobytes(text: string): number {
+export function kilobytes(text: string): number {
   return Math.ceil(text.length / 1024);
 }
 

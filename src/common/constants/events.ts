@@ -157,6 +157,13 @@ export const CUSTOM_EVENTS = {
   EXPAND_RIGHT_SIDEBAR: "mux:expandRightSidebar",
 
   /**
+   * Start a new chat the way the left sidebar's "New chat" button does. Sent by the app shell's
+   * toggle bar while the sidebar is collapsed; ProjectSidebar stays mounted and owns
+   * the draft logic. No payload.
+   */
+  NEW_CHAT_REQUESTED: "mux:newChatRequested",
+
+  /**
    * Open a /side chat as a right-sidebar tab of its parent workspace. Dispatched cancelable: the
    * sidebar calls preventDefault() once it shows the tab, and the sender falls back to opening
    * the side chat full-screen when nothing did (sidebar hidden on narrow viewports).
@@ -164,7 +171,7 @@ export const CUSTOM_EVENTS = {
   OPEN_SIDE_CHAT_TAB: "mux:openSideChatTab",
 
   /**
-   * Open an MCP Apps view in its app tab (artifacts experiment): uncollapse the right sidebar
+   * Open an MCP Apps view in its app tab (mcp-apps experiment): uncollapse the right sidebar
    * and open or focus the view's tab, or open the view's sheet on small viewports.
    */
   OPEN_MCP_APP_VIEW: "mux:openMcpAppView",
@@ -236,6 +243,7 @@ export interface CustomEventPayloads {
     handled: boolean;
   };
   [CUSTOM_EVENTS.OPEN_AGENT_PICKER]: never; // No payload
+  [CUSTOM_EVENTS.NEW_CHAT_REQUESTED]: never; // No payload
   [CUSTOM_EVENTS.CLOSE_AGENT_PICKER]: never; // No payload
   [CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED]: never; // No payload
   [CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED]: never; // No payload

@@ -18,7 +18,6 @@ interface AIViewProps {
   workspaceName: string;
   namedWorkspacePath: string; // User-friendly path for display and terminal
   leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
   runtimeConfig?: RuntimeConfig;
   className?: string;
   /** If set, workspace is incompatible (from newer mux version) and this error should be displayed */

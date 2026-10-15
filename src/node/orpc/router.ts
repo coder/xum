@@ -1335,7 +1335,7 @@ export const router = (authToken?: string) => {
                 input.workspaceId,
                 input.serverName,
                 input.toolName,
-                input.instanceToken,
+                { instanceToken: input.instanceToken, readId: input.readId },
                 { confirmed: input.confirmed, signal }
               )
             )
@@ -1349,7 +1349,7 @@ export const router = (authToken?: string) => {
                 input.workspaceId,
                 input.serverName,
                 input.toolName,
-                input.instanceToken,
+                { instanceToken: input.instanceToken, readId: input.readId },
                 { confirmed: input.confirmed, signal }
               )
             )
@@ -1449,6 +1449,10 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.agentPluginInstallService.setComponentsResult(input)
         ),
+      pendingSignOuts: t
+        .input(schemas.agentPlugins.pendingSignOuts.input)
+        .output(schemas.agentPlugins.pendingSignOuts.output)
+        .handler(({ context }) => context.agentPluginInstallService.pendingSignOutStatus()),
       containerLocation: t
         .input(schemas.agentPlugins.containerLocation.input)
         .output(schemas.agentPlugins.containerLocation.output)

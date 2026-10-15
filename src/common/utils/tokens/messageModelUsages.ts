@@ -10,7 +10,7 @@ import {
   type MuxMetadata,
   type PersistedToolModelUsage,
 } from "@/common/types/message";
-import { createDisplayUsage } from "./displayUsage";
+import { createDisplayUsage, readTurnSteps, type TurnSteps } from "./displayUsage";
 import type { ChatUsageDisplay } from "./usageAggregator";
 
 export interface MessageModelUsage {
@@ -49,11 +49,12 @@ export function getAssistantMessageModelUsages(
     rawUsage: Parameters<typeof createDisplayUsage>[0],
     providerMetadata: Record<string, unknown> | undefined,
     metadataModel: string | undefined,
-    isMessageUsage: boolean
+    isMessageUsage: boolean,
+    turnSteps?: TurnSteps
   ) => {
     // No live provider mapping: a row without a record-time `metadataModel` prices by its
     // persisted model alone, so a later mapping change cannot reprice history.
-    const usage = createDisplayUsage(rawUsage, model, providerMetadata, metadataModel);
+    const usage = createDisplayUsage(rawUsage, model, providerMetadata, metadataModel, turnSteps);
     if (!usage) return;
     const rawInputTokens = rawUsage?.inputTokens;
     result.push({
@@ -72,7 +73,8 @@ export function getAssistantMessageModelUsages(
       metadata.usage,
       metadata.providerMetadata,
       metadata.metadataModel,
-      true
+      true,
+      readTurnSteps(metadata)
     );
   }
 

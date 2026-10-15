@@ -6,6 +6,10 @@ import { useWorkspaceContext, toWorkspaceSelection } from "./contexts/WorkspaceC
 import { useProjectContext } from "./contexts/ProjectContext";
 import type { WorkspaceSelection } from "./components/ProjectSidebar/ProjectSidebar";
 import { LeftSidebar } from "./components/LeftSidebar/LeftSidebar";
+import {
+  LeftSidebarToggleBar,
+  LeftSidebarToggleBarSpacer,
+} from "./components/SidebarCollapseButton/SidebarCollapseButton";
 import { ProjectCreateModal } from "./components/ProjectCreateModal/ProjectCreateModal";
 import { MultiProjectWorkspaceCreateModal } from "./components/MultiProjectWorkspaceCreateModal/MultiProjectWorkspaceCreateModal";
 import type * as AIViewModule from "./components/AIView/AIView";
@@ -130,10 +134,11 @@ import { useRouting } from "@/browser/hooks/useRouting";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
 import assert from "@/common/utils/assert";
+import { cn } from "@/common/lib/utils";
 import { createProjectRefs } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import {
   prependInitialAppProxyBasePath,
   stripInitialAppProxyBasePathFromPathname,
@@ -222,27 +227,24 @@ function PageArea(props: { pageKey: string; children: React.ReactNode }) {
   );
 }
 
-function RootRouteShell(props: {
-  leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
-}) {
+function RootRouteShell(props: { leftSidebarCollapsed: boolean }) {
+  const isDesktop = isDesktopMode();
   return (
     // The page has no chat pane here, so the shell is its one `main` landmark (#5969).
     <main className="bg-surface-primary flex flex-1 flex-col overflow-hidden">
-      {props.leftSidebarCollapsed ? (
+      {props.leftSidebarCollapsed && (
+        // The collapsed page's title bar: a full-width window drag region on desktop. The fixed
+        // toggle bar over it is shrink-wrapped and its button is no-drag, so it cannot be one.
         <div
-          className={`bg-sidebar border-border-light flex shrink-0 items-center border-b px-4 py-2 ${isDesktopMode() ? "titlebar-drag" : ""}`}
+          className={cn(
+            "bg-sidebar border-border-light flex shrink-0 items-center border-b",
+            "[@media(max-width:768px)_and_(pointer:coarse)]:min-h-11",
+            isDesktop ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
+          )}
         >
-          <button
-            type="button"
-            onClick={props.onToggleLeftSidebarCollapsed}
-            className={`border-border-medium bg-background-secondary text-foreground hover:bg-hover rounded-md border px-3 py-1.5 text-sm transition-colors ${isDesktopMode() ? "titlebar-no-drag" : ""}`}
-            aria-label="Open sidebar menu"
-          >
-            Open sidebar
-          </button>
+          <LeftSidebarToggleBarSpacer showNewChat={false} />
         </div>
-      ) : null}
+      )}
       <div className="flex flex-1 items-center justify-center px-6">
         {/* text-content-secondary, not text-muted: the light theme's muted token is 3.8:1 on this
             surface, below WCAG AA for text-sm (#5948). */}
@@ -341,8 +343,9 @@ function AppInner() {
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
-  // MCP App entry points open as app tabs, so the Artifacts experiment gates them too.
-  useLoadMcpAppEntrypoints(selectedWorkspace?.workspaceId ?? null, artifactsEnabled);
+  const mcpAppsEnabled = useExperimentValue(EXPERIMENT_IDS.MCP_APPS);
+  // MCP App entry points open as app tabs, so the mcp-apps experiment gates them too.
+  useLoadMcpAppEntrypoints(selectedWorkspace?.workspaceId ?? null, mcpAppsEnabled);
   const mcpAppEntrypoints = useMcpAppEntrypoints(selectedWorkspace?.workspaceId ?? "");
   const sessionTapesEnabled = useExperimentValue(EXPERIMENT_IDS.SESSION_TAPES);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
@@ -1088,6 +1091,7 @@ function AppInner() {
     onStartMultiProjectWorkspaceCreation: openNewMultiProjectWorkspaceFromPalette,
     multiProjectWorkspacesEnabled,
     artifactsEnabled,
+    mcpAppsEnabled,
     mcpAppEntrypoints,
     perfFlightRecorderEnabled,
     sessionTapesEnabled,
@@ -1531,12 +1535,25 @@ function AppInner() {
     );
   }
 
+  const toggleBarShowsNewChat =
+    sidebarCollapsed && (selectedWorkspace != null || creationProjectPath != null);
+  // While collapsed, the fixed toggle bar sits over the top of the main column, so a platform
+  // warning banner there starts after it instead of under it.
+  const bannerToggleBarSpacer = sidebarCollapsed ? (
+    <LeftSidebarToggleBarSpacer showNewChat={toggleBarShowsNewChat} />
+  ) : null;
+
   return (
     <>
       <div
         className="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]"
         ref={appShellRef}
       >
+        <LeftSidebarToggleBar
+          collapsed={sidebarCollapsed}
+          showNewChat={toggleBarShowsNewChat}
+          onToggle={handleToggleSidebar}
+        />
         <LeftSidebar
           collapsed={sidebarCollapsed}
           onToggleCollapsed={handleToggleSidebar}
@@ -1547,8 +1564,8 @@ function AppInner() {
           workspaceRecency={workspaceRecency}
         />
         <div className="mobile-main-content flex min-w-0 flex-1 flex-col overflow-hidden">
-          <WindowsToolchainBanner />
-          <RosettaBanner />
+          <WindowsToolchainBanner toggleBarSpacer={bannerToggleBarSpacer} />
+          <RosettaBanner toggleBarSpacer={bannerToggleBarSpacer} />
           <PageArea
             pageKey={
               selectedWorkspace || currentWorkspaceId
@@ -1588,7 +1605,6 @@ function AppInner() {
                     projectPath={selectedWorkspace.projectPath}
                     projectName={selectedWorkspace.projectName}
                     leftSidebarCollapsed={sidebarCollapsed}
-                    onToggleLeftSidebarCollapsed={handleToggleSidebar}
                     workspaceName={workspaceName}
                     namedWorkspacePath={workspacePath}
                     runtimeConfig={currentMetadata.runtimeConfig}
@@ -1614,15 +1630,11 @@ function AppInner() {
                 // If metadata never hydrated for the routed workspace, avoid trapping the user
                 // on a permanent spinner. Show the same non-blocking root shell while the route
                 // waits for a later retry or manual navigation.
-                <RootRouteShell
-                  leftSidebarCollapsed={sidebarCollapsed}
-                  onToggleLeftSidebarCollapsed={handleToggleSidebar}
-                />
+                <RootRouteShell leftSidebarCollapsed={sidebarCollapsed} />
               )
             ) : creationProjectPath === SCRATCH_PROJECT_CONFIG_KEY ? (
               <ScratchPage
                 leftSidebarCollapsed={sidebarCollapsed}
-                onToggleLeftSidebarCollapsed={handleToggleSidebar}
                 pendingDraftId={pendingNewWorkspaceDraftId}
                 onWorkspaceCreated={handleWorkspaceCreated}
               />
@@ -1635,7 +1647,6 @@ function AppInner() {
                   "Project"
                 }
                 leftSidebarCollapsed={sidebarCollapsed}
-                onToggleLeftSidebarCollapsed={handleToggleSidebar}
                 pendingSubProjectPath={pendingNewWorkspaceSubProjectPath}
                 pendingDraftId={pendingNewWorkspaceDraftId}
                 onWorkspaceCreated={handleWorkspaceCreated}
@@ -1644,10 +1655,7 @@ function AppInner() {
               // The dedicated Xum home page was removed. Keep `/` as a minimal shell so
               // WorkspaceContext can redirect it to a concrete project route when possible,
               // without reintroducing a sticky dashboard screen.
-              <RootRouteShell
-                leftSidebarCollapsed={sidebarCollapsed}
-                onToggleLeftSidebarCollapsed={handleToggleSidebar}
-              />
+              <RootRouteShell leftSidebarCollapsed={sidebarCollapsed} />
             )}
           </PageArea>
         </div>

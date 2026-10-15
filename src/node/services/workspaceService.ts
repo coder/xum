@@ -1,3 +1,4 @@
+import { humanId } from "human-id";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import { removeRuntimeScratchDir } from "@/node/runtime/runtimeScratchDir";
 import type { ContextManagementService } from "./contextManagement/contextManagementService";
@@ -654,11 +655,23 @@ interface ActiveWorkflowRunIdsOptions {
 }
 
 /**
- * Base name used when /new auto-generates a branch name. Numbered suffixes
- * (`workspace-1`, `workspace-2`, ...) come from {@link generateForkBranchName}
- * so the existing fork-style numbering helpers stay the single source of truth.
+ * Random draws before an auto-generated name falls back to a numbered suffix. The pool holds
+ * millions of names, so a collision past the first draw means the generator is stubbed.
  */
-const AUTO_NEW_WORKSPACE_BASE_NAME = "workspace";
+const AUTO_WORKSPACE_NAME_ATTEMPTS = 10;
+
+/**
+ * Docker-style provisional names ("calm-otters-sing") read better than "workspace-N" while
+ * auto-naming runs, and do not look like a numbered sequence the user has to manage.
+ */
+export function generateAutoWorkspaceName(existingNames: ReadonlySet<string>): string {
+  let candidate = "";
+  for (let attempt = 0; attempt < AUTO_WORKSPACE_NAME_ATTEMPTS; attempt++) {
+    candidate = humanId({ separator: "-", capitalize: false });
+    if (!existingNames.has(candidate)) return candidate;
+  }
+  return generateForkBranchName(candidate, [...existingNames]);
+}
 
 // Keep short to feel instant, but debounce bursts of file_edit_* tool calls.
 
@@ -6398,7 +6411,7 @@ export class WorkspaceService
     }
   }
 
-  /** The next free "workspace-N" name, as /new and backend-named creations use. */
+  /** A free random name, as /new and backend-named creations use. */
   private async nextAutoWorkspaceBranchName(
     owningProjectPath: string,
     projectConfig: ProjectConfig,
@@ -6420,7 +6433,7 @@ export class WorkspaceService
         error: getErrorMessage(error),
       });
     }
-    return generateForkBranchName(AUTO_NEW_WORKSPACE_BASE_NAME, [...existingNamesSet]);
+    return generateAutoWorkspaceName(existingNamesSet);
   }
 
   async create(
@@ -6454,7 +6467,7 @@ export class WorkspaceService
       delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
       /**
        * Name the workspace after announcing it (see startCreationNaming): it opens under the
-       * provisional "workspace-N" name, and its branch is renamed before the init hook runs.
+       * provisional random name, and its branch is renamed before the init hook runs.
        */
       nameGeneration?: WorkspaceNameGenerationRequest;
     }
@@ -6537,8 +6550,8 @@ export class WorkspaceService
     }
 
     // Auto-generate a branch name when the caller omits one (used by /new to
-    // mirror /fork's seamless creation flow). Mirrors fork's auto-naming: scan
-    // existing workspace names AND local git branches so numbering is stable.
+    // mirror /fork's seamless creation flow). Scan existing workspace names AND
+    // local git branches so the random name never collides.
     // Branches/worktrees are owned by the parent project, so always read from
     // owningProjectPath even when a sub-project initiated creation.
     const resolvedBranchName =
@@ -10752,7 +10765,7 @@ export class WorkspaceService
   }
 
   /**
-   * Start naming a workspace that create() opens under its provisional "workspace-N" name, while
+   * Start naming a workspace that create() opens under its provisional random name, while
    * its checkout runs. The title applies as soon as it arrives (unless the user titled the
    * workspace meanwhile); a failure keeps pendingAutoTitle so a later message titles it. The
    * auto-title claim, taken before the workspace is announced, keeps the first message from

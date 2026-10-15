@@ -13,7 +13,7 @@
  * 1. Create a temp root holding XUM_ROOT, HOME and a throwaway git repo.
  * 2. Start the server on a private port and seed it through the HTTP API: the demo project
  *    (trusted), one workspace with a few artifacts (one with stored versions), onboarding marked
- *    seen, the artifacts experiment, and a fake Anthropic provider on a dead loopback port.
+ *    seen, the artifacts and mcp-apps experiments, and a fake Anthropic provider on a dead loopback port.
  * 3. Stop that server, then serve the same root on `--port`. e2e polls `--port` for readiness,
  *    so no explorer can open the app before seeding has finished.
  *
@@ -275,6 +275,8 @@ async function seed(
 ): Promise<string> {
   await api(base, "splashScreens/markSplashScreenViewed", { splashId: "onboarding-wizard-v1" });
   await api(base, "experiments/set", { experimentId: "artifacts", enabled: true });
+  // MCP App views have their own experiment (#6760); the MCP Apps suite and repros need it.
+  await api(base, "experiments/set", { experimentId: "mcp-apps", enabled: true });
   if (ai.mode === "real") {
     await api(base, "providers/setProviderConfig", {
       provider: ai.provider,

@@ -713,7 +713,9 @@
   --color-input-border: #4385be;
   --color-input-border-focus: color-mix(in srgb, var(--color-input-border), white 22%);
 
-  --color-muted: #878580;
+  /* Flexoki base-400, the same as --color-secondary: WCAG AA on every flexoki-dark surface, down to
+     #343331 (4.65:1). base-500 #878580 was 4.04:1 on hover (#6544). */
+  --color-muted: #9f9d96;
   --color-muted-light: #cecdc3;
   --color-muted-dark: #575653;
   --color-placeholder: #575653;
@@ -974,10 +976,10 @@ body,
     display: inline-flex !important;
   }
 
-  /* The collapsed-left-sidebar header inset reserves room for the desktop reopen affordance; at
-     phone widths this button is that affordance, so fall back to the header's ordinary gutter. */
-  .mobile-sticky-header:has(.mobile-menu-btn) {
-    padding-left: 0.5rem !important;
+  /* The app shell's fixed left sidebar toggle bar and its header spacers take the header's
+     ordinary phone gutter. */
+  .left-sidebar-toggle-host {
+    padding-left: max(var(--titlebar-left-inset, 0px), 0.5rem) !important;
   }
 
   .mobile-overlay {
@@ -1052,15 +1054,17 @@ body,
 /* Touch targets widen this button to 44px (see the coarse-pointer block above), so centering
    would drift the icon to 22px; anchor the box to the header edge to keep it on the 12px gutter.
    Fine pointers keep the 24px box, where this inset would push the icon out of the box and paint
-   the hover pill against the window edge. */
+   the hover pill against the window edge. The toggle bar and its spacers match the page header's
+   44px touch height, so the bar lines up with the header under it. */
 @media (max-width: 768px) and (pointer: coarse) {
   .mobile-menu-btn {
     justify-content: flex-start !important;
     padding-left: 12px !important;
   }
 
-  .mobile-sticky-header:has(.mobile-menu-btn) {
-    padding-left: 0 !important;
+  .left-sidebar-toggle-host {
+    padding-left: var(--titlebar-left-inset, 0px) !important;
+    min-height: 44px;
   }
 }
 

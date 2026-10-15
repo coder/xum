@@ -36,7 +36,11 @@ import { attachModelOnlyToolNotifications } from "@/common/utils/tools/internalT
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import type { HistoryService } from "./historyService";
 import { wrapFetchWithAnthropicCacheControl } from "./providerModelFactory";
+import { mcpToModelOutput } from "./mcpClient";
+import { wrapMCPTools } from "./mcpServerManager";
 import { createStreamManagerForTests } from "./streamManager.testHarness";
+import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
+import { withExecutionScope } from "./tools/withExecutionScope";
 import { createTestHistoryService } from "./testHistoryService";
 import { expectReproFailure } from "@/node/utils/repro.testHarness";
 import { assemblePromptPayload } from "./turnContextAssembler";
@@ -278,9 +282,16 @@ async function runTurn(
   /** Volatile system tail (hot memories, MCP warning, context-window ids) after SYSTEM. */
   volatileTail = "",
   /** Tool search: the advertised tool set changes when a step activates a deferred tool. */
-  toolSearchState?: ToolSearchStreamState
+  toolSearchState?: ToolSearchStreamState,
+  /** Runs after the request read history and before the assistant row is appended. */
+  beforePlaceholder?: () => Promise<void>
 ): Promise<WireBody[]> {
   const history = await readHistory();
+  // As turnRequestBuilder records it: the highest history row the request includes.
+  const requestHistorySequence = Math.max(
+    -1,
+    ...history.map((row) => row.metadata?.historySequence ?? -1)
+  );
   const payload = await assemblePromptPayload({
     history,
     systemMessage: SYSTEM + volatileTail,
@@ -295,6 +306,7 @@ async function runTurn(
     anthropicCacheTtl: "1h",
     workspaceId: WORKSPACE_ID,
   });
+  await beforePlaceholder?.();
   const messageId = `assistant-${nextSequence}`;
   const historySequence = nextSequence;
   const placeholder = await historyService.appendToHistory(WORKSPACE_ID, {
@@ -306,9 +318,15 @@ async function runTurn(
   if (!placeholder.success) throw new Error(placeholder.error);
   nextSequence = historySequence + 1;
 
-  const streamManager = createStreamManagerForTests(historyService);
+  const streamManager = createStreamManagerForTests(historyService, {
+    toolCallDisplayRegistry: displayRegistry,
+  });
   const before = anthropic.bodies.length;
   anthropic.script(steps);
+  // As turnRequestBuilder does: the tools carry the stream's scope, so MCP wrappers can publish
+  // the display data that StreamManager persists as `mcpServer`.
+  const streamToken = streamManager.generateStreamToken();
+  const executionScope = { workspaceId: WORKSPACE_ID, messageId, token: streamToken };
   const started = await streamManager.startStream({
     workspaceId: WORKSPACE_ID,
     messageId,
@@ -316,9 +334,12 @@ async function runTurn(
     modelString: MODEL_STRING,
     messages: payload.messages,
     system: payload.system,
-    tools: payload.tools,
+    tools: payload.tools && withExecutionScope(payload.tools, executionScope),
+    providedStreamToken: streamToken,
+    executionScope,
     providerOptions: { anthropic: { thinking: { type: "adaptive" } } },
     historySequence,
+    initialMetadata: { requestHistorySequence },
     thinkingLevel: "high",
     // TurnRequestBuilder puts the assembler's tail record on the turn's assistant row.
     ...(payload.volatileSystemTail != null
@@ -401,6 +422,47 @@ const divergesAt = (index: number) => ({
   received: String(index),
 });
 
+const ONE_PIXEL_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+/** Display data the real MCP wrapper publishes for each call; runTurn's StreamManager reads it. */
+const displayRegistry = new ToolCallDisplayRegistry();
+
+/**
+ * An MCP tool as mcpServerManager builds it: the client's raw tool (mcpToModelOutput) inside
+ * the real wrapMCPTools, optionally inside the model-only notification wrapper of tools.ts.
+ */
+function mcpTool(
+  name: string,
+  notes: string[] = [],
+  content: unknown[] = [{ type: "text", text: "page body" }]
+): Tool {
+  const raw = tool({
+    description: `${name} tool`,
+    inputSchema: z.object({ script: z.string() }),
+    execute: () => Promise.resolve({ content, isError: false }),
+    toModelOutput: mcpToModelOutput,
+  });
+  const wrapped = wrapMCPTools(
+    { [name]: raw },
+    {
+      display: {
+        connection: { key: "notion", transport: "http", origin: "https://mcp.example.com" },
+        identity: { name: "Notion MCP", version: "1.0.0" },
+        registry: displayRegistry,
+      },
+    }
+  )[name];
+  const execute = wrapped.execute;
+  if (execute === undefined) throw new Error("expected an executable MCP tool");
+  const reminded: Tool = {
+    ...wrapped,
+    execute: async (input, options) =>
+      attachModelOnlyToolNotifications(await execute(input, options), notes),
+  };
+  return reminded;
+}
+
 const plainTool = (name: string) =>
   tool({
     description: `${name} tool`,
@@ -409,6 +471,30 @@ const plainTool = (name: string) =>
   });
 
 describe("prompt-cache prefix: next turn vs the previous turn's last step", () => {
+  // A sub-agent report (TaskService appends it to the parent's history at once) can land after
+  // the request read history but before the assistant row is appended. It then sorts before
+  // that row, although the turn never saw it. Seen live on the dogfood server (f5714aa3af,
+  // 2026-10-14): the next turn rebuilt the earlier user message with the report merged in, and
+  // Anthropic rejected the turn's thinking ("Content before this block differs").
+  test("a row appended while the request was being built keeps the prefix", async () => {
+    const anthropic = createScriptedAnthropic();
+    const tools = { bash: plainTool("bash"), probe: plainTool("probe") };
+    await appendUser("Start the job and wait for it.");
+    const firstTurnBodies = await runTurn(
+      anthropic,
+      tools,
+      toolThenTextTurn("bash", "call-1"),
+      "",
+      undefined,
+      () => appendUser("<mux_subagent_report>done</mux_subagent_report>", { synthetic: true })
+    );
+    await appendUser(MONITOR_WAKE);
+    const [nextFirst] = await runTurn(anthropic, tools, toolThenTextTurn("probe", "call-next"));
+    expectExtendsLastStep(firstTurnBodies[firstTurnBodies.length - 1], nextFirst, MONITOR_WAKE);
+    // The model reads the report after its own reply, where it arrived.
+    expect(JSON.stringify(nextFirst.messages.at(-1))).toContain("mux_subagent_report");
+  });
+
   test("control: a plain tool round trip keeps the prefix", async () => {
     await expectNextTurnExtendsLastStep({
       tools: { bash: plainTool("bash"), probe: plainTool("probe") },
@@ -441,31 +527,46 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
   });
 
   // mcpClient.ts gives every MCP tool a toModelOutput (mcpToModelOutput) that turns the
-  // CallToolResult into `content` text parts in-turn. The rebuild calls
-  // convertToModelMessages without tools (messagePipeline.ts), so the persisted output
-  // replays through the SDK's default JSON encoding instead.
-  test("MCP-style toModelOutput results keep the prefix", async () => {
-    const mcpLike = tool({
-      description: "notion_fetch tool",
-      inputSchema: z.object({ script: z.string() }),
-      execute: () =>
-        Promise.resolve({ content: [{ type: "text", text: "page body" }], isError: false }),
-      toModelOutput: ({ output }) => {
-        const result = output as { content: Array<{ type: string; text: string }> };
-        return {
-          type: "content",
-          value: result.content.map((part) => ({ type: "text" as const, text: part.text })),
-        };
-      },
+  // CallToolResult into `content` text parts in-turn. The rebuild used to call
+  // convertToModelMessages without tools, so the persisted output replayed through the SDK's
+  // default JSON encoding instead. It now applies mcpToModelOutput to every persisted part with
+  // `mcpServer` (the display snapshot the real MCP wrapper publishes), so the bytes match.
+  test("MCP toModelOutput results keep the prefix", async () => {
+    await expectNextTurnExtendsLastStep({
+      tools: { notion_fetch: mcpTool("notion_fetch"), probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("notion_fetch", "call-1"),
     });
-    await expectReproFailure(
-      () =>
-        expectNextTurnExtendsLastStep({
-          tools: { notion_fetch: mcpLike, probe: plainTool("probe") },
-          firstTurn: toolThenTextTurn("notion_fetch", "call-1"),
-        }),
-      divergesAt(2)
+  });
+
+  // The model-only notes (#6658) ride on the MCP result too. In-turn, mcpToModelOutput reads
+  // only `content`, so the notes never reach the model. The rebuild re-attaches them before the
+  // same conversion, which must drop them the same way.
+  test("MCP results with model-only notifications keep the prefix", async () => {
+    const reminded = mcpTool("notion_fetch", [
+      "<notification>\nIt's been 5 tool calls since you last updated the TODO list.\n</notification>",
+    ]);
+    await expectNextTurnExtendsLastStep({
+      tools: { notion_fetch: reminded, probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("notion_fetch", "call-1"),
+    });
+  });
+
+  // In-turn, mcpToModelOutput keeps an MCP image inside the tool result as a file part, which
+  // the step's media extraction leaves alone. The rebuild used to extract it on MuxMessages
+  // before the MCP conversion ran and moved it behind the turn's final text (#6747).
+  test("MCP image results keep the prefix", async () => {
+    const screenshot = mcpTool(
+      "browser_screenshot",
+      [],
+      [
+        { type: "text", text: "Captured." },
+        { type: "image", data: ONE_PIXEL_PNG, mimeType: "image/png" },
+      ]
     );
+    await expectNextTurnExtendsLastStep({
+      tools: { browser_screenshot: screenshot, probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("browser_screenshot", "call-1"),
+    });
   });
 
   // The rebuild (applyToolOutputRedaction) used to cut every string over 12,000 chars while
@@ -586,12 +687,9 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
 
   // In-turn, StreamManager's transformStepMessages
   // (extractToolMediaAsUserMessagesFromModelMessages) puts the extracted image right after
-  // the tool result of that step. The rebuild's extractToolMediaAsUserMessages works on
-  // whole MuxMessages and appends the synthetic attachment row after the assistant row, so
-  // the image moves behind the turn's final text and merges into the NEXT user message.
+  // the tool result of that step. The rebuild used to extract on whole MuxMessages and append
+  // the image after the assistant row, behind the turn's final text.
   test("attach_file media stays where the in-turn step put it", async () => {
-    const png =
-      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
     const attachFile = tool({
       description: "attach_file tool",
       inputSchema: z.object({ script: z.string() }),
@@ -600,18 +698,14 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
           type: "content",
           value: [
             { type: "text", text: "[Attachment prepared: a.png]" },
-            { type: "media", data: png, mediaType: "image/png", filename: "a.png" },
+            { type: "media", data: ONE_PIXEL_PNG, mediaType: "image/png", filename: "a.png" },
           ],
         }),
     });
-    await expectReproFailure(
-      () =>
-        expectNextTurnExtendsLastStep({
-          tools: { attach_file: attachFile, probe: plainTool("probe") },
-          firstTurn: toolThenTextTurn("attach_file", "call-1"),
-        }),
-      divergesAt(2)
-    );
+    await expectNextTurnExtendsLastStep({
+      tools: { attach_file: attachFile, probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("attach_file", "call-1"),
+    });
   });
 });
 

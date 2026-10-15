@@ -142,7 +142,7 @@ export function summary(
       : [
           `**Incomplete coverage (${incomplete}): coverage-based violations are warnings. Complexity-only verdicts stand.**`,
         ]),
-    "Unit reports cover every Bun unit suite except the isolated ones marked `no-coverage:` in scripts/test-unit-ci.sh (Bun coverage crashes them). A suite whose coverage run crashed twice passes on a retry without coverage, so it has no report: its Test / Unit job shows a warning. No base coverage: the CRAP tax compares CC and only warns.",
+    "Unit reports cover every Bun unit suite except the isolated ones marked `no-coverage:` in scripts/test-unit-ci.sh (Bun coverage crashes them). A suite whose coverage run crashed twice passes on a retry without coverage, so it has no report: its Test / Unit job shows a warning. No base coverage: the CRAP tax compares CC. It only warns, with or without coverage.",
     "",
   ];
   if (report === null) {

@@ -2,6 +2,7 @@
  * Extra models not yet in LiteLLM's official models.json
  * This file is consulted as a fallback when a model is not found in the main file.
  * Models should be removed from here once they appear in the upstream LiteLLM repository.
+ * Retired entries stay: they price usage recorded before the model was retired.
  */
 
 interface ModelData {
@@ -34,6 +35,10 @@ interface ModelData {
   supports_response_schema?: boolean;
   knowledge_cutoff?: string;
   supported_endpoints?: string[];
+  // No longer offered: not in KNOWN_MODELS and hidden from the model catalog, but still
+  // priced, so recorded usage keeps its cost. Retire a model with this flag; deleting its
+  // entry would reprice its history at $0.
+  retired?: true;
 }
 
 export const modelsExtra: Record<string, ModelData> = {
@@ -508,6 +513,31 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_reasoning: true,
     supports_response_schema: true,
     knowledge_cutoff: "2026-04-30",
+  },
+
+  // GPT-6 Sol - Released September 22, 2026; retired by GPT-6.1 Sol (#5258). Above 272K
+  // input, the full request costs 2x input/cache and 1.5x output.
+  // Ref: https://developers.openai.com/api/docs/models/gpt-6-sol
+  "gpt-6-sol": {
+    max_input_tokens: 922000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.000002,
+    input_cost_per_token_above_200k_tokens: 0.000004,
+    output_cost_per_token: 0.00001,
+    output_cost_per_token_above_200k_tokens: 0.000015,
+    cache_read_input_token_cost: 0.0000002,
+    cache_read_input_token_cost_above_200k_tokens: 0.0000004,
+    cache_creation_input_token_cost: 0.0000025,
+    cache_creation_input_token_cost_above_200k_tokens: 0.000005,
+    tiered_pricing_threshold_tokens: 272000,
+    litellm_provider: "openai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+    knowledge_cutoff: "2026-04-20",
+    retired: true,
   },
 
   // Gemini 3.5 Flash - GA on May 19, 2026. Google AI docs list a stable

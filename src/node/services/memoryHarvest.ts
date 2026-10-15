@@ -227,6 +227,8 @@ export async function runMemoryHarvest(args: {
     usage: LanguageModelV2Usage,
     providerMetadata?: Record<string, unknown>
   ) => Promise<void>;
+  /** Pricing identity of `model`; its long-context threshold sets each step's tier. */
+  pricingModel?: string;
 }): Promise<MemoryHarvestResult> {
   assert(args.agentBody.trim().length > 0, "harvest agent body must not be empty");
   assert(
@@ -296,7 +298,10 @@ export async function runMemoryHarvest(args: {
         inputTokens: (usage?.inputTokens ?? 0) + (totalUsage.inputTokens ?? 0),
         outputTokens: (usage?.outputTokens ?? 0) + (totalUsage.outputTokens ?? 0),
       };
-      await args.recordUsage?.(totalUsage, accumulateStepsProviderMetadata(await stream.steps));
+      await args.recordUsage?.(
+        totalUsage,
+        accumulateStepsProviderMetadata(await stream.steps, args.pricingModel)
+      );
     } catch {
       usage = undefined;
     }

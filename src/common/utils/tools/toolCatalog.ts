@@ -18,6 +18,7 @@
  * aiService or streamText.
  */
 
+import assert from "@/common/utils/assert";
 import type {
   AssistantModelMessage,
   Tool,
@@ -195,6 +196,8 @@ interface ToolCatalogInputs {
    * the whole cached prefix (#5250); these models use native deferred loading.
    */
   promptCacheActive?: boolean;
+  /** The workspace's last overview: reused while it stays true, replaced otherwise. */
+  overviewMemo?: ToolCatalogOverviewMemo;
 }
 
 interface ToolCatalogClassification {
@@ -355,18 +358,37 @@ function stripToolCatalogOverview(description: string): string {
   return description.slice(0, regionStart) + description.slice(regionEnd);
 }
 
+/** What one server line of an overview claims. */
+interface ToolCatalogOverviewLine {
+  server: string;
+  /** The tool names the line lists, all from this server. */
+  listed: readonly string[];
+  /** The line ends in ", and more": the server has more tools than it lists. */
+  overflowed: boolean;
+}
+
+/** A built overview plus what decides whether a later catalog may reuse it. */
+export interface ToolCatalogOverview {
+  text: string;
+  /** Every server key of the catalog it was built from, in overview order. */
+  servers: readonly string[];
+  /** The emitted server lines (servers past the budget have none). */
+  lines: readonly ToolCatalogOverviewLine[];
+}
+
 /**
- * Build a compact, deterministic index of the deferred catalog grouped by MCP
- * server, e.g. `- github (12 tools): github_create_issue, … (+4 more)`.
- * Only names are listed — descriptions and parameter schemas stay deferred
- * until activation, so the overview solves the "unknown unknowns" discovery
- * problem without reintroducing schema token bloat. Returns "" for an empty
- * catalog.
+ * One workspace's last overview. The overview sits in tool_catalog_search's
+ * description, which Anthropic caches as part of the tools prefix, so any
+ * change to it rewrites the whole cached history. Remote MCP servers (Notion,
+ * linear, Sentry) return slightly different tool lists across refetches, so a
+ * workspace keeps its overview while it stays true (see canReuseOverview).
  */
-export function buildToolCatalogOverview(catalog: readonly ToolCatalogEntry[]): string {
-  if (catalog.length === 0) {
-    return "";
-  }
+export interface ToolCatalogOverviewMemo {
+  current?: ToolCatalogOverview;
+}
+
+/** Catalog tool names grouped by server key, both sorted. */
+function groupCatalogByServer(catalog: readonly ToolCatalogEntry[]): Array<[string, string[]]> {
   const byServer = new Map<string, string[]>();
   for (const entry of catalog) {
     const server = entry.serverName ?? "other tools";
@@ -374,8 +396,14 @@ export function buildToolCatalogOverview(catalog: readonly ToolCatalogEntry[]): 
     names.push(entry.name);
     byServer.set(server, names);
   }
-  const servers = [...byServer.entries()].sort(([a], [b]) => a.localeCompare(b));
+  for (const names of byServer.values()) names.sort((a, b) => a.localeCompare(b));
+  return [...byServer.entries()].sort(([a], [b]) => a.localeCompare(b));
+}
+
+function buildOverview(catalog: readonly ToolCatalogEntry[]): ToolCatalogOverview {
+  const servers = groupCatalogByServer(catalog);
   const lines: string[] = [];
+  const claims: ToolCatalogOverviewLine[] = [];
   let usedChars = OVERVIEW_HEADER.length + OVERVIEW_END_MARKER.length;
   let omittedServers = 0;
   for (const [server, names] of servers) {
@@ -385,24 +413,83 @@ export function buildToolCatalogOverview(catalog: readonly ToolCatalogEntry[]): 
       continue;
     }
     const label = displayServerLabel(server);
-    names.sort((a, b) => a.localeCompare(b));
     const shown = names.slice(0, OVERVIEW_MAX_TOOLS_PER_SERVER);
-    const extra = names.length - shown.length;
-    const suffix = extra > 0 ? ` (+${extra} more)` : "";
-    const line = `- ${label} (${names.length} tool${names.length === 1 ? "" : "s"}): ${shown.join(", ")}${suffix}`;
+    // No tool counts: a remote server that lists one tool more or less on a
+    // refetch would otherwise change the description and break the cache.
+    const suffix = names.length > shown.length ? ", and more" : "";
+    const line = `- ${label}: ${shown.join(", ")}${suffix}`;
     if (usedChars + line.length + 1 > OVERVIEW_MAX_CHARS) {
       omittedServers = 1;
       continue;
     }
     usedChars += line.length + 1;
     lines.push(line);
+    claims.push({ server, listed: shown, overflowed: suffix.length > 0 });
   }
   if (omittedServers > 0) {
     lines.push(
       `- …and ${omittedServers} more server${omittedServers === 1 ? "" : "s"} (use this tool to discover their tools)`
     );
   }
-  return `${OVERVIEW_HEADER}\n${lines.join("\n")}\n${OVERVIEW_END_MARKER}`;
+  return {
+    text: `${OVERVIEW_HEADER}\n${lines.join("\n")}\n${OVERVIEW_END_MARKER}`,
+    servers: servers.map(([server]) => server),
+    lines: claims,
+  };
+}
+
+/**
+ * Build a compact, deterministic index of the deferred catalog grouped by MCP
+ * server, e.g. `- github: github_create_issue, …, and more`.
+ * Only names are listed — descriptions and parameter schemas stay deferred
+ * until activation, so the overview solves the "unknown unknowns" discovery
+ * problem without reintroducing schema token bloat. Returns "" for an empty
+ * catalog.
+ */
+export function buildToolCatalogOverview(catalog: readonly ToolCatalogEntry[]): string {
+  return catalog.length === 0 ? "" : buildOverview(catalog).text;
+}
+
+/**
+ * A previous overview stays valid while none of its claims became false:
+ * - the server set is unchanged, so every line's server still exists, the
+ *   lines keep their order and labels, and the "…and N more servers" count
+ *   (servers minus emitted lines) is the same;
+ * - each listed name is still a tool of the same server (an MCP key can move
+ *   to another server when two server/tool pairs normalize to one name);
+ * - each ", and more" line's server still has more tools than the line lists.
+ * Not checked on purpose: a tool added since is not listed, and a line without
+ * "and more" whose server grew stays without it. That leaves the overview
+ * incomplete, not false, and search still finds the tool (it reads the live
+ * catalog); rebuilding would rewrite the prompt cache for no gain.
+ */
+function canReuseOverview(
+  previous: ToolCatalogOverview,
+  catalog: readonly ToolCatalogEntry[]
+): boolean {
+  const grouped = groupCatalogByServer(catalog);
+  if (grouped.length !== previous.servers.length) return false;
+  if (grouped.some(([server], index) => server !== previous.servers[index])) return false;
+  const namesByServer = new Map(grouped.map(([server, names]) => [server, new Set(names)]));
+  return previous.lines.every((line) => {
+    const names = namesByServer.get(line.server);
+    assert(names !== undefined, "an overview line's server is in the unchanged server set");
+    if (line.overflowed && names.size <= line.listed.length) return false;
+    return line.listed.every((name) => names.has(name));
+  });
+}
+
+function overviewForCatalog(
+  catalog: readonly ToolCatalogEntry[],
+  memo: ToolCatalogOverviewMemo | undefined
+): string {
+  assert(catalog.length > 0, "the overview is only built for a non-empty deferred catalog");
+  if (memo?.current !== undefined && canReuseOverview(memo.current, catalog)) {
+    return memo.current.text;
+  }
+  const built = buildOverview(catalog);
+  if (memo !== undefined) memo.current = built;
+  return built.text;
 }
 
 /**
@@ -492,7 +579,7 @@ function prepareToolSearchRecord(inputs: ToolCatalogInputs): {
   // index of deferred tool names to tool_catalog_search's description so the
   // model knows what capabilities exist to search for ("unknown unknowns"),
   // while full descriptions/schemas stay deferred until activation.
-  const overview = buildToolCatalogOverview(classification.catalog);
+  const overview = overviewForCatalog(classification.catalog, inputs.overviewMemo);
   const searchTool = inputs.tools[TOOL_SEARCH_TOOL_NAME];
   // Strip any overview appended by an earlier prepareToolSearch call: rebuild
   // paths (assembly hooks, model fallback) pass the augmented tool back in, and

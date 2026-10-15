@@ -323,7 +323,7 @@ export const MCPToolCallDisplaySchema = z
     /** Immutable session-local ref, never an icon URL or persisted image bytes. */
     iconRef: MCPIconRefSchema.optional().catch(undefined),
     /**
-     * MCP Apps (artifacts experiment): the tool declares a ui:// view. The server is
+     * MCP Apps (mcp-apps experiment): the tool declares a ui:// view. The server is
      * `connection.key`; the card offers "Open in Artifacts".
      */
     app: z
@@ -411,6 +411,8 @@ export const MCPSettingsSnapshotSchema = z.object({
 /** A snapshot plus its server instance's token (MCPSettingsReadSnapshot). */
 export const MCPSettingsReadSnapshotSchema = MCPSettingsSnapshotSchema.extend({
   instanceToken: z.string(),
+  /** This read's ID: a tool action names it, and only this read's layout tools may run. */
+  readId: z.string(),
 });
 export const MCPSettingsReadParamsSchema = z.object({
   workspaceId: z.string(),
@@ -438,6 +440,8 @@ export const MCPSettingsRunToolParamsSchema = MCPSettingsReadParamsSchema.extend
   toolName: z.string(),
   /** The read's instanceToken: the tool must belong to the server instance the user saw. */
   instanceToken: z.string(),
+  /** The read's readId: that read's layout must offer the tool (#6611). */
+  readId: z.string(),
   /** The user confirmed the run; required for a tool without `readOnlyHint: true`. */
   confirmed: z.boolean(),
 });

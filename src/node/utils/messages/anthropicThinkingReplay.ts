@@ -2,7 +2,7 @@ import type { ModelMessage } from "ai";
 
 import type { MuxMessage, MuxMetadata } from "@/common/types/message";
 import { findLatestContextBoundaryIndex } from "@/common/utils/messages/compactionBoundary";
-import { isTrustedStepStartList } from "./insertStepStartPartsForSdk";
+import { isTrustedStepStartList } from "@/common/utils/messages/stepStartPartIndices";
 import { stripReasoningReplay } from "./reasoningProviderOptions";
 
 /** Where a receipt's strip ends (MuxMetadata.anthropicThinkingReplayFromStep). */

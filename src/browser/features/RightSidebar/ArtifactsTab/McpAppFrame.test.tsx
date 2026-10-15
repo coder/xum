@@ -11,7 +11,7 @@ import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import assert from "@/common/utils/assert";
-import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
+import type { McpAppView, McpAppViewDomains } from "@/common/orpc/schemas/mcpApps";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
 import {
@@ -53,6 +53,9 @@ let widgetStateBinding: string | null = null;
 let widgetStateWrites: Array<{ binding: string; state: unknown }> = [];
 // When set, setWidgetState answers only once it settles (a write in flight).
 let widgetStateWriteGate: Promise<void> | null = null;
+// The approved list getView returns, and the live follow's reads (null: they never settle).
+let viewApprovedDomains: string[] | undefined;
+let followRead: (() => Promise<{ revision: number; approvals: McpAppViewDomains[] }>) | null = null;
 let toolCalls: Array<{
   serverName: string;
   toolName: string;
@@ -62,7 +65,22 @@ let toolCalls: Array<{
 
 function serverApi(): TestApiOverrides<APIClient> {
   return {
+    config: {
+      // A stream with no changes: the follow reads once when it opens.
+      onConfigChanged: (_input: unknown, options?: { signal?: AbortSignal }) =>
+        Promise.resolve({
+          [Symbol.asyncIterator]: () => ({
+            next: () =>
+              new Promise<{ done: true; value: undefined }>((resolve) =>
+                options?.signal?.addEventListener("abort", () =>
+                  resolve({ done: true, value: undefined })
+                )
+              ),
+          }),
+        }),
+    },
     mcpApps: {
+      readViewDomains: () => (followRead ?? (() => new Promise<never>(() => undefined)))(),
       getView: async () => {
         await getViewGate;
         return Promise.resolve({
@@ -75,6 +93,7 @@ function serverApi(): TestApiOverrides<APIClient> {
             result: { content: [] },
             invocation,
             approvalProjectPath,
+            approvedDomains: viewApprovedDomains,
             widgetState,
             widgetStateBinding,
             // Read now, like the backend: newer than every list published so far.
@@ -288,6 +307,8 @@ describe("McpAppFrame", () => {
     widgetStateWrites = [];
     widgetStateWriteGate = null;
     getViewGate = null;
+    viewApprovedDomains = undefined;
+    followRead = null;
     toolCalls = [];
     // Desktop mode by default: the preload bridge exists (isDesktopMode). Browser tests delete it.
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -373,6 +394,25 @@ describe("McpAppFrame", () => {
     approvalProjectPath = "/work/alpha";
     const { view } = await renderFrame();
     expect(view.getByRole("alert").textContent).toContain("alpha");
+  });
+
+  // #6181: a Revoke in another window or process reaches a mounted view through the follow.
+  test("a revoke that the live follow reads drops the origin from the mounted view's CSP", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    viewApprovedDomains = ["https://api.example.com"];
+    let releaseRead: () => void = () => undefined;
+    const readGate = new Promise<void>((resolve) => (releaseRead = resolve));
+    followRead = async () => {
+      await readGate;
+      return { revision: ++revision, approvals: [] };
+    };
+    const { view } = await renderFrame();
+    const srcdoc = () => view.getByTestId("mcp-app-frame").getAttribute("srcdoc") ?? "";
+    expect(srcdoc()).toContain("connect-src https://api.example.com");
+
+    act(() => releaseRead());
+    await waitFor(() => expect(srcdoc()).not.toContain("https://api.example.com"));
   });
 
   test("an approval applies at once to every mounted view of the same server", async () => {
@@ -549,6 +589,10 @@ describe("McpAppFrame", () => {
       params: { state: { step: 3 } },
     });
     await waitFor(() => expect(widgetStateWrites).toHaveLength(1));
+    // The mounted document keeps the seed it was built with: a write does not reload it.
+    expect(openAiSeedOf(first.frame.getAttribute("srcdoc"))).toMatchObject({
+      widgetState: { step: 2 },
+    });
     // The card collapses while the write is in flight, and opens again before it lands. The
     // record still holds step 2, but the new document starts with step 3.
     first.view.unmount();
@@ -1007,6 +1051,8 @@ describe("McpAppFrame host strips", () => {
     invocation = null;
     viewCsp = {};
     getViewGate = null;
+    viewApprovedDomains = undefined;
+    followRead = null;
     toolCalls = [];
     // Desktop mode: the preload bridge exists (isDesktopMode).
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -1372,6 +1418,69 @@ describe("McpAppFrame host strips", () => {
       expect(closed).toBe(0);
     } finally {
       if (cardMarked) unmarkCard();
+    }
+  });
+
+  // #6181: an expanded card of a fullscreen-only view shows the "Open in tab" notice, not a
+  // frame, so it cannot take the view back: inline must keep the view in its tab.
+  test("a fullscreen-only view's inline request keeps it in its tab", async () => {
+    let closed = 0;
+    const unmarkCard = markMcpAppViewHosted("ws", "call-1", "card");
+    setMcpAppViewFullscreenOnly("ws", "call-1", true);
+    try {
+      const view = render(<McpAppFrame workspaceId="ws" view={VIEW} onClose={() => closed++} />, {
+        wrapper: Wrapper,
+      });
+      const frame = await findOpenFrame(view);
+      const posted = capturePosted(frame);
+      // A list-less initialize (the shim's) keeps the mark.
+      postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "ui/request-display-mode",
+        params: { mode: "inline" },
+      });
+      await waitFor(() => expect(posted.some((m) => m.id === 2)).toBe(true));
+      expect(posted.some((m) => m.method === "ui/resource-teardown")).toBe(false);
+      expect(closed).toBe(0);
+    } finally {
+      setMcpAppViewFullscreenOnly("ws", "call-1", false);
+      unmarkCard();
+    }
+  });
+
+  test("a fullscreen-only mark that arrives during an inline move keeps the view in its tab", async () => {
+    let closed = 0;
+    const unmarkCard = markMcpAppViewHosted("ws", "call-1", "card");
+    try {
+      const view = render(<McpAppFrame workspaceId="ws" view={VIEW} onClose={() => closed++} />, {
+        wrapper: Wrapper,
+      });
+      const frame = await findOpenFrame(view);
+      const posted = capturePosted(frame);
+      postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "ui/request-display-mode",
+        params: { mode: "inline" },
+      });
+      const teardown = await waitFor(() => {
+        const message = posted.find((m) => m.method === "ui/resource-teardown");
+        if (message === undefined) throw new Error("no teardown yet");
+        return message;
+      });
+      // A late client declares only fullscreen before the view answers the teardown.
+      setMcpAppViewFullscreenOnly("ws", "call-1", true);
+      postFromView(frame, { jsonrpc: "2.0", id: teardown.id, result: {} });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(closed).toBe(0);
+    } finally {
+      setMcpAppViewFullscreenOnly("ws", "call-1", false);
+      unmarkCard();
     }
   });
 

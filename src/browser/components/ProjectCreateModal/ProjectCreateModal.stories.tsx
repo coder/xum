@@ -16,7 +16,7 @@ import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { PIXEL_DUAL_THEME, appMeta, AppWithMocks } from "@/browser/stories/meta.js";
-import { within, userEvent, waitFor } from "@storybook/test";
+import { within, userEvent, waitFor } from "storybook/test";
 
 const meta = {
   ...appMeta,

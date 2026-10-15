@@ -86,6 +86,8 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
+// process.platform-based: the common helper reads navigator, which Node 20 lacks (#6485).
+import { PlatformPaths as NodePlatformPaths } from "@/node/utils/paths.main";
 import { sharesPlanDirectory } from "@/common/utils/planStorage";
 import { stableStringify } from "@/common/utils/stableStringify";
 import type { RuntimeConfig } from "@/common/types/runtime";
@@ -1090,6 +1092,28 @@ function readLegacyMetadataId(file: string): string | null | undefined {
   }
 }
 
+/**
+ * One stored key can also hold an id-less legacy row next to its migrated copy (a hand edit or
+ * another tool; Xum's own migration fills in the id on the same row). Drop the legacy copy the
+ * same way as in an alias group (#6595). Gated on an id-less row with a string path, so a
+ * migrated project pays one in-memory pass on a cold load and no file access.
+ */
+function dropSingleKeyLegacyCopies(
+  key: string,
+  entry: StoredProjectEntry,
+  conflicts: ProjectAliasConflict[],
+  resolveLegacyId: (projectPath: string, workspace: Workspace) => string | undefined
+): void {
+  const workspaces = entry.config.workspaces;
+  if (!workspaces.some((workspace) => !workspace.id && typeof workspace.path === "string")) return;
+  const conflictingIds = dropLegacyDuplicateRows(workspaces, (workspace) =>
+    resolveLegacyId(key, workspace)
+  );
+  if (conflictingIds.length > 0) {
+    conflicts.push({ path: key, storedKeys: [entry.storedKey], conflictingIds });
+  }
+}
+
 /** An alias group whose merge kept one of two different rows for the same workspace. */
 interface ProjectAliasConflict {
   path: string;
@@ -1120,6 +1144,7 @@ function buildProjectsFromStoredEntries(
   for (const [key, group] of groups) {
     if (group.length === 1) {
       projects.set(key, group[0].config);
+      dropSingleKeyLegacyCopies(key, group[0], conflicts, resolveLegacyId);
       continue;
     }
     const storedKeys = group.map((entry) => entry.storedKey);
@@ -2300,8 +2325,7 @@ export class Config {
   }
 
   /** The beforeRename check for a save, or undefined when the save has no read to compare. */
-  private unchangedConfigCheck(expectedStatKey: string | undefined) {
-    if (expectedStatKey === undefined) return undefined;
+  private unchangedConfigCheck(expectedStatKey: string): () => void {
     return () => this.assertConfigFileUnchanged(expectedStatKey);
   }
 
@@ -2380,6 +2404,9 @@ export class Config {
   }
 
   // File-backed snapshots are shared and read-only; mutations must use editConfig's fresh read.
+  // A read can have side effects (#6699): a read that sees a changed file retries a failed
+  // config.json watch, and that retry can notify onConfigChanged listeners synchronously,
+  // before this call returns. A listener that reads config again gets this read's snapshot.
   loadConfigOrDefault(options?: { throwOnError?: boolean }): ProjectsConfig {
     const key = this.readConfigStatKey();
     if (key !== undefined && this.configSnapshot?.key === key) {
@@ -2575,9 +2602,9 @@ export class Config {
    */
   private resolveLegacyRowId(projectPath: string, workspace: Workspace): string | undefined {
     const legacyId = this.generateLegacyId(projectPath, workspace.path);
-    // The same basename expression as buildWorkspaceMetadata (#6485 tracks its Windows gap).
-    const basename =
-      workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+    // The same basename as buildWorkspaceMetadata and findWorkspace; PlatformPaths also splits on
+    // "\\" on Windows, where checkout paths use backslashes (#6485).
+    const basename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
     const ids = new Set<string | undefined>();
     for (const candidate of basename === legacyId ? [legacyId] : [legacyId, basename]) {
       const id = readLegacyMetadataId(path.join(this.sessionsDir, candidate, "metadata.json"));
@@ -3105,9 +3132,10 @@ export class Config {
    */
   /**
    * `expectedStatKey`: the stat key of the bytes the edit read. The save then fails without
-   * writing when config.json no longer has it. Undefined skips the check.
+   * writing when config.json no longer has it. Required, so no save path can skip the check
+   * (#6595).
    */
-  private saveConfig(config: ProjectsConfig, expectedStatKey?: string): Promise<void> {
+  private saveConfig(config: ProjectsConfig, expectedStatKey: string): Promise<void> {
     return Effect.runPromise(this.saveConfigEffect(config, expectedStatKey));
   }
 
@@ -3118,7 +3146,7 @@ export class Config {
    */
   private saveConfigEffect(
     config: LegacyAdvisorProjectsConfig,
-    expectedStatKey?: string
+    expectedStatKey: string
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -3958,8 +3986,11 @@ export class Config {
       // Route through the saveConfig Promise facade (not saveConfigEffect) so test
       // spies on saveConfig keep intercepting the serialized write. A failed save rejects
       // the edit and skips the change notification below (#4444).
+      // transform() always runs before write and records the key.
+      const expectedStatKey = readStatKey;
+      assert(expectedStatKey !== undefined, "config edit saved without a fresh read");
       yield* Effect.tryPromise({
-        try: () => self.saveConfig(newConfig, readStatKey),
+        try: () => self.saveConfig(newConfig, expectedStatKey),
         catch: (error) => error,
       });
       // Backend-initiated config edits (for example gateway auth changes) use this signal
@@ -4411,8 +4442,7 @@ export class Config {
       // LEGACY FORMAT: Fall back to metadata.json and legacy ID for unmigrated workspaces
       if (!workspace.id) {
         // Extract workspace basename (could be stable ID or legacy name)
-        const workspaceBasename =
-          workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+        const workspaceBasename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
 
         // Try loading metadata with basename as ID (works for old workspaces)
         const metadataPath = path.join(
@@ -4705,8 +4735,7 @@ export class Config {
           tags: storedWorkspace.tags ? { ...storedWorkspace.tags } : undefined,
         };
         // Extract workspace basename from path (could be stable ID or legacy name)
-        const workspaceBasename =
-          workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+        const workspaceBasename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
 
         // Captured BEFORE any in-memory migration mutates workspace.id: the queued
         // replay must retarget by persisted identity, never by path alone — paths are

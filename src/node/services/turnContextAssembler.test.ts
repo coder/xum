@@ -824,6 +824,53 @@ describe("assemblePromptPayload", () => {
       ]);
     });
 
+    test("a row skipped on rebuild does not hide its tail from the model", async () => {
+      // The empty-row filter depends on the thinking level, so a row's neighbor can change
+      // between the request that recorded it and a later rebuild. Each step below sends the
+      // request the assembler builds and records what it returns, as a turn does.
+      const thinking = { ...opus, effectiveThinkingLevel: "high" as const };
+      const u1 = createMuxMessage("u1", "user", "first");
+      const first = await withTail(hot("A"), [u1], thinking);
+      const a1 = answer("a1", "system", hot("A"));
+      expect(first.volatileSystemTail).toEqual(a1.metadata?.volatileSystemTail);
+      // The user stops the next turn while the model still thinks: a reasoning-only partial.
+      const u2 = createMuxMessage("u2", "user", "second");
+      const a2: MuxMessage = {
+        id: "a2",
+        role: "assistant",
+        parts: [{ type: "reasoning", text: "thinking" }],
+        metadata: { partial: true },
+      };
+      // With thinking off and new hot memories, the user resumes. The filter drops a2, so
+      // the request ends with u2 and B goes into a row that a3 records.
+      const resumed = await withTail(hot("B"), [u1, a1, u2, a2], opus);
+      expect(resumed.volatileSystemTail).toEqual({ text: hot("B"), placement: "row" });
+      const a3 = answer("a3", "row", hot("B"));
+      // Thinking on again: a2 comes back between u2 and a3, so a3's row is skipped. The live
+      // tail is still B and must reach the model (before the fix it saw only A).
+      const u3 = createMuxMessage("u3", "user", "third");
+      const next = await withTail(hot("B"), [u1, a1, u2, a2, a3, u3], thinking);
+      expect(roles(next).at(-1)).toBe("system-row");
+      expect(JSON.stringify(next.messages.at(-1))).toContain("<hot_memories>B</hot_memories>");
+      expect(next.volatileSystemTail).toEqual({ text: hot("B"), placement: "row" });
+
+      // A replay derives the live tail by the same rule. The planner sends this request for
+      // live A, and an older build sent it for live B: frozen A, no row, no record.
+      const history = [u1, a1, u2, a2, a3, u3];
+      const stale = await withTail(hot("A"), history, thinking);
+      expect(stale.volatileSystemTail).toBeUndefined();
+      for (const sent of [next, stale]) {
+        const replayed = await assemble({
+          ...thinking,
+          history,
+          systemMessage: sent.sentSystem.message,
+          volatileSystemSuffixLength: sent.sentSystem.volatileSuffixLength,
+          replayedTurn: { record: sent.volatileSystemTail },
+        });
+        expect(JSON.stringify(replayed.messages)).toBe(JSON.stringify(sent.messages));
+      }
+    });
+
     test("a replay from the sent system content rebuilds the live request", async () => {
       // PRRT_kwDOPxxmWM6srqjr: the envelope records what was sent (the frozen tail), so the
       // replay derives the live tail from the turn's record, or from the segment's last tail.

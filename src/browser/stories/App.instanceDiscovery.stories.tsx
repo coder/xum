@@ -6,7 +6,7 @@
  */
 
 import type { ComponentType } from "react";
-import { waitFor, within } from "@storybook/test";
+import { waitFor, within } from "storybook/test";
 
 import { getAutoExpandPrefsKey } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";

@@ -151,7 +151,9 @@ async function readSkillDescriptor(
       // Agree with discovery; the display name stays out of this model-facing output.
       allowDisplayName: true,
     });
-    if (!isPluginSkillConsented(skillConsent, skillDir, skillConsentFrontmatter(parsed))) {
+    if (
+      !isPluginSkillConsented(skillConsent, skillDir, skillConsentFrontmatter(parsed), parsed.body)
+    ) {
       log.warn(`Skipping ${scope} plugin skill '${directoryName}': not reviewed on this install`);
       return null;
     }

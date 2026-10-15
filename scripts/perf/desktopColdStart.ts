@@ -17,8 +17,9 @@
  * that race into a half-width of ~7% (A/A run 38549066574); the median and the trim keep the typical
  * start. So the bound describes the usual launch: a change that only makes the early ones more or
  * less common does not move it.
- * Runs under Node (tsx), not Bun: under Bun 1.3.12 Playwright never finishes the websocket
- * upgrade to Electron's debugger, so every launch hangs (`bun x playwright test` uses Node too).
+ * Runs under Node (tsx), not Bun: under Bun 1.3.12 Playwright never finished the websocket
+ * upgrade to Electron's debugger, so every launch hung (`bun x playwright test` uses Node too).
+ * Not re-measured on Bun 1.4.3.
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";

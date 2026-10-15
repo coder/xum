@@ -142,8 +142,9 @@ const DESKTOP_ONLY_CLASSES = new Set([
   "titlebar-safe-right-gutter-3",
   "titlebar-safe-right-capped",
   // Mobile app shell: these rules live in the desktop shell's (max-width: 768px) and
-  // (pointer: coarse) media blocks (sidebar overlay, sticky header). The webview has no app shell
-  // and does not bundle these components.
+  // (pointer: coarse) media blocks (sidebar overlay, sticky header, left sidebar toggle hosts).
+  // The webview has no app shell and does not bundle these components.
+  "left-sidebar-toggle-host",
   "mobile-header-spacer",
   "mobile-hide-right-sidebar",
   "mobile-layout",

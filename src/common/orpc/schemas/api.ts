@@ -212,6 +212,7 @@ import {
   AgentPluginComponentRefSchema,
   AgentPluginHooksSchema,
   AgentPluginListItemSchema,
+  AgentPluginPendingSignOutsSchema,
   AgentPluginUpdateCheckSchema,
   AgentPluginUpdateConsentSchema,
   AgentPluginUpdateReviewSchema,
@@ -866,6 +867,7 @@ export const mcpOauth = {
       hasRefreshToken: z.boolean(),
       scope: z.string().optional(),
       updatedAtMs: z.number().optional(),
+      insufficientScopes: z.array(z.string()).optional(),
     }),
   },
   logout: {
@@ -1109,6 +1111,7 @@ export const projects = {
         hasRefreshToken: z.boolean(),
         scope: z.string().optional(),
         updatedAtMs: z.number().optional(),
+        insufficientScopes: z.array(z.string()).optional(),
       }),
     },
     logout: {
@@ -1314,6 +1317,11 @@ export const agentPlugins = {
       }),
       z.object({ success: z.literal(false), error: z.string() }),
     ]),
+  },
+  /** The pending sign-out record that keeps managed plugins closed (#6627). */
+  pendingSignOuts: {
+    input: z.void(),
+    output: AgentPluginPendingSignOutsSchema,
   },
   /** Display path of the ACTIVE managed plugin container (config-derived root; never hardcode it in UI). */
   containerLocation: {
@@ -1579,7 +1587,7 @@ export const artifacts = {
 };
 
 /**
- * MCP Apps views in the Artifacts tab (artifacts experiment): the view resource plus the
+ * MCP Apps views in the Artifacts tab (mcp-apps experiment): the view resource plus the
  * host-only tool result, and tools/call and resources/read issued by a view.
  */
 export const mcpApps = {
@@ -1796,8 +1804,8 @@ export const workspace = {
     input: z.object({
       projectPath: z.string(),
       /**
-       * Workspace branch name. When omitted, the backend picks the next free
-       * "workspace-N" name (as /new does).
+       * Workspace branch name. When omitted, the backend picks a free random
+       * Docker-style name such as "calm-otters-sing" (as /new does).
        */
       branchName: z.string().optional(),
       /** Trunk branch to fork from - only required for worktree/SSH runtimes, ignored for local */
@@ -1819,7 +1827,7 @@ export const workspace = {
       tags: z.record(WorkspaceTagKeySchema, z.string()).optional(),
       /**
        * Name the workspace in the backend after it is announced, so creation does not wait for
-       * the naming model: it opens as "workspace-N", gets the generated title when it arrives,
+       * the naming model: it opens under a random name, gets the generated title when it arrives,
        * and its git branch is renamed before the init hook runs (the directory and workspace
        * name stay). Worktree runtime only; omit `branchName` and `title`.
        */

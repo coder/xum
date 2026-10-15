@@ -68,6 +68,14 @@ export type AgentPluginImportedComponents = z.infer<typeof AgentPluginImportedCo
 export const AgentPluginComponentConsentSchema = z.object({
   skills: z.record(z.string(), z.string()),
   mcpServers: z.record(z.string(), z.string()),
+  // Workflow scripts by file name (#6629). Absent in a record from before #6629: no workflow
+  // is reviewed, so each such plugin needs one review (no backfill). An older build strips
+  // the key on read and keeps it on save (installService mergeRawConsent).
+  workflows: z.record(z.string(), z.string()).default({}),
+  // Agents by ID (#6629), with the same upgrade rules as workflows.
+  agents: z.record(z.string(), z.string()).default({}),
+  // Slash commands by name (#6629), with the same upgrade rules as workflows.
+  slashCommands: z.record(z.string(), z.string()).default({}),
 });
 
 export const AgentPluginInstallEntrySchema = z.object({

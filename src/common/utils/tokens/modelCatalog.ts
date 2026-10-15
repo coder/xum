@@ -13,6 +13,15 @@ import { MAPPABLE_MODES, toCanonicalModelId } from "./updateModelsData";
 let cachedIds: string[] | undefined;
 
 /**
+ * True when `id`'s stats resolve from the catalog entry `key` itself, and that entry is not
+ * retired: a retired model stays priced for recorded usage but is no longer offered.
+ */
+function isOfferedCatalogEntry(id: string, key: string): boolean {
+  const resolved = resolveRawModelEntry(id);
+  return resolved?.key === key && resolved.data.retired !== true;
+}
+
+/**
  * Canonical `provider:model` ids for every catalog entry with resolvable model
  * stats, unioned with the curated KNOWN_MODELS ids. Sorted. Cached because
  * models.json is static for the process lifetime.
@@ -44,8 +53,7 @@ export function listModelCatalogIds(): string[] {
       // models-extra override, so selecting it would inherit metadata from a
       // different entry than the row represents; the id stays selectable through
       // whichever entry actually backs it.
-      const resolved = resolveRawModelEntry(normalized);
-      if (resolved?.key !== key) {
+      if (!isOfferedCatalogEntry(normalized, key)) {
         continue;
       }
       ids.add(normalized);

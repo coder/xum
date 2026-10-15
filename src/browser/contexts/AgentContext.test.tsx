@@ -1,6 +1,7 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { GlobalWindow } from "happy-dom";
 
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
@@ -32,6 +33,8 @@ import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync
 let mockAgentDefinitions: AgentDefinitionDescriptor[] = [];
 let mockWorkspaceMetadata = new Map<string, { parentWorkspaceId?: string; agentId?: string }>();
 let mockAgentListFails = false;
+/** When set, answers `agents.list` instead of the fixed definitions (to order overlapping calls). */
+let mockAgentListAnswer: (() => Promise<AgentDefinitionDescriptor[]>) | null = null;
 
 const EXEC_AGENT: AgentDefinitionDescriptor = {
   id: "exec",
@@ -136,9 +139,10 @@ function createApiClient(
     },
     agents: {
       list: () =>
-        mockAgentListFails
+        mockAgentListAnswer?.() ??
+        (mockAgentListFails
           ? Promise.reject(new Error("agents unavailable"))
-          : Promise.resolve(mockAgentDefinitions),
+          : Promise.resolve(mockAgentDefinitions)),
     },
     workspace: {
       list: () => Promise.resolve(workspaceMetadata),
@@ -207,6 +211,7 @@ describe("AgentContext", () => {
     mockAgentDefinitions = [];
     mockWorkspaceMetadata = new Map();
     mockAgentListFails = false;
+    mockAgentListAnswer = null;
 
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
@@ -269,6 +274,47 @@ describe("AgentContext", () => {
     await waitFor(() => {
       expect(getWorkspaceAiSelection(workspaceId, "review").model).toBe("openai:gpt-5.2");
     });
+  });
+
+  test("a plugin mutation reloads the agent list (#6629)", async () => {
+    mockAgentDefinitions = [EXEC_AGENT];
+    let contextValue: AgentContextValue | undefined;
+    renderAgentHarness({
+      projectPath: "/tmp/project",
+      onChange: (value) => (contextValue = value),
+    });
+    await waitFor(() => expect(contextValue?.agents.map((agent) => agent.id)).toEqual(["exec"]));
+
+    // A component review approved a plugin agent: the picker must show it without a remount.
+    mockAgentDefinitions = [EXEC_AGENT, REVIEW_PROJECT_AGENT];
+    act(() => publishAgentPluginsMutated());
+    await waitFor(() =>
+      expect(contextValue?.agents.map((agent) => agent.id)).toEqual(["exec", "review"])
+    );
+  });
+
+  test("an older agent list answer does not replace a newer one (#6629)", async () => {
+    const answers: Array<(agents: AgentDefinitionDescriptor[]) => void> = [];
+    mockAgentListAnswer = () => new Promise((resolve) => answers.push(resolve));
+    let contextValue: AgentContextValue | undefined;
+    renderAgentHarness({
+      projectPath: "/tmp/project",
+      onChange: (value) => (contextValue = value),
+    });
+    await waitFor(() => expect(answers).toHaveLength(1));
+
+    // A component review approves a plugin agent while the initial load is still pending.
+    act(() => publishAgentPluginsMutated());
+    await waitFor(() => expect(answers).toHaveLength(2));
+    answers[1]([EXEC_AGENT, REVIEW_PROJECT_AGENT]);
+    await waitFor(() =>
+      expect(contextValue?.agents.map((agent) => agent.id)).toEqual(["exec", "review"])
+    );
+    // The older answer arrives last; flush its continuation before checking.
+    answers[0]([EXEC_AGENT]);
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+
+    expect(contextValue?.agents.map((agent) => agent.id)).toEqual(["exec", "review"]);
   });
 
   test("a failed agent refresh drops the inherited defaults it loaded before", async () => {

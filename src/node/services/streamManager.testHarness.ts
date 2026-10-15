@@ -1,3 +1,4 @@
+import type { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
 import type { streamText } from "ai";
 import type { Scope } from "effect";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -65,6 +66,8 @@ export interface StreamManagerTestDeps extends StreamManagerOptions {
   eventSink?: TurnEngineEventSink;
   runner?: EffectRunner;
   engineScope?: Scope.Closeable;
+  /** MCP tool wrappers publish per-call display data here (the persisted `mcpServer`). */
+  toolCallDisplayRegistry?: ToolCallDisplayRegistry;
 }
 
 /** Builds a StreamManager with named test deps; the token tracker defaults to a no-op. */
@@ -79,7 +82,7 @@ export function createStreamManagerForTests(
     deps.eventSink,
     deps.runner,
     deps.engineScope,
-    undefined,
+    deps.toolCallDisplayRegistry,
     { streamText: deps.streamText, tokenTracker: deps.tokenTracker ?? noopTokenTracker }
   );
   if (deps.eventSink) constructionSinks.set(streamManager, deps.eventSink);

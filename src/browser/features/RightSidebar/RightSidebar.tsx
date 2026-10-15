@@ -1,4 +1,5 @@
 import { RIGHT_SIDEBAR_DEFAULT_COLLAPSED } from "@/constants/layout";
+import { addWindowListenerWhile } from "@/browser/utils/events";
 import React from "react";
 import { X } from "lucide-react";
 import {
@@ -128,7 +129,12 @@ import {
   type TerminalSessionCreateOptions,
 } from "@/browser/utils/terminal";
 import { SideChatTabTitle } from "./Tabs/TabLabels";
-import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTab/AppViewTab";
+import {
+  AppViewTabLabel,
+  AppViewTabPanel,
+  AppViewTabTooltip,
+  findOwnMaximizedAppPanel,
+} from "./AppViewTab/AppViewTab";
 import {
   appViewTabToolCallId,
   liveAppViewTabs,
@@ -1080,6 +1086,27 @@ export function useDesktopAvailable(
   return desktopAvailable;
 }
 
+/**
+ * Where Cmd/Ctrl+W closes a tab: the maximized app panel's pane; else the pane holding keyboard
+ * focus, when focus is in this sidebar; else (tabsetId undefined) the focused pane. Null when an
+ * open modal keeps the keys. A maximized app tab is a modal dialog, but it is this sidebar's tab,
+ * so the shortcut closes it (#6181).
+ */
+function closeTabTarget(
+  container: HTMLElement | null,
+  eventTarget: EventTarget | null
+): { tabsetId: string | undefined } | null {
+  const maximizedPanel = findOwnMaximizedAppPanel(container);
+  if (isDialogOpen() && maximizedPanel == null) return null;
+  const keyTarget = maximizedPanel ?? eventTarget;
+  const inSidebar = keyTarget instanceof Element && container?.contains(keyTarget) === true;
+  return {
+    tabsetId: inSidebar
+      ? keyTarget.closest<HTMLElement>("[data-tabset-id]")?.dataset.tabsetId
+      : undefined,
+  };
+}
+
 const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   workspaceId,
   workspacePath,
@@ -1157,6 +1184,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const liveApi = liveClientOf(apiState);
   const desktopExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const artifactsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const mcpAppsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MCP_APPS);
   const browserExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_BROWSER);
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   // Child task workspaces own a goal (pause/resume/complete), but goal-board and
@@ -1344,14 +1372,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   );
   const layout = React.useMemo(() => {
     let next = canReviewDiffs ? parsedLayout : removeTabEverywhere(parsedLayout, "review");
-    // App tabs exist only behind the artifacts experiment, like MCP Apps themselves.
-    if (!artifactsExperimentEnabled) {
+    // App tabs exist only behind the mcp-apps experiment, like MCP Apps themselves.
+    if (!mcpAppsExperimentEnabled) {
       for (const tab of collectAllTabs(next.root)) {
         if (getAppViewTabKey(tab) != null) next = removeTabEverywhere(next, tab);
       }
     }
     return next;
-  }, [artifactsExperimentEnabled, canReviewDiffs, parsedLayout]);
+  }, [mcpAppsExperimentEnabled, canReviewDiffs, parsedLayout]);
 
   const hasReviewPanelMounted = React.useMemo(
     () => !collapsed && hasMountedReviewPanel(layout.root),
@@ -1547,8 +1575,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // asks for the view's own app tab, focusing it when it is already open. On small viewports
   // WorkspaceMenuBar shows the tab in the full-screen sidebar instead; these handlers then stay
   // out, so one event never acts twice.
+  // Each event listens only while its own experiment is on (MCP Apps are independent, #6760).
   React.useEffect(() => {
-    if (!artifactsExperimentEnabled) return;
     const shown = () => {
       const container = sidebarContainerRef.current;
       return container == null || !isRightSidebarResponsivelyHidden(container);
@@ -1565,13 +1593,21 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       setCollapsed(false);
       setLayout((prev) => withAppViewTab(prev, detail.toolCallId));
     };
-    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenAppViewTab);
-    window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handleOpenArtifactsTab);
+    const removeAppView = addWindowListenerWhile(
+      mcpAppsExperimentEnabled,
+      CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
+      handleOpenAppViewTab
+    );
+    const removeArtifact = addWindowListenerWhile(
+      artifactsExperimentEnabled,
+      CUSTOM_EVENTS.OPEN_ARTIFACT,
+      handleOpenArtifactsTab
+    );
     return () => {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenAppViewTab);
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handleOpenArtifactsTab);
+      removeAppView();
+      removeArtifact();
     };
-  }, [artifactsExperimentEnabled, setCollapsed, setLayout, workspaceId]);
+  }, [artifactsExperimentEnabled, mcpAppsExperimentEnabled, setCollapsed, setLayout, workspaceId]);
 
   // Global shortcut: open (and un-collapse) the Artifacts tab. Works from the chat input
   // too, because Ctrl+Shift+K inserts nothing there. While the narrow layout hides the
@@ -1917,14 +1953,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       if (!matchesKeybind(e, KEYBINDS.CLOSE_TAB)) return;
       // Always prevent platform default (Cmd/Ctrl+W closes window), even during dialogs.
       e.preventDefault();
-      if (isDialogOpen()) return;
-
-      // The pane holding keyboard focus, when focus is in this sidebar; else the focused pane.
       const container = sidebarContainerRef.current;
-      const targetTabsetId =
-        e.target instanceof Element && container?.contains(e.target)
-          ? e.target.closest<HTMLElement>("[data-tabset-id]")?.dataset.tabsetId
-          : undefined;
+      const target = closeTabTarget(container, e.target);
+      if (target == null) return;
+      const targetTabsetId = target.tabsetId;
       const focusedTabset = findTabset(layout.root, targetTabsetId ?? layout.focusedTabsetId);
       if (focusedTabset?.type !== "tabset") return;
 
@@ -2602,6 +2634,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             onNewSideChat={canStartSideChat ? () => handleStartSideChat() : undefined}
             creatingSideChat={creatingSideChat}
             artifactsEnabled={artifactsExperimentEnabled}
+            mcpAppsEnabled={mcpAppsExperimentEnabled}
             unreadAssisted={unreadAssisted}
           />
         )}

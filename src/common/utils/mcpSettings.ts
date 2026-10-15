@@ -375,4 +375,8 @@ export function mcpSettingsSnapshotForIpc<T extends MCPSettingsSnapshot>(snapsho
  * instance that sent it. A save names the token, so it never validates against one instance
  * and sends its update to another (a server replaced while the dialog was open).
  */
-export type MCPSettingsReadSnapshot = MCPSettingsSnapshot & { instanceToken: string };
+export type MCPSettingsReadSnapshot = MCPSettingsSnapshot & {
+  instanceToken: string;
+  /** This read's ID: a tool action names it, and only this read's layout tools may run. */
+  readId: string;
+};

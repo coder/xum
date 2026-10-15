@@ -1316,7 +1316,40 @@ export class McpOauthService {
       hasRefreshToken: Boolean(tokens?.refresh_token),
       scope: tokens?.scope,
       updatedAtMs: creds?.updatedAtMs,
+      ...this.insufficientScopeFields(normalizedServerUrl, Boolean(tokens)),
     };
+  }
+
+  /** The prompt scopes of a signed-in server (see insufficientScopes). */
+  private insufficientScopeFields(
+    key: string,
+    signedIn: boolean
+  ): { insufficientScopes?: string[] } {
+    const scopes = signedIn ? this.insufficientScopes.get(key) : undefined;
+    return scopes !== undefined ? { insufficientScopes: scopes } : {};
+  }
+
+  /**
+   * Scope names a server asked for in a 403 `insufficient_scope` answer, per credential key
+   * (#6622). The stored tokens stay (tools that need less keep working). Settings → MCP shows a
+   * sign-in prompt that names these scopes until a new sign-in or a sign-out. In memory only: a
+   * restart shows the prompt again on the next refused request.
+   */
+  private readonly insufficientScopes = new Map<string, string[]>();
+
+  /** A new interactive sign-in asked for the scopes again: the prompt starts over (#6622). */
+  private endInsufficientScopePrompt(
+    saved: boolean,
+    input: { serverUrl: string; flowGeneration?: number }
+  ): void {
+    if (saved && input.flowGeneration !== undefined)
+      this.insufficientScopes.delete(input.serverUrl);
+  }
+
+  /** Records a 403 `insufficient_scope` answer (scopes are already sanitized). */
+  recordInsufficientScope(input: { serverUrl: string; scopes: string[] }): void {
+    const key = normalizeServerUrlForComparison(input.serverUrl);
+    if (key) this.insufficientScopes.set(key, input.scopes);
   }
 
   /**
@@ -1374,6 +1407,8 @@ export class McpOauthService {
         await this.persistStoreLocked(store);
       });
 
+      // After the store write: a failed sign-out keeps the token, so it keeps the prompt too.
+      this.insufficientScopes.delete(normalizedServerUrl);
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
@@ -2471,6 +2506,7 @@ export class McpOauthService {
       return true;
     });
     rejectDroppedFlowSave(saved, input.flowGeneration);
+    this.endInsufficientScopePrompt(saved, input);
   }
 
   /** A stale flow's write, or a refresh's back-stamp of a client another sign-in replaced. */

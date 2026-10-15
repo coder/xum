@@ -7,6 +7,9 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { createTestHistoryService } from "./testHistoryService";
 import { prepareMessagesForProvider, sanitizeAssistantModelMessages } from "./messagePipeline";
+import { SUPPORTED_PROVIDERS } from "@/common/constants/providers";
+import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
+import { createToolAttachmentSummaryText } from "@/node/utils/messages/toolResultAttachments";
 
 function isAssistantMessage(message: ModelMessage | undefined): message is AssistantModelMessage {
   return message?.role === "assistant";
@@ -971,5 +974,213 @@ describe("step boundaries in built provider requests", () => {
   it("keeps parallel tool calls of one step in one assistant message", async () => {
     const parallel = await build(history(twoSequentialCalls, [0, 3]));
     expect(shape(parallel)).toEqual(folded);
+  });
+
+  // Live 400s (F31): the rebuild appended a tool's image after the whole assistant row, while
+  // every in-turn step puts it right after its own tool result. Every provider builds through
+  // this path, so check each one: same media, in step order, never raw base64 in a tool result
+  // (the context-budget preflight and continuous compaction read this output).
+  for (const provider of SUPPORTED_PROVIDERS) {
+    it(`puts tool media right after its step's tool result (${provider})`, async () => {
+      const png =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+      const parts: MuxMessage["parts"] = [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "attach_file",
+          state: "output-available",
+          input: { path: "a.png" },
+          output: {
+            type: "content",
+            value: [
+              { type: "text", text: "[Attachment prepared: a.png]" },
+              { type: "media", data: png, mediaType: "image/png", filename: "a.png" },
+            ],
+          },
+        },
+        { type: "text", text: "Done." },
+      ];
+      const result = await build(history(parts, [0, 1]), provider);
+      expect(shape(result)).toEqual([
+        'user("go")',
+        "assistant(call-1)",
+        "tool(call-1)",
+        `user(${JSON.stringify(createToolAttachmentSummaryText(1))},image)`,
+        'assistant("Done.")',
+        'user("continue")',
+      ]);
+      const toolMessage = result[2];
+      expect(JSON.stringify(toolMessage)).not.toContain(png);
+      expect(JSON.stringify(result[3])).toContain(png);
+      // StreamManager runs the same extraction again on every in-turn step (step 0 included),
+      // so the rebuilt prefix must already be its fixed point.
+      expect(await extractToolMediaAsUserMessagesFromModelMessages(result)).toEqual(result);
+    });
+  }
+});
+
+describe("prepareMessagesForProvider: MCP tool results", () => {
+  const options = {
+    effectiveAgentId: "exec",
+    toolNamesForSentinel: [] as string[],
+    providerForMessages: "anthropic",
+    effectiveThinkingLevel: "off" as const,
+    modelString: "anthropic:claude-sonnet-4-5",
+    workspaceId: "test-ws",
+  };
+  const mcpServer = {
+    connection: { key: "notion", transport: "http" as const, origin: "https://mcp.example.com" },
+    identity: { name: "Notion MCP", version: "1.0.0" },
+    source: "connection" as const,
+  };
+
+  /** The tool-result outputs the request sends for one assistant row of calls, by call ID. */
+  async function replayedOutputs(
+    calls: Array<{ id: string; output: unknown; mcp: boolean }>
+  ): Promise<Record<string, unknown>> {
+    const assistant = createMuxMessage("assistant-1", "assistant", "", { historySequence: 2 });
+    assistant.parts = calls.map((call) => ({
+      type: "dynamic-tool" as const,
+      toolCallId: call.id,
+      toolName: "notion_fetch",
+      input: {},
+      state: "output-available" as const,
+      output: call.output,
+      ...(call.mcp ? { mcpServer } : {}),
+    }));
+    const messages = await prepareMessagesForProvider({
+      ...options,
+      messagesWithSentinel: [
+        createMuxMessage("user-1", "user", "Fetch the page.", { historySequence: 1 }),
+        assistant,
+        createMuxMessage("user-2", "user", "Thanks.", { historySequence: 3 }),
+      ],
+    });
+    const outputs: Record<string, unknown> = {};
+    for (const message of messages) {
+      if (message.role !== "tool") continue;
+      for (const part of message.content) {
+        if (part.type === "tool-result") outputs[part.toolCallId] = part.output;
+      }
+    }
+    return outputs;
+  }
+
+  /** The tool-result outputs in request order, for one assistant row per entry of `rows`. */
+  async function replayedOutputsByOrder(
+    rows: Array<Array<{ id: string; output: unknown; mcp: boolean }>>
+  ): Promise<unknown[]> {
+    const history: MuxMessage[] = [];
+    rows.forEach((calls, index) => {
+      history.push(
+        createMuxMessage(`user-${index}`, "user", "Fetch the page.", {
+          historySequence: index * 2 + 1,
+        })
+      );
+      const assistant = createMuxMessage(`assistant-${index}`, "assistant", "", {
+        historySequence: index * 2 + 2,
+      });
+      assistant.parts = calls.map((call) => ({
+        type: "dynamic-tool" as const,
+        toolCallId: call.id,
+        toolName: "notion_fetch",
+        input: {},
+        state: "output-available" as const,
+        output: call.output,
+        ...(call.mcp ? { mcpServer } : {}),
+      }));
+      history.push(assistant);
+    });
+    history.push(createMuxMessage("user-last", "user", "Thanks.", { historySequence: 99 }));
+    const messages = await prepareMessagesForProvider({
+      ...options,
+      messagesWithSentinel: history,
+    });
+    return messages.flatMap((message) =>
+      message.role === "tool"
+        ? message.content.flatMap((part) => (part.type === "tool-result" ? [part.output] : []))
+        : []
+    );
+  }
+
+  it("converts only the calls marked as MCP, even under a shared tool name", async () => {
+    const content = { content: [{ type: "text", text: "page body" }] };
+    const outputs = await replayedOutputs([
+      { id: "mcp-call", output: content, mcp: true },
+      { id: "plain-call", output: content, mcp: false },
+    ]);
+    expect(outputs["mcp-call"]).toMatchObject({
+      type: "content",
+      value: [{ type: "text", text: "page body" }],
+    });
+    expect(outputs["plain-call"]).toMatchObject({ type: "json", value: content });
+  });
+
+  it("keeps an ordinary call that reuses an MCP call's ID in the JSON form", async () => {
+    const content = { content: [{ type: "text", text: "page body" }] };
+    const outputs = await replayedOutputsByOrder([
+      [{ id: "call-1", output: content, mcp: true }],
+      [{ id: "call-1", output: content, mcp: false }],
+    ]);
+    expect(outputs).toMatchObject([
+      { type: "content", value: [{ type: "text", text: "page body" }] },
+      { type: "json", value: content },
+    ]);
+  });
+
+  it("keeps an ordinary output that has the envelope's field name in the JSON form", async () => {
+    const lookalike = { mcpReplayOutput: { content: [{ type: "text", text: "x" }] } };
+    const outputs = await replayedOutputs([
+      { id: "mcp-call", output: { content: [] }, mcp: true },
+      { id: "plain-call", output: lookalike, mcp: false },
+    ]);
+    expect(outputs["plain-call"]).toMatchObject({ type: "json", value: lookalike });
+  });
+
+  // Persisted output is unvalidated: one malformed MCP result must not fail every later send.
+  // A persisted MCP result with audio or SVG must not fail every later request: the replay
+  // replaces media no provider accepts, as the extraction it used to go through did.
+  const ONE_PIXEL_PNG =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+  it("replaces MCP media that no provider accepts on replay", async () => {
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString("base64");
+    const outputs = await replayedOutputs([
+      {
+        id: "call-1",
+        mcp: true,
+        output: {
+          type: "content",
+          value: [
+            { type: "media", data: "UklGRgAAAABXQVZF", mediaType: "audio/wav" },
+            { type: "media", data: svg, mediaType: "image/svg+xml" },
+            { type: "media", data: ONE_PIXEL_PNG, mediaType: "image/png" },
+            { type: "media", data: "bm90LWEtcG5n", mediaType: "image/png" },
+          ],
+        },
+      },
+    ]);
+    const serialized = JSON.stringify(outputs["call-1"]);
+    expect(serialized).not.toContain("UklGRgAAAABXQVZF");
+    expect(serialized).toContain("audio/wav is not supported");
+    expect(serialized).not.toContain('"mediaType":"image/svg+xml"');
+    expect(serialized).toContain("<svg");
+    // A supported image stays a file part, as the in-turn step sent it.
+    expect(serialized).toContain(ONE_PIXEL_PNG);
+    // Unreadable image bytes become a note instead of failing every later request.
+    expect(serialized).not.toContain("bm90LWEtcG5n");
+    expect(serialized).toContain("Image attachment omitted");
+  });
+
+  it("replays a malformed MCP result as JSON instead of failing the request", async () => {
+    const malformed = { content: [null] };
+    const outputs = await replayedOutputs([
+      { id: "mcp-call", output: malformed, mcp: true },
+      // A completed part without an output: the request still gets a JSON value.
+      { id: "mcp-missing", output: undefined, mcp: true },
+    ]);
+    expect(outputs["mcp-call"]).toMatchObject({ type: "json", value: malformed });
+    expect(outputs["mcp-missing"]).toEqual({ type: "json", value: null });
   });
 });

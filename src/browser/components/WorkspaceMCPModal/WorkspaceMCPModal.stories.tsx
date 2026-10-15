@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fireEvent, userEvent, waitFor, within } from "@storybook/test";
+import { expect, fireEvent, userEvent, waitFor, within } from "storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, useAPI, type APIClient } from "@/browser/contexts/API";
@@ -70,12 +70,20 @@ interface WorkspaceMCPStoryOptions {
   /** Servers the workspace already runs (the dialog reads their settings on open). */
   settingsConnected?: string[];
   settingsReads?: string[][];
+  /** Records the workspace of each settings read. */
+  settingsReadWorkspaces?: string[];
   settingsReadErrors?: Record<string, string>;
   settingsUpdateGate?: { promise: Promise<void> } | Array<{ promise: Promise<void> }>;
   settingsFirstReadGate?: { promise: Promise<void> };
+  /** Per server: what its first settings read returns (an older catalog than `settings`). */
+  settingsStaleFirstRead?: Record<string, MCPSettingsSnapshot>;
   settingsAfterSave?: Record<string, MCPSettingsSnapshot>;
   settingsToolRuns?: Array<{ toolName: string; confirmed: boolean }>;
   settingsToolRunGate?: { promise: Promise<void> };
+  settingsToolRunSets?: Record<string, Record<string, string | number | boolean>>;
+  settingsToolRunErrors?: string[];
+  settingsToolRunFailures?: string[];
+  settingsRestartAfterFirstRead?: string[];
   /** MCP Apps views by view key (a settings app action opens `settings:<server>:<tool>`). */
   mcpAppViews?: Record<string, McpAppView>;
   testGate?: { promise: Promise<void> };
@@ -153,12 +161,18 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
     ),
     mcpSettingsConnected: new Set(options.settingsConnected ?? []),
     mcpSettingsReads: options.settingsReads,
+    mcpSettingsReadWorkspaces: options.settingsReadWorkspaces,
     mcpSettingsReadErrors: new Map(Object.entries(options.settingsReadErrors ?? {})),
     mcpSettingsUpdateGate: options.settingsUpdateGate,
     mcpSettingsFirstReadGate: options.settingsFirstReadGate,
+    mcpSettingsStaleFirstRead: new Map(Object.entries(options.settingsStaleFirstRead ?? {})),
     mcpSettingsAfterUpdate: new Map(Object.entries(options.settingsAfterSave ?? {})),
     mcpSettingsToolRuns: options.settingsToolRuns,
     mcpSettingsToolRunGate: options.settingsToolRunGate,
+    mcpSettingsToolRunSets: new Map(Object.entries(options.settingsToolRunSets ?? {})),
+    mcpSettingsToolRunErrors: new Set(options.settingsToolRunErrors ?? []),
+    mcpSettingsToolRunFailures: new Set(options.settingsToolRunFailures ?? []),
+    mcpSettingsRestartAfterFirstRead: new Set(options.settingsRestartAfterFirstRead ?? []),
     ...(options.mcpAppViews ? { mcpApps: { views: options.mcpAppViews } } : {}),
     mcpTestGate: options.testGate,
   });
@@ -735,7 +749,7 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
   },
   play: async ({ canvasElement }) => {
     const dialog = await findWorkspaceMCPDialog(canvasElement);
-    const section = within(await within(dialog).findByTestId("mcp-server-settings"));
+    let section = within(await within(dialog).findByTestId("mcp-server-settings"));
     const page = within(canvasElement.ownerDocument.body);
     // The spec's display name (the tool's title), not the raw tool name.
     await userEvent.click(await section.findByRole("button", { name: "Run Part library" }));
@@ -748,6 +762,8 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
     await expect(section.getByRole("button", { name: "Run Reset parts" })).toBeDisabled();
     // The dialog's Save closes it, so it waits too.
     await expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled();
+    // A writing run re-reads the settings when it ends: an edit made meanwhile would be lost.
+    await expect(section.getByLabelText("Default zoom setting")).toBeDisabled();
     toolActionGate.resolve();
     await expect(section.findByText("cad.library finished")).resolves.toBeInTheDocument();
     await waitFor(() =>
@@ -761,7 +777,9 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
     await expect(toolActionRuns).toHaveLength(1);
     await userEvent.click(section.getByRole("button", { name: "Run Reset parts" }));
     await userEvent.click(await page.findByRole("button", { name: "Run" }));
-    await expect(section.findByText("cad.reset finished")).resolves.toBeInTheDocument();
+    // A tool that can write: the dialog reads the settings again, which remounts the section.
+    await expect(within(dialog).findByText("cad.reset finished")).resolves.toBeInTheDocument();
+    section = within(within(dialog).getByTestId("mcp-server-settings"));
     await expect(toolActionRuns[1]).toEqual({ toolName: "cad.reset", confirmed: true });
 
     // An unsaved edit blocks the runs: the tool would see the saved settings, not the draft.
@@ -794,6 +812,92 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
     await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(page.queryByRole("dialog", { name: "Payment method" })).toBeNull());
     await expect(within(dialog).getByTestId("mcp-server-settings")).toBeInTheDocument();
+  },
+};
+
+/** CAD_SETTINGS with Part library (cad.library) no longer read-only. */
+const CAD_SETTINGS_LIBRARY_WRITES: MCPSettingsSnapshot = {
+  ...CAD_SETTINGS,
+  layout: CAD_SETTINGS.layout.map((group) => ({
+    ...group,
+    items: group.items.map((item) =>
+      item.kind === "tool" && item.tool === "cad.library" && item.action
+        ? { ...item, action: { ...item.action, readOnly: false } }
+        : item
+    ),
+  })),
+};
+
+let staleFlagRuns: Array<{ toolName: string; confirmed: boolean }> = [];
+/**
+ * The server dropped Part library's readOnlyHint after the dialog read it (tools/list_changed).
+ * The backend refuses the unconfirmed run, and the row shows that. The row learns the new flag,
+ * so the next click asks first and runs the tool.
+ */
+export const WorkspaceMCPServerSettingsStaleReadOnlyFlag: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    staleFlagRuns = [];
+    return renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settings: { cad: CAD_SETTINGS_LIBRARY_WRITES },
+      settingsStaleFirstRead: { cad: CAD_SETTINGS },
+      settingsToolRuns: staleFlagRuns,
+    });
+  },
+  play: async ({ canvasElement }) => {
+    const dialog = await findWorkspaceMCPDialog(canvasElement);
+    const section = within(await within(dialog).findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    const run = await section.findByRole("button", { name: "Run Part library" });
+    await userEvent.click(run);
+    await expect(
+      section.findByText("'Part library' runs only after a confirmation")
+    ).resolves.toBeInTheDocument();
+    await waitFor(() => expect(run).toBeEnabled());
+    await expect(staleFlagRuns).toHaveLength(0);
+
+    await userEvent.click(run);
+    await expect(page.findByText("Run Part library?")).resolves.toBeInTheDocument();
+    await userEvent.click(page.getByRole("button", { name: "Run" }));
+    // The confirmed run can write, so the dialog reads the settings again (a new section).
+    await expect(within(dialog).findByText("cad.library finished")).resolves.toBeInTheDocument();
+    await expect(staleFlagRuns).toEqual([{ toolName: "cad.library", confirmed: true }]);
+  },
+};
+
+let restartRuns: Array<{ toolName: string; confirmed: boolean }> = [];
+/**
+ * The server restarted after the dialog read it, and its new instance has Part library as
+ * writable. The row does not take that flag: the run carries the old instance's token, so a
+ * confirmation would only lead to a refused run.
+ */
+export const WorkspaceMCPServerSettingsStaleFlagOtherInstance: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    restartRuns = [];
+    return renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settings: { cad: CAD_SETTINGS_LIBRARY_WRITES },
+      settingsStaleFirstRead: { cad: CAD_SETTINGS },
+      settingsRestartAfterFirstRead: ["cad"],
+      settingsToolRuns: restartRuns,
+    });
+  },
+  play: async ({ canvasElement }) => {
+    const dialog = await findWorkspaceMCPDialog(canvasElement);
+    const section = within(await within(dialog).findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    const run = await section.findByRole("button", { name: "Run Part library" });
+    await userEvent.click(run);
+    await expect(
+      section.findByText("'Part library' runs only after a confirmation")
+    ).resolves.toBeInTheDocument();
+    await waitFor(() => expect(run).toBeEnabled());
+    await userEvent.click(run);
+    await waitFor(() => expect(run).toBeEnabled());
+    await expect(page.queryByText("Run Part library?")).toBeNull();
+    await expect(restartRuns).toHaveLength(0);
   },
 };
 
@@ -859,6 +963,236 @@ export const WorkspaceMCPServerSettingsAppViewRetry: Story = {
     await userEvent.click(reload);
     await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
     await expect(retryViewRuns).toHaveLength(1);
+  },
+};
+
+const rereadReads: string[][] = [];
+
+/** Shared play: a read-only run reads nothing; Reset parts (it writes zoom 1) reads again. */
+async function exerciseRereadAfterWrite(canvasElement: HTMLElement, resetText: string) {
+  const modal = within(await findWorkspaceMCPDialog(canvasElement));
+  const section = within(await modal.findByTestId("mcp-server-settings"));
+  const page = within(canvasElement.ownerDocument.body);
+  await userEvent.click(await section.findByRole("button", { name: "Run Part library" }));
+  await expect(section.findByText("cad.library finished")).resolves.toBeInTheDocument();
+  await expect(rereadReads).toHaveLength(1);
+  await userEvent.click(section.getByRole("button", { name: "Run Reset parts" }));
+  await userEvent.click(await page.findByRole("button", { name: "Run" }));
+  // The re-read remounts the section: query it again.
+  await waitFor(() => expect(modal.getByLabelText("Default zoom setting")).toHaveValue(1));
+  await expect(rereadReads).toEqual([["cad"], ["cad"]]);
+  await expect(modal.findByText(resetText)).resolves.toBeInTheDocument();
+}
+
+/**
+ * A tool that can write (Reset parts) changes the server's settings: the dialog reads them
+ * again and shows the new values, and the run's result stays. It reads them even when the tool
+ * reports an error (it can fail after it wrote). A read-only run reads nothing.
+ */
+export const WorkspaceMCPServerSettingsRereadAfterWrite: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    rereadReads.length = 0;
+    return renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settingsReads: rereadReads,
+      settingsToolRunSets: { "cad.reset": { zoom: 1 } },
+      settingsToolRunErrors: ["cad.reset"],
+    });
+  },
+  play: async ({ canvasElement }) => exerciseRereadAfterWrite(canvasElement, "cad.reset finished"),
+};
+
+/** The run fails after the dispatch (a disconnect after the write): the dialog reads again. */
+export const WorkspaceMCPServerSettingsRereadAfterFailedWrite: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    rereadReads.length = 0;
+    return renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settingsReads: rereadReads,
+      settingsToolRunSets: { "cad.reset": { zoom: 1 } },
+      settingsToolRunFailures: ["cad.reset"],
+    });
+  },
+  play: async ({ canvasElement }) =>
+    exerciseRereadAfterWrite(canvasElement, "cad.reset disconnected"),
+};
+
+const appWriteReads: string[][] = [];
+/**
+ * An MCP App of a tool that can write (Payment method) may change the settings: the dialog
+ * reads them again when the app closes, not while it is open (that would close it).
+ */
+export const WorkspaceMCPServerSettingsRereadAfterApp: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    appWriteReads.length = 0;
+    return renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settingsReads: appWriteReads,
+      settingsToolRunSets: { "cad.payment": { zoom: 1 } },
+      mcpAppViews: {
+        "settings:cad:cad.payment": {
+          html: "<!doctype html><html><body><strong>Card form</strong></body></html>",
+          csp: {},
+          prefersBorder: null,
+          resultAvailable: true,
+          result: { content: [] },
+          invocation: null,
+        },
+      },
+    });
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await section.findByRole("button", { name: "Open Payment method" }));
+    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    const appDialog = await page.findByRole("dialog", { name: "Payment method" });
+    await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
+    await expect(appWriteReads).toHaveLength(1);
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(page.queryByRole("dialog", { name: "Payment method" })).toBeNull());
+    await waitFor(() => expect(modal.getByLabelText("Default zoom setting")).toHaveValue(1));
+    await expect(appWriteReads).toEqual([["cad"], ["cad"]]);
+  },
+};
+
+/** Closes the story's workspace MCP dialog from outside, as a workspace switch unmounts it. */
+let unmountWorkspaceMCPModal: (() => void) | null = null;
+const OutsideClosedWorkspaceMCPModal: FC = () => {
+  const [open, setOpen] = useState(true);
+  unmountWorkspaceMCPModal = () => setOpen(false);
+  return open ? (
+    <WorkspaceMCPModal
+      workspaceId={WORKSPACE_ID}
+      projectPath={PROJECT_PATH}
+      open
+      onOpenChange={setOpen}
+    />
+  ) : null;
+};
+
+const appUnmountReads: string[][] = [];
+/**
+ * The app of a tool that can write is still open when its row unmounts (the dialog goes away
+ * without the app's close): Xum still reads the settings again, so the backend's settings cache
+ * (plugin hooks use it) does not keep the pre-app values.
+ */
+export const WorkspaceMCPServerSettingsRereadAfterAppUnmount: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    appUnmountReads.length = 0;
+    return (
+      <WorkspaceMCPModalStoryShell
+        setup={() =>
+          setupWorkspaceMCPModalStory({
+            ...settingsStoryOptions(),
+            settingsReads: appUnmountReads,
+            settingsToolRunSets: { "cad.payment": { zoom: 1 } },
+            mcpAppViews: {
+              "settings:cad:cad.payment": {
+                html: "<!doctype html><html><body><strong>Card form</strong></body></html>",
+                csp: {},
+                prefersBorder: null,
+                resultAvailable: true,
+                result: { content: [] },
+                invocation: null,
+              },
+            },
+          })
+        }
+      >
+        <OutsideClosedWorkspaceMCPModal />
+      </WorkspaceMCPModalStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await section.findByRole("button", { name: "Open Payment method" }));
+    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    const appDialog = await page.findByRole("dialog", { name: "Payment method" });
+    await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
+    await expect(appUnmountReads).toHaveLength(1);
+    unmountWorkspaceMCPModal?.();
+    await waitFor(() =>
+      expect(queryWorkspaceMCPDialog(canvasElement.ownerDocument)).not.toBeInTheDocument()
+    );
+    await waitFor(() => expect(appUnmountReads).toEqual([["cad"], ["cad"]]), { timeout: 5000 });
+  },
+};
+
+/** The menu bar's workspace MCP dialog: one modal that a workspace switch reuses (no key). */
+let switchWorkspaceMCPModal: ((workspaceId: string) => void) | null = null;
+const WorkspaceSwitchingMCPModal: FC = () => {
+  const [workspaceId, setWorkspaceId] = useState(WORKSPACE_ID);
+  switchWorkspaceMCPModal = setWorkspaceId;
+  return (
+    <WorkspaceMCPModal
+      workspaceId={workspaceId}
+      projectPath={PROJECT_PATH}
+      open
+      onOpenChange={() => undefined}
+    />
+  );
+};
+
+const appSwitchReadWorkspaces: string[] = [];
+/**
+ * A workspace switch while a writable app is open: the reused dialog renders the old row with
+ * the new workspace before it drops it. The re-read when the app goes away is the workspace
+ * whose app wrote, not the one switched to.
+ */
+export const WorkspaceMCPServerSettingsRereadAfterAppWorkspaceSwitch: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    appSwitchReadWorkspaces.length = 0;
+    return (
+      <WorkspaceMCPModalStoryShell
+        setup={() =>
+          setupWorkspaceMCPModalStory({
+            ...settingsStoryOptions(),
+            settingsReadWorkspaces: appSwitchReadWorkspaces,
+            settingsToolRunSets: { "cad.payment": { zoom: 1 } },
+            mcpAppViews: {
+              "settings:cad:cad.payment": {
+                html: "<!doctype html><html><body><strong>Card form</strong></body></html>",
+                csp: {},
+                prefersBorder: null,
+                resultAvailable: true,
+                result: { content: [] },
+                invocation: null,
+              },
+            },
+          })
+        }
+      >
+        <WorkspaceSwitchingMCPModal />
+      </WorkspaceMCPModalStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await section.findByRole("button", { name: "Open Payment method" }));
+    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    const appDialog = await page.findByRole("dialog", { name: "Payment method" });
+    await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
+    await expect(appSwitchReadWorkspaces).toEqual([WORKSPACE_ID]);
+    switchWorkspaceMCPModal?.("ws-switched-to");
+    const reads = (workspaceId: string) =>
+      appSwitchReadWorkspaces.filter((read) => read === workspaceId).length;
+    // The re-read of the workspace whose app wrote, and the switched-to dialog's own read.
+    await waitFor(() => expect(reads(WORKSPACE_ID)).toBe(2), { timeout: 5000 });
+    await waitFor(() => expect(reads("ws-switched-to")).toBeGreaterThan(0), { timeout: 5000 });
+    await modal.findByTestId("mcp-server-settings");
+    // No second, spurious re-read of the switched-to workspace for the old app.
+    await expect(reads("ws-switched-to")).toBe(1);
   },
 };
 
@@ -930,6 +1264,53 @@ export const WorkspaceMCPServerSettingsRunAcrossRemount: Story = {
       expect(again.getByRole("button", { name: "Run Reset parts" })).toBeEnabled()
     );
     await expect(reopened.getByRole("button", { name: "Save" })).toBeEnabled();
+  },
+};
+
+let writeRemountGate = Promise.withResolvers<void>();
+/**
+ * A writing run (Reset parts) still in flight when the dialog closes: the reopened dialog reads
+ * the pre-write values, and the run's end reads the settings again into that dialog.
+ */
+export const WorkspaceMCPServerSettingsRereadAfterRemount: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    writeRemountGate = Promise.withResolvers<void>();
+    return (
+      <WorkspaceMCPModalStoryShell
+        setup={() =>
+          setupWorkspaceMCPModalStory({
+            ...settingsStoryOptions(),
+            settingsToolRunGate: writeRemountGate,
+            settingsToolRuns: [],
+            settingsToolRunSets: { "cad.reset": { zoom: 1 } },
+          })
+        }
+      >
+        <RemountingWorkspaceMCPModal />
+      </WorkspaceMCPModalStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await section.findByRole("button", { name: "Run Reset parts" }));
+    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    await waitFor(() =>
+      expect(section.getByRole("button", { name: "Run Part library" })).toBeDisabled()
+    );
+    await userEvent.click(modal.getByRole("button", { name: "Cancel" }));
+    await waitFor(() =>
+      expect(queryWorkspaceMCPDialog(canvasElement.ownerDocument)).not.toBeInTheDocument()
+    );
+    await userEvent.click(
+      within(canvasElement).getByRole("button", { name: "Open workspace MCP" })
+    );
+    const reopened = within(await findWorkspaceMCPDialog(canvasElement));
+    await expect(reopened.findByLabelText("Default zoom setting")).resolves.toHaveValue(2);
+    writeRemountGate.resolve();
+    await waitFor(() => expect(reopened.getByLabelText("Default zoom setting")).toHaveValue(1));
   },
 };
 

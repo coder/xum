@@ -1,4 +1,4 @@
-import { userEvent, waitFor } from "@storybook/test";
+import { userEvent, waitFor } from "storybook/test";
 
 import { appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
@@ -54,7 +54,9 @@ export const ScratchCreationWithProjects: AppStory = {
           // Guard: a previous story's play-function may have left the sidebar
           // collapsed via localStorage.
           if (document.documentElement.dataset.leftSidebarCollapsed === "true") {
-            const expandBtn = storyRoot.querySelector<HTMLElement>("[aria-label='Expand sidebar']");
+            const expandBtn = storyRoot.querySelector<HTMLElement>(
+              "[aria-label='Open sidebar menu']"
+            );
             if (expandBtn) expandBtn.click();
             throw new Error("Sidebar collapsed: expanding");
           }
