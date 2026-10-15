@@ -1408,6 +1408,75 @@ describe("DraftService moveCreation", () => {
     expect(events).toEqual([]);
   });
 
+  it("answers moved to a retry after a lost reply even when the source was written again", async () => {
+    using tempDir = new TestTempDir("drafts-move-retry-recreated");
+    const { projectPath, otherProject, service } = await createMoveHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    const written = await service.update({ scope: source, text: "moved text", nameState });
+    const dest = { kind: "creation" as const, projectPath: otherProject, draftId: "dst" };
+    const input = {
+      source,
+      sourceRevision: written.revision,
+      dest,
+      subProjectPath: null,
+      createdAt: 1,
+    };
+    const first = await service.moveCreation(input);
+    // The reply is lost; a late edit (this window's flush before the retry, or another window's
+    // write) recreates the source.
+    const recreated = await service.update({ scope: source, text: "typed later" });
+
+    expect(await service.moveCreation({ ...input, sourceRevision: recreated.revision })).toEqual(
+      first
+    );
+    expect((await service.get(dest)).text).toBe("moved text");
+    expect((await service.get(source)).text).toBe("typed later");
+
+    // Once a snapshot relisted the recreated source (a synthesized row), the retry still finds
+    // the move done.
+    await service.getSnapshotEvent();
+    expect((await service.getList()).entries.map(({ draftId }) => draftId).sort()).toEqual([
+      "dst",
+      "src",
+    ]);
+    expect(
+      await service.moveCreation({ ...input, sourceRevision: recreated.revision })
+    ).toMatchObject({ result: "moved", dest: first.result === "moved" ? first.dest : null });
+    expect((await service.get(dest)).text).toBe("moved text");
+    expect((await service.get(source)).text).toBe("typed later");
+  });
+
+  it("finishes a crashed attempt whose destination body a snapshot relisted", async () => {
+    using tempDir = new TestTempDir("drafts-move-crashed");
+    const { projectPath, otherProject, service } = await createMoveHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    const written = await service.update({ scope: source, text: "moving" });
+    const dest = { kind: "creation" as const, projectPath: otherProject, draftId: "dst" };
+    // The attempt wrote the destination body and exited; the next snapshot relisted it.
+    await service.update({ scope: dest, text: "moving" });
+    await service.getSnapshotEvent();
+    expect((await service.getList()).entries.map(({ draftId }) => draftId).sort()).toEqual([
+      "dst",
+      "src",
+    ]);
+
+    const reply = await service.moveCreation({
+      source,
+      sourceRevision: written.revision,
+      dest,
+      subProjectPath: "sub",
+      createdAt: 1,
+    });
+
+    expect(reply.result).toBe("moved");
+    expect((await service.get(source)).text).toBe("");
+    expect((await service.getList()).entries).toEqual([
+      { projectPath: otherProject, draftId: "dst", subProjectPath: "sub", createdAt: 1 },
+    ]);
+  });
+
   it("refuses an unowned destination and keeps the source", async () => {
     using tempDir = new TestTempDir("drafts-move-unowned");
     const { projectPath, service } = await createMoveHarness(tempDir);
