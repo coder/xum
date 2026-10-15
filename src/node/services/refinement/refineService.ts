@@ -1027,6 +1027,7 @@ export class RefineService {
 
       const result = await runRefinePass({
         model: modelResult.data.model,
+        pricingModel: modelResult.data.metadataModel,
         memoryService: this.memoryService,
         metaService: this.metaService,
         ctx,

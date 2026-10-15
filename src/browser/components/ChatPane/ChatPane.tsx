@@ -153,7 +153,6 @@ interface ChatPaneProps {
   workspaceName: string;
   namedWorkspacePath: string;
   leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
   runtimeConfig?: RuntimeConfig;
   onOpenTerminal: (options?: TerminalSessionCreateOptions) => void;
   /** Hide + inactivate chat pane while immersive review overlay is active. */
@@ -165,11 +164,7 @@ interface ChatPaneProps {
 
 export type ChatPaneContentProps = Omit<
   ChatPaneProps,
-  | "leftSidebarCollapsed"
-  | "onToggleLeftSidebarCollapsed"
-  | "immersiveHidden"
-  | "onOpenSidebar"
-  | "sidebarFullscreen"
+  "leftSidebarCollapsed" | "immersiveHidden" | "onOpenSidebar" | "sidebarFullscreen"
 > & {
   /**
    * Rendered inside another surface (the /side chat tab in the right sidebar) rather than as
@@ -304,7 +299,6 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
               workspaceName={props.workspaceName}
               workspaceTitle={workspaceTitle}
               leftSidebarCollapsed={props.leftSidebarCollapsed}
-              onToggleLeftSidebarCollapsed={props.onToggleLeftSidebarCollapsed}
               namedWorkspacePath={props.namedWorkspacePath}
               runtimeConfig={props.runtimeConfig}
               onOpenTerminal={props.onOpenTerminal}

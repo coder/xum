@@ -54,7 +54,9 @@ export const ScratchCreationWithProjects: AppStory = {
           // Guard: a previous story's play-function may have left the sidebar
           // collapsed via localStorage.
           if (document.documentElement.dataset.leftSidebarCollapsed === "true") {
-            const expandBtn = storyRoot.querySelector<HTMLElement>("[aria-label='Expand sidebar']");
+            const expandBtn = storyRoot.querySelector<HTMLElement>(
+              "[aria-label='Open sidebar menu']"
+            );
             if (expandBtn) expandBtn.click();
             throw new Error("Sidebar collapsed: expanding");
           }

@@ -37,6 +37,18 @@ export const ChatUsageDisplaySchema = z.object({
   costsIncluded: z.boolean().optional(),
   // Without it, the schema would strip the tier and repricing would drop the premium (#4787).
   serviceTier: z.enum(["flex", "fast", "ultrafast", "unknown", "mixed"]).optional(),
+  // Without it, repricing could not keep each request's context tier. A malformed share is
+  // dropped rather than rejecting the whole usage file; the aggregate then keeps its costs.
+  longContextTokens: z
+    .object({
+      input: z.number(),
+      cached: z.number(),
+      cacheCreate: z.number(),
+      cacheCreate1h: z.number(),
+      output: z.number(),
+    })
+    .optional()
+    .catch(undefined),
   // Merged sums of unpriced requests hold numeric partial costs, so only this flag keeps the
   // unknown-pricing warning across IPC.
   hasUnknownCosts: z.boolean().optional(),

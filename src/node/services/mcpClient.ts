@@ -270,11 +270,31 @@ function toolCallError(
   if (!(error instanceof InsufficientScopeError)) return error;
   const scopes = insufficientScopeNames(error.requiredScope);
   onInsufficientScope?.(scopes);
-  const needed =
-    scopes.length > 0 ? `the OAuth scope "${scopes.join(" ")}"` : "more OAuth permissions";
   return new Error(
-    `The MCP server refused this tool call: it needs ${needed}. The user must sign in to this MCP server again and grant it.`
+    `The MCP server refused this tool call: it needs ${scopesNeeded(scopes)}. The user must sign in to this MCP server again and grant it.`
   );
+}
+
+function scopesNeeded(scopes: string[]): string {
+  return scopes.length > 0 ? `the OAuth scope "${scopes.join(" ")}"` : "more OAuth permissions";
+}
+
+/**
+ * A 403 `insufficient_scope` of any other request (listing, resource read, transport error),
+ * with only the scope names (#6739). The SDK message quotes the server's raw `scope` value, and
+ * the renderer and the logs show these errors.
+ */
+function cleanScopeError<E>(error: E): E | Error {
+  if (!(error instanceof InsufficientScopeError)) return error;
+  return new Error(
+    `The MCP server refused this request: it needs ${scopesNeeded(insufficientScopeNames(error.requiredScope))}.`
+  );
+}
+
+function withCleanScopeError<T>(request: Promise<T>): Promise<T> {
+  return request.catch((error: unknown) => {
+    throw cleanScopeError(error);
+  });
 }
 
 /** An agent's tool call; a 403 `insufficient_scope` becomes toolCallError's message. */
@@ -433,10 +453,12 @@ async function listServerPrompts(
   // Cursorless listPrompts() aggregates pages up to ClientOptions.listMaxPages
   // and forwards these options to each request; the integration test covers
   // page two.
-  const result = await client.listPrompts(undefined, {
-    timeout: PROMPT_LIST_TIMEOUT_MS,
-    ...(signal !== undefined ? { signal } : {}),
-  });
+  const result = await withCleanScopeError(
+    client.listPrompts(undefined, {
+      timeout: PROMPT_LIST_TIMEOUT_MS,
+      ...(signal !== undefined ? { signal } : {}),
+    })
+  );
   assert(Array.isArray(result.prompts), "MCP prompts/list result must carry a prompts array");
   return result.prompts;
 }
@@ -523,7 +545,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
 
   if (config.onUncaughtError) {
     const onUncaughtError = config.onUncaughtError;
-    client.onerror = (error) => onUncaughtError(error);
+    client.onerror = (error) => onUncaughtError(cleanScopeError(error));
   }
   // Set once the handle exists. A notification before then needs no re-list: the first tools()
   // call lists the current catalog.
@@ -538,7 +560,9 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     ? createHttpTransport(config.transport)
     : config.transport;
 
-  await client.connect(transport, config.prior !== undefined ? { prior: config.prior } : {});
+  await withCleanScopeError(
+    client.connect(transport, config.prior !== undefined ? { prior: config.prior } : {})
+  );
   const settings = parseMCPSettingsCapability(client.getServerCapabilities());
   // Only the host reads and writes settings: hiding the tools keeps the model
   // from changing what the user configured.
@@ -548,7 +572,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
   const handle: MCPClientHandle = {
     tools: async () => {
       const listing = ++listingsStarted;
-      const listResult = await client.listTools();
+      const listResult = await withCleanScopeError(client.listTools());
       assert(Array.isArray(listResult.tools), "MCP tools/list result must carry a tools array");
 
       const tools: Record<string, Tool> = {};
@@ -629,14 +653,16 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     },
     prompts: (options) => listServerPrompts(client, options?.signal),
     getPrompt: (name, args, options) =>
-      client.getPrompt(
-        { name, arguments: args },
-        {
-          // Prompt expansion blocks send preparation, so use a shorter timeout than
-          // tool calls and honor send cancellation.
-          timeout: PROMPT_GET_TIMEOUT_MS,
-          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-        }
+      withCleanScopeError(
+        client.getPrompt(
+          { name, arguments: args },
+          {
+            // Prompt expansion blocks send preparation, so use a shorter timeout than
+            // tool calls and honor send cancellation.
+            timeout: PROMPT_GET_TIMEOUT_MS,
+            ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+          }
+        )
       ),
     negotiatedProtocolVersion: () => client.getNegotiatedProtocolVersion(),
     serverInfo: () => client.getServerVersion(),
@@ -661,12 +687,14 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       callAnyTool({ name, arguments: args }, { signal: options.signal }),
     readResource: (uri, options) => {
       assert(mcpApps, "readResource requires an MCP Apps connection");
-      return client.readResource(
-        { uri },
-        {
-          timeout: RESOURCE_READ_TIMEOUT_MS,
-          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-        }
+      return withCleanScopeError(
+        client.readResource(
+          { uri },
+          {
+            timeout: RESOURCE_READ_TIMEOUT_MS,
+            ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+          }
+        )
       );
     },
     settingsCapability: () => settings,

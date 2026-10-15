@@ -3,6 +3,7 @@ import { jsonSchema, tool, type Tool, type ToolSet } from "ai";
 import type { MuxMessage } from "@/common/types/message";
 import { log } from "@/node/services/log";
 import { mcpToModelOutput } from "@/node/services/mcpClient";
+import { replaceProviderUnreadyMcpMedia } from "@/node/utils/messages/toolResultAttachments";
 
 type ModelOutput = ReturnType<NonNullable<Tool["toModelOutput"]>>;
 
@@ -27,7 +28,7 @@ function defaultModelOutput(output: unknown): ModelOutput {
 function replayMcpModelOutput(output: unknown): ModelOutput {
   if (output === undefined) return defaultModelOutput(output);
   try {
-    return mcpToModelOutput({ output });
+    return mcpToModelOutput({ output: replaceProviderUnreadyMcpMedia(output) });
   } catch (error) {
     log.warn("[MCP] Persisted tool result is not readable as MCP content; replaying as JSON", {
       error,

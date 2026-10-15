@@ -1,5 +1,4 @@
 import React, { useRef, useCallback, useState, useEffect } from "react";
-import { Menu } from "lucide-react";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { cn } from "@/common/lib/utils";
 import { CREATION_COLUMN_MAX_WIDTH_CLASS } from "@/constants/layout";
@@ -34,15 +33,14 @@ import { updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { trimArrayToChars } from "@/browser/utils/boundedPersistedValue";
 import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
-import { Button } from "@/browser/components/Button/Button";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { LeftSidebarToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 
 interface ProjectPageProps {
   projectPath: string;
   projectName: string;
   leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
   /** Sub-project path for parent-owned draft creation. */
   pendingSubProjectPath?: string | null;
   /** Draft ID for UI-only workspace creation drafts (from URL) */
@@ -202,7 +200,6 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   projectPath,
   projectName,
   leftSidebarCollapsed,
-  onToggleLeftSidebarCollapsed,
   pendingSubProjectPath,
   pendingDraftId,
   onWorkspaceCreated,
@@ -329,25 +326,14 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
           {/* Draggable header bar - matches WorkspaceMenuBar for consistency */}
           <div
             className={cn(
-              "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2 [@media(max-width:768px)]:h-auto [@media(max-width:768px)]:py-2",
-              isDesktopMode() ? "h-10 titlebar-drag" : "h-8"
+              // Same height as the app shell's fixed sidebar toggle bar, which sits over this header
+              // while the sidebar is collapsed.
+              "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2",
+              leftSidebarCollapsed && "pl-0",
+              isDesktopMode() ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
             )}
           >
-            {leftSidebarCollapsed && (
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={onToggleLeftSidebarCollapsed}
-                title="Open sidebar"
-                aria-label="Open sidebar menu"
-                className={cn(
-                  "hidden mobile-menu-btn h-6 w-6 shrink-0 text-muted hover:text-foreground",
-                  isDesktopMode() && "titlebar-no-drag"
-                )}
-              >
-                <Menu className="h-4 w-4" />
-              </Button>
-            )}
+            {leftSidebarCollapsed && <LeftSidebarToggleBarSpacer showNewChat />}
           </div>
           {/* Scrollable content area. mobile-header-spacer keeps content below
               the fixed mobile header on touch devices. */}

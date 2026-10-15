@@ -50,6 +50,29 @@ describe("SessionUsageFileSchema conformance", () => {
     expect(Object.keys(parsed).sort()).toEqual(Object.keys(full).sort());
   });
 
+  it("drops a malformed long-context share instead of rejecting the file", () => {
+    const usage = {
+      input: { tokens: 1, cost_usd: 0.01 },
+      cached: { tokens: 0, cost_usd: 0 },
+      cacheCreate: { tokens: 0, cost_usd: 0 },
+      output: { tokens: 2, cost_usd: 0.02 },
+      reasoning: { tokens: 0, cost_usd: 0 },
+      model: "claude-haiku-5-5",
+    };
+
+    const parsed = SessionUsageFileSchema.parse({
+      byModel: {
+        "anthropic:claude-haiku-5-5": {
+          ...usage,
+          longContextTokens: { input: 1, cached: 0, cacheCreate: 0, cacheCreate1h: 0 },
+        },
+      },
+      version: 1,
+    });
+
+    expect(parsed.byModel["anthropic:claude-haiku-5-5"]).toEqual(usage);
+  });
+
   it("parses legacy session-usage.json without optional fields", () => {
     const legacy = {
       byModel: {},

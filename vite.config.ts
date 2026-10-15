@@ -8,6 +8,7 @@ import { fileURLToPath } from "url";
 import { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH } from "./src/node/orpc/wsPaths";
 import { novncCompatPlugin } from "./src/vite/novncCompatPlugin";
 import { streamdownShikiLangsPlugin } from "./src/vite/streamdownShikiLangsPlugin";
+import { streamdownRehypeKatexPlugin } from "./src/vite/streamdownRehypeKatexPlugin";
 import { resolveViteDevServerEnv } from "./src/vite/devServerEnv";
 // React Compiler automatically optimizes React components through memoization.
 import { reactCompilerConfig } from "./src/vite/reactCompilerConfig";
@@ -71,6 +72,7 @@ const basePlugins = [
   tailwindcss(),
   novncCompatPlugin(),
   streamdownShikiLangsPlugin(),
+  streamdownRehypeKatexPlugin(),
 ];
 
 export default defineConfig(({ mode }) => {

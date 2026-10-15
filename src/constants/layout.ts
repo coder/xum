@@ -1,15 +1,12 @@
 export const LEFT_SIDEBAR_DEFAULT_WIDTH_PX = 288;
-export const LEFT_SIDEBAR_MIN_WIDTH_PX = 200;
+export const LEFT_SIDEBAR_MIN_WIDTH_PX = 232;
 export const LEFT_SIDEBAR_MAX_WIDTH_PX = 600;
-export const LEFT_SIDEBAR_COLLAPSED_WIDTH_PX = 20;
+export const LEFT_SIDEBAR_COLLAPSED_WIDTH_PX = 0;
 
 // New chats should show the collapsed overview instead of opening Review (or another tool).
 // Share the fallback so the lazy frame, header controls, and saved layouts agree on first paint.
 export const RIGHT_SIDEBAR_DEFAULT_COLLAPSED = true;
 
-// When the left sidebar is collapsed, WorkspaceMenuBar still needs extra room for the
-// floating reopen affordance so the header content doesn't sit underneath it.
-export const WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX = 60;
 export const CREATION_COLUMN_MAX_WIDTH_CLASS = "max-w-[67rem]";
 
 // The composer dock cancels the transcript scrollport's padding to paint full-bleed, so surfaces

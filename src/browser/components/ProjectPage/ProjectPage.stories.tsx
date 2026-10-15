@@ -50,7 +50,7 @@ async function openFirstProjectCreationView(storyRoot: HTMLElement): Promise<voi
       // <html> (set by App.tsx) which works for both desktop (width-based)
       // and mobile (transform-based) collapse modes.
       if (document.documentElement.dataset.leftSidebarCollapsed === "true") {
-        const expandBtn = storyRoot.querySelector<HTMLElement>("[aria-label='Expand sidebar']");
+        const expandBtn = storyRoot.querySelector<HTMLElement>("[aria-label='Open sidebar menu']");
         if (expandBtn) expandBtn.click();
         throw new Error("Sidebar collapsed – expanding…");
       }
@@ -193,7 +193,8 @@ export const CreateWorkspaceWithSections: AppStory = {
       const sidebar = storyRoot.querySelector<HTMLElement>("[data-testid='left-sidebar']");
       const sidebarIsExpanded = sidebar && sidebar.getBoundingClientRect().width > 40;
       if (sidebarIsExpanded) {
-        const collapseBtn = sidebar.querySelector<HTMLElement>("[aria-label='Collapse sidebar']");
+        // The toggle lives in the app shell's toggle bar, outside the sidebar.
+        const collapseBtn = storyRoot.querySelector<HTMLElement>("[aria-label='Collapse sidebar']");
         if (collapseBtn) {
           await userEvent.click(collapseBtn);
         }

@@ -139,29 +139,44 @@ function validateInlineWorkflowSourceByteLength(sizeBytes: number): void {
   }
 }
 
+/** The skill a `skill://` path names, read the way discovery reads it (gates included). */
+function readWorkflowSkill(
+  input: ResolveWorkflowScriptInput,
+  skillName: Parameters<typeof readAgentSkill>[2]
+): ReturnType<typeof readAgentSkill> {
+  // Discovery uses the skill storage context when there is one, else the workspace.
+  const workspacePath = input.skillStorageContext?.workspacePath ?? input.workspacePath;
+  const roots = workflowSkillRoots(input);
+  const projectSearchRoot = roots?.projectSearchRoot ?? input.projectSearchRoot ?? workspacePath;
+  return readAgentSkill(workflowSkillRuntime(input), workspacePath, skillName, {
+    ...(roots != null ? { roots } : { projectSearchRoot }),
+    containment: workflowSkillContainment(input, projectSearchRoot),
+  });
+}
+
+function workflowSkillRuntime(input: ResolveWorkflowScriptInput) {
+  return input.skillStorageContext?.runtime ?? input.runtime;
+}
+
+function workflowSkillRoots(input: ResolveWorkflowScriptInput) {
+  return input.roots ?? input.skillStorageContext?.roots;
+}
+
+function workflowSkillContainment(input: ResolveWorkflowScriptInput, projectSearchRoot: string) {
+  return (
+    input.containment ??
+    input.skillStorageContext?.containment ??
+    ({ kind: "runtime", root: projectSearchRoot } as const)
+  );
+}
+
 async function resolveSkillWorkflowScript(
   input: ResolveWorkflowScriptInput & { scriptPath: string }
 ): Promise<ResolvedWorkflowScript> {
   const parsed = parseSkillWorkflowScriptPath(input.scriptPath);
   assertJavaScriptWorkflowPath(parsed.relativePath);
 
-  const skillDiscoveryRuntime = input.skillStorageContext?.runtime ?? input.runtime;
-  const skillWorkspacePath = input.skillStorageContext?.workspacePath ?? input.workspacePath;
-  const skillRoots = input.roots ?? input.skillStorageContext?.roots;
-  const projectSearchRoot =
-    skillRoots?.projectSearchRoot ?? input.projectSearchRoot ?? skillWorkspacePath;
-  const resolvedSkill = await readAgentSkill(
-    skillDiscoveryRuntime,
-    skillWorkspacePath,
-    parsed.skillName,
-    {
-      ...(skillRoots != null ? { roots: skillRoots } : { projectSearchRoot }),
-      containment:
-        input.containment ??
-        input.skillStorageContext?.containment ??
-        ({ kind: "runtime", root: projectSearchRoot } as const),
-    }
-  );
+  const resolvedSkill = await readWorkflowSkill(input, parsed.skillName);
 
   if (resolvedSkill.package.scope === "project" && !input.projectTrusted) {
     throw new Error("Project trust is required to run project skill workflow scripts");
@@ -396,6 +411,10 @@ export async function assertStoredPluginWorkflowReviewed(
     scope: AgentPluginContainer["scope"];
   }
 ): Promise<void> {
+  if (input.scriptPath.startsWith(SKILL_SCRIPT_PATH_PREFIX)) {
+    await assertStoredSkillWorkflowReviewed(input);
+    return;
+  }
   const parsed = parsePluginWorkflowScriptPath(input.scriptPath);
   const plugins = await discoverWorkflowPlugins(input);
   // Bound to the scope the run started in: a project plugin of the same name must not stand in
@@ -412,6 +431,30 @@ export async function assertStoredPluginWorkflowReviewed(
     );
   }
   assertWorkflowReviewed(plugin, parsed.relativePath, input.source);
+}
+
+/**
+ * The stored-run gate of a `skill://` run (#6777): the skill of that name, in the scope the run
+ * started in, must still vouch for the snapshot. A managed plugin skill checks it against its
+ * consent record, as the resolver does. Other skills carry no record and pass. A skill that is
+ * gone, or that another scope now serves (an unreviewed plugin skill reads as missing), fails
+ * closed: the skill found then is not the one whose script the run snapshotted.
+ */
+async function assertStoredSkillWorkflowReviewed(
+  input: ResolveWorkflowScriptInput & {
+    scriptPath: string;
+    source: string;
+    scope: AgentPluginContainer["scope"];
+  }
+): Promise<void> {
+  const parsed = parseSkillWorkflowScriptPath(input.scriptPath);
+  const skill = await readWorkflowSkill(input, parsed.skillName).catch(() => undefined);
+  if (skill?.package.scope !== input.scope) {
+    throw new Error(
+      `Skill '${parsed.skillName}' is no longer available in its ${input.scope} scope, so its workflow run cannot resume.`
+    );
+  }
+  assertSkillScriptReviewed(skill, parsed.relativePath, input.source);
 }
 
 /**
@@ -511,12 +554,13 @@ function parseSkillWorkflowScriptPath(scriptPath: string): {
 }
 
 function normalizeRelativeWorkflowPath(filePath: string, scheme: "skill" | "plugin"): string {
-  if (isAbsolutePathAny(filePath) || filePath.startsWith("~")) {
-    throw new Error(`Invalid ${scheme} workflow path (must be relative): ${filePath}`);
-  }
-
   const normalized = path.posix.normalize(filePath.replaceAll("\\", "/"));
   const stripped = normalized.startsWith("./") ? normalized.slice(2) : normalized;
+  // On the normalized path, so `./~run.js` is refused like `~run.js`: the workflow lister
+  // (workflowFiles.ts isResolvableWorkflowName) drops such names, and the two must agree (#6777).
+  if (isAbsolutePathAny(filePath) || stripped.startsWith("~")) {
+    throw new Error(`Invalid ${scheme} workflow path (must be relative): ${filePath}`);
+  }
   if (stripped === "" || stripped === "." || stripped.endsWith("/")) {
     throw new Error(`${scheme}:// workflow script paths must include a relative .js file path`);
   }

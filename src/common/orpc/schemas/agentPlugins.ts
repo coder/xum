@@ -190,6 +190,11 @@ export const AgentPluginInstallPreviewSchema = z.object({
   warnings: z.array(z.string()),
   /** Final install directory (~/.mux/plugins/<name>). */
   targetPath: z.string(),
+  /**
+   * Digest of every component fingerprint this preview showed (#6777). Install gets it back and
+   * refuses when its own clone reads different components.
+   */
+  consentDigest: z.string(),
 });
 
 export const AgentPluginListItemSchema = z.object({

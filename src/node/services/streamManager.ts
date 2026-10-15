@@ -106,8 +106,10 @@ import { hasCommitWorthyParts, type HistoryService } from "./historyService";
 import {
   addUsage,
   accumulateProviderMetadata,
+  accumulateStepsProviderMetadata,
   normalizeUsage,
   withCacheWriteMetadata,
+  withLongContextTokens,
   type AiSdkUsageLike,
 } from "@/common/utils/tokens/usageHelpers";
 import { linkAbortSignal } from "@/node/utils/abort";
@@ -1849,17 +1851,24 @@ export class StreamManager {
     };
   }
 
+  /**
+   * A retry that restarted the SDK stream but kept the earlier attempt's billed usage: the
+   * new stream's totals and steps cover only the retried call.
+   */
+  private restartedWithPreservedUsage(streamInfo: WorkspaceStreamInfo): boolean {
+    return (
+      streamInfo.didRetryPreviousResponseIdAtStep ||
+      streamInfo.didRetryAfterEmptyOutput === true ||
+      streamInfo.didRetryReasoningReplayAtStep === true
+    );
+  }
+
   private resolveTotalUsageForStreamEnd(
     streamInfo: WorkspaceStreamInfo,
     totalUsage: LanguageModelV2Usage | undefined
   ): LanguageModelV2Usage | undefined {
     const cumulativeUsage = streamInfo.cumulativeUsage;
-    if (
-      (streamInfo.didRetryPreviousResponseIdAtStep ||
-        streamInfo.didRetryAfterEmptyOutput ||
-        streamInfo.didRetryReasoningReplayAtStep) &&
-      hasTokenUsage(cumulativeUsage)
-    ) {
+    if (this.restartedWithPreservedUsage(streamInfo) && hasTokenUsage(cumulativeUsage)) {
       return cumulativeUsage;
     }
 
@@ -1935,6 +1944,21 @@ export class StreamManager {
   }
 
   /**
+   * Provider metadata for the usage resolveTotalUsageForStreamEnd picks: after a retry that
+   * kept the earlier attempt's usage, only the live accumulation also covers the steps before
+   * the retry (their cache writes and long-context shares).
+   */
+  private async resolveProviderMetadataForStreamEnd(
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<Record<string, unknown> | undefined> {
+    const cumulative = streamInfo.cumulativeProviderMetadata;
+    if (this.restartedWithPreservedUsage(streamInfo) && cumulative) {
+      return { ...cumulative };
+    }
+    return this.getAggregatedProviderMetadata(streamInfo);
+  }
+
+  /**
    * Aggregate provider metadata across all steps.
    *
    * CRITICAL: For multi-step tool calls, cache creation tokens are reported per-step.
@@ -1952,24 +1976,18 @@ export class StreamManager {
       ]);
 
       if (!steps || steps.length === 0) {
-        // Fall back to the final step's provider metadata; AI SDK 7 reports
-        // cache writes on usage, so re-inject them for downstream pricing.
+        // The live per-step accumulation covers every step; without one, fall back to the
+        // final step's provider metadata.
+        if (streamInfo.cumulativeProviderMetadata) {
+          return { ...streamInfo.cumulativeProviderMetadata };
+        }
         const finalStep = await streamInfo.streamResult.finalStep;
-        return withCacheWriteMetadata(finalStep.providerMetadata, finalStep.usage);
+        return accumulateStepsProviderMetadata([finalStep], streamInfo.metadataModel);
       }
 
-      // Aggregate cache creation tokens across all steps. AI SDK 7 moved
-      // per-step cache-write tokens from providerMetadata.anthropic to
-      // step.usage.inputTokenDetails, so inject them back per step before
-      // accumulating (accumulateProviderMetadata sums across steps).
-      let accumulated: Record<string, unknown> | undefined;
-      for (const step of steps) {
-        accumulated = accumulateProviderMetadata(
-          accumulated,
-          withCacheWriteMetadata(step.providerMetadata, step.usage)
-        );
-      }
-      return accumulated;
+      // Aggregate cache creation tokens and long-context shares across all steps
+      // (accumulateStepsProviderMetadata re-injects AI SDK 7's per-step cache writes).
+      return accumulateStepsProviderMetadata(steps, streamInfo.metadataModel);
     } catch (error) {
       log.debug("Could not aggregate provider metadata:", error);
       return undefined;
@@ -5175,7 +5193,7 @@ export class StreamManager {
                 streamInfo.cumulativeUsage = addUsage(streamInfo.cumulativeUsage, stepUsage);
                 streamInfo.cumulativeProviderMetadata = accumulateProviderMetadata(
                   streamInfo.cumulativeProviderMetadata,
-                  stepProviderMetadata
+                  withLongContextTokens(stepProviderMetadata, stepUsage, streamInfo.metadataModel)
                 );
 
                 // Track last step's data for context window display
@@ -5302,7 +5320,7 @@ export class StreamManager {
             const ttftMs = this.resolveTtftMsForStreamEnd(streamInfo);
             // Aggregated provider metadata across all steps (for cost calculation with cache tokens)
             const providerMetadata = markProviderMetadataCostsIncluded(
-              await this.getAggregatedProviderMetadata(streamInfo),
+              await this.resolveProviderMetadataForStreamEnd(streamInfo),
               streamInfo.initialMetadata?.costsIncluded
             );
             const canonicalModel = metadataModelIdentity(streamInfo.model);

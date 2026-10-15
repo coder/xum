@@ -47,10 +47,7 @@ import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appVie
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { CODER_RUNTIME_PLACEHOLDER, type RuntimeConfig } from "@/common/types/runtime";
 import { Err, Ok, type Result } from "@/common/types/result";
-import {
-  NARROW_VIEWPORT_MAX_WIDTH_PX,
-  WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
-} from "@/constants/layout";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
 // The consent dialog integration test renders the REAL modal inside the menu bar. Radix
 // Dialog portals do not render in happy-dom, so the shell is inlined (same double as the
@@ -394,7 +391,6 @@ const defaultProps: ComponentProps<typeof WorkspaceMenuBarComponent> = {
   namedWorkspacePath: "/projects/demo/workspaces/feature-branch",
   runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
   leftSidebarCollapsed: false,
-  onToggleLeftSidebarCollapsed: () => undefined,
 };
 
 const CONSENT_SWITCH_NAME = /allow messages from unrelated workspaces/i;
@@ -1207,14 +1203,6 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     });
     expect(onOpenSidebar).not.toHaveBeenCalled();
     shell.remove();
-  });
-
-  it("applies the collapsed-left-sidebar inset immediately from props", () => {
-    const view = render(<WorkspaceMenuBar {...defaultProps} leftSidebarCollapsed />);
-
-    expect(view.getByTestId("workspace-menu-bar").style.paddingLeft).toBe(
-      `${WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX}px`
-    );
   });
 
   it("opens the archive confirmation modal when preflight finds untracked files", async () => {

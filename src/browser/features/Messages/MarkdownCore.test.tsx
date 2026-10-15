@@ -1,10 +1,11 @@
 import "../../../../tests/ui/dom";
 
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { MarkdownCore } from "./MarkdownCore";
+import { MarkdownCore, markdownMayContainMath } from "./MarkdownCore";
+import { publishKatexPlugins } from "./mathRendering";
 
 // An earlier block holds a lone `*`. Repairing the whole text (Streamdown's own repair) would
 // append a stray `*` after the last block; repairing only the last block does not.
@@ -22,7 +23,7 @@ function renderCore(renderSynchronously: boolean) {
   );
 }
 
-describe("MarkdownCore incomplete-markdown repair", () => {
+describe("MarkdownCore", () => {
   let cleanupDom: (() => void) | null = null;
 
   beforeEach(() => {
@@ -81,5 +82,55 @@ describe("MarkdownCore incomplete-markdown repair", () => {
       expect(view.container.querySelector("img")?.getAttribute("src")).toBe("https://x/y.png")
     );
     expect(view.container.textContent).toContain("and more text.");
+  });
+
+  // Every form that remark-math or rehype-katex renders. KaTeX loads lazily, so each case fails
+  // if the math check misses the form or the lazy KaTeX render breaks.
+  test.each([
+    ["display math", "$$x^2$$"],
+    ["a math fence", "```math\nx^2\n```"],
+    ["a tilde math fence", "~~~ math\nx^2\n~~~"],
+    ["raw language-math code", '<code class="language-math">x^2</code>'],
+    ["raw math-inline code", '<code class="math-inline">x^2</code>'],
+    ["an encoded raw math class", '<code class="math&#45;inline">x^2</code>'],
+  ])("renders %s with KaTeX", async (_name, content) => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore content={content} />
+      </ThemeProvider>
+    );
+    await waitFor(() =>
+      expect(view.container.querySelector(".katex annotation")?.textContent?.trim()).toBe("x^2")
+    );
+  });
+
+  // Browser scroll anchoring holds on to a DOM node in view. If KaTeX's arrival replaced the whole
+  // row's DOM (as a Suspense swap does), the rows on screen jumped. Publishing an empty list first
+  // makes KaTeX arrive after the first render even when an earlier test already loaded it.
+  test("keeps the row's other DOM nodes when KaTeX arrives", async () => {
+    // eslint-disable-next-line no-restricted-syntax -- the lazy chunk, loaded as MarkdownCore does
+    const { katexRehypePlugins } = await import("./katexRehypePlugin");
+    act(() => publishKatexPlugins([]));
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore content={"Intro paragraph.\n\n$$x^2$$"} />
+      </ThemeProvider>
+    );
+    const intro = view.getByText("Intro paragraph.");
+    expect(view.container.querySelector(".katex")).toBeNull();
+    act(() => publishKatexPlugins(katexRehypePlugins));
+    await waitFor(() => expect(view.container.querySelector(".katex")).not.toBeNull());
+    expect(view.getByText("Intro paragraph.")).toBe(intro);
+  });
+
+  // remark-math leaves these as text (single-dollar math is off), so they must not load KaTeX.
+  test.each([
+    "A plain reply with **bold**, `code`, and a [link](https://example.com).",
+    "It costs $5, or $6 with tax.",
+    "Single-dollar $x$ stays text.",
+    "\\(x\\) and \\[x\\] stay text.",
+    "```ts\nconst mathResult = 1;\n```",
+  ])("does not treat %p as math", (content) => {
+    expect(markdownMayContainMath(content)).toBe(false);
   });
 });

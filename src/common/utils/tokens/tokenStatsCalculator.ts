@@ -19,8 +19,9 @@ import {
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import assert from "@/common/utils/assert";
 import { EventLoopYielder } from "@/node/utils/concurrency/eventLoopYielder";
-import { createDisplayUsage } from "./displayUsage";
+import { createDisplayUsage, readTurnSteps } from "./displayUsage";
 import type { ChatUsageDisplay } from "./usageAggregator";
+import { withoutStaleLongContextTokens } from "./usageHelpers";
 
 // Re-export for backward compatibility
 export { createDisplayUsage };
@@ -338,11 +339,18 @@ export function extractSyncMetadata(
       if (message.metadata?.usage) {
         const runtimeModel = message.metadata.model ?? model; // Use actual model from request
         const metadataModel = resolveModelForMetadata(runtimeModel, providersConfig);
+        // History reprices under the live mapping, which may not be the recording model.
+        const providerMetadata = withoutStaleLongContextTokens(
+          message.metadata.providerMetadata,
+          message.metadata.metadataModel,
+          metadataModel
+        );
         const usage = createDisplayUsage(
           message.metadata.usage,
           runtimeModel,
-          message.metadata.providerMetadata,
-          metadataModel
+          providerMetadata,
+          metadataModel,
+          readTurnSteps(message.metadata)
         );
         if (usage) {
           usageHistory.push(usage);

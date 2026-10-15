@@ -10,7 +10,15 @@ const DISMISS_DURATION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
  * Banner shown when Xum is running under Rosetta 2 translation.
  * Users can dismiss it, but it will re-appear after 30 days.
  */
-export const RosettaBanner: React.FC = () => {
+interface RosettaBannerProps {
+  /**
+   * The app shell's sidebar toggle bar spacer, while the fixed bar sits over this banner (left
+   * sidebar collapsed), so the warning starts after the bar instead of under it.
+   */
+  toggleBarSpacer?: React.ReactNode;
+}
+
+export const RosettaBanner: React.FC<RosettaBannerProps> = (props) => {
   const [dismissedAt, setDismissedAt] = usePersistedState<number | null>(
     ROSETTA_BANNER_DISMISSED_KEY,
     null
@@ -61,10 +69,12 @@ export const RosettaBanner: React.FC = () => {
   return (
     <div
       className={cn(
-        "bg-warning/10 border-warning/30 text-warning flex items-center justify-between gap-3 border-b px-4 py-2 text-sm"
+        "bg-warning/10 border-warning/30 text-warning flex items-center justify-between gap-3 border-b px-4 py-2 text-sm",
+        props.toggleBarSpacer != null && "pl-0"
       )}
     >
       <div className="flex items-center gap-2">
+        {props.toggleBarSpacer}
         <AlertTriangle className="text-warning size-4 shrink-0" />
         <span>
           Xum is running under Rosetta. For better performance,{" "}

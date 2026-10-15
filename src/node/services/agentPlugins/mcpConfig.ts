@@ -292,6 +292,31 @@ interface NormalizeContext {
   vars: PluginPlaceholderValues;
 }
 
+/** The first problem of a stdio entry's `env` object, or undefined when it is valid. */
+function stdioEnvError(env: Record<string, unknown>): string | undefined {
+  for (const [key, value] of Object.entries(env)) {
+    if (isReservedPluginEnvName(key)) {
+      // §9.2: reserved names in `env` make the entry invalid; the client
+      // supplies these variables itself.
+      return `'env' must not contain reserved variable '${key}'`;
+    }
+    if (typeof value !== "string") {
+      return `'env.${key}' must be a string`;
+    }
+    if (key.includes("\0") || value.includes("\0")) {
+      // Same spawn constraint as args: env entries must be NUL-free.
+      return `'env' entry ${JSON.stringify(key)} must not contain NUL bytes`;
+    }
+    if (key.length === 0 || key.includes("=")) {
+      // As env_vars names (codexEnvVarName): a key `PLUGIN_DATA=/x` would set PLUGIN_DATA in
+      // the joined env block, and Windows sorts that block, so order cannot protect it (#6713).
+      // An empty key would be an unnamed `=value` entry.
+      return `'env' key ${JSON.stringify(key)} must be a non-empty name without '='`;
+    }
+  }
+  return undefined;
+}
+
 /** Validate + normalize one stdio entry; returns null (with error) when invalid. */
 async function normalizeStdioEntry(
   entry: Record<string, unknown>,
@@ -329,20 +354,8 @@ async function normalizeStdioEntry(
     return { error: "'env' must be an object of strings" };
   }
   const env = entry.env ?? {};
-  for (const [key, value] of Object.entries(env)) {
-    if (isReservedPluginEnvName(key)) {
-      // §9.2: reserved names in `env` make the entry invalid; the client
-      // supplies these variables itself.
-      return { error: `'env' must not contain reserved variable '${key}'` };
-    }
-    if (typeof value !== "string") {
-      return { error: `'env.${key}' must be a string` };
-    }
-    if (key.includes("\0") || value.includes("\0")) {
-      // Same spawn constraint as args: env entries must be NUL-free.
-      return { error: `'env' entry ${JSON.stringify(key)} must not contain NUL bytes` };
-    }
-  }
+  const envError = stdioEnvError(env);
+  if (envError !== undefined) return { error: envError };
 
   if (entry.cwd !== undefined && typeof entry.cwd !== "string") {
     return { error: "'cwd' must be a string" };

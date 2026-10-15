@@ -118,10 +118,26 @@ test("warn mode lets the commit run and reports after it", () => {
   const gate = gateIn("warn");
 
   expect(runGate(gate, "pre", "git commit -am 'grow route'")).toEqual({ status: 0, out: "" });
-  const reported = runGate(gate, "post", "git commit -am 'grow route'");
+  const succeeded = { ...GIT_ENV, XUM_TOOL_RESULT_SUCCESS: "true" };
+  const reported = runGate(gate, "post", "git commit -am 'grow route'", succeeded);
   expect(reported.status).toBe(0);
   expect(reported.out).toContain("VIOLATION floor-cc     src/route.ts:1-12 route: CC 9 -> 12");
 }, 60_000);
+
+test("warn mode reports nothing for read-only git commands or a failed command", () => {
+  const gate = gateIn("warn");
+  // The scorer would report the regression above for any matched command.
+  for (const script of ["git log --grep commit", "git log --oneline --grep=push -- src"]) {
+    expect(runGate(gate, "post", script)).toEqual({ status: 0, out: "" });
+  }
+  // A nonzero exit anywhere in the chain: the commit may not have happened.
+  const failed = { ...GIT_ENV, XUM_TOOL_RESULT_SUCCESS: "false" };
+  expect(runGate(gate, "post", "git commit -am x", failed)).toEqual({ status: 0, out: "" });
+  expect(runGate(gate, "post", "git commit -am x && make test", failed)).toEqual({
+    status: 0,
+    out: "",
+  });
+});
 
 test("other commands skip the check, and a broken gate never blocks", () => {
   const gate = gateIn("block");
@@ -225,4 +241,115 @@ test("non-commit calls start no process", () => {
       out: "",
     });
   }
+});
+
+/**
+ * A project with the shipped .xum/tool_post and a copy of scripts/crap, so
+ * `${0%/*}/../scripts/crap/agent-gate.sh` resolves in the copy.
+ */
+function projectToolPost(): string {
+  const project = join(dir, "project");
+  mkdirSync(join(project, ".xum"), { recursive: true });
+  cpSync(join(REPO, ".xum/tool_post"), join(project, ".xum/tool_post"));
+  cpSync(dirname(gateIn("warn")), join(project, "scripts/crap"), { recursive: true });
+  return join(project, ".xum/tool_post");
+}
+
+/** A user tool_post in `home` that prints its args, stdin and input, then exits `status`. */
+function userToolPost(home: string, status: number, mode = 0o755): void {
+  mkdirSync(home, { recursive: true });
+  writeFileSync(
+    join(home, "tool_post"),
+    `#!/usr/bin/env bash\necho "user tool_post [$*] [$(cat)] [$XUM_TOOL_INPUT_SCRIPT]"\nexit ${status}\n`,
+    { mode }
+  );
+}
+
+/** The env Xum gives a local workspace's hook whose Xum home is `home`. */
+function xumHome(home: string): NodeJS.ProcessEnv {
+  return {
+    XUM_RUNTIME: "local",
+    XUM_WORKSPACE_ID: "ws1",
+    XUM_SCRATCH_DIR: join(home, "sessions/ws1/scratch"),
+  };
+}
+
+function runToolPost(
+  hook: string,
+  env: NodeJS.ProcessEnv,
+  opts: { script?: string; args?: string[]; input?: string } = {}
+) {
+  const base: NodeJS.ProcessEnv = { ...GIT_ENV };
+  for (const key of ["XUM_RUNTIME", "XUM_WORKSPACE_ID", "XUM_SCRATCH_DIR"]) delete base[key];
+  const result = spawnSync(hook, opts.args ?? [], {
+    cwd: repo,
+    env: { ...base, XUM_TOOL: "file_read", XUM_TOOL_INPUT_SCRIPT: opts.script ?? "", ...env },
+    input: opts.input ?? "",
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  return { status: result.status, out: result.stdout + result.stderr };
+}
+
+test("the project tool_post runs the user's tool_post once, last, and passes its exit through", () => {
+  const post = projectToolPost();
+  const home = join(dir, "home/.xum");
+  userToolPost(home, 3);
+
+  expect(runToolPost(post, xumHome(home), { args: ["a b"], input: "result" })).toEqual({
+    status: 3,
+    out: "user tool_post [a b] [result] []\n",
+  });
+  expect(runToolPost(post, { ...xumHome(home), XUM_RUNTIME: "worktree" }).status).toBe(3);
+  // Workspace secrets can override HOME and XUM_ROOT in the hook env. Xum's
+  // own home does not move with them.
+  userToolPost(join(dir, "secret-root"), 4);
+  const secrets = { HOME: join(dir, "elsewhere"), XUM_ROOT: join(dir, "secret-root") };
+  expect(runToolPost(post, { ...xumHome(home), ...secrets }).status).toBe(3);
+
+  // A real commit: the CRAP report comes first, then the user's hook.
+  const reported = runToolPost(
+    post,
+    { ...xumHome(home), XUM_TOOL: "bash" },
+    { script: "git commit -am x" }
+  );
+  expect(reported.status).toBe(3);
+  expect(reported.out).toContain("VIOLATION floor-cc     src/route.ts:1-12 route: CC 9 -> 12");
+  expect(reported.out).toEndWith("user tool_post [] [] [git commit -am x]\n");
+}, 60_000);
+
+test("the project tool_post skips the user's tool_post when the lookup is unusual", () => {
+  const post = projectToolPost();
+  const home = join(dir, "home/.xum");
+  userToolPost(home, 3);
+  userToolPost(join(dir, "plain"), 5, 0o644);
+  mkdirSync(join(dir, "linked"));
+  symlinkSync(post, join(dir, "linked/tool_post"));
+
+  for (const env of [
+    {},
+    { ...xumHome(home), XUM_RUNTIME: undefined },
+    { ...xumHome(home), XUM_RUNTIME: "ssh" },
+    { ...xumHome(home), XUM_RUNTIME: "docker" },
+    { ...xumHome(home), XUM_RUNTIME: "devcontainer" },
+    { ...xumHome(home), XUM_WORKSPACE_ID: "ws2" },
+    { ...xumHome(home), XUM_SCRATCH_DIR: "sessions/ws1/scratch" },
+    { ...xumHome(home), XUM_SCRATCH_DIR: "/sessions/ws1/scratch" },
+    { ...xumHome(home), XUM_SCRATCH_DIR: join(home, "scratch") },
+    xumHome(join(dir, "plain")),
+    xumHome(join(dir, "linked")),
+    xumHome(dirname(post)),
+  ]) {
+    expect({ env, ...runToolPost(post, env) }).toEqual({ env, status: 0, out: "" });
+  }
+});
+
+test("a user tool_post that calls the project tool_post again does not loop", () => {
+  const post = projectToolPost();
+  const home = join(dir, "home/.xum");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, "tool_post"), `#!/usr/bin/env bash\necho user\n"${post}"\nexit 7\n`, {
+    mode: 0o755,
+  });
+  expect(runToolPost(post, xumHome(home))).toEqual({ status: 7, out: "user\n" });
 });

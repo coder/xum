@@ -7,6 +7,7 @@ import { WorkspaceModeAISync } from "@/browser/components/WorkspaceModeAISync/Wo
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { BackgroundBashProvider } from "@/browser/contexts/BackgroundBashContext";
 import { WorkspaceShell } from "../WorkspaceShell/WorkspaceShell";
+import { ToolCardsPreloader } from "@/browser/features/Tools/Shared/ToolCardsLoad";
 
 // For MemoryFileEditor's lazy preview: keeps the Markdown stack in this page's chunk (see there).
 export { MarkdownFilePreview } from "@/browser/features/Messages/MarkdownFilePreview";
@@ -18,7 +19,6 @@ interface AIViewProps {
   workspaceName: string;
   namedWorkspacePath: string; // User-friendly path for display and terminal
   leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
   runtimeConfig?: RuntimeConfig;
   className?: string;
   /** If set, workspace is incompatible (from newer mux version) and this error should be displayed */
@@ -63,6 +63,7 @@ export const AIView: React.FC<AIViewProps> = (props) => {
   return (
     <AgentProvider workspaceId={props.workspaceId} projectPath={props.projectPath}>
       <WorkspaceModeAISync workspaceId={props.workspaceId} />
+      <ToolCardsPreloader />
       <ThinkingProvider workspaceId={props.workspaceId}>
         <BackgroundBashProvider workspaceId={props.workspaceId}>
           <WorkspaceShell {...props} />

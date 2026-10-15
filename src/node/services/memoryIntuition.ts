@@ -40,7 +40,9 @@ import {
   accumulateProviderMetadata,
   addUsage,
   withCacheWriteMetadata,
+  withLongContextTokens,
   normalizeUsage,
+  type AiSdkUsageLike,
 } from "@/common/utils/tokens/usageHelpers";
 import { MemoryToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type {
@@ -83,6 +85,16 @@ const STOP_WORDS = new Set(
 );
 
 const cueSegmenter = new Intl.Segmenter("und", { granularity: "word" });
+
+/** One request's metadata with its long-context share, priced as recordUsage prices it. */
+function withRequestTier(
+  providerMetadata: Record<string, unknown> | undefined,
+  usage: AiSdkUsageLike,
+  metadataModel: string | undefined,
+  modelString: string
+): Record<string, unknown> | undefined {
+  return withLongContextTokens(providerMetadata, usage, metadataModel ?? modelString);
+}
 
 function cueTokens(text: string): Set<string> {
   const normalized = text.toLowerCase();
@@ -528,7 +540,10 @@ export async function runMemoryIntuition(args: {
         stats,
         onUsage: (usage, providerMetadata) => {
           completedUsage = addUsage(completedUsage, usage);
-          completedMetadata = accumulateProviderMetadata(completedMetadata, providerMetadata);
+          completedMetadata = accumulateProviderMetadata(
+            completedMetadata,
+            withRequestTier(providerMetadata, usage, metadataModel, args.modelString)
+          );
         },
       });
       if (outcome.kind === "error") return { kind: "error", message: outcome.message, stats };
@@ -657,7 +672,12 @@ export async function runMemoryIntuition(args: {
         completedUsage = addUsage(completedUsage, normalizeUsage(step.usage));
         completedMetadata = accumulateProviderMetadata(
           completedMetadata,
-          withCacheWriteMetadata(step.providerMetadata, step.usage)
+          withRequestTier(
+            withCacheWriteMetadata(step.providerMetadata, step.usage),
+            step.usage,
+            metadataModel,
+            args.modelString
+          )
         );
       },
       onError: ({ error }) => {

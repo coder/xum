@@ -197,6 +197,7 @@ export function useAnalyticsSpendOverTime(params: {
   from?: Date | null;
   to?: Date | null;
   timeZone?: string | null;
+  filterTimeZone?: string | null;
 }): AsyncState<SpendOverTimeItem[]> {
   assert(
     params.granularity === "hour" || params.granularity === "day" || params.granularity === "week",
@@ -219,7 +220,14 @@ export function useAnalyticsSpendOverTime(params: {
     return runAnalyticsEffect(
       api,
       setState,
-      [params.projectPath, params.granularity, params.timeZone, fromMs, toMs],
+      [
+        params.projectPath,
+        params.granularity,
+        params.timeZone,
+        params.filterTimeZone,
+        fromMs,
+        toMs,
+      ],
       (analyticsApi) =>
         analyticsApi.getSpendOverTime({
           projectPath: params.projectPath ?? null,
@@ -227,9 +235,18 @@ export function useAnalyticsSpendOverTime(params: {
           from: fromDate,
           to: toDate,
           timeZone: params.timeZone ?? null,
+          filterTimeZone: params.filterTimeZone,
         })
     );
-  }, [api, params.projectPath, params.granularity, params.timeZone, fromMs, toMs]);
+  }, [
+    api,
+    params.projectPath,
+    params.granularity,
+    params.timeZone,
+    params.filterTimeZone,
+    fromMs,
+    toMs,
+  ]);
 
   return state;
 }

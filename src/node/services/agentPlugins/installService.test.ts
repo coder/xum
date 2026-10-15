@@ -1478,6 +1478,51 @@ describe("AgentPluginInstallService", () => {
     });
   });
 
+  test("install refuses components that differ from the ones its preview showed (#6777)", async () => {
+    // Preview and install read separate clones. A script the preview could not read (no row)
+    // must not get a consent record because install could read it.
+    const first = await service.preview({ input: remoteDir });
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
+    await fsPromises.writeFile(path.join(remoteDir, "workflows", "run.js"), "1;\n");
+    await commitAll(remoteDir, "add a workflow the first preview never showed");
+    const second = await service.preview({ input: remoteDir });
+    expect(second.consentDigest).not.toBe(first.consentDigest);
+
+    await expect(
+      service.install({
+        source: second.source,
+        expectedSha: second.lockedSha,
+        expectedConsentDigest: first.consentDigest,
+      })
+    ).rejects.toThrow("differ from the preview");
+    expect(await service.list()).toEqual([]);
+
+    await service.install({
+      source: second.source,
+      expectedSha: second.lockedSha,
+      expectedConsentDigest: second.consentDigest,
+    });
+    expect((await service.list()).map((item) => item.name)).toEqual(["demo-plugin"]);
+  });
+
+  test("install refuses an executable hook its preview did not show (#6777)", async () => {
+    // hooks.js loads on its own after install, so the digest must cover it (PRRT_kwDOPxxmWM6s3i_9).
+    const first = await service.preview({ input: remoteDir });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "hooks.js"),
+      "({ 'tool.execute.before': () => undefined })\n"
+    );
+    await commitAll(remoteDir, "add a hook the first preview never showed");
+    const second = await service.preview({ input: remoteDir });
+    await expect(
+      service.install({
+        source: second.source,
+        expectedSha: second.lockedSha,
+        expectedConsentDigest: first.consentDigest,
+      })
+    ).rejects.toThrow("differ from the preview");
+  });
+
   test("install records the reviewed fingerprint of each imported component (#6498)", async () => {
     const preview = await service.preview({ input: remoteDir });
     const installed = await service.install({
@@ -1873,6 +1918,118 @@ describe("AgentPluginInstallService", () => {
     expect((await runStore.getRun("wfr_unreviewed")).status).toBe("running");
     await runStore.appendStatus("wfr_unreviewed", "interrupted", "2026-10-15T00:00:02.000Z");
     await expect(resume("wfr_unreviewed")).rejects.toThrow("has not been reviewed on this install");
+  });
+
+  test("the preview lists only workflow names the resolver can run (#6777)", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
+    // The resolver refuses a name that starts with ~ and reads \ as a path separator, so a
+    // review row for either would approve a script that never runs.
+    const names = ["ok.js", "~run.js", ...(process.platform === "win32" ? [] : ["a\\b.js"])];
+    for (const name of names) {
+      await fsPromises.writeFile(path.join(remoteDir, "workflows", name), "1;\n");
+    }
+    await commitAll(remoteDir, "add workflows with names the resolver refuses");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.workflows).toEqual(["ok.js"]);
+    expect(preview.reviewedComponents.map((row) => row.name)).toEqual(["ok.js"]);
+
+    // The resolver checks the normalized path, so `./~run.js` is refused like `~run.js` and the
+    // lister and the resolver agree (Codex PRRT_kwDOPxxmWM6s5R_3).
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const resolve = (scriptPath: string) =>
+      resolveWorkflowScript({
+        scriptPath,
+        runtime: new LocalRuntime(muxRoot),
+        workspacePath: muxRoot,
+        projectTrusted: false,
+        roots: {
+          projectRoot: "",
+          globalRoot: path.join(muxRoot, "skills"),
+          universalRoot: "",
+          globalPluginRoots: [pluginsDir()],
+        },
+      });
+    for (const scriptPath of ["plugin://demo-plugin/~run.js", "plugin://demo-plugin/./~run.js"]) {
+      await expect(resolve(scriptPath)).rejects.toThrow("must be relative");
+    }
+    expect((await resolve("plugin://demo-plugin/./ok.js")).source).toBe("1;\n");
+  });
+
+  test("a stored managed skill workflow run resumes only while its snapshot is reviewed (#6777)", async () => {
+    const source = "export default function workflow() { return {}; }\n";
+    await fsPromises.writeFile(path.join(remoteDir, "skills", "greet", "workflow.js"), source);
+    await commitAll(remoteDir, "add a skill workflow");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(muxRoot, "workflow-runs") });
+    const createSkillRun = (id: string, runSource: string, scope: "global" | "project") =>
+      runStore.createRun({
+        id,
+        workspaceId: "workspace-1",
+        workflow: {
+          name: "greet",
+          description: "Skill workflow",
+          scope,
+          sourcePath: "skill://greet/workflow.js",
+          canonicalScriptPath: "skill://greet/workflow.js",
+          sourceKind: "skill",
+          executable: true,
+        },
+        source: runSource,
+        args: {},
+        now: "2026-10-15T00:00:00.000Z",
+      });
+    const workflows = new WorkflowService({
+      archiveAdmission: { getWorkflowArchiveRefusal: () => null },
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      assertStoredPluginWorkflowReviewed: (stored) =>
+        assertStoredPluginWorkflowReviewed({
+          ...stored,
+          runtime: new LocalRuntime(muxRoot),
+          workspacePath: muxRoot,
+          projectTrusted: true,
+          roots: {
+            projectRoot: "",
+            globalRoot: path.join(muxRoot, "skills"),
+            universalRoot: "",
+            globalPluginRoots: [pluginsDir()],
+          },
+        }),
+      runnerId: "runner-6777",
+    });
+    const resume = (runId: string) =>
+      workflows.resumeRun({ workspaceId: "workspace-1", runId, projectTrusted: true });
+
+    await createSkillRun("wfr_reviewed", source, "global");
+    expect((await resume("wfr_reviewed")).status).toBe("completed");
+    // A snapshot whose bytes no review covers (a run started before #6629) fails closed.
+    await createSkillRun("wfr_unreviewed", `${source}// before the upgrade\n`, "global");
+    await expect(resume("wfr_unreviewed")).rejects.toThrow("has not been reviewed on this install");
+    // The run started from another scope, so the managed skill cannot vouch for its snapshot.
+    await createSkillRun("wfr_other_scope", source, "project");
+    await expect(resume("wfr_other_scope")).rejects.toThrow("cannot resume");
+    // A record from before sourceKind existed is gated by its skill:// path (PRRT_kwDOPxxmWM6s3UjX).
+    await runStore.createRun({
+      id: "wfr_legacy",
+      workspaceId: "workspace-1",
+      workflow: {
+        name: "greet",
+        description: "Skill workflow",
+        scope: "global",
+        sourcePath: "skill://greet/workflow.js",
+        executable: true,
+      },
+      source: `${source}// legacy record\n`,
+      args: {},
+      now: "2026-10-15T00:00:00.000Z",
+    });
+    await expect(resume("wfr_legacy")).rejects.toThrow("has not been reviewed on this install");
   });
 
   test("review labels show a bidi control in a workflow file name; the identity stays raw (#6629)", async () => {
@@ -4382,6 +4539,40 @@ describe("AgentPluginInstallService", () => {
       const greet = preview.skills.find((skill) => skill.name === "greet");
       expect(greet?.directives).toEqual(["rm -rf \\u{200B}/tmp/x"]);
     });
+
+    test("an install preview with too much directive text is refused, not truncated (#6766)", async () => {
+      // Install records consent for every command the preview lists, so it cannot cut the list.
+      const command = "x".repeat(600_000);
+      for (const name of ["one", "two"]) {
+        await fsPromises.mkdir(path.join(remoteDir, "skills", name), { recursive: true });
+        await fsPromises.writeFile(
+          path.join(remoteDir, "skills", name, "SKILL.md"),
+          `---\nname: ${name}\ndescription: Big\n---\n\n!\`${command}\`\n`
+        );
+      }
+      await commitAll(remoteDir, "skills with long directives");
+      await expect(service.preview({ input: remoteDir })).rejects.toThrow(/too large to show/);
+    });
+
+    test("an installed plugin with too much directive text still lists; its picker refuses", async () => {
+      // The bound applies where a response lists the commands, not to every load of the tree,
+      // so one oversized plugin cannot break the plugin list (PRRT_kwDOPxxmWM6s2_dv).
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const command = "x".repeat(600_000);
+      for (const name of ["one", "two"]) {
+        const dir = path.join(pluginsDir(), "demo-plugin", "skills", name);
+        await fsPromises.mkdir(dir, { recursive: true });
+        await fsPromises.writeFile(
+          path.join(dir, "SKILL.md"),
+          `---\nname: ${name}\ndescription: Big\n---\n\n!\`${command}\`\n`
+        );
+      }
+      expect((await service.list()).map((item) => item.name)).toEqual(["demo-plugin"]);
+      await expect(service.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+        /too large to show/
+      );
+    });
   });
 
   test("update accepts a skill paths reordering as capability-neutral", async () => {
@@ -5592,6 +5783,25 @@ describe("AgentPluginInstallService", () => {
           }>;
         }
       ).plugins[0];
+
+    test("recovery keeps a consent record added after the crash (#6698)", async () => {
+      // The update died after the promote. Before recovery, the user records consent for another
+      // component (setComponents). Recovery must add the journal's records, not replace these.
+      const { greetFingerprint } = await crashAfterReviewedPromote(
+        "Greets people warmly",
+        () => undefined
+      );
+      const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+        plugins: Array<{ componentConsent: { skills: Record<string, string> } }>;
+      };
+      const later = "f".repeat(64);
+      document.plugins[0].componentConsent.skills.later = later;
+      await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+
+      await service.list();
+      const entry = await registrySkills();
+      expect(entry.componentConsent?.skills).toEqual({ greet: greetFingerprint, later });
+    });
 
     test("a journal with the consent applies it", async () => {
       const { newSha, greetFingerprint } = await crashAfterReviewedPromote(
