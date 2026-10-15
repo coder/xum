@@ -1012,7 +1012,8 @@ describe("useBoundedTranscriptReveal", () => {
 
       // Seeded random operations; after each one that is not a reader request, a checker that
       // reads only the hook's output asserts the cap rule.
-      test.each([1, 2, 3, 4])("invariant: seed %p", (seed) => {
+      // Seeds 28 and 29 reach check (d) with a held overshoot (they fail without keptPastCap).
+      test.each([1, 2, 3, 4, 28, 29])("invariant: seed %p", (seed) => {
         const slice = grouped();
         slice.set({});
         let state = seed;
@@ -1054,6 +1055,14 @@ describe("useBoundedTranscriptReveal", () => {
           // Liveness (#6742 review): after the frames, fully revealed or paused, never stuck.
           const { fromIndex: start, isRevealPaused: paused } = slice.reveal();
           expect(slice.pending() || (start === 0 ? !paused : paused)).toBe(true);
+          // (d) Back at the bottom (following, attached, frames flushed), the slice fits the cap
+          // again, except one bundle larger than the cap that mounts alone (keptPastCap refit).
+          const { fromIndex: head, toIndex: tail, isDetached } = slice.reveal();
+          if (slice.followsTail() && !isDetached && tail - head > CAP) {
+            const now = slice.messages().map((row) => row.id);
+            const bundleHeads = now.slice(head + 1, tail).filter((row) => !slice.joined.has(row));
+            expect(bundleHeads).toEqual([]);
+          }
           if (kind === 5 || kind === 6) continue;
           const ids = slice.messages().map((row) => row.id);
           const { fromIndex: from, toIndex: to } = slice.reveal();
