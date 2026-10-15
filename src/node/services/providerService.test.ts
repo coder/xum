@@ -296,9 +296,7 @@ describe("ProviderService.getConfig", () => {
             "google-vertex": { project: "   ", location: "europe-west4", keyFilename: "  " },
           });
 
-          const status = service.getConfig()["google-vertex"]?.googleVertex;
-
-          expect(status).toEqual({
+          expect(service.getConfig()["google-vertex"]?.googleVertex).toEqual({
             project: undefined,
             location: "europe-west4",
             envProject: "env-project",
@@ -306,7 +304,6 @@ describe("ProviderService.getConfig", () => {
             keyFilenameSet: false,
             envKeyFilenameSet: true,
           });
-          expect(JSON.stringify(status)).not.toContain("env-sa.json");
         });
       }
     );

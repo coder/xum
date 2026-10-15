@@ -312,6 +312,8 @@ describe("ProvidersSection", () => {
     // The key file is set (masked); the express mode API key is not.
     expect(within(vertexCard).getAllByText("••••••••")).toHaveLength(1);
     expect(within(vertexCard).getByText("Not set")).toBeTruthy();
+    // Nothing here comes from env vars, the key file included.
+    expect(within(vertexCard).queryByText("Set by env vars.")).toBeNull();
   });
 
   test("shows Google Vertex AI settings that come from env vars", async () => {
