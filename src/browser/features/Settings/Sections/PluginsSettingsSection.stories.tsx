@@ -871,9 +871,12 @@ export const PendingSignOutPhoneViewport: Story = {
 
 /** The backend's reason for a broken record; the notice shows it as given. */
 const BROKEN_SIGN_OUT_REASON =
-  "The pending plugin sign-out record (~/.mux/plugin-sign-outs-pending.json) is corrupt or from another Xum version. Sign out of the plugin's MCP servers in Settings → MCP, then delete the file.";
+  'The pending plugin sign-out record (~/.mux/plugin-sign-outs-pending.json) is corrupt or from another Xum version. In Settings → Plugins, choose "Sign out of plugin MCP servers": Xum deletes the file after the sign-outs succeed.';
 
-/** A corrupt record (#6627): only the user can clear it, so the notice gives the steps. */
+/**
+ * A corrupt record (#6627) at phone width: the notice gives the reason and a sign-out control,
+ * because the fenced servers do not show in Settings → MCP. Signing out clears the notice.
+ */
 export const BrokenSignOutRecord: Story = {
   parameters: { pixel: PIXEL_DISABLED },
   render: () => (
@@ -888,7 +891,10 @@ export const BrokenSignOutRecord: Story = {
         },
       }}
     >
-      <PluginsSettingsSection />
+      {/* Fixed phone width so the overflow check holds in the CI test-runner too (AGENTS.md). */}
+      <div style={{ width: 375 }}>
+        <PluginsSettingsSection />
+      </div>
     </PluginsSectionStoryShell>
   ),
   play: async ({ canvasElement }) => {
@@ -900,6 +906,21 @@ export const BrokenSignOutRecord: Story = {
         const notices = canvas.queryAllByRole("status");
         if (!notices.some((notice) => notice.textContent?.includes(BROKEN_SIGN_OUT_REASON))) {
           throw new Error("The broken sign-out notice must show the backend's reason");
+        }
+      },
+      { timeout: 5000 }
+    );
+    const button = await canvas.findByRole("button", { name: /Sign out of plugin MCP servers/ });
+    const box = button.closest("[role='status']");
+    if (!(box instanceof HTMLElement) || box.scrollWidth > box.clientWidth + 1) {
+      throw new Error("The broken sign-out notice overflows at phone width");
+    }
+    await userEvent.click(button);
+    // The mock deletes the record like the backend: the section re-lists and the notice goes.
+    await waitFor(
+      () => {
+        if (canvas.queryByRole("button", { name: /Sign out of plugin MCP servers/ }) !== null) {
+          throw new Error("The notice must clear after the sign-out deleted the record");
         }
       },
       { timeout: 5000 }

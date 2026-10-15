@@ -747,6 +747,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     }
   };
   let globalSecretsState: Secret[] = [...globalSecrets];
+  // signOutPluginServers deletes the pending sign-out record, as the backend does.
+  let pluginSignOutsCleared = false;
   const getInjectedGlobalSecretKeys = (projectPath: string): string[] => {
     const normalizedProjectPath = projectPath.trim();
     if (!normalizedProjectPath) {
@@ -1384,7 +1386,15 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       list: () => Promise.resolve({ success: true, data: agentPluginsMock?.items ?? [] }),
       containerLocation: () => Promise.resolve("~/.mux/plugins"),
       pendingSignOuts: () =>
-        Promise.resolve(agentPluginsMock?.pendingSignOuts ?? { kind: "none" as const }),
+        Promise.resolve(
+          (pluginSignOutsCleared ? undefined : agentPluginsMock?.pendingSignOuts) ?? {
+            kind: "none" as const,
+          }
+        ),
+      signOutPluginServers: () => {
+        pluginSignOutsCleared = true;
+        return Promise.resolve({ success: true as const });
+      },
       getComponents: () =>
         Promise.resolve({
           success: false,

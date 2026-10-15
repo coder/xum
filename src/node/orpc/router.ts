@@ -1453,6 +1453,17 @@ export const router = (authToken?: string) => {
         .input(schemas.agentPlugins.pendingSignOuts.input)
         .output(schemas.agentPlugins.pendingSignOuts.output)
         .handler(({ context }) => context.agentPluginInstallService.pendingSignOutStatus()),
+      signOutPluginServers: t
+        .input(schemas.agentPlugins.signOutPluginServers.input)
+        .output(schemas.agentPlugins.signOutPluginServers.output)
+        .handler(async ({ context }) => {
+          try {
+            await context.agentPluginInstallService.signOutPluginServers();
+            return { success: true as const };
+          } catch (error) {
+            return { success: false as const, error: getErrorMessage(error) };
+          }
+        }),
       containerLocation: t
         .input(schemas.agentPlugins.containerLocation.input)
         .output(schemas.agentPlugins.containerLocation.output)

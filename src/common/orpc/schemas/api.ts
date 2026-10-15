@@ -1311,6 +1311,14 @@ export const agentPlugins = {
     input: z.void(),
     output: AgentPluginPendingSignOutsSchema,
   },
+  /** Signs out of every plugin MCP server, then deletes a pending sign-out record (#6627). */
+  signOutPluginServers: {
+    input: z.void(),
+    output: z.discriminatedUnion("success", [
+      z.object({ success: z.literal(true) }),
+      z.object({ success: z.literal(false), error: z.string() }),
+    ]),
+  },
   /** Display path of the ACTIVE managed plugin container (config-derived root; never hardcode it in UI). */
   containerLocation: {
     input: z.void(),

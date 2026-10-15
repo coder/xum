@@ -3056,6 +3056,34 @@ describe("AgentPluginInstallService", () => {
       await Promise.all([failing.dispose(), oauth.dispose()]);
     });
 
+    test("Settings signs out of plugin servers while a broken record fences them, then deletes it (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      await fsPromises.writeFile(file, "{ not json");
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      await restarted.list();
+      // The record names no usable URL, so the servers come from the installed plugin trees.
+      spyOn(oauth, "logout").mockResolvedValueOnce({ success: false, error: "disk full" });
+      await expect(restarted.signOutPluginServers()).rejects.toThrow(/disk full/);
+      // A failed sign-out keeps the record: the old grant must not reach the plugin.
+      expect(await pathExists(file)).toBe(true);
+      expect(await oauth.hasAuthTokens({ serverUrl })).toBe(true);
+      expect(await discovered()).toBe(0);
+
+      await restarted.signOutPluginServers();
+      expect(await restarted.pendingSignOutStatus()).toEqual({ kind: "none" });
+      expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
+      expect(await pathExists(file)).toBe(false);
+      expect(await discovered()).toBe(1);
+      await oauth.dispose();
+    });
+
     test("a record of an unknown version is kept, and discovery stays closed", async () => {
       const { failing, result } = await updateWithFailingSignOut(stopStub);
       await result;

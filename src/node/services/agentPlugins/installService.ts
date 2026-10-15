@@ -275,7 +275,7 @@ function unusableRecordReason(error: unknown, file: string): string {
   const code: unknown =
     typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
   if (typeof code !== "string") return getErrorMessage(error);
-  return `Xum cannot read the pending plugin sign-out record (${file}): ${code}. Fix its permissions. Or: sign out of the plugin's MCP servers in Settings → MCP, then delete the file.`;
+  return `Xum cannot read the pending plugin sign-out record (${file}): ${code}. Fix its permissions. Or: in Settings → Plugins, choose "Sign out of plugin MCP servers": Xum deletes the file after the sign-outs succeed.`;
 }
 
 /** Waits for the startup sign-out pass at most timeoutMs, then lets discovery go on. */
@@ -1167,7 +1167,7 @@ function parsePendingSignOuts(raw: string, file: string): string[] {
   // plugin and reuse the old grant before the user signs out.
   if (!Array.isArray(value) || !value.every((url) => typeof url === "string"))
     throw new Error(
-      `The pending plugin sign-out record (${shortenHome(file)}) is corrupt or from another Xum version. Sign out of the plugin's MCP servers in Settings → MCP, then delete the file.`
+      `The pending plugin sign-out record (${shortenHome(file)}) is corrupt or from another Xum version. In Settings → Plugins, choose "Sign out of plugin MCP servers": Xum deletes the file after the sign-outs succeed.`
     );
   return value;
 }
@@ -4416,6 +4416,68 @@ export class AgentPluginInstallService {
     // An empty record still fences discovery while it exists (the next pass deletes it).
     const lastError = this.pendingSignOutLastError;
     return { kind: "pending", servers, ...(lastError !== undefined ? { lastError } : {}) };
+  }
+
+  /**
+   * Signs out of every remote MCP server of every installed managed plugin and of every URL the
+   * record names, then deletes the record (#6627). This is the recovery for a corrupt, newer or
+   * unreadable record: it fences discovery, so Settings → MCP shows no plugin server to sign out
+   * of, and deleting the file first would let an agent load a plugin with its old sign-in.
+   *
+   * The servers come from the plugin trees, not from discovery: only a plugin's own servers can
+   * use its stored sign-ins, so signing all of them out covers every URL the record can name for
+   * a plugin that still loads. Holds the plugin lock like a pass (no update can add a record
+   * meanwhile) and shares its deadline and in-flight logouts. Throws, and keeps the record, when
+   * any sign-out fails.
+   */
+  async signOutPluginServers(): Promise<void> {
+    const oauth = this.mcpOauthService;
+    if (oauth === undefined) throw new Error("The MCP sign-in service is not ready yet.");
+    await this.runExclusive(async () => {
+      const record = await pendingSignOutsRecordState(this.containerDir);
+      if (record.kind === "absent") return;
+      // Read only a regular file: readFile on a FIFO blocks while this holds the lock.
+      const recorded =
+        record.kind === "present" ? await this.readPendingSignOuts().catch(() => []) : [];
+      const urls = [...recorded, ...(await this.installedPluginServerUrls())];
+      const deadline = monotonicNow() + this.recoveryTimeoutMs;
+      const done = new Set<string>();
+      for (const serverUrl of urls) {
+        const key = oauth.credentialKey(serverUrl) ?? serverUrl;
+        if (done.has(key)) continue;
+        const failure = await signOutFailure(oauth, serverUrl, deadline, this.inFlightSignOuts);
+        if (failure !== undefined)
+          throw new Error(`Could not sign out of ${serverUrl}: ${failure}`);
+        done.add(key);
+      }
+      // Sign out first, delete last (see parsePendingSignOuts).
+      await this.writePendingSignOuts([]);
+      this.pendingSignOutLastError = undefined;
+      this.pendingSignOutRetryAtMs = 0;
+    });
+  }
+
+  /** The URLs of the remote MCP servers in every plugin tree of the managed container. */
+  private async installedPluginServerUrls(): Promise<string[]> {
+    const dirs = await fsPromises.readdir(this.containerDir).catch((error: unknown) => {
+      if (hasErrorCode(error, "ENOENT")) return [];
+      throw error;
+    });
+    const urls: string[] = [];
+    for (const dirName of dirs) {
+      const { plugin } = await discoverAgentPluginAt({
+        pluginDir: path.join(this.containerDir, dirName),
+        scope: "global",
+      });
+      if (plugin?.mcpConfigPath === undefined) continue;
+      const { servers } = await loadPluginMcpServers(plugin, {
+        xumHome: this.config.rootDir,
+        instanceId: this.instanceIdFor(dirName),
+      });
+      for (const info of Object.values(servers))
+        if (info.transport !== "stdio") urls.push(info.url);
+    }
+    return urls;
   }
   /** Logouts a pass started that have not settled yet (see signOutFailure). */
   private readonly inFlightSignOuts = new Map<
