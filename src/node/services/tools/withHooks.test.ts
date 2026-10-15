@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
-import { jsonSchema, tool, type Tool } from "ai";
+import { jsonSchema, tool, zodSchema, type Tool } from "ai";
 import { z } from "zod";
 import { withHooks } from "./withHooks";
 import { eventSpine, type ToolExecuteContext } from "@/node/services/events/eventSpine";
@@ -517,6 +517,36 @@ exit 0
       rewrite = { input: "ok" };
       await wrapped.execute!({ input: "x", mode: "safe" }, {} as never);
       expect(executed).toEqual([{ input: "ok", mode: "safe" }]);
+
+      // A lazy schema gets the same parser (Codex PRRT_kwDOPxxmWM6s5MCg), and a validator that
+      // throws rejects the rewrite instead of failing the call (Codex PRRT_kwDOPxxmWM6s5MCy).
+      const lazyTool = tool({
+        description: "Lazy",
+        // The AI SDK's LazySchema form: a function that returns the schema.
+        inputSchema: () =>
+          zodSchema(
+            z.object({ input: z.string() }).refine((args) => {
+              if (args.input === "throw") throw new Error("validator crashed");
+              return args.input !== "forbidden";
+            })
+          ),
+        execute: (args) => {
+          executed.push(args);
+          return Promise.resolve({ ok: true });
+        },
+      });
+      const lazyWrapped = withHooks("test_tool", lazyTool, {
+        runtime,
+        cwd: tempDir,
+        runtimeTempDir: tempDir,
+        workspaceId: "parse-ws",
+      });
+      executed.length = 0;
+      for (const input of ["forbidden", "throw"]) {
+        rewrite = { input };
+        expect(await lazyWrapped.execute!({ input: "x" }, {} as never)).toEqual(refused);
+      }
+      expect(executed).toEqual([]);
     } finally {
       unregister();
     }

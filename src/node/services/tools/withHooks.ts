@@ -169,20 +169,34 @@ function toolInputParser(
     rawTool !== null && typeof rawTool === "object"
       ? (rawTool as { inputSchema?: unknown }).inputSchema
       : undefined;
-  if (raw === null || typeof raw !== "object") return undefined;
-  // asSchema converts a standard schema (Zod). A plain object would make it call the object as a
-  // lazy schema (see extractToolJsonSchema), so only jsonSchema() wrappers pass through as-is.
-  const schema: { validate?: unknown } =
-    "~standard" in raw ? asSchema(raw as FlexibleSchema<unknown>) : raw;
-  const validate = schema.validate;
+  const schema = parserSchemaOf(raw);
+  const validate = schema?.validate;
   if (typeof validate !== "function") return undefined;
   return async (value) => {
-    const parsed = (await (validate as (value: unknown) => unknown).call(schema, value)) as {
-      success?: unknown;
-      value?: unknown;
-    };
-    return parsed.success === true ? { success: true, value: parsed.value } : { success: false };
+    try {
+      const parsed = (await (validate as (value: unknown) => unknown).call(schema, value)) as {
+        success?: unknown;
+        value?: unknown;
+      };
+      return parsed.success === true ? { success: true, value: parsed.value } : { success: false };
+    } catch {
+      // A validator that throws rejects the value, as in the AI SDK's own validation (Codex
+      // PRRT_kwDOPxxmWM6s5MCy).
+      return { success: false };
+    }
   };
+}
+
+/**
+ * The schema whose `validate` the AI SDK runs: asSchema converts a standard schema (Zod) and a
+ * lazy schema (a function, Codex PRRT_kwDOPxxmWM6s5MCg). A plain object would make asSchema call
+ * the object as a lazy schema (see extractToolJsonSchema), so only jsonSchema() wrappers pass
+ * through as-is.
+ */
+function parserSchemaOf(raw: unknown): { validate?: unknown } | undefined {
+  if (typeof raw === "function") return asSchema(raw as FlexibleSchema<unknown>);
+  if (raw === null || typeof raw !== "object") return undefined;
+  return "~standard" in raw ? asSchema(raw as FlexibleSchema<unknown>) : raw;
 }
 
 function readToolOption(options: unknown, key: "abortSignal" | "toolCallId"): unknown {
