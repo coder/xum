@@ -933,12 +933,12 @@ describe.skipIf(process.platform === "win32")("SSHConnectionPool stale ControlPa
   /**
    * A live socket at a short ControlPath (the old master), and an `ssh` on PATH that acts on
    * `whileSocket` while that socket exists and prints "ok" once it is gone (a fresh master).
-   * `ssh -O stop` removes the socket when `stop` is "answers", like OpenSSH's master, and fails
-   * when it is "no answer".
+   * `ssh -O stop` removes the socket when `stop` is "answers", like OpenSSH's master, fails when
+   * it is "no answer" and never returns when it "hangs".
    */
   async function setup(
     whileSocket: "fail" | "succeed" | "hang",
-    stop: "answers" | "no answer" = "answers"
+    stop: "answers" | "no answer" | "hangs" = "answers"
   ) {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-cp-"));
     const controlPath = path.join(dir, "cm-0");
@@ -948,7 +948,11 @@ describe.skipIf(process.platform === "win32")("SSHConnectionPool stale ControlPa
     const onSocket = { fail: "exit 255", succeed: "echo ok; exit 0", hang: "exec sleep 30" }[
       whileSocket
     ];
-    const onStop = stop === "answers" ? 'rm -f "$cp"; exit 0' : "exit 255";
+    const onStop = {
+      answers: 'rm -f "$cp"; exit 0',
+      "no answer": "exit 255",
+      hangs: "exec sleep 30",
+    }[stop];
     await fs.writeFile(
       path.join(dir, "ssh"),
       [
@@ -980,19 +984,44 @@ describe.skipIf(process.platform === "win32")("SSHConnectionPool stale ControlPa
   const config: SSHRuntimeConfig = { host: "stale.test", srcBaseDir: "/work" };
   const isStop = (call: string) => call === "-O stop";
 
-  test.each(["answers", "no answer"] as const)(
-    "a probe failure through a live master's socket heals on the next probe (stop %s)",
-    async (stop) => {
-      const { controlPath, socketExists, callLog } = await setup("fail", stop);
-      const pool = new SSHConnectionPool();
-      await pool.acquireConnection(config, { timeoutMs: 5_000, maxWaitMs: 8_000, controlPath });
-      // A failed probe, the stop request, then a probe that starts a fresh master.
-      expect((await callLog()).map(isStop)).toEqual([false, true, false]);
-      expect(await socketExists()).toBe(false);
-      expect(pool.getConnectionHealth(config)?.status).toBe("healthy");
-    },
-    15_000
-  );
+  test("a probe failure through a live master's socket heals on the next probe", async () => {
+    const { controlPath, socketExists, callLog } = await setup("fail");
+    const pool = new SSHConnectionPool();
+    await pool.acquireConnection(config, { timeoutMs: 5_000, maxWaitMs: 8_000, controlPath });
+    // A failed probe, the stop request, then a probe that starts a fresh master.
+    expect((await callLog()).map(isStop)).toEqual([false, true, false]);
+    expect(await socketExists()).toBe(false);
+    expect(pool.getConnectionHealth(config)?.status).toBe("healthy");
+  }, 15_000);
+
+  // Unlinking it would let the old master delete a replacement's socket when it exits.
+  test("a master that does not answer the stop request keeps its socket", async () => {
+    const { controlPath, socketExists, callLog } = await setup("fail", "no answer");
+    const pool = new SSHConnectionPool();
+    const error = await pool
+      .acquireConnection(config, { timeoutMs: 5_000, maxWaitMs: 0, controlPath })
+      .then(
+        () => null,
+        (e: unknown) => e
+      );
+    expect(String(error)).toContain("SSH probe failed with code 255");
+    expect((await callLog()).map(isStop)).toEqual([false, true]);
+    expect(await socketExists()).toBe(true);
+  });
+
+  test("a stop request that never returns ends within the probe's timeout", async () => {
+    const { controlPath } = await setup("fail", "hangs");
+    const pool = new SSHConnectionPool();
+    const startedAt = Date.now();
+    const error = await pool
+      .acquireConnection(config, { timeoutMs: 500, maxWaitMs: 0, controlPath })
+      .then(
+        () => null,
+        (e: unknown) => e
+      );
+    expect(String(error)).toContain("SSH probe failed with code 255");
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
 
   test("a healthy master's socket is never removed", async () => {
     const { controlPath, socketExists, callLog } = await setup("succeed");
