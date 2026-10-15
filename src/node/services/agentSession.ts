@@ -30,7 +30,6 @@ import {
   lastAssistantText,
   type MessageSendHookInput,
   type MessageSendHookOutcome,
-  TURN_STOP_PROMPT_MAX_CHARS,
   type TurnStopHookOutcome,
 } from "./agentPlugins/promptHooks";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
@@ -120,7 +119,11 @@ import type {
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { COMPACTION_RETRY_INPUT_BUDGET_SCALE } from "@/constants/continuousCompaction";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
-import { buildTodoTurnEndNudge } from "@/node/services/agentNotifications/todoTurnEndNudge";
+import {
+  mergeTurnStopContinuation,
+  needsTodoTurnEndNudge,
+  type TurnStopContinuation,
+} from "@/node/services/agentNotifications/todoTurnEndNudge";
 import { readAssistedReviewForSessionDir } from "@/node/services/reviewPane/assistedReviewStorage";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
 import {
@@ -10619,8 +10622,8 @@ export class AgentSession {
     // stream to supersede and clears the queue before the hook returns. Its epoch fences the
     // continuation instead (rechecked below, after the last await).
     const stopEpochAtHook = this.getStopEpoch();
-    const prompt = await this.readTurnStopContinuationPrompt(payload, options, provenance);
-    if (prompt.length === 0 || options == null) {
+    const continuation = await this.readTurnStopContinuation(payload, options, provenance);
+    if (continuation == null || options == null) {
       this.stopHookContinuations = 0;
       return;
     }
@@ -10670,7 +10673,11 @@ export class AgentSession {
       return;
     }
     this.stopHookContinuations++;
-    this.queueMessage(prompt, this.stopContinuationOptions(options, provenance), {
+    const continuationOptions = {
+      ...this.stopContinuationOptions(options, provenance),
+      ...continuation.optionOverrides,
+    };
+    this.queueMessage(continuation.prompt, continuationOptions, {
       acceptanceOrigin: "automatic",
       synthetic: true,
       ...(provenance.agentInitiated === true ? { agentInitiated: true } : {}),
@@ -10685,16 +10692,16 @@ export class AgentSession {
   }
 
   /**
-   * The turn.stop continuation prompt: the plugin hooks' reasons plus Xum's todo nudge, or "" when
+   * The turn.stop continuation: the plugin hooks' reasons plus Xum's todo nudge, or null when
    * nothing continues. One todo nudge per user turn: only before any continuation (so never after
    * the nudge itself), never against a plugin's halt, and never in Plan mode, where the list is
-   * the plan.
+   * the plan. A nudge alone may only call todo_write (TODO_TURN_END_NUDGE_TOOL_POLICY).
    */
-  private async readTurnStopContinuationPrompt(
+  private async readTurnStopContinuation(
     payload: StreamEndEvent,
     options: SendMessageOptions | undefined,
     provenance: StopContinuationProvenance
-  ): Promise<string> {
+  ): Promise<TurnStopContinuation | null> {
     const hookOutcome: TurnStopHookOutcome = (await this.aiService.runTurnStopHooks?.(
       this.workspaceId,
       {
@@ -10704,22 +10711,28 @@ export class AgentSession {
         model: stopHookModel(payload, provenance),
       }
     )) ?? { kind: "none" };
-    const nudgeAllowed =
+    return mergeTurnStopContinuation({
+      hookPrompt: hookOutcome.kind === "continue" ? hookOutcome.prompt : null,
+      todoNudge: await this.needsTodoNudge(hookOutcome, options, payload),
+      callerToolPolicy: options?.toolPolicy,
+    });
+  }
+
+  private async needsTodoNudge(
+    hookOutcome: TurnStopHookOutcome,
+    options: SendMessageOptions | undefined,
+    payload: StreamEndEvent
+  ): Promise<boolean> {
+    return (
       hookOutcome.kind !== "halted" &&
       this.stopHookContinuations === 0 &&
       options != null &&
-      options.agentId !== "plan";
-    const todoNudge = nudgeAllowed
-      ? await buildTodoTurnEndNudge({
-          sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
-          parts: payload.parts,
-        })
-      : null;
-    // The cap again on the joined prompt: todo items have no length limit.
-    return [hookOutcome.kind === "continue" ? hookOutcome.prompt : null, todoNudge]
-      .filter((text): text is string => text != null)
-      .join("\n\n")
-      .slice(0, TURN_STOP_PROMPT_MAX_CHARS);
+      options.agentId !== "plan" &&
+      (await needsTodoTurnEndNudge({
+        sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
+        parts: payload.parts,
+      }))
+    );
   }
 
   /** The ending stream's provenance for a turn.stop continuation (read before its reset). */

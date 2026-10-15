@@ -12,6 +12,10 @@ import type { CompletedMessagePart } from "@/common/types/stream";
 import type { TodoItem } from "@/common/types/tools";
 import { getTodoFilePath } from "@/node/services/todos/todoStorage";
 import { TURN_STOP_PROMPT_MAX_CHARS } from "./agentPlugins/promptHooks";
+import {
+  TODO_TURN_END_NUDGE,
+  TODO_TURN_END_NUDGE_TOOL_POLICY,
+} from "@/node/services/agentNotifications/todoTurnEndNudge";
 import { Ok } from "@/common/types/result";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { AgentSessionAIService } from "./agentSession";
@@ -745,17 +749,16 @@ describe("todo turn-end nudge", () => {
     { name: "a nested todo_write", parts: nestedTodoWriteThenReply },
   ])("a turn with $name that leaves open items gets exactly one nudge", async (row) => {
     // Every stream, the nudge's own included, calls todo_write and leaves the list open.
-    const { h, streams } = await setup({ parts: row.parts });
+    const { h, streams, requests } = await setup({ parts: row.parts });
     await writeTodos(h, openTodos);
 
     await h.session.sendMessage("fix the bug", options);
     await settle(h);
 
     expect(streams()).toBe(2);
-    const texts = await userTexts(h);
-    expect(texts).toHaveLength(2);
-    // The nudge shows the model the list it left behind.
-    expect(texts[1]).toContain("Verify the fix");
+    expect(await userTexts(h)).toEqual(["fix the bug", TODO_TURN_END_NUDGE]);
+    // The nudge turn may only update the list.
+    expect(requests[1].toolPolicy).toEqual(TODO_TURN_END_NUDGE_TOOL_POLICY);
 
     // The next user turn may be nudged again.
     await h.session.sendMessage("now lint", options);
@@ -765,28 +768,28 @@ describe("todo turn-end nudge", () => {
 
   test("a plugin continuation and the nudge share one continuation prompt", async () => {
     addConsumer(keepGoing);
+    const { h, requests } = await setup({ parts: todoWriteThenReply });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    const nudged = (await userTexts(h)).filter((text) => text.endsWith(TODO_TURN_END_NUDGE));
+    expect(nudged).toEqual([`Run the failing tests again.\n\n${TODO_TURN_END_NUDGE}`]);
+    // The plugin's continuation keeps the turn's tools.
+    expect(requests[1].toolPolicy).toBeUndefined();
+  });
+
+  test("the merged continuation prompt keeps the continuation size cap", async () => {
+    const longReason = "x".repeat(TURN_STOP_PROMPT_MAX_CHARS);
+    addConsumer((ctx) => void ctx.continueReasons.push(longReason));
     const { h } = await setup({ parts: todoWriteThenReply });
     await writeTodos(h, openTodos);
 
     await h.session.sendMessage("fix the bug", options);
     await settle(h);
 
-    const nudged = (await userTexts(h)).filter((text) => text.includes("Verify the fix"));
-    expect(nudged).toHaveLength(1);
-    expect(nudged[0]).toContain("Run the failing tests again.");
-  });
-
-  test("the merged continuation prompt keeps the continuation size cap", async () => {
-    addConsumer(keepGoing);
-    const { h } = await setup({ parts: todoWriteThenReply });
-    // Todo items have no length limit.
-    await writeTodos(h, [{ content: "x".repeat(TURN_STOP_PROMPT_MAX_CHARS), status: "pending" }]);
-
-    await h.session.sendMessage("fix the bug", options);
-    await settle(h);
-
     const [, continuation] = await userTexts(h);
-    expect(continuation).toStartWith("Run the failing tests again.");
     expect(continuation.length).toBe(TURN_STOP_PROMPT_MAX_CHARS);
   });
 
