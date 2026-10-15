@@ -10618,30 +10618,7 @@ export class AgentSession {
     // stream to supersede and clears the queue before the hook returns. Its epoch fences the
     // continuation instead (rechecked below, after the last await).
     const stopEpochAtHook = this.getStopEpoch();
-    const hookOutcome: TurnStopHookOutcome = (await this.aiService.runTurnStopHooks?.(
-      this.workspaceId,
-      {
-        messageId: payload.messageId,
-        lastAssistantMessage: lastAssistantText(payload.parts),
-        stopHookActive: this.stopHookContinuations > 0,
-        model: stopHookModel(payload, provenance),
-      }
-    )) ?? { kind: "none" };
-    // One todo nudge per user turn: only before any continuation (so never after the nudge
-    // itself), never against a plugin's halt, and never in Plan mode, where the list is the plan.
-    const todoNudge =
-      hookOutcome.kind !== "halted" &&
-      this.stopHookContinuations === 0 &&
-      options != null &&
-      options.agentId !== "plan"
-        ? await buildTodoTurnEndNudge({
-            sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
-            parts: payload.parts,
-          })
-        : null;
-    const prompt = [hookOutcome.kind === "continue" ? hookOutcome.prompt : null, todoNudge]
-      .filter((text): text is string => text != null)
-      .join("\n\n");
+    const prompt = await this.readTurnStopContinuationPrompt(payload, options, provenance);
     if (prompt.length === 0 || options == null) {
       this.stopHookContinuations = 0;
       return;
@@ -10704,6 +10681,42 @@ export class AgentSession {
       // Codex runs no UserPromptSubmit hook for a Stop continuation (see skipPromptHooks).
       skipPromptHooks: true,
     });
+  }
+
+  /**
+   * The turn.stop continuation prompt: the plugin hooks' reasons plus Xum's todo nudge, or "" when
+   * nothing continues. One todo nudge per user turn: only before any continuation (so never after
+   * the nudge itself), never against a plugin's halt, and never in Plan mode, where the list is
+   * the plan.
+   */
+  private async readTurnStopContinuationPrompt(
+    payload: StreamEndEvent,
+    options: SendMessageOptions | undefined,
+    provenance: StopContinuationProvenance
+  ): Promise<string> {
+    const hookOutcome: TurnStopHookOutcome = (await this.aiService.runTurnStopHooks?.(
+      this.workspaceId,
+      {
+        messageId: payload.messageId,
+        lastAssistantMessage: lastAssistantText(payload.parts),
+        stopHookActive: this.stopHookContinuations > 0,
+        model: stopHookModel(payload, provenance),
+      }
+    )) ?? { kind: "none" };
+    const nudgeAllowed =
+      hookOutcome.kind !== "halted" &&
+      this.stopHookContinuations === 0 &&
+      options != null &&
+      options.agentId !== "plan";
+    const todoNudge = nudgeAllowed
+      ? await buildTodoTurnEndNudge({
+          sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
+          parts: payload.parts,
+        })
+      : null;
+    return [hookOutcome.kind === "continue" ? hookOutcome.prompt : null, todoNudge]
+      .filter((text): text is string => text != null)
+      .join("\n\n");
   }
 
   /** The ending stream's provenance for a turn.stop continuation (read before its reset). */
