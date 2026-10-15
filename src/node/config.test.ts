@@ -1191,6 +1191,49 @@ describe("Config", () => {
   // Stored keys that normalize to the same project path ("aliases", e.g. "/repo" and "/repo/").
   // The loader used to build `new Map(pairs)`, so the last alias silently replaced the others
   // and the next save dropped their workspace rows.
+  // #6485: on Windows, an id-less legacy row's checkout path uses backslashes. The old session
+  // layout keys its metadata by the checkout basename, so the lookup must split on "\\" too.
+  describe("legacy rows with a Windows checkout path", () => {
+    const originalNavigator = globalThis.navigator;
+    const projectPath = "C:\\Users\\u\\repo";
+    const checkout = "C:\\Users\\u\\.xum\\src\\repo\\feature-x";
+
+    beforeEach(() => {
+      // PlatformPaths detects Windows through navigator.platform (see src/common/utils/paths.ts).
+      Object.defineProperty(globalThis, "navigator", {
+        value: { platform: "Win32" },
+        configurable: true,
+      });
+      // The old layout: sessions/<checkout basename>/metadata.json names the stable id.
+      const dir = path.join(config.sessionsDir, "feature-x");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, "metadata.json"),
+        JSON.stringify({ id: "stable-1", name: "feature-x", projectPath })
+      );
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ projects: [[projectPath, { workspaces: [{ path: checkout }] }]] })
+      );
+    });
+
+    afterEach(() => {
+      Object.defineProperty(globalThis, "navigator", {
+        value: originalNavigator,
+        configurable: true,
+      });
+    });
+
+    it("resolves the stable id from the basename metadata in the metadata build", async () => {
+      const metadata = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+      expect(metadata.map((meta) => meta.id)).toEqual(["stable-1"]);
+    });
+
+    it("finds the workspace by the stable id from the basename metadata", () => {
+      expect(config.findWorkspace("stable-1")?.workspacePath).toBe(checkout);
+    });
+  });
+
   describe("loadConfigOrDefault with aliased project keys", () => {
     type StoredRow = Record<string, unknown> & { id: string };
     type StoredPair = [string, Record<string, unknown> & { workspaces: StoredRow[] }];
