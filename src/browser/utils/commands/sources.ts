@@ -625,8 +625,23 @@ async function pluginsNeedingReviewOptions(api: BuildSourcesParams["api"]) {
 
 /** The palette path of the broken sign-out record notice in Settings → Plugins (#6627). */
 async function signOutPluginServersFromPalette(api: BuildSourcesParams["api"]): Promise<void> {
-  const result = await api?.agentPlugins.signOutPluginServers();
-  if (!result) return;
+  // The palette runs actions without a catch: a lost connection must still show an error.
+  await signOutPluginServersOrThrow(api).catch((error: unknown) =>
+    showCommandFeedbackToast({ type: "error", message: getErrorMessage(error) })
+  );
+}
+
+async function signOutPluginServersOrThrow(api: BuildSourcesParams["api"]): Promise<void> {
+  if (!api) return;
+  // Without a record the backend signs nothing out: do not report a sign-out that did not run.
+  if ((await api.agentPlugins.pendingSignOuts()).kind === "none") {
+    showCommandFeedbackToast({
+      type: "error",
+      message: "There is no pending plugin sign-out record. Nothing was signed out.",
+    });
+    return;
+  }
+  const result = await api.agentPlugins.signOutPluginServers();
   if (!result.success) {
     showCommandFeedbackToast({ type: "error", message: result.error });
     return;
