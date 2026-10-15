@@ -19,9 +19,7 @@ test(
     await settings.getByRole("button", "Plugins").tap();
     await settings.getByRole("button", "Review hooks for hook-odd-matchers").tap();
 
-    await expect(
-      settings.getByText(/ignoring its group "\\\\pL\(\?:Bash\|Edit\)"/)
-    ).toBeVisible({
+    await expect(settings.getByText(/ignoring its group "\\\\pL\(\?:Bash\|Edit\)"/)).toBeVisible({
       timeout: 15_000,
     });
     await expect(settings.getByText(/\('timeout' of tool "bad_timeout"\)/)).toBeVisible();
