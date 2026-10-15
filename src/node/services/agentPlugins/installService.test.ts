@@ -3428,13 +3428,18 @@ describe("AgentPluginInstallService", () => {
         path.join(muxRoot, "plugin-sign-outs-pending.json"),
         JSON.stringify({
           version: 1,
-          urls: ["https://user:pw@mcp.example.com/mcp?api_key=s3cret#frag", "not a url"],
+          urls: [
+            "https://user:pw@mcp.example.com/mcp?api_key=s3cret#frag",
+            "not a url",
+            // A non-HTTP URL nests another URL in its path, user info included.
+            "blob:https://user:pw@mcp.example.com/mcp?key=secret",
+          ],
         })
       );
       const status = await restarted.pendingSignOutStatus();
       expect(status).toEqual({
         kind: "pending",
-        servers: ["https://mcp.example.com/mcp?…", "(an unreadable URL)"],
+        servers: ["https://mcp.example.com/mcp?…", "(an unreadable URL)", "(an unreadable URL)"],
       });
     });
 

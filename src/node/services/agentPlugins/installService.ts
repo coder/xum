@@ -292,6 +292,9 @@ function displaySignOutUrl(url: string): string {
   } catch {
     return "(an unreadable URL)";
   }
+  // Remote MCP servers are HTTP(S). Another scheme (blob:) can nest a URL with user info in its
+  // path, so it is shown as unreadable.
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return "(an unreadable URL)";
   const cut = parsed.search !== "" || parsed.hash !== "";
   return `${parsed.origin}${parsed.pathname}${cut ? "?…" : ""}`;
 }
