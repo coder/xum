@@ -2138,6 +2138,7 @@ describe("MCPServerManager", () => {
 
   test("settings app opens: an older open shares a newer open's failed write and fails too", async () => {
     interface ActionResult {
+      [key: string]: unknown;
       content: Array<{ type: "text"; text: string }>;
     }
     using tmp = new DisposableTempDir("mcp-settings-apps-race");
