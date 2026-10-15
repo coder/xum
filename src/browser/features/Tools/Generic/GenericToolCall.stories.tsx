@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { ReactNode } from "react";
 import { APIProvider } from "@/browser/contexts/API";
 import { GenericToolCall } from "@/browser/features/Tools/GenericToolCall";

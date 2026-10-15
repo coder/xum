@@ -8,6 +8,7 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import {
   AgentPluginInstallEntrySchema,
+  AgentPluginComponentConsentSchema,
   AgentPluginImportedComponentsSchema,
   type AgentPluginImportedComponents,
   type AgentPluginGitSource,
@@ -102,6 +103,7 @@ import {
   bumpContainerMutationEpoch,
   MUTATION_LOCK_FILE,
   containerHasPendingSignOuts,
+  pendingSignOutsRecordState,
   isJournalName,
   JOURNAL_PREFIXES,
   MUTATION_EPOCH_FILE,
@@ -213,6 +215,47 @@ const PENDING_SIGN_OUT_RETRY_MS = 30_000;
 const LS_REMOTE_TIMEOUT_MS = 30_000;
 const CLONE_TIMEOUT_MS = 120_000;
 
+/** Milliseconds on a monotonic clock (wall-clock changes do not move it). */
+function monotonicNow(): number {
+  return performance.now();
+}
+
+/**
+ * Whether logout() succeeded before the pass deadline. A late or hung logout counts as failed:
+ * the URL stays in the record, and a later pass retries it (logout is idempotent).
+ *
+ * A late logout keeps running. A later pass waits for that same call instead of starting a
+ * second one, so the record stays until the original call settles: a second logout could
+ * otherwise clear the record while the first one still runs and later deletes a new sign-in.
+ */
+async function signedOutBefore(
+  oauth: Pick<McpOauthService, "logout" | "credentialKey">,
+  serverUrl: string,
+  deadline: number,
+  inFlight: Map<string, Promise<{ success: boolean }>>
+): Promise<boolean> {
+  // Past the pass deadline: start nothing more. The URL stays in the record for the next pass.
+  // Under 1 ms counts as past: timers have 1 ms resolution and can fire that much early.
+  if (deadline - monotonicNow() < 1) return false;
+  // Keyed by credential: `/mcp` and `/mcp/` are one stored sign-in, so one logout.
+  const key = oauth.credentialKey(serverUrl) ?? serverUrl;
+  let call = inFlight.get(key);
+  if (call === undefined) {
+    const started = oauth.logout({ serverUrl });
+    call = started;
+    inFlight.set(key, started);
+    const forget = () => {
+      if (inFlight.get(key) === started) inFlight.delete(key);
+    };
+    started.then(forget, forget);
+  }
+  const timeoutMs = Math.max(0, deadline - monotonicNow());
+  const settled = await raceWithAbortAndTimeout(call, { timeoutMs });
+  if (settled.kind === "ok") return settled.value.success;
+  log.warn("A pending plugin MCP sign-out timed out", { timeoutMs });
+  return false;
+}
+
 /** Waits for the startup sign-out pass at most timeoutMs, then lets discovery go on. */
 async function waitForPendingSignOuts(
   pass: Promise<void>,
@@ -220,6 +263,20 @@ async function waitForPendingSignOuts(
 ): Promise<void> {
   const settled = await raceWithAbortAndTimeout(pass, { timeoutMs });
   if (settled.kind === "timeout") log.warn("Pending plugin sign-outs timed out", { timeoutMs });
+}
+
+/** A component review that a pending or an unreadable sign-out record closed (#6627). */
+function pendingSignOutError(
+  record: { kind: "present" } | { kind: "unreadable"; code: string },
+  file: string
+): Error {
+  if (record.kind === "unreadable")
+    return new Error(
+      `Xum cannot read the pending plugin sign-out record (${record.code}). Plugin components are unavailable until Xum can read it: ${file}.`
+    );
+  return new Error(
+    "A plugin MCP sign-out from an update has not finished yet. Plugin components are unavailable until Xum finishes it; check the log for the reason."
+  );
 }
 
 function componentsChangedError(): Error {
@@ -266,8 +323,28 @@ type CollectedPluginSkill = AgentPluginPreviewSkill & {
  * The raw registry consent with this build's kinds replaced. A newer build may store more kinds,
  * and a save on this build must keep them (downgrade round-trip).
  */
+/**
+ * The consent an update journal carries (#6589). Absent in journals from older builds, and a
+ * malformed value is not consent: both return undefined, so recovery keeps the old records and
+ * the changed components ask for review again (fails closed).
+ */
+function journalComponentConsent(
+  doc: Record<string, unknown> | null
+): ComponentConsent | undefined {
+  const parsed = AgentPluginComponentConsentSchema.safeParse(doc?.componentConsent);
+  return parsed.success ? parsed.data : undefined;
+}
+
 function mergeRawConsent(raw: unknown, consent: ComponentConsent): Record<string, unknown> {
   return { ...(isPlainObject(raw) ? raw : {}), ...consent };
+}
+
+/** The registry patch for recovered consent: none when the journal carried none. */
+function recoveredConsentPatch(
+  raw: unknown,
+  consent: ComponentConsent | undefined
+): { componentConsent?: Record<string, unknown> } {
+  return consent === undefined ? {} : { componentConsent: mergeRawConsent(raw, consent) };
 }
 
 function skillChangeSummary(current: SurfaceSkill, staged: SurfaceSkill, name: string): string {
@@ -3532,7 +3609,8 @@ export class AgentPluginInstallService {
             const reconciled = await this.reconcilePromotedUpdateProvenance(
               name,
               targetPath,
-              newSha
+              newSha,
+              journalComponentConsent(journal.doc)
             );
             if (!reconciled) {
               return false; // Keep the journal; retried next reconciliation.
@@ -3625,7 +3703,9 @@ export class AgentPluginInstallService {
   private async reconcilePromotedUpdateProvenance(
     name: string,
     targetPath: string,
-    newSha: string
+    newSha: string,
+    /** The consent the interrupted update meant to record; undefined keeps the old one. */
+    componentConsent: ComponentConsent | undefined
   ): Promise<boolean> {
     const { envelope, rawEntries } = await this.readRegistryDocument("strict");
     const rawEntry = rawEntries.find((entry) => this.rawEntryName(entry) === name);
@@ -3665,6 +3745,7 @@ export class AgentPluginInstallService {
           ...rawRecord,
           lockedSha: newSha,
           updatedAt: new Date().toISOString(),
+          ...recoveredConsentPatch(rawRecord.componentConsent, componentConsent),
           manifest: {
             ...preservedManifest,
             ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
@@ -3966,10 +4047,10 @@ export class AgentPluginInstallService {
    * file changed, and a refresh fails the same way until the sign-out finishes (#6627).
    */
   private async closedComponentReviewError(): Promise<Error> {
-    if (!(await this.hasPendingSignOuts())) return componentsChangedError();
-    return new Error(
-      "A plugin MCP sign-out from an update has not finished yet. Plugin components are unavailable until Xum finishes it; check the log for the reason."
-    );
+    const record = await pendingSignOutsRecordState(this.containerDir);
+    return record.kind === "absent"
+      ? componentsChangedError()
+      : pendingSignOutError(record, shortenHome(this.pendingSignOutsFile));
   }
 
   async setComponents(args: {
@@ -4048,6 +4129,11 @@ export class AgentPluginInstallService {
     }
   }
 
+  /** The bound of startup crash-recovery waits and of each sign-out pass. */
+  private get recoveryTimeoutMs(): number {
+    return this.deps.reconciliationTimeoutMs ?? JOURNAL_RECONCILIATION_TIMEOUT_MS;
+  }
+
   private get pendingSignOutsFile(): string {
     return path.join(this.config.rootDir, PENDING_SIGN_OUTS_FILE_NAME);
   }
@@ -4100,10 +4186,47 @@ export class AgentPluginInstallService {
   /** Signs out `urls` after an update; the ones that failed stay pending. */
   private async signOutAndSettle(name: string, urls: string[]): Promise<void> {
     const done: string[] = [];
+    // One deadline for every wait of this update: N hung logouts must not hold the lock N times.
+    const deadline = monotonicNow() + this.recoveryTimeoutMs;
     for (const serverUrl of urls) {
-      if (await this.signOutPluginServer(name, serverUrl)) done.push(serverUrl);
+      if (await this.signOutAfterInFlight(name, serverUrl, deadline)) done.push(serverUrl);
     }
     await this.forgetPendingSignOuts(done);
+  }
+
+  /**
+   * A timed-out recovery logout can still run: let it settle first, so two logouts never
+   * overlap and the earlier one cannot delete a sign-in made after the later one (#6627).
+   */
+  private async settleInFlightSignOut(
+    name: string,
+    serverUrl: string,
+    deadline: number
+  ): Promise<boolean> {
+    const key = this.mcpOauthService?.credentialKey(serverUrl) ?? serverUrl;
+    const call = this.inFlightSignOuts.get(key);
+    if (call === undefined) return true;
+    // Bounded: the update holds the plugin lock here, so a hung logout must not hold it forever.
+    // On timeout this sign-out counts as failed, and its URL stays in the pending record.
+    const settled = await raceWithAbortAndTimeout(
+      call.catch(() => undefined),
+      { timeoutMs: Math.max(0, deadline - monotonicNow()) }
+    );
+    if (settled.kind === "ok") return true;
+    log.warn("A plugin MCP sign-out waits for an earlier one that has not finished", {
+      plugin: name,
+    });
+    return false;
+  }
+
+  /** A sign-out that waits too long for an earlier one fails: its URL stays pending. */
+  private async signOutAfterInFlight(
+    name: string,
+    serverUrl: string,
+    deadline: number
+  ): Promise<boolean> {
+    if (!(await this.settleInFlightSignOut(name, serverUrl, deadline))) return false;
+    return this.signOutPluginServer(name, serverUrl);
   }
 
   private async signOutPluginServer(name: string, serverUrl: string): Promise<boolean> {
@@ -4119,15 +4242,21 @@ export class AgentPluginInstallService {
   /**
    * Finishes the sign-outs that an update recorded but could not complete (#6122). Runs with
    * crash recovery and from the discovery gate. Without the sign-in service it does nothing.
+   * Returns true when it tried, and sign-outs are left.
+   *
+   * The pass holds the plugin mutation lock, so it is bounded like journal recovery: a logout
+   * that does not settle in time counts as failed (#6627). Its URL stays in the record, and the
+   * lock is released, so a section open, an install or an update does not hang behind it.
    */
-  /** True when it tried, and sign-outs are left. */
   private async completePendingSignOuts(): Promise<boolean> {
     const oauth = this.mcpOauthService;
     if (oauth === undefined || !(await this.hasPendingSignOuts())) return false;
     return this.runExclusive(async () => {
+      const deadline = monotonicNow() + this.recoveryTimeoutMs;
       const left: string[] = [];
       for (const serverUrl of await this.readPendingSignOuts()) {
-        if (!(await oauth.logout({ serverUrl })).success) left.push(serverUrl);
+        if (!(await signedOutBefore(oauth, serverUrl, deadline, this.inFlightSignOuts)))
+          left.push(serverUrl);
       }
       await this.writePendingSignOuts(left);
       return left.length > 0;
@@ -4167,7 +4296,7 @@ export class AgentPluginInstallService {
 
   /** True while the gate's wait after a pass that left the record runs. */
   private signOutRetryWaits(retryNow: boolean): boolean {
-    return !retryNow && Date.now() < this.pendingSignOutRetryAtMs;
+    return !retryNow && monotonicNow() < this.pendingSignOutRetryAtMs;
   }
 
   /** Resolves once no pass runs, the passes that `retryNow` callers asked for included. */
@@ -4193,11 +4322,13 @@ export class AgentPluginInstallService {
       log.warn("Could not finish pending plugin sign-outs", { error: getErrorMessage(error) });
       return true;
     });
-    this.pendingSignOutRetryAtMs = left ? Date.now() + PENDING_SIGN_OUT_RETRY_MS : 0;
+    this.pendingSignOutRetryAtMs = left ? monotonicNow() + PENDING_SIGN_OUT_RETRY_MS : 0;
   }
 
   private pendingSignOutPass: Promise<void> | undefined;
-  /** See startPendingSignOutPass. */
+  /** Logouts a pass started that have not settled yet (see signedOutBefore). */
+  private readonly inFlightSignOuts = new Map<string, Promise<{ success: boolean }>>();
+  /** See startPendingSignOutPass. On the monotonic clock: a wall-clock jump must not move it. */
   private pendingSignOutRetryAtMs = 0;
   /** See signOutPassRunning. */
   private pendingSignOutRerun = false;
@@ -5523,12 +5654,16 @@ export class AgentPluginInstallService {
           // between the promote below and the registry write leaves the
           // (consented) replacement live while the registry still claims the
           // old commit — recovery must be able to commit the recorded SHA.
+          // componentConsent: the consent this update records, so recovery can record it too
+          // instead of asking again for what the user just reviewed (#6589). Recovery reads it
+          // tolerantly: a journal without it (an older build) keeps the old consent.
           await this.writeJournalFile(updateJournalPath, {
             name: entry.name,
             trashDir,
             nonce: updateNonce,
             stagedAt: Date.now(),
             newSha: targetSha,
+            componentConsent,
           });
           try {
             await this.renameIntoStaging(targetPath, trashDir);

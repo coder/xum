@@ -8,7 +8,7 @@
  * is the Pixel capture of the open view at the phone viewport.
  */
 import { wrapAsyncIterator } from "@orpc/shared";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { ComponentType } from "react";
 
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";

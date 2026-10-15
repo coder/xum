@@ -64,6 +64,16 @@ export const AgentPluginImportedComponentsSchema = z.object({
 });
 export type AgentPluginImportedComponents = z.infer<typeof AgentPluginImportedComponentsSchema>;
 
+/** Reviewed fingerprints by component name (see `componentConsent` below). */
+export const AgentPluginComponentConsentSchema = z.object({
+  skills: z.record(z.string(), z.string()),
+  mcpServers: z.record(z.string(), z.string()),
+  // Workflow scripts by file name (#6629). Absent in a record from before #6629: no workflow
+  // is reviewed, so each such plugin needs one review (no backfill). An older build strips
+  // the key on read and keeps it on save (installService mergeRawConsent).
+  workflows: z.record(z.string(), z.string()).default({}),
+});
+
 export const AgentPluginInstallEntrySchema = z.object({
   /**
    * plugin.json `name`; also the directory name under `~/.mux/plugins`.
@@ -102,16 +112,7 @@ export const AgentPluginInstallEntrySchema = z.object({
    * older installs, which then need a review (no backfill). `z.record` drops a `__proto__` key on
    * parse, so the plugin MCP loader refuses that server name (mcpConfig.ts checkServerEntryShape).
    */
-  componentConsent: z
-    .object({
-      skills: z.record(z.string(), z.string()),
-      mcpServers: z.record(z.string(), z.string()),
-      // Workflow scripts by file name (#6629). Absent in a record from before #6629: no workflow
-      // is reviewed, so each such plugin needs one review (no backfill). An older build strips
-      // the key on read and keeps it on save (installService mergeRawConsent).
-      workflows: z.record(z.string(), z.string()).default({}),
-    })
-    .optional(),
+  componentConsent: AgentPluginComponentConsentSchema.optional(),
   /** Reserved: per-plugin opt-in auto-update. Unused in v1 — updates are badge + manual. */
   autoUpdate: z.boolean().optional(),
 });

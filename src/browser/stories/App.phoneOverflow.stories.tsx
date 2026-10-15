@@ -2,7 +2,7 @@
  * Phone-width overflow checks for #5769: the workspace footer must fit the screen, and a capped
  * bash Script block must show that more of the command sits below the cut.
  */
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { ComponentType } from "react";
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";

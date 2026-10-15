@@ -1,4 +1,4 @@
-import { fireEvent, userEvent, waitFor } from "@storybook/test";
+import { fireEvent, userEvent, waitFor } from "storybook/test";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { PIXEL_DUAL_THEME, appMeta, AppWithMocks } from "@/browser/stories/meta.js";
 import {
@@ -7,6 +7,7 @@ import {
   expandProjects,
 } from "@/browser/stories/helpers/uiState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { waitForChatInputAutofocusDone } from "@/browser/stories/storyPlayHelpers";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
@@ -41,6 +42,9 @@ export const ProjectRemovalDisabled: AppStory = {
     />
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    // The composer focuses itself on load. Focus leaving the open menu closes it, so a menu
+    // opened before that would close before the click below lands on it.
+    await waitForChatInputAutofocusDone(canvasElement);
     const projectOptionsButton = await waitFor(() => {
       const button = canvasElement.querySelector<HTMLButtonElement>(
         'button[aria-label="Project options for my-app"]'

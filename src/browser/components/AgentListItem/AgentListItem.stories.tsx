@@ -8,7 +8,7 @@ import { TitleEditProvider } from "@/browser/contexts/WorkspaceTitleEditContext"
 import { DndProvider } from "react-dnd";
 import { HTML5Backend } from "react-dnd-html5-backend";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
-import { screen, waitFor, userEvent } from "@storybook/test";
+import { screen, waitFor, userEvent } from "storybook/test";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { NOW, createWorkspace } from "@/browser/stories/mocks/workspaces";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";

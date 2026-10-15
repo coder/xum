@@ -1,4 +1,4 @@
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import { appMeta, AppWithMocks, type AppStory } from "./meta";

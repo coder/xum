@@ -8,7 +8,11 @@ import type { ContextWindowIds } from "./contextWindowRollover";
 import * as path from "node:path";
 
 import assert from "@/common/utils/assert";
-import { isTokenBudgetInternalMessage, type MuxMessage } from "@/common/types/message";
+import {
+  isTokenBudgetInternalMessage,
+  type MuxMessage,
+  type VolatileSystemTailRecord,
+} from "@/common/types/message";
 import {
   getHistoryItemId,
   isHiddenFromSessionHistory,
@@ -82,10 +86,82 @@ import {
   type AnthropicCacheTtl,
 } from "@/common/utils/ai/cacheStrategy";
 import { prepareMessagesForProvider } from "./messagePipeline";
+import {
+  acceptsVolatileSystemTailRow,
+  planVolatileSystemTail,
+} from "@/node/utils/messages/volatileSystemTail";
 import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
 const keepContextRow = (message: MuxMessage) =>
   !isModelHiddenMessage(message) && !message.metadata?.contextBudgetRejected;
+
+/**
+ * Moves each row that a turn's request did not include to just after that turn's assistant row.
+ *
+ * A request contains exactly the rows with historySequence <= its requestHistorySequence (the
+ * contract replayVerify's sliceEpochForTurn relies on). A row appended after the request read
+ * history but before the assistant placeholder (a sub-agent report that TaskService delivers at
+ * once) gets a lower sequence than the placeholder, so sequence order puts it before a reply
+ * whose request never contained it. The next request then merged it into the earlier user
+ * message, which changed bytes the provider had already signed: Anthropic rejected the turn's
+ * thinking ("Content before this block differs"), seen in 6 of 200 dogfood sessions. Placing
+ * the row after the reply makes the rebuild match what each turn sent. chat.jsonl keeps its
+ * order, so only provider requests change.
+ */
+function placeRowsAfterTheTurnThatMissedThem(messages: MuxMessage[]): MuxMessage[] {
+  let ordered: MuxMessage[] | undefined;
+  for (let index = 0; index < messages.length; index++) {
+    const missedCount = countRowsTheRequestMissed(messages, index);
+    if (missedCount === 0) {
+      ordered?.push(messages[index]);
+      continue;
+    }
+    ordered ??= messages.slice(0, index);
+    // Earlier iterations copied the missed rows already; they are the tail of `ordered`.
+    const missedRows = ordered.splice(ordered.length - missedCount);
+    ordered.push(messages[index], ...missedRows);
+  }
+  return ordered ?? messages;
+}
+
+/** Rows directly before an assistant row that its request did not include (0 for other rows). */
+function countRowsTheRequestMissed(messages: MuxMessage[], index: number): number {
+  const { requestHistorySequence, historySequence } = messages[index].metadata ?? {};
+  if (
+    messages[index].role !== "assistant" ||
+    requestHistorySequence == null ||
+    historySequence == null
+  ) {
+    return 0;
+  }
+  // History is in sequence order, so the missed rows sit directly before the assistant row.
+  let count = 0;
+  while (
+    count < index &&
+    isRowAfterRequest(messages[index - count - 1], requestHistorySequence, historySequence)
+  ) {
+    count++;
+  }
+  return count;
+}
+
+/**
+ * A row between a request's history read and its assistant row. Assistant rows never count,
+ * so the walk stops before rows that an earlier turn already moved.
+ */
+function isRowAfterRequest(
+  row: MuxMessage,
+  requestHistorySequence: number,
+  assistantHistorySequence: number
+): boolean {
+  const sequence = row.metadata?.historySequence;
+  return (
+    row.role !== "assistant" &&
+    sequence != null &&
+    sequence > requestHistorySequence &&
+    sequence < assistantHistorySequence
+  );
+}
 
 /**
  * History rows that can reach the provider, before the thinking-level-dependent empty-row
@@ -94,7 +170,9 @@ const keepContextRow = (message: MuxMessage) =>
 export function selectActiveContextMessages(messages: MuxMessage[]): MuxMessage[] {
   // A durable reset still seals history when its row is rejected or display-only.
   // Establish the boundary before any content filter can erase that structural evidence.
-  const boundarySlicedMessages = sliceMessagesForProviderFromLatestContextBoundary(messages);
+  const boundarySlicedMessages = sliceMessagesForProviderFromLatestContextBoundary(
+    placeRowsAfterTheTurnThatMissedThem(messages)
+  );
   // RLM keep-recent floor: a stamped compaction request summarizes only the older head.
   return excludeKeepRecentTailForCompactionRequest(boundarySlicedMessages.filter(keepContextRow));
 }
@@ -163,11 +241,34 @@ export function measureVolatileSystemSuffix(
   return end > 0 ? systemMessage.length - end : 0;
 }
 
+/**
+ * measureVolatileSystemSuffix, but 0 unless every present section ends the message intact. A
+ * partial split means middleware edited or appended text, so part of the volatile content sits
+ * in the stable part, and the volatile-tail rows (mechanism 10) must not run on the rest.
+ */
+export function measureWholeVolatileSystemSuffix(
+  systemMessage: string,
+  sections: ReadonlyArray<string | null | undefined>
+): number {
+  const length = measureVolatileSystemSuffix(systemMessage, sections);
+  const whole = sections.reduce((sum, section) => sum + (section?.length ?? 0), 0);
+  return length === whole ? length : 0;
+}
+
 export interface PromptPayload {
   providerRequestMessages: MuxMessage[];
   messages: ModelMessage[];
   system: Instructions | undefined;
   tools: Record<string, Tool> | undefined;
+  /** For this turn's assistant row (MuxMetadata.volatileSystemTail); undefined records nothing. */
+  volatileSystemTail?: VolatileSystemTailRecord;
+  /**
+   * The system content this request sends (prompt-cache mechanism 10): the stable part plus
+   * the tail it actually carries (frozen inside a segment), its volatile length, and the text of
+   * the tail rows in the messages. The turn envelope, debug views and system token count must
+   * describe this, not the live system message.
+   */
+  sentSystem: { message: string; volatileSuffixLength: number; rowsText: string };
 }
 
 export interface AssemblePromptPayloadOptions {
@@ -215,6 +316,11 @@ export interface AssemblePromptPayloadOptions {
    * transform (mergeConsecutiveUserMessages) merges it into the start of that user message.
    */
   requestContextMessage?: MuxMessage;
+  /**
+   * Replay only: `systemMessage` is the system content the turn sent (its envelope), and this
+   * holds the turn's own MuxMetadata.volatileSystemTail, so the planner can derive the live tail.
+   */
+  replayedTurn?: { record?: VolatileSystemTailRecord };
 }
 
 /**
@@ -316,6 +422,51 @@ async function historyShareOfBudget(
   return Math.max(1, budgetTokens - contextTokens);
 }
 
+/**
+ * The system prompt split into its cached stable block and the volatile tail, and where the
+ * tail goes: a tail change inside a segment becomes a system row instead of a system edit
+ * (prompt-cache mechanism 10, volatileSystemTail.ts).
+ */
+function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMessage[]) {
+  const volatileLength = options.volatileSystemSuffixLength ?? 0;
+  assert(
+    Number.isSafeInteger(volatileLength) &&
+      volatileLength >= 0 &&
+      (volatileLength === 0 || volatileLength < options.systemMessage.length),
+    "volatileSystemSuffixLength must leave a non-empty stable system prefix"
+  );
+  const stableSystem = options.systemMessage.slice(
+    0,
+    options.systemMessage.length - volatileLength
+  );
+  const cachedSystemMessage = createCachedSystemMessage(
+    stableSystem,
+    options.modelString,
+    options.anthropicCacheTtl,
+    options.providersConfig
+  );
+  // Length 0 means no volatile sections, or a tail the caller could not split off (middleware
+  // edited it; turnRequestBuilder passes 0 then). Either way this request sends as before and
+  // records nothing: a row could only claim that sections still in the prompt are gone.
+  // A compaction request (it has a budget) does the same: the trim already fitted `history`
+  // to its budget, so rows added now could exceed it. Its system prompt is the compact
+  // agent's, so no cached prefix is lost, and its summary starts a new segment anyway.
+  const tailPlan = planVolatileSystemTail(
+    history,
+    options.systemMessage.slice(stableSystem.length),
+    volatileLength > 0 &&
+      options.compactionInputBudgetTokens == null &&
+      cachedSystemMessage != null &&
+      acceptsVolatileSystemTailRow(
+        options.modelString,
+        options.routeProvider,
+        options.providersConfig
+      ),
+    options.replayedTurn
+  );
+  return { stableSystem, cachedSystemMessage, tailPlan };
+}
+
 export async function assemblePromptPayload(
   options: AssemblePromptPayloadOptions
 ): Promise<PromptPayload> {
@@ -339,15 +490,23 @@ export async function assemblePromptPayload(
     options.modelString,
     options.requestContextMessage
   );
+  const { stableSystem, cachedSystemMessage, tailPlan } = planSystemPrompt(
+    options,
+    providerRequestMessages
+  );
+  const historyWithSentinel = addInterruptedSentinel(
+    insertRequestContextMessage(
+      options.tagHistoryItemIds === true
+        ? tagUserRowsWithHistoryItemIds(tailPlan.messages)
+        : tailPlan.messages,
+      options.requestContextMessage
+    )
+  );
   let messages = await prepareMessagesForProvider({
-    messagesWithSentinel: addInterruptedSentinel(
-      insertRequestContextMessage(
-        options.tagHistoryItemIds === true
-          ? tagUserRowsWithHistoryItemIds(providerRequestMessages)
-          : providerRequestMessages,
-        options.requestContextMessage
-      )
-    ),
+    // The new row goes last, after the newest user row and its request context.
+    messagesWithSentinel: tailPlan.appendedRow
+      ? [...historyWithSentinel, tailPlan.appendedRow]
+      : historyWithSentinel,
     replayReceiptMessages: prepared.activeContextMessages,
     effectiveAgentId: options.effectiveAgentId,
     toolNamesForSentinel: options.toolNamesForSentinel,
@@ -365,28 +524,9 @@ export async function assemblePromptPayload(
       : options.deferLoadingToolNames,
   });
   let system: Instructions | undefined = options.systemMessage;
-  const volatileLength = options.volatileSystemSuffixLength ?? 0;
-  assert(
-    Number.isSafeInteger(volatileLength) &&
-      volatileLength >= 0 &&
-      (volatileLength === 0 || volatileLength < options.systemMessage.length),
-    "volatileSystemSuffixLength must leave a non-empty stable system prefix"
-  );
-  const stableSystem = options.systemMessage.slice(
-    0,
-    options.systemMessage.length - volatileLength
-  );
   // Uncached trailing block: the stable block keeps the cache breakpoint.
   const volatileRows: SystemModelMessage[] =
-    volatileLength > 0
-      ? [{ role: "system", content: options.systemMessage.slice(stableSystem.length) }]
-      : [];
-  const cachedSystemMessage = createCachedSystemMessage(
-    stableSystem,
-    options.modelString,
-    options.anthropicCacheTtl,
-    options.providersConfig
-  );
+    tailPlan.systemTail.length > 0 ? [{ role: "system", content: tailPlan.systemTail }] : [];
   if (cachedSystemMessage) {
     // Anthropic requires the cached system row in messages and no separate system parameter.
     messages = [cachedSystemMessage, ...volatileRows, ...messages];
@@ -413,6 +553,12 @@ export async function assemblePromptPayload(
     providerRequestMessages,
     messages,
     system,
+    ...(tailPlan.record != null ? { volatileSystemTail: tailPlan.record } : {}),
+    sentSystem: {
+      message: stableSystem + tailPlan.systemTail,
+      volatileSuffixLength: stableSystem === options.systemMessage ? 0 : tailPlan.systemTail.length,
+      rowsText: tailPlan.rowsText,
+    },
     tools: options.tools
       ? applyCacheControlToTools(
           options.tools,

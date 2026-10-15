@@ -6,7 +6,7 @@ import { createAssistantMessage, createUserMessage } from "@/browser/stories/moc
 import { createGenericTool, createPendingTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
 import { MOBILE_TOUCH_TARGET_PX } from "@/constants/layout";
-import { within, userEvent, waitFor } from "@storybook/test";
+import { within, userEvent, waitFor } from "storybook/test";
 import type { ComponentType } from "react";
 
 const meta = { ...appMeta, title: "App/Chat/Tools/AskUserQuestion" };
