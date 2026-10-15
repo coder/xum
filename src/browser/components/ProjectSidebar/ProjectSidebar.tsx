@@ -1989,7 +1989,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const hasProjectMenuTarget = projectMenuTargetPath !== null;
 
-  // Ctrl+N and the collapsed sidebar's header New chat: beside the selected chat, else in the open
+  // Ctrl+N and the collapsed sidebar's toggle bar New chat: beside the selected chat, else in the open
   // draft page's project. useCallback for the effects' dependency lists, not for memoization.
   const handleNewChat = useCallback(() => {
     if (selectedWorkspace) {
@@ -2019,8 +2019,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     handleAddWorkspace,
   ]);
 
-  // The collapsed sidebar's New chat lives in the page headers (WorkspaceMenuBar and the draft
-  // pages), which ask this always-mounted sidebar to run it.
+  // The collapsed sidebar's New chat lives in the app shell's toggle bar, which asks this
+  // always-mounted sidebar to run it.
   useEffect(() => {
     window.addEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, handleNewChat);
     return () => window.removeEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, handleNewChat);
@@ -2590,7 +2590,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             // The sidebar doubles as a drag surface, so keep copy selection disabled
             // unless a child input explicitly opts back into text selection.
             "font-primary bg-surface-primary border-border-light relative flex flex-1 select-none flex-col overflow-hidden border-r",
-            // The collapsed sidebar is zero-width; its reopen button lives in the page header.
+            // The collapsed sidebar is zero-width; the app shell's toggle bar reopens it.
             collapsed && "border-r-0"
           )}
           role="navigation"

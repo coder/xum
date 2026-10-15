@@ -1,31 +1,29 @@
 import "../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { useState } from "react";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
+import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { TooltipProvider } from "../Tooltip/Tooltip";
-import { CollapsedSidebarHeaderControls, SidebarCollapseButton } from "./SidebarCollapseButton";
+import { LeftSidebarToggleBar } from "./SidebarCollapseButton";
 
 let cleanupDom: (() => void) | null = null;
 
-// Like the app: the sidebar's title bar holds the toggle while expanded and the page header holds
-// it while collapsed, so every toggle unmounts the button that was pressed.
-function ToggleHosts() {
+function ToggleBar(props: { hasNewChatTarget: boolean }) {
   const [collapsed, setCollapsed] = useState(false);
-  const toggle = () => setCollapsed((prev) => !prev);
   return (
     <TooltipProvider>
-      {collapsed ? (
-        <CollapsedSidebarHeaderControls onToggle={toggle} />
-      ) : (
-        <SidebarCollapseButton collapsed={false} onToggle={toggle} />
-      )}
+      <LeftSidebarToggleBar
+        collapsed={collapsed}
+        showNewChat={collapsed && props.hasNewChatTarget}
+        onToggle={() => setCollapsed((prev) => !prev)}
+      />
     </TooltipProvider>
   );
 }
 
-describe("SidebarCollapseButton", () => {
+describe("LeftSidebarToggleBar", () => {
   beforeEach(() => {
     cleanupDom = installDom();
   });
@@ -36,29 +34,33 @@ describe("SidebarCollapseButton", () => {
     cleanupDom = null;
   });
 
-  test("keyboard activation hands focus to the toggle in the other host", () => {
-    const view = render(<ToggleHosts />);
+  // The toggle is one element for both states, so a keyboard user keeps focus on it.
+  test("the focused toggle survives collapse and expand", () => {
+    const view = render(<ToggleBar hasNewChatTarget />);
 
-    const collapse = view.getByRole("button", { name: "Collapse sidebar" });
-    act(() => collapse.focus());
-    // Enter or Space on a focused button dispatches a click with detail 0.
-    fireEvent.click(collapse, { detail: 0 });
-    const open = view.getByRole("button", { name: "Open sidebar menu" });
-    expect(document.activeElement).toBe(open);
+    const toggle = view.getByRole("button", { name: "Collapse sidebar" });
+    act(() => toggle.focus());
+    fireEvent.click(toggle);
+    expect(view.getByRole("button", { name: "Open sidebar menu" })).toBe(toggle);
+    expect(document.activeElement).toBe(toggle);
 
-    fireEvent.click(open, { detail: 0 });
-    expect(document.activeElement).toBe(view.getByRole("button", { name: "Collapse sidebar" }));
+    fireEvent.click(toggle);
+    expect(view.getByRole("button", { name: "Collapse sidebar" })).toBe(toggle);
+    expect(document.activeElement).toBe(toggle);
   });
 
-  // Focus would open the new button's tooltip under the pointer.
-  test("a pointer click does not move focus to the other toggle", () => {
-    const view = render(<ToggleHosts />);
+  test("New chat shows while collapsed and asks the sidebar to start a chat", () => {
+    const view = render(<ToggleBar hasNewChatTarget />);
+    expect(view.queryByRole("button", { name: "New chat" })).toBeNull();
 
-    const collapse = view.getByRole("button", { name: "Collapse sidebar" });
-    act(() => collapse.focus());
-    fireEvent.click(collapse, { detail: 1 });
-    expect(document.activeElement).not.toBe(
-      view.getByRole("button", { name: "Open sidebar menu" })
-    );
+    fireEvent.click(view.getByRole("button", { name: "Collapse sidebar" }));
+    const onNewChat = mock(() => undefined);
+    window.addEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, onNewChat);
+    try {
+      fireEvent.click(view.getByRole("button", { name: "New chat" }));
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, onNewChat);
+    }
+    expect(onNewChat).toHaveBeenCalledTimes(1);
   });
 });

@@ -974,8 +974,8 @@ body,
     display: inline-flex !important;
   }
 
-  /* Both hosts of the left sidebar toggle (the drawer's title bar, the page header) take the
-     header's ordinary phone gutter, so the toggle stays put when the drawer opens over it. */
+  /* The app shell's fixed left sidebar toggle bar and its header spacers take the header's
+     ordinary phone gutter. */
   .left-sidebar-toggle-host {
     padding-left: max(var(--titlebar-left-inset, 0px), 0.5rem) !important;
   }
@@ -1052,8 +1052,8 @@ body,
 /* Touch targets widen this button to 44px (see the coarse-pointer block above), so centering
    would drift the icon to 22px; anchor the box to the header edge to keep it on the 12px gutter.
    Fine pointers keep the 24px box, where this inset would push the icon out of the box and paint
-   the hover pill against the window edge. The hosts match the page header's 44px touch height,
-   so the toggle stays put vertically too. */
+   the hover pill against the window edge. The toggle bar and its spacers match the page header's
+   44px touch height, so the bar lines up with the header under it. */
 @media (max-width: 768px) and (pointer: coarse) {
   .mobile-menu-btn {
     justify-content: flex-start !important;

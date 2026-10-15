@@ -151,11 +151,13 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await within(sidebar).findByText(RUN_NAME);
     // The view closes from its header, so its strip has no collapse button.
     await expect(within(sidebar).queryByRole("button", { name: "Collapse sidebar" })).toBeNull();
-    // Everything behind the view is inert, not just the chat: the left sidebar and the footer
-    // sit outside the chat pane.
+    // Everything behind the view is inert, not just the chat: the left sidebar, its toggle bar
+    // and the footer sit outside the chat pane.
     await expect(chatPane.closest("[inert]")).not.toBeNull();
     const leftSidebar = canvasElement.querySelector("[data-testid='left-sidebar']");
     await expect(leftSidebar?.closest("[inert]")).not.toBeNull();
+    const toggleBar = canvasElement.querySelector("[data-testid='left-sidebar-toggle-bar']");
+    await expect(toggleBar?.closest("[inert]")).not.toBeNull();
     // Focus moves into the view and stays there. The closing menu returns focus to the More
     // button on a timer, which must not win: the inert chat pane cannot take focus. Check again
     // after that timer had its turn.
@@ -179,6 +181,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await waitFor(() => expect(moreButton).toHaveFocus());
     await expect(chatPane.closest("[inert]")).toBeNull();
     await expect(leftSidebar?.closest("[inert]")).toBeNull();
+    await expect(toggleBar?.closest("[inert]")).toBeNull();
     // Opening the view expanded the sidebar (it was collapsed), so its panels stay mounted.
     await expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
 

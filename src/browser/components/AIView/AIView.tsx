@@ -7,7 +7,6 @@ import { WorkspaceModeAISync } from "@/browser/components/WorkspaceModeAISync/Wo
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { BackgroundBashProvider } from "@/browser/contexts/BackgroundBashContext";
 import { WorkspaceShell } from "../WorkspaceShell/WorkspaceShell";
-import { CollapsedSidebarHeaderBar } from "../SidebarCollapseButton/SidebarCollapseButton";
 
 // For MemoryFileEditor's lazy preview: keeps the Markdown stack in this page's chunk (see there).
 export { MarkdownFilePreview } from "@/browser/features/Messages/MarkdownFilePreview";
@@ -19,7 +18,6 @@ interface AIViewProps {
   workspaceName: string;
   namedWorkspacePath: string; // User-friendly path for display and terminal
   leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
   runtimeConfig?: RuntimeConfig;
   className?: string;
   /** If set, workspace is incompatible (from newer mux version) and this error should be displayed */
@@ -32,27 +30,22 @@ interface AIViewProps {
  * Incompatible workspace error display.
  * Shown when a workspace was created with a newer version of xum.
  */
-const IncompatibleWorkspaceView: React.FC<{
-  message: string;
-  className?: string;
-  leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
-}> = ({ message, className, leftSidebarCollapsed, onToggleLeftSidebarCollapsed }) => (
-  <div className={cn("flex h-full w-full flex-col", className)}>
-    {leftSidebarCollapsed && <CollapsedSidebarHeaderBar onToggle={onToggleLeftSidebarCollapsed} />}
-    <div className="flex flex-1 flex-col items-center justify-center p-8">
-      <div className="max-w-md text-center">
-        <div className="mb-4 flex justify-center">
-          <AlertTriangle aria-hidden="true" className="text-warning h-10 w-10" />
-        </div>
-        <h2 className="mb-2 text-xl font-semibold text-[var(--color-text-primary)]">
-          Incompatible Workspace
-        </h2>
-        <p className="mb-4 text-[var(--color-text-secondary)]">{message}</p>
-        <p className="text-sm text-[var(--color-text-tertiary)]">
-          You can delete this workspace and create a new one, or upgrade xum to use it.
-        </p>
+const IncompatibleWorkspaceView: React.FC<{ message: string; className?: string }> = ({
+  message,
+  className,
+}) => (
+  <div className={cn("flex h-full w-full flex-col items-center justify-center p-8", className)}>
+    <div className="max-w-md text-center">
+      <div className="mb-4 flex justify-center">
+        <AlertTriangle aria-hidden="true" className="text-warning h-10 w-10" />
       </div>
+      <h2 className="mb-2 text-xl font-semibold text-[var(--color-text-primary)]">
+        Incompatible Workspace
+      </h2>
+      <p className="mb-4 text-[var(--color-text-secondary)]">{message}</p>
+      <p className="text-sm text-[var(--color-text-tertiary)]">
+        You can delete this workspace and create a new one, or upgrade xum to use it.
+      </p>
     </div>
   </div>
 );
@@ -62,12 +55,7 @@ export const AIView: React.FC<AIViewProps> = (props) => {
   // Early return for incompatible workspaces - no hooks called in this path
   if (props.incompatibleRuntime) {
     return (
-      <IncompatibleWorkspaceView
-        message={props.incompatibleRuntime}
-        className={props.className}
-        leftSidebarCollapsed={props.leftSidebarCollapsed}
-        onToggleLeftSidebarCollapsed={props.onToggleLeftSidebarCollapsed}
-      />
+      <IncompatibleWorkspaceView message={props.incompatibleRuntime} className={props.className} />
     );
   }
 

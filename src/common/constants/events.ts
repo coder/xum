@@ -157,8 +157,8 @@ export const CUSTOM_EVENTS = {
   EXPAND_RIGHT_SIDEBAR: "mux:expandRightSidebar",
 
   /**
-   * Start a new chat the way the left sidebar's "New chat" button does. Sent by the page header's
-   * stand-in for that button while the sidebar is collapsed; ProjectSidebar stays mounted and owns
+   * Start a new chat the way the left sidebar's "New chat" button does. Sent by the app shell's
+   * toggle bar while the sidebar is collapsed; ProjectSidebar stays mounted and owns
    * the draft logic. No payload.
    */
   NEW_CHAT_REQUESTED: "mux:newChatRequested",

@@ -17,7 +17,6 @@ import * as RealOpenTerminalModule from "@/browser/hooks/useOpenTerminal";
 import * as RealReviewsModule from "@/browser/hooks/useReviews";
 import * as RealConnectionStatusToastModule from "@/browser/components/ConnectionStatusToast/ConnectionStatusToast";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
-import { TooltipProvider } from "../Tooltip/Tooltip";
 
 interface MockWorkspaceState {
   loading?: boolean;
@@ -205,7 +204,6 @@ const defaultProps = {
   workspaceName: "feature-branch",
   namedWorkspacePath: "/projects/demo/workspaces/feature-branch",
   leftSidebarCollapsed: false,
-  onToggleLeftSidebarCollapsed: () => undefined,
 };
 
 describe("estimateWorkspaceShellFallbackWidthPx", () => {
@@ -381,27 +379,6 @@ describe("WorkspaceShell loading placeholders", () => {
     const mains = view.getAllByRole("main");
     expect(mains).toHaveLength(1);
     expect(mains[0].textContent).toContain("Loading workspace...");
-  });
-
-  it("keeps the collapsed left sidebar's reopen control on the loading placeholder", () => {
-    workspaceState = {
-      loading: true,
-      isHydratingTranscript: false,
-    };
-    const onToggle = mock(() => undefined);
-
-    const view = render(
-      <TooltipProvider>
-        <WorkspaceShell
-          {...defaultProps}
-          leftSidebarCollapsed
-          onToggleLeftSidebarCollapsed={onToggle}
-        />
-      </TooltipProvider>
-    );
-
-    fireEvent.click(view.getByRole("button", { name: "Open sidebar menu" }));
-    expect(onToggle).toHaveBeenCalledTimes(1);
   });
 
   // A narrow window with a mouse: the CSS hides the sidebar, but no coarse-pointer query matches.

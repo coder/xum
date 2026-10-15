@@ -1136,7 +1136,7 @@ describe("ProjectSidebar flat chat list", () => {
     });
   });
 
-  // The collapsed sidebar's header New chat and Ctrl+N share one path; on a draft page nothing is
+  // The collapsed sidebar's toggle bar New chat and Ctrl+N share one path; on a draft page nothing is
   // selected, so both open another draft in the page's project.
   describe("New chat without a selected chat", () => {
     function renderOnDraftPage() {
@@ -1167,7 +1167,7 @@ describe("ProjectSidebar flat chat list", () => {
       );
     });
 
-    test("the header's New chat request opens a draft in the draft page's project", () => {
+    test("the toggle bar's New chat request opens a draft in the draft page's project", () => {
       const createWorkspaceDraft = renderOnDraftPage();
       act(() => {
         window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.NEW_CHAT_REQUESTED));

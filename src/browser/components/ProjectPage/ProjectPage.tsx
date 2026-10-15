@@ -35,16 +35,12 @@ import { trimArrayToChars } from "@/browser/utils/boundedPersistedValue";
 import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import {
-  CollapsedSidebarHeaderControls,
-  LEFT_SIDEBAR_TOGGLE_HOST_CLASS,
-} from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
+import { LeftSidebarToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 
 interface ProjectPageProps {
   projectPath: string;
   projectName: string;
   leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
   /** Sub-project path for parent-owned draft creation. */
   pendingSubProjectPath?: string | null;
   /** Draft ID for UI-only workspace creation drafts (from URL) */
@@ -204,7 +200,6 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   projectPath,
   projectName,
   leftSidebarCollapsed,
-  onToggleLeftSidebarCollapsed,
   pendingSubProjectPath,
   pendingDraftId,
   onWorkspaceCreated,
@@ -331,15 +326,14 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
           {/* Draggable header bar - matches WorkspaceMenuBar for consistency */}
           <div
             className={cn(
-              "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2 [@media(max-width:768px)]:h-auto [@media(max-width:768px)]:py-2",
-              // The collapsed left sidebar is zero-width: clear the macOS traffic lights.
-              leftSidebarCollapsed && LEFT_SIDEBAR_TOGGLE_HOST_CLASS,
+              // Same height as the app shell's fixed sidebar toggle bar, which sits over this header
+              // while the sidebar is collapsed.
+              "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2",
+              leftSidebarCollapsed && "pl-0",
               isDesktopMode() ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
             )}
           >
-            {leftSidebarCollapsed && (
-              <CollapsedSidebarHeaderControls onToggle={onToggleLeftSidebarCollapsed} />
-            )}
+            {leftSidebarCollapsed && <LeftSidebarToggleBarSpacer showNewChat />}
           </div>
           {/* Scrollable content area. mobile-header-spacer keeps content below
               the fixed mobile header on touch devices. */}

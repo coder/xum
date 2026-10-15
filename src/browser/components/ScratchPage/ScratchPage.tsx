@@ -7,10 +7,7 @@ import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
 import { CREATION_COLUMN_MAX_WIDTH_CLASS } from "@/constants/layout";
 import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import {
-  CollapsedSidebarHeaderControls,
-  LEFT_SIDEBAR_TOGGLE_HOST_CLASS,
-} from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
+import { LeftSidebarToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
 import { ChatInput } from "@/browser/features/ChatInput";
@@ -24,7 +21,6 @@ import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 
 interface ScratchPageProps {
   leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
   pendingDraftId?: string | null;
   onWorkspaceCreated: (
     metadata: FrontendWorkspaceMetadata,
@@ -85,15 +81,14 @@ export function ScratchPage(props: ScratchPageProps) {
         <main className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
           <div
             className={cn(
-              "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2 [@media(max-width:768px)]:h-auto [@media(max-width:768px)]:py-2",
-              // The collapsed left sidebar is zero-width: clear the macOS traffic lights.
-              props.leftSidebarCollapsed && LEFT_SIDEBAR_TOGGLE_HOST_CLASS,
+              // Same height as the app shell's fixed sidebar toggle bar, which sits over this header
+              // while the sidebar is collapsed.
+              "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2",
+              props.leftSidebarCollapsed && "pl-0",
               isDesktopMode() ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
             )}
           >
-            {props.leftSidebarCollapsed && (
-              <CollapsedSidebarHeaderControls onToggle={props.onToggleLeftSidebarCollapsed} />
-            )}
+            {props.leftSidebarCollapsed && <LeftSidebarToggleBarSpacer showNewChat />}
           </div>
           {/* mobile-header-spacer keeps content below the fixed mobile header on touch devices. */}
           <div className="mobile-header-spacer min-h-0 flex-1 overflow-y-auto">

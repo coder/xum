@@ -83,18 +83,13 @@ export function LeftSidebar(props: LeftSidebarProps) {
           "h-full bg-sidebar border-r border-border flex flex-col shrink-0 overflow-hidden relative z-20",
           !isResizing && "transition-[width] duration-200",
           "mobile-sidebar",
-          // Collapsed, the sidebar is zero-width (no strip, like the right sidebar): page headers
-          // carry the reopen button instead.
+          // Collapsed, the sidebar is zero-width (no strip, like the right sidebar): the app shell's
+          // fixed toggle bar reopens it.
           collapsed && "mobile-sidebar-collapsed border-r-0"
         )}
         style={{ width }}
       >
-        {!collapsed && (
-          <TitleBar
-            onBeforeOpenSettings={handleBeforeOpenSettings}
-            onCollapseSidebar={onToggleCollapsed}
-          />
-        )}
+        {!collapsed && <TitleBar onBeforeOpenSettings={handleBeforeOpenSettings} />}
         <ProjectSidebar
           {...projectSidebarProps}
           collapsed={collapsed}

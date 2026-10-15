@@ -58,10 +58,13 @@ export function firstRunViewHtml(gitDescribe: string): string {
   <div class="h-full">
     <div class="bg-surface-primary h-full">
       <div class="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
+        <div class="left-sidebar-toggle-host titlebar-safe-left titlebar-safe-left-gutter-4 flex shrink-0 items-center gap-1 fixed top-[env(safe-area-inset-top)] left-[env(safe-area-inset-left)] z-[1050] h-8">
+          <button class="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium text-muted hover:text-foreground h-6 w-6 shrink-0 mobile-menu-btn"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-panel-left h-3.5 w-3.5"><rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M9 3v18"></path></svg></button>
+        </div>
         <div class="mobile-overlay fixed inset-0 z-40 hidden before:absolute before:inset-0 before:bg-black/50 before:backdrop-blur-sm" data-pre="e"></div>
         <div class="h-full bg-sidebar border-r border-border flex flex-col shrink-0 overflow-hidden relative z-20 transition-[width] duration-200 mobile-sidebar" style="width:${LEFT_SIDEBAR_DEFAULT_WIDTH_PX}px" data-pre="e">
-          <div class="bg-sidebar border-border-light font-primary text-muted flex shrink-0 items-center justify-between border-b px-4 text-[11px] select-none left-sidebar-toggle-host titlebar-safe-left titlebar-safe-left-gutter-4 h-8">
-            <button class="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium text-muted hover:text-foreground h-6 w-6 shrink-0 mobile-menu-btn"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-panel-left h-3.5 w-3.5"><rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M9 3v18"></path></svg></button>
+          <div class="bg-sidebar border-border-light font-primary text-muted flex shrink-0 items-center justify-between border-b pr-4 text-[11px] select-none [@media(max-width:768px)_and_(pointer:coarse)]:min-h-11 h-8">
+            <div aria-hidden="true" class="left-sidebar-toggle-host titlebar-safe-left titlebar-safe-left-gutter-4 flex shrink-0 items-center gap-1 invisible"><button tabindex="-1" class="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium text-muted hover:text-foreground h-6 w-6 shrink-0 mobile-menu-btn"></button></div>
             <div class="mr-4 ml-2 flex min-w-0 flex-1 items-center gap-2">
               <button type="button" class="flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left text-inherit transition-opacity"><div class="text-content-secondary min-w-0 flex-1 truncate font-normal tracking-wider text-xs" data-pre-version>${version}</div></button>
             </div>
@@ -110,9 +113,6 @@ export function firstRunViewHtml(gitDescribe: string): string {
         <div class="mobile-main-content flex min-w-0 flex-1 flex-col overflow-hidden">
           <div class="mobile-layout flex flex-1 overflow-hidden">
             <div class="bg-surface-primary flex flex-1 flex-col overflow-hidden">
-              <div class="bg-sidebar border-border-light titlebar-safe-left titlebar-safe-left-gutter-4 flex shrink-0 items-center border-b px-4 py-2 " data-pre="c">
-                <button type="button" class="border-border-medium bg-background-secondary text-foreground hover:bg-hover rounded-md border px-3 py-1.5 text-sm transition-colors " aria-label="Open sidebar menu">Open sidebar</button>
-              </div>
               <div class="flex flex-1 items-center justify-center px-6">
                 <p class="text-content-secondary text-sm">Select or add a project to get started.</p>
               </div>

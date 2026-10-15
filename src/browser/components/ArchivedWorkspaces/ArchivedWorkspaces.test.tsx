@@ -89,7 +89,6 @@ function stubPageApi(
 
 const pageProps = {
   leftSidebarCollapsed: false,
-  onToggleLeftSidebarCollapsed: () => undefined,
   onWorkspaceCreated: () => undefined,
 };
 

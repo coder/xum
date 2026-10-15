@@ -391,7 +391,6 @@ const defaultProps: ComponentProps<typeof WorkspaceMenuBarComponent> = {
   namedWorkspacePath: "/projects/demo/workspaces/feature-branch",
   runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
   leftSidebarCollapsed: false,
-  onToggleLeftSidebarCollapsed: () => undefined,
 };
 
 const CONSENT_SWITCH_NAME = /allow messages from unrelated workspaces/i;
@@ -1188,32 +1187,6 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     });
     expect(onOpenSidebar).not.toHaveBeenCalled();
     shell.remove();
-  });
-
-  it("shows the collapsed left sidebar controls and clears the titlebar only while collapsed", () => {
-    const onToggle = mock(() => undefined);
-    const view = render(
-      <WorkspaceMenuBar
-        {...defaultProps}
-        leftSidebarCollapsed
-        onToggleLeftSidebarCollapsed={onToggle}
-      />
-    );
-
-    expect(view.getByTestId("workspace-menu-bar").classList).toContain("titlebar-safe-left");
-    fireEvent.click(view.getByRole("button", { name: "Open sidebar menu" }));
-    expect(onToggle).toHaveBeenCalledTimes(1);
-
-    // The collapsed sidebar's New chat asks the (still mounted) sidebar to start the chat.
-    const onNewChat = mock(() => undefined);
-    window.addEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, onNewChat);
-    fireEvent.click(view.getByRole("button", { name: "New chat" }));
-    window.removeEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, onNewChat);
-    expect(onNewChat).toHaveBeenCalledTimes(1);
-
-    view.rerender(<WorkspaceMenuBar {...defaultProps} leftSidebarCollapsed={false} />);
-    expect(view.getByTestId("workspace-menu-bar").classList).not.toContain("titlebar-safe-left");
-    expect(view.queryByRole("button", { name: "Open sidebar menu" })).toBeNull();
   });
 
   it("opens the archive confirmation modal when preflight finds untracked files", async () => {

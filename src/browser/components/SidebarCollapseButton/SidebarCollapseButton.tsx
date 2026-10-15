@@ -1,5 +1,3 @@
-import React from "react";
-import { flushSync } from "react-dom";
 import { PanelLeft, SquarePen } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
@@ -8,124 +6,112 @@ import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { cn } from "@/common/lib/utils";
 
-/**
- * Hosts of the left sidebar toggle (the sidebar's TitleBar while expanded, page headers while
- * collapsed) share this left padding and the titlebar height, so the icon stays put when the
- * sidebar opens or closes. `left-sidebar-toggle-host` keeps them equal at phone widths too
- * (globals.css).
- */
-export const LEFT_SIDEBAR_TOGGLE_HOST_CLASS =
-  "left-sidebar-toggle-host titlebar-safe-left titlebar-safe-left-gutter-4";
-
-const TOGGLE_SELECTOR = "[data-left-sidebar-toggle]";
-
-/**
- * Props for every control that toggles the left sidebar. Toggling unmounts the pressed control and
- * mounts the one in the other host. After keyboard activation (`detail === 0`: Enter or Space on
- * the focused button), focus moves to that control so it does not fall to the body. Not after a
- * click: focus would open its tooltip under the pointer.
- */
-export function leftSidebarToggleProps(onToggle: () => void) {
-  return {
-    "data-left-sidebar-toggle": "",
-    onClick: (event: React.MouseEvent<HTMLElement>) => {
-      if (event.detail !== 0 || event.currentTarget !== document.activeElement) {
-        onToggle();
-        return;
-      }
-      flushSync(onToggle);
-      document.querySelector<HTMLElement>(TOGGLE_SELECTOR)?.focus({ preventScroll: true });
-    },
-  };
-}
-
+// Shared by the bar and its spacers, so a spacer is exactly as wide as the bar in every layout:
+// the titlebar insets, phone gutters and 44px touch targets (`left-sidebar-toggle-host` and
+// `mobile-menu-btn` in globals.css) all key off these classes.
+const BAR_LAYOUT_CLASS =
+  "left-sidebar-toggle-host titlebar-safe-left titlebar-safe-left-gutter-4 flex shrink-0 items-center gap-1";
 const ICON_BUTTON_CLASS = "text-muted hover:text-foreground h-6 w-6 shrink-0";
+const TOGGLE_BUTTON_CLASS = cn(ICON_BUTTON_CLASS, "mobile-menu-btn");
+const DIVIDER_CLASS = "bg-border-light mx-1.5 h-4 w-px";
 
-interface SidebarCollapseButtonProps {
+interface LeftSidebarToggleBarProps {
   collapsed: boolean;
+  /** Whether the bar offers New chat: only while collapsed and when the page has a target. */
+  showNewChat: boolean;
   onToggle: () => void;
 }
 
-export const SidebarCollapseButton: React.FC<SidebarCollapseButtonProps> = (props) => {
-  const label = props.collapsed ? "Open sidebar" : "Collapse sidebar";
-
+/**
+ * The left sidebar's toggle (and, while it is collapsed, its New chat action). The app shell
+ * mounts it once, fixed at the window's top-left, outside the animated sidebar and the page
+ * headers: it stays put while the sidebar width animates, keeps focus across toggles, and exists
+ * on every page state, including the page loading and failure frames. Headers under it reserve its
+ * width with {@link LeftSidebarToggleBarSpacer}.
+ *
+ * z-[1050]: above sticky page headers (z-50) and the phone sidebar drawer (z-1000), below the
+ * full-screen right sidebar (z-1100) and dialogs (z-1500).
+ */
+export function LeftSidebarToggleBar(props: LeftSidebarToggleBarProps) {
+  const isDesktop = isDesktopMode();
+  const toggleLabel = props.collapsed ? "Open sidebar" : "Collapse sidebar";
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon"
-          {...leftSidebarToggleProps(props.onToggle)}
-          // "menu": at phone widths the collapsed sidebar opens as a drawer.
-          aria-label={props.collapsed ? "Open sidebar menu" : label}
-          className={cn(
-            ICON_BUTTON_CLASS,
-            // Phone-width touch layout of the toggle (globals.css), the same in both hosts.
-            "mobile-menu-btn",
-            isDesktopMode() && "titlebar-no-drag"
-          )}
-        >
-          <PanelLeft className="h-3.5 w-3.5" />
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>
-        {label}
-        <span className="mobile-hide-shortcut-hints">
-          {" "}
-          ({formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)})
-        </span>
-      </TooltipContent>
-    </Tooltip>
+    <div
+      data-testid="left-sidebar-toggle-bar"
+      className={cn(
+        BAR_LAYOUT_CLASS,
+        "fixed top-[env(safe-area-inset-top)] left-[env(safe-area-inset-left)] z-[1050]",
+        isDesktop ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
+      )}
+    >
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={props.onToggle}
+            // "menu": at phone widths the collapsed sidebar opens as a drawer.
+            aria-label={props.collapsed ? "Open sidebar menu" : toggleLabel}
+            className={cn(TOGGLE_BUTTON_CLASS, isDesktop && "titlebar-no-drag")}
+          >
+            <PanelLeft className="h-3.5 w-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>
+          {toggleLabel}
+          <span className="mobile-hide-shortcut-hints">
+            {" "}
+            ({formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)})
+          </span>
+        </TooltipContent>
+      </Tooltip>
+      {props.showNewChat && (
+        <>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                // ProjectSidebar stays mounted while collapsed and owns the draft logic.
+                onClick={() =>
+                  window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.NEW_CHAT_REQUESTED))
+                }
+                aria-label="New chat"
+                className={cn(ICON_BUTTON_CLASS, isDesktop && "titlebar-no-drag")}
+              >
+                <SquarePen className="h-3.5 w-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>
+              New chat
+              <span className="mobile-hide-shortcut-hints">
+                {" "}
+                ({formatKeybind(KEYBINDS.NEW_WORKSPACE)})
+              </span>
+            </TooltipContent>
+          </Tooltip>
+          <div aria-hidden className={DIVIDER_CLASS} />
+        </>
+      )}
+    </div>
   );
-};
+}
 
 /**
- * Page-header controls that stand in for the collapsed left sidebar: its toggle, its "New chat"
- * action, and (with `divider`) a line before the page's own header title.
+ * An invisible, inert copy of {@link LeftSidebarToggleBar} for the header the bar covers (the
+ * sidebar's TitleBar while expanded, the page header while collapsed), so header content starts
+ * after the bar. Real buttons, so the coarse-pointer 44px minimum widens them like the bar's.
  */
-export const CollapsedSidebarHeaderControls: React.FC<{
-  onToggle: () => void;
-  divider?: boolean;
-}> = (props) => (
-  <div className={cn("flex shrink-0 items-center gap-1", isDesktopMode() && "titlebar-no-drag")}>
-    <SidebarCollapseButton collapsed onToggle={props.onToggle} />
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={() => window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.NEW_CHAT_REQUESTED))}
-          aria-label="New chat"
-          className={ICON_BUTTON_CLASS}
-        >
-          <SquarePen className="h-3.5 w-3.5" />
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>
-        New chat
-        <span className="mobile-hide-shortcut-hints">
-          {" "}
-          ({formatKeybind(KEYBINDS.NEW_WORKSPACE)})
-        </span>
-      </TooltipContent>
-    </Tooltip>
-    {props.divider && <div aria-hidden className="bg-border-light mx-1.5 h-4 w-px" />}
-  </div>
-);
-
-/**
- * A header with only those controls, for workspace states without a header of their own (an
- * incompatible workspace, the loading placeholder). The collapsed sidebar has no width, so without
- * it a pointer user could not reopen the sidebar from these states.
- */
-export const CollapsedSidebarHeaderBar: React.FC<{ onToggle: () => void }> = (props) => (
-  <div
-    className={cn(
-      "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2 [@media(max-width:768px)]:h-auto [@media(max-width:768px)]:py-2",
-      LEFT_SIDEBAR_TOGGLE_HOST_CLASS,
-      isDesktopMode() ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
-    )}
-  >
-    <CollapsedSidebarHeaderControls onToggle={props.onToggle} />
-  </div>
-);
+export function LeftSidebarToggleBarSpacer(props: { showNewChat: boolean }) {
+  return (
+    <div aria-hidden className={cn(BAR_LAYOUT_CLASS, "invisible")}>
+      <Button variant="ghost" size="icon" tabIndex={-1} className={TOGGLE_BUTTON_CLASS} />
+      {props.showNewChat && (
+        <>
+          <Button variant="ghost" size="icon" tabIndex={-1} className={ICON_BUTTON_CLASS} />
+          <div className={DIVIDER_CLASS} />
+        </>
+      )}
+    </div>
+  );
+}

@@ -6,7 +6,7 @@ import { useWorkspaceContext, toWorkspaceSelection } from "./contexts/WorkspaceC
 import { useProjectContext } from "./contexts/ProjectContext";
 import type { WorkspaceSelection } from "./components/ProjectSidebar/ProjectSidebar";
 import { LeftSidebar } from "./components/LeftSidebar/LeftSidebar";
-import { leftSidebarToggleProps } from "./components/SidebarCollapseButton/SidebarCollapseButton";
+import { LeftSidebarToggleBar } from "./components/SidebarCollapseButton/SidebarCollapseButton";
 import { ProjectCreateModal } from "./components/ProjectCreateModal/ProjectCreateModal";
 import { MultiProjectWorkspaceCreateModal } from "./components/MultiProjectWorkspaceCreateModal/MultiProjectWorkspaceCreateModal";
 import type * as AIViewModule from "./components/AIView/AIView";
@@ -134,7 +134,6 @@ import assert from "@/common/utils/assert";
 import { createProjectRefs } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import {
   prependInitialAppProxyBasePath,
   stripInitialAppProxyBasePathFromPathname,
@@ -223,29 +222,10 @@ function PageArea(props: { pageKey: string; children: React.ReactNode }) {
   );
 }
 
-function RootRouteShell(props: {
-  leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
-}) {
+function RootRouteShell() {
   return (
     // The page has no chat pane here, so the shell is its one `main` landmark (#5969).
     <main className="bg-surface-primary flex flex-1 flex-col overflow-hidden">
-      {props.leftSidebarCollapsed ? (
-        // titlebar-safe-left: with the sidebar collapsed to zero width, this button is the only
-        // pointer way back, so it must clear the macOS traffic lights.
-        <div
-          className={`bg-sidebar border-border-light titlebar-safe-left titlebar-safe-left-gutter-4 flex shrink-0 items-center border-b px-4 py-2 ${isDesktopMode() ? "titlebar-drag" : ""}`}
-        >
-          <button
-            type="button"
-            {...leftSidebarToggleProps(props.onToggleLeftSidebarCollapsed)}
-            className={`border-border-medium bg-background-secondary text-foreground hover:bg-hover rounded-md border px-3 py-1.5 text-sm transition-colors ${isDesktopMode() ? "titlebar-no-drag" : ""}`}
-            aria-label="Open sidebar menu"
-          >
-            Open sidebar
-          </button>
-        </div>
-      ) : null}
       <div className="flex flex-1 items-center justify-center px-6">
         {/* text-content-secondary, not text-muted: the light theme's muted token is 3.8:1 on this
             surface, below WCAG AA for text-sm (#5948). */}
@@ -1540,6 +1520,13 @@ function AppInner() {
         className="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]"
         ref={appShellRef}
       >
+        <LeftSidebarToggleBar
+          collapsed={sidebarCollapsed}
+          showNewChat={
+            sidebarCollapsed && (selectedWorkspace != null || creationProjectPath != null)
+          }
+          onToggle={handleToggleSidebar}
+        />
         <LeftSidebar
           collapsed={sidebarCollapsed}
           onToggleCollapsed={handleToggleSidebar}
@@ -1591,7 +1578,6 @@ function AppInner() {
                     projectPath={selectedWorkspace.projectPath}
                     projectName={selectedWorkspace.projectName}
                     leftSidebarCollapsed={sidebarCollapsed}
-                    onToggleLeftSidebarCollapsed={handleToggleSidebar}
                     workspaceName={workspaceName}
                     namedWorkspacePath={workspacePath}
                     runtimeConfig={currentMetadata.runtimeConfig}
@@ -1617,15 +1603,11 @@ function AppInner() {
                 // If metadata never hydrated for the routed workspace, avoid trapping the user
                 // on a permanent spinner. Show the same non-blocking root shell while the route
                 // waits for a later retry or manual navigation.
-                <RootRouteShell
-                  leftSidebarCollapsed={sidebarCollapsed}
-                  onToggleLeftSidebarCollapsed={handleToggleSidebar}
-                />
+                <RootRouteShell />
               )
             ) : creationProjectPath === SCRATCH_PROJECT_CONFIG_KEY ? (
               <ScratchPage
                 leftSidebarCollapsed={sidebarCollapsed}
-                onToggleLeftSidebarCollapsed={handleToggleSidebar}
                 pendingDraftId={pendingNewWorkspaceDraftId}
                 onWorkspaceCreated={handleWorkspaceCreated}
               />
@@ -1638,7 +1620,6 @@ function AppInner() {
                   "Project"
                 }
                 leftSidebarCollapsed={sidebarCollapsed}
-                onToggleLeftSidebarCollapsed={handleToggleSidebar}
                 pendingSubProjectPath={pendingNewWorkspaceSubProjectPath}
                 pendingDraftId={pendingNewWorkspaceDraftId}
                 onWorkspaceCreated={handleWorkspaceCreated}
@@ -1647,10 +1628,7 @@ function AppInner() {
               // The dedicated Xum home page was removed. Keep `/` as a minimal shell so
               // WorkspaceContext can redirect it to a concrete project route when possible,
               // without reintroducing a sticky dashboard screen.
-              <RootRouteShell
-                leftSidebarCollapsed={sidebarCollapsed}
-                onToggleLeftSidebarCollapsed={handleToggleSidebar}
-              />
+              <RootRouteShell />
             )}
           </PageArea>
         </div>
