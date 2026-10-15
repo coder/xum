@@ -799,7 +799,11 @@ describe("MCP Apps experiment gate", () => {
       () => approveMcpAppViewDomains(gated, { workspaceId: ws } as never),
     ];
     for (const call of calls) {
-      await expect(call()).rejects.toThrow("MCP Apps views are disabled");
+      const error: unknown = await call().then(
+        () => null,
+        (rejection: unknown) => rejection
+      );
+      expect(error instanceof Error ? error.message : error).toBe("MCP Apps views are disabled");
     }
   });
 });
