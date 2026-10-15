@@ -963,7 +963,9 @@ exit 1
             const failedInitEvent = initEndEvents.find((e) => e.exitCode === 1);
             expect(failedInitEvent).toBeDefined();
 
-            // Clear collector for second message
+            // Clear collector for second message. Keep the init lines for the watchdog first.
+            const initLines = initOutputLines(collector);
+            ctx.initLines = () => initLines;
             collector.clear();
 
             // SECOND MESSAGE: Send another message
