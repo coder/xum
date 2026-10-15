@@ -36,7 +36,7 @@ import { attachModelOnlyToolNotifications } from "@/common/utils/tools/internalT
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import type { HistoryService } from "./historyService";
 import { wrapFetchWithAnthropicCacheControl } from "./providerModelFactory";
-import { mcpToModelOutput } from "./mcpModelOutput";
+import { mcpToModelOutput } from "./mcpClient";
 import { wrapMCPTools } from "./mcpServerManager";
 import { createStreamManagerForTests } from "./streamManager.testHarness";
 import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
