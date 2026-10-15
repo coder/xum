@@ -423,6 +423,86 @@ describe("useWorkspaceName draft state", () => {
     expect(view.result.current.error).toBeNull();
   });
 
+  // The composer stays mounted when another window deletes its draft: a reply that lands before
+  // the emptied message cancels the request must not bring the draft back as a name-only body.
+  test("a name that arrives after another window deleted the draft is dropped", async () => {
+    act(() => getDraftStore().setText(SCOPE, "fix the sidebar"));
+    await getDraftStore().flush(SCOPE);
+    const generation = Promise.withResolvers<Awaited<ReturnType<typeof generateMock>>>();
+    generateMock.mockImplementationOnce(() => generation.promise);
+    renderWorkspaceName("fix the sidebar");
+    await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(1));
+
+    // One act: the reply lands after the delete but before React re-renders and runs effects.
+    await act(async () => {
+      pushEvent({ type: "deleted", scope: SCOPE, revision: ++revision });
+      await waitFor(() => expect(getDraftStore().getView(SCOPE).text).toBe(""));
+      generation.resolve({
+        success: true as const,
+        data: { name: "stale-a1b2", title: "Stale name", modelUsed: "test:model" },
+      });
+      await generation.promise;
+    });
+    expect(getDraftStore().getView(SCOPE).nameState).toBeNull();
+  });
+
+  // A Send click after a reconnect, before its snapshot: the cached draft may be stale, so no
+  // request starts (its reply would replace the backend's newer name once the snapshot is in).
+  test("a submit before a replacement client's snapshot starts no name request", async () => {
+    // Its own mock: after the fix nothing consumes the held reply, which must not reach later tests.
+    const generation = Promise.withResolvers<Awaited<ReturnType<typeof generateMock>>>();
+    const heldGenerate = mock((_input: { draftNamingId?: string }) => generation.promise);
+    const heldApi = createTestApiClient({ nameGeneration: { generate: heldGenerate } });
+    const view = renderHook(
+      () => useWorkspaceName({ message: "fix the sidebar", debounceMs: 60_000, scope: SCOPE }),
+      {
+        wrapper: (props: { children: ReactNode }) => (
+          <APIProvider client={heldApi}>{props.children}</APIProvider>
+        ),
+      }
+    );
+    const backendName = {
+      generatedIdentity: { name: "backend-k3m9", title: "Backend name" },
+      manualName: "",
+      autoGenerate: true,
+      lastGeneratedFor: "fix the sidebar",
+    };
+    const snapshot = Promise.withResolvers<void>();
+    const reconnect = createReconnectClient(backendName);
+    act(() =>
+      getDraftStore().setClient(
+        createTestApiClient({
+          drafts: {
+            ...reconnect.client.drafts,
+            subscribe: async (input: void, opts?: { signal?: AbortSignal }) => {
+              await snapshot.promise;
+              return reconnect.client.drafts.subscribe(input, opts);
+            },
+          },
+        })
+      )
+    );
+    const waited = view.result.current.waitForGeneration();
+
+    await act(async () => {
+      snapshot.resolve();
+      await waitFor(() => expect(getDraftStore().hasCurrentSnapshot()).toBe(true));
+    });
+    await act(async () => {
+      generation.resolve({
+        success: true as const,
+        data: { name: "stale-a1b2", title: "Stale name", modelUsed: "test:model" },
+      });
+      await generation.promise;
+    });
+    await getDraftStore().flush(SCOPE);
+
+    expect(getDraftStore().getView(SCOPE).nameState).toEqual(backendName);
+    expect(await waited).toBeNull();
+    expect(heldGenerate).toHaveBeenCalledTimes(0);
+    expect(view.result.current.name).toBe("backend-k3m9");
+  });
+
   test("another window's name edit replaces the shown name", async () => {
     const view = renderWorkspaceName("");
     act(() => view.result.current.setAutoGenerate(false));
