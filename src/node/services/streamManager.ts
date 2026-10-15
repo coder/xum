@@ -3330,7 +3330,8 @@ export class StreamManager {
         // replay reasoning again. Blocks produced after it are bound to the new prefix and
         // keep replaying (#5279). This applies to every Anthropic Messages thinking mode,
         // not only `between_tools` (which cannot carry blockBinding): only the direct API
-        // route sends `drop_block`, so adaptive/enabled thinking on other routes would 400.
+        // route and anthropic-typed Coder AI Gateway instances send `drop_block`, so
+        // adaptive/enabled thinking on other routes would 400.
         // Claude on Bedrock gets the same strip (#5841): Bedrock cannot take drop_block.
         const toolSetKey = activeTools === undefined ? "" : [...activeTools].sort().join("\n");
         const consumedSwap = stepTracker?.consumedPrefixSwap;
