@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { waitFor, within } from "@storybook/test";
+import { waitFor, within } from "storybook/test";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import {

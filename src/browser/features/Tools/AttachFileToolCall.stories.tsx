@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fireEvent, waitFor, within } from "@storybook/test";
+import { expect, fireEvent, waitFor, within } from "storybook/test";
 import { createDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
 import { AttachFileToolCall } from "@/browser/features/Tools/AttachFileToolCall";
 import { lightweightMeta } from "@/browser/stories/meta.js";

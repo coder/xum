@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fn, userEvent, within } from "@storybook/test";
+import { expect, fn, userEvent, within } from "storybook/test";
 import { NewTabLauncher } from "./NewTabLauncher";
 import { mcpAppEntrypointDescription } from "./AppViewTab/mcpAppEntrypoints";
 import { PIXEL_DISABLED } from "@/browser/stories/meta.js";

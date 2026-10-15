@@ -9,7 +9,7 @@
  * Playwright hover. Under the test runner a missing hook fails the play instead of skipping.
  */
 
-import { expect, waitFor, within } from "@storybook/test";
+import { expect, waitFor, within } from "storybook/test";
 
 import { AgentsInitBanner } from "@/browser/components/AgentsInitBanner/AgentsInitBanner";
 import { Button } from "@/browser/components/Button/Button";
