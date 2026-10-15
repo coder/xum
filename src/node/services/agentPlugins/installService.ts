@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { Dirent } from "node:fs";
+import { constants as fsConstants } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -4309,10 +4310,17 @@ export class AgentPluginInstallService {
   private async readPendingSignOuts(): Promise<string[]> {
     try {
       const file = this.pendingSignOutsFile;
-      // Callers hold the plugin lock: readFile on a FIFO would block the pass and the update.
-      if (!(await fsPromises.stat(file)).isFile())
-        throw new Error(unusableRecordReason({ code: "not a regular file" }, shortenHome(file)));
-      return parsePendingSignOuts(await fsPromises.readFile(file, "utf-8"), file);
+      // Callers hold the plugin lock: a blocking read of a FIFO would hang the pass and the
+      // update. Open without blocking and check the opened file, so a swap between the check
+      // and the read cannot slip a FIFO in.
+      const handle = await fsPromises.open(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+      try {
+        if (!(await handle.stat()).isFile())
+          throw new Error(unusableRecordReason({ code: "not a regular file" }, shortenHome(file)));
+        return parsePendingSignOuts(await handle.readFile("utf-8"), file);
+      } finally {
+        await handle.close();
+      }
     } catch (error) {
       if (hasErrorCode(error, "ENOENT")) return [];
       throw error;
