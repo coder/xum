@@ -523,14 +523,11 @@ function useCloseDiscardedDocumentChannel(
 }
 
 /** The widget state a view document starts with; null before the view loaded. */
-function widgetStateSeedOf(
-  workspaceId: string,
-  loaded: Loaded | null,
-  viewDocument: { nonce: string } | null
-): unknown {
+function widgetStateSeedOf(workspaceId: string, loaded: Loaded | null): unknown {
   if (loaded === null) return null;
-  const target = mcpAppWidgetStateTarget(workspaceId, loaded.toolCallId, loaded.view);
-  return mcpAppWidgetStateSeed(viewDocument, target);
+  return mcpAppWidgetStateSeed(
+    mcpAppWidgetStateTarget(workspaceId, loaded.toolCallId, loaded.view)
+  );
 }
 
 /** Widget states saved while Xum reconnected go out with the new client (mcpAppWidgetState.ts). */
@@ -679,7 +676,7 @@ export function McpAppFrame(props: {
     locale: navigator.language,
     platform: hostPlatform(),
     maxHeight: inline ? inlineMaxHeight() : null,
-    widgetState: widgetStateSeedOf(workspaceId, current, null),
+    widgetState: widgetStateSeedOf(workspaceId, current),
   }));
   const srcDoc = buildMcpAppViewSrcDoc(current, grant, viewDocument);
 

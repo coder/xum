@@ -549,6 +549,10 @@ describe("McpAppFrame", () => {
       params: { state: { step: 3 } },
     });
     await waitFor(() => expect(widgetStateWrites).toHaveLength(1));
+    // The mounted document keeps the seed it was built with: a write does not reload it.
+    expect(openAiSeedOf(first.frame.getAttribute("srcdoc"))).toMatchObject({
+      widgetState: { step: 2 },
+    });
     // The card collapses while the write is in flight, and opens again before it lands. The
     // record still holds step 2, but the new document starts with step 3.
     first.view.unmount();
