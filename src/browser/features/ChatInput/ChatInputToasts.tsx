@@ -130,13 +130,15 @@ export const createErrorToast = (error: SendMessageErrorType): Toast => {
   switch (error.type) {
     case "api_key_not_found": {
       const formatted = formatSendMessageError(error);
-      const setupCopy = getCredentialSetupCopy(error.provider);
+      const { title, message } = getCredentialSetupCopy(error.provider) ?? {
+        title: "API Key Not Found",
+        message: `The ${error.provider} provider requires an API key to function.`,
+      };
       return {
         id: Date.now().toString(),
         type: "error",
-        title: setupCopy?.title ?? "API Key Not Found",
-        message:
-          setupCopy?.message ?? `The ${error.provider} provider requires an API key to function.`,
+        title,
+        message,
         solution: (
           <>
             <SolutionLabel>Fix:</SolutionLabel>
