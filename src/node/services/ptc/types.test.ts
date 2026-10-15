@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { parsePatch } from "diff";
 import { AgentSkillPackageSchema } from "@/common/orpc/schemas/agentSkill";
 import { MAX_FILE_CONTENT_SIZE } from "@/common/constants/attachments";
+import { extractLoadedSkillSnapshotsFromMessages } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import {
   KERNEL_RETAINED_CONTAINER_MAX_PARTS,
   KERNEL_RETAINED_MEDIA_BUDGET_BYTES,
@@ -146,6 +147,69 @@ describe("retainExemptKernelRecordResult", () => {
       ).toBe(true);
       expect(JSON.stringify(retained).length).toBeLessThanOrEqual(MAX_FILE_CONTENT_SIZE);
       expect(AgentSkillPackageSchema.safeParse(retained?.skill).success).toBe(true);
+    });
+  });
+
+  describe("agent_skill_read skill directory", () => {
+    const skill = {
+      scope: "global",
+      directoryName: "demo",
+      frontmatter: { name: "demo", description: "a demo skill" },
+      body: "Run sh ${CLAUDE_SKILL_DIR}/x.sh",
+    };
+
+    /** The snapshot compaction re-injects for a kernel-mode code_execution record. */
+    function reinjectedFirstLine(result: unknown): string | undefined {
+      const retained = retainExemptKernelRecordResult("agent_skill_read", result);
+      const [snapshot] = extractLoadedSkillSnapshotsFromMessages([
+        {
+          id: "kernel",
+          role: "assistant",
+          parts: [
+            {
+              type: "dynamic-tool",
+              toolCallId: "call-kernel",
+              toolName: "code_execution",
+              state: "output-available",
+              input: { code: "..." },
+              output: {
+                success: true,
+                toolCalls: [
+                  { toolName: "agent_skill_read", args: { name: "demo" }, result: retained },
+                ],
+              },
+            },
+          ],
+        },
+      ]);
+      return snapshot?.body.split("\n")[0];
+    }
+
+    it("keeps the location fields that the re-injected snapshot needs (#6704)", () => {
+      const skillDir = "/home/user/.xum/plugins/p/skills/demo";
+      const pluginRoot = "/home/user/.xum/plugins/p";
+      const firstLine = reinjectedFirstLine({ success: true, skill, skillDir, pluginRoot });
+      expect(firstLine).toContain(`\`${skillDir}\``);
+      expect(firstLine).toContain(`\`${pluginRoot}\``);
+      // The off-host reason is kept too (its note is covered in agent_skill_read.test.ts).
+      const reason = "Read its files with agent_skill_read_file.";
+      const retained = retainExemptKernelRecordResult("agent_skill_read", {
+        success: true,
+        skill,
+        skillDirUnavailable: reason,
+      }) as { skillDirUnavailable?: string };
+      expect(retained?.skillDirUnavailable).toBe(reason);
+    });
+
+    it("keeps the location fields when the skill body is truncated at capture", () => {
+      const skillDir = "/home/user/.xum/skills/demo";
+      const retained = retainExemptKernelRecordResult("agent_skill_read", {
+        success: true,
+        skill: { ...skill, body: "B".repeat(MAX_FILE_CONTENT_SIZE) },
+        skillDir,
+      }) as { skillDir?: string };
+      expect(retained?.skillDir).toBe(skillDir);
+      expect(JSON.stringify(retained).length).toBeLessThanOrEqual(MAX_FILE_CONTENT_SIZE);
     });
   });
 
