@@ -16,7 +16,7 @@ import { ensurePrivateDir } from "@/node/utils/fs";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 /**
- * Host-only side store for MCP Apps tool results (artifacts experiment).
+ * Host-only side store for MCP Apps tool results (mcp-apps experiment).
  *
  * A view needs the full CallToolResult (structuredContent and result `_meta`), but the model
  * copy goes through mcpResultTransform, which strips protocol `_meta` and caps sizes so history
@@ -126,6 +126,8 @@ function fileNameFor(toolCallId: string): string {
 
 export class McpAppResultStore {
   private readonly memory = new Map<string, McpAppResultRecord>();
+  /** Changes around each record file a prune deletes: get() caches a read only if none landed. */
+  private prunedCount = 0;
   /** Queues this backend's model-context updates, so superseded ones skip the target lock. */
   private readonly modelContextLock = new AsyncMutex();
   /**
@@ -166,6 +168,18 @@ export class McpAppResultStore {
     }
   }
 
+  /**
+   * Cache a read's record, unless a prune landed since `pruned` (prunedCount before the read): it
+   * may have deleted this record (#6611), and caching it would return it until a restart.
+   */
+  private rememberUnlessPruned(
+    workspaceId: string,
+    record: McpAppResultRecord | null,
+    pruned: number
+  ) {
+    if (record !== null && pruned === this.prunedCount) this.remember(workspaceId, record);
+  }
+
   /** Record a tool result. Never throws: a failed write only means the view opens without it. */
   /** Resolves true once the record is stored (a failure is logged, never thrown). */
   async record(
@@ -188,10 +202,8 @@ export class McpAppResultStore {
       const dir = this.dirFor(workspaceId);
       if (!(await this.writeRecord(workspaceId, dir, record.toolCallId, serialized))) return false;
       // Publish to memory only once the record is durable: a failed write must not leave a
-      // record that opens now but vanishes on restart. Before prune, so a prune failure does
-      // not hide a record that is already on disk.
+      // record that opens now but vanishes on restart.
       this.remember(workspaceId, record);
-      await this.prune(dir);
       return true;
     } catch (error) {
       log.debug("[MCP Apps] Failed to record tool result", { workspaceId, error });
@@ -215,7 +227,15 @@ export class McpAppResultStore {
       if (this.rootDir !== null && (await isWorkspaceRemovalTombstoned(this.rootDir, workspaceId)))
         return false;
       await ensurePrivateDir(dir);
-      await writeFileAtomic(path.join(dir, fileNameFor(toolCallId)), serialized);
+      const name = fileNameFor(toolCallId);
+      await writeFileAtomic(path.join(dir, name), serialized);
+      // Under the same lock (#6611): a concurrent record's prune must not run between this
+      // write and this prune. Best effort: the record is stored, so a failed prune must not make
+      // the caller (openSettingsApp) refuse it. The next record prunes again.
+      // Warn, not debug (#6611): a prune that keeps failing lets the folder grow unseen.
+      await this.prune(workspaceId, dir, name).catch((error: unknown) => {
+        log.warn("[MCP Apps] Failed to prune tool results", { workspaceId, error });
+      });
       return true;
     });
   }
@@ -255,7 +275,11 @@ export class McpAppResultStore {
       // not push a newer view's record out.
       const { atime, mtime } = await fs.stat(filePath);
       await writeFileAtomic(filePath, JSON.stringify(file));
-      await fs.utimes(filePath, atime, mtime);
+      // Best effort: the state is stored. A failed utimes only makes the record look newer to
+      // prune(), and must not skip the cache update below (#6181).
+      await fs.utimes(filePath, atime, mtime).catch((error: unknown) => {
+        log.debug("[MCP Apps] Could not keep the record's age", { workspaceId, error });
+      });
       const { widgetState: _old, ...known } = read.record;
       // Parsed back from its JSON, so memory holds exactly what the file holds.
       return stateJson === null ? known : { ...known, widgetState: file.widgetState };
@@ -296,8 +320,9 @@ export class McpAppResultStore {
       return null;
     }
     // A corrupt or foreign record reads as missing (self-healing), never as an error.
+    const pruned = this.prunedCount;
     const record = await this.readRecord(filePath, toolCallId);
-    if (record) this.remember(workspaceId, record);
+    this.rememberUnlessPruned(workspaceId, record, pruned);
     return record;
   }
 
@@ -409,24 +434,46 @@ export class McpAppResultStore {
     return path.join(path.dirname(this.dirFor(workspaceId)), MCP_APP_MODEL_CONTEXT_FILE);
   }
 
-  private async prune(dir: string) {
+  /**
+   * Drop the oldest records past the cap. Never `keep` (the record just written) and never a file
+   * whose stat fails: its age is unknown, and a record that counts as stored must survive a
+   * restart. Callers hold the session dir's target lock (writeRecord). A dropped record also
+   * leaves the memory cache (#6611), so get() does not return it until a restart.
+   */
+  private async prune(workspaceId: string, dir: string, keep: string) {
     const names = (await fs.readdir(dir)).filter((name) => name.endsWith(".json"));
-    if (names.length <= MCP_APP_RESULT_MAX_PER_WORKSPACE) return;
-    const withTimes = await Promise.all(
-      names.map(async (name) => {
-        try {
-          return { name, mtimeMs: (await fs.stat(path.join(dir, name))).mtimeMs };
-        } catch {
-          return { name, mtimeMs: 0 };
-        }
-      })
+    const excess = names.length - MCP_APP_RESULT_MAX_PER_WORKSPACE;
+    if (excess <= 0) return;
+    const stated = await Promise.all(
+      names
+        .filter((name) => name !== keep)
+        .map(async (name) => {
+          try {
+            return { name, mtimeMs: (await fs.stat(path.join(dir, name))).mtimeMs };
+          } catch {
+            return null;
+          }
+        })
     );
+    const withTimes = stated.filter((entry) => entry !== null);
     withTimes.sort((a, b) => a.mtimeMs - b.mtimeMs);
-    for (const { name } of withTimes.slice(
-      0,
-      withTimes.length - MCP_APP_RESULT_MAX_PER_WORKSPACE
-    )) {
+    for (const { name } of withTimes.slice(0, excess)) {
+      // Counted before and after the delete: a read that overlaps either side skips the cache.
+      this.prunedCount++;
       await fs.rm(path.join(dir, name), { force: true });
+      this.forget(workspaceId, name);
+      this.prunedCount++;
+    }
+  }
+
+  /** Drop the memory cache entry whose record file is `fileName` (at most MEMORY_MAX_ENTRIES). */
+  private forget(workspaceId: string, fileName: string) {
+    for (const [key, record] of this.memory) {
+      if (
+        key === `${workspaceId}\0${record.toolCallId}` &&
+        fileNameFor(record.toolCallId) === fileName
+      )
+        this.memory.delete(key);
     }
   }
 }

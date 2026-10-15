@@ -137,12 +137,36 @@ describe("readPluginMcpPolicy", () => {
     expect(isPluginMcpServerAllowed(server, unreviewed)).toBe(false);
     // Neither does a record for another fingerprint, or a skill record of the same name.
     expect(
-      isPluginMcpServerAllowed(server, await save({ skills: {}, mcpServers: { srv: "x" } }))
+      isPluginMcpServerAllowed(
+        server,
+        await save({
+          skills: {},
+          mcpServers: { srv: "x" },
+          workflows: {},
+          agents: {},
+          slashCommands: {},
+        })
+      )
     ).toBe(false);
     expect(
-      isPluginMcpServerAllowed(server, await save({ skills: { srv: "reviewed" }, mcpServers: {} }))
+      isPluginMcpServerAllowed(
+        server,
+        await save({
+          skills: { srv: "reviewed" },
+          mcpServers: {},
+          workflows: {},
+          agents: {},
+          slashCommands: {},
+        })
+      )
     ).toBe(false);
-    const reviewed = await save({ skills: {}, mcpServers: { srv: "reviewed" } });
+    const reviewed = await save({
+      skills: {},
+      mcpServers: { srv: "reviewed" },
+      workflows: {},
+      agents: {},
+      slashCommands: {},
+    });
     expect(isPluginMcpServerAllowed(server, reviewed)).toBe(true);
     // A consent change is a policy change, so running clients are rechecked.
     expect(reviewed).not.toEqual(unreviewed);

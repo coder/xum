@@ -42,9 +42,18 @@ function createClient(service: DraftService) {
     failDeletes: 0,
     failGets: 0,
     updateGate: null as Promise<void> | null,
+    /** Holds an update's reply after the service applied it (and pushed its change event). */
+    updateReplyGate: null as Promise<void> | null,
     getGate: null as Promise<void> | null,
     subscribeGate: null as Promise<void> | null,
+    /** Holds the legacy import that follows a snapshot. */
+    importGate: null as Promise<void> | null,
+    imports: 0,
     updates: 0,
+    /** Snapshots the store finished handling (it asks for the next event only after that). */
+    snapshotsHandled: 0,
+    /** Change events (not snapshots) the store finished handling. */
+    changesHandled: 0,
   };
   const drafts = {
     list: () => service.list(),
@@ -63,7 +72,9 @@ function createClient(service: DraftService) {
         control.failUpdates--;
         throw new Error("update failed");
       }
-      return service.update(input);
+      const reply = await service.update(input);
+      await control.updateReplyGate;
+      return reply;
     },
     delete: async ({ scope }: { scope: DraftScope }) => {
       if (control.failDeletes > 0) {
@@ -73,6 +84,8 @@ function createClient(service: DraftService) {
       return service.delete(scope);
     },
     importLegacy: async (input: Parameters<DraftService["importLegacy"]>[0]) => {
+      control.imports++;
+      await control.importGate;
       if (control.failImports > 0) {
         control.failImports--;
         throw new Error("import failed");
@@ -95,6 +108,8 @@ function createClient(service: DraftService) {
             const next = queue.shift();
             if (next) {
               yield next;
+              if (next.type === "snapshot") control.snapshotsHandled++;
+              else control.changesHandled++;
               continue;
             }
             await new Promise<void>((resolve) => {
@@ -136,6 +151,8 @@ async function waitFor(
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** The message `flush` rejects with, or "" when it resolves. */
 function flushError(store: DraftStore): Promise<string> {
@@ -380,6 +397,63 @@ describe("DraftStore", () => {
     await waitFor(async () => (await service.get(scope)).text === "");
   });
 
+  test("a delete that waits for a write still deletes when that write's change event arrives first", async () => {
+    using tempDir = new TestTempDir("draft-store-delete-echo");
+    const { service, client, control } = await createHarness(tempDir);
+    const scope = WS_SCOPE;
+    const store = createStore(client);
+    await store.whenReady();
+    let releaseUpdate: () => void = () => undefined;
+    control.updateGate = new Promise<void>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let releaseReply: () => void = () => undefined;
+    control.updateReplyGate = new Promise<void>((resolve) => {
+      releaseReply = resolve;
+    });
+    store.setText(scope, "typed");
+    const written = store.flush(scope);
+    await waitFor(() => control.updates > 0);
+    // The draft is deleted while its write is in flight, so the delete waits for that write.
+    const deleted = store.deleteDraft(scope);
+    const changesBefore = control.changesHandled;
+    releaseUpdate();
+    // The write lands, and the store handles its change event before the write's reply.
+    await waitFor(() => control.changesHandled > changesBefore);
+    releaseReply();
+    await written;
+    await deleted;
+    expect((await service.get(scope)).text).toBe("");
+    expect(store.getText(scope)).toBe("");
+  });
+
+  test("an edit during a waiting delete replaces the whole stored draft", async () => {
+    using tempDir = new TestTempDir("draft-store-delete-wait-edit");
+    const { service, client, control } = await createHarness(tempDir);
+    const scope = WS_SCOPE;
+    const store = createStore(client);
+    await store.whenReady();
+    let releaseReply: () => void = () => undefined;
+    control.updateReplyGate = new Promise<void>((resolve) => {
+      releaseReply = resolve;
+    });
+    store.setText(scope, "typed");
+    const written = store.flush(scope);
+    await waitFor(async () => (await service.get(scope)).text === "typed");
+    const deleted = store.deleteDraft(scope);
+    // The user adds an attachment while the delete waits: the draft is live again, without text.
+    store.setAttachments(scope, [image]);
+    releaseReply();
+    await written;
+    await deleted;
+    control.updateReplyGate = null;
+    await store.flush(scope);
+    const stored = await service.get(scope);
+    expect(stored.text).toBe("");
+    expect(stored.attachments.map(({ id }) => id)).toEqual([image.id]);
+    expect(store.getText(scope)).toBe("");
+  });
+
   test("becomes ready without a snapshot, and a late snapshot keeps typed text", async () => {
     using tempDir = new TestTempDir("draft-store-ready-timeout");
     const { service, client, control } = await createHarness(tempDir);
@@ -572,7 +646,8 @@ describe("DraftStore", () => {
     }
     const next = createClient(service);
     store.setClient(next.client);
-    await waitFor(() => next.control.updates === 0 && store.isHydrated());
+    await waitFor(() => next.control.snapshotsHandled > 0);
+    expect(next.control.updates).toBe(0);
 
     store.setText(WS_SCOPE, "typed after the switch");
     await store.flush(WS_SCOPE);
@@ -581,10 +656,13 @@ describe("DraftStore", () => {
     expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
   });
 
-  // #6438, review round 3: an edit saved to a new backend before its snapshot arrived. That
-  // reply was compared with the old backend's view, lost to it, and the old text came back. Each
-  // subscription start forgets the old views, so the reply is taken as it comes.
-  test("an edit saved to a new backend before its snapshot keeps the typed text", async () => {
+  // #6438, review round 3, #6542 and #6748: an edit saved to a new backend before its snapshot
+  // was compared with the old backend's view, lost to it, and the old text came back; and the
+  // write went to a backend whose drafts the store had not seen. Then (#6748) a save in that
+  // window was refused, because readiness was the first client's: a fork right after a reconnect
+  // copied the draft without the latest text. Now whenReady and the save wait for the new
+  // client's snapshot, as on a cold start, and the edit is saved once.
+  test("an edit waits for a new backend's snapshot before it is saved, and keeps the typed text", async () => {
     using tempDir = new TestTempDir("draft-store-new-backend-early-write");
     const { config, client } = await createHarness(tempDir);
     const store = createStore(client);
@@ -607,20 +685,126 @@ describe("DraftStore", () => {
     });
     store.setClient(next.client);
 
+    let ready = false;
+    const readiness = store.whenReady().then(() => (ready = true));
     store.setText(WS_SCOPE, "typed after the switch");
-    await store.flush(WS_SCOPE);
-    expect(next.control.updates).toBeGreaterThan(0);
+    const saving = flushError(store);
+    await sleep(50);
+    expect(ready).toBe(false);
+    expect(next.control.updates).toBe(0);
     expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
+    // Other readers still see the drafts as loaded (the WorkspaceContext draft GC).
+    expect(store.isHydrated()).toBe(true);
 
     releaseSnapshot();
-    await waitFor(() => store.isHydrated());
-    await store.flush(WS_SCOPE);
+    expect(await saving).toBe("");
+    await readiness;
+    expect(next.control.updates).toBe(1);
     expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
     expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
+    // Saved once: the snapshot's own save of unsaved edits finds nothing left to write.
+    await sleep(400);
+    expect(next.control.updates).toBe(1);
     store.setText(WS_SCOPE, "typed later");
     await store.flush(WS_SCOPE);
     expect(store.getText(WS_SCOPE)).toBe("typed later");
     expect((await service.get(WS_SCOPE)).text).toBe("typed later");
+  });
+
+  // #6542: the old subscription's run resumed after its legacy import and opened writes for the
+  // client after it, so an edit reached the new backend before that backend's snapshot.
+  test("a client swap during the old subscription's legacy import keeps writes off the new backend", async () => {
+    using oldDir = new TestTempDir("draft-store-swap-during-import");
+    using newDir = new TestTempDir("draft-store-swap-target");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    // A reconnect whose snapshot is followed by an older build's workspace draft import.
+    seedLegacyKey(getInputKey(WS), "legacy text");
+    let releaseImport: () => void = () => undefined;
+    old.control.importGate = new Promise<void>((resolve) => {
+      releaseImport = resolve;
+    });
+    store.setClient(null);
+    store.setClient(old.client);
+    await waitFor(() => old.control.imports > 0);
+    store.setText(WS_SCOPE, "typed during the import");
+
+    const next = await createHarness(newDir);
+    let releaseSnapshot: () => void = () => undefined;
+    next.control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(next.client);
+    releaseImport();
+    // The old run resumes after its import (it removes the legacy key once the backend took the
+    // draft); it must not open writes for the new client.
+    await waitFor(() => listPersistedKeys(getInputKey(WS)).length === 0);
+    const saving = flushError(store);
+    await sleep(50);
+    expect(next.control.updates).toBe(0);
+
+    releaseSnapshot();
+    expect(await saving).toBe("");
+    expect((await next.service.get(WS_SCOPE)).text).toBe("typed during the import");
+  });
+
+  // #6748: a save waiting for a reconnect's snapshot follows a further client change, and gives up
+  // only when the client is removed. The typed text stays either way.
+  test("a save waiting for a reconnect follows the next client, and rejects when the client is removed", async () => {
+    using oldDir = new TestTempDir("draft-store-wait-old");
+    using midDir = new TestTempDir("draft-store-wait-mid");
+    using newDir = new TestTempDir("draft-store-wait-new");
+    using laterDir = new TestTempDir("draft-store-wait-later");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    const mid = await createHarness(midDir);
+    mid.control.subscribeGate = new Promise<void>(() => undefined);
+    store.setClient(mid.client);
+    store.setText(WS_SCOPE, "typed during two reconnects");
+    const saving = flushError(store);
+
+    const next = await createHarness(newDir);
+    store.setClient(next.client);
+    expect(await saving).toBe("");
+    expect((await next.service.get(WS_SCOPE)).text).toBe("typed during two reconnects");
+    expect(mid.control.updates).toBe(0);
+
+    const later = await createHarness(laterDir);
+    later.control.subscribeGate = new Promise<void>(() => undefined);
+    store.setClient(later.client);
+    store.setText(WS_SCOPE, "typed before a disconnect");
+    const refused = flushError(store);
+    store.setClient(null);
+    expect(await refused).toContain("not connected");
+    expect(store.getText(WS_SCOPE)).toBe("typed before a disconnect");
+  });
+
+  // #6753 review: the save waited for the snapshot with the entry from before the wait. A delete
+  // and a new edit meanwhile replaced it, so the save resolved without writing the new text.
+  test("a save waiting for a reconnect writes the draft edited again after a delete", async () => {
+    using oldDir = new TestTempDir("draft-store-wait-replaced-old");
+    using newDir = new TestTempDir("draft-store-wait-replaced-new");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "saved on the old backend");
+    await store.flush(WS_SCOPE);
+
+    const next = await createHarness(newDir);
+    let releaseSnapshot: () => void = () => undefined;
+    next.control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(next.client);
+    const saving = flushError(store);
+    await store.deleteDraft(WS_SCOPE);
+    store.setText(WS_SCOPE, "typed after the delete");
+
+    releaseSnapshot();
+    expect(await saving).toBe("");
+    expect((await next.service.get(WS_SCOPE)).text).toBe("typed after the delete");
   });
 
   // #6438: forgetting the views on a reconnect must not touch what the composer shows.
@@ -638,11 +822,12 @@ describe("DraftStore", () => {
     control.subscribeGate = new Promise<void>((resolve) => {
       releaseSnapshot = resolve;
     });
+    const handled = control.snapshotsHandled;
     store.setClient(client);
     const view = store.getView(WS_SCOPE);
     expect([view.text, view.attachments.map(({ id }) => id)]).toEqual(["saved text", ["img-1"]]);
     releaseSnapshot();
-    await waitFor(() => store.isHydrated());
+    await waitFor(() => control.snapshotsHandled > handled);
     expect(store.getText(WS_SCOPE)).toBe("saved text");
   });
 
@@ -658,10 +843,11 @@ describe("DraftStore", () => {
     control.failUpdates = 100;
     store.setText(WS_SCOPE, "unsaved typing");
     expect(await flushError(store)).toContain("update failed");
+    const handled = control.snapshotsHandled;
     store.setClient(null);
     store.setClient(client);
     // The snapshot still holds the saved text.
-    await waitFor(() => store.isHydrated());
+    await waitFor(() => control.snapshotsHandled > handled);
     expect(store.getText(WS_SCOPE)).toBe("unsaved typing");
     control.failUpdates = 0;
     await store.flush(WS_SCOPE);
@@ -691,11 +877,12 @@ describe("DraftStore", () => {
       releaseSnapshot = resolve;
     });
     store.setClient(next.client);
-    // The old backend answers before the new one's snapshot.
+    // The old backend answers before the new one's snapshot: nothing is written there yet.
     release();
     await inFlight;
+    expect(next.control.updates).toBe(0);
     releaseSnapshot();
-    await waitFor(() => store.isHydrated());
+    await waitFor(() => next.control.snapshotsHandled > 0);
     await store.flush(WS_SCOPE);
     expect((await next.service.get(WS_SCOPE)).text).toBe("typed during the switch");
 

@@ -16,12 +16,16 @@
  * notifications passively. The shim sends its own ui/initialize only when the view first uses
  * `window.openai` and no handshake was seen yet, so a standard-only view gets no extra
  * handshake. A widget that only listens for `openai:set_globals` never reads a global, so the
- * shim also connects once the page loaded, if no client did by then.
+ * shim also connects once the page loaded, if no client did by then. So a standard view whose
+ * client connects only after load gets the shim's handshake first, and its client the replay
+ * below.
  * The host sends the tool lifecycle (tool-input, tool-result or tool-cancelled) once per frame.
  * If the view's own client connects after the shim, the shim replays to it, in this page, the
  * lifecycle messages that arrived before that client sent its ui/initialize: the client's
  * listener is in place from then on (the ext-apps SDK starts its transport before it sends
- * initialize), so it gets every later message from the host itself. The shim sees that moment
+ * initialize), so it gets every later message from the host itself. When that initialize falls
+ * inside the lifecycle (after tool-input, before tool-result), the later messages wait for the
+ * replay of the earlier ones, so the client still gets them in order. The shim sees that moment
  * because it wraps `window.parent.postMessage` (the document's port, mcpAppDocumentChannel.ts).
  * Each lifecycle message is cached as a copy, so a widget that mutates its globals does not
  * change what its client is replayed. The shim leaves teardown replies to that client.
@@ -98,6 +102,11 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
   // lifecycle.length when the view's own client sent its ui/initialize; null before that.
   var clientBoundary = null;
   var replaying = false;
+  // Lifecycle messages that arrived live after the client's ui/initialize, while the replay of
+  // the earlier ones was still due: held back from the client and replayed after them, so it
+  // never gets tool-result before tool-input (#6181).
+  var heldForReplay = [];
+  var replayed = false;
   var warned = {};
   var globals = {
     theme: "light",
@@ -196,8 +205,9 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
     if (messages.length === 0) return;
     setTimer(function () {
       replaying = true;
+      replayed = true;
       try {
-        messages.forEach(function (message) {
+        messages.concat(heldForReplay).forEach(function (message) {
           dispatch(new MessageEventCtor("message", {
             data: copy(message.data),
             origin: message.origin,
@@ -206,8 +216,14 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
         });
       } finally {
         replaying = false;
+        heldForReplay = [];
       }
     }, 0);
+  }
+  // A replay is due: the shim's handshake took the lifecycle, and the view's client sent its
+  // ui/initialize after part of it arrived.
+  function replayDue() {
+    return ownHandshake && !replayed && clientBoundary !== null && clientBoundary > 0;
   }
 
   window.addEventListener("message", function (event) {
@@ -236,7 +252,14 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
       data.method === "ui/notifications/tool-result" ||
       data.method === "ui/notifications/tool-cancelled"
     ) {
-      lifecycle.push({ data: copy(data), origin: event.origin });
+      var cached = { data: copy(data), origin: event.origin };
+      lifecycle.push(cached);
+      // The shim's listener runs before the view's (its script comes first): the client's
+      // listener does not see this one now, only in the replay, after the earlier messages.
+      if (replayDue()) {
+        heldForReplay.push(cached);
+        event.stopImmediatePropagation();
+      }
     }
     switch (data.method) {
       case "ui/notifications/tool-input":

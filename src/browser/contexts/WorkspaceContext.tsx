@@ -1,4 +1,8 @@
 import {
+  forgetSettingsToolRuns,
+  forgetSettingsToolRunsExcept,
+} from "@/browser/components/WorkspaceMCPModal/settingsToolRuns";
+import {
   createContext,
   useCallback,
   useContext,
@@ -880,6 +884,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             arrivals.lastSnapshot = arrivals.count;
             arrivals.lastByWorkspaceId.clear();
             setWorkspaceMetadata(buildActiveWorkspaceMetadataMap(event.workspaces));
+            forgetSettingsToolRunsExcept(new Set(event.workspaces.map((w) => w.id)));
             setLoaded(true);
             setLoadError(null);
             if (!snapshotApplied) {
@@ -971,6 +976,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             deleteWorkspaceStorage(event.workspaceId);
             getReviewStateStore().removeWorkspace(event.workspaceId);
             getDraftStore().forgetWorkspace(event.workspaceId);
+            forgetSettingsToolRuns(event.workspaceId);
 
             // Navigate away only if the deleted workspace was selected
             const currentSelection = selectedWorkspaceRef.current;
@@ -1100,6 +1106,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           deleteWorkspaceStorage(workspaceId);
           getReviewStateStore().removeWorkspace(workspaceId);
           getDraftStore().forgetWorkspace(workspaceId);
+          forgetSettingsToolRuns(workspaceId);
 
           // Optimistically remove from the local metadata map so the sidebar updates immediately.
           // Relying on the metadata subscription can leave the item visible until the next refresh.

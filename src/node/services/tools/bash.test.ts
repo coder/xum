@@ -6,6 +6,7 @@ import type { BashOutputEvent } from "@/common/types/stream";
 import type { ProjectRef } from "@/common/types/workspace";
 import type { BashToolArgs, BashToolResult } from "@/common/types/tools";
 import { BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
+import { shellQuote } from "@/common/utils/shell";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import * as path from "path";
 import * as fs from "fs";
@@ -2251,6 +2252,152 @@ describe("bash tool - background execution", () => {
     await manager.terminateAll();
     fs.rmSync(`/tmp/mux-bashes/${workspaceId}`, { recursive: true, force: true });
     tempDir[Symbol.dispose]();
+  });
+
+  describe("live queued-message backgrounding", () => {
+    it.each([
+      { phase: "running", emitEvents: true, backgrounds: true },
+      { phase: "running", emitEvents: false, backgrounds: true },
+      { phase: "preparation", emitEvents: true, backgrounds: true },
+      { phase: "registration", emitEvents: true, backgrounds: true },
+      { phase: "never", emitEvents: true, backgrounds: false },
+      { phase: "withdrawn", emitEvents: true, backgrounds: false },
+    ] as const)(
+      "$phase (chat events: $emitEvents)",
+      async ({ phase, emitEvents, backgrounds }) => {
+        using tempDir = new TestTempDir("test-bash-live-queue");
+        const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+        const config = createTestToolConfig(tempDir.path);
+        config.backgroundProcessManager = manager;
+        if (emitEvents) config.emitChatEvent = () => undefined;
+
+        const processReady = Promise.withResolvers<void>();
+        const sampledWhileReady = Promise.withResolvers<void>();
+        let runtimeReady = false;
+        let queued = phase === "preparation" || phase === "withdrawn";
+        const dispatchModes: Array<"tool-end" | "turn-end" | undefined> = [];
+        config.hasQueuedMessages = (dispatchMode?: "tool-end" | "turn-end") => {
+          dispatchModes.push(dispatchMode);
+          if (runtimeReady) sampledWhileReady.resolve();
+          return queued;
+        };
+
+        // Publish/withdraw the live decision before registration is ready, without notifying
+        // the manager. A withdrawn preparation-time decision must not become a pending flag.
+        const register = manager.registerForegroundProcess.bind(manager);
+        const registrationSpy = spyOn(manager, "registerForegroundProcess").mockImplementation(
+          (...args) => {
+            if (phase === "registration") queued = true;
+            if (phase === "withdrawn") queued = false;
+            return register(...args);
+          }
+        );
+
+        // Keep the actual runtime/manager: wait for the process to install its completion
+        // watcher before returning its real ExecStream. No sleeps or exit-grace coordination.
+        const exec = config.runtime.exec.bind(config.runtime);
+        const execSpy = spyOn(config.runtime, "exec").mockImplementation(
+          async (script, options) => {
+            const stream = await exec(script, options);
+            const reader = stream.stdout.getReader();
+            try {
+              if ((await reader.read()).done) throw new Error("Process exited before readiness");
+            } finally {
+              reader.releaseLock();
+            }
+            runtimeReady = true;
+            processReady.resolve();
+            return stream;
+          }
+        );
+
+        const completionFile = path.join(tempDir.path, "complete");
+        const scriptFile = path.join(tempDir.path, "gated.cjs");
+        fs.writeFileSync(completionFile, "");
+        fs.writeFileSync(
+          scriptFile,
+          `const fs = require("node:fs");
+const completionFile = ${JSON.stringify(completionFile)};
+const watcher = fs.watch(completionFile, () => {
+  if (fs.readFileSync(completionFile, "utf8") !== "complete") return;
+  watcher.close();
+  console.log("done");
+  process.exitCode = 3;
+});
+console.log("ready");
+`
+        );
+        const abortController = new AbortController();
+        let settled = false;
+        const resultPromise = (
+          createBashTool(config).execute!(
+            {
+              script: `${shellQuote(process.execPath)} ${shellQuote(scriptFile)}`,
+              timeout_secs: 10,
+              run_in_background: false,
+              display_name: "live-queue",
+            },
+            {
+              ...mockToolCallOptions,
+              abortSignal: AbortSignal.any([abortController.signal, AbortSignal.timeout(5000)]),
+            }
+          ) as Promise<BashToolResult>
+        ).then((result) => {
+          settled = true;
+          return result;
+        });
+        const waitForSignal = (signal: Promise<void>) =>
+          Promise.race([signal.then(() => true), resultPromise.then(() => false)]);
+
+        try {
+          expect(await waitForSignal(processReady.promise)).toBe(true);
+          // Already-true decisions can background immediately on registration; the other
+          // cases must observe the live interval while the actual process is still running.
+          if (phase === "running" || !backgrounds) {
+            expect(await waitForSignal(sampledWhileReady.promise)).toBe(true);
+          }
+
+          if (phase === "running") {
+            expect(settled).toBe(false);
+            // A live decision can change without any new enqueue event (e.g. compaction ends).
+            queued = true;
+          }
+
+          if (backgrounds) {
+            const result = await resultPromise;
+            expect(result.success).toBe(true);
+            if (!(result.success && "backgroundProcessId" in result)) {
+              throw new Error("Expected the running Bash process to background");
+            }
+            const running = await manager.list(config.workspaceId);
+            expect(running).toHaveLength(1);
+            expect(running[0]).toMatchObject({ id: result.backgroundProcessId, status: "running" });
+            expect(manager.getForegroundToolCallIds(config.workspaceId!)).toEqual([]);
+          } else {
+            // A false/withdrawn live decision must leave Bash waiting on the actual process.
+            expect(settled).toBe(false);
+            expect(manager.getForegroundToolCallIds(config.workspaceId!)).toEqual([
+              mockToolCallOptions.toolCallId,
+            ]);
+            expect(await manager.list(config.workspaceId)).toEqual([]);
+            fs.writeFileSync(completionFile, "complete");
+            const result = await resultPromise;
+            // A nonzero process exit stays a foreground failure, not a successful background task.
+            expect(result).toMatchObject({ success: false, exitCode: 3, output: "done" });
+            expect(manager.getForegroundToolCallIds(config.workspaceId!)).toEqual([]);
+          }
+          expect(dispatchModes.length).toBeGreaterThan(0);
+          expect(dispatchModes.every((mode) => mode === "tool-end")).toBe(true);
+        } finally {
+          abortController.abort();
+          await resultPromise.catch(() => undefined);
+          await manager.cleanup(config.workspaceId!);
+          execSpy.mockRestore();
+          registrationSpy.mockRestore();
+        }
+      },
+      15000
+    );
   });
 
   it("terminates the process and fails when foreground-to-background migration fails", async () => {

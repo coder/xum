@@ -180,7 +180,6 @@ describe("ProjectPage", () => {
       projectPath: "/projects/demo",
       projectName: "demo",
       leftSidebarCollapsed: true,
-      onToggleLeftSidebarCollapsed: () => undefined,
       onWorkspaceCreated: () => undefined,
     };
 

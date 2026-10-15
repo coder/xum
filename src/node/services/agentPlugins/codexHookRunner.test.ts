@@ -864,7 +864,7 @@ describe("UserPromptSubmit and Stop", () => {
         lastAssistantMessage: "done",
         stopHookActive: false,
       })
-    ).toEqual({ kind: "none" });
+    ).toEqual({ kind: "halted" });
     expect(notices).toEqual(["Tests are red; stopping."]);
   });
 
@@ -975,7 +975,7 @@ describe("UserPromptSubmit and Stop", () => {
           ? json({ decision: "block", reason: "Run the tests again." })
           : { structuredContent: { continue: false } }
     );
-    expect(await runTurnStopHooks(halt.spine, workspaceId, input)).toEqual({ kind: "none" });
+    expect(await runTurnStopHooks(halt.spine, workspaceId, input)).toEqual({ kind: "halted" });
   });
 
   test("UserPromptSubmit: a block without a reason fails open (Codex), continue false still blocks", async () => {
@@ -1020,7 +1020,7 @@ describe("UserPromptSubmit and Stop", () => {
         lastAssistantMessage: "done",
         stopHookActive: false,
       })
-    ).toEqual({ kind: "none" });
+    ).toEqual({ kind: "halted" });
   });
 
   test("hooks that cannot run are never called", async () => {

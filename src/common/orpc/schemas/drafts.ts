@@ -184,11 +184,14 @@ export const DraftBeginSendInputSchema = z.object({
    */
   text: z.string().optional(),
   /**
-   * #6405: the sender's visible text, the sent text followed only by keys typed after Enter. When
-   * the backend's visible text (after `text` is merged in) is exactly this, it takes exactly the
-   * sent prefix (takeSentText). Otherwise only the whitespace rule applies.
+   * #6405, #6585: how the sender took the sent text (takeSentText with what it saw since Enter),
+   * from its visible text `from`, or `text` when `from` is absent (one copy of the text per
+   * request). The backend repeats that take only when its visible text (after `text` is merged
+   * in) is exactly that text. Otherwise it applies the whitespace rule (removeSentText).
    */
-  typedAfterSendText: z.string().optional(),
+  localTake: z
+    .object({ kind: z.enum(["typed-after", "edited"]), from: z.string().optional() })
+    .optional(),
   /** As for drafts.update: the pending sends the sender's unsaved text was written against. */
   basisSends: z.array(BasisSendSchema).max(1000).optional(),
 });
@@ -362,6 +365,7 @@ export type BasisSend = z.infer<typeof BasisSendSchema>;
 export type DraftWriteOutput = z.infer<typeof DraftWriteOutputSchema>;
 export type PendingSend = z.infer<typeof PendingSendSchema>;
 export type DraftBeginSendInput = z.infer<typeof DraftBeginSendInputSchema>;
+export type LocalTake = NonNullable<DraftBeginSendInput["localTake"]>;
 export type DraftSetSendReceiverInput = z.infer<typeof DraftSetSendReceiverInputSchema>;
 export type DraftResolveSendsInput = z.infer<typeof DraftResolveSendsInputSchema>;
 export type DraftResolveSendsOutput = z.infer<typeof DraftResolveSendsOutputSchema>;

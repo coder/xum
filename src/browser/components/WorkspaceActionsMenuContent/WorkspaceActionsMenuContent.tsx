@@ -252,7 +252,11 @@ function useRowShortcutKeys(
   }, [rootRef]);
 }
 
-/** The key comes from the popover around the menu (Radix PopoverContent, role dialog). */
+/**
+ * The key comes from the popover around the menu (Radix PopoverContent, role dialog). Both
+ * callers mount the menu inside one. Without a dialog around it, only keys from the menu's own
+ * root count: the narrower scope, so keys elsewhere keep their global meaning.
+ */
 function isInMenuPopover(root: HTMLElement, target: EventTarget | null): boolean {
   const popover = root.closest('[role="dialog"]') ?? root;
   return target instanceof Node && popover.contains(target);

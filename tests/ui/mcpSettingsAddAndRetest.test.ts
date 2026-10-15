@@ -1,6 +1,6 @@
 import "./dom";
 import { createServer, type Server, type ServerResponse } from "http";
-import { fireEvent, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, waitFor, within } from "@testing-library/react";
 import type { BoundFunctions, queries } from "@testing-library/react";
 import { shouldRunIntegrationTests } from "../testUtils";
 import { preloadTestModules } from "../ipc/setup";
@@ -209,7 +209,8 @@ describeIntegration("MCP settings add and re-test", () => {
       .spyOn(service, "startServerFlowForApi")
       .mockImplementation(async () => {
         await startReleased;
-        return { success: false, error: "stopped by test" };
+        // What the backend answers for a flow cancelled while it started.
+        return { success: false, error: "OAuth flow cancelled" };
       });
     const cancelServerFlow = jest.spyOn(service, "cancelServerFlow");
 
@@ -242,6 +243,20 @@ describeIntegration("MCP settings add and re-test", () => {
       await waitFor(() => expect(cancelServerFlow).toHaveBeenCalledWith(startedId), {
         timeout: 10000,
       });
+
+      // The start's late answer belongs to the cancelled attempt: the row is idle again.
+      releaseStart();
+      await within(loginRow.parentElement!).findByRole(
+        "button",
+        { name: "Login via OAuth" },
+        { timeout: 10000 }
+      );
+      // Let the component handle the late answer before the negative checks.
+      await act(async () => {
+        await startServerFlow.mock.results[0]?.value;
+      });
+      expect(within(loginRow.parentElement!).queryByText(/OAuth error/)).toBeNull();
+      expect(within(loginRow.parentElement!).queryByRole("button", { name: "Cancel" })).toBeNull();
     } finally {
       releaseStart();
       startServerFlow.mockRestore();

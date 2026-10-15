@@ -36,7 +36,11 @@ import { attachModelOnlyToolNotifications } from "@/common/utils/tools/internalT
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import type { HistoryService } from "./historyService";
 import { wrapFetchWithAnthropicCacheControl } from "./providerModelFactory";
+import { mcpToModelOutput } from "./mcpClient";
+import { wrapMCPTools } from "./mcpServerManager";
 import { createStreamManagerForTests } from "./streamManager.testHarness";
+import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
+import { withExecutionScope } from "./tools/withExecutionScope";
 import { createTestHistoryService } from "./testHistoryService";
 import { expectReproFailure } from "@/node/utils/repro.testHarness";
 import { assemblePromptPayload } from "./turnContextAssembler";
@@ -278,15 +282,23 @@ async function runTurn(
   /** Volatile system tail (hot memories, MCP warning, context-window ids) after SYSTEM. */
   volatileTail = "",
   /** Tool search: the advertised tool set changes when a step activates a deferred tool. */
-  toolSearchState?: ToolSearchStreamState
+  toolSearchState?: ToolSearchStreamState,
+  /** Runs after the request read history and before the assistant row is appended. */
+  beforePlaceholder?: () => Promise<void>
 ): Promise<WireBody[]> {
   const history = await readHistory();
+  // As turnRequestBuilder records it: the highest history row the request includes.
+  const requestHistorySequence = Math.max(
+    -1,
+    ...history.map((row) => row.metadata?.historySequence ?? -1)
+  );
   const payload = await assemblePromptPayload({
     history,
     systemMessage: SYSTEM + volatileTail,
     volatileSystemSuffixLength: volatileTail.length,
     tools,
     modelString: MODEL_STRING,
+    routeProvider: "anthropic",
     providerForMessages: "anthropic",
     effectiveThinkingLevel: "high",
     effectiveAgentId: "exec",
@@ -294,6 +306,7 @@ async function runTurn(
     anthropicCacheTtl: "1h",
     workspaceId: WORKSPACE_ID,
   });
+  await beforePlaceholder?.();
   const messageId = `assistant-${nextSequence}`;
   const historySequence = nextSequence;
   const placeholder = await historyService.appendToHistory(WORKSPACE_ID, {
@@ -305,9 +318,15 @@ async function runTurn(
   if (!placeholder.success) throw new Error(placeholder.error);
   nextSequence = historySequence + 1;
 
-  const streamManager = createStreamManagerForTests(historyService);
+  const streamManager = createStreamManagerForTests(historyService, {
+    toolCallDisplayRegistry: displayRegistry,
+  });
   const before = anthropic.bodies.length;
   anthropic.script(steps);
+  // As turnRequestBuilder does: the tools carry the stream's scope, so MCP wrappers can publish
+  // the display data that StreamManager persists as `mcpServer`.
+  const streamToken = streamManager.generateStreamToken();
+  const executionScope = { workspaceId: WORKSPACE_ID, messageId, token: streamToken };
   const started = await streamManager.startStream({
     workspaceId: WORKSPACE_ID,
     messageId,
@@ -315,10 +334,17 @@ async function runTurn(
     modelString: MODEL_STRING,
     messages: payload.messages,
     system: payload.system,
-    tools: payload.tools,
+    tools: payload.tools && withExecutionScope(payload.tools, executionScope),
+    providedStreamToken: streamToken,
+    executionScope,
     providerOptions: { anthropic: { thinking: { type: "adaptive" } } },
     historySequence,
+    initialMetadata: { requestHistorySequence },
     thinkingLevel: "high",
+    // TurnRequestBuilder puts the assembler's tail record on the turn's assistant row.
+    ...(payload.volatileSystemTail != null
+      ? { initialMetadata: { volatileSystemTail: payload.volatileSystemTail } }
+      : {}),
     toolSearchState,
     runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
     providedRuntimeTempDir: "",
@@ -360,8 +386,18 @@ async function expectNextTurnExtendsLastStep(params: {
   expectExtendsLastStep(firstTurnBodies[firstTurnBodies.length - 1], nextFirst, MONITOR_WAKE);
 }
 
+/**
+ * `body` without a trailing system row: a volatile-tail change goes after the trigger as a
+ * mid-conversation system row (mechanism 10), and the checks below look at the conversation.
+ */
+function withoutTrailingSystemRow(body: WireBody): WireBody {
+  const last = body.messages.at(-1) as { role?: unknown } | undefined;
+  return last?.role === "system" ? { ...body, messages: body.messages.slice(0, -1) } : body;
+}
+
 /** The contract for one turn boundary: `nextFirst` repeats `lastStep`, then sends `trigger`. */
-function expectExtendsLastStep(lastStep: WireBody, nextFirst: WireBody, trigger: string): void {
+function expectExtendsLastStep(lastStep: WireBody, sentFirst: WireBody, trigger: string): void {
+  const nextFirst = withoutTrailingSystemRow(sentFirst);
   expect(withoutCacheControl(nextFirst.system)).toEqual(withoutCacheControl(lastStep.system));
   expect(withoutCacheControl(nextFirst.tools)).toEqual(withoutCacheControl(lastStep.tools));
   // A request that dropped the new trigger would match the previous one exactly, so check it
@@ -386,6 +422,47 @@ const divergesAt = (index: number) => ({
   received: String(index),
 });
 
+const ONE_PIXEL_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+/** Display data the real MCP wrapper publishes for each call; runTurn's StreamManager reads it. */
+const displayRegistry = new ToolCallDisplayRegistry();
+
+/**
+ * An MCP tool as mcpServerManager builds it: the client's raw tool (mcpToModelOutput) inside
+ * the real wrapMCPTools, optionally inside the model-only notification wrapper of tools.ts.
+ */
+function mcpTool(
+  name: string,
+  notes: string[] = [],
+  content: unknown[] = [{ type: "text", text: "page body" }]
+): Tool {
+  const raw = tool({
+    description: `${name} tool`,
+    inputSchema: z.object({ script: z.string() }),
+    execute: () => Promise.resolve({ content, isError: false }),
+    toModelOutput: mcpToModelOutput,
+  });
+  const wrapped = wrapMCPTools(
+    { [name]: raw },
+    {
+      display: {
+        connection: { key: "notion", transport: "http", origin: "https://mcp.example.com" },
+        identity: { name: "Notion MCP", version: "1.0.0" },
+        registry: displayRegistry,
+      },
+    }
+  )[name];
+  const execute = wrapped.execute;
+  if (execute === undefined) throw new Error("expected an executable MCP tool");
+  const reminded: Tool = {
+    ...wrapped,
+    execute: async (input, options) =>
+      attachModelOnlyToolNotifications(await execute(input, options), notes),
+  };
+  return reminded;
+}
+
 const plainTool = (name: string) =>
   tool({
     description: `${name} tool`,
@@ -394,6 +471,30 @@ const plainTool = (name: string) =>
   });
 
 describe("prompt-cache prefix: next turn vs the previous turn's last step", () => {
+  // A sub-agent report (TaskService appends it to the parent's history at once) can land after
+  // the request read history but before the assistant row is appended. It then sorts before
+  // that row, although the turn never saw it. Seen live on the dogfood server (f5714aa3af,
+  // 2026-10-14): the next turn rebuilt the earlier user message with the report merged in, and
+  // Anthropic rejected the turn's thinking ("Content before this block differs").
+  test("a row appended while the request was being built keeps the prefix", async () => {
+    const anthropic = createScriptedAnthropic();
+    const tools = { bash: plainTool("bash"), probe: plainTool("probe") };
+    await appendUser("Start the job and wait for it.");
+    const firstTurnBodies = await runTurn(
+      anthropic,
+      tools,
+      toolThenTextTurn("bash", "call-1"),
+      "",
+      undefined,
+      () => appendUser("<mux_subagent_report>done</mux_subagent_report>", { synthetic: true })
+    );
+    await appendUser(MONITOR_WAKE);
+    const [nextFirst] = await runTurn(anthropic, tools, toolThenTextTurn("probe", "call-next"));
+    expectExtendsLastStep(firstTurnBodies[firstTurnBodies.length - 1], nextFirst, MONITOR_WAKE);
+    // The model reads the report after its own reply, where it arrived.
+    expect(JSON.stringify(nextFirst.messages.at(-1))).toContain("mux_subagent_report");
+  });
+
   test("control: a plain tool round trip keeps the prefix", async () => {
     await expectNextTurnExtendsLastStep({
       tools: { bash: plainTool("bash"), probe: plainTool("probe") },
@@ -426,31 +527,46 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
   });
 
   // mcpClient.ts gives every MCP tool a toModelOutput (mcpToModelOutput) that turns the
-  // CallToolResult into `content` text parts in-turn. The rebuild calls
-  // convertToModelMessages without tools (messagePipeline.ts), so the persisted output
-  // replays through the SDK's default JSON encoding instead.
-  test("MCP-style toModelOutput results keep the prefix", async () => {
-    const mcpLike = tool({
-      description: "notion_fetch tool",
-      inputSchema: z.object({ script: z.string() }),
-      execute: () =>
-        Promise.resolve({ content: [{ type: "text", text: "page body" }], isError: false }),
-      toModelOutput: ({ output }) => {
-        const result = output as { content: Array<{ type: string; text: string }> };
-        return {
-          type: "content",
-          value: result.content.map((part) => ({ type: "text" as const, text: part.text })),
-        };
-      },
+  // CallToolResult into `content` text parts in-turn. The rebuild used to call
+  // convertToModelMessages without tools, so the persisted output replayed through the SDK's
+  // default JSON encoding instead. It now applies mcpToModelOutput to every persisted part with
+  // `mcpServer` (the display snapshot the real MCP wrapper publishes), so the bytes match.
+  test("MCP toModelOutput results keep the prefix", async () => {
+    await expectNextTurnExtendsLastStep({
+      tools: { notion_fetch: mcpTool("notion_fetch"), probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("notion_fetch", "call-1"),
     });
-    await expectReproFailure(
-      () =>
-        expectNextTurnExtendsLastStep({
-          tools: { notion_fetch: mcpLike, probe: plainTool("probe") },
-          firstTurn: toolThenTextTurn("notion_fetch", "call-1"),
-        }),
-      divergesAt(2)
+  });
+
+  // The model-only notes (#6658) ride on the MCP result too. In-turn, mcpToModelOutput reads
+  // only `content`, so the notes never reach the model. The rebuild re-attaches them before the
+  // same conversion, which must drop them the same way.
+  test("MCP results with model-only notifications keep the prefix", async () => {
+    const reminded = mcpTool("notion_fetch", [
+      "<notification>\nIt's been 5 tool calls since you last updated the TODO list.\n</notification>",
+    ]);
+    await expectNextTurnExtendsLastStep({
+      tools: { notion_fetch: reminded, probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("notion_fetch", "call-1"),
+    });
+  });
+
+  // In-turn, mcpToModelOutput keeps an MCP image inside the tool result as a file part, which
+  // the step's media extraction leaves alone. The rebuild used to extract it on MuxMessages
+  // before the MCP conversion ran and moved it behind the turn's final text (#6747).
+  test("MCP image results keep the prefix", async () => {
+    const screenshot = mcpTool(
+      "browser_screenshot",
+      [],
+      [
+        { type: "text", text: "Captured." },
+        { type: "image", data: ONE_PIXEL_PNG, mimeType: "image/png" },
+      ]
     );
+    await expectNextTurnExtendsLastStep({
+      tools: { browser_screenshot: screenshot, probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("browser_screenshot", "call-1"),
+    });
   });
 
   // The rebuild (applyToolOutputRedaction) used to cut every string over 12,000 chars while
@@ -571,12 +687,9 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
 
   // In-turn, StreamManager's transformStepMessages
   // (extractToolMediaAsUserMessagesFromModelMessages) puts the extracted image right after
-  // the tool result of that step. The rebuild's extractToolMediaAsUserMessages works on
-  // whole MuxMessages and appends the synthetic attachment row after the assistant row, so
-  // the image moves behind the turn's final text and merges into the NEXT user message.
+  // the tool result of that step. The rebuild used to extract on whole MuxMessages and append
+  // the image after the assistant row, behind the turn's final text.
   test("attach_file media stays where the in-turn step put it", async () => {
-    const png =
-      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
     const attachFile = tool({
       description: "attach_file tool",
       inputSchema: z.object({ script: z.string() }),
@@ -585,18 +698,14 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
           type: "content",
           value: [
             { type: "text", text: "[Attachment prepared: a.png]" },
-            { type: "media", data: png, mediaType: "image/png", filename: "a.png" },
+            { type: "media", data: ONE_PIXEL_PNG, mediaType: "image/png", filename: "a.png" },
           ],
         }),
     });
-    await expectReproFailure(
-      () =>
-        expectNextTurnExtendsLastStep({
-          tools: { attach_file: attachFile, probe: plainTool("probe") },
-          firstTurn: toolThenTextTurn("attach_file", "call-1"),
-        }),
-      divergesAt(2)
-    );
+    await expectNextTurnExtendsLastStep({
+      tools: { attach_file: attachFile, probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("attach_file", "call-1"),
+    });
   });
 });
 
@@ -673,7 +782,10 @@ describe("prompt-cache prefix: thinking-replay receipt", () => {
     stripTurn: Array<ScriptedStep | ScriptedError>;
     /** Thinking the strip turn's last step sent after the strip: the rebuild must keep it. */
     keptThinking: string;
-  }): Promise<{ receipt: MuxMessage["metadata"] }> {
+    /** Volatile system tail of each of the four turns (default: none). */
+    tails?: [string, string, string, string];
+  }): Promise<{ receipt: MuxMessage["metadata"]; stripBodies: WireBody[]; laterFirst: WireBody }> {
+    const tails = params.tails ?? ["", "", "", ""];
     const state = toolSearchState();
     const tools = toolsFor(state);
     const anthropic = createScriptedAnthropic();
@@ -682,11 +794,11 @@ describe("prompt-cache prefix: thinking-replay receipt", () => {
       anthropic,
       tools,
       [thinkThenCall("call-0", "bash"), thinkThenAnswer("0")],
-      "",
+      tails[0],
       state
     );
     await appendUser("Now the next part.");
-    const stripBodies = await runTurn(anthropic, tools, params.stripTurn, "", state);
+    const stripBodies = await runTurn(anthropic, tools, params.stripTurn, tails[1], state);
     const stripLast = stripBodies[stripBodies.length - 1];
     // The strip happened: the last step sent no earlier thinking, but kept the newer block.
     expect(sentThinking(stripLast)).toEqual([params.keptThinking]);
@@ -697,7 +809,7 @@ describe("prompt-cache prefix: thinking-replay receipt", () => {
       anthropic,
       tools,
       toolThenTextTurn("probe", "call-n"),
-      "",
+      tails[2],
       state
     );
     expectExtendsLastStep(stripLast, nextBodies[0], MONITOR_WAKE);
@@ -707,11 +819,11 @@ describe("prompt-cache prefix: thinking-replay receipt", () => {
       anthropic,
       tools,
       toolThenTextTurn("probe", "call-l"),
-      "",
+      tails[3],
       state
     );
     expectExtendsLastStep(nextBodies[nextBodies.length - 1], laterFirst, laterWake);
-    return { receipt };
+    return { receipt, stripBodies, laterFirst };
   }
 
   test("an in-turn tool-set change keeps the thinking sent after the strip", async () => {
@@ -726,6 +838,31 @@ describe("prompt-cache prefix: thinking-replay receipt", () => {
       keptThinking: "plan-call-2",
     });
     expect(receipt?.anthropicThinkingReplay).toBe("off");
+    expect(receipt?.anthropicThinkingReplayFromStep).toBe(1);
+  });
+
+  test("volatile-tail rows in the segment keep the receipt's point", async () => {
+    // Mechanism 10 rows are request messages, not parts of an assistant row, so they move no
+    // part or step index the receipt points at. The strip turn and the last turn each change
+    // the hot memories, so each sends a system row after its trigger.
+    const hot = (text: string) => `\n\n<hot_memories>\n${text}\n</hot_memories>`;
+    const { receipt, stripBodies, laterFirst } = await expectStripTurnKeepsPrefix({
+      stripTurn: [
+        thinkThenCall("call-1", "activate_send"),
+        thinkThenCall("call-2", "bash"),
+        thinkThenAnswer("1"),
+      ],
+      keptThinking: "plan-call-2",
+      tails: [hot("A"), hot("B"), hot("B"), hot("C")],
+    });
+    const systemRows = (body: WireBody) =>
+      body.messages.filter((message) => (message as { role?: unknown }).role === "system");
+    // The strip turn's row stays in place, before the steps, in its later requests.
+    const stripLast = stripBodies[stripBodies.length - 1];
+    expect(JSON.stringify(systemRows(stripLast))).toContain("B\\n</hot_memories>");
+    expect((stripLast.messages.at(-1) as { role?: unknown }).role).not.toBe("system");
+    expect(systemRows(laterFirst)).toHaveLength(2);
+    expect(JSON.stringify(laterFirst.messages.at(-1))).toContain("C\\n</hot_memories>");
     expect(receipt?.anthropicThinkingReplayFromStep).toBe(1);
   });
 
@@ -779,11 +916,7 @@ describe("prompt-cache prefix: volatile system tail", () => {
   // when the tail changes, but every message after the tail still misses, so a tail
   // change re-writes the whole conversation.
   test("a hot-memory change in the volatile tail costs only the tail", async () => {
-    await expectReproFailure(hotMemoryChangeKeepsHistoryCached, {
-      matcher: "toBe",
-      expected: "0",
-      received: "1",
-    });
+    await hotMemoryChangeKeepsHistoryCached();
   });
 });
 
@@ -806,10 +939,13 @@ async function hotMemoryChangeKeepsHistoryCached(): Promise<void> {
     "\n\n<hot_memories>\nB\n</hot_memories>"
   );
 
-  expect(sendsAfter(first, second, MONITOR_WAKE)).toBe(true);
+  // A fix may send the new tail as a system row after the trigger: check the conversation
+  // without it.
+  const conversation = withoutTrailingSystemRow(second);
+  expect(sendsAfter(first, conversation, MONITOR_WAKE)).toBe(true);
   // The first turn's answer must precede the trigger: a fix that rebuilt the history without
   // it would still keep the tail-only change below and pass the target assertion.
-  expect(endsWithAnswerThenTrigger(second)).toBe(true);
+  expect(endsWithAnswerThenTrigger(conversation)).toBe(true);
   // Each request must send its own hot memories: a fix that dropped the tail or kept "A"
   // would otherwise pass the prefix check below.
   expect(JSON.stringify(first)).toContain("<hot_memories>\\nA\\n</hot_memories>");

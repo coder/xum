@@ -1,6 +1,6 @@
 /**
  * MCP Apps (SEP-1865, `io.modelcontextprotocol/ui`, spec 2026-01-26) shared constants and pure
- * helpers. Gated by the artifacts experiment: with it off, Xum neither announces the extension
+ * helpers. Gated by the mcp-apps experiment: with it off, Xum neither announces the extension
  * nor keeps any `_meta.ui`.
  */
 

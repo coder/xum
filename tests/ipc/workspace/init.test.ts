@@ -33,6 +33,7 @@ import type { RuntimeConfig } from "../../../src/common/types/runtime";
 import { sshConnectionPool } from "../../../src/node/runtime/sshConnectionPool";
 import type { InitStatus } from "../../../src/node/services/initStateManager";
 import { ssh2ConnectionPool } from "../../../src/node/runtime/SSH2ConnectionPool";
+import { initOutputLines, runWatchedSshTest, type SshStepContext } from "../sshStepWatchdog";
 
 // Skip all tests if TEST_INTEGRATION is not set
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -872,6 +873,11 @@ describeIntegration("Init Queue - Runtime Matrix", () => {
 
       // Timeouts vary by runtime type
       const testTimeout = type === "ssh" ? 90000 : 30000;
+      // #6588: ssh runs fail before jest's limit with the step they hung in (sshStepWatchdog.ts).
+      const watched = (body: (ctx: SshStepContext) => Promise<void>) => async (): Promise<void> => {
+        if (type !== "ssh") return body({ step: "setup", initLines: () => [] });
+        await runWatchedSshTest(testTimeout - 10_000, () => sshConfig, body);
+      };
       const streamTimeout = type === "ssh" ? 30000 : 15000;
 
       // Skip SSH tests if Docker is not available
@@ -879,7 +885,7 @@ describeIntegration("Init Queue - Runtime Matrix", () => {
 
       test(
         "file_read should wait for init hook before executing (even when init fails)",
-        async () => {
+        watched(async (ctx) => {
           if (!shouldRunSSH()) {
             console.log("Skipping SSH test - Docker not available");
             return;
@@ -899,12 +905,14 @@ exit 1
           });
 
           try {
+            ctx.step = "set up providers";
             await setupProviders(env, { anthropic: { apiKey: getApiKey("ANTHROPIC_API_KEY") } });
             const branchName = generateBranchName();
             const runtimeConfig = getRuntimeConfig(branchName);
             const client = resolveOrpcClient(env);
 
             // Create workspace to trigger init hook
+            ctx.step = "create workspace";
             const result = await createWorkspace(
               env,
               repoPath,
@@ -917,14 +925,17 @@ exit 1
             expect(workspaceId).toBeTruthy();
 
             // Set up collector to track events
+            ctx.step = "subscribe";
             const collector = createStreamCollector(client, workspaceId!);
             collector.start();
+            ctx.initLines = () => initOutputLines(collector);
             await collector.waitForSubscription(5000);
 
             // FIRST MESSAGE: Send message that requires file read
             // This should wait for init to complete before file operations can happen
             // Use Haiku for faster responses - this test is about init queue, not model capability
             const firstMessageStart = Date.now();
+            ctx.step = "first message (waits for init)";
             await client.workspace.sendMessage({
               workspaceId: workspaceId!,
               message: "Read the README.md file and tell me what it says.",
@@ -935,6 +946,7 @@ exit 1
             });
 
             // Wait for stream to complete
+            ctx.step = "first stream-end";
             await collector.waitForEvent("stream-end", streamTimeout);
             const firstMessageEnd = Date.now();
             const firstMessageDuration = firstMessageEnd - firstMessageStart;
@@ -951,11 +963,14 @@ exit 1
             const failedInitEvent = initEndEvents.find((e) => e.exitCode === 1);
             expect(failedInitEvent).toBeDefined();
 
-            // Clear collector for second message
+            // Clear collector for second message. Keep the init lines for the watchdog first.
+            const initLines = initOutputLines(collector);
+            ctx.initLines = () => initLines;
             collector.clear();
 
             // SECOND MESSAGE: Send another message
             // Init is already complete (even though it failed), so no init wait
+            ctx.step = "second message";
             await client.workspace.sendMessage({
               workspaceId: workspaceId!,
               message: "What is 2 + 2?",
@@ -966,14 +981,16 @@ exit 1
             });
 
             // Wait for stream to complete - proves second message also works
+            ctx.step = "second stream-end";
             await collector.waitForEvent("stream-end", streamTimeout);
 
             collector.stop();
           } finally {
+            ctx.step = "clean up the test environment";
             await cleanupTestEnvironment(env);
             await cleanupTempGitRepo(repoPath);
           }
-        },
+        }),
         testTimeout
       );
     }

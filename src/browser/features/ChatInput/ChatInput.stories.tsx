@@ -11,7 +11,7 @@ import {
   blurActiveElement,
   waitForChatInputAutofocusDone,
 } from "@/browser/stories/storyPlayHelpers.js";
-import { expect, within, userEvent, waitFor } from "@storybook/test";
+import { expect, within, userEvent, waitFor } from "storybook/test";
 import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import { textContrasts } from "@/browser/stories/helpers/contrast";
@@ -587,9 +587,9 @@ export const ThinkingSelectorUltrafast: AppStory = {
     viewport: { value: "mobile1", isRotated: false },
   },
   render: () => (
-    // min() keeps the test-runner's desktop window at the tightest row while Pixel's
-    // phone viewport (narrower than 400px) still sets the real width.
-    <div data-testid="composer-width-wrapper" style={{ width: "min(400px, 100%)", height: 700 }}>
+    // 380px puts the row at its tightest stage both in the test-runner's desktop window and in
+    // Pixel's 390px phone viewport; min() yields to narrower viewports.
+    <div data-testid="composer-width-wrapper" style={{ width: "min(380px, 100%)", height: 700 }}>
       <AppWithMocks
         setup={() => {
           collapseLeftSidebar();
@@ -773,7 +773,7 @@ export const NarrowControlRowCollapse: AppStory = {
       }
     };
 
-    await resizeRowInto(400, 300, 341);
+    await resizeRowInto(380, 300, 341);
     await waitFor(() => {
       if (agentTrigger.innerText.trim() !== "") {
         throw new Error(`Agent pill should be icon-only, showing "${agentTrigger.innerText}"`);
@@ -790,7 +790,7 @@ export const NarrowControlRowCollapse: AppStory = {
       assertNoOverflow("tightest");
     });
 
-    await resizeRowInto(425, 344, 359);
+    await resizeRowInto(405, 344, 359);
     await waitFor(() => {
       if (agentTrigger.innerText.trim() !== "") {
         throw new Error(
@@ -804,7 +804,7 @@ export const NarrowControlRowCollapse: AppStory = {
 
     // Phone-width workspace rows land here. The agent label does not fit alongside the context pill
     // yet, so it must stay hidden rather than clip, and the model name must keep its own room.
-    await resizeRowInto(474, 365, 445);
+    await resizeRowInto(454, 365, 445);
     await waitFor(() => {
       if (agentTrigger.innerText.trim() !== "") {
         throw new Error(
@@ -825,7 +825,7 @@ export const NarrowControlRowCollapse: AppStory = {
       }
     });
 
-    await resizeRowInto(544, 455, 495);
+    await resizeRowInto(524, 455, 495);
     await waitFor(() => {
       if (agentTrigger.innerText.trim() === "") {
         throw new Error("Agent pill should show its label once the row clears 450px");
@@ -841,7 +841,7 @@ export const NarrowControlRowCollapse: AppStory = {
       assertNoOverflow("agent-label-returns");
     });
 
-    await resizeRowInto(640, 505, 1200);
+    await resizeRowInto(620, 505, 1200);
     await waitFor(() => {
       if (!/^\d+%$/.test(contextTrigger.innerText.trim())) {
         throw new Error(

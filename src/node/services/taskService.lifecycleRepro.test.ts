@@ -352,7 +352,7 @@ describe("task lifecycle races (WorkspaceService resume)", () => {
       cleanup: mock(() => Promise.resolve()),
       hasRunningBackgroundProcesses: mock(() => false),
       hasOrphanedRunningBackgroundProcesses: mock(() => Promise.resolve(false)),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
       getActiveMonitorCount: mock(() => 0),
     }) as unknown as BackgroundProcessManager;
     const aiEmitter = new EventEmitter();

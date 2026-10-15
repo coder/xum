@@ -2,6 +2,7 @@ import { describe, test, expect, mock } from "bun:test";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { Ok } from "@/common/types/result";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import {
   DEFAULT_MODEL_FALLBACKS,
   resolveModelFallbackChain,
@@ -12,7 +13,7 @@ import type {
   StreamManager,
 } from "./streamManager";
 import type { SessionUsageService } from "./sessionUsageService";
-import { createStreamManagerForTests } from "./streamManager.testHarness";
+import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import {
   installStreamManagerTestHistory,
   historyService,
@@ -369,6 +370,77 @@ describe("StreamManager - fallback construction callbacks", () => {
     expect(failed.completion.status).toBe("failed");
     expect(failure.prepare).toHaveBeenCalledTimes(1);
     expect(onFailure).not.toHaveBeenCalled();
+  });
+});
+
+describe("StreamManager - fallback volatile-tail record (mechanism 10)", () => {
+  test("a step-0 thinking rebuild on the fallback keeps its newer tail record", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6srL1S): the fallback stream may prepare its first step before
+    // activation finishes. A thinking change consumed there rebuilds the request and records
+    // its own tail plan, which the prepared baseline must not overwrite afterwards.
+    const baseline = { text: "\n\n<hot_memories>A</hot_memories>", placement: "system" as const };
+    const rebuiltTail = { text: "\n\n<hot_memories>B</hot_memories>", placement: "row" as const };
+    let firstStep: unknown;
+    const attempts: ScriptedAttempt[] = [
+      { chunks: [REFUSAL_FINISH], usage: NO_USAGE },
+      { chunks: [{ type: "text-delta", text: "fallback answer" }, STOP_FINISH], usage: NO_USAGE },
+    ];
+    const scripted = scriptedStreamText(attempts);
+    let calls = 0;
+    const streamText = fakeStreamText((request) => {
+      // Like the AI SDK: the fallback (second call) starts preparing step 0 at construction.
+      if (++calls === 2) {
+        firstStep = request.prepareStep?.({
+          messages: [{ role: "user", content: "hello" }],
+          stepNumber: 0,
+          steps: [],
+        } as never);
+      }
+      return (scripted as unknown as (options: typeof request) => unknown)(request);
+    });
+    const holder: { pending?: "high" } = {};
+    const prepare = mock((nextModelString: string) => {
+      // The user changes the thinking level while the fallback is being prepared.
+      holder.pending = "high";
+      return Promise.resolve(
+        Ok({
+          model: createTestLanguageModel("fallback-model"),
+          modelString: nextModelString,
+          messages: [{ role: "user" as const, content: "hello" }],
+          system: "You are a helpful assistant",
+          tools: undefined,
+          thinkingLevel: "low" as const,
+          providerOptions: {},
+          initialMetadataPatch: { volatileSystemTail: baseline },
+          rebuildProviderOptionsForThinkingLevel: (level: ThinkingLevel) => ({
+            providerOptions: {},
+            effectiveLevel: level,
+          }),
+          rebuildFirstStepForThinkingLevel: () =>
+            Promise.resolve({
+              messages: [{ role: "user" as const, content: "hello" }],
+              volatileSystemTail: rebuiltTail,
+            }),
+          // Activation awaits this; the eager first step finishes meanwhile.
+          onStreamConstructed: async () => {
+            await Promise.resolve(firstStep);
+          },
+        })
+      );
+    });
+    const workspaceId = "fallback-volatile-tail-workspace";
+    const streamManager = createStreamManagerForTests(historyService, { streamText });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId,
+      modelString: KNOWN_MODELS.SONNET.id,
+      modelFallback: { chain: ["openai:gpt-5.6-luna"], prepare },
+      thinkingOverrideState: holder,
+    });
+    expect(completion.status).toBe("completed");
+    expect(firstStep).toBeDefined();
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    expect(history.data.at(-1)?.metadata?.volatileSystemTail).toEqual(rebuiltTail);
   });
 });
 

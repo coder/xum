@@ -7,7 +7,7 @@ import {
   setupStreamingChatStory,
 } from "@/browser/stories/helpers/chatSetup";
 import { collapseLeftSidebar } from "@/browser/stories/helpers/uiState";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { userEvent, waitFor, within } from "storybook/test";
 import {
   createAgentPeerMessage,
   createAgentPeerTriggerMessage,

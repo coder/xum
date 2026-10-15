@@ -57,7 +57,12 @@ import type {
 } from "@/common/types/stream";
 
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
-import type { MuxMetadata, MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
+import type {
+  MuxMetadata,
+  MuxMessage,
+  PersistedToolModelUsage,
+  VolatileSystemTailRecord,
+} from "@/common/types/message";
 import { hasTokenUsage, MODEL_FALLBACK_REFUSAL_TOOL_NAME } from "@/common/types/message";
 import {
   findFirstReasoningPartIndexInTrailingRun,
@@ -101,8 +106,10 @@ import { hasCommitWorthyParts, type HistoryService } from "./historyService";
 import {
   addUsage,
   accumulateProviderMetadata,
+  accumulateStepsProviderMetadata,
   normalizeUsage,
   withCacheWriteMetadata,
+  withLongContextTokens,
   type AiSdkUsageLike,
 } from "@/common/utils/tokens/usageHelpers";
 import { linkAbortSignal } from "@/node/utils/abort";
@@ -473,7 +480,24 @@ interface StepMessageTracker {
   anthropicThinkingStripStep?: number;
   /** True once this turn holds the Anthropic thinking-repair receipt (reads initialMetadata). */
   hasAnthropicReplayReceipt?: () => boolean;
+  /** After a step-0 rebuild: the row's tail record and system token count follow it. */
+  recordVolatileSystemTail: (rebuilt: {
+    volatileSystemTail?: VolatileSystemTailRecord;
+    systemMessageTokens?: number;
+  }) => void;
 }
+/** The row metadata after a step-0 rebuild: its tail record and system token count follow it. */
+function withRebuiltSystemMetadata(
+  metadata: Partial<MuxMetadata> | undefined,
+  rebuilt: { volatileSystemTail?: VolatileSystemTailRecord; systemMessageTokens?: number }
+): Partial<MuxMetadata> {
+  return {
+    ...metadata,
+    volatileSystemTail: rebuilt.volatileSystemTail,
+    systemMessageTokens: rebuilt.systemMessageTokens ?? metadata?.systemMessageTokens,
+  };
+}
+
 interface StreamRequestConfig {
   stopCause?: StreamStopCause;
   cacheEnabled?: boolean;
@@ -1827,17 +1851,24 @@ export class StreamManager {
     };
   }
 
+  /**
+   * A retry that restarted the SDK stream but kept the earlier attempt's billed usage: the
+   * new stream's totals and steps cover only the retried call.
+   */
+  private restartedWithPreservedUsage(streamInfo: WorkspaceStreamInfo): boolean {
+    return (
+      streamInfo.didRetryPreviousResponseIdAtStep ||
+      streamInfo.didRetryAfterEmptyOutput === true ||
+      streamInfo.didRetryReasoningReplayAtStep === true
+    );
+  }
+
   private resolveTotalUsageForStreamEnd(
     streamInfo: WorkspaceStreamInfo,
     totalUsage: LanguageModelV2Usage | undefined
   ): LanguageModelV2Usage | undefined {
     const cumulativeUsage = streamInfo.cumulativeUsage;
-    if (
-      (streamInfo.didRetryPreviousResponseIdAtStep ||
-        streamInfo.didRetryAfterEmptyOutput ||
-        streamInfo.didRetryReasoningReplayAtStep) &&
-      hasTokenUsage(cumulativeUsage)
-    ) {
+    if (this.restartedWithPreservedUsage(streamInfo) && hasTokenUsage(cumulativeUsage)) {
       return cumulativeUsage;
     }
 
@@ -1913,6 +1944,21 @@ export class StreamManager {
   }
 
   /**
+   * Provider metadata for the usage resolveTotalUsageForStreamEnd picks: after a retry that
+   * kept the earlier attempt's usage, only the live accumulation also covers the steps before
+   * the retry (their cache writes and long-context shares).
+   */
+  private async resolveProviderMetadataForStreamEnd(
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<Record<string, unknown> | undefined> {
+    const cumulative = streamInfo.cumulativeProviderMetadata;
+    if (this.restartedWithPreservedUsage(streamInfo) && cumulative) {
+      return { ...cumulative };
+    }
+    return this.getAggregatedProviderMetadata(streamInfo);
+  }
+
+  /**
    * Aggregate provider metadata across all steps.
    *
    * CRITICAL: For multi-step tool calls, cache creation tokens are reported per-step.
@@ -1930,24 +1976,18 @@ export class StreamManager {
       ]);
 
       if (!steps || steps.length === 0) {
-        // Fall back to the final step's provider metadata; AI SDK 7 reports
-        // cache writes on usage, so re-inject them for downstream pricing.
+        // The live per-step accumulation covers every step; without one, fall back to the
+        // final step's provider metadata.
+        if (streamInfo.cumulativeProviderMetadata) {
+          return { ...streamInfo.cumulativeProviderMetadata };
+        }
         const finalStep = await streamInfo.streamResult.finalStep;
-        return withCacheWriteMetadata(finalStep.providerMetadata, finalStep.usage);
+        return accumulateStepsProviderMetadata([finalStep], streamInfo.metadataModel);
       }
 
-      // Aggregate cache creation tokens across all steps. AI SDK 7 moved
-      // per-step cache-write tokens from providerMetadata.anthropic to
-      // step.usage.inputTokenDetails, so inject them back per step before
-      // accumulating (accumulateProviderMetadata sums across steps).
-      let accumulated: Record<string, unknown> | undefined;
-      for (const step of steps) {
-        accumulated = accumulateProviderMetadata(
-          accumulated,
-          withCacheWriteMetadata(step.providerMetadata, step.usage)
-        );
-      }
-      return accumulated;
+      // Aggregate cache creation tokens and long-context shares across all steps
+      // (accumulateStepsProviderMetadata re-injects AI SDK 7's per-step cache writes).
+      return accumulateStepsProviderMetadata(steps, streamInfo.metadataModel);
     } catch (error) {
       log.debug("Could not aggregate provider metadata:", error);
       return undefined;
@@ -3272,10 +3312,8 @@ export class StreamManager {
           appliedLevel != null
         ) {
           try {
-            const rebuilt = await request.rebuildFirstStepForThinkingLevel(
-              appliedLevel,
-              thinkingOverride
-            );
+            const { messages: rebuilt, ...rebuiltSystem } =
+              await request.rebuildFirstStepForThinkingLevel(appliedLevel, thinkingOverride);
             const receiptApplied = applyTurnReplayReceipt(stepTracker, rebuilt);
             // A retry's step 0 can rebuild this row's earlier steps too: what it stripped
             // is gone from here on, so the receipt's point moves to this step.
@@ -3288,6 +3326,9 @@ export class StreamManager {
             );
             if (stepTracker) {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
+              // The rebuilt request decides which volatile-tail rows the row recorded, and
+              // what its system content (tail rows included) costs.
+              stepTracker.recordVolatileSystemTail(rebuiltSystem);
             }
             // onStepMessages fired above with the pre-rebuild transcript;
             // re-notify so consumers track the
@@ -3307,7 +3348,8 @@ export class StreamManager {
         // replay reasoning again. Blocks produced after it are bound to the new prefix and
         // keep replaying (#5279). This applies to every Anthropic Messages thinking mode,
         // not only `between_tools` (which cannot carry blockBinding): only the direct API
-        // route sends `drop_block`, so adaptive/enabled thinking on other routes would 400.
+        // route and anthropic-typed Coder AI Gateway instances send `drop_block`, so
+        // adaptive/enabled thinking on other routes would 400.
         // Claude on Bedrock gets the same strip (#5841): Bedrock cannot take drop_block.
         const toolSetKey = activeTools === undefined ? "" : [...activeTools].sort().join("\n");
         const consumedSwap = stepTracker?.consumedPrefixSwap;
@@ -3456,7 +3498,11 @@ export class StreamManager {
       maxOutputTokens,
       runtime,
     } = options;
-    const stepTracker: StepMessageTracker = { workspaceId: options.workspaceId };
+    // The tail hook is wired to streamInfo below, once it exists.
+    const stepTracker: StepMessageTracker = {
+      workspaceId: options.workspaceId,
+      recordVolatileSystemTail: () => undefined,
+    };
     const metadataModel = this.resolveMetadataModel(modelString, options.providersConfigSnapshot);
     const request = this.buildStreamRequestConfig({
       ...options,
@@ -3545,6 +3591,9 @@ export class StreamManager {
     // Single source for same-turn rebuilds: the receipt lives on initialMetadata (#5886).
     stepTracker.hasAnthropicReplayReceipt = () =>
       streamInfo.initialMetadata?.anthropicThinkingReplay === "off";
+    stepTracker.recordVolatileSystemTail = (rebuilt) => {
+      streamInfo.initialMetadata = withRebuiltSystemMetadata(streamInfo.initialMetadata, rebuilt);
+    };
 
     // Mid-turn thinking override: route applied levels into this stream's
     // metadata (partials, stream-end, final assistant message). Wired before
@@ -3625,7 +3674,8 @@ export class StreamManager {
           ...(mcpServer ? { mcpServer } : {}),
           state: "output-available" as const,
           output,
-          ...modelOnlyNotificationsField(modelOnlyNotifications),
+          // Set even when undefined: an earlier completion's notes must not outlive it (#6665).
+          modelOnlyNotifications,
         };
       }
     } else {
@@ -4423,6 +4473,14 @@ export class StreamManager {
       };
     }
 
+    // Before any await: the stream may already be preparing its first step, and a step-0
+    // thinking rebuild there records a newer volatile-tail plan (recordVolatileSystemTail),
+    // which must win over the patch's baseline. That rebuild always runs after an await.
+    streamInfo.initialMetadata = {
+      ...streamInfo.initialMetadata,
+      ...prepared.data.initialMetadataPatch,
+    };
+
     // The fallback stream exists now; durable side effects describing this
     // request identity (superseding turn envelope) may be recorded.
     await prepared.data.onStreamConstructed?.();
@@ -4464,10 +4522,9 @@ export class StreamManager {
       streamInfo.thinkingLevel = prepared.data.thinkingLevel;
     }
     // Final stream-end metadata spreads initialMetadata, so route attribution
-    // corrections and the fallback record propagate automatically.
+    // corrections (the patch, applied above) and the fallback record propagate automatically.
     streamInfo.initialMetadata = {
       ...streamInfo.initialMetadata,
-      ...prepared.data.initialMetadataPatch,
       modelFallback: {
         requestedModel: fallbackState.requestedModel,
         refusedModels: [...fallbackState.refusedModels],
@@ -5136,7 +5193,7 @@ export class StreamManager {
                 streamInfo.cumulativeUsage = addUsage(streamInfo.cumulativeUsage, stepUsage);
                 streamInfo.cumulativeProviderMetadata = accumulateProviderMetadata(
                   streamInfo.cumulativeProviderMetadata,
-                  stepProviderMetadata
+                  withLongContextTokens(stepProviderMetadata, stepUsage, streamInfo.metadataModel)
                 );
 
                 // Track last step's data for context window display
@@ -5263,7 +5320,7 @@ export class StreamManager {
             const ttftMs = this.resolveTtftMsForStreamEnd(streamInfo);
             // Aggregated provider metadata across all steps (for cost calculation with cache tokens)
             const providerMetadata = markProviderMetadataCostsIncluded(
-              await this.getAggregatedProviderMetadata(streamInfo),
+              await this.resolveProviderMetadataForStreamEnd(streamInfo),
               streamInfo.initialMetadata?.costsIncluded
             );
             const canonicalModel = metadataModelIdentity(streamInfo.model);

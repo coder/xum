@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { useEffect, useRef, type ReactNode } from "react";
 import { APIProvider } from "@/browser/contexts/API";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
@@ -976,7 +976,7 @@ export const FullscreenKeepsFocusWhenViewerSwaps: Story = {
   },
 };
 
-// MCP Apps view (artifacts experiment) in its app tab (no longer in Artifacts): a fake server
+// MCP Apps view (mcp-apps experiment) in its app tab (no longer in Artifacts): a fake server
 // view implementing the spec handshake.
 // The frame is opaque-origin, so the play test reads progress from the heights the view
 // reports: 321px only after initialize -> initialized -> tool-input -> tool-result, then

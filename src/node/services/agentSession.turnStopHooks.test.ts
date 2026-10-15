@@ -5,8 +5,15 @@
  */
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import assert from "node:assert";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { EventEmitter } from "events";
 import type { CompletedMessagePart } from "@/common/types/stream";
+import type { TodoItem } from "@/common/types/tools";
+import { getTodoFilePath } from "@/node/services/todos/todoStorage";
+import { TURN_STOP_PROMPT_MAX_CHARS } from "./agentPlugins/promptHooks";
+import { TODO_TURN_END_NUDGE } from "@/node/services/agentNotifications/todoTurnEndNudge";
+import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { Ok } from "@/common/types/result";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { AgentSessionAIService } from "./agentSession";
@@ -694,6 +701,132 @@ describe("turn.stop", () => {
     await settle(h);
 
     expect(calls).toEqual([]);
+    expect(streams()).toBe(1);
+  });
+});
+
+describe("todo turn-end nudge", () => {
+  const openTodos: TodoItem[] = [
+    { content: "Fix the bug", status: "completed" },
+    { content: "Verify the fix", status: "in_progress" },
+  ];
+  const doneTodos = openTodos.map((todo): TodoItem => ({ ...todo, status: "completed" }));
+  const todoWrite = {
+    toolCallId: "todo-1",
+    toolName: "todo_write",
+    input: { todos: openTodos },
+    state: "output-available",
+    output: { success: true },
+  } as const;
+  const todoWriteThenReply = (): CompletedMessagePart[] => [
+    { type: "dynamic-tool", ...todoWrite },
+    { type: "text", text: "Fixed." },
+  ];
+  // An agent that denies todo_write answers the call with a refusal.
+  const refusedTodoWriteThenReply = (): CompletedMessagePart[] => [
+    {
+      type: "dynamic-tool",
+      ...todoWrite,
+      output: { success: false, error: "todo_write is disabled for this agent" },
+    },
+    { type: "text", text: "Fixed." },
+  ];
+  // Programmatic tool calling: todo_write runs inside code_execution.
+  const nestedTodoWriteThenReply = (): CompletedMessagePart[] => [
+    {
+      type: "dynamic-tool",
+      toolCallId: "code-1",
+      toolName: "code_execution",
+      input: { code: "" },
+      state: "output-available",
+      output: { success: true },
+      nestedCalls: [todoWrite],
+    },
+    { type: "text", text: "Fixed." },
+  ];
+
+  async function writeTodos(h: AgentSessionHarness, todos: TodoItem[]): Promise<void> {
+    const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(getTodoFilePath(sessionDir), JSON.stringify(todos));
+  }
+
+  test.each([
+    { name: "todo_write", parts: todoWriteThenReply },
+    { name: "a nested todo_write", parts: nestedTodoWriteThenReply },
+  ])("a turn with $name that leaves open items gets exactly one nudge", async (row) => {
+    // Every stream, the nudge's own included, calls todo_write and leaves the list open.
+    const { h, streams, requests } = await setup({ parts: row.parts });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(streams()).toBe(2);
+    expect(await userTexts(h)).toEqual(["fix the bug", TODO_TURN_END_NUDGE]);
+    // The nudge turn may only update the list, and never gets a tool its agent denies.
+    const nudgePolicy = requests[1].toolPolicy ?? [];
+    expect(applyToolPolicyToNames(["bash", "file_read", "todo_write"], nudgePolicy)).toEqual([
+      "todo_write",
+    ]);
+    const agentDeny = { regex_match: "todo_write", action: "disable" } as const;
+    expect(applyToolPolicyToNames(["bash", "todo_write"], [agentDeny, ...nudgePolicy])).toEqual([]);
+
+    // The next user turn may be nudged again.
+    await h.session.sendMessage("now lint", options);
+    await settle(h);
+    expect(streams()).toBe(4);
+  });
+
+  test("a plugin continuation and the nudge share one continuation prompt", async () => {
+    addConsumer(keepGoing);
+    const { h, requests } = await setup({ parts: todoWriteThenReply });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    const nudged = (await userTexts(h)).filter((text) => text.endsWith(TODO_TURN_END_NUDGE));
+    expect(nudged).toEqual([`Run the failing tests again.\n\n${TODO_TURN_END_NUDGE}`]);
+    // The plugin's continuation keeps the turn's tools.
+    expect(requests[1].toolPolicy).toBeUndefined();
+  });
+
+  test("the merged continuation prompt keeps the continuation size cap", async () => {
+    const longReason = "x".repeat(TURN_STOP_PROMPT_MAX_CHARS);
+    addConsumer((ctx) => void ctx.continueReasons.push(longReason));
+    const { h } = await setup({ parts: todoWriteThenReply });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    const [, continuation] = await userTexts(h);
+    expect(continuation.length).toBe(TURN_STOP_PROMPT_MAX_CHARS);
+    expect(continuation.endsWith(TODO_TURN_END_NUDGE)).toBe(true);
+  });
+
+  test.each([
+    { name: "a turn whose list is complete", todos: doneTodos },
+    { name: "a turn that never called todo_write", noTodoWrite: true },
+    { name: "a turn whose todo_write was refused", refused: true },
+    { name: "a Plan mode turn", agentId: "plan" },
+    { name: "a turn a plugin halted", halt: true },
+  ])("$name gets no nudge", async (row) => {
+    if (row.halt === true) addConsumer((ctx) => (ctx.halted = { pluginName: "guard" }));
+    const { h, streams } = await setup({
+      parts:
+        row.noTodoWrite === true
+          ? undefined
+          : row.refused === true
+            ? refusedTodoWriteThenReply
+            : todoWriteThenReply,
+    });
+    await writeTodos(h, row.todos ?? openTodos);
+
+    await h.session.sendMessage("fix the bug", { ...options, agentId: row.agentId ?? "exec" });
+    await settle(h);
+
     expect(streams()).toBe(1);
   });
 });

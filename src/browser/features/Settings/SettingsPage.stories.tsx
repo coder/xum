@@ -1,5 +1,5 @@
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "@/browser/stories/meta.js";
-import { expect, waitFor, within, userEvent } from "@storybook/test";
+import { expect, waitFor, within, userEvent } from "storybook/test";
 import {
   getSettingsDialog,
   openSettingsDialog,

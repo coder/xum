@@ -12,7 +12,7 @@
  * - ManyWorkspaces: 14 workspaces across 5 projects to stress-test scrolling/grouping
  */
 
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { PIXEL_DISABLED, PIXEL_DUAL_THEME, appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { NOW, createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
 import { collapseRightSidebar, expandProjects, selectWorkspace } from "./helpers/uiState";

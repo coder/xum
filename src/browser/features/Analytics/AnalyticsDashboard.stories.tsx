@@ -19,7 +19,7 @@ import { NOW, createWorkspace, groupWorkspacesByProject } from "@/browser/storie
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import assert from "@/common/utils/assert";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import React from "react";
 import { LazyAnalyticsDashboard } from "./LazyAnalyticsDashboard.js";
 

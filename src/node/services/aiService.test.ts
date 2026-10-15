@@ -89,9 +89,13 @@ import {
   resolveCompactionInputBudgetTokens,
 } from "./turnRequestBuilder";
 import * as messagePipeline from "./messagePipeline";
+import { createAnthropic } from "@ai-sdk/anthropic";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
+import type { ThinkingLevel } from "@/common/types/thinking";
+import { buildReplayRequest } from "@/node/services/replay/replayRequestBuilder";
 import { MemoryService, projectMemoryDirName } from "@/node/services/memoryService";
 import * as toolAssembly from "./toolAssembly";
 import type {
@@ -369,6 +373,9 @@ function modelIdFromModelString(modelString: string): string {
 type ResolveAndCreateModelSpy = ReturnType<
   typeof spyOn<ProviderModelFactory, "resolveAndCreateModel">
 >;
+
+/** The real pipeline, before stubCommonStreamMessageDependencies replaces it. */
+const realPrepareMessagesForProvider = messagePipeline.prepareMessagesForProvider;
 
 function stubCommonStreamMessageDependencies(args: {
   service: AIService;
@@ -3278,6 +3285,131 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(off.toolNames).not.toContain("tool_catalog_search");
   });
 
+  // The overview in tool_catalog_search's description is part of the cached tools prefix: a
+  // remote server that lists one more tool on a refetch must not rewrite the cached history.
+  function createOverviewHarness(xumHomePath: string) {
+    const metadata = createLocalWorkspaceMetadata("tool-search-overview", xumHomePath);
+    const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
+    const mcpTools: Record<string, Tool> = {
+      tracker_list_issues: { ...stubTool, description: NATIVE_DEFERRAL_DESCRIPTION },
+    };
+    /** MCP tools a model does not get (like a request.assemble hook filtering by model). */
+    const hiddenByModel: Record<string, readonly string[]> = {};
+    const fixture = { stubTool, mcpTools, hiddenByModel };
+    const harness = createHarness(xumHomePath, metadata, { useRequestedModelString: true });
+    harness.getToolsForModelSpy.mockImplementation((model, config) => {
+      const hidden = new Set(fixture.hiddenByModel[model] ?? []);
+      return Promise.resolve({
+        file_read: stubTool,
+        ...(config.toolSearchRuntime ? { tool_catalog_search: stubTool } : {}),
+        ...Object.fromEntries(Object.entries(fixture.mcpTools).filter(([n]) => !hidden.has(n))),
+      });
+    });
+    harness.service.turnRequestBuilderBindings.mcpServerManager = {
+      listServers: () => Promise.resolve({}),
+      getToolsForWorkspace: () =>
+        Promise.resolve({
+          tools: fixture.mcpTools,
+          toolServerNames: Object.fromEntries(
+            Object.keys(fixture.mcpTools).map((n) => [n, "tracker"])
+          ),
+          promptDescriptors: [],
+          stats: {
+            totalTools: Object.keys(fixture.mcpTools).length,
+            activeServerCount: 1,
+            failedServerCount: 0,
+            failedServerNames: [],
+          },
+        }),
+    } as unknown as MCPServerManager;
+    const send = async (modelString = "anthropic:claude-sonnet-4-5") => {
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "hello")],
+        workspaceId: metadata.id,
+        modelString,
+        thinkingLevel: "off",
+      });
+      expect(result.success).toBe(true);
+      const started = harness.startStreamCalls.at(-1);
+      if (!started) throw new Error("Expected streamManager.startStream call");
+      const description = started.tools?.tool_catalog_search?.description;
+      if (typeof description !== "string") throw new Error("Expected a tool_catalog_search");
+      return { description, state: started.toolSearchState };
+    };
+    return { fixture, harness, metadata, send };
+  }
+
+  it("keeps a workspace's tool_catalog_search description when a refetch adds a tool", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview");
+    const { fixture, harness, send } = createOverviewHarness(xumHome.path);
+
+    const first = await send();
+    expect(first.description).toContain("tracker_list_issues");
+    // Sorts before tracker_list_issues, so a fresh overview would list it.
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
+    const second = await send();
+    expect(harness.startStreamCalls).toHaveLength(2);
+    expect(second.description).toBe(first.description);
+    expect(second.state?.deferredToolNames.has("tracker_add_label")).toBe(true);
+  });
+
+  it("keeps each model's overview when another model sees fewer tools", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview-models");
+    const { fixture, send } = createOverviewHarness(xumHome.path);
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
+    fixture.hiddenByModel = { "anthropic:claude-opus-4-5": ["tracker_add_label"] };
+
+    const sonnet = await send("anthropic:claude-sonnet-4-5");
+    expect(sonnet.description).toContain("tracker_add_label");
+    const opus = await send("anthropic:claude-opus-4-5");
+    expect(opus.description).not.toContain("tracker_add_label");
+    // Opus's overview is valid for Sonnet's catalog too: a shared memo would hand it to Sonnet.
+    expect((await send("anthropic:claude-sonnet-4-5")).description).toBe(sonnet.description);
+  });
+
+  it.each([
+    ["removed", null],
+    ["archived", { archivedAt: "2026-01-01T00:00:00.000Z" }],
+  ])("rebuilds the overview once the workspace is %s", async (_state, eventMetadata) => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview-forget");
+    const { fixture, harness, metadata, send } = createOverviewHarness(xumHome.path);
+    const first = await send();
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
+    // A metadata update of a live workspace keeps the overview.
+    harness.service.handleWorkspaceMetadata({ workspaceId: metadata.id, metadata: {} });
+    expect((await send()).description).toBe(first.description);
+    harness.service.handleWorkspaceMetadata({ workspaceId: metadata.id, metadata: eventMetadata });
+    expect((await send()).description).toContain("tracker_add_label");
+  });
+
+  it("shares one overview between selections that reach the same wire model", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview-alias");
+    const { fixture, harness, send } = createOverviewHarness(xumHome.path);
+    const wireModel = "mux-gateway:anthropic/claude-sonnet-4-5";
+    const resolveToWire = harness.resolveAndCreateModelSpy.getMockImplementation();
+    if (resolveToWire === undefined) throw new Error("Expected a resolveAndCreateModel stub");
+    // Like routing: the direct selection goes out through the gateway the explicit one names.
+    harness.resolveAndCreateModelSpy.mockImplementation((_requested, ...rest) =>
+      resolveToWire(wireModel, ...rest)
+    );
+    const direct = await send("anthropic:claude-sonnet-4-5");
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
+    expect((await send(wireModel)).description).toBe(direct.description);
+  });
+
+  it("rebuilds the least recently used model's overview past the per-workspace bound", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview-bound");
+    const { fixture, send } = createOverviewHarness(xumHome.path);
+    const first = await send("anthropic:claude-sonnet-4-5");
+    for (const model of ["opus-4-5", "haiku-4-5", "opus-4-6", "sonnet-4-6"]) {
+      await send(`anthropic:claude-${model}`);
+    }
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
+    const rebuilt = await send("anthropic:claude-sonnet-4-5");
+    expect(rebuilt.description).not.toBe(first.description);
+    expect(rebuilt.description).toContain("tracker_add_label");
+  });
+
   it.each([true, false])(
     "passes the heartbeat service to tools only when agent heartbeats are enabled (%s)",
     async (enabled) => {
@@ -5959,6 +6091,311 @@ describe("AIService.streamMessage volatile system content (#5251)", () => {
       expect(await journal.blobs.getText(envelope.data.systemPromptHash)).toBe(
         rows.map((row) => textOf(row)).join("")
       );
+    }
+  });
+});
+
+describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  /** The Anthropic Messages body the SDK sends for one stream call (cache markers removed). */
+  async function wireBody(
+    call: TurnExecutionOptions
+  ): Promise<{ system: unknown; messages: unknown[] }> {
+    let body: { system?: unknown; messages?: unknown[] } | undefined;
+    const fetch = ((_url: unknown, init?: { body?: unknown }) => {
+      body = JSON.parse(String(init?.body), (key, value: unknown) =>
+        key === "cache_control" ? undefined : value
+      ) as typeof body;
+      return Promise.resolve(new Response("{}", { status: 400 }));
+    }) as unknown as typeof globalThis.fetch;
+    await generateText({
+      model: createAnthropic({ apiKey: "k", baseURL: "http://wire.invalid/v1", fetch })(
+        "claude-opus-5-5"
+      ),
+      system: call.system,
+      messages: call.messages,
+      allowSystemInMessages: true,
+      maxRetries: 0,
+    }).catch(() => undefined);
+    if (body?.messages == null) throw new Error("the provider SDK sent no request");
+    return { system: body.system, messages: body.messages };
+  }
+
+  /** A real TurnRequestBuilder and request pipeline on Opus 5.5 with a hot-memories tail. */
+  async function setup(xumHome: DisposableTempDir) {
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-volatile-tail-row";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(xumHome.path),
+      xumHome: xumHome.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (experimentId) =>
+        experimentId === EXPERIMENT_IDS.MEMORY || experimentId === EXPERIMENT_IDS.MEMORY_HOT_SET
+    );
+    const { config, historyService, initStateManager, streamManager, service } =
+      createBasicAIService(xumHome.path, { experimentsService });
+    const startStreamCalls: TurnExecutionOptions[] = [];
+    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub for memory availability gating
+    const stubTool: Tool = {} as never;
+    stubCommonStreamMessageDependencies({
+      service,
+      streamManager,
+      config,
+      historyService,
+      initStateManager,
+      metadata,
+      startStreamCalls,
+      allTools: { memory: stubTool },
+      useRequestedModelString: true,
+      routeProvider: "anthropic",
+    });
+    // The real request pipeline: the bytes below are what Anthropic receives.
+    spyOn(messagePipeline, "prepareMessagesForProvider").mockImplementation(
+      realPrepareMessagesForProvider
+    );
+    service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      config,
+      new MemoryMetaService(xumHome.path)
+    );
+    const stableSystem = "stable-system-prompt";
+    spyOn(turnContextAssembler, "buildStreamSystemContext").mockImplementation((contextArgs) => {
+      const hotMemoriesSection = contextArgs.hotMemoriesBlock
+        ? `\n\n${contextArgs.hotMemoriesBlock}`
+        : undefined;
+      return Promise.resolve({
+        instructionSources: contextArgs.instructionSources ?? { global: [], context: [] },
+        agentSystemPromptSections: ["test-agent-prompt"],
+        systemMessage: stableSystem + (hotMemoriesSection ?? ""),
+        hotMemoriesSection,
+        systemMessageTokens: 1,
+        agentDefinitions: undefined,
+        availableSkills: undefined,
+        ancestorPlanFilePaths: [],
+      });
+    });
+
+    const mcp = { failedServerNames: [] as string[] };
+    service.turnRequestBuilderBindings.mcpServerManager = {
+      listServers: () => Promise.resolve({}),
+      getToolsForWorkspace: () =>
+        Promise.resolve({
+          tools: {},
+          promptDescriptors: [],
+          stats: {
+            totalTools: 0,
+            activeServerCount: 1,
+            failedServerCount: mcp.failedServerNames.length,
+            failedServerNames: mcp.failedServerNames,
+          },
+        }),
+    } as unknown as MCPServerManager;
+    const send = async (
+      messages: MuxMessage[],
+      hot: string,
+      extra: Partial<Parameters<typeof service.streamMessage>[0]> = {}
+    ) => {
+      const result = await service.streamMessage({
+        messages,
+        workspaceId,
+        modelString: KNOWN_MODELS.OPUS.id,
+        thinkingLevel: "high",
+        resolveMemoryContext: () =>
+          Promise.resolve({
+            indexEntries: [],
+            hotMemoriesBlock: `<hot_memories>${hot}</hot_memories>`,
+          }),
+        ...extra,
+      });
+      expect(result.success).toBe(true);
+      return startStreamCalls.at(-1)!;
+    };
+    return { workspaceId, mcp, send, service, config };
+  }
+
+  const hotTail = (text: string) => `\n\n<hot_memories>${text}</hot_memories>`;
+  const systemRows = (call: TurnExecutionOptions) =>
+    call.messages.filter((message) => message.role === "system");
+
+  it("sends a hot-memory change as a row that extends the previous request byte for byte", async () => {
+    using xumHome = new DisposableTempDir("ai-service-volatile-tail-row");
+    const { send } = await setup(xumHome);
+    // Each turn sends the persisted history; the previous answer carries its stream's record.
+    const history: MuxMessage[] = [];
+    const runTurn = async (user: string, hot: string) => {
+      history.push(createMuxMessage(`u-${history.length}`, "user", user));
+      const call = await send([...history], hot);
+      history.push(
+        createMuxMessage(`a-${history.length}`, "assistant", `answer to ${user}`, {
+          ...(call.initialMetadata?.volatileSystemTail != null
+            ? { volatileSystemTail: call.initialMetadata.volatileSystemTail }
+            : {}),
+        })
+      );
+      return { call, body: await wireBody(call) };
+    };
+    const lastText = (body: { messages: unknown[] }) => JSON.stringify(body.messages.at(-1));
+    const extends_ = (previous: { messages: unknown[] }, next: { messages: unknown[] }) =>
+      JSON.stringify(next.messages.slice(0, previous.messages.length)) ===
+      JSON.stringify(previous.messages);
+
+    const first = await runTurn("first", "note v1");
+    expect(first.call.initialMetadata?.volatileSystemTail?.placement).toBe("system");
+    expect(JSON.stringify(first.body.system)).toContain("note v1");
+
+    const second = await runTurn("second", "note v2");
+    // System is unchanged, the history extends, and v2 goes after the newest user message.
+    expect(second.body.system).toEqual(first.body.system);
+    expect(extends_(first.body, second.body)).toBe(true);
+    expect(
+      second.body.messages
+        .slice(first.body.messages.length)
+        .map((m) => (m as { role: string }).role)
+    ).toEqual(["assistant", "user", "system"]);
+    expect(lastText(second.body)).toContain("note v2");
+    expect(JSON.stringify(second.body.messages.at(-2))).toContain("second");
+    expect(second.call.initialMetadata?.volatileSystemTail?.placement).toBe("row");
+
+    // An unchanged tail adds no row, and the next request still extends this one.
+    const third = await runTurn("third", "note v2");
+    expect(third.body.system).toEqual(first.body.system);
+    expect(extends_(second.body, third.body)).toBe(true);
+    expect((third.body.messages.at(-1) as { role: string }).role).toBe("user");
+    expect(third.call.initialMetadata?.volatileSystemTail).toBeUndefined();
+  });
+
+  it("describes the system content it sent: envelope, replay, debug snapshot, token count", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6srqjr, PRRT_kwDOPxxmWM6srqjx): on a change the request sends
+    // the frozen tail A in the system prompt and B as a row. Every consumer of the request shape
+    // must see that, not the live system message (stable + B).
+    using xumHome = new DisposableTempDir("ai-service-volatile-tail-consumers");
+    const { send, service, config, workspaceId } = await setup(xumHome);
+    const history = [
+      createMuxMessage("u1", "user", "first"),
+      createMuxMessage("a1", "assistant", "answer", {
+        volatileSystemTail: { text: hotTail("note v1"), placement: "system" },
+      }),
+      createMuxMessage("u2", "user", "second"),
+    ];
+    const call = await send(history, "note v2");
+    expect(call.initialMetadata?.volatileSystemTail?.placement).toBe("row");
+    const leading = call.messages.slice(
+      0,
+      call.messages.findIndex((m) => m.role !== "system")
+    );
+    const textOf = (message: ModelMessage | undefined): string => {
+      if (typeof message?.content !== "string") throw new Error("expected a text system row");
+      return message.content;
+    };
+    const sentSystem = leading.map(textOf).join("");
+    expect(sentSystem).toBe(`stable-system-prompt${hotTail("note v1")}`);
+    const row = textOf(call.messages.at(-1));
+    expect(row).toContain("note v2");
+
+    const journal = new DurableEventJournal(path.join(config.sessionsDir, workspaceId));
+    const envelope = (await journal.read()).findLast((event) => event.kind === "turn-envelope");
+    if (envelope?.kind !== "turn-envelope") throw new Error("expected a turn envelope");
+    const envelopeSystem = await journal.blobs.getText(envelope.data.systemPromptHash);
+    expect(envelopeSystem).toBe(sentSystem);
+    const snapshot = service.debugGetLastLlmRequest(workspaceId);
+    expect(snapshot.success && snapshot.data?.systemMessage).toBe(sentSystem);
+
+    // The replay verifier rebuilds the same request from the envelope and the turn's record.
+    const rebuilt = await buildReplayRequest({
+      historyMessages: history,
+      systemPrompt: envelopeSystem!,
+      systemPromptVolatileSuffixLength: envelope.data.systemPromptVolatileSuffixLength,
+      volatileSystemTail: call.initialMetadata?.volatileSystemTail,
+      modelString: envelope.data.modelString,
+      thinkingLevel: envelope.data.thinkingLevel as ThinkingLevel,
+      effectiveAgentId: "exec",
+      toolNamesForSentinel: envelope.data.sentinelToolNames ?? [],
+      routeProvider: "anthropic",
+      wireProviderName: envelope.data.wireProviderName,
+      anthropicCacheTtl: envelope.data.anthropicCacheTtl === "1h" ? "1h" : undefined,
+      workspaceId,
+    });
+    expect(JSON.stringify(rebuilt.messages)).toBe(JSON.stringify(call.messages));
+
+    // The row lives only in the request, so it counts as system content.
+    const tokenizer = await getTokenizerForModel(KNOWN_MODELS.OPUS.id);
+    expect(call.initialMetadata?.systemMessageTokens).toBe(
+      await tokenizer.countTokens(sentSystem + row)
+    );
+  });
+
+  it("records the tail plan of the request a thinking-level fold sent", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6sqho6): the level decides whether a reasoning-only row (and
+    // the tail row before it) is sent. At "high" row B replays before r0, so nothing changed;
+    // at "off" r0 is dropped, so the request appends B again and the row must record it.
+    using xumHome = new DisposableTempDir("ai-service-volatile-tail-fold");
+    const { send } = await setup(xumHome);
+    const history = [
+      createMuxMessage("u1", "user", "first"),
+      createMuxMessage("a1", "assistant", "answer", {
+        volatileSystemTail: { text: hotTail("A"), placement: "system" },
+      }),
+      createMuxMessage("u2", "user", "second"),
+      createMuxMessage(
+        "r0",
+        "assistant",
+        "",
+        { volatileSystemTail: { text: hotTail("B"), placement: "row" } },
+        [{ type: "reasoning", text: "thinking", signature: "sig-r0" }]
+      ),
+      createMuxMessage("u3", "user", "third"),
+    ];
+    const unfolded = await send(history, "B", { modelString: KNOWN_MODELS.HAIKU.id });
+    expect(unfolded.initialMetadata?.volatileSystemTail).toBeUndefined();
+    const folded = await send(history, "B", {
+      modelString: KNOWN_MODELS.HAIKU.id,
+      activeTurnThinkingOverride: { pending: "off" },
+    });
+    expect(folded.messages.at(-1)?.role).toBe("system");
+    expect(folded.initialMetadata?.volatileSystemTail).toEqual({
+      text: hotTail("B"),
+      placement: "row",
+    });
+    // The step-0 rebuild returns its record too, for StreamManager to apply.
+    const rebuilt = await unfolded.rebuildFirstStepForThinkingLevel!("off", {});
+    expect(rebuilt.volatileSystemTail).toEqual({ text: hotTail("B"), placement: "row" });
+  });
+
+  it("sends as before when middleware edited a volatile section", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6sqhpD): the edited hot memories end up in the stable part, and
+    // only the MCP warning still ends the prompt. A row with just the warning would tell the
+    // model the hot memories are gone.
+    using xumHome = new DisposableTempDir("ai-service-volatile-tail-middleware");
+    const { send, mcp, workspaceId } = await setup(xumHome);
+    const history = [
+      createMuxMessage("u1", "user", "first"),
+      createMuxMessage("a1", "assistant", "answer", {
+        volatileSystemTail: { text: hotTail("A"), placement: "system" },
+      }),
+      createMuxMessage("u2", "user", "second"),
+    ];
+    mcp.failedServerNames = ["alpha-server"];
+    const remove = eventSpine.useBefore(
+      "request.assemble",
+      (ctx: RequestAssembleContext) => {
+        ctx.systemMessage = ctx.systemMessage.replace("note v2", "note v2 (edited)");
+      },
+      { workspaceId }
+    );
+    try {
+      const call = await send(history, "note v2");
+      expect(systemRows(call)).toHaveLength(1);
+      const prompt = JSON.stringify(systemRows(call)[0]);
+      expect(prompt).toContain("note v2 (edited)");
+      expect(prompt).toContain("alpha-server");
+      expect(call.initialMetadata?.volatileSystemTail).toBeUndefined();
+    } finally {
+      remove();
     }
   });
 });

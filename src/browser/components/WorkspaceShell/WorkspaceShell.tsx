@@ -88,7 +88,6 @@ interface WorkspaceShellProps {
   workspaceName: string;
   namedWorkspacePath: string;
   leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
   runtimeConfig?: RuntimeConfig;
   className?: string;
   /** True if workspace is still being initialized (postCreateSetup or initWorkspace running) */
@@ -485,7 +484,6 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         workspaceName={props.workspaceName}
         namedWorkspacePath={props.namedWorkspacePath}
         leftSidebarCollapsed={props.leftSidebarCollapsed}
-        onToggleLeftSidebarCollapsed={props.onToggleLeftSidebarCollapsed}
         runtimeConfig={props.runtimeConfig}
         onOpenTerminal={handleOpenTerminal}
         immersiveHidden={isReviewImmersive}

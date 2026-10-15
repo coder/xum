@@ -13,11 +13,15 @@ import {
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "@/node/services/agentPlugins/discovery";
+import { isPluginWorkflowConsented } from "@/node/services/agentPlugins/componentConsent";
+import { pluginSkillScriptKey } from "@/node/services/agentPlugins/workflowFiles";
 import { isValidAgentPluginName } from "@/node/services/agentPlugins/manifest";
 import {
   getDefaultAgentSkillsRoots,
   readAgentSkill,
   type AgentSkillsRoots,
+  type ResolvedAgentSkill,
+  getPluginManagedHome,
 } from "@/node/services/agentSkills/agentSkillsService";
 import { readBuiltInSkillFile } from "@/node/services/agentSkills/builtInSkillDefinitions";
 import type {
@@ -135,29 +139,44 @@ function validateInlineWorkflowSourceByteLength(sizeBytes: number): void {
   }
 }
 
+/** The skill a `skill://` path names, read the way discovery reads it (gates included). */
+function readWorkflowSkill(
+  input: ResolveWorkflowScriptInput,
+  skillName: Parameters<typeof readAgentSkill>[2]
+): ReturnType<typeof readAgentSkill> {
+  // Discovery uses the skill storage context when there is one, else the workspace.
+  const workspacePath = input.skillStorageContext?.workspacePath ?? input.workspacePath;
+  const roots = workflowSkillRoots(input);
+  const projectSearchRoot = roots?.projectSearchRoot ?? input.projectSearchRoot ?? workspacePath;
+  return readAgentSkill(workflowSkillRuntime(input), workspacePath, skillName, {
+    ...(roots != null ? { roots } : { projectSearchRoot }),
+    containment: workflowSkillContainment(input, projectSearchRoot),
+  });
+}
+
+function workflowSkillRuntime(input: ResolveWorkflowScriptInput) {
+  return input.skillStorageContext?.runtime ?? input.runtime;
+}
+
+function workflowSkillRoots(input: ResolveWorkflowScriptInput) {
+  return input.roots ?? input.skillStorageContext?.roots;
+}
+
+function workflowSkillContainment(input: ResolveWorkflowScriptInput, projectSearchRoot: string) {
+  return (
+    input.containment ??
+    input.skillStorageContext?.containment ??
+    ({ kind: "runtime", root: projectSearchRoot } as const)
+  );
+}
+
 async function resolveSkillWorkflowScript(
   input: ResolveWorkflowScriptInput & { scriptPath: string }
 ): Promise<ResolvedWorkflowScript> {
   const parsed = parseSkillWorkflowScriptPath(input.scriptPath);
   assertJavaScriptWorkflowPath(parsed.relativePath);
 
-  const skillDiscoveryRuntime = input.skillStorageContext?.runtime ?? input.runtime;
-  const skillWorkspacePath = input.skillStorageContext?.workspacePath ?? input.workspacePath;
-  const skillRoots = input.roots ?? input.skillStorageContext?.roots;
-  const projectSearchRoot =
-    skillRoots?.projectSearchRoot ?? input.projectSearchRoot ?? skillWorkspacePath;
-  const resolvedSkill = await readAgentSkill(
-    skillDiscoveryRuntime,
-    skillWorkspacePath,
-    parsed.skillName,
-    {
-      ...(skillRoots != null ? { roots: skillRoots } : { projectSearchRoot }),
-      containment:
-        input.containment ??
-        input.skillStorageContext?.containment ??
-        ({ kind: "runtime", root: projectSearchRoot } as const),
-    }
-  );
+  const resolvedSkill = await readWorkflowSkill(input, parsed.skillName);
 
   if (resolvedSkill.package.scope === "project" && !input.projectTrusted) {
     throw new Error("Project trust is required to run project skill workflow scripts");
@@ -195,6 +214,7 @@ async function resolveSkillWorkflowScript(
   }
 
   const source = await readFileString(skillRuntime, resolvedPath);
+  assertSkillScriptReviewed(resolvedSkill, parsed.relativePath, source);
   return buildResolvedScript({
     requestedScriptPath: input.scriptPath,
     canonicalScriptPath: `${SKILL_SCRIPT_PATH_PREFIX}${parsed.skillName}/${parsed.relativePath}`,
@@ -256,7 +276,10 @@ export async function discoverWorkflowPlugins(input: {
   }
   await addContainers(roots.globalPluginRoots ?? [], "global");
 
-  const { plugins } = await discoverAgentPlugins(containers);
+  const { plugins } = await discoverAgentPlugins(
+    containers,
+    await managedHomeOption(localRuntime, roots)
+  );
 
   // Project plugin roots keep the repo-symlink posture: a committed
   // .xum/plugins/<name> symlink must not resolve outside the checkout.
@@ -272,6 +295,20 @@ export async function discoverWorkflowPlugins(input: {
     eligible.push(plugin);
   }
   return eligible;
+}
+
+/**
+ * The managed home names the registry, so managed plugins carry their consent records (#6629), as
+ * plugin skill discovery does.
+ */
+async function managedHomeOption(
+  localRuntime: LocalRuntime,
+  roots: AgentSkillsRoots
+): Promise<{ managedHome?: string }> {
+  const managedHome = getPluginManagedHome(roots);
+  return managedHome !== undefined
+    ? { managedHome: await localRuntime.resolvePath(managedHome) }
+    : {};
 }
 
 async function resolvePluginWorkflowScript(
@@ -328,6 +365,7 @@ async function resolvePluginWorkflowScript(
   } catch (error) {
     throw new Error(`Plugin workflow script not readable: ${getErrorMessage(error)}`);
   }
+  assertWorkflowReviewed(plugin, parsed.relativePath, source);
   return buildResolvedScript({
     requestedScriptPath: input.scriptPath,
     canonicalScriptPath: `${PLUGIN_SCRIPT_PATH_PREFIX}${plugin.name}/${parsed.relativePath}`,
@@ -338,6 +376,96 @@ async function resolvePluginWorkflowScript(
     relativePath: parsed.relativePath,
     resolvedPath,
   });
+}
+
+/**
+ * The consent gate of a managed plugin skill's script (#6629). The skill's own consent (#6498)
+ * covers its SKILL.md frontmatter, not the bytes `skill://` runs, so the script needs its own
+ * record, keyed by its plugin-relative path. It checks the source about to run. Only the skill's
+ * `workflow.js` can have a record (the install review lists no other script).
+ */
+function assertSkillScriptReviewed(
+  skill: Pick<ResolvedAgentSkill, "pluginConsent" | "pluginRoot" | "pluginName" | "skillDir">,
+  relativePath: string,
+  source: string
+): void {
+  if (skill.pluginConsent === undefined || skill.pluginRoot === undefined) return;
+  const file = pluginSkillScriptKey(skill.pluginRoot, path.join(skill.skillDir, relativePath));
+  if (isPluginWorkflowConsented(skill.pluginConsent, { file, source })) return;
+  throw new Error(
+    `Plugin workflow '${file}' has not been reviewed on this install, so it does not run. Open Settings → Plugins and select Review on plugin '${skill.pluginName ?? "?"}'.`
+  );
+}
+
+/**
+ * The consent gate for a stored plugin run (#6629). Resume, checkpoint retry and crash recovery
+ * run the source snapshotted in the run record and never reread the plugin file, so they check
+ * that snapshot against the plugin's current consent record. A run started before the upgrade, or
+ * on bytes whose review an update replaced, cannot resume. A plugin that is gone fails closed.
+ */
+export async function assertStoredPluginWorkflowReviewed(
+  input: ResolveWorkflowScriptInput & {
+    scriptPath: string;
+    source: string;
+    /** The discovery scope of the plugin the run started from (its descriptor's scope). */
+    scope: AgentPluginContainer["scope"];
+  }
+): Promise<void> {
+  if (input.scriptPath.startsWith(SKILL_SCRIPT_PATH_PREFIX)) {
+    await assertStoredSkillWorkflowReviewed(input);
+    return;
+  }
+  const parsed = parsePluginWorkflowScriptPath(input.scriptPath);
+  const plugins = await discoverWorkflowPlugins(input);
+  // Bound to the scope the run started in: a project plugin of the same name must not stand in
+  // for a managed global one (project plugins carry no consent, so it would pass any snapshot).
+  const plugin = plugins.find(
+    (candidate) =>
+      candidate.name === parsed.pluginName &&
+      candidate.scope === input.scope &&
+      candidate.workflowsDir != null
+  );
+  if (plugin === undefined) {
+    throw new Error(
+      `Plugin '${parsed.pluginName}' is no longer installed, so its workflow run cannot resume.`
+    );
+  }
+  assertWorkflowReviewed(plugin, parsed.relativePath, input.source);
+}
+
+/**
+ * The stored-run gate of a `skill://` run (#6777): the skill of that name, in the scope the run
+ * started in, must still vouch for the snapshot. A managed plugin skill checks it against its
+ * consent record, as the resolver does. Other skills carry no record and pass. A skill that is
+ * gone, or that another scope now serves (an unreviewed plugin skill reads as missing), fails
+ * closed: the skill found then is not the one whose script the run snapshotted.
+ */
+async function assertStoredSkillWorkflowReviewed(
+  input: ResolveWorkflowScriptInput & {
+    scriptPath: string;
+    source: string;
+    scope: AgentPluginContainer["scope"];
+  }
+): Promise<void> {
+  const parsed = parseSkillWorkflowScriptPath(input.scriptPath);
+  const skill = await readWorkflowSkill(input, parsed.skillName).catch(() => undefined);
+  if (skill?.package.scope !== input.scope) {
+    throw new Error(
+      `Skill '${parsed.skillName}' is no longer available in its ${input.scope} scope, so its workflow run cannot resume.`
+    );
+  }
+  assertSkillScriptReviewed(skill, parsed.relativePath, input.source);
+}
+
+/**
+ * The consent gate (#6629): it checks the source the resolver is about to run, so a script changed
+ * after its review cannot run. Listing goes through the resolver too, so it hides the script.
+ */
+function assertWorkflowReviewed(plugin: AgentPluginInfo, file: string, source: string): void {
+  if (isPluginWorkflowConsented(plugin.componentConsent, { file, source })) return;
+  throw new Error(
+    `Plugin workflow '${file}' has not been reviewed on this install, so it does not run. Open Settings → Plugins and select Review on plugin '${plugin.name}'.`
+  );
 }
 
 function parsePluginWorkflowScriptPath(scriptPath: string): {

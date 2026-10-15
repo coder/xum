@@ -806,13 +806,15 @@ function managedPluginFields(
   imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,
   registryPath: string | undefined
 ): Pick<AgentPluginInfo, "componentPolicy" | "componentConsent" | "importedComponents"> {
-  if (imports === null) return { importedComponents: { skills: [], mcpServers: [] } };
+  // A corrupt registry, or an unidentified row that can own the directory: nothing loads, also
+  // nothing the picker does not select (workflows, #6629).
+  const nothing = {
+    importedComponents: { skills: [], mcpServers: [] },
+    componentConsent: noComponentConsent(),
+  };
+  if (imports === null) return nothing;
   if (imports === undefined) return {};
-  if (!imports.byName.has(entryName)) {
-    return imports.hasUnidentifiedEntries
-      ? { importedComponents: { skills: [], mcpServers: [] } }
-      : {};
-  }
+  if (!imports.byName.has(entryName)) return imports.hasUnidentifiedEntries ? nothing : {};
   return {
     importedComponents: imports.byName.get(entryName),
     ...(registryPath !== undefined

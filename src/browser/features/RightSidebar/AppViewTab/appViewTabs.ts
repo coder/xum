@@ -17,7 +17,7 @@ import {
 } from "../ArtifactsTab/mcpAppViewsStore";
 
 /**
- * MCP App views as right-sidebar tabs (artifacts experiment): one "app:<viewKey>" tab per view,
+ * MCP App views as right-sidebar tabs (mcp-apps experiment): one "app:<viewKey>" tab per view,
  * keyed by the view's mcpAppSelectionKey. Plugin UIs get their own tab like built-in tools,
  * instead of living in Artifacts (which shows only files the agent created).
  */

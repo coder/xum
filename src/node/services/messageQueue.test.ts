@@ -782,6 +782,46 @@ describe("MessageQueue", () => {
       expect(queue.getVisibleQueueDispatchMode()).toBe("turn-end");
     });
 
+    it.each(["admission", "task", "compaction"] as const)(
+      "uses the first surviving entry's mode after %s admission goes stale",
+      (gate) => {
+        const stale = { admission: false, task: false, compaction: false };
+        queue.add(
+          "automatic guidance",
+          { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+          {
+            synthetic: true,
+            sealed: true,
+            admissionStale: () => stale.admission,
+            turnAdmission: {
+              admissionStale: () => stale.task,
+              onEnqueued: () => undefined,
+              onAdmitted: () => undefined,
+              onDisposed: () => undefined,
+            },
+            compactionAdmissionStale: () => stale.compaction,
+          }
+        );
+        expect(queue.hasDispatchableEntries()).toBe(true);
+        expect(queue.getNextDispatchableMode()).toBe("tool-end");
+
+        stale[gate] = true;
+        expect(queue.hasDispatchableEntries()).toBe(false);
+        expect(queue.getNextDispatchableMode()).toBeUndefined();
+        // Refusal/cancellation callbacks still belong to the normal FIFO drain.
+        expect(queue.isEmpty()).toBe(false);
+
+        queue.add("held user input", {
+          model: "gpt-4",
+          agentId: "exec",
+          queueDispatchMode: "turn-end",
+        });
+        expect(queue.hasDispatchableEntries()).toBe(true);
+        expect(queue.getNextDispatchableMode()).toBe("turn-end");
+        expect(queue.getNextQueueCutCandidate()?.dispatchMode).toBe("turn-end");
+      }
+    );
+
     it("should reset mode to tool-end when cleared", () => {
       queue.add("Follow up", {
         model: "gpt-4",
@@ -868,25 +908,67 @@ describe("MessageQueue", () => {
       }
     });
 
-    it("leads past a withdrawn entry, which drains as a no-op and cuts nothing", () => {
-      const withdrawn = new AbortController();
-      queue.add(
-        "withdrawn wake",
-        { ...validOptions, queueDispatchMode: "tool-end" },
-        { ...hidden, cancelSignal: withdrawn.signal }
-      );
-      queue.add("peer", { ...validOptions, queueDispatchMode: "turn-end" }, hidden);
-      expect(queue.promotedToolEndWouldLead()).toBe(false);
-      withdrawn.abort();
-      expect(queue.promotedToolEndWouldLead()).toBe(true);
-      queue.add(
-        "promoted",
-        { ...validOptions, queueDispatchMode: "tool-end" },
-        { ...hidden, promoteAheadOfHiddenTurnEnd: true }
-      );
-      expect(queue.getMessages()).toEqual(["withdrawn wake", "promoted", "peer"]);
-      expect(queue.getNextDispatchableMode()).toBe("tool-end");
-    });
+    it.each(["cancel", "admission", "task", "compaction"] as const)(
+      "promotion, dispatch and correlation agree after hidden %s withdrawal",
+      (gate) => {
+        const turnMetadata: MuxMessageMetadata = {
+          type: "workspace-turn-task",
+          taskHandleId: "wst_parent",
+          ownerWorkspaceId: "grandparent",
+          turnId: "turn-1",
+        };
+        for (const mode of ["tool-end", "turn-end"] as const) {
+          queue = new MessageQueue();
+          const withdrawn = new AbortController();
+          let stale = false;
+          queue.add(
+            "withdrawn wake",
+            { ...validOptions, queueDispatchMode: mode },
+            {
+              ...hidden,
+              cancelSignal: withdrawn.signal,
+              admissionStale: () => gate === "admission" && stale,
+              turnAdmission: {
+                admissionStale: () => gate === "task" && stale,
+                onEnqueued: () => undefined,
+                onAdmitted: () => undefined,
+                onDisposed: () => undefined,
+              },
+              compactionAdmissionStale: () => gate === "compaction" && stale,
+            }
+          );
+          const peerCanceled = () => undefined;
+          queue.add(
+            "peer message",
+            { ...validOptions, queueDispatchMode: "turn-end", muxMetadata: turnMetadata },
+            { ...hidden, workspaceTurnContinuation: true, onCanceled: peerCanceled }
+          );
+          expect(queue.promotedToolEndWouldLead()).toBe(mode === "turn-end");
+          if (gate === "cancel") withdrawn.abort();
+          stale = true;
+          expect(queue.promotedToolEndWouldLead()).toBe(true);
+          expect(
+            queue.hasAllWorkspaceTurnContinuations("wst_parent", "grandparent", "turn-1", {
+              promoteAheadOfHiddenTurnEnd: true,
+            })
+          ).toBe(true);
+          queue.add(
+            "progress report",
+            { ...validOptions, queueDispatchMode: "tool-end", muxMetadata: turnMetadata },
+            { ...hidden, workspaceTurnContinuation: true, promoteAheadOfHiddenTurnEnd: true }
+          );
+          expect(queue.getNextDispatchableMode()).toBe("tool-end");
+          expect(queue.dequeueNext().message).toBe("withdrawn wake");
+          const promoted = queue.dequeueNext();
+          expect(promoted.message).toBe("progress report");
+          expect(promoted.options?.muxMetadata).toEqual(turnMetadata);
+          const skipped = queue.dequeueNext();
+          expect(skipped.message).toBe("peer message");
+          expect(skipped.options?.muxMetadata).toEqual(turnMetadata);
+          expect(skipped.internal?.onCanceled).toBe(peerCanceled);
+        }
+      }
+    );
 
     it("never overtakes a user-authored turn-end entry", () => {
       queue.add("hidden turn-end", { ...validOptions, queueDispatchMode: "turn-end" }, hidden);
@@ -994,42 +1076,6 @@ describe("MessageQueue", () => {
       expect(skipped.internal?.onCanceled).toBe(peerCanceled);
     });
 
-    it("ignores a withdrawn predecessor when revalidating correlations after a promotion", () => {
-      const turnMetadata: MuxMessageMetadata = {
-        type: "workspace-turn-task",
-        taskHandleId: "wst_parent",
-        ownerWorkspaceId: "grandparent",
-        turnId: "turn-1",
-      };
-      const withdrawn = new AbortController();
-      queue.add(
-        "withdrawn wake",
-        { ...validOptions, queueDispatchMode: "tool-end" },
-        { ...hidden, cancelSignal: withdrawn.signal }
-      );
-      withdrawn.abort();
-      const peerCanceled = () => undefined;
-      queue.add(
-        "peer message",
-        { ...validOptions, queueDispatchMode: "turn-end", muxMetadata: turnMetadata },
-        { ...hidden, workspaceTurnContinuation: true, onCanceled: peerCanceled }
-      );
-      queue.add(
-        "progress report",
-        { ...validOptions, queueDispatchMode: "tool-end", muxMetadata: turnMetadata },
-        { ...hidden, workspaceTurnContinuation: true, promoteAheadOfHiddenTurnEnd: true }
-      );
-
-      expect(queue.dequeueNext().message).toBe("withdrawn wake");
-      const promoted = queue.dequeueNext();
-      expect(promoted.message).toBe("progress report");
-      expect(promoted.options?.muxMetadata).toEqual(turnMetadata);
-      const skipped = queue.dequeueNext();
-      expect(skipped.message).toBe("peer message");
-      expect(skipped.options?.muxMetadata).toEqual(turnMetadata);
-      expect(skipped.internal?.onCanceled).toBe(peerCanceled);
-    });
-
     it("ignores the hidden turn-end entries a promoted report overtakes when judging its correlation", () => {
       // A queued heartbeat (hidden, turn-end, uncorrelated) would make the plain check report a
       // superseding predecessor and strip the report's correlation before enqueue — yet the
@@ -1041,11 +1087,9 @@ describe("MessageQueue", () => {
         turnId: "turn-1",
       };
       const ahead = (): boolean =>
-        queue.hasAllWorkspaceTurnContinuationsAheadOfPromotedToolEnd(
-          "wst_parent",
-          "grandparent",
-          "turn-1"
-        );
+        queue.hasAllWorkspaceTurnContinuations("wst_parent", "grandparent", "turn-1", {
+          promoteAheadOfHiddenTurnEnd: true,
+        });
 
       expect(ahead()).toBe(true);
       queue.add(
@@ -1077,22 +1121,18 @@ describe("MessageQueue", () => {
       queue.add("unrelated tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden);
       queue.add("peer message", { ...validOptions, queueDispatchMode: "turn-end" }, hidden);
       expect(
-        queue.hasAllWorkspaceTurnContinuationsAheadOfPromotedToolEnd(
-          "wst_parent",
-          "grandparent",
-          "turn-1"
-        )
+        queue.hasAllWorkspaceTurnContinuations("wst_parent", "grandparent", "turn-1", {
+          promoteAheadOfHiddenTurnEnd: true,
+        })
       ).toBe(false);
     });
 
     it("counts a user-authored turn-end tail as a predecessor for a promoted report", () => {
       queue.add("user wait for turn end", { ...validOptions, queueDispatchMode: "turn-end" });
       expect(
-        queue.hasAllWorkspaceTurnContinuationsAheadOfPromotedToolEnd(
-          "wst_parent",
-          "grandparent",
-          "turn-1"
-        )
+        queue.hasAllWorkspaceTurnContinuations("wst_parent", "grandparent", "turn-1", {
+          promoteAheadOfHiddenTurnEnd: true,
+        })
       ).toBe(false);
     });
   });

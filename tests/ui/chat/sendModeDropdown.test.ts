@@ -460,6 +460,7 @@ describe("Send dispatch modes (mock AI router)", () => {
 
       const manager = getBackgroundProcessManager(app.env);
 
+      await app.chat.startHeldToolTurn("keyboard send after turn source");
       const turnToolCallId = "bash-foreground-send-after-turn";
       let turnBackgrounded = false;
 
@@ -480,13 +481,23 @@ describe("Send dispatch modes (mock AI router)", () => {
 
       const turnEndMessage = "turn-end keyboard test";
       await app.chat.typeWithoutSending(turnEndMessage);
+      // stream-start precedes the source send's completion; wait until the composer can send.
+      await waitForSendModeMenuTrigger(app.view.container);
       let textarea = await getActiveTextarea(app.view.container);
       fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
 
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("Queued");
+        expect(app.view.container.textContent).toContain("Sends after this turn");
+      });
+      expect(turnBackgrounded).toBe(false);
+      unregisterTurn();
+      app.env.services.aiService.releaseMockToolCalls(app.workspaceId);
       await app.chat.expectTranscriptContains(`Mock response: ${turnEndMessage}`);
       await app.chat.expectStreamComplete();
       expect(turnBackgrounded).toBe(false);
 
+      await app.chat.startHeldToolTurn("keyboard send after step source");
       const stepToolCallId = "bash-foreground-send-after-step";
       let stepBackgrounded = false;
 
@@ -498,6 +509,7 @@ describe("Send dispatch modes (mock AI router)", () => {
         () => {
           stepBackgrounded = true;
           unregisterStep?.();
+          app.env.services.aiService.releaseMockToolCalls(app.workspaceId);
         }
       );
 
@@ -507,6 +519,7 @@ describe("Send dispatch modes (mock AI router)", () => {
 
       const stepEndMessage = "tool-end test";
       await app.chat.typeWithoutSending(stepEndMessage);
+      await waitForSendModeMenuTrigger(app.view.container);
       textarea = await getActiveTextarea(app.view.container);
       fireEvent.keyDown(textarea, { key: "Enter" });
 

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { waitFor } from "@storybook/test";
+import { waitFor } from "storybook/test";
 import { APIProvider } from "@/browser/contexts/API";
 import { RetryBarrierContent } from "@/browser/features/Messages/ChatBarrier/RetryBarrier";
 import { StreamErrorMessage } from "@/browser/features/Messages/StreamErrorMessage";

@@ -611,9 +611,9 @@ export const CoreWiringLive: Layer.Layer<
     agentPluginHookService.setSettingsProvider((workspaceId, keyPrefix, timeoutMs) =>
       mcpServerManager.getSettingsForPluginHooks(workspaceId, keyPrefix, timeoutMs)
     );
-    // MCP Apps views (artifacts experiment): host-only raw results live in the session dir.
+    // MCP Apps views (mcp-apps experiment): host-only raw results live in the session dir.
     mcpServerManager.setMcpApps({
-      isEnabled: () => aiService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS),
+      isEnabled: () => aiService.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS),
       store: new McpAppResultStore(
         (workspaceId) => path.join(config.sessionsDir, workspaceId),
         config.rootDir

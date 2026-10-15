@@ -323,7 +323,7 @@ export const MCPToolCallDisplaySchema = z
     /** Immutable session-local ref, never an icon URL or persisted image bytes. */
     iconRef: MCPIconRefSchema.optional().catch(undefined),
     /**
-     * MCP Apps (artifacts experiment): the tool declares a ui:// view. The server is
+     * MCP Apps (mcp-apps experiment): the tool declares a ui:// view. The server is
      * `connection.key`; the card offers "Open in Artifacts".
      */
     app: z

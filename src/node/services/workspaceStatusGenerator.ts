@@ -314,7 +314,7 @@ function attemptCandidate(
         yield* Effect.tryPromise({
           try: async () =>
             options.recordUsage?.(modelString, usage, {
-              providerMetadata: accumulateStepsProviderMetadata(steps),
+              providerMetadata: accumulateStepsProviderMetadata(steps, created.metadataModel),
               metadataModel: created.metadataModel,
             }),
           catch: (error) => error,

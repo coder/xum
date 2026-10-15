@@ -15,6 +15,7 @@ import { useAPI } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { matchesKeybind, KEYBINDS, paneHandlesKeyEvent } from "@/browser/utils/ui/keybinds";
 import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
@@ -66,14 +67,6 @@ type AgentProviderProps =
 
 function getScopeId(workspaceId: string | undefined, projectPath: string | undefined): string {
   return workspaceId ?? (projectPath ? getProjectScopeId(projectPath) : GLOBAL_SCOPE_ID);
-}
-
-function isSameFetch(
-  current: { projectPath: string | undefined; workspaceId: string | undefined },
-  projectPath: string | undefined,
-  workspaceId: string | undefined
-): boolean {
-  return current.projectPath === projectPath && current.workspaceId === workspaceId;
 }
 
 function coerceAgentId(value: unknown): string {
@@ -148,6 +141,7 @@ function AgentProviderWithState(props: {
   const fetchParamsRef = useRef({
     projectPath: props.projectPath,
     workspaceId: props.workspaceId,
+    generation: 0,
   });
 
   const fetchAgents = useCallback(
@@ -156,7 +150,11 @@ function AgentProviderWithState(props: {
       workspaceId: string | undefined,
       agentScopeId: string
     ) => {
-      fetchParamsRef.current = { projectPath, workspaceId };
+      // Each fetch takes the next generation, and only the latest one commits. Two fetches of the
+      // same scope can overlap (a plugin-mutation refresh during the initial load, #6629), and an
+      // older answer must not replace a newer one.
+      const generation = fetchParamsRef.current.generation + 1;
+      fetchParamsRef.current = { projectPath, workspaceId, generation };
 
       if (!api || (!projectPath && !workspaceId)) {
         if (isMountedRef.current) {
@@ -171,7 +169,7 @@ function AgentProviderWithState(props: {
 
       try {
         const result = await api.agents.list({ projectPath, workspaceId });
-        if (isSameFetch(fetchParamsRef.current, projectPath, workspaceId) && isMountedRef.current) {
+        if (fetchParamsRef.current.generation === generation && isMountedRef.current) {
           setAgents(result);
           setAgentBases(agentScopeId, result);
           setLoadFailed(false);
@@ -180,7 +178,7 @@ function AgentProviderWithState(props: {
       } catch (error) {
         // A lost connection (or the reconnect that replaced the client) is no load failure.
         if (isConnectionLostError(error)) return;
-        if (isSameFetch(fetchParamsRef.current, projectPath, workspaceId) && isMountedRef.current) {
+        if (fetchParamsRef.current.generation === generation && isMountedRef.current) {
           setAgents([]);
           setAgentBases(agentScopeId, []);
           setLoadFailed(true);
@@ -316,8 +314,12 @@ function AgentProviderWithState(props: {
     };
 
     window.addEventListener(CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED, handleRefreshRequested);
-    return () =>
+    // A plugin install, update or component review changes which plugin agents load (#6629).
+    const unsubscribe = subscribeAgentPluginsMutated(handleRefreshRequested);
+    return () => {
       window.removeEventListener(CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED, handleRefreshRequested);
+      unsubscribe();
+    };
   }, [refresh]);
 
   const agentContextValue = useMemo(

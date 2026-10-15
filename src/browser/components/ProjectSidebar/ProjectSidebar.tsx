@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { cn } from "@/common/lib/utils";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import XumLogoDark from "@/browser/assets/logos/xum-logo-dark.svg?react";
 import XumLogoLight from "@/browser/assets/logos/xum-logo-light.svg?react";
 import { useTheme } from "@/browser/contexts/ThemeContext";
@@ -81,7 +80,6 @@ import {
 } from "@/browser/utils/ui/pinnedReorder";
 import { isWorkspaceRowRendered } from "@/browser/utils/ui/workspaceDomNav";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
-import { SidebarCollapseButton } from "../SidebarCollapseButton/SidebarCollapseButton";
 import { ConfirmationModal } from "../ConfirmationModal/ConfirmationModal";
 import { useArchiveWorkspaceConfirmation } from "@/browser/hooks/useArchiveWorkspaceConfirmation";
 import { ProjectDeleteConfirmationModal } from "../ProjectDeleteConfirmationModal/ProjectDeleteConfirmationModal";
@@ -652,6 +650,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     reorderPinnedWorkspaces,
     refreshWorkspaceMetadata,
     pendingNewWorkspaceProject,
+    pendingNewWorkspaceSubProjectPath,
     pendingNewWorkspaceDraftId,
     workspaceDraftsByProject,
     workspaceDraftPromotionsByProject,
@@ -1850,19 +1849,49 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const hasProjectMenuTarget = projectMenuTargetPath !== null;
 
+  // Ctrl+N and the collapsed sidebar's toggle bar New chat: beside the selected chat, else in the open
+  // draft page's project. useCallback for the effects' dependency lists, not for memoization.
+  const handleNewChat = useCallback(() => {
+    if (selectedWorkspace) {
+      // Sub-project workspaces share the parent worktree, so recover the child
+      // target from the live sidebar metadata before opening a sibling draft.
+      const meta = workspaceStore.getWorkspaceMetadata(selectedWorkspace.workspaceId);
+      if (meta) {
+        handleAddSiblingWorkspace(meta);
+      } else {
+        handleAddWorkspace(selectedWorkspace.projectPath);
+      }
+    } else if (pendingNewWorkspaceProject === SCRATCH_PROJECT_CONFIG_KEY) {
+      handleAddScratchWorkspace();
+    } else if (pendingNewWorkspaceProject) {
+      handleAddWorkspace(
+        pendingNewWorkspaceProject,
+        pendingNewWorkspaceSubProjectPath ?? undefined
+      );
+    }
+  }, [
+    selectedWorkspace,
+    pendingNewWorkspaceProject,
+    pendingNewWorkspaceSubProjectPath,
+    workspaceStore,
+    handleAddSiblingWorkspace,
+    handleAddScratchWorkspace,
+    handleAddWorkspace,
+  ]);
+
+  // The collapsed sidebar's New chat lives in the app shell's toggle bar, which asks this
+  // always-mounted sidebar to run it.
+  useEffect(() => {
+    window.addEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, handleNewChat);
+    return () => window.removeEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, handleNewChat);
+  }, [handleNewChat]);
+
   // Handle keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Sub-project workspaces share the parent worktree, so recover the child
-      // target from the live sidebar metadata before opening a sibling draft.
-      if (matchesKeybind(e, KEYBINDS.NEW_WORKSPACE) && selectedWorkspace) {
+      if (matchesKeybind(e, KEYBINDS.NEW_WORKSPACE)) {
         e.preventDefault();
-        const meta = workspaceStore.getWorkspaceMetadata(selectedWorkspace.workspaceId);
-        if (meta) {
-          handleAddSiblingWorkspace(meta);
-        } else {
-          handleAddWorkspace(selectedWorkspace.projectPath);
-        }
+        handleNewChat();
       } else if (matchesKeybind(e, KEYBINDS.ARCHIVE_WORKSPACE) && selectedWorkspace) {
         e.preventDefault();
         void handleArchiveWorkspace(selectedWorkspace.workspaceId);
@@ -1894,8 +1923,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   }, [
     closeProjectContextMenu,
     selectedWorkspace,
-    handleAddSiblingWorkspace,
-    handleAddWorkspace,
+    handleNewChat,
     handleArchiveWorkspace,
     setWorkspacePinned,
     movePinnedWorkspace,
@@ -2410,8 +2438,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             // The sidebar doubles as a drag surface, so keep copy selection disabled
             // unless a child input explicitly opts back into text selection.
             "font-primary bg-surface-primary border-border-light relative flex flex-1 select-none flex-col overflow-hidden border-r",
-            // In desktop mode when collapsed, hide border (LeftSidebar handles the partial border)
-            isDesktopMode() && collapsed && "border-r-0"
+            // The collapsed sidebar is zero-width; the app shell's toggle bar reopens it.
+            collapsed && "border-r-0"
           )}
           role="navigation"
           aria-label="Projects"
@@ -3483,11 +3511,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
               </ScrollArea>
             </>
           )}
-          <SidebarCollapseButton
-            collapsed={collapsed}
-            onToggle={onToggleCollapsed}
-            shortcut={formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)}
-          />
           <PositionedMenu
             open={projectContextMenu.isOpen}
             onOpenChange={handleProjectMenuOpenChange}
@@ -3639,7 +3662,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             prefix="Failed to remove sub-project"
             onDismiss={sectionRemoveError.clearError}
           />
-          {!(isDesktopMode() && collapsed) && (
+          {!collapsed && (
             // Keep the sidebar divider above sticky row content and scroll-layer visuals.
             <div
               aria-hidden

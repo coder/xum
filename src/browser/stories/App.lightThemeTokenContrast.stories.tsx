@@ -26,7 +26,7 @@
  * themes, which use the text-only accent token (#5946 dark, #6449 light).
  */
 
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_TAB_KEY } from "@/common/constants/storage";
@@ -39,6 +39,7 @@ import {
   textContrastOnBase,
   textContrasts,
   tokenTextContrasts,
+  textsBelowAaInThemes,
   type TextContrast,
 } from "@/browser/stories/helpers/contrast";
 import {
@@ -126,7 +127,9 @@ export const Home: AppStory = {
   render: () => <AppWithMocks setup={() => createMockORPCClient()} />,
   play: async ({ canvasElement }) => {
     await within(canvasElement).findByText("No projects", {}, { timeout: 15_000 });
-    await expectTokenTextsReadable(canvasElement, { "--color-muted": 1 });
+    // No minimum: home shows no muted or secondary text (the sidebar toggle is an icon), and the
+    // scan still checks any that a later change adds.
+    await expectTokenTextsReadable(canvasElement, {});
   },
 };
 
@@ -734,3 +737,26 @@ export const AccentLinksLight = accentLinkStory("light");
 export const AccentLinksFlexokiLight = accentLinkStory("flexoki-light");
 export const AccentLinksDark = accentLinkStory("dark");
 export const AccentLinksFlexokiDark = accentLinkStory("flexoki-dark");
+
+// ─── Dark muted text on raised surfaces (#6544) ──────────────────────────────────────────────
+
+/**
+ * Every `--color-muted` text on the Settings > Agents cards (`bg-background-secondary`) reaches
+ * 4.5:1 in dark and flexoki-dark. Dark muted at 53% was 4.16:1 on these cards.
+ */
+export const MutedOnRaisedSurfacesDark: AppStory = {
+  globals: { theme: "dark" },
+  parameters: lightContract,
+  render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
+  play: async ({ canvasElement }) => {
+    const dialog = await openSettingsDialog(canvasElement);
+    await userEvent.click(await within(dialog).findByRole("button", { name: "Agents" }));
+    await within(dialog).findByRole("group", { name: "Exec defaults" });
+    // Read the muted texts per theme: the token resolves to a different color in each one.
+    const mutedTexts = () => tokenTextContrasts(dialog, ["--color-muted"]).map((e) => e.element);
+    await waitFor(() => {
+      if (mutedTexts().length < 5) throw new Error("expected 5+ muted texts on the Agents cards");
+    });
+    await expect(textsBelowAaInThemes(mutedTexts, ["dark", "flexoki-dark"]).join("\n")).toBe("");
+  },
+};

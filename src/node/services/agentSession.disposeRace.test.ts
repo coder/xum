@@ -67,7 +67,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const backgroundProcessManager: BackgroundProcessManager = {
       cleanup: mock(() => Promise.resolve()),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     } as unknown as BackgroundProcessManager;
 
     const { session } = await createAgentSessionHarness({
@@ -152,7 +152,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const backgroundProcessManager: BackgroundProcessManager = {
       cleanup: mock(() => Promise.resolve()),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     } as unknown as BackgroundProcessManager;
 
     const workspaceId = "ws-branch-summary-dispose";
@@ -279,7 +279,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const backgroundProcessManager: BackgroundProcessManager = {
       cleanup: mock(() => Promise.resolve()),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     } as unknown as BackgroundProcessManager;
 
     const { session } = await createAgentSessionHarness({
@@ -355,7 +355,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const backgroundProcessManager: BackgroundProcessManager = {
       cleanup: mock(() => Promise.resolve()),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     } as unknown as BackgroundProcessManager;
 
     const { session } = await createAgentSessionHarness({
@@ -433,7 +433,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const backgroundProcessManager: BackgroundProcessManager = {
       cleanup: mock(() => Promise.resolve()),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     } as unknown as BackgroundProcessManager;
 
     const { session } = await createAgentSessionHarness({
@@ -565,7 +565,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const backgroundProcessManager: BackgroundProcessManager = {
       cleanup: mock(() => Promise.resolve()),
-      setMessageQueued: mock(() => undefined),
+      getForegroundToolCallIds: mock(() => []),
     } as unknown as BackgroundProcessManager;
 
     const { session } = await createAgentSessionHarness({

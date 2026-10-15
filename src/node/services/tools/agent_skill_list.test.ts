@@ -476,6 +476,9 @@ describe("agent_skill_list", () => {
       await saveConsent({
         skills: { shared: "0".repeat(64), solo: "0".repeat(64) },
         mcpServers: {},
+        workflows: {},
+        agents: {},
+        slashCommands: {},
       });
       expect(await list()).toEqual({ shared: "fallback", free: "unmanaged" });
 

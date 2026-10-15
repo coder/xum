@@ -38,7 +38,10 @@ import { closeScopeBounded, disposeAppRuntime } from "@/node/services/di/appRunt
 import { log, type LogLevel } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
+import {
+  assertStoredPluginWorkflowReviewed,
+  resolveWorkflowScript,
+} from "@/node/services/workflows/workflowScriptResolver";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { WorkflowService } from "@/node/services/workflows/WorkflowService";
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
@@ -221,6 +224,7 @@ async function copyPersistentConfig(
 
 async function disposeWorkflowResources(input: {
   tempDir: DisposableTempDir;
+  config: Config;
   services?: WorkflowServices;
   session?: AgentSession;
   codexOauthService?: CodexOauthService;
@@ -232,6 +236,9 @@ async function disposeWorkflowResources(input: {
   // timed as a `[shutdown]` line; a failing step never skips the ones after it.
   await runBestEffortCleanup(
     [
+      // First: stop the config.json watches before the services go, so no watch callback
+      // reaches a torn-down service. A failed setup stops them too.
+      { name: "config.stopWatchingConfigFile", run: () => input.config.stopWatchingConfigFile() },
       ...(services
         ? [
             // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
@@ -271,11 +278,9 @@ async function disposeWorkflowResources(input: {
 }
 
 async function disposeWorkflowContext(ctx: WorkflowContext): Promise<void> {
-  // Stop the config.json watches before the services go, so no watch callback reaches a
-  // torn-down service. A failed setup skips this, but the watches are non-persistent.
-  ctx.config.stopWatchingConfigFile();
   await disposeWorkflowResources({
     tempDir: ctx.tempDir,
+    config: ctx.config,
     services: ctx.services,
     session: ctx.session,
     codexOauthService: ctx.codexOauthService,
@@ -289,6 +294,10 @@ async function createWorkflowContext(options: {
   projectDir: string;
 }): Promise<WorkflowContext> {
   const tempDir = new DisposableTempDir("mux-workflow");
+  // Outside the try: the stores only build paths, and the setup-failure cleanup below needs
+  // the run config to stop its config.json watches.
+  const runStores = createConfigStores(tempDir.path);
+  const config = runStores.config;
   let services: WorkflowServices | undefined;
   let session: AgentSession | undefined;
   let codexOauthService: CodexOauthService | undefined;
@@ -297,8 +306,6 @@ async function createWorkflowContext(options: {
   try {
     const realStores = createConfigStores();
     const realConfig = realStores.config;
-    const runStores = createConfigStores(tempDir.path);
-    const config = runStores.config;
     await copyPersistentConfig(realStores, runStores);
 
     const realProvidersStore = realStores.providersConfigStore;
@@ -399,6 +406,7 @@ async function createWorkflowContext(options: {
   } catch (error) {
     await disposeWorkflowResources({
       tempDir,
+      config,
       services,
       session,
       codexOauthService,
@@ -460,6 +468,13 @@ function createWorkflowService(input: {
     resolveWorkflowScript: (scriptPath) =>
       resolveWorkflowScript({
         scriptPath,
+        runtime,
+        workspacePath: input.ctx.workspacePath,
+        projectTrusted: input.ctx.projectTrusted,
+      }),
+    assertStoredPluginWorkflowReviewed: (stored) =>
+      assertStoredPluginWorkflowReviewed({
+        ...stored,
         runtime,
         workspacePath: input.ctx.workspacePath,
         projectTrusted: input.ctx.projectTrusted,

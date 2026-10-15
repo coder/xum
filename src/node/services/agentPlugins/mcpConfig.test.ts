@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { describe, expect, spyOn, test } from "bun:test";
 
 import type { MCPStdioServerInfo } from "@/common/types/mcp";
+import assert from "@/common/utils/assert";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { Config } from "@/node/config";
@@ -317,6 +318,111 @@ describe("loadPluginMcpServers", () => {
       ["error", "badName"],
       ["error", "http"],
     ]);
+  });
+
+  test("a Codex stdio server says that its OAuth settings and loader variables are unused or risky", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const plugin = await makePlugin(
+      tmp.path,
+      "stdio-notes",
+      {
+        mcpServers: {
+          // Xum reads OAuth only for remote servers (#6646): say so, with or without env_vars.
+          withEnv: {
+            command: "node",
+            env_vars: ["API_TOKEN"],
+            oauth: { client_id: "c" },
+            scopes: ["read"],
+          },
+          withoutEnv: { command: "node", oauth_resource: "https://r.example.com" },
+          // These names change how the server process loads code: flag them in the review.
+          loaders: {
+            command: "node",
+            env_vars: ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS", "API_TOKEN"],
+          },
+          plain: { command: "node", env_vars: ["API_TOKEN"] },
+        },
+      },
+      { fileName: ".mcp.json" }
+    );
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    expect(Object.values(servers).map((s) => s.plugin?.serverName)).toEqual([
+      "withEnv",
+      "withoutEnv",
+      "loaders",
+      "plain",
+    ]);
+    const notes = diagnostics.map((d) => [d.severity, /server '(\w+)'/.exec(d.message)?.[1]]);
+    expect(notes).toEqual([
+      ["warning", "withEnv"],
+      ["warning", "withoutEnv"],
+      ["warning", "loaders"],
+    ]);
+    expect(diagnostics[0].message).toContain("oauth, scopes");
+    expect(diagnostics[1].message).toContain("oauth_resource");
+    expect(diagnostics[2].message).toContain("LD_PRELOAD, DYLD_INSERT_LIBRARIES, NODE_OPTIONS");
+    expect(diagnostics[2].message).not.toContain("API_TOKEN");
+  });
+
+  test("on Windows, reserved and duplicate env names compare without case", async () => {
+    // Windows env names are case-insensitive (#6646): plugin_data would shadow PLUGIN_DATA.
+    const original = Object.getOwnPropertyDescriptor(process, "platform");
+    assert(original !== undefined, "process.platform must be an own property");
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const plugin = await makePlugin(
+      tmp.path,
+      "win-env",
+      {
+        mcpServers: {
+          forwardReserved: { command: "node", env_vars: ["plugin_data"] },
+          envReserved: { command: "node", env: { Plugin_Root: "x" } },
+          duplicates: { command: "node", env_vars: ["API_TOKEN", "api_token"] },
+          // node_options is NODE_OPTIONS on Windows, so the review must name it.
+          loader: { command: "node", env_vars: ["node_options"] },
+        },
+      },
+      { fileName: ".mcp.json" }
+    );
+    const load = async (platform: NodeJS.Platform) => {
+      Object.defineProperty(process, "platform", { ...original, value: platform });
+      try {
+        return await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+      } finally {
+        Object.defineProperty(process, "platform", original);
+      }
+    };
+    const windows = await load("win32");
+    expect(
+      Object.values(windows.servers).map((s) => [
+        s.plugin?.serverName,
+        s.transport === "stdio" ? s.forwardEnv : undefined,
+      ])
+    ).toEqual([
+      ["duplicates", ["API_TOKEN"]],
+      ["loader", ["node_options"]],
+    ]);
+    expect(
+      windows.diagnostics.map((d) => [d.severity, /server '(\w+)'/.exec(d.message)?.[1]])
+    ).toEqual([
+      ["error", "forwardReserved"],
+      ["error", "envReserved"],
+      ["warning", "loader"],
+    ]);
+    // Elsewhere names are case-sensitive, so these are ordinary variables.
+    const linux = await load("linux");
+    expect(
+      Object.values(linux.servers).map((s) => [
+        s.plugin?.serverName,
+        s.transport === "stdio" ? s.forwardEnv : undefined,
+      ])
+    ).toEqual([
+      ["forwardReserved", ["plugin_data"]],
+      ["envReserved", undefined],
+      ["duplicates", ["API_TOKEN", "api_token"]],
+      ["loader", ["node_options"]],
+    ]);
+    // There node_options is not NODE_OPTIONS: no loader warning.
+    expect(linux.diagnostics.some((d) => d.message.includes("server 'loader'"))).toBe(false);
   });
 
   test("the Codex dialect maps streamable_http spellings and resolves a relative cwd", async () => {
@@ -1070,7 +1176,13 @@ describe("createAgentPluginsMcpProvider", () => {
       // An install from before #6498 has no records: its imported server does not start.
       expect(await loaded()).toEqual(["free"]);
       // A record for another definition under the same name is no consent either.
-      await saveConsent({ skills: {}, mcpServers: { srv: "0".repeat(64) } });
+      await saveConsent({
+        skills: {},
+        mcpServers: { srv: "0".repeat(64) },
+        workflows: {},
+        agents: {},
+        slashCommands: {},
+      });
       expect(await loaded()).toEqual(["free"]);
       await saveConsent(reviewed);
       expect(await loaded()).toEqual(["free", "srv"]);
