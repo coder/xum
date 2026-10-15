@@ -1608,6 +1608,9 @@ describe("ProviderModelFactory Google Vertex AI", () => {
     { name: "missing", prepare: (_keyFilename: string) => Promise.resolve() },
     { name: "a directory", prepare: (keyFilename: string) => mkdir(keyFilename) },
     { name: "not JSON", prepare: (keyFilename: string) => writeFile(keyFilename, "-----BEGIN") },
+    { name: "a JSON array", prepare: (keyFilename: string) => writeFile(keyFilename, "[]") },
+    { name: "JSON null", prepare: (keyFilename: string) => writeFile(keyFilename, "null") },
+    { name: "a JSON string", prepare: (keyFilename: string) => writeFile(keyFilename, '"key"') },
   ])(
     "fails a service account key file that is $name before sending a request",
     async ({ prepare }) => {
