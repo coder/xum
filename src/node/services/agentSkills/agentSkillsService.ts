@@ -70,6 +70,7 @@ import {
 import {
   isPluginSkillConsented,
   pluginSkillConsentGate,
+  type ComponentConsent,
   type PluginSkillConsentGate,
 } from "@/node/services/agentPlugins/componentConsent";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -249,6 +250,8 @@ interface AgentSkillScanCandidate {
   importedSkills?: string[];
   /** Managed plugins only: the reviewed skill fingerprints (#6498). */
   skillConsent?: PluginSkillConsentGate;
+  /** Managed plugins only: every consent record, for the skill's workflow script (#6629). */
+  pluginConsent?: ComponentConsent | undefined;
 }
 
 /**
@@ -319,6 +322,7 @@ async function buildPluginScanCandidates(args: {
         pluginName: plugin.name,
         importedSkills,
         skillConsent,
+        pluginConsent: plugin.componentConsent,
       }))
     );
   }
@@ -1019,14 +1023,20 @@ export interface ResolvedAgentSkill {
    * qualified names of this plugin's shadowed siblings (pluginSiblingNote.ts).
    */
   pluginName?: string;
+  /**
+   * A managed plugin skill's consent records: the `skill://` resolver checks the skill's workflow
+   * script against them (#6629). Absent for unmanaged plugins and non-plugin skills.
+   */
+  pluginConsent?: ComponentConsent | undefined;
 }
 
-/** Stamp a plugin skill's plugin name on its read result (see ResolvedAgentSkill.pluginName). */
+/** Stamp a plugin skill's provenance on its read result (see ResolvedAgentSkill.pluginName). */
 function withPluginName(
   resolved: ResolvedAgentSkill | null,
-  pluginName: string | undefined
+  candidate: { pluginName?: string; pluginConsent?: ComponentConsent | undefined }
 ): ResolvedAgentSkill | null {
-  return resolved != null && pluginName != null ? { ...resolved, pluginName } : resolved;
+  if (resolved == null || candidate.pluginName == null) return resolved;
+  return { ...resolved, pluginName: candidate.pluginName, pluginConsent: candidate.pluginConsent };
 }
 
 /** Read a non-plugin SKILL.md for a direct skill read; every failure throws. */
@@ -1174,7 +1184,7 @@ async function readCandidateSkill(
         candidate.pluginRoot,
         candidate.skillConsent
       ),
-      candidate.pluginName
+      candidate
     );
   } catch (error) {
     // An unreadable skill (transport, permission) must not let a lower-scope

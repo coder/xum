@@ -14,11 +14,13 @@ import {
   type AgentPluginInfo,
 } from "@/node/services/agentPlugins/discovery";
 import { isPluginWorkflowConsented } from "@/node/services/agentPlugins/componentConsent";
+import { pluginSkillScriptKey } from "@/node/services/agentPlugins/workflowFiles";
 import { isValidAgentPluginName } from "@/node/services/agentPlugins/manifest";
 import {
   getDefaultAgentSkillsRoots,
   readAgentSkill,
   type AgentSkillsRoots,
+  type ResolvedAgentSkill,
   getPluginManagedHome,
 } from "@/node/services/agentSkills/agentSkillsService";
 import { readBuiltInSkillFile } from "@/node/services/agentSkills/builtInSkillDefinitions";
@@ -197,6 +199,7 @@ async function resolveSkillWorkflowScript(
   }
 
   const source = await readFileString(skillRuntime, resolvedPath);
+  assertSkillScriptReviewed(resolvedSkill, parsed.relativePath, source);
   return buildResolvedScript({
     requestedScriptPath: input.scriptPath,
     canonicalScriptPath: `${SKILL_SCRIPT_PATH_PREFIX}${parsed.skillName}/${parsed.relativePath}`,
@@ -358,6 +361,25 @@ async function resolvePluginWorkflowScript(
     relativePath: parsed.relativePath,
     resolvedPath,
   });
+}
+
+/**
+ * The consent gate of a managed plugin skill's script (#6629). The skill's own consent (#6498)
+ * covers its SKILL.md frontmatter, not the bytes `skill://` runs, so the script needs its own
+ * record, keyed by its plugin-relative path. It checks the source about to run. Only the skill's
+ * `workflow.js` can have a record (the install review lists no other script).
+ */
+function assertSkillScriptReviewed(
+  skill: Pick<ResolvedAgentSkill, "pluginConsent" | "pluginRoot" | "pluginName" | "skillDir">,
+  relativePath: string,
+  source: string
+): void {
+  if (skill.pluginConsent === undefined || skill.pluginRoot === undefined) return;
+  const file = pluginSkillScriptKey(skill.pluginRoot, path.join(skill.skillDir, relativePath));
+  if (isPluginWorkflowConsented(skill.pluginConsent, { file, source })) return;
+  throw new Error(
+    `Plugin workflow '${file}' has not been reviewed on this install, so it does not run. Open Settings → Plugins and select Review on plugin '${skill.pluginName ?? "?"}'.`
+  );
 }
 
 /**

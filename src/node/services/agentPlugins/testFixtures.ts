@@ -20,7 +20,7 @@ import {
 } from "./componentConsent";
 import { discoverAgentPluginAt, type AgentPluginScope } from "./discovery";
 import { getPluginDataPath, loadPluginMcpServers, resolvePluginInstanceId } from "./mcpConfig";
-import { listPluginWorkflowFiles } from "./workflowFiles";
+import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
 import { listPluginAgentFiles } from "./agentFiles";
 
 /** Valid managed registry row; tests override individual fields to exercise corruption. */
@@ -115,6 +115,13 @@ export async function reviewedComponentConsent(args: {
     if (plugin.workflowsDir === undefined) break;
     const source = await fs.readFile(path.join(plugin.workflowsDir, file), "utf8");
     if (source.length > 0) consent.workflows[file] = workflowConsentFingerprint({ file, source });
+  }
+  // Skill workflow scripts (#6629), keyed by their plugin-relative path.
+  for (const script of await listPluginSkillScripts(plugin)) {
+    const source = await fs.readFile(script.filePath, "utf8");
+    if (source.length > 0) {
+      consent.workflows[script.file] = workflowConsentFingerprint({ file: script.file, source });
+    }
   }
   // Agents (#6629), listed and parsed the way the install review does.
   for (const agent of await listPluginAgentFiles(plugin.agentsDir)) {

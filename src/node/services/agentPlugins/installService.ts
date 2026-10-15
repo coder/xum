@@ -78,7 +78,7 @@ import {
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "./discovery";
-import { listPluginWorkflowFiles } from "./workflowFiles";
+import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
 import { listPluginAgentFiles, type PluginAgentFile } from "./agentFiles";
 import { checkLogoImage } from "./imageHeader";
 import {
@@ -960,6 +960,29 @@ function ambiguousAgentChanges(
     .map((agentId) => ({
       summary: `agent '${showInvisibleControls(agentId)}' will not load: more than one file claims its ID`,
     }));
+}
+
+/** A workflow script's source as the runtime reads it; undefined (with a warning) when unreadable. */
+async function readWorkflowScriptForReview(
+  pluginRoot: string,
+  target: { file: string; filePath: string },
+  warnings: string[]
+): Promise<string | undefined> {
+  try {
+    return (
+      await readPluginFileWithinRootCapped({
+        filePath: target.filePath,
+        pluginRoot,
+        maxBytes: MAX_FILE_SIZE,
+        label: "plugin workflow script",
+      })
+    ).content;
+  } catch (error) {
+    warnings.push(
+      `Workflow '${showInvisibleControls(target.file)}' cannot be read and will not run: ${getErrorMessage(error)}`
+    );
+    return undefined;
+  }
 }
 
 /** The consent view of one plugin agent (#6629). */
@@ -2545,40 +2568,37 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * Executable workflow scripts (workflows/*.js), read as the runtime resolver reads them (the
-   * shared lister, the root-checked capped read) so the consent fingerprint matches what can run
-   * (#6629). A script the runtime cannot read or run is reported and skipped.
+   * Executable workflow scripts, read as the runtime resolver reads them (the shared lister, the
+   * root-checked capped read) so the consent fingerprint matches what can run (#6629): the
+   * top-level `workflows/*.js`, keyed by file name, and each skill's `workflow.js` (the `skill://`
+   * entry), keyed by its plugin-relative path. A script the runtime cannot read is reported and
+   * skipped.
    */
   private async collectWorkflowScripts(
     plugin: AgentPluginInfo,
     warnings: string[]
   ): Promise<Array<SurfaceWhole & { file: string }>> {
-    const workflowsDir = plugin.workflowsDir;
-    if (workflowsDir === undefined) return [];
-    const scripts: Array<SurfaceWhole & { file: string }> = [];
-    for (const file of await listPluginWorkflowFiles(workflowsDir)) {
-      let source: string;
-      try {
-        source = (
-          await readPluginFileWithinRootCapped({
-            filePath: path.join(workflowsDir, file),
-            pluginRoot: plugin.rootPath,
-            maxBytes: MAX_FILE_SIZE,
-            label: "plugin workflow script",
-          })
-        ).content;
-      } catch (error) {
-        warnings.push(
-          `Workflow '${showInvisibleControls(file)}' cannot be read and will not run: ${getErrorMessage(error)}`
-        );
-        continue;
-      }
-      if (source.length === 0) continue;
-      const input = { file, source };
-      scripts.push({
+    const targets = [
+      ...(await listPluginWorkflowFiles(plugin.workflowsDir)).map((file) => ({
         file,
-        consentFingerprint: workflowConsentFingerprint(input),
+        // listPluginWorkflowFiles lists nothing without a workflows dir.
+        filePath: path.join(plugin.workflowsDir ?? "", file),
         display: `Workflow script workflows/${file}`,
+      })),
+      ...(await listPluginSkillScripts(plugin)).map((script) => ({
+        ...script,
+        display: `Skill workflow script ${script.file}`,
+      })),
+    ];
+    const scripts: Array<SurfaceWhole & { file: string }> = [];
+    for (const target of targets) {
+      const source = await readWorkflowScriptForReview(plugin.rootPath, target, warnings);
+      if (source === undefined || source.length === 0) continue;
+      const input = { file: target.file, source };
+      scripts.push({
+        file: target.file,
+        consentFingerprint: workflowConsentFingerprint(input),
+        display: target.display,
         consentDetail: () => workflowConsentDetail(input),
       });
     }

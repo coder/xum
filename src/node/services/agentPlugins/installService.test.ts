@@ -1885,6 +1885,56 @@ describe("AgentPluginInstallService", () => {
     expect(review.changes[0]?.component?.name).toBe(file);
   });
 
+  test("a managed plugin skill's workflow script runs only while its exact bytes are reviewed (#6629)", async () => {
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "greet", "workflow.js"),
+      "export const meta = { name: 'greet' };\n"
+    );
+    await fsPromises.writeFile(path.join(remoteDir, "skills", "greet", "helper.js"), "1;\n");
+    await commitAll(remoteDir, "add a skill workflow");
+    const preview = await service.preview({ input: remoteDir });
+    // The preview shows the skill script that install approves.
+    expect(preview.reviewedComponents.map((row) => row.name)).toEqual(["skills/greet/workflow.js"]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const resolve = (scriptPath: string) =>
+      resolveWorkflowScript({
+        scriptPath,
+        runtime: new LocalRuntime(muxRoot),
+        workspacePath: muxRoot,
+        projectTrusted: false,
+        roots: {
+          projectRoot: "",
+          globalRoot: path.join(muxRoot, "skills"),
+          universalRoot: "",
+          globalPluginRoots: [pluginsDir()],
+        },
+      });
+    expect((await resolve("skill://greet/workflow.js")).source).toContain("name: 'greet'");
+    // No review covers any other script of a managed skill, so it never runs as a workflow.
+    await expect(resolve("skill://greet/helper.js")).rejects.toThrow(
+      "has not been reviewed on this install"
+    );
+
+    // Changed bytes under an unchanged SKILL.md do not run until their review.
+    await fsPromises.writeFile(
+      path.join(pluginsDir(), "demo-plugin", "skills", "greet", "workflow.js"),
+      "export const meta = { name: 'greet' }; // changed\n"
+    );
+    await expect(resolve("skill://greet/workflow.js")).rejects.toThrow(
+      "has not been reviewed on this install"
+    );
+    const review = await service.previewComponentReview({ name: "demo-plugin" });
+    expect(review.changes.map((change) => change.summary)).toEqual([
+      "Workflow 'skills/greet/workflow.js' needs review",
+    ]);
+    await service.confirmComponentReview({
+      name: "demo-plugin",
+      expectedLockedSha: review.fromSha,
+      reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+    });
+    expect((await resolve("skill://greet/workflow.js")).source).toContain("// changed");
+  });
+
   test("an update review lists a changed workflow script, and confirming records it (#6629)", async () => {
     await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
     const script = path.join(remoteDir, "workflows", "run.js");
