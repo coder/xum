@@ -4026,8 +4026,10 @@ export class AgentPluginInstallService {
   /** Signs out `urls` after an update; the ones that failed stay pending. */
   private async signOutAndSettle(name: string, urls: string[]): Promise<void> {
     const done: string[] = [];
+    // One deadline for every wait of this update: N hung logouts must not hold the lock N times.
+    const deadline = monotonicNow() + this.recoveryTimeoutMs;
     for (const serverUrl of urls) {
-      if (await this.signOutAfterInFlight(name, serverUrl)) done.push(serverUrl);
+      if (await this.signOutAfterInFlight(name, serverUrl, deadline)) done.push(serverUrl);
     }
     await this.forgetPendingSignOuts(done);
   }
@@ -4036,7 +4038,11 @@ export class AgentPluginInstallService {
    * A timed-out recovery logout can still run: let it settle first, so two logouts never
    * overlap and the earlier one cannot delete a sign-in made after the later one (#6627).
    */
-  private async settleInFlightSignOut(name: string, serverUrl: string): Promise<boolean> {
+  private async settleInFlightSignOut(
+    name: string,
+    serverUrl: string,
+    deadline: number
+  ): Promise<boolean> {
     const key = this.mcpOauthService?.credentialKey(serverUrl) ?? serverUrl;
     const call = this.inFlightSignOuts.get(key);
     if (call === undefined) return true;
@@ -4044,7 +4050,7 @@ export class AgentPluginInstallService {
     // On timeout this sign-out counts as failed, and its URL stays in the pending record.
     const settled = await raceWithAbortAndTimeout(
       call.catch(() => undefined),
-      { timeoutMs: this.recoveryTimeoutMs }
+      { timeoutMs: Math.max(0, deadline - monotonicNow()) }
     );
     if (settled.kind === "ok") return true;
     log.warn("A plugin MCP sign-out waits for an earlier one that has not finished", {
@@ -4054,8 +4060,12 @@ export class AgentPluginInstallService {
   }
 
   /** A sign-out that waits too long for an earlier one fails: its URL stays pending. */
-  private async signOutAfterInFlight(name: string, serverUrl: string): Promise<boolean> {
-    if (!(await this.settleInFlightSignOut(name, serverUrl))) return false;
+  private async signOutAfterInFlight(
+    name: string,
+    serverUrl: string,
+    deadline: number
+  ): Promise<boolean> {
+    if (!(await this.settleInFlightSignOut(name, serverUrl, deadline))) return false;
     return this.signOutPluginServer(name, serverUrl);
   }
 

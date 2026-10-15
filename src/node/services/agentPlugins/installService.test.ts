@@ -2803,6 +2803,28 @@ describe("AgentPluginInstallService", () => {
       expect(await pendingSignOuts()).toEqual([serverUrl]);
     });
 
+    test("an update's waits for hung logouts share one deadline (#6627)", async () => {
+      const service = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 300,
+      });
+      service.setMcpOauthService({
+        logout: () => Promise.resolve({ success: true }),
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      const internals = service as unknown as {
+        inFlightSignOuts: Map<string, Promise<{ success: boolean }>>;
+        signOutAndSettle: (name: string, urls: string[]) => Promise<void>;
+      };
+      const hung = new Promise<never>(() => undefined);
+      const urls = ["https://a.example/mcp", "https://b.example/mcp", "https://c.example/mcp"];
+      for (const url of urls) internals.inFlightSignOuts.set(url, hung);
+      const started = performance.now();
+      await internals.signOutAndSettle("demo-plugin", urls);
+      // One 300 ms bound for the three, not 900 ms.
+      expect(performance.now() - started).toBeLessThan(600);
+    });
+
     test("one pass signs out equivalent URL spellings once (#6627)", async () => {
       const { failing, result } = await updateWithFailingSignOut(stopStub);
       await result;
