@@ -1,15 +1,15 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
+import type { ComponentProps } from "react";
 import { Streamdown } from "streamdown";
 import type { Element, ElementContent, Root, RootContent, Text } from "hast";
 import type { Pluggable, Plugin } from "unified";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import remarkBreaks from "remark-breaks";
-import rehypeKatex from "rehype-katex";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { harden } from "rehype-harden";
-import "katex/dist/katex.min.css";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
 import { normalizeMarkdown } from "./MarkdownStyles";
 import { repairIncompleteMarkdownTail } from "./repairIncompleteMarkdownTail";
 import { markdownComponents } from "./MarkdownComponents";
@@ -258,13 +258,12 @@ const FILE_PREVIEW_HARDEN_OPTIONS: HardenOptions = {
   allowDataImages: true,
 };
 
-// Everything after raw HTML parsing, shared by the lists below.
+// Everything after raw HTML parsing, shared by the lists below. KatexStreamdown appends KaTeX.
 function rehypePluginsAfterRawHtml(hardenOptions: HardenOptions): Pluggable[] {
   return [
     [rehypeSanitize, sanitizeSchema], // Sanitize HTML to prevent XSS (strips dangerous elements/attributes)
     rehypeFootnoteLinks,
     [harden, hardenOptions], // Additional URL filtering for links and images
-    [rehypeKatex, { errorColor: "var(--color-muted-foreground)" }], // Render math
   ];
 }
 
@@ -309,6 +308,21 @@ function selectRehypePlugins(renderRawHtml: boolean, filePreview: boolean): Plug
   return renderRawHtml ? REHYPE_PLUGINS : REHYPE_PLUGINS_RAW_HTML_AS_TEXT;
 }
 
+// KaTeX's JS and CSS load only for a message that contains math, so the transcript's first load
+// does not carry them (T3, #5971). A math message renders without KaTeX until the chunk loads,
+// then upgrades once.
+const KatexStreamdown = React.lazy(() => import("./KatexStreamdown"));
+
+// Matches every input that renders as math: `$$` (remark-math, with single-dollar math off), a
+// fence with the info string `math` (rehype-katex renders language-math code), and raw HTML code
+// with a math class (sanitizeSchema allows these). A false positive costs one chunk load; a
+// false negative shows TeX source, so the pattern errs wide.
+const MATH_HINT = /\$\$|[`~]{3}[ \t]*math|language-math|math-inline|math-display/i;
+
+export function markdownMayContainMath(markdown: string): boolean {
+  return MATH_HINT.test(markdown);
+}
+
 /**
  * Core markdown rendering component that handles all markdown processing.
  * This is the single source of truth for markdown configuration.
@@ -334,23 +348,50 @@ export const MarkdownCore = React.memo<MarkdownCoreProps>(
       return parseIncompleteMarkdown ? repairIncompleteMarkdownTail(normalized) : normalized;
     }, [content, parseIncompleteMarkdown]);
 
+    // Once a row has math it keeps the KaTeX render, so a streaming row never flips back to the
+    // plain one (and never scans again). Setting state during render is React's pattern for this.
+    const [hasMath, setHasMath] = useState(false);
+    if (!hasMath && markdownMayContainMath(normalizedContent)) setHasMath(true);
+
+    const streamdownProps: ComponentProps<typeof Streamdown> = {
+      components: markdownComponents,
+      remarkPlugins: preserveLineBreaks ? REMARK_PLUGINS_WITH_BREAKS : REMARK_PLUGINS,
+      rehypePlugins: selectRehypePlugins(renderRawHtml, filePreview),
+      // The text is already repaired above. In streamdown 2.0 this prop only gates its
+      // whole-text remend call (MarkdownCore.test.tsx fails if an upgrade changes that).
+      parseIncompleteMarkdown: false,
+      // Use "static" mode for completed content to bypass useTransition() deferral.
+      // After ORPC migration, async event boundaries let React deprioritize transitions indefinitely.
+      mode: parseIncompleteMarkdown && !renderSynchronously ? "streaming" : "static",
+      className: "space-y-2", // Reduce from default space-y-4 (16px) to space-y-2 (8px)
+      controls: { table: false, code: true, mermaid: true }, // Disable table copy/download, keep code/mermaid controls
+      children: normalizedContent,
+    };
+    const plain = <Streamdown {...streamdownProps} />;
+
     return (
       <>
-        <Streamdown
-          components={markdownComponents}
-          remarkPlugins={preserveLineBreaks ? REMARK_PLUGINS_WITH_BREAKS : REMARK_PLUGINS}
-          rehypePlugins={selectRehypePlugins(renderRawHtml, filePreview)}
-          // The text is already repaired above. In streamdown 2.0 this prop only gates its
-          // whole-text remend call (MarkdownCore.test.tsx fails if an upgrade changes that).
-          parseIncompleteMarkdown={false}
-          // Use "static" mode for completed content to bypass useTransition() deferral.
-          // After ORPC migration, async event boundaries let React deprioritize transitions indefinitely.
-          mode={parseIncompleteMarkdown && !renderSynchronously ? "streaming" : "static"}
-          className="space-y-2" // Reduce from default space-y-4 (16px) to space-y-2 (8px)
-          controls={{ table: false, code: true, mermaid: true }} // Disable table copy/download, keep code/mermaid controls
-        >
-          {normalizedContent}
-        </Streamdown>
+        {hasMath ? (
+          // Until KaTeX loads, and if its chunk fails to load, the row keeps its plain render.
+          <LazyFeature
+            name="Math rendering"
+            fallback={plain}
+            frame={(state, kind) =>
+              kind === "failed" ? (
+                <>
+                  {plain}
+                  {state}
+                </>
+              ) : (
+                state
+              )
+            }
+          >
+            <KatexStreamdown {...streamdownProps} />
+          </LazyFeature>
+        ) : (
+          plain
+        )}
         {children}
       </>
     );

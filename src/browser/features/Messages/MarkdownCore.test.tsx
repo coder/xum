@@ -4,7 +4,7 @@ import { cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { MarkdownCore } from "./MarkdownCore";
+import { MarkdownCore, markdownMayContainMath } from "./MarkdownCore";
 
 // An earlier block holds a lone `*`. Repairing the whole text (Streamdown's own repair) would
 // append a stray `*` after the last block; repairing only the last block does not.
@@ -81,5 +81,49 @@ describe("MarkdownCore incomplete-markdown repair", () => {
       expect(view.container.querySelector("img")?.getAttribute("src")).toBe("https://x/y.png")
     );
     expect(view.container.textContent).toContain("and more text.");
+  });
+});
+
+describe("MarkdownCore math", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  // Every form that remark-math or rehype-katex renders. KaTeX loads lazily, so each case fails
+  // if the math check misses the form or the lazy KaTeX render breaks.
+  test.each([
+    ["display math", "$$x^2$$"],
+    ["a math fence", "```math\nx^2\n```"],
+    ["a tilde math fence", "~~~ math\nx^2\n~~~"],
+    ["raw language-math code", '<code class="language-math">x^2</code>'],
+    ["raw math-inline code", '<code class="math-inline">x^2</code>'],
+  ])("renders %s with KaTeX", async (_name, content) => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore content={content} />
+      </ThemeProvider>
+    );
+    await waitFor(() =>
+      expect(view.container.querySelector(".katex annotation")?.textContent?.trim()).toBe("x^2")
+    );
+  });
+
+  // remark-math leaves these as text (single-dollar math is off), so they must not load KaTeX.
+  test.each([
+    "A plain reply with **bold**, `code`, and a [link](https://example.com).",
+    "It costs $5, or $6 with tax.",
+    "Single-dollar $x$ stays text.",
+    "\\(x\\) and \\[x\\] stay text.",
+    "```ts\nconst mathResult = 1;\n```",
+  ])("does not load KaTeX for %p", (content) => {
+    expect(markdownMayContainMath(content)).toBe(false);
   });
 });

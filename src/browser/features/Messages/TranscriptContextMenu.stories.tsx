@@ -42,6 +42,8 @@ export const SelectedMarkdown: Story = {
     const document = canvasElement.ownerDocument;
     const canvas = within(canvasElement);
     const body = within(document.body);
+    // KaTeX loads lazily and then re-renders the message, so select text only after that.
+    await waitFor(() => expect(canvasElement.querySelector(".katex")).not.toBeNull());
     const selected = await canvas.findByText("bold selection", {
       selector: 'strong, [data-streamdown="strong"]',
     });
