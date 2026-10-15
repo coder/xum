@@ -887,6 +887,8 @@ describe("task tool", () => {
         ],
         [{ model: "grok-4.7-fast" }, { modelString: KNOWN_MODELS.GROK_47.id }],
         [{ model: "opus-max" }, { modelString: KNOWN_MODELS.OPUS.id, thinkingLevel: "max" }],
+        // A valid provider:model keeps its literal meaning even if it ends in a level.
+        [{ model: "openai:gpt-6-high" }, { modelString: "openai:gpt-6-high" }],
         [
           { model: "claude-opus-5-5-xhigh", thinking: "low" },
           { modelString: KNOWN_MODELS.OPUS.id, thinkingLevel: "low" },

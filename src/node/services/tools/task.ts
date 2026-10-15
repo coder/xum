@@ -127,14 +127,15 @@ function buildParentRuntimeAiSettings(
   };
 }
 
+// `<base>[-<thinking level>][-fast]`; the lazy base leaves both suffixes to the groups.
+const EFFORT_SLUG_PATTERN = new RegExp(`^(.+?)(?:-(${THINKING_LEVELS.join("|")}))?(?:-fast)?$`);
+
 /**
  * Map a `<model>-<effort>[-fast]` slug (pstack's form, e.g. `claude-opus-5-5-xhigh`,
  * `grok-4.7-xhigh-fast`) to a known model ID plus thinking level. The base must be a
  * Xum alias or a known provider model ID. Xum has no per-task speed mode, so `-fast`
  * runs the same model at standard speed. Returns null when the slug does not map.
  */
-const EFFORT_SLUG_PATTERN = new RegExp(`^(.+?)(?:-(${THINKING_LEVELS.join("|")}))?(?:-fast)?$`);
-
 function mapEffortSlug(raw: string): { model: string; effort?: ThinkingLevel } | null {
   const match = EFFORT_SLUG_PATTERN.exec(raw.trim().toLowerCase());
   if (match == null) return null;
@@ -153,7 +154,8 @@ function readAvailableModels(
   try {
     return listAvailableModels?.();
   } catch (error) {
-    // Same policy as models_list: log on the Node side, never block the launch on it.
+    // Same policy as models_list: log on the Node side. Without a catalog a mapped slug
+    // is accepted like any provider:model string, which is never availability-checked.
     log.error("[task tool] failed to compute the model catalog", { error });
     return undefined;
   }
