@@ -137,6 +137,7 @@ import { MUX_GATEWAY_AI_BASE_URL } from "@/common/constants/muxGatewayOAuth";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 import {
+  MAX_CREDENTIAL_FILE_BYTES,
   resolveCustomProviderCredentials,
   resolveProviderCredentials,
   resolveTypeSafeCredentials,
@@ -1178,10 +1179,14 @@ function createGoogleVertexModelEffect(
 async function isUsableKeyFile(filePath: string): Promise<boolean> {
   let reason: string;
   try {
-    // Check the type before reading: reading a FIFO blocks until a writer
-    // appears, and reading a device such as /dev/zero never ends.
-    if (!(await stat(filePath)).isFile()) {
+    // Check the type and size before reading: reading a FIFO blocks until a
+    // writer appears, reading a device such as /dev/zero never ends, and a
+    // huge file would be read whole.
+    const fileStat = await stat(filePath);
+    if (!fileStat.isFile()) {
       reason = "not a regular file";
+    } else if (fileStat.size > MAX_CREDENTIAL_FILE_BYTES) {
+      reason = "too large";
     } else if (isPlainObject(JSON.parse(await readFile(filePath, "utf8")))) {
       return true;
     } else {

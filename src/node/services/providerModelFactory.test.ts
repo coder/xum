@@ -36,6 +36,7 @@ import {
 import { Ok } from "@/common/types/result";
 import { TOOL_PAYLOAD_DEPTH_REJECTION } from "@/common/utils/tools/toolPayloadDepth";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import { MAX_CREDENTIAL_FILE_BYTES } from "@/node/utils/providerRequirements";
 import {
   ProviderModelFactory,
   buildAIProviderRequestHeaders,
@@ -1627,6 +1628,12 @@ describe("ProviderModelFactory Google Vertex AI", () => {
     { name: "a JSON array", prepare: (keyFilename: string) => writeFile(keyFilename, "[]") },
     { name: "JSON null", prepare: (keyFilename: string) => writeFile(keyFilename, "null") },
     { name: "a JSON string", prepare: (keyFilename: string) => writeFile(keyFilename, '"key"') },
+    // A JSON object, so only the size check rejects it.
+    {
+      name: "over the size cap",
+      prepare: (keyFilename: string) =>
+        writeFile(keyFilename, JSON.stringify({ padding: "x".repeat(MAX_CREDENTIAL_FILE_BYTES) })),
+    },
     // POSIX only: Windows has no mkfifo. Reading a FIFO with no writer blocks forever.
     ...(process.platform === "win32"
       ? []

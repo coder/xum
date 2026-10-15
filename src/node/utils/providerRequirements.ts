@@ -266,6 +266,13 @@ type ApiKeyFileResolution =
   | { kind: "resolved"; apiKey: string }
   | { kind: "error"; error: ProviderRequirementError };
 
+/**
+ * Size cap for credential files read from disk (API key files, Vertex service
+ * account keys). Real ones are a few KB; a larger file is a wrong path, and
+ * reading it whole could exhaust the heap.
+ */
+export const MAX_CREDENTIAL_FILE_BYTES = 64 * 1024;
+
 function expandHomePath(filePath: string): string {
   return filePath.startsWith("~") ? path.join(os.homedir(), filePath.slice(1)) : filePath;
 }
@@ -312,7 +319,7 @@ function resolveApiKeyFileDetailed(filePath: unknown): ApiKeyFileResolution {
         error: { code: "api_key_file_unreadable", path: filePath, reason: "not_file" },
       };
     }
-    if (stat.size > 65536) {
+    if (stat.size > MAX_CREDENTIAL_FILE_BYTES) {
       return {
         kind: "error",
         error: { code: "api_key_file_unreadable", path: filePath, reason: "too_large" },
