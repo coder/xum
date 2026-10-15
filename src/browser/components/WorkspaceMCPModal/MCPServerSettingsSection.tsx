@@ -14,6 +14,11 @@ import {
 } from "@/common/utils/mcpSettings";
 import { MCPSettingsToolActionRow } from "./MCPSettingsToolActionRow";
 import { settingsErrors } from "./serverSettingsEntries";
+import {
+  serverSettingsToolRuns,
+  startSettingsToolRun,
+  useSettingsToolRuns,
+} from "./settingsToolRuns";
 
 interface MCPServerSettingsSectionProps {
   workspaceId: string;
@@ -26,8 +31,11 @@ interface MCPServerSettingsSectionProps {
    * keeps Refresh Tools disabled until the save ends.
    */
   beginSave: () => (snapshot: MCPSettingsReadSnapshot | null) => void;
-  /** A tool action run starts (Refresh Tools waits for it); the returned callback ends it. */
-  beginToolRun: () => () => void;
+  /**
+   * The dialog has unsaved workspace overrides (enablement or tool allowlist) for this server.
+   * Runs wait for them: the backend checks the saved allowlist, not the dialog's.
+   */
+  unsavedOverrides: boolean;
   /**
    * Refresh Tools runs for this server. Its settings read would take a newer request ID than
    * a save started now, and the save's result would be dropped, so Save waits for it.
@@ -57,8 +65,10 @@ export const MCPServerSettingsSection = React.forwardRef<
   // Number inputs keep their raw text so a half-typed "1." is not rewritten.
   const [numberText, setNumberText] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
-  // Tool action runs in flight: Save waits for them, and they wait for a save (see below).
-  const [runningTools, setRunningTools] = useState(0);
+  // Tool action runs in flight: Save waits for them, and they wait for a save (see below). They
+  // live outside the section, so a run started before the dialog closed still counts.
+  const toolRuns = serverSettingsToolRuns(useSettingsToolRuns(props.workspaceId), props.serverName);
+  const runningTools = toolRuns.running.length;
   const [error, setError] = useState<string | null>(null);
 
   const { properties } = props.snapshot;
@@ -202,6 +212,8 @@ export const MCPServerSettingsSection = React.forwardRef<
                   serverName={props.serverName}
                   instanceToken={props.snapshot.instanceToken}
                   item={item}
+                  running={toolRuns.running.includes(item.tool)}
+                  result={getOwn(toolRuns.results, item.tool) ?? null}
                   // A save or refresh replaces the snapshot and remounts this section: a run
                   // started meanwhile would lose its result.
                   // One run at a time: two writing tools must not race on the server.
@@ -210,16 +222,12 @@ export const MCPServerSettingsSection = React.forwardRef<
                     saving ||
                     props.refreshing ||
                     runningTools > 0 ||
-                    Object.keys(changed).length > 0
+                    Object.keys(changed).length > 0 ||
+                    props.unsavedOverrides
                   }
-                  beginRun={() => {
-                    setRunningTools((count) => count + 1);
-                    const end = props.beginToolRun();
-                    return () => {
-                      setRunningTools((count) => count - 1);
-                      end();
-                    };
-                  }}
+                  beginRun={() =>
+                    startSettingsToolRun(props.workspaceId, props.serverName, item.tool)
+                  }
                 />
               );
             const schema = getOwn(properties, item.property);
