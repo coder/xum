@@ -1188,13 +1188,11 @@ describe("Config", () => {
     });
   });
 
-  // Stored keys that normalize to the same project path ("aliases", e.g. "/repo" and "/repo/").
-  // The loader used to build `new Map(pairs)`, so the last alias silently replaced the others
-  // and the next save dropped their workspace rows.
   // #6485: on Windows, an id-less legacy row's checkout path uses backslashes. The old session
   // layout keys its metadata by the checkout basename, so the lookup must split on "\\" too.
   describe("legacy rows with a Windows checkout path", () => {
-    const originalNavigator = globalThis.navigator;
+    // Restore the original property exactly (it can be an accessor), not just its value.
+    const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
     const projectPath = "C:\\Users\\u\\repo";
     const checkout = "C:\\Users\\u\\.xum\\src\\repo\\feature-x";
 
@@ -1218,10 +1216,8 @@ describe("Config", () => {
     });
 
     afterEach(() => {
-      Object.defineProperty(globalThis, "navigator", {
-        value: originalNavigator,
-        configurable: true,
-      });
+      if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator);
+      else Reflect.deleteProperty(globalThis, "navigator");
     });
 
     it("resolves the stable id from the basename metadata in the metadata build", async () => {
@@ -1252,6 +1248,9 @@ describe("Config", () => {
     });
   });
 
+  // Stored keys that normalize to the same project path ("aliases", e.g. "/repo" and "/repo/").
+  // The loader used to build `new Map(pairs)`, so the last alias silently replaced the others
+  // and the next save dropped their workspace rows.
   describe("loadConfigOrDefault with aliased project keys", () => {
     type StoredRow = Record<string, unknown> & { id: string };
     type StoredPair = [string, Record<string, unknown> & { workspaces: StoredRow[] }];
