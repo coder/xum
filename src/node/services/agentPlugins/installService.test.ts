@@ -1887,6 +1887,27 @@ describe("AgentPluginInstallService", () => {
     const preview = await service.preview({ input: remoteDir });
     expect(preview.workflows).toEqual(["ok.js"]);
     expect(preview.reviewedComponents.map((row) => row.name)).toEqual(["ok.js"]);
+
+    // The resolver checks the normalized path, so `./~run.js` is refused like `~run.js` and the
+    // lister and the resolver agree (Codex PRRT_kwDOPxxmWM6s5R_3).
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const resolve = (scriptPath: string) =>
+      resolveWorkflowScript({
+        scriptPath,
+        runtime: new LocalRuntime(muxRoot),
+        workspacePath: muxRoot,
+        projectTrusted: false,
+        roots: {
+          projectRoot: "",
+          globalRoot: path.join(muxRoot, "skills"),
+          universalRoot: "",
+          globalPluginRoots: [pluginsDir()],
+        },
+      });
+    for (const scriptPath of ["plugin://demo-plugin/~run.js", "plugin://demo-plugin/./~run.js"]) {
+      await expect(resolve(scriptPath)).rejects.toThrow("must be relative");
+    }
+    expect((await resolve("plugin://demo-plugin/./ok.js")).source).toBe("1;\n");
   });
 
   test("a stored managed skill workflow run resumes only while its snapshot is reviewed (#6777)", async () => {
