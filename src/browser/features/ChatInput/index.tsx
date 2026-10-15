@@ -294,10 +294,6 @@ async function forEachProviderConfigChange(
   }
 }
 
-/**
- * Why a send waits for the transcript. Offline the transcript cannot catch up until the
- * reconnect, so the toast says that instead of "still loading".
- */
 /** A drop on a locked composer: nothing is read, and the page does not open the file. */
 function preventDefault(event: React.DragEvent): void {
   event.preventDefault();
@@ -334,6 +330,10 @@ function paletteTogglesVoice(shown: boolean, paneScope: ChatPaneScope, locked: b
   return shown && paneScope === "main" && !locked;
 }
 
+/**
+ * Why a send waits for the transcript. Offline the transcript cannot catch up until the
+ * reconnect, so the toast says that instead of "still loading".
+ */
 function transcriptBarrierMessage(offline: boolean): string {
   return offline ? CONNECTION_LOST_MESSAGE : TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE;
 }
