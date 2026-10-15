@@ -67,6 +67,7 @@ function unwrap<T>(result: Result<T, string>): T {
     const invalid = await env.orpc.agentPlugins.install({
       source: preview.source,
       expectedSha: preview.lockedSha,
+      expectedConsentDigest: preview.consentDigest,
       importedComponents: { ...selection, skills: ["unknown"] },
     });
     expect(invalid.success).toBe(false);
@@ -78,6 +79,7 @@ function unwrap<T>(result: Result<T, string>): T {
       await env.orpc.agentPlugins.install({
         source: preview.source,
         expectedSha: preview.lockedSha,
+        expectedConsentDigest: preview.consentDigest,
         importedComponents: selection,
       })
     );

@@ -146,6 +146,15 @@ function digest(input: unknown): string {
   return createHash("sha256").update(stableStringify(input)).digest("hex");
 }
 
+/**
+ * One digest of every fingerprint an inventory shows (#6777). The install preview returns it, and
+ * install refuses a clone whose inventory digests differently, so install never records consent
+ * for a component the preview did not show.
+ */
+export function componentConsentDigest(consent: ComponentConsent): string {
+  return digest({ scheme: CONSENT_SCHEME, kind: "inventory", consent });
+}
+
 /** Everything a plugin MCP server launches or connects with, paths normalized (the hashed part). */
 function serverConsentSubject(info: MCPServerInfo, paths: ConsentPaths): unknown {
   const server =
