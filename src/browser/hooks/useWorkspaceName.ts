@@ -4,7 +4,7 @@ import {
   draftStoreScopeKey,
   getDraftStore,
   useDraft,
-  useDraftStoreHydrated,
+  useDraftStoreSnapshotCurrent,
   type DraftStoreScope,
 } from "@/browser/stores/DraftStore";
 import type { WorkspaceIdentity, WorkspaceNamePersistedState } from "@/common/orpc/schemas/drafts";
@@ -161,8 +161,9 @@ export function getDisplayTitleFromPersistedState(
 }
 
 /**
- * Before the drafts load, a backend draft's stored name is unknown: a name generated against the
- * empty default would replace it once saved.
+ * Before the drafts load, and after a reconnect until the new subscription's snapshot, a backend
+ * draft's stored name is unknown: a name generated against the cached (or empty default) state
+ * would be an unsaved edit and replace the backend's name once saved.
  */
 function isBackendDraft(scope: DraftStoreScope | null): boolean {
   return scope !== null && scope.kind !== "pending";
@@ -172,7 +173,7 @@ function isBackendDraft(scope: DraftStoreScope | null): boolean {
 function useWorkspaceNameStorage(scope: DraftStoreScope | null) {
   // Always subscribe, but only *use* the draft when a scope is provided.
   const draft = useDraft(scope ?? NO_DRAFT_SCOPE);
-  const hydrated = useDraftStoreHydrated();
+  const snapshotCurrent = useDraftStoreSnapshotCurrent();
   const [localState, setLocalState] = useState<WorkspaceNamePersistedState>(
     DEFAULT_WORKSPACE_NAME_STATE
   );
@@ -206,8 +207,30 @@ function useWorkspaceNameStorage(scope: DraftStoreScope | null) {
     setStoredIn,
     currentScope,
     scopeKey: scope === null ? null : draftStoreScopeKey(scope),
-    canAutoGenerate: hydrated || !isBackendDraft(scope),
+    canAutoGenerate: snapshotCurrent || !isBackendDraft(scope),
   };
+}
+
+/**
+ * A request that settles after unmount must not write the draft's name: the draft may have been
+ * discarded (navigation unmounts its composer), and the write would bring its body back.
+ */
+function storeGeneratedIdentity(
+  mountedRef: { current: boolean },
+  target: DraftStoreScope | null,
+  setStoredIn: (
+    target: DraftStoreScope | null,
+    update: (prev: WorkspaceNamePersistedState) => WorkspaceNamePersistedState
+  ) => void,
+  identity: WorkspaceIdentity,
+  forMessage: string
+): void {
+  if (!mountedRef.current) return;
+  setStoredIn(target, (prev) => ({
+    ...prev,
+    generatedIdentity: identity,
+    lastGeneratedFor: toStoredMessage(forMessage),
+  }));
 }
 
 /**
@@ -280,6 +303,14 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     setError(null);
   }, [scopeKey, cancelPendingGeneration]);
 
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   const generateIdentity = useCallback(
     async (
       forMessage: string,
@@ -288,14 +319,10 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       if (!api || !forMessage.trim()) {
         return null;
       }
-      const setGenerated = (identity: WorkspaceIdentity) =>
-        setStoredIn(target, (prev) => ({
-          ...prev,
-          generatedIdentity: identity,
-          lastGeneratedFor: toStoredMessage(forMessage),
-        }));
 
       const requestId = ++requestIdRef.current;
+      const storeIdentity = (identity: WorkspaceIdentity) =>
+        storeGeneratedIdentity(mountedRef, target, setStoredIn, identity, forMessage);
       setIsGenerating(true);
       setError(null);
 
@@ -338,14 +365,14 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
             title: result.data.title,
           };
 
-          setGenerated(identity);
+          storeIdentity(identity);
 
           safeResolve(identity);
           return identity;
         }
 
         const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
-        setGenerated(fallbackIdentity);
+        storeIdentity(fallbackIdentity);
         setError(null);
         safeResolve(fallbackIdentity);
         return fallbackIdentity;
@@ -354,7 +381,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
           return null;
         }
         const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
-        setGenerated(fallbackIdentity);
+        storeIdentity(fallbackIdentity);
         setError(null);
         safeResolve(fallbackIdentity);
         return fallbackIdentity;
