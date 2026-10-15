@@ -1338,38 +1338,24 @@ export class McpOauthService {
   private readonly insufficientScopes = new Map<string, string[]>();
 
   /** A new interactive sign-in asked for the scopes again: the prompt starts over (#6622). */
-  private endInsufficientScopePrompt(input: { serverUrl: string; flowGeneration?: number }): void {
-    if (input.flowGeneration === undefined) return;
-    this.insufficientScopes.delete(input.serverUrl);
-    this.signInSavedAt.set(input.serverUrl, performance.now());
+  private endInsufficientScopePrompt(
+    saved: boolean,
+    input: { serverUrl: string; flowGeneration?: number }
+  ): void {
+    if (saved && input.flowGeneration !== undefined)
+      this.insufficientScopes.delete(input.serverUrl);
   }
 
   /**
-   * When each credential key's last interactive sign-in became visible to tool calls (its tokens
-   * entered the in-memory store), on the `performance.now()` clock.
+   * Records a 403 `insufficient_scope` answer (scopes are already sanitized). A late 403 can
+   * answer for tokens that a new sign-in already replaced (#6739). When the stored grant names
+   * every scope the server asked for, the new sign-in has them: the prompt has nothing to ask.
    */
-  private readonly signInSavedAt = new Map<string, number>();
-
-  /**
-   * Records a 403 `insufficient_scope` answer (scopes are already sanitized). A request that
-   * started before the last interactive sign-in answered for the old tokens: it must not bring
-   * the prompt back against the new ones (#6739).
-   */
-  recordInsufficientScope(input: {
-    serverUrl: string;
-    scopes: string[];
-    /** When the refused request started, on the `performance.now()` clock. */
-    requestStartedAt?: number;
-  }): void {
+  recordInsufficientScope(input: { serverUrl: string; scopes: string[] }): void {
     const key = normalizeServerUrlForComparison(input.serverUrl);
     if (!key) return;
-    const savedAt = this.signInSavedAt.get(key);
-    if (
-      input.requestStartedAt !== undefined &&
-      savedAt !== undefined &&
-      input.requestStartedAt < savedAt
-    )
-      return;
+    const granted = new Set((this.store?.entries[key]?.tokens?.scope ?? "").split(/\s+/));
+    if (input.scopes.length > 0 && input.scopes.every((scope) => granted.has(scope))) return;
     this.insufficientScopes.set(key, input.scopes);
     // Mounted Settings rows refresh on this signal: a 403 changes nothing they would otherwise see.
     for (const listener of this.insufficientScopeListeners) listener();
@@ -2532,14 +2518,12 @@ export class McpOauthService {
       creds.serverUrl = input.serverUrl;
       creds.tokens = { ...input.tokens, ...refreshedScope(input), ...legacyBinding };
       creds.updatedAtMs = Date.now();
-      // Calls that start from here on read the new tokens (#6739): end the prompt now, so a
-      // report from one of them is kept, and one from an older call is dropped.
-      this.endInsufficientScopePrompt(input);
 
       await this.persistStoreLocked(store);
       return true;
     });
     rejectDroppedFlowSave(saved, input.flowGeneration);
+    this.endInsufficientScopePrompt(saved, input);
   }
 
   /** A stale flow's write, or a refresh's back-stamp of a client another sign-in replaced. */

@@ -2053,42 +2053,27 @@ describe("McpOauthService OAuth flows", () => {
     );
   });
 
-  test("a refused request that started before a new sign-in does not bring the prompt back (#6739)", async () => {
+  test("a late refusal for scopes the new sign-in granted does not bring the prompt back (#6739)", async () => {
     const oauth = { clientId: "c", baseScopes: ["read"] };
-    let startedBefore = 0;
-    await signInWithGrant(
-      { scope: "read files.write" },
-      oauth,
-      async (serverUrl, result) => {
-        expect(result.success).toBe(true);
-        let notified = 0;
-        const unsubscribe = service.onInsufficientScope(() => notified++);
-        // Its 403 answered for the old tokens.
-        service.recordInsufficientScope({
-          serverUrl,
-          scopes: ["files.write"],
-          requestStartedAt: startedBefore,
-        });
-        expect(
-          (await service.getAuthStatus({ serverUrl, oauth })).insufficientScopes
-        ).toBeUndefined();
-        // A request that started after it still reports.
-        service.recordInsufficientScope({
-          serverUrl,
-          scopes: ["admin"],
-          requestStartedAt: performance.now(),
-        });
-        expect((await service.getAuthStatus({ serverUrl, oauth })).insufficientScopes).toEqual([
-          "admin",
-        ]);
-        // Mounted Settings rows refresh on the recorded prompt only, not on the dropped one.
-        expect(notified).toBe(1);
-        unsubscribe();
-      },
-      () => {
-        startedBefore = performance.now();
-      }
-    );
+    await signInWithGrant({ scope: "read files.write" }, oauth, async (serverUrl, result) => {
+      expect(result.success).toBe(true);
+      let notified = 0;
+      const unsubscribe = service.onInsufficientScope(() => notified++);
+      // A 403 that answered for the old tokens: the new grant has the scope.
+      service.recordInsufficientScope({ serverUrl, scopes: ["files.write"] });
+      expect(
+        (await service.getAuthStatus({ serverUrl, oauth })).insufficientScopes
+      ).toBeUndefined();
+      // A scope the new grant lacks still asks for a sign-in.
+      service.recordInsufficientScope({ serverUrl, scopes: ["files.write", "admin"] });
+      expect((await service.getAuthStatus({ serverUrl, oauth })).insufficientScopes).toEqual([
+        "files.write",
+        "admin",
+      ]);
+      // Mounted Settings rows refresh on the recorded prompt only, not on the dropped one.
+      expect(notified).toBe(1);
+      unsubscribe();
+    });
   });
 
   test("a sign-in whose server renames the granted scopes stays signed in (#6564)", async () => {
