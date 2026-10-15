@@ -10,6 +10,33 @@ export interface ArchivedHistoryRows {
   foldedByRowId: Map<string, FrontendWorkspaceMetadata[]>;
 }
 
+/** Top of a workspace's archived ancestry: itself when its parent is not archived; null on a cycle. */
+function getArchivedTop(
+  workspace: FrontendWorkspaceMetadata,
+  archivedById: ReadonlyMap<string, FrontendWorkspaceMetadata>
+): FrontendWorkspaceMetadata | null {
+  const visited = new Set<string>([workspace.id]);
+  let current = workspace;
+  for (;;) {
+    const parentId = current.parentWorkspaceId;
+    const parent = parentId == null ? undefined : archivedById.get(parentId);
+    if (parent == null) return current;
+    if (visited.has(parent.id)) return null;
+    visited.add(parent.id);
+    current = parent;
+  }
+}
+
+function isWorkerOfLiveParent(
+  workspace: FrontendWorkspaceMetadata,
+  liveWorkspaceIds: { has(id: string): boolean } | undefined
+): boolean {
+  const parentId = workspace.parentWorkspaceId;
+  return (
+    workspace.workflowTask != null && parentId != null && liveWorkspaceIds?.has(parentId) === true
+  );
+}
+
 /**
  * The archived history should list what the user archived, not every sub-agent swept along with
  * it: archiving a parent cascades over its sub-agents (#4477) and the startup sweep archives the
@@ -30,34 +57,12 @@ export function partitionArchivedHistoryRows(
   liveWorkspaceIds: { has(id: string): boolean } | undefined
 ): ArchivedHistoryRows {
   const byId = new Map(workspaces.map((workspace) => [workspace.id, workspace] as const));
-
-  // Top of a workspace's archived ancestry: itself when its parent is not archived; null on a cycle.
-  const getArchivedTop = (
-    workspace: FrontendWorkspaceMetadata
-  ): FrontendWorkspaceMetadata | null => {
-    const visited = new Set<string>([workspace.id]);
-    let current = workspace;
-    for (;;) {
-      const parent =
-        current.parentWorkspaceId == null ? undefined : byId.get(current.parentWorkspaceId);
-      if (parent == null) return current;
-      if (visited.has(parent.id)) return null;
-      visited.add(parent.id);
-      current = parent;
-    }
-  };
-
-  const isWorkerOfLiveParent = (workspace: FrontendWorkspaceMetadata): boolean =>
-    workspace.workflowTask != null &&
-    workspace.parentWorkspaceId != null &&
-    liveWorkspaceIds?.has(workspace.parentWorkspaceId) === true;
-
   const rows: FrontendWorkspaceMetadata[] = [];
   const foldedByRowId = new Map<string, FrontendWorkspaceMetadata[]>();
   for (const workspace of workspaces) {
-    const top = getArchivedTop(workspace) ?? workspace;
+    const top = getArchivedTop(workspace, byId) ?? workspace;
     // A worker of a live parent hides with everything below it; nothing lists it.
-    if (isWorkerOfLiveParent(top)) continue;
+    if (isWorkerOfLiveParent(top, liveWorkspaceIds)) continue;
     if (top === workspace) {
       rows.push(workspace);
       continue;
