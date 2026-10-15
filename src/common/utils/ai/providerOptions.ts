@@ -398,7 +398,12 @@ function anthropicBlockBindingRouteAvailable(
       muxProviderOptions
     );
   }
+  // The backend's `providers.anthropic.disableBetaFeatures` (ZDR) is authoritative for
+  // Coder Anthropic instances too (the coder provider has no opt-out of its own), and
+  // a persisted request `false` must not override it: check both sources, as the
+  // direct route does.
   return (
+    providersConfig?.anthropic?.disableBetaFeatures !== true &&
     muxProviderOptions?.anthropic?.disableBetaFeatures !== true &&
     anthropicTypedCoderRoute(modelString, providersConfig)
   );

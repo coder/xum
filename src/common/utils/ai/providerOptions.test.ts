@@ -596,6 +596,38 @@ describe("buildProviderOptions - Anthropic", () => {
           thinking: { type: "adaptive", display: "summarized" },
         });
       }
+
+      // The backend's `providers.anthropic.disableBetaFeatures` (ZDR) is
+      // authoritative for Coder Anthropic instances too: persisted request
+      // options that say `false` must not re-enable the beta.
+      const zdrConfig = {
+        ...coderInstance("anthropic", "anthropic"),
+        anthropic: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: false,
+          disableBetaFeatures: true,
+        },
+      } as unknown as ProvidersConfigMap;
+      for (const model of ["coder:anthropic/claude-opus-5-5", "anthropic:claude-opus-5-5"]) {
+        const thinking = anthropicProviderOptions(
+          buildProviderOptions(
+            model,
+            "high",
+            undefined,
+            undefined,
+            { anthropic: { disableBetaFeatures: false } },
+            undefined,
+            undefined,
+            zdrConfig,
+            "coder"
+          )
+        ).thinking;
+        expect({ model, thinking }).toEqual({
+          model,
+          thinking: { type: "adaptive", display: "summarized" },
+        });
+      }
     });
 
     test("leaves models that do not bind thinking to the prefix unchanged", () => {
