@@ -21,6 +21,7 @@ import type {
   AgentPluginHooks,
   AgentPluginInterfaceSummary,
   AgentPluginListItem,
+  AgentPluginPendingSignOuts,
   AgentPluginManifestSummary,
   AgentPluginPreviewHook,
   AgentPluginPreviewMcpServer,
@@ -216,19 +217,30 @@ function monotonicNow(): number {
 }
 
 /**
- * Whether logout() succeeded before the pass deadline. A late or hung logout counts as failed:
- * the URL stays in the record, and a later pass retries it (logout is idempotent).
+ * Why logout() did not succeed before the pass deadline, or undefined when it did. A late or
+ * hung logout counts as failed: the URL stays in the record, and a later pass retries it
+ * (logout is idempotent).
  */
-async function signedOutBefore(
+async function signOutFailure(
   oauth: Pick<McpOauthService, "logout">,
   serverUrl: string,
   deadline: number
-): Promise<boolean> {
+): Promise<string | undefined> {
   const timeoutMs = Math.max(0, deadline - monotonicNow());
   const settled = await raceWithAbortAndTimeout(oauth.logout({ serverUrl }), { timeoutMs });
-  if (settled.kind === "ok") return settled.value.success;
+  if (settled.kind === "ok") return settled.value.success ? undefined : settled.value.error;
   log.warn("A pending plugin MCP sign-out timed out", { timeoutMs });
-  return false;
+  return `The sign-out did not finish within ${Math.round(timeoutMs / 1000)} s.`;
+}
+
+/**
+ * The Settings text for a sign-out record Xum cannot use (#6627). The parser's own errors
+ * already name the recovery step. A read error gets one here.
+ */
+function unusableRecordReason(error: unknown, file: string): string {
+  const code = error instanceof Error && "code" in error ? error.code : undefined;
+  if (typeof code !== "string") return getErrorMessage(error);
+  return `Xum cannot read the pending plugin sign-out record (${file}): ${code}. Fix its permissions, or sign out of the plugin MCP servers in Settings, then delete the file.`;
 }
 
 /** Waits for the startup sign-out pass at most timeoutMs, then lets discovery go on. */
@@ -4040,10 +4052,15 @@ export class AgentPluginInstallService {
     return this.runExclusive(async () => {
       const deadline = monotonicNow() + this.recoveryTimeoutMs;
       const left: string[] = [];
+      const failures: string[] = [];
       for (const serverUrl of await this.readPendingSignOuts()) {
-        if (!(await signedOutBefore(oauth, serverUrl, deadline))) left.push(serverUrl);
+        const failure = await signOutFailure(oauth, serverUrl, deadline);
+        if (failure === undefined) continue;
+        left.push(serverUrl);
+        failures.push(failure);
       }
       await this.writePendingSignOuts(left);
+      this.pendingSignOutLastError = failures[0];
       return left.length > 0;
     });
   }
@@ -4104,13 +4121,37 @@ export class AgentPluginInstallService {
     // A pass before the sign-in service is wired tries nothing, so it sets no wait.
     const left = await this.completePendingSignOuts().catch((error: unknown) => {
       // An unreadable record stays: it keeps discovery closed until the user deletes it.
-      log.warn("Could not finish pending plugin sign-outs", { error: getErrorMessage(error) });
+      this.pendingSignOutLastError = getErrorMessage(error);
+      log.warn("Could not finish pending plugin sign-outs", {
+        error: this.pendingSignOutLastError,
+      });
       return true;
     });
     this.pendingSignOutRetryAtMs = left ? monotonicNow() + PENDING_SIGN_OUT_RETRY_MS : 0;
   }
 
   private pendingSignOutPass: Promise<void> | undefined;
+  /** Why the last pass left the record; shown in Settings (pendingSignOutStatus). */
+  private pendingSignOutLastError: string | undefined;
+
+  /**
+   * The pending sign-out record for Settings → Plugins (#6627). While it exists, managed plugins
+   * are unavailable to agents, so Settings names it and the recovery step. Never throws.
+   */
+  async pendingSignOutStatus(): Promise<AgentPluginPendingSignOuts> {
+    let servers: string[];
+    try {
+      servers = await this.readPendingSignOuts();
+    } catch (error) {
+      return {
+        kind: "broken",
+        reason: unusableRecordReason(error, shortenHome(this.pendingSignOutsFile)),
+      };
+    }
+    if (servers.length === 0) return { kind: "none" };
+    const lastError = this.pendingSignOutLastError;
+    return { kind: "pending", servers, ...(lastError !== undefined ? { lastError } : {}) };
+  }
   /** See startPendingSignOutPass. On the monotonic clock: a wall-clock jump must not move it. */
   private pendingSignOutRetryAtMs = 0;
   /** See signOutPassRunning. */

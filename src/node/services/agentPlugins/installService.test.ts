@@ -2725,6 +2725,52 @@ describe("AgentPluginInstallService", () => {
       await failing.dispose();
     });
 
+    test("Settings reads the pending, the failed and the corrupt record (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      // Before the sign-in service is wired, no pass ran: the record is pending without an error.
+      expect(await restarted.pendingSignOutStatus()).toEqual({
+        kind: "pending",
+        servers: [serverUrl],
+      });
+      let fail = true;
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService({
+        logout: (input: { serverUrl: string }) =>
+          fail ? Promise.resolve({ success: false, error: "offline" }) : oauth.logout(input),
+        credentialKey: (url: string) => oauth.credentialKey(url),
+      } as unknown as McpOauthService);
+      await restarted.list();
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      await internals.settledSignOutPasses();
+      // The failed pass's reason is shown next to the record.
+      expect(await restarted.pendingSignOutStatus()).toEqual({
+        kind: "pending",
+        servers: [serverUrl],
+        lastError: "offline",
+      });
+
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      const kept = await fsPromises.readFile(file, "utf-8");
+      await fsPromises.writeFile(file, "{ not json");
+      const broken = await restarted.pendingSignOutStatus();
+      expect(broken.kind).toBe("broken");
+      expect(broken.kind === "broken" && broken.reason).toMatch(
+        /corrupt or from another Xum version/
+      );
+
+      await fsPromises.writeFile(file, kept);
+      fail = false;
+      await restarted.list();
+      await internals.settledSignOutPasses();
+      expect(await restarted.pendingSignOutStatus()).toEqual({ kind: "none" });
+      await oauth.dispose();
+    });
+
     test("component review names a pending sign-out instead of changed files (#6627)", async () => {
       const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
       await result;

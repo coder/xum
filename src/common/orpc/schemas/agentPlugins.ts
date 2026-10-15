@@ -194,6 +194,23 @@ export const AgentPluginListItemSchema = z.object({
   mcpServerCount: z.number().int().nonnegative(),
 });
 
+/**
+ * The pending plugin sign-out record (#6122): sign-outs that an update could not finish. While
+ * it exists, every discovery gate keeps managed plugins closed. `broken`: the record is corrupt,
+ * from another version, or unreadable, and only the user can clear it.
+ */
+export const AgentPluginPendingSignOutsSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("none") }),
+  z.object({
+    kind: z.literal("pending"),
+    /** Credential URLs still to sign out. */
+    servers: z.array(z.string()),
+    /** Why the last attempt left them, when one ran in this process. */
+    lastError: z.string().optional(),
+  }),
+  z.object({ kind: z.literal("broken"), reason: z.string() }),
+]);
+
 export const AgentPluginUpdateCheckSchema = z.object({
   name: z.string(),
   status: z.enum(["up-to-date", "update-available", "tag-moved", "pinned", "error"]),
@@ -272,6 +289,7 @@ export type AgentPluginHooks = z.infer<typeof AgentPluginHooksSchema>;
 export type AgentPluginManifestSummary = z.infer<typeof AgentPluginManifestSummarySchema>;
 export type AgentPluginInstallPreview = z.infer<typeof AgentPluginInstallPreviewSchema>;
 export type AgentPluginListItem = z.infer<typeof AgentPluginListItemSchema>;
+export type AgentPluginPendingSignOuts = z.infer<typeof AgentPluginPendingSignOutsSchema>;
 export type AgentPluginUpdateCheck = z.infer<typeof AgentPluginUpdateCheckSchema>;
 
 /**

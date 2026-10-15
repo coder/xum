@@ -212,6 +212,7 @@ import {
   AgentPluginComponentRefSchema,
   AgentPluginHooksSchema,
   AgentPluginListItemSchema,
+  AgentPluginPendingSignOutsSchema,
   AgentPluginUpdateCheckSchema,
   AgentPluginUpdateConsentSchema,
   AgentPluginUpdateReviewSchema,
@@ -1302,6 +1303,11 @@ export const agentPlugins = {
       }),
       z.object({ success: z.literal(false), error: z.string() }),
     ]),
+  },
+  /** The pending sign-out record that keeps managed plugins closed (#6627). */
+  pendingSignOuts: {
+    input: z.void(),
+    output: AgentPluginPendingSignOutsSchema,
   },
   /** Display path of the ACTIVE managed plugin container (config-derived root; never hardcode it in UI). */
   containerLocation: {

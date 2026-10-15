@@ -23,6 +23,7 @@ import type {
   AgentPluginInstallPreview,
   AgentPluginInterfaceSummary,
   AgentPluginListItem,
+  AgentPluginPendingSignOuts,
   AgentPluginUpdateCheck,
   AgentPluginUpdateConsent,
   AgentPluginUpdateReview,
@@ -994,6 +995,39 @@ const UpdateReviewPanel: React.FC<{
   );
 };
 
+/**
+ * Section notice while a post-update sign-out record exists (#6627). Every discovery gate keeps
+ * managed plugins closed until it is gone, and without this notice they only disappear.
+ */
+const PendingSignOutNotice: React.FC<{ status: AgentPluginPendingSignOuts | null }> = (props) => {
+  const status = props.status;
+  if (status === null || status.kind === "none") return null;
+  return (
+    <div
+      role="status"
+      className="bg-warning/10 text-warning mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm"
+    >
+      <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+      {status.kind === "broken" ? (
+        <span className="break-words">
+          Managed plugins are unavailable to agents. {status.reason}
+        </span>
+      ) : (
+        <span className="space-y-1 break-words">
+          <span className="block">
+            Managed plugins are unavailable to agents until Xum finishes signing out of a plugin MCP
+            server whose sign-in changed in an update: {status.servers.join(", ")}. Xum retries on
+            its own and each time you open this section.
+          </span>
+          {status.lastError !== undefined && (
+            <span className="block">Last attempt: {status.lastError}</span>
+          )}
+        </span>
+      )}
+    </div>
+  );
+};
+
 /** Section notice while any plugin has components not reviewed on this install (#6498). */
 const ComponentReviewNotice: React.FC<{ items: AgentPluginListItem[] | null }> = (props) => {
   if (!(props.items ?? []).some((item) => (item.reviewRequiredCount ?? 0) > 0)) return null;
@@ -1147,6 +1181,8 @@ export const PluginsSettingsSection: React.FC = () => {
   // Backend-provided container path: the root is config-derived (canonically
   // ~/.shux, possibly custom/legacy), so this copy must never hardcode it.
   const [containerLocation, setContainerLocation] = useState<string | null>(null);
+  // The record that keeps managed plugins closed after a failed post-update sign-out (#6627).
+  const [pendingSignOuts, setPendingSignOuts] = useState<AgentPluginPendingSignOuts | null>(null);
   // Palette intents (keyboard rule: install/uninstall/update need keyboard
   // paths). The initializer covers palette → fresh mount; the subscription
   // below covers commands invoked while this section is already on screen
@@ -1197,9 +1233,12 @@ export const PluginsSettingsSection: React.FC = () => {
     const generation = ++listGenerationRef.current;
     try {
       const result = await api.agentPlugins.list();
+      // Read after the list: opening the section retries the pending sign-outs first.
+      const signOuts = await api.agentPlugins.pendingSignOuts().catch(() => null);
       if (generation !== listGenerationRef.current) {
         return; // A newer list request superseded this one.
       }
+      setPendingSignOuts(signOuts);
       if (result.success) {
         setItems(result.data);
         setError(null);
@@ -1462,6 +1501,7 @@ export const PluginsSettingsSection: React.FC = () => {
           </div>
         )}
 
+        <PendingSignOutNotice status={pendingSignOuts} />
         <ComponentReviewNotice items={items} />
 
         <div className="space-y-2">
