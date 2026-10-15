@@ -307,10 +307,11 @@ function stdioEnvError(env: Record<string, unknown>): string | undefined {
       // Same spawn constraint as args: env entries must be NUL-free.
       return `'env' entry ${JSON.stringify(key)} must not contain NUL bytes`;
     }
-    if (key.includes("=")) {
+    if (key.length === 0 || key.includes("=")) {
       // As env_vars names (codexEnvVarName): a key `PLUGIN_DATA=/x` would set PLUGIN_DATA in
       // the joined env block, and Windows sorts that block, so order cannot protect it (#6713).
-      return `'env' key ${JSON.stringify(key)} must not contain '='`;
+      // An empty key would be an unnamed `=value` entry.
+      return `'env' key ${JSON.stringify(key)} must be a non-empty name without '='`;
     }
   }
   return undefined;

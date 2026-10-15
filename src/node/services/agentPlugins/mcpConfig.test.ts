@@ -373,7 +373,10 @@ describe("loadPluginMcpServers", () => {
         mcpServers: {
           // A key with = would set PLUGIN_DATA once the env block is joined.
           equalsKey: { command: "node", env: { "PLUGIN_DATA=/x": "y" } },
-          // stdio servers start through bash -c, which runs the file BASH_ENV or ENV names.
+          // An empty key is no variable name either (PRRT_kwDOPxxmWM6s3uZs).
+          emptyKey: { command: "node", env: { "": "y" } },
+          // stdio servers start through bash -c, which runs the file BASH_ENV names. ENV is read
+          // only by interactive shells, so it is no loader here (PRRT_kwDOPxxmWM6s3uZ2).
           loaders: {
             command: "node",
             env_vars: ["BASH_ENV", "ENV", "LD_AUDIT", "NODE_PATH", "PYTHONPATH", "API_TOKEN"],
@@ -386,10 +389,11 @@ describe("loadPluginMcpServers", () => {
     expect(Object.values(servers).map((s) => s.plugin?.serverName)).toEqual(["loaders"]);
     expect(diagnostics.map((d) => [d.severity, /server '(\w+)'/.exec(d.message)?.[1]])).toEqual([
       ["error", "equalsKey"],
+      ["error", "emptyKey"],
       ["warning", "loaders"],
     ]);
-    expect(diagnostics[1].message).toContain("BASH_ENV, ENV, LD_AUDIT, NODE_PATH, PYTHONPATH");
-    expect(diagnostics[1].message).not.toContain("API_TOKEN");
+    expect(diagnostics[2].message).toContain("BASH_ENV, LD_AUDIT, NODE_PATH, PYTHONPATH");
+    expect(diagnostics[2].message).not.toContain("API_TOKEN");
   });
 
   test("on Windows, reserved and duplicate env names compare without case", async () => {
