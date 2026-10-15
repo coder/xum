@@ -94,6 +94,8 @@ test("tool runs in flight count like saves: per server, until none runs", () => 
     cad: { running: ["cad.reset"], results: {} },
     lathe: { running: [], results: {} },
   };
-  expect(withSettingsToolRuns({ cad: 1 }, runs)).toEqual({ cad: 2 });
-  expect(withSettingsToolRuns({}, { lathe: runs.lathe })).toEqual({});
+  expect(withSettingsToolRuns({ cad: 1 }, runs, ["cad", "lathe"])).toEqual({ cad: 2 });
+  expect(withSettingsToolRuns({}, { lathe: runs.lathe }, ["lathe"])).toEqual({});
+  // A server the dialog no longer lists (removed from the config) does not block Save.
+  expect(withSettingsToolRuns({}, runs, ["lathe"])).toEqual({});
 });

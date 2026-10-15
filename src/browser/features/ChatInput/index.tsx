@@ -216,6 +216,7 @@ import {
 import { useComposerDraft } from "./useComposerDraft";
 import { getDraftStore, type SendOutcome } from "@/browser/stores/DraftStore";
 import { useComposerTypingLock } from "./useComposerTypingLock";
+import { useSendMarkEditTracking } from "./useSendMarkEditTracking";
 import { useReportCreationSendBlocked } from "./useReportCreationSendBlocked";
 import { assert } from "@/common/utils/assert";
 import { acceptedSendIds, isEditSendAccepted } from "./sendAcceptance";
@@ -546,6 +547,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     };
   }, []);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // #6585: edits other than typing at the end stop a send in flight from cutting its text.
+  useSendMarkEditTracking(inputRef, draftScope);
   const modelSelectorRef = useRef<ModelSelectorRef>(null);
   const powerMode = usePowerMode();
   const handleInputChange = useCallback(
@@ -2892,9 +2895,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // this send resolved its options) stays in the composer (#5226).
         const sentAttachmentIds = new Set([...attachments, ...sendAttachments].map(({ id }) => id));
         // Read before the update below: takeSendMark ends the mark.
-        const typedAfterSend = getDraftStore().takeSendMark(draftScope, input);
+        const take = getDraftStore().takeSendMark(draftScope, input);
         if (!tracksSend) {
-          setInput((current) => takeSentText(current, input, typedAfterSend));
+          setInput((current) => takeSentText(current, input, take));
           taken = { text: input };
         }
         // Likewise for notes: drop the override this send captured, keeping notes an edit's

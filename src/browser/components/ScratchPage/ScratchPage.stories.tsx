@@ -1,4 +1,4 @@
-import { userEvent, waitFor } from "@storybook/test";
+import { userEvent, waitFor } from "storybook/test";
 
 import { appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";

@@ -11,7 +11,7 @@ import {
   blurActiveElement,
   waitForChatInputAutofocusDone,
 } from "@/browser/stories/storyPlayHelpers.js";
-import { expect, within, userEvent, waitFor } from "@storybook/test";
+import { expect, within, userEvent, waitFor } from "storybook/test";
 import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import { textContrasts } from "@/browser/stories/helpers/contrast";

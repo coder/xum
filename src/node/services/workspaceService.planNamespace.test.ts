@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import * as humanIdModule from "human-id";
 import { execFileSync } from "child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -225,14 +226,17 @@ describe("same-basename projects share the plan-directory name namespace (#5139)
 
     test("/new skips a name a same-basename project uses on the same plan storage, so it inherits no plan", async () => {
       await withTempMuxRoot(async (root) => {
-        await addWorkspace(projectA, "aaaaaaaa11", "workspace-1");
-        const otherPlan = await writePlan(root, "workspace-1", "# A's workspace-1 plan\n");
+        await addWorkspace(projectA, "aaaaaaaa11", "brave-cows-jump");
+        const otherPlan = await writePlan(root, "brave-cows-jump", "# A's plan\n");
+        spyOn(humanIdModule, "humanId")
+          .mockReturnValueOnce("brave-cows-jump")
+          .mockReturnValue("calm-otters-sing");
 
         const result = await createLocal(projectB, undefined);
 
-        expect(result.success ? result.data.metadata.name : result.error).toBe("workspace-2");
-        expect(await exists(getPlanFilePath("workspace-2", "project", root))).toBe(false);
-        expect(await fs.readFile(otherPlan, "utf8")).toBe("# A's workspace-1 plan\n");
+        expect(result.success ? result.data.metadata.name : result.error).toBe("calm-otters-sing");
+        expect(await exists(getPlanFilePath("calm-otters-sing", "project", root))).toBe(false);
+        expect(await fs.readFile(otherPlan, "utf8")).toBe("# A's plan\n");
       });
     });
 

@@ -1,6 +1,6 @@
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { getOwn } from "@/common/utils/getOwn";
-import type { ServerSettingsToolRuns } from "./settingsToolRuns";
+import { serverSettingsToolRuns, type ServerSettingsToolRuns } from "./settingsToolRuns";
 import {
   validateMCPSettingValue,
   type MCPSettingsReadSnapshot,
@@ -91,15 +91,18 @@ export function isDialogSaveBlocked(saving: boolean, savingSettings: Record<stri
  * Saves in flight per server plus each server's settings tool runs (settingsToolRuns). Both
  * block Refresh Tools: a refresh remounts the section, which would drop a run's result while
  * the tool still runs (the user could run a writing tool twice). The runs live outside the
- * dialog, so a run started before a reopen still counts.
+ * dialog, so a run started before a reopen still counts. Only `listedServers` count: the run of
+ * a server removed from the config can hang until its timeout, and must not block Save.
  */
 export function withSettingsToolRuns(
   savingSettings: Record<string, number>,
-  toolRuns: Readonly<Record<string, ServerSettingsToolRuns>>
+  toolRuns: Readonly<Record<string, ServerSettingsToolRuns>>,
+  listedServers: readonly string[]
 ): Record<string, number> {
   let counts = savingSettings;
-  for (const [serverName, runs] of Object.entries(toolRuns))
-    for (const _tool of runs.running) counts = countSettingsSave(counts, serverName, 1);
+  for (const serverName of listedServers)
+    for (const _tool of serverSettingsToolRuns(toolRuns, serverName).running)
+      counts = countSettingsSave(counts, serverName, 1);
   return counts;
 }
 

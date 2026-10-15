@@ -1,7 +1,7 @@
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import type { ComponentType } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, waitFor, within } from "@storybook/test";
+import { expect, waitFor, within } from "storybook/test";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { TasksSection } from "./TasksSection.js";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils.js";

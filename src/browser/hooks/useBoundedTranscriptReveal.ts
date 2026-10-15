@@ -111,6 +111,18 @@ interface RevealState {
    * bundle stays mounted (more rows, never hidden ones) until a row after it is a safe cut.
    */
   tailBundleHeadId: string | null;
+  /**
+   * Ids of the newest rows (one chunk), for telling a deletion of only the newest rows (the new
+   * newest row is one of them) from a replaced tail (it is new): see `appendRestarts`.
+   */
+  tailIds: readonly string[];
+  /** A held reader left this attached slice past the cap (see `resolveSliceEnd`). */
+  keptPastCap: boolean;
+  /**
+   * The automatic step stopped at the cap before a bundle too large for the room left: the reveal
+   * is paused, and the next Load older press walks to a target, which may pass the cap.
+   */
+  capBlocked: boolean;
 }
 
 /**
@@ -147,12 +159,20 @@ function nearestSafeCutAtOrAfter(index: number, length: number, isSafeCut: IsSaf
 }
 
 /** A detached slice's stored end: its first unmounted row survives deleted mounted rows. */
-function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCut: IsSafeCut) {
+function storedSliceEnd(
+  state: RevealState,
+  rows: readonly RevealRow[],
+  isSafeCut: IsSafeCut,
+  /** Where the end goes from its row's index; the vanished-start fallback keeps the index. */
+  nearest: (index: number, length: number, isSafeCut: IsSafeCut) => number = nearestSafeCutAtOrAfter
+) {
   const { endMessageId: id, endIndexHint: hint, endRows } = state;
   if (id === null) return rows.length;
   const found = rows[hint]?.id === id ? hint : rows.findIndex((row) => row.id === id);
-  if (found !== -1) return nearestSafeCutAtOrBefore(found, rows.length, isSafeCut);
-  return endAtNearestUnmountedRow(rows, endRows, isSafeCut);
+  if (found === -1) return endAtNearestUnmountedRow(rows, endRows, isSafeCut);
+  // A regroup that puts the end row inside a bundle moves the end forward: no mounted row
+  // unmounts (cap rule); the bundle mounts whole.
+  return nearest(found, rows.length, isSafeCut);
 }
 
 /**
@@ -176,6 +196,17 @@ function endAtNearestUnmountedRow(
   return rows.length;
 }
 
+interface SliceEndInputs {
+  fromIndex: number;
+  max: number | undefined;
+  isSafeCut: IsSafeCut;
+  /** No safe cut lies in (fromIndex, bundleScanFrom): see `tailBundleHeadId`. */
+  bundleScanFrom: number;
+  /** Held, no walk (cap rule, #6680 round 3): the end never moves back over mounted rows. */
+  keepsEnd: boolean;
+  appendedFrom: number;
+}
+
 /**
  * Where a slice from `fromIndex` ends (#4961 F20): the start is settled first, then a slice over
  * the cap gives up its newest rows in the same render; a first bundle over the cap mounts alone.
@@ -183,21 +214,41 @@ function endAtNearestUnmountedRow(
 function resolveSliceEnd(
   state: RevealState,
   messages: readonly RevealRow[],
-  fromIndex: number,
-  max: number | undefined,
-  isSafeCut: IsSafeCut,
-  /** No safe cut lies in (fromIndex, bundleScanFrom): see `tailBundleHeadId`. */
-  bundleScanFrom: number
+  inputs: SliceEndInputs
 ): number {
+  const { fromIndex, max, isSafeCut } = inputs;
   const length = messages.length;
   if (max === undefined) return length;
   assert(
     Number.isInteger(max) && max >= TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS,
     "maxMountedRows must be an integer holding an automatic reveal budget plus a chunk"
   );
-  let to = storedSliceEnd(state, messages, isSafeCut);
-  if (to - fromIndex > max) to = cappedEnd(fromIndex, to, max, length, isSafeCut, bundleScanFrom);
+  const to = endWithinCap(state, messages, storedSliceEnd(state, messages, isSafeCut), {
+    ...inputs,
+    max,
+  });
   return to > fromIndex ? to : nearestSafeCutAtOrAfter(fromIndex + 1, length, isSafeCut);
+}
+
+/** The stored end `to`, or for a slice over the cap, where the cap rule lets it end. */
+function endWithinCap(
+  state: RevealState,
+  messages: readonly RevealRow[],
+  to: number,
+  inputs: SliceEndInputs & { max: number }
+): number {
+  const { fromIndex, max, isSafeCut } = inputs;
+  const length = messages.length;
+  if (to - fromIndex <= max) return to;
+  if (inputs.keepsEnd) {
+    // Detached: the stored end stays. Attached: the rows mounted before this render (up to the
+    // previous length) stay, with the rest of a bundle they began; only newer rows past the cap
+    // stay unmounted. O(appended rows).
+    if (state.endMessageId !== null) return to;
+    const kept = nearestSafeCutAtOrAfter(inputs.appendedFrom, length, isSafeCut);
+    if (kept - fromIndex > max) return kept;
+  }
+  return cappedEnd(fromIndex, to, max, length, isSafeCut, inputs.bundleScanFrom);
 }
 
 /** The end of a slice over the cap; a known bundle (`tailBundleHeadId`) skips its scanned rows. */
@@ -223,19 +274,48 @@ function endedState(
   fromIndex: number,
   max: number | undefined,
   isSafeCut: IsSafeCut,
-  appendedFrom: number
+  appendedFrom: number,
+  holds: boolean
 ): { toIndex: number; state: RevealState } {
   const length = messages.length;
   const headId = fromIndex < length ? messages[fromIndex].id : null;
   const knownBundle = headId !== null && headId === state.tailBundleHeadId;
+  const keepsEnd = holds && state.targetMessageId === null;
   const bundleScanFrom = knownBundle ? appendedFrom : fromIndex + 1;
-  const toIndex = resolveSliceEnd(state, messages, fromIndex, max, isSafeCut, bundleScanFrom);
+  const inputs = { fromIndex, max, isSafeCut, bundleScanFrom, keepsEnd, appendedFrom };
+  const toIndex = resolveSliceEnd(state, messages, inputs);
   const sliced = withSliceEnd(state, messages, toIndex);
-  // Past the cap means no safe cut between the start and the end: one bundle, scanned to the end.
-  const overCap = max !== undefined && toIndex - fromIndex > max;
-  const tailBundleHeadId = overCap ? headId : null;
-  if (sliced.tailBundleHeadId === tailBundleHeadId) return { toIndex, state: sliced };
-  return { toIndex, state: { ...sliced, tailBundleHeadId } };
+  const pastCap = {
+    headId,
+    mounted: toIndex - fromIndex,
+    max,
+    keepsEnd,
+    atTail: toIndex === length,
+  };
+  return { toIndex, state: withBundleFlags(sliced, pastCap) };
+}
+
+/**
+ * `state` with `tailBundleHeadId` and `keptPastCap`. Past the cap without a kept end means no safe
+ * cut between the start and the end: one bundle, scanned to the end. A kept end can span several
+ * bundles, so it is never cached.
+ */
+function withBundleFlags(
+  state: RevealState,
+  slice: {
+    headId: string | null;
+    mounted: number;
+    max: number | undefined;
+    keepsEnd: boolean;
+    atTail: boolean;
+  }
+): RevealState {
+  const pastCap = slice.max !== undefined && slice.mounted > slice.max;
+  const tailBundleHeadId = pastCap && !slice.keepsEnd ? slice.headId : null;
+  const keptPastCap = pastCap && slice.keepsEnd && slice.atTail;
+  if (state.tailBundleHeadId === tailBundleHeadId && state.keptPastCap === keptPastCap)
+    return state;
+  return { ...state, tailBundleHeadId, keptPastCap };
 }
 
 /** `state` with its end fields set for a slice ending at `to` (null at the tail). */
@@ -331,10 +411,72 @@ function isBudgetSpent(
 }
 
 /**
+ * `state` started at row 0: null (fully revealed) without a cap. With a cap the start stays
+ * anchored to its row, so rows prepended above it (older pages) are new rows past the cap and
+ * stay unmounted (cap rule, F20 PR3a-3b part 2a-2).
+ */
+function startAtZero(state: RevealState, messages: readonly RevealRow[]): RevealState {
+  const anchorMessageId =
+    state.maxMountedRows !== undefined && messages.length > 0 ? messages[0].id : null;
+  if (state.anchorMessageId === anchorMessageId) return state;
+  return { ...state, anchorMessageId, anchorIndexHint: 0 };
+}
+
+/** A capped start at row 0 keeps an anchor (see startAtZero) but has nothing older to step to. */
+const isFullyRevealedAt = (anchorMessageId: string | null, max: number | undefined, from: number) =>
+  anchorMessageId === null || (max !== undefined && from === 0);
+
+/** One automatic step older: a chunk, kept within the cap unless a walk is active. */
+function autoStepState(
+  previous: RevealState,
+  snapshot: RevealSnapshot & { stepInputs: StepInputs }
+): RevealState {
+  const cut = cappedStepCut(
+    previous,
+    snapshot,
+    nextStepCut(
+      Math.min(snapshot.fromIndex, snapshot.messages.length),
+      TRANSCRIPT_REVEAL_CHUNK_ROWS,
+      snapshot.stepInputs
+    )
+  );
+  // Blocked by the cap: a zero budget pauses the reveal (see capBlocked).
+  if (cut > 0 && cut >= snapshot.fromIndex)
+    return { ...previous, capBlocked: true, autoRowLimit: 0 };
+  if (cut === 0) return withStartAt(previous, snapshot.messages, 0);
+  return { ...previous, anchorMessageId: snapshot.messages[cut].id, anchorIndexHint: cut };
+}
+
+/** An automatic step's cut, kept within the cap unless a walk (a reader request) is active. */
+function cappedStepCut(
+  state: RevealState,
+  snapshot: RevealSnapshot & { stepInputs: StepInputs },
+  cut: number
+): number {
+  const max = state.maxMountedRows;
+  if (max === undefined || state.targetMessageId !== null || snapshot.toIndex - cut <= max) {
+    return cut;
+  }
+  const { messages, toIndex, stepInputs } = snapshot;
+  return nearestSafeCutAtOrAfter(toIndex - max, messages.length, stepInputs.isSafeCut);
+}
+
+/**
  * Load older: attached, main's rule (one more budget of mounted rows). Detached, or about to be,
  * the walk ends at the row one budget older (revealThrough's target rule) instead of a count, so
  * no deletion elsewhere can lengthen it (F20 PR3a-2); a vanished target ends it early.
  */
+/** A Load older press adds a budget (main's rule): no cap, or attached, within it, not blocked. */
+function pressFitsBudget(
+  state: RevealState,
+  snapshot: RevealSnapshot,
+  max: number | undefined,
+  limit: number
+): boolean {
+  if (max === undefined) return true;
+  return snapshot.toIndex === snapshot.messages.length && limit <= max && !state.capBlocked;
+}
+
 function revealMoreState(
   previous: RevealState,
   snapshot: RevealSnapshot,
@@ -344,7 +486,7 @@ function revealMoreState(
   if (previous.generation !== snapshot.generation) return previous;
   const length = snapshot.messages.length;
   const limit = length - snapshot.fromIndex + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS;
-  if (max === undefined || (snapshot.toIndex === length && limit <= max)) {
+  if (pressFitsBudget(previous, snapshot, max, limit)) {
     return previous.autoRowLimit >= limit ? previous : { ...previous, autoRowLimit: limit };
   }
   if (snapshot.fromIndex === 0) return previous;
@@ -353,7 +495,7 @@ function revealMoreState(
     length,
     isSafeCut
   );
-  return { ...previous, targetMessageId: snapshot.messages[cut].id };
+  return { ...previous, targetMessageId: snapshot.messages[cut].id, capBlocked: false };
 }
 
 /**
@@ -369,7 +511,8 @@ function vanishedStartFallback(
 ): number {
   if (state.endMessageId === null) return state.anchorIndexHint;
   const mountedBefore = state.endIndexHint - state.anchorIndexHint;
-  return storedSliceEnd(state, messages, isSafeCut) - mountedBefore;
+  // The end row's own index: a safe cut before any regroup in this update (#6742 review).
+  return storedSliceEnd(state, messages, isSafeCut, (index) => index) - mountedBefore;
 }
 
 interface TailAppend {
@@ -377,31 +520,35 @@ interface TailAppend {
   /** Index of the first row this render appended (the length when nothing was appended). */
   appendedFrom: number;
   max: number | undefined;
-  appended: boolean;
+  /** Rows were appended, or a held reader left the slice past the cap (`keptPastCap`). */
+  moved: boolean;
   /** The caller's `followsTail`: false while the reader is scrolled away from the bottom. */
   follows: boolean;
 }
 
-/** Whether this render's append may move the start: attached, no walk, the reader at the bottom. */
+/**
+ * Whether the start may move up to fit the cap: attached, no walk, the reader at the bottom, and
+ * rows were appended or a held reader left the slice past the cap (`keptPastCap`).
+ */
 function followsAppend(state: RevealState, tail: TailAppend): boolean {
   return (
-    tail.appended && tail.follows && state.endMessageId === null && state.targetMessageId === null
+    tail.moved && tail.follows && state.endMessageId === null && state.targetMessageId === null
   );
 }
 
 /**
- * Attached past the cap before this append means `from` heads a tail bundle larger than the cap.
- * Rows appended into that bundle keep it: O(appended rows), not a rescan (#6678 review).
+ * `from` heads a cached tail bundle larger than the cap (`tailBundleHeadId`), and no appended
+ * row starts a new one: the bundle keeps the start. O(appended rows), not a rescan (#6678).
  */
 function keepsOversizedTail(
+  state: RevealState,
   messages: readonly RevealRow[],
   tail: TailAppend,
   isSafeCut: IsSafeCut
 ) {
   const length = messages.length;
   return (
-    tail.max !== undefined &&
-    tail.appendedFrom - tail.from > tail.max &&
+    messages[tail.from]?.id === state.tailBundleHeadId &&
     nearestSafeCutAtOrAfter(tail.appendedFrom, length, isSafeCut) === length
   );
 }
@@ -421,7 +568,7 @@ function tailFollowingStart(
   const { from, max } = tail;
   const length = messages.length;
   if (max === undefined || !followsAppend(state, tail) || length - from <= max) return from;
-  if (keepsOversizedTail(messages, tail, isSafeCut)) return from;
+  if (keepsOversizedTail(state, messages, tail, isSafeCut)) return from;
   const cut = nearestSafeCutAtOrAfter(length - max, length, isSafeCut);
   return cut < length ? cut : nearestSafeCutAtOrBefore(length - 1, length, isSafeCut);
 }
@@ -432,11 +579,7 @@ function withStartAt(
   messages: readonly RevealRow[],
   from: number
 ): RevealState {
-  if (from === 0) {
-    return state.anchorMessageId === null
-      ? state
-      : { ...state, anchorMessageId: null, anchorIndexHint: 0 };
-  }
+  if (from === 0) return startAtZero(state, messages);
   if (from >= messages.length || messages[from].id === state.anchorMessageId) return state;
   return { ...state, anchorMessageId: messages[from].id, anchorIndexHint: from };
 }
@@ -498,19 +641,54 @@ function exceedsOneStep(start: number, end: number, inputs: StepInputs): boolean
 }
 
 /**
- * Whether an append restarts the reveal at the tail: a replaced tail (`previousNewestIndex` -1)
- * always does. A bulk arrival (more than one step) does too, unless a capped reader is scrolled up
- * (`holdsSlice`, #6680 review): the slice then keeps its start, and past the cap it detaches.
+ * Whether a tail change restarts the reveal at the tail. A replaced tail (the previous newest row
+ * is gone and the newest row is new: edit, truncate, compaction) always does. With a cap, deleting
+ * only newest rows does not (`deletedTail`): a retry that removes an error row keeps a reader's
+ * place. A bulk arrival (more than one step) restarts unless the slice is held (`holds`: scrolled
+ * up, a walk, or detached; #6680 review): it then keeps its start, and past the cap it detaches.
  */
 function appendRestarts(
   previousNewestIndex: number,
   length: number,
   inputs: StepInputs,
-  holdsSlice: boolean
+  hold: { holds: boolean; deletedTail: boolean }
 ): boolean {
-  if (previousNewestIndex === -1) return true;
-  return !holdsSlice && exceedsOneStep(previousNewestIndex + 1, length, inputs);
+  if (previousNewestIndex === -1) return !hold.deletedTail;
+  return !hold.holds && exceedsOneStep(previousNewestIndex + 1, length, inputs);
 }
+
+/** Held (see the cap rule): scrolled up, a walk, or detached; only with a cap. */
+function isHeld(state: RevealState, max: number | undefined, followsTail: boolean | undefined) {
+  if (max === undefined) return false;
+  return followsTail === false || state.targetMessageId !== null || state.endMessageId !== null;
+}
+
+/**
+ * For a render whose newest row changed: whether the reveal restarts, and where the appended rows
+ * begin (the length when rows were only deleted).
+ */
+function tailChange(
+  state: RevealState,
+  messages: readonly RevealRow[],
+  inputs: StepInputs,
+  holds: boolean
+): { restart: boolean; appendedFrom: number } {
+  const length = messages.length;
+  const newestId = messages[length - 1]?.id;
+  const previousNewestIndex =
+    state.newestMessageId === null
+      ? -1
+      : messages.findIndex((row) => row.id === state.newestMessageId);
+  const capped = inputs.maxMountedRows !== undefined;
+  const deletedTail = capped && newestId !== undefined && state.tailIds.includes(newestId);
+  const restart = appendRestarts(previousNewestIndex, length, inputs, { holds, deletedTail });
+  // Only rows deleted: nothing was appended.
+  return { restart, appendedFrom: previousNewestIndex === -1 ? length : previousNewestIndex + 1 };
+}
+
+/** Ids of the newest rows, see `tailIds`. */
+const newestIds = (messages: readonly RevealRow[]) =>
+  messages.slice(-TRANSCRIPT_REVEAL_CHUNK_ROWS).map((row) => row.id);
 
 function startState<Row extends RevealRow>(
   workspaceId: string,
@@ -531,6 +709,9 @@ function startState<Row extends RevealRow>(
     endIndexHint: 0,
     endRows: [],
     tailBundleHeadId: null,
+    tailIds: newestIds(messages),
+    keptPastCap: false,
+    capBlocked: false,
   };
   const cut = nextStepCut(length, TRANSCRIPT_REVEAL_TAIL_ROWS, inputs);
   if (cut === 0) return { ...base, anchorMessageId: null, anchorIndexHint: 0 };
@@ -583,26 +764,20 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   const newestMessageId = length > 0 ? args.messages[length - 1].id : null;
   let restart = transcriptKey(current) !== transcriptKey(args);
   let appendedFrom = length;
+  const max = args.maxMountedRows;
+  const holds = isHeld(current, max, args.followsTail);
   if (!restart && newestMessageId !== current.newestMessageId) {
     // The tail moved. Rows after the previous newest row are the appended suffix; a previous
     // newest row that is gone means the tail was replaced. An empty transcript that filled
     // (the hydration skeleton hands this hook no rows until it clears) is a fresh transcript,
     // judged by the initial-tail limits in startState rather than the chunk ceiling.
-    const previousNewestIndex =
-      current.newestMessageId === null
-        ? -1
-        : args.messages.findIndex((row) => row.id === current.newestMessageId);
-    const holdsSlice = args.followsTail === false && args.maxMountedRows !== undefined;
-    restart = appendRestarts(previousNewestIndex, length, stepInputs, holdsSlice);
-    appendedFrom = previousNewestIndex + 1;
+    ({ restart, appendedFrom } = tailChange(current, args.messages, stepInputs, holds));
   }
-  let appended = false;
   if (restart) {
     current = startState(args.workspaceId, args.messages, stepInputs, current.generation + 1);
     setState(current);
   } else if (current.newestMessageId !== newestMessageId) {
-    appended = true;
-    current = { ...current, newestMessageId };
+    current = { ...current, newestMessageId, tailIds: newestIds(args.messages) };
     setState(current);
   }
 
@@ -634,9 +809,9 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       args.isSafeCut
     );
   }
-  const max = args.maxMountedRows;
   const follows = args.followsTail !== false;
-  const tail = { from: fromIndex, appendedFrom, max, appended, follows };
+  const moved = appendedFrom < length || current.keptPastCap;
+  const tail = { from: fromIndex, appendedFrom, max, moved, follows };
   fromIndex = tailFollowingStart(current, args.messages, tail, args.isSafeCut);
   const started = withStartAt(current, args.messages, fromIndex);
   if (started !== current) {
@@ -644,7 +819,15 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
     setState(current);
   }
   assert(fromIndex >= 0 && fromIndex <= length, "reveal boundary must stay within the transcript");
-  const ended = endedState(current, args.messages, fromIndex, max, args.isSafeCut, appendedFrom);
+  const ended = endedState(
+    current,
+    args.messages,
+    fromIndex,
+    max,
+    args.isSafeCut,
+    appendedFrom,
+    holds
+  );
   const toIndex = ended.toIndex;
   if (ended.state !== current) {
     current = ended.state;
@@ -660,8 +843,10 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       setState(current);
     }
   }
+  // A fully revealed capped start is never paused (#6742 review): Load older must fetch history.
+  const isFullyRevealed = isFullyRevealedAt(current.anchorMessageId, max, fromIndex);
   const isRevealPaused =
-    current.anchorMessageId !== null &&
+    !isFullyRevealed &&
     current.targetMessageId === null &&
     isBudgetSpent(current, { messages: args.messages, fromIndex, toIndex });
 
@@ -691,7 +876,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   const generation = current.generation;
   const workspaceId = args.workspaceId;
   useEffect(() => {
-    if (anchorMessageId === null || isRevealPaused) return;
+    if (isFullyRevealed || isRevealPaused) return;
     const cancel = scheduleFrame(() => {
       const snapshot = latest.current;
       setState((previous) => {
@@ -708,17 +893,11 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
         if (previous.targetMessageId === null && isBudgetSpent(previous, snapshot)) {
           return previous;
         }
-        const cut = nextStepCut(
-          Math.min(snapshot.fromIndex, snapshot.messages.length),
-          TRANSCRIPT_REVEAL_CHUNK_ROWS,
-          snapshot.stepInputs
-        );
-        if (cut === 0) return { ...previous, anchorMessageId: null, anchorIndexHint: 0 };
-        return { ...previous, anchorMessageId: snapshot.messages[cut].id, anchorIndexHint: cut };
+        return autoStepState(previous, snapshot);
       });
     });
     return cancel;
-  }, [anchorMessageId, generation, workspaceId, scheduleFrame, isRevealPaused]);
+  }, [anchorMessageId, isFullyRevealed, generation, workspaceId, scheduleFrame, isRevealPaused]);
 
   // Both read the latest COMMITTED snapshot (like the scheduled step), so a caller's effect sees
   // the rows and boundary it just rendered.
@@ -744,7 +923,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
 
   return {
     fromIndex,
-    isFullyRevealed: current.anchorMessageId === null,
+    isFullyRevealed,
     isRevealPaused,
     revealMore,
     revealThrough,
