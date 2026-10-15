@@ -140,7 +140,7 @@ function renderOverview(
     loaded: true,
     loadError: null,
   };
-  const card = (
+  const cardFor = (flags: { artifactsEnabled?: boolean; mcpAppsEnabled?: boolean }) => (
     <WorkspaceContext.Provider value={value as WorkspaceContextValue}>
       <TooltipProvider>
         <RightSidebarOverview
@@ -160,18 +160,21 @@ function renderOverview(
                 }
           }
           creatingSideChat={false}
-          artifactsEnabled={options.artifactsEnabled ?? false}
-          mcpAppsEnabled={options.mcpAppsEnabled ?? options.artifactsEnabled ?? false}
+          artifactsEnabled={flags.artifactsEnabled ?? false}
+          mcpAppsEnabled={flags.mcpAppsEnabled ?? flags.artifactsEnabled ?? false}
           unreadAssisted={options.unreadAssisted ?? 0}
         />
       </TooltipProvider>
     </WorkspaceContext.Provider>
   );
-  const view = render(
-    options.client != null ? <APIProvider client={options.client}>{card}</APIProvider> : card
-  );
+  const wrap = (card: React.ReactElement) =>
+    options.client != null ? <APIProvider client={options.client}>{card}</APIProvider> : card;
+  const view = render(wrap(cardFor(options)));
   return {
     view,
+    /** Re-renders the same card with other experiment flags. */
+    rerender: (flags: { artifactsEnabled: boolean; mcpAppsEnabled: boolean }) =>
+      view.rerender(wrap(cardFor(flags))),
     opened,
     expandCount: () => expanded,
     terminalOpenCount: () => terminalOpens,
@@ -535,6 +538,36 @@ describe("RightSidebarOverview", () => {
     };
     expect(await rows(true, false)).toEqual(["a.md"]);
     expect(await rows(false, true)).toEqual(["Roll dice"]);
+  });
+
+  test("turning Artifacts back on never shows the files listed before it went off", async () => {
+    let entries = [artifact("old.md", 1)];
+    let release: (() => void) | null = null;
+    const client = createTestApiClient({
+      artifacts: {
+        list: () => {
+          const data = { available: true as const, dir: "/a", entries, truncated: false };
+          // The read after re-enabling stays pending, so only stale state could show a row.
+          if (entries.length === 0) {
+            return new Promise((resolve) => {
+              release = () => resolve({ success: true as const, data });
+            });
+          }
+          return Promise.resolve({ success: true as const, data });
+        },
+      },
+    });
+    const { view, rerender } = renderOverview([workspace({ id: WORKSPACE_ID })], {
+      artifactsEnabled: true,
+      mcpAppsEnabled: true,
+      client,
+    });
+    await view.findByRole("button", { name: /old\.md/ });
+    entries = [];
+    rerender({ artifactsEnabled: false, mcpAppsEnabled: true });
+    rerender({ artifactsEnabled: true, mcpAppsEnabled: true });
+    expect(view.queryByRole("button", { name: /old\.md/ })).toBeNull();
+    (release as (() => void) | null)?.();
   });
 
   // A view from the transcript only: after compaction drops its call, the tab still needs the

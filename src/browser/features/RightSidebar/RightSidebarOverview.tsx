@@ -409,6 +409,13 @@ function useOverviewArtifactFiles(workspaceId: string, enabled: boolean): Artifa
   const api = useOptionalAPI()?.api ?? null;
   const [listing, setListing] = React.useState<ArtifactFilesListing>(EMPTY_LISTING);
   const [refreshTick, setRefreshTick] = React.useState(0);
+  // Drop the listing when Artifacts turns off (React's reset-on-prop-change pattern, no effect),
+  // so turning it back on never shows files from before the toggle while the new read runs.
+  const [listedWhileEnabled, setListedWhileEnabled] = React.useState(enabled);
+  if (listedWhileEnabled !== enabled) {
+    setListedWhileEnabled(enabled);
+    setListing(EMPTY_LISTING);
+  }
 
   React.useEffect(() => {
     if (api == null || !enabled) return;
