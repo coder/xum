@@ -999,6 +999,26 @@ const UpdateReviewPanel: React.FC<{
 const PENDING_SIGN_OUT_POLL_MS = 30_000;
 
 /**
+ * The pending sign-out record (#6627). The section sets it after each list. A background pass
+ * (the discovery gate retries every 30 s) can clear or change the record without any section
+ * action, so the hook re-reads it while the notice shows.
+ */
+function usePendingSignOuts(
+  api: ReturnType<typeof useAPI>["api"]
+): [AgentPluginPendingSignOuts | null, (status: AgentPluginPendingSignOuts | null) => void] {
+  const [status, setStatus] = useState<AgentPluginPendingSignOuts | null>(null);
+  const shown = status !== null && status.kind !== "none";
+  useEffect(() => {
+    if (!api || !shown) return;
+    const timer = setInterval(() => {
+      api.agentPlugins.pendingSignOuts().then(setStatus, () => undefined);
+    }, PENDING_SIGN_OUT_POLL_MS);
+    return () => clearInterval(timer);
+  }, [api, shown]);
+  return [status, setStatus];
+}
+
+/**
  * Section notice while a post-update sign-out record exists (#6627). Every discovery gate keeps
  * managed plugins closed until it is gone, and without this notice they only disappear.
  */
@@ -1186,7 +1206,7 @@ export const PluginsSettingsSection: React.FC = () => {
   // ~/.shux, possibly custom/legacy), so this copy must never hardcode it.
   const [containerLocation, setContainerLocation] = useState<string | null>(null);
   // The record that keeps managed plugins closed after a failed post-update sign-out (#6627).
-  const [pendingSignOuts, setPendingSignOuts] = useState<AgentPluginPendingSignOuts | null>(null);
+  const [pendingSignOuts, setPendingSignOuts] = usePendingSignOuts(api);
   // Palette intents (keyboard rule: install/uninstall/update need keyboard
   // paths). The initializer covers palette → fresh mount; the subscription
   // below covers commands invoked while this section is already on screen
@@ -1286,17 +1306,6 @@ export const PluginsSettingsSection: React.FC = () => {
       }
     }
   };
-
-  // A background pass (the discovery gate retries every 30 s) can clear or change the record
-  // without any section action, so re-read it while the notice shows (#6627).
-  const signOutsPending = pendingSignOuts !== null && pendingSignOuts.kind !== "none";
-  useEffect(() => {
-    if (!api || !signOutsPending) return;
-    const timer = setInterval(() => {
-      api.agentPlugins.pendingSignOuts().then(setPendingSignOuts, () => undefined);
-    }, PENDING_SIGN_OUT_POLL_MS);
-    return () => clearInterval(timer);
-  }, [api, signOutsPending]);
 
   // Approved update policy: passive check on section open + explicit button only.
   useEffect(() => {
