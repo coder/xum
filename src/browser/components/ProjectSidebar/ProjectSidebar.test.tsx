@@ -9,7 +9,6 @@ import * as ReactColorfulModule from "react-colorful";
 import { installDom } from "../../../../tests/ui/dom";
 import { EXPANDED_PROJECTS_KEY } from "@/common/constants/storage";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
-import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
@@ -1181,23 +1180,16 @@ describe("ProjectSidebar flat chat list", () => {
           pendingNewWorkspaceProject: null,
           pendingNewWorkspaceDraftId: null,
           workspaceDraftsByProject: {
-            _multi: [{ draftId: "draft-multi", createdAt: Date.now() }],
-            "/projects/demo-project": [{ draftId: "draft-single", createdAt: Date.now() }],
+            _multi: [{ draftId: "draft-multi", createdAt: Date.now(), manualName: "" }],
+            "/projects/demo-project": [
+              { draftId: "draft-single", createdAt: Date.now(), manualName: "" },
+            ],
           },
           workspaceDraftPromotionsByProject: {},
           createWorkspaceDraft: () => undefined,
           openWorkspaceDraft: () => undefined,
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
-    );
-    // Give both drafts persisted content so their rows would render.
-    getDraftStore().setText(
-      { kind: "creation", projectPath: "_multi", draftId: "draft-multi" },
-      "Multi draft"
-    );
-    getDraftStore().setText(
-      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-single" },
-      "Single draft"
     );
     setSidebarPreferences({ sidebarFlatMode: true });
 
@@ -1236,17 +1228,13 @@ describe("ProjectSidebar flat chat list", () => {
           pendingNewWorkspaceProject: null,
           pendingNewWorkspaceDraftId: null,
           workspaceDraftsByProject: {
-            _multi: [{ draftId: "draft-multi-badge", createdAt: Date.now() }],
+            _multi: [{ draftId: "draft-multi-badge", createdAt: Date.now(), manualName: "" }],
           },
           workspaceDraftPromotionsByProject: {},
           createWorkspaceDraft: () => undefined,
           openWorkspaceDraft: () => undefined,
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
-    );
-    getDraftStore().setText(
-      { kind: "creation", projectPath: "_multi", draftId: "draft-multi-badge" },
-      "Multi draft"
     );
     setSidebarPreferences({ sidebarFlatMode: true });
 
@@ -1331,6 +1319,7 @@ describe("ProjectSidebar flat chat list", () => {
               {
                 draftId: "draft-in-section",
                 createdAt: Date.now(),
+                manualName: "",
                 subProjectPath: "/projects/demo-project/features",
               },
             ],
@@ -1508,18 +1497,15 @@ describe("ProjectSidebar flat chat list", () => {
           pendingNewWorkspaceProject: null,
           pendingNewWorkspaceDraftId: null,
           workspaceDraftsByProject: {
-            "/projects/demo-project": [{ draftId: "draft-order", createdAt: Date.now() }],
+            "/projects/demo-project": [
+              { draftId: "draft-order", createdAt: Date.now(), manualName: "" },
+            ],
           },
           workspaceDraftPromotionsByProject: {},
           createWorkspaceDraft: () => undefined,
           openWorkspaceDraft: () => undefined,
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
-    );
-    // Non-empty drafts render as rows; empty ones stay hidden.
-    getDraftStore().setText(
-      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-order" },
-      "Draft prompt"
     );
     setSidebarPreferences({ sidebarFlatMode: true });
 
@@ -1573,11 +1559,6 @@ describe("ProjectSidebar flat chat list", () => {
           openWorkspaceDraft: () => undefined,
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
-    );
-    // Give the draft persisted content so the draft row would render pre-substitution.
-    getDraftStore().setText(
-      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-promoted" },
-      "Draft prompt"
     );
 
     const view = render(
@@ -3357,88 +3338,5 @@ describe("ProjectSidebar project actions menu", () => {
 
     expect(view.getByText("Custom Label")).toBeTruthy();
     expect(view.getByText("fallback-project")).toBeTruthy();
-  });
-
-  test("keeps empty placeholder visible when only hidden empty drafts exist", () => {
-    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
-      () =>
-        ({
-          archivingWorkspaceIds: new Set<string>(),
-          selectedWorkspace: null,
-          setSelectedWorkspace: () => undefined,
-          preflightArchiveWorkspace: () =>
-            Promise.resolve({ success: true, data: { kind: "ready" as const } }),
-          archiveWorkspace: archiveWorkspaceActionMock,
-          removeWorkspace: () => Promise.resolve({ success: true }),
-          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
-          refreshWorkspaceMetadata: () => Promise.resolve(),
-          pendingNewWorkspaceProject: null,
-          pendingNewWorkspaceDraftId: null,
-          workspaceDraftsByProject: {
-            [demoProjectPath]: [
-              {
-                draftId: "draft-hidden-empty",
-                subProjectPath: null,
-                createdAt: Date.now(),
-              },
-            ],
-          },
-          workspaceDraftPromotionsByProject: {},
-          createWorkspaceDraft: () => undefined,
-          openWorkspaceDraft: () => undefined,
-          deleteWorkspaceDraft: () => undefined,
-        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
-    );
-
-    const view = renderSidebar();
-
-    expect(view.getByText("Empty")).toBeTruthy();
-  });
-
-  test("hides empty placeholder immediately when a hidden draft becomes visible", async () => {
-    const draftId = "draft-hidden-empty";
-    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
-      () =>
-        ({
-          archivingWorkspaceIds: new Set<string>(),
-          selectedWorkspace: null,
-          setSelectedWorkspace: () => undefined,
-          preflightArchiveWorkspace: () =>
-            Promise.resolve({ success: true, data: { kind: "ready" as const } }),
-          archiveWorkspace: archiveWorkspaceActionMock,
-          removeWorkspace: () => Promise.resolve({ success: true }),
-          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
-          refreshWorkspaceMetadata: () => Promise.resolve(),
-          pendingNewWorkspaceProject: null,
-          pendingNewWorkspaceDraftId: null,
-          workspaceDraftsByProject: {
-            [demoProjectPath]: [
-              {
-                draftId,
-                subProjectPath: null,
-                createdAt: Date.now(),
-              },
-            ],
-          },
-          workspaceDraftPromotionsByProject: {},
-          createWorkspaceDraft: () => undefined,
-          openWorkspaceDraft: () => undefined,
-          deleteWorkspaceDraft: () => undefined,
-        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
-    );
-
-    const view = renderSidebar();
-    expect(view.getByText("Empty")).toBeTruthy();
-
-    act(() => {
-      getDraftStore().setText(
-        { kind: "creation", projectPath: demoProjectPath, draftId },
-        "Visible draft prompt"
-      );
-    });
-
-    await waitFor(() => {
-      expect(view.queryByText("Empty")).toBeNull();
-    });
   });
 });

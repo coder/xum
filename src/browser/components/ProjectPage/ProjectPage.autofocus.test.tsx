@@ -8,6 +8,7 @@ import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealLottieModule from "lottie-react";
 import { APIContext } from "@/browser/contexts/API";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import * as RealProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as RealConfiguredProvidersBarModule from "@/browser/components/ConfiguredProvidersBar/ConfiguredProvidersBar";
 import * as RealProjectContextModule from "@/browser/contexts/ProjectContext";
@@ -172,7 +173,10 @@ describe("ProjectPage", () => {
       WorkspaceProvider: typeof WorkspaceContextModule.WorkspaceProvider;
     }>("@/browser/contexts/WorkspaceContext");
 
+    // The composer renders once its draft resolved; a draft made in this window is ready at once.
+    const pendingDraftId = getCreationDraftStore().create("/projects/demo", null);
     const baseProps = {
+      pendingDraftId,
       projectPath: "/projects/demo",
       projectName: "demo",
       leftSidebarCollapsed: true,

@@ -1,21 +1,43 @@
 import {
   DraftAttachmentSchema,
+  type CreationDraft,
+  type CreationDraftExecution,
+  type CreationDraftSummary,
   type Draft,
   type DraftAttachment,
   type DraftAttachmentMetadata,
   type DraftScope,
   type DraftSummary,
   type PendingSend,
-  type WorkspaceNamePersistedState,
 } from "@/common/orpc/schemas/drafts";
 import { joinDraftText } from "@/common/utils/composerDraftText";
 import { MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 
-/** Stable map key for a draft scope (creation keys are unambiguous for any project path). */
+/** Stable map key for a draft scope. */
 export function draftScopeKey(scope: DraftScope): string {
-  return scope.kind === "workspace"
-    ? `workspace:${scope.workspaceId}`
-    : `creation:${JSON.stringify([scope.projectPath, scope.draftId])}`;
+  return `workspace:${scope.workspaceId}`;
+}
+
+/** A creation draft's sidebar row (also computed locally, so a local edit updates it at once). */
+export function summarizeCreationDraft(draft: CreationDraft): CreationDraftSummary {
+  return {
+    draftId: draft.id,
+    projectPath: draft.projectPath,
+    subProjectPath: draft.subProjectPath,
+    createdAt: draft.createdAt,
+    manualName: draft.manualName,
+    preview: draft.text.slice(0, 1000).trim().replace(/\s+/g, " ").slice(0, 200),
+  };
+}
+
+/** UTF-8 size of a whole creation draft record, compared against MAX_DRAFT_JSON_BYTES. */
+export function creationDraftJsonBytes(draft: CreationDraft): number {
+  return utf8ByteLength(JSON.stringify(draft));
+}
+
+/** The draft's execution choices, unless they were made for another project (then none). */
+export function ownExecution(draft: CreationDraft): CreationDraftExecution | null {
+  return draft.execution?.projectPath === draft.projectPath ? draft.execution : null;
 }
 
 /** A new creation draft id (matches DRAFT_ID_PATTERN: it becomes a backend file name). */
@@ -78,22 +100,15 @@ function utf8ByteLength(value: string): number {
  * JSON size of a draft in UTF-8 bytes, compared against MAX_DRAFT_JSON_BYTES. Bytes, because the
  * transport limits count bytes: UTF-16 code units undercount non-ASCII text up to 3x.
  */
-export function draftJsonBytes(
-  draft: Draft & {
-    pendingSends?: readonly PendingSend[];
-    nameState?: WorkspaceNamePersistedState;
-  }
-): number {
+export function draftJsonBytes(draft: Draft & { pendingSends?: readonly PendingSend[] }): number {
   return utf8ByteLength(
     JSON.stringify({
       text: draft.text,
       attachments: draft.attachments,
-      // Replay bookkeeping and the name state count too: the file holds them.
+      // Replay bookkeeping counts too: the file holds it.
       ...(draft.pendingSends != null && draft.pendingSends.length > 0
         ? { pendingSends: draft.pendingSends }
         : {}),
-      // Omitted from the JSON when undefined, as in the file.
-      nameState: draft.nameState,
     })
   );
 }
@@ -189,7 +204,9 @@ export function sanitizeDraft(raw: unknown): { draft: Draft; droppedEntries: num
 }
 
 /** Forks do not share worktree files, so staged attachments (worktree paths) are dropped. */
-export function stripStagedDraftAttachments(attachments: DraftAttachment[]): DraftAttachment[] {
+export function stripStagedDraftAttachments(
+  attachments: DraftAttachment[]
+): Array<Exclude<DraftAttachment, { kind: "staged" }>> {
   return attachments.filter((attachment) => attachment.kind !== "staged");
 }
 
@@ -221,7 +238,7 @@ export function toDraftAttachmentMetadata(attachment: DraftAttachment): DraftAtt
 
 export function summarizeDraft(
   scope: DraftScope,
-  draft: Draft & { nameState?: WorkspaceNamePersistedState },
+  draft: Draft,
   revision: number,
   pendingSends: readonly PendingSend[] = []
 ): DraftSummary {
@@ -230,7 +247,6 @@ export function summarizeDraft(
     text: draft.text,
     attachments: draft.attachments.map(toDraftAttachmentMetadata),
     ...(pendingSends.length > 0 ? { pendingSends: [...pendingSends] } : {}),
-    nameState: draft.nameState,
     revision,
   };
 }

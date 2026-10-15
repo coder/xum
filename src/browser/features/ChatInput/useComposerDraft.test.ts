@@ -21,7 +21,6 @@ const renderDraft = (workspaceId: string) =>
     useComposerDraft({
       variant: "workspace",
       workspaceId,
-      creationProjectPath: "",
       attachedReviews: [],
       pushToast: () => undefined,
     })

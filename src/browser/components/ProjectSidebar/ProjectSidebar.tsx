@@ -22,7 +22,6 @@ import {
   EXPANDED_COMPLETED_SUB_AGENTS_KEY,
   EXPANDED_TASK_GROUPS_KEY,
 } from "@/common/constants/storage";
-import { getDisplayTitleFromPersistedState } from "@/browser/hooks/useWorkspaceName";
 import { DndProvider } from "react-dnd";
 import { HTML5Backend, getEmptyImage } from "react-dnd-html5-backend";
 import { useDrag, useDrop, useDragLayer } from "react-dnd";
@@ -147,7 +146,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
-import { getDraftStore, useDraft, type DraftView } from "@/browser/stores/DraftStore";
+import type { CreationDraftSummary } from "@/common/orpc/schemas/drafts";
 import {
   MULTI_PROJECT_CONFIG_KEY,
   MULTI_PROJECT_SIDEBAR_SECTION_ID,
@@ -435,12 +434,11 @@ const DraggableProjectItem: React.FC<DraggableProjectItemProps> = ({
 };
 
 /**
- * Wrapper that fetches draft data from localStorage and renders via unified AgentListItem.
- * Keeps data-fetching logic colocated with sidebar while delegating rendering to shared component.
+ * A creation draft's sidebar row, from its listed summary (no payload read per render).
  */
 interface DraftAgentListItemWrapperProps {
   projectPath: string;
-  draftId: string;
+  draft: CreationDraftSummary;
   draftNumber: number;
   isSelected: boolean;
   sectionId?: string;
@@ -475,71 +473,8 @@ interface CoalescedWorkspaceListContext {
   ) => React.ReactNode;
 }
 
-// Debounce delay for sidebar preview updates during typing.
-// Prevents constant re-renders while still providing timely feedback.
-const DRAFT_PREVIEW_DEBOUNCE_MS = 1000;
-
-/** Whether a creation draft has user-provided content: text, attachments or a workspace name. */
-function isDraftVisible(draft: DraftView): boolean {
-  return draft.text.trim().length > 0 || draft.attachmentCount > 0 || draft.nameState !== null;
-}
-
-/**
- * Reports one draft's sidebar visibility. Rendered for every listed draft, whether or not its
- * row is mounted (a collapsed section unmounts rows), so the sidebar's count, placeholder and
- * draft numbers never read a stale value (#5677).
- */
-function DraftVisibilityWatcher(props: {
-  projectPath: string;
-  draftId: string;
-  onVisibilityChange: (projectPath: string, draftId: string, isVisible: boolean) => void;
-}) {
-  const draft = useDraft({
-    kind: "creation",
-    projectPath: props.projectPath,
-    draftId: props.draftId,
-  });
-  const isVisible = isDraftVisible(draft);
-  const { projectPath, draftId, onVisibilityChange } = props;
-  useEffect(() => {
-    onVisibilityChange(projectPath, draftId, isVisible);
-  }, [projectPath, draftId, isVisible, onVisibilityChange]);
-  return null;
-}
-
 function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
-  const draft = useDraft({
-    kind: "creation",
-    projectPath: props.projectPath,
-    draftId: props.draftId,
-  });
-  const draftPrompt = draft.text;
-  const workspaceNameState = draft.nameState;
-
-  // Debounce the preview values to avoid constant sidebar updates while typing.
-  const debouncedPrompt = useDebouncedValue(draftPrompt, DRAFT_PREVIEW_DEBOUNCE_MS);
-  const debouncedNameState = useDebouncedValue(workspaceNameState, DRAFT_PREVIEW_DEBOUNCE_MS);
-
-  // Keep empty drafts reusable without immediately surfacing them in the sidebar.
-  // Show the row when the draft has any user-provided content (typed text,
-  // attachments, or workspace-name edits), mirroring the isDraftEmpty() contract
-  // so non-empty drafts never become hidden orphans.
-  // Uses raw (non-debounced) values so the row appears immediately, while the
-  // preview text below still updates at the debounced cadence.
-  const isVisible = isDraftVisible(draft);
-
-  if (!isVisible) {
-    return null;
-  }
-
-  const workspaceTitle = getDisplayTitleFromPersistedState(debouncedNameState);
-
-  // Collapse whitespace so multi-line prompts show up nicely as a single-line preview.
-  const promptPreview =
-    typeof debouncedPrompt === "string" ? debouncedPrompt.trim().replace(/\s+/g, " ") : "";
-
-  const titleText = workspaceTitle.trim().length > 0 ? workspaceTitle.trim() : "Draft";
-
+  const manualName = props.draft.manualName.trim();
   return (
     <AgentListItem
       variant="draft"
@@ -549,10 +484,10 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
       projectBadgeName={props.projectBadgeName}
       projectBadgeColor={props.projectBadgeColor}
       draft={{
-        draftId: props.draftId,
+        draftId: props.draft.draftId,
         draftNumber: props.draftNumber,
-        title: titleText,
-        promptPreview,
+        title: manualName.length > 0 ? manualName : "Draft",
+        promptPreview: props.draft.preview,
         onOpen: props.onOpen,
         onDelete: props.onDelete,
       }}
@@ -944,9 +879,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   };
 
   const [removingWorkspaceIds, setRemovingWorkspaceIds] = useState<Set<string>>(new Set());
-  const [draftVisibilityByProject, setDraftVisibilityByProject] = useState<
-    Record<string, Record<string, boolean>>
-  >({});
   const workspaceArchiveError = usePopoverError();
   const workspaceForkError = usePopoverError();
   const workspaceStopRuntimeError = usePopoverError();
@@ -961,26 +893,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   } | null>(null);
   const projectRemoveError = usePopoverError();
   const sectionRemoveError = usePopoverError();
-
-  const handleDraftVisibilityChange = useCallback(
-    (projectPath: string, draftId: string, isVisible: boolean) => {
-      setDraftVisibilityByProject((prev) => {
-        const existing = prev[projectPath] ?? {};
-        if (existing[draftId] === isVisible) {
-          return prev;
-        }
-
-        return {
-          ...prev,
-          [projectPath]: {
-            ...existing,
-            [draftId]: isVisible,
-          },
-        };
-      });
-    },
-    []
-  );
 
   const projectContextMenu = useContextMenuPosition({ longPress: true });
   const [projectMenuTargetPath, setProjectMenuTargetPath] = useState<string | null>(null);
@@ -1768,24 +1680,10 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const scratchDrafts = (workspaceDraftsByProject[SCRATCH_PROJECT_CONFIG_KEY] ?? [])
     .slice()
     .sort((a, b) => b.createdAt - a.createdAt);
-  // Empty drafts render no row (DraftAgentListItemWrapper), so counts, placeholders and draft
-  // numbers use only drafts that show one: a hidden draft must not count as a chat or renumber
-  // the visible drafts (#5677). DraftVisibilityWatcher keeps the reactive map current for every
-  // draft; the store read covers the render before its first report.
-  const isDraftShownInSidebar = (projectPath: string, draftId: string): boolean =>
-    draftVisibilityByProject[projectPath]?.[draftId] ??
-    isDraftVisible(getDraftStore().getView({ kind: "creation", projectPath, draftId }));
+  // Every listed draft shows a row: a draft is listed once its first edit (or New) saved it.
   const getVisibleDraftNumbers = (
-    drafts: ReadonlyArray<{ projectPath: string; draftId: string }>
-  ): Map<string, number> => {
-    const numbers = new Map<string, number>();
-    for (const draft of drafts) {
-      if (isDraftShownInSidebar(draft.projectPath, draft.draftId)) {
-        numbers.set(draft.draftId, numbers.size + 1);
-      }
-    }
-    return numbers;
-  };
+    drafts: ReadonlyArray<{ draftId: string }>
+  ): Map<string, number> => new Map(drafts.map((draft, index) => [draft.draftId, index + 1]));
   const scratchDraftNumberById = getVisibleDraftNumbers(
     scratchDrafts.map((draft) => ({
       projectPath: SCRATCH_PROJECT_CONFIG_KEY,
@@ -2466,7 +2364,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           <DraftAgentListItemWrapper
             key={draft.draftId}
             projectPath={projectPath}
-            draftId={draft.draftId}
+            draft={draft}
             draftNumber={flatDraftNumberById.get(draft.draftId) ?? 0}
             isSelected={isSelected}
             projectBadgeName={draftBadge?.name}
@@ -2504,18 +2402,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         selectedWorkspace={selectedWorkspace ?? undefined}
         sortedWorkspacesByProject={sortedWorkspacesByProject}
       />
-      {/* Outside the collapsed-only UI: the watchers live exactly as long as the visibility map
-          they fill, so a collapsed sidebar or section never leaves a stale value in it. */}
-      {Object.entries(workspaceDraftsByProject).flatMap(([projectPath, drafts]) =>
-        drafts.map((draft) => (
-          <DraftVisibilityWatcher
-            key={`${projectPath}:${draft.draftId}`}
-            projectPath={projectPath}
-            draftId={draft.draftId}
-            onVisibilityChange={handleDraftVisibilityChange}
-          />
-        ))
-      )}
       <DndProvider backend={HTML5Backend}>
         <ProjectDragLayer />
         <WorkspaceDragLayer />
@@ -2641,7 +2527,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                             <DraftAgentListItemWrapper
                               key={draft.draftId}
                               projectPath={SCRATCH_PROJECT_CONFIG_KEY}
-                              draftId={draft.draftId}
+                              draft={draft}
                               draftNumber={scratchDraftNumberById.get(draft.draftId) ?? 0}
                               isSelected={isSelected}
                               onOpen={() =>
@@ -3351,7 +3237,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                     <DraftAgentListItemWrapper
                                       key={draft.draftId}
                                       projectPath={projectPath}
-                                      draftId={draft.draftId}
+                                      draft={draft}
                                       draftNumber={draftNumber}
                                       isSelected={isSelected}
                                       sectionId={sectionId ?? undefined}

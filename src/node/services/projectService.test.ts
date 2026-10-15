@@ -11,7 +11,7 @@ import { ORPCError } from "@orpc/server";
 import type { SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import { SshPromptService } from "@/node/services/sshPromptService";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import { DraftService } from "./draftService";
+import { CreationDraftService } from "./creationDraftService";
 import { ProjectService, type CloneEvent } from "./projectService";
 import {
   projectRegistrationLockFilePath,
@@ -2880,11 +2880,10 @@ exit 1
       const cfg = config.loadConfigOrDefault();
       cfg.projects.set(projectPath, { workspaces: [] });
       await config.editConfig(() => cfg);
-      const draftService = new DraftService(config);
+      const draftService = new CreationDraftService(config);
       service.setDraftCleaner(draftService);
-      const draftScope = { kind: "creation" as const, projectPath, draftId: "draft-1" };
-      await draftService.update({ scope: draftScope, text: "unsent" });
-      await draftService.putListEntry({ ...draftScope, subProjectPath: null, createdAt: 1 });
+      const scope = { kind: "creation" as const, draftId: "draft-1" };
+      await draftService.update({ scope, projectPath, text: "unsent" });
 
       const result = await service.remove(projectPath);
 
@@ -2896,8 +2895,8 @@ exit 1
       const after = config.loadConfigOrDefault();
       expect(after.projects.has(projectPath)).toBe(false);
       // Removal cleans the draft files server-side, whichever client (if any) removed it.
-      expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual(["list.json"]);
-      expect((await draftService.getList()).entries).toEqual([]);
+      expect(await fs.readdir(path.join(config.rootDir, "creation-drafts"))).toEqual([]);
+      expect((await draftService.list()).drafts).toEqual([]);
     });
 
     it.each([
@@ -2910,19 +2909,18 @@ exit 1
       cfg.projects.set(parentPath, { workspaces: [] });
       cfg.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
       await config.editConfig(() => cfg);
-      const draftService = new DraftService(config);
+      const draftService = new CreationDraftService(config);
       service.setDraftCleaner(draftService);
-      const draftScope = { kind: "creation" as const, projectPath: childPath, draftId: "draft-1" };
-      await draftService.update({ scope: draftScope, text: "unsent" });
-      await draftService.putListEntry({ ...draftScope, subProjectPath: null, createdAt: 1 });
+      const scope = { kind: "creation" as const, draftId: "draft-1" };
+      await draftService.update({ scope, projectPath: childPath, text: "unsent" });
 
       const result = await service.remove(removedPath);
 
       expect(result.success && result.data.removedCreationDrafts).toEqual([
         { projectPath: childPath, draftId: "draft-1" },
       ]);
-      expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual(["list.json"]);
-      expect((await draftService.getList()).entries).toEqual([]);
+      expect(await fs.readdir(path.join(config.rootDir, "creation-drafts"))).toEqual([]);
+      expect((await draftService.list()).drafts).toEqual([]);
     });
 
     it("returns project_not_found for unknown project", async () => {

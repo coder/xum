@@ -667,10 +667,6 @@ export class ServiceContainer {
         log.warn("[MemoryConsolidation] launch sweep failed", { error });
       });
 
-    // Creation drafts of projects removed while this build was not running. Best-effort and
-    // internally non-throwing; fire-and-forget so it never delays startup.
-    void this.draftService.collectOrphanedCreationDrafts();
-
     // Refresh xum-owned Coder SSH config in background (handles binary path changes on restart)
     // Skip getCoderInfo() to avoid caching "unavailable" if coder isn't installed yet
     void this.coderService.ensureMuxCoderSSHConfig().catch((error: unknown) => {

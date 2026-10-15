@@ -46,7 +46,7 @@ import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scope
 import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import {
-  getProjectScopeId,
+  getCreationDraftScopeId,
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
   getWorkspaceLastReadKey,
@@ -110,7 +110,6 @@ import {
   isDialogOpen,
   isEditableElement,
   paneHandlesKeyEvent,
-  type ChatPaneScope,
 } from "@/browser/utils/ui/keybinds";
 import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import {
@@ -162,7 +161,6 @@ import type {
   QueueDispatchMode,
 } from "./types";
 import { CreationControls } from "./CreationControls";
-import { useCreationDraftMove } from "./useCreationDraftMove";
 import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
 import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useCoderConfigChangeHandler } from "./useCoderConfigChangeHandler";
@@ -218,11 +216,7 @@ import {
 import { useComposerDraft } from "./useComposerDraft";
 import { getDraftStore, type SendOutcome } from "@/browser/stores/DraftStore";
 import { useComposerTypingLock } from "./useComposerTypingLock";
-import {
-  isSendBlocked,
-  useReportCreationSendBlocked,
-  type CreationSendBlockers,
-} from "./useReportCreationSendBlocked";
+import { useReportCreationSendBlocked } from "./useReportCreationSendBlocked";
 import { assert } from "@/common/utils/assert";
 import { acceptedSendIds, isEditSendAccepted } from "./sendAcceptance";
 import { createSendId } from "@/common/utils/drafts";
@@ -295,49 +289,6 @@ async function forEachProviderConfigChange(
   }
 }
 
-/** A drop on a locked composer: nothing is read, and the page does not open the file. */
-function preventDefault(event: React.DragEvent): void {
-  event.preventDefault();
-}
-
-/**
- * A locked composer starts no file read from a paste or drop (its result would land after the
- * lock), and its attachments show without remove buttons (a removal would miss a moving body).
- */
-function attachmentInputHandlers<Paste, Drop, Remove>(
-  locked: boolean,
-  handlers: { onPaste: Paste; onDrop: Drop; onRemove: Remove }
-): {
-  onPaste: Paste | undefined;
-  onDrop: Drop | typeof preventDefault;
-  onRemove: Remove | undefined;
-} {
-  return locked ? { onPaste: undefined, onDrop: preventDefault, onRemove: undefined } : handlers;
-}
-
-/**
- * While its creation draft moves to another draft, the composer takes no input, as during a
- * creation send: an edit made then is not in the moved body, and the moved draft opens without it.
- */
-function creationInputLocks(input: {
-  draftMoving: boolean;
-  sendInFlight: boolean;
-  sendInFlightBlocksInput: boolean;
-}): { typing: boolean; controls: boolean } {
-  return {
-    typing: input.sendInFlightBlocksInput || input.draftMoving,
-    controls: input.sendInFlight || input.draftMoving,
-  };
-}
-
-/**
- * The palette's unscoped voice toggle: only the main composer starts recording (see paneScope),
- * and a locked composer starts none, like its disabled voice button.
- */
-function paletteTogglesVoice(shown: boolean, paneScope: ChatPaneScope, locked: boolean): boolean {
-  return shown && paneScope === "main" && !locked;
-}
-
 /**
  * Why a send waits for the transcript. Offline the transcript cannot catch up until the
  * reconnect, so the toast says that instead of "still loading".
@@ -388,6 +339,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ? resolveWorkspaceCreationScope(props.projectPath, userProjects, props.pendingSubProjectPath)
       : null;
   const creationParentProjectPath = creationScope?.projectPath ?? "";
+  // The creation composer's AI choices belong to its draft (keyed by id, not project).
+  const creationDraftId = variant === "creation" ? (props.pendingDraftId ?? "") : "";
   const creationSubProjectPath = creationScope?.subProjectPath ?? undefined;
   const creationProject =
     variant === "creation" ? userProjects.get(creationParentProjectPath) : undefined;
@@ -554,13 +507,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     setToast(null);
   };
 
-  const creationPendingDraftId =
-    variant === "creation" ? (props.pendingDraftId ?? undefined) : undefined;
   const draft = useComposerDraft({
     variant,
     workspaceId,
-    creationProjectPath: creationParentProjectPath,
-    pendingDraftId: creationPendingDraftId,
+    pendingDraftId: creationDraftId,
     attachedReviews: variant === "workspace" ? (props.attachedReviews ?? []) : [],
     pushToast,
   });
@@ -664,8 +614,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   );
 
   const { open } = useSettings();
-  const { selectedWorkspace, workspaceMetadata } = useWorkspaceContext();
-  const { agentId, currentAgent, agents, loaded: agentsLoaded } = useAgent();
+  const { selectedWorkspace, beginWorkspaceCreation, workspaceMetadata } = useWorkspaceContext();
+  const { agentId, currentAgent, agents } = useAgent();
 
   // Use current agent's uiColor, or neutral border until agents load
   const agentColor = currentAgent?.uiColor ?? "var(--color-border-light)";
@@ -724,7 +674,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Get current send message options from shared hook (must be at component top level)
   // For creation variant, use project-scoped key; for workspace, use workspace ID
   const sendOptionsScopeId =
-    variant === "workspace" ? props.workspaceId : getProjectScopeId(creationParentProjectPath);
+    variant === "workspace" ? props.workspaceId : getCreationDraftScopeId(creationDraftId);
   const sendMessageOptions = useSendMessageOptions(sendOptionsScopeId);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const [autoModelRoutingActive, setAutoModelRoutingActive] = useAutoRoutingSelection(
@@ -823,7 +773,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       onModelChange(selectedModel);
     } else {
       const scopeId =
-        variant === "creation" ? getProjectScopeId(creationParentProjectPath) : workspaceId;
+        variant === "creation" ? getCreationDraftScopeId(creationDraftId) : workspaceId;
       if (scopeId) {
         setWorkspaceModelWithOrigin(scopeId, selectedModel, "user");
       }
@@ -920,37 +870,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
   const sendInFlightBlocksInput =
     variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
-  const creationDraftMove = useCreationDraftMove({
-    draftScope,
-    projectPath: creationParentProjectPath,
-    draftId: creationPendingDraftId,
-    runtimePick: creationState.explicitRuntimePick,
-    agent: currentAgent,
-    sendInFlight: isSendInFlight,
-    processingAttachmentCount,
-    voiceInputActive: voiceInput.state !== "idle",
-    agentsLoaded,
-  });
-  const creationLocks = creationInputLocks({
-    draftMoving: creationDraftMove.moving,
-    sendInFlight: isSendInFlight,
-    sendInFlightBlocksInput,
-  });
   // #6259: typing stays on once a send has taken its draft; submission waits for it to settle.
   const typingLock = useComposerTypingLock({
     variant,
     sendingCount,
     isStreamStarting,
-    creationLocksTyping: creationLocks.typing,
+    creationLocksTyping: sendInFlightBlocksInput,
     inputRef,
   });
   const sendLocksTyping = typingLock.locksTyping;
-  const composerLocked = !editingMessageForUi && (disabled || sendLocksTyping);
-  const attachmentInput = attachmentInputHandlers(composerLocked, {
-    onPaste: handlePaste,
-    onDrop: handleDrop,
-    onRemove: handleRemoveAttachment,
-  });
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
@@ -987,7 +915,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           sshHostFallback: creationState.sshHostFallback,
           defaultRuntimeMode: creationState.defaultRuntimeMode,
           onSelectedRuntimeChange: creationState.setSelectedRuntime,
-          disabled: creationLocks.controls,
+          disabled: isSendInFlight,
           projectPath: creationParentProjectPath,
           // Surface the actually-targeted project (possibly a sub-project) to
           // the dropdown so the trigger label reflects what the user picked,
@@ -998,8 +926,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           // routes (deep link to a sub-project, or sidebar "+") collapse here.
           selectedProjectPath: creationSubProjectPath ?? props.projectPath,
           userProjects,
-          onSelectedProjectPathChange: creationDraftMove.move,
-          projectSelectorDisabled: creationDraftMove.locked,
+          onSelectedProjectPathChange: beginWorkspaceCreation,
           projectName: props.projectName,
           nameState: creationState.nameState,
           runtimeAvailabilityState: creationState.runtimeAvailabilityState,
@@ -1045,16 +972,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     creationState.branchLoad !== "loaded" &&
     creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
   const isProcessingAttachments = processingAttachmentCount > 0;
-  // #6423: canSend below checks the same blockers, so "Run /init" is off whenever Send is.
-  const sendBlockers: CreationSendBlockers = {
-    disabled,
-    sendInFlight: sendInFlightBlocksInput,
-    processingAttachments: isProcessingAttachments,
-    coderPresetsLoading,
-    branchesNotLoaded: creationBranchesLoading,
-    draftMoving: creationDraftMove.moving,
-  };
-  useReportCreationSendBlocked(sendBlockers, props);
+  const creationDraftNotSaved = variant === "creation" && draft.saveError !== null;
+  // #6423: the same blockers as canSend below, so "Run /init" is off whenever Send is.
+  useReportCreationSendBlocked(
+    {
+      disabled,
+      sendInFlight: sendInFlightBlocksInput,
+      processingAttachments: isProcessingAttachments,
+      coderPresetsLoading,
+      branchesNotLoaded: creationBranchesLoading,
+      draftNotSaved: creationDraftNotSaved,
+    },
+    props
+  );
   const hasSendableDraft = hasTypedText || hasImages || hasReviews;
   // Workspace sends/edits mutate history relative to the visible transcript, so they wait for
   // the onChat replay to finish; the creation composer has no transcript to catch up with.
@@ -1072,7 +1002,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const editPreconditionInvalidated = editingMessageForUi?.preconditionInvalidated === true;
   const canSend =
     hasSendableDraft &&
-    !isSendBlocked(sendBlockers) &&
+    !disabled &&
+    !sendInFlightBlocksInput &&
+    !isProcessingAttachments &&
+    !coderPresetsLoading &&
+    !creationBranchesLoading &&
+    !creationDraftNotSaved &&
     !transcriptBlocksSend &&
     !editPreconditionInvalidated;
   const runningGoalActive =
@@ -1147,7 +1082,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return;
     }
 
-    const scopeId = getProjectScopeId(creationParentProjectPath);
+    const scopeId = getCreationDraftScopeId(creationDraftId);
 
     const fallbackModel = defaultModel;
 
@@ -1195,7 +1130,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     if (existingReasoning !== resolvedReasoning) {
       markAiSelectionIntent(scopeId, "reasoningMode", resolvedReasoning);
     }
-  }, [agentAiDefaults, agentId, agents, creationParentProjectPath, defaultModel, variant]);
+  }, [agentAiDefaults, agentId, agents, creationDraftId, defaultModel, variant]);
 
   const chatDockColumnWidthClass = useChatDockColumnWidthClass();
 
@@ -1892,7 +1827,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Voice input: command palette toggle + global recording keybinds
   useEffect(() => {
-    if (!paletteTogglesVoice(voiceInput.shouldShowUI, paneScope, composerLocked)) return;
+    // Unscoped palette event: only the main composer starts recording (see paneScope).
+    if (!voiceInput.shouldShowUI || paneScope !== "main") return;
 
     const handleToggle = () => {
       if (!voiceInput.isAvailable) {
@@ -1909,7 +1845,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     return () => {
       window.removeEventListener(CUSTOM_EVENTS.TOGGLE_VOICE_INPUT, handleToggle as EventListener);
     };
-  }, [voiceInput, pushToast, voiceInputUnavailableMessage, paneScope, composerLocked]);
+  }, [voiceInput, pushToast, voiceInputUnavailableMessage, paneScope]);
 
   // Auto-focus chat input when workspace changes (workspace only).
   const workspaceIdForFocus = variant === "workspace" ? props.workspaceId : null;
@@ -2197,7 +2133,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // Async phases can outlive the invoking render, so check the live
         // draft: the getDraft closure captured here still reports
         // this render's input and would refuse to restore over a newer draft.
-        if (getDraftStore().getText(draftScope).trim().length === 0) {
+        if (draft.getLiveText().trim().length === 0) {
           setInput(restoreInput);
         } else {
           setDraftReviews(null);
@@ -2347,9 +2283,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       pushToast({ type: "error", message: transcriptBarrierMessage(liveApiRef.current == null) });
       return;
     }
-    // The live store too: a send racing the move's start (before this render) would take the
-    // body the move gives to the destination.
-    if (!canSend || getDraftStore().isMovingCreationDraft(draftScope)) {
+    if (!canSend) {
       return;
     }
     if (!draft.payloadsLoaded) {
@@ -3415,6 +3349,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
           {/* Creation header controls - shown above textarea for creation variant */}
           {creationControlsProps && <CreationControls {...creationControlsProps} />}
+          {creationDraftNotSaved && (
+            <div role="alert" className="text-error mb-2 text-xs">
+              Not saved: {draft.saveError}. Keep this window open.
+            </div>
+          )}
 
           {/* Scratch chats have no CreationControls, but mobile users still
               need the current scope visible and a way to reach a project's
@@ -3425,8 +3364,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               <CreationProjectSelect
                 selected={SCRATCH_PROJECT_CONFIG_KEY}
                 userProjects={userProjects}
-                onChange={creationDraftMove.move}
-                disabled={creationDraftMove.locked}
+                onChange={beginWorkspaceCreation}
               />
             </div>
           )}
@@ -3476,23 +3414,25 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     // Write the draft when focus leaves instead of after the debounce; a failure
                     // keeps the change in the draft store, which retries it.
                     onBlur={() => {
-                      getDraftStore()
-                        .flush(draftScope)
-                        .catch(() => undefined);
+                      draft
+                        .flush()
+                        .catch((error: unknown) =>
+                          console.warn("Failed to save the draft:", error)
+                        );
                     }}
                     onKeyDown={handleKeyDown}
-                    onPaste={attachmentInput.onPaste}
+                    onPaste={handlePaste}
                     onKeyUp={composerSuggestions.handleCursorActivity}
                     onMouseUp={composerSuggestions.handleCursorActivity}
                     onSelect={composerSuggestions.handleCursorActivity}
                     onDragOver={handleDragOver}
-                    onDrop={attachmentInput.onDrop}
+                    onDrop={handleDrop}
                     onEscapeInNormalMode={handleEscapeInNormalMode}
                     suppressKeys={
                       composerSuggestions.isVisible ? COMMAND_SUGGESTION_KEYS : undefined
                     }
                     placeholder={placeholder}
-                    disabled={composerLocked}
+                    disabled={!editingMessageForUi && (disabled || sendLocksTyping)}
                     aria-label={editingMessageForUi ? "Edit message" : "Message"}
                     // No aria-expanded: the textbox role does not allow it (#5951), and a
                     // textarea cannot take role="combobox" without screen readers treating
@@ -3529,7 +3469,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               )}
             </div>
 
-            <ChatAttachments attachments={attachments} onRemove={attachmentInput.onRemove} />
+            <ChatAttachments attachments={attachments} onRemove={handleRemoveAttachment} />
 
             <div className="flex flex-col gap-0.5" data-component="ChatModeToggles">
               {/* Editing indicator - workspace only */}

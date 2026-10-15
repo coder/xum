@@ -191,6 +191,7 @@ import { throwWorkflowOrpcError } from "./formatOrpcError";
 import { isDraftTooLargeError } from "@/common/utils/drafts";
 import { resolveDraftSends } from "@/node/services/draftSendResolution";
 import type { SendAcceptance } from "@/node/services/draftService";
+import { CreationDraftRejectedError } from "@/node/services/creationDraftService";
 import {
   boundMCPSettingsError,
   mcpSettingsSnapshotForIpc,
@@ -208,6 +209,14 @@ function rethrowDraftTooLarge(error: unknown): never {
     throw new ORPCError("BAD_REQUEST", { message: (error as Error).message });
   }
   throw error;
+}
+
+/** A refused creation draft save needs corrected choices or a reload, never a retry. */
+function rethrowCreationDraftRefusal(error: unknown): never {
+  if (error instanceof CreationDraftRejectedError) {
+    throw new ORPCError("BAD_REQUEST", { message: error.message });
+  }
+  return rethrowDraftTooLarge(error);
 }
 
 /**
@@ -828,22 +837,30 @@ export const router = (authToken?: string) => {
         .input(schemas.drafts.resolveSends.input)
         .output(schemas.drafts.resolveSends.output)
         .handler(({ context, input }) => resolveDraftSends(context, input)),
-      getList: t
-        .input(schemas.drafts.getList.input)
-        .output(schemas.drafts.getList.output)
-        .handler(({ context }) => context.draftService.getList({ strict: true })),
-      putListEntry: t
-        .input(schemas.drafts.putListEntry.input)
-        .output(schemas.drafts.putListEntry.output)
-        .handler(({ context, input }) => context.draftService.putListEntry(input)),
-      moveCreation: t
-        .input(schemas.drafts.moveCreation.input)
-        .output(schemas.drafts.moveCreation.output)
-        .handler(({ context, input }) => context.draftService.moveCreation(input)),
-      importLegacyList: t
-        .input(schemas.drafts.importLegacyList.input)
-        .output(schemas.drafts.importLegacyList.output)
-        .handler(({ context, input }) => context.draftService.importLegacyList(input.entries)),
+      listCreation: t
+        .input(schemas.drafts.listCreation.input)
+        .output(schemas.drafts.listCreation.output)
+        .handler(({ context }) => context.draftService.creation.list()),
+      getCreation: t
+        .input(schemas.drafts.getCreation.input)
+        .output(schemas.drafts.getCreation.output)
+        .handler(({ context, input }) => context.draftService.creation.get(input.scope.draftId)),
+      updateCreation: t
+        .input(schemas.drafts.updateCreation.input)
+        .output(schemas.drafts.updateCreation.output)
+        .handler(({ context, input }) =>
+          context.draftService.creation.update(input).catch(rethrowCreationDraftRefusal)
+        ),
+      deleteCreation: t
+        .input(schemas.drafts.deleteCreation.input)
+        .output(schemas.drafts.deleteCreation.output)
+        .handler(({ context, input }) => context.draftService.creation.delete(input.scope.draftId)),
+      importLegacyCreation: t
+        .input(schemas.drafts.importLegacyCreation.input)
+        .output(schemas.drafts.importLegacyCreation.output)
+        .handler(({ context, input }) =>
+          context.draftService.creation.importLegacy(input).catch(rethrowCreationDraftRefusal)
+        ),
       subscribe: t
         .input(schemas.drafts.subscribe.input)
         .output(schemas.drafts.subscribe.output)

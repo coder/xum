@@ -15,7 +15,6 @@ import {
   setAutoRoutingPick,
   setWorkspaceAgentPick,
   setWorkspaceAiMetadata,
-  snapshotPendingAiSelection,
 } from "@/browser/utils/aiSelectionIntent";
 
 const WS = "intent-ws";
@@ -252,20 +251,5 @@ describe("aiSelectionIntent", () => {
     expect(getWorkspaceAgentId(WS)).toBe("plan");
     expect(getPendingAiSelection(WS, "exec", "model")).toBeUndefined();
     expect(getAutoRoutingPick(WS, "exec", "model")).toBeUndefined();
-  });
-
-  test("copied picks replace the destination's own, so it shows the source's choices", () => {
-    const DEST = "dest-ws";
-    setAutoRoutingPick(WS, "plan", "model", false);
-    // The destination's picks for an agent the source has none for must go too: the moved draft
-    // shows that agent's configured defaults there, as the source does.
-    setAutoRoutingPick(DEST, "exec", "model", true);
-    markAiSelectionIntent(DEST, "serviceTier", "flex");
-
-    snapshotPendingAiSelection(WS)(DEST);
-
-    expect(getAutoRoutingPick(DEST, "plan", "model")).toBe(false);
-    expect(getAutoRoutingPick(DEST, "exec", "model")).toBeUndefined();
-    expect(getPendingAiSelection(DEST, "exec", "serviceTier")).toBeUndefined();
   });
 });

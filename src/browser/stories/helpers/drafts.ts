@@ -1,4 +1,3 @@
-import type { WorkspaceNamePersistedState } from "@/common/orpc/schemas/drafts";
 import {
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
   getDraftScopeId,
@@ -22,10 +21,8 @@ export interface WorkspaceDraftFixture {
 }
 
 /**
- * Seed workspace drafts for a project as legacy localStorage keys (the list, prompts and workspace
- * names), which the DraftStore imports into the story's mock backend on every hydration. Not
- * through the DraftStore itself: it outlives a story (one preview page renders many), so a name
- * set there can be saved to the previous story's backend, and the next story's snapshot clears it.
+ * Set workspace drafts for a project in localStorage.
+ * This seeds the sidebar with UI-only draft placeholders.
  */
 export function setWorkspaceDrafts(projectPath: string, drafts: WorkspaceDraftFixture[]): void {
   // Set the drafts index
@@ -53,12 +50,11 @@ export function setWorkspaceDrafts(projectPath: string, drafts: WorkspaceDraftFi
       localStorage.setItem(getInputKey(scopeId), JSON.stringify(draft.prompt));
     }
 
+    // Set workspace name state if provided
     if (draft.workspaceName !== undefined) {
-      const nameState: WorkspaceNamePersistedState = {
-        generatedIdentity: null,
-        manualName: draft.workspaceName,
+      const nameState = {
         autoGenerate: false,
-        lastGeneratedFor: "",
+        manualName: draft.workspaceName,
       };
       localStorage.setItem(getWorkspaceNameStateKey(scopeId), JSON.stringify(nameState));
     }

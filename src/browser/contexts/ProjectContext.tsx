@@ -15,9 +15,7 @@ import type { z } from "zod";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import type { Secret } from "@/common/types/secrets";
 import type { Result } from "@/common/types/result";
-import { getDraftScopeId } from "@/common/constants/storage";
-import { deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import type { ProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
@@ -300,9 +298,6 @@ export function ProjectProvider(props: { children: ReactNode }) {
         };
       }
       try {
-        const draftIds = (getDraftStore().getCreationDraftsByProject()[path] ?? []).map(
-          (draft) => draft.draftId
-        );
         const result = await liveApi.projects.remove({
           projectPath: path,
           force: options?.force,
@@ -314,17 +309,8 @@ export function ProjectProvider(props: { children: ReactNode }) {
             return next;
           });
 
-          // The backend deleted the project's creation drafts. Clean up their localStorage
-          // settings: the drafts it deleted (this store's list may not have hydrated) and the ids
-          // captured before the call (optimistic rows the backend never saw), then drop them from
-          // memory.
-          for (const draft of result.data.removedCreationDrafts) {
-            deleteWorkspaceStorage(getDraftScopeId(draft.projectPath, draft.draftId));
-          }
-          for (const draftId of draftIds) {
-            deleteWorkspaceStorage(getDraftScopeId(path, draftId));
-          }
-          getDraftStore().forgetProject(path);
+          // The backend deleted the project's creation drafts (by their project field).
+          getCreationDraftStore().forgetProject(path);
 
           await refreshProjects();
           return { success: true };

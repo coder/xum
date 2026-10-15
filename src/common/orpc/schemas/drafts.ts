@@ -1,25 +1,28 @@
 import { z } from "zod";
-import { DEFAULT_CREATION_DRAFT_ID, DRAFT_ID_PATTERN } from "@/constants/drafts";
+import { CREATION_DRAFT_NAME_MAX_CHARS, DRAFT_ID_PATTERN } from "@/constants/drafts";
+import { ServiceTierSchema } from "@/common/config/schemas/providersConfig";
+import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "@/common/types/thinking";
+import { AgentDefinitionScopeSchema } from "./agentDefinition";
+import { CoderWorkspaceConfigSchema } from "./coder";
 import { SendIdSchema, SendMessageOptionsSchema } from "./stream";
 
 /**
  * Composer drafts persisted by the backend DraftService (see src/node/services/draftService.ts).
  *
- * A workspace draft lives in `<sessionDir>/draft.json`; a creation draft (the "new workspace"
- * composer) lives in `<xumRoot>/drafts/<projectHash>/<draftId>.json`; the composer opened without
- * a draft id uses a fixed draft id (see defaultCreationDraftScope). The legacy renderer pending
+ * A workspace draft lives in `<sessionDir>/draft.json`. A creation draft (the "new workspace"
+ * composer) is one record, `<xumRoot>/creation-drafts/<draftId>.json` (CreationDraftSchema): its
+ * project is data, not identity, so changing it keeps the draft. The legacy renderer pending
  * scope (getPendingScopeId) is never a backend scope.
  */
-const CreationDraftScopeSchema = z.object({
-  kind: z.literal("creation"),
-  projectPath: z.string().min(1),
-  draftId: z.string().regex(DRAFT_ID_PATTERN),
+export const DraftScopeSchema = z.object({
+  kind: z.literal("workspace"),
+  workspaceId: z.string().min(1),
 });
 
-export const DraftScopeSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("workspace"), workspaceId: z.string().min(1) }),
-  CreationDraftScopeSchema,
-]);
+export const CreationDraftScopeSchema = z.object({
+  kind: z.literal("creation"),
+  draftId: z.string().regex(DRAFT_ID_PATTERN),
+});
 
 const ProviderDraftAttachmentSchema = z.object({
   kind: z.literal("provider"),
@@ -109,25 +112,6 @@ export const PendingSendSchema = z.object({
   }),
 });
 
-/** A generated workspace identity: a short git-safe name and a human-readable title. */
-export const WorkspaceIdentitySchema = z.object({
-  /** Short git-safe name with suffix (e.g., "plan-a1b2") */
-  name: z.string(),
-  /** Human-readable title (e.g., "Fix plan mode over SSH") */
-  title: z.string(),
-});
-
-/**
- * A creation draft's workspace name state (useWorkspaceName), stored in the draft body next to
- * its text so both move and persist together. Bounded by boundWorkspaceNamePersistedState.
- */
-export const WorkspaceNamePersistedStateSchema = z.object({
-  generatedIdentity: WorkspaceIdentitySchema.nullable(),
-  manualName: z.string(),
-  autoGenerate: z.boolean(),
-  lastGeneratedFor: z.string(),
-});
-
 /**
  * Per-scope monotonic revision, bumped on every persisted change. Scopes start at the backend
  * process start time, so a restarted backend does not regress below the previous one in practice.
@@ -144,13 +128,11 @@ export const DraftSummarySchema = z.object({
   text: z.string(),
   attachments: z.array(DraftAttachmentMetadataSchema),
   pendingSends: z.array(PendingSendSchema).optional(),
-  nameState: WorkspaceNamePersistedStateSchema.optional(),
   revision: DraftRevisionSchema,
 });
 
 export const DraftGetOutputSchema = DraftSchema.extend({
   pendingSends: z.array(PendingSendSchema).optional(),
-  nameState: WorkspaceNamePersistedStateSchema.optional(),
   revision: DraftRevisionSchema,
 });
 
@@ -180,8 +162,6 @@ export const DraftUpdateInputSchema = z.object({
   // the VISIBLE part: the backend keeps what pending sends retain.
   text: z.string().optional(),
   attachments: z.array(DraftAttachmentSchema).optional(),
-  // Omitted keeps the stored name state, null clears it.
-  nameState: WorkspaceNamePersistedStateSchema.nullable().optional(),
   basisSends: z.array(BasisSendSchema).max(1000).optional(),
 });
 
@@ -191,16 +171,10 @@ export const DraftWriteOutputSchema = z.object({
   text: z.string(),
   attachments: z.array(DraftAttachmentMetadataSchema),
   pendingSends: z.array(PendingSendSchema).optional(),
-  nameState: WorkspaceNamePersistedStateSchema.optional(),
-});
-
-const WorkspaceDraftScopeSchema = z.object({
-  kind: z.literal("workspace"),
-  workspaceId: z.string().min(1),
 });
 
 export const DraftBeginSendInputSchema = z.object({
-  scope: WorkspaceDraftScopeSchema,
+  scope: DraftScopeSchema,
   pendingSend: PendingSendSchema,
   /** Payloads of `pendingSend.attachmentIds` the stored draft may lack (not saved yet). */
   attachments: z.array(DraftAttachmentSchema),
@@ -220,7 +194,7 @@ export const DraftBeginSendInputSchema = z.object({
 });
 
 export const DraftSetSendReceiverInputSchema = z.object({
-  scope: WorkspaceDraftScopeSchema,
+  scope: DraftScopeSchema,
   sendId: SendIdSchema,
   receiverId: z.string().min(1),
 });
@@ -232,7 +206,7 @@ export const DraftSetSendReceiverOutputSchema = z.object({
 });
 
 export const DraftResolveSendsInputSchema = z.object({
-  scope: WorkspaceDraftScopeSchema,
+  scope: DraftScopeSchema,
   /**
    * Ids this client has a send request in flight for: not looked up (a lookup before the request
    * reaches the receiver makes it refuse the send).
@@ -250,94 +224,134 @@ export const DraftResolveSendsOutputSchema = z.object({
 
 export const DraftRevisionOutputSchema = z.object({ revision: DraftRevisionSchema });
 
-/**
- * "applied": the backend stored the legacy body, name state or both where it had none, and answers
- * with the stored draft's view like a write (a partial import keeps the stored part). "present":
- * the backend already had a draft and kept it (never clobbered). "orphaned": the scope has no owner
- * (unregistered workspace, unconfigured project, invalid id), so nothing was stored. In every case
- * the client may delete its legacy keys.
- */
-export const DraftImportLegacyOutputSchema = z.discriminatedUnion("result", [
-  DraftWriteOutputSchema.extend({ result: z.literal("applied") }),
-  z.object({ result: z.literal("present"), revision: DraftRevisionSchema }),
-  z.object({ result: z.literal("orphaned"), revision: DraftRevisionSchema }),
-]);
-
-/**
- * One listed creation draft (a row under its project in the sidebar). The list lives in
- * `<xumRoot>/drafts/list.json`, separate from draft bodies: a listed draft may be empty (no body),
- * and clearing a draft's text never delists it. It used to be the renderer localStorage key
- * `workspaceDraftsByProject`, whose size budget dropped newer entries after a restart (#5225).
- */
-export const DraftListEntrySchema = z.object({
-  projectPath: z.string().min(1),
-  draftId: z.string().regex(DRAFT_ID_PATTERN),
-  /** Sub-project the workspace is created in; null for the project itself. */
-  subProjectPath: z.string().min(1).nullable(),
-  createdAt: z.number(),
-});
-
-/**
- * Move a creation draft (the project's default draft or a listed one) to a new listed draft, in
- * the same project or another: body and list row together, then the source is deleted.
- */
-export const DraftMoveCreationInputSchema = z.object({
-  source: CreationDraftScopeSchema,
-  /** The source revision the client last confirmed; null when it knows of no stored source. */
-  sourceRevision: DraftRevisionSchema.nullable(),
-  /** A fresh draft id the client minted: a retry after a lost reply must find only its move. */
-  dest: CreationDraftScopeSchema.refine((scope) => scope.draftId !== DEFAULT_CREATION_DRAFT_ID, {
-    message: "The default creation draft is never a move destination",
-  }),
-  subProjectPath: z.string().min(1).nullable(),
-  createdAt: z.number(),
-});
-
-/**
- * "moved": the destination's stored view and the list revision. "changed": the source changed
- * since `sourceRevision` (its current revision, and whether a body is stored: a source that is
- * gone was deleted or moved away); nothing was written.
- */
-export const DraftMoveCreationOutputSchema = z.discriminatedUnion("result", [
-  z.object({
-    result: z.literal("moved"),
-    dest: DraftWriteOutputSchema,
-    listRevision: DraftRevisionSchema,
-  }),
-  z.object({ result: z.literal("changed"), revision: DraftRevisionSchema, present: z.boolean() }),
-]);
-
-/** A creation draft deleted by a project removal (never the default draft). */
-export const RemovedCreationDraftSchema = DraftListEntrySchema.pick({
-  projectPath: true,
-  draftId: true,
-});
-
-/** The whole list with its revision (bumped on every change; starts at the process start time). */
-export const DraftListSchema = z.object({
-  entries: z.array(DraftListEntrySchema),
+export const DraftImportLegacyOutputSchema = z.object({
+  /**
+   * "applied": the backend had no draft and stored the legacy one. "present": the backend already
+   * had a draft and kept it (never clobbered). "orphaned": the scope has no owner (unregistered
+   * workspace, unconfigured project, invalid id), so nothing was stored. In every case the client
+   * may delete its legacy keys.
+   */
+  result: z.enum(["applied", "present", "orphaned"]),
   revision: DraftRevisionSchema,
 });
 
 /**
- * `drafts.subscribe` stream: a full snapshot first (the same data as `drafts.list`, plus the
- * creation draft list), then one event per change (the whole list on a list change). A resubscription starts with a fresh snapshot, so a client that missed events while
- * disconnected reconciles from it (including deletions).
+ * `drafts.subscribe` stream (workspace drafts): a full snapshot first (the same data as
+ * `drafts.list`), then one event per change. A resubscription starts with a fresh snapshot, so a
+ * client that missed events while disconnected reconciles from it (including deletions).
  */
 export const DraftEventSchema = z.discriminatedUnion("type", [
-  z.object({
-    type: z.literal("snapshot"),
-    drafts: z.array(DraftSummarySchema),
-    list: DraftListSchema,
-  }),
-  DraftListSchema.extend({ type: z.literal("list") }),
+  z.object({ type: z.literal("snapshot"), drafts: z.array(DraftSummarySchema) }),
   DraftSummarySchema.extend({ type: z.literal("changed") }),
   z.object({ type: z.literal("deleted"), scope: DraftScopeSchema, revision: DraftRevisionSchema }),
 ]);
 
+/** Mirrors ParsedRuntime (checked at compile time in creationDrafts.ts). */
+export const ParsedRuntimeSchema = z.discriminatedUnion("mode", [
+  z.object({ mode: z.literal("local") }),
+  z.object({ mode: z.literal("worktree") }),
+  z.object({
+    mode: z.literal("ssh"),
+    host: z.string(),
+    coder: CoderWorkspaceConfigSchema.optional(),
+  }),
+  z.object({
+    mode: z.literal("docker"),
+    image: z.string(),
+    shareCredentials: z.boolean().optional(),
+  }),
+  z.object({
+    mode: z.literal("devcontainer"),
+    configPath: z.string(),
+    shareCredentials: z.boolean().optional(),
+  }),
+]);
+
+/**
+ * A creation draft's execution choices, grouped with the project they were made for: the backend
+ * refuses a save whose `projectPath` is not the record's (a stale window's choices for another
+ * project). Null fields (and a null group) fall back to the project's defaults.
+ */
+export const CreationDraftExecutionSchema = z.object({
+  projectPath: z.string().min(1),
+  agent: z.object({ id: z.string().min(1), scope: AgentDefinitionScopeSchema }).nullable(),
+  runtime: ParsedRuntimeSchema.nullable(),
+  trunkBranch: z.string().nullable(),
+});
+
+/**
+ * One creation draft. Its AI choices and manual name belong to the draft: a project change keeps
+ * them, and project defaults only seed a new draft. Absent AI fields fall back to defaults.
+ */
+export const CreationDraftSchema = z.object({
+  id: z.string().regex(DRAFT_ID_PATTERN),
+  projectPath: z.string().min(1),
+  /** Sub-project the workspace is created in; null for the project itself. */
+  subProjectPath: z.string().min(1).nullable(),
+  createdAt: z.number(),
+  text: z.string(),
+  // Staged attachments are worktree paths: a creation draft has no worktree.
+  attachments: z.array(
+    z.discriminatedUnion("kind", [ProviderDraftAttachmentSchema, PendingFileDraftAttachmentSchema])
+  ),
+  /** Empty: the workspace is named automatically on Send. */
+  manualName: z.string().max(CREATION_DRAFT_NAME_MAX_CHARS),
+  ai: z.object({
+    model: z.string().optional(),
+    thinkingLevel: ThinkingLevelSchema.optional(),
+    reasoningMode: OpenAIReasoningModeSchema.optional(),
+    serviceTier: ServiceTierSchema.optional(),
+  }),
+  intent: z.object({
+    model: z.literal(true).optional(),
+    thinkingLevel: z.literal(true).optional(),
+    reasoningMode: z.literal(true).optional(),
+    serviceTier: z.literal(true).optional(),
+  }),
+  auto: z.object({ model: z.boolean().optional(), thinkingLevel: z.boolean().optional() }),
+  execution: CreationDraftExecutionSchema.nullable(),
+});
+
+/** A creation draft deleted by a project removal. */
+export const RemovedCreationDraftSchema = z.object({
+  projectPath: z.string().min(1),
+  draftId: z.string().regex(DRAFT_ID_PATTERN),
+});
+
+/** A sidebar row: kept in backend memory, so listing never reads payloads. */
+export const CreationDraftSummarySchema = CreationDraftSchema.pick({
+  projectPath: true,
+  subProjectPath: true,
+  createdAt: true,
+  manualName: true,
+}).extend({ draftId: z.string().regex(DRAFT_ID_PATTERN), preview: z.string() });
+
+export const CreationDraftListSchema = z.object({
+  drafts: z.array(CreationDraftSummarySchema),
+  /** Old drafts the one-way import kept because a newer draft differs (their files stay). */
+  importError: z.string().nullable(),
+});
+
+/** Partial: omitted fields keep their stored value; only an explicit `projectPath` moves it. */
+export const CreationDraftUpdateInputSchema = CreationDraftSchema.omit({ id: true })
+  .partial()
+  .extend({ scope: CreationDraftScopeSchema });
+
+/** A pre-record renderer draft (localStorage text or a typed name) of an old creation scope. */
+export const CreationDraftImportLegacyInputSchema = z.object({
+  projectPath: z.string().min(1),
+  legacyDraftId: z.string().regex(DRAFT_ID_PATTERN),
+  text: z.string().optional(),
+  attachments: z.array(DraftAttachmentSchema).optional(),
+  manualName: z.string().max(CREATION_DRAFT_NAME_MAX_CHARS).optional(),
+});
+
+export const CreationDraftImportLegacyOutputSchema = z.object({
+  /** "conflict": a newer draft differs; the caller keeps its legacy keys (and shows the error). */
+  result: z.enum(["imported", "conflict", "orphaned"]),
+});
+
 export type DraftScope = z.infer<typeof DraftScopeSchema>;
-export type WorkspaceIdentity = z.infer<typeof WorkspaceIdentitySchema>;
-export type WorkspaceNamePersistedState = z.infer<typeof WorkspaceNamePersistedStateSchema>;
 export type DraftAttachment = z.infer<typeof DraftAttachmentSchema>;
 export type DraftAttachmentMetadata = z.infer<typeof DraftAttachmentMetadataSchema>;
 export type Draft = z.infer<typeof DraftSchema>;
@@ -354,8 +368,11 @@ export type DraftResolveSendsOutput = z.infer<typeof DraftResolveSendsOutputSche
 export type SendStatus = z.infer<typeof SendStatusSchema>;
 export type DraftImportLegacyOutput = z.infer<typeof DraftImportLegacyOutputSchema>;
 export type DraftEvent = z.infer<typeof DraftEventSchema>;
-export type DraftListEntry = z.infer<typeof DraftListEntrySchema>;
-export type DraftList = z.infer<typeof DraftListSchema>;
-export type DraftMoveCreationInput = z.infer<typeof DraftMoveCreationInputSchema>;
-export type DraftMoveCreationOutput = z.infer<typeof DraftMoveCreationOutputSchema>;
 export type RemovedCreationDraft = z.infer<typeof RemovedCreationDraftSchema>;
+export type CreationDraftScope = z.infer<typeof CreationDraftScopeSchema>;
+export type CreationDraft = z.infer<typeof CreationDraftSchema>;
+export type CreationDraftExecution = z.infer<typeof CreationDraftExecutionSchema>;
+export type CreationDraftSummary = z.infer<typeof CreationDraftSummarySchema>;
+export type CreationDraftList = z.infer<typeof CreationDraftListSchema>;
+export type CreationDraftUpdateInput = z.infer<typeof CreationDraftUpdateInputSchema>;
+export type CreationDraftImportLegacyInput = z.infer<typeof CreationDraftImportLegacyInputSchema>;

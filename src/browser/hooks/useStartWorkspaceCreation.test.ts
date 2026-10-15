@@ -3,13 +3,10 @@ import {
   persistWorkspaceCreationPrefill,
   type StartWorkspaceCreationDetail,
 } from "./useStartWorkspaceCreation";
-import { getProjectScopeId } from "@/common/constants/storage";
-import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { createTestApiClient, createTestPreferencesConfig } from "@/browser/testUtils";
-import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { resetAiSelectionIntentForTests } from "@/browser/utils/aiSelectionIntent";
-import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
-import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 
 describe("persistWorkspaceCreationPrefill", () => {
   const projectPath = "/tmp/project";
@@ -21,52 +18,41 @@ describe("persistWorkspaceCreationPrefill", () => {
   });
 
   afterEach(() => {
+    getCreationDraftStore().forgetProject(projectPath);
     resetAiSelectionIntentForTests();
     getAppConfigStore().setClient(null);
     getAppConfigStore().updateOptimistically({ userPreferences: undefined });
   });
 
-  function projectModel() {
-    return getUserPreferences().ai?.projectDefaults?.[projectPath]?.model;
-  }
-
-  function projectTrunk() {
-    return getUserPreferences().workspaceCreation?.byProject?.[projectPath]?.trunkBranch;
+  function prefilledDraft(detail: StartWorkspaceCreationDetail) {
+    const draftId = persistWorkspaceCreationPrefill(projectPath, null, detail);
+    expect(draftId).toBeDefined();
+    return getCreationDraftStore().getView(draftId!).draft;
   }
 
   test("writes provided values and normalizes whitespace", () => {
-    const detail: StartWorkspaceCreationDetail = {
+    const draft = prefilledDraft({
       projectPath,
       startMessage: "Ship it",
       model: "provider:model",
       trunkBranch: " main ",
       runtime: " ssh dev ", // runtime is NOT persisted - it's a one-time override
-    };
-    persistWorkspaceCreationPrefill(projectPath, detail);
-
-    expect(getDraftStore().getText(defaultCreationDraftScope(projectPath))).toBe("Ship it");
-    expect(projectModel()).toBe("provider:model");
-    expect(projectTrunk()).toBe("main");
-  });
-
-  test("a prefilled model is an explicit pick and leaves the project's Auto routing", () => {
-    const scopeId = getProjectScopeId(projectPath);
-    setAutoRoutingChoice(scopeId, "model", true);
-
-    persistWorkspaceCreationPrefill(projectPath, { projectPath, model: "provider:model" });
-
-    expect(projectModel()).toBe("provider:model");
-    expect(getAutoRouting(scopeId, "model")).toBe(false);
-  });
-
-  test("clears persisted values when empty strings are provided", () => {
-    getAppConfigStore().updateOptimistically({
-      userPreferences: {
-        workspaceCreation: { byProject: { [projectPath]: { trunkBranch: "dev" } } },
-      },
     });
-    persistWorkspaceCreationPrefill(projectPath, { projectPath, trunkBranch: "   " });
 
-    expect(projectTrunk()).toBeUndefined();
+    expect(draft?.text).toBe("Ship it");
+    expect(draft?.ai.model).toBe("provider:model");
+    expect(draft?.execution).toEqual({
+      projectPath,
+      agent: null,
+      runtime: null,
+      trunkBranch: "main",
+    });
+  });
+
+  test("a prefilled model is an explicit pick and leaves Auto routing", () => {
+    const draft = prefilledDraft({ projectPath, model: "provider:model" });
+
+    expect(draft?.ai.model).toBe("provider:model");
+    expect(draft?.auto.model).toBe(false);
   });
 });

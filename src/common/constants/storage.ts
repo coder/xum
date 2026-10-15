@@ -42,9 +42,33 @@ export function getDraftScopeId(projectPath: string, draftId: string): string {
 const DRAFT_SCOPE_ID_PREFIX = "__draft__/";
 
 /**
+ * A creation draft composer's scope: keyed by the draft id alone, so a project change keeps
+ * every choice made in it (CreationDraftStore holds them in the draft's record).
+ */
+export function getCreationDraftScopeId(draftId: string): string {
+  return `${CREATION_DRAFT_SCOPE_ID_PREFIX}${draftId}`;
+}
+
+/** The draft id of a getCreationDraftScopeId scope, else null. */
+export function parseCreationDraftScopeId(scopeId: string): string | null {
+  return scopeId.startsWith(CREATION_DRAFT_SCOPE_ID_PREFIX)
+    ? scopeId.slice(CREATION_DRAFT_SCOPE_ID_PREFIX.length)
+    : null;
+}
+
+const CREATION_DRAFT_SCOPE_ID_PREFIX = "__creation__/";
+
+/**
  * Global scope ID for workspace-independent preferences
  */
 export const GLOBAL_SCOPE_ID = "__global__";
+
+const NON_WORKSPACE_SCOPE_PREFIXES = [
+  getProjectScopeId(""),
+  getPendingScopeId(""),
+  DRAFT_SCOPE_ID_PREFIX,
+  CREATION_DRAFT_SCOPE_ID_PREFIX,
+];
 
 /**
  * Global, project, pending and draft composer scopes. Every other id is a workspace id,
@@ -53,9 +77,7 @@ export const GLOBAL_SCOPE_ID = "__global__";
 export function isNonWorkspaceScopeId(scopeId: string): boolean {
   return (
     scopeId === GLOBAL_SCOPE_ID ||
-    scopeId.startsWith(getProjectScopeId("")) ||
-    scopeId.startsWith(getPendingScopeId("")) ||
-    scopeId.startsWith(DRAFT_SCOPE_ID_PREFIX)
+    NON_WORKSPACE_SCOPE_PREFIXES.some((prefix) => scopeId.startsWith(prefix))
   );
 }
 
@@ -216,8 +238,10 @@ export function getAutoExpandPrefsKey(workspaceId: string): string {
 }
 
 /**
- * Legacy localStorage key of a creation draft's workspace name state, which now lives in the
- * draft body on the backend (imported once, see DraftStore.migrateLegacyDrafts).
+ * Get the localStorage key for persisted workspace name-generation state.
+ *
+ * This is used by the workspace creation flow so drafts can preserve their
+ * auto-generated (or manually edited) workspace name independently.
  *
  * Format: "workspaceNameState:{scopeId}"
  */
@@ -823,10 +847,9 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Copied on fork.
   // { thinking?, tools?: Record<toolName, boolean> }: one entry per tool the user toggled.
   workspaceKey(getAutoExpandPrefsKey, "ui", true, AUTO_EXPAND_PREFS_MAX_CHARS),
-  // Legacy creation-draft name state, now in the draft body on the backend (imported once by
-  // DraftStore.migrateLegacyDrafts, then removed). Never written again, so no budget (0). Still
-  // copied, so a key not imported yet follows its draft's settings.
-  workspaceKey(getWorkspaceNameStateKey, "draft", true, 0, "draft"),
+  // Creation-draft scopes only. ~80 skeleton + generatedIdentity <= ~410 (propose_name: name <= 20
+  // plus suffix, title <= 60) + lastGeneratedFor 2000 + manualName 1024 (the caps above).
+  workspaceKey(getWorkspaceNameStateKey, "draft", true, 4096, "draft"),
   // The VS Code webview composer's unsent text. Longer drafts still work for the session (kept in
   // memory); the webview then persists only the last text that fit.
   workspaceKey(getInputKey, "draft", false, 8192, "webview"),

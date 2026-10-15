@@ -22,7 +22,6 @@ import { ChatHarness } from "../harness";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getAgentsInitNudgeKey, getDraftScopeId } from "@/common/constants/storage";
 import { BRANCH_LIST_TIMEOUT_MS } from "@/browser/features/ChatInput/branchListLoad";
-import type { DraftScope } from "@/common/orpc/schemas/drafts";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
@@ -174,8 +173,10 @@ async function openCreationViewWithHeldBranches(options?: {
   await openCreationViewWhileBranchesLoad(view, projectPath);
   await waitFor(() => expect(held.spy).toHaveBeenCalled(), { timeout: 10_000 });
   const draftId = await waitForLatestDraftId(projectPath);
-  const scope: DraftScope = { kind: "creation", projectPath, draftId };
-  const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), scope);
+  const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), {
+    kind: "creation",
+    draftId,
+  });
   const create = jest.spyOn(env.services.workspaceService, "create");
   return { env, view, cleanupDom, chat, held, create };
 }
@@ -266,8 +267,10 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
       await openCreationViewWhileBranchesLoad(view, projectPath);
       await waitFor(() => expect(reject).toHaveBeenCalled(), { timeout: 10_000 });
       const draftId = await waitForLatestDraftId(projectPath);
-      const scope: DraftScope = { kind: "creation", projectPath, draftId };
-      const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), scope);
+      const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), {
+        kind: "creation",
+        draftId,
+      });
       await chat.typeWithoutSending("hello after a failed branch list");
 
       await waitFor(() => expect(view.container.textContent ?? "").toContain(BRANCH_LIST_FAILED), {

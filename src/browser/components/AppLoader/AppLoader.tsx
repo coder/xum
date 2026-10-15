@@ -13,6 +13,7 @@ import { getReviewStateStore } from "../../stores/ReviewStateStore";
 import { getPRStatusStoreInstance } from "../../stores/PRStatusStore";
 import { getAppConfigStore } from "../../stores/AppConfigStore";
 import { getDraftStore, useDraftStoreReady } from "../../stores/DraftStore";
+import { getCreationDraftStore } from "../../stores/CreationDraftStore";
 import { getProvidersConfigStore } from "../../stores/ProvidersConfigStore";
 import { ProjectProvider, useProjectContext } from "../../contexts/ProjectContext";
 import { APIProvider, useAPI, useLiveAPI, type APIClient } from "@/browser/contexts/API";
@@ -220,6 +221,7 @@ function AppLoaderInner() {
     getProvidersConfigStore().setClient(api ?? null);
     getReviewStateStore().setClient(api ?? null);
     getDraftStore().setClient(api ?? null);
+    getCreationDraftStore().setClient(api ?? null);
     getAgentSkillsStore().setClient(api ?? null);
 
     if (!workspaceContext.loading) {

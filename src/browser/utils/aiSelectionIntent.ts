@@ -15,12 +15,16 @@ import type { ServiceTier } from "@/common/config/schemas/providersConfig";
  * follows the same token lifecycle as the field picks.
  */
 import type { AiSelectionIntent } from "@/common/types/agentAiSettings";
+import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import { normalizeAgentId, resolvePersistedAgentId } from "@/common/utils/agentIds";
 import assert from "@/common/utils/assert";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { getUserPreferences } from "@/browser/stores/AppConfigStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
+import { parseCreationDraftScopeId } from "@/common/constants/storage";
+import { CreationDraftSchema } from "@/common/orpc/schemas/drafts";
 
 export type AiSelectionField = keyof AiSelectionIntent;
 export type AutoRoutingDimension = "model" | "thinkingLevel";
@@ -65,6 +69,7 @@ const pendingAutoRoutingByScope = new Map<
 const metadataByWorkspace = new Map<string, WorkspaceAiMetadata>();
 const savedRevisionByWorkspace = new Map<string, number>();
 const agentBasesByScope = new Map<string, ReadonlyMap<string, string | undefined>>();
+const agentScopesByScope = new Map<string, ReadonlyMap<string, AgentDefinitionScope | undefined>>();
 const listeners = new Set<() => void>();
 let nextToken = 1;
 let version = 0;
@@ -139,8 +144,9 @@ function getSavedRevision(workspaceId: string): number {
  */
 export function setAgentBases(
   scopeId: string,
-  agents: ReadonlyArray<{ id: string; base?: string }>
+  agents: ReadonlyArray<{ id: string; base?: string; scope?: AgentDefinitionScope }>
 ): void {
+  agentScopesByScope.set(scopeId, new Map(agents.map((agent) => [agent.id, agent.scope])));
   const bases = new Map(agents.map((agent) => [agent.id, agent.base]));
   const previous = agentBasesByScope.get(scopeId);
   if (previous != null && JSON.stringify([...previous]) === JSON.stringify([...bases])) return;
@@ -152,6 +158,11 @@ export function getAgentBases(
   scopeId: string
 ): ReadonlyMap<string, string | undefined> | undefined {
   return agentBasesByScope.get(scopeId);
+}
+
+/** Where an agent loaded for the scope is defined (a creation draft resets project agents). */
+export function getAgentScope(scopeId: string, agentId: string): AgentDefinitionScope | undefined {
+  return agentScopesByScope.get(scopeId)?.get(agentId);
 }
 
 function normalizeAgent(agentId: string): string {
@@ -196,6 +207,8 @@ export function getAutoRoutingPick(
   agentId: string,
   dimension: AutoRoutingDimension
 ): boolean | undefined {
+  const draftId = parseCreationDraftScopeId(scopeId);
+  if (draftId !== null) return getCreationDraftStore().getView(draftId).draft?.auto[dimension];
   return pendingAutoRoutingByScope.get(scopeKey(scopeId, agentId))?.[dimension]?.value;
 }
 
@@ -205,6 +218,14 @@ export function setAutoRoutingPick(
   dimension: AutoRoutingDimension,
   active: boolean
 ): void {
+  const draftId = parseCreationDraftScopeId(scopeId);
+  if (draftId !== null) {
+    const draft = getCreationDraftStore().getView(draftId).draft;
+    if (draft)
+      getCreationDraftStore().update(draftId, { auto: { ...draft.auto, [dimension]: active } });
+    notify();
+    return;
+  }
   const key = scopeKey(scopeId, agentId);
   pendingAutoRoutingByScope.set(key, {
     ...pendingAutoRoutingByScope.get(key),
@@ -289,9 +310,23 @@ export function markAiSelectionIntent(
   field: AiSelectionField,
   value: string
 ): void {
-  const key = scopeKey(workspaceId, getWorkspaceAgentId(workspaceId));
   const normalized = comparable(field, value);
   assert(normalized != null, "markAiSelectionIntent: value must be non-empty");
+  const draftId = parseCreationDraftScopeId(workspaceId);
+  if (draftId !== null) {
+    // A creation draft's picks persist in its record (one set, not per agent).
+    const draft = getCreationDraftStore().getView(draftId).draft;
+    const ai = CreationDraftSchema.shape.ai.safeParse({ ...draft?.ai, [field]: normalized });
+    if (draft && ai.success) {
+      getCreationDraftStore().update(draftId, {
+        ai: ai.data,
+        intent: { ...draft.intent, [field]: true },
+      });
+    }
+    notify();
+    return;
+  }
+  const key = scopeKey(workspaceId, getWorkspaceAgentId(workspaceId));
   const token = nextToken++;
   pendingByScope.set(key, { ...pendingByScope.get(key), [field]: { value: normalized, token } });
   notify();
@@ -302,6 +337,8 @@ export function getPendingAiSelection(
   agentId: string,
   field: AiSelectionField
 ): string | undefined {
+  const draftId = parseCreationDraftScopeId(workspaceId);
+  if (draftId !== null) return getCreationDraftStore().getView(draftId).draft?.ai[field];
   return pendingByScope.get(`${workspaceId}\u0000${normalizeAgent(agentId)}`)?.[field]?.value;
 }
 
@@ -456,22 +493,9 @@ export function dropPendingModelPicks(shouldDrop: (model: string) => boolean): v
   notify();
 }
 
-/** Forgets a scope's unsent picks, of every agent. */
-function dropPendingPicks(scopeId: string): void {
-  const prefix = `${scopeId}\u0000`;
-  for (const picks of [pendingByScope, pendingAutoRoutingByScope]) {
-    for (const key of [...picks.keys()]) {
-      if (key.startsWith(prefix)) picks.delete(key);
-    }
-  }
-  pendingAgentByWorkspace.delete(scopeId);
-}
-
 /**
  * A fork starts from what the source composer shows, including its unsent picks. Taken before
- * the fork runs: a source send meanwhile ends the picks the user forked with. The source's picks
- * replace the destination's, so a moved creation draft shows the source's Auto state even where
- * the destination project had its own pick.
+ * the fork runs: a source send meanwhile ends the picks the user forked with.
  */
 export function snapshotPendingAiSelection(
   sourceWorkspaceId: string
@@ -485,7 +509,6 @@ export function snapshotPendingAiSelection(
   const autoPicks = bySourceAgent(pendingAutoRoutingByScope);
   const agentPick = pendingAgentByWorkspace.get(sourceWorkspaceId);
   return (destWorkspaceId) => {
-    dropPendingPicks(destWorkspaceId);
     for (const [agentId, pending] of fieldPicks) {
       pendingByScope.set(scopeKey(destWorkspaceId, agentId), pending);
     }
@@ -505,6 +528,7 @@ export function clearAiSelectionState(): void {
   metadataByWorkspace.clear();
   savedRevisionByWorkspace.clear();
   agentBasesByScope.clear();
+  agentScopesByScope.clear();
   notify();
 }
 

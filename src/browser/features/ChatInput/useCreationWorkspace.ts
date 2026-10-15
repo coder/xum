@@ -11,20 +11,15 @@ import type {
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
-import {
-  useDraftWorkspaceSettings,
-  type SelectedRuntimeChangeOptions,
-} from "@/browser/hooks/useDraftWorkspaceSettings";
+import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
 import { handOffCreationAiSelection } from "@/browser/utils/aiSelectionIntent";
 import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
-  getDraftScopeId,
+  getCreationDraftScopeId,
   getPendingDraftSkillDiscoveryKey,
-  getPendingScopeId,
   getPendingWorkspaceSendErrorKey,
-  getProjectScopeId,
 } from "@/common/constants/storage";
 import {
   getAppConfigStore,
@@ -58,8 +53,7 @@ import {
   unlockInitialStaging,
 } from "@/browser/features/ChatInput/initialStagingLock";
 import { appendStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
-import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
-import { getDraftStore, listedCreationDraftId } from "@/browser/stores/DraftStore";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
@@ -72,13 +66,13 @@ import {
 } from "@/browser/utils/chatCommands";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
-  getNameFromPersistedState,
+  buildFallbackWorkspaceIdentity,
   useWorkspaceName,
-  type UseWorkspaceNameReturn,
   type WorkspaceNameState,
 } from "@/browser/hooks/useWorkspaceName";
+import { getCreationDraftStore, useCreationDraft } from "@/browser/stores/CreationDraftStore";
+import { CREATION_DRAFT_NAME_MAX_CHARS } from "@/constants/drafts";
 import type { WorkspaceNameGenerationRequest } from "@/common/orpc/schemas/api";
-import type { WorkspaceNamePersistedState } from "@/common/orpc/schemas/drafts";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import {
@@ -104,7 +98,7 @@ interface UseCreationWorkspaceOptions {
     metadata: FrontendWorkspaceMetadata,
     options?: WorkspaceCreatedOptions
   ) => void;
-  /** Current message input for name generation */
+  /** The message the workspace is named for (named on Send only). */
   message: string;
   /** Sub-project path to use for cwd and AGENTS.md context. */
   subProjectPath?: string | null;
@@ -129,6 +123,7 @@ function resolveCreationAgentId(
 
 function syncCreationPreferences(
   projectPath: string,
+  creationScopeId: string,
   workspaceId: string,
   agentId: string,
   reasoningMode: string,
@@ -136,7 +131,6 @@ function syncCreationPreferences(
 ): void {
   // Without the experiment the composer offers no Auto, so the creation scope has no choice.
   const experiments = getAppConfigStore().getSnapshot()?.experiments;
-  const projectScopeId = getProjectScopeId(projectPath);
   // Until the creation save lands the workspace has no saved settings, and project defaults
   // hold no reasoning mode.
   handOffCreationAiSelection(workspaceId, agentId, {
@@ -145,8 +139,8 @@ function syncCreationPreferences(
     ...(experiments?.[EXPERIMENT_IDS.AUTO_MODEL_ROUTING] === true
       ? {
           autoRouting: {
-            model: getAutoRouting(projectScopeId, "model", agentId),
-            thinkingLevel: getAutoRouting(projectScopeId, "thinkingLevel", agentId),
+            model: getAutoRouting(creationScopeId, "model", agentId),
+            thinkingLevel: getAutoRouting(creationScopeId, "thinkingLevel", agentId),
           },
         }
       : {}),
@@ -190,15 +184,13 @@ interface UseCreationWorkspaceReturn {
   setTrunkBranch: (branch: string) => void;
   /** Currently selected runtime (discriminated union: SSH has host, Docker has image) */
   selectedRuntime: ParsedRuntime;
-  /** The runtime the user picked, which moving the draft to another project carries. */
-  explicitRuntimePick: ParsedRuntime | null;
   /** Fallback Coder config used when re-selecting Coder runtime. */
   coderConfigFallback: CoderWorkspaceConfig;
   /** Fallback SSH host used when leaving the Coder runtime. */
   sshHostFallback: string;
   defaultRuntimeMode: RuntimeChoice;
   /** Set the currently selected runtime (discriminated union) */
-  setSelectedRuntime: (runtime: ParsedRuntime, options?: SelectedRuntimeChangeOptions) => void;
+  setSelectedRuntime: (runtime: ParsedRuntime) => void;
   toast: Toast | null;
   setToast: (toast: Toast | null) => void;
   isSending: boolean;
@@ -226,45 +218,40 @@ export type RuntimeAvailabilityState =
   | { status: "failed" }
   | { status: "loaded"; data: RuntimeAvailabilityMap };
 
-/** How workspace.create names the workspace, and the name the form showed for it. */
+/** How workspace.create (or createScratch, with the title) names the workspace. */
 interface CreationName {
   branchName?: string;
   title?: string;
   nameGeneration?: WorkspaceNameGenerationRequest;
-  submittedName: string;
-  /** Call it when no workspace was created: a handed-off naming goes back to the form. */
-  resumeNaming: () => void;
 }
 
 /**
- * A worktree workspace opens without waiting for its name (`canHandOff`): the backend names it,
- * and renames its branch before the init hook runs. Other runtimes create the checkout under the
- * final name, so they wait for it. Null when there is no name to create under (the hook has set
- * the error).
+ * Names exist only on Send. A manual name is used as typed; an attachment-only send gets the
+ * local fallback. Otherwise a worktree opens without waiting (`canHandOff`: the backend names it
+ * and renames its branch before the init hook runs), and other runtimes, which create the
+ * checkout under the final name, wait for the generated name (the fallback when that fails).
  */
-async function resolveCreationName(
-  canHandOff: boolean,
-  nameState: Pick<UseWorkspaceNameReturn, "handOffGeneration" | "waitForGeneration" | "name">
-): Promise<CreationName | null> {
-  const handOff = canHandOff ? nameState.handOffGeneration() : null;
-  if (handOff) {
-    // The form still shows an older message's name (or none); it is dropped with the draft.
-    return {
-      nameGeneration: handOff.request,
-      submittedName: nameState.name,
-      resumeNaming: handOff.resume,
-    };
+async function resolveCreationName(input: {
+  api: NonNullable<ReturnType<typeof useLiveAPI>>;
+  manualName: string;
+  message: string;
+  canHandOff: boolean;
+  candidates: string[];
+}): Promise<CreationName> {
+  const manualName = input.manualName.trim();
+  if (manualName) return { branchName: manualName, title: manualName };
+  const { message, candidates } = input;
+  if (message.trim() && input.canHandOff) return { nameGeneration: { message, candidates } };
+  let identity = buildFallbackWorkspaceIdentity(message);
+  if (message.trim()) {
+    try {
+      const result = await input.api.nameGeneration.generate({ message, candidates });
+      if (result.success) identity = result.data;
+    } catch (error) {
+      console.warn("Workspace name generation failed; using the fallback name:", error);
+    }
   }
-  const identity = await nameState.waitForGeneration();
-  if (!identity) return null;
-  const normalizedTitle = typeof identity.title === "string" ? identity.title.trim() : "";
-  return {
-    branchName: identity.name,
-    title: normalizedTitle || undefined,
-    submittedName: identity.name,
-    // The form kept its name: nothing to resume.
-    resumeNaming: () => undefined,
-  };
+  return { branchName: identity.name, title: identity.title.trim() || undefined };
 }
 
 /** True for a real (non-blank) creation draft ID. */
@@ -303,15 +290,6 @@ async function transferDraftToWorkspace(
   await getDraftStore()
     .flush(scope)
     .catch((error: unknown) => console.warn("Failed to save the transferred draft:", error));
-}
-
-/** Whether a default draft's name state holds no name newer than the one just submitted. */
-function holdsOnlySubmittedName(
-  nameState: WorkspaceNamePersistedState | null,
-  submittedName: string
-): boolean {
-  // Trimmed like waitForGeneration trims a typed name before it is submitted.
-  return nameState === null || getNameFromPersistedState(nameState).trim() === submittedName;
 }
 
 /**
@@ -366,52 +344,23 @@ export function useCreationWorkspace({
   const [runtimeAvailabilityState, setRuntimeAvailabilityState] =
     useState<RuntimeAvailabilityState>({ status: "loading" });
 
-  // Read like the composer reads its route: a blank or invalid id edits the default draft.
-  const listedDraftId = listedCreationDraftId(draftId);
-  // The draft's localStorage scope: a moved draft's runtime pick is handed off under it.
-  const draftStorageScopeId =
-    projectPath.trim().length > 0
-      ? listedDraftId != null
-        ? getDraftScopeId(projectPath, listedDraftId)
-        : getPendingScopeId(projectPath)
-      : null;
-  // Each creation draft (the project's default one included) stores its own name generation
-  // state in its body, so drafts never share a single auto-naming/manual-name state.
-  const workspaceNameScope =
-    projectPath.trim().length > 0
-      ? getComposerDraftScope({
-          variant: "creation",
-          workspaceId: null,
-          creationProjectPath: projectPath,
-          pendingDraftId: listedDraftId,
-        })
-      : null;
-
   // Centralized draft workspace settings with automatic persistence
-  const {
-    settings,
-    explicitRuntimePick,
-    coderConfigFallback,
-    sshHostFallback,
-    setSelectedRuntime,
-    setTrunkBranch,
-  } = useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk, draftStorageScopeId);
+  const { settings, coderConfigFallback, sshHostFallback, setSelectedRuntime, setTrunkBranch } =
+    useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk, draftId ?? "");
   const creationAgentId = resolveCreationAgentId(settings.agentId, agentBaseById);
 
-  // Project scope ID for reading send options at send time
-  const projectScopeId = getProjectScopeId(projectPath);
-
-  // Workspace name generation with debounce
-  // Backend tries the configured naming model first, then cheap models, then user's model
+  // The draft owns its AI choices and manual name (CreationDraftStore).
+  const creationScopeId = getCreationDraftScopeId(draftId ?? "");
+  const manualName = useCreationDraft(draftId ?? "").draft?.manualName ?? "";
+  const [isGeneratingName, setIsGeneratingName] = useState(false);
   const workspaceNameState = useWorkspaceName({
-    message,
-    debounceMs: 500,
-    userModel,
-    scope: workspaceNameScope,
+    manualName,
+    setManualName: (name) =>
+      getCreationDraftStore().update(draftId ?? "", {
+        manualName: name.slice(0, CREATION_DRAFT_NAME_MAX_CHARS),
+      }),
+    isGenerating: isGeneratingName,
   });
-
-  // Destructure name state functions for use in callbacks
-  const { waitForGeneration, handOffGeneration, name: shownWorkspaceName } = workspaceNameState;
 
   // The project whose runtimes are shown. Only a new project shows the runtimes as "loading"
   // again: a new client (reconnect) reloads the same project behind the shown values.
@@ -487,6 +436,21 @@ export function useCreationWorkspace({
         return { success: false };
       }
 
+      // Send creates from the saved draft: wait for every local change (a failed save stops it,
+      // keeping the draft).
+      if (isDraftId(draftId)) {
+        try {
+          await getCreationDraftStore().flush(draftId);
+        } catch (error) {
+          setToast({
+            id: Date.now().toString(),
+            type: "error",
+            message: `The draft is not saved: ${getErrorMessage(error)}`,
+          });
+          return { success: false };
+        }
+      }
+
       // Build runtime config early (used later for workspace creation)
       let runtimeSelection = settings.selectedRuntime;
 
@@ -548,8 +512,6 @@ export function useCreationWorkspace({
       setToast(null);
 
       let createdWorkspaceId: string | null = null;
-      // Until the name is resolved, nothing has been handed off.
-      let resumeNaming: CreationName["resumeNaming"] = () => undefined;
 
       try {
         // Read send options at send time: render state can lag a pick made just
@@ -557,7 +519,7 @@ export function useCreationWorkspace({
         // Override agentId from current draft settings so first-send uses the same
         // project/global/default resolution chain as the creation UI.
         const sendMessageOptions = {
-          ...getSendOptionsFromStorage(projectScopeId),
+          ...getSendOptionsFromStorage(creationScopeId),
           agentId: creationAgentId,
         };
         // Use normalized override if provided, otherwise fall back to already-normalized storage model
@@ -629,19 +591,15 @@ export function useCreationWorkspace({
           // Trust was confirmed and set, continue with creation
         }
 
-        // Wait for identity generation to complete (blocks if still in progress), unless a
-        // worktree creation hands it to the backend. After the preflights, so that a hand-off
-        // reaches a create request.
-        // Returns null if generation failed or manual name is empty (error already set in hook)
-        const creationName = await resolveCreationName(
-          kind !== "scratch" && runtimeSelection.mode === RUNTIME_MODE.WORKTREE,
-          { handOffGeneration, waitForGeneration, name: shownWorkspaceName }
-        );
-        if (!creationName) {
-          setIsSending(false);
-          return { success: false };
-        }
-        resumeNaming = creationName.resumeNaming;
+        // After the preflights, so that a hand-off reaches a create request.
+        setIsGeneratingName(true);
+        const creationName = await resolveCreationName({
+          api: liveApi,
+          manualName,
+          message,
+          canHandOff: kind !== "scratch" && runtimeSelection.mode === RUNTIME_MODE.WORKTREE,
+          candidates: userModel ? [userModel] : [],
+        }).finally(() => setIsGeneratingName(false));
         const createTitle = creationName.title;
 
         const createResult =
@@ -658,7 +616,6 @@ export function useCreationWorkspace({
               });
 
         if (!createResult.success) {
-          resumeNaming();
           setToast({
             id: Date.now().toString(),
             type: "error",
@@ -670,8 +627,6 @@ export function useCreationWorkspace({
 
         const { metadata } = createResult;
         createdWorkspaceId = metadata.id;
-        // Captured now: the form's name state can change while the rest of this send runs.
-        const { submittedName } = creationName;
 
         // Best-effort: persist the initial AI settings to the backend immediately so this workspace
         // is portable across devices even before the first stream starts. Initial /goal commands do
@@ -698,40 +653,20 @@ export function useCreationWorkspace({
         const clearPendingDraft = () => {
           // Once the workspace exists, drop the draft even if the initial send fails
           // so we don't keep a hidden placeholder in the sidebar.
-          if (!projectPath) {
+          if (!isDraftId(draftId)) return;
+          if (deleteWorkspaceDraft) {
+            deleteWorkspaceDraft(projectPath, draftId);
             return;
           }
-
-          if (listedDraftId != null && deleteWorkspaceDraft) {
-            deleteWorkspaceDraft(projectPath, listedDraftId);
-            return;
-          }
-
-          const defaultScope = getComposerDraftScope({
-            variant: "creation",
-            workspaceId: null,
-            creationProjectPath: projectPath,
-            pendingDraftId: draftId ?? undefined,
-          });
-          // The default form's typed or generated name belongs to the workspace that now exists:
-          // left behind, the next visit offers it again and that create collides with the branch.
-          // Only the submitted name: after a failed /goal hand-off save this runs once the command
-          // finishes, and the user may have typed the next workspace's name in the form by then.
-          const nameState = getDraftStore().getView(defaultScope).nameState;
-          if (holdsOnlySubmittedName(nameState, submittedName)) {
-            getDraftStore()
-              .deleteDraft(defaultScope)
-              .catch(() => undefined);
-          } else {
-            // The name is in the draft body: clear the rest and keep the newer name.
-            getDraftStore().setText(defaultScope, "");
-            getDraftStore().setAttachments(defaultScope, []);
-          }
+          getCreationDraftStore()
+            .delete(draftId)
+            .catch((error: unknown) => console.error("Failed to delete a creation draft:", error));
         };
 
         // Sync preferences before switching (keeps workspace settings consistent).
         syncCreationPreferences(
           projectPath,
+          creationScopeId,
           metadata.id,
           creationAgentId,
           settings.reasoningMode,
@@ -778,16 +713,16 @@ export function useCreationWorkspace({
               ? undefined
               : {
                   workspaceName: metadata.name,
-                  nameGenerated: workspaceNameState.autoGenerate,
+                  nameGenerated: manualName.trim().length === 0,
                   kind,
                   hookPath: projectPath,
                   timestamp: pendingUserMessage?.timestamp ?? Date.now(),
                 },
         });
 
-        if (listedDraftId != null && promoteWorkspaceDraft) {
+        if (isDraftId(draftId) && promoteWorkspaceDraft) {
           // UI-only: show the created workspace in-place where the draft was rendered.
-          promoteWorkspaceDraft(projectPath, listedDraftId, metadata);
+          promoteWorkspaceDraft(projectPath, draftId, metadata);
         }
 
         // An initial /goal sends no user message, so nothing durable holds its input until the
@@ -1012,8 +947,6 @@ export function useCreationWorkspace({
       } catch (err) {
         if (createdWorkspaceId) {
           workspaceStore.clearPendingInitialSendState(createdWorkspaceId);
-        } else {
-          resumeNaming();
         }
         const errorMessage = getErrorMessage(err);
         setToast({
@@ -1034,7 +967,7 @@ export function useCreationWorkspace({
       liveApi,
       isSending,
       projectPath,
-      projectScopeId,
+      creationScopeId,
       getProjectConfig,
       projectsLoading,
       onWorkspaceCreated,
@@ -1046,14 +979,11 @@ export function useCreationWorkspace({
       settings.thinkingLevel,
       settings.reasoningMode,
       settings.trunkBranch,
-      waitForGeneration,
-      handOffGeneration,
-      shownWorkspaceName,
-      workspaceNameState.autoGenerate,
+      manualName,
       message,
+      userModel,
       subProjectPath,
       draftId,
-      listedDraftId,
       promoteWorkspaceDraft,
       deleteWorkspaceDraft,
       providersConfig,
@@ -1109,7 +1039,6 @@ export function useCreationWorkspace({
     trunkBranch: settings.trunkBranch,
     setTrunkBranch,
     selectedRuntime: settings.selectedRuntime,
-    explicitRuntimePick,
     coderConfigFallback,
     sshHostFallback,
     defaultRuntimeMode: settings.defaultRuntimeMode,

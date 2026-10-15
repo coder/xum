@@ -29,11 +29,12 @@ import {
   getAgentsInitNudgeKey,
   getArchivedWorkspacesKey,
   getArchivedWorkspacesExpandedKey,
+  getCreationDraftScopeId,
 } from "@/common/constants/storage";
 import { updateUserPreferences } from "@/browser/stores/AppConfigStore";
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
+import { CreationDraftGate } from "@/browser/features/ChatInput/CreationDraftGate";
 import { trimArrayToChars } from "@/browser/utils/boundedPersistedValue";
-import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
 import { Button } from "@/browser/components/Button/Button";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
@@ -213,8 +214,10 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   // #6038, #6423: "Run /init" sends through the creation composer, so it is off whenever that
   // composer's Send is off (branch list, Coder presets, a send in flight, ...). Off until the
   // composer of this scope reports it can send.
-  const creationComposerKey = `${projectPath}:${pendingDraftId ?? "__pending__"}`;
+  // Keyed by draft id alone: a project change keeps the same editor (file reads, voice input).
+  const creationComposerKey = pendingDraftId ?? "__pending__";
   const [creationSendBlocked, setCreationSendBlocked] = useCreationSendBlocked(creationComposerKey);
+  const creationScopeId = pendingDraftId ? getCreationDraftScopeId(pendingDraftId) : undefined;
   const [showAgentsInitNudge, setShowAgentsInitNudge] = usePersistedState<boolean>(
     getAgentsInitNudgeKey(projectPath),
     false,
@@ -283,15 +286,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
       });
     } else {
       pendingAgentsInitSendRef.current = true;
-      getDraftStore().setText(
-        getComposerDraftScope({
-          variant: "creation",
-          workspaceId: null,
-          creationProjectPath: projectPath,
-          pendingDraftId: pendingDraftId ?? undefined,
-        }),
-        "/init"
-      );
+      if (pendingDraftId) getCreationDraftStore().update(pendingDraftId, { text: "/init" });
     }
 
     setShowAgentsInitNudge(false);
@@ -321,8 +316,8 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   }, []);
 
   return (
-    <AgentProvider projectPath={projectPath}>
-      <ThinkingProvider projectPath={projectPath}>
+    <AgentProvider projectPath={projectPath} scopeId={creationScopeId}>
+      <ThinkingProvider projectPath={projectPath} scopeId={creationScopeId}>
         {/* Flex container to fill parent space */}
         {/* No workspace is open, so this page is the one `main` landmark (#5969). */}
         <main className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
@@ -372,19 +367,23 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
                       />
                     )}
                     {/* ChatInput for workspace creation. */}
-                    <ChatInput
-                      // Key by project + draft so project navigation and draft switches both remount
-                      // creation-local state (including any in-flight creation send).
-                      key={creationComposerKey}
-                      variant="creation"
+                    <CreationDraftGate
+                      draftId={pendingDraftId}
                       projectPath={projectPath}
-                      projectName={projectName}
-                      pendingSubProjectPath={pendingSubProjectPath}
-                      pendingDraftId={pendingDraftId}
-                      onReady={handleChatReady}
-                      onCreationSendBlockedChange={setCreationSendBlocked}
-                      onWorkspaceCreated={onWorkspaceCreated}
-                    />
+                      subProjectPath={pendingSubProjectPath ?? null}
+                    >
+                      <ChatInput
+                        key={creationComposerKey}
+                        variant="creation"
+                        projectPath={projectPath}
+                        projectName={projectName}
+                        pendingSubProjectPath={pendingSubProjectPath}
+                        pendingDraftId={pendingDraftId}
+                        onReady={handleChatReady}
+                        onCreationSendBlockedChange={setCreationSendBlocked}
+                        onWorkspaceCreated={onWorkspaceCreated}
+                      />
+                    </CreationDraftGate>
                     {providersLoading ? (
                       <div className="flex items-center justify-center gap-2 py-1.5">
                         <Skeleton className="h-7 w-32" />

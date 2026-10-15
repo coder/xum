@@ -38,7 +38,6 @@ import {
 } from "@/browser/utils/runtimeUi";
 
 import type { WorkspaceNameState, WorkspaceNameUIError } from "@/browser/hooks/useWorkspaceName";
-import type { SelectedRuntimeChangeOptions } from "@/browser/hooks/useDraftWorkspaceSettings";
 import type { CoderInfo } from "@/common/orpc/schemas/coder";
 import {
   CoderAvailabilityMessage,
@@ -110,7 +109,7 @@ interface CreationControlsProps {
   sshHostFallback: string;
   defaultRuntimeMode: RuntimeChoice;
   /** Set the currently selected runtime (discriminated union) */
-  onSelectedRuntimeChange: (runtime: ParsedRuntime, options?: SelectedRuntimeChangeOptions) => void;
+  onSelectedRuntimeChange: (runtime: ParsedRuntime) => void;
   disabled: boolean;
   /** Owning project path used for runtime/settings scoping (always the parent). */
   projectPath: string;
@@ -125,8 +124,6 @@ interface CreationControlsProps {
   /** Stable project data passed by ChatInput so typing does not subscribe this form to broad contexts. */
   userProjects: Map<string, ProjectConfig>;
   onSelectedProjectPathChange: (path: string) => void;
-  /** The project selector moves the draft, so it is off while the draft cannot move. */
-  projectSelectorDisabled?: boolean;
   /** Project name to display as header */
   projectName: string;
   /** Workspace name/title generation state and actions */
@@ -576,15 +573,13 @@ function CreationControlsContent(props: CreationControlsProps) {
     if (!firstEnabled || firstEnabled === runtimeChoice) {
       return;
     }
-    const fallBackTo = (runtime: ParsedRuntime) =>
-      onSelectedRuntimeChange(runtime, { fallback: true });
 
     // User request: auto-switch away from Settings-disabled runtimes.
     if (firstEnabled === "coder") {
       if (!props.coderProps || !isCoderAvailable) {
         return;
       }
-      fallBackTo({
+      onSelectedRuntimeChange({
         mode: "ssh",
         host: CODER_RUNTIME_PLACEHOLDER,
         coder: props.coderConfigFallback,
@@ -599,14 +594,14 @@ function CreationControlsContent(props: CreationControlsProps) {
           selectedRuntime.host !== CODER_RUNTIME_PLACEHOLDER
             ? selectedRuntime.host
             : props.sshHostFallback;
-        fallBackTo({
+        onSelectedRuntimeChange({
           mode: "ssh",
           host: sshHost,
         });
         return;
       }
       case RUNTIME_MODE.DOCKER:
-        fallBackTo({
+        onSelectedRuntimeChange({
           mode: "docker",
           image: selectedRuntime.mode === "docker" ? selectedRuntime.image : "",
         });
@@ -616,7 +611,7 @@ function CreationControlsContent(props: CreationControlsProps) {
           selectedRuntime: { mode: "devcontainer", configPath: "" },
           availabilityState: runtimeAvailabilityState,
         });
-        fallBackTo({
+        onSelectedRuntimeChange({
           mode: "devcontainer",
           configPath:
             selectedRuntime.mode === "devcontainer"
@@ -628,11 +623,11 @@ function CreationControlsContent(props: CreationControlsProps) {
         return;
       }
       case RUNTIME_MODE.LOCAL:
-        fallBackTo({ mode: "local" });
+        onSelectedRuntimeChange({ mode: "local" });
         return;
       case RUNTIME_MODE.WORKTREE:
       default:
-        fallBackTo({ mode: "worktree" });
+        onSelectedRuntimeChange({ mode: "worktree" });
         return;
     }
   }, [
@@ -691,7 +686,6 @@ function CreationControlsContent(props: CreationControlsProps) {
               selected={selected}
               userProjects={props.userProjects}
               onChange={props.onSelectedProjectPathChange}
-              disabled={props.projectSelectorDisabled}
             />
           );
         })()}
@@ -709,7 +703,13 @@ function CreationControlsContent(props: CreationControlsProps) {
                   value={nameState.name}
                   onChange={handleNameChange}
                   onFocus={handleInputFocus}
-                  placeholder={nameState.isGenerating ? "Generating..." : "workspace-name"}
+                  placeholder={
+                    nameState.isGenerating
+                      ? "Generating..."
+                      : nameState.autoGenerate
+                        ? "Automatic on Send"
+                        : "workspace-name"
+                  }
                   disabled={props.disabled}
                   aria-invalid={nameState.error ? true : undefined}
                   className={cn(
@@ -1126,7 +1126,6 @@ export function CreationControls(props: CreationControlsProps) {
       selectedProjectPath={props.selectedProjectPath}
       userProjects={props.userProjects}
       onSelectedProjectPathChange={props.onSelectedProjectPathChange}
-      projectSelectorDisabled={props.projectSelectorDisabled}
       projectName={props.projectName}
       nameState={nameState}
       runtimeAvailabilityState={props.runtimeAvailabilityState}

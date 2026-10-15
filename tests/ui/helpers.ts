@@ -5,7 +5,7 @@
 import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/workspace";
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import type { RenderedApp } from "./renderReviewPanel";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { useGitStatusStoreRaw } from "@/browser/stores/GitStatusStore";
@@ -294,17 +294,14 @@ export async function addProjectViaUI(view: RenderedApp, projectPath: string): P
 }
 
 export function getWorkspaceDraftIds(projectPath: string): string[] {
-  const draftsForProject = getDraftStore().getCreationDraftsByProject()[projectPath] ?? [];
+  const draftsForProject = getCreationDraftStore().getDraftsByProject()[projectPath] ?? [];
   return draftsForProject.map((draft) => draft.draftId);
 }
 
-/** Delete every listed creation draft of a project (the list lives on the backend). */
+/** Delete every listed creation draft of a project (records live on the backend). */
 export async function clearWorkspaceDrafts(projectPath: string): Promise<void> {
-  await getDraftStore().whenReady();
   await Promise.all(
-    getWorkspaceDraftIds(projectPath).map((draftId) =>
-      getDraftStore().deleteDraft({ kind: "creation", projectPath, draftId })
-    )
+    getWorkspaceDraftIds(projectPath).map((draftId) => getCreationDraftStore().delete(draftId))
   );
 }
 

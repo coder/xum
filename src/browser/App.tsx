@@ -66,10 +66,7 @@ import {
   useMcpAppEntrypoints,
 } from "./features/RightSidebar/AppViewTab/mcpAppEntrypoints";
 
-import {
-  getTopLevelProjectEntries,
-  resolveWorkspaceCreationScope,
-} from "@/common/utils/subProjects";
+import { getTopLevelProjectEntries } from "@/common/utils/subProjects";
 import {
   THINKING_LEVELS,
   type OpenAIReasoningMode,
@@ -79,7 +76,7 @@ import { createCustomEvent, CUSTOM_EVENTS } from "@/common/constants/events";
 import { isWorkspaceForkSwitchEvent } from "./utils/workspaceEvents";
 import {
   getAgentsInitNudgeKey,
-  getProjectScopeId,
+  getCreationDraftScopeId,
   getWorkspaceLastReadKey,
   EXPANDED_PROJECTS_KEY,
   LAST_VISITED_ROUTE_KEY,
@@ -382,15 +379,11 @@ function AppInner() {
   }, [sidebarCollapsed]);
   const creationProjectPath =
     !selectedWorkspace && !currentWorkspaceId ? pendingNewWorkspaceProject : null;
-  // Sub-project creation shares the owning parent's model preference, matching ChatInput.
-  const creationScope = creationProjectPath
-    ? resolveWorkspaceCreationScope(
-        creationProjectPath,
-        userProjects,
-        pendingNewWorkspaceSubProjectPath
-      )
-    : null;
-  const creationScopeId = creationScope ? getProjectScopeId(creationScope.projectPath) : null;
+  // The creation composer's choices belong to its draft, matching ChatInput.
+  const creationScopeId =
+    creationProjectPath && pendingNewWorkspaceDraftId
+      ? getCreationDraftScopeId(pendingNewWorkspaceDraftId)
+      : null;
 
   // History navigation (back/forward)
   const location = useLocation();

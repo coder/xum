@@ -56,7 +56,7 @@ describe("forkWorkspace", () => {
         subscribe: (_input: void, opts?: { signal?: AbortSignal }) =>
           Promise.resolve(
             (async function* (): AsyncGenerator<DraftEvent> {
-              yield { type: "snapshot", drafts: [], list: { entries: [], revision: 0 } };
+              yield { type: "snapshot", drafts: [] };
               await new Promise<void>((resolve) =>
                 opts?.signal?.addEventListener("abort", () => resolve(), { once: true })
               );
