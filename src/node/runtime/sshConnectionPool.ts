@@ -15,6 +15,7 @@
  */
 
 import * as crypto from "crypto";
+import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { spawn } from "child_process";
@@ -610,8 +611,13 @@ export class SSHConnectionPool {
           resolve();
         } else {
           const error = stderr.trim() || `SSH probe failed with code ${code ?? "unknown"}`;
-          this.markFailedByKey(key, error);
-          reject(new Error(error));
+          // Remove the socket before the failure becomes visible, so no next probe reuses it.
+          const fail = async () => {
+            await removeFailedControlSocket(controlPath);
+            this.markFailedByKey(key, error);
+            reject(new Error(error));
+          };
+          fail().catch(reject);
         }
       });
 
@@ -622,6 +628,28 @@ export class SSHConnectionPool {
         reject(new Error(error));
       });
     });
+  }
+}
+
+/**
+ * After an SSH outage, a ControlMaster can stay alive while it fails every session it serves at
+ * once (exit 255, nothing on stderr), so every later probe through its socket failed the same way
+ * and acquireConnection waited out its whole budget (#6588). After a probe through `controlPath`
+ * exits nonzero, remove that socket: the next probe (after the usual backoff) starts a fresh
+ * master. Only an exit status removes it. Our own timeout says nothing about the master, since a
+ * slow network looks the same.
+ *
+ * Safe for anyone else on this socket, another Xum process included: unlinking only drops the
+ * path. The old master and the sessions it already serves keep running until they end, and the
+ * next connection with ControlMaster=auto starts a new master at the same path.
+ */
+async function removeFailedControlSocket(controlPath: string): Promise<void> {
+  try {
+    if (!(await fs.lstat(controlPath)).isSocket()) return;
+    await fs.unlink(controlPath);
+    log.debug(`Removed ControlPath ${controlPath} after a failed SSH probe`);
+  } catch {
+    // No socket there (no master yet, or already gone): nothing to remove.
   }
 }
 

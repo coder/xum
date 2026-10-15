@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as os from "os";
+import * as net from "net";
 import * as path from "path";
 import { afterEach, describe, expect, jest, test, spyOn } from "bun:test";
 import {
@@ -918,3 +919,86 @@ describe.skipIf(process.platform === "win32")(
     });
   }
 );
+
+// #6588: after an SSH outage, a ControlMaster that is still alive can fail every session it
+// serves at once (exit 255, nothing on stderr). Probes go through its socket, so on the old code
+// every probe failed the same way and acquireConnection waited out its whole budget.
+describe.skipIf(process.platform === "win32")("SSHConnectionPool stale ControlPath socket", () => {
+  let restore: (() => Promise<void>) | undefined;
+  afterEach(async () => {
+    await restore?.();
+    restore = undefined;
+  });
+
+  /**
+   * A live socket at a short ControlPath (the old master), and an `ssh` on PATH that acts on
+   * `whileSocket` while that socket exists and prints "ok" once it is gone (a fresh master).
+   */
+  async function setup(whileSocket: "fail" | "succeed" | "hang") {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-cp-"));
+    const controlPath = path.join(dir, "cm-0");
+    const master = net.createServer();
+    await new Promise<void>((resolve) => master.listen(controlPath, resolve));
+    const calls = path.join(dir, "calls");
+    const onSocket = { fail: "exit 255", succeed: "echo ok; exit 0", hang: "exec sleep 30" }[
+      whileSocket
+    ];
+    await fs.writeFile(
+      path.join(dir, "ssh"),
+      [
+        "#!/bin/sh",
+        `echo call >> '${calls}'`,
+        'cp=""; for a in "$@"; do case "$a" in ControlPath=*) cp=${a#ControlPath=};; esac; done',
+        `if [ -S "$cp" ]; then ${onSocket}; fi`,
+        "echo ok",
+        "",
+      ].join("\n"),
+      { mode: 0o755 }
+    );
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${dir}${path.delimiter}${originalPath ?? ""}`;
+    restore = async () => {
+      process.env.PATH = originalPath;
+      await new Promise<void>((resolve) => master.close(() => resolve()));
+      await fs.rm(dir, { recursive: true, force: true });
+    };
+    const socketExists = async () =>
+      (await fs.lstat(controlPath).catch(() => null))?.isSocket() === true;
+    const callCount = async () =>
+      (await fs.readFile(calls, "utf8").catch(() => "")).split("\n").filter(Boolean).length;
+    return { controlPath, socketExists, callCount };
+  }
+
+  const config: SSHRuntimeConfig = { host: "stale.test", srcBaseDir: "/work" };
+
+  test("a probe failure through a live master's socket heals on the next probe", async () => {
+    const { controlPath, socketExists, callCount } = await setup("fail");
+    const pool = new SSHConnectionPool();
+    await pool.acquireConnection(config, { timeoutMs: 5_000, maxWaitMs: 8_000, controlPath });
+    expect(await callCount()).toBe(2);
+    expect(await socketExists()).toBe(false);
+    expect(pool.getConnectionHealth(config)?.status).toBe("healthy");
+  }, 15_000);
+
+  test("a healthy master's socket is never removed", async () => {
+    const { controlPath, socketExists, callCount } = await setup("succeed");
+    const pool = new SSHConnectionPool();
+    await pool.acquireConnection(config, { timeoutMs: 5_000, maxWaitMs: 0, controlPath });
+    expect(await callCount()).toBe(1);
+    expect(await socketExists()).toBe(true);
+  });
+
+  // Our own deadline says nothing about the master: a slow network looks the same.
+  test("a probe that hits our timeout leaves the socket", async () => {
+    const { controlPath, socketExists } = await setup("hang");
+    const pool = new SSHConnectionPool();
+    const error = await pool
+      .acquireConnection(config, { timeoutMs: 300, maxWaitMs: 0, controlPath })
+      .then(
+        () => null,
+        (e: unknown) => e
+      );
+    expect(String(error)).toContain("SSH probe timed out");
+    expect(await socketExists()).toBe(true);
+  });
+});
