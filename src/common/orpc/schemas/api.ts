@@ -1780,6 +1780,25 @@ export const refinements = {
  */
 const WorkspaceTagKeySchema = z.string().regex(/\S/, "Workspace tag keys must be non-empty");
 
+/** A `workspace.history.tail` row. `text` is null when the static view cannot draw the row. */
+export const WorkspaceViewTailRowSchema = z.object({
+  id: z.string(),
+  role: z.enum(["user", "assistant", "other"]),
+  text: z.string().nullable(),
+  timestamp: z.number().nullable(),
+  /** The meta row's model label and provider icon, formatted by the server. */
+  model: z.object({ label: z.string(), provider: z.string() }).nullable(),
+});
+
+export const WorkspaceViewTailSchema = z.object({
+  title: z.string(),
+  project: z.string(),
+  hasOlder: z.boolean(),
+  rows: z.array(WorkspaceViewTailRowSchema),
+});
+export type WorkspaceViewTail = z.infer<typeof WorkspaceViewTailSchema>;
+export type WorkspaceViewTailRow = z.infer<typeof WorkspaceViewTailRowSchema>;
+
 export const workspace = {
   list: {
     input: z
@@ -2436,6 +2455,11 @@ export const workspace = {
         // Windowed requests only: the rows before the cursor cannot be paged; do a full replay.
         notPageable: z.boolean().optional(),
       }),
+    },
+    /** The static first view's newest rows (T3 #5971): fixed server caps, null = no view. */
+    tail: {
+      input: z.object({ workspaceId: z.string() }),
+      output: WorkspaceViewTailSchema.nullable(),
     },
     /** Searches full history, including prompts before the replay boundary. */
     lastUserPrompt: {
