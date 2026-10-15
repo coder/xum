@@ -234,6 +234,9 @@ async function signOutFailure(
   deadline: number,
   inFlight: Map<string, Promise<Awaited<ReturnType<McpOauthService["logout"]>>>>
 ): Promise<string | undefined> {
+  // Past the pass deadline: start nothing more. The URL stays in the record for the next pass.
+  // Under 1 ms counts as past: timers have 1 ms resolution and can fire that much early.
+  if (deadline - monotonicNow() < 1) return "The sign-out pass ran out of time before this server.";
   // Keyed by credential: `/mcp` and `/mcp/` are one stored sign-in, so one logout.
   const key = oauth.credentialKey(serverUrl) ?? serverUrl;
   let call = inFlight.get(key);
