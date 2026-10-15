@@ -92,6 +92,7 @@ import {
   skillConsentDetail,
   skillConsentFingerprint,
   skillReviewDirectives,
+  directivesField,
   type ComponentConsent,
 } from "./componentConsent";
 import type { OpenAIPluginInterface } from "./openaiExtension";
@@ -348,11 +349,6 @@ function skillChangeSummary(current: SurfaceSkill, staged: SurfaceSkill, name: s
   return current.fingerprint !== staged.fingerprint
     ? `changes the model-visible advertisement of skill '${name}'`
     : `changes the definition of skill '${name}'`;
-}
-
-/** A skill row's directive commands, absent when there are none. */
-function directivesField(directives: readonly string[]): { directives?: string[] } {
-  return directives.length > 0 ? { directives: [...directives] } : {};
 }
 
 /** Both consent views of one skill (componentConsent.ts). */
@@ -3753,7 +3749,7 @@ export class AgentPluginInstallService {
       skills: skills.map(({ name, description, directives }) => ({
         name,
         ...(description !== undefined ? { description } : {}),
-        ...directivesField(directives ?? []),
+        ...directivesField(directives),
       })),
       mcpServers,
       /** What this review showed, as consent fingerprints (#6498). Never sent to the renderer. */

@@ -206,8 +206,13 @@ function skillConsentSubject(args: SkillConsentInput): {
       ...args.frontmatter,
       ...(Array.isArray(paths) ? { paths: [...(paths as unknown[])].map(String).sort() } : {}),
     },
-    ...(directives.length > 0 ? { directives } : {}),
+    ...directivesField(directives),
   };
+}
+
+/** A `directives` field, absent when there are none (the key-absent upgrade rule above). */
+export function directivesField(directives: readonly string[] = []): { directives?: string[] } {
+  return directives.length > 0 ? { directives: [...directives] } : {};
 }
 
 /**
