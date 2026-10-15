@@ -1073,6 +1073,24 @@ function confirmMessage(
   return result.success ? result.data.cleanupWarning : result.error;
 }
 
+/**
+ * The section's initial palette intent, handed out once. The mount effect reruns on every API
+ * reconnect (APIProvider makes a new client), and replaying the intent would reopen a review the
+ * user already cancelled (#6609). Only an API-backed attempt consumes it: without a client
+ * nothing could open yet.
+ */
+function useInitialIntentOnce(
+  api: ReturnType<typeof useAPI>["api"],
+  initialIntent: PluginsSectionIntent | null
+): () => PluginsSectionIntent | null {
+  const consumedRef = useRef(false);
+  return () => {
+    if (!api || consumedRef.current) return null;
+    consumedRef.current = true;
+    return initialIntent;
+  };
+}
+
 function useComponentReview(deps: ComponentReviewDeps) {
   const [review, setReview] = useState<AgentPluginUpdateReview | null>(null);
   const open = (name: string) =>
@@ -1244,11 +1262,14 @@ export const PluginsSettingsSection: React.FC = () => {
     }
   };
 
+  const takeInitialIntent = useInitialIntentOnce(api, initialIntent);
+
   // Approved update policy: passive check on section open + explicit button only.
   useEffect(() => {
     // A palette review intent opens after the first list refresh: the refresh clears the shared
     // error, so a concurrent preview failure would vanish without an explanation.
-    void refresh().finally(() => componentReview.openFromIntent(initialIntent));
+    const intent = takeInitialIntent();
+    void refresh().finally(() => componentReview.openFromIntent(intent));
     void checkForUpdates();
     void api?.agentPlugins.containerLocation().then(setContainerLocation, () => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fetch on mount / API reconnect only; refresh/checkForUpdates are plain handlers (compiler-memoized), not inputs

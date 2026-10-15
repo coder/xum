@@ -1,7 +1,7 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, within } from "@storybook/test";
+import { userEvent, waitFor, within } from "@storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -15,6 +15,7 @@ import type {
 } from "@/common/orpc/schemas/agentPlugins";
 
 import { PluginsSettingsSection } from "./PluginsSettingsSection";
+import { publishPluginsSectionIntent } from "./pluginsSectionIntents";
 
 /** 1x1 PNG: the backend sends logos as data URLs, never paths. */
 const LOGO_DATA_URL =
@@ -896,6 +897,85 @@ export const ComponentReviewPhoneViewport: Story = {
     if (!(card instanceof HTMLElement)) throw new Error("Component review card not found");
     if (card.scrollWidth > card.clientWidth + 1) {
       throw new Error("Component review overflows its card at phone width");
+    }
+  },
+};
+
+/** Records the reconnected client's calls, so the play can wait for its list refresh. */
+const reconnectCalls = { list: 0, preview: 0 };
+
+/**
+ * A palette intent that arrived before the section mounted, and a Reconnect button that swaps the
+ * API client the way APIProvider does on a WebSocket reconnect.
+ */
+const ReconnectingShell: FC<{ children: ReactNode }> = (props) => {
+  const [client, setClient] = useState<APIClient>(() => {
+    // Buffered: the section consumes it on mount (pluginsSectionIntents).
+    publishPluginsSectionIntent({ type: "review-components", name: MANAGED_ITEM.name });
+    return createMockORPCClient(componentReviewOptions());
+  });
+  const reconnect = () => {
+    const next = createMockORPCClient(componentReviewOptions());
+    const list = next.agentPlugins.list.bind(next.agentPlugins);
+    const preview = next.agentPlugins.previewComponentReview.bind(next.agentPlugins);
+    next.agentPlugins.list = (...args: Parameters<typeof list>) => {
+      reconnectCalls.list++;
+      return list(...args);
+    };
+    next.agentPlugins.previewComponentReview = (...args: Parameters<typeof preview>) => {
+      reconnectCalls.preview++;
+      return preview(...args);
+    };
+    setClient(next);
+  };
+  return (
+    <ThemeProvider>
+      <TooltipProvider>
+        <button type="button" onClick={reconnect}>
+          Reconnect
+        </button>
+        <APIProvider client={client}>{props.children}</APIProvider>
+      </TooltipProvider>
+    </ThemeProvider>
+  );
+};
+
+/**
+ * #6609: a palette "Review Plugin Components" intent opens its review once. After the user
+ * cancels it, an API reconnect must not reopen it.
+ */
+export const ComponentReviewIntentNotReplayedOnReconnect: Story = {
+  // Out of Pixel snapshots (snapshot budget). The play checks the behavior.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <ReconnectingShell>
+      <PluginsSettingsSection />
+    </ReconnectingShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    reconnectCalls.list = 0;
+    reconnectCalls.preview = 0;
+    await canvas.findByText(/Skill 'grilling' needs review/);
+    await userEvent.click(canvas.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => {
+      if (canvas.queryByText(/Skill 'grilling' needs review/) !== null) {
+        throw new Error("Cancel must close the review");
+      }
+    });
+
+    await userEvent.click(canvas.getByRole("button", { name: "Reconnect" }));
+    await waitFor(() => {
+      if (reconnectCalls.list === 0)
+        throw new Error("The reconnected client must refresh the list");
+    });
+    // The replay ran right after that refresh (one macrotask covers the promise chain).
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (reconnectCalls.preview !== 0) {
+      throw new Error("A reconnect must not replay the palette review intent");
+    }
+    if (canvas.queryByText(/Skill 'grilling' needs review/) !== null) {
+      throw new Error("A reconnect must not reopen the cancelled review");
     }
   },
 };
