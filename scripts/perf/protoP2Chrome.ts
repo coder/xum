@@ -39,7 +39,7 @@ const out = await page.evaluate(() => {
   setSlot("[data-testid=workspace-title]", [{ s: "title" }]);
   setSlot("[data-testid=workspace-footer-bar] span.font-mono.truncate", [{ s: "project" }]);
   setSlot("[data-testid=workspace-footer-bar] button span.truncate", []); // branch
-  setSlot("[data-component=Model] span.truncate", []); // model
+  setSlot("[data-component=ModelSelectorGroup] span.truncate", []); // model
   setSlot("[data-thinking-label]", []);
   setSlot("[data-context-usage-percent]", []);
   setSlot('[aria-label$="skills loaded"] span.absolute', []);
