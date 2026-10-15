@@ -730,6 +730,23 @@ describe("long-context tiers chosen per request", () => {
       expect(totalCost(priced)).toBeCloseTo(totalCost(priceRequests(steps)), 12);
     });
 
+    test("a final step that emitted no part still counts as a step", () => {
+      // StreamManager persists no start for a step without parts, so the list is [0].
+      const steps = [
+        step({ inputTokens: 50_000 }),
+        step({ inputTokens: 101_000, outputTokens: 0 }),
+      ];
+      const priced = createDisplayUsage(
+        turnUsage(steps),
+        MODEL,
+        undefined,
+        undefined,
+        readTurnSteps({ contextUsage: steps[1].usage, stepStartPartIndices: [0] })
+      )!;
+
+      expect(totalCost(priced)).toBeCloseTo(totalCost(priceRequests(steps)), 12);
+    });
+
     test("the last step prices at its own recorded counts", () => {
       // Only the 101K request's 1K output is long, not the prompt ratio of all 11K.
       const steps = [

@@ -102,7 +102,10 @@ export interface TurnSteps {
   lastStepUsage: AiSdkUsageLike;
   /** The last step's provider metadata (`metadata.contextProviderMetadata`). */
   lastStepProviderMetadata?: Record<string, unknown>;
-  /** The number of steps (`metadata.stepStartPartIndices`); absent or corrupted counts as one. */
+  /**
+   * The number of steps (`metadata.stepStartPartIndices`), a lower bound: a step that emitted
+   * no part records no start. Absent or corrupted counts as one.
+   */
   stepCount?: number;
 }
 
@@ -193,15 +196,18 @@ function estimateEarlierShareOver(
   threshold: number,
   lastPrompt: number,
   summedPrompt: number,
-  stepCount: number
+  recordedSteps: number
 ): number {
   const earlierPrompt = summedPrompt - lastPrompt;
   if (earlierPrompt <= 0) return 0;
+  // No step's prompt is taken to exceed the last's, so the turn had at least
+  // summedPrompt / lastPrompt steps, whatever the step list missed.
+  const stepCount = Math.max(recordedSteps, Math.ceil(summedPrompt / lastPrompt));
   const firstPrompt = Math.min(
     lastPrompt,
     Math.max(0, (2 * summedPrompt) / stepCount - lastPrompt)
   );
-  if (stepCount === 1 || firstPrompt >= threshold) return 1;
+  if (firstPrompt >= threshold) return 1;
   const growth = (lastPrompt - firstPrompt) / (stepCount - 1);
   const stepsOver = stepCount - 1 - Math.floor((threshold - firstPrompt) / growth);
   const earlierPromptsOver =
