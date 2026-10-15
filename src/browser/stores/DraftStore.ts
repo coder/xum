@@ -2209,7 +2209,8 @@ export class DraftStore {
    * The snapshot knows this creation draft: the default one, a listed row (synthesized rows
    * included) or a body. localStorage is per origin, so a tab keeps the name key of a draft that
    * another window sent or deleted; importing it would write a body holding only the name, which
-   * the backend relists as a row. Such a key is left alone (the startup cleanup owns it).
+   * the backend relists as a row. Such a key is left alone, as on main (the startup cleanup keeps
+   * typed names).
    */
   private isKnownCreationDraft(scope: Extract<DraftScope, { kind: "creation" }>): boolean {
     if (scope.draftId === DEFAULT_CREATION_DRAFT_ID) return true;
