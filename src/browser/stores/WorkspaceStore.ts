@@ -1,8 +1,12 @@
 import assert from "@/common/utils/assert";
 import {
+  afterToolCardsLoad,
   requestToolCards,
   requestToolCardsForRows,
+  rowsHaveToolCalls,
+  toolCardsLoaded,
 } from "@/browser/features/Tools/Shared/toolCardsStore";
+import { CHAT_VIEW_DATA_READY_TIMEOUT_MS } from "@/constants/timers";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
@@ -955,6 +959,8 @@ function getStreamingMessageKey(workspaceId: string, messageId: string): string 
 }
 
 export class WorkspaceStore {
+  // Per workspace: chat events held until the lazy tool cards load (see dispatchChatEvent).
+  private readonly toolCardsHolds = new Map<string, Array<() => void>>();
   // Per-workspace state (lazy computed on get)
   private states = new MapStore<string, WorkspaceState>();
 
@@ -4561,10 +4567,12 @@ export class WorkspaceStore {
         return { events: iterator, context: attemptContext };
       },
       onEvent: (data, attemptContext, attemptSignal) =>
-        queueMicrotask(() => {
-          if (!signal.aborted && !attemptSignal.aborted)
-            this.handleChatMessage(workspaceId, data, attemptContext);
-        }),
+        queueMicrotask(() =>
+          this.dispatchChatEvent(workspaceId, data, () => {
+            if (!signal.aborted && !attemptSignal.aborted)
+              this.handleChatMessage(workspaceId, data, attemptContext);
+          })
+        ),
       onUnexpectedEnd: ({ attemptAborted }) =>
         console.warn(
           attemptAborted
@@ -5058,6 +5066,24 @@ export class WorkspaceStore {
       data.type === "task-created" ||
       data.type === "workflow-run-attached"
     );
+  }
+
+  /**
+   * Holds caught-up, and every event after it, until the lazy tool cards load when the replayed
+   * rows have tool calls (bounded). Otherwise those rows would first mount header-only and grow
+   * when the cards arrive: on desktop the chunk's evaluation often loses that race (#6800).
+   */
+  private dispatchChatEvent(workspaceId: string, data: WorkspaceChatMessage, run: () => void) {
+    const held = this.toolCardsHolds.get(workspaceId);
+    if (held) return void held.push(run);
+    const buffered = this.chatTransientState.get(workspaceId)?.historicalMessages ?? [];
+    if (!isCaughtUpMessage(data) || toolCardsLoaded() || !rowsHaveToolCalls(buffered)) return run();
+    const queue = [run];
+    this.toolCardsHolds.set(workspaceId, queue);
+    afterToolCardsLoad(CHAT_VIEW_DATA_READY_TIMEOUT_MS, () => {
+      this.toolCardsHolds.delete(workspaceId);
+      for (const next of queue) next();
+    });
   }
 
   private handleChatMessage(

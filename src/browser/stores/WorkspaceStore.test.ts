@@ -15,6 +15,7 @@ import { getInterruptionContext } from "@/common/utils/messages/retryEligibility
 import type { TurnCoordinator, OperationId } from "@/node/services/turnCoordinator";
 import { Ok } from "@/common/types/result";
 import { GlobalWindow } from "happy-dom";
+import * as toolCardsStore from "@/browser/features/Tools/Shared/toolCardsStore";
 import { createORPCClient } from "@orpc/client";
 import { RPCLink as MessagePortLink } from "@orpc/client/message-port";
 import { eventIterator, os, type RouterClient } from "@orpc/server";
@@ -872,6 +873,77 @@ describe("WorkspaceStore", () => {
 
   afterEach(() => {
     store.dispose();
+  });
+
+  describe("with lazy tool cards not loaded yet", () => {
+    const toolRow: WorkspaceChatMessage = {
+      type: "message",
+      id: "assistant-tool",
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "t1",
+          toolName: "bash",
+          state: "output-available",
+          input: {},
+          output: {},
+        },
+      ],
+      metadata: { historySequence: 1, timestamp: 1 },
+    };
+    const hydrating = (workspaceId: string) =>
+      store.getWorkspaceState(workspaceId).isHydratingTranscript;
+    let loaded: ReturnType<typeof spyOn>;
+    beforeEach(() => {
+      loaded = spyOn(toolCardsStore, "toolCardsLoaded").mockReturnValue(false);
+    });
+    afterEach(() => loaded.mockRestore());
+
+    // Rows that mount before their cards load first render header-only, then grow.
+    it("holds caught-up for replayed tool rows until the cards publish", async () => {
+      let publish: (() => void) | undefined;
+      const wait = spyOn(toolCardsStore, "afterToolCardsLoad").mockImplementation((_ms, cb) => {
+        publish = cb;
+      });
+      try {
+        mockChatScript([toolRow, { type: "caught-up", historyReplayStatus: "complete" }], {
+          keepOpen: true,
+        });
+        createAndAddWorkspace(store, "ws-tools");
+        expect(await waitUntil(() => publish !== undefined)).toBe(true);
+        expect(hydrating("ws-tools")).toBe(true);
+        publish!();
+        expect(hydrating("ws-tools")).toBe(false);
+        expect(store.getWorkspaceState("ws-tools").messages.length).toBeGreaterThan(0);
+      } finally {
+        wait.mockRestore();
+      }
+    });
+
+    it("releases caught-up when the cards never load", async () => {
+      mockChatScript([toolRow, { type: "caught-up", historyReplayStatus: "complete" }], {
+        keepOpen: true,
+      });
+      createAndAddWorkspace(store, "ws-slow-cards");
+      await tick(1000);
+      expect(hydrating("ws-slow-cards")).toBe(true);
+      expect(await waitUntil(() => !hydrating("ws-slow-cards"), 3000)).toBe(true);
+    });
+
+    it("does not hold a chat without tool calls", async () => {
+      mockChatScript(
+        [
+          createHistoryMessageEvent("u1", 1),
+          { type: "caught-up", historyReplayStatus: "complete" },
+        ],
+        {
+          keepOpen: true,
+        }
+      );
+      createAndAddWorkspace(store, "ws-text");
+      expect(await waitUntil(() => !hydrating("ws-text"), 500)).toBe(true);
+    });
   });
 
   describe("toast-only events through the store", () => {

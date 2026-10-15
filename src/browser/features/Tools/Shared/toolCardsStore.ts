@@ -25,12 +25,33 @@ const notify = () => {
   for (const listener of listeners) listener();
 };
 
+const waiters = new Set<() => void>();
+
 export function publishToolCards(next: ToolCards): void {
   // The chunk evaluates once per page; a second, different registry would be a bundling bug.
   assert(cards === null || cards.getToolComponent === next.getToolComponent, "tool cards differ");
   if (cards !== null) return;
   cards = next;
   notify();
+  for (const waiter of [...waiters]) waiter();
+}
+
+/**
+ * Runs `callback` once the cards publish, or after `timeoutMs` (a failed or slow chunk must not
+ * hold the caller forever). Check toolCardsLoaded() first: the cards publish only once.
+ */
+export function afterToolCardsLoad(timeoutMs: number, callback: () => void): void {
+  const done = () => {
+    if (!waiters.delete(done)) return;
+    clearTimeout(timer);
+    callback();
+  };
+  const timer = setTimeout(done, timeoutMs);
+  waiters.add(done);
+}
+
+export function toolCardsLoaded(): boolean {
+  return cards !== null;
 }
 
 /**
@@ -45,7 +66,11 @@ export function requestToolCards(): void {
 
 /** Requests the cards when one of these history rows holds a tool call. */
 export function requestToolCardsForRows(rows: ReadonlyArray<{ parts: readonly unknown[] }>): void {
-  if (rows.some((row) => row.parts.some(isDynamicToolPart))) requestToolCards();
+  if (rowsHaveToolCalls(rows)) requestToolCards();
+}
+
+export function rowsHaveToolCalls(rows: ReadonlyArray<{ parts: readonly unknown[] }>): boolean {
+  return rows.some((row) => row.parts.some(isDynamicToolPart));
 }
 
 /** The loaded cards, or null until the lazy chunk has evaluated. */
