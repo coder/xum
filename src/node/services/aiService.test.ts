@@ -3336,7 +3336,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       if (typeof description !== "string") throw new Error("Expected a tool_catalog_search");
       return { description, state: started.toolSearchState };
     };
-    return { fixture, harness, send };
+    return { fixture, harness, metadata, send };
   }
 
   it("keeps a workspace's tool_catalog_search description when a refetch adds a tool", async () => {
@@ -3365,6 +3365,21 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(opus.description).not.toContain("tracker_add_label");
     // Opus's overview is valid for Sonnet's catalog too: a shared memo would hand it to Sonnet.
     expect((await send("anthropic:claude-sonnet-4-5")).description).toBe(sonnet.description);
+  });
+
+  it.each([
+    ["removed", null],
+    ["archived", { archivedAt: "2026-01-01T00:00:00.000Z" }],
+  ])("rebuilds the overview once the workspace is %s", async (_state, eventMetadata) => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview-forget");
+    const { fixture, harness, metadata, send } = createOverviewHarness(xumHome.path);
+    const first = await send();
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
+    // A metadata update of a live workspace keeps the overview.
+    harness.service.handleWorkspaceMetadata({ workspaceId: metadata.id, metadata: {} });
+    expect((await send()).description).toBe(first.description);
+    harness.service.handleWorkspaceMetadata({ workspaceId: metadata.id, metadata: eventMetadata });
+    expect((await send()).description).toContain("tracker_add_label");
   });
 
   it("rebuilds the least recently used model's overview past the per-workspace bound", async () => {

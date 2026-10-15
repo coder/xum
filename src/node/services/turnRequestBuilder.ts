@@ -853,11 +853,17 @@ export class TurnRequestBuilder {
    * Per model because request.assemble hooks, policies and fallbacks can give each model its own
    * catalog, and the prompt cache is per model too: one shared memo would let a model with fewer
    * tools replace the overview another model's cache still holds. In memory only: a restart
-   * builds one fresh overview per model, which costs one cache rewrite.
+   * builds one fresh overview per model, which costs one cache rewrite. forgetWorkspace drops a
+   * removed or archived workspace's entry.
    */
   private readonly toolCatalogOverviews = new Map<string, Map<string, ToolCatalogOverviewMemo>>();
 
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
+
+  /** Drop a removed or archived workspace's in-memory request state, so it does not grow the map. */
+  forgetWorkspace(workspaceId: string): void {
+    this.toolCatalogOverviews.delete(workspaceId);
+  }
 
   private toolCatalogOverviewMemo(
     workspaceId: string,
