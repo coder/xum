@@ -1057,6 +1057,72 @@ export const WorkspaceMCPServerSettingsRereadAfterApp: Story = {
   },
 };
 
+/** Closes the story's workspace MCP dialog from outside, as a workspace switch unmounts it. */
+let unmountWorkspaceMCPModal: (() => void) | null = null;
+const OutsideClosedWorkspaceMCPModal: FC = () => {
+  const [open, setOpen] = useState(true);
+  unmountWorkspaceMCPModal = () => setOpen(false);
+  return open ? (
+    <WorkspaceMCPModal
+      workspaceId={WORKSPACE_ID}
+      projectPath={PROJECT_PATH}
+      open
+      onOpenChange={setOpen}
+    />
+  ) : null;
+};
+
+const appUnmountReads: string[][] = [];
+/**
+ * The app of a tool that can write is still open when its row unmounts (the dialog goes away
+ * without the app's close): Xum still reads the settings again, so the backend's settings cache
+ * (plugin hooks use it) does not keep the pre-app values.
+ */
+export const WorkspaceMCPServerSettingsRereadAfterAppUnmount: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    appUnmountReads.length = 0;
+    return (
+      <WorkspaceMCPModalStoryShell
+        setup={() =>
+          setupWorkspaceMCPModalStory({
+            ...settingsStoryOptions(),
+            settingsReads: appUnmountReads,
+            settingsToolRunSets: { "cad.payment": { zoom: 1 } },
+            mcpAppViews: {
+              "settings:cad:cad.payment": {
+                html: "<!doctype html><html><body><strong>Card form</strong></body></html>",
+                csp: {},
+                prefersBorder: null,
+                resultAvailable: true,
+                result: { content: [] },
+                invocation: null,
+              },
+            },
+          })
+        }
+      >
+        <OutsideClosedWorkspaceMCPModal />
+      </WorkspaceMCPModalStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await section.findByRole("button", { name: "Open Payment method" }));
+    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    const appDialog = await page.findByRole("dialog", { name: "Payment method" });
+    await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
+    await expect(appUnmountReads).toHaveLength(1);
+    unmountWorkspaceMCPModal?.();
+    await waitFor(() =>
+      expect(queryWorkspaceMCPDialog(canvasElement.ownerDocument)).not.toBeInTheDocument()
+    );
+    await waitFor(() => expect(appUnmountReads).toEqual([["cad"], ["cad"]]), { timeout: 5000 });
+  },
+};
+
 /** The modal mounts only while open, like the sidebar row's settings dialog. */
 const RemountingWorkspaceMCPModal: FC = () => {
   const [open, setOpen] = useState(true);

@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import {
@@ -92,13 +92,7 @@ function RunnableToolRow(props: MCPSettingsToolActionRowProps & { action: MCPSet
         </Button>
       </div>
       {result && <ToolRunResultText result={result} />}
-      {app && (
-        <SettingsAppModal
-          workspaceId={props.workspaceId}
-          app={app}
-          onClose={() => void closeApp()}
-        />
-      )}
+      {app && <SettingsAppModal workspaceId={props.workspaceId} app={app} onClose={closeApp} />}
     </div>
   );
 }
@@ -363,17 +357,30 @@ function useToolActionRun(
   };
   /**
    * The app of a tool that can write may have changed the settings (the open or its own tool
-   * calls): read them again once it closes. The read counts as a run, so Save waits for it.
+   * calls): read them again once it goes away. That is when it closes, and also when its row
+   * unmounts with the app still open (#6611: the dialog goes away without the app's close), so
+   * the backend's settings cache that plugin hooks use does not keep the pre-app values. The
+   * read counts as a run (the run store outlives the row), so Save waits for it.
    */
-  const closeApp = async () => {
-    setApp(null);
-    if (app?.canWrite !== true) return;
-    const endRun = props.beginRun();
-    try {
-      await writeSettled();
-    } finally {
-      endRun(null);
-    }
-  };
+  const canWriteApp = app?.canWrite === true;
+  // The latest re-read, for the cleanup below: props.beginRun is a new function each render.
+  const rereadAfterApp = useRef<() => void>(() => undefined);
+  useEffect(() => {
+    rereadAfterApp.current = () => {
+      const endRun = props.beginRun();
+      // publishSettingsToolWrite never rejects (it settles every read); the run ends either way.
+      writeSettled().then(
+        () => endRun(null),
+        () => endRun(null)
+      );
+    };
+  });
+  // The open app's lifetime only: its close and the row's unmount end it, a re-render does not.
+  useEffect(() => {
+    if (!canWriteApp) return;
+    const reread = rereadAfterApp;
+    return () => reread.current();
+  }, [canWriteApp, app?.openCount]);
+  const closeApp = () => setApp(null);
   return { app, closeApp, run };
 }
