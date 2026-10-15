@@ -26,17 +26,16 @@ type ForeignToolListKey = (typeof FOREIGN_TOOL_LIST_KEYS)[number];
 
 /**
  * Claude Code tool names (code.claude.com/docs/en/tools-reference) mapped to
- * the Xum tools that do the same work. Names that are missing here (Grep, Glob,
- * LSP, PowerShell, Monitor, ...) have no Xum tool of their own: they grant
- * nothing in `tools` and remove nothing in `disallowedTools`. Several names
- * share one Xum tool family, so denying Write also removes Edit.
+ * the Xum tools that do the same work. Several names share one Xum tool
+ * family, so denying Write also removes Edit.
  */
 const BASH_TOOLS = ["bash", "bash_output", "bash_background_.*"];
 // Every tool that changes workspace files, as Explore's read-only list removes them.
 const FILE_EDIT_TOOLS = ["file_edit_.*", "image_.*", "task_apply_git_patch"];
 const TODO_TOOLS = ["todo_.*"];
-// Workflows spawn sub-agents too, so denying Agent must remove them as well.
-const TASK_TOOLS = ["task", "task_.*", "workflow_run", "workflow_resume"];
+const TASK_TOOLS = ["task", "task_.*"];
+const WORKFLOW_TOOLS = ["workflow_run", "workflow_resume"];
+const SCHEDULE_TOOLS = ["heartbeat"];
 const CLAUDE_TOOL_PATTERNS: Readonly<Record<string, readonly string[]>> = {
   // attach_file also reads files (images, PDFs), as Claude Code's Read does.
   Read: ["file_read", "attach_file"],
@@ -57,10 +56,66 @@ const CLAUDE_TOOL_PATTERNS: Readonly<Record<string, readonly string[]>> = {
   // Claude Code renamed Task to Agent and keeps Task as an alias.
   Agent: TASK_TOOLS,
   Task: TASK_TOOLS,
-  Workflow: ["workflow_run", "workflow_resume"],
+  TaskStop: ["task_stop", "bash_background_terminate"],
+  SendMessage: ["task_send_message", "task_message_parent", "task_message_sibling"],
+  ListAgents: ["task_list"],
+  Workflow: WORKFLOW_TOOLS,
   Skill: ["agent_skill_read", "agent_skill_read_file", "agent_skill_list"],
   ToolSearch: ["tool_catalog_search"],
+  Artifact: ["artifact", "artifact_list", "artifact_read"],
+  AskUserQuestion: ["ask_user_question"],
+  EnterPlanMode: ["propose_plan"],
+  ExitPlanMode: ["propose_plan"],
+  PushNotification: ["notify"],
+  CronCreate: SCHEDULE_TOOLS,
+  CronDelete: SCHEDULE_TOOLS,
+  CronList: SCHEDULE_TOOLS,
+  ScheduleWakeup: SCHEDULE_TOOLS,
 };
+
+/**
+ * Claude Code tools with no Xum tool of their own: they grant nothing in
+ * `tools` and remove nothing in `disallowedTools`. Any other unknown name in
+ * `disallowedTools` refuses the agent, so a newer Claude tool that Xum does
+ * have can never stay enabled because this table missed it.
+ */
+const CLAUDE_TOOLS_WITHOUT_XUM_TOOL = new Set(
+  [
+    "Grep",
+    "Glob",
+    "LSP",
+    "PowerShell",
+    "Monitor",
+    "EnterWorktree",
+    "ExitWorktree",
+    "EndConversation",
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
+    "RemoteTrigger",
+    "ReportFindings",
+    "SendFeedback",
+    "SendUserFile",
+    "ShareOnboardingGuide",
+    "SubagentHandback",
+    "TaskOutput",
+    "WaitForMcpServers",
+  ].map((name) => name.toLowerCase())
+);
+
+/** Denying Agent also removes workflows: they spawn sub-agents too. Allowing Agent does not grant them. */
+const ALSO_DENIED = new Map<string, readonly string[]>([
+  ["agent", WORKFLOW_TOOLS],
+  ["task", WORKFLOW_TOOLS],
+]);
+
+/** Claude Code removes these from every sub-agent, so listing them in `tools` grants nothing. */
+const NEVER_IN_SUBAGENTS = new Set([
+  "AskUserQuestion",
+  "EnterPlanMode",
+  "ExitPlanMode",
+  "ScheduleWakeup",
+  "Workflow",
+]);
 
 export class ForeignPluginAgentToolsError extends Error {
   constructor(message: string) {
@@ -91,7 +146,8 @@ function readToolList(raw: Record<string, unknown>, key: ForeignToolListKey): st
   const value = raw[key];
   const entries =
     typeof value === "string"
-      ? value.split(",")
+      ? // Commas inside a specifier, such as Agent(worker, researcher), do not split entries.
+        value.split(/,(?![^(]*\))/)
       : Array.isArray(value) && value.every((entry) => typeof entry === "string")
         ? value
         : undefined;
@@ -143,7 +199,14 @@ function mapDeniedEntry(entry: string): readonly string[] {
   }
   // A specifier still removes the whole tool, as in Claude Code. The name is
   // matched without case, so a denylist never misses a tool over its spelling.
-  return CLAUDE_TOOL_PATTERNS_BY_LOWERCASE_NAME.get(match[1].toLowerCase()) ?? [];
+  const name = match[1].toLowerCase();
+  const patterns = CLAUDE_TOOL_PATTERNS_BY_LOWERCASE_NAME.get(name);
+  if (patterns === undefined && !CLAUDE_TOOLS_WITHOUT_XUM_TOOL.has(name)) {
+    throw new ForeignPluginAgentToolsError(
+      `Xum does not know the Claude Code tool '${match[1]}' in 'disallowedTools'.`
+    );
+  }
+  return [...(patterns ?? []), ...(ALSO_DENIED.get(name) ?? [])];
 }
 
 /** Xum tool patterns that one `tools` entry grants; `mcp__` entries grant nothing yet. */
@@ -155,6 +218,7 @@ function mapAllowedEntry(entry: string): readonly string[] {
   // that, so it does not grant the tool, except Agent(...), whose type list
   // Claude Code ignores in sub-agents.
   if (specifier !== undefined && !SPECIFIER_IGNORED_TOOLS.has(name)) return [];
+  if (NEVER_IN_SUBAGENTS.has(name)) return [];
   return Object.hasOwn(CLAUDE_TOOL_PATTERNS, name) ? CLAUDE_TOOL_PATTERNS[name] : [];
 }
 

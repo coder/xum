@@ -195,9 +195,17 @@ Body
         "file_edit_insert",
         "task",
         "task_await",
-        "workflow_run",
         "todo_write",
       ]);
+      // A comma inside a specifier does not split the entry; Agent does not grant workflows.
+      expect(toolsOf("name: a\ntools: Agent(worker, researcher), Read")).toEqual([
+        "file_read",
+        "attach_file",
+        "task",
+        "task_await",
+      ]);
+      // Denying Agent also removes workflows, which spawn sub-agents too.
+      expect(toolsOf("name: a\ndisallowedTools: Agent, SendMessage")).not.toContain("workflow_run");
       expect(toolsOf("name: a\ndisallowedTools: Write, TodoWrite, WebFetch, bash")).toEqual([
         "file_read",
         "attach_file",
@@ -225,6 +233,10 @@ Body
         // A denylist entry Xum cannot read must not be dropped: the agent would keep that tool.
         "name: a\ndisallowedTools: [Write, 42]",
         "name: a\ndisallowedTools: Bash (git push *)",
+        // An unknown denylist name may be a tool Xum has: refuse instead of keeping it.
+        "name: a\ndisallowedTools: FutureTool",
+        // Claude Code never gives a sub-agent AskUserQuestion, so it does not resolve.
+        "name: a\ntools: AskUserQuestion",
       ]) {
         expect(() => parse(frontmatter, "plugin")).toThrow(AgentDefinitionParseError);
       }
