@@ -541,6 +541,50 @@ describe("MCP App entry points", () => {
     }
   });
 
+  // An entry point that a successful list retired, then opened after a failed re-list.
+  test("an open after a failed re-list brings back an entry point an earlier list retired", async () => {
+    const library = entrypoint("Library");
+    let listing: () => Promise<McpAppEntrypoint[]> = () => Promise.resolve([library]);
+    const client = createTestApiClient({
+      mcpApps: {
+        listEntrypoints: () => listing(),
+        openEntrypoint: () => Promise.resolve({ success: true as const, data: library }),
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    try {
+      const { result } = renderHook(
+        () => {
+          useLoadMcpAppEntrypoints("ws-reopen-retired", true);
+          return {
+            list: useMcpAppEntrypoints("ws-reopen-retired"),
+            view: useMcpAppView("ws-reopen-retired", library.viewKey),
+          };
+        },
+        { wrapper }
+      );
+      await waitFor(() =>
+        expect(result.current.view).toMatchObject({ toolCallId: library.viewKey })
+      );
+      // A list without it retires it; then a re-list fails.
+      listing = () => Promise.resolve([]);
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(result.current.view).toBeNull());
+      listing = () => Promise.reject(new Error("backend busy"));
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(result.current.list).toEqual([]));
+      await act(async () => {
+        expect(await openMcpAppEntrypoint(client, "ws-reopen-retired", library)).toBeNull();
+      });
+      expect(result.current.view).toMatchObject({ toolCallId: library.viewKey });
+    } finally {
+      restore();
+    }
+  });
+
   test("with the experiment off the list settles empty, so a restored tab stops loading", async () => {
     const client = createTestApiClient({ mcpApps: { getViewRecords: viewRecords([]) } });
     const wrapper = (props: { children: React.ReactNode }) => (

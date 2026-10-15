@@ -118,7 +118,9 @@ function updateMcpAppEntrypoint(workspaceId: string, entrypoint: McpAppEntrypoin
   const list = entrypointsByWorkspace.get(workspaceId);
   if (list === undefined) return;
   if (failedWorkspaces.has(workspaceId)) {
-    // One open is no full list: keep the failed state, so it retires no other entry point.
+    // One open is no full list: keep the failed state, so it retires no other entry point. The
+    // opened one is back, also when an earlier list retired it.
+    retiredKeys.delete(refKey(workspaceId, entrypoint.viewKey));
     entrypointsByWorkspace.set(workspaceId, withEntrypoint(list, entrypoint));
     emit();
     return;
