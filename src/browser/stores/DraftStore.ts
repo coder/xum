@@ -1898,6 +1898,23 @@ export class DraftStore {
     if (!wasHydrated) for (const listener of this.readyListeners) listener();
   }
 
+  /** After each (re)subscription's snapshot: send what waited for it. */
+  private resendAfterSnapshot(): void {
+    for (const entry of this.entries.values()) this.scheduleFlush(entry);
+    for (const key of [...this.pendingDeletes.keys()]) {
+      this.sendDelete(key, 0).catch(() => undefined);
+    }
+    for (const [key, pending] of this.pendingListPuts) {
+      if (pending.confirmedRevision === null) this.startListPut(key, pending);
+    }
+    // Load and every reconnect (a new subscription): resolve every pending send.
+    for (const entry of this.entries.values()) {
+      if (entry.scope.kind === "workspace" && entry.pendingSends.length > 0) {
+        this.triggerSendResolution(entry.scope.workspaceId, { afterStop: true });
+      }
+    }
+  }
+
   private startSubscription(client: APIClient): void {
     if (this.resubscribeTimer) {
       clearTimeout(this.resubscribeTimer);
@@ -1939,20 +1956,9 @@ export class DraftStore {
             // scan is cheap.
             await this.migrateLegacyDrafts(client);
             this.markHydrated();
+            // A newer subscription started during the import: its own snapshot sets this.
             if (!signal.aborted) this.setSnapshotCurrent(true);
-            for (const entry of this.entries.values()) this.scheduleFlush(entry);
-            for (const key of [...this.pendingDeletes.keys()]) {
-              this.sendDelete(key, 0).catch(() => undefined);
-            }
-            for (const [key, pending] of this.pendingListPuts) {
-              if (pending.confirmedRevision === null) this.startListPut(key, pending);
-            }
-            // Load and every reconnect (a new subscription): resolve every pending send.
-            for (const entry of this.entries.values()) {
-              if (entry.scope.kind === "workspace" && entry.pendingSends.length > 0) {
-                this.triggerSendResolution(entry.scope.workspaceId, { afterStop: true });
-              }
-            }
+            this.resendAfterSnapshot();
           } else if (event.type === "list") {
             // Pushes that trail a newer snapshot are stale.
             if (event.revision > this.serverListRevision) this.applyList(event);
