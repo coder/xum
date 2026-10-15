@@ -623,6 +623,19 @@ async function pluginsNeedingReviewOptions(api: BuildSourcesParams["api"]) {
     .map((item) => ({ id: item.name, label: item.name, keywords: [item.name, item.location] }));
 }
 
+/** The palette path of the broken sign-out record notice in Settings → Plugins (#6627). */
+async function signOutPluginServersFromPalette(api: BuildSourcesParams["api"]): Promise<void> {
+  const result = await api?.agentPlugins.signOutPluginServers();
+  if (!result) return;
+  if (!result.success) {
+    showCommandFeedbackToast({ type: "error", message: result.error });
+    return;
+  }
+  publishPluginsSectionIntent({ type: "refresh" });
+  publishAgentPluginsMutated();
+  showCommandFeedbackToast({ type: "success", message: "Signed out of the plugin MCP servers." });
+}
+
 export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandAction[]> {
   const actions: Array<() => CommandAction[]> = [];
 
@@ -2612,6 +2625,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           });
           openSettings("plugins");
         },
+      },
+      {
+        // Keyboard path for the broken sign-out record notice (#6627): the record fences the
+        // plugin servers, so Settings → MCP has no Logout for them.
+        id: CommandIds.pluginsSignOutServers(),
+        title: "Sign Out of Plugin MCP Servers",
+        subtitle: "Recover from a broken pending sign-out record",
+        section: section.settings,
+        keywords: ["plugin", "mcp", "sign out", "logout", "pending", "record"],
+        run: () => signOutPluginServersFromPalette(p.api),
       },
       {
         id: CommandIds.pluginsUpdateAll(),
