@@ -332,6 +332,9 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
         },
         { timeout: 10_000 }
       );
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(false), {
+        timeout: 10_000,
+      });
       fireEvent.click(await runInitButton(view.container));
       await waitFor(() => expect(create).toHaveBeenCalledTimes(1), { timeout: 30_000 });
     } finally {
