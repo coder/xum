@@ -103,6 +103,7 @@ The rules follow Claude Code:
 
 - With `tools`, the agent gets only the granted Xum tools (within its base, Exec or Explore), and no MCP tools. Xum always keeps `agent_report`, because every sub-agent reports through it.
 - With `disallowedTools`, the agent gets every tool of its base except the removed ones. If both are set, a tool in both lists is removed.
+- The lists restrict this agent only. If it keeps `Agent` (the task tools), it can spawn sub-agents, which get their own tools, as in Claude Code. To restrict the whole tree, also deny `Agent`, or leave it out of `tools`.
 - If no `tools` entry grants a Xum tool, Xum skips the agent with a warning. Claude Code also refuses to launch such an agent.
 - `disallowedTools` names are matched without case (`bash` removes Bash). If Xum cannot read an entry, or does not know the name, it skips the agent with a warning, because the name can stand for a tool Xum has.
 - A removed family such as `task_*` can also remove MCP tools whose server name starts the same way (an MCP server named `task`).
