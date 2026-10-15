@@ -311,7 +311,12 @@ function recordAddMetadata(entry: QueueEntry, muxMetadata: unknown): void {
 function metadataWithBatchedReviews(entry: QueueEntry): unknown {
   const batched = entry.batchedReviews ?? [];
   const meta = entry.muxMetadata;
-  if (batched.length === 0 || isCompactionMetadata(meta) || typeof meta !== "object" || meta === null)
+  if (
+    batched.length === 0 ||
+    isCompactionMetadata(meta) ||
+    typeof meta !== "object" ||
+    meta === null
+  )
     return meta;
   const own = hasReviews(meta) ? (meta.reviews ?? []) : [];
   return { ...meta, reviews: [...own, ...batched] };
