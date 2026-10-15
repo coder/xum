@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { HistoryService } from "./historyService";
+import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { createTestHistoryService } from "./testHistoryService";
 import { readWorkspaceViewTail, WORKSPACE_VIEW_TAIL_CAPS } from "./workspaceViewTail";
 
@@ -47,25 +48,6 @@ async function append(messages: MuxMessage[]) {
 }
 
 describe("readWorkspaceViewTail", () => {
-  test("shapes the rows for the static view", async () => {
-    await append([msg("u0", "user", "Add a helper."), msg("a1", "assistant", "```ts\nx\n```")]);
-    expect(await read()).toEqual({
-      title: "seed",
-      project: "demo-app",
-      hasOlder: false,
-      rows: [
-        { id: "u0", role: "user", text: "Add a helper.", timestamp: 1, model: null },
-        {
-          id: "a1",
-          role: "assistant",
-          text: "```ts\nx\n```",
-          timestamp: 1,
-          model: { label: "Sonnet 4.5", provider: "anthropic" },
-        },
-      ],
-    });
-  });
-
   test("an unknown workspace returns null before any history read", async () => {
     const window = spyOn(historyService, "getHistoryWindowFromLatestBoundary");
     const partial = spyOn(historyService, "hasPartial");
@@ -97,6 +79,47 @@ describe("readWorkspaceViewTail", () => {
     expect(await read()).toBeNull();
   });
 
+  test("draws rows as the send and stream paths persist them today", async () => {
+    // The keys AgentSession.sendMessage and the StreamManager stream-end write today.
+    const send = { retrySendOptions: {}, muxMetadata: { type: "normal", requestedModel: "x" } };
+    const numbers = { requestHistorySequence: 0, systemMessageTokens: 9, duration: 9, ttftMs: 5 };
+    const objects = {
+      usage: {},
+      contextUsage: {},
+      providerMetadata: {},
+      contextProviderMetadata: {},
+    };
+    const stream = {
+      ...numbers,
+      ...objects,
+      agentId: "exec",
+      thinkingLevel: "high",
+      metadataModel: "x",
+    };
+    Object.assign(stream, { routedThroughGateway: false, stopCause: { kind: "required-tool" } });
+    const textPart = (text: string) => [{ type: "text", text, timestamp: 7 }] as never;
+    await append([
+      msg("u", "user", "hello", send),
+      msg("u2", "user", "bare", { muxMetadata: { type: "normal" } }),
+      msg("a", "assistant", "", stream, textPart("direct")),
+      msg("g", "assistant", "", { ...stream, routeProvider: "mux-gateway" }, textPart("routed")),
+      msg("bad", "assistant", "damaged", { model: 7, timestamp: "x" }),
+      msg("ok", "assistant", "after"),
+    ]);
+    const { rows, ...tail } = (await read())!;
+    expect(tail).toEqual({ title: "seed", project: "demo-app", hasOlder: false });
+    const model = { label: "Sonnet 4.5", provider: "anthropic", via: null };
+    expect(rows[2]).toEqual({ id: "a", role: "assistant", text: "direct", timestamp: 7, model });
+    expect(rows.map((row) => [row.id, row.text, row.timestamp, row.model?.via])).toEqual([
+      ["u", "hello", 1, undefined],
+      ["u2", "bare", 1, undefined],
+      ["a", "direct", 7, null],
+      ["g", "routed", 7, PROVIDER_DEFINITIONS["mux-gateway"].displayName],
+      ["bad", null, null, undefined],
+      ["ok", "after", 1, null],
+    ]);
+  });
+
   test("rows the live transcript draws differently carry no text", async () => {
     const tool = { type: "dynamic-tool", toolName: "bash", toolCallId: "t", input: {} };
     await append([
@@ -106,13 +129,13 @@ describe("readWorkspaceViewTail", () => {
       msg("synthetic", "user", "[CONTINUE]", { synthetic: true }),
       msg("command", "user", "/compact", { muxMetadata: { type: "compaction-request" } }),
       msg("cut", "assistant", "partial answ", { finishReason: "length" }),
-      msg("routed", "assistant", "via a gateway", { routeProvider: "mux-gateway" }),
+      msg("skill", "user", "use it", { muxMetadata: { type: "normal", agentSkillRefs: [] } }),
       msg("last", "assistant", "fine"),
     ]);
     const texts = Object.fromEntries((await read())!.rows.map((row) => [row.id, row.text]));
     expect(texts).toEqual({
       plain: "hi",
-      ...{ tool: null, reasoning: null, synthetic: null, command: null, cut: null, routed: null },
+      ...{ tool: null, reasoning: null, synthetic: null, command: null, cut: null, skill: null },
       last: "fine",
     });
   });

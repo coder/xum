@@ -1787,7 +1787,9 @@ export const WorkspaceViewTailRowSchema = z.object({
   text: z.string().nullable(),
   timestamp: z.number().nullable(),
   /** The meta row's model label and provider icon, formatted by the server. */
-  model: z.object({ label: z.string(), provider: z.string() }).nullable(),
+  model: z
+    .object({ label: z.string(), provider: z.string(), via: z.string().nullable() })
+    .nullable(),
 });
 
 export const WorkspaceViewTailSchema = z.object({
@@ -2458,7 +2460,7 @@ export const workspace = {
     },
     /** The static first view's newest rows (T3 #5971): fixed server caps, null = no view. */
     tail: {
-      input: z.object({ workspaceId: z.string() }),
+      input: z.object({ workspaceId: z.string().trim().min(1) }),
       output: WorkspaceViewTailSchema.nullable(),
     },
     /** Searches full history, including prompts before the replay boundary. */
