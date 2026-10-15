@@ -2,6 +2,8 @@ import { expect, test } from "bun:test";
 import {
   clearSettingsToolResults,
   forgetSettingsToolRuns,
+  publishSettingsToolWrite,
+  subscribeSettingsToolWrites,
   settingsToolRunsOf,
   startSettingsToolRun,
 } from "./settingsToolRuns";
@@ -31,4 +33,20 @@ test("settings tool runs: a removed workspace's entries go, and a late run end d
   expect(settingsToolRunsOf("ws-removed")).toEqual({});
   end({ text: "done", isError: false });
   expect(settingsToolRunsOf("ws-removed")).toEqual({});
+});
+
+test("a writing run's end reaches the dialogs of its workspace only", async () => {
+  const reread: string[] = [];
+  const stop = subscribeSettingsToolWrites("ws-write", async (serverName) => {
+    reread.push(serverName);
+  });
+  const other = subscribeSettingsToolWrites("ws-other", async () => {
+    reread.push("other");
+  });
+  await publishSettingsToolWrite("ws-write", "cad");
+  stop();
+  // A closed dialog no longer reads.
+  await publishSettingsToolWrite("ws-write", "cad");
+  other();
+  expect(reread).toEqual(["cad"]);
 });

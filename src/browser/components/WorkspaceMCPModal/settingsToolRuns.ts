@@ -100,6 +100,37 @@ export function settingsToolRunsOf(workspaceId: string): WorkspaceSettingsToolRu
   return runsByWorkspace.get(workspaceId) ?? NO_RUNS;
 }
 
+/** Mounted workspace MCP dialogs: each reads a server's settings again after a writing run. */
+const writeListeners = new Set<{
+  workspaceId: string;
+  reread: (serverName: string) => Promise<void>;
+}>();
+
+/**
+ * A dialog listens for writing runs of its workspace. The run can outlive the dialog that
+ * started it (a close and reopen): the reopened dialog read the values before the write, so the
+ * run's end must reach the dialog mounted now, not the one that started it.
+ */
+export function subscribeSettingsToolWrites(
+  workspaceId: string,
+  reread: (serverName: string) => Promise<void>
+): () => void {
+  const listener = { workspaceId, reread };
+  writeListeners.add(listener);
+  return () => writeListeners.delete(listener);
+}
+
+/** A tool that can write ran on `serverName`: the mounted dialogs read its settings again. */
+export async function publishSettingsToolWrite(
+  workspaceId: string,
+  serverName: string
+): Promise<void> {
+  const rereads = [...writeListeners]
+    .filter((listener) => listener.workspaceId === workspaceId)
+    .map((listener) => listener.reread(serverName));
+  await Promise.allSettled(rereads);
+}
+
 /** One server's runs (NO_SERVER_RUNS when it has none). */
 export function serverSettingsToolRuns(
   runs: WorkspaceSettingsToolRuns,

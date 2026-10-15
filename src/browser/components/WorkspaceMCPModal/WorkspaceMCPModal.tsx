@@ -30,7 +30,11 @@ import {
   MCPServerSettingsSection,
   type MCPServerSettingsSectionHandle,
 } from "./MCPServerSettingsSection";
-import { clearSettingsToolResults, useSettingsToolRuns } from "./settingsToolRuns";
+import {
+  clearSettingsToolResults,
+  subscribeSettingsToolWrites,
+  useSettingsToolRuns,
+} from "./settingsToolRuns";
 import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import {
   MCPServerIdentityBadge,
@@ -211,6 +215,13 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
 
     void loadData();
   }, [open, api, projectPath, workspaceId, settingsRequests]);
+
+  // A tool that can write (a reset, an import) may have changed a server's settings: read them
+  // again (the backend's read refreshes its settings caches too). The run can have started in
+  // an earlier mount of this dialog, so its end reaches whichever dialog is open now.
+  useSettingsToolWriteRereads(open, workspaceId, (serverName) =>
+    readServerSettingsRef.current([serverName], true, settingsRequests.current())
+  );
 
   // Fetch/refresh tools for a server
   const fetchTools = useCallback(
@@ -633,9 +644,6 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                               overrides,
                               name
                             )}
-                            rereadSettings={() =>
-                              readServerSettings([name], true, settingsRequests.current())
-                            }
                             refreshing={isLoadingTools === true}
                           />
                         </div>
@@ -651,6 +659,21 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
     </Dialog>
   );
 };
+
+/** While the dialog is open, `reread` runs after each writing settings tool run of the workspace. */
+function useSettingsToolWriteRereads(
+  open: boolean,
+  workspaceId: string,
+  reread: (serverName: string) => Promise<void>
+) {
+  // Ref: the subscription follows the dialog's open state, not each render's callback.
+  const rereadRef = useRef(reread);
+  rereadRef.current = reread;
+  useEffect(() => {
+    if (!open) return;
+    return subscribeSettingsToolWrites(workspaceId, (serverName) => rereadRef.current(serverName));
+  }, [open, workspaceId]);
+}
 
 /** A server's settings note when no snapshot is shown: a failed read, or a server not running. */
 function ServerSettingsNote(props: {

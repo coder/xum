@@ -36,8 +36,6 @@ interface MCPServerSettingsSectionProps {
    * Runs wait for them: the backend checks the saved allowlist, not the dialog's.
    */
   unsavedOverrides: boolean;
-  /** A tool that can write ran: read the server's settings again (it may have changed them). */
-  rereadSettings: () => Promise<void>;
   /**
    * Refresh Tools runs for this server. Its settings read would take a newer request ID than
    * a save started now, and the save's result would be dropped, so Save waits for it.
@@ -227,7 +225,6 @@ export const MCPServerSettingsSection = React.forwardRef<
                     Object.keys(changed).length > 0 ||
                     props.unsavedOverrides
                   }
-                  rereadSettings={props.rereadSettings}
                   beginRun={() =>
                     startSettingsToolRun(props.workspaceId, props.serverName, item.tool)
                   }

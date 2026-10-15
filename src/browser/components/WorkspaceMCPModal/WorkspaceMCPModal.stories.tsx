@@ -1022,6 +1022,53 @@ export const WorkspaceMCPServerSettingsRunAcrossRemount: Story = {
   },
 };
 
+let writeRemountGate = Promise.withResolvers<void>();
+/**
+ * A writing run (Reset parts) still in flight when the dialog closes: the reopened dialog reads
+ * the pre-write values, and the run's end reads the settings again into that dialog.
+ */
+export const WorkspaceMCPServerSettingsRereadAfterRemount: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    writeRemountGate = Promise.withResolvers<void>();
+    return (
+      <WorkspaceMCPModalStoryShell
+        setup={() =>
+          setupWorkspaceMCPModalStory({
+            ...settingsStoryOptions(),
+            settingsToolRunGate: writeRemountGate,
+            settingsToolRuns: [],
+            settingsToolRunSets: { "cad.reset": { zoom: 1 } },
+          })
+        }
+      >
+        <RemountingWorkspaceMCPModal />
+      </WorkspaceMCPModalStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await section.findByRole("button", { name: "Run Reset parts" }));
+    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    await waitFor(() =>
+      expect(section.getByRole("button", { name: "Run Part library" })).toBeDisabled()
+    );
+    await userEvent.click(modal.getByRole("button", { name: "Cancel" }));
+    await waitFor(() =>
+      expect(queryWorkspaceMCPDialog(canvasElement.ownerDocument)).not.toBeInTheDocument()
+    );
+    await userEvent.click(
+      within(canvasElement).getByRole("button", { name: "Open workspace MCP" })
+    );
+    const reopened = within(await findWorkspaceMCPDialog(canvasElement));
+    await expect(reopened.findByLabelText("Default zoom setting")).resolves.toHaveValue(2);
+    writeRemountGate.resolve();
+    await waitFor(() => expect(reopened.getByLabelText("Default zoom setting")).toHaveValue(1));
+  },
+};
+
 /** Not running yet: the dialog does not start it on open; Fetch Tools connects it. */
 export const WorkspaceMCPServerSettingsNotConnected: Story = {
   parameters: { pixel: PIXEL_DISABLED },

@@ -20,7 +20,7 @@ import type {
   MCPSettingsSnapshot,
   MCPSettingsToolAction,
 } from "@/common/utils/mcpSettings";
-import type { SettingsToolRunResult } from "./settingsToolRuns";
+import { publishSettingsToolWrite, type SettingsToolRunResult } from "./settingsToolRuns";
 
 interface MCPSettingsToolActionRowProps {
   workspaceId: string;
@@ -39,8 +39,6 @@ interface MCPSettingsToolActionRowProps {
    * dialog wait for it).
    */
   beginRun: () => (result: SettingsToolRunResult | null) => void;
-  /** Read the server's settings again: a tool that can write may have changed them. */
-  rereadSettings: () => Promise<void>;
 }
 
 /**
@@ -327,7 +325,9 @@ function useToolActionRun(
     let result: SettingsToolRunResult | null = null;
     try {
       const outcome = await callWithFreshFlag(api, target, action, setRefreshed);
-      result = await settleOutcome(outcome, openApp, props.rereadSettings);
+      result = await settleOutcome(outcome, openApp, () =>
+        publishSettingsToolWrite(props.workspaceId, props.serverName)
+      );
     } catch (caught) {
       result = { text: getErrorMessage(caught), isError: true };
     } finally {
