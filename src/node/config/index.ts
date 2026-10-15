@@ -2404,6 +2404,9 @@ export class Config {
   }
 
   // File-backed snapshots are shared and read-only; mutations must use editConfig's fresh read.
+  // A read can have side effects (#6699): a read that sees a changed file retries a failed
+  // config.json watch, and that retry can notify onConfigChanged listeners synchronously,
+  // before this call returns. A listener that reads config again gets this read's snapshot.
   loadConfigOrDefault(options?: { throwOnError?: boolean }): ProjectsConfig {
     const key = this.readConfigStatKey();
     if (key !== undefined && this.configSnapshot?.key === key) {
