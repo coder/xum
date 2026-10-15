@@ -769,13 +769,17 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
         timeout: 10_000,
       });
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
-      const secondId = await waitFor(async () => {
-        const sideChats = (await app.env.orpc.workspace.list()).filter(
-          (ws) => ws.sideChatParentWorkspaceId === app.workspaceId
-        );
-        expect(sideChats).toHaveLength(2);
-        return sideChats.find((ws) => ws.id !== firstId)!.id;
-      });
+      // Creating a side chat is backend work that can pass the default one-second budget (#6375).
+      const secondId = await waitFor(
+        async () => {
+          const sideChats = (await app.env.orpc.workspace.list()).filter(
+            (ws) => ws.sideChatParentWorkspaceId === app.workspaceId
+          );
+          expect(sideChats).toHaveLength(2);
+          return sideChats.find((ws) => ws.id !== firstId)!.id;
+        },
+        { timeout: 10_000 }
+      );
       // Registration precedes the open-tab event; dock only after that event selects the second.
       await waitFor(() => expect(getSidePane(app, secondId)).not.toBeNull(), { timeout: 10_000 });
       act(() => {
