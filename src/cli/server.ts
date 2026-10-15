@@ -24,6 +24,7 @@ import { resolveServerAuthToken } from "./serverAuthToken";
 import { resolveInstallLayout } from "@/node/services/serverUpdate/installLayout";
 import { appendServerCrashLogSync } from "./serverCrashLogging";
 import { shouldExposeLaunchProject } from "./launchProject";
+import { startMajorGcHeapFields } from "./memoryBreadcrumbs";
 
 // Server-mode crashes can terminate the process before the async logger flushes,
 // so these top-level hooks mirror fatal details into mux.log synchronously.
@@ -334,10 +335,14 @@ const MEMORY_BREADCRUMB_INTERVAL_MS = 10 * 60 * 1000;
 
 function startMemoryBreadcrumbs(): void {
   const toMb = (bytes: number) => Math.round(bytes / (1024 * 1024));
+  const majorGcHeapFields = startMajorGcHeapFields();
   const emit = () => {
     const usage = process.memoryUsage();
+    // New fields go last so readers of the older fields keep parsing the line. heapUsed is a
+    // point on the GC sawtooth; the after-major-GC values are the retained heap (see
+    // memoryBreadcrumbs.ts).
     console.log(
-      `[memory] rss=${toMb(usage.rss)}MB heapUsed=${toMb(usage.heapUsed)}MB heapTotal=${toMb(usage.heapTotal)}MB external=${toMb(usage.external)}MB arrayBuffers=${toMb(usage.arrayBuffers)}MB uptime=${Math.round(process.uptime())}s`
+      `[memory] rss=${toMb(usage.rss)}MB heapUsed=${toMb(usage.heapUsed)}MB heapTotal=${toMb(usage.heapTotal)}MB external=${toMb(usage.external)}MB arrayBuffers=${toMb(usage.arrayBuffers)}MB uptime=${Math.round(process.uptime())}s${majorGcHeapFields()}`
     );
   };
   emit();
