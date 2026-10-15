@@ -80,6 +80,7 @@ Use this index to find a page's:
       - Init Hooks (`/hooks/init`) → `references/docs/hooks/init.mdx`: Run setup commands automatically when creating new workspaces
       - Archive and Delete Hooks (`/hooks/lifecycle`) → `references/docs/hooks/lifecycle.mdx`: Run project cleanup before archiving or deleting a workspace
       - Tool Hooks (`/hooks/tools`) → `references/docs/hooks/tools.mdx`: Block dangerous commands, lint after edits, and set up your environment
+      - Plugin hooks (`/hooks/plugins`) → `references/docs/hooks/plugins.mdx`: Hooks that Agent Plugins ship, how you trust them, and the contract Xum gives hook authors
       - Environment Variables (`/hooks/environment-variables`) → `references/docs/hooks/environment-variables.mdx`: Environment variables available in agent bash commands and hooks
   - **Agents**
     - Agents (`/agents`) → `references/docs/agents/index.mdx`: Define custom agents (modes + subagents) as Markdown files
