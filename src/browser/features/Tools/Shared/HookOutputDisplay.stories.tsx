@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, within } from "storybook/test";
+import { expect, userEvent, within } from "storybook/test";
+import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { HookOutputDisplay } from "./HookOutputDisplay";
 
@@ -41,7 +42,10 @@ export const ToolHooksOutputExpanded: Story = {
     const canvas = within(canvasElement);
     const hookButton = await canvas.findByText("hook output");
     await userEvent.click(hookButton);
-    await canvas.findByText(/post-hook: git status check/);
+    const output = await canvas.findByText(/post-hook: git status check/);
+    // The output reaches WCAG AA in every theme. Muted text on its muted tint was 2.96:1 in light
+    // and 4.35:1 in dark once #6544 lightened the tint.
+    await expect(textsBelowAaInThemes(() => [output]).join("\n")).toBe("");
   },
   parameters: {
     docs: {
