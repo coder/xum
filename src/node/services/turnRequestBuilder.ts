@@ -195,6 +195,7 @@ import {
   rebuildToolSearchState,
   seedToolSearchActivationsFromMessages,
   TOOL_SEARCH_TOOL_NAME,
+  type ToolCatalogOverviewMemo,
   type ToolSearchRuntime,
 } from "@/common/utils/tools/toolCatalog";
 import {
@@ -841,8 +842,22 @@ interface PreparedModelAttempt {
 export class TurnRequestBuilder {
   /** Remote scratch dirs per workspace and runtime config (see RemoteScratchDirCache). */
   private readonly remoteScratchDirs = new RemoteScratchDirCache();
+  /**
+   * The last deferred-tool catalog overview per workspace (ToolCatalogOverviewMemo). In memory
+   * only: a restart builds one fresh overview, which costs one cache rewrite.
+   */
+  private readonly toolCatalogOverviews = new Map<string, ToolCatalogOverviewMemo>();
 
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
+
+  private toolCatalogOverviewMemo(workspaceId: string): ToolCatalogOverviewMemo {
+    let memo = this.toolCatalogOverviews.get(workspaceId);
+    if (memo === undefined) {
+      memo = {};
+      this.toolCatalogOverviews.set(workspaceId, memo);
+    }
+    return memo;
+  }
 
   private resolveOverridesIdentity(
     rawModelString: string,
@@ -2947,6 +2962,7 @@ export class TurnRequestBuilder {
           supportsAnthropicToolSearch(seed.capabilityModelString.split(":")[1] ?? "") &&
           resolveProviderOptionsNamespaceKey(seed.wireProviderName, seed.routeProvider) ===
             "anthropic";
+        const toolCatalogOverviewMemo = this.toolCatalogOverviewMemo(workspaceId);
         if (toolSearchRuntime) {
           if (options.initializeToolSearch) {
             const preparedSearch = prepareToolSearch({
@@ -2956,6 +2972,7 @@ export class TurnRequestBuilder {
               toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
             });
             attemptTools = preparedSearch.tools;
             if (preparedSearch.state) {
@@ -2969,6 +2986,7 @@ export class TurnRequestBuilder {
               toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
             }).tools;
           } else if (!(mcpTools && TOOL_SEARCH_TOOL_NAME in mcpTools)) {
             const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = attemptTools;
@@ -3032,6 +3050,7 @@ export class TurnRequestBuilder {
               toolPolicy: toolSearchPolicy,
               ptcEnabled,
               promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
             }).tools;
           }
           // Middleware may filter tools too, but must not restore policy-denied

@@ -2613,9 +2613,19 @@ export class MCPServerManager {
     const inFlight = this.toolRefreshesInFlight.get(instance);
     if (inFlight !== undefined) return inFlight;
     if (instance.isClosed || !instance.refreshTools) return Promise.resolve(true);
+    const previousToolCount = Object.keys(instance.tools).length;
     const refresh = instance
       .refreshTools()
-      .then(() => true)
+      .then(() => {
+        // Counts per refetch show whether a remote server's tool list drifts between
+        // fetches (which used to change the tool_catalog_search overview).
+        log.debug("[MCP] Refreshed tool catalog", {
+          name: instance.name,
+          previousToolCount,
+          toolCount: Object.keys(instance.tools).length,
+        });
+        return true;
+      })
       .catch((error: unknown) => {
         log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
           name: instance.name,

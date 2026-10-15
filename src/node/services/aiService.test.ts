@@ -3285,6 +3285,63 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(off.toolNames).not.toContain("tool_catalog_search");
   });
 
+  // The overview in tool_catalog_search's description is part of the cached tools prefix: a
+  // remote server that lists one more tool on a refetch must not rewrite the cached history.
+  it("keeps a workspace's tool_catalog_search description when a refetch adds a tool", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview");
+    const metadata = createLocalWorkspaceMetadata("tool-search-overview", xumHome.path);
+    const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
+    let mcpTools: Record<string, Tool> = {
+      tracker_list_issues: { ...stubTool, description: NATIVE_DEFERRAL_DESCRIPTION },
+    };
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    harness.getToolsForModelSpy.mockImplementation((_model, config) =>
+      Promise.resolve({
+        file_read: stubTool,
+        ...(config.toolSearchRuntime ? { tool_catalog_search: stubTool } : {}),
+        ...mcpTools,
+      })
+    );
+    harness.service.turnRequestBuilderBindings.mcpServerManager = {
+      listServers: () => Promise.resolve({}),
+      getToolsForWorkspace: () =>
+        Promise.resolve({
+          tools: mcpTools,
+          toolServerNames: Object.fromEntries(Object.keys(mcpTools).map((n) => [n, "tracker"])),
+          promptDescriptors: [],
+          stats: {
+            totalTools: Object.keys(mcpTools).length,
+            activeServerCount: 1,
+            failedServerCount: 0,
+            failedServerNames: [],
+          },
+        }),
+    } as unknown as MCPServerManager;
+    const send = async () => {
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "hello")],
+        workspaceId: metadata.id,
+        modelString: "anthropic:claude-sonnet-4-5",
+        thinkingLevel: "off",
+      });
+      expect(result.success).toBe(true);
+      const started = harness.startStreamCalls.at(-1);
+      if (!started) throw new Error("Expected streamManager.startStream call");
+      return started;
+    };
+
+    const first = await send();
+    expect(first.tools?.tool_catalog_search?.description).toContain("tracker_list_issues");
+    // Sorts before tracker_list_issues, so a fresh overview would list it.
+    mcpTools = { ...mcpTools, tracker_add_label: stubTool };
+    const second = await send();
+    expect(harness.startStreamCalls).toHaveLength(2);
+    expect(second.tools?.tool_catalog_search?.description).toBe(
+      first.tools?.tool_catalog_search?.description
+    );
+    expect(second.toolSearchState?.deferredToolNames.has("tracker_add_label")).toBe(true);
+  });
+
   it.each([true, false])(
     "passes the heartbeat service to tools only when agent heartbeats are enabled (%s)",
     async (enabled) => {
