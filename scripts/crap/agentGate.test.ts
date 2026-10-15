@@ -264,13 +264,22 @@ function userToolPost(home: string, status: number, mode = 0o755): void {
   );
 }
 
+/** The env Xum gives a local workspace's hook whose Xum home is `home`. */
+function xumHome(home: string): NodeJS.ProcessEnv {
+  return {
+    XUM_RUNTIME: "local",
+    XUM_WORKSPACE_ID: "ws1",
+    XUM_SCRATCH_DIR: join(home, "sessions/ws1/scratch"),
+  };
+}
+
 function runToolPost(
   hook: string,
   env: NodeJS.ProcessEnv,
   opts: { script?: string; args?: string[]; input?: string } = {}
 ) {
   const base: NodeJS.ProcessEnv = { ...GIT_ENV };
-  for (const key of ["HOME", "XUM_ROOT", "MUX_ROOT", "NODE_ENV", "XUM_RUNTIME"]) delete base[key];
+  for (const key of ["XUM_RUNTIME", "XUM_WORKSPACE_ID", "XUM_SCRATCH_DIR"]) delete base[key];
   const result = spawnSync(hook, opts.args ?? [], {
     cwd: repo,
     env: { ...base, XUM_TOOL: "file_read", XUM_TOOL_INPUT_SCRIPT: opts.script ?? "", ...env },
@@ -283,58 +292,52 @@ function runToolPost(
 
 test("the project tool_post runs the user's tool_post once, last, and passes its exit through", () => {
   const post = projectToolPost();
-  const home = join(dir, "home");
-  userToolPost(join(home, ".xum"), 3);
-  userToolPost(join(home, ".xum-dev"), 4);
-  userToolPost(join(dir, "root"), 5);
-  userToolPost(join(dir, "mux-root"), 6);
+  const home = join(dir, "home/.xum");
+  userToolPost(home, 3);
 
-  // Default home: ~/.xum, with Xum's args and stdin.
-  expect(runToolPost(post, { HOME: home }, { args: ["a b"], input: "result" })).toEqual({
+  expect(runToolPost(post, xumHome(home), { args: ["a b"], input: "result" })).toEqual({
     status: 3,
     out: "user tool_post [a b] [result] []\n",
   });
-  // The same paths as Xum's getXumHome(): -dev suffix, XUM_ROOT, then MUX_ROOT.
-  expect(runToolPost(post, { HOME: home, NODE_ENV: "development" }).status).toBe(4);
-  expect(runToolPost(post, { HOME: home, XUM_ROOT: join(dir, "root") }).status).toBe(5);
-  expect(runToolPost(post, { HOME: home, MUX_ROOT: join(dir, "mux-root") }).status).toBe(6);
-  expect(runToolPost(post, { HOME: home, XUM_ROOT: "", MUX_ROOT: join(dir, "root") }).status).toBe(
-    3
-  );
-  expect(runToolPost(post, { HOME: home, XUM_RUNTIME: "worktree" }).status).toBe(3);
+  expect(runToolPost(post, { ...xumHome(home), XUM_RUNTIME: "worktree" }).status).toBe(3);
+  // Workspace secrets can override HOME and XUM_ROOT in the hook env. Xum's
+  // own home does not move with them.
+  userToolPost(join(dir, "secret-root"), 4);
+  const secrets = { HOME: join(dir, "elsewhere"), XUM_ROOT: join(dir, "secret-root") };
+  expect(runToolPost(post, { ...xumHome(home), ...secrets }).status).toBe(3);
 
   // A real commit: the CRAP report comes first, then the user's hook.
   const reported = runToolPost(
     post,
-    { XUM_ROOT: join(dir, "root"), XUM_TOOL: "bash" },
+    { ...xumHome(home), XUM_TOOL: "bash" },
     { script: "git commit -am x" }
   );
-  expect(reported.status).toBe(5);
+  expect(reported.status).toBe(3);
   expect(reported.out).toContain("VIOLATION floor-cc     src/route.ts:1-5 route: CC 2 -> 5");
   expect(reported.out).toEndWith("user tool_post [] [] [git commit -am x]\n");
 }, 60_000);
 
 test("the project tool_post skips the user's tool_post when the lookup is unusual", () => {
   const post = projectToolPost();
-  const home = join(dir, "home");
-  userToolPost(join(home, ".xum"), 3);
-  userToolPost(join(repo, "relative-root"), 4);
+  const home = join(dir, "home/.xum");
+  userToolPost(home, 3);
   userToolPost(join(dir, "plain"), 5, 0o644);
   mkdirSync(join(dir, "linked"));
   symlinkSync(post, join(dir, "linked/tool_post"));
-  userToolPost(join(dir, "slash/.xum"), 6);
 
   for (const env of [
-    { HOME: home, XUM_ROOT: "relative-root" },
-    { HOME: home, XUM_ROOT: "C:\\Users\\me\\.xum" },
     {},
-    { HOME: "/" },
-    { HOME: home, XUM_RUNTIME: "ssh" },
-    { HOME: home, XUM_RUNTIME: "docker" },
-    { HOME: home, XUM_RUNTIME: "devcontainer" },
-    { HOME: home, XUM_ROOT: join(dir, "plain") },
-    { HOME: home, XUM_ROOT: join(dir, "linked") },
-    { HOME: home, XUM_ROOT: dirname(post) },
+    { ...xumHome(home), XUM_RUNTIME: undefined },
+    { ...xumHome(home), XUM_RUNTIME: "ssh" },
+    { ...xumHome(home), XUM_RUNTIME: "docker" },
+    { ...xumHome(home), XUM_RUNTIME: "devcontainer" },
+    { ...xumHome(home), XUM_WORKSPACE_ID: "ws2" },
+    { ...xumHome(home), XUM_SCRATCH_DIR: "sessions/ws1/scratch" },
+    { ...xumHome(home), XUM_SCRATCH_DIR: "/sessions/ws1/scratch" },
+    { ...xumHome(home), XUM_SCRATCH_DIR: join(home, "scratch") },
+    xumHome(join(dir, "plain")),
+    xumHome(join(dir, "linked")),
+    xumHome(dirname(post)),
   ]) {
     expect({ env, ...runToolPost(post, env) }).toEqual({ env, status: 0, out: "" });
   }
@@ -342,10 +345,10 @@ test("the project tool_post skips the user's tool_post when the lookup is unusua
 
 test("a user tool_post that calls the project tool_post again does not loop", () => {
   const post = projectToolPost();
-  const root = join(dir, "root");
-  mkdirSync(root);
-  writeFileSync(join(root, "tool_post"), `#!/usr/bin/env bash\necho user\n"${post}"\nexit 7\n`, {
+  const home = join(dir, "home/.xum");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, "tool_post"), `#!/usr/bin/env bash\necho user\n"${post}"\nexit 7\n`, {
     mode: 0o755,
   });
-  expect(runToolPost(post, { XUM_ROOT: root })).toEqual({ status: 7, out: "user\n" });
+  expect(runToolPost(post, xumHome(home))).toEqual({ status: 7, out: "user\n" });
 });
