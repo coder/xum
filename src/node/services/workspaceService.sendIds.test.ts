@@ -335,12 +335,19 @@ describe("idempotent sends (real host)", () => {
       const first = send();
       const retry = send();
       await h.until(() => hookCalls >= 1, "a send to reach the hooks");
-      // Give the retry time to reach the hooks if nothing holds it back.
-      await new Promise((resolve) => setTimeout(resolve, 50));
       release.resolve();
       expect(await first).toEqual(Ok(undefined));
       expect(await retry).toEqual(Ok(undefined));
+      // The retry was queued behind the first send: end that turn and let the queue dispatch it
+      // (Codex PRRT_kwDOPxxmWM6s4Eb5), so a hook run at dispatch would show here.
+      await h.until(() => h.streamCalls() === 1, "the first send to stream");
+      await h.endStream();
+      await h.until(
+        () => !h.session.isBusy() && !h.session.hasQueuedMessages(),
+        "the queued retry to dispatch"
+      );
       expect(hookCalls).toBe(1);
+      expect(h.streamCalls()).toBe(1);
       expect(await h.userRows()).toEqual([{ text: "hello", sendIds: ["race-1"] }]);
     } finally {
       unregister();
