@@ -43,11 +43,6 @@
     "expected_exit_code": 10,
     "in_progress": true
   },
-  "receipt_review_no_findings": {
-    "source": "https://github.com/coder/xum/pull/6796#issuecomment-6200963271",
-    "body": "<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues. :rocket:\n\n**Reviewed commit:** `dc3f6e9483`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
-    "expected_exit_code": 0
-  },
   "receipt_security_no_findings": {
     "source": "https://github.com/coder/xum/pull/6796#issuecomment-6200983367",
     "body": "<!-- codex-review-receipt:v1 -->\n\n### 🛡️ Codex Security Review · _Automatically triggered_\n\nSecurity review completed. No security issues were found in this pull request.\n\n**Reviewed commit:** `dc3f6e9483`\n\n[View security finding report](https://chatgpt.com/codex/cloud/tasks/task_b_6ad12e960e2c832ebe72662811c79ac5)\n\n_Only the user who started this review can view the report in Codex._\n\n<details> <summary>ℹ️ About Codex security reviews in GitHub</summary>\n<br/>\n\nThis is an experimental Codex feature. Security reviews are triggered when:\n- You comment \"@codex security review\"\n- A regular code review gets triggered (for example, \"@codex review\" or when a PR is opened), and you’re opted in so security review runs alongside code review\n\nOnce complete, Codex will leave suggestions, or a comment if no findings are found.\n\n\n</details>",
