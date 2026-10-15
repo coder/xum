@@ -976,6 +976,16 @@ describe("useBoundedTranscriptReveal", () => {
         subset(before.slice(1), slice.mounted());
       });
 
+      test("a capped transcript that starts fully revealed keeps its rows when a page is prepended", () => {
+        const slice = grouped(TRANSCRIPT_REVEAL_TAIL_ROWS); // #6742 review: no anchor at start.
+        const before = slice.mounted();
+        slice.set({ messages: [...rows(CAP + 100, "page"), ...slice.messages()] }, false);
+        expect(slice.mounted()).toEqual(before); // The page stays unmounted ...
+        slice.set({}); // ... and the automatic reveal mounts older rows within the cap only.
+        subset(before, slice.mounted());
+        expect(slice.mounted().length).toBeLessThanOrEqual(CAP);
+      });
+
       test("held, deleting only the newest rows keeps the start; new rows replacing them restart", () => {
         const slice = grouped();
         slice.atCap();
