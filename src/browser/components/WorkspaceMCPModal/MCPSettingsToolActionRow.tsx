@@ -9,16 +9,18 @@ import {
 } from "@/browser/components/Dialog/Dialog";
 import { McpAppFrame } from "@/browser/features/RightSidebar/ArtifactsTab/McpAppFrame";
 import type { McpAppViewRef } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
 import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
+import { getOwn } from "@/common/utils/getOwn";
 import type {
   MCPSettingsAppView,
   MCPSettingsLayoutItem,
+  MCPSettingsSnapshot,
   MCPSettingsToolAction,
 } from "@/common/utils/mcpSettings";
-import type { SettingsToolRunResult } from "./settingsToolRuns";
+import { publishSettingsToolWrite, type SettingsToolRunResult } from "./settingsToolRuns";
 
 interface MCPSettingsToolActionRowProps {
   workspaceId: string;
@@ -90,7 +92,13 @@ function RunnableToolRow(props: MCPSettingsToolActionRowProps & { action: MCPSet
         </Button>
       </div>
       {result && <ToolRunResultText result={result} />}
-      {app && <SettingsAppModal workspaceId={props.workspaceId} app={app} onClose={closeApp} />}
+      {app && (
+        <SettingsAppModal
+          workspaceId={props.workspaceId}
+          app={app}
+          onClose={() => void closeApp()}
+        />
+      )}
     </div>
   );
 }
@@ -171,55 +179,201 @@ function SettingsAppModal(props: {
   );
 }
 
+/** Which tool a run calls, on the server instance the user saw. */
+interface ToolActionTarget {
+  workspaceId: string;
+  serverName: string;
+  toolName: string;
+  instanceToken: string;
+}
+
+/** A run's outcome: its text result or opened view, and whether the tool may have written. */
+type ToolActionOutcome =
+  | { success: false; error: string; wrote: boolean }
+  | {
+      success: true;
+      result: SettingsToolRunResult | null;
+      view: MCPSettingsAppView | null;
+      wrote: boolean;
+    };
+
+/** Run or open `action` once. */
+async function callToolAction(
+  api: APIClient,
+  target: ToolActionTarget,
+  action: MCPSettingsToolAction,
+  confirmed: boolean
+): Promise<ToolActionOutcome> {
+  const request = { ...target, confirmed };
+  if (action.opensApp) {
+    const response = await api.mcp.settings.openApp(request);
+    // The open (or the app's own calls) can change the settings, but a re-read now would
+    // remount the section and close the app modal: closeApp re-reads instead.
+    // A failed open shows no app, and its tool call can have written before the failure.
+    return response.success
+      ? { success: true, result: null, view: response.data, wrote: false }
+      : { ...response, wrote: confirmed };
+  }
+  const response = await api.mcp.settings.runTool(request);
+  // A tool can write and then report an error, or fail after the dispatch (a disconnect): every
+  // confirmed run counts as a write.
+  return response.success
+    ? { success: true, result: response.data, view: null, wrote: confirmed }
+    : { ...response, wrote: confirmed };
+}
+
+/** A settings read only for the backend's settings caches (no dialog shows it). */
+async function readSettingsWithoutDialog(
+  api: APIClient | null,
+  workspaceId: string,
+  serverName: string
+): Promise<void> {
+  if (!api) return;
+  await api.mcp.settings.read({ workspaceId, serverNames: [serverName], ifConnected: true });
+}
+
+/** The action of `toolName` in a settings read, or null when it cannot run. */
+function toolActionOf(snapshot: MCPSettingsSnapshot, toolName: string) {
+  const item = snapshot.layout
+    .flatMap((group) => group.items)
+    .find((candidate) => candidate.kind === "tool" && candidate.tool === toolName);
+  return item?.kind === "tool" ? (item.action ?? null) : null;
+}
+
+/** The target's action, read again; null when the read fails or the tool cannot run. */
+async function readToolAction(
+  api: APIClient,
+  target: ToolActionTarget
+): Promise<MCPSettingsToolAction | null> {
+  try {
+    const reads = await api.mcp.settings.read({
+      workspaceId: target.workspaceId,
+      serverNames: [target.serverName],
+      ifConnected: true,
+    });
+    const read = getOwn(reads, target.serverName);
+    if (read?.success !== true || read.data === null || "notConnected" in read.data) return null;
+    // Another server instance (a restart): its flag does not apply, since the run carries the
+    // token of the instance the user saw, which the backend refuses.
+    if (read.data.instanceToken !== target.instanceToken) return null;
+    return toolActionOf(read.data, target.toolName);
+  } catch {
+    // The run's own error is the one to show.
+    return null;
+  }
+}
+
+/**
+ * Run `action`, and learn its new flag when the read-only flag is stale. A server can drop a
+ * tool's readOnlyHint (tools/list_changed) after the dialog read its settings. The backend
+ * refreshes the catalog before a run and refuses the unconfirmed run, but the row kept the old
+ * flag, so every click failed the same way. So after a failed read-only run, read the action
+ * again: if it can write now, `onFresh` keeps the new flag, and the next click asks for the
+ * confirmation. This run does not repeat on its own: the failure can also come after the
+ * dispatch (a transport error), and a second call could run a writing tool twice.
+ */
+async function callWithFreshFlag(
+  api: APIClient,
+  target: ToolActionTarget,
+  action: MCPSettingsToolAction,
+  onFresh: (action: MCPSettingsToolAction) => void
+): Promise<ToolActionOutcome> {
+  const outcome = await callToolAction(api, target, action, !action.readOnly);
+  if (outcome.success || !action.readOnly) return outcome;
+  const fresh = await readToolAction(api, target);
+  if (fresh !== null && !fresh.readOnly && fresh.opensApp === action.opensApp) onFresh(fresh);
+  return outcome;
+}
+
+/**
+ * Show an outcome: open its app, and read the settings again after a tool that can write (a
+ * reset, an import): it may have changed them, and the backend's read refreshes its settings
+ * caches too. Returns the text result to show.
+ */
+async function settleOutcome(
+  outcome: ToolActionOutcome,
+  openApp: (view: MCPSettingsAppView) => void,
+  rereadSettings: () => Promise<void>
+): Promise<SettingsToolRunResult | null> {
+  if (outcome.success && outcome.view !== null) openApp(outcome.view);
+  if (outcome.wrote) await rereadSettings();
+  return outcome.success ? outcome.result : { text: outcome.error, isError: true };
+}
+
 /**
  * Confirm (a tool that can write), run or open, and keep the latest app. The result goes to the
- * run's end callback (settingsToolRuns keeps it).
+ * run's end callback (settingsToolRuns keeps it). The run ends after a settings re-read, so
+ * Save and Refresh Tools wait for it.
  */
 function useToolActionRun(
   props: MCPSettingsToolActionRowProps & { action: MCPSettingsToolAction }
 ) {
   const { api } = useAPI();
   const { confirm } = useConfirmDialog();
-  const [app, setApp] = useState<{ view: MCPSettingsAppView; openCount: number } | null>(null);
+  const [app, setApp] = useState<{
+    view: MCPSettingsAppView;
+    openCount: number;
+    /** A tool that can write opened it: the settings are read again when it closes. */
+    canWrite: boolean;
+  } | null>(null);
   const [openCount, setOpenCount] = useState(0);
-  const { readOnly, title, opensApp } = props.action;
+  // The action as this row's latest re-read saw it (callWithFreshFlag).
+  const [refreshed, setRefreshed] = useState<MCPSettingsToolAction | null>(null);
+
+  // Server text is untrusted: the dialog names the tool and server, nothing the tool claims.
+  const ask = (action: MCPSettingsToolAction) =>
+    confirm({
+      title: `Run ${action.title}?`,
+      description: `This tool of ${props.serverName} can change data. Run it only if you trust the server.`,
+      confirmLabel: "Run",
+    });
+  const writeSettled = () =>
+    publishSettingsToolWrite(props.workspaceId, props.serverName, () =>
+      readSettingsWithoutDialog(api, props.workspaceId, props.serverName)
+    );
+  const openApp = (view: MCPSettingsAppView, canWrite: boolean) => {
+    setApp({ view, openCount: openCount + 1, canWrite });
+    setOpenCount(openCount + 1);
+  };
 
   const run = async () => {
     if (!api) return;
-    // Server text is untrusted: the dialog names the tool and server, nothing the tool claims.
-    const confirmed =
-      readOnly ||
-      (await confirm({
-        title: `Run ${title}?`,
-        description: `This tool of ${props.serverName} can change data. Run it only if you trust the server.`,
-        confirmLabel: "Run",
-      }));
-    if (!confirmed) return;
+    const action = refreshed ?? props.action;
+    if (!action.readOnly && !(await ask(action))) return;
     const endRun = props.beginRun();
-    let result: SettingsToolRunResult | null = null;
-    const request = {
+    const target = {
       workspaceId: props.workspaceId,
       serverName: props.serverName,
       toolName: props.item.tool,
       instanceToken: props.instanceToken,
-      confirmed: !readOnly,
     };
+    let result: SettingsToolRunResult | null = null;
     try {
-      if (opensApp) {
-        const response = await api.mcp.settings.openApp(request);
-        if (response.success) {
-          setApp({ view: response.data, openCount: openCount + 1 });
-          setOpenCount(openCount + 1);
-        } else result = { text: response.error, isError: true };
-      } else {
-        const response = await api.mcp.settings.runTool(request);
-        result = response.success ? response.data : { text: response.error, isError: true };
-      }
+      const outcome = await callWithFreshFlag(api, target, action, setRefreshed);
+      result = await settleOutcome(
+        outcome,
+        (view) => openApp(view, !action.readOnly),
+        writeSettled
+      );
     } catch (caught) {
       result = { text: getErrorMessage(caught), isError: true };
     } finally {
       endRun(result);
     }
   };
-  return { app, closeApp: () => setApp(null), run };
+  /**
+   * The app of a tool that can write may have changed the settings (the open or its own tool
+   * calls): read them again once it closes. The read counts as a run, so Save waits for it.
+   */
+  const closeApp = async () => {
+    setApp(null);
+    if (app?.canWrite !== true) return;
+    const endRun = props.beginRun();
+    try {
+      await writeSettled();
+    } finally {
+      endRun(null);
+    }
+  };
+  return { app, closeApp, run };
 }

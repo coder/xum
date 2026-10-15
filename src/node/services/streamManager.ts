@@ -3655,7 +3655,8 @@ export class StreamManager {
           ...(mcpServer ? { mcpServer } : {}),
           state: "output-available" as const,
           output,
-          ...modelOnlyNotificationsField(modelOnlyNotifications),
+          // Set even when undefined: an earlier completion's notes must not outlive it (#6665).
+          modelOnlyNotifications,
         };
       }
     } else {

@@ -855,6 +855,7 @@ export const mcpOauth = {
       hasRefreshToken: z.boolean(),
       scope: z.string().optional(),
       updatedAtMs: z.number().optional(),
+      insufficientScopes: z.array(z.string()).optional(),
     }),
   },
   logout: {
@@ -1098,6 +1099,7 @@ export const projects = {
         hasRefreshToken: z.boolean(),
         scope: z.string().optional(),
         updatedAtMs: z.number().optional(),
+        insufficientScopes: z.array(z.string()).optional(),
       }),
     },
     logout: {

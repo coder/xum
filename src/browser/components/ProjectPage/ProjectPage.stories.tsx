@@ -2,7 +2,7 @@
  * Welcome/Empty state and workspace creation stories
  */
 
-import { within, userEvent, waitFor, expect } from "@storybook/test";
+import { within, userEvent, waitFor, expect } from "storybook/test";
 
 import { expandProjects } from "@/browser/stories/helpers/uiState";
 import { PIXEL_DUAL_THEME, appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";

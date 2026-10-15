@@ -9440,7 +9440,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "## Tips",
       "",
       "- Keep story data deterministic (no `Math.random()` / real `Date.now()` in fixtures).",
-      "- Use `play` functions (`@storybook/test`) to navigate the UI into the desired state.",
+      "- Use `play` functions (`storybook/test`) to navigate the UI into the desired state.",
       "- If async rendering changes element heights (Markdown, Mermaid, tool expansion), wait for scroll stabilization (double `requestAnimationFrame`) before snapshotting.",
       "",
     ].join("\n"),

@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { userEvent, waitFor, within } from "storybook/test";
 import { TodoToolCall } from "@/browser/features/Tools/TodoToolCall";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import type { TodoItem } from "@/common/types/tools";
