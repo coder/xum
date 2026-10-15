@@ -2721,7 +2721,13 @@ describe("AgentPluginInstallService", () => {
       );
       // Still fail-closed.
       expect(await discovered()).toBe(0);
+      // A record that can be stat'ed but not read names its read error too.
       await fsPromises.rm(record);
+      await fsPromises.mkdir(record);
+      await expect(updater.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+        /cannot read the pending plugin sign-out record \(EISDIR\)/
+      );
+      await fsPromises.rm(record, { recursive: true });
       await failing.dispose();
     });
 
@@ -2769,6 +2775,39 @@ describe("AgentPluginInstallService", () => {
       await internals.settledSignOutPasses();
       expect(await restarted.pendingSignOutStatus()).toEqual({ kind: "none" });
       await oauth.dispose();
+    });
+
+    test("a later pass waits for a timed-out logout instead of starting a second one (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 20,
+      });
+      let calls = 0;
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      restarted.setMcpOauthService({
+        logout: async () => {
+          calls++;
+          if (calls === 1) await released;
+          return { success: true };
+        },
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      await restarted.list();
+      await restarted.list();
+      await internals.settledSignOutPasses();
+      // The hung first call is still the only one, and the record stays until it settles.
+      expect(calls).toBe(1);
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+      release();
+      await released;
+      await restarted.list();
+      await internals.settledSignOutPasses();
+      expect(await pendingSignOuts()).toBeUndefined();
     });
 
     test("component review names a pending sign-out instead of changed files (#6627)", async () => {

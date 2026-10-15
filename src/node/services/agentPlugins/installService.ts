@@ -220,14 +220,29 @@ function monotonicNow(): number {
  * Why logout() did not succeed before the pass deadline, or undefined when it did. A late or
  * hung logout counts as failed: the URL stays in the record, and a later pass retries it
  * (logout is idempotent).
+ *
+ * A late logout keeps running. A later pass waits for that same call instead of starting a
+ * second one, so the record stays until the original call settles: a second logout could
+ * otherwise clear the record while the first one still runs and later deletes a new sign-in.
  */
 async function signOutFailure(
   oauth: Pick<McpOauthService, "logout">,
   serverUrl: string,
-  deadline: number
+  deadline: number,
+  inFlight: Map<string, Promise<Awaited<ReturnType<McpOauthService["logout"]>>>>
 ): Promise<string | undefined> {
+  let call = inFlight.get(serverUrl);
+  if (call === undefined) {
+    const started = oauth.logout({ serverUrl });
+    call = started;
+    inFlight.set(serverUrl, started);
+    const forget = () => {
+      if (inFlight.get(serverUrl) === started) inFlight.delete(serverUrl);
+    };
+    started.then(forget, forget);
+  }
   const timeoutMs = Math.max(0, deadline - monotonicNow());
-  const settled = await raceWithAbortAndTimeout(oauth.logout({ serverUrl }), { timeoutMs });
+  const settled = await raceWithAbortAndTimeout(call, { timeoutMs });
   if (settled.kind === "ok") return settled.value.success ? undefined : settled.value.error;
   log.warn("A pending plugin MCP sign-out timed out", { timeoutMs });
   return `The sign-out did not finish within ${Math.round(timeoutMs / 1000)} s.`;
@@ -238,7 +253,9 @@ async function signOutFailure(
  * already name the recovery step. A read error gets one here.
  */
 function unusableRecordReason(error: unknown, file: string): string {
-  const code = error instanceof Error && "code" in error ? error.code : undefined;
+  // fs errors come from another realm under the Jest VM: read `code` without instanceof.
+  const code: unknown =
+    typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
   if (typeof code !== "string") return getErrorMessage(error);
   return `Xum cannot read the pending plugin sign-out record (${file}): ${code}. Fix its permissions, or sign out of the plugin MCP servers in Settings, then delete the file.`;
 }
@@ -4054,7 +4071,7 @@ export class AgentPluginInstallService {
       const left: string[] = [];
       const failures: string[] = [];
       for (const serverUrl of await this.readPendingSignOuts()) {
-        const failure = await signOutFailure(oauth, serverUrl, deadline);
+        const failure = await signOutFailure(oauth, serverUrl, deadline, this.inFlightSignOuts);
         if (failure === undefined) continue;
         left.push(serverUrl);
         failures.push(failure);
@@ -4152,6 +4169,11 @@ export class AgentPluginInstallService {
     const lastError = this.pendingSignOutLastError;
     return { kind: "pending", servers, ...(lastError !== undefined ? { lastError } : {}) };
   }
+  /** Logouts a pass started that have not settled yet (see signOutFailure). */
+  private readonly inFlightSignOuts = new Map<
+    string,
+    Promise<Awaited<ReturnType<McpOauthService["logout"]>>>
+  >();
   /** See startPendingSignOutPass. On the monotonic clock: a wall-clock jump must not move it. */
   private pendingSignOutRetryAtMs = 0;
   /** See signOutPassRunning. */
