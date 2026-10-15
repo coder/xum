@@ -627,8 +627,8 @@ export class DraftService extends EventEmitter {
    * after the destination body, that body is unlisted (the next snapshot relists it) next to the
    * intact source; after the source body's delete, the destination is still relisted that way,
    * and a listed source stays as an empty row. A retry after a lost reply finds the destination
-   * listed and the source gone, and answers "moved". An unowned destination throws, so the client
-   * keeps the source.
+   * listed (a real row) and answers "moved", whatever the source holds by then. An unowned
+   * destination throws, so the client keeps the source.
    */
   async moveCreation(input: DraftMoveCreationInput): Promise<DraftMoveCreationOutput> {
     const { source, dest } = input;
@@ -636,10 +636,12 @@ export class DraftService extends EventEmitter {
     assert(draftScopeKey(source) !== draftScopeKey(dest), "a draft move needs a new destination");
     const dirs = [source, dest].map((scope) => this.projectDraftsDir(scope.projectPath));
     return withTargetMutationLocks(this.config.rootDir, dirs, async () => {
-      const stored = await this.load(source);
-      if (stored === null && isMoveDone((await this.readListFile()).entries, source, dest)) {
+      // Before the source is read: a source written again after the move (a lost reply's retry
+      // follows a flush, another window types) is a draft of its own, never moved over it.
+      if (isMoveDone((await this.readListFile()).entries, dest)) {
         return this.movedOutput(dest, this.listRevision);
       }
+      const stored = await this.load(source);
       if (!(await this.hasOwner(dest))) {
         throw new Error(`Draft move refused: project ${dest.projectPath} is not configured`);
       }
@@ -1434,14 +1436,13 @@ function toApiEntry(entry: DraftListFileEntry): DraftListEntry {
   return apiEntry;
 }
 
-/** A move's retry after a lost reply: its destination is listed and its source is not. */
-function isMoveDone(
-  entries: readonly DraftListFileEntry[],
-  source: CreationScope,
-  dest: CreationScope
-): boolean {
-  const listed = (scope: CreationScope) => entries.some((entry) => isSameListEntry(entry, scope));
-  return listed(dest) && !listed(source);
+/**
+ * A move's retry after a lost reply: its destination has a real row. The destination id is fresh
+ * and only the move's own list write gives it one; a synthesized row is a body relisted after a
+ * crashed attempt, which the move then finishes.
+ */
+function isMoveDone(entries: readonly DraftListFileEntry[], dest: CreationScope): boolean {
+  return entries.some((entry) => entry.synthesized !== true && isSameListEntry(entry, dest));
 }
 
 function isSameListEntry(
