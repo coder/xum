@@ -350,6 +350,11 @@ function localTakeField(
   return { localTake: { kind: take, ...(unsavedText === undefined ? { from } : {}) } };
 }
 
+function cancelScheduledFlush(entry: Entry): void {
+  if (entry.flushTimer) clearTimeout(entry.flushTimer);
+  entry.flushTimer = null;
+}
+
 function isTextDirty(entry: Entry): boolean {
   return entry.textVersion > entry.confirmedTextVersion;
 }
@@ -1040,14 +1045,15 @@ export class DraftStore {
    */
   async flush(scope: DraftStoreScope): Promise<void> {
     if (scope.kind === "pending") return;
-    const entry = this.entries.get(draftStoreScopeKey(scope));
-    if (!entry) return;
-    if (entry.flushTimer) {
-      clearTimeout(entry.flushTimer);
-      entry.flushTimer = null;
-    }
+    const key = draftStoreScopeKey(scope);
+    if (!this.entries.has(key)) return;
     await this.whenReady();
     if (!this.canWrite(this.client)) throw new Error(DRAFTS_NOT_LOADED);
+    // The entry after the wait: a delete and a new edit meanwhile replace it, and the new one is
+    // what the caller needs saved.
+    const entry = this.entries.get(key);
+    if (!entry) return;
+    cancelScheduledFlush(entry);
     // An attachment update waiting for the payloads is not saved yet: apply it (by loading them)
     // first, so this never confirms a draft without it. A failed load rejects.
     if (entry.queuedAttachmentUpdates.length > 0) await this.ensurePayloads(scope);
@@ -1590,8 +1596,7 @@ export class DraftStore {
   private dropEntry(key: string): Entry | undefined {
     const entry = this.entries.get(key);
     if (!entry) return undefined;
-    if (entry.flushTimer) clearTimeout(entry.flushTimer);
-    entry.flushTimer = null;
+    cancelScheduledFlush(entry);
     if (entry.payloadRetryTimer) clearTimeout(entry.payloadRetryTimer);
     entry.payloadRetryTimer = null;
     this.entries.delete(key);
@@ -2117,10 +2122,7 @@ export class DraftStore {
 
   private flushAllInBackground(): void {
     for (const entry of this.entries.values()) {
-      if (entry.flushTimer) {
-        clearTimeout(entry.flushTimer);
-        entry.flushTimer = null;
-      }
+      cancelScheduledFlush(entry);
       if (isTextDirty(entry) || isAttachmentsDirty(entry)) this.flushInBackground(entry);
     }
   }

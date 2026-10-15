@@ -1072,6 +1072,32 @@ describe("DraftStore", () => {
     expect(store.getText(WS_SCOPE)).toBe("typed before a disconnect");
   });
 
+  // #6753 review: the save waited for the snapshot with the entry from before the wait. A delete
+  // and a new edit meanwhile replaced it, so the save resolved without writing the new text.
+  test("a save waiting for a reconnect writes the draft edited again after a delete", async () => {
+    using oldDir = new TestTempDir("draft-store-wait-replaced-old");
+    using newDir = new TestTempDir("draft-store-wait-replaced-new");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "saved on the old backend");
+    await store.flush(WS_SCOPE);
+
+    const next = await createHarness(newDir);
+    let releaseSnapshot: () => void = () => undefined;
+    next.control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(next.client);
+    const saving = flushError(store);
+    await store.deleteDraft(WS_SCOPE);
+    store.setText(WS_SCOPE, "typed after the delete");
+
+    releaseSnapshot();
+    expect(await saving).toBe("");
+    expect((await next.service.get(WS_SCOPE)).text).toBe("typed after the delete");
+  });
+
   // #6438: forgetting the views on a reconnect must not touch what the composer shows.
   test("a reconnect to the same backend keeps showing the draft until its snapshot", async () => {
     using tempDir = new TestTempDir("draft-store-reconnect-view");
