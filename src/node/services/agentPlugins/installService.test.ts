@@ -46,6 +46,7 @@ import {
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { skillConsentFingerprint } from "./componentConsent";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
+import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
 
 /**
  * Lifecycle tests against a real local git "remote". Local-path remotes go
@@ -1692,6 +1693,89 @@ describe("AgentPluginInstallService", () => {
     expect(await loaded()).toEqual({ skills: ["greet"], servers: ["echo"] });
   });
 
+  test("a plugin workflow runs only while its exact script is reviewed (#6629)", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "workflows", "run.js"),
+      "export const meta = { name: 'run' };\n"
+    );
+    await commitAll(remoteDir, "add a workflow");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const resolve = () =>
+      resolveWorkflowScript({
+        scriptPath: "plugin://demo-plugin/run.js",
+        runtime: new LocalRuntime(muxRoot),
+        workspacePath: muxRoot,
+        projectTrusted: false,
+        roots: {
+          projectRoot: "",
+          globalRoot: path.join(muxRoot, "skills"),
+          universalRoot: "",
+          globalPluginRoots: [pluginsDir()],
+        },
+      });
+    const approveReview = async () => {
+      const review = await service.previewComponentReview({ name: "demo-plugin" });
+      await service.confirmComponentReview({
+        name: "demo-plugin",
+        expectedLockedSha: review.fromSha,
+        reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+      });
+      return review;
+    };
+    // The install recorded the script its preview named.
+    expect((await resolve()).source).toContain("name: 'run'");
+
+    // A changed script under the same name does not run until its review.
+    const installedScript = path.join(pluginsDir(), "demo-plugin", "workflows", "run.js");
+    await fsPromises.writeFile(installedScript, "export const meta = { name: 'other' };\n");
+    await expect(resolve()).rejects.toThrow("has not been reviewed on this install");
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
+    const review = await approveReview();
+    expect(review.changes).toEqual([
+      expect.objectContaining({
+        summary: "Workflow 'run.js' needs review",
+        before: "Changed since you reviewed it",
+        after: expect.stringContaining("name: 'other'"),
+        component: expect.objectContaining({ kind: "workflows", name: "run.js" }),
+      }),
+    ]);
+    expect((await resolve()).source).toContain("name: 'other'");
+
+    // A record from before #6629 has no workflow entries: one review, and no backfill.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent: Record<string, unknown> }>;
+    };
+    delete document.plugins[0].componentConsent.workflows;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    await expect(resolve()).rejects.toThrow("has not been reviewed on this install");
+    expect((await approveReview()).changes[0]?.before).toBe("Not reviewed on this install");
+    expect((await resolve()).source).toContain("name: 'other'");
+  });
+
+  test("an update review lists a changed workflow script, and confirming records it (#6629)", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"), { recursive: true });
+    const script = path.join(remoteDir, "workflows", "run.js");
+    await fsPromises.writeFile(script, "export const meta = { name: 'run' };\n");
+    await commitAll(remoteDir, "add a workflow");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await fsPromises.writeFile(script, "export const meta = { name: 'run' }; // changed\n");
+    await commitAll(remoteDir, "change the workflow");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const row = review.changes.find((change) => change.component?.kind === "workflows");
+    expect(row).toMatchObject({ summary: "changes workflow 'run.js'" });
+    assert(row?.component !== undefined, "the changed workflow row carries its component");
+    const updated = await service.update({
+      name: "demo-plugin",
+      consent: { fromSha: review.fromSha, toSha: review.toSha, reviewed: [row.component] },
+    });
+    expect(updated.componentConsent?.workflows).toEqual({ "run.js": row.component.fingerprint });
+    expect((await service.list())[0].reviewRequiredCount).toBe(0);
+  });
+
   test("an update records consent only for the changes the user reviewed (#6498)", async () => {
     const preview = await service.preview({ input: remoteDir });
     const installed = await service.install({
@@ -3225,7 +3309,7 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "v2.1 adds a skill, agent, workflow, and slash command");
     await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
-      /adds skill 'sneak'.*adds agent evil\.md.*adds workflow run\.js.*adds slash command \/pwn/s
+      /adds skill 'sneak'.*adds agent evil\.md.*adds workflow 'run\.js'.*adds slash command \/pwn/s
     );
     // Rejected updates leave the install untouched.
     expect(((await registry())[0] as { lockedSha: string }).lockedSha).toBe(installedSha);

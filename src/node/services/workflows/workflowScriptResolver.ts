@@ -19,6 +19,7 @@ import {
   getDefaultAgentSkillsRoots,
   readAgentSkill,
   type AgentSkillsRoots,
+  getPluginManagedHome,
 } from "@/node/services/agentSkills/agentSkillsService";
 import { readBuiltInSkillFile } from "@/node/services/agentSkills/builtInSkillDefinitions";
 import type {
@@ -257,7 +258,14 @@ export async function discoverWorkflowPlugins(input: {
   }
   await addContainers(roots.globalPluginRoots ?? [], "global");
 
-  const { plugins } = await discoverAgentPlugins(containers);
+  // The managed home names the registry, so managed plugins carry their consent records (#6629),
+  // as plugin skill discovery does.
+  const managedHome = getPluginManagedHome(roots);
+  const { plugins } = await discoverAgentPlugins(containers, {
+    ...(managedHome !== undefined
+      ? { managedHome: await localRuntime.resolvePath(managedHome) }
+      : {}),
+  });
 
   // Project plugin roots keep the repo-symlink posture: a committed
   // .xum/plugins/<name> symlink must not resolve outside the checkout.

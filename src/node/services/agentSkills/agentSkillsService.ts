@@ -327,7 +327,7 @@ async function buildPluginScanCandidates(args: {
 }
 
 /** Host Xum home that owns the plugin registry; see AgentSkillsRoots.pluginManagedHome. */
-function getPluginManagedHome(roots: AgentSkillsRoots): string | undefined {
+export function getPluginManagedHome(roots: AgentSkillsRoots): string | undefined {
   return roots.pluginManagedHome ?? (roots.globalRoot ? path.dirname(roots.globalRoot) : undefined);
 }
 
