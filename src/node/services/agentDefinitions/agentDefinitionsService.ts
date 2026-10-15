@@ -162,7 +162,7 @@ interface AgentDefinitionScanCandidate {
   /** Agent Plugins only: contributing plugin name for descriptor attribution. */
   pluginName?: string;
   /** Managed plugins only: the reviewed fingerprints (#6629). Unmanaged plugins have none. */
-  pluginConsent?: ComponentConsent;
+  pluginConsent?: ComponentConsent | undefined;
 }
 
 /**
@@ -223,7 +223,7 @@ async function buildPluginAgentScanCandidates(args: {
       runtime: localRuntime,
       pluginRoot: plugin.rootPath,
       pluginName: plugin.name,
-      ...(plugin.componentConsent !== undefined ? { pluginConsent: plugin.componentConsent } : {}),
+      pluginConsent: plugin.componentConsent,
     });
   }
 
@@ -349,28 +349,35 @@ function getAgentIdFromFilename(filename: string): AgentId | null {
   return idParsed.data;
 }
 
-/**
- * The consent gate of plugin agents (#6629): discovery and the definition read check the
- * frontmatter they parsed, so an agent changed after its review neither lists nor loads.
- */
-function isPluginAgentReviewed(
-  candidate: Pick<AgentDefinitionScanCandidate, "pluginConsent" | "pluginName">,
-  agentId: AgentId,
-  frontmatter: unknown
-): boolean {
-  if (isPluginAgentConsented(candidate.pluginConsent, { id: agentId, frontmatter })) return true;
-  log.warn(
-    `Skipping agent '${agentId}' of plugin '${candidate.pluginName ?? "?"}': it has not been reviewed on this install. Open Settings → Plugins and select Review on the plugin.`
-  );
-  return false;
-}
-
 /** Plugin agents parse with the Claude Code / Cursor format mapping (pluginAgentFormat.ts). */
 function parseSource(
   pluginRoot: string | undefined,
   agentId: AgentId
 ): { plugin?: { agentId: string } } {
   return pluginRoot != null ? { plugin: { agentId } } : {};
+}
+
+/**
+ * Parse one agent file. A managed plugin agent must also match its review (#6629): discovery and
+ * the definition read both parse through here, so an agent changed after its review neither lists
+ * nor loads. It throws like an invalid definition, which both callers skip.
+ */
+function parseAgentFile(
+  args: { content: string; byteSize: number; agentId: AgentId },
+  candidate: Pick<AgentDefinitionScanCandidate, "pluginRoot" | "pluginName" | "pluginConsent">
+) {
+  const parsed = parseAgentDefinitionMarkdown({
+    content: args.content,
+    byteSize: args.byteSize,
+    ...parseSource(candidate.pluginRoot, args.agentId),
+  });
+  const consentInput = { id: args.agentId, frontmatter: parsed.frontmatter };
+  if (!isPluginAgentConsented(candidate.pluginConsent, consentInput)) {
+    throw new Error(
+      `Agent '${args.agentId}' of plugin '${candidate.pluginName ?? "?"}' has not been reviewed on this install. Open Settings → Plugins and select Review on the plugin.`
+    );
+  }
+  return parsed;
 }
 
 async function readAgentDescriptorFromFile(
@@ -437,14 +444,10 @@ async function readAgentDescriptorFromFile(
   }
 
   try {
-    const parsed = parseAgentDefinitionMarkdown({
-      content,
-      byteSize,
-      ...parseSource(pluginRoot, agentId),
-    });
-    if (!isPluginAgentReviewed({ pluginConsent, pluginName }, agentId, parsed.frontmatter)) {
-      return null;
-    }
+    const parsed = parseAgentFile(
+      { content, byteSize, agentId },
+      { pluginRoot, pluginName, pluginConsent }
+    );
 
     const { selectable } = resolveAgentVisibility(parsed.frontmatter.ui);
 
@@ -787,12 +790,7 @@ async function loadAgentDefinition(
         content = await readFileString(candidate.runtime, filePath, abortSignal);
         byteSize = stat.size;
       }
-      const parsed = parseAgentDefinitionMarkdown({
-        content,
-        byteSize,
-        ...parseSource(candidate.pluginRoot, agentId),
-      });
-      if (!isPluginAgentReviewed(candidate, agentId, parsed.frontmatter)) continue;
+      const parsed = parseAgentFile({ content, byteSize, agentId }, candidate);
 
       const pkg: AgentDefinitionPackage = {
         id: agentId,

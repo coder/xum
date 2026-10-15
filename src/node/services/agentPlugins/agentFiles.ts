@@ -1,3 +1,4 @@
+import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
@@ -43,40 +44,52 @@ export async function listPluginAgentFiles(dir: string | undefined): Promise<Plu
   // capability surface must not fingerprint a definition that never loads.
   const seenAgentIds = new Set<string>();
   for (const entry of entries) {
-    const agentIdParse = AgentIdSchema.safeParse(path.parse(entry.name).name.trim().toLowerCase());
-    if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".md") || !agentIdParse.success) {
+    const agentId = agentIdOfEntry(entry);
+    if (agentId === null || seenAgentIds.has(agentId)) {
       continue;
     }
-    if (seenAgentIds.has(agentIdParse.data)) {
-      continue;
-    }
-    let frontmatter: unknown;
-    try {
-      const filePath = path.join(dir, entry.name);
-      const stat = await fsPromises.stat(filePath);
-      // Size-check BEFORE reading (mirroring runtime discovery): the parse
-      // below applies the same cap, but only after the whole file has been
-      // read and UTF-8-decoded — an untrusted repo pouring its checkout
-      // quota into one agents/*.md could stall the main process first.
-      if (stat.size > MAX_FILE_SIZE) {
-        continue;
-      }
-      const content = await fsPromises.readFile(filePath, "utf8");
-      // Throws on malformed frontmatter or oversized content — exactly the
-      // definitions runtime discovery would skip.
-      frontmatter = parseAgentDefinitionMarkdown({
-        content,
-        byteSize: stat.size,
-        plugin: { agentId: agentIdParse.data },
-      }).frontmatter;
-    } catch {
+    const frontmatter = await readAgentFrontmatter(path.join(dir, entry.name), agentId);
+    if (frontmatter === undefined) {
       continue;
     }
     // Seen only AFTER a successful parse, mirroring runtime dedupe: when
     // the enumeration-order winner is malformed (skipped above), the next
     // same-ID file is the one that actually loads.
-    seenAgentIds.add(agentIdParse.data);
-    agents.push({ name: entry.name, id: agentIdParse.data, frontmatter });
+    seenAgentIds.add(agentId);
+    agents.push({ name: entry.name, id: agentId, frontmatter });
   }
   return agents.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** The agent ID of a directory entry that can load: a regular `.md` file with a valid ID stem. */
+function agentIdOfEntry(entry: Dirent): string | null {
+  const agentIdParse = AgentIdSchema.safeParse(path.parse(entry.name).name.trim().toLowerCase());
+  if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".md") || !agentIdParse.success) {
+    return null;
+  }
+  return agentIdParse.data;
+}
+
+/** The parsed frontmatter of one agent file, or undefined when the runtime would skip it. */
+async function readAgentFrontmatter(filePath: string, agentId: string): Promise<unknown> {
+  try {
+    const stat = await fsPromises.stat(filePath);
+    // Size-check BEFORE reading (mirroring runtime discovery): the parse
+    // below applies the same cap, but only after the whole file has been
+    // read and UTF-8-decoded — an untrusted repo pouring its checkout
+    // quota into one agents/*.md could stall the main process first.
+    if (stat.size > MAX_FILE_SIZE) {
+      return undefined;
+    }
+    const content = await fsPromises.readFile(filePath, "utf8");
+    // Throws on malformed frontmatter or oversized content — exactly the
+    // definitions runtime discovery would skip.
+    return parseAgentDefinitionMarkdown({
+      content,
+      byteSize: stat.size,
+      plugin: { agentId },
+    }).frontmatter;
+  } catch {
+    return undefined;
+  }
 }
