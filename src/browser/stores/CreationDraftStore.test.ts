@@ -57,9 +57,13 @@ async function createHarness(
     loseUpdateReplies: 0,
     readError: null as Error | null,
     readGate: Promise.resolve(),
+    listGate: Promise.resolve(),
   };
   const drafts = {
-    listCreation: () => service.list(),
+    listCreation: async () => {
+      await control.listGate;
+      return service.list();
+    },
     getCreation: async ({ scope }: { scope: CreationDraftScope }) => {
       await control.readGate;
       if (control.readError) throw control.readError;
@@ -225,6 +229,42 @@ describe("CreationDraftStore", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(hanging.getView(id).load.status).toBe("loadFailed");
+  });
+
+  test("a list that lands after its timeout keeps a blank draft being typed into", async () => {
+    using tempDir = new TestTempDir("creation-store-late-list");
+    const harness = await createHarness(tempDir);
+    const { service, control } = harness;
+    await service.update({
+      scope: { kind: "creation", draftId: "older" },
+      projectPath: PROJECT_A,
+      text: "older",
+    });
+    let releaseList: () => void = () => undefined;
+    control.listGate = new Promise<void>((resolve) => {
+      releaseList = resolve;
+    });
+    // bun-types lacks advanceTimersByTime; bun implements it.
+    const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
+    jest.useFakeTimers();
+    const store = new CreationDraftStore();
+    store.setClient(harness.newClient());
+    fakeTimers.advanceTimersByTime(DRAFT_STORE_READY_TIMEOUT_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getListState().status).toBe("ready");
+    jest.useRealTimers();
+
+    const blank = store.draftIdForProject(PROJECT_A);
+    store.open(blank, PROJECT_A);
+    await waitFor(() => store.getView(blank).load.status === "ready");
+    control.updateGate = new Promise(() => undefined);
+    store.update(blank, { text: "typing" });
+    releaseList();
+    await waitFor(() =>
+      (store.getDraftsByProject()[PROJECT_A] ?? []).some((draft) => draft.draftId === "older")
+    );
+    expect(store.draftIdForProject(PROJECT_A)).toBe(blank);
   });
 
   test("an absent draft opens blank and its first edit lists it", async () => {

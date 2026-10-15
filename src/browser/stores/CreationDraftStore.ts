@@ -272,9 +272,10 @@ export class CreationDraftStore {
       const list = await client.drafts.listCreation();
       if (this.listedClient !== client) return;
       this.summaries = new Map(list.drafts.map((summary) => [summary.draftId, summary]));
-      // A local copy is newer than the backend's row.
+      // A local copy is newer than the backend's row, and a first save still running (the list
+      // can land after its timeout) has no row yet.
       for (const [id, entry] of this.entries) {
-        if (entry.draft && entry.persisted)
+        if (entry.draft && (entry.persisted || entry.view.unsaved))
           this.summaries.set(id, summarizeCreationDraft(entry.draft));
       }
       this.listState = { status: "ready" };
