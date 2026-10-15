@@ -123,7 +123,7 @@ describe("MarkdownCore math", () => {
     "Single-dollar $x$ stays text.",
     "\\(x\\) and \\[x\\] stay text.",
     "```ts\nconst mathResult = 1;\n```",
-  ])("does not load KaTeX for %p", (content) => {
+  ])("does not treat %p as math", (content) => {
     expect(markdownMayContainMath(content)).toBe(false);
   });
 });
