@@ -65,6 +65,9 @@ describe("static markdown subset", () => {
     ["a new bullet marker", "- a\n* b"],
     ["a new ordered delimiter", "1. a\n2) b"],
     ["a tab after a list marker", "-\titem"],
+    ["a spaced thematic break", "a\n\n-- --"],
+    ["an unclosed fence", "```ts\nx\n"],
+    ["a no-break-space line", "\u00a0\nb"],
   ])("no view for %s", (_name, text) => {
     expect(renderStatic(document, text, false)).toBeNull();
   });
@@ -74,6 +77,10 @@ describe("static markdown subset", () => {
     root.append(renderStatic(document, "one\u2028\u2028- two\n\n```ts\nx\n   ```", false)!);
     expect([...root.children].map((c) => c.tagName)).toEqual(["P", "UL", "DIV"]);
     expect(root.querySelectorAll(".code-line").length).toBe(1);
+    // normalizeMarkdown collapses 3+ newlines, inside fences too: a, one empty row, b.
+    const fence = document.createElement("div");
+    fence.append(renderStatic(document, "```ts\na\n\n\nb\n```", false)!);
+    expect(fence.querySelectorAll(".code-line").length).toBe(3);
   });
 
   test("attacker text stays text, in prose and in code", () => {

@@ -15,7 +15,7 @@
  */
 export const UNSUPPORTED_MARKDOWN = {
   block: {
-    setextUnderline: /^(=+|-+)[ \t]*$/, // also a `---` thematic break
+    setextUnderline: /^(=+|(-[ \t]*)+)[ \t]*$/, // also a `---` or `- - -` thematic break
     emptyListItem: /^([-*+]|\d{1,9}[.)])[ \t]*$/,
     indent: /^[ \t]/, // indented code, nested lists, list continuations
     hardBreak: / {2,}$/,
@@ -105,14 +105,17 @@ export function renderMarkdownJs(rules: typeof UNSUPPORTED_MARKDOWN): string {
     return wrapper;
   };
   // The live renderer (normalizeMarkdown) also breaks lines at U+2028, U+2029 and U+0085.
-  const lines = text.replace(/\\r\\n?|[\\u2028\\u2029\\u0085]/g, "\\n").split("\\n");
+  // ...and collapses 3+ newlines to 2, also inside fences.
+  const lines = text.replace(/\\r\\n?|[\\u2028\\u2029\\u0085]/g, "\\n").replace(/\\n{3,}/g, "\\n\\n").split("\\n");
+  // Markdown whitespace is only space and tab: NBSP and the like must reach the allow list.
+  const blank = (l) => /^[ \\t]*$/.test(l), trimEnd = (l) => l.replace(/[ \\t]+$/, "");
   const out = doc.createDocumentFragment();
   let list = null, blankAfterItem = false;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (!line.trim()) { blankAfterItem = list !== null; continue; }
+    if (blank(line)) { blankAfterItem = list !== null; continue; }
     const fence = FENCE.exec(line);
-    const language = fence ? fence[2].trim() : "";
+    const language = fence ? trimEnd(fence[2].replace(/^[ \\t]+/, "")) : "";
     if (fence && /^[\\w+-]+$/.test(language)) {
       if (FENCE_LANGUAGE.test(language)) return null;
       // A closing fence: up to 3 spaces, the same character, at least as long, nothing else.
@@ -122,6 +125,7 @@ export function renderMarkdownJs(rules: typeof UNSUPPORTED_MARKDOWN): string {
       };
       const code = [];
       for (i++; i < lines.length && !closes(lines[i]); i++) code.push(lines[i]);
+      if (i === lines.length) return null; // unclosed: the live view drops a trailing empty row
       if (code.length === 0) return null;
       out.append(codeBlock(code, language));
       list = null;
@@ -141,17 +145,17 @@ export function renderMarkdownJs(rules: typeof UNSUPPORTED_MARKDOWN): string {
       }
       const item = el("li", { class: "py-1 [&>p]:inline", "data-streamdown": "list-item" });
       const content = line.slice((ol || ul)[0].length);
-      if (nested(content) || !inline(item, content.trimEnd())) return null;
+      if (nested(content) || !inline(item, trimEnd(content))) return null;
       list.node.append(item);
       blankAfterItem = false;
       continue;
     }
     if (list && !blankAfterItem) return null; // a lazy continuation line of a list item
     list = null;
-    const para = [line.trimEnd()];
-    while (i + 1 < lines.length && lines[i + 1].trim() && !FENCE.test(lines[i + 1]) && !OL.test(lines[i + 1]) && !UL.test(lines[i + 1])) {
+    const para = [trimEnd(line)];
+    while (i + 1 < lines.length && !blank(lines[i + 1]) && !FENCE.test(lines[i + 1]) && !OL.test(lines[i + 1]) && !UL.test(lines[i + 1])) {
       if (BLOCK.some((re) => re.test(lines[i + 1]))) return null;
-      para.push(lines[++i].trimEnd());
+      para.push(trimEnd(lines[++i]));
     }
     const p = el("p", {});
     if (!inline(p, para.join("\\n"))) return null;

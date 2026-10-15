@@ -33,6 +33,7 @@ const SAMPLES = [
   "Two cases cover it:\n\n1. `subtract(5, 3)` returns `2`.\n2. `subtract(0, 4)` returns `-4` (negative results).\n\nI can write them.",
   "First line\nsecond line\n\n- one\n- two\n\n```py\nx = 1\n\n```\n\nsnake_case and a_b stay text.",
   "```json\n{}\n```",
+  "```ts\na\n\n\nb\n```",
 ];
 
 describe("static markdown parity with the live renderer", () => {
