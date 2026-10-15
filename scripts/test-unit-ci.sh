@@ -87,9 +87,6 @@ isolated_unit_tests=(
   # (document/window set to undefined, a replaced baseline window), which would
   # perturb later suites in a shared process.
   ./tests/ui/domIsolation.test.ts
-  # Spawns a bun child that forces the Bun 1.3.12 test.each GC window (#6020); bun-only, so
-  # Jest skips it.
-  ./tests/bunEachTableGc.test.ts
 )
 # Strip the marker so every later use of isolated_unit_tests sees plain paths, and
 # record it per index, so the coverage choice cannot drift from the list.
