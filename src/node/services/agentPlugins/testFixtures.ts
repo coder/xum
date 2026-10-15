@@ -15,6 +15,7 @@ import {
   skillConsentFingerprint,
   workflowConsentFingerprint,
   agentConsentFingerprint,
+  slashCommandConsentFingerprint,
   type ComponentConsent,
 } from "./componentConsent";
 import { discoverAgentPluginAt, type AgentPluginScope } from "./discovery";
@@ -65,7 +66,13 @@ export async function reviewedComponentConsent(args: {
       `reviewedComponentConsent: not a plugin: ${diagnostics.map((d) => d.message).join("; ")}`
     );
   }
-  const consent: ComponentConsent = { skills: {}, mcpServers: {}, workflows: {}, agents: {} };
+  const consent: ComponentConsent = {
+    skills: {},
+    mcpServers: {},
+    workflows: {},
+    agents: {},
+    slashCommands: {},
+  };
   for (const skillsDir of plugin.skillsDirs ?? []) {
     for (const dirName of await fs.readdir(skillsDir)) {
       const directoryName = SkillNameSchema.safeParse(dirName);
@@ -112,6 +119,9 @@ export async function reviewedComponentConsent(args: {
   // Agents (#6629), listed and parsed the way the install review does.
   for (const agent of await listPluginAgentFiles(plugin.agentsDir)) {
     consent.agents[agent.id] = agentConsentFingerprint(agent);
+  }
+  for (const command of plugin.manifest.contributes?.slashCommands ?? []) {
+    consent.slashCommands[command.name] = slashCommandConsentFingerprint(command);
   }
   return consent;
 }

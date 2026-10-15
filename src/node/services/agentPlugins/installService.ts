@@ -89,6 +89,8 @@ import {
   isImportedComponent,
   agentConsentDetail,
   agentConsentFingerprint,
+  slashCommandConsentDetail,
+  slashCommandConsentFingerprint,
   workflowConsentDetail,
   workflowConsentFingerprint,
   serverConsentDetail,
@@ -356,6 +358,7 @@ function unreviewedRows(
     servers: Map<string, SurfaceServer>;
     workflows: Map<string, SurfaceWhole>;
     agents: Map<string, SurfaceWhole>;
+    slashCommands: Map<string, SurfaceWhole>;
   }
 ): AgentPluginCapabilityChange[] {
   return [
@@ -367,6 +370,9 @@ function unreviewedRows(
       unreviewedRow(entry, "workflows", name, item)
     ),
     ...[...surface.agents].flatMap(([name, item]) => unreviewedRow(entry, "agents", name, item)),
+    ...[...surface.slashCommands].flatMap(([name, item]) =>
+      unreviewedRow(entry, "slashCommands", name, item)
+    ),
   ];
 }
 
@@ -375,6 +381,7 @@ const COMPONENT_LABELS: Record<keyof ComponentConsent, string> = {
   mcpServers: "MCP server",
   workflows: "Workflow",
   agents: "Agent",
+  slashCommands: "Slash command",
 };
 
 function reviewedBefore(
@@ -412,7 +419,7 @@ function unreviewedRow(
  * update records it. Removals apply without one.
  */
 function wholeComponentChanges(
-  kind: "workflows" | "agents",
+  kind: "workflows" | "agents" | "slashCommands",
   staged: ReadonlyMap<string, SurfaceWhole>,
   /** The installed tree's components of this kind; absent when the tree is missing or invalid. */
   current: ReadonlyMap<string, SurfaceWhole> | undefined
@@ -873,6 +880,20 @@ interface SurfaceSkill {
   display: string;
   /** Every fingerprinted field as text, built on demand for a review row (see reviewText). */
   consentDetail: () => string;
+}
+
+/** The consent views of a plugin's slash commands, by name (#6629). */
+function slashCommandSurface(plugin: AgentPluginInfo): Map<string, SurfaceWhole> {
+  return new Map(
+    (plugin.manifest.contributes?.slashCommands ?? []).map((command) => [
+      command.name,
+      {
+        consentFingerprint: slashCommandConsentFingerprint(command),
+        display: `Slash command /${command.name}`,
+        consentDetail: () => slashCommandConsentDetail(command),
+      },
+    ])
+  );
 }
 
 /** The consent view of one plugin agent (#6629). */
@@ -2222,7 +2243,8 @@ export class AgentPluginInstallService {
     agents: Map<string, SurfaceWhole>;
     /** file → consent view (#6629): any byte change of a script is a change. */
     workflows: Map<string, SurfaceWhole>;
-    components: Set<string>;
+    /** name → consent view (#6629): the expansion is what the command inserts. */
+    slashCommands: Map<string, SurfaceWhole>;
   }> {
     const hook = this.collectHook(plugin);
     const readSecret = createSecretReader();
@@ -2243,11 +2265,6 @@ export class AgentPluginInstallService {
     const workflows = new Map(
       (await this.collectWorkflowScripts(plugin, warnings)).map((w) => [w.file, w] as const)
     );
-    const components = new Set<string>([
-      ...(plugin.manifest.contributes?.slashCommands ?? []).map(
-        (command) => `slash command /${command.name}`
-      ),
-    ]);
     const servers = new Map<string, SurfaceServer>();
     if (plugin.mcpConfigPath !== undefined) {
       const { servers: infos, diagnostics } = await loadPluginMcpServers(plugin, {
@@ -2283,7 +2300,7 @@ export class AgentPluginInstallService {
         });
       }
     }
-    return { hook, servers, skills, agents, workflows, components };
+    return { hook, servers, skills, agents, workflows, slashCommands: slashCommandSurface(plugin) };
   }
 
   /**
@@ -2442,12 +2459,9 @@ export class AgentPluginInstallService {
     // gated exactly like an addition.
     changes.push(...wholeComponentChanges("agents", staged.agents, current?.agents));
     changes.push(...wholeComponentChanges("workflows", staged.workflows, current?.workflows));
-    // Consent covered a specific component set; additions need a new preview.
-    for (const component of staged.components) {
-      if (!(current?.components.has(component) ?? false)) {
-        changes.push({ summary: `adds ${component}` });
-      }
-    }
+    changes.push(
+      ...wholeComponentChanges("slashCommands", staged.slashCommands, current?.slashCommands)
+    );
     assertReviewFits(changes);
     return changes;
   }
@@ -3676,6 +3690,9 @@ export class AgentPluginInstallService {
             agent.id,
             agentConsentFingerprint(agent),
           ])
+        ),
+        slashCommands: Object.fromEntries(
+          [...slashCommandSurface(plugin)].map(([name, item]) => [name, item.consentFingerprint])
         ),
       } satisfies ComponentConsent,
     };

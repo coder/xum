@@ -1,6 +1,6 @@
 /**
  * Component consent fingerprints (#6498, #6629). A managed plugin's skill, MCP server, workflow
- * script or agent is bound to the fingerprint the user reviewed, not to its name: when a newer Xum parses
+ * script, agent or slash command is bound to the fingerprint the user reviewed, not to its name: when a newer Xum parses
  * more of an installed package (a Codex dialect field, an extra skills root), the component's
  * fingerprint changes and it needs a new review instead of loading under an approved name.
  *
@@ -266,6 +266,36 @@ export function agentConsentDetail(args: AgentConsentInput): string {
   return stableStringify(agentConsentSubject(args));
 }
 
+interface SlashCommandConsentInput {
+  name: string;
+  description?: string;
+  /** The full text the command inserts on use. */
+  expansion: string;
+}
+
+/** The fingerprinted slash command fields (#6629): the whole parsed contribution. */
+function slashCommandConsentSubject(args: SlashCommandConsentInput): SlashCommandConsentInput {
+  return {
+    name: args.name,
+    ...(args.description !== undefined ? { description: args.description } : {}),
+    expansion: args.expansion,
+  };
+}
+
+/** Fingerprint of one plugin slash command: its name, description and expansion. */
+export function slashCommandConsentFingerprint(args: SlashCommandConsentInput): string {
+  return digest({
+    scheme: CONSENT_SCHEME,
+    kind: "slashCommand",
+    ...slashCommandConsentSubject(args),
+  });
+}
+
+/** The reviewed slash command fields as text. */
+export function slashCommandConsentDetail(args: SlashCommandConsentInput): string {
+  return stableStringify(slashCommandConsentSubject(args));
+}
+
 /** Reviewed fingerprints of one install, by component name (registry `componentConsent`). */
 export interface ComponentConsent {
   skills: Record<string, string>;
@@ -274,6 +304,8 @@ export interface ComponentConsent {
   workflows: Record<string, string>;
   /** Agents by ID (#6629). Absent in records an older build wrote: none reviewed. */
   agents: Record<string, string>;
+  /** Slash commands by name (#6629). Absent in records an older build wrote: none reviewed. */
+  slashCommands: Record<string, string>;
 }
 
 /** Every consent kind. A kind the component picker does not select is reviewed all-or-nothing. */
@@ -282,11 +314,12 @@ export const CONSENT_KINDS = [
   "mcpServers",
   "workflows",
   "agents",
+  "slashCommands",
 ] as const satisfies ReadonlyArray<keyof ComponentConsent>;
 
 /** The consent of an install without records (every install from before #6498): nothing reviewed. */
 export function noComponentConsent(): ComponentConsent {
-  return { skills: {}, mcpServers: {}, workflows: {}, agents: {} };
+  return { skills: {}, mcpServers: {}, workflows: {}, agents: {}, slashCommands: {} };
 }
 
 /** True only when the user reviewed exactly this fingerprint. No record (every older install) means no. */
@@ -346,6 +379,7 @@ export function consentForSelection(args: {
     mcpServers: records("mcpServers"),
     workflows: unpickedRecords(args.shown, args.previous, "workflows"),
     agents: unpickedRecords(args.shown, args.previous, "agents"),
+    slashCommands: unpickedRecords(args.shown, args.previous, "slashCommands"),
   };
 }
 
@@ -370,6 +404,7 @@ function copyConsent(consent: ComponentConsent | undefined): ComponentConsent {
     mcpServers: { ...consent?.mcpServers },
     workflows: { ...consent?.workflows },
     agents: { ...consent?.agents },
+    slashCommands: { ...consent?.slashCommands },
   };
 }
 
@@ -478,4 +513,17 @@ export function isPluginAgentConsented(
 ): boolean {
   if (consent === undefined) return true;
   return getOwn(consent.agents, args.id) === agentConsentFingerprint(args);
+}
+
+/**
+ * The one load-time slash command predicate (#6629): the command registry calls it with the
+ * contribution it is about to offer, so a command changed after its review is not offered.
+ * Unmanaged plugins have no records and always pass.
+ */
+export function isPluginSlashCommandConsented(
+  consent: ComponentConsent | undefined,
+  args: SlashCommandConsentInput
+): boolean {
+  if (consent === undefined) return true;
+  return getOwn(consent.slashCommands, args.name) === slashCommandConsentFingerprint(args);
 }

@@ -478,6 +478,7 @@ describe("agent_skill_list", () => {
         mcpServers: {},
         workflows: {},
         agents: {},
+        slashCommands: {},
       });
       expect(await list()).toEqual({ shared: "fallback", free: "unmanaged" });
 

@@ -1656,6 +1656,7 @@ describe("agentSkillsService agent plugins", () => {
       mcpServers: {},
       workflows: {},
       agents: {},
+      slashCommands: {},
     });
     expect(await state()).toEqual(unreviewed);
 
