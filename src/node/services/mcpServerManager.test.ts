@@ -2137,12 +2137,12 @@ describe("MCPServerManager", () => {
   });
 
   test("settings app opens: an older open shares a newer open's failed write and fails too", async () => {
+    type ActionResult = { content: Array<{ type: "text"; text: string }> };
     using tmp = new DisposableTempDir("mcp-settings-apps-race");
     const store = new McpAppResultStore((id) => path.join(tmp.path, id));
     manager.setMcpApps({ isEnabled: () => true, store });
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-apps-race") });
-    const calls: Array<PromiseWithResolvers<{ content: Array<{ type: "text"; text: string }> }>> =
-      [];
+    const calls: Array<ReturnType<typeof Promise.withResolvers<ActionResult>>> = [];
     servers.serve("settings-apps-race", {
       tools: { draw: testTool() },
       apps: {
@@ -2164,7 +2164,7 @@ describe("MCPServerManager", () => {
           }),
         settingsToolAction: () => ({ title: "Payment method", readOnly: false, opensApp: true }),
         callSettingsActionTool: () => {
-          const call = Promise.withResolvers<{ content: Array<{ type: "text"; text: string }> }>();
+          const call = Promise.withResolvers<ActionResult>();
           calls.push(call);
           return call.promise;
         },
