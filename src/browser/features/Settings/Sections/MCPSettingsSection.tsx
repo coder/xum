@@ -665,8 +665,9 @@ function ownScopeTickOf(
   ticks: InsufficientScopeTicks | undefined,
   status: MCPOAuthAuthStatus | null
 ): number | undefined {
-  if (ticks === undefined || status === null) return undefined;
-  return ticks[status.serverUrl];
+  const key = status?.serverUrl;
+  if (ticks === undefined || key === undefined) return undefined;
+  return ticks[key];
 }
 
 const RemoteMCPOAuthSection: React.FC<{
