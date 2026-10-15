@@ -243,6 +243,9 @@ describe("readOpenAIExtension", () => {
       "\u{1f3f4}\u{e0067}\u{e0062}\u{e0073}\u{e0063}\u{e007f}",
       // Malayalam ZWJ after a virama stays refused before a letter of another script.
       "\u0d28\u0d4d\u200dA",
+      // The old chillu exists only for five consonants: അ (U+0D05) has none.
+      "\u0d05\u0d4d\u200d",
+      "\u0d15\u0d4d\u200d ",
     ]) {
       expect(read({ ...validInterface, developerName: bad }).extension).toEqual({});
     }

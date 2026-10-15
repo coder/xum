@@ -165,7 +165,7 @@ const RGI_SUBDIVISION_FLAGS = new RegExp(
   `\u{1f3f4}(?:${["gbeng", "gbsct", "gbwls"].map(tags).join("|")})\u{e007f}`,
   "gu"
 );
-const VIRAMA_SCRIPTS: ReadonlyArray<[script: string, virama: string, after?: string]> = [
+const VIRAMA_SCRIPTS: ReadonlyArray<[script: string, virama: string]> = [
   ["Devanagari", "\\u094d"],
   ["Bengali", "\\u09cd"],
   ["Gurmukhi", "\\u0a4d"],
@@ -174,8 +174,7 @@ const VIRAMA_SCRIPTS: ReadonlyArray<[script: string, virama: string, after?: str
   ["Tamil", "\\u0bcd"],
   ["Telugu", "\\u0c4d"],
   ["Kannada", "\\u0ccd"],
-  // The old chillu: letter, virama, ZWJ before a non-letter or at the end of the text.
-  ["Malayalam", "\\u0d4d", "|[^\\p{L}\\p{M}]|$"],
+  ["Malayalam", "\\u0d4d"],
   ["Sinhala", "\\u0dca"],
 ];
 /**
@@ -187,8 +186,9 @@ const VIRAMA_SCRIPTS: ReadonlyArray<[script: string, virama: string, after?: str
  * - ZWNJ (U+200C) between letters of a shaping script (SHAPING_LETTER), with combining marks on
  *   either side (UTS #39 allows transparent characters there), as in Persian.
  * - ZWJ (U+200D) after a letter, its marks and a virama of an Indic script, before a letter of
- *   the same script (VIRAMA_SCRIPTS). In Malayalam also at a word end (before a non-letter or
- *   the end of the text): the pre-Unicode-5.1 chillu encoding (#6660).
+ *   the same script (VIRAMA_SCRIPTS).
+ * - ZWJ in the pre-Unicode-5.1 Malayalam chillu: one of the five consonants that have one (ṇa,
+ *   na, ra, la, ḷa), a virama, then ZWJ before a non-letter or the end of the text (#6660).
  * - Tag characters in one of the three RGI subdivision flags (England, Scotland, Wales): U+1F3F4,
  *   the tags of gbeng, gbsct or gbwls, then U+E007F. Fonts render only these, so any other
  *   payload shows as a plain black flag and could make two names look alike (#6653).
@@ -206,13 +206,14 @@ const ALLOWED_FORMAT_SEQUENCES: ReadonlyArray<[RegExp, string]> = [
     new RegExp(`(${SHAPING_LETTER}\\p{M}*)\\u200c(?=(?:${SHAPING_MARK})*${SHAPING_LETTER})`, "gu"),
     "$1",
   ],
-  ...VIRAMA_SCRIPTS.map(([script, virama, after = ""]): [RegExp, string] => [
+  ...VIRAMA_SCRIPTS.map(([script, virama]): [RegExp, string] => [
     new RegExp(
-      `((?=\\p{Script=${script}})\\p{L}(?:(?=\\p{Script=${script}})\\p{M})*?${virama})\\u200d(?=(?=\\p{Script=${script}})\\p{L}${after})`,
+      `((?=\\p{Script=${script}})\\p{L}(?:(?=\\p{Script=${script}})\\p{M})*?${virama})\\u200d(?=(?=\\p{Script=${script}})\\p{L})`,
       "gu"
     ),
     "$1",
   ]),
+  [/([\u0d23\u0d28\u0d30\u0d32\u0d33]\u0d4d)\u200d(?=[^\p{L}\p{M}]|$)/gu, "$1"],
   [RGI_SUBDIVISION_FLAGS, "\u{1f3f4}"],
   [/(\p{Extended_Pictographic})(?:\ufe0e|\ufe0f)/gu, "$1"],
   [/([0-9#*])\ufe0f(?=\u20e3)/gu, "$1"],
