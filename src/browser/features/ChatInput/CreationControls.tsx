@@ -703,6 +703,8 @@ function CreationControlsContent(props: CreationControlsProps) {
                 <input
                   id="workspace-name"
                   type="text"
+                  // The placeholder changes with auto-naming, so it cannot be the field's name.
+                  aria-label="Workspace name"
                   value={nameState.name}
                   onChange={handleNameChange}
                   onFocus={handleInputFocus}

@@ -55,6 +55,7 @@ import { getDraftStore } from "@/browser/stores/DraftStore";
 import {
   getCreationDraftStore,
   useCreationDraftListState,
+  useCreationDraftField,
   useCreationDraftsByProject,
 } from "@/browser/stores/CreationDraftStore";
 import type { CreationDraftSummary } from "@/common/orpc/schemas/drafts";
@@ -592,12 +593,17 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     ? (pendingDraftId ??
       (draftsReady ? getCreationDraftStore().draftIdForProject(pendingNewWorkspaceProject) : null))
     : null;
-  const pendingNewWorkspaceSubProjectPathRaw =
-    pendingNewWorkspaceProject && pendingNewWorkspaceDraftId
-      ? ((workspaceDraftsByProject[pendingNewWorkspaceProject] ?? []).find(
-          (draft) => draft.draftId === pendingNewWorkspaceDraftId
-        )?.subProjectPath ?? null)
-      : null;
+  // The open draft's own fields (the composer shows only a loaded draft): the sidebar list
+  // follows confirmed saves, so a sub-project picked just before Send would read the old one.
+  const pendingDraftProjectPath = useCreationDraftField(
+    pendingNewWorkspaceDraftId ?? "",
+    "projectPath"
+  );
+  const pendingDraftSubProjectPath = useCreationDraftField(
+    pendingNewWorkspaceDraftId ?? "",
+    "subProjectPath"
+  );
+  const pendingNewWorkspaceSubProjectPathRaw = pendingDraftSubProjectPath ?? null;
   // Drop the draft's stored sub-project path if the sub-project has since been
   // removed/unregistered. WorkspaceService.create rejects unknown sub-project
   // paths under the parent, so leaking a stale value would brick reopening a
@@ -611,6 +617,24 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       ? pendingNewWorkspaceSubProjectPathRaw
       : null;
   })();
+  // A route can name a draft that a project change moved away (browser Back): open it where it
+  // lives, so a Send never pairs this page's project with choices made for another one. Replace,
+  // so Back is not trapped bouncing between the two routes. CreationDraftGate waits meanwhile.
+  useEffect(() => {
+    if (
+      pendingNewWorkspaceDraftId &&
+      pendingDraftProjectPath &&
+      pendingNewWorkspaceProject &&
+      pendingDraftProjectPath !== pendingNewWorkspaceProject
+    ) {
+      navigateToProject(pendingDraftProjectPath, pendingNewWorkspaceDraftId, { replace: true });
+    }
+  }, [
+    pendingNewWorkspaceDraftId,
+    pendingDraftProjectPath,
+    pendingNewWorkspaceProject,
+    navigateToProject,
+  ]);
 
   // selectedWorkspace is derived from currentWorkspaceId in URL + workspaceMetadata
   const selectedWorkspace = useMemo(() => {

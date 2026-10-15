@@ -253,7 +253,11 @@ export function useDraftWorkspaceSettings(
   // gateway routing choices like "openrouter:openai/gpt-5".
   const defaultModel = normalizeSelectedModel(defaultModelPref).trim() || WORKSPACE_DEFAULTS.model;
 
-  const modelOverride = choices.model;
+  const projectModel = useUserPreferences(
+    (preferences) => preferences.ai?.projectDefaults?.[projectPath]?.model
+  );
+  // An unset draft model shows its project's default, like the model selector (scopedAiDefaults).
+  const modelOverride = choices.model ?? projectModel;
   const model = normalizeSelectedModel(
     typeof modelOverride === "string" && modelOverride.trim().length > 0
       ? modelOverride.trim()

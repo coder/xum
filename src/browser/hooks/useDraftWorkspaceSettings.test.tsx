@@ -132,6 +132,26 @@ describe("useDraftWorkspaceSettings", () => {
     });
   });
 
+  test("an unset draft model uses the project's model over the global default", async () => {
+    const projectPath = "/tmp/project";
+    getAppConfigStore().updateOptimistically({ defaultModel: "openai:gpt-5" });
+
+    const wrapper = createWrapper(projectPath, {
+      ai: { projectDefaults: { [projectPath]: { model: "anthropic:claude-sonnet-4-5" } } },
+    });
+
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      {
+        wrapper,
+      }
+    );
+
+    await waitFor(() => {
+      expect(result.current.settings.model).toBe("anthropic:claude-sonnet-4-5");
+    });
+  });
+
   test("preserves explicit gateway model in the draft", async () => {
     const projectPath = "/tmp/project";
     getCreationDraftStore().update(draftId, { ai: { model: "openrouter:openai/gpt-5" } });

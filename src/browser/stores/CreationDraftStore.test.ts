@@ -256,6 +256,21 @@ describe("CreationDraftStore", () => {
     expect(store.getView(id).draft).toBeNull();
   });
 
+  test("after a bare project page's draft is sent, the page opens a new blank draft", async () => {
+    using tempDir = new TestTempDir("creation-store-sent-blank");
+    const harness = await createHarness(tempDir);
+    const { store } = harness;
+    await waitFor(() => store.getListState().status === "ready");
+    const id = store.draftIdForProject(PROJECT_A);
+    store.open(id, PROJECT_A);
+    await waitFor(() => store.getView(id).load.status === "ready");
+    store.update(id, { text: "sent" });
+    await store.flush(id);
+
+    await store.delete(id);
+    expect(store.draftIdForProject(PROJECT_A)).not.toBe(id);
+  });
+
   test("imports old browser drafts before listing, and keeps the keys of a failed import", async () => {
     using tempDir = new TestTempDir("creation-store-legacy-import");
     const named = getDraftScopeId(PROJECT_A, "named");

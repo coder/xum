@@ -5,6 +5,8 @@
  */
 
 import "../dom";
+import * as fs from "fs/promises";
+import * as path from "path";
 import { fireEvent, waitFor } from "@testing-library/react";
 
 import { shouldRunIntegrationTests } from "../../testUtils";
@@ -204,6 +206,51 @@ describeIntegration("Creation draft project change", () => {
     } finally {
       await env.orpc.config.updateAgentAiDefaults({ agentAiDefaults: {} });
       await cleanupView(view, cleanupDom);
+    }
+  }, 60_000);
+
+  // The sidebar list follows confirmed saves; the composer, and so its Send, must not wait for one.
+  test("a sub-project pick applies before its save lands", async () => {
+    const env = getSharedEnv();
+    const parent = await createTempGitRepo();
+    const cleanupDom = setupTestDom();
+    let view: ReturnType<typeof renderApp> | null = null;
+    try {
+      await fs.mkdir(path.join(parent, "sub"));
+      const created = await env.orpc.projects.create({ projectPath: parent });
+      if (!created.success) throw new Error(created.error);
+      const parentPath = created.data.normalizedPath;
+      const sub = await env.orpc.projects.create({ projectPath: path.join(parentPath, "sub") });
+      if (!sub.success) throw new Error(sub.error);
+      expect(sub.data.projectConfig.parentProjectPath).toBe(parentPath);
+      view = renderApp({ apiClient: env.orpc });
+      await openProjectCreationView(view, parentPath);
+      const parentLabel = parentPath.split("/").pop() ?? parentPath;
+      await waitForScope(view.container, parentLabel);
+
+      const trigger = view.container.querySelector<HTMLElement>('[data-testid="project-selector"]');
+      if (!trigger) throw new Error("Project selector not found");
+      fireEvent.click(trigger);
+      const subLabel = `${parentLabel} / sub`;
+      const option = await waitFor(() => {
+        const candidate = Array.from(
+          document.querySelectorAll<HTMLElement>('[role="option"]')
+        ).find((element) => element.textContent?.trim() === subLabel);
+        if (!candidate) throw new Error(`Project option '${subLabel}' not found`);
+        return candidate;
+      });
+      fireEvent.click(option);
+      // No wait: a save is still debounced here.
+      expect(
+        view.container.querySelector('[data-testid="project-selector"]')?.textContent?.trim()
+      ).toBe(subLabel);
+    } finally {
+      if (view) await cleanupView(view, cleanupDom);
+      else cleanupDom();
+      // Later tests share this backend: leave no project whose directory is gone.
+      await env.orpc.projects.remove({ projectPath: path.join(parent, "sub"), force: true });
+      await env.orpc.projects.remove({ projectPath: parent, force: true });
+      await cleanupTempGitRepo(parent);
     }
   }, 60_000);
 

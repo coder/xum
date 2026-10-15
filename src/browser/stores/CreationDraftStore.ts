@@ -280,10 +280,11 @@ export class CreationDraftStore {
       this.listState = { status: "ready" };
       this.recomputeList();
     };
-    run().catch((error: unknown) => {
-      // No rows: a new draft still works, and the next connection lists again.
+    // Failed or slow: composers open without rows (a new draft still works). A slow list still
+    // lands in the background; a failed one is retried by the next connection.
+    withTimeout(run(), DRAFT_STORE_READY_TIMEOUT_MS).catch((error: unknown) => {
       console.error("Failed to load creation drafts:", error);
-      if (this.listedClient !== client) return;
+      if (this.listedClient !== client || this.listState.status !== "loading") return;
       this.listState = { status: "ready" };
       this.recomputeList();
     });
@@ -482,6 +483,8 @@ export class CreationDraftStore {
     const entry = this.entries.get(id);
     if (entry?.timer) clearTimeout(entry.timer);
     this.entries.delete(id);
+    // A bare project page that showed it opens a new blank draft, not the deleted id.
+    this.releaseBlankId(id);
     this.notify(id);
     this.summaries.delete(id);
     this.recomputeList();
@@ -561,6 +564,18 @@ export function useCreationDraft(id: string): CreationDraftView {
   return useSyncExternalStore(
     (listener) => s.subscribe(id, listener),
     () => s.getView(id)
+  );
+}
+
+/** Where a loaded draft lives (undefined while it loads); re-renders only when that changes. */
+export function useCreationDraftField<K extends "projectPath" | "subProjectPath">(
+  id: string,
+  key: K
+): CreationDraft[K] | undefined {
+  const s = getCreationDraftStore();
+  return useSyncExternalStore(
+    (listener) => s.subscribe(id, listener),
+    () => s.getView(id).draft?.[key]
   );
 }
 

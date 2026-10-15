@@ -314,8 +314,11 @@ export function useCreationWorkspace({
   const promoteWorkspaceDraft = workspaceContext?.promoteWorkspaceDraft;
   const deleteWorkspaceDraft = workspaceContext?.deleteWorkspaceDraft;
   const { currentWorkspaceId, currentProjectId, pendingDraftId } = useRouter();
+  // A bare project route shows a draft too (its newest, else a blank one), so the route's draft is
+  // the one WorkspaceContext resolved, not only an explicit ?draft= id.
+  const routeDraftId = workspaceContext?.pendingNewWorkspaceDraftId ?? pendingDraftId;
   const isMountedRef = useRef(true);
-  const latestRouteRef = useRef({ currentWorkspaceId, currentProjectId, pendingDraftId });
+  const latestRouteRef = useRef({ currentWorkspaceId, currentProjectId, routeDraftId });
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -325,7 +328,7 @@ export function useCreationWorkspace({
   }, []);
 
   // Keep router state fresh synchronously so auto-navigation checks don't lag behind route changes.
-  latestRouteRef.current = { currentWorkspaceId, currentProjectId, pendingDraftId };
+  latestRouteRef.current = { currentWorkspaceId, currentProjectId, routeDraftId };
   const { api } = useAPI();
   const liveApi = useLiveAPI();
   const { getProjectConfig, refreshProjects, loading: projectsLoading } = useProjectContext();
@@ -683,7 +686,7 @@ export function useCreationWorkspace({
             if (!isMountedRef.current) return false;
             const latestRoute = latestRouteRef.current;
             if (latestRoute.currentWorkspaceId) return false;
-            return latestRoute.pendingDraftId === draftId;
+            return latestRoute.routeDraftId === draftId;
           })();
 
         // Navigate before staging: stageAttachment waits for runtime init, which
