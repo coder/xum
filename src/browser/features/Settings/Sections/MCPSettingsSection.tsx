@@ -654,19 +654,19 @@ const InsufficientScopePrompt: React.FC<{ status: MCPOAuthAuthStatus | null }> =
   );
 };
 
-/** A recorded insufficient_scope prompt: its credential key and a counter that makes it new. */
-interface InsufficientScopeTick {
-  key: string;
-  n: number;
-}
+/** Recorded insufficient_scope prompts per credential key: a count that makes each one new. */
+type InsufficientScopeTicks = Readonly<Record<string, number>>;
 
-/** The tick's counter when it names this row's credential key, else undefined. */
+/**
+ * This row's own count. A prompt for another key leaves it unchanged, so that row does not
+ * read its status again.
+ */
 function ownScopeTickOf(
-  tick: InsufficientScopeTick | null | undefined,
+  ticks: InsufficientScopeTicks | undefined,
   status: MCPOAuthAuthStatus | null
 ): number | undefined {
-  if (tick == null || status?.serverUrl !== tick.key) return undefined;
-  return tick.n;
+  if (ticks === undefined || status === null) return undefined;
+  return ticks[status.serverUrl];
 }
 
 const RemoteMCPOAuthSection: React.FC<{
@@ -674,9 +674,9 @@ const RemoteMCPOAuthSection: React.FC<{
   transport: Exclude<MCPServerTransport, "stdio">;
   url: string;
   oauthRefreshNonce?: number;
-  /** The last recorded insufficient_scope prompt (#6739): this row re-reads it when it is its own. */
-  scopeTick?: InsufficientScopeTick | null;
-}> = ({ serverName, transport, url, oauthRefreshNonce, scopeTick }) => {
+  /** Recorded insufficient_scope prompts (#6739): this row re-reads on its own key's. */
+  scopeTicks?: InsufficientScopeTicks;
+}> = ({ serverName, transport, url, oauthRefreshNonce, scopeTicks }) => {
   const { api } = useAPI();
   const isDesktop = !!window.api;
 
@@ -712,7 +712,7 @@ const RemoteMCPOAuthSection: React.FC<{
 
   // getAuthStatus returns the credential key as `serverUrl`; a row that has not loaded yet reads
   // the prompt on its first load.
-  const ownScopeTick = ownScopeTickOf(scopeTick, authStatus);
+  const ownScopeTick = ownScopeTickOf(scopeTicks, authStatus);
   useEffect(() => {
     void refreshAuthStatus();
   }, [refreshAuthStatus, transport, url, oauthRefreshNonce, ownScopeTick]);
@@ -921,11 +921,13 @@ async function forEachInsufficientScope(
   }
 }
 
-/** The last recorded insufficient_scope prompt, as a tick that changes on every prompt. */
+/** The recorded insufficient_scope prompts, counted per credential key. */
 function useInsufficientScopeTick(api: ReturnType<typeof useAPI>["api"]) {
-  const [tick, setTick] = useState<InsufficientScopeTick | null>(null);
-  useInsufficientScopeTicks(api, (key) => setTick((last) => ({ key, n: (last?.n ?? 0) + 1 })));
-  return tick;
+  const [ticks, setTicks] = useState<InsufficientScopeTicks>({});
+  useInsufficientScopeTicks(api, (key) =>
+    setTicks((last) => ({ ...last, [key]: (last[key] ?? 0) + 1 }))
+  );
+  return ticks;
 }
 
 /** Calls onTick with the key each time the backend records an insufficient_scope prompt (#6739). */
@@ -987,7 +989,7 @@ export const MCPSettingsSection: React.FC = () => {
   // A refused tool call records a sign-in prompt in the backend only: re-read the mounted rows'
   // auth status when one does (#6739).
   // One tick per prompt, carrying its credential key: only that server's row re-reads its status.
-  const scopeTick = useInsufficientScopeTick(api);
+  const scopeTicks = useInsufficientScopeTick(api);
   const viewDomains = useMcpAppViewDomains();
 
   interface EditableServer {
@@ -1694,7 +1696,7 @@ export const MCPSettingsSection: React.FC = () => {
                           transport={remoteEntry.transport}
                           url={remoteEntry.url}
                           oauthRefreshNonce={mcpOauthRefreshNonce}
-                          scopeTick={scopeTick}
+                          scopeTicks={scopeTicks}
                         />
                       </div>
                     )}
