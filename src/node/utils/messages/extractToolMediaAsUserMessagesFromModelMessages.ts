@@ -254,7 +254,7 @@ interface ToolMediaPools {
   totalAttachments: number;
   reservedMediaParts: number;
   syntheticMediaParts: unknown[];
-  /** Media items tool results carry inline without the synthetic marker (MCP images). */
+  /** Media items tool results carry inline (see collectToolResultMedia). */
   inlineToolResultMedia: number;
   /** Evictable media and extractions in message order, oldest first (see planMediaCap). */
   order: Array<{ key: object; count: number; extraction: boolean }>;
@@ -291,35 +291,33 @@ function collectMessageMedia(part: unknown, pools: ToolMediaPools): void {
 }
 
 function collectToolResultMedia(part: ToolResultPart, pools: ToolMediaPools): void {
-  // Media an earlier step already inlined into a tool result (deferred
-  // server tool, see holdsDeferredProviderToolCall) stays where it is, so
-  // it reserves its share of the request-wide cap.
-  if (part.output.type === "content") {
-    pools.reservedMediaParts += part.output.value.filter(isSyntheticToolMediaPart).length;
-  }
   const extracted = extractAttachmentsFromToolOutput(part.output as unknown);
   if (extracted == null) {
-    // MCP images stay inside the tool result (mcpToModelOutput), unmarked: evictable
-    // like synthetic tool media, or a screenshot loop could pass the provider's limit.
-    const inlineMedia = unmarkedToolResultMedia(part.output);
+    // Media a tool result carries inline stays where it is: MCP images (mcpToModelOutput,
+    // unmarked) and media an earlier extraction inlined after a deferred server tool (marked,
+    // see holdsDeferredProviderToolCall). Both are evictable oldest-first like synthetic tool
+    // media, or a screenshot loop could pass the provider's limit, and a rebuild (which
+    // extracts that media again) and an in-turn step would drop different items.
+    const inlineMedia = inlineToolResultMedia(part.output);
     pools.inlineToolResultMedia += inlineMedia.length;
     addEvictableMedia(pools, inlineMedia);
     return;
+  }
+  // This part is extracted again, which leaves its inline media in place: it reserves its share.
+  if (part.output.type === "content") {
+    pools.reservedMediaParts += part.output.value.filter(isSyntheticToolMediaPart).length;
   }
   pools.extractionsByPart.set(part, extracted);
   pools.totalAttachments += extracted.attachments.length;
   pools.order.push({ key: part, count: extracted.attachments.length, extraction: true });
 }
 
-/** Media items a tool result carries inline without the synthetic marker (MCP images). */
-function unmarkedToolResultMedia(output: ToolResultOutput): object[] {
+/** Media items a tool result carries inline (see collectToolResultMedia). */
+function inlineToolResultMedia(output: ToolResultOutput): object[] {
   if (output.type !== "content") return [];
   return output.value.filter((item) => {
     const type = (item as { type?: unknown }).type;
-    return (
-      (type === "file" || type === "file-data" || type === "image-data") &&
-      !isSyntheticToolMediaPart(item)
-    );
+    return type === "file" || type === "file-data" || type === "image-data";
   });
 }
 

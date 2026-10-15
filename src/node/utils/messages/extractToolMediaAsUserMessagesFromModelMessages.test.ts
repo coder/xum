@@ -538,6 +538,49 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
       expect(await extractToolMediaAsUserMessagesFromModelMessages(rewritten)).toEqual(rewritten);
     });
 
+    it("evicts media kept inside a deferred tool result oldest-first at the cap", async () => {
+      const newer = Array.from(
+        { length: MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST },
+        (_, i): ModelMessage[] => [
+          {
+            role: "assistant",
+            content: [{ type: "tool-call", toolCallId: `new-${i}`, toolName: "t", input: {} }],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: `new-${i}`,
+                toolName: "t",
+                output: {
+                  type: "content",
+                  value: [{ type: "media", data: `JVBERi${i}AAA`, mediaType: "application/pdf" }],
+                },
+              } as unknown as ToolResultPart,
+            ],
+          },
+        ]
+      ).flat();
+      const shot = Buffer.from("shot").toString("base64");
+      // An in-turn step sees the deferred result already inlined; a rebuild extracts it again.
+      const inTurn = [
+        ...(await extractToolMediaAsUserMessagesFromModelMessages(stepMessages(false))),
+        ...newer,
+      ];
+      const rebuild = [...stepMessages(false), ...newer];
+
+      for (const messages of [inTurn, rebuild]) {
+        const serialized = JSON.stringify(
+          await extractToolMediaAsUserMessagesFromModelMessages(messages)
+        );
+        // Both drop the oldest item, the inlined screenshot, and keep every newer one.
+        expect(serialized).not.toContain(shot);
+        expect(serialized).toContain("JVBERi0AAA");
+        expect(serialized).toContain(createOmittedToolAttachmentText(1));
+      }
+    });
+
     it("still moves the media to a user message once the server tool has its result", async () => {
       const rewritten = await extractToolMediaAsUserMessagesFromModelMessages(stepMessages(true));
       expect(rewritten.map((message) => message.role)).toEqual([
