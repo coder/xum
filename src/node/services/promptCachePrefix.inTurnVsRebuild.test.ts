@@ -287,6 +287,7 @@ async function runTurn(
     volatileSystemSuffixLength: volatileTail.length,
     tools,
     modelString: MODEL_STRING,
+    routeProvider: "anthropic",
     providerForMessages: "anthropic",
     effectiveThinkingLevel: "high",
     effectiveAgentId: "exec",
@@ -319,6 +320,10 @@ async function runTurn(
     providerOptions: { anthropic: { thinking: { type: "adaptive" } } },
     historySequence,
     thinkingLevel: "high",
+    // TurnRequestBuilder puts the assembler's tail record on the turn's assistant row.
+    ...(payload.volatileSystemTail != null
+      ? { initialMetadata: { volatileSystemTail: payload.volatileSystemTail } }
+      : {}),
     toolSearchState,
     runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
     providedRuntimeTempDir: "",
@@ -360,8 +365,18 @@ async function expectNextTurnExtendsLastStep(params: {
   expectExtendsLastStep(firstTurnBodies[firstTurnBodies.length - 1], nextFirst, MONITOR_WAKE);
 }
 
+/**
+ * `body` without a trailing system row: a volatile-tail change goes after the trigger as a
+ * mid-conversation system row (mechanism 10), and the checks below look at the conversation.
+ */
+function withoutTrailingSystemRow(body: WireBody): WireBody {
+  const last = body.messages.at(-1) as { role?: unknown } | undefined;
+  return last?.role === "system" ? { ...body, messages: body.messages.slice(0, -1) } : body;
+}
+
 /** The contract for one turn boundary: `nextFirst` repeats `lastStep`, then sends `trigger`. */
-function expectExtendsLastStep(lastStep: WireBody, nextFirst: WireBody, trigger: string): void {
+function expectExtendsLastStep(lastStep: WireBody, sentFirst: WireBody, trigger: string): void {
+  const nextFirst = withoutTrailingSystemRow(sentFirst);
   expect(withoutCacheControl(nextFirst.system)).toEqual(withoutCacheControl(lastStep.system));
   expect(withoutCacheControl(nextFirst.tools)).toEqual(withoutCacheControl(lastStep.tools));
   // A request that dropped the new trigger would match the previous one exactly, so check it
@@ -673,7 +688,10 @@ describe("prompt-cache prefix: thinking-replay receipt", () => {
     stripTurn: Array<ScriptedStep | ScriptedError>;
     /** Thinking the strip turn's last step sent after the strip: the rebuild must keep it. */
     keptThinking: string;
-  }): Promise<{ receipt: MuxMessage["metadata"] }> {
+    /** Volatile system tail of each of the four turns (default: none). */
+    tails?: [string, string, string, string];
+  }): Promise<{ receipt: MuxMessage["metadata"]; stripBodies: WireBody[]; laterFirst: WireBody }> {
+    const tails = params.tails ?? ["", "", "", ""];
     const state = toolSearchState();
     const tools = toolsFor(state);
     const anthropic = createScriptedAnthropic();
@@ -682,11 +700,11 @@ describe("prompt-cache prefix: thinking-replay receipt", () => {
       anthropic,
       tools,
       [thinkThenCall("call-0", "bash"), thinkThenAnswer("0")],
-      "",
+      tails[0],
       state
     );
     await appendUser("Now the next part.");
-    const stripBodies = await runTurn(anthropic, tools, params.stripTurn, "", state);
+    const stripBodies = await runTurn(anthropic, tools, params.stripTurn, tails[1], state);
     const stripLast = stripBodies[stripBodies.length - 1];
     // The strip happened: the last step sent no earlier thinking, but kept the newer block.
     expect(sentThinking(stripLast)).toEqual([params.keptThinking]);
@@ -697,7 +715,7 @@ describe("prompt-cache prefix: thinking-replay receipt", () => {
       anthropic,
       tools,
       toolThenTextTurn("probe", "call-n"),
-      "",
+      tails[2],
       state
     );
     expectExtendsLastStep(stripLast, nextBodies[0], MONITOR_WAKE);
@@ -707,11 +725,11 @@ describe("prompt-cache prefix: thinking-replay receipt", () => {
       anthropic,
       tools,
       toolThenTextTurn("probe", "call-l"),
-      "",
+      tails[3],
       state
     );
     expectExtendsLastStep(nextBodies[nextBodies.length - 1], laterFirst, laterWake);
-    return { receipt };
+    return { receipt, stripBodies, laterFirst };
   }
 
   test("an in-turn tool-set change keeps the thinking sent after the strip", async () => {
@@ -726,6 +744,31 @@ describe("prompt-cache prefix: thinking-replay receipt", () => {
       keptThinking: "plan-call-2",
     });
     expect(receipt?.anthropicThinkingReplay).toBe("off");
+    expect(receipt?.anthropicThinkingReplayFromStep).toBe(1);
+  });
+
+  test("volatile-tail rows in the segment keep the receipt's point", async () => {
+    // Mechanism 10 rows are request messages, not parts of an assistant row, so they move no
+    // part or step index the receipt points at. The strip turn and the last turn each change
+    // the hot memories, so each sends a system row after its trigger.
+    const hot = (text: string) => `\n\n<hot_memories>\n${text}\n</hot_memories>`;
+    const { receipt, stripBodies, laterFirst } = await expectStripTurnKeepsPrefix({
+      stripTurn: [
+        thinkThenCall("call-1", "activate_send"),
+        thinkThenCall("call-2", "bash"),
+        thinkThenAnswer("1"),
+      ],
+      keptThinking: "plan-call-2",
+      tails: [hot("A"), hot("B"), hot("B"), hot("C")],
+    });
+    const systemRows = (body: WireBody) =>
+      body.messages.filter((message) => (message as { role?: unknown }).role === "system");
+    // The strip turn's row stays in place, before the steps, in its later requests.
+    const stripLast = stripBodies[stripBodies.length - 1];
+    expect(JSON.stringify(systemRows(stripLast))).toContain("B\\n</hot_memories>");
+    expect((stripLast.messages.at(-1) as { role?: unknown }).role).not.toBe("system");
+    expect(systemRows(laterFirst)).toHaveLength(2);
+    expect(JSON.stringify(laterFirst.messages.at(-1))).toContain("C\\n</hot_memories>");
     expect(receipt?.anthropicThinkingReplayFromStep).toBe(1);
   });
 
@@ -779,11 +822,7 @@ describe("prompt-cache prefix: volatile system tail", () => {
   // when the tail changes, but every message after the tail still misses, so a tail
   // change re-writes the whole conversation.
   test("a hot-memory change in the volatile tail costs only the tail", async () => {
-    await expectReproFailure(hotMemoryChangeKeepsHistoryCached, {
-      matcher: "toBe",
-      expected: "0",
-      received: "1",
-    });
+    await hotMemoryChangeKeepsHistoryCached();
   });
 });
 
@@ -806,10 +845,13 @@ async function hotMemoryChangeKeepsHistoryCached(): Promise<void> {
     "\n\n<hot_memories>\nB\n</hot_memories>"
   );
 
-  expect(sendsAfter(first, second, MONITOR_WAKE)).toBe(true);
+  // A fix may send the new tail as a system row after the trigger: check the conversation
+  // without it.
+  const conversation = withoutTrailingSystemRow(second);
+  expect(sendsAfter(first, conversation, MONITOR_WAKE)).toBe(true);
   // The first turn's answer must precede the trigger: a fix that rebuilt the history without
   // it would still keep the tail-only change below and pass the target assertion.
-  expect(endsWithAnswerThenTrigger(second)).toBe(true);
+  expect(endsWithAnswerThenTrigger(conversation)).toBe(true);
   // Each request must send its own hot memories: a fix that dropped the tail or kept "A"
   // would otherwise pass the prefix check below.
   expect(JSON.stringify(first)).toContain("<hot_memories>\\nA\\n</hot_memories>");

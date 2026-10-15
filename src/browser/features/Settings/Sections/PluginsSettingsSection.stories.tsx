@@ -1,10 +1,10 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, within } from "@storybook/test";
+import { userEvent, waitFor, within } from "@storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { PIXEL_DISABLED } from "@/browser/stories/meta";
 import { createMockORPCClient, type MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
@@ -15,6 +15,7 @@ import type {
 } from "@/common/orpc/schemas/agentPlugins";
 
 import { PluginsSettingsSection } from "./PluginsSettingsSection";
+import { publishPluginsSectionIntent } from "./pluginsSectionIntents";
 
 /** 1x1 PNG: the backend sends logos as data URLs, never paths. */
 const LOGO_DATA_URL =
@@ -897,5 +898,144 @@ export const ComponentReviewPhoneViewport: Story = {
     if (card.scrollWidth > card.clientWidth + 1) {
       throw new Error("Component review overflows its card at phone width");
     }
+  },
+};
+
+/** Records the reconnected client's calls, so the play can wait for its list refresh. */
+const reconnectCalls = { list: 0, preview: 0 };
+
+/**
+ * A palette intent that arrived before the section mounted, and a Reconnect button that swaps the
+ * API client the way APIProvider does on a WebSocket reconnect.
+ */
+const ReconnectingShell: FC<{ children: ReactNode }> = (props) => {
+  const [client, setClient] = useState<APIClient>(() => {
+    // Buffered: the section consumes it on mount (pluginsSectionIntents).
+    publishPluginsSectionIntent({ type: "review-components", name: MANAGED_ITEM.name });
+    return createMockORPCClient(componentReviewOptions());
+  });
+  const reconnect = () => {
+    const next = createMockORPCClient(componentReviewOptions());
+    const list = next.agentPlugins.list.bind(next.agentPlugins);
+    const preview = next.agentPlugins.previewComponentReview.bind(next.agentPlugins);
+    next.agentPlugins.list = (...args: Parameters<typeof list>) => {
+      reconnectCalls.list++;
+      return list(...args);
+    };
+    next.agentPlugins.previewComponentReview = (...args: Parameters<typeof preview>) => {
+      reconnectCalls.preview++;
+      return preview(...args);
+    };
+    setClient(next);
+  };
+  return (
+    <ThemeProvider>
+      <TooltipProvider>
+        <button type="button" onClick={reconnect}>
+          Reconnect
+        </button>
+        <APIProvider client={client}>{props.children}</APIProvider>
+      </TooltipProvider>
+    </ThemeProvider>
+  );
+};
+
+/**
+ * #6609: a palette "Review Plugin Components" intent opens its review once. After the user
+ * cancels it, an API reconnect must not reopen it.
+ */
+export const ComponentReviewIntentNotReplayedOnReconnect: Story = {
+  // Out of Pixel snapshots (snapshot budget). The play checks the behavior.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <ReconnectingShell>
+      <PluginsSettingsSection />
+    </ReconnectingShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    reconnectCalls.list = 0;
+    reconnectCalls.preview = 0;
+    await canvas.findByText(/Skill 'grilling' needs review/);
+    await userEvent.click(canvas.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => {
+      if (canvas.queryByText(/Skill 'grilling' needs review/) !== null) {
+        throw new Error("Cancel must close the review");
+      }
+    });
+
+    await userEvent.click(canvas.getByRole("button", { name: "Reconnect" }));
+    await waitFor(() => {
+      if (reconnectCalls.list === 0)
+        throw new Error("The reconnected client must refresh the list");
+    });
+    // The replay ran right after that refresh (one macrotask covers the promise chain).
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (reconnectCalls.preview !== 0) {
+      throw new Error("A reconnect must not replay the palette review intent");
+    }
+    if (canvas.queryByText(/Skill 'grilling' needs review/) !== null) {
+      throw new Error("A reconnect must not reopen the cancelled review");
+    }
+  },
+};
+
+/**
+ * The section mounts while Xum reconnects: `api` still holds the detached client, whose calls
+ * fail. A Connect button then provides the live client.
+ */
+const MountWhileReconnectingShell: FC<{ children: ReactNode }> = (props) => {
+  const [live, setLive] = useState<APIClient | null>(null);
+  const [stale] = useState<APIClient>(() => {
+    publishPluginsSectionIntent({ type: "review-components", name: MANAGED_ITEM.name });
+    const client = createMockORPCClient(componentReviewOptions());
+    const offline = () => Promise.reject(new Error("connection lost"));
+    client.agentPlugins.list = offline;
+    client.agentPlugins.previewComponentReview = offline;
+    return client;
+  });
+  return (
+    <ThemeProvider>
+      <TooltipProvider>
+        <button
+          type="button"
+          onClick={() => setLive(createMockORPCClient(componentReviewOptions()))}
+        >
+          Connect
+        </button>
+        {/* One provider for both states, so the section stays mounted across the reconnect. */}
+        <APIContext.Provider
+          value={{
+            ...(live !== null
+              ? { status: "connected", api: live }
+              : { status: "reconnecting", api: stale, attempt: 1 }),
+            error: null,
+            authenticate: () => undefined,
+            retry: () => undefined,
+          }}
+        >
+          {props.children}
+        </APIContext.Provider>
+      </TooltipProvider>
+    </ThemeProvider>
+  );
+};
+
+/**
+ * #6609 review: a palette intent that arrives while Xum reconnects waits for the live client.
+ * Consuming it on the detached client would lose it, because that client's calls fail.
+ */
+export const ComponentReviewIntentWaitsForLiveConnection: Story = {
+  // Out of Pixel snapshots (snapshot budget). The play checks the behavior.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <MountWhileReconnectingShell>
+      <PluginsSettingsSection />
+    </MountWhileReconnectingShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: "Connect" }));
+    await canvas.findByText(/Skill 'grilling' needs review/);
   },
 };

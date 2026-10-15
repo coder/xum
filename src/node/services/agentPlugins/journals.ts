@@ -163,10 +163,36 @@ export const PENDING_SIGN_OUTS_FILE_NAME = "plugin-sign-outs-pending.json";
 /** One stat. Fail-closed: a record that cannot be stat'ed counts as pending. */
 export async function containerHasPendingSignOuts(containerPath: string): Promise<boolean> {
   try {
-    await fsPromises.stat(path.join(path.dirname(containerPath), PENDING_SIGN_OUTS_FILE_NAME));
+    await fsPromises.stat(pendingSignOutsPath(containerPath));
     return true;
   } catch (error) {
     return !hasErrorCode(error, "ENOENT");
+  }
+}
+
+function pendingSignOutsPath(containerPath: string): string {
+  return path.join(path.dirname(containerPath), PENDING_SIGN_OUTS_FILE_NAME);
+}
+
+/**
+ * The record's state for a diagnostic (#6627). It reads the file, because a record that can be
+ * stat'ed but not read (a directory, missing read permission) still fails every sign-out pass.
+ */
+export async function pendingSignOutsRecordState(
+  containerPath: string
+): Promise<{ kind: "absent" } | { kind: "present" } | { kind: "unreadable"; code: string }> {
+  try {
+    // Not a regular file (a FIFO would block readFile): unreadable, without reading it.
+    if (!(await fsPromises.stat(pendingSignOutsPath(containerPath))).isFile())
+      return { kind: "unreadable", code: "not a regular file" };
+    await fsPromises.readFile(pendingSignOutsPath(containerPath));
+    return { kind: "present" };
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return { kind: "absent" };
+    // fs errors come from another realm under the Jest VM: read `code` without instanceof.
+    const code: unknown =
+      typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+    return { kind: "unreadable", code: typeof code === "string" ? code : "unknown error" };
   }
 }
 
