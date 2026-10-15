@@ -1203,21 +1203,14 @@ function usePendingSignOuts(
 }
 
 /**
- * Section notice while a post-update sign-out record exists (#6627). Every discovery gate keeps
- * managed plugins closed until it is gone, and without this notice they only disappear.
+ * The broken-record notice text and its sign-out control (#6627). A broken record fences the
+ * plugin servers, so Settings → MCP cannot list them. The backend signs out of them from the
+ * plugin trees and deletes the record only after that succeeds.
  */
-const PendingSignOutNotice: React.FC<{
-  status: AgentPluginPendingSignOuts | null;
-  /** Re-lists the plugins after the sign-out deleted the record. */
-  onCleared: () => void;
-}> = (props) => {
+const BrokenSignOutRecord: React.FC<{ reason: string; onCleared: () => void }> = (props) => {
   const { api } = useAPI();
   const [signingOut, setSigningOut] = useState(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
-  const status = props.status;
-  if (status === null || status.kind === "none") return null;
-  // A broken record fences the plugin servers, so Settings → MCP cannot list them. The backend
-  // signs out of them from the plugin trees and deletes the record only after that succeeds.
   const signOut = async () => {
     if (!api) return;
     setSigningOut(true);
@@ -1233,24 +1226,40 @@ const PendingSignOutNotice: React.FC<{
     }
   };
   return (
+    <span className="min-w-0 space-y-2 break-words">
+      <span className="block">Managed plugins are unavailable to agents. {props.reason}</span>
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={signingOut || !api}
+        onClick={() => void signOut()}
+      >
+        {signingOut ? "Signing out…" : "Sign out of plugin MCP servers"}
+      </Button>
+      {signOutError !== null && <span className="block">{signOutError}</span>}
+    </span>
+  );
+};
+
+/**
+ * Section notice while a post-update sign-out record exists (#6627). Every discovery gate keeps
+ * managed plugins closed until it is gone, and without this notice they only disappear.
+ */
+const PendingSignOutNotice: React.FC<{
+  status: AgentPluginPendingSignOuts | null;
+  /** Re-lists the plugins after the sign-out deleted the record. */
+  onCleared: () => void;
+}> = (props) => {
+  const status = props.status;
+  if (status === null || status.kind === "none") return null;
+  return (
     <div
       role="status"
       className="bg-warning/10 text-warning mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm"
     >
       <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
       {status.kind === "broken" ? (
-        <span className="min-w-0 space-y-2 break-words">
-          <span className="block">Managed plugins are unavailable to agents. {status.reason}</span>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={signingOut || !api}
-            onClick={() => void signOut()}
-          >
-            {signingOut ? "Signing out…" : "Sign out of plugin MCP servers"}
-          </Button>
-          {signOutError !== null && <span className="block">{signOutError}</span>}
-        </span>
+        <BrokenSignOutRecord reason={status.reason} onCleared={props.onCleared} />
       ) : (
         <span className="space-y-1 break-words">
           <span className="block">

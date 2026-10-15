@@ -2996,6 +2996,10 @@ export class AgentPluginInstallService {
     return this.captureResult(() => this.list());
   }
 
+  signOutPluginServersResult() {
+    return this.captureResult(() => this.signOutPluginServers());
+  }
+
   uninstallResult(args: Parameters<AgentPluginInstallService["uninstall"]>[0]) {
     return this.captureResult(() => this.uninstall(args));
   }
