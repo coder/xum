@@ -2374,8 +2374,24 @@ export class DraftStore {
         updatePersistedState(key, undefined);
         continue;
       }
+      if (!this.isKnownCreationDraft(legacy.scope)) continue;
       await this.importLegacyNameState(client, key, legacy.scope, legacy.nameState);
     }
+  }
+
+  /**
+   * The snapshot knows this creation draft: the default one, a listed row (synthesized rows
+   * included) or a body. localStorage is per origin, so a tab keeps the name key of a draft that
+   * another window sent or deleted; importing it would write a body holding only the name, which
+   * the backend relists as a row. Such a key is left alone, as on main (the startup cleanup keeps
+   * typed names).
+   */
+  private isKnownCreationDraft(scope: Extract<DraftScope, { kind: "creation" }>): boolean {
+    if (scope.draftId === DEFAULT_CREATION_DRAFT_ID) return true;
+    const listed = this.creationDrafts[scope.projectPath] ?? [];
+    if (listed.some(({ draftId }) => draftId === scope.draftId)) return true;
+    const entry = this.entries.get(draftScopeKey(scope));
+    return entry !== undefined && !isEmptyView(entry.view);
   }
 
   private async importLegacyNameState(

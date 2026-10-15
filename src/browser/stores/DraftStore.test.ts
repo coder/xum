@@ -88,6 +88,7 @@ function createClient(service: DraftService) {
     loseMoveReplies: 0,
     /** Held before the backend runs a move. */
     moveGate: null as Promise<void> | null,
+    importedScopes: [] as DraftScope[],
   };
   const drafts = {
     list: () => service.list(),
@@ -118,6 +119,7 @@ function createClient(service: DraftService) {
       return service.delete(scope);
     },
     importLegacy: async (input: Parameters<DraftService["importLegacy"]>[0]) => {
+      control.importedScopes.push(input.scope);
       if (control.failImports > 0) {
         control.failImports--;
         throw new Error("import failed");
@@ -1145,6 +1147,7 @@ describe("DraftStore", () => {
       projectPath,
       draftId: DEFAULT_CREATION_DRAFT_ID,
     };
+    await service.putListEntry({ ...listed, subProjectPath: null, createdAt: 1 });
     const listedKey = getWorkspaceNameStateKey(getDraftScopeId(projectPath, "draft-a"));
     const pendingKey = getWorkspaceNameStateKey(getPendingScopeId(projectPath));
     seedLegacyKey(listedKey, NAME_STATE);
@@ -1167,11 +1170,43 @@ describe("DraftStore", () => {
     expect(store.getView(defaultScope).nameState?.manualName).toBe("default-name");
   });
 
+  // localStorage is per origin: a browser tab keeps the name key of a draft that the desktop app
+  // sent or deleted. Importing it would write a body that holds only the name, and the backend
+  // relists a body without a row, so the gone draft would come back as a sidebar row.
+  test("leaves a legacy name key of a draft the backend does not know", async () => {
+    using tempDir = new TestTempDir("draft-store-legacy-name-unknown");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const ghost: DraftScope = { kind: "creation", projectPath, draftId: "ghost-of-sent-draft" };
+    const listed: DraftScope = { kind: "creation", projectPath, draftId: "listed-no-body" };
+    await service.putListEntry({ ...listed, subProjectPath: null, createdAt: 1 });
+    const ghostKey = getWorkspaceNameStateKey(getDraftScopeId(projectPath, ghost.draftId));
+    const listedKey = getWorkspaceNameStateKey(getDraftScopeId(projectPath, listed.draftId));
+    seedLegacyKey(ghostKey, NAME_STATE);
+    seedLegacyKey(listedKey, NAME_STATE);
+
+    const store = createStore(client);
+    await store.whenReady();
+    expect(control.importedScopes).toEqual([listed]);
+    expect(listPersistedKeys("workspaceNameState:")).toEqual([ghostKey]);
+    expect((await service.get(listed)).nameState).toEqual(NAME_STATE);
+    expect(store.getView(ghost).nameState).toBeNull();
+    expect((await service.get(ghost)).nameState).toBeUndefined();
+    store.setClient(null);
+
+    // The next start (the backend relists bodies without a row then) shows no row for it.
+    const restarted = createStore(client);
+    await restarted.whenReady();
+    expect(
+      restarted.getCreationDraftsByProject()[projectPath]?.map(({ draftId }) => draftId)
+    ).toEqual([listed.draftId]);
+  });
+
   // Older builds read these keys with a partial schema, and wrote keys holding only some fields.
   test("imports a legacy name key that holds only some fields", async () => {
     using tempDir = new TestTempDir("draft-store-legacy-partial-name");
     const { projectPath, service, client } = await createHarness(tempDir);
     const scope: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    await service.putListEntry({ ...scope, subProjectPath: null, createdAt: 1 });
     const key = getWorkspaceNameStateKey(getDraftScopeId(projectPath, "draft-a"));
     seedLegacyKey(key, { autoGenerate: false, manualName: "typed-name" });
 
