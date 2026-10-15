@@ -296,6 +296,20 @@ describe("MCP Apps host router", () => {
     expect(t.sent.some((m) => m.method === "ui/resource-teardown")).toBe(false);
   });
 
+  // The window.openai shim posts request-display-mode right after its initialize, before
+  // initialized: the move must still wait for the teardown reply, its delivery barrier.
+  test("an accepted mode change before initialized still waits for the teardown reply", async () => {
+    const t = setup();
+    await t.request(1, "ui/initialize", { appCapabilities: {} });
+    const done = t.request(2, "ui/request-display-mode", { mode: "fullscreen" });
+    const teardown = t.sent.find((m) => m.method === "ui/resource-teardown");
+    expect(teardown).toBeDefined();
+    expect(t.moves).toEqual([]);
+    await t.host.handleMessage({ jsonrpc: "2.0", id: teardown?.id, result: {} });
+    await done;
+    expect(t.moves).toEqual(["fullscreen"]);
+  });
+
   test("widget state is saved in order, and a state over the cap is dropped", async () => {
     const t = setup();
     const send = (state: unknown) =>

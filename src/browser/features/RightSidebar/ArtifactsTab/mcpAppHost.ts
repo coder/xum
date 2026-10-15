@@ -409,9 +409,9 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   const notify = (method: string, params: unknown) =>
     options.postToView({ jsonrpc: "2.0", method, params });
 
-  const teardown = (reason: string): Promise<void> =>
+  const teardown = (reason: string, barrier = false): Promise<void> =>
     requestTeardown({
-      initialized,
+      initialized: initialized || barrier,
       id: `host-${nextHostRequestId++}`,
       pending: pendingHostRequests,
       post: options.postToView,
@@ -543,7 +543,10 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         // The move unmounts this instance, and a frame removed before a queued postMessage
         // runs never gets it. The teardown reply comes after the view handled the mode reply
         // (messages arrive in order), and the view must get a teardown before it goes anyway.
-        await teardown("display-mode");
+        // Also before initialized (the window.openai shim posts its first request-display-mode
+        // right after its initialize): the teardown reply is the barrier that proves the view
+        // got its mode reply before the move removes the frame.
+        await teardown("display-mode", true);
         move();
         return;
       }
