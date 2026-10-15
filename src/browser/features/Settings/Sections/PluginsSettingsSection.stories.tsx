@@ -848,7 +848,7 @@ export const PendingSignOutPhoneViewport: Story = {
 
 /** The backend's reason for a broken record; the notice shows it as given. */
 const BROKEN_SIGN_OUT_REASON =
-  "The pending plugin sign-out record (~/.mux/plugin-sign-outs-pending.json) is corrupt or from another Xum version. Delete the file, then sign out of the plugin's MCP servers in Settings → MCP before you use them.";
+  "The pending plugin sign-out record (~/.mux/plugin-sign-outs-pending.json) is corrupt or from another Xum version. Sign out of the plugin's MCP servers in Settings → MCP, then delete the file.";
 
 /** A corrupt record (#6627): only the user can clear it, so the notice gives the steps. */
 export const BrokenSignOutRecord: Story = {
