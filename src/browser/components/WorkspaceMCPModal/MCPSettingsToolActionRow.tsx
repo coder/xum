@@ -249,27 +249,25 @@ async function readToolAction(
 }
 
 /**
- * Run `action`, and run it again when its read-only flag is stale. A server can drop a tool's
- * readOnlyHint (tools/list_changed) after the dialog read its settings. The backend refreshes
- * the catalog before a run and refuses the unconfirmed run, but the row kept the old flag, so
- * every click failed the same way. So after a failed read-only run, read the action again: if
- * it can write now, `onFresh` keeps the new flag, and the run repeats after the confirmation.
- * Null: the user declined it.
+ * Run `action`, and learn its new flag when the read-only flag is stale. A server can drop a
+ * tool's readOnlyHint (tools/list_changed) after the dialog read its settings. The backend
+ * refreshes the catalog before a run and refuses the unconfirmed run, but the row kept the old
+ * flag, so every click failed the same way. So after a failed read-only run, read the action
+ * again: if it can write now, `onFresh` keeps the new flag, and the next click asks for the
+ * confirmation. This run does not repeat on its own: the failure can also come after the
+ * dispatch (a transport error), and a second call could run a writing tool twice.
  */
 async function callWithFreshFlag(
   api: APIClient,
   target: ToolActionTarget,
   action: MCPSettingsToolAction,
-  ask: (action: MCPSettingsToolAction) => Promise<boolean>,
   onFresh: (action: MCPSettingsToolAction) => void
-): Promise<ToolActionOutcome | null> {
+): Promise<ToolActionOutcome> {
   const outcome = await callToolAction(api, target, action, !action.readOnly);
   if (outcome.success || !action.readOnly) return outcome;
   const fresh = await readToolAction(api, target);
-  if (fresh === null || fresh.readOnly || fresh.opensApp !== action.opensApp) return outcome;
-  onFresh(fresh);
-  if (!(await ask(fresh))) return null;
-  return callToolAction(api, target, fresh, true);
+  if (fresh !== null && !fresh.readOnly && fresh.opensApp === action.opensApp) onFresh(fresh);
+  return outcome;
 }
 
 /**
@@ -278,11 +276,10 @@ async function callWithFreshFlag(
  * caches too. Returns the text result to show.
  */
 async function settleOutcome(
-  outcome: ToolActionOutcome | null,
+  outcome: ToolActionOutcome,
   openApp: (view: MCPSettingsAppView) => void,
   rereadSettings: () => Promise<void>
 ): Promise<SettingsToolRunResult | null> {
-  if (outcome === null) return null;
   if (!outcome.success) return { text: outcome.error, isError: true };
   if (outcome.view !== null) openApp(outcome.view);
   if (outcome.wrote) await rereadSettings();
@@ -329,7 +326,7 @@ function useToolActionRun(
     };
     let result: SettingsToolRunResult | null = null;
     try {
-      const outcome = await callWithFreshFlag(api, target, action, ask, setRefreshed);
+      const outcome = await callWithFreshFlag(api, target, action, setRefreshed);
       result = await settleOutcome(outcome, openApp, props.rereadSettings);
     } catch (caught) {
       result = { text: getErrorMessage(caught), isError: true };

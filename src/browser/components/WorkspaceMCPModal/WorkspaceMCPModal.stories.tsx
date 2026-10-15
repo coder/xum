@@ -820,8 +820,8 @@ const CAD_SETTINGS_LIBRARY_WRITES: MCPSettingsSnapshot = {
 let staleFlagRuns: Array<{ toolName: string; confirmed: boolean }> = [];
 /**
  * The server dropped Part library's readOnlyHint after the dialog read it (tools/list_changed).
- * The backend refuses the unconfirmed run; the row learns the new flag, asks, and runs it. The
- * next click asks first.
+ * The backend refuses the unconfirmed run, and the row shows that. The row learns the new flag,
+ * so the next click asks first and runs the tool.
  */
 export const WorkspaceMCPServerSettingsStaleReadOnlyFlag: Story = {
   parameters: { pixel: PIXEL_DISABLED },
@@ -838,17 +838,20 @@ export const WorkspaceMCPServerSettingsStaleReadOnlyFlag: Story = {
     const dialog = await findWorkspaceMCPDialog(canvasElement);
     const section = within(await within(dialog).findByTestId("mcp-server-settings"));
     const page = within(canvasElement.ownerDocument.body);
-    await userEvent.click(await section.findByRole("button", { name: "Run Part library" }));
+    const run = await section.findByRole("button", { name: "Run Part library" });
+    await userEvent.click(run);
+    await expect(
+      section.findByText("'Part library' runs only after a confirmation")
+    ).resolves.toBeInTheDocument();
+    await waitFor(() => expect(run).toBeEnabled());
+    await expect(staleFlagRuns).toHaveLength(0);
+
+    await userEvent.click(run);
     await expect(page.findByText("Run Part library?")).resolves.toBeInTheDocument();
     await userEvent.click(page.getByRole("button", { name: "Run" }));
     // The confirmed run can write, so the dialog reads the settings again (a new section).
     await expect(within(dialog).findByText("cad.library finished")).resolves.toBeInTheDocument();
     await expect(staleFlagRuns).toEqual([{ toolName: "cad.library", confirmed: true }]);
-
-    await userEvent.click(within(dialog).getByRole("button", { name: "Run Part library" }));
-    await userEvent.click(await page.findByRole("button", { name: "Cancel" }));
-    await waitFor(() => expect(page.queryByText("Run Part library?")).not.toBeInTheDocument());
-    await expect(staleFlagRuns).toHaveLength(1);
   },
 };
 
