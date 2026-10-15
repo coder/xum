@@ -1185,9 +1185,14 @@ export const WorkspaceMCPServerSettingsRereadAfterAppWorkspaceSwitch: Story = {
     await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
     await expect(appSwitchReadWorkspaces).toEqual([WORKSPACE_ID]);
     switchWorkspaceMCPModal?.("ws-switched-to");
-    await waitFor(() => expect(appSwitchReadWorkspaces.slice(1)).toContain(WORKSPACE_ID), {
-      timeout: 5000,
-    });
+    const reads = (workspaceId: string) =>
+      appSwitchReadWorkspaces.filter((read) => read === workspaceId).length;
+    // The re-read of the workspace whose app wrote, and the switched-to dialog's own read.
+    await waitFor(() => expect(reads(WORKSPACE_ID)).toBe(2), { timeout: 5000 });
+    await waitFor(() => expect(reads("ws-switched-to")).toBeGreaterThan(0), { timeout: 5000 });
+    await modal.findByTestId("mcp-server-settings");
+    // No second, spurious re-read of the switched-to workspace for the old app.
+    await expect(reads("ws-switched-to")).toBe(1);
   },
 };
 

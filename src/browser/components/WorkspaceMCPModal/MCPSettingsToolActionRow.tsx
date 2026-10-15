@@ -313,6 +313,8 @@ function useToolActionRun(
     openCount: number;
     /** A tool that can write opened it: the settings are read again when it closes. */
     canWrite: boolean;
+    /** Who opened it: the re-read belongs to this workspace and server. */
+    opener: { workspaceId: string; serverName: string; toolName: string };
   } | null>(null);
   const [openCount, setOpenCount] = useState(0);
   // The action as this row's latest re-read saw it (callWithFreshFlag).
@@ -330,7 +332,12 @@ function useToolActionRun(
       readSettingsWithoutDialog(api, props.workspaceId, props.serverName)
     );
   const openApp = (view: MCPSettingsAppView, canWrite: boolean) => {
-    setApp({ view, openCount: openCount + 1, canWrite });
+    const opener = {
+      workspaceId: props.workspaceId,
+      serverName: props.serverName,
+      toolName: props.item.tool,
+    };
+    setApp({ view, openCount: openCount + 1, canWrite, opener });
     setOpenCount(openCount + 1);
   };
 
@@ -366,16 +373,15 @@ function useToolActionRun(
    * the backend's settings cache that plugin hooks use does not keep the pre-app values. The
    * read counts as a run (the run store outlives the row), so Save waits for it.
    */
-  const canWriteApp = app?.canWrite === true;
-  const { workspaceId, serverName } = props;
-  const toolName = props.item.tool;
   // The open app's lifetime only: its close and the row's unmount end it, a re-render does not.
-  // The cleanup keeps the workspace and server of the render that opened the app: a reused
-  // dialog can render this row with a switched-to workspace before it drops the row, and the
-  // re-read belongs to the workspace whose app wrote. The run is the one `props.beginRun`
-  // starts (startSettingsToolRun), so a reopened dialog's Save waits for it.
+  // The re-read uses the workspace and server that opened the app (app.opener), and the effect
+  // depends on the app itself, not on the current props: a reused dialog can render this row
+  // with a switched-to workspace before it drops the row, and that must neither re-read the
+  // new workspace nor re-arm the old app for it. The run is the one `props.beginRun` starts
+  // (startSettingsToolRun), so a reopened dialog's Save waits for it.
   useEffect(() => {
-    if (!canWriteApp) return;
+    if (app?.canWrite !== true) return;
+    const { workspaceId, serverName, toolName } = app.opener;
     return () => {
       const endRun = startSettingsToolRun(workspaceId, serverName, toolName);
       // publishSettingsToolWrite never rejects (it settles every read); the run ends either way.
@@ -386,7 +392,7 @@ function useToolActionRun(
         () => endRun(null)
       );
     };
-  }, [canWriteApp, app?.openCount, api, workspaceId, serverName, toolName]);
+  }, [app, api]);
   const closeApp = () => setApp(null);
   return { app, closeApp, run };
 }
