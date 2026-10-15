@@ -453,39 +453,58 @@ const TRANSLATED_ESCAPES: Readonly<Record<string, string>> = {
 function translateRustSyntax(pattern: string): { source: string; refused?: string } {
   let inClass = false;
   let source = "";
-  const refuse = (refused: string) => ({ source, refused });
-  for (let i = 0; i < pattern.length; i++) {
-    const char = pattern[i];
-    if (char === "\\") {
-      const escape = readEscape(pattern, i);
-      const translated = inClass ? undefined : TRANSLATED_ESCAPES[escape];
-      if (translated === undefined && !isSameEscape(escape)) return refuse(`'${escape}'`);
-      if (/^\\[bB]$/.test(escape) && pattern[i + 2] === "{") return refuse(`'${escape}{...}'`);
-      source += translated ?? escape;
-      i += escape.length - 1;
-      continue;
-    }
-    if (!inClass) {
-      if (pattern.startsWith("(?P<", i)) {
-        source += "(?<";
-        i += 3;
-        continue;
-      }
-      source += char;
-      if (char !== "[") continue;
-      inClass = true;
-      if (pattern[i + 1] === "^") source += pattern[++i];
-      if (pattern[i + 1] === "]") return refuse("'[]...]'");
-      continue;
-    }
-    const pair = pattern.slice(i, i + 2);
-    if (char === "[" || pair === "&&" || pair === "--" || pair === "~~") {
-      return refuse(`'${char === "[" ? char : pair}' in a character class`);
-    }
-    source += char;
-    if (char === "]") inClass = false;
+  for (let i = 0; i < pattern.length; ) {
+    const step =
+      pattern[i] === "\\"
+        ? escapeStep(pattern, i, inClass)
+        : inClass
+          ? classStep(pattern, i)
+          : textStep(pattern, i);
+    if (step.refused !== undefined) return { source, refused: step.refused };
+    source += step.text;
+    i += step.length;
+    inClass = step.inClass ?? inClass;
   }
   return { source };
+}
+
+/** One step of translateRustSyntax: the text it emits, the characters it read, a class change. */
+interface SyntaxStep {
+  text: string;
+  length: number;
+  inClass?: boolean;
+  refused?: string;
+}
+
+function escapeStep(pattern: string, index: number, inClass: boolean): SyntaxStep {
+  const escape = readEscape(pattern, index);
+  const translated = inClass ? undefined : TRANSLATED_ESCAPES[escape];
+  if (translated === undefined && !isSameEscape(escape)) {
+    return { text: "", length: 0, refused: `'${escape}'` };
+  }
+  if (/^\\[bB]$/.test(escape) && pattern[index + 2] === "{") {
+    return { text: "", length: 0, refused: `'${escape}{...}'` };
+  }
+  return { text: translated ?? escape, length: escape.length };
+}
+
+/** Outside a class: `(?P<` becomes `(?<`, and `[` opens a class (with its `^`). */
+function textStep(pattern: string, index: number): SyntaxStep {
+  if (pattern.startsWith("(?P<", index)) return { text: "(?<", length: 4 };
+  if (pattern[index] !== "[") return { text: pattern[index], length: 1 };
+  const open = pattern[index + 1] === "^" ? "[^" : "[";
+  if (pattern[index + open.length] === "]") return { text: "", length: 0, refused: "'[]...]'" };
+  return { text: open, length: open.length, inClass: true };
+}
+
+/** Inside a class: nested classes and set operators are refused, `]` closes it. */
+function classStep(pattern: string, index: number): SyntaxStep {
+  const char = pattern[index];
+  const pair = pattern.slice(index, index + 2);
+  if (char === "[" || pair === "&&" || pair === "--" || pair === "~~") {
+    return { text: "", length: 0, refused: `'${char === "[" ? char : pair}' in a character class` };
+  }
+  return { text: char, length: 1, ...(char === "]" ? { inClass: false } : {}) };
 }
 
 /** The escape at `index`: `\` and one character, plus the hex digits of `\xhh` and `\uhhhh`. */
