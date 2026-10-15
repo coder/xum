@@ -791,6 +791,7 @@ describe("todo turn-end nudge", () => {
 
     const [, continuation] = await userTexts(h);
     expect(continuation.length).toBe(TURN_STOP_PROMPT_MAX_CHARS);
+    expect(continuation.endsWith(TODO_TURN_END_NUDGE)).toBe(true);
   });
 
   test.each([

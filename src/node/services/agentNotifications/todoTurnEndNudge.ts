@@ -71,8 +71,11 @@ export function mergeTurnStopContinuation(input: {
       },
     };
   }
-  // A plugin continuation keeps the turn's tools. The cap applies again to the joined prompt.
+  // A plugin continuation keeps the turn's tools. The joined prompt keeps the cap: the plugin's
+  // part is cut, so the nudge always arrives whole.
+  const separator = "\n\n";
+  const hookRoom = TURN_STOP_PROMPT_MAX_CHARS - separator.length - TODO_TURN_END_NUDGE.length;
   return {
-    prompt: `${input.hookPrompt}\n\n${TODO_TURN_END_NUDGE}`.slice(0, TURN_STOP_PROMPT_MAX_CHARS),
+    prompt: `${input.hookPrompt.slice(0, hookRoom)}${separator}${TODO_TURN_END_NUDGE}`,
   };
 }
