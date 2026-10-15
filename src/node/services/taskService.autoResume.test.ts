@@ -5,6 +5,7 @@ import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
 import { Ok, Err, type Result } from "@/common/types/result";
+import { readSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import { createMuxMessage } from "@/common/types/message";
 import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
@@ -2188,6 +2189,84 @@ describe("TaskService", () => {
         taskId: childTaskId,
         status: "completed",
         reportMarkdown: "Spawned child done",
+        // Clean child context: the queued event is delivered as-is.
+        carriesProjectSkillContent: false,
+      });
+    } finally {
+      postSpy.mockRestore();
+    }
+  });
+
+  test("terminal report carries the child's project skill provenance into the task-terminal event", async () => {
+    // The kernel queue is another channel for the report: a drain by a routed
+    // turn without trust must be able to withhold it (SandboxMount).
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-sandbox-evt-prov";
+    const childTaskId = "task-sandbox-evt-prov";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        projectWorkspace(projectPath, "child-task", childTaskId, {
+          name: "agent_explore_child",
+          parentWorkspaceId,
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+          taskThinkingLevel: "medium",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { taskService, historyService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
+    await historyService.appendToHistory(
+      childTaskId,
+      createMuxMessage("snap-project", "user", "PROJECT SKILL BODY", {
+        timestamp: Date.now(),
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "s" },
+      })
+    );
+
+    const postSpy = spyOn(sandboxHostService, "postTaskTerminalEvent");
+    try {
+      await streamEnd(taskService, {
+        type: "stream-end",
+        workspaceId: childTaskId,
+        messageId: "assistant-child-output",
+        metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "agent-report-call-1",
+            toolName: "agent_report",
+            input: { reportMarkdown: "Distilled from the skill", title: "Result" },
+            state: "output-available",
+            output: {
+              success: true,
+              report: { reportMarkdown: "Distilled from the skill", title: "Result" },
+            },
+          },
+          { type: "text", text: "Distilled from the skill" },
+        ],
+      });
+
+      expect(postSpy).toHaveBeenCalledTimes(1);
+      expect(postSpy.mock.calls[0]?.[1]).toMatchObject({
+        taskId: childTaskId,
+        carriesProjectSkillContent: true,
       });
     } finally {
       postSpy.mockRestore();
@@ -2321,6 +2400,79 @@ describe("TaskService", () => {
     });
     expect(report.model).toBe("anthropic:claude-opus-5");
     expect(report.thinkingLevel).toBe("high");
+  });
+
+  test("waitForAgentReport carries the child's project skill provenance, persisted with the artifact", async () => {
+    // The child's context held project skill content: its report is classified
+    // once at finalize (while the child's history exists) and the verdict rides
+    // the cached report, the waiter result and every persisted artifact copy,
+    // so a later task_await refetch classifies the same way.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-report-provenance";
+    const childTaskId = "task-report-provenance";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        {
+          path: path.join(projectPath, "child-task"),
+          id: childTaskId,
+          name: "agent_exec_child",
+          parentWorkspaceId,
+          agentType: "exec",
+          taskStatus: "running",
+          taskModelString: "anthropic:claude-opus-5",
+        },
+      ],
+      testTaskSettings()
+    );
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { taskService, historyService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
+    await historyService.appendToHistory(
+      childTaskId,
+      createMuxMessage("snap-project", "user", "PROJECT SKILL BODY", {
+        timestamp: Date.now(),
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "s" },
+      })
+    );
+
+    await streamEnd(taskService, {
+      type: "stream-end",
+      workspaceId: childTaskId,
+      messageId: "assistant-child-report-provenance",
+      metadata: { model: "anthropic:claude-opus-5", finishReason: "stop" },
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "agent-report-provenance-call",
+          toolName: "agent_report",
+          input: { reportMarkdown: "Applied the skill", title: "Result" },
+          state: "output-available",
+          output: {
+            success: true,
+            report: { reportMarkdown: "Applied the skill", title: "Result" },
+          },
+        },
+        { type: "text", text: "Done" },
+      ],
+    });
+
+    const report = await taskService.waitForAgentReport(childTaskId, {
+      requestingWorkspaceId: parentWorkspaceId,
+    });
+    expect(report.carriesProjectSkillContent).toBe(true);
+    const artifact = await readSubagentReportArtifact(
+      path.join(config.sessionsDir, parentWorkspaceId),
+      childTaskId
+    );
+    expect(artifact?.carriesProjectSkillContent).toBe(true);
   });
 
   test("workflow-owned child reports do not resume the parent directly", async () => {

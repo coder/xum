@@ -52,7 +52,7 @@ import {
 import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
 import type { Config, ProviderConfig, ProvidersConfig } from "@/node/config";
 import { ProvidersConfigStore } from "@/node/config";
-import type { MuxProviderOptions } from "@/common/types/providerOptions";
+import type { MuxProviderOptions, OpenAIWireFormat } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   ServiceTierSchema,
@@ -1713,7 +1713,12 @@ export class ProviderModelFactory {
   private isProviderAvailableForRouting(
     provider: ProviderName,
     providersConfig: ProvidersConfig,
-    config: ReturnType<Config["loadConfigOrDefault"]>
+    config: ReturnType<Config["loadConfigOrDefault"]>,
+    canonicalModel?: string,
+    // The request's own OpenAI wire format (muxProviderOptions.openai.wireFormat):
+    // createModel honors it when no stored format is set, so route selection
+    // must judge the same request (matches canDirectOpenAIServeModel).
+    openaiWireFormat?: OpenAIWireFormat | null
   ): boolean {
     const providerConfig = providersConfig[provider] ?? {};
     const credentials = resolveProviderCredentials(provider, providerConfig);
@@ -1725,6 +1730,35 @@ export class ProviderModelFactory {
       parseCodexOauthAuth((providerConfig as { codexOauth?: unknown }).codexOauth) !== null;
 
     if (!credentials.isConfigured && !hasCodexOauth) {
+      return false;
+    }
+
+    // Model-aware OpenAI gate, mirroring createModel's credential outcome: a
+    // Codex-OAuth-only credential serves only the OAuth-allowed model set, so
+    // direct OpenAI must not win the route for a model it would then reject
+    // with api_key_not_found — a usable gateway later in routePriority (or the
+    // caller's availability error) should win instead. Matches the shared
+    // canDirectOpenAIServeModel predicate used by availability preflights.
+    if (
+      provider === "openai" &&
+      canonicalModel != null &&
+      !credentials.isConfigured &&
+      !isCodexOauthAllowedModel(canonicalModel, providersConfig)
+    ) {
+      return false;
+    }
+
+    // Same mirror for the wire format: Codex OAuth speaks only the Responses
+    // endpoint, so an OAuth-only credential cannot serve a provider pinned to
+    // chatCompletions — createModel rejects it with api_key_not_found, and a
+    // usable gateway later in routePriority should win instead (matches
+    // canDirectOpenAIServeModel).
+    if (
+      provider === "openai" &&
+      !credentials.isConfigured &&
+      ((providerConfig as { wireFormat?: unknown }).wireFormat ?? openaiWireFormat) ===
+        "chatCompletions"
+    ) {
       return false;
     }
 
@@ -1854,7 +1888,8 @@ export class ProviderModelFactory {
         modelString = self.resolveEffectiveModelString(
           modelString,
           opts?.routeContext,
-          opts?.providersConfig
+          opts?.providersConfig,
+          muxProviderOptions?.openai?.wireFormat
         );
 
         // Parse model string (format: "provider:model-id")
@@ -3625,7 +3660,8 @@ export class ProviderModelFactory {
 
       const routeContext = self.resolveModelRoute(
         routeSeedModelString,
-        providersConfigForShadowCheck
+        providersConfigForShadowCheck,
+        muxProviderOptions?.openai?.wireFormat
       );
       if (rawCoderGatewayModelId != null) {
         const appConfig = self.config.loadConfigOrDefault();
@@ -3825,7 +3861,8 @@ export class ProviderModelFactory {
 
   private resolveModelRoute(
     canonicalModel: string,
-    providersConfigSnapshot?: ProvidersConfig
+    providersConfigSnapshot?: ProvidersConfig,
+    openaiWireFormat?: OpenAIWireFormat | null
   ): RouteContext {
     const config = this.config.loadConfigOrDefault();
     // resolveAndCreateModel passes its snapshot so route availability,
@@ -3847,7 +3884,9 @@ export class ProviderModelFactory {
         return this.isProviderAvailableForRouting(
           provider as ProviderName,
           providersConfig,
-          config
+          config,
+          canonicalModel,
+          openaiWireFormat
         );
       },
       isGatewayModelAccessible,
@@ -3866,14 +3905,16 @@ export class ProviderModelFactory {
   resolveEffectiveModelString(
     modelString: string,
     routeContext?: RouteContext,
-    providersConfig?: ProvidersConfig
+    providersConfig?: ProvidersConfig,
+    openaiWireFormat?: OpenAIWireFormat | null
   ): string {
     const explicitGateway = getExplicitGatewayProvider(modelString);
     return this.resolveGatewayModelString(
       modelString,
       routeContext,
       explicitGateway,
-      providersConfig
+      providersConfig,
+      openaiWireFormat
     );
   }
 
@@ -3881,7 +3922,8 @@ export class ProviderModelFactory {
     modelString: string,
     modelKeyOrRouteContext?: string | RouteContext,
     explicitGatewayOrLegacyFlag?: ProviderName | boolean,
-    providersConfigSnapshot?: ProvidersConfig
+    providersConfigSnapshot?: ProvidersConfig,
+    openaiWireFormat?: OpenAIWireFormat | null
   ): string {
     // Legacy callers may still pass boolean true to mean an explicit mux-gateway request.
     const explicitGateway: ProviderName | undefined =
@@ -3950,7 +3992,11 @@ export class ProviderModelFactory {
               return this.isProviderAvailableForRouting(
                 provider as ProviderName,
                 providersConfig,
-                config
+                config,
+                typeof modelKeyOrRouteContext === "string"
+                  ? normalizeToCanonical(modelKeyOrRouteContext)
+                  : canonicalModelString,
+                openaiWireFormat
               );
             },
             isGatewayModelAccessible,

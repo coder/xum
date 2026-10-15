@@ -972,17 +972,19 @@ describe("task launch races", () => {
         // A thin WorkspaceHost: the real session accepts or refuses each send.
         send: (_workspaceId, message, options, internal) => {
           if (box.session == null) throw new Error("the session exists before the launch");
-          return box.session.sendMessage(message, options as SendMessageOptions, {
-            acceptanceOrigin: internal?.acceptanceOrigin ?? "automatic",
-            agentInitiated: internal?.agentInitiated,
-            sendIdentities: internal?.sendIdentities,
-            skipOnSendCompaction: internal?.skipOnSendCompaction,
-            admissionStale: internal?.admissionStale,
-            startStreamInBackground: true,
-            onAccepted: internal?.onAccepted,
-            onCanceled: internal?.onCanceled,
-            onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
-          });
+          return box.session
+            .sendMessage(message, options as SendMessageOptions, {
+              acceptanceOrigin: internal?.acceptanceOrigin ?? "automatic",
+              agentInitiated: internal?.agentInitiated,
+              sendIdentities: internal?.sendIdentities,
+              skipOnSendCompaction: internal?.skipOnSendCompaction,
+              admissionStale: internal?.admissionStale,
+              startStreamInBackground: true,
+              onAccepted: internal?.onAccepted,
+              onCanceled: internal?.onCanceled,
+              onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
+            })
+            .then((result) => (result.success ? Ok(undefined) : result));
         },
       });
       const aiEmitter = new EventEmitter();

@@ -200,7 +200,9 @@ test.each([
           ...internal,
           restoreQueued: !live,
         })
-      ).toEqual(Ok(undefined));
+        // A busy session queues the guidance: the accepted payload says so, and the
+        // renderer relies on that flag to skip its own send attribution.
+      ).toEqual(Ok(live ? { queued: true } : undefined));
       if (!live) expect(drain).not.toHaveBeenCalled();
       busy.mockReturnValue(false);
       const drainsBeforeRestore = drain.mock.calls.length;

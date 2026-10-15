@@ -46,6 +46,35 @@ describe("task_retitle tool", () => {
     });
   });
 
+  it("stamps the task when the retitling context carries project skill content", async () => {
+    // The new title is authored from repository-derived text: TaskService
+    // persists the verdict so task_list withholds it after a revocation.
+    using tempDir = new TestTempDir("task-retitle-provenance");
+    const retitleDescendantAgentTask = mock(
+      (): Promise<Result<RetitleAgentTaskResult, RetitleAgentTaskError>> =>
+        Promise.resolve(Ok({ title: "Convention Auditor" }))
+    );
+    const taskService = { retitleDescendantAgentTask } as unknown as TaskService;
+    const tool = createTaskRetitleTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "parent" }),
+      taskService,
+      projectSkillContentInContext: () => true,
+    });
+
+    await Promise.resolve(
+      tool.execute!({ task_id: "child", title: "Convention Auditor" }, toolCallOptions)
+    );
+
+    expect(retitleDescendantAgentTask).toHaveBeenCalledWith(
+      "parent",
+      "child",
+      "Convention Auditor",
+      {
+        carriesProjectSkillContent: true,
+      }
+    );
+  });
+
   it("maps scope and update failures", async () => {
     using tempDir = new TestTempDir("task-retitle-errors");
     const outcomes: RetitleAgentTaskError[] = [

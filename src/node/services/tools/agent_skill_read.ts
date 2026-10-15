@@ -53,7 +53,17 @@ function isIndexedSkill(skill: AgentSkillDescriptor): boolean {
  */
 function buildSkillReadDescription(config: ToolConfiguration): string {
   const baseDescription = TOOL_DEFINITIONS.agent_skill_read.description;
-  const skills = (config.availableSkills ?? []).filter(isIndexedSkill);
+  // Only indexed skills (isIndexedSkill: advertised and model-invocable) are
+  // listed; the others can still be invoked via /skill-name or agent_skill_read.
+  // A routed turn that must not carry project skill content also leaves the
+  // project-scope descriptors out: description and whenToUse are
+  // repository-controlled text that would otherwise ride the initial request
+  // (kept under trust, they arm the turn's consent gate instead — see
+  // withToolDescriptionProvenance).
+  const skills = (config.availableSkills ?? []).filter(
+    (s) =>
+      isIndexedSkill(s) && !(config.excludeProjectSkillContent === true && s.scope === "project")
+  );
 
   if (skills.length === 0) {
     return baseDescription;

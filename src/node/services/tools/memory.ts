@@ -1,3 +1,4 @@
+import { toolExcludesProjectSkillContent } from "./projectSkillContentGate";
 import { tool } from "ai";
 import assert from "@/common/utils/assert";
 import type { MemoryToolResult } from "@/common/types/tools";
@@ -100,6 +101,9 @@ export function memoryScopeContextFromToolConfig(config: ToolConfiguration): Mem
     // so "" disables project-keyed memory (same resolution as
     // resolveMemoryProjectIdentity; config.projects mirrors metadata.projects).
     projectPath: (config.projects?.length ?? 0) > 1 ? "" : (config.workspaceProjectPath ?? ""),
+    ...(config.memoryWriteCarriesProjectSkillContent === true
+      ? { writeProvenance: { carriesProjectSkillContent: true as const } }
+      : {}),
     scopes: toolMemoryScopes(config),
   };
 }
@@ -114,7 +118,16 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
   assert(memoryService != null, "memory tool requires config.memoryService");
   const access = config.memoryAccess ?? READ_ONLY_ACCESS;
 
-  const ctx = memoryScopeContextFromToolConfig(config);
+  const baseCtx = memoryScopeContextFromToolConfig(config);
+  // Write provenance can also arise DURING the turn: a view of a file carrying
+  // project skill provenance puts that content in the model's context, so
+  // every later write of this tool instance (one provider request) inherits
+  // it — the assembly-time flag alone would let a view-then-create launder it.
+  let contextTainted = baseCtx.writeProvenance?.carriesProjectSkillContent === true;
+  const commandCtx = (): MemoryScopeContext =>
+    contextTainted || config.projectSkillContentInContext?.() === true
+      ? { ...baseCtx, writeProvenance: { carriesProjectSkillContent: true as const } }
+      : baseCtx;
 
   /**
    * Returns a recoverable error result when the (parsed) scope is read-only
@@ -141,10 +154,21 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
     description: buildMemoryDescription(config),
     inputSchema: TOOL_DEFINITIONS.memory.schema,
     execute: async (input, { toolCallId, abortSignal }): Promise<MemoryToolResult> => {
-      // A stopped stream must not commit a late write.
-      return executeMemoryCommand(memoryService, ctx, input, checkWriteAccess, toolCallId, {
-        abortSignal,
-      });
+      const result = await executeMemoryCommand(
+        memoryService,
+        commandCtx(),
+        input,
+        checkWriteAccess,
+        toolCallId,
+        {
+          // A stopped stream must not commit a late write.
+          abortSignal,
+          // Re-evaluated per call: a routed turn's trust can be revoked mid-turn.
+          excludeProjectSkillContent: await toolExcludesProjectSkillContent(config),
+        }
+      );
+      if (result.success && result.carriesProjectSkillContent === true) contextTainted = true;
+      return result;
     },
   });
 };
@@ -187,6 +211,8 @@ export async function executeMemoryCommand(
      * I/O unblocks. Ignored by reads.
      */
     abortSignal?: AbortSignal;
+    /** See ToolConfiguration.excludeProjectSkillContent. */
+    excludeProjectSkillContent?: boolean;
     /**
      * Consolidation's pin protection (pinned files are editable but never
      * deleted/renamed), enforced by MemoryService INSIDE its target mutation
@@ -205,6 +231,7 @@ export async function executeMemoryCommand(
         return await memoryService.view(ctx, input.path, {
           offset: input.offset ?? undefined,
           limit: input.limit ?? undefined,
+          excludeProjectSkillContent: options?.excludeProjectSkillContent === true,
         });
       }
       case "create": {
