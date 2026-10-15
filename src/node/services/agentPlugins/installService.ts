@@ -224,18 +224,20 @@ function monotonicNow(): number {
  * otherwise clear the record while the first one still runs and later deletes a new sign-in.
  */
 async function signedOutBefore(
-  oauth: Pick<McpOauthService, "logout">,
+  oauth: Pick<McpOauthService, "logout" | "credentialKey">,
   serverUrl: string,
   deadline: number,
   inFlight: Map<string, Promise<{ success: boolean }>>
 ): Promise<boolean> {
-  let call = inFlight.get(serverUrl);
+  // Keyed by credential: `/mcp` and `/mcp/` are one stored sign-in, so one logout.
+  const key = oauth.credentialKey(serverUrl) ?? serverUrl;
+  let call = inFlight.get(key);
   if (call === undefined) {
     const started = oauth.logout({ serverUrl });
     call = started;
-    inFlight.set(serverUrl, started);
+    inFlight.set(key, started);
     const forget = () => {
-      if (inFlight.get(serverUrl) === started) inFlight.delete(serverUrl);
+      if (inFlight.get(key) === started) inFlight.delete(key);
     };
     started.then(forget, forget);
   }
@@ -4025,7 +4027,7 @@ export class AgentPluginInstallService {
   private async signOutAndSettle(name: string, urls: string[]): Promise<void> {
     const done: string[] = [];
     for (const serverUrl of urls) {
-      if (await this.signOutPluginServer(name, serverUrl)) done.push(serverUrl);
+      if (await this.signOutAfterInFlight(name, serverUrl)) done.push(serverUrl);
     }
     await this.forgetPendingSignOuts(done);
   }
@@ -4034,13 +4036,30 @@ export class AgentPluginInstallService {
    * A timed-out recovery logout can still run: let it settle first, so two logouts never
    * overlap and the earlier one cannot delete a sign-in made after the later one (#6627).
    */
-  private async settleInFlightSignOut(serverUrl: string): Promise<void> {
-    const call = this.inFlightSignOuts.get(serverUrl);
-    if (call !== undefined) await call.catch(() => undefined);
+  private async settleInFlightSignOut(name: string, serverUrl: string): Promise<boolean> {
+    const key = this.mcpOauthService?.credentialKey(serverUrl) ?? serverUrl;
+    const call = this.inFlightSignOuts.get(key);
+    if (call === undefined) return true;
+    // Bounded: the update holds the plugin lock here, so a hung logout must not hold it forever.
+    // On timeout this sign-out counts as failed, and its URL stays in the pending record.
+    const settled = await raceWithAbortAndTimeout(
+      call.catch(() => undefined),
+      { timeoutMs: this.recoveryTimeoutMs }
+    );
+    if (settled.kind === "ok") return true;
+    log.warn("A plugin MCP sign-out waits for an earlier one that has not finished", {
+      plugin: name,
+    });
+    return false;
+  }
+
+  /** A sign-out that waits too long for an earlier one fails: its URL stays pending. */
+  private async signOutAfterInFlight(name: string, serverUrl: string): Promise<boolean> {
+    if (!(await this.settleInFlightSignOut(name, serverUrl))) return false;
+    return this.signOutPluginServer(name, serverUrl);
   }
 
   private async signOutPluginServer(name: string, serverUrl: string): Promise<boolean> {
-    await this.settleInFlightSignOut(serverUrl);
     const result = await this.mcpOauthService?.logout({ serverUrl });
     if (result?.success === true) return true;
     log.warn("Could not sign out a plugin MCP server after its sign-in changed", {

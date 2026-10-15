@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
-import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import assert from "@/common/utils/assert";
@@ -2773,21 +2772,15 @@ describe("AgentPluginInstallService", () => {
       expect(await pendingSignOuts()).toBeUndefined();
     });
 
-    test("an update's sign-out waits for a timed-out recovery logout of the same server (#6627)", async () => {
+    test("an update does not wait forever for a recovery logout that never settles (#6627)", async () => {
       const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
       await result;
       await failing.dispose();
-      const events: string[] = [];
-      let release!: () => void;
-      const released = new Promise<void>((resolve) => (release = resolve));
       let calls = 0;
       updater.setMcpOauthService({
-        logout: async () => {
-          const call = ++calls;
-          events.push(`start ${call}`);
-          if (call === 1) await released;
-          events.push(`end ${call}`);
-          return { success: true };
+        logout: () => {
+          calls++;
+          return new Promise<never>(() => undefined);
         },
         credentialKey: (url: string) => url,
       } as unknown as McpOauthService);
@@ -2796,24 +2789,45 @@ describe("AgentPluginInstallService", () => {
         settledSignOutPasses: () => Promise<void>;
       };
       internals.deps.reconciliationTimeoutMs = 20;
-      // A section open's pass times out on the hung logout; the call keeps running.
       await updater.list();
       await internals.settledSignOutPasses();
-      expect(events).toEqual(["start 1"]);
-      // The next update changes the sign-in again: its sign-out must not overlap the hung call.
+      expect(calls).toBe(1);
       await writeServer("client-c");
       const review = await updater.previewUpdate({ name: "demo-plugin" });
-      const updating = updater.update({
+      // The update finishes within the bound, starts no second logout, and keeps the URL pending.
+      await updater.update({
         name: "demo-plugin",
         consent: { fromSha: review.fromSha, toSha: review.toSha },
       });
-      // Without the fence the update signs out at once and finishes while the first call hangs.
-      const early = await raceWithAbortAndTimeout(updating, { timeoutMs: 2_000 });
-      expect(early.kind).toBe("timeout");
-      expect(events).toEqual(["start 1"]);
-      release();
-      await updating;
-      expect(events.slice(0, 3)).toEqual(["start 1", "end 1", "start 2"]);
+      expect(calls).toBe(1);
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+    });
+
+    test("one pass signs out equivalent URL spellings once (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      await fsPromises.writeFile(
+        file,
+        JSON.stringify({ version: 1, urls: [serverUrl, `${serverUrl}/`] })
+      );
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 20,
+      });
+      let calls = 0;
+      restarted.setMcpOauthService({
+        logout: () => {
+          calls++;
+          return new Promise<never>(() => undefined);
+        },
+        // Both spellings are one stored sign-in.
+        credentialKey: (url: string) => url.replace(/\/$/, ""),
+      } as unknown as McpOauthService);
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      await internals.settledSignOutPasses();
+      expect(calls).toBe(1);
     });
 
     test("component review names a pending sign-out instead of changed files (#6627)", async () => {
