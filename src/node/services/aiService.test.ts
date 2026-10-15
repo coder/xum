@@ -3287,59 +3287,99 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
   // The overview in tool_catalog_search's description is part of the cached tools prefix: a
   // remote server that lists one more tool on a refetch must not rewrite the cached history.
-  it("keeps a workspace's tool_catalog_search description when a refetch adds a tool", async () => {
-    using xumHome = new DisposableTempDir("ai-tool-search-overview");
-    const metadata = createLocalWorkspaceMetadata("tool-search-overview", xumHome.path);
+  function createOverviewHarness(xumHomePath: string) {
+    const metadata = createLocalWorkspaceMetadata("tool-search-overview", xumHomePath);
     const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
-    let mcpTools: Record<string, Tool> = {
-      tracker_list_issues: { ...stubTool, description: NATIVE_DEFERRAL_DESCRIPTION },
+    const fixture = {
+      stubTool,
+      mcpTools: {
+        tracker_list_issues: { ...stubTool, description: NATIVE_DEFERRAL_DESCRIPTION },
+      } as Record<string, Tool>,
+      /** MCP tools a model does not get (like a request.assemble hook filtering by model). */
+      hiddenByModel: {} as Record<string, readonly string[]>,
     };
-    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
-    harness.getToolsForModelSpy.mockImplementation((_model, config) =>
-      Promise.resolve({
+    const harness = createHarness(xumHomePath, metadata, { useRequestedModelString: true });
+    harness.getToolsForModelSpy.mockImplementation((model, config) => {
+      const hidden = new Set(fixture.hiddenByModel[model] ?? []);
+      return Promise.resolve({
         file_read: stubTool,
         ...(config.toolSearchRuntime ? { tool_catalog_search: stubTool } : {}),
-        ...mcpTools,
-      })
-    );
+        ...Object.fromEntries(Object.entries(fixture.mcpTools).filter(([n]) => !hidden.has(n))),
+      });
+    });
     harness.service.turnRequestBuilderBindings.mcpServerManager = {
       listServers: () => Promise.resolve({}),
       getToolsForWorkspace: () =>
         Promise.resolve({
-          tools: mcpTools,
-          toolServerNames: Object.fromEntries(Object.keys(mcpTools).map((n) => [n, "tracker"])),
+          tools: fixture.mcpTools,
+          toolServerNames: Object.fromEntries(
+            Object.keys(fixture.mcpTools).map((n) => [n, "tracker"])
+          ),
           promptDescriptors: [],
           stats: {
-            totalTools: Object.keys(mcpTools).length,
+            totalTools: Object.keys(fixture.mcpTools).length,
             activeServerCount: 1,
             failedServerCount: 0,
             failedServerNames: [],
           },
         }),
     } as unknown as MCPServerManager;
-    const send = async () => {
+    const send = async (modelString = "anthropic:claude-sonnet-4-5") => {
       const result = await harness.service.streamMessage({
         messages: [createMuxMessage("user", "user", "hello")],
         workspaceId: metadata.id,
-        modelString: "anthropic:claude-sonnet-4-5",
+        modelString,
         thinkingLevel: "off",
       });
       expect(result.success).toBe(true);
       const started = harness.startStreamCalls.at(-1);
       if (!started) throw new Error("Expected streamManager.startStream call");
-      return started;
+      const description = started.tools?.tool_catalog_search?.description;
+      if (typeof description !== "string") throw new Error("Expected a tool_catalog_search");
+      return { description, state: started.toolSearchState };
     };
+    return { fixture, harness, send };
+  }
+
+  it("keeps a workspace's tool_catalog_search description when a refetch adds a tool", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview");
+    const { fixture, harness, send } = createOverviewHarness(xumHome.path);
 
     const first = await send();
-    expect(first.tools?.tool_catalog_search?.description).toContain("tracker_list_issues");
+    expect(first.description).toContain("tracker_list_issues");
     // Sorts before tracker_list_issues, so a fresh overview would list it.
-    mcpTools = { ...mcpTools, tracker_add_label: stubTool };
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
     const second = await send();
     expect(harness.startStreamCalls).toHaveLength(2);
-    expect(second.tools?.tool_catalog_search?.description).toBe(
-      first.tools?.tool_catalog_search?.description
-    );
-    expect(second.toolSearchState?.deferredToolNames.has("tracker_add_label")).toBe(true);
+    expect(second.description).toBe(first.description);
+    expect(second.state?.deferredToolNames.has("tracker_add_label")).toBe(true);
+  });
+
+  it("keeps each model's overview when another model sees fewer tools", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview-models");
+    const { fixture, send } = createOverviewHarness(xumHome.path);
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
+    fixture.hiddenByModel = { "anthropic:claude-opus-4-5": ["tracker_add_label"] };
+
+    const sonnet = await send("anthropic:claude-sonnet-4-5");
+    expect(sonnet.description).toContain("tracker_add_label");
+    const opus = await send("anthropic:claude-opus-4-5");
+    expect(opus.description).not.toContain("tracker_add_label");
+    // Opus's overview is valid for Sonnet's catalog too: a shared memo would hand it to Sonnet.
+    expect((await send("anthropic:claude-sonnet-4-5")).description).toBe(sonnet.description);
+  });
+
+  it("rebuilds the least recently used model's overview past the per-workspace bound", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-search-overview-bound");
+    const { fixture, send } = createOverviewHarness(xumHome.path);
+    const first = await send("anthropic:claude-sonnet-4-5");
+    for (const model of ["opus-4-5", "haiku-4-5", "opus-4-6", "sonnet-4-6"]) {
+      await send(`anthropic:claude-${model}`);
+    }
+    fixture.mcpTools = { ...fixture.mcpTools, tracker_add_label: fixture.stubTool };
+    const rebuilt = await send("anthropic:claude-sonnet-4-5");
+    expect(rebuilt.description).not.toBe(first.description);
+    expect(rebuilt.description).toContain("tracker_add_label");
   });
 
   it.each([true, false])(
