@@ -1194,6 +1194,8 @@ export class McpOauthService {
     projectPath?: string;
     serverName: string;
     pendingServer?: MCPOAuthPendingServerConfig;
+    /** Caller-generated, so Cancel reaches the flow while it starts (#6565). */
+    flowId?: string;
   }): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
     return this.startDesktopFlow({
       ...input,
@@ -1206,6 +1208,8 @@ export class McpOauthService {
       projectPath?: string;
       serverName: string;
       pendingServer?: MCPOAuthPendingServerConfig;
+      /** See startDesktopFlowForApi. */
+      flowId?: string;
     },
     headers?: IncomingHttpHeaders
   ): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
