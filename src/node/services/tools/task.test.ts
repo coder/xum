@@ -916,14 +916,17 @@ describe("task tool", () => {
         ["grok-4.7-xhigh-fast", /unavailable model/],
         ["nonexistent-model-xhigh", /invalid model/],
       ] as const) {
-        const result = Promise.resolve(
+        const message = await Promise.resolve(
           tool.execute!(
             { agentId: "explore", prompt: "review", title: "Reviewer", model },
             mockToolCallOptions
           )
+        ).then(
+          () => "resolved",
+          (error: unknown) => (error instanceof Error ? error.message : String(error))
         );
-        await expect(result).rejects.toThrow(reason);
-        await expect(result).rejects.toThrow(/Configured: opus \(see models_list\)/);
+        expect(message).toMatch(reason);
+        expect(message).toMatch(/Configured: opus \(see models_list\)/);
       }
       expect(create).not.toHaveBeenCalled();
     });
