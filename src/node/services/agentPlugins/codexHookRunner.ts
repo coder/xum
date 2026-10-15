@@ -468,10 +468,12 @@ function startHookPhase(
       : []
   );
   if (timeouts.length === 0) {
-    return { signal, expired: () => false, [Symbol.dispose]: () => undefined };
+    return { signal, expired: () => false, decided: false, [Symbol.dispose]: () => undefined };
   }
   const deadline = new AbortController();
   const seconds = Math.max(...timeouts);
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  let grace: Promise<true> | undefined;
   const timer = setTimeout(() => {
     deadline.abort();
     log.warn(
@@ -482,7 +484,15 @@ function startHookPhase(
   return {
     signal: signal ? AbortSignal.any([deadline.signal, signal]) : deadline.signal,
     expired: () => deadline.signal.aborted,
-    [Symbol.dispose]: () => clearTimeout(timer),
+    decided: false,
+    [Symbol.dispose]: () => {
+      clearTimeout(timer);
+      clearTimeout(graceTimer);
+    },
+    graceEnded: () =>
+      (grace ??= new Promise<true>((resolve) => {
+        graceTimer = setTimeout(() => resolve(true), HOOK_DEADLINE_TRUST_GRACE_MS);
+      })),
   };
 }
 
@@ -490,15 +500,28 @@ interface HookPhase {
   signal: AbortSignal | undefined;
   /** The shared deadline passed (not a cancel). */
   expired: () => boolean;
+  /** A guard left unrun already decided this phase: its deny or block applies once. */
+  decided: boolean;
+  /** Resolves when the trust rechecks after the deadline ran out of time (see stillGuards). */
+  graceEnded?: () => Promise<true>;
   [Symbol.dispose]: () => void;
 }
+
+/** How long the trust rechecks of unstarted guards may take after the deadline, together. */
+const HOOK_DEADLINE_TRUST_GRACE_MS = 1000;
 
 const HOOK_DEADLINE_REASON =
   "the plugin's hooks ran out of time before every hook could check this.";
 const denyReason = HOOK_DEADLINE_REASON;
 const blockReason = HOOK_DEADLINE_REASON;
 
-/** `run` (one hook call), or `leftUnrun` for a guard the deadline left unrun (guardLeftUnrun). */
+/**
+ * `run` (one hook call) before the deadline. After it, the first hook that still guards (see
+ * stillGuards) but never started counts as a deny (PreToolUse) or block (PostToolUse,
+ * UserPromptSubmit), as an input too large to check does: `leftUnrun`, once per phase (Codex
+ * PRRT_kwDOPxxmWM6s4cyF). The other unstarted hooks are skipped. Stop has no guard and does not
+ * use this.
+ */
 async function invokeInPhase<T>(
   phase: HookPhase,
   hook: PluginHookDefinition,
@@ -506,24 +529,29 @@ async function invokeInPhase<T>(
   leftUnrun: T,
   run: () => Promise<T | null>
 ): Promise<T | null> {
-  return guardLeftUnrun(phase, hook, registration) ? leftUnrun : run();
+  if (!phase.expired()) return run();
+  if (phase.decided || !(await stillGuards(phase, hook, registration))) return null;
+  phase.decided = true;
+  return leftUnrun;
 }
 
 /**
- * After the deadline, a hook that could run but never started counts as a deny (PreToolUse) or
- * block (PostToolUse, UserPromptSubmit), as an input too large to check does. One whose server or
- * tool is off fails open like any unavailable hook. Stop has no guard and does not use this.
+ * Whether an unstarted hook would have run: its server and tool are on, and it passes the same
+ * trust gate a started hook passes (Codex PRRT_kwDOPxxmWM6s4cx-). A revoked or changed hook fails
+ * open like any hook that does not run. The rechecks share a short grace: a trust store that
+ * stalls past it counts as a guard, so a slow read cannot open the gate.
  */
-function guardLeftUnrun(
+async function stillGuards(
   phase: HookPhase,
   hook: PluginHookDefinition,
   registration: CodexHookRegistration
-): boolean {
-  if (!phase.expired() || hook.handler.type !== "mcp_tool") return false;
-  return registration.deps.canCallPluginTool({
-    server: hook.handler.server,
-    tool: hook.handler.tool,
-  });
+): Promise<boolean> {
+  if (hook.handler.type !== "mcp_tool") return false;
+  const target = { server: hook.handler.server, tool: hook.handler.tool };
+  if (!registration.deps.canCallPluginTool(target)) return false;
+  const allowed = registration.deps.isHookAllowed(hook).catch(() => false);
+  assert(phase.graceEnded !== undefined, "an expired phase has a grace");
+  return Promise.race([allowed, phase.graceEnded()]);
 }
 
 async function invoke<T extends { systemMessage?: string; invalid?: string }>(

@@ -457,6 +457,21 @@ describe("PreToolUse", () => {
     });
     expect(outcome).toMatchObject({ kind: "blocked", pluginName: "guard" });
 
+    // Many unstarted hooks give one deadline block, not one each (Codex PRRT_kwDOPxxmWM6s4cyF).
+    const many = setup(
+      Array.from({ length: 4 }, () => hook("PostToolUse", { timeoutSeconds: 0.05 })),
+      () => new Promise(() => undefined)
+    );
+    expect((await runTool(many.spine, "bash", {})).result).toEqual(ctx.result);
+
+    // A hook whose trust was revoked meanwhile does not run, so it blocks nothing (Codex
+    // PRRT_kwDOPxxmWM6s4cx-).
+    const revoked = setup(stalledThenAllow(), () => {
+      revoked.state.allowed = false;
+      return new Promise(() => undefined);
+    });
+    expect((await runTool(revoked.spine, "bash", {})).result).toEqual({ ran: {} });
+
     // A hook whose server is off fails open, as any unavailable hook does.
     const off = setup(stalledThenAllow(), () => new Promise(() => undefined));
     off.deps.canCallPluginTool = () => false;
