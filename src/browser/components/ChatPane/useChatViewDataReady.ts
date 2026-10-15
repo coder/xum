@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { CHAT_VIEW_DATA_READY_TIMEOUT_MS } from "@/constants/timers";
 import { useAPI } from "@/browser/contexts/API";
 import { useBackgroundBashStateKnown } from "@/browser/stores/BackgroundBashStore";
 import { useSessionUsageKnown } from "@/browser/stores/WorkspaceStore";
@@ -96,7 +95,10 @@ export function useChatViewDataReadyDeadline(workspaceId: string, allKnown: bool
   return allKnown || forcedReadyWorkspaceId === workspaceId;
 }
 
-export { CHAT_VIEW_DATA_READY_TIMEOUT_MS };
+// Generous relative to the expected cost (each source is roughly one local
+// IPC round trip resolved in parallel), tight enough that a wedged source
+// degrades to "decorations pop in late" instead of "chat looks broken".
+export const CHAT_VIEW_DATA_READY_TIMEOUT_MS = 2_000;
 
 export interface ChatViewRevealInputs {
   /** Transcript history replay still in flight for the active workspace. */
