@@ -2101,11 +2101,11 @@ describe("AgentPluginInstallService", () => {
     expect(preview.slashCommands).toEqual([{ name: "standup", description: "Daily standup" }]);
   });
 
-  test("preview dedupes agents that normalize to the same agent ID", async () => {
+  test("preview refuses agents that normalize to the same agent ID (#6629)", async () => {
     // On a case-sensitive filesystem a repo can ship agents/reviewer.md AND
-    // agents/REVIEWER.md; runtime discovery lowercases both to one agent ID
-    // and loads only one. The consent preview must promise one selectable
-    // agent, not two.
+    // agents/REVIEWER.md; runtime discovery lowercases both to one agent ID.
+    // Discovery and the definition read could then use different files, so
+    // the runtime loads neither and the preview promises neither.
     await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
     await fsPromises.writeFile(
       path.join(remoteDir, "agents", "reviewer.md"),
@@ -2118,7 +2118,8 @@ describe("AgentPluginInstallService", () => {
     await commitAll(remoteDir, "case-colliding agents");
 
     const preview = await service.preview({ input: remoteDir });
-    expect(preview.agents).toHaveLength(1);
+    expect(preview.agents).toEqual([]);
+    expect(preview.warnings.join("\n")).toContain("more than one file claims its ID");
   });
 
   test("preview rejects an oversized plugin.json before it can reach the renderer", async () => {
