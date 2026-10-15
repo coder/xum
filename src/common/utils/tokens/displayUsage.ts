@@ -150,12 +150,13 @@ function readLastStepTokens(steps: TurnSteps, tokens: UsageTokens): UsageTokens 
  * Estimates the long-context share of a turn recorded without per-request shares from its
  * last step, the only step a legacy row keeps. Prompts usually grow within a turn, so a last
  * step at or under the threshold means no step crossed it, unless the earlier steps average
- * over it (a mid-turn compaction): then they price long and the last step base. Over it,
- * prompts are taken to grow evenly from the first step to the last, and the steps past the
- * threshold take their prompts' share of every token class. On the gateway's per-request
- * ledger (Sept 15 to Oct 14) this came within 2.2% per model and the compaction rule was
- * exact, while pricing only the last step long was 13-67% low and the whole turn 6-58% high.
- * Undefined when the last step's counts are malformed or its prompt exceeds the turn's.
+ * over it (a mid-turn compaction): then they price long and the last step base. Over it, the
+ * last step prices long at its own counts, and the earlier steps past the threshold take
+ * their share of the earlier steps' tokens (see {@link estimateEarlierShareOver}). On the
+ * gateway's per-request ledger (Sept 15 to Oct 14) this came within 1.9% per model and the
+ * compaction rule was exact, while pricing only the last step long was 13-67% low and the
+ * whole turn 6-58% high. Undefined when the last step's counts are malformed or its prompt
+ * exceeds the turn's.
  */
 function estimateLongContextTokens(
   threshold: number,
@@ -167,26 +168,45 @@ function estimateLongContextTokens(
   const lastPrompt = getPromptTokens(lastStep);
   const summedPrompt = getPromptTokens(tokens);
   const stepCount = Math.max(1, steps.stepCount ?? 1);
-  const totals = toLongContextTokens(tokens);
+  const last = toLongContextTokens(lastStep);
+  const earlier = addLongContextTokens(
+    toLongContextTokens(tokens),
+    scaleLongContextTokens(last, -1)
+  );
   if (lastPrompt <= threshold) {
     const earlierSteps = stepCount - 1;
     const earlierStepsOver =
       earlierSteps > 0 && summedPrompt - lastPrompt > threshold * earlierSteps;
-    return earlierStepsOver
-      ? addLongContextTokens(totals, scaleLongContextTokens(toLongContextTokens(lastStep), -1))
-      : NO_LONG_CONTEXT_TOKENS;
+    return earlierStepsOver ? earlier : NO_LONG_CONTEXT_TOKENS;
   }
+  const earlierShare = estimateEarlierShareOver(threshold, lastPrompt, summedPrompt, stepCount);
+  return addLongContextTokens(last, scaleLongContextTokens(earlier, earlierShare));
+}
+
+/**
+ * The share of the earlier steps' prompts in steps past the threshold, for a turn whose last
+ * step is over it. Prompts are taken to grow evenly from the first step to the last. The
+ * provider prices each request whole at one tier, so this counts whole steps and takes their
+ * estimated prompts, not a fraction of the step that crosses the threshold.
+ */
+function estimateEarlierShareOver(
+  threshold: number,
+  lastPrompt: number,
+  summedPrompt: number,
+  stepCount: number
+): number {
+  const earlierPrompt = summedPrompt - lastPrompt;
+  if (earlierPrompt <= 0) return 0;
   const firstPrompt = Math.min(
     lastPrompt,
     Math.max(0, (2 * summedPrompt) / stepCount - lastPrompt)
   );
-  if (stepCount === 1 || firstPrompt >= threshold) return totals;
-  // The provider prices each request whole at one tier, so count the steps past the threshold
-  // and take their estimated prompts, not a fraction of the step that crosses it.
+  if (stepCount === 1 || firstPrompt >= threshold) return 1;
   const growth = (lastPrompt - firstPrompt) / (stepCount - 1);
   const stepsOver = stepCount - 1 - Math.floor((threshold - firstPrompt) / growth);
-  const promptsOver = stepsOver * lastPrompt - (growth * stepsOver * (stepsOver - 1)) / 2;
-  return scaleLongContextTokens(totals, Math.min(1, promptsOver / summedPrompt));
+  const earlierPromptsOver =
+    (stepsOver - 1) * lastPrompt - (growth * stepsOver * (stepsOver - 1)) / 2;
+  return Math.min(1, earlierPromptsOver / earlierPrompt);
 }
 
 /**

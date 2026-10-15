@@ -730,6 +730,20 @@ describe("long-context tiers chosen per request", () => {
       expect(totalCost(priced)).toBeCloseTo(totalCost(priceRequests(steps)), 12);
     });
 
+    test("the last step prices at its own recorded counts", () => {
+      // Only the 101K request's 1K output is long, not the prompt ratio of all 11K.
+      const steps = [
+        step({ inputTokens: 50_000, outputTokens: 10_000 }),
+        step({ inputTokens: 101_000, outputTokens: 1_000 }),
+      ];
+      const priced = createDisplayUsage(turnUsage(steps), MODEL, undefined, undefined, {
+        lastStepUsage: steps[1].usage,
+        stepCount: 2,
+      })!;
+
+      expect(totalCost(priced)).toBeCloseTo(totalCost(priceRequests(steps)), 12);
+    });
+
     test("a mid-turn compaction prices the earlier steps long and the last step base", () => {
       // The earlier steps average over the threshold, so at least one of them crossed it.
       const turn = legacyTurn([120_000, 150_000, 30_000]);
