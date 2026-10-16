@@ -143,7 +143,7 @@ const n = require("node:fs").readFileSync(${startsFile}, "utf8").length;
 setTimeout(() => port.postMessage("ready"), n > 1 ? 400 : 0);`
     );
     const c = client(ok, { requestTimeoutMs: 100 });
-    c.warm();
+    void c.render("ws", rows); // starts the first worker
     const end = Date.now() + 300;
     while (Date.now() < end); // block until its "ready" is queued
     c.dispose(); // stop it before that "ready" is delivered
@@ -151,20 +151,6 @@ setTimeout(() => port.postMessage("ready"), n > 1 ? 400 : 0);`
     // A new worker starts, and the old "ready" must not send this read to it before its own.
     expect(await c.render("ws", rows)).toEqual([null]);
     await untilStarts("late", 2);
-  });
-
-  test("warm() starts the worker once, and a warm-up without a read still stops when idle", async () => {
-    const c = client(
-      await fakeWorker("warm", `port.on("message", (m) => reply(m)); port.postMessage("ready");`),
-      { idleMs: 300 }
-    );
-    c.warm();
-    c.warm();
-    await untilStarts("warm", 1);
-    await Bun.sleep(400);
-    c.warm();
-    await untilStarts("warm", 2);
-    expect(await c.render("ws", rows)).toEqual([["p", {}, "hi"]]);
   });
 
   test("an oversized batch gets null before its rows are serialized for the memo key", async () => {

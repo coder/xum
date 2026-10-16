@@ -15,8 +15,6 @@ import { log } from "@/node/services/log";
 export interface RowTreeClient {
   /** One tree per row, or null. */
   render(workspaceId: string, rows: RowTreeRow[]): Promise<Array<StaticNode | null>>;
-  /** Starts the worker ahead of a likely read (a phone's page load); the idle stop still applies. */
-  warm(): void;
   dispose(): void;
 }
 export interface RowTreeRow {
@@ -121,17 +119,13 @@ class WorkerRowTreeClient implements RowTreeClient {
       this.memo.set(cacheKey, cached);
       return Promise.resolve(cached.trees);
     }
-    this.warm();
-    // A loading worker sends the queue once ready; with none (backoff, failed start), null at once.
-    if (!this.worker) return Promise.resolve(nulls(rows));
-    return this.enqueue(workspaceId, cacheKey, rows);
-  }
-
-  warm() {
     clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => this.stop(null), this.limits.idleMs);
     this.idleTimer.unref();
     if (!this.worker && Date.now() >= this.backoffUntil) this.start();
+    // A loading worker sends the queue once ready; with none (backoff, failed start), null at once.
+    if (!this.worker) return Promise.resolve(nulls(rows));
+    return this.enqueue(workspaceId, cacheKey, rows);
   }
 
   dispose() {
