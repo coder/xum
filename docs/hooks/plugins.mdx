@@ -166,7 +166,9 @@ After 3 `Stop` continuations for one message, Xum logs that the cap was reached 
 
 `hookSpecificOutput` must have `hookEventName` set to the event name. `Stop` has no `hookSpecificOutput`.
 
-A rewrite in `updatedInput` must match the tool's input schema. If it does not, Xum denies the call. For `Bash`, set `updatedInput.command`. The call keeps its other Xum arguments.
+A rewrite in `updatedInput` must match the tool's input schema and pass the tool's own input parser (its refinements and defaults). If it does not, Xum denies the call. The tool runs with the parsed value. For `Bash`, set `updatedInput.command`. The call keeps its other Xum arguments.
+
+The transcript keeps the model's original tool call. Xum adds a note to the tool result that names the fields the hook changed, for example `[plugin:guard] Rewrote this tool call's input (fields: script).` The note never contains the values, because a hook can put a secret into the input, and the model provider and the chat log see the note.
 
 Xum honors an explicit deny or block even when the rest of the output breaks a Codex rule. Xum does not support `permissionDecision: "ask"`, `updatedMCPToolOutput`, or `suppressOutput`.
 
