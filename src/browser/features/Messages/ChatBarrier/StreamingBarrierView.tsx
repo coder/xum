@@ -58,9 +58,7 @@ export const StreamingBarrierView: React.FC<StreamingBarrierViewProps> = (props)
           {/* Narrow panes hide the stats slot, so they read t/s here. It follows the live prop
               rather than statusText, whose within-phase debounce would freeze the number, and
               comes last in the one truncating line so a long model name stays visible. */}
-          {hasLiveTps(props.tps) && (
-            <span className="@lg:hidden">{` at ${props.tps} t/s`}</span>
-          )}
+          {hasLiveTps(props.tps) && <span className="@lg:hidden">{` at ${props.tps} t/s`}</span>}
         </span>
         {props.hintElement}
         {/* Render the stats slot for streaming-bound phases so the row geometry is
