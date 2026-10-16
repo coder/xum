@@ -122,6 +122,70 @@ describe("createRowTreeClient", () => {
     await untilTrees(c, "after"); // 4 crashes, never 3 in a row: no backoff
   });
 
+  test("events of a stopped worker are ignored", async () => {
+    const ok = await fakeWorker(
+      "late",
+      `port.on("message", (m) => reply(m)); port.postMessage("ready");`
+    );
+    const c = client(ok);
+    await c.render("ws", "k", rows);
+    const end = Date.now() + 300;
+    while (Date.now() < end); // block until its "ready" is queued
+    c.dispose(); // stop it before that "ready" is delivered
+    await Bun.sleep(50);
+    // A new worker starts, and this read must not reach it before it is ready.
+    expect(await c.render("ws", "k", rows)).toEqual([null]);
+  });
+
+  test("a worker that cannot start gives null rows", async () => {
+    const c = client("not-a-valid-worker-path.js"); // Worker throws synchronously for this path
+    for (let i = 0; i < 4; i++) expect(await c.render("ws", `k${i}`, rows)).toEqual([null]);
+  });
+
+  test("the tree byte cap is the configured one, in UTF-8 bytes", async () => {
+    const c = client(
+      await fakeWorker("cap", `port.on("message", (m) => reply(m)); port.postMessage("ready");`),
+      {
+        maxTreeBytes: 100,
+      }
+    );
+    await untilTrees(c);
+    // 70 two-byte characters: 82 UTF-16 code units of JSON, but 152 bytes.
+    expect(await c.render("ws", "wide", [{ text: "é".repeat(70), isUser: true }])).toEqual([null]);
+    expect(await c.render("ws", "narrow", [{ text: "e".repeat(70), isUser: true }])).not.toEqual([
+      null,
+    ]);
+  });
+
+  test("the memo keeps the most recently used tails within its byte budget", async () => {
+    const c = client(
+      await fakeWorker("lru", `port.on("message", (m) => reply(m)); port.postMessage("ready");`),
+      {
+        memoBytes: 60,
+      }
+    );
+    const tail = (key: string) => c.render("ws", key, [{ text: key, isUser: true }]);
+    await untilTrees(c, "a", [{ text: "a", isUser: true }]); // each entry is about 20 bytes
+    const a = await tail("a");
+    const b = await tail("b");
+    expect(await tail("a")).toBe(a); // a hit makes "a" the most recent
+    await tail("c");
+    await tail("d"); // over budget: evicts "b", the least recently used
+    expect(await tail("a")).toBe(a);
+    expect(await tail("b")).not.toBe(b);
+  });
+
+  test("batches for different workspaces run one at a time, each timed from its own start", async () => {
+    const slow = await fakeWorker(
+      "serial",
+      `port.on("message", (m) => setTimeout(() => reply(m), 60)); port.postMessage("ready");`
+    );
+    const c = client(slow, { batchTimeoutMs: 100 });
+    await untilTrees(c, "warm");
+    const trees = await Promise.all(["w1", "w2", "w3"].map((ws) => c.render(ws, "k", rows)));
+    expect(trees).toEqual([rows, rows, rows].map(() => [["p", {}, "hi"]]));
+  });
+
   test("a newer request for a busy workspace replaces the waiting one", async () => {
     const slow = await fakeWorker(
       "slow",

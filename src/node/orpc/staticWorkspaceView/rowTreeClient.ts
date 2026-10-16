@@ -1,4 +1,5 @@
 import assert from "node:assert";
+import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { Worker } from "node:worker_threads";
 import { validateStaticTree, type StaticNode } from "@/common/staticWorkspaceView/tree";
@@ -33,17 +34,24 @@ export const ROW_TREE_LIMITS = {
   maxFailures: 3,
   backoffMs: 60_000,
   maxRows: 40,
-  /** A larger serialized tree would bloat the page; that row gets null. */
+  /** A larger serialized tree (UTF-8 bytes) would bloat the page; that row gets null. */
   maxTreeBytes: 64 * 1024,
-  memoEntries: 64,
+  /** The memo keeps the most recently used tails up to this many serialized bytes in total. */
+  memoBytes: 8 * 1024 * 1024,
 };
 
-/** The worker next to this file's build output, or its source when Bun runs from src. */
+/**
+ * The worker's source when Bun runs from src, else dist/workers: from this file's tsc output
+ * (dist/node/orpc/staticWorkspaceView) or from the Docker server bundle (dist/runtime).
+ */
 export function defaultRowTreeWorkerPath(): string {
-  const fromSource = path.extname(__filename) === ".ts";
-  return fromSource
-    ? path.join(__dirname, "../../../browser/workers/staticRowTree.worker.ts")
-    : path.join(__dirname, "../../../workers/staticRowTree.worker.js");
+  if (path.extname(__filename) === ".ts") {
+    return path.join(__dirname, "../../../browser/workers/staticRowTree.worker.ts");
+  }
+  const candidates = ["../../../workers", "../workers"].map((dir) =>
+    path.join(__dirname, dir, "staticRowTree.worker.js")
+  );
+  return candidates.find((file) => existsSync(file)) ?? candidates[0];
 }
 
 interface Batch {
@@ -52,16 +60,14 @@ interface Batch {
   rows: RowTreeRow[];
   resolve: (trees: Array<StaticNode | null>) => void;
 }
+interface MemoEntry {
+  trees: Array<StaticNode | null>;
+  bytes: number;
+}
 
 const nulls = (rows: RowTreeRow[]) => rows.map((): StaticNode | null => null);
 
-/** A tree the page may draw: allowed nodes only, and small. */
-function acceptTree(tree: unknown): StaticNode | null {
-  const valid = validateStaticTree(tree);
-  return valid !== null && JSON.stringify(valid).length <= ROW_TREE_LIMITS.maxTreeBytes
-    ? valid
-    : null;
-}
+const treeBytes = (tree: StaticNode | null) => Buffer.byteLength(JSON.stringify(tree));
 
 export function createRowTreeClient(options: {
   workerPath: string;
@@ -71,7 +77,8 @@ export function createRowTreeClient(options: {
 }
 
 class WorkerRowTreeClient implements RowTreeClient {
-  private readonly memo = new Map<string, Array<StaticNode | null>>();
+  private readonly memo = new Map<string, MemoEntry>();
+  private memoBytes = 0;
   private worker: Worker | null = null;
   private ready = false;
   private failures = 0;
@@ -79,9 +86,10 @@ class WorkerRowTreeClient implements RowTreeClient {
   private nextId = 0;
   private loadTimer: NodeJS.Timeout | undefined;
   private idleTimer: NodeJS.Timeout | undefined;
-  // At most one batch per workspace in the worker, and the newest request waiting behind it.
-  private readonly inFlight = new Map<number, { batch: Batch; timer: NodeJS.Timeout }>();
-  private readonly waiting = new Map<string, Batch>();
+  // The worker renders one batch at a time, so one is posted at a time and its timer starts when
+  // it is posted. Queued batches wait in arrival order, at most one (the newest) per workspace.
+  private inFlight: { id: number; batch: Batch; timer: NodeJS.Timeout } | null = null;
+  private readonly queue = new Map<string, Batch>();
 
   constructor(
     private readonly workerPath: string,
@@ -91,7 +99,11 @@ class WorkerRowTreeClient implements RowTreeClient {
   render(workspaceId: string, tailKey: string, rows: RowTreeRow[]) {
     const cacheKey = `${workspaceId}\0${tailKey}`;
     const cached = this.memo.get(cacheKey);
-    if (cached) return Promise.resolve(cached);
+    if (cached) {
+      this.memo.delete(cacheKey); // re-inserting moves a hit to the newest end (LRU)
+      this.memo.set(cacheKey, cached);
+      return Promise.resolve(cached.trees);
+    }
     if (rows.length === 0 || rows.length > this.limits.maxRows) return Promise.resolve(nulls(rows));
     clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => this.stop(null), this.limits.idleMs);
@@ -108,22 +120,26 @@ class WorkerRowTreeClient implements RowTreeClient {
   }
 
   private start() {
-    const worker = new Worker(this.workerPath);
+    let worker: Worker;
+    try {
+      worker = new Worker(this.workerPath);
+    } catch (error) {
+      // Thread creation can fail synchronously (no memory for a thread): a miss, not a throw.
+      return this.stop(`start failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     this.worker = worker;
     worker.unref(); // never keeps the server process alive
+    // Events of a worker this client already stopped or replaced are stale.
+    const current = () => this.worker === worker;
     worker.on("message", (message: "ready" | { id: number; trees: unknown[] }) => {
+      if (!current()) return;
       if (message !== "ready") return this.onReply(message.id, message.trees);
       clearTimeout(this.loadTimer);
       this.ready = true;
     });
-    worker.on("error", (error: Error) => this.stopWorker(worker, `error: ${error.message}`));
-    worker.on("exit", (code: number) => this.stopWorker(worker, `exit ${code}`));
+    worker.on("error", (error: Error) => current() && this.stop(`error: ${error.message}`));
+    worker.on("exit", (code: number) => current() && this.stop(`exit ${code}`));
     this.loadTimer = setTimeout(() => this.stop("load timeout"), this.limits.loadTimeoutMs);
-  }
-
-  /** Events of a worker this client already replaced are stale. */
-  private stopWorker(worker: Worker, reason: string) {
-    if (this.worker === worker) this.stop(reason);
   }
 
   private stop(reason: string | null) {
@@ -132,13 +148,13 @@ class WorkerRowTreeClient implements RowTreeClient {
     const worker = this.worker;
     this.worker = null;
     this.ready = false;
-    for (const { batch, timer } of this.inFlight.values()) {
-      clearTimeout(timer);
-      batch.resolve(nulls(batch.rows));
+    if (this.inFlight) {
+      clearTimeout(this.inFlight.timer);
+      this.inFlight.batch.resolve(nulls(this.inFlight.batch.rows));
+      this.inFlight = null;
     }
-    for (const batch of this.waiting.values()) batch.resolve(nulls(batch.rows));
-    this.inFlight.clear();
-    this.waiting.clear();
+    for (const batch of this.queue.values()) batch.resolve(nulls(batch.rows));
+    this.queue.clear();
     worker?.terminate().catch(() => undefined);
     if (reason === null) return; // the idle stop is not a failure
     log.warn(`Static view row-tree worker stopped: ${reason}`);
@@ -149,35 +165,51 @@ class WorkerRowTreeClient implements RowTreeClient {
   }
 
   private enqueue(batch: Batch) {
-    const busy = [...this.inFlight.values()].some((e) => e.batch.workspaceId === batch.workspaceId);
-    if (!busy) return this.send(batch);
-    const older = this.waiting.get(batch.workspaceId);
+    const older = this.queue.get(batch.workspaceId);
     older?.resolve(nulls(older.rows)); // a burst of page loads keeps only the newest request
-    this.waiting.set(batch.workspaceId, batch);
+    this.queue.delete(batch.workspaceId);
+    this.queue.set(batch.workspaceId, batch);
+    this.sendNext();
   }
 
-  private send(batch: Batch) {
+  private sendNext() {
+    const next = this.queue.values().next();
+    if (this.inFlight || next.done) return;
     assert(this.worker && this.ready, "row-tree batches go only to a ready worker");
+    const batch = next.value;
+    this.queue.delete(batch.workspaceId);
     const id = this.nextId++;
     const timer = setTimeout(() => this.stop("batch timeout"), this.limits.batchTimeoutMs);
-    this.inFlight.set(id, { batch, timer });
+    this.inFlight = { id, batch, timer };
     this.worker.postMessage({ id, rows: batch.rows });
   }
 
+  /** A tree the page may draw: allowed nodes only, and at most `maxTreeBytes`. */
+  private accept(tree: unknown): StaticNode | null {
+    const valid = validateStaticTree(tree);
+    return valid !== null && treeBytes(valid) <= this.limits.maxTreeBytes ? valid : null;
+  }
+
+  private remember(cacheKey: string, trees: Array<StaticNode | null>) {
+    const bytes = cacheKey.length + trees.reduce((sum, tree) => sum + treeBytes(tree), 0);
+    this.memo.set(cacheKey, { trees, bytes });
+    this.memoBytes += bytes;
+    for (const [key, entry] of this.memo) {
+      if (this.memoBytes <= this.limits.memoBytes) break;
+      this.memo.delete(key); // the least recently used first
+      this.memoBytes -= entry.bytes;
+    }
+  }
+
   private onReply(id: number, trees: unknown[]) {
-    const entry = this.inFlight.get(id);
-    if (!entry) return;
-    clearTimeout(entry.timer);
-    this.inFlight.delete(id);
+    if (this.inFlight?.id !== id) return;
+    const { batch, timer } = this.inFlight;
+    clearTimeout(timer);
+    this.inFlight = null;
     this.failures = 0; // a crash loop on one row still backs off: only a reply resets the count
-    const accepted = entry.batch.rows.map((_, i) => acceptTree(trees[i]));
-    this.memo.delete(entry.batch.cacheKey); // re-inserting moves the key to the newest end
-    this.memo.set(entry.batch.cacheKey, accepted);
-    const oldest = this.memo.keys().next();
-    if (this.memo.size > this.limits.memoEntries && !oldest.done) this.memo.delete(oldest.value);
-    entry.batch.resolve(accepted);
-    const next = this.waiting.get(entry.batch.workspaceId);
-    this.waiting.delete(entry.batch.workspaceId);
-    if (next) this.send(next);
+    const accepted = batch.rows.map((_, i) => this.accept(trees[i]));
+    if (!this.memo.has(batch.cacheKey)) this.remember(batch.cacheKey, accepted);
+    batch.resolve(accepted);
+    this.sendNext();
   }
 }
