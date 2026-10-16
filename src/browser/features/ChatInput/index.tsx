@@ -346,8 +346,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const creationSubProjectPath = creationScope?.subProjectPath ?? undefined;
   const creationProject =
     variant === "creation" ? userProjects.get(creationParentProjectPath) : undefined;
+  // Files and skills come from the picked sub-project; the parent owns runtime settings.
   const atMentionProjectPath =
-    variant === "creation" && props.kind !== "scratch" ? props.projectPath : null;
+    variant === "creation" && props.kind !== "scratch"
+      ? (creationSubProjectPath ?? props.projectPath)
+      : null;
   const asyncCommandScopeRef = useRef<{ variant: typeof variant; workspaceId: string | null }>({
     variant,
     workspaceId: variant === "workspace" ? props.workspaceId : null,

@@ -210,13 +210,17 @@ describeIntegration("Creation draft project change", () => {
   }, 60_000);
 
   // The sidebar list follows confirmed saves; the composer, and so its Send, must not wait for one.
-  test("a sub-project pick applies before its save lands", async () => {
+  test("a sub-project pick applies before its save lands and lists the sub-project's agents", async () => {
     const env = getSharedEnv();
     const parent = await createTempGitRepo();
     const cleanupDom = setupTestDom();
     let view: ReturnType<typeof renderApp> | null = null;
     try {
-      await fs.mkdir(path.join(parent, "sub"));
+      await fs.mkdir(path.join(parent, "sub", ".xum", "agents"), { recursive: true });
+      await fs.writeFile(
+        path.join(parent, "sub", ".xum", "agents", "sub-only.md"),
+        "---\nname: Sub Only\ndescription: Defined in the sub-project.\nbase: exec\n---\n\nSub.\n"
+      );
       const created = await env.orpc.projects.create({ projectPath: parent });
       if (!created.success) throw new Error(created.error);
       const parentPath = created.data.normalizedPath;
@@ -244,6 +248,22 @@ describeIntegration("Creation draft project change", () => {
       expect(
         view.container.querySelector('[data-testid="project-selector"]')?.textContent?.trim()
       ).toBe(subLabel);
+
+      // Agents (like files and skills) come from the sub-project, not its parent.
+      const agentTrigger = await waitFor(() => {
+        const button = view?.container.querySelector<HTMLElement>('[aria-label="Select agent"]');
+        if (!button) throw new Error("Agent picker trigger not found");
+        return button;
+      });
+      fireEvent.click(agentTrigger);
+      await waitFor(
+        () => {
+          if (!view?.container.querySelector('[data-agent-id="sub-only"]')) {
+            throw new Error("Sub-project agent not listed");
+          }
+        },
+        { timeout: 10_000 }
+      );
     } finally {
       if (view) await cleanupView(view, cleanupDom);
       else cleanupDom();
