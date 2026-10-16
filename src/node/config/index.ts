@@ -1203,8 +1203,10 @@ function buildProjectsFromStoredEntries(
   const projects = new Map<string, ProjectConfig>();
   for (const [key, group] of groups) {
     if (group.length === 1) {
-      projects.set(key, healSingleKeyDuplicateIds(key, group[0], conflicts));
+      // Legacy copies first: the heal can drop the only id row on a legacy row's path, and the
+      // id migration would then give that legacy row the same id again.
       dropSingleKeyLegacyCopies(key, group[0], conflicts, resolveLegacyId);
+      projects.set(key, healSingleKeyDuplicateIds(key, group[0], conflicts));
       continue;
     }
     const storedKeys = group.map((entry) => entry.storedKey);

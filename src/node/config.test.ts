@@ -2086,6 +2086,39 @@ describe("Config", () => {
         }
       });
 
+      // #6717: the heal keeps the copy on the other path, so the legacy row must be matched
+      // against the dropped copy first. Else the id migration gives it the same id again.
+      it("drops a legacy copy of a repeated id before it keeps the copy on another path", async () => {
+        const checkout = checkoutPath();
+        const id = config.generateLegacyId("/home/u/repo", checkout);
+        const elsewhere = path.join(config.srcDir, "repo", "elsewhere");
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              [
+                "/home/u/repo",
+                {
+                  workspaces: [
+                    { id, name: "x", path: checkout },
+                    { id, name: "x", path: elsewhere },
+                    { name: "x", path: checkout },
+                  ],
+                },
+              ],
+            ],
+          })
+        );
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          expect(await savedIdsOnCheckout(checkout)).toEqual([]);
+          const saved = readSavedProjects()[0][1].workspaces;
+          expect(saved.map((w) => [w.id, w.path])).toEqual([[id, elsewhere]]);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
       it("keeps both rows under one key when the legacy row resolves to another id", () => {
         const checkout = checkoutPath();
         writeSingleKeyLegacyAndIdRows(checkout, "stable-1");
