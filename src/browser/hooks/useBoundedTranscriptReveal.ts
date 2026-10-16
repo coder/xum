@@ -558,13 +558,19 @@ function detachedStartFallback(
   messages: readonly RevealRow[],
   isSafeCut: IsSafeCut
 ): number {
-  // Right after the nearest older row still present, unless no mounted row survives (the end row
-  // follows at once): then the old rule below mounts older rows instead of unread newer ones.
-  const after = firstPresentIndex(messages, state.startRows) + 1;
-  if (after > 0 && messages[after]?.id !== state.endMessageId) return after;
+  // The end row's own index: a safe cut before any regroup in this update (#6742 review). When
+  // the end row went too, its `endRows` fallback (#6757 round 3).
+  const end = storedSliceEnd(state, messages, isSafeCut, (index) => index);
   const mountedBefore = state.endIndexHint - state.anchorIndexHint;
-  // The end row's own index: a safe cut before any regroup in this update (#6742 review).
-  return storedSliceEnd(state, messages, isSafeCut, (index) => index) - mountedBefore;
+  const after = firstPresentIndex(messages, state.startRows) + 1;
+  // No row before the start survives: as many rows before the end as were mounted (#6669 round 7).
+  if (after === 0) return end - mountedBefore;
+  // Right after the nearest older row still present, while a mounted row (or a replacement)
+  // still lies between it and the end.
+  if (after < end) return after;
+  // No mounted row survives: older rows instead of unread newer ones, at most one cap of them, so
+  // a held slice past the cap mounts no more rows it never showed (#6757 round 3).
+  return end - Math.min(mountedBefore, state.maxMountedRows ?? mountedBefore);
 }
 
 interface TailAppend {
