@@ -39,7 +39,7 @@ import {
 } from "@/browser/utils/ui/keybinds";
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
-import { useGitStatus } from "@/browser/stores/GitStatusStore";
+import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { Button } from "@/browser/components/Button/Button";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
@@ -134,15 +134,25 @@ function getPhoneHeaderSnapshot(): boolean {
 
 /**
  * The full selector, not just the name: phones drop the footer's branch selector, so this is
- * their only way to switch branches. Subscribes at the leaf so git status polling does not
- * re-render the whole header.
+ * their only way to switch branches. Mounted like the footer's: for every repository workspace,
+ * because it loads its own branch (waking a stopped runtime when opened), and keyed by workspace
+ * so a header kept across a workspace switch never offers the previous workspace's branches.
  */
-function WorkspaceDetailsBranch(props: { workspaceId: string; workspaceName: string }) {
-  const branch = useGitStatus(props.workspaceId)?.branch;
-  if (!branch) {
+function WorkspaceDetailsBranch(props: {
+  workspaceId: string;
+  workspaceName: string;
+  hasRepository: boolean;
+}) {
+  if (!props.hasRepository) {
     return null;
   }
-  return <BranchSelector workspaceId={props.workspaceId} workspaceName={props.workspaceName} />;
+  return (
+    <BranchSelector
+      key={props.workspaceId}
+      workspaceId={props.workspaceId}
+      workspaceName={props.workspaceName}
+    />
+  );
 }
 
 export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
@@ -763,7 +773,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             <span className="font-mono">{projectLabel}</span>
             <span>{workspaceName}</span>
             <span className="text-muted">{namedWorkspacePath}</span>
-            <WorkspaceDetailsBranch workspaceId={workspaceId} workspaceName={workspaceName} />
+            <WorkspaceDetailsBranch
+              workspaceId={workspaceId}
+              workspaceName={workspaceName}
+              hasRepository={hasWorkspaceRepository(workspaceEntry)}
+            />
           </PopoverContent>
         </Popover>
         {isArchiving && (

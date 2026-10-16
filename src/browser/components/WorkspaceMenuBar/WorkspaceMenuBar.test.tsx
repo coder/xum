@@ -1,6 +1,12 @@
 import "../../../../tests/ui/dom";
 
-import { StrictMode, type ComponentProps, type PropsWithChildren, type ReactNode } from "react";
+import {
+  StrictMode,
+  useState,
+  type ComponentProps,
+  type PropsWithChildren,
+  type ReactNode,
+} from "react";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -12,7 +18,6 @@ import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as RuntimeStatusStoreModule from "@/browser/stores/RuntimeStatusStore";
-import * as GitStatusStoreModule from "@/browser/stores/GitStatusStore";
 import * as OpenTerminalModule from "@/browser/hooks/useOpenTerminal";
 import * as OpenInEditorModule from "@/browser/hooks/useOpenInEditor";
 import * as PersistedStateModule from "@/browser/hooks/usePersistedState";
@@ -229,7 +234,9 @@ function installWorkspaceMenuBarTestDoubles() {
       }) as unknown as ReturnType<typeof WorkspaceStoreModule.useWorkspaceSidebarState>
   );
   spyOn(RuntimeStatusStoreModule, "useRuntimeStatus").mockImplementation(() => "unsupported");
-  spyOn(GitStatusStoreModule, "useGitStatus").mockImplementation(() => null);
+  spyOn(BranchSelectorModule, "BranchSelector").mockImplementation(
+    (() => null) as unknown as typeof BranchSelectorModule.BranchSelector
+  );
   spyOn(RuntimeStatusStoreModule, "useRuntimeStatusStoreRaw").mockImplementation(
     () =>
       ({ invalidateWorkspace: () => undefined }) as unknown as ReturnType<
@@ -395,6 +402,18 @@ const defaultProps: ComponentProps<typeof WorkspaceMenuBarComponent> = {
   runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
   leftSidebarCollapsed: false,
 };
+
+function repoWorkspaceMetadata(id: string): FrontendWorkspaceMetadata {
+  return {
+    id,
+    name: "feature-branch",
+    projectName: "demo",
+    projectPath: "/projects/demo",
+    namedWorkspacePath: `/projects/demo/workspaces/${id}`,
+    runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
+    createdAt: "2026-01-01T00:00:00.000Z",
+  };
+}
 
 const CONSENT_SWITCH_NAME = /allow messages from unrelated workspaces/i;
 
@@ -718,30 +737,44 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(document.activeElement).toBe(focused);
   });
 
-  it("offers the branch selector in the workspace details once the branch is known", () => {
-    const branchSelector = spyOn(BranchSelectorModule, "BranchSelector").mockImplementation(
-      (() => null) as unknown as typeof BranchSelectorModule.BranchSelector
-    );
-    const view = render(<WorkspaceMenuBar {...defaultProps} />);
-    expect(branchSelector).not.toHaveBeenCalled();
+  it("offers the branch selector in repository workspace details before git status loads", () => {
+    workspaceMetadata.set(workspaceId, repoWorkspaceMetadata(workspaceId));
 
-    spyOn(GitStatusStoreModule, "useGitStatus").mockImplementation(() => ({
-      branch: "mike/compact-footer",
-      ahead: 0,
-      behind: 0,
-      dirty: false,
-      outgoingAdditions: 0,
-      outgoingDeletions: 0,
-      incomingAdditions: 0,
-      incomingDeletions: 0,
-    }));
-    view.rerender(<WorkspaceMenuBar {...defaultProps} />);
+    render(<WorkspaceMenuBar {...defaultProps} />);
 
     // The selector, not just the name: phones have no footer branch selector to switch from.
+    const branchSelector = BranchSelectorModule.BranchSelector as unknown as {
+      mock: { calls: Array<[{ workspaceId: string; workspaceName: string }]> };
+    };
     expect(branchSelector.mock.calls.at(-1)?.[0]).toMatchObject({
-      workspaceId: defaultProps.workspaceId,
+      workspaceId,
       workspaceName: defaultProps.workspaceName,
     });
+  });
+
+  it("leaves the branch selector out of scratch workspace details", () => {
+    workspaceMetadata.set(workspaceId, { ...repoWorkspaceMetadata(workspaceId), kind: "scratch" });
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    expect(BranchSelectorModule.BranchSelector).not.toHaveBeenCalled();
+  });
+
+  it("remounts the details branch selector when the workspace changes", () => {
+    const mountedFor: string[] = [];
+    spyOn(BranchSelectorModule, "BranchSelector").mockImplementation(((props: {
+      workspaceId: string;
+    }) => {
+      useState(() => mountedFor.push(props.workspaceId));
+      return null;
+    }) as unknown as typeof BranchSelectorModule.BranchSelector);
+    workspaceMetadata.set(workspaceId, repoWorkspaceMetadata(workspaceId));
+    workspaceMetadata.set("workspace-2", repoWorkspaceMetadata("workspace-2"));
+
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+
+    expect(mountedFor).toEqual([workspaceId, "workspace-2"]);
   });
 
   it("offers the hidden sidebar as one row, and opens it full-screen", () => {
