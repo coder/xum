@@ -96,7 +96,6 @@ import {
   useUserPreferences,
 } from "@/browser/stores/AppConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
-import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { getPlaceholderTip } from "./placeholderTips";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -1118,14 +1117,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     prevCreationAgentIdRef.current = normalizedAgentId;
     prevCreationScopeIdRef.current = scopeId;
     prevCreationProjectRef.current = creationParentProjectPath;
-    // The draft owns its choices: after the composer's first sync, only the user's agent pick
-    // applies agent defaults over them (not a move, its agent reset or an agent list reload). The
-    // first sync (a new draft, or a reopened one: that remounts this composer) keeps every field
-    // the user picked (intent) and fills only the others.
+    // The draft owns its choices: after the composer seeds them, only the user's agent pick applies
+    // agent defaults over them (not a move, its agent reset or an agent list reload).
     if (!isFirstSync && !isExplicitAgentSwitch) return;
-    const picked = isFirstSync
-      ? (getCreationDraftStore().getView(creationDraftId).draft?.intent ?? {})
-      : {};
 
     const existingModel = readScopedAiDefault(scopeId, "model") ?? fallbackModel;
     const existingThinking = readScopedAiDefault(scopeId, "thinkingLevel") ?? "off";
@@ -1149,15 +1143,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       existingReasoningMode: existingReasoning,
       agentBaseById,
     });
-    if (existingModel !== resolvedModel && !picked.model) {
+    if (existingModel !== resolvedModel) {
       setWorkspaceModelWithOrigin(scopeId, resolvedModel, isExplicitAgentSwitch ? "agent" : "sync");
     }
 
-    if (existingThinking !== resolvedThinking && !picked.thinkingLevel) {
+    if (existingThinking !== resolvedThinking) {
       writeScopedAiDefault(scopeId, "thinkingLevel", resolvedThinking);
     }
 
-    if (existingReasoning !== resolvedReasoning && !picked.reasoningMode) {
+    if (existingReasoning !== resolvedReasoning) {
       markAiSelectionIntent(scopeId, "reasoningMode", resolvedReasoning);
     }
   }, [

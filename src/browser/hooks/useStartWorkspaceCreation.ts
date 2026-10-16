@@ -27,13 +27,8 @@ export function persistWorkspaceCreationPrefill(
   const draftId = store.create(projectPath, subProjectPath, { persist: true, text: startMessage });
   const draft = store.getView(draftId).draft;
   if (draft && model !== undefined) {
-    // A prefilled model is an explicit pick: it leaves Auto (see setWorkspaceModelWithOrigin), and
-    // its intent keeps it over the agent's defaults when the composer first syncs.
-    store.update(draftId, {
-      ai: { ...draft.ai, model },
-      intent: { ...draft.intent, model: true },
-      auto: { ...draft.auto, model: false },
-    });
+    // A prefilled model is an explicit pick, so it leaves Auto (see setWorkspaceModelWithOrigin).
+    store.update(draftId, { ai: { ...draft.ai, model }, auto: { ...draft.auto, model: false } });
   }
   // The runtime is intentionally not prefilled: it is a one-time override.
   const trunk = trunkBranch?.trim();

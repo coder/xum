@@ -202,6 +202,26 @@ describe("CreationDraftStore", () => {
     expect((await reopen(harness, id, PROJECT_A)).getView(id).draft?.text).toBe("keep me");
   });
 
+  test("a save lost with a replaced connection is retried on the new one", async () => {
+    using tempDir = new TestTempDir("creation-store-save-across-reconnect");
+    const harness = await createHarness(tempDir);
+    const { store, control, service } = harness;
+    const id = store.create(PROJECT_A, null, { persist: true });
+    await store.flush(id);
+    let releaseSave: () => void = () => undefined;
+    control.updateGate = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    control.failUpdates = 1;
+    store.update(id, { text: "typed before the drop" });
+    const flushed = store.flush(id).catch(() => undefined);
+    store.setClient(harness.newClient());
+    releaseSave();
+    await flushed;
+    await waitFor(() => store.getView(id).saveError === null && !store.getView(id).unsaved);
+    expect((await service.get(id))?.text).toBe("typed before the drop");
+  });
+
   test("a failed or timed-out read shows Retry and never an editable blank draft", async () => {
     using tempDir = new TestTempDir("creation-store-read-failure");
     const harness = await createHarness(tempDir);

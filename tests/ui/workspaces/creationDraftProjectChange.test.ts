@@ -27,9 +27,7 @@ import {
   setupTestDom,
 } from "../helpers";
 
-import { getUserPreferences, updateUserPreferences } from "@/browser/stores/AppConfigStore";
-import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
-import { getCreationDraftScopeId } from "@/common/constants/storage";
+import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 
@@ -178,14 +176,9 @@ describeIntegration("Creation draft project change", () => {
     });
     const cleanupDom = setupTestDom();
     const view = renderApp({ apiClient: env.orpc });
-    let pathA = "";
     try {
-      pathA = await addProjectViaUI(view, getSharedRepoPath());
+      const pathA = await addProjectViaUI(view, getSharedRepoPath());
       const labelB = (await addProjectViaUI(view, projectB)).split("/").pop() ?? projectB;
-      // A new draft starts from its project's model; its agent's configured model still wins.
-      updateUserPreferences({
-        ai: { projectDefaults: { [pathA]: { model: "anthropic:claude-haiku-4-5" } } },
-      });
       await openProjectCreationView(view, pathA);
       await waitForScope(view.container, pathA.split("/").pop() ?? pathA);
       const store = getCreationDraftStore();
@@ -199,30 +192,9 @@ describeIntegration("Creation draft project change", () => {
       });
       const model = () => store.getView(draftId).draft?.ai.model;
       await waitFor(() => expect(model()).toBe("openai:gpt-5"));
-      // The model selector's pick (with its intent).
-      markAiSelectionIntent(
-        getCreationDraftScopeId(draftId),
-        "model",
-        "anthropic:claude-sonnet-4-5"
-      );
-      await store.flush(draftId);
-
-      // Reopening the draft remounts its composer: that seeds nothing over what it holds.
-      fireEvent.keyDown(window, { key: "n", ctrlKey: true });
-      await waitFor(() => expect(messageTextarea(view.container).value).toBe(""));
-      const expand = view.container.querySelector<HTMLElement>(
-        `[data-project-path="${pathA}"] [aria-label*="Expand project"]`
-      );
-      if (expand) fireEvent.click(expand);
-      const row = await waitFor(() => {
-        const element = view.container.querySelector<HTMLElement>(`[data-draft-id="${draftId}"]`);
-        if (!element) throw new Error("Draft row not found");
-        return element;
-      });
-      fireEvent.click(row);
-      await waitFor(() => expect(messageTextarea(view.container).value).toBe("keep my model"));
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      expect(model()).toBe("anthropic:claude-sonnet-4-5");
+      const draft = store.getView(draftId).draft;
+      if (!draft) throw new Error("Draft not loaded");
+      store.update(draftId, { ai: { ...draft.ai, model: "anthropic:claude-sonnet-4-5" } });
 
       await pickProject(view.container, labelB);
       // Let B's agent list load (the sync waits for it).
@@ -232,7 +204,6 @@ describeIntegration("Creation draft project change", () => {
       store.updateExecution(draftId, { agent: { id: "plan", scope: "built-in" } });
       await waitFor(() => expect(model()).toBe("anthropic:claude-opus-4-1"));
     } finally {
-      if (pathA) updateUserPreferences({ ai: { projectDefaults: { [pathA]: { model: null } } } });
       await env.orpc.config.updateAgentAiDefaults({ agentAiDefaults: {} });
       await cleanupView(view, cleanupDom);
     }

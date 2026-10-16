@@ -504,9 +504,10 @@ export class CreationDraftStore {
     entry.pending = {};
     entry.saving = true;
     this.recompute(id, entry);
+    const client = this.client;
     try {
-      if (!this.client) throw new Error("Not connected.");
-      await this.client.drafts.updateCreation({
+      if (!client) throw new Error("Not connected.");
+      await client.drafts.updateCreation({
         scope: { kind: "creation", draftId: id },
         ...patch,
       });
@@ -522,6 +523,12 @@ export class CreationDraftStore {
       // Later edits win over the fields this save carried.
       entry.pending = { ...patch, ...entry.pending };
       entry.saveError = getErrorMessage(error);
+      // Lost with a connection that was replaced meanwhile: the reconnect saw no error to retry.
+      if (this.client && this.client !== client) {
+        this.recompute(id, entry);
+        this.flushInBackground(id);
+        return;
+      }
     }
     this.recompute(id, entry);
   }
