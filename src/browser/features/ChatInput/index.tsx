@@ -554,7 +554,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   }, []);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // #6585: edits other than typing at the end stop a send in flight from cutting its text.
-  useSendMarkEditTracking(inputRef, draftScope);
+  const sendMarkEdits = useSendMarkEditTracking(inputRef, draftScope);
   const modelSelectorRef = useRef<ModelSelectorRef>(null);
   const powerMode = usePowerMode();
   const handleInputChange = useCallback(
@@ -2931,9 +2931,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // Clear only what this send took: a draft restored meanwhile (an edit completing while
         // this send resolved its options) stays in the composer (#5226).
         const sentAttachmentIds = new Set([...attachments, ...sendAttachments].map(({ id }) => id));
-        // Read before the update below: takeSendMark ends the mark.
-        const take = getDraftStore().takeSendMark(draftScope, input);
         if (!tracksSend) {
+          // An edit send has no beginSend, which takes the mark of every other send (#6729).
+          // Read before the update below: takeSendMark ends the mark.
+          const take = getDraftStore().takeSendMark(draftScope, input);
           setInput((current) => takeSentText(current, input, take));
           taken = { text: input };
         }
@@ -3465,6 +3466,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     onDragOver={handleDragOver}
                     onDrop={handleDrop}
                     onEscapeInNormalMode={handleEscapeInNormalMode}
+                    onKeyEdit={sendMarkEdits.onKeyEdit}
                     suppressKeys={
                       composerSuggestions.isVisible ? COMMAND_SUGGESTION_KEYS : undefined
                     }

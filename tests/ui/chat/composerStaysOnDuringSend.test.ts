@@ -11,6 +11,7 @@ jest.mock("lottie-react", () => ({
 }));
 import { act, fireEvent, waitFor } from "@testing-library/react";
 
+import { getUserPreferences, updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
@@ -239,19 +240,29 @@ describe("composer during an unsettled send (#6259)", () => {
   // #6585: the same flows through real textarea events (beforeinput + input), not DraftStore.
   describe("textarea edits between Enter and the take (#6585)", () => {
     /** Sends `sent`, runs `edit` while the take is held, and returns the composer text after. */
-    async function editBeforeTake(sent: string, edit: (app: AppHarness) => void) {
+    async function editBeforeTake(
+      sent: string,
+      edit: (app: AppHarness) => void | Promise<void>,
+      options?: { vim: boolean }
+    ) {
       const app = await createAppHarness({ branchPrefix: "composer-textarea-take" });
       const takes = holdTakes();
       try {
+        // After the harness: preference writes need its backend connection.
+        if (options?.vim) {
+          act(() => updateUserPreferences({ appearance: { vimEnabled: true } }));
+          await waitFor(() => expect(getUserPreferences().appearance?.vimEnabled).toBe(true), WAIT);
+        }
         await app.chat.send(sent);
         await waitFor(() => expect(takes.spy).toHaveBeenCalledTimes(1), WAIT);
-        edit(app);
+        await edit(app);
         takes.release();
         await app.chat.expectTranscriptContains(`Mock response: ${sent}`, WAIT.timeout);
         await app.chat.expectStreamComplete();
         await waitFor(() => expect(sendButton(app).disabled).toBe(false), WAIT);
         return composer(app).value;
       } finally {
+        if (options?.vim) act(() => updateUserPreferences({ appearance: { vimEnabled: false } }));
         takes.release();
         takes.spy.mockRestore();
         await app.dispose();
@@ -270,6 +281,26 @@ describe("composer during an unsettled send (#6259)", () => {
         editTextarea(app, { inputType: "insertFromPaste", value: pasted, selection: [0, 11] })
       );
       expect(value).toBe(pasted);
+    }, 120_000);
+
+    // #6729: Vim normal-mode commands edit through VimTextArea's key handler, with no
+    // beforeinput. `cc` clears the line; the user then types the new text in insert mode.
+    test("a Vim cc and a retyped text keep what was typed", async () => {
+      const value = await editBeforeTake(
+        "yes",
+        async (app) => {
+          for (const key of ["Escape", "c", "c"]) {
+            fireEvent.keyDown(composer(app), { key });
+            // VimTextArea moves the DOM caret in a timeout after each key, as a person's next
+            // key would find it.
+            await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+          }
+          expect(composer(app).value).toBe("");
+          typeIntoTextarea(app, "yes please");
+        },
+        { vim: true }
+      );
+      expect(value).toBe("yes please");
     }, 120_000);
 
     test("deleting the sent text and typing it again keeps what was typed", async () => {

@@ -32,12 +32,29 @@ export interface VimTextAreaProps extends Omit<
   ghostHint?: string | null;
   /** Called when Escape is pressed in normal mode (vim) - useful for cancel edit */
   onEscapeInNormalMode?: () => void;
+  /**
+   * Called just before onChange when a key Vim handles (a normal-mode command such as `cc`, `dd`
+   * or `x`) changes the text. Those edits fire no `beforeinput`.
+   */
+  onKeyEdit?: (previous: string, next: string) => void;
 }
 
 type VimMode = vim.VimMode;
 
 export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProps>(
-  ({ value, onChange, suppressKeys, onKeyDown, ghostHint, onEscapeInNormalMode, ...rest }, ref) => {
+  (
+    {
+      value,
+      onChange,
+      suppressKeys,
+      onKeyDown,
+      ghostHint,
+      onEscapeInNormalMode,
+      onKeyEdit,
+      ...rest
+    },
+    ref
+  ) => {
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
     // Expose DOM ref to parent
     useEffect(() => {
@@ -192,6 +209,7 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
       cursorRef.current = newState.cursor;
 
       if (newState.text !== value) {
+        onKeyEdit?.(value, newState.text);
         onChange(newState.text, newState.cursor);
       }
       if (newState.mode !== vimMode) {
