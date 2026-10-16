@@ -16,6 +16,7 @@ import { mcpAppEntrypointDescription } from "./AppViewTab/mcpAppEntrypoints";
 /** Tools with a global shortcut of their own; the launcher shows it as a hint. */
 const TOOL_KEYBINDS: Partial<Record<BaseTabType, Keybind>> = {
   artifacts: KEYBINDS.OPEN_ARTIFACTS_TAB,
+  plan: KEYBINDS.OPEN_PLAN_TAB,
 };
 
 interface NewTabLauncherProps {

@@ -626,6 +626,9 @@ export const KEYBINDS = {
   /** Agent interface view: open Start Here from the agent's last reply, from the status page's bar */
   STATUS_START_HERE: { key: "h", code: "KeyH", ctrl: true, alt: true, shift: true },
 
+  /** Open (or focus) the Plan tab in the right sidebar */
+  OPEN_PLAN_TAB: { key: "B", ctrl: true, shift: true },
+
   // Artifacts tab shortcuts: only handled while focus is inside the Artifacts panel,
   // like the Review panel's single-key hunk navigation.
   /** Toggle fullscreen for the selected artifact */
