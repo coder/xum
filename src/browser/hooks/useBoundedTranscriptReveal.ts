@@ -737,16 +737,18 @@ function exceedsOneStep(start: number, end: number, inputs: StepInputs): boolean
  * Whether a tail change restarts the reveal at the tail. A replaced tail (the previous newest row
  * is gone and the newest row is new: edit, truncate, compaction) always does. With a cap, deleting
  * only newest rows does not (`deletedTail`): a retry that removes an error row keeps a reader's
- * place. A bulk arrival (more than one step) restarts unless the slice is held (`holds`: scrolled
- * up, a walk, or detached; #6680 review): it then keeps its start, and past the cap it detaches.
+ * place. Nor does one that also deletes a detached slice's start or end row (`refits`): a truncate
+ * through the slice refits around the rows the reader sees (#6884 review). A bulk arrival (more
+ * than one step) restarts unless the slice is held (`holds`: scrolled up, a walk, or detached;
+ * #6680 review): it then keeps its start, and past the cap it detaches.
  */
 function appendRestarts(
   previousNewestIndex: number,
   length: number,
   inputs: StepInputs,
-  hold: { holds: boolean; deletedTail: boolean }
+  hold: { holds: boolean; deletedTail: boolean; refits: () => boolean }
 ): boolean {
-  if (previousNewestIndex === -1) return !hold.deletedTail;
+  if (previousNewestIndex === -1) return !hold.deletedTail && !hold.refits();
   return !hold.holds && exceedsOneStep(previousNewestIndex + 1, length, inputs);
 }
 
@@ -774,7 +776,13 @@ function tailChange(
       : messages.findIndex((row) => row.id === state.newestMessageId);
   const capped = inputs.maxMountedRows !== undefined;
   const deletedTail = capped && newestId !== undefined && state.tailIds.includes(newestId);
-  const restart = appendRestarts(previousNewestIndex, length, inputs, { holds, deletedTail });
+  // Scans for the edge rows only when the previous newest row is gone (see appendRestarts).
+  const refits = () =>
+    capped &&
+    state.endMessageId !== null &&
+    (anchorIndexIn(state, messages) === -1 || storedEndIndex(state, messages) === -1);
+  const hold = { holds, deletedTail, refits };
+  const restart = appendRestarts(previousNewestIndex, length, inputs, hold);
   // Only rows deleted: nothing was appended.
   return { restart, appendedFrom: previousNewestIndex === -1 ? length : previousNewestIndex + 1 };
 }

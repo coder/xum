@@ -1056,6 +1056,18 @@ describe("useBoundedTranscriptReveal", () => {
 
       // #6871 round 1: one mounted row survives, and the first surviving unmounted row joins its
       // bundle in the same update. The end snaps back to that bundle's head; the row stays.
+      // #6884 review: one update truncates through the slice (the end row and every newer row go)
+      // and new rows arrive: a replaced tail, which restarts, unless the refit keeps the reader.
+      test("a truncate through a detached slice plus new rows keeps the visible rows", () => {
+        const slice = detachedPastCap();
+        const { fromIndex: from, toIndex: to } = slice.reveal();
+        const seen = slice.mounted().slice(5, 15);
+        const kept = slice.messages().slice(0, to - 1);
+        slice.set({ messages: [...kept, ...rows(3, "after-truncate")], visible: seen }, false);
+        expect(slice.reveal().fromIndex).toBeLessThanOrEqual(from + 5);
+        subset(seen, slice.mounted());
+      });
+
       test("the last surviving mounted row stays when the end regroups into its bundle", () => {
         const slice = detachedPastCap();
         const { fromIndex: from, toIndex: to } = slice.reveal();
