@@ -55,9 +55,9 @@ export const WORKSPACE_VIEW_EARLY_SCRIPT = `(() => {
       console.error("workspace view: no usable module list", error);
       return (list = false);
     }
-    for (const href of [...list.preload, list.script]) {
+    for (const href of list.preload) {
       const link = document.createElement("link");
-      Object.assign(link, { rel: "modulepreload", crossOrigin: "", fetchPriority: "low", href });
+      Object.assign(link, { rel: "modulepreload", crossOrigin: "", href });
       document.head.appendChild(link);
     }
     return list;
@@ -83,7 +83,6 @@ export const WORKSPACE_VIEW_EARLY_SCRIPT = `(() => {
   addEventListener("resize", () => phone() || view()?.remove());
   ${VIEW_BUILDER_SOURCE}
   const SKELETON = ${PHONE_CHROME_JSON};
-  preload();
   const token = new URLSearchParams(location.search).get("token")?.trim() || read(${q(AUTH_TOKEN_KEY)});
   const headers = { "Content-Type": "application/json", ...(token ? { Authorization: "Bearer " + token } : {}) };
   const abort = new AbortController();
