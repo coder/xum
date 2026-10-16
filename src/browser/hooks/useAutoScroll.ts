@@ -36,6 +36,11 @@ function isWithinBottomThreshold(element: HTMLElement, thresholdPx: number): boo
   return getMaxScrollTop(element) - element.scrollTop <= thresholdPx;
 }
 
+/** Near the bottom, and that bottom is the live tail (not a detached transcript slice). */
+function isRelockableBottom(element: HTMLElement, isDetached: boolean): boolean {
+  return !isDetached && isWithinBottomThreshold(element, USER_BOTTOM_RELOCK_THRESHOLD_PX);
+}
+
 function isEditableKeyboardTarget(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false;
 
@@ -95,6 +100,12 @@ function isMouseDownExemptFromScrollIntent(
  * we are at the bottom). Once the user scrolls up, `autoScroll` flips false, rows
  * regain `overflow-anchor: auto`, and the browser preserves the user's reading
  * position when off-screen content above the fold settles.
+ *
+ * `setTranscriptDetached` (#4961 F20): while the transcript's newest rows are unmounted, the
+ * scroll bottom is not the live tail. Reaching it never relocks: a relock would pin the bottom and
+ * skip the rows a "Show newer messages" press mounts below the reader. Jump to bottom still locks.
+ * A ref, read when a scroll event arrives: the caller learns about detachment only after it has
+ * passed `autoScroll` to the reveal.
  */
 export function useAutoScroll() {
   const [autoScroll, setAutoScroll] = useState(true);
@@ -104,6 +115,10 @@ export function useAutoScroll() {
   // `overflow-anchor: auto` element so native anchoring pins the bottom.
   const sentinelRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
+  const isDetachedRef = useRef(false);
+  const setTranscriptDetached = useCallback((isDetached: boolean) => {
+    isDetachedRef.current = isDetached;
+  }, []);
   const programmaticDisableRef = useRef(false);
   const userScrollIntentUntilRef = useRef(0);
   // Tracks the scrollTop observed during the previous handleScroll call so the
@@ -265,7 +280,7 @@ export function useAutoScroll() {
         if (
           !autoScrollRef.current &&
           !programmaticDisableRef.current &&
-          isWithinBottomThreshold(scrollContainer, USER_BOTTOM_RELOCK_THRESHOLD_PX)
+          isRelockableBottom(scrollContainer, isDetachedRef.current)
         ) {
           setAutoScrollEnabled(true);
           // Snap the sentinel fully onscreen so anchoring re-engages from the exact
@@ -301,10 +316,7 @@ export function useAutoScroll() {
       // (e.g., the second small wheel tick after the first one already
       // released the lock).
       const userScrollingTowardBottom = currentScrollTop > previousScrollTop;
-      if (
-        userScrollingTowardBottom &&
-        isWithinBottomThreshold(scrollContainer, USER_BOTTOM_RELOCK_THRESHOLD_PX)
-      ) {
+      if (userScrollingTowardBottom && isRelockableBottom(scrollContainer, isDetachedRef.current)) {
         setAutoScrollEnabled(true);
         stickToBottom();
       }
@@ -345,6 +357,7 @@ export function useAutoScroll() {
     autoScroll,
     disableAutoScroll,
     jumpToBottom,
+    setTranscriptDetached,
     handleScroll,
     markUserScrollIntent,
     handleScrollContainerWheel,

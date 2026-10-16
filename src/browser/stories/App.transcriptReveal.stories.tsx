@@ -12,6 +12,7 @@ import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { APIClient } from "@/browser/contexts/API";
 import type { ChatMuxMessage } from "@/common/orpc/types";
 import {
+  TRANSCRIPT_MAX_MOUNTED_ROWS,
   TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
   TRANSCRIPT_REVEAL_CHUNK_ROWS,
   TRANSCRIPT_REVEAL_TAIL_ROWS,
@@ -463,5 +464,60 @@ export const PauseAtBudgetPhone: AppStory = {
       ).toBeLessThanOrEqual(IPHONE_16E.width)
     );
     await pauseAtBudget(context);
+  },
+};
+
+/** Displayed rows (every user prompt is kept) beyond the mounted-row cap by over one budget. */
+const CAPPED_ROWS = 2 * (TRANSCRIPT_MAX_MOUNTED_ROWS + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS);
+const setupCapped = () => setup(CAPPED_ROWS);
+
+// F20 PR3a-3: reading back past the cap detaches the transcript from the live tail.
+export const DetachedPastCap: AppStory = {
+  render: () => <AppWithMocks setup={setupCapped} />,
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement, step }) => {
+    const canvas = within(canvasElement);
+    await findVisibleText(canvasElement, "A short transcript.");
+    const newest = rowText(CAPPED_ROWS - 1);
+    const scrollport = () =>
+      canvasElement.querySelector<HTMLElement>('[data-testid="message-window"]')!;
+    const rows = () => scrollport().querySelectorAll<HTMLElement>('[data-testid="chat-message"]');
+    await step("Load older past the cap unmounts the newest rows", async () => {
+      await switchToLargeWorkspace(canvasElement);
+      await findVisibleText(canvasElement, newest);
+      scrollport().dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
+      for (let press = 0; press < 3; press += 1) {
+        const loadOlder = { name: "Load older messages" };
+        const button = await canvas.findByRole("button", loadOlder, { timeout: 15_000 });
+        scrollport().scrollTop = 0;
+        await userEvent.click(button);
+      }
+      // The last walk ends at the oldest row; Show newer appears as soon as the slice detaches.
+      await canvas.findByText(rowText(0), {}, { timeout: 15_000 });
+      await canvas.findByRole("button", { name: "Show newer messages" }, { timeout: 15_000 });
+      await expect(canvas.queryByText(newest)).toBeNull();
+      await expect(rows().length).toBeLessThanOrEqual(TRANSCRIPT_MAX_MOUNTED_ROWS);
+    });
+    await step("Show newer mounts rows below the reader without moving the read row", async () => {
+      const button = canvas.getByRole("button", { name: "Show newer messages" });
+      button.scrollIntoView({ block: "end", behavior: "instant" });
+      // Tracked by id: what must hold is the reader's position, not one DOM node.
+      const idRows = () => scrollport().querySelectorAll<HTMLElement>("[data-message-id]");
+      const readId = idRows()[idRows().length - 1].dataset.messageId!;
+      const readRow = () => scrollport().querySelector(`[data-message-id="${readId}"]`)!;
+      const readRowTop = readRow().getBoundingClientRect().top;
+      await userEvent.click(button);
+      await waitFor(() => expect(idRows()[idRows().length - 1].dataset.messageId).not.toBe(readId));
+      await expect(
+        Math.abs(readRow().getBoundingClientRect().top - readRowTop)
+      ).toBeLessThanOrEqual(1);
+    });
+    await step("Jump to bottom returns to the live tail", async () => {
+      await userEvent.click(canvas.getByRole("button", { name: /Jump to bottom/ }));
+      await findVisibleText(canvasElement, newest);
+      await waitFor(() =>
+        expect(canvas.queryByRole("button", { name: "Show newer messages" })).toBeNull()
+      );
+    });
   },
 };

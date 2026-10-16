@@ -520,6 +520,44 @@ describe("useAutoScroll", () => {
     }
   });
 
+  test("a detached transcript's bottom never relocks; jumpToBottom still does", () => {
+    const { result } = renderHook(() => useAutoScroll());
+    const element = document.createElement("div");
+    const metrics = attachScrollMetrics(element, {
+      scrollHeight: 1300,
+      clientHeight: 400,
+      initialScrollTop: 900,
+    });
+
+    const dateNowSpy = spyOn(Date, "now");
+    try {
+      let now = 1_000_000;
+      dateNowSpy.mockImplementation(() => now);
+      act(() => {
+        (result.current.contentRef as MutableRefObject<HTMLDivElement | null>).current = element;
+        result.current.setTranscriptDetached(true);
+      });
+      const scrollTo = (scrollTop: number, intent: boolean) => {
+        metrics.setScrollTop(scrollTop);
+        act(() => {
+          if (intent) result.current.markUserScrollIntent();
+          now += intent ? 1 : 1_000;
+          result.current.handleScroll(createScrollEvent(element));
+        });
+      };
+      scrollTo(500, true);
+      expect(result.current.autoScroll).toBe(false);
+      // Back to the bottom: once while the intent window is open, once after it expired.
+      scrollTo(metrics.maxScrollTop - 4, true);
+      scrollTo(metrics.maxScrollTop, false);
+      expect(result.current.autoScroll).toBe(false);
+      act(() => result.current.jumpToBottom());
+      expect(result.current.autoScroll).toBe(true);
+    } finally {
+      dateNowSpy.mockRestore();
+    }
+  });
+
   test("interactive content mousedown does not release the lock", () => {
     const { result } = renderHook(() => useAutoScroll());
     const element = document.createElement("div");

@@ -53,6 +53,7 @@ import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useAutoScroll } from "@/browser/hooks/useAutoScroll";
 import { useBoundedTranscriptReveal } from "@/browser/hooks/useBoundedTranscriptReveal";
+import { TRANSCRIPT_MAX_MOUNTED_ROWS } from "@/common/constants/ui";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
@@ -193,6 +194,53 @@ const TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE = { overflowAnchor: "none" } as const;
 function jumpToLiveTail(isDetached: boolean, resetToLatest: () => void, jumpToBottom: () => void) {
   if (isDetached) resetToLatest();
   jumpToBottom();
+}
+
+/** The mounted rows [from, to) of the transcript (the same array when that is all of it). */
+function mountedSlice<Row>(rows: readonly Row[], from: number, to: number): readonly Row[] {
+  return from === 0 && to === rows.length ? rows : rows.slice(from, to);
+}
+
+const isInSlice = (index: number, from: number, to: number) => index >= from && index < to;
+
+/** Off the bottom, or detached: the bottom of the slice is not the live tail. */
+const offersJumpToBottom = (autoScroll: boolean, isDetached: boolean) => !autoScroll || isDetached;
+
+/** The last mounted transcript row and where it is now, for loadOlderAnchorRef. */
+function lastRowAnchor(scrollport: HTMLDivElement | null) {
+  const rows = scrollport?.querySelectorAll<HTMLElement>("[data-message-id]") ?? [];
+  const element = rows[rows.length - 1];
+  if (!scrollport || !element) return null;
+  return { element, top: element.getBoundingClientRect().top, scrollTop: scrollport.scrollTop };
+}
+
+/** History ids of the transcript rows inside the scrollport now (the reader's view). */
+function visibleHistoryIds(scrollport: HTMLDivElement | null): Set<string> {
+  const ids = new Set<string>();
+  if (!scrollport) return ids;
+  const view = scrollport.getBoundingClientRect();
+  for (const element of scrollport.querySelectorAll<HTMLElement>("[data-message-id]")) {
+    const rect = element.getBoundingClientRect();
+    const id = element.getAttribute("data-message-id");
+    if (id && rect.bottom > view.top && rect.top < view.bottom) ids.add(id);
+  }
+  return ids;
+}
+
+/** Below a detached slice (#4961 F20): mounts the next newer rows (see revealNewer). */
+function ShowNewerMessagesButton(props: { visible: boolean; onClick: () => void }) {
+  if (!props.visible) return null;
+  return (
+    <div className="flex justify-center py-3">
+      <button
+        type="button"
+        onClick={props.onClick}
+        className="text-muted hover:text-foreground text-xs underline underline-offset-2 transition-colors"
+      >
+        Show newer messages
+      </button>
+    </div>
+  );
 }
 // The sentinel is the sole anchor candidate while locked.
 const TRANSCRIPT_BOTTOM_SENTINEL_STYLE = { overflowAnchor: "auto" } as const;
@@ -608,25 +656,59 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       isTranscriptStale: workspaceState.isTranscriptStale,
       isIncrementalCatchUp: workspaceState.isIncrementalCatchUp,
     });
+  // Use auto-scroll hook for scroll management
+  const {
+    contentRef,
+    sentinelRef,
+    autoScroll,
+    disableAutoScroll,
+    jumpToBottom,
+    setTranscriptDetached,
+    handleScroll,
+    markUserScrollIntent,
+    handleScrollContainerWheel,
+    handleScrollContainerMouseDown,
+    handleScrollContainerMouseMove,
+    handleScrollContainerMouseUp,
+    handleScrollContainerKeyDown,
+  } = useAutoScroll();
+
   // While the skeleton owns the pane no row is mounted, so the reveal must not advance behind
   // it: it would otherwise mount the whole transcript in the one commit that replaces the
   // skeleton. Handing it no rows keeps it idle; the real transcript then starts tail-first.
   const {
     fromIndex: revealFromIndex,
+    toIndex: revealToIndex,
     isDetached: isTranscriptDetached,
     isFullyRevealed,
     isRevealPaused,
     revealMore,
     revealThrough,
+    revealNewer,
     resetToLatest,
   } = useBoundedTranscriptReveal({
     workspaceId,
     messages: showTranscriptHydrationPlaceholder ? EMPTY_TRANSCRIPT : deferredMessages,
     isSafeCut: isSafeRevealCut,
     rowWeight: (index) => estimateTranscriptRowWeight(deferredMessages[index]),
+    // Bounds renderer heap on long read-backs (#4961 F20): past the cap the newest rows unmount
+    // ("detached") until Show newer or Jump to bottom brings them back.
+    maxMountedRows: TRANSCRIPT_MAX_MOUNTED_ROWS,
+    // A reader scrolled up keeps the rows they read: appends past the cap detach the slice instead.
+    followsTail: autoScroll,
+    // Read once, on the render where an edit deletes a detached slice's edge row: the DOM still
+    // shows the previous commit, so these are the rows the reader saw (refitDetached keeps them).
+    readVisibleMessageIds: () => {
+      const seen = visibleHistoryIds(contentRef.current);
+      return deferredMessages
+        .filter((message) => "historyId" in message && seen.has(message.historyId))
+        .map((message) => message.id);
+    },
   });
-  const revealedMessages =
-    revealFromIndex === 0 ? deferredMessages : deferredMessages.slice(revealFromIndex);
+  useLayoutEffect(() => {
+    setTranscriptDetached(isTranscriptDetached);
+  }, [isTranscriptDetached, setTranscriptDetached]);
+  const revealedMessages = mountedSlice(deferredMessages, revealFromIndex, revealToIndex);
   const hasCommittedTranscriptRow =
     !showTranscriptHydrationPlaceholder && revealedMessages.length > 0;
   // Chat-switch User Timing (#4504): first transcript row painted after a switch. The commit
@@ -689,22 +771,6 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     (preferences) => preferences.appearance?.vimEnabled === true
   );
 
-  // Use auto-scroll hook for scroll management
-  const {
-    contentRef,
-    sentinelRef,
-    autoScroll,
-    disableAutoScroll,
-    jumpToBottom,
-    handleScroll,
-    markUserScrollIntent,
-    handleScrollContainerWheel,
-    handleScrollContainerMouseDown,
-    handleScrollContainerMouseMove,
-    handleScrollContainerMouseUp,
-    handleScrollContainerKeyDown,
-  } = useAutoScroll();
-
   const [pendingTimelineReveal, setPendingTimelineReveal] = useState<
     CustomEventPayloads[typeof CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR] | null
   >(null);
@@ -766,8 +832,9 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
 
     // The tail-first reveal mounts older rows in chunks; re-run once the target's chunk lands.
-    // The automatic reveal may have paused above the target, so ask it to reach the target.
-    if (targetIndex < revealFromIndex) {
+    // The automatic reveal may have paused above the target, so ask it to reach the target. A
+    // target below a detached slice re-centers the slice on it.
+    if (!isInSlice(targetIndex, revealFromIndex, revealToIndex)) {
       revealThrough(targetIndex);
       return;
     }
@@ -800,6 +867,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     pendingTimelineReveal,
     revealFromIndex,
     revealThrough,
+    revealToIndex,
     setOperationalBundleExpanded,
     setWorkBundleExpanded,
     workBundleExpansionOverrides,
@@ -888,7 +956,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     const targetIndex = deferredMessages.findIndex(
       (message) => "historyId" in message && message.historyId === pendingScrollTarget.historyId
     );
-    if (targetIndex === -1 || targetIndex >= revealFromIndex) {
+    if (targetIndex === -1 || isInSlice(targetIndex, revealFromIndex, revealToIndex)) {
       setPendingScrollTarget(null);
       return;
     }
@@ -900,6 +968,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     pendingScrollTarget,
     revealFromIndex,
     revealThrough,
+    revealToIndex,
     workspaceId,
   ]);
 
@@ -1302,6 +1371,12 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
     if (revealSettled || !anchor.element.isConnected) loadOlderAnchorRef.current = null;
   }, [contentRef, revealFromIndex, revealSettled, shouldRenderLoadOlderMessagesButton]);
+  // Show newer unmounts rows above the reader. Chromium's native scroll anchoring holds the read row
+  // (DetachedPastCap); the explicit pin of the last mounted row does not depend on it.
+  const handleShowNewerMessages = () => {
+    loadOlderAnchorRef.current = lastRowAnchor(contentRef.current);
+    revealNewer();
+  };
   const handleTranscriptScroll = (event: React.UIEvent<HTMLDivElement>) => {
     handleScroll(event);
     // The reader scrolling while the requested rows mount moves the position to keep, so the
@@ -1632,6 +1707,10 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       bundles={transcriptBundles}
                       renderMessageAtIndex={renderMessageAtIndex}
                     />
+                    <ShowNewerMessagesButton
+                      visible={isTranscriptDetached}
+                      onClick={handleShowNewerMessages}
+                    />
                   </MessageListProvider>
                 </BashCollapsedSummaryModeProvider>
               )}
@@ -1687,7 +1766,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       <span className="sr-only">Loading messages...</span>
                     </div>
                   )}
-                  {!autoScroll && (
+                  {offersJumpToBottom(autoScroll, isTranscriptDetached) && (
                     <button
                       onClick={handleJumpToBottom}
                       type="button"
