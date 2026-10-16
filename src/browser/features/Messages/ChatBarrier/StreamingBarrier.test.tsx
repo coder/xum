@@ -356,7 +356,7 @@ describe("StreamingBarrier", () => {
     currentStreamingStats = { tokenCount: 42, tps: 18, charsPerSec: 72 };
 
     const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
-    const label = () => view.getByText("claude-opus-4-6 streaming").textContent;
+    const label = () => view.getByText(/^claude-opus-4-6 streaming/).textContent;
     expect(label()).toBe("claude-opus-4-6 streaming at 18 t/s");
 
     currentStreamingStats = { tokenCount: 84, tps: 34, charsPerSec: 136 };
