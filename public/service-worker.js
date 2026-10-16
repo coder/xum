@@ -49,28 +49,9 @@ function isUncacheable(url, path) {
 }
 
 /**
- * True when the server answers this navigation with the SPA shell. Mirrors the SPA fallback rule
- * in src/node/orpc/server.ts: index.html, `workspace/<id>` (legacy IDs can contain dots), or a
- * path with no file extension and no dot segment. Other HTML build entries (terminal.html and
- * desktop.html popouts) must never replace the shell, or an offline launch opens a popout.
- */
-function isSpaRoute(path) {
-  if (path === "index.html" || /^workspace\/[^/]+$/.test(path)) return true;
-  // serve-static decodes percent escapes before its lookup (terminal%2Ehtml is terminal.html).
-  let decoded = path;
-  try {
-    decoded = decodeURIComponent(path);
-  } catch {
-    // Not decodable: classify the raw path, as the server does.
-  }
-  const lastSegment = decoded.slice(decoded.lastIndexOf("/") + 1);
-  return !`/${decoded}`.includes("/.") && !lastSegment.includes(".");
-}
-
-/**
  * The shell is the one exception to Cache-Control: the server sends it with no-store, but it
  * holds no session or workspace data (base href, first-run view, module list, font preload, the
- * deployment's proxy URI template). A 200 navigation refreshes the cached copy, so an offline
+ * deployment's proxy URI template). A 200 root navigation refreshes the cached copy, so an offline
  * launch starts the newest frontend, not the one from the first install.
  */
 function isShellResponse(response) {
@@ -88,28 +69,6 @@ function isCacheableResponse(response) {
   return !/(^|[\s,])(no-store|private)([\s,=]|$)/.test(cacheControl);
 }
 
-// The server's root-only slash-appending redirect (SLASHLESS_ROOT_REDIRECT_SCRIPT in
-// src/node/orpc/server.ts; serviceWorker.test.ts reads it from there, so a change fails the test).
-const SLASHLESS_ROOT_REDIRECT = /<script>\(\(\)=>\{const pathname=location\.pathname;.*?<\/script>/;
-
-/**
- * The cached shell was built for the one route it came from: its <base> is relative to that route
- * and the root copy holds the redirect. A navigation document keeps the requested URL, so offline
- * the worker points <base> at the scope and drops the redirect. Otherwise a deep route loads its
- * assets from the wrong folder, or gains a trailing slash that the router does not match.
- */
-function routeNeutralShell(cachedResponse) {
-  return cachedResponse.text().then(
-    (body) =>
-      new Response(
-        body
-          .replace(SLASHLESS_ROOT_REDIRECT, "")
-          .replace(/<base\b[^>]*>/i, `<base href="${self.registration.scope}" />`),
-        { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } }
-      )
-  );
-}
-
 function offlineResponse() {
   return new Response("Network error and no cached version available", {
     status: 503,
@@ -120,10 +79,10 @@ function offlineResponse() {
 
 /**
  * Network first: store a cacheable answer under `cacheKey`, else answer from this cache.
- * `isCacheable` decides what may be stored, and `fromCache` prepares a cached answer. The write
- * runs under `event.waitUntil`, so the browser keeps the worker alive until it ends.
+ * `isCacheable` decides what may be stored. The write runs under `event.waitUntil`, so the
+ * browser keeps the worker alive until it ends.
  */
-function networkFirst(event, cacheKey, isCacheable, fromCache = (cached) => cached) {
+function networkFirst(event, cacheKey, isCacheable) {
   return fetch(event.request)
     .then((response) => {
       if (isCacheable(response)) {
@@ -141,7 +100,7 @@ function networkFirst(event, cacheKey, isCacheable, fromCache = (cached) => cach
       caches
         .open(CACHE_NAME)
         .then((cache) => cache.match(cacheKey))
-        .then((cachedResponse) => (cachedResponse ? fromCache(cachedResponse) : offlineResponse()))
+        .then((cachedResponse) => cachedResponse || offlineResponse())
     );
 }
 
@@ -192,11 +151,11 @@ self.addEventListener("fetch", (event) => {
   if (path === null || isUncacheable(url, path)) return;
 
   if (event.request.mode === "navigate") {
-    // Every client route loads the same shell; one entry, never keyed by the visited URL.
-    // Other navigations (popout pages, files) go to the network untouched.
-    if (isSpaRoute(path)) {
-      event.respondWith(networkFirst(event, SHELL_PATH, isShellResponse, routeNeutralShell));
-    }
+    // Only the app root, where the installed PWA starts (manifest start_url "."). The server builds
+    // the shell for the route it answers: a route-relative <base>, and at the root a redirect and
+    // a first-run loader that needs it. So the cached root copy is correct only at the root.
+    // Every other navigation (deep routes, popout pages, files) goes to the network untouched.
+    if (path === "") event.respondWith(networkFirst(event, SHELL_PATH, isShellResponse));
     return;
   }
 

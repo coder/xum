@@ -17,18 +17,6 @@ const WORKER_SOURCE = await fs.readFile(
   path.join(import.meta.dir, "../../public/service-worker.js"),
   "utf-8"
 );
-// The root-only redirect the server injects into the shell. Read from the server source (browser
-// code cannot import src/node), so a change to it fails the offline shell test below.
-const SERVER_SOURCE = await fs.readFile(
-  path.join(import.meta.dir, "../node/orpc/server.ts"),
-  "utf-8"
-);
-const SLASHLESS_ROOT_REDIRECT_SCRIPT = /const SLASHLESS_ROOT_REDIRECT_SCRIPT =\s*'([^']+)';/.exec(
-  SERVER_SOURCE
-)?.[1];
-if (SLASHLESS_ROOT_REDIRECT_SCRIPT === undefined) {
-  throw new Error("SLASHLESS_ROOT_REDIRECT_SCRIPT not found in server.ts");
-}
 const ORIGIN = "https://xum.test";
 const ROOT_SCOPE = `${ORIGIN}/`;
 const HASHED_JS = "main-AbCd1234.js";
@@ -184,7 +172,7 @@ describe("service worker caching (#6848)", () => {
     await worker.request(`${ORIGIN}/notes.json`);
     await worker.request(`${ORIGIN}/workspace/abc`, { mode: "navigate" });
 
-    // The visited route is not a key: every route shares the "./" shell entry.
+    // A deep route is left to the browser, so it adds no entry; the root shares "./".
     expect(worker.storage.urlsIn(worker.cacheName)).toEqual(
       [
         ROOT_SCOPE,
@@ -250,14 +238,18 @@ describe("service worker caching (#6848)", () => {
     await worker.request(`${scope}${HASHED_JS}`);
     expect(worker.storage.urlsIn(cacheNameFor(scope))).toContain(`${scope}${HASHED_JS}`);
     expect(worker.storage.storedUrls()).not.toContain(`${scope}api/docs`);
+    // The scope root is the app root: an offline launch there gets the shell.
+    worker.offline();
+    expect(await (await worker.request(scope, { mode: "navigate" })).response?.text()).toBe(
+      "shell"
+    );
   });
 
   test("a no-store navigation refreshes the shell, so offline starts the newest one", async () => {
     const worker = await startWorker(); // installs "shell"
     // The server sends the shell with no-store; the shell is the one exception.
     worker.setNetwork(() => html("shell v2", { "Cache-Control": "no-store" }));
-    // A legacy workspace ID can contain dots; the server still answers it with the shell.
-    await worker.request(`${ORIGIN}/workspace/next.js-main`, { mode: "navigate" });
+    await worker.request(`${ORIGIN}/`, { mode: "navigate" });
     // An error page must not replace the shell.
     worker.setNetwork(() => new Response("bad gateway", { status: 502 }));
     await worker.request(`${ORIGIN}/`, { mode: "navigate" });
@@ -276,14 +268,19 @@ describe("service worker caching (#6848)", () => {
     ["the terminal popout", "terminal.html?workspaceId=w&sessionId=s", () => html("terminal page")],
     ["the desktop popout", "desktop.html?workspaceId=w&instanceId=i", () => html("desktop page")],
     ["an escaped popout name", "terminal%2Ehtml?workspaceId=w", () => html("terminal page")],
+    // The server builds the shell per route (relative <base>, root-only redirect and loader).
+    ["a deep route", "workspace/abc", () => html("deep-route shell")],
+    // Served at /index.html, the root shell's redirect would navigate to /index.html/.
+    ["the index file", "index.html", () => html("index page")],
   ])(
-    "a navigation to %s goes to the network and never replaces the shell",
+    "a navigation to %s is left to the browser and never replaces the shell",
     async (_l, path, reply) => {
       const worker = await startWorker();
       worker.setNetwork(reply);
       expect((await worker.request(`${ORIGIN}/${path}`, { mode: "navigate" })).handled).toBe(false);
       worker.offline();
-      const { response } = await worker.request(`${ORIGIN}/settings`, { mode: "navigate" });
+      expect((await worker.request(`${ORIGIN}/${path}`, { mode: "navigate" })).handled).toBe(false);
+      const { response } = await worker.request(`${ORIGIN}/`, { mode: "navigate" });
       expect(await response?.text()).toBe("shell");
     }
   );
@@ -298,34 +295,10 @@ describe("service worker caching (#6848)", () => {
     expect(await response?.text()).toBe("shell");
   });
 
-  test.each([
-    // The root copy: relative <base> and the slash-appending redirect.
-    ["the root shell", ROOT_SCOPE, `${SLASHLESS_ROOT_REDIRECT_SCRIPT}\n    <base href="./" />`],
-    // A copy refreshed from a deep route under an app-proxy prefix.
-    ["a deep-route shell", `${ORIGIN}/@u/ws/apps/mux/`, '<base href="./../" />'],
-  ])("offline, %s starts a deep route from the scope", async (_l, scope, head) => {
-    const page = `<html><head>${head}<script type="module" src="./${HASHED_JS}"></script></head><body></body></html>`;
-    const storage = new MemoryCacheStorage();
-    storage.network = () => html(page);
-    const worker = await startWorker({ scope, storage });
-    await worker.request(`${scope}workspace/abc`, { mode: "navigate" });
-    worker.offline();
-
-    const { response } = await worker.request(`${scope}workspace/abc`, { mode: "navigate" });
-    const body = (await response?.text()) ?? "";
-    // The document keeps the deep URL, so assets must resolve from the scope, not /workspace/.
-    expect(body).toContain(`<base href="${scope}" />`);
-    expect(body).not.toContain('<base href="./');
-    expect(body).not.toContain("location.replace");
-    expect(body).toContain(`src="./${HASHED_JS}"`);
-  });
-
-  test("serves the app shell offline for every client route", async () => {
+  test("serves the app shell offline at the app root, where the installed PWA starts", async () => {
     const worker = await startWorker();
     worker.offline();
-    const { handled, response } = await worker.request(`${ORIGIN}/settings/providers`, {
-      mode: "navigate",
-    });
+    const { handled, response } = await worker.request(`${ORIGIN}/`, { mode: "navigate" });
     expect(handled).toBe(true);
     expect(response?.status).toBe(200);
     expect(await response?.text()).toBe("shell");
@@ -418,7 +391,7 @@ describe("auth token changes clear the service worker caches (#6848)", () => {
     const worker = await startWorker({ storage });
     await clearStoredAuthToken();
     worker.offline();
-    const { response } = await worker.request(`${ORIGIN}/settings`, { mode: "navigate" });
+    const { response } = await worker.request(`${ORIGIN}/`, { mode: "navigate" });
     expect(await response?.text()).toBe("shell");
   });
 });
