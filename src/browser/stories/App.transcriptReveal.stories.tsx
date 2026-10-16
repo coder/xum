@@ -281,7 +281,7 @@ function recordRevealEvidence(scrollport: HTMLElement, anchor: Element): { stop:
     for (const record of records) {
       if (!(record.target instanceof Element) || !record.target.contains(anchor)) continue;
       if (ancestorChanges.length < 10) {
-        ancestorChanges.push(`${describeElement(record.target)}.${record.attributeName}`);
+        ancestorChanges.push(`${describeElement(record.target)}.${record.attributeName ?? "?"}`);
       }
     }
   });
