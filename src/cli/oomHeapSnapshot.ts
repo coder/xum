@@ -10,6 +10,9 @@ import { getErrorMessage } from "@/common/utils/errors";
  */
 export const OOM_HEAP_SNAPSHOT_DIR_NAME = "heap-snapshots";
 
+/** Longest that server startup waits for this setup; the moves then continue in the background. */
+export const OOM_HEAP_SNAPSHOT_STARTUP_WAIT_MS = 5_000;
+
 /** Node's own file names for near-heap-limit snapshots (Heap.<date>.<time>.<pid>.<tid>.<seq>). */
 const NODE_HEAP_SNAPSHOT_NAME = /^Heap\.\d{8}\.\d{6}\.\d+\.\d+\.\d+\.heapsnapshot$/;
 
@@ -72,6 +75,13 @@ export async function prepareOomHeapSnapshots(deps: OomHeapSnapshotDeps): Promis
   const snapshotDir = path.join(deps.xumHome, OOM_HEAP_SNAPSHOT_DIR_NAME);
   try {
     if (!(await isDirectory(snapshotDir))) return;
+    // Armed before the moves, so a caller that stops waiting on a slow filesystem keeps it.
+    // A CLI --heapsnapshot-near-heap-limit takes precedence; this call then changes nothing.
+    deps.setHeapSnapshotNearHeapLimit(1);
+    deps.log.info("[heap-snapshot] A heap snapshot will be written near the heap limit", {
+      cwd: deps.cwd,
+      snapshotDir,
+    });
     const moved: string[] = [];
     for (const name of await fs.readdir(deps.cwd)) {
       if (!NODE_HEAP_SNAPSHOT_NAME.test(name)) continue;
@@ -88,12 +98,6 @@ export async function prepareOomHeapSnapshots(deps: OomHeapSnapshotDeps): Promis
     if (moved.length > 0) {
       deps.log.info("[heap-snapshot] Moved heap snapshots", { snapshotDir, files: moved });
     }
-    // A CLI --heapsnapshot-near-heap-limit takes precedence; this call then changes nothing.
-    deps.setHeapSnapshotNearHeapLimit(1);
-    deps.log.info("[heap-snapshot] A heap snapshot will be written near the heap limit", {
-      cwd: deps.cwd,
-      snapshotDir,
-    });
   } catch (error) {
     deps.log.warn("[heap-snapshot] Near-heap-limit snapshot setup failed", {
       error: getErrorMessage(error),

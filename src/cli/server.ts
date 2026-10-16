@@ -25,7 +25,7 @@ import { resolveInstallLayout } from "@/node/services/serverUpdate/installLayout
 import { appendServerCrashLogSync } from "./serverCrashLogging";
 import { shouldExposeLaunchProject } from "./launchProject";
 import { startMajorGcHeapFields } from "./memoryBreadcrumbs";
-import { prepareOomHeapSnapshots } from "./oomHeapSnapshot";
+import { OOM_HEAP_SNAPSHOT_STARTUP_WAIT_MS, prepareOomHeapSnapshots } from "./oomHeapSnapshot";
 import * as v8 from "node:v8";
 import {
   createRowTreeClient,
@@ -144,13 +144,17 @@ async function main(): Promise<void> {
   }
   // Opt-in OOM diagnostics (<xum root>/heap-snapshots exists): arm one near-heap-limit snapshot
   // and move the one a previous OOM left in cwd. Runs only for the process that becomes the
-  // server; it never throws.
-  await prepareOomHeapSnapshots({
-    xumHome,
-    cwd: process.cwd(),
-    setHeapSnapshotNearHeapLimit: (limit) => v8.setHeapSnapshotNearHeapLimit(limit),
-    log,
-  });
+  // server; it never throws. Bounded: a slow mount must not hold startup, and the moves then
+  // finish in the background.
+  await raceWithAbortAndTimeout(
+    prepareOomHeapSnapshots({
+      xumHome,
+      cwd: process.cwd(),
+      setHeapSnapshotNearHeapLimit: (limit) => v8.setHeapSnapshotNearHeapLimit(limit),
+      log,
+    }),
+    { timeoutMs: OOM_HEAP_SNAPSHOT_STARTUP_WAIT_MS }
+  );
 
   const stores = createConfigStores();
   const config = stores.config;

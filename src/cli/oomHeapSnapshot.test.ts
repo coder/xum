@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { readdirSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -90,6 +91,25 @@ describe("prepareOomHeapSnapshots", () => {
     expect(await fs.readdir(s.snapshotDir)).toEqual([]);
     expect((await fs.lstat(path.join(s.cwd, name))).isSymbolicLink()).toBe(true);
     expect(s.armed).toEqual([1]);
+  });
+
+  test("the snapshot is armed before any snapshot is moved", async () => {
+    const s = await setup();
+    await fs.mkdir(s.snapshotDir, { mode: 0o700 });
+    await fs.writeFile(path.join(s.cwd, "Heap.20261016.130810.2982.0.001.heapsnapshot"), "x");
+    let movedBeforeArm: string[] | undefined;
+    const deps = {
+      ...s.deps,
+      setHeapSnapshotNearHeapLimit: () => {
+        movedBeforeArm = readdirSync(s.snapshotDir);
+      },
+    };
+
+    await prepareOomHeapSnapshots(deps);
+
+    // Server startup stops waiting after a bound; the snapshot must already be armed then.
+    expect(movedBeforeArm).toEqual([]);
+    expect(await fs.readdir(s.snapshotDir)).toHaveLength(1);
   });
 
   test("a failure is logged and does not reject, so startup continues", async () => {
