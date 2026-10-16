@@ -141,6 +141,31 @@ describe("MultiProjectGitStatusIndicator", () => {
     expect(button.textContent).toContain("1 dirty");
   });
 
+  test("compact chips keep only the most urgent category", () => {
+    currentSummary = createSummary([
+      createProjectStatusResult({
+        projectPath: "/tmp/repo-a",
+        projectName: "repo-a",
+        gitStatus: null,
+        error: "Git status unavailable",
+      }),
+      createProjectStatusResult({
+        projectPath: "/tmp/repo-b",
+        projectName: "repo-b",
+        gitStatus: createGitStatus({ ahead: 2, dirty: true }),
+      }),
+    ]);
+
+    const view = renderWithTooltipProvider(
+      <MultiProjectGitStatusIndicator workspaceId="workspace-1" compact />
+    );
+    const button = view.getByRole("button", { name: "Open multi-project git status details" });
+
+    expect(button.textContent).toContain("1 unknown");
+    expect(button.textContent).not.toContain("diverged");
+    expect(button.textContent).not.toContain("dirty");
+  });
+
   test("opens the dialog on click and closes it through dialog dismissal", async () => {
     currentSummary = createSummary([
       createProjectStatusResult({

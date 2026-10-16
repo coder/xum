@@ -614,6 +614,30 @@ describe("WorkspaceFooterBar at narrow viewports", () => {
     expect(lastGitStatusIndicatorProps()?.tapTogglesMode).toBe(false);
   });
 
+  it("compacts the multi-project git status until the viewport widens", () => {
+    workspaceMetadata.set(workspaceId, {
+      ...repoMetadata,
+      projects: [
+        { projectPath: "/projects/demo", projectName: "demo" },
+        { projectPath: "/projects/other", projectName: "other" },
+      ],
+    });
+    const indicator =
+      MultiProjectGitStatusIndicatorModule.MultiProjectGitStatusIndicator as unknown as {
+        mock: { calls: Array<[{ compact?: boolean }]> };
+      };
+
+    renderFooter();
+    expect(indicator.mock.calls.at(-1)?.[0].compact).toBe(true);
+
+    viewportIsNarrow = false;
+    act(() => {
+      for (const listener of viewportListeners) listener();
+    });
+
+    expect(indicator.mock.calls.at(-1)?.[0].compact).toBe(false);
+  });
+
   it("still toggles the drift mode from the keyboard shortcut", () => {
     const update = spyOn(AppConfigStoreModule, "updateUserPreferences").mockImplementation(
       () => undefined

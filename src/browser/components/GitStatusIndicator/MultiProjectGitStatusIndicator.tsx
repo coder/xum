@@ -16,6 +16,8 @@ interface MultiProjectGitStatusIndicatorProps {
   workspaceId: string;
   tooltipPosition?: "right" | "bottom";
   isWorking?: boolean;
+  /** Shows only the most urgent category so the chip fits a phone footer; the dialog keeps the full breakdown. */
+  compact?: boolean;
 }
 
 interface ChipPresentation {
@@ -121,6 +123,7 @@ export const MultiProjectGitStatusIndicator: React.FC<MultiProjectGitStatusIndic
   workspaceId,
   tooltipPosition = "right",
   isWorking = false,
+  compact = false,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const trimmedWorkspaceId = workspaceId.trim();
@@ -154,7 +157,7 @@ export const MultiProjectGitStatusIndicator: React.FC<MultiProjectGitStatusIndic
           >
             {presentation.icon}
             <span className="counter-nums whitespace-nowrap">{presentation.primaryLabel}</span>
-            {presentation.secondaryLabels.map((label) => (
+            {(compact ? [] : presentation.secondaryLabels).map((label) => (
               <span key={label} className="text-muted whitespace-nowrap">
                 · <span className="counter-nums">{label}</span>
               </span>

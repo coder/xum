@@ -68,6 +68,7 @@ function WorkspaceDriftIndicator(props: {
         workspaceId={props.workspaceId}
         tooltipPosition="bottom"
         isWorking={props.isWorking}
+        compact={props.isNarrow}
       />
     );
   }
