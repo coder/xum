@@ -148,18 +148,18 @@ function StatusLine(props: { state: LimitsState; disabled: boolean; onRetry: () 
  * elsewhere. Offline the fields are disabled, since a save could not reach the server.
  */
 function useAgentResourceLimits() {
-  const liveApi = useLiveAPI();
+  const api = useLiveAPI();
   const [view, setView] = useState<LimitsView | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     // API doubles in tests of other settings can omit this namespace.
-    if (liveApi?.agentResourceLimits == null) {
+    if (api?.agentResourceLimits == null) {
       return;
     }
     const controller = new AbortController();
     let loaded = false;
-    followAppliedLimits(liveApi, controller.signal, (next) => {
+    followAppliedLimits(api, controller.signal, (next) => {
       // Each connection starts from the saved limits: an edit kept from before would look saved.
       const reset = !loaded;
       loaded = true;
@@ -171,14 +171,14 @@ function useAgentResourceLimits() {
       }
     });
     return () => controller.abort();
-  }, [liveApi]);
+  }, [api]);
 
   const save = (limits: AgentResourceLimits) => {
-    if (liveApi == null) {
+    if (api == null) {
       setError(CONNECTION_LOST_MESSAGE);
       return;
     }
-    liveApi.agentResourceLimits
+    api.agentResourceLimits
       .set(limits)
       .then((saved) => {
         setView((current) => withAppliedLimits(current, saved));
@@ -192,7 +192,7 @@ function useAgentResourceLimits() {
   const setDraft = (field: LimitField, draft: string) =>
     setView((current) => withDraft(current, field, draft));
 
-  return { view, setDraft, error, setError, save, disabled: view === null || liveApi == null };
+  return { view, setDraft, error, setError, save, disabled: view === null || api == null };
 }
 
 /** Settings > Agents: one CPU and memory limit that all local agent processes share. */

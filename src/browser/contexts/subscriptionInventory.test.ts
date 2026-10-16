@@ -44,6 +44,7 @@ const RESTART_RULES: Record<string, RestartRule> = {
   "src/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore.ts": "effect-deps",
   "src/browser/features/RightSidebar/DevToolsTab/useDevToolsSubscription.ts": "effect-deps",
   "src/browser/features/RightSidebar/Workflows/useWorkflowRuns.ts": "effect-deps",
+  "src/browser/features/Settings/Sections/AgentResourceLimitsSettings.tsx": "effect-deps",
   "src/browser/features/Settings/Sections/BackupSection.tsx": "effect-deps",
   "src/browser/features/Settings/Sections/GeneralSection.tsx": "effect-deps",
   "src/browser/features/Settings/Sections/MCPSettingsSection.tsx": "effect-deps",
