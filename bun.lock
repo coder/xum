@@ -1,5 +1,6 @@
 {
   "lockfileVersion": 1,
+  "configVersion": 0,
   "workspaces": {
     "": {
       "name": "@coder/xum",
@@ -85,6 +86,7 @@
         "ollama-ai-provider-v2": "^3.5.0",
         "openai": "^6.18.0",
         "parse-duration": "^2.1.4",
+        "parse5": "^7.3.0",
         "picomatch": "^4.0.3",
         "posthog-node": "^5.17.0",
         "quickjs-emscripten": "^0.31.0",
