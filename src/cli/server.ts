@@ -149,7 +149,7 @@ async function main(): Promise<void> {
   await raceWithAbortAndTimeout(
     prepareOomHeapSnapshots({
       xumHome,
-      cwd: process.cwd(),
+      cwd: () => process.cwd(),
       setHeapSnapshotNearHeapLimit: (limit) => v8.setHeapSnapshotNearHeapLimit(limit),
       log,
     }),

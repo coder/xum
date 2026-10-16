@@ -21,7 +21,7 @@ async function setup() {
   const logs: string[] = [];
   const deps = {
     xumHome,
-    cwd,
+    cwd: () => cwd,
     setHeapSnapshotNearHeapLimit: (limit: number) => armed.push(limit),
     log: {
       info: (message: string, meta: OomHeapSnapshotLogDetails) =>
@@ -91,6 +91,37 @@ describe("prepareOomHeapSnapshots", () => {
     expect(await fs.readdir(s.snapshotDir)).toEqual([]);
     expect((await fs.lstat(path.join(s.cwd, name))).isSymbolicLink()).toBe(true);
     expect(s.armed).toEqual([1]);
+  });
+
+  test("a hard link with a snapshot name is not moved and its other name keeps its mode", async () => {
+    const s = await setup();
+    await fs.mkdir(s.snapshotDir, { mode: 0o700 });
+    const victim = path.join(s.xumHome, "victim.sh");
+    await fs.writeFile(victim, "#!/bin/sh\n", { mode: 0o700 });
+    const victimMode = (await fs.stat(victim)).mode & 0o777;
+    const name = "Heap.20261016.130810.2982.0.001.heapsnapshot";
+    await fs.link(victim, path.join(s.cwd, name));
+
+    await prepareOomHeapSnapshots(s.deps);
+
+    expect((await fs.stat(victim)).mode & 0o777).toBe(victimMode);
+    expect(await fs.readdir(s.snapshotDir)).toEqual([]);
+  });
+
+  test("a launch directory that is gone does not stop the setup", async () => {
+    const s = await setup();
+    await fs.mkdir(s.snapshotDir, { mode: 0o700 });
+    const deps = {
+      ...s.deps,
+      cwd: () => {
+        throw new Error("ENOENT: process.cwd failed");
+      },
+    };
+
+    await prepareOomHeapSnapshots(deps);
+
+    expect(s.armed).toEqual([1]);
+    expect(s.logs.some((line) => line.startsWith("warn"))).toBe(true);
   });
 
   test("the snapshot is armed before any snapshot is moved", async () => {
