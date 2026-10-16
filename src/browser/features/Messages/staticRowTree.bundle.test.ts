@@ -5,7 +5,9 @@ import * as esbuild from "esbuild";
 // staticRowTree renders on the server with react-dom/server, and only the row-tree worker of
 // `xum server` may load it. Every module either side reaches is checked, lazy imports included.
 // parse5 is not checked: rehype-raw already brings it to the renderer.
-const SSR_CODE = /staticRowTree\.(tsx|worker\.ts)$|react-dom\/(server|cjs\/react-dom-server)/;
+// The phone skeleton (about 32 KB, phoneChrome.generated.ts) stays out of both until its loader lands.
+const SSR_CODE =
+  /staticRowTree\.(tsx|worker\.ts)$|phoneChrome\.generated\.ts$|react-dom\/(server|cjs\/react-dom-server)/;
 // The renderer draws markdown with Streamdown itself; the main process must not load it.
 const MAIN_PROCESS_BANNED = new RegExp(`${SSR_CODE.source}|/streamdown/`);
 

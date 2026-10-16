@@ -586,6 +586,12 @@ jobs:
           SHARD: ${{ matrix.shard }}
           # No provider secrets here, so the repros' app uses the mock AI.
           BUGBASH_REPROS: ${{ matrix.shard == '1/4' && '1' || '0' }}
+      # The static workspace view's phone skeleton must match the live page (#5971). On drift, the
+      # failure names the element and the command that regenerates the skeleton.
+      # It reuses the `make build` of `make test-e2e` above.
+      - name: Check the phone chrome skeleton
+        if: matrix.os == 'linux' && matrix.shard == '1/4'
+        run: make check-phone-chrome
       - name: Run tests
         if: matrix.os == 'macos'
         env:
