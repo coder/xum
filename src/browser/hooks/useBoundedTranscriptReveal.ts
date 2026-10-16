@@ -170,16 +170,19 @@ function storedSliceEnd(
   state: RevealState,
   rows: readonly RevealRow[],
   isSafeCut: IsSafeCut,
-  /** Where the end goes from its row's index; the vanished-start fallback keeps the index. */
-  nearest: (index: number, length: number, isSafeCut: IsSafeCut) => number = nearestSafeCutAtOrAfter
+  /**
+   * The index of the end row (or of its `endRows` fallback) before any safe-cut snap: the
+   * vanished-start fallback compares with it, so a regroup this update cannot hide a survivor.
+   */
+  unsnapped = false
 ) {
   const { endMessageId: id, endIndexHint: hint, endRows } = state;
   if (id === null) return rows.length;
   const found = rows[hint]?.id === id ? hint : rows.findIndex((row) => row.id === id);
-  if (found === -1) return endAtNearestUnmountedRow(rows, endRows, isSafeCut);
+  if (found === -1) return endAtNearestUnmountedRow(rows, endRows, isSafeCut, unsnapped);
   // A regroup that puts the end row inside a bundle moves the end forward: no mounted row
   // unmounts (cap rule); the bundle mounts whole.
-  return nearest(found, rows.length, isSafeCut);
+  return unsnapped ? found : nearestSafeCutAtOrAfter(found, rows.length, isSafeCut);
 }
 
 /**
@@ -193,10 +196,12 @@ function storedSliceEnd(
 function endAtNearestUnmountedRow(
   rows: readonly RevealRow[],
   endRows: readonly string[],
-  isSafeCut: IsSafeCut
+  isSafeCut: IsSafeCut,
+  unsnapped: boolean
 ): number {
   const index = firstPresentIndex(rows, endRows);
-  return index === -1 ? rows.length : nearestSafeCutAtOrBefore(index, rows.length, isSafeCut);
+  if (index === -1 || unsnapped) return index === -1 ? rows.length : index;
+  return nearestSafeCutAtOrBefore(index, rows.length, isSafeCut);
 }
 
 /**
@@ -558,19 +563,29 @@ function detachedStartFallback(
   messages: readonly RevealRow[],
   isSafeCut: IsSafeCut
 ): number {
-  // The end row's own index: a safe cut before any regroup in this update (#6742 review). When
-  // the end row went too, its `endRows` fallback (#6757 round 3).
-  const end = storedSliceEnd(state, messages, isSafeCut, (index) => index);
+  // The end row's own index, before any regroup in this update (#6742 review). When the end row
+  // went too, its `endRows` fallback (#6757 round 3) snapped back to a safe cut, as the end
+  // resolves; the comparison below uses the row's own index (#6871 review), so a regroup in this
+  // update that pulls the end back over a surviving mounted row does not count it as gone.
+  const row = storedSliceEnd(state, messages, isSafeCut, true);
+  const end =
+    messages[row]?.id === state.endMessageId
+      ? row
+      : nearestSafeCutAtOrBefore(row, messages.length, isSafeCut);
   const mountedBefore = state.endIndexHint - state.anchorIndexHint;
   const after = firstPresentIndex(messages, state.startRows) + 1;
   // No row before the start survives: as many rows before the end as were mounted (#6669 round 7).
   if (after === 0) return end - mountedBefore;
   // Right after the nearest older row still present, while a mounted row (or a replacement)
   // still lies between it and the end.
-  if (after < end) return after;
+  if (after < row) return after;
   // No mounted row survives: older rows instead of unread newer ones, at most one cap of them, so
-  // a held slice past the cap mounts no more rows it never showed (#6757 round 3).
-  return end - Math.min(mountedBefore, state.maxMountedRows ?? mountedBefore);
+  // a held slice past the cap mounts no more rows it never showed (#6757 round 3). From a safe cut
+  // at or after that point, so the caller's snap back adds no older bundle; one bundle larger
+  // than the rows before the end mounts whole (#6871 review).
+  const from = end - Math.min(mountedBefore, state.maxMountedRows ?? mountedBefore);
+  const cut = nearestSafeCutAtOrAfter(from, end, isSafeCut);
+  return cut < end ? cut : from;
 }
 
 interface TailAppend {

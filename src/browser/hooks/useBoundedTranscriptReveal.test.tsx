@@ -1041,6 +1041,31 @@ describe("useBoundedTranscriptReveal", () => {
         expect(slice.mounted().filter((row) => unread.includes(row))).toEqual([]);
       });
 
+      // #6871 round 1: one mounted row survives, and the first surviving unmounted row joins its
+      // bundle in the same update. The end snaps back to that bundle's head; the row stays.
+      test("the last surviving mounted row stays when the end regroups into its bundle", () => {
+        const slice = detachedPastCap();
+        const { fromIndex: from, toIndex: to } = slice.reveal();
+        const all = slice.messages();
+        const kept = all[to - 1].id;
+        slice.joined.add(all[to + 1].id);
+        slice.set({ messages: all.filter((_, i) => i < from || i === to - 1 || i > to) });
+        expect(slice.mounted()).toContain(kept);
+      });
+
+      // #6871 round 1: with no mounted row left, an older bundle across the one-cap point must
+      // not add its older part on top of the cap.
+      test("with no mounted row left, an older bundle across the cap point does not pass the cap", () => {
+        const slice = detachedPastCap();
+        const { fromIndex: from, toIndex: to } = slice.reveal();
+        const all = slice.messages();
+        const point = from - CAP;
+        all.slice(point - 19, point + 20).forEach((row) => slice.joined.add(row.id));
+        slice.set({ messages: all.filter((_, i) => i < from || i > to) });
+        expect(slice.mounted().length).toBeGreaterThan(0);
+        expect(slice.mounted().length).toBeLessThanOrEqual(CAP);
+      });
+
       test("held, deleting only the newest rows keeps the start; new rows replacing them restart", () => {
         const slice = grouped();
         slice.atCap();
