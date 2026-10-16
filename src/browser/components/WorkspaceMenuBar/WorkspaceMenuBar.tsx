@@ -6,7 +6,6 @@ import {
   Bell,
   BellOff,
   Ellipsis,
-  GitBranch,
   Info,
   PanelRightOpen,
   Pencil,
@@ -67,6 +66,7 @@ import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceT
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
 import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
+import { BranchSelector } from "../BranchSelector/BranchSelector";
 import { LeftSidebarToggleBarSpacer } from "../SidebarCollapseButton/SidebarCollapseButton";
 import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
 import { useLiveAPI } from "@/browser/contexts/API";
@@ -132,18 +132,17 @@ function getPhoneHeaderSnapshot(): boolean {
   );
 }
 
-/** Subscribes at the leaf so git status polling does not re-render the whole header. */
-function WorkspaceDetailsBranch(props: { workspaceId: string }) {
+/**
+ * The full selector, not just the name: phones drop the footer's branch selector, so this is
+ * their only way to switch branches. Subscribes at the leaf so git status polling does not
+ * re-render the whole header.
+ */
+function WorkspaceDetailsBranch(props: { workspaceId: string; workspaceName: string }) {
   const branch = useGitStatus(props.workspaceId)?.branch;
   if (!branch) {
     return null;
   }
-  return (
-    <span className="flex min-w-0 items-center gap-1">
-      <GitBranch className="h-3 w-3 shrink-0" aria-hidden="true" />
-      <span className="truncate font-mono">{branch}</span>
-    </span>
-  );
+  return <BranchSelector workspaceId={props.workspaceId} workspaceName={props.workspaceName} />;
 }
 
 export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
@@ -764,7 +763,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             <span className="font-mono">{projectLabel}</span>
             <span>{workspaceName}</span>
             <span className="text-muted">{namedWorkspacePath}</span>
-            <WorkspaceDetailsBranch workspaceId={workspaceId} />
+            <WorkspaceDetailsBranch workspaceId={workspaceId} workspaceName={workspaceName} />
           </PopoverContent>
         </Popover>
         {isArchiving && (

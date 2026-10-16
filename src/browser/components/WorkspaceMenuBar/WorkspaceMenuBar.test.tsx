@@ -34,6 +34,7 @@ import * as WorkspaceActionsMenuContentModule from "../WorkspaceActionsMenuConte
 import type { WorkspaceActionId } from "../WorkspaceActionsMenuContent/workspaceActionItems";
 import * as WorkspaceTerminalIconModule from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
+import * as BranchSelectorModule from "../BranchSelector/BranchSelector";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
@@ -717,9 +718,12 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(document.activeElement).toBe(focused);
   });
 
-  it("lists the git branch in the workspace details once it is known", () => {
+  it("offers the branch selector in the workspace details once the branch is known", () => {
+    const branchSelector = spyOn(BranchSelectorModule, "BranchSelector").mockImplementation(
+      (() => null) as unknown as typeof BranchSelectorModule.BranchSelector
+    );
     const view = render(<WorkspaceMenuBar {...defaultProps} />);
-    expect(view.container.querySelector("svg.lucide-git-branch")).toBeNull();
+    expect(branchSelector).not.toHaveBeenCalled();
 
     spyOn(GitStatusStoreModule, "useGitStatus").mockImplementation(() => ({
       branch: "mike/compact-footer",
@@ -733,8 +737,11 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     }));
     view.rerender(<WorkspaceMenuBar {...defaultProps} />);
 
-    const branch = view.getByText("mike/compact-footer");
-    expect(branch.parentElement?.querySelector("svg.lucide-git-branch")).not.toBeNull();
+    // The selector, not just the name: phones have no footer branch selector to switch from.
+    expect(branchSelector.mock.calls.at(-1)?.[0]).toMatchObject({
+      workspaceId: defaultProps.workspaceId,
+      workspaceName: defaultProps.workspaceName,
+    });
   });
 
   it("offers the hidden sidebar as one row, and opens it full-screen", () => {
