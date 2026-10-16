@@ -1995,6 +1995,32 @@ describe("Config", () => {
         });
       }
 
+      it("keeps one row and backs up the bytes for an identical copy inside one alias", async () => {
+        // The alias merge keeps an identical copy once and records no conflict of its own.
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              ["/home/u/repo", { workspaces: [row("ws-1"), row("ws-1")] }],
+              ["/home/u/repo/", { workspaces: [row("ws-2")] }],
+            ],
+          })
+        );
+        const original = fs.readFileSync(path.join(tempDir, "config.json"));
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          await flushConfigEdits();
+          const saved = readSavedProjects();
+          expect(saved).toHaveLength(1);
+          expect(saved[0][1].workspaces.map((w) => w.id)).toEqual(["ws-1", "ws-2"]);
+          const backups = aliasConflictBackups();
+          expect(backups).toHaveLength(1);
+          expect(fs.readFileSync(backups[0])).toEqual(original);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
       (process.getuid?.() === 0 ? it.skip : it)(
         "keeps config.json and refuses edits while the duplicate-id backup fails",
         async () => {
@@ -2033,9 +2059,11 @@ describe("Config", () => {
         );
         try {
           fresh.loadConfigOrDefault();
-          // A clean load schedules no save of its own (perf condition d).
-          await new Promise((resolve) => setTimeout(resolve, 20));
-          expect(save).not.toHaveBeenCalled();
+          // A clean load schedules no save of its own (perf condition d). Edits run one at a
+          // time in order, so once this identity edit is done, any save the load queued is done
+          // too: exactly one save means the load queued none.
+          await fresh.editConfig((cfg) => cfg);
+          expect(save).toHaveBeenCalledTimes(1);
           expect(aliasConflictBackups()).toHaveLength(0);
         } finally {
           save.mockRestore();

@@ -1130,6 +1130,28 @@ function hasDuplicateRowId(workspaces: ProjectConfig["workspaces"]): boolean {
   return false;
 }
 
+/** The ids that more than one row holds, each once, in one pass. */
+function duplicateRowIds(workspaces: ProjectConfig["workspaces"]): string[] {
+  const seen = new Set<string>();
+  const duplicated = new Set<string>();
+  for (const workspace of workspaces) {
+    if (!workspace.id) continue;
+    if (seen.has(workspace.id)) duplicated.add(workspace.id);
+    else seen.add(workspace.id);
+  }
+  return [...duplicated];
+}
+
+/**
+ * The ids that one alias entry holds in more than one row. The alias merge keeps an identical
+ * copy once without a conflict, so without this list a save would drop the copy with no backup.
+ */
+function aliasEntryDuplicateIds(group: StoredProjectEntry[]): string[] {
+  return group.flatMap((entry) =>
+    hasDuplicateRowId(entry.config.workspaces) ? duplicateRowIds(entry.config.workspaces) : []
+  );
+}
+
 /**
  * One stored key can already hold two rows with one workspace id: an earlier build saved them, and
  * no merge repairs them, because neither row is an alias or a legacy copy (#6717). Keep one row
@@ -1145,8 +1167,7 @@ function healSingleKeyDuplicateIds(
   conflicts: ProjectAliasConflict[]
 ): ProjectConfig {
   if (!hasDuplicateRowId(entry.config.workspaces)) return entry.config;
-  const ids = entry.config.workspaces.flatMap((workspace) => (workspace.id ? [workspace.id] : []));
-  const duplicatedIds = [...new Set(ids.filter((id, index) => ids.indexOf(id) !== index))];
+  const duplicatedIds = duplicateRowIds(entry.config.workspaces);
   // The rows only: settings and trust stay exactly as stored for a single key.
   entry.config.workspaces = mergeProjectAliases([entry]).config.workspaces;
   conflicts.push({ path: key, storedKeys: [entry.storedKey], conflictingIds: duplicatedIds });
@@ -1189,10 +1210,13 @@ function buildProjectsFromStoredEntries(
     const storedKeys = group.map((entry) => entry.storedKey);
     const merged = mergeProjectAliases(group);
     const conflictingIds = [
-      ...merged.conflictingIds,
-      ...dropLegacyDuplicateRows(merged.config.workspaces, (workspace) =>
-        resolveLegacyId(key, workspace)
-      ),
+      ...new Set([
+        ...merged.conflictingIds,
+        ...aliasEntryDuplicateIds(group),
+        ...dropLegacyDuplicateRows(merged.config.workspaces, (workspace) =>
+          resolveLegacyId(key, workspace)
+        ),
+      ]),
     ];
     if (conflictingIds.length > 0) {
       conflicts.push({ path: key, storedKeys, conflictingIds });
