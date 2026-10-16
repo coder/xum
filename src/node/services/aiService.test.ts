@@ -110,6 +110,7 @@ import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import * as systemMessageModule from "./systemMessage";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import { DEBUG_LLM_REQUEST_MAX_WORKSPACES } from "@/constants/debugLlmRequest";
 import { Ok } from "@/common/types/result";
 
 // Captured before any test spies on the module, so a test can still build the
@@ -3380,6 +3381,60 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect((await send()).description).toBe(first.description);
     harness.service.handleWorkspaceMetadata({ workspaceId: metadata.id, metadata: eventMetadata });
     expect((await send()).description).toContain("tracker_add_label");
+  });
+
+  it("keeps the debug request snapshot only for the most recent workspaces", async () => {
+    using xumHome = new DisposableTempDir("ai-debug-request-bound");
+    const metadata = createLocalWorkspaceMetadata("debug-request-bound", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata);
+    const ids = Array.from(
+      { length: DEBUG_LLM_REQUEST_MAX_WORKSPACES + 1 },
+      (_, index) => `debug-ws-${index}`
+    );
+    for (const workspaceId of ids) {
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "hello")],
+        workspaceId,
+        modelString: "anthropic:claude-sonnet-4-5",
+        thinkingLevel: "off",
+      });
+      expect(result.success).toBe(true);
+    }
+    const snapshotOf = (workspaceId: string) => {
+      const result = harness.service.debugGetLastLlmRequest(workspaceId);
+      if (!result.success) throw new Error(result.error);
+      return result.data;
+    };
+    // Each snapshot copies a whole request, so the oldest workspace's copy is dropped.
+    expect(snapshotOf(ids[0])).toBeNull();
+    expect(snapshotOf(ids.at(-1)!)?.workspaceId).toBe(ids.at(-1));
+    expect(snapshotOf(ids[1])?.workspaceId).toBe(ids[1]);
+  });
+
+  it.each([
+    ["removed", null],
+    ["archived", { archivedAt: "2026-01-01T00:00:00.000Z" }],
+  ])("drops the debug request snapshot once the workspace is %s", async (_state, eventMetadata) => {
+    using xumHome = new DisposableTempDir("ai-debug-request-forget");
+    const metadata = createLocalWorkspaceMetadata("debug-request-forget", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata);
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("user", "user", "hello")],
+      workspaceId: metadata.id,
+      modelString: "anthropic:claude-sonnet-4-5",
+      thinkingLevel: "off",
+    });
+    expect(result.success).toBe(true);
+    const snapshot = () => {
+      const read = harness.service.debugGetLastLlmRequest(metadata.id);
+      if (!read.success) throw new Error(read.error);
+      return read.data;
+    };
+    // A metadata update of a live workspace keeps it.
+    harness.service.handleWorkspaceMetadata({ workspaceId: metadata.id, metadata: {} });
+    expect(snapshot()?.workspaceId).toBe(metadata.id);
+    harness.service.handleWorkspaceMetadata({ workspaceId: metadata.id, metadata: eventMetadata });
+    expect(snapshot()).toBeNull();
   });
 
   it("shares one overview between selections that reach the same wire model", async () => {
