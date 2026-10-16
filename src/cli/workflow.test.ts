@@ -120,15 +120,13 @@ describe("xum workflow CLI helpers", () => {
       .quiet();
 
     const output = result.stdout.toString() + result.stderr.toString();
-    // #6735: the child once exited 133 (SIGTRAP: a V8 fatal error) in CI. Show its stderr tail,
-    // where V8 prints the reason, so the next failure explains itself.
-    expect({
-      exitCode: result.exitCode,
-      stderrTail: result.stderr.toString().slice(-4000),
-    }).toEqual({
-      exitCode: 0,
-      stderrTail: expect.any(String),
-    });
+    // #6735: the child once exited 133 (SIGTRAP: a V8 fatal error) in CI. On a failure, show its
+    // exit code with the stderr tail, where V8 prints the reason, so the failure explains itself.
+    const failure =
+      result.exitCode === 0
+        ? ""
+        : `exit ${result.exitCode}\n${result.stderr.toString().slice(-4000)}`;
+    expect(failure).toBe("");
     const scopeClosedAt = output.indexOf("[shutdown] AppFiberScope closed");
     const terminateAllAt = output.indexOf("BackgroundProcessManager.terminateAll() called");
     const runtimeDisposedAt = output.indexOf("[shutdown] AppRuntime disposed");
