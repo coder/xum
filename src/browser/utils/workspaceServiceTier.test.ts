@@ -17,6 +17,7 @@ import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfi
 import { getSendOptionsFromStorage } from "./messages/sendOptions";
 import { getWorkspaceAiSelection } from "./workspaceAiSettingsSync";
 import { setWorkspaceServiceTier, toggleServiceTier } from "./fastModeServiceTier";
+import { writeScopedAiPick } from "./scopedAiDefaults";
 import {
   consumeAiSelectionIntent,
   getAiSelectionIntentForSendOptions,
@@ -215,5 +216,39 @@ describe("per-chat OpenAI speed", () => {
     expect(applyAiSelectionIntentToPins(pins, {}, { ...saved, serviceTier: "priority" })).toBe(
       pins
     );
+  });
+});
+
+// Pro/Cyber mode follows the same rules as speed and the thinking level.
+describe("new-workspace Pro mode", () => {
+  test("a project or global pick is a saved default; a chat pick stays on the chat", () => {
+    const project = "/pro-project";
+    const scope = getProjectScopeId(project);
+    writeScopedAiPick(scope, "reasoningMode", "pro");
+    resetAiSelectionIntentForTests(); // A renderer reload keeps saved defaults.
+    expect(getWorkspaceAiSelection(scope).reasoningMode).toBe("pro");
+    expect(getUserPreferences().ai?.projectDefaults?.[project]?.reasoningMode).toBe("pro");
+
+    // A chat without saved settings inherits it; a saved bucket owns its mode (absent = standard).
+    setWorkspaceAiMetadata("inherits", { projectPath: project });
+    setWorkspaceAiMetadata("own", { projectPath: project, aiSettingsByAgent: { exec: saved } });
+    setWorkspaceAiMetadata("elsewhere", { projectPath: "/other" });
+    expect(getWorkspaceAiSelection("inherits").reasoningMode).toBe("pro");
+    expect(getWorkspaceAiSelection("own").reasoningMode).toBe("standard");
+    expect(getWorkspaceAiSelection("elsewhere").reasoningMode).toBe("standard");
+
+    writeScopedAiPick(GLOBAL_SCOPE_ID, "reasoningMode", "cyber");
+    expect(getWorkspaceAiSelection("elsewhere").reasoningMode).toBe("cyber");
+    expect(getWorkspaceAiSelection("inherits").reasoningMode).toBe("pro");
+
+    // In a chat or a draft, the pick is unsent and changes no default.
+    writeScopedAiPick("own", "reasoningMode", "pro");
+    writeScopedAiPick(getDraftScopeId(project, "draft-1"), "reasoningMode", "standard");
+    expect(getWorkspaceAiSelection("own").reasoningMode).toBe("pro");
+    expect(getPendingAiSelection("own", "exec", "reasoningMode")).toBe("pro");
+    expect(getWorkspaceAiSelection(getDraftScopeId(project, "draft-1")).reasoningMode).toBe(
+      "standard"
+    );
+    expect(getUserPreferences().ai?.projectDefaults?.[project]?.reasoningMode).toBe("pro");
   });
 });

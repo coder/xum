@@ -1155,7 +1155,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     if (existingReasoning !== resolvedReasoning) {
-      markAiSelectionIntent(scopeId, "reasoningMode", resolvedReasoning);
+      writeScopedAiDefault(scopeId, "reasoningMode", resolvedReasoning);
     }
   }, [
     agentAiDefaults,

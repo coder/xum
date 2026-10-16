@@ -15,16 +15,17 @@ import { useMinThinkingLevels } from "@/browser/hooks/useMinThinkingLevels";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useAPI } from "@/browser/contexts/API";
 import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
-import {
-  getWorkspaceAiSelection,
-  useWorkspaceAiSelection,
-} from "@/browser/utils/workspaceAiSettingsSync";
+import { useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { useOptionalAgent } from "@/browser/contexts/AgentContext";
 import { KEYBINDS, matchesKeybind, paneHandlesKeyEvent } from "@/browser/utils/ui/keybinds";
 import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
-import { useScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
+import {
+  useScopedAiDefault,
+  writeScopedAiDefault,
+  writeScopedAiPick,
+} from "@/browser/utils/scopedAiDefaults";
 
 interface ThinkingContextType {
   thinkingLevel: ThinkingLevel;
@@ -74,9 +75,7 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
     workspaceId != null ? selection.model : normalizeSelectedModel(scopedModel ?? defaultModel);
   const thinkingLevel =
     workspaceId != null ? selection.thinkingLevel : (scopedThinkingLevel ?? THINKING_LEVEL_OFF);
-  // useWorkspaceAiSelection re-renders this provider when a creation scope's pick changes.
-  const reasoningMode =
-    workspaceId != null ? selection.reasoningMode : getWorkspaceAiSelection(scopeId).reasoningMode;
+  const reasoningMode = selection.reasoningMode;
 
   const serviceTier = selection.serviceTier;
   const setServiceTier = (tier: ServiceTier) => setWorkspaceServiceTier(api, scopeId, tier);
@@ -102,7 +101,7 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
   );
 
   const setReasoningMode = (mode: OpenAIReasoningMode) => {
-    markAiSelectionIntent(scopeId, "reasoningMode", mode);
+    writeScopedAiPick(scopeId, "reasoningMode", mode);
   };
 
   // Global keybinds for adjusting the thinking level.

@@ -90,9 +90,14 @@ function resolveWorkspaceAiSelection(input: WorkspaceAiSelectionInput): Workspac
     coerceThinkingLevel(global.thinkingLevel) ??
     WORKSPACE_DEFAULTS.thinkingLevel;
   // A saved per-agent bucket owns the reasoning choice: its absent mode means standard.
+  // Without one, the mode falls back like the thinking level.
   const reasoningMode =
     coerceOpenAIReasoningMode(pick("reasoningMode")) ??
-    (saved != null ? coerceOpenAIReasoningMode(saved.reasoningMode) : configured.reasoningMode) ??
+    (saved != null
+      ? coerceOpenAIReasoningMode(saved.reasoningMode)
+      : [configured.reasoningMode, project.reasoningMode, global.reasoningMode].find(
+          (mode) => mode != null
+        )) ??
     "standard";
   return {
     model: normalizeModelPreference(model, input.defaultModel),
@@ -109,6 +114,7 @@ interface ScopedAiSelection {
   model: string | undefined;
   thinkingLevel: ThinkingLevel | undefined;
   serviceTier: ServiceTier | undefined;
+  reasoningMode: OpenAIReasoningMode | undefined;
 }
 
 function resolveCreationScopeSelection(
@@ -125,11 +131,13 @@ function resolveCreationScopeSelection(
       ServiceTierSchema.safeParse(
         getPendingAiSelection(scopeId, getWorkspaceAgentId(scopeId), "serviceTier")
       ).data,
-    // A creation scope's reasoning mode is only an unsent pick.
+    // Like speed: a saved project or global default, else a draft scope's unsent pick.
     reasoningMode:
+      scoped.reasoningMode ??
       coerceOpenAIReasoningMode(
         getPendingAiSelection(scopeId, getWorkspaceAgentId(scopeId), "reasoningMode")
-      ) ?? "standard",
+      ) ??
+      "standard",
   };
 }
 
@@ -149,6 +157,7 @@ export function getWorkspaceAiSelection(
         model: readScopedAiDefault(workspaceId, "model"),
         thinkingLevel: readScopedAiDefault(workspaceId, "thinkingLevel"),
         serviceTier: readScopedAiDefault(workspaceId, "serviceTier"),
+        reasoningMode: readScopedAiDefault(workspaceId, "reasoningMode"),
       },
       getDefaultModel()
     );
@@ -174,6 +183,7 @@ export function useWorkspaceAiSelection(
   const scopedModel = useScopedAiDefault(workspaceId, "model");
   const scopedThinkingLevel = useScopedAiDefault(workspaceId, "thinkingLevel");
   const scopedServiceTier = useScopedAiDefault(workspaceId, "serviceTier");
+  const scopedReasoningMode = useScopedAiDefault(workspaceId, "reasoningMode");
   const ai = useUserPreferences((preferences) => preferences.ai);
   const agentAiDefaults = useAgentAiDefaults();
   const defaultModel = normalizeModelPreference(
@@ -183,7 +193,12 @@ export function useWorkspaceAiSelection(
   if (isNonWorkspaceScopeId(workspaceId)) {
     return resolveCreationScopeSelection(
       workspaceId,
-      { model: scopedModel, thinkingLevel: scopedThinkingLevel, serviceTier: scopedServiceTier },
+      {
+        model: scopedModel,
+        thinkingLevel: scopedThinkingLevel,
+        serviceTier: scopedServiceTier,
+        reasoningMode: scopedReasoningMode,
+      },
       defaultModel
     );
   }

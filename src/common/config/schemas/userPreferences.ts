@@ -16,7 +16,12 @@ import {
 import { ServiceTierSchema } from "@/common/config/schemas/providersConfig";
 import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
 import { REVIEW_FILE_TREE_VIEW_MODES, REVIEW_SORT_ORDERS } from "@/common/types/review";
-import { ThinkingLevelSchema, coerceThinkingLevel } from "@/common/types/thinking";
+import {
+  OpenAIReasoningModeSchema,
+  ThinkingLevelSchema,
+  coerceOpenAIReasoningMode,
+  coerceThinkingLevel,
+} from "@/common/types/thinking";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { isValidModelFormat, normalizeSelectedModel } from "@/common/utils/ai/models";
 import { isPlainObject } from "@/common/utils/isPlainObject";
@@ -123,8 +128,12 @@ export const UserPreferencesSchema = z.object({
         .object({
           agentId: repairOnLoad(nonBlankString(), repairAgentId).optional(),
           thinkingLevel: repairOnLoad(ThinkingLevelSchema, coerceThinkingLevel).optional(),
-          // Speed (Fast/Ultrafast) is a default like the thinking level.
+          // Speed (Fast/Ultrafast) and Pro/Cyber mode are defaults like the thinking level.
           serviceTier: repairOnLoad(ServiceTierSchema, repairServiceTier).optional(),
+          reasoningMode: repairOnLoad(
+            OpenAIReasoningModeSchema,
+            coerceOpenAIReasoningMode
+          ).optional(),
         })
         .optional(),
       projectDefaults: z
@@ -138,6 +147,10 @@ export const UserPreferencesSchema = z.object({
             ).optional(),
             thinkingLevel: repairOnLoad(ThinkingLevelSchema, coerceThinkingLevel).optional(),
             serviceTier: repairOnLoad(ServiceTierSchema, repairServiceTier).optional(),
+            reasoningMode: repairOnLoad(
+              OpenAIReasoningModeSchema,
+              coerceOpenAIReasoningMode
+            ).optional(),
           })
         )
         .optional(),

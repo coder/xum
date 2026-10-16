@@ -7,6 +7,7 @@ import {
 import {
   getAgentScope,
   getWorkspaceAgentId,
+  markAiSelectionIntent,
   setWorkspaceAgentPick,
   subscribeAiSelection,
 } from "@/browser/utils/aiSelectionIntent";
@@ -41,6 +42,24 @@ function getServerScope(scopeId: string): { projectPath?: string } | undefined {
 /** Project and global scopes save AI picks as defaults; workspace and draft scopes cannot. */
 export function hasScopedAiDefaults(scopeId: string): boolean {
   return getServerScope(scopeId) != null;
+}
+
+/**
+ * A speed or Pro/Cyber pick. Like the thinking level, a pick on the project or global
+ * new-workspace page is that scope's saved default, so it survives reloads and seeds later
+ * workspaces; in a chat (or a draft, which has no saved defaults) it is an unsent pick that
+ * the next send stores on the chat.
+ */
+export function writeScopedAiPick<F extends "serviceTier" | "reasoningMode">(
+  scopeId: string,
+  field: F,
+  value: NonNullable<AiDefaults[F]>
+): void {
+  if (hasScopedAiDefaults(scopeId)) {
+    writeScopedAiDefault(scopeId, field, value);
+  } else {
+    markAiSelectionIntent(scopeId, field, value);
+  }
 }
 
 function selectServerDefault<F extends ScopedAiField>(
