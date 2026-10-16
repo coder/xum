@@ -4,6 +4,8 @@ import { cn } from "@/common/lib/utils";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { ProjectConfig } from "@/common/types/project";
 import { getDevcontainerStatusChip } from "@/browser/utils/runtimeUi";
 import { formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
@@ -390,22 +392,28 @@ function FooterLastPrompt(props: { workspaceId: string }) {
   );
 }
 
+// Metadata uses the top-level project name, so include a known sub-project path to preserve
+// the workspace's full project context.
+function getFooterProjectLabel(
+  workspaceEntry: FrontendWorkspaceMetadata | undefined,
+  userProjects: Map<string, ProjectConfig>,
+  projectName: string
+): string {
+  if (workspaceEntry?.kind === "scratch") return SCRATCH_PROJECT_NAME;
+  const subProjectPath = workspaceEntry?.subProjectPath;
+  return subProjectPath && userProjects.has(subProjectPath)
+    ? formatProjectHierarchyLabel(subProjectPath, userProjects)
+    : projectName;
+}
+
 export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => {
   const { workspaceMetadata } = useWorkspaceContext();
   const workspaceEntry = workspaceMetadata.get(props.workspaceId);
   const hasRepository = hasWorkspaceRepository(workspaceEntry);
   const showMultiProjectStatus = workspaceEntry != null && isMultiProject(workspaceEntry);
 
-  // Metadata uses the top-level project name, so include a known sub-project path to preserve
-  // the workspace's full project context.
   const { userProjects } = useProjectContext();
-  const subProjectPath = workspaceEntry?.subProjectPath;
-  const projectLabel =
-    workspaceEntry?.kind === "scratch"
-      ? SCRATCH_PROJECT_NAME
-      : subProjectPath && userProjects.has(subProjectPath)
-        ? formatProjectHierarchyLabel(subProjectPath, userProjects)
-        : props.projectName;
+  const projectLabel = getFooterProjectLabel(workspaceEntry, userProjects, props.projectName);
 
   const { canInterrupt, isStarting, awaitingUserQuestion } = useWorkspaceSidebarState(
     props.workspaceId

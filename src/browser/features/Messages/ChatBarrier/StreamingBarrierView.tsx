@@ -30,6 +30,10 @@ export interface StreamingBarrierViewProps {
   hideHintOnNarrow?: boolean;
 }
 
+function hasLiveTps(tps: number | undefined): tps is number {
+  return tps !== undefined && tps > 0;
+}
+
 /**
  * Presentation-only StreamingBarrier.
  *
@@ -54,7 +58,7 @@ export const StreamingBarrierView: React.FC<StreamingBarrierViewProps> = (props)
           {/* Narrow panes hide the stats slot, so they read t/s here. It follows the live prop
               rather than statusText, whose within-phase debounce would freeze the number, and
               comes last in the one truncating line so a long model name stays visible. */}
-          {props.tps !== undefined && props.tps > 0 && (
+          {hasLiveTps(props.tps) && (
             <span className="@lg:hidden">{` at ${props.tps} t/s`}</span>
           )}
         </span>
@@ -76,7 +80,7 @@ export const StreamingBarrierView: React.FC<StreamingBarrierViewProps> = (props)
             <span>~{(props.tokenCount ?? 0).toLocaleString()} tokens</span>
             <span className="text-dim ml-1 inline-flex min-w-[7ch] items-baseline justify-end gap-1">
               <span>@</span>
-              <span>{props.tps !== undefined && props.tps > 0 ? props.tps : "--"}</span>
+              <span>{hasLiveTps(props.tps) ? props.tps : "--"}</span>
               <span>t/s</span>
             </span>
           </span>
