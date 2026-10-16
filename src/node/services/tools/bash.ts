@@ -1202,8 +1202,9 @@ ${scriptWithEnv}`;
 
       // Helper to trigger file truncation (stop collecting, close streams)
       const triggerFileTruncation = (reason: string) => {
-        // Closing the pipes below can end a command that is still writing (#6732).
-        if (!truncationState.fileTruncated) cutWhileRunning = !exitCodeResolved;
+        // Closing the pipes below can end a command that is still writing (#6732). This runs
+        // once: the line handler stops calling it after the file limit is hit.
+        cutWhileRunning = !exitCodeResolved;
         truncationState.fileTruncated = true;
         truncationState.displayTruncated = true;
         truncated = true;
