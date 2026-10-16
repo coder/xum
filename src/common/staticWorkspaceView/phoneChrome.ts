@@ -6,11 +6,11 @@
  */
 
 /**
- * Page slots, each a region with workspace or user state: the title, the notification button, the
- * agent mode picker, the model group (model, provider, thinking), the footer (runtime, project,
- * git) and the transcript rows.
+ * Page slots, each a region with workspace or user state: the title, the header's action row
+ * (PR and stack links, notifications, skills, Stats, Artifacts), the agent mode picker, the model
+ * group (model, provider, thinking), the footer (runtime, project, git) and the transcript rows.
  */
-export const CHROME_SLOTS = ["title", "notify", "mode", "model", "footer", "rows"] as const;
+export const CHROME_SLOTS = ["title", "headerActions", "mode", "model", "footer", "rows"] as const;
 /** Row slots: the row tree (renderRowTree), timestamp, model display and the action buttons. */
 export const ROW_SLOTS = ["md", "ts", "model", "actions"] as const;
 export type SkeletonSlot = (typeof CHROME_SLOTS)[number] | (typeof ROW_SLOTS)[number];

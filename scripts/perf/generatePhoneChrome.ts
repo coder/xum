@@ -27,8 +27,6 @@ const OUT = path.join(
   "../../src/common/staticWorkspaceView/phoneChrome.generated.ts"
 );
 const REGENERATE = "make generate-phone-chrome";
-/** SkillIndicator's span while the skill list loads (#6221): what the live first frame shows. */
-const SKILLS_PLACEHOLDER = ["span", { "aria-hidden": "true", class: "h-6 w-6 shrink-0" }];
 
 async function startServer(root: string, home: string, log: string) {
   const probe = net.createServer().listen(0, "127.0.0.1");
@@ -65,7 +63,7 @@ async function startServer(root: string, home: string, log: string) {
 }
 
 /** Runs in the page: the skeleton of the live DOM. Self-contained, Playwright serializes it. */
-function capture(placeholder: unknown) {
+function capture() {
   type Node = string | { slot: string } | [string, Record<string, string>, ...Node[]];
   const SKIP =
     "[id^=DndDescribedBy],[id^=DndLiveRegion],#review-immersive-root,.mobile-hide-right-sidebar," +
@@ -74,7 +72,6 @@ function capture(placeholder: unknown) {
   const DROP =
     /^(id|role|tabindex|title|for|name|aria-(?!hidden).*|data-testid|data-message-id|data-tutorial|data-state|data-autofocus-state|data-loaded|autocomplete|spellcheck)$/;
   const children = new Map<Element, Node[]>();
-  const swapped = new Map<Element, Node>();
   const MODE_STYLE = /var\(--color-[\w-]*-mode\)/; // the selected agent's color, workspace state
   const one = (selector: string, scope: ParentNode = document) => {
     const found = scope.querySelectorAll(selector);
@@ -86,16 +83,14 @@ function capture(placeholder: unknown) {
     children.set(one(selector, scope), kids);
   // Every region that shows workspace or user state is a slot: the page builder fills it.
   slot("[data-testid=workspace-title]", [{ slot: "title" }]);
-  slot("[data-testid=notify-on-response-button]", [{ slot: "notify" }]);
+  // The phone header's action row: PR and stack links, the bell, skills, Stats and Artifacts.
+  slot("div:has(> [data-testid=notify-on-response-button])", [{ slot: "headerActions" }]);
   slot('[data-component=ChatInputSurface] button[style*="-mode)"]', [{ slot: "mode" }]);
   slot("[data-component=ModelSelectorGroup]", [{ slot: "model" }]); // model, provider, thinking
   slot("button:has([data-context-usage-percent])", []); // the usage meter
   slot("[data-testid=workspace-footer-bar]", [{ slot: "footer" }]); // runtime, project, git
-  swapped.set(one('button[aria-label*="skills loaded"]'), placeholder as Node);
   const log = one("[role=log]");
   const convert = (el: Element): Node => {
-    const swap = swapped.get(el);
-    if (swap) return swap;
     const tag = el.tagName === "MAIN" ? "div" : el.localName; // one <main>: the boot loader's
     const attrs: Record<string, string> = {};
     for (const a of el.attributes) {
@@ -142,14 +137,13 @@ async function captureAt(browser: Browser, url: string, width: number) {
   });
   await page.goto(url);
   // Explicit readiness, never a quiet interval: the chat view's reveal barrier (data-loaded,
-  // useChatViewDataReady), the loaded skill list and the agent's color. Other late data (git,
-  // usage, settings) sits in slots, and every width is a separate load that must give one tree.
+  // useChatViewDataReady) and the agent's color. Other late data (git, usage, skills, settings)
+  // sits in slots, and every width is a separate load that must give one tree.
   await page.waitForSelector('[data-testid=message-window][data-loaded="true"] [data-message-id]');
-  await page.waitForSelector('button[aria-label*="skills loaded"]');
   // Attached, not visible: a container query hides the picker at 360 px (CSS only, same DOM).
   const agent = '[data-component=ChatInputSurface] button[style*="-mode)"]';
   await page.waitForSelector(agent, { state: "attached" });
-  const tree = JSON.stringify(await page.evaluate(capture, SKILLS_PLACEHOLDER));
+  const tree = JSON.stringify(await page.evaluate(capture));
   await page.close();
   return tree;
 }

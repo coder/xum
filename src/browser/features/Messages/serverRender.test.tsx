@@ -17,7 +17,12 @@ describe("server rendering of the markdown hooks", () => {
   beforeAll(() =>
     store.updateOptimistically({ userPreferences: { appearance: { theme: "dark" } } })
   );
-  afterAll(() => (before ? store.updateOptimistically(before) : store.clearCachedState()));
+  // Only userPreferences changed: restore that key (undefined too), since the update merges.
+  afterAll(() =>
+    before
+      ? store.updateOptimistically({ userPreferences: before.userPreferences })
+      : store.clearCachedState()
+  );
   const hooks: Array<[name: string, useHook: () => unknown, clientSnapshot: () => unknown]> = [
     [
       "useAppConfig",

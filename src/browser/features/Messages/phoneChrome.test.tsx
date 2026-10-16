@@ -1,7 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
-import { renderToStaticMarkup } from "react-dom/server";
-import { SkillIndicator } from "@/browser/components/SkillIndicator/SkillIndicator";
 import {
   CHROME_SLOTS,
   ROW_SLOTS,
@@ -21,10 +19,6 @@ function* walk(node: SkeletonNode): Generator<SkeletonNode> {
 const elements = (node: SkeletonNode) => [...walk(node)].filter((n) => Array.isArray(n));
 const slots = (node: SkeletonNode) =>
   [...walk(node)].flatMap((n) => (typeof n === "object" && !Array.isArray(n) ? [n.slot] : []));
-const toHtml = ([tag, attrs]: Extract<SkeletonNode, unknown[]>) =>
-  `<${tag}${Object.entries(attrs)
-    .map(([k, v]) => ` ${k}="${v}"`)
-    .join("")}></${tag}>`;
 
 describe("phone chrome skeleton", () => {
   test("each slot appears exactly once, in its own tree", () => {
@@ -55,14 +49,5 @@ describe("phone chrome skeleton", () => {
     for (const snippet of snippets)
       expect(text).not.toContain(JSON.stringify(snippet).slice(1, -1));
     expect(text).not.toContain("demo-app"); // the seeded project
-  });
-
-  test("the skills button is the placeholder SkillIndicator shows while skills load", () => {
-    const loading = renderToStaticMarkup(
-      <SkillIndicator loadedSkills={[]} availableSkills={[]} loading={true} />
-    );
-    const held = elements(skeleton.chrome).filter((n) => toHtml(n) === loading);
-    expect(held).toHaveLength(1);
-    expect(JSON.stringify(skeleton.chrome)).not.toContain("skills loaded");
   });
 });
