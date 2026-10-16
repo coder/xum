@@ -50,10 +50,13 @@ def comment(body, author=BOT, created_at=AFTER, minimized=False):
     }
 
 
-def thread(body, author=BOT, resolved=False, created_at=AFTER, discussion="1"):
-    """`discussion` is the root comment ID that board links use (#discussion_r<id>)."""
+def thread(body, author=BOT, resolved=False, created_at=AFTER, discussion="1", commit=None):
+    """`discussion` is the root comment ID that board links use (#discussion_r<id>).
+    `commit` is the commit the root comment was written on."""
     root = comment(body, author, created_at)
     root["fullDatabaseId"] = discussion
+    if commit is not None:
+        root["originalCommit"] = {"oid": commit}
     return {
         "id": "thread",
         "isResolved": resolved,
@@ -270,19 +273,32 @@ else:
     def test_resolved_codex_threads_clear_unresolved_review_state(self):
         # Codex keeps has_unresolved_findings true after its threads are resolved
         # until it reviews again (seen on coder/xum#6786), like advisory bullets
-        # (coder/xum#5045). Only resolved Codex threads clear it; with no Codex
-        # thread at all, the findings are somewhere the gate cannot see.
-        body = FIXTURES["review_state_summary"]["body"].replace(
-            '"has_unresolved_findings":false', '"has_unresolved_findings":true', 1
+        # (coder/xum#5045). Only resolved Codex finding threads of the same review
+        # kind on the reviewed commit clear it; other evidence proves nothing.
+        clean = FIXTURES["review_state_summary"]["body"]
+        head = board_head(clean)
+        code = clean.replace('"has_unresolved_findings":false', '"has_unresolved_findings":true', 1)
+        security = clean.replace(
+            '"has_unresolved_findings":false,"status":"completed"}}',
+            '"has_unresolved_findings":true,"status":"completed"}}',
         )
-        head = board_head(body)
-        resolved = thread("[P2] Fixed", resolved=True)
-        for case, threads, expected in (
-            ("resolved Codex thread", [resolved], 0),
-            ("unresolved Codex thread", [resolved, thread("[P2] Still open")], 1),
-            ("unresolved human thread", [resolved, thread("Nit", "human-reviewer")], 0),
-            ("resolved human thread only", [thread("Nit", "human-reviewer", resolved=True)], 1),
-            ("no threads", [], 1),
+        code_marker = "\n\n<!-- codex-code-review-finding:v1 -->"
+        security_marker = "<!-- codex-security-review-finding:v1 -->\n\n"
+        fixed = thread("[P2] Fixed" + code_marker, resolved=True, commit=head)
+        for case, body, threads, expected in (
+            ("resolved code thread", code, [fixed], 0),
+            ("unresolved Codex thread", code, [fixed, thread("[P2] Open" + code_marker, commit=head)], 1),
+            ("unresolved human thread", code, [fixed, thread("Nit", "human-reviewer")], 0),
+            ("thread on an older commit", code,
+             [thread("[P2] Fixed" + code_marker, resolved=True, commit="c" * 40)], 1),
+            ("thread without a commit", code, [thread("[P2] Fixed" + code_marker, resolved=True)], 1),
+            ("thread without a marker", code, [thread("[P2] Fixed", resolved=True, commit=head)], 1),
+            ("human thread with a marker", code,
+             [thread("[P2] Fixed" + code_marker, "human-reviewer", resolved=True, commit=head)], 1),
+            ("no threads", code, [], 1),
+            ("security flag, code thread", security, [fixed], 1),
+            ("security flag, security thread", security,
+             [thread(security_marker + "[P2] Fixed", resolved=True, commit=head)], 0),
         ):
             for cached in (False, True):
                 with self.subTest(case=case, cached=cached):
@@ -657,7 +673,7 @@ else:
                 + BOT
                 + '"; "'
                 + board_head(FIXTURES["summary"]["body"])
-                + '"; []; false)]',
+                + '"; []; {code_review: [], security_review: []})]',
             ],
             input=json.dumps(comments),
             text=True,
