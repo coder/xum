@@ -26,17 +26,19 @@ import { truncateToFirstLine } from "./devToolsStepCardHelpers";
 
 const PRE_CLASS_NAME =
   "whitespace-pre-wrap break-words text-[10px] text-muted bg-background-primary rounded border border-border-light p-2 mt-1 max-h-[220px] overflow-auto min-w-0";
+// The green chips use the theme success tokens: raw green text was below WCAG AA in the light
+// themes, and success text on a /20 tint was below it in the dark ones (#6882).
 const ROLE_COLORS: Record<string, string> = {
   system: "bg-neutral-500/20 text-neutral-400",
   user: "bg-blue-500/20 text-blue-400",
-  assistant: "bg-green-500/20 text-green-400",
+  assistant: "bg-success/10 text-success-text",
   tool: "bg-violet-500/20 text-violet-400",
 };
 const DEFAULT_ROLE_COLOR = "bg-neutral-500/20 text-neutral-400";
 const POLICY_ACTION_STYLES: Record<ToolPolicy[number]["action"], string> = {
   require: "bg-blue-500/20 text-blue-400",
   disable: "bg-red-500/20 text-red-400",
-  enable: "bg-green-500/20 text-green-400",
+  enable: "bg-success/10 text-success-text",
 };
 
 type MetadataSection = "tools" | "options" | "usage" | "thinking" | "policy";

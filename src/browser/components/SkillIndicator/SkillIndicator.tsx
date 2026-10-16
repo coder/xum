@@ -165,7 +165,7 @@ const SkillsPopoverContent: React.FC<SkillsPopoverContentProps> = (props) => {
                           aria-label="Not advertised in system prompt"
                         />
                       )}
-                      {isLoaded && <Check className="text-success ml-1 inline h-3 w-3" />}
+                      {isLoaded && <Check className="text-success-text ml-1 inline h-3 w-3" />}
                     </span>
                     {/* Full text (#5697): the list already scrolls, and a clamp left no way to read
                         the rest. */}

@@ -186,7 +186,7 @@ const ReviewItem: React.FC<ReviewItemProps> = ({
             <Button
               variant="ghost"
               size="icon"
-              className={cn("size-5 shrink-0 [&_svg]:size-3", isChecked && "text-success")}
+              className={cn("size-5 shrink-0 [&_svg]:size-3", isChecked && "text-success-text")}
               onClick={isChecked ? onUncheck : onCheck}
             >
               {isChecked ? <Undo2 /> : <Check />}

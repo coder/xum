@@ -49,7 +49,7 @@ function getBranchStatusDisplay(branch: WorkspaceStackBranch): BranchStatusDispl
   if (branch.needsRebase) {
     return { Icon: AlertCircle, colorClass: "text-warning", label: "Needs rebase" };
   }
-  return { Icon: GitPullRequest, colorClass: "text-success", label: "Open" };
+  return { Icon: GitPullRequest, colorClass: "text-success-text", label: "Open" };
 }
 
 function StackBranchRow(props: { branch: WorkspaceStackBranch; onNavigate: () => void }) {

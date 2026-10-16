@@ -195,7 +195,7 @@ function renderPolicySummary(agent: AgentDefinitionDescriptor): React.ReactNode 
             <ul className="mt-1 space-y-0.5">
               {toolAdd.map((pattern) => (
                 <li key={`add:${pattern}`}>
-                  <span className="text-green-500">+</span> <code>{pattern}</code>
+                  <span className="text-success-text">+</span> <code>{pattern}</code>
                 </li>
               ))}
               {toolRemove.map((pattern) => (

@@ -261,7 +261,8 @@ export function getDevcontainerStatusChip(
     case "running":
       return {
         label: "Devcontainer Running",
-        className: "bg-emerald-500/15 text-emerald-400",
+        // Theme success tokens: raw emerald text was below WCAG AA in the light themes (#6882).
+        className: "bg-success/10 text-success-text",
       };
     case "stopped":
       return {

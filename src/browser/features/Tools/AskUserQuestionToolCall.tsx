@@ -717,7 +717,7 @@ export function AskUserQuestionToolCall(props: {
                           isActive
                             ? "border-accent bg-accent text-accent-foreground shadow-sm"
                             : answered
-                              ? "border-success/40 bg-success/10 text-success hover:bg-success/20"
+                              ? "border-success/40 bg-success/10 text-success-text hover:bg-success/20"
                               : "border-white/10 bg-white/5 text-secondary hover:border-white/20 hover:text-foreground"
                         )}
                         onClick={() => setActiveIndex(idx)}
@@ -734,7 +734,7 @@ export function AskUserQuestionToolCall(props: {
                       isOnSummary
                         ? "border-accent bg-accent text-accent-foreground shadow-sm"
                         : isComplete
-                          ? "border-success/40 bg-success/10 text-success hover:bg-success/20"
+                          ? "border-success/40 bg-success/10 text-success-text hover:bg-success/20"
                           : "border-white/10 bg-white/5 text-secondary hover:border-white/20 hover:text-foreground"
                     )}
                     onClick={() => setActiveIndex(summaryIndex)}
@@ -924,7 +924,7 @@ export function AskUserQuestionToolCall(props: {
                             {answered ? (
                               <Check
                                 aria-hidden="true"
-                                className="text-success mt-0.5 h-3 w-3 shrink-0"
+                                className="text-success-text mt-0.5 h-3 w-3 shrink-0"
                               />
                             ) : (
                               <AlertTriangle

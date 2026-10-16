@@ -110,7 +110,7 @@ const TaskStatusBadge: React.FC<{
       case "retitled":
       case "completed":
       case "reported":
-        return "bg-success/20 text-success";
+        return "bg-success/20 text-success-text";
       case "running":
       case "backgrounded":
         return "bg-pending/20 text-pending";
@@ -1451,7 +1451,7 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
             "[&_svg]:size-3.5",
             summaryTone === "active" && "text-task-mode",
             summaryTone === "danger" && "text-danger",
-            summaryTone === "success" && "text-success",
+            summaryTone === "success" && "text-success-text",
             summaryTone === "interrupted" && "text-interrupted",
             summaryTone === "waiting" && "text-muted"
           )}
@@ -1462,7 +1462,7 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
             "size-3 shrink-0",
             summaryTone === "active" && "text-task-mode animate-spin",
             summaryTone === "danger" && "text-danger",
-            summaryTone === "success" && "text-success",
+            summaryTone === "success" && "text-success-text",
             summaryTone === "interrupted" && "text-interrupted",
             summaryTone === "waiting" && "text-muted"
           )}

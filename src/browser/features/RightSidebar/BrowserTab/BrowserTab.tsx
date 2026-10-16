@@ -34,7 +34,7 @@ const STATUS_BADGES: Record<BrowserSessionStatus, { label: string; className: st
   },
   live: {
     label: "Live",
-    className: "bg-success/20 text-success",
+    className: "bg-success/20 text-success-text",
   },
   error: {
     label: "Unavailable",

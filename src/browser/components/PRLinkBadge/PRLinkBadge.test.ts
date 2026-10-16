@@ -45,7 +45,7 @@ describe("getStatusColorClass", () => {
   it("uses non-queue status colors when merge queue entry is null", () => {
     const pr = makePRLink({ mergeStateStatus: "CLEAN", mergeQueueEntry: null });
 
-    expect(getStatusColorClass(pr)).toBe("text-success");
+    expect(getStatusColorClass(pr)).toBe("text-success-text");
   });
 });
 

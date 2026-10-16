@@ -201,7 +201,7 @@ function importResultLabel(result: BackupProjectImportResult): string {
 
 function importResultTone(result: BackupProjectImportResult): string {
   if (result.status === "failed") return "text-error";
-  return result.skippedFiles.length > 0 ? "text-warning" : "text-success";
+  return result.skippedFiles.length > 0 ? "text-warning" : "text-success-text";
 }
 
 /**
@@ -1054,7 +1054,7 @@ export function BackupSection() {
       ) : null}
 
       {actionError ? <div className="text-error text-xs">{actionError}</div> : null}
-      {statusMessage ? <div className="text-success text-xs">{statusMessage}</div> : null}
+      {statusMessage ? <div className="text-success-text text-xs">{statusMessage}</div> : null}
 
       <section className="border-border-light flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center">
         <Button

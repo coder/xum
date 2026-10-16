@@ -1519,7 +1519,7 @@ export const MCPSettingsSection: React.FC = () => {
                         {cached?.result.success && !isEditing && isEnabled && (
                           <Tooltip>
                             <TooltipTrigger asChild>
-                              <span className="rounded bg-green-500/10 px-1.5 py-0.5 text-xs text-green-500">
+                              <span className="text-success-text rounded bg-green-500/10 px-1.5 py-0.5 text-xs">
                                 {cached.result.tools.length} tools
                               </span>
                             </TooltipTrigger>
@@ -1593,7 +1593,7 @@ export const MCPSettingsSection: React.FC = () => {
                                     editUrlError !== null ||
                                     editHeadersValidation.errors.length > 0
                                   }
-                                  className="h-7 w-7 text-green-500 hover:text-green-400"
+                                  className="text-success-text h-7 w-7"
                                   aria-label="Save"
                                 >
                                   {savingEdit ? (
@@ -1871,7 +1871,7 @@ export const MCPSettingsSection: React.FC = () => {
                 className={cn(
                   "flex items-start gap-2 rounded-md px-3 py-2 text-sm",
                   newTestResult.result.success
-                    ? "bg-green-500/10 text-green-500"
+                    ? "bg-green-500/10 text-success-text"
                     : "bg-destructive/10 text-destructive"
                 )}
               >

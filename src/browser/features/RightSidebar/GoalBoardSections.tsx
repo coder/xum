@@ -164,7 +164,7 @@ export interface RowActionButtonProps extends React.ButtonHTMLAttributes<HTMLBut
 
 const ROW_ACTION_TONE_CLASS: Record<RowActionTone, string> = {
   neutral: "text-muted hover:text-foreground hover:bg-surface-tertiary",
-  positive: "text-muted hover:text-success hover:bg-success/10 hover:border-success/40",
+  positive: "text-muted hover:text-success-text hover:bg-success/10 hover:border-success/40",
   destructive:
     "text-muted hover:text-danger-soft hover:bg-danger-soft/10 hover:border-danger-soft/40",
 };

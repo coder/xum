@@ -110,7 +110,7 @@ function getGoalStatus(goal: GoalSnapshot): { label: string; className?: string 
 function getGoalStatusLabel(goal: GoalSnapshot): { label: string; className?: string } {
   switch (goalActiveMode(goal.status)) {
     case "running":
-      return { label: "Active", className: "text-success" };
+      return { label: "Active", className: "text-success-text" };
     case "paused":
       return { label: "Paused", className: "text-warning" };
     case "budget_limited":

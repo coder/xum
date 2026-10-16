@@ -37,7 +37,7 @@ export function ConfiguredProvidersBar(props: ConfiguredProvidersBarProps) {
       <Tooltip>
         <TooltipTrigger asChild>
           <span className="border-border/50 hover:border-border inline-flex items-center gap-1.5 rounded border px-2 py-1 text-sm transition-colors">
-            <Check className="text-success h-3.5 w-3.5" />
+            <Check className="text-success-text h-3.5 w-3.5" />
             <span className="flex items-center gap-1">
               {configuredProviders.map((provider) =>
                 hasProviderIcon(provider) ? (

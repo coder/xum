@@ -310,7 +310,7 @@ interface SubAgentStatusPresentation {
 const COMPLETED_PRESENTATION: SubAgentStatusPresentation = {
   label: "Completed",
   icon: CheckCircle2,
-  iconClassName: "text-success",
+  iconClassName: "text-success-text",
 };
 const INACTIVE_PRESENTATION: SubAgentStatusPresentation = {
   label: "Inactive",
@@ -336,7 +336,7 @@ function getTaskStatusPresentation(workspace: SubAgentTaskWorkspace): SubAgentSt
         return {
           label: "Running",
           icon: LoaderCircle,
-          iconClassName: "text-success animate-spin",
+          iconClassName: "text-success-text animate-spin",
         };
       case "completed":
         return COMPLETED_PRESENTATION;
@@ -352,7 +352,11 @@ function getTaskStatusPresentation(workspace: SubAgentTaskWorkspace): SubAgentSt
     case "starting":
       return { label: "Starting", icon: LoaderCircle, iconClassName: "text-warning animate-spin" };
     case "running":
-      return { label: "Running", icon: LoaderCircle, iconClassName: "text-success animate-spin" };
+      return {
+        label: "Running",
+        icon: LoaderCircle,
+        iconClassName: "text-success-text animate-spin",
+      };
     case "awaiting_report":
       return { label: "Finishing", icon: LoaderCircle, iconClassName: "text-warning animate-spin" };
     case "reported":

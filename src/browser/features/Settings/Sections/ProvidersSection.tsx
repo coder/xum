@@ -2445,7 +2445,7 @@ export function ProvidersSection() {
                                   variant="ghost"
                                   size="icon"
                                   onClick={handleSaveEdit}
-                                  className="h-6 w-6 text-green-500 hover:text-green-400"
+                                  className="text-success-text h-6 w-6"
                                 >
                                   <Check className="h-4 w-4" />
                                 </Button>

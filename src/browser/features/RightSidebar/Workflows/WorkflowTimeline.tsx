@@ -484,7 +484,7 @@ const WorkflowPhaseSection: React.FC<WorkflowPhaseSectionProps> = (props) => {
         ) : phase.failed ? (
           <AlertTriangle className="h-3 w-3" style={{ color: WORKFLOW_TONE_VAR.destructive }} />
         ) : allDone ? (
-          <Check className="text-success h-3 w-3" />
+          <Check className="text-success-text h-3 w-3" />
         ) : null}
         {hasBody &&
           (open ? (

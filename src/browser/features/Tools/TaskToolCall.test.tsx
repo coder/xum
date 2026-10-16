@@ -1299,7 +1299,7 @@ describe("TaskSendMessageToolCall", () => {
     );
     const status = view.getByRole("status");
     const sent = result.status === "accepted" || result.status === "reactivated";
-    expect(status.className.includes("text-success")).toBe(sent);
+    expect(status.className.includes("text-success-text")).toBe(sent);
     expect(status.className.includes("text-danger")).toBe(!sent && result.status !== "queued");
     if (result.error != null) expect(view.getByRole("alert").textContent).toBe(result.error);
     if (result.reason != null) expect(view.getByRole("alert").textContent).toBe(result.reason);
@@ -1366,7 +1366,7 @@ describe("TaskSendMessageToolCall", () => {
         <TaskSendMessageToolCall args={taskSendMessageArgs} result={result} status="completed" />
       </TooltipProvider>
     );
-    expect(view.getByRole("status").className).not.toContain("text-success");
+    expect(view.getByRole("status").className).not.toContain("text-success-text");
     fireEvent.click(view.getByRole("button", { name: "Message to agent" }));
     expect(view.getByText(taskSendMessageArgs.message)).toBeTruthy();
   });
@@ -1440,7 +1440,7 @@ describe("TaskSendMessageToolCall", () => {
       const statuses = view.getAllByRole("status");
       expect(statuses).toHaveLength(2);
       for (const status of statuses) {
-        expect(status.className).not.toContain("text-success");
+        expect(status.className).not.toContain("text-success-text");
         expect(status.className.includes("text-danger")).toBe(expectedStatus === "failed");
         expect(status.textContent).not.toContain("Result unavailable");
       }
@@ -1460,7 +1460,7 @@ describe("TaskSendMessageToolCall", () => {
           <TaskSendMessageToolCall args={taskSendMessageArgs} result={result} status="completed" />
         </TooltipProvider>
       );
-      expect(view.getByRole("status").className).not.toContain("text-success");
+      expect(view.getByRole("status").className).not.toContain("text-success-text");
       expect(view.getByRole("status").textContent).toBe("Result unavailable");
     }
   );

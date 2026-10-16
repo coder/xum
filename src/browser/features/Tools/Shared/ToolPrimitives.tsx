@@ -115,7 +115,7 @@ const getStatusColor = (status: string) => {
     case "executing":
       return "text-pending";
     case "completed":
-      return "text-success";
+      return "text-success-text";
     case "failed":
       return "text-danger";
     case "interrupted":
