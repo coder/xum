@@ -21,6 +21,7 @@ import type { WorkspaceFooterBar as WorkspaceFooterBarComponent } from "./Worksp
 import type { DisplayedMessage } from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
 let WorkspaceFooterBar!: typeof WorkspaceFooterBarComponent;
 
@@ -505,7 +506,7 @@ describe("WorkspaceFooterBar at narrow viewports", () => {
       value: (query: string) =>
         ({
           get matches() {
-            return query === "(max-width: 768px)" && viewportIsNarrow;
+            return query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)` && viewportIsNarrow;
           },
           media: query,
           onchange: null,
@@ -598,15 +599,10 @@ describe("WorkspaceFooterBar at narrow viewports", () => {
     expect(container.textContent).toContain("Devcontainer Running");
   });
 
-  it("makes the diff numbers toggle the drift mode", () => {
-    renderFooter();
-
-    expect(lastGitStatusIndicatorProps()?.tapTogglesMode).toBe(true);
-  });
-
-  it("returns to the full footer when the viewport widens", () => {
+  it("makes the diff numbers toggle the drift mode until the viewport widens", () => {
     const { container } = renderFooter();
     expect(BranchSelectorModule.BranchSelector).not.toHaveBeenCalled();
+    expect(lastGitStatusIndicatorProps()?.tapTogglesMode).toBe(true);
 
     viewportIsNarrow = false;
     act(() => {
