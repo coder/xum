@@ -1,5 +1,6 @@
 import * as path from "path";
 import { EventEmitter } from "events";
+import type { Stats } from "fs";
 import * as fs from "fs/promises";
 import { StringDecoder } from "string_decoder";
 import assert from "@/common/utils/assert";
@@ -61,6 +62,8 @@ const MAX_RETAINED_BYTES_PER_WORKSPACE = 64 * 1024 * 1024;
 /** FIFO cap on remembered evicted run ids; see WorkspaceData.evictedRunIds. */
 const MAX_TRACKED_EVICTED_RUNS = 4 * MAX_RETAINED_RUNS_PER_WORKSPACE;
 const LOAD_CHUNK_BYTES = 1024 * 1024;
+/** Suffix of the temporary files that compaction writes beside devtools.jsonl. */
+const COMPACTING_SUFFIX = ".compacting";
 
 interface WorkspaceData {
   runs: Map<string, DevToolsRun>;
@@ -155,8 +158,26 @@ async function* readLines(filePath: string): AsyncGenerator<string> {
 /** Write one log line; returns its length in the units of the retention bytes. */
 async function writeLogLine(handle: fs.FileHandle, entry: DevToolsLogEntry): Promise<number> {
   const line = `${JSON.stringify(entry)}\n`;
-  await handle.write(line);
+  const buffer = Buffer.from(line, "utf-8");
+  // A nearly full disk can accept part of a write without an error.
+  for (let offset = 0; offset < buffer.length; ) {
+    const { bytesWritten } = await handle.write(buffer, offset, buffer.length - offset);
+    if (bytesWritten <= 0) {
+      throw new Error(`Wrote ${offset} of ${buffer.length} bytes of a devtools.jsonl line`);
+    }
+    offset += bytesWritten;
+  }
   return line.length;
+}
+
+/** Whether two stats of a path show the same file, unchanged in between. */
+function isSameFileVersion(before: Stats, after: Stats): boolean {
+  return (
+    before.dev === after.dev &&
+    before.ino === after.ino &&
+    before.size === after.size &&
+    before.mtimeMs === after.mtimeMs
+  );
 }
 
 /**
@@ -1142,35 +1163,49 @@ export class DevToolsService extends EventEmitter {
 
   /**
    * Rewrite devtools.jsonl as what replaying it keeps. It replays the file
-   * under the session lock instead of using this process's memory, which
-   * lacks rows other backends appended and already holds entries whose appends
-   * are queued behind this one; those then land once, after the rewrite. Never
-   * rejects: the caller's own line is already written, and a rejection would
-   * roll it back.
+   * instead of using this process's memory, which lacks rows other backends
+   * appended and already holds entries whose appends are queued behind this
+   * one; those then land once, after the rewrite. The replay and the rewrite
+   * run outside the session lock, which guards the workspace's other session
+   * files too and which other processes give up on after
+   * TARGET_MUTATION_LOCK_TIMEOUT_MS. Under the lock, the rewrite replaces the
+   * file only if the file is unchanged since the replay started; otherwise
+   * the next attempt waits for more growth. Never rejects: the caller's own
+   * line is already written, and a rejection would roll it back.
    */
   private async compactSessionFile(workspaceId: string, data: WorkspaceData): Promise<void> {
     if (this.workspaces.get(workspaceId) !== data) {
       return;
     }
     const filePath = this.getSessionFilePath(workspaceId);
-    const tempPath = `${filePath}.compacting`;
-    let bytes = 0;
+    // One per process: another backend can be rewriting the same file.
+    const tempPath = `${filePath}${COMPACTING_SUFFIX}-${process.pid}`;
+    let replaced = false;
     try {
+      const replayedVersion = await fs.stat(filePath);
+      const replayed = createWorkspaceData();
+      for await (const line of readLines(filePath)) {
+        this.replayLogLine(workspaceId, replayed, line);
+      }
+      const handle = await fs.open(tempPath, "w");
+      let bytes: number;
+      try {
+        bytes = await writeRetainedEntries(handle, replayed);
+      } finally {
+        await handle.close();
+      }
       await this.commitToSessionFileUnlessRemoved(workspaceId, async () => {
-        const replayed = createWorkspaceData();
-        for await (const line of readLines(filePath)) {
-          this.replayLogLine(workspaceId, replayed, line);
-        }
-        const handle = await fs.open(tempPath, "w");
-        try {
-          bytes = await writeRetainedEntries(handle, replayed);
-        } finally {
-          await handle.close();
+        if (!isSameFileVersion(replayedVersion, await fs.stat(filePath))) {
+          throw new Error("devtools.jsonl changed while it was being compacted");
         }
         await fs.rename(tempPath, filePath);
+        replaced = true;
+        await this.removeAbandonedRewrites(workspaceId, filePath);
       });
-      data.fileBytes = bytes;
-      data.compactionRetryAtBytes = 0;
+      if (replaced) {
+        data.fileBytes = bytes;
+        data.compactionRetryAtBytes = 0;
+      }
     } catch (error) {
       // Keep appending to the full file; retrying on every append would rewrite
       // the whole window each time while the disk is full.
@@ -1179,11 +1214,34 @@ export class DevToolsService extends EventEmitter {
         workspaceId,
         error: getErrorMessage(error),
       });
+    }
+    if (!replaced) {
       await fs.rm(tempPath, { force: true }).catch((rmError: unknown) => {
         log.warn("DevTools: failed to remove the partial devtools.jsonl rewrite", {
           workspaceId,
           error: getErrorMessage(rmError),
         });
+      });
+    }
+  }
+
+  /**
+   * Remove the rewrites that a crashed backend left, or that another backend
+   * is still writing, which can no longer replace the file just rewritten.
+   */
+  private async removeAbandonedRewrites(workspaceId: string, filePath: string): Promise<void> {
+    const directory = path.dirname(filePath);
+    const prefix = `${path.basename(filePath)}${COMPACTING_SUFFIX}`;
+    try {
+      for (const name of await fs.readdir(directory)) {
+        if (name.startsWith(prefix)) {
+          await fs.rm(path.join(directory, name), { force: true });
+        }
+      }
+    } catch (error) {
+      log.warn("DevTools: failed to remove an abandoned devtools.jsonl rewrite", {
+        workspaceId,
+        error: getErrorMessage(error),
       });
     }
   }

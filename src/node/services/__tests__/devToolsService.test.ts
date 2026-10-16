@@ -5,6 +5,7 @@ import * as path from "path";
 import type { DevToolsEvent, DevToolsRun, DevToolsStep } from "@/common/types/devtools";
 import { Config } from "@/node/config";
 import { DevToolsService, MAX_RETAINED_RUNS_PER_WORKSPACE } from "@/node/services/devToolsService";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 
 function makeRun(id: string, startedAt = "2025-06-01T00:00:00Z"): DevToolsRun {
   return { id, workspaceId: "ws-1", startedAt };
@@ -1452,11 +1453,12 @@ describe("DevToolsService", () => {
 
         it("keeps the full log when the rewrite fails and waits for more growth to retry", async () => {
           const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+          const tempPath = `${logPath}.compacting-${process.pid}`;
           // A directory at the rewrite's temporary path makes every attempt fail.
-          await fs.mkdir(`${logPath}.compacting`, { recursive: true });
+          await fs.mkdir(tempPath, { recursive: true });
           const openSpy = spyOn(fs, "open");
           const rewriteAttempts = () =>
-            openSpy.mock.calls.filter(([file]) => String(file).endsWith(".compacting")).length;
+            openSpy.mock.calls.filter(([file]) => String(file) === tempPath).length;
           const service = newService();
           try {
             for (let index = 1; index <= 5; index += 1) {
@@ -1547,6 +1549,114 @@ describe("DevToolsService", () => {
           const entries = await readEntries();
           expect(entries.map((entry) => entry.type)).not.toContain("step-update");
           expect(stepRowIds(entries)).toEqual(["step-1", "step-2"]);
+        });
+
+        it("rewrites outside the session lock and keeps a row another backend appends meanwhile", async () => {
+          const config = createTestConfig({ sessionsDir, enabled: true });
+          const service = new DevToolsService(config, {
+            maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+          });
+          for (let index = 1; index <= 4; index += 1) {
+            await service.createRun("ws-1", runAt(index));
+            await service.createStep("ws-1", bigStep(index, 60_000));
+          }
+          const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+          let rewriteStarted!: () => void;
+          const rewriting = new Promise<void>((resolve) => (rewriteStarted = resolve));
+          let finishRewrite!: () => void;
+          const rewriteMayFinish = new Promise<void>((resolve) => (finishRewrite = resolve));
+          const originalOpen = fs.open;
+          const openSpy = spyOn(fs, "open").mockImplementation((async (
+            ...args: Parameters<typeof fs.open>
+          ) => {
+            if (String(args[0]).includes(".compacting")) {
+              rewriteStarted();
+              await rewriteMayFinish;
+            }
+            return originalOpen(...args);
+          }) as typeof fs.open);
+          const foreignRow = JSON.stringify({ type: "run", run: runAt(9) });
+          try {
+            await service.createRun("ws-1", runAt(5));
+            const compactingAppend = service.createStep("ws-1", bigStep(5, 60_000));
+            await rewriting;
+            const foreignAppend = withTargetMutationLock(
+              config.rootDir,
+              path.join(config.sessionsDir, "ws-1"),
+              () => fs.appendFile(logPath, `${foreignRow}\n`, "utf-8")
+            );
+            const outcome = await Promise.race([
+              foreignAppend.then(() => "appended"),
+              new Promise((resolve) => setTimeout(() => resolve("blocked"), 2_000)),
+            ]);
+            finishRewrite();
+            await Promise.all([compactingAppend, foreignAppend]);
+            expect(outcome).toBe("appended");
+          } finally {
+            finishRewrite();
+            openSpy.mockRestore();
+          }
+
+          const logContents = await fs.readFile(logPath, "utf-8");
+          expect(logContents).toContain(foreignRow);
+          expect(logContents).toContain(`"step-1"`);
+          expect(await pathExists(`${logPath}.compacting-${process.pid}`)).toBe(false);
+        });
+
+        it("finishes a rewritten line that the disk accepted only part of", async () => {
+          const originalOpen = fs.open;
+          const openSpy = spyOn(fs, "open").mockImplementation((async (
+            ...args: Parameters<typeof fs.open>
+          ) => {
+            const handle = await originalOpen(...args);
+            if (!String(args[0]).includes(".compacting")) {
+              return handle;
+            }
+            const realWrite = handle.write.bind(handle) as (data: Buffer) => Promise<unknown>;
+            let shortened = false;
+            handle.write = ((data: string | Buffer, offset = 0, length?: number) => {
+              const bytes =
+                typeof data === "string"
+                  ? Buffer.from(data, "utf-8")
+                  : data.subarray(offset, offset + (length ?? data.length - offset));
+              if (shortened) {
+                return realWrite(bytes);
+              }
+              shortened = true;
+              return realWrite(bytes.subarray(0, Math.floor(bytes.length / 2)));
+            }) as unknown as typeof handle.write;
+            return handle;
+          }) as typeof fs.open);
+
+          const service = newService();
+          try {
+            for (let index = 1; index <= 5; index += 1) {
+              await service.createRun("ws-1", runAt(index));
+              await service.createStep("ws-1", bigStep(index, 60_000));
+            }
+          } finally {
+            openSpy.mockRestore();
+          }
+
+          const entries = await readEntries();
+          expect(entries.map((entry) => entry.type)).toEqual(["run", "step"]);
+          expect(await newService().getRuns("ws-1")).toEqual(await service.getRuns("ws-1"));
+        });
+
+        it("removes a rewrite that another backend left beside the log", async () => {
+          const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+          const leftover = `${logPath}.compacting-0`;
+          await fs.mkdir(path.dirname(logPath), { recursive: true });
+          await fs.writeFile(leftover, "partial rewrite", "utf-8");
+
+          const service = newService();
+          for (let index = 1; index <= 5; index += 1) {
+            await service.createRun("ws-1", runAt(index));
+            await service.createStep("ws-1", bigStep(index, 60_000));
+          }
+
+          expect((await readEntries()).map((entry) => entry.type)).toEqual(["run", "step"]);
+          expect(await pathExists(leftover)).toBe(false);
         });
       });
     });
