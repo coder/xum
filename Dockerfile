@@ -51,7 +51,7 @@ COPY Makefile fmt.mk ./
 COPY src/ src/
 COPY tsconfig.json tsconfig.main.json ./
 COPY scripts/generate-version.sh scripts/generate-builtin-agents.sh scripts/generate-builtin-skills.sh scripts/
-COPY scripts/gen_builtin_skills.ts scripts/gen_workflow_runtime_sources.ts scripts/precompress-static.ts scripts/
+COPY scripts/gen_builtin_skills.ts scripts/gen_workflow_runtime_sources.ts scripts/precompress-static.ts scripts/build-row-tree-worker.ts scripts/
 COPY docs/ docs/
 COPY index.html terminal.html desktop.html vite.config.ts ./
 COPY public/ public/
@@ -139,6 +139,8 @@ COPY --from=builder /app/dist/typescript-lib ./dist/typescript-lib
 
 # Copy runtime bundles last (most volatile layer during backend iteration).
 COPY --from=builder /app/dist/runtime ./dist/runtime
+# The static workspace view row-tree worker of `xum server` (rowTreeClient.ts).
+COPY --from=builder /app/dist/workers ./dist/workers
 
 # Keep the established container data path for existing volumes and downgraded images.
 RUN mkdir -p /root/.mux

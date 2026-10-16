@@ -406,6 +406,7 @@ verify-docker-runtime-artifacts: build-docker-runtime ## Verify required Docker 
 	done
 	@test -f dist/runtime/mcpIconDecode.js
 	@test -f dist/runtime/analyticsWorker.js
+	@test -f dist/workers/staticRowTree.worker.js
 	@test -f dist/static/splash.html
 	@test -f dist/typescript-lib/lib.es2023.d.ts.txt
 

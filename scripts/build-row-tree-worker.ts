@@ -5,7 +5,7 @@
  * import.meta), so esbuild bundles them. Lazy `import()` edges (Shiki grammars, Mermaid, KaTeX)
  * stay out: server rendering never runs the effects that load them, and they would add ~20 MB.
  */
-import { statSync } from "node:fs";
+import { renameSync, rmSync, statSync } from "node:fs";
 import * as esbuild from "esbuild";
 
 const outfile = process.argv[2] ?? "dist/workers/staticRowTree.worker.js";
@@ -14,7 +14,8 @@ const MAX_BYTES = 5 * 1024 * 1024;
 
 await esbuild.build({
   entryPoints: ["src/browser/workers/staticRowTree.worker.ts"],
-  outfile,
+  // A temporary file, so a bundle over the cap never sits at `outfile` looking up to date to make.
+  outfile: `${outfile}.tmp`,
   bundle: true,
   minify: true,
   platform: "node",
@@ -35,7 +36,9 @@ await esbuild.build({
   ],
 });
 
-const bytes = statSync(outfile).size;
+const bytes = statSync(`${outfile}.tmp`).size;
 if (bytes > MAX_BYTES) {
+  rmSync(`${outfile}.tmp`);
   throw new Error(`${outfile} is ${bytes} bytes, over ${MAX_BYTES}: did a lazy import become static?`);
 }
+renameSync(`${outfile}.tmp`, outfile);

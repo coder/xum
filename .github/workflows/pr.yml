@@ -116,6 +116,7 @@ jobs:
               - 'scripts/gen_builtin_skills.ts'
               - 'scripts/gen_workflow_runtime_sources.ts'
               - 'scripts/precompress-static.ts'
+              - 'scripts/build-row-tree-worker.ts'
               - 'scripts/check-analytics-worker.cjs'
               - 'docs/**'
               - 'index.html'
