@@ -21,7 +21,12 @@ import {
 } from "./hooks/usePersistedState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
 import { useComputerUse } from "./hooks/useComputerUse";
-import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
+import {
+  getSideChatPaneWorkspaceId,
+  isDialogOpen,
+  matchesKeybind,
+  KEYBINDS,
+} from "./utils/ui/keybinds";
 import { openServerWindow } from "./utils/openServerWindow";
 import {
   getFastModeProvider,
@@ -712,8 +717,9 @@ function AppInner() {
 
   // Speed is scoped to the chat for every provider, like its reasoning level.
   const togglePremiumServiceTier = useCallback(
-    (targetServiceTier: PremiumServiceTier) => {
-      const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
+    (targetServiceTier: PremiumServiceTier, sideChatWorkspaceId?: string | null) => {
+      // Speed belongs to a chat: the shortcut acts on the focused /side chat, if any.
+      const scopeId = sideChatWorkspaceId ?? selectedWorkspace?.workspaceId ?? creationScopeId;
       if (!liveApi || !scopeId || providersConfig == null) return;
 
       // Creation composers use the same project-scoped model preference as their selector,
@@ -1173,10 +1179,14 @@ function AppInner() {
         e.preventDefault();
         // Modals trap focus and hide the page behind them; don't change hidden page UI.
         // A held chord would flip the tier once per repeat, leaving it timing-dependent.
-        if (!isDialogOpen() && !e.repeat) togglePremiumServiceTier("priority");
+        if (!isDialogOpen() && !e.repeat) {
+          togglePremiumServiceTier("priority", getSideChatPaneWorkspaceId(e.target));
+        }
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ULTRAFAST_MODE)) {
         e.preventDefault();
-        if (!isDialogOpen() && !e.repeat) togglePremiumServiceTier("ultrafast");
+        if (!isDialogOpen() && !e.repeat) {
+          togglePremiumServiceTier("ultrafast", getSideChatPaneWorkspaceId(e.target));
+        }
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_COMPUTER_USE) && computerUseAvailable) {
         e.preventDefault();
         // A held shortcut would race enable and disable requests and leave either state behind.

@@ -7,6 +7,7 @@ import {
   matchesNewSidebarTabKeybind,
   isKeybindDeprecated,
   KEYBINDS,
+  getSideChatPaneWorkspaceId,
   paneHandlesKeyEvent,
   SIDE_CHAT_PANE_ATTR,
   type ChatPaneScope,
@@ -636,9 +637,13 @@ describe("paneHandlesKeyEvent", () => {
     document.body.appendChild(outerPane);
 
     expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["side:beta"]);
+    // Window shortcuts (Fast/Ultrafast) act on the chat this lookup names.
+    expect(getSideChatPaneWorkspaceId(text)).toBe("beta");
     innerPane.removeAttribute(SIDE_CHAT_PANE_ATTR);
     expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["side:alpha"]);
+    expect(getSideChatPaneWorkspaceId(text)).toBe("alpha");
     outerPane.removeAttribute(SIDE_CHAT_PANE_ATTR);
     expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["main"]);
+    expect(getSideChatPaneWorkspaceId(text)).toBeNull();
   });
 });

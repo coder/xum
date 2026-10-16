@@ -244,17 +244,24 @@ export type ChatPaneScope = "main" | `side:${string}`;
  * resolve through their parent so they follow the same ownership as focused elements.
  */
 export function paneHandlesKeyEvent(scope: ChatPaneScope, target: EventTarget | null): boolean {
+  const sideWorkspaceId = getSideChatPaneWorkspaceId(target);
+  return scope === "main"
+    ? sideWorkspaceId == null
+    : sideWorkspaceId != null && scope === `side:${sideWorkspaceId}`;
+}
+
+/**
+ * The workspace of the /side chat pane that owns the target (the nearest pane marker), or null
+ * when the main pane owns it. Window-level shortcuts use it to act on the focused chat.
+ */
+export function getSideChatPaneWorkspaceId(target: EventTarget | null): string | null {
   const element =
     typeof HTMLElement !== "undefined" && target instanceof HTMLElement
       ? target
       : typeof Node !== "undefined" && target instanceof Node
         ? target.parentElement
         : null;
-  const sidePane = element?.closest(`[${SIDE_CHAT_PANE_ATTR}]`);
-  const sideWorkspaceId = sidePane?.getAttribute(SIDE_CHAT_PANE_ATTR);
-  return scope === "main"
-    ? !sidePane
-    : sideWorkspaceId != null && scope === `side:${sideWorkspaceId}`;
+  return element?.closest(`[${SIDE_CHAT_PANE_ATTR}]`)?.getAttribute(SIDE_CHAT_PANE_ATTR) ?? null;
 }
 
 /**
