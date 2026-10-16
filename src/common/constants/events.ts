@@ -138,6 +138,12 @@ export const CUSTOM_EVENTS = {
   OPEN_GOAL_TAB: "mux:openGoalTab",
 
   /**
+   * Event to open the right-sidebar Plan tab ("/plan open", the Stats tab's plan row).
+   * Detail: { workspaceId: string }
+   */
+  OPEN_PLAN_TAB: "mux:openPlanTab",
+
+  /**
    * Open (and focus) a New tab in the focused right-sidebar pane, the same path as "+" and the
    * keyboard shortcut. Detail: { workspaceId: string }
    */
@@ -282,6 +288,9 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.OPEN_GOAL_TAB]: {
     workspaceId: string;
     openCompleteInput?: boolean;
+  };
+  [CUSTOM_EVENTS.OPEN_PLAN_TAB]: {
+    workspaceId: string;
   };
   [CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB]: {
     workspaceId: string;
