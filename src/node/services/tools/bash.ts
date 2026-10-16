@@ -743,6 +743,27 @@ function createLineHandler(
 }
 
 /**
+ * What the file limit does to a command that is still running; returns whether it stopped it.
+ *
+ * The truncate policy returns the output it kept as a success, so it stops the command itself
+ * (#6732). Cancelling the output streams alone does not stop it reliably: the child's stdout is a
+ * Unix socket, and closing one that still holds unread data gives the writer ECONNRESET, not
+ * SIGPIPE. The command then exits with its own error status (perl: 1), which says nothing about
+ * the command, so the old code reported that cut as a failure. The tmpfile policy reports the
+ * overflow without the exit status, and keeps its old behavior.
+ */
+const AT_FILE_LIMIT: Record<
+  "tmpfile" | "truncate",
+  (running: boolean, stop: () => void) => boolean
+> = {
+  truncate: (running, stop) => {
+    if (running) stop();
+    return running;
+  },
+  tmpfile: () => false,
+};
+
+/**
  * Formats the final bash tool result based on exit code and truncation state
  */
 function formatResult(
@@ -753,9 +774,20 @@ function formatResult(
   wall_duration_ms: number,
   overflowPolicy: "tmpfile" | "truncate",
   effectiveTimeout: number,
-  cutWhileRunning = false
+  stoppedAtFileLimit = false
 ): BashToolResult {
   const output = lines.join("\n");
+
+  // The truncate policy stopped this command at the file limit, so its status is ours (#6732).
+  if (stoppedAtFileLimit) {
+    return {
+      success: true,
+      output,
+      exitCode: 0,
+      wall_duration_ms,
+      truncated: { reason: overflowReason ?? "unknown reason", totalLines: lines.length },
+    };
+  }
 
   // Check for special error codes from runtime
   if (exitCode === EXIT_CODE_ABORTED) {
@@ -784,10 +816,8 @@ function formatResult(
     };
 
     if (overflowPolicy === "truncate") {
-      // Return all collected lines with truncation marker. A command whose output we closed
-      // while it ran ends with a status we caused: it dies of SIGPIPE, or, where SIGPIPE is
-      // ignored, gets EPIPE and exits nonzero (perl exits 1). That is not its own failure (#6732).
-      if (exitCode === 0 || cutWhileRunning) {
+      // Return all collected lines with truncation marker
+      if (exitCode === 0) {
         return {
           success: true,
           output,
@@ -1189,8 +1219,8 @@ ${scriptWithEnv}`;
       // Collect output concurrently from Web Streams to avoid readline race conditions.
       const lines: string[] = [];
       let truncated = false;
-      // Set when the file limit closed the output before the command exited.
-      let cutWhileRunning = false;
+      // Set when the truncate policy stopped the command at the file limit (#6732).
+      let stoppedAtFileLimit = false;
 
       // Helper to trigger display truncation (stop showing to agent, keep collecting)
       const triggerDisplayTruncation = (reason: string) => {
@@ -1202,9 +1232,10 @@ ${scriptWithEnv}`;
 
       // Helper to trigger file truncation (stop collecting, close streams)
       const triggerFileTruncation = (reason: string) => {
-        // Closing the pipes below can end a command that is still writing (#6732). This runs
-        // once: the line handler stops calling it after the file limit is hit.
-        cutWhileRunning = !exitCodeResolved;
+        // Runs once: the line handler stops calling it after the file limit is hit.
+        stoppedAtFileLimit = AT_FILE_LIMIT[overflowPolicy](!exitCodeResolved, () =>
+          wrappedAbortController.abort()
+        );
         truncationState.fileTruncated = true;
         truncationState.displayTruncated = true;
         truncated = true;
@@ -1739,7 +1770,7 @@ File will be automatically cleaned up when stream ends.`;
           wall_duration_ms,
           config.overflow_policy ?? "tmpfile",
           effectiveTimeout,
-          cutWhileRunning
+          stoppedAtFileLimit
         )
       );
     },

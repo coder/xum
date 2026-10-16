@@ -516,34 +516,38 @@ describe("bash tool", () => {
     tempDir[Symbol.dispose]();
   });
 
-  // #6732: the truncate policy closes the pipe once it has 1 MB, often while the command is
-  // still writing. The command then dies of SIGPIPE, or, where SIGPIPE is ignored (as in some CI
-  // processes), gets EPIPE and exits nonzero: perl exits 1 when its last flush fails. That status
-  // is caused by our close, so the result must not be a failure. Ignoring SIGPIPE and pausing
-  // after 1 MB makes that order certain; the test above hit it only on some CI runs.
-  it("should succeed when truncation closes the output of a command that is still writing", async () => {
-    using tempDir = new TestTempDir("test-bash-truncate-epipe");
-    const config = createTestToolConfig(process.cwd());
-    config.runtimeTempDir = tempDir.path;
-    config.overflow_policy = "truncate";
-    const tool = createBashTool(config);
+  // #6732: the truncate policy keeps 1 MB and then stops a command that is still writing. Closing
+  // its output alone did not stop it reliably: here it ignores the broken pipe, sleeps and fails
+  // with its own status, which the old code then reported. The stop makes the result ours.
+  it(
+    "should stop a command that is still writing once truncation keeps 1 MB",
+    async () => {
+      using tempDir = new TestTempDir("test-bash-truncate-stop");
+      const config = createTestToolConfig(process.cwd());
+      config.runtimeTempDir = tempDir.path;
+      config.overflow_policy = "truncate";
+      const tool = createBashTool(config);
 
-    const args: BashToolArgs = {
-      script:
-        'trap \'\' PIPE; perl -e \'$| = 1; for (1..1200) { print "A" x 900 . "\\n" } sleep 1; for (1..500) { print "A" x 900 . "\\n" }\'',
-      timeout_secs: 10,
-      run_in_background: false,
-      display_name: "test",
-    };
+      const args: BashToolArgs = {
+        script:
+          "trap '' PIPE; perl -e '$| = 1; for (1..1300) { print \"A\" x 900 . \"\\n\" }' 2>/dev/null; sleep 5; exit 42",
+        timeout_secs: 30,
+        run_in_background: false,
+        display_name: "test",
+      };
 
-    const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
+      const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
 
-    expect(result).toMatchObject({ success: true, exitCode: 0 });
-    if (result.success && "truncated" in result) {
-      expect(result.truncated?.reason).toContain("exceed");
-    }
-    expect(result.output?.length).toBeGreaterThan(1000000);
-  });
+      expect(result).toMatchObject({ success: true, exitCode: 0 });
+      if (result.success && "truncated" in result) {
+        expect(result.truncated?.reason).toContain("exceed");
+      }
+      expect(result.output?.length).toBeGreaterThan(1000000);
+      // Stopped at the cut, not after its 5 s sleep.
+      expect(result.wall_duration_ms).toBeLessThan(4000);
+    },
+    { timeout: 20_000 }
+  );
 
   it("should reject single overlong line before storing it (IPC mode)", async () => {
     const tempDir = new TestTempDir("test-bash-overlong-line");
