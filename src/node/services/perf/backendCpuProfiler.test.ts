@@ -99,6 +99,32 @@ describe("createBackendCpuProfiler", () => {
     expect(failedDiscard.sessions[0].disconnects).toBe(1);
   });
 
+  test("a release that overlaps a pending one waits for its disconnect", async () => {
+    const discard = Promise.withResolvers<void>();
+    const { profiler, sessions } = setup();
+    const started = await profiler.start({ samplingIntervalUs: 1000 });
+    if (!started.ok) throw new Error("expected a run");
+    const session = sessions[0];
+    const post = session.post.bind(session);
+    session.post = (method: string) =>
+      method === "Runtime.discardConsoleEntries"
+        ? discard.promise.then(() => post(method))
+        : post(method);
+
+    let secondDone = false;
+    const first = started.run.cancel();
+    const second = started.run.cancel().then(() => {
+      secondDone = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    // The second cancel must not report a release while the session is still connected.
+    expect(secondDone).toBe(false);
+    discard.resolve();
+    await Promise.all([first, second]);
+    expect(session.disconnects).toBe(1);
+  });
+
   test("cancel releases the session without stopping through it", async () => {
     const { profiler, sessions } = setup();
     const started = await profiler.start({ samplingIntervalUs: 1000 });
