@@ -1762,6 +1762,14 @@ describe("Config", () => {
             ],
           ] as unknown as StoredPair[],
       ],
+      [
+        // #6717: the duplicate-id check runs over these ids and finds none.
+        "one key with several rows and unique ids",
+        () =>
+          [
+            ["/home/u/repo", { workspaces: [row("ws-one"), row("ws-two"), row("ws-three")] }],
+          ] as StoredPair[],
+      ],
     ] as const) {
       it(`reads no session metadata and lists no directory on a load with ${name}`, () => {
         writeProjects(stored());
@@ -1937,6 +1945,102 @@ describe("Config", () => {
           })
         );
       }
+
+      // #6717: an earlier build already saved two rows with one id under one stored key. The
+      // loader keeps one row per id (the last variant, at the first row's position, as for
+      // aliases) and backs up the original bytes first, also for an identical copy.
+      // Builders: row() and config exist only inside a test. `kept` is a value the kept row holds.
+      const duplicateIdCases: Array<
+        [string, () => { rows: Array<Record<string, unknown>>; kept: string }]
+      > = [
+        ["an identical copy", () => ({ rows: [row("ws-1"), row("ws-1")], kept: "ws-1" })],
+        [
+          "a copy that differs",
+          () => ({
+            rows: [row("ws-1", { title: "first" }), row("ws-1", { title: "second" })],
+            kept: "second",
+          }),
+        ],
+        [
+          "a copy on another checkout path",
+          () => {
+            const elsewhere = path.join(config.srcDir, "repo", "elsewhere");
+            return { rows: [row("ws-1"), row("ws-1", { path: elsewhere })], kept: elsewhere };
+          },
+        ],
+      ];
+      for (const [name, build] of duplicateIdCases) {
+        it(`keeps one row per id and backs up the bytes for ${name} under one key`, async () => {
+          const { rows: stored, kept } = build();
+          fs.writeFileSync(
+            path.join(tempDir, "config.json"),
+            JSON.stringify({
+              projects: [["/home/u/repo", { workspaces: [...stored, row("ws-2")] }]],
+            })
+          );
+          const original = fs.readFileSync(path.join(tempDir, "config.json"));
+          const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+          try {
+            await flushConfigEdits();
+            const saved = readSavedProjects()[0][1].workspaces;
+            expect(saved.map((w) => w.id)).toEqual(["ws-1", "ws-2"]);
+            const keptRow = saved[0] as Record<string, unknown>;
+            expect([keptRow.id, keptRow.title, keptRow.path]).toContain(kept);
+            const backups = aliasConflictBackups();
+            expect(backups).toHaveLength(1);
+            expect(fs.readFileSync(backups[0])).toEqual(original);
+          } finally {
+            errorSpy.mockRestore();
+          }
+        });
+      }
+
+      (process.getuid?.() === 0 ? it.skip : it)(
+        "keeps config.json and refuses edits while the duplicate-id backup fails",
+        async () => {
+          const configFile = path.join(tempDir, "config.json");
+          fs.writeFileSync(
+            configFile,
+            JSON.stringify({
+              projects: [["/home/u/repo", { workspaces: [row("ws-1"), row("ws-1")] }]],
+            })
+          );
+          const original = fs.readFileSync(configFile);
+          const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+          fs.chmodSync(tempDir, 0o500);
+          try {
+            const blocked = await config.setUpdateChannel("nightly").then(
+              () => null,
+              (error: unknown) => error
+            );
+            expect(String(blocked)).toContain("could not back them up");
+            expect(fs.readFileSync(configFile)).toEqual(original);
+          } finally {
+            fs.chmodSync(tempDir, 0o700);
+            errorSpy.mockRestore();
+          }
+        }
+      );
+
+      it("writes no backup and makes no save on a load with unique ids under one key", async () => {
+        writeProjects([["/home/u/repo", { workspaces: [row("ws-1"), row("ws-2")] }]]);
+        // One save first, so config.json is canonical and the load runs no one-time migration.
+        await flushConfigEdits();
+        const fresh = new Config(tempDir);
+        const save = spyOn(
+          fresh as unknown as { saveConfig: (...args: unknown[]) => Promise<void> },
+          "saveConfig"
+        );
+        try {
+          fresh.loadConfigOrDefault();
+          // A clean load schedules no save of its own (perf condition d).
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          expect(save).not.toHaveBeenCalled();
+          expect(aliasConflictBackups()).toHaveLength(0);
+        } finally {
+          save.mockRestore();
+        }
+      });
 
       it("keeps one row and backs up the bytes for a legacy copy under one key", async () => {
         const checkout = checkoutPath();

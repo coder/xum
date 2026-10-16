@@ -1115,7 +1115,45 @@ function dropSingleKeyLegacyCopies(
   }
 }
 
-/** An alias group whose merge kept one of two different rows for the same workspace. */
+/**
+ * True when two rows share a workspace id. Allocates nothing for 0 or 1 rows, and stops at the
+ * first duplicate.
+ */
+function hasDuplicateRowId(workspaces: ProjectConfig["workspaces"]): boolean {
+  if (workspaces.length < 2) return false;
+  const seen = new Set<string>();
+  for (const workspace of workspaces) {
+    if (!workspace.id) continue;
+    if (seen.has(workspace.id)) return true;
+    seen.add(workspace.id);
+  }
+  return false;
+}
+
+/**
+ * One stored key can already hold two rows with one workspace id: an earlier build saved them, and
+ * no merge repairs them, because neither row is an alias or a legacy copy (#6717). Keep one row
+ * per id with the alias merge's rule: an identical copy once, and for rows that differ, the last
+ * one at the first row's position. Record a conflict for every repair, an identical copy
+ * included, so the original bytes are backed up before any save drops a row. All copies share
+ * the id's session folder, so no session history is lost. A copy on another checkout path loses
+ * only its config row: its checkout stays on disk and its row stays in the backup.
+ */
+function healSingleKeyDuplicateIds(
+  key: string,
+  entry: StoredProjectEntry,
+  conflicts: ProjectAliasConflict[]
+): ProjectConfig {
+  if (!hasDuplicateRowId(entry.config.workspaces)) return entry.config;
+  const ids = entry.config.workspaces.flatMap((workspace) => (workspace.id ? [workspace.id] : []));
+  const duplicatedIds = [...new Set(ids.filter((id, index) => ids.indexOf(id) !== index))];
+  // The rows only: settings and trust stay exactly as stored for a single key.
+  entry.config.workspaces = mergeProjectAliases([entry]).config.workspaces;
+  conflicts.push({ path: key, storedKeys: [entry.storedKey], conflictingIds: duplicatedIds });
+  return entry.config;
+}
+
+/** A stored project whose rows needed a repair that a save would persist (see the callers). */
 interface ProjectAliasConflict {
   path: string;
   storedKeys: string[];
@@ -1144,7 +1182,7 @@ function buildProjectsFromStoredEntries(
   const projects = new Map<string, ProjectConfig>();
   for (const [key, group] of groups) {
     if (group.length === 1) {
-      projects.set(key, group[0].config);
+      projects.set(key, healSingleKeyDuplicateIds(key, group[0], conflicts));
       dropSingleKeyLegacyCopies(key, group[0], conflicts, resolveLegacyId);
       continue;
     }
@@ -2288,7 +2326,7 @@ export class Config {
       // A reused sidecar means an earlier load already logged this content.
       if (!sidecar.reused) {
         log.error(
-          `Project config entries share a path and hold conflicting rows for the same workspace. Xum keeps one row per workspace. The original config.json bytes, with every row, were backed up to ${sidecar.path}.`,
+          `config.json holds more than one row for the same workspace. Xum keeps one row per workspace. The original config.json bytes, with every row, were backed up to ${sidecar.path}.`,
           { conflicts }
         );
       }
@@ -2310,7 +2348,7 @@ export class Config {
     const signature = `${sha256Hex(rawBytes)}:${(error as NodeJS.ErrnoException).code ?? message}`;
     if (rememberAliasBackupFailure(this.configFile, signature)) {
       log.error(
-        `Project config entries share a path and hold conflicting rows for the same workspace, and the backup of ${this.configFile} failed (${message}). Settings changes will not overwrite config.json until a backup succeeds.`,
+        `config.json holds more than one row for the same workspace, and the backup of ${this.configFile} failed (${message}). Settings changes will not overwrite config.json until a backup succeeds.`,
         { conflicts }
       );
     }
