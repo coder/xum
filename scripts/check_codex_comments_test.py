@@ -299,6 +299,15 @@ else:
             ("security flag, code thread", security, [fixed], 1),
             ("security flag, security thread", security,
              [thread(security_marker + "[P2] Fixed", resolved=True, commit=head)], 0),
+            # A marker counts only in its protocol position: code last, security first.
+            ("security flag, code thread quoting its marker", security,
+             [thread("[P2] Quotes " + security_marker + "Fixed" + code_marker, resolved=True, commit=head)], 1),
+            ("code flag, security thread quoting its marker", code,
+             [thread(security_marker + "[P2] Quotes " + code_marker + " here", resolved=True, commit=head)], 1),
+            ("marker sharing its line", code,
+             [thread("[P2] Fixed <!-- codex-code-review-finding:v1 -->", resolved=True, commit=head)], 1),
+            ("thread with both markers", security,
+             [thread(security_marker + "[P2] Fixed" + code_marker, resolved=True, commit=head)], 1),
         ):
             for cached in (False, True):
                 with self.subTest(case=case, cached=cached):

@@ -30,13 +30,21 @@ def codex_resolved_discussions($bot):
 # Threads without a known marker or commit, and other reviewers', never count.
 def codex_resolved_finding_commits($bot):
   [.[] | select(.comments.nodes[0].author.login == $bot)] as $codex
-  | def cleared($marker):
-      [$codex[] | select(.comments.nodes[0].body | contains($marker))
+  # A marker counts only in its protocol position: security as the first line,
+  # code as the last non-empty line. A body with both is neither, because
+  # findings can quote marker literals.
+  | def finding_kind:
+      (split("\n") | map(rtrimstr("\r"))) as $body_lines
+      | ($body_lines[0] == "<!-- codex-security-review-finding:v1 -->") as $security
+      | (($body_lines | map(select(test("\\S"))) | last) == "<!-- codex-code-review-finding:v1 -->") as $code
+      | if $code == $security then null
+        elif $code then "code_review" else "security_review" end;
+    def cleared($kind):
+      [$codex[] | select(.comments.nodes[0].body | finding_kind == $kind)
         | {commit: .comments.nodes[0].originalCommit.oid, resolved: (.isResolved == true)}
         | select(.commit | type == "string")]
       | group_by(.commit) | map(select(all(.resolved)) | .[0].commit);
-    {code_review: cleared("<!-- codex-code-review-finding:v1 -->"),
-     security_review: cleared("<!-- codex-security-review-finding:v1 -->")};
+    {code_review: cleared("code_review"), security_review: cleared("security_review")};
 
 def codex_review_row_prefix: "^\\| [^[:alnum:]|]*\\*\\*(Code|Security) Review\\*\\* \\| [^[:alnum:]|]*\\*\\*";
 def codex_review_row_suffix: " \\| `[0-9a-f]+` \\| (Manual request|New commits|Draft marked ready|PR opened) \\|$";
