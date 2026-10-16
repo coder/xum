@@ -39,6 +39,16 @@ function isUncacheable(url, path) {
   return UNCACHEABLE_PREFIXES.some((prefix) => path.startsWith(prefix) || `${path}/` === prefix);
 }
 
+/**
+ * The shell is the one exception to Cache-Control: the server sends it with no-store, but it
+ * holds no session or workspace data (base href, first-run view, module list, font preload, the
+ * deployment's proxy URI template). A 200 navigation refreshes the cached copy, so an offline
+ * launch starts the newest frontend, not the one from the first install.
+ */
+function isShellResponse(response) {
+  return response.status === 200 && response.type !== "opaque";
+}
+
 /** Only a successful response that the server allows any cache to keep. */
 function isCacheableResponse(response) {
   if (!response.ok || response.type === "opaque") return false;
@@ -54,11 +64,14 @@ function offlineResponse() {
   });
 }
 
-/** Network first: store a cacheable answer under `cacheKey`, else answer from this cache. */
-function networkFirst(request, cacheKey) {
+/**
+ * Network first: store a cacheable answer under `cacheKey`, else answer from this cache.
+ * `isCacheable` decides what may be stored.
+ */
+function networkFirst(request, cacheKey, isCacheable) {
   return fetch(request)
     .then((response) => {
-      if (isCacheableResponse(response)) {
+      if (isCacheable(response)) {
         const responseToCache = response.clone();
         caches.open(CACHE_NAME).then((cache) => cache.put(cacheKey, responseToCache));
       }
@@ -118,11 +131,11 @@ self.addEventListener("fetch", (event) => {
 
   if (event.request.mode === "navigate") {
     // Every client route loads the same shell; one entry, never keyed by the visited URL.
-    event.respondWith(networkFirst(event.request, SHELL_PATH));
+    event.respondWith(networkFirst(event.request, SHELL_PATH, isShellResponse));
     return;
   }
 
   if (HASHED_STATIC_ASSET_NAME.test(path) || SHELL_PUBLIC_FILES.has(path)) {
-    event.respondWith(networkFirst(event.request, event.request));
+    event.respondWith(networkFirst(event.request, event.request, isCacheableResponse));
   }
 });

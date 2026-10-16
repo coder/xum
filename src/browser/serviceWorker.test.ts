@@ -222,6 +222,30 @@ describe("service worker caching (#6848)", () => {
     expect(worker.caches.storedUrls()).not.toContain(`${scope}api/docs`);
   });
 
+  test("a no-store navigation refreshes the shell, so offline starts the newest one", async () => {
+    const worker = await startWorker(); // installs "shell"
+    // The server sends the shell with no-store; the shell is the one exception.
+    worker.setNetwork(() => ok("shell v2", { "Cache-Control": "no-store" }));
+    await worker.request(`${ORIGIN}/workspace/abc`, { mode: "navigate" });
+    // An error page must not replace the shell.
+    worker.setNetwork(() => new Response("bad gateway", { status: 502 }));
+    await worker.request(`${ORIGIN}/`, { mode: "navigate" });
+
+    worker.offline();
+    const { response } = await worker.request(`${ORIGIN}/`, { mode: "navigate" });
+    expect(await response?.text()).toBe("shell v2");
+  });
+
+  test("a no-store GET that is not a navigation is still not stored", async () => {
+    const worker = await startWorker();
+    worker.setNetwork(() => ok("page", { "Cache-Control": "no-store" }));
+    await worker.request(`${ORIGIN}/`, { mode: "cors" });
+    worker.offline();
+    const { response } = await worker.request(`${ORIGIN}/`, { mode: "navigate" });
+    // Still the installed shell, not the no-store fetch() answer.
+    expect(await response?.text()).toBe("shell");
+  });
+
   test("serves the app shell offline for every client route", async () => {
     const worker = await startWorker();
     worker.offline();
