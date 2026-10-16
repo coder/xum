@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { fn } from "storybook/test";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import { StreamingBarrierView } from "./StreamingBarrierView";
 
 const meta = {
@@ -70,7 +70,7 @@ export const LoadingToolsDiagnostic: Story = {
  */
 export const Streaming: Story = {
   args: {
-    statusText: "claude-opus-4 streaming...",
+    statusText: "claude-opus-4 streaming",
     cancelText: "hit Esc to cancel",
     cancelShortcutText: "Esc",
     onCancel: fn(),
@@ -106,6 +106,30 @@ export const WaitingOnBackgroundBashMonitorNarrow: Story = {
     reserveStatsSlot: false,
     hideHintOnNarrow: true,
   },
+  render: (args) => (
+    <div className="bg-background flex min-h-screen items-start p-6">
+      <div className="w-[320px] rounded-md border border-[var(--color-border-medium)] bg-[var(--color-card)] p-4">
+        <StreamingBarrierView {...args} />
+      </div>
+    </div>
+  ),
+};
+
+/**
+ * Streaming in a phone-width pane: the stats slot is hidden, so the label carries the live t/s.
+ * A long model name keeps the start of the line and the t/s suffix is what truncates.
+ */
+export const StreamingNarrowLongModelName: Story = {
+  args: {
+    statusText: "claude-opus-4-5-with-a-very-long-model-name streaming",
+    cancelText: "hit Esc to cancel",
+    cancelShortcutText: "Esc",
+    onCancel: fn(),
+    tokenCount: 12_840,
+    tps: 73,
+  },
+  // No Pixel capture: the snapshot budget (scripts/check-storybook-snapshot-budget.mjs) is full.
+  parameters: { pixel: PIXEL_DISABLED },
   render: (args) => (
     <div className="bg-background flex min-h-screen items-start p-6">
       <div className="w-[320px] rounded-md border border-[var(--color-border-medium)] bg-[var(--color-card)] p-4">

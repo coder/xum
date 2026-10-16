@@ -437,6 +437,15 @@ export const IPhone17ProMaxTouchTargetRows: AppStory = {
           workspaceName: "mobile-touch",
           projectName: "mux",
           messages: [...MESSAGES],
+          // Phone widths drop the footer's branch button, so a detected PR supplies the
+          // repository link as the footer's touch target at every width.
+          executeBash: (_workspaceId, script) =>
+            Promise.resolve({
+              success: true as const,
+              output: script.includes("gh pr view") ? PR_DETECTION_JSON : "",
+              exitCode: 0,
+              wall_duration_ms: 5,
+            }),
         })
       }
     />
@@ -463,11 +472,13 @@ export const IPhone17ProMaxTouchTargetRows: AppStory = {
       { label: "footer info row", el: footerRow },
       { label: "composer model pill", el: modelGroup },
     ];
-    for (const row of rows) {
-      if (row.el.querySelectorAll("button, a").length === 0) {
-        throw new Error(`${row.label} has no touch targets to size against`);
+    await waitFor(() => {
+      for (const row of rows) {
+        if (row.el.querySelectorAll("button, a").length === 0) {
+          throw new Error(`${row.label} has no touch targets to size against`);
+        }
       }
-    }
+    });
 
     const touchFloor = document.createElement("style");
     touchFloor.textContent = `[data-testid="workspace-footer-bar"] button, [data-testid="workspace-footer-bar"] a, [data-component="ModelSelectorGroup"] button { min-height: ${MOBILE_TOUCH_TARGET_PX}px; }`;

@@ -9,6 +9,7 @@ import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { waitForScrollStabilization } from "./storyPlayHelpers.js";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
 const meta = { ...appMeta, title: "App/PhoneViewports/Overflow" };
 export default meta;
@@ -107,6 +108,7 @@ export const FooterAndScriptBlock: AppStory = {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
     await waitForScrollStabilization(storyRoot);
 
+    const narrow = window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
     const footerRow = await waitFor(() => {
       const row = storyRoot.querySelector<HTMLElement>(
         '[data-testid="workspace-footer-bar"] > div'
@@ -115,7 +117,11 @@ export const FooterAndScriptBlock: AppStory = {
       return row;
     });
     await waitFor(() => {
-      if (!footerRow.textContent?.includes("Last prompt")) throw new Error("Footer still loading");
+      // Phone widths drop "Last prompt" from the footer; wider windows (the test runner) still
+      // wait for it so the fit check covers the full row.
+      if (!narrow && !footerRow.textContent?.includes("Last prompt")) {
+        throw new Error("Footer still loading");
+      }
       if (!storyRoot.querySelector('[data-testid="workspace-footer-repository"]')) {
         throw new Error("PR repository label not shown yet");
       }

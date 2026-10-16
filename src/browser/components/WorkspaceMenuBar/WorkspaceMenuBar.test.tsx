@@ -12,6 +12,7 @@ import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as RuntimeStatusStoreModule from "@/browser/stores/RuntimeStatusStore";
+import * as GitStatusStoreModule from "@/browser/stores/GitStatusStore";
 import * as OpenTerminalModule from "@/browser/hooks/useOpenTerminal";
 import * as OpenInEditorModule from "@/browser/hooks/useOpenInEditor";
 import * as PersistedStateModule from "@/browser/hooks/usePersistedState";
@@ -227,6 +228,7 @@ function installWorkspaceMenuBarTestDoubles() {
       }) as unknown as ReturnType<typeof WorkspaceStoreModule.useWorkspaceSidebarState>
   );
   spyOn(RuntimeStatusStoreModule, "useRuntimeStatus").mockImplementation(() => "unsupported");
+  spyOn(GitStatusStoreModule, "useGitStatus").mockImplementation(() => null);
   spyOn(RuntimeStatusStoreModule, "useRuntimeStatusStoreRaw").mockImplementation(
     () =>
       ({ invalidateWorkspace: () => undefined }) as unknown as ReturnType<
@@ -713,6 +715,26 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     fireEvent.keyDown(input, { key: "Escape" });
     expect(view.queryByTestId("workspace-title-input")).toBeNull();
     expect(document.activeElement).toBe(focused);
+  });
+
+  it("lists the git branch in the workspace details once it is known", () => {
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    expect(view.container.querySelector("svg.lucide-git-branch")).toBeNull();
+
+    spyOn(GitStatusStoreModule, "useGitStatus").mockImplementation(() => ({
+      branch: "mike/compact-footer",
+      ahead: 0,
+      behind: 0,
+      dirty: false,
+      outgoingAdditions: 0,
+      outgoingDeletions: 0,
+      incomingAdditions: 0,
+      incomingDeletions: 0,
+    }));
+    view.rerender(<WorkspaceMenuBar {...defaultProps} />);
+
+    const branch = view.getByText("mike/compact-footer");
+    expect(branch.parentElement?.querySelector("svg.lucide-git-branch")).not.toBeNull();
   });
 
   it("offers the hidden sidebar as one row, and opens it full-screen", () => {

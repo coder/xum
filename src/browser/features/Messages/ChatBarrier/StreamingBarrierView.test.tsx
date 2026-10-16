@@ -22,7 +22,7 @@ describe("StreamingBarrierView", () => {
 
     const view = render(
       <StreamingBarrierView
-        statusText="streaming..."
+        statusText="streaming"
         cancelText="hit Esc to cancel"
         cancelShortcutText="Esc"
         onCancel={onCancel}
@@ -43,7 +43,7 @@ describe("StreamingBarrierView", () => {
     const onCancel = mock(() => undefined);
     const view = render(
       <StreamingBarrierView
-        statusText="streaming..."
+        statusText="streaming"
         cancelText="hit Esc to cancel"
         onCancel={onCancel}
       />
@@ -56,7 +56,7 @@ describe("StreamingBarrierView", () => {
 
   test("renders cancel hint as plain text when onCancel is omitted", () => {
     const view = render(
-      <StreamingBarrierView statusText="streaming..." cancelText="hit Esc to cancel" />
+      <StreamingBarrierView statusText="streaming" cancelText="hit Esc to cancel" />
     );
 
     expect(view.getByText("hit Esc to cancel")).toBeTruthy();
@@ -80,7 +80,7 @@ describe("StreamingBarrierView", () => {
   test("reveals the same stats slot with values once streaming", () => {
     const view = render(
       <StreamingBarrierView
-        statusText="streaming..."
+        statusText="streaming"
         cancelText="hit Esc to cancel"
         tokenCount={1234}
         tps={45}
@@ -92,5 +92,23 @@ describe("StreamingBarrierView", () => {
     expect(stats.getAttribute("aria-hidden")).toBe("false");
     expect(stats.textContent).toContain("1,234");
     expect(stats.textContent).toContain("45");
+  });
+
+  // Narrow panes hide the stats slot, so the status label is their only place for t/s.
+  test.each([
+    [21, "model streaming at 21 t/s"],
+    [0, "model streaming"],
+    [undefined, "model streaming"],
+  ])("with tps %p the status label reads %p", (tps, label) => {
+    const view = render(
+      <StreamingBarrierView
+        statusText="model streaming"
+        cancelText="hit Esc to cancel"
+        tokenCount={1234}
+        tps={tps}
+      />
+    );
+
+    expect(view.getByText("model streaming").textContent).toBe(label);
   });
 });

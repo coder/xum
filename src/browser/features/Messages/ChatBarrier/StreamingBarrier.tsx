@@ -317,9 +317,9 @@ export const StreamingBarrierContent: React.FC<StreamingBarrierContentProps> = (
       case "awaiting-input":
         return "Awaiting your input...";
       case "compacting":
-        return modelName ? `${modelName} compacting...` : "compacting...";
+        return modelName ? `${modelName} compacting` : "compacting";
       case "streaming":
-        return modelName ? `${modelName} streaming...` : "streaming...";
+        return modelName ? `${modelName} streaming` : "streaming";
       case "waiting-on-monitor":
         return activeBashMonitorCount === 1
           ? "Waiting on background bash monitor..."

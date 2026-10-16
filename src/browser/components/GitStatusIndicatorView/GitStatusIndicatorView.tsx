@@ -40,6 +40,40 @@ function formatCountAbbrev(count: number): string {
   return `${count < 0 ? "-" : ""}${normalized}m`;
 }
 
+function otherMode(mode: GitStatusIndicatorMode): GitStatusIndicatorMode {
+  return mode === "divergence" ? "line-delta" : "divergence";
+}
+
+function hasModeContent(mode: GitStatusIndicatorMode, gitStatus: GitStatus): boolean {
+  if (gitStatus.dirty) return true;
+  if (mode === "divergence") return gitStatus.ahead > 0 || gitStatus.behind > 0;
+  return (
+    gitStatus.outgoingAdditions +
+      gitStatus.outgoingDeletions +
+      gitStatus.incomingAdditions +
+      gitStatus.incomingDeletions >
+    0
+  );
+}
+
+/**
+ * Tap-toggle triggers stay tappable when only the other mode has content, so the user can never
+ * get stuck on an empty mode with nothing to tap.
+ */
+function getTriggerVisibility(
+  mode: GitStatusIndicatorMode,
+  gitStatus: GitStatus,
+  tapTogglesMode: boolean
+): "content" | "zero-count" | "empty" {
+  if (hasModeContent(mode, gitStatus)) return "content";
+  return tapTogglesMode && hasModeContent(otherMode(mode), gitStatus) ? "zero-count" : "empty";
+}
+
+function getTriggerAriaLabel(mode: GitStatusIndicatorMode, tapTogglesMode: boolean): string {
+  if (!tapTogglesMode) return "View git divergence details";
+  return mode === "divergence" ? "Show lines" : "Show commits";
+}
+
 export interface GitStatusIndicatorViewProps {
   gitStatus: GitStatus | null;
   tooltipPosition?: "right" | "bottom";
@@ -63,6 +97,8 @@ export interface GitStatusIndicatorViewProps {
   isWorking?: boolean;
   /** When true, shows shimmer effect to indicate git status is refreshing */
   isRefreshing?: boolean;
+  /** When true, a tap switches between line delta and commit divergence instead of opening the dialog. */
+  tapTogglesMode?: boolean;
 }
 
 const CounterPill: React.FC<{ children: React.ReactNode }> = ({ children }) => (
@@ -95,6 +131,7 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
   workspaceId,
   isWorking = false,
   isRefreshing = false,
+  tapTogglesMode = false,
 }) => {
   // Handle null gitStatus (initial loading state)
   if (!gitStatus) {
@@ -106,16 +143,12 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
     );
   }
 
-  const outgoingLines = gitStatus.outgoingAdditions + gitStatus.outgoingDeletions;
   const incomingLines = gitStatus.incomingAdditions + gitStatus.incomingDeletions;
 
-  // Render empty placeholder when nothing to show (prevents layout shift)
-  const isEmpty =
-    mode === "divergence"
-      ? gitStatus.ahead === 0 && gitStatus.behind === 0 && !gitStatus.dirty
-      : outgoingLines === 0 && !gitStatus.dirty && incomingLines === 0;
+  const visibility = getTriggerVisibility(mode, gitStatus, tapTogglesMode);
 
-  if (isEmpty) {
+  // Render empty placeholder when nothing to show (prevents layout shift)
+  if (visibility === "empty") {
     return (
       <span
         className="text-accent-text relative flex items-center gap-1 font-mono text-[11px]"
@@ -306,6 +339,13 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
 
   const triggerContent = (
     <>
+      {visibility === "zero-count" && (
+        <CounterPill>
+          <span className="flex items-center px-1.5 font-normal">
+            {mode === "divergence" ? "↑0" : "+0"}
+          </span>
+        </CounterPill>
+      )}
       {mode === "divergence" ? (
         hasCommitDivergence && (
           <CounterPill>
@@ -366,11 +406,15 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
           statusColor,
           isRefreshing && "animate-pulse"
         )}
-        aria-label="View git divergence details"
+        aria-label={getTriggerAriaLabel(mode, tapTogglesMode)}
         onKeyDown={stopKeyboardPropagation}
         onClick={(e) => {
           e.stopPropagation();
-          onOpenChange(true);
+          if (tapTogglesMode) {
+            onModeChange(otherMode(mode));
+          } else {
+            onOpenChange(true);
+          }
         }}
       >
         {triggerContent}

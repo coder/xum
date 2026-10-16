@@ -6,6 +6,7 @@ import {
   Bell,
   BellOff,
   Ellipsis,
+  GitBranch,
   Info,
   PanelRightOpen,
   Pencil,
@@ -39,6 +40,7 @@ import {
 } from "@/browser/utils/ui/keybinds";
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
+import { useGitStatus } from "@/browser/stores/GitStatusStore";
 import { Button } from "@/browser/components/Button/Button";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
@@ -127,6 +129,20 @@ function getPhoneHeaderSnapshot(): boolean {
     typeof window !== "undefined" &&
     typeof window.matchMedia === "function" &&
     window.matchMedia(PHONE_HEADER_QUERY).matches
+  );
+}
+
+/** Subscribes at the leaf so git status polling does not re-render the whole header. */
+function WorkspaceDetailsBranch(props: { workspaceId: string }) {
+  const branch = useGitStatus(props.workspaceId)?.branch;
+  if (!branch) {
+    return null;
+  }
+  return (
+    <span className="flex min-w-0 items-center gap-1">
+      <GitBranch className="h-3 w-3 shrink-0" aria-hidden="true" />
+      <span className="truncate font-mono">{branch}</span>
+    </span>
   );
 }
 
@@ -748,6 +764,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             <span className="font-mono">{projectLabel}</span>
             <span>{workspaceName}</span>
             <span className="text-muted">{namedWorkspacePath}</span>
+            <WorkspaceDetailsBranch workspaceId={workspaceId} />
           </PopoverContent>
         </Popover>
         {isArchiving && (

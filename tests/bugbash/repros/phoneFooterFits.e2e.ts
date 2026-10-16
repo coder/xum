@@ -10,9 +10,12 @@ test(
   async ({ app, screen, browser }) => {
     await browser.setViewport({ width: 390, height: 844 });
     await openPlayground(app, screen, browser);
-    // The footer adds its token count and "Last prompt" once the chat has a message.
+    // Phone widths keep only the compact footer items, so wait on the sent message instead of a
+    // footer item that this width no longer shows.
     await sendMessage(screen, "Footer width check at phone size");
-    await expect(screen.getByText("Last prompt").first()).toBeVisible({ timeout: 20_000 });
+    await expect(screen.getByText("Footer width check at phone size").first()).toBeVisible({
+      timeout: 20_000,
+    });
 
     // Overflow in px of the footer's row; -1 while the footer is not rendered yet.
     await expect

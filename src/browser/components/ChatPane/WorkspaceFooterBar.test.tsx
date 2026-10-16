@@ -2,7 +2,7 @@ import "../../../../tests/ui/dom";
 
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
@@ -10,6 +10,7 @@ import * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as GitStatusStoreModule from "@/browser/stores/GitStatusStore";
 import * as PRStatusStoreModule from "@/browser/stores/PRStatusStore";
 import * as RuntimeStatusStoreModule from "@/browser/stores/RuntimeStatusStore";
+import * as AppConfigStoreModule from "@/browser/stores/AppConfigStore";
 import * as RuntimeBadgeModule from "../RuntimeBadge/RuntimeBadge";
 import * as BranchSelectorModule from "../BranchSelector/BranchSelector";
 import * as GitStatusIndicatorModule from "../GitStatusIndicator/GitStatusIndicator";
@@ -488,5 +489,145 @@ describe("WorkspaceFooterBar last prompt", () => {
     expect(view.getByTestId("workspace-footer-last-prompt").getAttribute("aria-expanded")).toBe(
       "false"
     );
+  });
+});
+
+describe("WorkspaceFooterBar at narrow viewports", () => {
+  let restoreMatchMedia: (() => void) | null = null;
+  let viewportListeners: Array<() => void> = [];
+  let viewportIsNarrow = true;
+
+  // Answers only the footer's narrow-viewport query, so other media queries keep their defaults.
+  function stubViewport() {
+    const original = Object.getOwnPropertyDescriptor(window, "matchMedia");
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: (query: string) =>
+        ({
+          get matches() {
+            return query === "(max-width: 768px)" && viewportIsNarrow;
+          },
+          media: query,
+          onchange: null,
+          addListener: () => undefined,
+          removeListener: () => undefined,
+          addEventListener: (_type: string, listener: () => void) => {
+            viewportListeners.push(listener);
+          },
+          removeEventListener: (_type: string, listener: () => void) => {
+            viewportListeners = viewportListeners.filter((l) => l !== listener);
+          },
+          dispatchEvent: () => false,
+        }) as unknown as MediaQueryList,
+    });
+    restoreMatchMedia = () => {
+      if (original) {
+        Object.defineProperty(window, "matchMedia", original);
+      } else {
+        Reflect.deleteProperty(window, "matchMedia");
+      }
+    };
+  }
+
+  function mockFooterContent() {
+    spyOn(WorkspaceStoreModule, "useWorkspaceUsage").mockImplementation(
+      () =>
+        ({ totalTokens: 274_200 }) as unknown as ReturnType<
+          typeof WorkspaceStoreModule.useWorkspaceUsage
+        >
+    );
+    spyOn(WorkspaceStoreModule, "useWorkspaceRoundedStreamingTps").mockImplementation(() => 21);
+    spyOn(WorkspaceStoreModule, "useWorkspaceLastUserPromptInfo").mockImplementation(() => ({
+      text: "ship the footer",
+      messageId: "prompt-1",
+    }));
+  }
+
+  function lastGitStatusIndicatorProps() {
+    const spy = GitStatusIndicatorModule.GitStatusIndicator as unknown as {
+      mock: { calls: Array<[{ tapTogglesMode?: boolean }]> };
+    };
+    return spy.mock.calls.at(-1)?.[0];
+  }
+
+  beforeEach(() => {
+    workspaceMetadata = new Map();
+    workspaceState = { messages: [], muxMessages: [], hasOlderHistory: false };
+    loadOlderHistory = () => Promise.resolve("exhausted" as const);
+    cleanupDom = installDom();
+    viewportListeners = [];
+    viewportIsNarrow = true;
+    stubViewport();
+    installFooterBarTestDoubles();
+    mockFooterContent();
+    workspaceMetadata.set(workspaceId, repoMetadata);
+    /* eslint-disable @typescript-eslint/no-require-imports */
+    ({ WorkspaceFooterBar } = require("./WorkspaceFooterBar?workspace-footer-bar-test=3") as {
+      WorkspaceFooterBar: typeof WorkspaceFooterBarComponent;
+    });
+    /* eslint-enable @typescript-eslint/no-require-imports */
+  });
+
+  afterEach(() => {
+    cleanup();
+    mock.restore();
+    restoreMatchMedia?.();
+    restoreMatchMedia = null;
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  it("drops the branch, drift label, usage stats and last prompt but keeps the repo label", () => {
+    const { container, queryByTestId } = renderFooter();
+
+    expect(BranchSelectorModule.BranchSelector).not.toHaveBeenCalled();
+    expect(container.textContent).not.toContain("Lines");
+    expect(container.textContent).not.toContain("tok");
+    expect(container.textContent).not.toContain("t/s");
+    expect(queryByTestId("workspace-footer-last-prompt")).toBeNull();
+    expect(container.textContent).toContain("demo");
+  });
+
+  it("keeps the devcontainer status chip", () => {
+    spyOn(RuntimeStatusStoreModule, "useRuntimeStatus").mockImplementation(() => "running");
+    const devcontainer = { type: "devcontainer", configPath: ".devcontainer.json" } as const;
+    workspaceMetadata.set(workspaceId, { ...repoMetadata, runtimeConfig: devcontainer });
+
+    const { container } = renderFooter({ runtimeConfig: devcontainer });
+
+    expect(container.textContent).toContain("Devcontainer Running");
+  });
+
+  it("makes the diff numbers toggle the drift mode", () => {
+    renderFooter();
+
+    expect(lastGitStatusIndicatorProps()?.tapTogglesMode).toBe(true);
+  });
+
+  it("returns to the full footer when the viewport widens", () => {
+    const { container } = renderFooter();
+    expect(BranchSelectorModule.BranchSelector).not.toHaveBeenCalled();
+
+    viewportIsNarrow = false;
+    act(() => {
+      for (const listener of viewportListeners) listener();
+    });
+
+    expect(BranchSelectorModule.BranchSelector).toHaveBeenCalled();
+    expect(container.textContent).toContain("Lines");
+    expect(lastGitStatusIndicatorProps()?.tapTogglesMode).toBe(false);
+  });
+
+  it("still toggles the drift mode from the keyboard shortcut", () => {
+    const update = spyOn(AppConfigStoreModule, "updateUserPreferences").mockImplementation(
+      () => undefined
+    );
+
+    renderFooter();
+    fireEvent.keyDown(window, { key: "G", ctrlKey: true, shiftKey: true });
+
+    expect(update.mock.calls).toEqual([
+      [{ appearance: { gitStatusIndicatorMode: "divergence" } }],
+    ]);
   });
 });

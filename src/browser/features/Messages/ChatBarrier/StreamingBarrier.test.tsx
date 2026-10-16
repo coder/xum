@@ -323,7 +323,7 @@ describe("StreamingBarrier", () => {
     });
     view.rerender(<StreamingBarrier workspaceId="ws-1" />);
 
-    expect(view.getByText("claude-opus-4-6 streaming...")).toBeTruthy();
+    expect(view.getByText("claude-opus-4-6 streaming")).toBeTruthy();
     expect(view.queryByText("Loading tools...")).toBeNull();
   });
 
@@ -335,7 +335,7 @@ describe("StreamingBarrier", () => {
 
     // First appearance is immediate.
     const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
-    expect(view.getByText("claude-opus-4-6 streaming...")).toBeTruthy();
+    expect(view.getByText("claude-opus-4-6 streaming")).toBeTruthy();
 
     // Token count updates don't change statusText, so the displayed text stays.
     currentWorkspaceState = createWorkspaceState({
@@ -345,7 +345,24 @@ describe("StreamingBarrier", () => {
     currentStreamingStats = { tokenCount: 42, tps: 18, charsPerSec: 72 };
     view.rerender(<StreamingBarrier workspaceId="ws-1" />);
 
-    expect(view.getByText("claude-opus-4-6 streaming...")).toBeTruthy();
+    expect(view.getByText("claude-opus-4-6 streaming")).toBeTruthy();
+  });
+
+  test("the status label tracks live tps without waiting for the status debounce", () => {
+    currentWorkspaceState = createWorkspaceState({
+      canInterrupt: true,
+      currentModel: "anthropic:claude-opus-4-6",
+    });
+    currentStreamingStats = { tokenCount: 42, tps: 18, charsPerSec: 72 };
+
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
+    const label = () => view.getByText("claude-opus-4-6 streaming").textContent;
+    expect(label()).toBe("claude-opus-4-6 streaming at 18 t/s");
+
+    currentStreamingStats = { tokenCount: 84, tps: 34, charsPerSec: 136 };
+    view.rerender(<StreamingBarrier workspaceId="ws-1" />);
+
+    expect(label()).toBe("claude-opus-4-6 streaming at 34 t/s");
   });
 
   test("shows vim interrupt shortcut when vim mode is enabled", () => {
@@ -413,7 +430,7 @@ describe("StreamingBarrier", () => {
     });
 
     const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
-    expect(view.getByText("claude-opus-4-6 streaming...")).toBeTruthy();
+    expect(view.getByText("claude-opus-4-6 streaming")).toBeTruthy();
 
     // Switch workspace — immediately shows the new workspace's text.
     currentWorkspaceState = createWorkspaceState({
@@ -423,8 +440,8 @@ describe("StreamingBarrier", () => {
     view.rerender(<StreamingBarrier workspaceId="ws-2" />);
 
     // Old workspace text gone; new workspace text shown immediately.
-    expect(view.queryByText("claude-opus-4-6 streaming...")).toBeNull();
-    expect(view.getByText("gpt-4o-mini streaming...")).toBeTruthy();
+    expect(view.queryByText("claude-opus-4-6 streaming")).toBeNull();
+    expect(view.getByText("gpt-4o-mini streaming")).toBeTruthy();
   });
 
   test("awaiting-input phase keeps cancel hint non-interactive", () => {
@@ -476,7 +493,7 @@ describe("StreamingBarrier", () => {
 
     const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
 
-    expect(view.getByText("gpt-4o-mini streaming...")).toBeTruthy();
+    expect(view.getByText("gpt-4o-mini streaming")).toBeTruthy();
     expect(view.getByRole("button", { name: "Stop streaming" })).toBeTruthy();
   });
 });
