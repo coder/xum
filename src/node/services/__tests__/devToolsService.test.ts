@@ -1331,11 +1331,18 @@ describe("DevToolsService", () => {
       });
 
       describe("compaction", () => {
-        const readEntries = async (): Promise<Array<{ type: string; run?: DevToolsRun }>> =>
+        interface LogEntry {
+          type: string;
+          run?: DevToolsRun;
+          step?: DevToolsStep;
+        }
+        const readEntries = async (): Promise<LogEntry[]> =>
           (await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8"))
             .split("\n")
             .filter((line) => line.length > 0)
-            .map((line) => JSON.parse(line) as { type: string; run?: DevToolsRun });
+            .map((line) => JSON.parse(line) as LogEntry);
+        const stepRowIds = (entries: LogEntry[]) =>
+          entries.filter((entry) => entry.type === "step").map((entry) => entry.step?.id);
         const newService = () =>
           new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
             maxRetainedBytesPerWorkspace: BUDGET_BYTES,
@@ -1473,6 +1480,73 @@ describe("DevToolsService", () => {
           for (let index = 1; index <= 6; index += 1) {
             expect(logContents).toContain(`"step-${index}"`);
           }
+        });
+
+        it("keeps the rows another backend appended after this one loaded", async () => {
+          const first = newService();
+          await first.createRun("ws-1", runAt(1));
+          await first.createStep(
+            "ws-1",
+            makeStep({ id: "step-1", runId: "run-1", durationMs: null })
+          );
+          const second = newService();
+          await second.createRun("ws-1", runAt(2));
+          await second.createStep("ws-1", makeStep({ id: "step-2", runId: "run-2" }));
+
+          for (let attempt = 1; attempt <= 5; attempt += 1) {
+            await first.updateStep("ws-1", "step-1", { rawChunks: rawChunksOf(60_000 + attempt) });
+          }
+
+          expect((await readEntries()).map((entry) => entry.type)).not.toContain("step-update");
+          const replayed = newService();
+          expect(await runIds(replayed)).toEqual(["run-1", "run-2"]);
+          expect(
+            (await replayed.getRunWithSteps("ws-1", "run-2"))?.steps.map((step) => step.id)
+          ).toEqual(["step-2"]);
+        });
+
+        it("keeps the steps of overlapping runs in the order they were logged", async () => {
+          const service = newService();
+          await service.createRun("ws-1", runAt(1));
+          await service.createRun("ws-1", runAt(2));
+          await service.createStep("ws-1", makeStep({ id: "step-a0", runId: "run-1" }));
+          await service.createStep("ws-1", makeStep({ id: "step-b0", runId: "run-2" }));
+          await service.createStep(
+            "ws-1",
+            makeStep({ id: "step-a1", runId: "run-1", durationMs: null })
+          );
+          for (let attempt = 1; attempt <= 5; attempt += 1) {
+            await service.updateStep("ws-1", "step-a1", {
+              rawChunks: rawChunksOf(60_000 + attempt),
+            });
+          }
+
+          const entries = await readEntries();
+          expect(entries.map((entry) => entry.type)).not.toContain("step-update");
+          expect(stepRowIds(entries)).toEqual(["step-a0", "step-b0", "step-a1"]);
+        });
+
+        it("writes a step created while the compacting append is queued once", async () => {
+          const service = newService();
+          await service.createRun("ws-1", runAt(1));
+          await service.createStep(
+            "ws-1",
+            makeStep({ id: "step-1", runId: "run-1", durationMs: null })
+          );
+          for (let attempt = 1; attempt <= 4; attempt += 1) {
+            await service.updateStep("ws-1", "step-1", {
+              rawChunks: rawChunksOf(60_000 + attempt),
+            });
+          }
+          // The fifth payload's append compacts the log while step-2's append waits behind it.
+          await Promise.all([
+            service.updateStep("ws-1", "step-1", { rawChunks: rawChunksOf(60_005) }),
+            service.createStep("ws-1", makeStep({ id: "step-2", runId: "run-1" })),
+          ]);
+
+          const entries = await readEntries();
+          expect(entries.map((entry) => entry.type)).not.toContain("step-update");
+          expect(stepRowIds(entries)).toEqual(["step-1", "step-2"]);
         });
       });
     });

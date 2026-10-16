@@ -42,8 +42,9 @@ import { sanitizeInputTransformations } from "@/node/utils/messages/anthropicInp
  * The file is cut down to the same window: once more than twice the byte budget
  * of it is lines that replay no longer keeps (evicted runs, superseded
  * updates), it is rewritten as one line per retained run and step (updates
- * merged in). Disk use and the next replay therefore stay within the retained
- * bytes plus twice the budget instead of growing with every run ever logged.
+ * merged in, log order kept). Disk use and the next replay therefore stay
+ * within the retained bytes plus twice the budget instead of growing with
+ * every run ever logged.
  * Lines of evicted runs, including ones still streaming, do not survive it.
  *
  * The run bound alone does not cap memory: a single streamed step carries the
@@ -158,6 +159,33 @@ async function writeLogLine(handle: fs.FileHandle, entry: DevToolsLogEntry): Pro
   return line.length;
 }
 
+/**
+ * Write the retained runs and steps, each step after its run, keeping both in
+ * the order replay inserted them: the replay audit reads steps in log order
+ * across overlapping runs. Returns the bytes written.
+ */
+async function writeRetainedEntries(handle: fs.FileHandle, data: WorkspaceData): Promise<number> {
+  const runs = data.runs.values();
+  const writtenRunIds = new Set<string>();
+  let bytes = 0;
+  const writeRunsThrough = async (runId: string | null): Promise<void> => {
+    while (runId === null || !writtenRunIds.has(runId)) {
+      const next = runs.next();
+      if (next.done) {
+        return;
+      }
+      bytes += await writeLogLine(handle, { type: "run", run: next.value });
+      writtenRunIds.add(next.value.id);
+    }
+  };
+  for (const step of data.steps.values()) {
+    await writeRunsThrough(step.runId);
+    bytes += await writeLogLine(handle, { type: "step", step });
+  }
+  await writeRunsThrough(null);
+  return bytes;
+}
+
 function jsonLength(value: unknown): number {
   const json = JSON.stringify(value);
   return json === undefined ? 0 : json.length;
@@ -200,6 +228,23 @@ function removeRun(data: WorkspaceData, runId: string): DevToolsStep[] {
   data.retainedBytes -= data.runBytes.get(runId) ?? 0;
   data.runBytes.delete(runId);
   return removedSteps;
+}
+
+function createWorkspaceData(): WorkspaceData {
+  return {
+    runs: new Map<string, DevToolsRun>(),
+    steps: new Map<string, DevToolsStep>(),
+    runBytes: new Map<string, number>(),
+    stepBytes: new Map<string, number>(),
+    retainedBytes: 0,
+    loaded: false,
+    evictedStepIds: new Set<string>(),
+    evictedRunIds: new Set<string>(),
+    replayComplete: false,
+    clearGeneration: 0,
+    fileBytes: 0,
+    compactionRetryAtBytes: 0,
+  };
 }
 
 function evictRun(data: WorkspaceData, runId: string): void {
@@ -792,20 +837,7 @@ export class DevToolsService extends EventEmitter {
       return data;
     }
 
-    data = {
-      runs: new Map<string, DevToolsRun>(),
-      steps: new Map<string, DevToolsStep>(),
-      runBytes: new Map<string, number>(),
-      stepBytes: new Map<string, number>(),
-      retainedBytes: 0,
-      loaded: false,
-      evictedStepIds: new Set<string>(),
-      evictedRunIds: new Set<string>(),
-      replayComplete: false,
-      clearGeneration: 0,
-      fileBytes: 0,
-      compactionRetryAtBytes: 0,
-    };
+    data = createWorkspaceData();
     this.workspaces.set(workspaceId, data);
     return data;
   }
@@ -1100,54 +1132,38 @@ export class DevToolsService extends EventEmitter {
     });
   }
 
-  /**
-   * Whether more than twice the byte budget of devtools.jsonl is lines that
-   * replay no longer keeps. After a failed partial replay memory is only a
-   * prefix of the file, so rewriting the file from it would drop the rest.
-   */
+  /** Whether more than twice the byte budget of devtools.jsonl is lines that replay no longer keeps. */
   private shouldCompact(data: WorkspaceData): boolean {
     return (
-      data.replayComplete &&
       data.fileBytes - data.retainedBytes > 2 * this.maxRetainedBytesPerWorkspace &&
       data.fileBytes > data.compactionRetryAtBytes
     );
   }
 
   /**
-   * Rewrite devtools.jsonl as the retained runs, each followed by its steps.
-   * It runs inside the write queue, so no append interleaves; an entry whose
-   * append is queued behind it lands twice, which replay tolerates (a repeated
-   * run line is skipped, a step or update is applied again). Never rejects: the
-   * caller's own line is already written, and a rejection would roll it back.
+   * Rewrite devtools.jsonl as what replaying it keeps. It replays the file
+   * under the session lock instead of using this process's memory, which
+   * lacks rows other backends appended and already holds entries whose appends
+   * are queued behind this one; those then land once, after the rewrite. Never
+   * rejects: the caller's own line is already written, and a rejection would
+   * roll it back.
    */
   private async compactSessionFile(workspaceId: string, data: WorkspaceData): Promise<void> {
     if (this.workspaces.get(workspaceId) !== data) {
       return;
     }
-    const runs = Array.from(data.runs.values());
-    const stepsByRun = new Map<string, DevToolsStep[]>();
-    for (const step of data.steps.values()) {
-      const steps = stepsByRun.get(step.runId);
-      if (steps) {
-        steps.push(step);
-      } else {
-        stepsByRun.set(step.runId, [step]);
-      }
-    }
-
     const filePath = this.getSessionFilePath(workspaceId);
     const tempPath = `${filePath}.compacting`;
     let bytes = 0;
     try {
       await this.commitToSessionFileUnlessRemoved(workspaceId, async () => {
+        const replayed = createWorkspaceData();
+        for await (const line of readLines(filePath)) {
+          this.replayLogLine(workspaceId, replayed, line);
+        }
         const handle = await fs.open(tempPath, "w");
         try {
-          for (const run of runs) {
-            bytes += await writeLogLine(handle, { type: "run", run });
-            for (const step of stepsByRun.get(run.id) ?? []) {
-              bytes += await writeLogLine(handle, { type: "step", step });
-            }
-          }
+          bytes = await writeRetainedEntries(handle, replayed);
         } finally {
           await handle.close();
         }
