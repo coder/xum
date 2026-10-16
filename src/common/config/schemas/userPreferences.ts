@@ -13,7 +13,6 @@ import {
   normalizeEditorConfig,
   normalizeTerminalBadgeConfig,
 } from "@/common/constants/storage";
-import { ServiceTierSchema } from "@/common/config/schemas/providersConfig";
 import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
 import { REVIEW_FILE_TREE_VIEW_MODES, REVIEW_SORT_ORDERS } from "@/common/types/review";
 import { ThinkingLevelSchema, coerceThinkingLevel } from "@/common/types/thinking";
@@ -48,7 +47,6 @@ const nonBlank = (value: unknown) =>
   typeof value === "string" && value.trim().length > 0 ? value : undefined;
 const trimmedNonBlank = (value: unknown) => nonBlank(value)?.trim();
 const repairAgentId = (value: unknown) => normalizeAgentId(value, "") || undefined;
-const repairServiceTier = (value: unknown) => ServiceTierSchema.safeParse(value).data;
 const repairFontSize = (value: unknown) =>
   Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : undefined;
 // A fresh schema per field, since each one registers its own repair.
@@ -123,8 +121,6 @@ export const UserPreferencesSchema = z.object({
         .object({
           agentId: repairOnLoad(nonBlankString(), repairAgentId).optional(),
           thinkingLevel: repairOnLoad(ThinkingLevelSchema, coerceThinkingLevel).optional(),
-          // Speed (Fast/Ultrafast) is a default like the thinking level.
-          serviceTier: repairOnLoad(ServiceTierSchema, repairServiceTier).optional(),
         })
         .optional(),
       projectDefaults: z
@@ -137,7 +133,6 @@ export const UserPreferencesSchema = z.object({
               repairModelString
             ).optional(),
             thinkingLevel: repairOnLoad(ThinkingLevelSchema, coerceThinkingLevel).optional(),
-            serviceTier: repairOnLoad(ServiceTierSchema, repairServiceTier).optional(),
           })
         )
         .optional(),

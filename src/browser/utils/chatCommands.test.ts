@@ -30,9 +30,6 @@ import { parseCommand } from "./slashCommands/parser";
 import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
-import type { UserPreferences } from "@/common/config/schemas/userPreferences";
-import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
-import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { createTestApiClient } from "@/browser/testUtils";
 import type { RuntimeConfig, RuntimeEnablementId } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -458,14 +455,8 @@ describe("processSlashCommand speed toggles", () => {
   afterEach(() => resetAiSelectionIntentForTests());
   const store = getProvidersConfigStore();
   let config: ProvidersConfigMap;
-  let preferences: UserPreferences;
 
   beforeEach(() => {
-    preferences = {};
-    const appConfig = getAppConfigStore();
-    spyOn(appConfig, "updateUserPreferences").mockImplementation((patch) => {
-      preferences = normalizeUserPreferences(applyMergePatch(preferences, patch)) ?? {};
-    });
     const provider = { apiKeySet: true, isEnabled: true, isConfigured: true, models: [] };
     config = {
       openai: { ...provider, serviceTier: "flex" },
@@ -474,10 +465,7 @@ describe("processSlashCommand speed toggles", () => {
       openrouter: { ...provider },
     };
     // Pin routing/cache state without opening app-wide backend subscriptions in these unit tests.
-    spyOn(appConfig, "getSnapshot").mockImplementation(() => ({
-      routePriority: ["direct"],
-      userPreferences: preferences,
-    }));
+    spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue({ routePriority: ["direct"] });
     spyOn(store, "getConfig").mockImplementation(() => config);
     spyOn(store, "refresh").mockResolvedValue(undefined);
     spyOn(store, "updateOptimistically").mockImplementation((provider, patch) => {
@@ -525,10 +513,6 @@ describe("processSlashCommand speed toggles", () => {
         expectDisposition(result, "consume");
         expect(batches[0]).toContainEqual({ type: "clear-input" });
         expect(getWorkspaceAiSelection(scopeId).serviceTier).toBe(tier);
-        // Like the thinking level, a new-workspace pick is the project default.
-        expect(preferences.ai?.projectDefaults?.["/tmp/project"]?.serviceTier).toBe(
-          variant === "creation" ? tier : undefined
-        );
         expect(config.openai.serviceTier).toBe("flex");
         expect(setProviderConfig).not.toHaveBeenCalled();
         expect(sendMessage).not.toHaveBeenCalled();
