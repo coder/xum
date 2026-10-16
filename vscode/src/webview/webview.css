@@ -14,6 +14,9 @@
 /* Non-renderer modules the bundle imports can carry class names too (for example the composer
    class constants in src/constants/layout.ts); the desktop build scans all of src. */
 @source "../../../src/{common,constants}/**/*.{ts,tsx}";
+/* Captured markup that spells out Streamdown's utility classes; see the matching rule in
+   src/browser/styles/globals.css. */
+@source not "../../../src/common/staticWorkspaceView";
 
 /*
  * CSS bundle for the xum VS Code webview.

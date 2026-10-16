@@ -176,6 +176,14 @@
   text-align: left;
 }
 
+/* Streamdown puts utility classes on table parts (bg-muted/80 on thead, bg-muted/40 on tbody).
+   They fill with a text gray. These rules are unlayered, so they beat Tailwind's utilities layer
+   and keep the look below even when some source file makes Tailwind generate those utilities. */
+.markdown-content table thead,
+.markdown-content table tbody {
+  background: none;
+}
+
 .markdown-content table th {
   background: rgba(255, 255, 255, 0.05);
   font-weight: 600;

@@ -15,6 +15,13 @@
 
 @source "../node_modules/streamdown/dist/index.js";
 
+/* src/common/staticWorkspaceView holds captured markup: the static view's class allow-list and
+   the generated phone skeleton. Those files spell out Streamdown's own utility classes as strings,
+   and scanning them made Tailwind generate utilities the transcript never had (#6836), such as
+   bg-muted/80 on table headers and list-inside on lists. They mirror classes rather than use
+   them, so leave them out of the scan. */
+@source not "../../common/staticWorkspaceView";
+
 /* Geist Font Declarations */
 @font-face {
   font-family: "Geist";
