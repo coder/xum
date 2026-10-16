@@ -313,42 +313,52 @@ describe("replayVerifySession pairing", () => {
     expect(result.stepPrefix).toMatchObject({ auditedSteps: 3, comparedPairs: 2 });
   });
 
-  test("a step that failed before reaching the provider is not an audited request", async () => {
-    using tmp = new DisposableTempDir("replay-verify-failed-step");
-    const ctx = createReplayFixtureSessionContext(tmp.path);
-    for (const userText of ["First.", "Second."]) {
-      await appendReplayFixtureTurn(ctx, {
-        userText,
-        assistantText: "Done.",
-        systemPrompt: SYSTEM_PROMPT,
-        tools: tools(),
-      });
-    }
-    // Turn 1 started a second step with another prompt that was aborted locally: the step row
-    // exists, and its update records only the error.
-    const [, firstStepLine] = ctx.devtoolsLines;
-    const firstStep = (JSON.parse(firstStepLine) as { step: DevToolsStep }).step;
-    ctx.devtoolsLines.splice(
-      2,
-      0,
-      JSON.stringify({
-        type: "step",
-        step: {
-          ...firstStep,
-          id: "step-aborted",
-          stepNumber: 1,
-          input: {
-            ...firstStep.input,
-            prompt: [{ role: "user", content: [{ type: "text", text: "x" }] }],
-          },
+  // A compacted log (DevToolsService) has the update merged into the step row.
+  test.each([["an update row"], ["the step row"]])(
+    "a step that failed before reaching the provider is not an audited request (error in %s)",
+    async (layout) => {
+      using tmp = new DisposableTempDir("replay-verify-failed-step");
+      const ctx = createReplayFixtureSessionContext(tmp.path);
+      for (const userText of ["First.", "Second."]) {
+        await appendReplayFixtureTurn(ctx, {
+          userText,
+          assistantText: "Done.",
+          systemPrompt: SYSTEM_PROMPT,
+          tools: tools(),
+        });
+      }
+      // Turn 1 started a second step with another prompt that was aborted locally: the step row
+      // exists, and its update records only the error.
+      const [, firstStepLine] = ctx.devtoolsLines;
+      const firstStep = (JSON.parse(firstStepLine) as { step: DevToolsStep }).step;
+      const abortedStep: DevToolsStep = {
+        ...firstStep,
+        id: "step-aborted",
+        stepNumber: 1,
+        input: {
+          ...firstStep.input,
+          prompt: [{ role: "user", content: [{ type: "text", text: "x" }] }],
         },
-      }),
-      JSON.stringify({ type: "step-update", stepId: "step-aborted", update: { error: "aborted" } })
-    );
+      };
+      ctx.devtoolsLines.splice(
+        2,
+        0,
+        ...(layout === "the step row"
+          ? [JSON.stringify({ type: "step", step: { ...abortedStep, error: "aborted" } })]
+          : [
+              JSON.stringify({ type: "step", step: abortedStep }),
+              JSON.stringify({
+                type: "step-update",
+                stepId: "step-aborted",
+                update: { error: "aborted" },
+              }),
+            ])
+      );
 
-    const result = await verify(ctx);
-    expect(result.stepPrefix).toMatchObject({ comparedPairs: 1, breaks: [] });
-  });
+      const result = await verify(ctx);
+      expect(result.stepPrefix).toMatchObject({ comparedPairs: 1, breaks: [] });
+    }
+  );
 
   test("a step whose stream failed after its OK response is audited from its wire facts", async () => {
     using tmp = new DisposableTempDir("replay-verify-wire-facts");

@@ -1329,6 +1329,152 @@ describe("DevToolsService", () => {
         ]);
         expect(await service.getRunWithSteps("ws-1", "run-3")).toBeNull();
       });
+
+      describe("compaction", () => {
+        const readEntries = async (): Promise<Array<{ type: string; run?: DevToolsRun }>> =>
+          (await fs.readFile(getDevtoolsLogPath(sessionsDir, "ws-1"), "utf-8"))
+            .split("\n")
+            .filter((line) => line.length > 0)
+            .map((line) => JSON.parse(line) as { type: string; run?: DevToolsRun });
+        const newService = () =>
+          new DevToolsService(createTestConfig({ sessionsDir, enabled: true }), {
+            maxRetainedBytesPerWorkspace: BUDGET_BYTES,
+          });
+
+        it("rewrites the log to the retained runs once more than twice the budget is stale", async () => {
+          const service = newService();
+          // Each 60 KB run evicts the one before it, so the 5th leaves 240 KB stale.
+          for (let index = 1; index <= 5; index += 1) {
+            await service.createRun("ws-1", runAt(index));
+            await service.createStep("ws-1", bigStep(index, 60_000));
+          }
+
+          const entries = await readEntries();
+          expect(entries.map((entry) => entry.type)).toEqual(["run", "step"]);
+          expect(entries[0]?.run?.id).toBe("run-5");
+          const replayed = newService();
+          expect(await replayed.getRuns("ws-1")).toEqual(await service.getRuns("ws-1"));
+          expect(await replayed.getRunWithSteps("ws-1", "run-5")).toEqual(
+            await service.getRunWithSteps("ws-1", "run-5")
+          );
+        });
+
+        it("merges a step's superseded updates into its line and still applies later ones", async () => {
+          const service = newService();
+          await service.createRun("ws-1", runAt(1));
+          await service.createStep(
+            "ws-1",
+            makeStep({ id: "step-1", runId: "run-1", durationMs: null })
+          );
+          // Each re-sent payload replaces the last one, so only the newest is retained.
+          for (let attempt = 1; attempt <= 5; attempt += 1) {
+            await service.updateStep("ws-1", "step-1", {
+              rawChunks: rawChunksOf(60_000 + attempt),
+            });
+          }
+          await service.updateStep("ws-1", "step-1", { durationMs: 5 });
+
+          expect((await readEntries()).map((entry) => entry.type)).toEqual([
+            "run",
+            "step",
+            "step-update",
+          ]);
+          const detail = await newService().getRunWithSteps("ws-1", "run-1");
+          expect(detail?.steps[0]).toMatchObject({ durationMs: 5, rawChunks: rawChunksOf(60_005) });
+          expect(detail).toEqual(await service.getRunWithSteps("ws-1", "run-1"));
+        });
+
+        it("rewrites an oversized log the first time it is loaded", async () => {
+          const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+          const lines: string[] = [];
+          for (let index = 1; index <= 6; index += 1) {
+            lines.push(JSON.stringify({ type: "run", run: runAt(index) }));
+            lines.push(JSON.stringify({ type: "step", step: bigStep(index, 60_000) }));
+          }
+          await fs.mkdir(path.dirname(logPath), { recursive: true });
+          await fs.writeFile(logPath, `${lines.join("\n")}\n`, "utf-8");
+
+          expect(await runIds(newService())).toEqual(["run-6"]);
+          const entries = await readEntries();
+          expect(entries.map((entry) => entry.type)).toEqual(["run", "step"]);
+          expect(entries[0]?.run?.id).toBe("run-6");
+        });
+
+        it("never rewrites a log whose replay failed before its end", async () => {
+          const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+          const lines: string[] = [];
+          for (let index = 1; index <= 6; index += 1) {
+            lines.push(JSON.stringify({ type: "run", run: runAt(index) }));
+            lines.push(JSON.stringify({ type: "step", step: bigStep(index, 60_000) }));
+          }
+          const contents = `${lines.join("\n")}\n`;
+          await fs.mkdir(path.dirname(logPath), { recursive: true });
+          await fs.writeFile(logPath, contents, "utf-8");
+
+          // Replay gets the first five runs, then the read fails: memory is only a prefix.
+          const cutBytes = Buffer.byteLength(`${lines.slice(0, 10).join("\n")}\n`, "utf-8");
+          const originalOpen = fs.open;
+          const openSpy = spyOn(fs, "open").mockImplementation((async (
+            ...args: Parameters<typeof fs.open>
+          ) => {
+            const handle = await originalOpen(...args);
+            if (args[0] !== logPath) {
+              return handle;
+            }
+            const realRead = handle.read.bind(handle);
+            handle.read = ((buffer: Buffer, offset: number, length: number, position: number) => {
+              if (position >= cutBytes) {
+                throw new Error("simulated read failure");
+              }
+              return realRead(buffer, offset, Math.min(length, cutBytes - position), position);
+            }) as typeof handle.read;
+            return handle;
+          }) as typeof fs.open);
+
+          try {
+            const service = newService();
+            expect(await runIds(service)).toEqual(["run-5"]);
+            await service.createRun("ws-1", runAt(7));
+            await service.createStep("ws-1", bigStep(7, 60_000));
+          } finally {
+            openSpy.mockRestore();
+          }
+
+          expect((await fs.readFile(logPath, "utf-8")).startsWith(contents)).toBe(true);
+        });
+
+        it("keeps the full log when the rewrite fails and waits for more growth to retry", async () => {
+          const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+          // A directory at the rewrite's temporary path makes every attempt fail.
+          await fs.mkdir(`${logPath}.compacting`, { recursive: true });
+          const openSpy = spyOn(fs, "open");
+          const rewriteAttempts = () =>
+            openSpy.mock.calls.filter(([file]) => String(file).endsWith(".compacting")).length;
+          const service = newService();
+          try {
+            for (let index = 1; index <= 5; index += 1) {
+              await service.createRun("ws-1", runAt(index));
+              await service.createStep("ws-1", bigStep(index, 60_000));
+            }
+            expect(rewriteAttempts()).toBe(1);
+            // The append that triggered the failed rewrite is kept.
+            expect(
+              (await service.getRunWithSteps("ws-1", "run-5"))?.steps.map((step) => step.id)
+            ).toEqual(["step-5"]);
+
+            await service.createRun("ws-1", runAt(6));
+            await service.createStep("ws-1", bigStep(6, 60_000));
+            expect(rewriteAttempts()).toBe(1);
+          } finally {
+            openSpy.mockRestore();
+          }
+
+          const logContents = await fs.readFile(logPath, "utf-8");
+          for (let index = 1; index <= 6; index += 1) {
+            expect(logContents).toContain(`"step-${index}"`);
+          }
+        });
+      });
     });
 
     it("applies a large final step-update on load so stale finalization leaves a completed step alone", async () => {

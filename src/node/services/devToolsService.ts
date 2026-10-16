@@ -37,7 +37,14 @@ import { sanitizeInputTransformations } from "@/node/utils/messages/anthropicInp
  * header, an update needs its step), so any cut point loses or corrupts the
  * newest run in some layout. Steps whose run was already evicted are dropped.
  * The DevTools panel therefore shows a bounded recent window rather than the
- * full history; the on-disk file is left untouched (compaction is a follow-up).
+ * full history.
+ *
+ * The file is cut down to the same window: once more than twice the byte budget
+ * of it is lines that replay no longer keeps (evicted runs, superseded
+ * updates), it is rewritten as one line per retained run and step (updates
+ * merged in). Disk use and the next replay therefore stay within the retained
+ * bytes plus twice the budget instead of growing with every run ever logged.
+ * Lines of evicted runs, including ones still streaming, do not survive it.
  *
  * The run bound alone does not cap memory: a single streamed step carries the
  * raw provider payload (a live heap held two 15-16 MB arrays of raw OpenAI SSE
@@ -93,6 +100,13 @@ interface WorkspaceData {
   replayComplete: boolean;
   /** Incremented on each clear(); appendToFile drops writes queued under an older generation. */
   clearGeneration: number;
+  /**
+   * Length of devtools.jsonl in the units of the retention bytes: the lines
+   * replayed plus every line appended since.
+   */
+  fileBytes: number;
+  /** After a failed compaction, the file length at which the next attempt may run. */
+  compactionRetryAtBytes: number;
 }
 
 export interface DevToolsServiceOptions {
@@ -135,6 +149,13 @@ async function* readLines(filePath: string): AsyncGenerator<string> {
   } finally {
     await handle.close();
   }
+}
+
+/** Write one log line; returns its length in the units of the retention bytes. */
+async function writeLogLine(handle: fs.FileHandle, entry: DevToolsLogEntry): Promise<number> {
+  const line = `${JSON.stringify(entry)}\n`;
+  await handle.write(line);
+  return line.length;
 }
 
 function jsonLength(value: unknown): number {
@@ -624,6 +645,8 @@ export class DevToolsService extends EventEmitter {
     data.clearGeneration += 1;
     data.loaded = true;
     data.replayComplete = true;
+    data.fileBytes = 0;
+    data.compactionRetryAtBytes = 0;
     this.pendingRunMetadata.delete(workspaceId);
 
     // Enqueue truncation so clear() cannot race with pending appends.
@@ -780,6 +803,8 @@ export class DevToolsService extends EventEmitter {
       evictedRunIds: new Set<string>(),
       replayComplete: false,
       clearGeneration: 0,
+      fileBytes: 0,
+      compactionRetryAtBytes: 0,
     };
     this.workspaces.set(workspaceId, data);
     return data;
@@ -878,6 +903,7 @@ export class DevToolsService extends EventEmitter {
 
     try {
       for await (const line of readLines(filePath)) {
+        data.fileBytes += line.length + 1;
         this.replayLogLine(workspaceId, data, line);
       }
       data.replayComplete = true;
@@ -900,6 +926,9 @@ export class DevToolsService extends EventEmitter {
     data.evictedStepIds.clear();
     data.evictedRunIds.clear();
     data.loaded = true;
+    if (this.shouldCompact(data)) {
+      await this.enqueueWrite(workspaceId, () => this.compactSessionFile(workspaceId, data));
+    }
     await this.finalizeStaleStepsForLoadedWorkspace(workspaceId, data);
   }
 
@@ -1064,7 +1093,83 @@ export class DevToolsService extends EventEmitter {
       await this.commitToSessionFileUnlessRemoved(workspaceId, (filePath) =>
         fs.appendFile(filePath, `${json}\n`, "utf-8")
       );
+      data.fileBytes += json.length + 1;
+      if (this.shouldCompact(data)) {
+        await this.compactSessionFile(workspaceId, data);
+      }
     });
+  }
+
+  /**
+   * Whether more than twice the byte budget of devtools.jsonl is lines that
+   * replay no longer keeps. After a failed partial replay memory is only a
+   * prefix of the file, so rewriting the file from it would drop the rest.
+   */
+  private shouldCompact(data: WorkspaceData): boolean {
+    return (
+      data.replayComplete &&
+      data.fileBytes - data.retainedBytes > 2 * this.maxRetainedBytesPerWorkspace &&
+      data.fileBytes > data.compactionRetryAtBytes
+    );
+  }
+
+  /**
+   * Rewrite devtools.jsonl as the retained runs, each followed by its steps.
+   * It runs inside the write queue, so no append interleaves; an entry whose
+   * append is queued behind it lands twice, which replay tolerates (a repeated
+   * run line is skipped, a step or update is applied again). Never rejects: the
+   * caller's own line is already written, and a rejection would roll it back.
+   */
+  private async compactSessionFile(workspaceId: string, data: WorkspaceData): Promise<void> {
+    if (this.workspaces.get(workspaceId) !== data) {
+      return;
+    }
+    const runs = Array.from(data.runs.values());
+    const stepsByRun = new Map<string, DevToolsStep[]>();
+    for (const step of data.steps.values()) {
+      const steps = stepsByRun.get(step.runId);
+      if (steps) {
+        steps.push(step);
+      } else {
+        stepsByRun.set(step.runId, [step]);
+      }
+    }
+
+    const filePath = this.getSessionFilePath(workspaceId);
+    const tempPath = `${filePath}.compacting`;
+    let bytes = 0;
+    try {
+      await this.commitToSessionFileUnlessRemoved(workspaceId, async () => {
+        const handle = await fs.open(tempPath, "w");
+        try {
+          for (const run of runs) {
+            bytes += await writeLogLine(handle, { type: "run", run });
+            for (const step of stepsByRun.get(run.id) ?? []) {
+              bytes += await writeLogLine(handle, { type: "step", step });
+            }
+          }
+        } finally {
+          await handle.close();
+        }
+        await fs.rename(tempPath, filePath);
+      });
+      data.fileBytes = bytes;
+      data.compactionRetryAtBytes = 0;
+    } catch (error) {
+      // Keep appending to the full file; retrying on every append would rewrite
+      // the whole window each time while the disk is full.
+      data.compactionRetryAtBytes = data.fileBytes + 2 * this.maxRetainedBytesPerWorkspace;
+      log.warn("DevTools: failed to compact devtools.jsonl, keeping the full file", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      await fs.rm(tempPath, { force: true }).catch((rmError: unknown) => {
+        log.warn("DevTools: failed to remove the partial devtools.jsonl rewrite", {
+          workspaceId,
+          error: getErrorMessage(rmError),
+        });
+      });
+    }
   }
 
   /**
