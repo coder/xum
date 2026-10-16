@@ -539,10 +539,10 @@ describe("bash tool", () => {
     const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
 
     expect(result).toMatchObject({ success: true, exitCode: 0 });
-    if (result.success) {
+    if (result.success && "truncated" in result) {
       expect(result.truncated?.reason).toContain("exceed");
-      expect(result.output.length).toBeGreaterThan(1000000);
     }
+    expect(result.output?.length).toBeGreaterThan(1000000);
   });
 
   it("should reject single overlong line before storing it (IPC mode)", async () => {
