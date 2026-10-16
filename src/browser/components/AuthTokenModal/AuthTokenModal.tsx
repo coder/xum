@@ -44,22 +44,24 @@ export function getStoredAuthToken(): string | null {
   return readPersistedRawString(AUTH_TOKEN_KEY);
 }
 
-export function setStoredAuthToken(token: string): void {
+/**
+ * The token is stored at once. The promise settles when the service worker's caches of the
+ * previous session are gone (#6848): await it before connecting or navigating. It never rejects.
+ */
+export function setStoredAuthToken(token: string): Promise<void> {
   const changed = getStoredAuthToken() !== token;
   writePersistedRawString(AUTH_TOKEN_KEY, token);
-  // #6848: the service worker's caches belong to the previous session. Clearing is best effort
-  // and never fails (it catches), so login does not wait for it.
-  if (changed) void clearServiceWorkerCaches();
+  return changed ? clearServiceWorkerCaches() : Promise.resolve();
 }
 
-export function clearStoredAuthToken(): void {
+/** Logout: the token is removed at once, and the promise settles after the cache cleanup. */
+export function clearStoredAuthToken(): Promise<void> {
   try {
     removePersistedStateKeys([AUTH_TOKEN_KEY]);
   } catch {
     // Ignore storage errors
   }
-  // #6848: logout leaves nothing of the session in Cache Storage (best effort, never fails).
-  void clearServiceWorkerCaches();
+  return clearServiceWorkerCaches();
 }
 
 async function parseJsonResponse<T>(response: Response): Promise<T | null> {
@@ -99,9 +101,10 @@ export function AuthTokenModal(props: AuthTokenModalProps) {
   const handleSubmit = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();
-      if (token.trim()) {
-        setStoredAuthToken(token.trim());
-        onSubmit(token.trim());
+      const trimmed = token.trim();
+      if (trimmed) {
+        // Connect only after the previous session's caches are gone (#6848).
+        void setStoredAuthToken(trimmed).then(() => onSubmit(trimmed));
       }
     },
     [token, onSubmit]
@@ -220,7 +223,7 @@ export function AuthTokenModal(props: AuthTokenModalProps) {
           return;
         }
 
-        clearStoredAuthToken();
+        await clearStoredAuthToken();
         props.onSessionAuthenticated?.();
       } catch (error) {
         if (isAbortError(error)) {

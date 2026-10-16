@@ -4,9 +4,14 @@
 // the shell's own public files),
 // only cacheable responses, and never auth flows, API/oRPC routes or token-bearing URLs. It
 // answers only GET requests and never caches the authenticated non-GET traffic (#5971 relies
-// on that). The app clears every "mux-" cache when the auth token changes or is removed
-// (src/browser/utils/serviceWorkerCache.ts), so keep that prefix.
-const CACHE_NAME = "mux-v3";
+// on that). When the auth token changes or is removed, the app deletes the other "mux-" caches
+// and every entry of this one except the shell (src/browser/utils/serviceWorkerCache.ts), so
+// keep that prefix and the SHELL_PATH key.
+// One cache per registration scope: app-proxy deployments run several workers on one origin, and
+// Cache Storage is origin-wide. Older generations of this scope and the unscoped legacy caches
+// ("mux-v2" stored every GET response) are dropped on activate.
+const CACHE_NAME = `mux-v3:${self.registration.scope}`;
+const LEGACY_CACHE_NAME = /^mux-v\d+$/;
 const SHELL_PATH = "./";
 const urlsToCache = [SHELL_PATH, "./index.html"];
 
@@ -36,7 +41,11 @@ function scopedPath(url) {
 
 function isUncacheable(url, path) {
   if (url.searchParams.has("token")) return true;
-  return UNCACHEABLE_PREFIXES.some((prefix) => path.startsWith(prefix) || `${path}/` === prefix);
+  // Express matches routes case-insensitively, so /AUTH/... reaches the auth routes too.
+  const lowerPath = path.toLowerCase();
+  return UNCACHEABLE_PREFIXES.some(
+    (prefix) => lowerPath.startsWith(prefix) || `${lowerPath}/` === prefix
+  );
 }
 
 /**
@@ -46,7 +55,11 @@ function isUncacheable(url, path) {
  * launch starts the newest frontend, not the one from the first install.
  */
 function isShellResponse(response) {
-  return response.status === 200 && response.type !== "opaque";
+  // A navigation can also open manifest.json, an icon or a script: only HTML may become the shell.
+  const contentType = (response.headers.get("Content-Type") || "").toLowerCase();
+  return (
+    response.status === 200 && response.type !== "opaque" && contentType.startsWith("text/html")
+  );
 }
 
 /** Only a successful response that the server allows any cache to keep. */
@@ -66,14 +79,20 @@ function offlineResponse() {
 
 /**
  * Network first: store a cacheable answer under `cacheKey`, else answer from this cache.
- * `isCacheable` decides what may be stored.
+ * `isCacheable` decides what may be stored. The write runs under `event.waitUntil`, so the
+ * browser keeps the worker alive until it ends.
  */
-function networkFirst(request, cacheKey, isCacheable) {
-  return fetch(request)
+function networkFirst(event, cacheKey, isCacheable) {
+  return fetch(event.request)
     .then((response) => {
       if (isCacheable(response)) {
         const responseToCache = response.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(cacheKey, responseToCache));
+        event.waitUntil(
+          caches
+            .open(CACHE_NAME)
+            .then((cache) => cache.put(cacheKey, responseToCache))
+            .catch(() => undefined)
+        );
       }
       return response;
     })
@@ -96,7 +115,7 @@ self.addEventListener("install", (event) => {
   );
 });
 
-// Activate event - clean up old caches (mux-v2 stored every GET response, #6848)
+// Activate event - drop this scope's older caches and the legacy unscoped ones (#6848)
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches
@@ -104,7 +123,9 @@ self.addEventListener("activate", (event) => {
       .then((cacheNames) => {
         return Promise.all(
           cacheNames.map((cacheName) => {
-            if (cacheName !== CACHE_NAME) {
+            const ownGeneration =
+              cacheName.startsWith("mux-v") && cacheName.endsWith(`:${self.registration.scope}`);
+            if (cacheName !== CACHE_NAME && (ownGeneration || LEGACY_CACHE_NAME.test(cacheName))) {
               return caches.delete(cacheName);
             }
           })
@@ -131,11 +152,11 @@ self.addEventListener("fetch", (event) => {
 
   if (event.request.mode === "navigate") {
     // Every client route loads the same shell; one entry, never keyed by the visited URL.
-    event.respondWith(networkFirst(event.request, SHELL_PATH, isShellResponse));
+    event.respondWith(networkFirst(event, SHELL_PATH, isShellResponse));
     return;
   }
 
   if (HASHED_STATIC_ASSET_NAME.test(path) || SHELL_PUBLIC_FILES.has(path)) {
-    event.respondWith(networkFirst(event.request, event.request, isCacheableResponse));
+    event.respondWith(networkFirst(event, event.request, isCacheableResponse));
   }
 });

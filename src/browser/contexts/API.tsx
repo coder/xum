@@ -228,7 +228,8 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
     const urlParams = new URLSearchParams(window.location.search);
     const urlToken = urlParams.get("token")?.trim();
     if (urlToken) {
-      setStoredAuthToken(urlToken);
+      // Not awaited: render cannot wait. The cache cleanup still runs (#6848).
+      void setStoredAuthToken(urlToken);
       // Strip token from URL so it doesn't leak into bookmarks, browser
       // history, PWA launch URLs, or Referer headers.
       const cleanUrl = new URL(window.location.href);
@@ -277,7 +278,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
   // unmounts behind the token prompt.
   const enterAuthRequired = useCallback((error: string | undefined) => {
     authRequiredRef.current = true;
-    clearStoredAuthToken();
+    void clearStoredAuthToken();
     hasConnectedRef.current = false;
     lastClientRef.current = null;
     setState({ status: "auth_required", error });
@@ -703,7 +704,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
   const authenticate = useCallback(
     (token: string) => {
       authProbeAttemptedRef.current = false;
-      setStoredAuthToken(token);
+      void setStoredAuthToken(token);
       setAuthToken(token);
       connect(token);
     },

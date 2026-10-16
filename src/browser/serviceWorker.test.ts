@@ -18,7 +18,9 @@ const WORKER_SOURCE = await fs.readFile(
   "utf-8"
 );
 const ORIGIN = "https://xum.test";
+const ROOT_SCOPE = `${ORIGIN}/`;
 const HASHED_JS = "main-AbCd1234.js";
+const cacheNameFor = (scope: string) => `mux-v3:${scope}`;
 
 interface FakeRequest {
   url: string;
@@ -28,54 +30,63 @@ interface FakeRequest {
 
 type Network = (request: FakeRequest | string) => Response;
 
-/** Cache Storage keyed by absolute URL, like the real one for these requests. */
+const html = (body: string, headers: Record<string, string> = {}) =>
+  new Response(body, { status: 200, headers: { "Content-Type": "text/html", ...headers } });
+const ok = (body: string, headers: Record<string, string> = {}) =>
+  new Response(body, { status: 200, headers });
+
+/** Cache Storage keyed by absolute URL, shared by every worker and page of one origin. */
 class MemoryCacheStorage {
   readonly stores = new Map<string, Map<string, Response>>();
+  network: Network = () => html("shell");
 
-  constructor(
-    private readonly baseUrl: string,
-    private readonly network: () => Network
-  ) {}
-
-  private keyOf(key: FakeRequest | string): string {
-    return typeof key === "string" ? new URL(key, this.baseUrl).href : key.url;
+  private keyOf(base: string, key: FakeRequest | string): string {
+    return typeof key === "string" ? new URL(key, base).href : key.url;
   }
 
-  open(name: string) {
-    let store = this.stores.get(name);
-    if (!store) this.stores.set(name, (store = new Map()));
-    const entries = store;
-    return Promise.resolve({
-      put: (key: FakeRequest | string, response: Response) => {
-        entries.set(this.keyOf(key), response);
-        return Promise.resolve();
-      },
-      match: (key: FakeRequest | string) => Promise.resolve(entries.get(this.keyOf(key))?.clone()),
-      addAll: (urls: string[]) => {
-        for (const url of urls) {
-          const response = this.network()(url);
-          if (!response.ok) return Promise.reject(new TypeError(`addAll: ${response.status}`));
-          entries.set(this.keyOf(url), response);
+  /** `base` resolves relative keys, like the worker's or the page's own URL does. */
+  view(base: string) {
+    return {
+      open: (name: string) => {
+        let store = this.stores.get(name);
+        if (!store) {
+          store = new Map<string, Response>();
+          this.stores.set(name, store);
         }
-        return Promise.resolve();
+        const entries = store;
+        return Promise.resolve({
+          put: (key: FakeRequest | string, response: Response) => {
+            entries.set(this.keyOf(base, key), response);
+            return Promise.resolve();
+          },
+          match: (key: FakeRequest | string) =>
+            Promise.resolve(entries.get(this.keyOf(base, key))?.clone()),
+          keys: () => Promise.resolve([...entries.keys()].map((url) => ({ url }))),
+          delete: (key: FakeRequest | string) =>
+            Promise.resolve(entries.delete(this.keyOf(base, key))),
+          addAll: (urls: string[]) => {
+            for (const url of urls) {
+              const response = this.network(url);
+              if (!response.ok) return Promise.reject(new TypeError(`addAll: ${response.status}`));
+              entries.set(this.keyOf(base, url), response);
+            }
+            return Promise.resolve();
+          },
+        });
       },
-    });
+      keys: () => Promise.resolve([...this.stores.keys()]),
+      delete: (name: string) => Promise.resolve(this.stores.delete(name)),
+    };
   }
 
-  keys() {
-    return Promise.resolve([...this.stores.keys()]);
+  seed(name: string, urls: string[]) {
+    const store = this.stores.get(name) ?? new Map<string, Response>();
+    for (const url of urls) store.set(url, ok(`seeded ${url}`));
+    this.stores.set(name, store);
   }
 
-  delete(name: string) {
-    return Promise.resolve(this.stores.delete(name));
-  }
-
-  match(key: FakeRequest | string) {
-    for (const store of this.stores.values()) {
-      const hit = store.get(this.keyOf(key));
-      if (hit) return Promise.resolve(hit.clone());
-    }
-    return Promise.resolve(undefined);
+  urlsIn(name: string): string[] {
+    return [...(this.stores.get(name)?.keys() ?? [])].sort();
   }
 
   /** Every URL stored in any cache. */
@@ -84,17 +95,11 @@ class MemoryCacheStorage {
   }
 }
 
-const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
-
 /** Loads the worker for a scope, runs install and activate, and dispatches fetch events. */
-async function startWorker(options: { scope?: string; existingCaches?: string[] } = {}) {
-  const scope = options.scope ?? `${ORIGIN}/`;
-  let network: Network = () => new Response("shell", { status: 200 });
-  const caches = new MemoryCacheStorage(new URL("service-worker.js", scope).href, () => network);
-  for (const name of options.existingCaches ?? []) {
-    const store = await caches.open(name);
-    await store.put(`${scope}secret`, new Response("old entry"));
-  }
+async function startWorker(options: { scope?: string; storage?: MemoryCacheStorage } = {}) {
+  const scope = options.scope ?? ROOT_SCOPE;
+  const storage = options.storage ?? new MemoryCacheStorage();
+  const caches = storage.view(new URL("service-worker.js", scope).href);
   const listeners = new Map<string, (event: unknown) => void>();
   const self = {
     registration: { scope },
@@ -108,7 +113,7 @@ async function startWorker(options: { scope?: string; existingCaches?: string[] 
     caches,
     fetch: (request: FakeRequest | string) => {
       try {
-        return Promise.resolve(network(request));
+        return Promise.resolve(storage.network(request));
       } catch (error) {
         return Promise.reject(error instanceof Error ? error : new TypeError(String(error)));
       }
@@ -129,36 +134,37 @@ async function startWorker(options: { scope?: string; existingCaches?: string[] 
   /** One fetch event. `handled` is false when the worker left it to the browser. */
   const request = async (url: string, init: { method?: string; mode?: string } = {}) => {
     let answer: Promise<Response> | undefined;
+    const kept: Array<Promise<unknown>> = [];
     listeners.get("fetch")?.({
       request: { url, method: init.method ?? "GET", mode: init.mode ?? "cors" },
       respondWith: (response: Promise<Response>) => {
         answer = response;
       },
+      waitUntil: (promise: Promise<unknown>) => kept.push(promise),
     });
     const response = answer ? await answer : undefined;
-    await flush(); // the worker stores responses without awaiting them
-    return { handled: answer !== undefined, response };
+    // The browser keeps the worker alive only for respondWith and waitUntil promises.
+    await Promise.all(kept);
+    return { handled: answer !== undefined, response, waitUntilCalls: kept.length };
   };
 
   return {
-    caches,
+    storage,
+    cacheName: cacheNameFor(scope),
     request,
     setNetwork: (next: Network) => {
-      network = next;
+      storage.network = next;
     },
     offline: () => {
-      network = () => {
+      storage.network = () => {
         throw new TypeError("Failed to fetch");
       };
     },
   };
 }
 
-const ok = (body: string, headers: Record<string, string> = {}) =>
-  new Response(body, { status: 200, headers });
-
 describe("service worker caching (#6848)", () => {
-  test("stores only the app shell and hashed assets", async () => {
+  test("stores only the app shell, hashed assets and the shell's public files", async () => {
     const worker = await startWorker();
     worker.setNetwork(() => ok("body", { "Cache-Control": "public, max-age=31536000, immutable" }));
     await worker.request(`${ORIGIN}/${HASHED_JS}`);
@@ -167,14 +173,21 @@ describe("service worker caching (#6848)", () => {
     await worker.request(`${ORIGIN}/workspace/abc`, { mode: "navigate" });
 
     // The visited route is not a key: every route shares the "./" shell entry.
-    expect(worker.caches.storedUrls().sort()).toEqual(
+    expect(worker.storage.urlsIn(worker.cacheName)).toEqual(
       [
-        `${ORIGIN}/`,
+        ROOT_SCOPE,
         `${ORIGIN}/index.html`,
         `${ORIGIN}/${HASHED_JS}`,
         `${ORIGIN}/manifest.json`,
       ].sort()
     );
+  });
+
+  test("keeps the worker alive until the cache write ends", async () => {
+    const worker = await startWorker();
+    worker.setNetwork(() => ok("body"));
+    expect((await worker.request(`${ORIGIN}/${HASHED_JS}`)).waitUntilCalls).toBe(1);
+    expect(worker.storage.urlsIn(worker.cacheName)).toContain(`${ORIGIN}/${HASHED_JS}`);
   });
 
   test.each([
@@ -185,29 +198,34 @@ describe("service worker caching (#6848)", () => {
     const worker = await startWorker();
     worker.setNetwork(() => response.clone());
     await worker.request(`${ORIGIN}/${HASHED_JS}`);
-    expect(worker.caches.storedUrls()).not.toContain(`${ORIGIN}/${HASHED_JS}`);
+    expect(worker.storage.storedUrls()).not.toContain(`${ORIGIN}/${HASHED_JS}`);
   });
 
   test.each([
     ["an OAuth start", `${ORIGIN}/auth/mux-gateway/start`, "cors"],
     ["an OAuth callback", `${ORIGIN}/auth/coder/callback?code=c0de&state=st4te`, "navigate"],
+    ["an upper-case OAuth callback", `${ORIGIN}/AUTH/coder/callback?code=c0de`, "navigate"],
     ["an oRPC GET", `${ORIGIN}/orpc/workspace/list`, "cors"],
     ["the API docs", `${ORIGIN}/api/docs`, "navigate"],
+    ["mixed-case API docs", `${ORIGIN}/Api/docs`, "navigate"],
     ["a token URL", `${ORIGIN}/?token=s3cret`, "navigate"],
     ["a hashed asset with a token", `${ORIGIN}/${HASHED_JS}?token=s3cret`, "cors"],
   ])(
     "leaves %s to the browser: never stored, never served from the cache",
     async (_l, url, mode) => {
       const worker = await startWorker();
-      worker.setNetwork(() => ok("secret body"));
-      expect(await worker.request(url, { mode })).toEqual({ handled: false, response: undefined });
-      expect(worker.caches.storedUrls()).not.toContain(url);
-      expect(worker.caches.storedUrls().some((stored) => stored.includes("s3cret"))).toBe(false);
+      worker.setNetwork(() => html("secret body"));
+      const first = await worker.request(url, { mode });
+      expect(first.handled).toBe(false);
+      expect(worker.storage.storedUrls()).not.toContain(url);
+      expect(worker.storage.storedUrls().some((stored) => stored.includes("s3cret"))).toBe(false);
+      // The shell was not replaced by the secret page either.
+      worker.offline();
+      const shell = await worker.request(`${ORIGIN}/`, { mode: "navigate" });
+      expect(await shell.response?.text()).toBe("shell");
 
       // Even an entry an older worker left behind is never answered offline.
-      const store = await worker.caches.open("mux-v3");
-      await store.put({ url, method: "GET", mode }, ok("stale secret"));
-      worker.offline();
+      worker.storage.seed(worker.cacheName, [url]);
       expect((await worker.request(url, { mode })).handled).toBe(false);
     }
   );
@@ -218,14 +236,14 @@ describe("service worker caching (#6848)", () => {
     worker.setNetwork(() => ok("body", { "Cache-Control": "public, max-age=31536000, immutable" }));
     expect((await worker.request(`${scope}api/docs`)).handled).toBe(false);
     await worker.request(`${scope}${HASHED_JS}`);
-    expect(worker.caches.storedUrls()).toContain(`${scope}${HASHED_JS}`);
-    expect(worker.caches.storedUrls()).not.toContain(`${scope}api/docs`);
+    expect(worker.storage.urlsIn(cacheNameFor(scope))).toContain(`${scope}${HASHED_JS}`);
+    expect(worker.storage.storedUrls()).not.toContain(`${scope}api/docs`);
   });
 
   test("a no-store navigation refreshes the shell, so offline starts the newest one", async () => {
     const worker = await startWorker(); // installs "shell"
     // The server sends the shell with no-store; the shell is the one exception.
-    worker.setNetwork(() => ok("shell v2", { "Cache-Control": "no-store" }));
+    worker.setNetwork(() => html("shell v2", { "Cache-Control": "no-store" }));
     await worker.request(`${ORIGIN}/workspace/abc`, { mode: "navigate" });
     // An error page must not replace the shell.
     worker.setNetwork(() => new Response("bad gateway", { status: 502 }));
@@ -236,9 +254,18 @@ describe("service worker caching (#6848)", () => {
     expect(await response?.text()).toBe("shell v2");
   });
 
+  test("a navigation to a non-HTML file never replaces the shell", async () => {
+    const worker = await startWorker();
+    worker.setNetwork(() => ok('{"name":"xum"}', { "Content-Type": "application/json" }));
+    await worker.request(`${ORIGIN}/manifest.json`, { mode: "navigate" });
+    worker.offline();
+    const { response } = await worker.request(`${ORIGIN}/settings`, { mode: "navigate" });
+    expect(await response?.text()).toBe("shell");
+  });
+
   test("a no-store GET that is not a navigation is still not stored", async () => {
     const worker = await startWorker();
-    worker.setNetwork(() => ok("page", { "Cache-Control": "no-store" }));
+    worker.setNetwork(() => html("page", { "Cache-Control": "no-store" }));
     await worker.request(`${ORIGIN}/`, { mode: "cors" });
     worker.offline();
     const { response } = await worker.request(`${ORIGIN}/`, { mode: "navigate" });
@@ -265,34 +292,57 @@ describe("service worker caching (#6848)", () => {
     });
     expect(handled).toBe(true);
     expect(await response?.text()).toBe("rpc result");
-    expect(worker.caches.storedUrls()).not.toContain(`${ORIGIN}/orpc/workspace/list`);
+    expect(worker.storage.storedUrls()).not.toContain(`${ORIGIN}/orpc/workspace/list`);
   });
 
-  test("activation drops the mux-v2 cache, which stored every GET response", async () => {
-    const worker = await startWorker({ existingCaches: ["mux-v2"] });
-    expect(await worker.caches.keys()).not.toContain("mux-v2");
-    expect(worker.caches.storedUrls()).not.toContain(`${ORIGIN}/secret`);
+  test("activation drops legacy caches and its own old ones, but not other scopes' or apps'", async () => {
+    const storage = new MemoryCacheStorage();
+    const otherScope = `${ORIGIN}/@u/other/apps/mux/`;
+    storage.seed("mux-v2", [`${ORIGIN}/secret`]);
+    storage.seed(`mux-v1:${ROOT_SCOPE}`, [`${ORIGIN}/old`]);
+    storage.seed(cacheNameFor(otherScope), [`${otherScope}${HASHED_JS}`]);
+    storage.seed("other-app", [`${ORIGIN}/their-file`]);
+    await startWorker({ storage });
+
+    expect([...storage.stores.keys()].sort()).toEqual(
+      [cacheNameFor(otherScope), cacheNameFor(ROOT_SCOPE), "other-app"].sort()
+    );
   });
 });
 
 describe("auth token changes clear the service worker caches (#6848)", () => {
-  let deleted: string[];
+  const otherScope = `${ORIGIN}/@u/other/apps/mux/`;
+  let storage: MemoryCacheStorage;
+
+  /** A previous session's state: the shell and an asset here, a legacy cache, another scope. */
+  function seedPreviousSession() {
+    storage.seed("mux-v2", [`${ORIGIN}/api/docs`]);
+    storage.seed(cacheNameFor(ROOT_SCOPE), [
+      ROOT_SCOPE,
+      `${ORIGIN}/index.html`,
+      `${ORIGIN}/${HASHED_JS}`,
+    ]);
+    storage.seed(cacheNameFor(otherScope), [`${otherScope}${HASHED_JS}`]);
+  }
+
+  function expectCleared() {
+    expect(storage.stores.has("mux-v2")).toBe(false);
+    // The shell holds no session data and stays the offline start.
+    expect(storage.urlsIn(cacheNameFor(ROOT_SCOPE))).toEqual(
+      [ROOT_SCOPE, `${ORIGIN}/index.html`].sort()
+    );
+    expect(storage.urlsIn(cacheNameFor(otherScope))).toEqual([`${otherScope}${HASHED_JS}`]);
+  }
 
   beforeEach(() => {
     saveDomGlobals();
-    const happyWindow = new GlobalWindow({ url: `${ORIGIN}/` });
+    const happyWindow = new GlobalWindow({ url: ROOT_SCOPE });
     globalThis.window = happyWindow as unknown as Window & typeof globalThis;
-    deleted = [];
-    const names = ["mux-v2", "mux-v3", "other-app"];
+    globalThis.document = happyWindow.document as unknown as Document;
+    storage = new MemoryCacheStorage();
     Object.defineProperty(globalThis, "caches", {
       configurable: true,
-      value: {
-        keys: () => Promise.resolve(names.filter((name) => !deleted.includes(name))),
-        delete: (name: string) => {
-          deleted.push(name);
-          return Promise.resolve(true);
-        },
-      },
+      value: storage.view(ROOT_SCOPE),
     });
   });
 
@@ -301,20 +351,27 @@ describe("auth token changes clear the service worker caches (#6848)", () => {
     restoreDomGlobals();
   });
 
-  test("logout deletes every mux cache and nothing else", async () => {
-    clearStoredAuthToken();
-    await flush();
-    expect(deleted.sort()).toEqual(["mux-v2", "mux-v3"]);
+  test("logout keeps this scope's shell and finishes before its promise settles", async () => {
+    seedPreviousSession();
+    await clearStoredAuthToken();
+    expectCleared();
   });
 
-  test("a new token deletes the mux caches; the same token again does not", async () => {
-    setStoredAuthToken("token-a");
-    await flush();
-    expect(deleted.sort()).toEqual(["mux-v2", "mux-v3"]);
+  test("a new token clears the previous session; the same token again does not", async () => {
+    seedPreviousSession();
+    await setStoredAuthToken("token-a");
+    expectCleared();
 
-    deleted = [];
-    setStoredAuthToken("token-a");
-    await flush();
-    expect(deleted).toEqual([]);
+    storage.seed(cacheNameFor(ROOT_SCOPE), [`${ORIGIN}/${HASHED_JS}`]);
+    await setStoredAuthToken("token-a");
+    expect(storage.urlsIn(cacheNameFor(ROOT_SCOPE))).toContain(`${ORIGIN}/${HASHED_JS}`);
+  });
+
+  test("after logout the worker still starts offline from the shell", async () => {
+    const worker = await startWorker({ storage });
+    await clearStoredAuthToken();
+    worker.offline();
+    const { response } = await worker.request(`${ORIGIN}/settings`, { mode: "navigate" });
+    expect(await response?.text()).toBe("shell");
   });
 });
