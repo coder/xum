@@ -1118,14 +1118,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     prevCreationAgentIdRef.current = normalizedAgentId;
     prevCreationScopeIdRef.current = scopeId;
     prevCreationProjectRef.current = creationParentProjectPath;
-    // The draft owns its choices: after the composer seeds them, only the user's agent pick applies
-    // agent defaults over them (not a move, its agent reset, an agent list reload, or reopening
-    // the draft, which remounts this composer).
+    // The draft owns its choices: after the composer's first sync, only the user's agent pick
+    // applies agent defaults over them (not a move, its agent reset or an agent list reload). The
+    // first sync (a new draft, or a reopened one: that remounts this composer) keeps every field
+    // the user picked (intent) and fills only the others.
     if (!isFirstSync && !isExplicitAgentSwitch) return;
-    const storedAi = getCreationDraftStore().getView(creationDraftId).draft?.ai;
-    const holdsChoices =
-      storedAi?.model != null || storedAi?.thinkingLevel != null || storedAi?.reasoningMode != null;
-    if (isFirstSync && holdsChoices) return;
+    const picked = isFirstSync
+      ? (getCreationDraftStore().getView(creationDraftId).draft?.intent ?? {})
+      : {};
 
     const existingModel = readScopedAiDefault(scopeId, "model") ?? fallbackModel;
     const existingThinking = readScopedAiDefault(scopeId, "thinkingLevel") ?? "off";
@@ -1149,15 +1149,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       existingReasoningMode: existingReasoning,
       agentBaseById,
     });
-    if (existingModel !== resolvedModel) {
+    if (existingModel !== resolvedModel && !picked.model) {
       setWorkspaceModelWithOrigin(scopeId, resolvedModel, isExplicitAgentSwitch ? "agent" : "sync");
     }
 
-    if (existingThinking !== resolvedThinking) {
+    if (existingThinking !== resolvedThinking && !picked.thinkingLevel) {
       writeScopedAiDefault(scopeId, "thinkingLevel", resolvedThinking);
     }
 
-    if (existingReasoning !== resolvedReasoning) {
+    if (existingReasoning !== resolvedReasoning && !picked.reasoningMode) {
       markAiSelectionIntent(scopeId, "reasoningMode", resolvedReasoning);
     }
   }, [

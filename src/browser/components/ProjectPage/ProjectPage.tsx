@@ -30,7 +30,6 @@ import {
   getArchivedWorkspacesExpandedKey,
   getCreationDraftScopeId,
 } from "@/common/constants/storage";
-import { updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { CreationDraftGate } from "@/browser/features/ChatInput/CreationDraftGate";
 import { trimArrayToChars } from "@/browser/utils/boundedPersistedValue";
@@ -272,8 +271,12 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   }, [setShowAgentsInitNudge]);
 
   const handleRunAgentsInit = useCallback(() => {
-    // Switch project-scope mode to exec.
-    updateUserPreferences({ ai: { projectDefaults: { [projectPath]: { agentId: "exec" } } } });
+    // Run it in Exec: the draft owns its agent, so a project default would not reach this send.
+    if (pendingDraftId) {
+      getCreationDraftStore().updateExecution(pendingDraftId, {
+        agent: { id: "exec", scope: "built-in" },
+      });
+    }
 
     // Run the /init skill and start the creation chat.
     if (chatInputRef.current) {
@@ -287,7 +290,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
     }
 
     setShowAgentsInitNudge(false);
-  }, [projectPath, pendingDraftId, setShowAgentsInitNudge]);
+  }, [pendingDraftId, setShowAgentsInitNudge]);
 
   const handleChatReady = useCallback((api: ChatInputAPI) => {
     chatInputRef.current = api;

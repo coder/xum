@@ -20,6 +20,7 @@ import { addProjectViaUI, cleanupView, setupTestDom, waitForLatestDraftId } from
 import { ChatHarness } from "../harness";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { getAgentsInitNudgeKey, getDraftScopeId } from "@/common/constants/storage";
 import { BRANCH_LIST_TIMEOUT_MS } from "@/browser/features/ChatInput/branchListLoad";
 
@@ -178,7 +179,7 @@ async function openCreationViewWithHeldBranches(options?: {
     draftId,
   });
   const create = jest.spyOn(env.services.workspaceService, "create");
-  return { env, view, cleanupDom, chat, held, create };
+  return { env, view, cleanupDom, chat, held, create, draftId };
 }
 
 describeIntegration("creation composer while the branch list loads (#6033)", () => {
@@ -317,10 +318,15 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
     BRANCH_LIST_TIMEOUT_MS + 60_000
   );
 
-  test("Run /init clicked after the branches load sends /init at once", async () => {
-    const { view, cleanupDom, held, create } = await openCreationViewWithHeldBranches({
-      showAgentsInitBanner: true,
-    });
+  test("Run /init clicked after the branches load sends /init at once, in Exec", async () => {
+    const { env, view, cleanupDom, held, create, draftId } = await openCreationViewWithHeldBranches(
+      {
+        showAgentsInitBanner: true,
+      }
+    );
+    // The draft owns its agent, so Run /init must switch the draft itself to Exec.
+    getCreationDraftStore().updateExecution(draftId, { agent: { id: "plan", scope: "built-in" } });
+    const send = jest.spyOn(env.services.workspaceService, "sendMessage");
     try {
       held.release();
       await waitFor(
@@ -337,10 +343,13 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
       });
       fireEvent.click(await runInitButton(view.container));
       await waitFor(() => expect(create).toHaveBeenCalledTimes(1), { timeout: 30_000 });
+      await waitFor(() => expect(send).toHaveBeenCalled(), { timeout: 30_000 });
+      expect(send.mock.calls[0]?.[2].agentId).toBe("exec");
     } finally {
       held.release();
       held.spy.mockRestore();
       create.mockRestore();
+      send.mockRestore();
       await cleanupView(view, cleanupDom);
     }
   }, 90_000);

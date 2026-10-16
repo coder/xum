@@ -27,7 +27,9 @@ import {
   setupTestDom,
 } from "../helpers";
 
-import { getUserPreferences } from "@/browser/stores/AppConfigStore";
+import { getUserPreferences, updateUserPreferences } from "@/browser/stores/AppConfigStore";
+import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
+import { getCreationDraftScopeId } from "@/common/constants/storage";
 import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 
@@ -176,9 +178,14 @@ describeIntegration("Creation draft project change", () => {
     });
     const cleanupDom = setupTestDom();
     const view = renderApp({ apiClient: env.orpc });
+    let pathA = "";
     try {
-      const pathA = await addProjectViaUI(view, getSharedRepoPath());
+      pathA = await addProjectViaUI(view, getSharedRepoPath());
       const labelB = (await addProjectViaUI(view, projectB)).split("/").pop() ?? projectB;
+      // A new draft starts from its project's model; its agent's configured model still wins.
+      updateUserPreferences({
+        ai: { projectDefaults: { [pathA]: { model: "anthropic:claude-haiku-4-5" } } },
+      });
       await openProjectCreationView(view, pathA);
       await waitForScope(view.container, pathA.split("/").pop() ?? pathA);
       const store = getCreationDraftStore();
@@ -192,9 +199,12 @@ describeIntegration("Creation draft project change", () => {
       });
       const model = () => store.getView(draftId).draft?.ai.model;
       await waitFor(() => expect(model()).toBe("openai:gpt-5"));
-      const draft = store.getView(draftId).draft;
-      if (!draft) throw new Error("Draft not loaded");
-      store.update(draftId, { ai: { ...draft.ai, model: "anthropic:claude-sonnet-4-5" } });
+      // The model selector's pick (with its intent).
+      markAiSelectionIntent(
+        getCreationDraftScopeId(draftId),
+        "model",
+        "anthropic:claude-sonnet-4-5"
+      );
       await store.flush(draftId);
 
       // Reopening the draft remounts its composer: that seeds nothing over what it holds.
@@ -222,6 +232,7 @@ describeIntegration("Creation draft project change", () => {
       store.updateExecution(draftId, { agent: { id: "plan", scope: "built-in" } });
       await waitFor(() => expect(model()).toBe("anthropic:claude-opus-4-1"));
     } finally {
+      if (pathA) updateUserPreferences({ ai: { projectDefaults: { [pathA]: { model: null } } } });
       await env.orpc.config.updateAgentAiDefaults({ agentAiDefaults: {} });
       await cleanupView(view, cleanupDom);
     }
