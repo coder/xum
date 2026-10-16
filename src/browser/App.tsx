@@ -135,7 +135,6 @@ import { cn } from "@/common/lib/utils";
 import { createProjectRefs } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
-import { writeScopedAiPick } from "@/browser/utils/scopedAiDefaults";
 import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import {
   prependInitialAppProxyBasePath,
@@ -659,7 +658,7 @@ function AppInner() {
     }
     const next: OpenAIReasoningMode =
       getReasoningModeForWorkspace(workspaceId) === mode ? "standard" : mode;
-    writeScopedAiPick(workspaceId, "reasoningMode", next);
+    markAiSelectionIntent(workspaceId, "reasoningMode", next);
   };
 
   const getFastModeActive = useCallback(() => {

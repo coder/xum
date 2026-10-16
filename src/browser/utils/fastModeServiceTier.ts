@@ -1,5 +1,6 @@
 import { isNonWorkspaceScopeId } from "@/common/constants/storage";
-import { writeScopedAiPick } from "@/browser/utils/scopedAiDefaults";
+import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
+import { hasScopedAiDefaults, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import type { APIClient } from "@/browser/contexts/API";
 import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
@@ -40,7 +41,11 @@ export function setWorkspaceServiceTier(
   scopeId: string,
   serviceTier: ServiceTier
 ): void {
-  writeScopedAiPick(scopeId, "serviceTier", serviceTier);
+  if (hasScopedAiDefaults(scopeId)) {
+    writeScopedAiDefault(scopeId, "serviceTier", serviceTier);
+  } else {
+    markAiSelectionIntent(scopeId, "serviceTier", serviceTier);
+  }
   if (api != null && !isNonWorkspaceScopeId(scopeId)) {
     api.workspace.setActiveTurnServiceTier({ workspaceId: scopeId, serviceTier }).catch(() => {
       // Best-effort: a transient IPC failure must not discard the next-send pick.

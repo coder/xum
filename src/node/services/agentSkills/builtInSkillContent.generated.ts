@@ -4809,7 +4809,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "### Pro reasoning mode (GPT-6)",
       "",
-      'GPT-6.1 Sol, GPT-6 Astra, and GPT-6 Luna support OpenAI\'s pro reasoning mode. Open the reasoning selector next to the model picker and enable **Pro mode** (or run "Toggle Pro Reasoning Mode" from the Command Palette) to send `reasoning.mode: "pro"` with each request. Like the thinking level, the setting is saved per chat; on the new-workspace page it becomes the project\'s default, which chats without a setting of their own inherit. Pro mode can consume more tokens and responses can take noticeably longer. Pro is available on supported direct OpenAI Responses API routes. Gateway routes, Chat Completions, and Codex OAuth use standard mode.',
+      'GPT-6.1 Sol, GPT-6 Astra, and GPT-6 Luna support OpenAI\'s pro reasoning mode. Open the reasoning selector next to the model picker and enable **Pro mode** (or run "Toggle Pro Reasoning Mode" from the Command Palette) to send `reasoning.mode: "pro"` with each request. The setting is saved per workspace. Pro mode can consume more tokens and responses can take noticeably longer. Pro is available on supported direct OpenAI Responses API routes. Gateway routes, Chat Completions, and Codex OAuth use standard mode.',
       "",
       "## Model Selection",
       "",
