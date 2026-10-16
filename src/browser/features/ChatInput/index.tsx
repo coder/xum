@@ -1123,7 +1123,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // the draft, which remounts this composer).
     if (!isFirstSync && !isExplicitAgentSwitch) return;
     const storedAi = getCreationDraftStore().getView(creationDraftId).draft?.ai;
-    if (isFirstSync && (storedAi?.model != null || storedAi?.thinkingLevel != null)) return;
+    const holdsChoices =
+      storedAi?.model != null || storedAi?.thinkingLevel != null || storedAi?.reasoningMode != null;
+    if (isFirstSync && holdsChoices) return;
 
     const existingModel = readScopedAiDefault(scopeId, "model") ?? fallbackModel;
     const existingThinking = readScopedAiDefault(scopeId, "thinkingLevel") ?? "off";
