@@ -2413,3 +2413,36 @@ describe("createOrpcServer", () => {
     }
   });
 });
+
+// PR5b-2: a phone's workspace page carries the static view's script and no request or workspace
+// data: the service worker caches every GET, also for other routes and windows.
+describe("the static workspace view on a phone's workspace page", () => {
+  const PHONE = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Mobile/15E148 Safari/604.1";
+  const DESKTOP = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/140.0 Safari/537.36";
+  const indexHtml =
+    '<!doctype html><html><head><title>x</title><meta name="viewport" content="width=device-width"><script type="module" src="./main-A.js"></script></head><body><div id="root"></div></body></html>';
+
+  test("only a phone gets the script, the same for every workspace, with the same headers", async () => {
+    const { server, close } = await createStaticTestServer({ files: { "index.html": indexHtml } });
+    try {
+      const read = async (route: string, userAgent: string) => {
+        const res = await fetch(`${server.baseUrl}${route}`, {
+          headers: { "Accept-Encoding": "identity", "User-Agent": userAgent },
+        });
+        const skip = new Set(["date", "content-length", "etag"]); // etag: a body hash
+        const headers = Object.fromEntries([...res.headers].filter(([name]) => !skip.has(name)));
+        return { headers, body: await res.text() };
+      };
+      const phone = await read("/workspace/a1b2c3d4e5", PHONE);
+      const desktop = await read("/workspace/a1b2c3d4e5", DESKTOP);
+      expect(phone.body).toContain("buildWorkspaceView");
+      expect(desktop.body).toContain('<script type="module" src="./main-A.js">');
+      expect(desktop.body).not.toContain("buildWorkspaceView");
+      expect(phone.headers).toEqual(desktop.headers);
+      expect((await read("/workspace/other-ws", PHONE)).body).toBe(phone.body);
+      expect(phone.body).not.toContain("a1b2c3d4e5");
+    } finally {
+      await close();
+    }
+  });
+});

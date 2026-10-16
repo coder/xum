@@ -10,7 +10,7 @@ import {
   WORKSPACE_VIEW_ID,
 } from "@/common/constants/workspaceView";
 import { FIRST_RUN_MODULES_ID } from "@/node/orpc/firstRunView";
-import { WORKSPACE_VIEW_EARLY_SCRIPT } from "./workspaceViewPage";
+import { injectWorkspaceView, WORKSPACE_VIEW_EARLY_SCRIPT } from "./workspaceViewPage";
 
 let dom: GlobalWindow | undefined;
 afterEach(async () => {
@@ -202,6 +202,43 @@ describe("the workspace view's early script", () => {
       expect(page.view() === null).toBe(false);
       remove(page);
       expect(page.view() === null).toBe(true);
+    }
+  });
+});
+
+describe("injectWorkspaceView", () => {
+  const PAGE =
+    '<html><head><base href="./"><meta name="viewport" content="width=device-width"><script type="module" src="./main-A.js"></script></head><body><div id="root"></div></body></html>';
+  const PHONE = { "user-agent": "Mozilla/5.0 (iPhone) Mobile/15E148" };
+  const WS = "/workspace/ws1";
+
+  test.each([
+    ["the UA token", WS, PHONE],
+    ["Sec-CH-UA-Mobile", WS, { "sec-ch-ua-mobile": "?1", "user-agent": "Mozilla/5.0 (X11)" }],
+    ["an app proxy path", `/@u/ws/apps/xum${WS}`, PHONE],
+  ])(
+    "a phone's workspace page (%s) gets the module list and one script that cannot end early",
+    (_name, path, headers) => {
+      const html = injectWorkspaceView(PAGE, { path, headers });
+      expect(html).not.toContain('<script type="module"');
+      const inline = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map((m) => m[1]);
+      expect(inline).toHaveLength(2); // the module list and the early script, each whole
+      expect(inline.join("")).toContain("buildWorkspaceView");
+      for (const text of inline) expect(text).not.toMatch(/<!--|<script|<\/script/i);
+    }
+  );
+
+  test("any other page stays byte-identical", () => {
+    for (const page of [
+      { path: "/", headers: PHONE },
+      { path: `${WS}/x`, headers: PHONE },
+      { path: WS, headers: { "user-agent": "Mozilla/5.0 (Macintosh) Chrome/140.0" } },
+    ]) {
+      expect(injectWorkspaceView(PAGE, page)).toBe(PAGE);
+    }
+    for (const tag of ['<base href="./">', '<meta name="viewport" content="width=device-width">']) {
+      const page = PAGE.replace(tag, "");
+      expect(injectWorkspaceView(page, { path: WS, headers: PHONE })).toBe(page);
     }
   });
 });
