@@ -5,6 +5,7 @@ import type { HistoryService } from "./historyService";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { createTestHistoryService } from "./testHistoryService";
 import type { Config } from "@/node/config";
+import * as fsPromises from "fs/promises";
 import { writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { readWorkspaceViewTail, WORKSPACE_VIEW_TAIL_CAPS } from "./workspaceViewTail";
@@ -208,43 +209,79 @@ describe("row trees", () => {
 describe("an interrupted stream's partial.json (#6832)", () => {
   const partialFile = () => path.join(config.sessionsDir, ID, "partial.json");
   const longer = [{ type: "text", text: " and more" }] as never;
+  const owning = () => msg("m1", "assistant", "text 1", { historySequence: 1 }, longer);
   test.each([
-    [
-      "owns the last row and has more parts",
-      () => msg("m1", "assistant", "text 1", { historySequence: 1 }, longer),
-    ],
+    ["owns the last row", owning],
     ["is newer than the tail", () => msg("m2", "assistant", "next", { historySequence: 2 })],
-  ])("a partial that %s gives no view: the live replay shows it", async (_case, partial) => {
+    // The replay drops every row with the partial's historySequence, whatever its id.
+    ["reuses a row's sequence", () => msg("gone", "assistant", "old", { historySequence: 1 })],
+  ])("a readable partial that %s gives no view: the live replay shows it", async (_, partial) => {
     await append(turns(2));
     expect((await historyService.writePartial(ID, partial())).success).toBe(true);
     expect(await read()).toBeNull();
   });
 
-  test("an orphaned or malformed partial changes nothing, so the view stays", async () => {
+  test("a malformed partial keeps the view, as readPartial ignores it in the replay", async () => {
     await append(turns(2));
-    const orphan = msg("gone", "assistant", "discarded", { historySequence: 0 });
-    expect((await historyService.writePartial(ID, orphan)).success).toBe(true);
-    expect((await read())?.rows).toHaveLength(2);
     await writeFile(partialFile(), "{ not json");
     expect((await read())?.rows).toHaveLength(2);
   });
 
   test("a partial over the byte cap gives no view without being parsed", async () => {
     await append(turns(2));
-    // Orphaned, so parsing it would keep the view: only the size check can hide it.
-    const huge = msg("gone", "assistant", "x".repeat(maxBytes), { historySequence: 0 });
-    expect((await historyService.writePartial(ID, huge)).success).toBe(true);
+    // Malformed, so parsing it would keep the view: only the size check can hide it.
+    await writeFile(partialFile(), `{ not json${"x".repeat(maxBytes)}`);
+    expect(await read()).toBeNull();
+  });
+
+  test("short reads are joined until EOF, so a readable partial still hides the view", async () => {
+    await append(turns(2));
+    expect((await historyService.writePartial(ID, owning())).success).toBe(true);
+    const open = fsPromises.open;
+    const spy = spyOn(fsPromises, "open").mockImplementation(
+      async (...args: Parameters<typeof open>) => {
+        const handle = await open(...args);
+        if (args[0] !== partialFile()) return handle;
+        const read = handle.read.bind(handle) as (
+          ...a: unknown[]
+        ) => ReturnType<typeof handle.read>;
+        return Object.assign(handle, {
+          // At most 7 bytes per read, as some network filesystems answer.
+          read: (buffer: Buffer, offset: number, length: number, position: number) =>
+            read(buffer, offset, Math.min(length, 7), position),
+        });
+      }
+    );
+    try {
+      expect(await read()).toBeNull();
+      expect(spy).toHaveBeenCalled();
+    } finally {
+      spy.mockRestore(); // a module spy outlives the test otherwise
+    }
+  });
+
+  test("the partial is read before the window: a commit between them serves no stale tail", async () => {
+    await append(turns(2));
+    expect((await historyService.writePartial(ID, owning())).success).toBe(true);
+    const readWindow = historyService.getHistoryWindowFromLatestBoundary.bind(historyService);
+    spyOn(historyService, "getHistoryWindowFromLatestBoundary").mockImplementation(
+      async (...args) => {
+        const window = await readWindow(...args);
+        expect((await historyService.commitPartial(ID)).success).toBe(true);
+        return window;
+      }
+    );
     expect(await read()).toBeNull();
   });
 
   test("a read during concurrent partial writes gives the old or the new state, never a throw", async () => {
     await append(turns(2));
-    const owning = (i: number) =>
+    const owningWith = (i: number) =>
       msg("m1", "assistant", "text 1", { historySequence: 1 }, [
         { type: "text", text: `${i}` },
       ] as never);
     const writes = Promise.all(
-      Array.from({ length: 20 }, (_, i) => historyService.writePartial(ID, owning(i)))
+      Array.from({ length: 20 }, (_, i) => historyService.writePartial(ID, owningWith(i)))
     );
     const reads = await Promise.all(Array.from({ length: 20 }, () => read()));
     await writes;

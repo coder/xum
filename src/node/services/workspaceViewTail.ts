@@ -8,7 +8,7 @@ import type { MuxMessage } from "@/common/types/message";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { WorkspaceViewTail, WorkspaceViewTailRow } from "@/common/orpc/schemas/api";
 import type { AIService } from "./aiService";
-import { mergeTranscriptPartial, type HistoryService } from "./historyService";
+import type { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { isMultiProject } from "@/common/utils/multiProject";
 import type { RowTreeClient } from "@/node/orpc/staticWorkspaceView/rowTreeClient";
@@ -118,7 +118,7 @@ function toWorkspaceViewTailRow(message: MuxMessage): Omit<WorkspaceViewTailRow,
  * Null when there is nothing to draw: an unknown workspace (checked before any history read), a
  * stream in flight (the live transcript then ends in a row chat.jsonl lacks), a failed read, a
  * tail not windowable within the caps (one turn or row larger than them), or an interrupted
- * stream's partial.json that the live replay would show (#6832).
+ * stream's partial.json (#6832).
  */
 export async function readWorkspaceViewTail(
   deps: {
@@ -137,18 +137,17 @@ export async function readWorkspaceViewTail(
   const options = { probeCheckouts: false, persistMigrations: false } as const;
   const info = await deps.config.getWorkspaceMetadataById(workspaceId, options);
   if (!info || isMultiProject(info) || deps.aiService.isStreaming(workspaceId)) return null;
-  const window = await deps.historyService.getHistoryWindowFromLatestBoundary(
-    workspaceId,
-    WORKSPACE_VIEW_TAIL_CAPS
-  );
-  if (!window.success || window.data.kind !== "window") return null;
-  // #6832: after a restart isStreaming() is false, but a partial.json that still owns its row, or
-  // is newer than the tail, is what the live replay shows. Then the static tail would differ, so
-  // no view. The live predicate decides; malformed and orphaned partials change nothing.
+  // #6832: after a restart isStreaming() is false, but the live replay still shows an interrupted
+  // stream's partial.json, and drops every row that shares its historySequence. So any readable
+  // partial (and an oversized one, never parsed) means no view. It is read before the window, as
+  // the replay reads it: a commit between the two reads then gives the committed rows, never a
+  // stale tail. A malformed partial is null here and in readPartial, so both show the rows.
   const caps = WORKSPACE_VIEW_TAIL_CAPS;
-  const partial = await deps.historyService.readBoundedPartial(workspaceId, caps.maxBytes);
-  if (partial === "oversized") return null;
-  if (mergeTranscriptPartial(window.data.messages, partial) !== window.data.messages) return null;
+  if ((await deps.historyService.readBoundedPartial(workspaceId, caps.maxBytes)) !== null) {
+    return null;
+  }
+  const window = await deps.historyService.getHistoryWindowFromLatestBoundary(workspaceId, caps);
+  if (!window.success || window.data.kind !== "window") return null;
   const rows = window.data.messages.map(toWorkspaceViewTailRow);
   return {
     title: info.title ?? info.name,

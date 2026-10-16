@@ -3265,9 +3265,9 @@ export class HistoryService {
   }
 
   /**
-   * The static workspace view's partial read (workspace.history.tail, #6832): one read of at most
-   * `maxBytes` + 1 bytes, so a large partial never costs a full read and parse. "oversized" past
-   * `maxBytes`; null when absent, unreadable or malformed, as readPartial treats those.
+   * The static workspace view's partial read (workspace.history.tail, #6832): at most `maxBytes` + 1
+   * bytes, so a large partial never costs a full read and parse. "oversized" past `maxBytes`; null
+   * when absent, unreadable or malformed, as readPartial treats those.
    */
   async readBoundedPartial(
     workspaceId: string,
@@ -3277,9 +3277,15 @@ export class HistoryService {
     try {
       handle = await fs.open(this.getPartialPath(workspaceId), "r");
       const buffer = Buffer.allocUnsafe(maxBytes + 1);
-      const { bytesRead } = await handle.read(buffer, 0, maxBytes + 1, 0);
-      if (bytesRead > maxBytes) return "oversized";
-      const message: unknown = JSON.parse(buffer.toString("utf8", 0, bytesRead));
+      let length = 0;
+      // A positioned read can return fewer bytes than asked before EOF (some network filesystems).
+      while (length < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+        if (bytesRead === 0) break;
+        length += bytesRead;
+      }
+      if (length > maxBytes) return "oversized";
+      const message: unknown = JSON.parse(buffer.toString("utf8", 0, length));
       return isReadableHistoryMessage(message) ? normalizePersistedMessage(message) : null;
     } catch {
       return null;
