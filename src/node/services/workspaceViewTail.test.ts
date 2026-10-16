@@ -4,6 +4,9 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { HistoryService } from "./historyService";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { createTestHistoryService } from "./testHistoryService";
+import type { Config } from "@/node/config";
+import { writeFile } from "node:fs/promises";
+import * as path from "node:path";
 import { readWorkspaceViewTail, WORKSPACE_VIEW_TAIL_CAPS } from "./workspaceViewTail";
 import type { RowTreeClient, RowTreeRow } from "@/node/orpc/staticWorkspaceView/rowTreeClient";
 import type { StaticNode } from "@/common/staticWorkspaceView/tree";
@@ -17,10 +20,11 @@ const STOP = { model: "anthropic:claude-sonnet-4-5", finishReason: "stop" } as c
 const { maxRows, maxBytes } = WORKSPACE_VIEW_TAIL_CAPS;
 
 let historyService: HistoryService;
+let config: Config;
 let cleanup: () => Promise<void>;
 let streaming = false;
 beforeEach(async () => {
-  ({ historyService, cleanup } = await createTestHistoryService());
+  ({ historyService, config, cleanup } = await createTestHistoryService());
   streaming = false;
 });
 afterEach(() => cleanup());
@@ -198,5 +202,54 @@ describe("row trees", () => {
     echo.mockClear();
     expect(await treesOf({ render: echo })).toEqual([["synthetic", null]]);
     expect(echo).not.toHaveBeenCalled();
+  });
+});
+
+describe("an interrupted stream's partial.json (#6832)", () => {
+  const partialFile = () => path.join(config.sessionsDir, ID, "partial.json");
+  const longer = [{ type: "text", text: " and more" }] as never;
+  test.each([
+    [
+      "owns the last row and has more parts",
+      () => msg("m1", "assistant", "text 1", { historySequence: 1 }, longer),
+    ],
+    ["is newer than the tail", () => msg("m2", "assistant", "next", { historySequence: 2 })],
+  ])("a partial that %s gives no view: the live replay shows it", async (_case, partial) => {
+    await append(turns(2));
+    expect((await historyService.writePartial(ID, partial())).success).toBe(true);
+    expect(await read()).toBeNull();
+  });
+
+  test("an orphaned or malformed partial changes nothing, so the view stays", async () => {
+    await append(turns(2));
+    const orphan = msg("gone", "assistant", "discarded", { historySequence: 0 });
+    expect((await historyService.writePartial(ID, orphan)).success).toBe(true);
+    expect((await read())?.rows).toHaveLength(2);
+    await writeFile(partialFile(), "{ not json");
+    expect((await read())?.rows).toHaveLength(2);
+  });
+
+  test("a partial over the byte cap gives no view without being parsed", async () => {
+    await append(turns(2));
+    // Orphaned, so parsing it would keep the view: only the size check can hide it.
+    const huge = msg("gone", "assistant", "x".repeat(maxBytes), { historySequence: 0 });
+    expect((await historyService.writePartial(ID, huge)).success).toBe(true);
+    expect(await read()).toBeNull();
+  });
+
+  test("a read during concurrent partial writes gives the old or the new state, never a throw", async () => {
+    await append(turns(2));
+    const owning = (i: number) =>
+      msg("m1", "assistant", "text 1", { historySequence: 1 }, [
+        { type: "text", text: `${i}` },
+      ] as never);
+    const writes = Promise.all(
+      Array.from({ length: 20 }, (_, i) => historyService.writePartial(ID, owning(i)))
+    );
+    const reads = await Promise.all(Array.from({ length: 20 }, () => read()));
+    await writes;
+    // Before the first write lands the view shows; after it, the owning partial hides it.
+    for (const tail of reads) expect(tail === null || tail.rows.length === 2).toBe(true);
+    expect(await read()).toBeNull();
   });
 });
