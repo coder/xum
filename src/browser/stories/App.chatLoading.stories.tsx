@@ -351,7 +351,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         historySequence: 2,
         startTime: STABLE_TIMESTAMP,
       });
-      await expect(await canvas.findByText(/streaming\.\.\./)).toBeVisible();
+      await expect(await canvas.findByText(/ streaming$/)).toBeVisible();
       await checkTranscriptLayout(canvasElement);
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat(history);
