@@ -1,10 +1,10 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo } from "react";
 import { ChevronRight, FileText, ExternalLink, Eye, EyeOff, Info } from "lucide-react";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import type { RuntimeConfig } from "@/common/types/runtime";
-import { PlanFileDialog } from "./PlanFileDialog";
+import { openPlanTab } from "@/browser/utils/openPlanTab";
 import {
   POST_COMPACTION_COLLAPSED_KEY,
   POST_COMPACTION_FILES_EXPANDED_KEY,
@@ -35,7 +35,6 @@ export const PostCompactionSection: React.FC<PostCompactionSectionProps> = (prop
     POST_COMPACTION_FILES_EXPANDED_KEY,
     false
   );
-  const [isPlanDialogOpen, setIsPlanDialogOpen] = useState(false);
 
   const handleOpenPlan = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -129,7 +128,10 @@ export const PostCompactionSection: React.FC<PostCompactionSectionProps> = (prop
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <button
-                      onClick={() => setIsPlanDialogOpen(true)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openPlanTab(props.workspaceId);
+                      }}
                       className={`text-subtle hover:text-foreground flex items-center gap-2 text-left text-xs transition-colors ${isPlanExcluded ? "line-through" : ""}`}
                       type="button"
                     >
@@ -138,7 +140,7 @@ export const PostCompactionSection: React.FC<PostCompactionSectionProps> = (prop
                     </button>
                   </TooltipTrigger>
                   <TooltipContent side="top" showArrow={false}>
-                    View plan
+                    Open the Plan tab
                   </TooltipContent>
                 </Tooltip>
                 <Tooltip>
@@ -156,11 +158,6 @@ export const PostCompactionSection: React.FC<PostCompactionSectionProps> = (prop
                   </TooltipContent>
                 </Tooltip>
               </div>
-              <PlanFileDialog
-                open={isPlanDialogOpen}
-                onOpenChange={setIsPlanDialogOpen}
-                workspaceId={props.workspaceId}
-              />
             </>
           )}
 

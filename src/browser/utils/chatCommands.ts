@@ -82,7 +82,7 @@ import { buildCompactionMessageText } from "@/common/utils/compaction/compaction
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { isValidProvider } from "@/common/constants/providers";
-import { openInEditor } from "@/browser/utils/openInEditor";
+import { openPlanTab } from "@/browser/utils/openPlanTab";
 import {
   appendStagedAttachmentNotice,
   getStagedAttachments,
@@ -2055,53 +2055,11 @@ function handlePlanShowCommand(env: WorkspaceCommandEnv): CommandResult {
 }
 
 function handlePlanOpenCommand(env: WorkspaceCommandEnv): CommandResult {
-  return phase([{ type: "clear-input" }], async () => {
-    try {
-      const planResult = await env.api.workspace.getPlanContent({ workspaceId: env.workspaceId });
-      if (!planResult.success) {
-        return complete("consume", [
-          showToast({
-            id: Date.now().toString(),
-            type: "error",
-            message: "No plan found for this workspace",
-          }),
-        ]);
-      }
-      const workspaceInfo = await env.api.workspace.getInfo({ workspaceId: env.workspaceId });
-      const openResult = await openInEditor({
-        api: env.api,
-        workspaceId: env.workspaceId,
-        targetPath: planResult.data.path,
-        runtimeConfig: workspaceInfo?.runtimeConfig,
-        isFile: true,
-      });
-      if (!openResult.success) {
-        return complete("consume", [
-          showToast({
-            id: Date.now().toString(),
-            type: "error",
-            message: openResult.error ?? "Failed to open editor",
-          }),
-        ]);
-      }
-      trackCommandUsed("plan");
-      return complete("consume", [
-        showToast({
-          id: Date.now().toString(),
-          type: "success",
-          message: "Opened plan in editor",
-        }),
-      ]);
-    } catch (error) {
-      return complete("restore", [
-        showToast({
-          id: Date.now().toString(),
-          type: "error",
-          message: error instanceof Error ? error.message : "Failed to open plan",
-        }),
-      ]);
-    }
-  });
+  // The Plan tab shows the plan, or that there is none yet; opening it in an editor is one of
+  // the tab's actions.
+  openPlanTab(env.workspaceId);
+  trackCommandUsed("plan");
+  return complete("consume", [{ type: "clear-input" }]);
 }
 
 // ============================================================================
