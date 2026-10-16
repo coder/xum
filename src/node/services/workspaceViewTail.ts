@@ -11,6 +11,7 @@ import type { AIService } from "./aiService";
 import type { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { isMultiProject } from "@/common/utils/multiProject";
+import type { RowTreeClient } from "@/node/orpc/staticWorkspaceView/rowTreeClient";
 
 /**
  * The read behind `workspace.history.tail` (T3 #5971): the newest rows for the static first view of
@@ -101,7 +102,7 @@ function rowTimestamp(message: MuxMessage, metadata: Record<string, unknown>): n
 }
 
 /** Persisted metadata is not validated on read: a damaged field degrades this row, never the tail. */
-function toWorkspaceViewTailRow(message: MuxMessage): WorkspaceViewTailRow {
+function toWorkspaceViewTailRow(message: MuxMessage): Omit<WorkspaceViewTailRow, "tree"> {
   const metadata: Record<string, unknown> = isPlainObject(message.metadata) ? message.metadata : {};
   const model = message.role === "assistant" ? modelDisplay(metadata) : null;
   return {
@@ -123,6 +124,7 @@ export async function readWorkspaceViewTail(
     config: Pick<Config, "getWorkspaceMetadataById">;
     aiService: Pick<AIService, "isStreaming">;
     historyService: Pick<HistoryService, "getHistoryWindowFromLatestBoundary">;
+    rowTreeClient?: Pick<RowTreeClient, "render">;
   },
   workspaceId: string
 ): Promise<WorkspaceViewTail | null> {
@@ -136,9 +138,39 @@ export async function readWorkspaceViewTail(
     WORKSPACE_VIEW_TAIL_CAPS
   );
   if (!window.success || window.data.kind !== "window") return null;
+  const rows = window.data.messages.map(toWorkspaceViewTailRow);
   return {
     title: info.title ?? info.name,
     project: info.projectName,
-    rows: window.data.messages.map(toWorkspaceViewTailRow),
+    rows: await withRowTrees(deps.rowTreeClient, workspaceId, rows),
   };
+}
+
+/**
+ * Each drawable row's element tree, rendered by `xum server`'s row-tree worker with the live
+ * markdown components. No client (desktop, CLI), a cold or failed worker, and a row the static
+ * view cannot draw all give tree: null. The client never throws by contract; the catch keeps a
+ * broken worker from ever failing the tail.
+ */
+async function withRowTrees(
+  client: Pick<RowTreeClient, "render"> | undefined,
+  workspaceId: string,
+  rows: Array<Omit<WorkspaceViewTailRow, "tree">>
+): Promise<WorkspaceViewTailRow[]> {
+  const drawable = rows.flatMap((row) =>
+    row.text !== null && row.role !== "other"
+      ? [{ row, text: row.text, isUser: row.role === "user" }]
+      : []
+  );
+  const trees =
+    client && drawable.length > 0
+      ? await client
+          .render(
+            workspaceId,
+            drawable.map(({ text, isUser }) => ({ text, isUser }))
+          )
+          .catch(() => [])
+      : [];
+  const treeOf = new Map(drawable.map(({ row }, i) => [row, trees[i] ?? null]));
+  return rows.map((row) => ({ ...row, tree: treeOf.get(row) ?? null }));
 }

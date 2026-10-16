@@ -1824,6 +1824,8 @@ export const WorkspaceViewTailRowSchema = z.object({
   model: z
     .object({ label: z.string(), provider: z.string(), via: z.string().nullable() })
     .nullable(),
+  /** The row's element tree (a StaticNode), or null. The page runs validateStaticTree on it. */
+  tree: z.unknown().nullable(),
 });
 
 export const WorkspaceViewTailSchema = z.object({

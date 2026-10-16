@@ -5,6 +5,8 @@ import type { HistoryService } from "./historyService";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { createTestHistoryService } from "./testHistoryService";
 import { readWorkspaceViewTail, WORKSPACE_VIEW_TAIL_CAPS } from "./workspaceViewTail";
+import type { RowTreeClient, RowTreeRow } from "@/node/orpc/staticWorkspaceView/rowTreeClient";
+import type { StaticNode } from "@/common/staticWorkspaceView/tree";
 
 const ID = "view-tail-ws";
 const INFO: FrontendWorkspaceMetadata = {
@@ -108,7 +110,14 @@ describe("readWorkspaceViewTail", () => {
     const { rows, ...tail } = (await read())!;
     expect(tail).toEqual({ title: "seed", project: "demo-app" });
     const model = { label: "Sonnet 4.5", provider: "anthropic", via: null };
-    expect(rows[2]).toEqual({ id: "a", role: "assistant", text: "direct", timestamp: 7, model });
+    expect(rows[2]).toEqual({
+      id: "a",
+      role: "assistant",
+      text: "direct",
+      timestamp: 7,
+      model,
+      tree: null,
+    });
     expect(rows.map((row) => [row.id, row.text, row.timestamp, row.model?.via])).toEqual([
       ["u", "hello", 1, undefined],
       ["u2", "bare", 1, undefined],
@@ -138,5 +147,56 @@ describe("readWorkspaceViewTail", () => {
       ...{ tool: null, reasoning: null, synthetic: null, command: null, cut: null, skill: null },
       last: "fine",
     });
+  });
+});
+
+describe("row trees", () => {
+  const readWith = (rowTreeClient?: Pick<RowTreeClient, "render">) => {
+    lookup.mockImplementation(() => Promise.resolve(INFO));
+    const deps = { aiService: { isStreaming: () => streaming }, historyService, rowTreeClient };
+    return readWorkspaceViewTail({ ...deps, config: { getWorkspaceMetadataById: lookup } }, ID);
+  };
+  const echo = mock((_id: string, rows: RowTreeRow[]) =>
+    Promise.resolve(rows.map((row): StaticNode => ["p", {}, row.text]))
+  );
+  const treesOf = async (client?: Pick<RowTreeClient, "render">) =>
+    (await readWith(client))!.rows.map((row) => [row.id, row.tree]);
+
+  test("drawable rows go to the worker as text and role, and each gets its own tree", async () => {
+    await append([
+      msg("u", "user", "hi"),
+      msg("synthetic", "user", "[CONTINUE]", { synthetic: true }), // not drawable: never sent
+      msg("a", "assistant", "yo"),
+    ]);
+    echo.mockClear();
+    expect(await treesOf({ render: echo })).toEqual([
+      ["u", ["p", {}, "hi"]],
+      ["synthetic", null],
+      ["a", ["p", {}, "yo"]],
+    ]);
+    expect(echo).toHaveBeenCalledWith(ID, [
+      { text: "hi", isUser: true },
+      { text: "yo", isUser: false },
+    ]);
+  });
+
+  test("a failed or cold worker, or no client at all, gives tree: null", async () => {
+    await append(turns(2));
+    const nulls = [
+      ["m0", null],
+      ["m1", null],
+    ];
+    expect(await treesOf({ render: () => Promise.reject(new Error("crashed")) })).toEqual(nulls);
+    expect(await treesOf({ render: (_id, rows) => Promise.resolve(rows.map(() => null)) })).toEqual(
+      nulls
+    );
+    expect(await treesOf(undefined)).toEqual(nulls);
+  });
+
+  test("a tail with nothing to draw never wakes the worker", async () => {
+    await append([msg("synthetic", "user", "[CONTINUE]", { synthetic: true })]);
+    echo.mockClear();
+    expect(await treesOf({ render: echo })).toEqual([["synthetic", null]]);
+    expect(echo).not.toHaveBeenCalled();
   });
 });
