@@ -749,6 +749,44 @@ describe("DraftStore", () => {
     expect((await next.service.get(WS_SCOPE)).text).toBe("typed during the import");
   });
 
+  // #6726: the same client reconnected (A, null, A) while the first run awaits its legacy import.
+  // The client check alone passes then (the client is A again); only the aborted signal stops the
+  // replaced run from opening writes, and readiness, before the new run's snapshot.
+  test("a same-client reconnect during the legacy import keeps writes until the new snapshot", async () => {
+    using tempDir = new TestTempDir("draft-store-same-client-reconnect-import");
+    const { client, control, service } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    seedLegacyKey(getInputKey(WS), "legacy text");
+    let releaseImport: () => void = () => undefined;
+    control.importGate = new Promise<void>((resolve) => {
+      releaseImport = resolve;
+    });
+    store.setClient(null);
+    store.setClient(client);
+    await waitFor(() => control.imports > 0);
+    store.setText(WS_SCOPE, "typed during the import");
+
+    let releaseSnapshot: () => void = () => undefined;
+    control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(null);
+    store.setClient(client);
+    const updatesBefore = control.updates;
+    releaseImport();
+    // The replaced run resumes after its import and removes the legacy key once the backend took
+    // the draft; it must not open writes for the run after it.
+    await waitFor(() => listPersistedKeys(getInputKey(WS)).length === 0);
+    const saving = flushError(store);
+    await sleep(50);
+    expect(control.updates).toBe(updatesBefore);
+
+    releaseSnapshot();
+    expect(await saving).toBe("");
+    expect((await service.get(WS_SCOPE)).text).toBe("typed during the import");
+  });
+
   // #6748: a save waiting for a reconnect's snapshot follows a further client change, and gives up
   // only when the client is removed. The typed text stays either way.
   test("a save waiting for a reconnect follows the next client, and rejects when the client is removed", async () => {

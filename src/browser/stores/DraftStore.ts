@@ -1858,7 +1858,16 @@ export class DraftStore {
     return client;
   }
 
-  /** Writes wait for the snapshot of the client they go to (#6542). */
+  /**
+   * Writes of draft fields (drain, beginSend, flush) wait for the snapshot of the client they go
+   * to (#6542): before it, the store does not know that backend's drafts and could overwrite them.
+   * Not held, on purpose (#6726), because none of them writes text the store would have to merge:
+   * - `sendDelete`: the user's delete. It removes whatever the backend holds, and the snapshot
+   *   handler (openWrites) resends pending deletes anyway.
+   * - `resolveSends`: the backend resolves its own pending-send records against the receiver.
+   * - `setSendReceiver`: moves a pending send the backend holds to the current receiver. A
+   *   backend that does not hold it answers `present: false`, and nothing is written.
+   */
   private canWrite(client: APIClient | null): client is APIClient {
     return client !== null && this.snapshotClient === client;
   }
