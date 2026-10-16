@@ -224,6 +224,94 @@ function topVisibleRowId(scrollport: HTMLElement): string | null {
   return null;
 }
 
+function describeElement(element: Element | null): string {
+  if (element === null) return "null";
+  const id =
+    element.getAttribute("data-message-id") ??
+    element.getAttribute("data-testid") ??
+    element.getAttribute("role") ??
+    element.classList.item(0);
+  return id === null ? element.tagName : `${element.tagName}[${id}]`;
+}
+
+/**
+ * Evidence for #6758, printed only in the assertion messages below. The story failed once in CI
+ * (never locally in 36 full-suite runs): the first chunk mounted above the reader without the
+ * browser's scroll-anchoring adjustment, so the top row moved by exactly that chunk's height.
+ * Each sample is taken in a ResizeObserver callback, after the layout and its anchoring
+ * adjustment: `contentHeight/scrollTop/mountedRows`. Running animations and class/style
+ * changes on the anchor row or its ancestors are recorded because a change to a property like
+ * `transform` there makes Chromium skip that layout's adjustment (an unproven hypothesis).
+ */
+function recordRevealEvidence(scrollport: HTMLElement, anchor: Element): { stop: () => string } {
+  const content = scrollport.querySelector<HTMLElement>('[role="log"]');
+  if (content === null) throw new Error("the transcript content element is missing");
+  const rows = () => scrollport.querySelectorAll("[data-message-id]").length;
+  // Animations inside the scrollport or on its ancestors; the left sidebar's transitions are noise.
+  // A "*" marks one on the anchor row or an ancestor of it.
+  const transcriptAnimations = () =>
+    document.getAnimations().flatMap((animation) => {
+      const target = animation.effect instanceof KeyframeEffect ? animation.effect.target : null;
+      if (target === null || !(scrollport.contains(target) || target.contains(scrollport))) {
+        return [];
+      }
+      const name =
+        animation instanceof CSSAnimation
+          ? animation.animationName
+          : animation instanceof CSSTransition
+            ? animation.transitionProperty
+            : "script";
+      const onAnchorPath = target.contains(anchor) ? "*" : "";
+      return [`${name}@${describeElement(target)}${onAnchorPath}:${animation.playState}`];
+    });
+  const sample = () => {
+    const animations = transcriptAnimations().filter((entry) => entry.includes("*"));
+    const height = Math.round(content.getBoundingClientRect().height);
+    const geometry = `${height}/${Math.round(scrollport.scrollTop)}/${rows()}`;
+    return animations.length === 0 ? geometry : `${geometry} ${animations.join(",")}`;
+  };
+  const start = sample();
+  const samples: string[] = [];
+  const resizeObserver = new ResizeObserver(() => {
+    if (samples.length < 30) samples.push(sample());
+  });
+  resizeObserver.observe(content);
+  const ancestorChanges: string[] = [];
+  const mutationObserver = new MutationObserver((records) => {
+    for (const record of records) {
+      if (!(record.target instanceof Element) || !record.target.contains(anchor)) continue;
+      if (ancestorChanges.length < 10) {
+        ancestorChanges.push(`${describeElement(record.target)}.${record.attributeName}`);
+      }
+    }
+  });
+  mutationObserver.observe(scrollport, {
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["class", "style"],
+  });
+  const animations = Array.from(new Set(transcriptAnimations())).slice(0, 10);
+  const scrollportBox = scrollport.getBoundingClientRect();
+  const topEdge = document.elementFromPoint(
+    scrollportBox.left + scrollportBox.width / 2,
+    scrollportBox.top + 1
+  );
+  const atRelease = {
+    start,
+    overflowAnchor: getComputedStyle(content).overflowAnchor,
+    topEdge: describeElement(topEdge),
+    activeElement: describeElement(document.activeElement),
+    animations,
+  };
+  return {
+    stop: () => {
+      resizeObserver.disconnect();
+      mutationObserver.disconnect();
+      return JSON.stringify({ ...atRelease, samples, ancestorChanges, end: sample() });
+    },
+  };
+}
+
 export const ScrollUpMidReveal: AppStory = {
   render: () => <AppWithMocks setup={setup} />,
   play: async ({ canvasElement, step }) => {
@@ -260,6 +348,7 @@ export const ScrollUpMidReveal: AppStory = {
             throw new Error("no transcript row is visible after scrolling up");
           const anchorElement = () => scrollport.querySelector(`[data-message-id="${anchorRow}"]`)!;
           const anchorTop = anchorElement().getBoundingClientRect().top;
+          const evidence = recordRevealEvidence(scrollport, anchorElement());
 
           transcriptRevealFrameScheduler.schedule = realSchedule;
           held.shift()!();
@@ -269,13 +358,15 @@ export const ScrollUpMidReveal: AppStory = {
           await new Promise<void>((resolve) =>
             requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
           );
-          await expect(topVisibleRowId(scrollport), "top visible row after the reveal").toBe(
-            anchorRow
-          );
+          const report = evidence.stop();
+          await expect(
+            topVisibleRowId(scrollport),
+            `top visible row after the reveal; evidence (#6758): ${report}`
+          ).toBe(anchorRow);
           // Native scroll anchoring restores the row within a sub-pixel of its previous position.
           await expect(
             Math.abs(anchorElement().getBoundingClientRect().top - anchorTop),
-            "anchor row displacement (px)"
+            `anchor row displacement (px); evidence (#6758): ${report}`
           ).toBeLessThanOrEqual(1);
         }
       );
