@@ -57,6 +57,12 @@ interface WorkspaceAiSelectionInput {
   agentBaseById?: ReadonlyMap<string, string | undefined>;
 }
 
+/** The project's and the global saved AI defaults; empty when a scope has none. */
+function getScopedDefaults(ai: UserPreferences["ai"], projectPath: string | undefined) {
+  const projectDefaults = projectPath != null ? ai?.projectDefaults?.[projectPath] : undefined;
+  return { project: projectDefaults ?? {}, global: ai?.globalDefaults ?? {} };
+}
+
 /**
  * Per field: the unsent pick, the workspace's saved settings for the agent, the agent's
  * configured defaults, then project and global defaults.
@@ -72,17 +78,16 @@ function resolveWorkspaceAiSelection(input: WorkspaceAiSelectionInput): Workspac
     input.agentAiDefaults,
     input.agentBaseById ?? getAgentBases(input.workspaceId)
   );
-  const project =
-    metadata?.projectPath != null ? input.ai?.projectDefaults?.[metadata.projectPath] : undefined;
+  const { project, global } = getScopedDefaults(input.ai, metadata?.projectPath);
 
-  const model = [pick("model"), saved?.model, configured.modelString, project?.model].find(
+  const model = [pick("model"), saved?.model, configured.modelString, project.model].find(
     (candidate): candidate is string => candidate != null && isValidModelFormat(candidate.trim())
   );
   const thinkingLevel =
-    [pick("thinkingLevel"), saved?.thinkingLevel, configured.thinkingLevel, project?.thinkingLevel]
+    [pick("thinkingLevel"), saved?.thinkingLevel, configured.thinkingLevel, project.thinkingLevel]
       .map(coerceThinkingLevel)
       .find((level) => level != null) ??
-    coerceThinkingLevel(input.ai?.globalDefaults?.thinkingLevel) ??
+    coerceThinkingLevel(global.thinkingLevel) ??
     WORKSPACE_DEFAULTS.thinkingLevel;
   // A saved per-agent bucket owns the reasoning choice: its absent mode means standard.
   const reasoningMode =
@@ -93,23 +98,33 @@ function resolveWorkspaceAiSelection(input: WorkspaceAiSelectionInput): Workspac
     model: normalizeModelPreference(model, input.defaultModel),
     thinkingLevel,
     reasoningMode,
-    serviceTier:
-      ServiceTierSchema.safeParse(pick("serviceTier")).data ??
-      ServiceTierSchema.safeParse(saved?.serviceTier).data,
+    // Speed falls back like the thinking level; with no choice anywhere the provider decides.
+    serviceTier: [pick("serviceTier"), saved?.serviceTier, project.serviceTier, global.serviceTier]
+      .map((tier) => ServiceTierSchema.safeParse(tier).data)
+      .find((tier) => tier != null),
   };
+}
+
+interface ScopedAiSelection {
+  model: string | undefined;
+  thinkingLevel: ThinkingLevel | undefined;
+  serviceTier: ServiceTier | undefined;
 }
 
 function resolveCreationScopeSelection(
   scopeId: string,
-  scoped: { model: string | undefined; thinkingLevel: ThinkingLevel | undefined },
+  scoped: ScopedAiSelection,
   defaultModel: string
 ): WorkspaceAiSelection {
   return {
     model: normalizeModelPreference(scoped.model, defaultModel),
     thinkingLevel: scoped.thinkingLevel ?? WORKSPACE_DEFAULTS.thinkingLevel,
-    serviceTier: ServiceTierSchema.safeParse(
-      getPendingAiSelection(scopeId, getWorkspaceAgentId(scopeId), "serviceTier")
-    ).data,
+    // Project and global scopes save speed as a default; draft scopes keep an unsent pick.
+    serviceTier:
+      scoped.serviceTier ??
+      ServiceTierSchema.safeParse(
+        getPendingAiSelection(scopeId, getWorkspaceAgentId(scopeId), "serviceTier")
+      ).data,
     // A creation scope's reasoning mode is only an unsent pick.
     reasoningMode:
       coerceOpenAIReasoningMode(
@@ -133,6 +148,7 @@ export function getWorkspaceAiSelection(
       {
         model: readScopedAiDefault(workspaceId, "model"),
         thinkingLevel: readScopedAiDefault(workspaceId, "thinkingLevel"),
+        serviceTier: readScopedAiDefault(workspaceId, "serviceTier"),
       },
       getDefaultModel()
     );
@@ -157,6 +173,7 @@ export function useWorkspaceAiSelection(
   // Subscribed for creation scopes, which resolve like getWorkspaceAiSelection.
   const scopedModel = useScopedAiDefault(workspaceId, "model");
   const scopedThinkingLevel = useScopedAiDefault(workspaceId, "thinkingLevel");
+  const scopedServiceTier = useScopedAiDefault(workspaceId, "serviceTier");
   const ai = useUserPreferences((preferences) => preferences.ai);
   const agentAiDefaults = useAgentAiDefaults();
   const defaultModel = normalizeModelPreference(
@@ -166,7 +183,7 @@ export function useWorkspaceAiSelection(
   if (isNonWorkspaceScopeId(workspaceId)) {
     return resolveCreationScopeSelection(
       workspaceId,
-      { model: scopedModel, thinkingLevel: scopedThinkingLevel },
+      { model: scopedModel, thinkingLevel: scopedThinkingLevel, serviceTier: scopedServiceTier },
       defaultModel
     );
   }

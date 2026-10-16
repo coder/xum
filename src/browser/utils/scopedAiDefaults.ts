@@ -38,6 +38,11 @@ function getServerScope(scopeId: string): { projectPath?: string } | undefined {
     : undefined;
 }
 
+/** Project and global scopes save AI picks as defaults; workspace and draft scopes cannot. */
+export function hasScopedAiDefaults(scopeId: string): boolean {
+  return getServerScope(scopeId) != null;
+}
+
 function selectServerDefault<F extends ScopedAiField>(
   preferences: UserPreferences,
   scope: { projectPath?: string },

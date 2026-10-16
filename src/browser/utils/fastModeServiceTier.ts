@@ -1,5 +1,6 @@
 import { isNonWorkspaceScopeId } from "@/common/constants/storage";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
+import { hasScopedAiDefaults, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import type { APIClient } from "@/browser/contexts/API";
 import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
@@ -32,14 +33,19 @@ export interface FastModeAvailabilityOptions {
 /**
  * Speed belongs to this chat, just like reasoning. Keep the pending pick for
  * the next send and nudge an active turn without changing any other chat's default.
- * Creation scopes have no active turn yet; their first send carries the same choice.
+ * Like the thinking level, a pick on the new-workspace page is the project (or global)
+ * default instead, so it survives reloads and seeds later workspaces.
  */
 export function setWorkspaceServiceTier(
   api: APIClient | null | undefined,
   scopeId: string,
   serviceTier: ServiceTier
 ): void {
-  markAiSelectionIntent(scopeId, "serviceTier", serviceTier);
+  if (hasScopedAiDefaults(scopeId)) {
+    writeScopedAiDefault(scopeId, "serviceTier", serviceTier);
+  } else {
+    markAiSelectionIntent(scopeId, "serviceTier", serviceTier);
+  }
   if (api != null && !isNonWorkspaceScopeId(scopeId)) {
     api.workspace.setActiveTurnServiceTier({ workspaceId: scopeId, serviceTier }).catch(() => {
       // Best-effort: a transient IPC failure must not discard the next-send pick.

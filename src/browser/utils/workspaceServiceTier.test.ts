@@ -1,7 +1,9 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../../tests/ui/dom";
 import { createTestApiClient } from "@/browser/testUtils";
-import { getProjectScopeId } from "@/common/constants/storage";
+import { getDraftScopeId, getProjectScopeId, GLOBAL_SCOPE_ID } from "@/common/constants/storage";
+import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { SendMessageOptionsSchema } from "@/common/orpc/schemas/stream";
 import { WorkspaceAISettingsSchema } from "@/common/orpc/schemas/workspaceAiSettings";
 import { pickPreservedSendOptions, pickStartupRetrySendOptions } from "@/common/types/message";
@@ -11,7 +13,7 @@ import {
   targetWorkspaceBucketToLayer,
 } from "@/common/types/agentAiSettings";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getSendOptionsFromStorage } from "./messages/sendOptions";
 import { getWorkspaceAiSelection } from "./workspaceAiSettingsSync";
 import { setWorkspaceServiceTier, toggleServiceTier } from "./fastModeServiceTier";
@@ -30,11 +32,19 @@ let cleanupDom: () => void;
 beforeEach(() => {
   cleanupDom = installDom();
   resetAiSelectionIntentForTests();
-  getAppConfigStore().updateOptimistically({ defaultModel: saved.model });
+  const store = getAppConfigStore();
+  store.updateOptimistically({ defaultModel: saved.model });
+  // Apply preference writes locally, as a connected store would once they save.
+  spyOn(store, "updateUserPreferences").mockImplementation((patch) => {
+    store.updateOptimistically({
+      userPreferences: normalizeUserPreferences(applyMergePatch(getUserPreferences(), patch)),
+    });
+  });
 });
 afterEach(() => {
   resetAiSelectionIntentForTests();
-  getAppConfigStore().updateOptimistically({ defaultModel: undefined });
+  mock.restore();
+  getAppConfigStore().updateOptimistically({ defaultModel: undefined, userPreferences: undefined });
   cleanupDom();
 });
 
@@ -91,14 +101,13 @@ describe("per-chat OpenAI speed", () => {
   test.each(["priority", "ultrafast", "default"] as const)(
     "serializes %s at the send root through compaction and restart",
     (serviceTier) => {
-      const scope = getProjectScopeId("/speed-project");
-      setWorkspaceServiceTier(null, scope, serviceTier);
-      const options = getSendOptionsFromStorage(scope);
+      setWorkspaceServiceTier(null, "a", serviceTier);
+      const options = getSendOptionsFromStorage("a");
       const parsed = SendMessageOptionsSchema.parse(
         JSON.parse(
           JSON.stringify({
             ...options,
-            aiSelectionIntent: getAiSelectionIntentForSendOptions(scope, "exec", options).intent,
+            aiSelectionIntent: getAiSelectionIntentForSendOptions("a", "exec", options).intent,
           })
         )
       );
@@ -111,6 +120,45 @@ describe("per-chat OpenAI speed", () => {
       expect(getWorkspaceAiSelection("created").serviceTier).toBe(serviceTier);
     }
   );
+
+  // Like the thinking level, the new-workspace page's speed is the project (or global) default.
+  test("a new-workspace speed pick is a saved default that later chats inherit", () => {
+    const project = "/speed-project";
+    const scope = getProjectScopeId(project);
+    setWorkspaceServiceTier(null, scope, "priority");
+    resetAiSelectionIntentForTests(); // A renderer reload keeps saved defaults.
+    expect(getWorkspaceAiSelection(scope).serviceTier).toBe("priority");
+    expect(getSendOptionsFromStorage(scope).serviceTier).toBe("priority");
+    expect(getUserPreferences().ai?.projectDefaults?.[project]?.serviceTier).toBe("priority");
+
+    // Existing chats in the project inherit it until they save their own choice.
+    setWorkspaceAiMetadata("inherits", {
+      projectPath: project,
+      aiSettingsByAgent: { exec: saved },
+    });
+    setWorkspaceAiMetadata("own", {
+      projectPath: project,
+      aiSettingsByAgent: { exec: { ...saved, serviceTier: "default" } },
+    });
+    setWorkspaceAiMetadata("elsewhere", {
+      projectPath: "/other",
+      aiSettingsByAgent: { exec: saved },
+    });
+    expect(getWorkspaceAiSelection("inherits").serviceTier).toBe("priority");
+    expect(getWorkspaceAiSelection("own").serviceTier).toBe("default");
+    expect(getWorkspaceAiSelection("elsewhere").serviceTier).toBeUndefined();
+
+    // The global new-workspace page sets the fallback for every project.
+    setWorkspaceServiceTier(null, GLOBAL_SCOPE_ID, "ultrafast");
+    expect(getWorkspaceAiSelection("elsewhere").serviceTier).toBe("ultrafast");
+    expect(getWorkspaceAiSelection("inherits").serviceTier).toBe("priority");
+
+    // Draft scopes have no saved defaults; they keep an unsent pick.
+    const draft = getDraftScopeId(project, "draft-1");
+    setWorkspaceServiceTier(null, draft, "default");
+    expect(getWorkspaceAiSelection(draft).serviceTier).toBe("default");
+    expect(getUserPreferences().ai?.projectDefaults?.[project]?.serviceTier).toBe("priority");
+  });
 
   test("legacy absence remains inheritable while turning Fast off is an explicit default", () => {
     setWorkspaceAiMetadata("a", { aiSettings: saved });
