@@ -9,6 +9,9 @@ import { PHONE_CHROME_WIDTHS } from "@/common/staticWorkspaceView/phoneChrome";
 import { PHONE_CHROME_JSON } from "@/common/staticWorkspaceView/phoneChrome.generated";
 import { VIEW_BUILDER_SOURCE } from "@/common/staticWorkspaceView/viewBuilder";
 import { FIRST_RUN_MODULES_ID } from "@/node/orpc/firstRunView";
+import type { IncomingHttpHeaders } from "node:http";
+import { deferAppModules } from "@/node/orpc/staticAssets";
+import { stripAppProxyBasePath } from "@/common/appProxyBasePath";
 
 const q = (value: string) => JSON.stringify(value);
 /** The app loads at this point when the tail has not answered: a slow tail never holds it longer. */
@@ -116,3 +119,42 @@ export const WORKSPACE_VIEW_EARLY_SCRIPT = `(() => {
 // An inline script ends at the first "</script" and changes parse state at "<!--" or "<script".
 // The skeleton JSON escapes "<" (\u003c), and no line of the script or the builder may hold one.
 assert(!/<\/script|<!--|<script/i.test(WORKSPACE_VIEW_EARLY_SCRIPT), "unsafe inline script");
+
+/**
+ * Whether a page request looks like a phone, the only device the static view draws on. A false
+ * positive costs nothing: the early script checks the real width and pointer. Browsers send
+ * Sec-CH-UA-Mobile only to secure origins, so `xum server` over plain http on a LAN depends on the
+ * User-Agent: "Mobi" is MDN's rule, in iPhone and Android phone agents but not in tablet ones.
+ */
+export function isPhoneRequest(headers: IncomingHttpHeaders): boolean {
+  return headers["sec-ch-ua-mobile"] === "?1" || (headers["user-agent"] ?? "").includes("Mobi");
+}
+
+/** `/workspace/<id>`, also behind a Coder app proxy path (/@user/ws/apps/xum/workspace/<id>). */
+function isWorkspacePage(path: string): boolean {
+  return /^\/workspace\/[^/]+$/.test(stripAppProxyBasePath(path).routePathname);
+}
+
+/**
+ * The SPA page for a phone's `/workspace/<id>`: the app's module tags move into the module list
+ * right after the viewport <meta>, then the early script. Not earlier: before that tag, a phone's
+ * innerWidth is the 980 px default layout width, and the script would see no phone. Not later: an
+ * inline script after the stylesheet waits for it. Any other page, and one without exactly one
+ * module script, a <base> or the viewport <meta>, is served as is.
+ * SECURITY AUDIT: the sink adds only fixed build-time text and the page's own module URLs (escaped
+ * as JSON with "<" as \u003c). Nothing from the request or the workspace reaches it.
+ */
+export function injectWorkspaceView(
+  html: string,
+  page: { path: string; headers: IncomingHttpHeaders }
+): string {
+  const phonePage = isWorkspacePage(page.path) && isPhoneRequest(page.headers);
+  const deferred = phonePage ? deferAppModules(html) : null;
+  const VIEWPORT = /<meta\b[^>]*\bname="viewport"[^>]*>/i;
+  if (!deferred || !/<base\b[^>]*>/i.test(deferred.html) || !VIEWPORT.test(deferred.html)) {
+    return html;
+  }
+  const list = JSON.stringify(deferred.modules).replaceAll("<", "\\u003c");
+  const head = `\n    <script type="application/json" id="${FIRST_RUN_MODULES_ID}">${list}</script>\n    <script>${WORKSPACE_VIEW_EARLY_SCRIPT}</script>`;
+  return deferred.html.replace(VIEWPORT, (meta) => meta + head);
+}

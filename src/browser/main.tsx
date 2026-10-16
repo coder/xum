@@ -15,7 +15,10 @@ import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { initTitlebarInsets } from "@/browser/hooks/useDesktopTitlebar";
 import { resolveBrowserAssetUrl } from "@/browser/utils/frontendBasePath";
 import { removeFirstRunView } from "@/browser/features/SplashScreens/SplashScreenProvider";
-import { removeWorkspaceView } from "@/browser/features/StaticWorkspaceView/removeWorkspaceView";
+import {
+  markAppStarted,
+  removeWorkspaceView,
+} from "@/browser/features/StaticWorkspaceView/removeWorkspaceView";
 
 // Initialize telemetry on app startup
 try {
@@ -103,6 +106,7 @@ export class FirstRunViewErrorBoundary extends React.Component<
   }
 }
 
+markAppStarted();
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <FirstRunViewErrorBoundary>

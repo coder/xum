@@ -42,6 +42,7 @@ import { createFlowControlledWebSocket, type FlowControlObserver } from "@/node/
 import { perfEpochNowMs } from "@/common/utils/perf/clock";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
+import { injectWorkspaceView } from "@/node/orpc/staticWorkspaceView/workspaceViewPage";
 import {
   SERVER_AUTH_SESSION_COOKIE_NAME,
   SERVER_AUTH_SESSION_MAX_AGE_SECONDS,
@@ -1680,11 +1681,14 @@ export async function createOrpcServer({
       if (rawSpaIndexHtml !== null) {
         const isAppRoot = shouldInjectSlashlessRootRedirect(req);
         const spaIndexHtml = injectProxyUriTemplate(
-          injectFirstRunView(
-            injectBaseHref(rawSpaIndexHtml, getPublicBaseHref(req, res), {
-              includeSlashlessRootRedirect: isAppRoot,
-            }),
-            isAppRoot
+          injectWorkspaceView(
+            injectFirstRunView(
+              injectBaseHref(rawSpaIndexHtml, getPublicBaseHref(req, res), {
+                includeSlashlessRootRedirect: isAppRoot,
+              }),
+              isAppRoot
+            ),
+            { path: req.path, headers: req.headers }
           ),
           getBrowserProxyUriTemplate()
         );
