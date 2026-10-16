@@ -84,13 +84,13 @@ function capture(placeholder: unknown) {
   };
   const slot = (selector: string, kids: Node[], scope?: ParentNode) =>
     children.set(one(selector, scope), kids);
+  // Every region that shows workspace or user state is a slot: the page builder fills it.
   slot("[data-testid=workspace-title]", [{ slot: "title" }]);
-  slot("[data-testid=workspace-footer-bar] span.font-mono.truncate", [{ slot: "project" }]);
-  slot("[data-testid=workspace-footer-bar] button span.truncate", []); // the branch
-  slot("[data-component=ModelSelectorGroup] span.truncate", []);
-  slot("[data-thinking-label]", []);
-  slot("[data-context-usage-percent]", []);
+  slot("[data-testid=notify-on-response-button]", [{ slot: "notify" }]);
   slot('[data-component=ChatInputSurface] button[style*="-mode)"]', [{ slot: "mode" }]);
+  slot("[data-component=ModelSelectorGroup]", [{ slot: "model" }]); // model, provider, thinking
+  slot("button:has([data-context-usage-percent])", []); // the usage meter
+  slot("[data-testid=workspace-footer-bar]", [{ slot: "footer" }]); // runtime, project, git
   swapped.set(one('button[aria-label*="skills loaded"]'), placeholder as Node);
   const log = one("[role=log]");
   const convert = (el: Element): Node => {
@@ -141,18 +141,17 @@ async function captureAt(browser: Browser, url: string, width: number) {
     hasTouch: true,
   });
   await page.goto(url);
+  // Explicit readiness, never a quiet interval: the chat view's reveal barrier (data-loaded,
+  // useChatViewDataReady), the loaded skill list and the agent's color. Other late data (git,
+  // usage, settings) sits in slots, and every width is a separate load that must give one tree.
   await page.waitForSelector('[data-testid=message-window][data-loaded="true"] [data-message-id]');
   await page.waitForSelector('button[aria-label*="skills loaded"]');
-  // Late async updates (git status, usage, the agent's color) must not land in the tree: wait for
-  // two equal captures. A capture that fails (a slot element not there yet) is not settled either.
-  let previous: unknown = "";
-  for (let i = 0; i < 40; i++) {
-    const tree = await page.evaluate(capture, SKILLS_PLACEHOLDER).then(JSON.stringify, (e) => e);
-    if (tree === previous) return await page.close().then(() => tree);
-    previous = tree;
-    await page.waitForTimeout(250);
-  }
-  throw previous instanceof Error ? previous : new Error(`the page at ${width} px never settled`);
+  // Attached, not visible: a container query hides the picker at 360 px (CSS only, same DOM).
+  const agent = '[data-component=ChatInputSurface] button[style*="-mode)"]';
+  await page.waitForSelector(agent, { state: "attached" });
+  const tree = JSON.stringify(await page.evaluate(capture, SKILLS_PLACEHOLDER));
+  await page.close();
+  return tree;
 }
 
 /** Where two trees first differ: the key path, the tags on the way and both values; or null. */
