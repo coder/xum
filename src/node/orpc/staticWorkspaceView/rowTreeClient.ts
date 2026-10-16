@@ -107,6 +107,8 @@ class WorkerRowTreeClient implements RowTreeClient {
   ) {}
 
   render(workspaceId: string, rows: RowTreeRow[]) {
+    // Checked before the hash: an oversized batch gets null anyway, so it must cost nothing.
+    if (rows.length === 0 || rows.length > this.limits.maxRows) return Promise.resolve(nulls(rows));
     const cacheKey = memoKey(workspaceId, rows);
     const cached = this.memo.get(cacheKey);
     if (cached) {
@@ -114,7 +116,6 @@ class WorkerRowTreeClient implements RowTreeClient {
       this.memo.set(cacheKey, cached);
       return Promise.resolve(cached.trees);
     }
-    if (rows.length === 0 || rows.length > this.limits.maxRows) return Promise.resolve(nulls(rows));
     clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => this.stop(null), this.limits.idleMs);
     this.idleTimer.unref();

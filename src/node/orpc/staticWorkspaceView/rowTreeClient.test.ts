@@ -140,6 +140,17 @@ describe("createRowTreeClient", () => {
     expect(await c.render("ws", rows)).toEqual([null]);
   });
 
+  test("an oversized batch gets null before its rows are serialized for the memo key", async () => {
+    const c = client("not-a-valid-worker-path.js");
+    const unreadable = Object.assign(row("x")[0], {
+      toJSON: () => {
+        throw new Error("the rows were serialized");
+      },
+    });
+    const oversized = Array.from({ length: 41 }, () => unreadable);
+    expect(await c.render("ws", oversized)).toEqual(oversized.map(() => null));
+  });
+
   test("a worker that cannot start gives null rows", async () => {
     const c = client("not-a-valid-worker-path.js"); // Worker throws synchronously for this path
     for (let i = 0; i < 4; i++) expect(await c.render("ws", rows)).toEqual([null]);
