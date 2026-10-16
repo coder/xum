@@ -114,6 +114,7 @@ import { MuxGatewaySessionExpiredDialog } from "./components/MuxGatewaySessionEx
 import { SshPromptDialog } from "./components/SshPromptDialog/SshPromptDialog";
 import { TerminalDialog } from "./components/TerminalView/TerminalDialog";
 import { SplashScreenProvider } from "./features/SplashScreens/SplashScreenProvider";
+import { WorkspaceViewGuard } from "./features/StaticWorkspaceView/workspaceViewHandoff";
 import { TutorialProvider } from "./contexts/TutorialContext";
 import { PowerModeProvider } from "./contexts/PowerModeContext";
 import { TooltipProvider } from "./components/Tooltip/Tooltip";
@@ -1570,6 +1571,7 @@ function AppInner() {
                     : "root"
             }
           >
+            <WorkspaceViewGuard />
             {/* Settings and analytics are modals over whatever page they were opened from, so the
                 page stays mounted underneath them. */}
             {selectedWorkspace ? (
