@@ -248,6 +248,19 @@ export class CreationDraftStore {
   private listedClient: APIClient | null = null;
   private readonly blankIds = new Map<string, string>();
 
+  constructor() {
+    // The save debounce is the only unload risk (main wrote localStorage at once): save as soon
+    // as the page goes away, as DraftStore does.
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+      window.addEventListener("beforeunload", () => this.flushDebounced());
+    }
+    if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") this.flushDebounced();
+      });
+    }
+  }
+
   setClient(client: APIClient | null): void {
     if (client === this.client) return;
     this.client = client;
@@ -491,6 +504,12 @@ export class CreationDraftStore {
       });
       await entry.inFlight;
       if (entry.saveError !== null) throw new Error(entry.saveError);
+    }
+  }
+
+  private flushDebounced(): void {
+    for (const [id, entry] of this.entries) {
+      if (entry.timer) this.flushInBackground(id);
     }
   }
 

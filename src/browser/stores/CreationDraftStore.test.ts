@@ -244,6 +244,21 @@ describe("CreationDraftStore", () => {
     });
   });
 
+  test("an edit still in its save debounce is saved when the page goes away", async () => {
+    using tempDir = new TestTempDir("creation-store-unload");
+    const harness = await createHarness(tempDir);
+    const { store, service, control } = harness;
+    const id = store.create(PROJECT_A, null, { persist: true });
+    await store.flush(id);
+    store.update(id, { text: "typed just before reload" });
+    const saves = control.updates.length;
+    window.dispatchEvent(new Event("beforeunload"));
+    // Sent at once, not after the debounce.
+    expect(control.updates.length).toBe(saves + 1);
+    await waitFor(() => !store.getView(id).unsaved);
+    expect((await service.get(id))?.text).toBe("typed just before reload");
+  });
+
   test("a failed or timed-out read shows Retry and never an editable blank draft", async () => {
     using tempDir = new TestTempDir("creation-store-read-failure");
     const harness = await createHarness(tempDir);
