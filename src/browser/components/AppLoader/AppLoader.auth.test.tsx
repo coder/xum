@@ -128,10 +128,8 @@ void mock.module("@/browser/components/AuthTokenModal/AuthTokenModal", () => ({
     <div data-testid="AuthTokenModalMock">{props.error ?? "no-error"}</div>
   ),
   getStoredAuthToken: () => null,
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
-  setStoredAuthToken: () => {},
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
-  clearStoredAuthToken: () => {},
+  setStoredAuthToken: () => Promise.resolve(),
+  clearStoredAuthToken: () => Promise.resolve(),
 }));
 
 import type { AppLoader as AppLoaderComponent } from "../AppLoader/AppLoader";

@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { useRef } from "react";
 import { LeftSidebar } from "./LeftSidebar";
@@ -147,9 +148,10 @@ function LeftSidebarStoryShell(props: LeftSidebarStoryShellProps) {
 
   if (clientRef.current === null) {
     clientRef.current = props.setup();
-    // No AppLoader here: connect the drafts store, which owns the creation draft list and imports
-    // the story's seeded legacy list from the mock backend.
+    // No AppLoader here: connect the draft stores. The creation draft store owns the sidebar's
+    // draft rows and imports the story's seeded legacy drafts into the mock backend.
     getDraftStore().setClient(clientRef.current);
+    getCreationDraftStore().setClient(clientRef.current);
   }
   const providerTreeKey = `${renderKey ?? "left-sidebar"}:${MODULE_RENDER_TOKEN}:${remountEpochRef.current}`;
 

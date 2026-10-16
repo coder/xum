@@ -98,6 +98,7 @@ import {
 } from "@/common/schemas/project";
 import {
   getValidAgentMessageDispatchMode,
+  getValidMessagingTag,
   getValidUnrelatedWorkspaceConsent,
 } from "@/common/orpc/schemas/workspace";
 import {
@@ -1114,7 +1115,72 @@ function dropSingleKeyLegacyCopies(
   }
 }
 
-/** An alias group whose merge kept one of two different rows for the same workspace. */
+/**
+ * True when two rows share a workspace id. Allocates nothing for 0 or 1 rows, and stops at the
+ * first duplicate.
+ */
+function hasDuplicateRowId(workspaces: ProjectConfig["workspaces"]): boolean {
+  if (workspaces.length < 2) return false;
+  const seen = new Set<string>();
+  for (const workspace of workspaces) {
+    if (!workspace.id) continue;
+    if (seen.has(workspace.id)) return true;
+    seen.add(workspace.id);
+  }
+  return false;
+}
+
+/** The ids that more than one row holds, each once, in one pass. */
+function duplicateRowIds(workspaces: ProjectConfig["workspaces"]): string[] {
+  const seen = new Set<string>();
+  const duplicated = new Set<string>();
+  for (const workspace of workspaces) {
+    if (!workspace.id) continue;
+    if (seen.has(workspace.id)) duplicated.add(workspace.id);
+    else seen.add(workspace.id);
+  }
+  return [...duplicated];
+}
+
+/**
+ * The ids that one alias entry holds in more than one row. The alias merge keeps an identical
+ * copy once without a conflict, so without this list a save would drop the copy with no backup.
+ */
+function aliasEntryDuplicateIds(group: StoredProjectEntry[]): string[] {
+  return group.flatMap((entry) =>
+    hasDuplicateRowId(entry.config.workspaces) ? duplicateRowIds(entry.config.workspaces) : []
+  );
+}
+
+/**
+ * One stored key can already hold two rows with one workspace id: an earlier build saved them, and
+ * no merge repairs them, because neither row is an alias or a legacy copy (#6717). Keep the first
+ * row for each id: the row lookups and the task index already resolve a repeated id to its first
+ * row (#4550), so the user sees the same workspace and parent as before. Record a conflict for every repair, an identical copy
+ * included, so the original bytes are backed up before any save drops a row. All copies share the
+ * id's session folder, so no session history is lost. A copy on another checkout path loses only
+ * its config row: its checkout stays on disk and its row stays in the backup.
+ */
+function healSingleKeyDuplicateIds(
+  key: string,
+  entry: StoredProjectEntry,
+  conflicts: ProjectAliasConflict[]
+): ProjectConfig {
+  if (!hasDuplicateRowId(entry.config.workspaces)) return entry.config;
+  const duplicatedIds = duplicateRowIds(entry.config.workspaces);
+  const keptIds = new Set<string>();
+  // The rows only: settings and trust stay exactly as stored for a single key.
+  entry.config.workspaces = entry.config.workspaces.filter((workspace) => {
+    if (!workspace.id) return true;
+    if (keptIds.has(workspace.id)) return false;
+    keptIds.add(workspace.id);
+    return true;
+  });
+  conflicts.push({ path: key, storedKeys: [entry.storedKey], conflictingIds: duplicatedIds });
+  return entry.config;
+}
+
+/** A stored project whose rows needed a repair that a save would persist (see the callers). */
 interface ProjectAliasConflict {
   path: string;
   storedKeys: string[];
@@ -1143,17 +1209,22 @@ function buildProjectsFromStoredEntries(
   const projects = new Map<string, ProjectConfig>();
   for (const [key, group] of groups) {
     if (group.length === 1) {
-      projects.set(key, group[0].config);
+      // Legacy copies first: the heal can drop the only id row on a legacy row's path, and the
+      // id migration would then give that legacy row the same id again.
       dropSingleKeyLegacyCopies(key, group[0], conflicts, resolveLegacyId);
+      projects.set(key, healSingleKeyDuplicateIds(key, group[0], conflicts));
       continue;
     }
     const storedKeys = group.map((entry) => entry.storedKey);
     const merged = mergeProjectAliases(group);
     const conflictingIds = [
-      ...merged.conflictingIds,
-      ...dropLegacyDuplicateRows(merged.config.workspaces, (workspace) =>
-        resolveLegacyId(key, workspace)
-      ),
+      ...new Set([
+        ...merged.conflictingIds,
+        ...aliasEntryDuplicateIds(group),
+        ...dropLegacyDuplicateRows(merged.config.workspaces, (workspace) =>
+          resolveLegacyId(key, workspace)
+        ),
+      ]),
     ];
     if (conflictingIds.length > 0) {
       conflicts.push({ path: key, storedKeys, conflictingIds });
@@ -2287,7 +2358,7 @@ export class Config {
       // A reused sidecar means an earlier load already logged this content.
       if (!sidecar.reused) {
         log.error(
-          `Project config entries share a path and hold conflicting rows for the same workspace. Xum keeps one row per workspace. The original config.json bytes, with every row, were backed up to ${sidecar.path}.`,
+          `config.json holds more than one row for the same workspace. Xum keeps one row per workspace. The original config.json bytes, with every row, were backed up to ${sidecar.path}.`,
           { conflicts }
         );
       }
@@ -2309,7 +2380,7 @@ export class Config {
     const signature = `${sha256Hex(rawBytes)}:${(error as NodeJS.ErrnoException).code ?? message}`;
     if (rememberAliasBackupFailure(this.configFile, signature)) {
       log.error(
-        `Project config entries share a path and hold conflicting rows for the same workspace, and the backup of ${this.configFile} failed (${message}). Settings changes will not overwrite config.json until a backup succeeds.`,
+        `config.json holds more than one row for the same workspace, and the backup of ${this.configFile} failed (${message}). Settings changes will not overwrite config.json until a backup succeeds.`,
         { conflicts }
       );
     }
@@ -4786,6 +4857,8 @@ export class Config {
               unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
                 workspace.unrelatedWorkspaceConsent
               ),
+              // Fail closed: a corrupted/invalid tag publishes as absent (untagged).
+              messagingTag: getValidMessagingTag(workspace.messagingTag),
               agentMessageDispatchMode: getValidAgentMessageDispatchMode(
                 workspace.agentMessageDispatchMode
               ),
@@ -5068,7 +5141,12 @@ export class Config {
               });
             }
 
-            workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
+            // The messaging tag lives only in config (legacy metadata.json predates it), so
+            // overlay the validated config value or a tag write would publish stale metadata.
+            workspaceMetadata.push({
+              ...this.addPathsToMetadata(metadata, workspace.path),
+              messagingTag: getValidMessagingTag(workspace.messagingTag),
+            });
             metadataFound = true;
           }
 
@@ -5095,6 +5173,8 @@ export class Config {
               unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
                 workspace.unrelatedWorkspaceConsent
               ),
+              // Fail closed: a corrupted/invalid tag publishes as absent (untagged).
+              messagingTag: getValidMessagingTag(workspace.messagingTag),
               agentMessageDispatchMode: getValidAgentMessageDispatchMode(
                 workspace.agentMessageDispatchMode
               ),
@@ -5179,6 +5259,7 @@ export class Config {
             unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
               workspace.unrelatedWorkspaceConsent
             ),
+            messagingTag: getValidMessagingTag(workspace.messagingTag),
             agentMessageDispatchMode: getValidAgentMessageDispatchMode(
               workspace.agentMessageDispatchMode
             ),
@@ -5413,6 +5494,7 @@ export class Config {
         unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
           metadata.unrelatedWorkspaceConsent
         ),
+        messagingTag: getValidMessagingTag(metadata.messagingTag),
         agentMessageDispatchMode: getValidAgentMessageDispatchMode(
           metadata.agentMessageDispatchMode
         ),
@@ -5460,6 +5542,9 @@ export class Config {
           pendingRemoval: existing.pendingRemoval,
           pendingArchive: existing.pendingArchive,
           unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
+          // Server-owned and unpublished on metadata: a round trip must not drop it,
+          // or in-flight tagged sends would read a spurious revocation.
+          messagingTagGeneration: existing.messagingTagGeneration,
           delegatedCreation: existing.delegatedCreation,
           // Monotone (#5174): a metadata round trip never un-marks a migrated plan.
           remotePlanMigrated: existing.remotePlanMigrated,

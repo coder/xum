@@ -41,12 +41,32 @@ export interface Options {
    * removed and the target stays untouched. Lets a caller refuse to replace bytes it did not read.
    */
   beforeRename?: (target: string) => void;
+  /**
+   * Runs once, right after the rename and before the parent directory fsync: the moment readers
+   * of the target see the new contents. Opt-in; the write still resolves only after the fsync.
+   * Lets a caller publish in-memory state at that moment (DraftService, #6728). A throw is logged
+   * and does not fail the write: the file is already replaced.
+   */
+  afterRename?: () => void;
 }
 
 type ResolvedOptions = Options & {
   encoding: BufferEncoding;
   beforeRename: (target: string) => void;
 };
+
+/** Runs `afterRename`; a throw is logged, never raised (the rename already replaced the target). */
+function runAfterRename(options: ResolvedOptions, target: string): void {
+  if (!options.afterRename) return;
+  try {
+    options.afterRename();
+  } catch (error) {
+    log.error("writeFileAtomic: afterRename failed after the target was replaced", {
+      target,
+      error: getErrorMessage(error),
+    });
+  }
+}
 
 /** The beforeRename default: replace the target without a check. */
 function noCheck(): void {
@@ -258,6 +278,7 @@ async function writeFileAtomicUnserialized(
     fd = undefined;
     await applyOwnership(tempFile, options);
     await renameWithRetry(tempFile, target, options.beforeRename);
+    runAfterRename(options, target);
     if (options.fsync !== false) {
       await fsyncParentDirectory(target);
     }
@@ -393,6 +414,7 @@ export function sync(
     // in-process reader holds open.
     resolved.beforeRename(target);
     fs.renameSync(tempFile, target);
+    runAfterRename(resolved, target);
     if (resolved.fsync !== false) {
       fsyncParentDirectorySync(target);
     }

@@ -15,6 +15,8 @@ import {
 } from "@/common/utils/agentSkills/skillSnapshot";
 import { resolveSkillReadIdentity } from "@/common/utils/agentSkills/skillLookupName";
 
+import { prependSkillDirectoryNote, type SkillDirectory } from "./skillDirectory";
+
 interface CreateLoadedSkillSnapshotArgs {
   name: string;
   scope: unknown;
@@ -105,6 +107,30 @@ function getMessageTextContent(message: MuxMessage): string {
     .join("");
 }
 
+/**
+ * The SkillDirectory an agent_skill_read result reported. Fields are read one
+ * by one, not with the full result schema: persisted history is untrusted, and
+ * one malformed optional field must not drop the whole skill from later
+ * requests (it degrades to the bare body instead).
+ */
+function getToolResultSkillDirectory(toolResult: {
+  skillDir?: unknown;
+  pluginRoot?: unknown;
+  skillDirUnavailable?: unknown;
+}): SkillDirectory | undefined {
+  if (typeof toolResult.skillDir === "string" && toolResult.skillDir.length > 0) {
+    return {
+      available: true,
+      skillDir: toolResult.skillDir,
+      ...(typeof toolResult.pluginRoot === "string" ? { pluginRoot: toolResult.pluginRoot } : {}),
+    };
+  }
+  if (typeof toolResult.skillDirUnavailable === "string") {
+    return { available: false, reason: toolResult.skillDirUnavailable };
+  }
+  return undefined;
+}
+
 function extractLoadedSkillSnapshotFromToolOutput(
   output: unknown,
   input?: unknown
@@ -113,7 +139,13 @@ function extractLoadedSkillSnapshotFromToolOutput(
     return null;
   }
 
-  const toolResult = output as { success?: unknown; skill?: unknown };
+  const toolResult = output as {
+    success?: unknown;
+    skill?: unknown;
+    skillDir?: unknown;
+    pluginRoot?: unknown;
+    skillDirUnavailable?: unknown;
+  };
   if (toolResult.success !== true) {
     return null;
   }
@@ -124,10 +156,20 @@ function extractLoadedSkillSnapshotFromToolOutput(
   }
 
   const skill = parsedSkill.data;
+  // #6704/#6462: rebuilding the snapshot from the body alone dropped where the
+  // skill's bundled files are, so after compaction the model saw a bare
+  // ${CLAUDE_SKILL_DIR} with no path or off-host note, and this bare snapshot
+  // replaced an earlier slash snapshot's directory line in
+  // mergeLoadedSkillSnapshots. Use the slash-snapshot builder: it also hides
+  // unsafe paths, since persisted history is untrusted.
+  const directory = getToolResultSkillDirectory(toolResult);
+  // Results persisted before #6409 have no location fields: keep the body.
+  const body = directory != null ? prependSkillDirectoryNote(skill.body, directory) : skill.body;
+
   return createLoadedSkillSnapshot({
     name: resolveSkillReadIdentity(input, skill.frontmatter.name),
     scope: skill.scope,
-    body: skill.body,
+    body,
     frontmatterYaml: stringifyAgentSkillFrontmatter(skill.frontmatter),
   });
 }

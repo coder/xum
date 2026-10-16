@@ -20,9 +20,9 @@ import { addProjectViaUI, cleanupView, setupTestDom, waitForLatestDraftId } from
 import { ChatHarness } from "../harness";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { getAgentsInitNudgeKey, getDraftScopeId } from "@/common/constants/storage";
 import { BRANCH_LIST_TIMEOUT_MS } from "@/browser/features/ChatInput/branchListLoad";
-import type { DraftScope } from "@/common/orpc/schemas/drafts";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
@@ -174,10 +174,12 @@ async function openCreationViewWithHeldBranches(options?: {
   await openCreationViewWhileBranchesLoad(view, projectPath);
   await waitFor(() => expect(held.spy).toHaveBeenCalled(), { timeout: 10_000 });
   const draftId = await waitForLatestDraftId(projectPath);
-  const scope: DraftScope = { kind: "creation", projectPath, draftId };
-  const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), scope);
+  const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), {
+    kind: "creation",
+    draftId,
+  });
   const create = jest.spyOn(env.services.workspaceService, "create");
-  return { env, view, cleanupDom, chat, held, create };
+  return { env, view, cleanupDom, chat, held, create, draftId };
 }
 
 describeIntegration("creation composer while the branch list loads (#6033)", () => {
@@ -266,8 +268,10 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
       await openCreationViewWhileBranchesLoad(view, projectPath);
       await waitFor(() => expect(reject).toHaveBeenCalled(), { timeout: 10_000 });
       const draftId = await waitForLatestDraftId(projectPath);
-      const scope: DraftScope = { kind: "creation", projectPath, draftId };
-      const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), scope);
+      const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), {
+        kind: "creation",
+        draftId,
+      });
       await chat.typeWithoutSending("hello after a failed branch list");
 
       await waitFor(() => expect(view.container.textContent ?? "").toContain(BRANCH_LIST_FAILED), {
@@ -314,10 +318,15 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
     BRANCH_LIST_TIMEOUT_MS + 60_000
   );
 
-  test("Run /init clicked after the branches load sends /init at once", async () => {
-    const { view, cleanupDom, held, create } = await openCreationViewWithHeldBranches({
-      showAgentsInitBanner: true,
-    });
+  test("Run /init clicked after the branches load sends /init at once, in Exec", async () => {
+    const { env, view, cleanupDom, held, create, draftId } = await openCreationViewWithHeldBranches(
+      {
+        showAgentsInitBanner: true,
+      }
+    );
+    // The draft owns its agent, so Run /init must switch the draft itself to Exec.
+    getCreationDraftStore().updateExecution(draftId, { agent: { id: "plan", scope: "built-in" } });
+    const send = jest.spyOn(env.services.workspaceService, "sendMessage");
     try {
       held.release();
       await waitFor(
@@ -329,12 +338,18 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
         },
         { timeout: 10_000 }
       );
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(false), {
+        timeout: 10_000,
+      });
       fireEvent.click(await runInitButton(view.container));
       await waitFor(() => expect(create).toHaveBeenCalledTimes(1), { timeout: 30_000 });
+      await waitFor(() => expect(send).toHaveBeenCalled(), { timeout: 30_000 });
+      expect(send.mock.calls[0]?.[2].agentId).toBe("exec");
     } finally {
       held.release();
       held.spy.mockRestore();
       create.mockRestore();
+      send.mockRestore();
       await cleanupView(view, cleanupDom);
     }
   }, 90_000);

@@ -42,9 +42,33 @@ export function getDraftScopeId(projectPath: string, draftId: string): string {
 const DRAFT_SCOPE_ID_PREFIX = "__draft__/";
 
 /**
+ * A creation draft composer's scope: keyed by the draft id alone, so a project change keeps
+ * every choice made in it (CreationDraftStore holds them in the draft's record).
+ */
+export function getCreationDraftScopeId(draftId: string): string {
+  return `${CREATION_DRAFT_SCOPE_ID_PREFIX}${draftId}`;
+}
+
+/** The draft id of a getCreationDraftScopeId scope, else null. */
+export function parseCreationDraftScopeId(scopeId: string): string | null {
+  return scopeId.startsWith(CREATION_DRAFT_SCOPE_ID_PREFIX)
+    ? scopeId.slice(CREATION_DRAFT_SCOPE_ID_PREFIX.length)
+    : null;
+}
+
+const CREATION_DRAFT_SCOPE_ID_PREFIX = "__creation__/";
+
+/**
  * Global scope ID for workspace-independent preferences
  */
 export const GLOBAL_SCOPE_ID = "__global__";
+
+const NON_WORKSPACE_SCOPE_PREFIXES = [
+  getProjectScopeId(""),
+  getPendingScopeId(""),
+  DRAFT_SCOPE_ID_PREFIX,
+  CREATION_DRAFT_SCOPE_ID_PREFIX,
+];
 
 /**
  * Global, project, pending and draft composer scopes. Every other id is a workspace id,
@@ -53,9 +77,7 @@ export const GLOBAL_SCOPE_ID = "__global__";
 export function isNonWorkspaceScopeId(scopeId: string): boolean {
   return (
     scopeId === GLOBAL_SCOPE_ID ||
-    scopeId.startsWith(getProjectScopeId("")) ||
-    scopeId.startsWith(getPendingScopeId("")) ||
-    scopeId.startsWith(DRAFT_SCOPE_ID_PREFIX)
+    NON_WORKSPACE_SCOPE_PREFIXES.some((prefix) => scopeId.startsWith(prefix))
   );
 }
 

@@ -190,8 +190,10 @@ function getReviewStatusSidebarClasses(status: Review["status"]): {
   if (status === "checked") {
     return {
       accent: "bg-success",
-      badge: "bg-success/20 text-success",
-      icon: "text-success",
+      // Foreground text on the success tint: success text on its own tint was 2.3-3.9:1 in every
+      // theme (#6767). The tint, the accent bar and the icon keep the success color.
+      badge: "bg-success/20 text-foreground",
+      icon: "text-success-text",
     };
   }
 

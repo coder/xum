@@ -23,6 +23,7 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   anthropic: "Anthropic",
   openai: "OpenAI",
   google: "Google",
+  "google-vertex": "Google Vertex AI",
   xai: "xAI",
   unknown: "Unknown",
 };

@@ -24,7 +24,7 @@ export function WorkflowBadge(props: {
     <span
       className={cn(
         "border-border bg-background/40 rounded border px-1.5 py-0.5 text-[10px] font-medium whitespace-nowrap",
-        props.tone === "success" && "border-success/30 text-success",
+        props.tone === "success" && "border-success/30 text-success-text",
         props.tone === "warning" && "border-warning/30 text-warning",
         // Blocked workflows/actions need to stand apart from yellow external-action warnings.
         props.tone === "danger" && "border-danger/40 bg-danger-overlay text-danger",

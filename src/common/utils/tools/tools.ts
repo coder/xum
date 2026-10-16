@@ -1193,8 +1193,15 @@ export async function getToolsForModel(
         break;
       }
 
-      case "google": {
+      case "google":
+      case "google-vertex": {
+        // The wire model ID, unlike the OpenAI and xAI branches: @ai-sdk/google picks tool
+        // support from the ID it sends, and for an ID it does not see as Gemini 3 (a "Treat
+        // as" alias) it drops provider tools and every function tool with them. The
+        // allowlist below still removes these tools when the capability model lacks them.
         if (supportsGoogleNativeToolsWithFunctionTools(modelId)) {
+          // @ai-sdk/google-vertex re-exports these same tool factories (tools are
+          // matched by id, not provider instance), so one import serves both.
           const { google } = await import("@ai-sdk/google");
           allTools = {
             ...baseTools,

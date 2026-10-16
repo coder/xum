@@ -75,6 +75,9 @@ export interface ToolExecutionHost {
   env?: Record<string, string>;
 }
 
+/** Outcome of ToolExecuteContext.parseInput: on success, the value the tool runs with. */
+export type ToolInputParseResult = { success: true; value: unknown } | { success: false };
+
 export interface ToolExecuteContext {
   readonly toolName: string;
   /**
@@ -88,6 +91,11 @@ export interface ToolExecuteContext {
   readonly abortSignal?: AbortSignal;
   /** The tool's input JSON schema, when the caller holds the Tool (validates hook rewrites). */
   readonly inputJsonSchema?: () => unknown;
+  /**
+   * The tool's own input parser, when the caller holds a Tool whose schema has one (Zod): a hook
+   * rewrite must pass it too, since the JSON schema omits refinements and defaults.
+   */
+  readonly parseInput?: (value: unknown) => Promise<ToolInputParseResult>;
   /** Server and original name of an MCP tool (Codex hooks match `mcp__<server>__<tool>`). */
   readonly mcpOrigin?: { serverName: string; toolName: string };
   /** Set by the terminal after the tool actually executed. */

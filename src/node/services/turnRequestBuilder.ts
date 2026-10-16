@@ -773,7 +773,10 @@ interface TurnRequestBuilderDependencies {
   sessionUsageService?: SessionUsageService;
   devToolsService?: DevToolsService;
   experimentsService?: Pick<ExperimentsService, "isExperimentEnabled">;
-  lastLlmRequestByWorkspace: Map<string, DebugLlmRequestSnapshot>;
+  /** Only written here; AIService owns the bounded store and its reads. */
+  lastLlmRequestByWorkspace: {
+    set(workspaceId: string, snapshot: DebugLlmRequestSnapshot): unknown;
+  };
   bindings: TurnRequestBuilderBindings;
   emit: (event: string, ...args: unknown[]) => boolean;
   createAbortedTurnHandle: (messageId: string, signal?: AbortSignal) => TurnStreamHandle;

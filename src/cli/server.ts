@@ -25,6 +25,12 @@ import { resolveInstallLayout } from "@/node/services/serverUpdate/installLayout
 import { appendServerCrashLogSync } from "./serverCrashLogging";
 import { shouldExposeLaunchProject } from "./launchProject";
 import { startMajorGcHeapFields } from "./memoryBreadcrumbs";
+import { OOM_HEAP_SNAPSHOT_STARTUP_WAIT_MS, prepareOomHeapSnapshots } from "./oomHeapSnapshot";
+import * as v8 from "node:v8";
+import {
+  createRowTreeClient,
+  defaultRowTreeWorkerPath,
+} from "@/node/orpc/staticWorkspaceView/rowTreeClient";
 
 // Server-mode crashes can terminate the process before the async logger flushes,
 // so these top-level hooks mirror fatal details into mux.log synchronously.
@@ -136,6 +142,18 @@ async function main(): Promise<void> {
     console.error(`Use 'xum api' commands to interact with the running instance.`);
     process.exit(1);
   }
+  // Opt-in OOM diagnostics (<xum root>/heap-snapshots exists): arm one near-heap-limit snapshot
+  // unless one already exists. Runs only for the process that becomes the server; it never
+  // throws, and a slow filesystem holds startup for at most the bound.
+  await raceWithAbortAndTimeout(
+    prepareOomHeapSnapshots({
+      xumHome,
+      cwd: () => process.cwd(),
+      setHeapSnapshotNearHeapLimit: (limit) => v8.setHeapSnapshotNearHeapLimit(limit),
+      log,
+    }),
+    { timeoutMs: OOM_HEAP_SNAPSHOT_STARTUP_WAIT_MS }
+  );
 
   const stores = createConfigStores();
   const config = stores.config;
@@ -169,7 +187,10 @@ async function main(): Promise<void> {
     config.getServerSshHost();
   serviceContainer.serverService.setSshHost(sshHost);
 
-  const context = serviceContainer.toORPCContext();
+  // T3 #5971: only `xum server` serves the static workspace view. The factory stores fields only:
+  // the row-tree worker starts on the first workspace.history.tail request, never at startup.
+  const rowTreeClient = createRowTreeClient({ workerPath: defaultRowTreeWorkerPath() });
+  const context = { ...serviceContainer.toORPCContext(), rowTreeClient };
 
   // Start server via ServerService (handles lockfile, mDNS, network URLs)
   const serverInfo = await serviceContainer.serverService.startServer({
@@ -278,6 +299,7 @@ async function main(): Promise<void> {
         serviceContainer.terminalService.closeAllSessions()
       );
 
+      shutdownStep("rowTreeClient.dispose", () => rowTreeClient.dispose());
       // Dispose background processes (writes its own per-step [shutdown] lines)
       await serviceContainer.dispose();
 

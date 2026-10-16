@@ -23,14 +23,26 @@ import { parseArgs } from "node:util";
 import { chromium } from "playwright";
 import { diffSeed, snapshotSeed, writeNeutralSeed } from "./neutralSeed";
 import * as core from "./pageTimingCore";
-import { probe, STATIC_VIEW_ID } from "./pageTimingProbe";
+import { probe, STATIC_VIEW_IDS } from "./pageTimingProbe";
 import * as stats from "./pageTimingStats";
 import { BLOCK_PAIRS, gate, kthLargest, launchPlan, median, type Signal } from "./pageTimingStats";
 
 /** Lighthouse's mobile values, applied as DevTools throttling: real timings, not the simulator's. */
 const viewport = { width: 412, height: 823 };
+/**
+ * Lighthouse's mobile User-Agent (its emulatedUserAgent). `xum server` picks a phone page by the
+ * User-Agent ("Mobi"), and Chrome sends no Sec-CH-UA-Mobile over plain http.
+ */
+const LIGHTHOUSE_MOBILE_UA =
+  "Mozilla/5.0 (Linux; Android 11; moto g power (2022)) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36";
 const PHONE = {
-  context: { viewport, deviceScaleFactor: 1.75, isMobile: true, hasTouch: true },
+  context: {
+    viewport,
+    deviceScaleFactor: 1.75,
+    isMobile: true,
+    hasTouch: true,
+    userAgent: LIGHTHOUSE_MOBILE_UA,
+  },
   network: {
     offline: false,
     latency: 562.5,
@@ -167,7 +179,7 @@ async function browse(o: Parameters<typeof measure>[0], url: string) {
     let [workers, fromWorker] = [0, 0];
     context.on("serviceworker", () => workers++);
     const { mode, page } = o;
-    const arg = { target: core.TARGET[page], mode, page, staticViewId: STATIC_VIEW_ID };
+    const arg = { target: core.TARGET[page], mode, page, staticViewIds: STATIC_VIEW_IDS };
     // tsx (esbuild keepNames) wraps the probe's inner functions in __name(), which the page lacks.
     const content = `var __name = (f) => f; (${probe})(${JSON.stringify(arg)})`;
     await context.addInitScript({ content });

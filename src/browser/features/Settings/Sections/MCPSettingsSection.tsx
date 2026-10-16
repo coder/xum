@@ -654,12 +654,30 @@ const InsufficientScopePrompt: React.FC<{ status: MCPOAuthAuthStatus | null }> =
   );
 };
 
+/** Recorded insufficient_scope prompts per credential key: a count that makes each one new. */
+type InsufficientScopeTicks = Readonly<Record<string, number>>;
+
+/**
+ * This row's own count. A prompt for another key leaves it unchanged, so that row does not
+ * read its status again.
+ */
+function ownScopeTickOf(
+  ticks: InsufficientScopeTicks | undefined,
+  status: MCPOAuthAuthStatus | null
+): number | undefined {
+  const key = status?.serverUrl;
+  if (ticks === undefined || key === undefined) return undefined;
+  return ticks[key];
+}
+
 const RemoteMCPOAuthSection: React.FC<{
   serverName: string;
   transport: Exclude<MCPServerTransport, "stdio">;
   url: string;
   oauthRefreshNonce?: number;
-}> = ({ serverName, transport, url, oauthRefreshNonce }) => {
+  /** Recorded insufficient_scope prompts (#6739): this row re-reads on its own key's. */
+  scopeTicks?: InsufficientScopeTicks;
+}> = ({ serverName, transport, url, oauthRefreshNonce, scopeTicks }) => {
   const { api } = useAPI();
   const isDesktop = !!window.api;
 
@@ -693,9 +711,12 @@ const RemoteMCPOAuthSection: React.FC<{
     }
   }, [api, url, serverName]);
 
+  // getAuthStatus returns the credential key as `serverUrl`; a row that has not loaded yet reads
+  // the prompt on its first load.
+  const ownScopeTick = ownScopeTickOf(scopeTicks, authStatus);
   useEffect(() => {
     void refreshAuthStatus();
-  }, [refreshAuthStatus, transport, url, oauthRefreshNonce]);
+  }, [refreshAuthStatus, transport, url, oauthRefreshNonce, ownScopeTick]);
 
   const { loginStatus, loginError, loginInProgress, startLogin, cancelLogin } = useMCPOAuthLogin({
     isDesktop,
@@ -874,6 +895,69 @@ function ToolSearchSetting() {
   );
 }
 
+/**
+ * Runs onChange with the credential key of each recorded insufficient_scope prompt (#6739). A plain function because
+ * React Compiler cannot lower `for await` inside a component. The caller's cleanup must
+ * `return()` the iterator, so the backend subscription releases its listener.
+ */
+async function forEachInsufficientScope(
+  api: NonNullable<ReturnType<typeof useAPI>["api"]>,
+  signal: AbortSignal,
+  onIterator: (iterator: AsyncIterator<unknown>) => void,
+  onChange: (key: string) => void
+): Promise<void> {
+  try {
+    const subscribed = await api.mcpOauth.onInsufficientScope(undefined, { signal });
+    if (signal.aborted) {
+      void subscribed.return?.();
+      return;
+    }
+    onIterator(subscribed);
+    for await (const key of subscribed) {
+      if (signal.aborted) break;
+      onChange(key);
+    }
+  } catch {
+    // Cancelled through the abort signal on cleanup.
+  }
+}
+
+/** The recorded insufficient_scope prompts, counted per credential key. */
+function useInsufficientScopeTick(api: ReturnType<typeof useAPI>["api"]) {
+  const [ticks, setTicks] = useState<InsufficientScopeTicks>({});
+  useInsufficientScopeTicks(api, (key) =>
+    setTicks((last) => ({ ...last, [key]: (last[key] ?? 0) + 1 }))
+  );
+  return ticks;
+}
+
+/** Calls onTick with the key each time the backend records an insufficient_scope prompt (#6739). */
+function useInsufficientScopeTicks(
+  api: ReturnType<typeof useAPI>["api"],
+  onTick: (key: string) => void
+) {
+  // The subscription calls the latest callback.
+  const onTickRef = useRef(onTick);
+  onTickRef.current = onTick;
+  useEffect(() => {
+    if (!api) return;
+    const abortController = new AbortController();
+    let iterator: AsyncIterator<unknown> | null = null;
+    void forEachInsufficientScope(
+      api,
+      abortController.signal,
+      (subscribed) => {
+        iterator = subscribed;
+      },
+      (key) => onTickRef.current(key)
+    );
+    return () => {
+      abortController.abort();
+      void iterator?.return?.();
+    };
+  }, [api]);
+}
+
 export const MCPSettingsSection: React.FC = () => {
   const design = useClaudeDesign();
   const refreshRequest = useRef({ id: 0 });
@@ -903,6 +987,10 @@ export const MCPSettingsSection: React.FC = () => {
     Record<string, { serverInfo: MCPServerIdentity; icon?: string }>
   >({});
   const [mcpOauthRefreshNonce, setMcpOauthRefreshNonce] = useState(0);
+  // A refused tool call records a sign-in prompt in the backend only: re-read the mounted rows'
+  // auth status when one does (#6739).
+  // One tick per prompt, carrying its credential key: only that server's row re-reads its status.
+  const scopeTicks = useInsufficientScopeTick(api);
   const viewDomains = useMcpAppViewDomains();
 
   interface EditableServer {
@@ -1431,7 +1519,7 @@ export const MCPSettingsSection: React.FC = () => {
                         {cached?.result.success && !isEditing && isEnabled && (
                           <Tooltip>
                             <TooltipTrigger asChild>
-                              <span className="rounded bg-green-500/10 px-1.5 py-0.5 text-xs text-green-500">
+                              <span className="text-success-text rounded bg-green-500/10 px-1.5 py-0.5 text-xs">
                                 {cached.result.tools.length} tools
                               </span>
                             </TooltipTrigger>
@@ -1505,7 +1593,7 @@ export const MCPSettingsSection: React.FC = () => {
                                     editUrlError !== null ||
                                     editHeadersValidation.errors.length > 0
                                   }
-                                  className="h-7 w-7 text-green-500 hover:text-green-400"
+                                  className="text-success-text h-7 w-7"
                                   aria-label="Save"
                                 >
                                   {savingEdit ? (
@@ -1609,6 +1697,7 @@ export const MCPSettingsSection: React.FC = () => {
                           transport={remoteEntry.transport}
                           url={remoteEntry.url}
                           oauthRefreshNonce={mcpOauthRefreshNonce}
+                          scopeTicks={scopeTicks}
                         />
                       </div>
                     )}
@@ -1782,7 +1871,7 @@ export const MCPSettingsSection: React.FC = () => {
                 className={cn(
                   "flex items-start gap-2 rounded-md px-3 py-2 text-sm",
                   newTestResult.result.success
-                    ? "bg-green-500/10 text-green-500"
+                    ? "bg-green-500/10 text-success-text"
                     : "bg-destructive/10 text-destructive"
                 )}
               >

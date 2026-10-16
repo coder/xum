@@ -1,5 +1,7 @@
 import {
   DraftAttachmentSchema,
+  type CreationDraft,
+  type CreationDraftSummary,
   type Draft,
   type DraftAttachment,
   type DraftAttachmentMetadata,
@@ -10,11 +12,21 @@ import {
 import { joinDraftText } from "@/common/utils/composerDraftText";
 import { MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 
-/** Stable map key for a draft scope (creation keys are unambiguous for any project path). */
+/** Stable map key for a draft scope. */
 export function draftScopeKey(scope: DraftScope): string {
-  return scope.kind === "workspace"
-    ? `workspace:${scope.workspaceId}`
-    : `creation:${JSON.stringify([scope.projectPath, scope.draftId])}`;
+  return `workspace:${scope.workspaceId}`;
+}
+
+/** A creation draft's sidebar row (also computed locally, so a local edit updates it at once). */
+export function summarizeCreationDraft(draft: CreationDraft): CreationDraftSummary {
+  return {
+    draftId: draft.id,
+    projectPath: draft.projectPath,
+    subProjectPath: draft.subProjectPath,
+    createdAt: draft.createdAt,
+    manualName: draft.manualName,
+    preview: draft.text.slice(0, 1000).trim().replace(/\s+/g, " ").slice(0, 200),
+  };
 }
 
 /** A new creation draft id (matches DRAFT_ID_PATTERN: it becomes a backend file name). */
@@ -181,7 +193,9 @@ export function sanitizeDraft(raw: unknown): { draft: Draft; droppedEntries: num
 }
 
 /** Forks do not share worktree files, so staged attachments (worktree paths) are dropped. */
-export function stripStagedDraftAttachments(attachments: DraftAttachment[]): DraftAttachment[] {
+export function stripStagedDraftAttachments(
+  attachments: DraftAttachment[]
+): Array<Exclude<DraftAttachment, { kind: "staged" }>> {
   return attachments.filter((attachment) => attachment.kind !== "staged");
 }
 

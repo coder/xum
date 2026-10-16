@@ -151,11 +151,11 @@ const cases: Case[] = [
   },
   {
     name: "D1",
-    projects: () =>
-      inRepo(
-        row("X", { title: "first", path: ws("one") }),
-        row("X", { title: "second", path: ws("two") })
-      )(),
+    // Two projects: the load keeps only the first row of an id repeated under one key (#6717).
+    projects: () => [
+      ...inRepo(row("X", { title: "first", path: ws("one") }))(),
+      [`${repo()}-other`, { workspaces: [row("X", { title: "second", path: ws("two") })] }],
+    ],
     id: "X",
     expected: { title: "first" },
     expectedAt: { updateTags: { title: "second" } },

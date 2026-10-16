@@ -70,7 +70,7 @@ export function SubagentReportMessageContent(
             <span
               className={cn(
                 "inline-flex shrink-0 items-center gap-1",
-                isInProgress ? "text-backgrounded" : "text-success"
+                isInProgress ? "text-backgrounded" : "text-success-text"
               )}
             >
               <StatusIcon aria-hidden="true" className="size-3" />

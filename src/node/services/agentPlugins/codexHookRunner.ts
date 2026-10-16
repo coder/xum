@@ -19,6 +19,7 @@
  * as the around-middleware unwinds, so in reverse plugin order (Codex promises no order at all).
  */
 import assert from "node:assert";
+import { isDeepStrictEqual } from "node:util";
 import type {
   EventSpine,
   ToolExecuteContext,
@@ -220,7 +221,7 @@ async function runToolHooks(
       return;
     }
     if (output.updatedInput !== undefined) {
-      applyUpdatedInput(ctx, output.updatedInput, view, registration, hook);
+      await applyUpdatedInput(ctx, output.updatedInput, view, registration, hook, notes);
       if (ctx.blocked) return;
     }
     if (output.additionalContext !== undefined) notes.push(output.additionalContext);
@@ -367,13 +368,14 @@ function haltTurn(
   if (halt.stopReason !== undefined) registration.deps.notifyUser(halt.stopReason);
 }
 
-function applyUpdatedInput(
+async function applyUpdatedInput(
   ctx: ToolExecuteContext,
   updatedInput: unknown,
   view: CodexToolView,
   registration: CodexHookRegistration,
-  hook: PluginHookDefinition
-): void {
+  hook: PluginHookDefinition,
+  notes: string[]
+): Promise<void> {
   // A Codex-shaped rewrite (Bash `command`) maps back to Xum's names before the schema check.
   const updated = view.fromCodexInput(updatedInput, ctx.args);
   const schema = ctx.inputJsonSchema?.();
@@ -382,26 +384,71 @@ function applyUpdatedInput(
     // original arguments would silently bypass a guard that redirects the call (Codex
     // PRRT_kwDOPxxmWM6rRKxR).
     warn(registration, hook, "returned updatedInput, but the tool has no input schema to check it");
-    ctx.blocked = {
-      result: {
-        error: `Tool call blocked by plugin '${registration.pluginName}' hook: Xum cannot check its rewrite of this call.`,
-      },
-    };
+    blockRewrite(ctx, "Xum cannot check its rewrite of this call.", notes, registration);
     return;
   }
-  if (!matchesToolSchema(schema, updated)) {
+  // The tool's own parser too, when it has one: the JSON schema omits Zod refinements and
+  // defaults, and the tool runs with the parsed value as for a model's call (Codex
+  // PRRT_kwDOPxxmWM6rgsaE).
+  const parsed = matchesToolSchema(schema, updated)
+    ? ((await ctx.parseInput?.(updated)) ?? { success: true, value: updated })
+    : { success: false as const };
+  if (!parsed.success) {
     // Deny, as for a missing schema: the hook allowed only its rewrite, so running the original
     // arguments would bypass it (a mux.load guard that narrows a read to a range, Codex
     // PRRT_kwDOPxxmWM6rb3ih).
     warn(registration, hook, "returned updatedInput that does not match the tool's input schema");
-    ctx.blocked = {
-      result: {
-        error: `Tool call blocked by plugin '${registration.pluginName}' hook: its rewrite of this call does not match the tool's input.`,
-      },
-    };
+    blockRewrite(
+      ctx,
+      "its rewrite of this call does not match the tool's input.",
+      notes,
+      registration
+    );
     return;
   }
-  ctx.args = updated;
+  const note = rewriteNote(schema, ctx.args, parsed.value);
+  if (note !== undefined) notes.push(note);
+  ctx.args = parsed.value;
+}
+
+/**
+ * Deny a call whose rewrite Xum cannot apply. The notes so far (an earlier hook's rewrite note and
+ * context) stay on the result, as for an explicit deny (Codex PRRT_kwDOPxxmWM6s5BSD).
+ */
+function blockRewrite(
+  ctx: ToolExecuteContext,
+  reason: string,
+  notes: string[],
+  registration: CodexHookRegistration
+): void {
+  const result = {
+    error: `Tool call blocked by plugin '${registration.pluginName}' hook: ${reason}`,
+  };
+  ctx.blocked = { result: notes.length > 0 ? annotate(result, notes, registration) : result };
+}
+
+/**
+ * The recorded tool call keeps the model's input (replay must resend its exact bytes), so a note
+ * on the result says that a hook changed it (Codex PRRT_kwDOPxxmWM6rb-TX). It names the changed
+ * fields only, never their values: a hook may inject a secret (a token in `script`) or redact one,
+ * and the note goes to the model provider and into chat.jsonl. The names come from the tool's
+ * schema, not from the hook's output, so a hook cannot put text into the note.
+ */
+function rewriteNote(schema: unknown, before: unknown, after: unknown): string | undefined {
+  if (isDeepStrictEqual(before, after)) return undefined;
+  const properties = isPlainObject(schema) ? schema.properties : undefined;
+  const fields = (isPlainObject(properties) ? Object.keys(properties) : []).filter(
+    (key) =>
+      /^[A-Za-z0-9_.-]{1,64}$/.test(key) &&
+      !isDeepStrictEqual(fieldOf(before, key), fieldOf(after, key))
+  );
+  return fields.length > 0
+    ? `Rewrote this tool call's input (fields: ${fields.join(", ")}).`
+    : "Rewrote this tool call's input.";
+}
+
+function fieldOf(value: unknown, key: string): unknown {
+  return isPlainObject(value) ? value[key] : undefined;
 }
 
 /**

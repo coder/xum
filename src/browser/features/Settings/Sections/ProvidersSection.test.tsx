@@ -189,8 +189,8 @@ function patchProviderMethods(client: APIClient, providersConfig: ProvidersConfi
   };
 }
 
-function renderProvidersSection() {
-  const providersConfig = createProvidersConfig();
+function renderProvidersSection(extraProviders: ProvidersConfigMap = {}) {
+  const providersConfig = { ...createProvidersConfig(), ...extraProviders };
   providersConfigMock = providersConfig;
   const client = setupSettingsStory({ providersConfig: {} });
   const providerMocks = patchProviderMethods(client, providersConfig);
@@ -291,6 +291,49 @@ describe("ProvidersSection", () => {
     expect(within(customCard).getByText("API key")).toBeTruthy();
     expect(within(customCard).getByText("API key file")).toBeTruthy();
     expect(within(customCard).getByText("Base URL")).toBeTruthy();
+  });
+
+  test("shows saved Google Vertex AI settings from the provider status", async () => {
+    const view = renderProvidersSection({
+      "google-vertex": {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        googleVertex: { project: "my-gcp-project", location: "us-central1", keyFilenameSet: true },
+      },
+    });
+    const vertexButton = await view.findByRole("button", { name: /Google Vertex AI/ });
+
+    fireEvent.click(vertexButton);
+
+    const vertexCard = getProviderCard(vertexButton);
+    expect(within(vertexCard).getByText("my-gcp-project")).toBeTruthy();
+    expect(within(vertexCard).getByText("us-central1")).toBeTruthy();
+    // The key file is set (masked); the express mode API key is not.
+    expect(within(vertexCard).getAllByText("••••••••")).toHaveLength(1);
+    expect(within(vertexCard).getByText("Not set")).toBeTruthy();
+    // Nothing here comes from env vars, the key file included.
+    expect(within(vertexCard).queryByText("Set by env vars.")).toBeNull();
+  });
+
+  test("shows Google Vertex AI settings that come from env vars", async () => {
+    const view = renderProvidersSection({
+      "google-vertex": {
+        apiKeySet: false,
+        apiKeySource: "env",
+        isEnabled: true,
+        isConfigured: true,
+        googleVertex: { envProject: "env-project", keyFilenameSet: false, envKeyFilenameSet: true },
+      },
+    });
+    const vertexButton = await view.findByRole("button", { name: /Google Vertex AI/ });
+
+    fireEvent.click(vertexButton);
+
+    const vertexCard = getProviderCard(vertexButton);
+    expect(within(vertexCard).getByText("env-project")).toBeTruthy();
+    // One note each for the env project, the env key file and the env express mode API key.
+    expect(within(vertexCard).getAllByText("Set by env vars.")).toHaveLength(3);
   });
 
   test("persists API format changes for an existing custom provider", async () => {

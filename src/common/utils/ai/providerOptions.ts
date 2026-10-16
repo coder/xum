@@ -61,6 +61,7 @@ import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
 import type { MuxMessage } from "@/common/types/message";
 import {
+  isGoogleFamilyProvider,
   normalizeToCanonical,
   resolveProviderOptionsNamespaceKey,
   supports1MContext,
@@ -178,6 +179,7 @@ type ProviderOptions =
   | { anthropic: AnthropicProviderOptions }
   | { openai: OpenAIResponsesProviderOptions }
   | { google: GoogleGenerativeAIProviderOptions }
+  | { googleVertex: GoogleGenerativeAIProviderOptions }
   | { openrouter: OpenRouterReasoningOptions }
   | { moonshotai: MoonshotAIProviderOptions }
   | { zai: ZaiLanguageModelChatOptions }
@@ -820,8 +822,8 @@ export function buildProviderOptions(
     return options;
   }
 
-  // Build Google-specific options
-  if (formatProvider === "google") {
+  // Build Google-specific options (Gemini API and Vertex AI share the Gemini payload)
+  if (isGoogleFamilyProvider(formatProvider)) {
     const capBareModelName = capModelName.split("/").at(-1) ?? capModelName;
     const usesGeminiThinkingLevelConfig = /gemini-[34]/.test(capBareModelName);
     const isGeminiFlashThinkingModel = isGeminiFlashThinkingLevelModelName(capBareModelName);
@@ -853,11 +855,11 @@ export function buildProviderOptions(
       }
     }
 
-    const options = {
-      google: {
-        thinkingConfig,
-      },
-    } satisfies { google: GoogleGenerativeAIProviderOptions };
+    const googleOptions = { thinkingConfig } satisfies GoogleGenerativeAIProviderOptions;
+    const options =
+      formatProvider === "google-vertex"
+        ? { googleVertex: googleOptions }
+        : { google: googleOptions };
     log.debug("buildProviderOptions: Google options", options);
     return options;
   }

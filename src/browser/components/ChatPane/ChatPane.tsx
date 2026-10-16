@@ -120,6 +120,7 @@ import { isBlockedPreStreamTaskStatus } from "@/browser/utils/ui/workspaceFilter
 import { PerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
 import { markChatSwitchMilestoneOnNextFrame } from "@/browser/utils/perf/chatSwitchTiming";
 import { runWithCatch } from "@/browser/utils/compilerSafeControlFlow";
+import { useWorkspaceViewHandoff } from "@/browser/features/StaticWorkspaceView/workspaceViewHandoff";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import {
   CUSTOM_EVENTS,
@@ -638,6 +639,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Settled: every row is mounted, or the automatic reveal paused at its rows budget (#4869;
   // older rows then mount only on request) — either way no chunk is still mounting.
   const revealSettled = isFullyRevealed || isRevealPaused;
+  const chatViewLoaded = !loading && !isHydratingTranscript && chatViewDataReady && revealSettled;
+  useWorkspaceViewHandoff(workspaceId, chatViewLoaded, transcriptReplayFailed); // T3 #5971
   // Streaming rows render synchronously while older chunks still mount (see
   // TranscriptBackfillContext). Gated on an active stream so a switch to an idle chat never
   // flips the value, which would re-render every mounted markdown row once the reveal ends.
@@ -1530,7 +1533,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             // (fully revealed or paused at the automatic budget), so waiting on it
             // observes the chat view's final layout rather than a tail whose
             // earlier chunks are still committing.
-            data-loaded={!loading && !isHydratingTranscript && chatViewDataReady && revealSettled}
+            data-loaded={chatViewLoaded}
             // Browser scroll anchoring stays ENABLED on the scrollport; the
             // overflow-anchor policy lives on the inner content (opt rows out while
             // locked so the bottom sentinel is the sole anchor). No bottom padding:

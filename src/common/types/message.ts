@@ -569,6 +569,13 @@ export interface ArtifactInteractionMetadata {
   data?: unknown;
 }
 
+/** Answers to a non-blocking ask_user_question, delivered as a user message. */
+export interface AskUserQuestionAnswerMetadata {
+  toolCallId: string;
+  /** Keyed by question text; an empty string means the user skipped that question. */
+  answers: Record<string, string>;
+}
+
 /** Base fields common to all metadata types */
 interface MuxMessageMetadataBase {
   /** Correlates a rollover continuation without replacing its original attribution. */
@@ -577,6 +584,13 @@ interface MuxMessageMetadataBase {
   reviews?: ReviewNoteDataForDisplay[];
   /** Set by the backend only: this user message came from an artifact (Artifacts M5b). */
   artifactInteraction?: ArtifactInteractionMetadata;
+  /**
+   * Set by the question card: this user message delivers the answers to a non-blocking
+   * ask_user_question (answerDelivery "message"). A display hint only, like Codex dropping a
+   * pending question once its reply is in history: the card shows these answers instead of the
+   * form. Nothing gates on it, so a missing or forged value only changes which card looks open.
+   */
+  askUserQuestionAnswer?: AskUserQuestionAnswerMetadata;
   /** Command prefix to highlight in UI (e.g., "/compact -m sonnet" or "/react-effects") */
   commandPrefix?: string;
   /**
@@ -1288,6 +1302,7 @@ export interface MuxReasoningPart {
    * - OpenAI/xAI Responses (esp. store=false/ZDR): itemId + reasoningEncryptedContent
    *   so the next turn can restore encrypted reasoning without server-side storage.
    * - Google: { google: { thoughtSignature } }
+   * - Google Vertex AI: { googleVertex: { thoughtSignature } }
    */
   providerOptions?: {
     anthropic?: {
@@ -1307,6 +1322,9 @@ export interface MuxReasoningPart {
       reasoningEncryptedContent?: string | null;
     };
     google?: {
+      thoughtSignature?: string;
+    };
+    googleVertex?: {
       thoughtSignature?: string;
     };
   };
@@ -1404,6 +1422,8 @@ export type DisplayedMessage =
       reviews?: ReviewNoteDataForDisplay[];
       /** Message sent from an artifact (from muxMetadata); drives the "from artifact" pill. */
       artifactInteraction?: ArtifactInteractionMetadata;
+      /** Answers to a non-blocking ask_user_question (from muxMetadata). */
+      askUserQuestionAnswer?: AskUserQuestionAnswerMetadata;
       /** Present when this synthetic turn is a background bash monitor wake-up. */
       bashMonitorWake?: {
         records: BashMonitorWakeDisplayRecord[];

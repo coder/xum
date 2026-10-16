@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
-import { QuotaLimitedStorage, restartLocalStorage } from "../../../tests/ui/quotaLimitedStorage";
+import { QuotaLimitedStorage } from "../../../tests/ui/quotaLimitedStorage";
 
 import {
   copyWorkspaceStorage,
@@ -10,10 +10,8 @@ import {
 } from "@/browser/utils/workspaceStorage";
 import {
   getAutoExpandPrefsKey,
-  getDraftScopeId,
   getReviewsKey,
   getPersistedKeyRegistration,
-  getWorkspaceNameStateKey,
   getDesktopPopoutKey,
   getMCPTestResultsKey,
   getPinnedTodoExpandedKey,
@@ -121,35 +119,6 @@ describe("migrateWorkspaceStorage", () => {
     migrateWorkspaceStorage("__pending__/repo2", "ws-destination2");
 
     expect(localStorage.getItem(sourceKey)).toBe(legacyValue);
-  });
-
-  // Older builds stored the whole creation message in workspaceNameState; its owner bound shrinks
-  // it, so the moved draft keeps its name state after a restart.
-  test("moves an oversized legacy workspace name state in bounded form", () => {
-    const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
-    globalThis.window = domWindow;
-    globalThis.document = domWindow.document;
-    globalThis.localStorage = domWindow.localStorage;
-    const sourceKey = getWorkspaceNameStateKey("__pending__/repo3");
-    const destinationScopeId = getDraftScopeId("/repo3", "draft-1");
-    const destinationKey = getWorkspaceNameStateKey(destinationScopeId);
-    const generatedIdentity = { name: "sidebar-a1b2", title: "Fix sidebar" };
-    localStorage.setItem(
-      sourceKey,
-      JSON.stringify({
-        generatedIdentity,
-        manualName: "my-name",
-        autoGenerate: false,
-        lastGeneratedFor: "m".repeat(10_000),
-      })
-    );
-
-    migrateWorkspaceStorage("__pending__/repo3", destinationScopeId);
-    const restarted = restartLocalStorage();
-
-    const moved: unknown = JSON.parse(restarted.getItem(destinationKey) ?? "null");
-    expect(moved).toMatchObject({ generatedIdentity, manualName: "my-name", autoGenerate: false });
-    expect(restarted.getItem(sourceKey)).toBeNull();
   });
 });
 

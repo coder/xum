@@ -2,7 +2,8 @@
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import { describe, expect, mock, test } from "bun:test";
-import { asSchema, type Tool } from "ai";
+import { asSchema, generateText, type Tool } from "ai";
+import { createVertex } from "@ai-sdk/google-vertex";
 import { z } from "zod";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -623,6 +624,67 @@ describe("getToolsForModel", () => {
 
     expect(gemini35Tools.google_search).toBeDefined();
     expect(gemini35Tools.url_context).toBeDefined();
+
+    // Vertex AI serves the same Gemini models, so it gets the same native tools.
+    const vertexGemini35Tools = await getToolsForModel(
+      "google-vertex:gemini-3.5-flash",
+      {
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        workspaceId: "ws-1",
+      },
+      "ws-1",
+      initStateManager
+    );
+    expect(vertexGemini35Tools.google_search).toBeDefined();
+    expect(vertexGemini35Tools.url_context).toBeDefined();
+  });
+
+  // @ai-sdk/google picks tool support from the model ID it sends: native tools on an
+  // alias ID it does not see as Gemini 3 would drop every tool from the request.
+  test.each([
+    { name: "a Gemini 3 model", wireModelId: "gemini-3.5-flash", nativeTools: true },
+    {
+      name: "a Treat as alias of a Gemini 3 model",
+      wireModelId: "team-gemini",
+      nativeTools: false,
+    },
+  ])("sends Xum's function tools to Vertex AI for $name", async ({ wireModelId, nativeTools }) => {
+    const tools = await getToolsForModel(
+      `google-vertex:${wireModelId}`,
+      {
+        cwd: process.cwd(),
+        runtime: new LocalRuntime(process.cwd()),
+        runtimeTempDir: "/tmp",
+        workspaceId: "ws-1",
+        capabilityModelString: "google-vertex:gemini-3.5-flash",
+      },
+      "ws-1",
+      createInitStateManager()
+    );
+    let sentTools: Array<Record<string, unknown>> = [];
+    const fakeFetchImpl = (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (typeof init?.body !== "string") {
+        throw new Error("Expected a JSON string request body");
+      }
+      const body = JSON.parse(init.body) as { tools?: Array<Record<string, unknown>> };
+      sentTools = body.tools ?? [];
+      const reply = {
+        candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+      };
+      return Promise.resolve(Response.json(reply));
+    };
+    // Keep Bun's fetch extensions (preconnect) that `typeof fetch` expects.
+    const vertex = createVertex({
+      apiKey: "test-key",
+      fetch: Object.assign(fakeFetchImpl, fetch) as typeof fetch,
+    });
+
+    await generateText({ model: vertex(wireModelId), prompt: "hello", tools, maxRetries: 0 });
+
+    expect(sentTools.some((entry) => "functionDeclarations" in entry)).toBe(true);
+    expect(sentTools.some((entry) => "googleSearch" in entry)).toBe(nativeTools);
   });
 
   test("adds xAI native web and X search tools for Grok 4.5", async () => {

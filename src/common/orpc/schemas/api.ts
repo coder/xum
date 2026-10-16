@@ -136,8 +136,6 @@ import {
   DraftEventSchema,
   DraftGetOutputSchema,
   DraftImportLegacyOutputSchema,
-  DraftListEntrySchema,
-  DraftListSchema,
   DraftResolveSendsInputSchema,
   DraftResolveSendsOutputSchema,
   DraftRevisionOutputSchema,
@@ -148,6 +146,12 @@ import {
   DraftUpdateInputSchema,
   DraftWriteOutputSchema,
   RemovedCreationDraftSchema,
+  CreationDraftImportLegacyInputSchema,
+  CreationDraftListSchema,
+  CreationDraftSchema,
+  CreationDraftScopeSchema,
+  CreationDraftSummarySchema,
+  CreationDraftUpdateInputSchema,
 } from "./drafts";
 import {
   AgentMessageDispatchModeSchema,
@@ -384,6 +388,18 @@ export const AWSCredentialStatusSchema = z.object({
   secretAccessKeySet: z.boolean(),
 });
 
+export const GoogleVertexCredentialStatusSchema = z.object({
+  project: z.string().optional(),
+  location: z.string().optional(),
+  /** Values from GOOGLE_VERTEX_* env vars, set only when the config value is unset. */
+  envProject: z.string().optional(),
+  envLocation: z.string().optional(),
+  /** Service-account key file path is never sent to the frontend, only whether one is set. */
+  keyFilenameSet: z.boolean(),
+  /** Whether an env var supplies the key file; set only when the saved one is unset. */
+  envKeyFilenameSet: z.boolean().optional(),
+});
+
 export const ProviderConfigInfoSchema = z.object({
   apiKeySet: z.boolean(),
   /** Whether this provider is enabled for model requests */
@@ -425,6 +441,8 @@ export const ProviderConfigInfoSchema = z.object({
   codexOauthDefaultAuth: CodexOauthDefaultAuthSchema.optional(),
   /** AWS-specific fields (only present for bedrock provider) */
   aws: AWSCredentialStatusSchema.optional(),
+  /** Google Vertex AI-specific fields (only present for google-vertex provider) */
+  googleVertex: GoogleVertexCredentialStatusSchema.optional(),
   /** Xum Gateway-specific fields */
   couponCodeSet: z.boolean().optional(),
   /** Xum Gateway-specific: which models are enabled for gateway routing */
@@ -782,6 +800,14 @@ const MCPOAuthPendingServerSchema = z
 
 // MCP OAuth
 export const mcpOauth = {
+  /**
+   * The credential key (`serverUrl` of getAuthStatus) each time a refused request records a
+   * sign-in prompt (#6739), after the keys that have one at attach time: re-read that row.
+   */
+  onInsufficientScope: {
+    input: z.void(),
+    output: eventIterator(z.string()),
+  },
   startDesktopFlow: {
     input: z
       .object({
@@ -1308,10 +1334,26 @@ export const agentPlugins = {
       z.object({ success: z.literal(false), error: z.string() }),
     ]),
   },
+  /** Settings → Plugins: the list and the pending sign-out record in one call (#6627). */
+  listForSettings: {
+    input: z.void(),
+    output: z.object({
+      list: ResultSchema(z.array(AgentPluginListItemSchema), z.string()),
+      pendingSignOuts: AgentPluginPendingSignOutsSchema,
+    }),
+  },
   /** The pending sign-out record that keeps managed plugins closed (#6627). */
   pendingSignOuts: {
     input: z.void(),
     output: AgentPluginPendingSignOutsSchema,
+  },
+  /** Signs out of every plugin MCP server, then deletes a pending sign-out record (#6627). */
+  signOutPluginServers: {
+    input: z.void(),
+    output: z.discriminatedUnion("success", [
+      z.object({ success: z.literal(true) }),
+      z.object({ success: z.literal(false), error: z.string() }),
+    ]),
   },
   /** Display path of the ACTIVE managed plugin container (config-derived root; never hardcode it in UI). */
   containerLocation: {
@@ -1772,6 +1814,28 @@ export const refinements = {
  */
 const WorkspaceTagKeySchema = z.string().regex(/\S/, "Workspace tag keys must be non-empty");
 
+/** A `workspace.history.tail` row. `text` is null when the static view cannot draw the row. */
+export const WorkspaceViewTailRowSchema = z.object({
+  id: z.string(),
+  role: z.enum(["user", "assistant", "other"]),
+  text: z.string().nullable(),
+  timestamp: z.number().nullable(),
+  /** The meta row's model label and provider icon, formatted by the server. */
+  model: z
+    .object({ label: z.string(), provider: z.string(), via: z.string().nullable() })
+    .nullable(),
+  /** The row's element tree (a StaticNode), or null. The page runs validateStaticTree on it. */
+  tree: z.unknown().nullable(),
+});
+
+export const WorkspaceViewTailSchema = z.object({
+  title: z.string(),
+  project: z.string(),
+  rows: z.array(WorkspaceViewTailRowSchema),
+});
+export type WorkspaceViewTail = z.infer<typeof WorkspaceViewTailSchema>;
+export type WorkspaceViewTailRow = z.infer<typeof WorkspaceViewTailRowSchema>;
+
 export const workspace = {
   list: {
     input: z
@@ -2180,6 +2244,16 @@ export const workspace = {
     }),
     output: ResultSchema(z.void(), z.string()),
   },
+  // User-only messaging tag for a root chat (see WorkspaceMetadata.messagingTag). There is
+  // deliberately no UI for it: users set it through the API (e.g. `xum api workspace
+  // set-messaging-tag`), and no agent tool may set a tag. `tag: null` (or empty) clears it.
+  setMessagingTag: {
+    input: z.object({
+      workspaceId: z.string(),
+      tag: z.string().nullable(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   // Recipient-side delivery preference for agent messages that arrive while this workspace is
   // busy (see WorkspaceMetadata.agentMessageDispatchMode).
   setAgentMessageDispatchMode: {
@@ -2418,6 +2492,11 @@ export const workspace = {
         // Windowed requests only: the rows before the cursor cannot be paged; do a full replay.
         notPageable: z.boolean().optional(),
       }),
+    },
+    /** The static first view's newest rows (T3 #5971): fixed server caps, null = no view. */
+    tail: {
+      input: z.object({ workspaceId: z.string().trim().min(1) }),
+      output: WorkspaceViewTailSchema.nullable(),
     },
     /** Searches full history, including prompts before the replay boundary. */
     lastUserPrompt: {
@@ -3801,23 +3880,27 @@ export const drafts = {
     input: DraftResolveSendsInputSchema,
     output: DraftResolveSendsOutputSchema,
   },
-  /**
-   * The creation draft list, strictly: rejects when it cannot be read (the subscription snapshot
-   * falls back to an empty list instead). For the renderer's storage GC.
-   */
-  getList: {
+  /** Creation draft rows (metadata kept in backend memory). */
+  listCreation: {
     input: z.void(),
-    output: DraftListSchema,
+    output: CreationDraftListSchema,
   },
-  /** Add a creation draft to the list, or update its sub-project. Output: the list revision. */
-  putListEntry: {
-    input: DraftListEntrySchema,
-    output: DraftRevisionOutputSchema,
+  /** One creation draft with payloads; null when it has no record. */
+  getCreation: {
+    input: z.object({ scope: CreationDraftScopeSchema }),
+    output: CreationDraftSchema.nullable(),
   },
-  /** One-way import of the legacy localStorage list (never clobbers). Output: the list revision. */
-  importLegacyList: {
-    input: z.object({ entries: z.array(DraftListEntrySchema) }),
-    output: DraftRevisionOutputSchema,
+  updateCreation: {
+    input: CreationDraftUpdateInputSchema,
+    output: CreationDraftSummarySchema,
+  },
+  deleteCreation: {
+    input: z.object({ scope: CreationDraftScopeSchema }),
+    output: z.void(),
+  },
+  importLegacyCreation: {
+    input: CreationDraftImportLegacyInputSchema,
+    output: z.void(),
   },
   subscribe: {
     input: z.void(),

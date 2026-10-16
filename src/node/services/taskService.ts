@@ -3,6 +3,7 @@ import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoo
 import { randomUUID } from "node:crypto";
 import {
   getValidAgentMessageDispatchMode,
+  getValidMessagingTag,
   getValidUnrelatedWorkspaceConsent,
 } from "@/common/orpc/schemas/workspace";
 import { isPlainObject } from "@/common/utils/isPlainObject";
@@ -283,7 +284,14 @@ import { formatSendMessageError } from "@/node/services/utils/sendMessageError";
 import {
   AgentPeerMessageBroker,
   type AgentPeerMessageAdmissionError,
+  type PeerPathRelation,
 } from "@/node/services/agentPeerMessageBroker";
+
+/** Cross-tree senders are untrusted: their refusal reasons carry no path/runtime detail. */
+const OPAQUE_CHECKOUT_RELATIONS: ReadonlySet<PeerPathRelation> = new Set([
+  "target_unrelated",
+  "target_tagged",
+]);
 import { taskQueueDebug } from "@/node/services/taskQueueDebug";
 import {
   readSubagentGitPatchArtifact,
@@ -457,6 +465,15 @@ type AgentReportFinalizationResult =
  * Rendered form of a labeled task message as sendMessageToDescendantAgentTask
  * persists it.
  */
+/**
+ * Config loads leniently: a corrupted non-string or blank id must never become an advertised
+ * related-chat row, or one bad entry would break task_list's result schema for every peer.
+ * Returns the id unchanged (not trimmed) so it still addresses the exact entry.
+ */
+function addressableWorkspaceId(entry: { id?: unknown }): string | undefined {
+  return typeof entry.id === "string" && entry.id.trim().length > 0 ? entry.id : undefined;
+}
+
 function renderLabeledTaskMessage(label: string, message: string): string {
   return `${label}:\n\n${message}`;
 }
@@ -1045,6 +1062,7 @@ export type AgentTreeTargetRelation =
   | "peer"
   | "target_main_chat"
   | "target_side_chat"
+  | "target_tagged"
   | "target_unrelated";
 
 export type SendAgentTreeMessageError = SendAgentTaskMessageError | AgentPeerMessageAdmissionError;
@@ -1101,6 +1119,8 @@ type TreeMessagePipelineError = SendAgentTreeMessageError | SendParentAgentMessa
 interface PeerDelegatedTurnWait {
   /** Recipient consent at first admission: an off/on cycle must not revive the message. */
   unrelatedConsent: string | undefined;
+  /** Both endpoints' tag generations at first admission: a clear/re-tag cycle is a new link. */
+  tagGenerations?: { sender: string | undefined; target: string | undefined };
   /**
    * The target's delegated-turn registration count when the message parked. Any later
    * registration is a replacement turn, which the message never waits through, even one that
@@ -1144,11 +1164,11 @@ export interface TaskTreeAgentsResult {
    */
   callerPeerMessagingRestricted?: true;
   tasks: TreeAgentTaskInfo[];
-  /** Direct chat links only; these grant no task ancestry or lifecycle authority. */
+  /** Direct chat links and shared-@tag links; neither grants task ancestry or lifecycle authority. */
   relatedChats?: Array<{
     workspaceId: string;
     title?: string;
-    relationship: "main_chat" | "side_chat";
+    relationship: "main_chat" | "side_chat" | "tagged";
   }>;
 }
 
@@ -10596,13 +10616,21 @@ export class TaskService implements AgentTaskIntegration {
       );
       // A retry after a delegated turn needs the grant it was first admitted under: an off/on
       // cycle is a new grant, not permission to revive input admitted before it.
-      if (
-        relation === "target_unrelated" &&
-        (unrelatedConsent == null ||
-          (awaitedDelegatedTurn != null &&
-            unrelatedConsent !== awaitedDelegatedTurn.unrelatedConsent))
-      ) {
+      if (this.unrelatedConsentRevoked(relation, unrelatedConsent, awaitedDelegatedTurn)) {
         return Err({ code: "not_found" as const });
+      }
+      // Same rule for tag links: both endpoints' generations are captured here and in
+      // the parked wait, so restoring the same tag string after a revocation is a new
+      // link and cannot revive a message admitted under the previous one.
+      const tagGenerations = this.messagingTagGenerationsOf(
+        senderEntry.workspace,
+        targetEntry.workspace
+      );
+      if (
+        awaitedDelegatedTurn != null &&
+        this.tagGenerationMismatch(relation, awaitedDelegatedTurn.tagGenerations, tagGenerations)
+      ) {
+        return Err({ code: "invalid_scope" as const });
       }
 
       const unrelatedRuntimeRefusal = {
@@ -10851,10 +10879,9 @@ export class TaskService implements AgentTaskIntegration {
       if (checkoutError != null) {
         return Err({
           code: "refused" as const,
-          reason:
-            relation === "target_unrelated"
-              ? "The target workspace's checkout is unavailable, so it cannot receive messages."
-              : `The target workspace's checkout is unavailable (${checkoutError}), so it cannot receive messages.`,
+          reason: OPAQUE_CHECKOUT_RELATIONS.has(relation)
+            ? "The target workspace's checkout is unavailable, so it cannot receive messages."
+            : `The target workspace's checkout is unavailable (${checkoutError}), so it cannot receive messages.`,
         });
       }
 
@@ -11074,8 +11101,8 @@ export class TaskService implements AgentTaskIntegration {
           admissionRefusal = { code: "not_found" as const };
           return true;
         }
-        // A side-chat link authorizes only its own main chat, not a permanent cross-runtime
-        // grant. Recheck after preparation and again when queued input dispatches.
+        // Chat links and @tags authorize only the currently linked pair/group, not a
+        // permanent cross-runtime grant. Recheck after preparation and at queued dispatch.
         if (
           this.resolveAgentTreeTargetRelation(
             freshCfg,
@@ -11083,6 +11110,18 @@ export class TaskService implements AgentTaskIntegration {
             senderWorkspaceId,
             targetId
           ) !== relation
+        ) {
+          admissionRefusal = { code: "invalid_scope" as const };
+          return true;
+        }
+        // The relation can re-resolve as tagged after a clear/re-tag cycle with the
+        // same string; the generation fence is what permanently invalidates the send.
+        if (
+          this.tagGenerationMismatch(
+            relation,
+            tagGenerations,
+            this.messagingTagGenerationsOf(freshSender.workspace, freshEntry.workspace)
+          )
         ) {
           admissionRefusal = { code: "invalid_scope" as const };
           return true;
@@ -11166,6 +11205,7 @@ export class TaskService implements AgentTaskIntegration {
           ...spec,
           awaitedDelegatedTurn: {
             unrelatedConsent,
+            tagGenerations,
             registrationEpoch:
               refusedAtRegistrationEpoch ?? this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0,
             stopEpochs: new Map(capturedStopEpochs),
@@ -11277,16 +11317,25 @@ export class TaskService implements AgentTaskIntegration {
     assert(ancestorWorkspaceId.length > 0, "stopDescendantAgentTask: ancestorWorkspaceId required");
     assert(taskId.length > 0, "stopDescendantAgentTask: taskId required");
 
-    return await this.withTaskTreeLifecycleLock(taskId, () =>
+    // A resolved Stop means the stopped tasks accept a message at once (#6727). Their latches drop
+    // only after the cleanup (Phase C: e.g. once the settlement receipt is on disk), so wait for
+    // that. The bound is terminateAllDescendantAgentTasks' and starts with the Stop: at the
+    // deadline the wait logs and returns, the Stop still resolves, and a send is refused as before.
+    const releaseDeadlineMs = Date.now() + TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS;
+    const stopped = await this.withTaskTreeLifecycleLock(taskId, () =>
       this.stopDescendantAgentTaskUnderLifecycleLock(ancestorWorkspaceId, taskId)
     );
+    if (!stopped.success) return stopped;
+    // Outside the lifecycle lock: nothing that drops a latch can wait behind this Stop.
+    await this.waitForWorkspaceStopsToRelease(stopped.data.latchedTaskIds, releaseDeadlineMs);
+    return Ok({ stoppedTaskIds: stopped.data.stoppedTaskIds });
   }
 
   private async stopDescendantAgentTaskUnderLifecycleLock(
     ancestorWorkspaceId: string,
     taskId: string,
     drainQueue = true
-  ): Promise<Result<{ stoppedTaskIds: string[] }, string>> {
+  ): Promise<Result<{ stoppedTaskIds: string[]; latchedTaskIds: readonly string[] }, string>> {
     const stoppedTaskIds: string[] = [];
     const metadataToEmit = new Set<string>();
     const activeHandlesById = new Map<
@@ -11407,7 +11456,7 @@ export class TaskService implements AgentTaskIntegration {
       await this.emitWorkspaceMetadata(id);
     }
     if (drainQueue) await this.maybeStartQueuedTasks();
-    return Ok({ stoppedTaskIds });
+    return Ok({ stoppedTaskIds, latchedTaskIds: latched });
   }
 
   /**
@@ -16136,7 +16185,33 @@ export class TaskService implements AgentTaskIntegration {
     return null;
   }
 
-  /** Relation for messaging only; side-chat links never enter the task ownership graph. */
+  /**
+   * User-set @tag link: two root chats whose user assigned the same messaging tag may
+   * intercommunicate. Tags are user-only consent (no agent tool sets them), shared-tag
+   * equality is mutual, and clearing/changing either side revokes the link because every
+   * admission re-resolves it. Root chats only: sub-agent children and side chats can
+   * neither carry nor bridge a tag link, so runtime-isolated top-level workspaces stay
+   * isolated unless their user explicitly tags them.
+   */
+  private sharesMessagingTag(sender: WorkspaceConfigEntry, target: WorkspaceConfigEntry): boolean {
+    if (
+      sender.sideChatParentWorkspaceId != null ||
+      target.sideChatParentWorkspaceId != null ||
+      // Raw presence, not coercion: config loads leniently, so a malformed non-string
+      // or blank parent marker must fail closed as a child, exactly as setMessagingTag
+      // rejects any non-null marker — never silently promote it to a root chat.
+      sender.parentWorkspaceId != null ||
+      target.parentWorkspaceId != null ||
+      sender.id == null ||
+      sender.id === target.id
+    ) {
+      return false;
+    }
+    const tag = getValidMessagingTag(sender.messagingTag);
+    return tag != null && tag === getValidMessagingTag(target.messagingTag);
+  }
+
+  /** Relation for messaging only; chat links and tags never enter the task ownership graph. */
   private resolveAgentTreeTargetRelation(
     cfg: ProjectsConfig,
     parentById: Map<string, string>,
@@ -16152,9 +16227,74 @@ export class TaskService implements AgentTaskIntegration {
       sender.workspace.sideChatParentWorkspaceId == null &&
       target.workspace.sideChatParentWorkspaceId == null
     ) {
-      return this.resolveTaskAncestryRelation(parentById, senderWorkspaceId, targetId);
+      return this.resolveNonSideChatRelation(
+        sender.workspace,
+        target.workspace,
+        parentById,
+        senderWorkspaceId,
+        targetId
+      );
     }
     return this.resolveDirectChatRelation(sender.workspace, target.workspace);
+  }
+
+  /** A retry needs the consent grant it was first admitted under (off/on is a new grant). */
+  private unrelatedConsentRevoked(
+    relation: PeerPathRelation,
+    unrelatedConsent: string | undefined,
+    awaitedDelegatedTurn: PeerDelegatedTurnWait | undefined
+  ): boolean {
+    return (
+      relation === "target_unrelated" &&
+      (unrelatedConsent == null ||
+        (awaitedDelegatedTurn != null &&
+          unrelatedConsent !== awaitedDelegatedTurn.unrelatedConsent))
+    );
+  }
+
+  /** True when a tagged send's endpoint generations differ from its admission baseline. */
+  private tagGenerationMismatch(
+    relation: PeerPathRelation,
+    expected: { sender: string | undefined; target: string | undefined } | undefined,
+    actual: { sender: string | undefined; target: string | undefined }
+  ): boolean {
+    return relation === "target_tagged" && !this.messagingTagGenerationsEqual(expected, actual);
+  }
+
+  /**
+   * Config loads leniently, so a corrupted generation may be a non-string whose identity
+   * changes on every config reparse. Read only valid strings (else undefined) so corrupted
+   * state can never manufacture a spurious revocation.
+   */
+  private messagingTagGenerationsOf(
+    sender: WorkspaceConfigEntry,
+    target: WorkspaceConfigEntry
+  ): { sender: string | undefined; target: string | undefined } {
+    return {
+      sender: coerceNonEmptyString(sender.messagingTagGeneration),
+      target: coerceNonEmptyString(target.messagingTagGeneration),
+    };
+  }
+
+  private messagingTagGenerationsEqual(
+    a: { sender: string | undefined; target: string | undefined } | undefined,
+    b: { sender: string | undefined; target: string | undefined } | undefined
+  ): boolean {
+    return a?.sender === b?.sender && a?.target === b?.target;
+  }
+
+  /** Ancestry wins inside a tree; only cross-tree root pairs can be tag-linked. */
+  private resolveNonSideChatRelation(
+    sender: WorkspaceConfigEntry,
+    target: WorkspaceConfigEntry,
+    parentById: Map<string, string>,
+    senderWorkspaceId: string,
+    targetId: string
+  ): AgentTreeTargetRelation | null {
+    const ancestry = this.resolveTaskAncestryRelation(parentById, senderWorkspaceId, targetId);
+    return ancestry === "target_unrelated" && this.sharesMessagingTag(sender, target)
+      ? "target_tagged"
+      : ancestry;
   }
 
   /** Only task parent chains grant ancestry; chat links and workspace-turn ownership do not. */
@@ -16466,16 +16606,28 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
+  private relatedChatRelationship(
+    caller: WorkspaceConfigEntry,
+    candidate: WorkspaceConfigEntry
+  ): "main_chat" | "side_chat" | "tagged" | undefined {
+    const direct = this.resolveDirectChatRelation(caller, candidate);
+    if (direct === "target_main_chat") return "main_chat";
+    if (direct === "target_side_chat") return "side_chat";
+    return this.sharesMessagingTag(caller, candidate) ? "tagged" : undefined;
+  }
+
   private getRelatedChatInfo(
     caller: WorkspaceConfigEntry,
     candidate: WorkspaceConfigEntry
   ): NonNullable<TaskTreeAgentsResult["relatedChats"]>[number] | undefined {
-    const relation = this.resolveDirectChatRelation(caller, candidate);
-    if (relation == null || candidate.id == null) return undefined;
+    const workspaceId = addressableWorkspaceId(candidate);
+    if (workspaceId == null) return undefined;
+    const relationship = this.relatedChatRelationship(caller, candidate);
+    if (relationship == null) return undefined;
     return {
-      workspaceId: candidate.id,
+      workspaceId,
       title: coerceNonEmptyString(candidate.title) ?? coerceNonEmptyString(candidate.name),
-      relationship: relation === "target_main_chat" ? "main_chat" : "side_chat",
+      relationship,
     };
   }
 
@@ -16495,15 +16647,28 @@ export class TaskService implements AgentTaskIntegration {
     const candidates = Array.from(cfg.projects.values()).flatMap((project) => project.workspaces);
     return candidates.flatMap((candidate) => {
       const info = this.getRelatedChatInfo(caller, candidate);
-      if (
-        info == null ||
-        this.isInactivePeerMessagingEndpoint(candidate, info.workspaceId) ||
-        this.isPeerMessagingRestricted(index, info.workspaceId)
-      ) {
+      if (info == null || !this.isDiscoverableRelatedChat(index, candidate, info.workspaceId)) {
         return [];
       }
       return [info];
     });
+  }
+
+  /**
+   * Discovery mirrors admission: inactive, restricted, or user-stopped chats are hidden, since
+   * sendTreeMessage refuses a stopped target chain regardless of relationship.
+   */
+  private isDiscoverableRelatedChat(
+    index: AgentTaskIndex,
+    candidate: WorkspaceConfigEntry,
+    workspaceId: string
+  ): boolean {
+    return !(
+      this.isInactivePeerMessagingEndpoint(candidate, workspaceId) ||
+      this.isPeerMessagingRestricted(index, workspaceId) ||
+      this.interruptedParentWorkspaceIds.has(workspaceId) ||
+      this.isWorkspaceStopInProgress(workspaceId)
+    );
   }
 
   // --- Internal orchestration ---

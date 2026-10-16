@@ -2853,13 +2853,13 @@ describe("AgentPluginInstallService", () => {
       path.join(remoteDir, "agents", "helper.md"),
       "---\nname: helper\ndescription: Reviews\nreadonly: true\n---\nReview.\n"
     );
-    // A Claude tool list is not translated yet: runtime skips the agent, so
-    // the preview must not promise it. disallowedTools (not `tools`) because
-    // the schema already rejects a string `tools`, so only the plugin mapping
-    // keeps this one out.
+    // A Xum-format agent with a Claude tool list: runtime skips it, so the
+    // preview must not promise it. disallowedTools (not `tools`) because the
+    // schema already rejects a string `tools`, so only the plugin mapping keeps
+    // this one out.
     await fsPromises.writeFile(
       path.join(remoteDir, "agents", "narrow.md"),
-      "---\nname: narrow\ndescription: Reads\ndisallowedTools: Write\n---\nRead.\n"
+      "---\nname: narrow\nbase: exec\ndisallowedTools: Write\n---\nRead.\n"
     );
     await commitAll(remoteDir, "adds foreign-format agents");
     const preview = await service.preview({ input: remoteDir });
@@ -2873,6 +2873,27 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "v2 drops readonly");
     await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/changes agent 'helper'/);
+  });
+
+  test("update gates a Claude Code agent change that widens its tools list", async () => {
+    // The mapped tools.remove patterns are part of the fingerprinted
+    // frontmatter, so dropping a disallowedTools entry asks for re-consent.
+    await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
+    const writeAgent = (disallowed: string) =>
+      fsPromises.writeFile(
+        path.join(remoteDir, "agents", "narrow.md"),
+        `---\nname: narrow\ndescription: Reads\ndisallowedTools: ${disallowed}\n---\nRead.\n`
+      );
+    await writeAgent("Write, Bash");
+    await commitAll(remoteDir, "adds a Claude Code agent with a denylist");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.agents).toEqual(["narrow.md"]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    await writeAgent("Write");
+    await commitAll(remoteDir, "v2 allows Bash");
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/changes agent 'narrow'/);
   });
 
   test("a logo is refused (with a warning) when it decodes too large or is a GIF", async () => {
@@ -3213,6 +3234,102 @@ describe("AgentPluginInstallService", () => {
       await Promise.all([failing.dispose(), oauth.dispose()]);
     });
 
+    test("Settings signs out of plugin servers while a broken record fences them, then deletes it (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      await fsPromises.writeFile(file, "{ not json");
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      await restarted.list();
+      // A plugin whose servers this scan cannot read keeps the record: it can load later.
+      const mcpFile = path.join(pluginsDir(), "demo-plugin", "mcp.json");
+      const mcpJson = await fsPromises.readFile(mcpFile, "utf-8");
+      await fsPromises.writeFile(mcpFile, "{ not json");
+      await expect(restarted.signOutPluginServers()).rejects.toThrow(/demo-plugin/);
+      expect(await pathExists(file)).toBe(true);
+      await fsPromises.writeFile(mcpFile, mcpJson);
+      // So does a tree without a manifest: restored later, it would load with the old sign-in.
+      const manifest = path.join(pluginsDir(), "demo-plugin", "plugin.json");
+      await fsPromises.rename(manifest, `${manifest}.moved`);
+      await expect(restarted.signOutPluginServers()).rejects.toThrow(/manifest of plugin/);
+      expect(await pathExists(file)).toBe(true);
+      await fsPromises.rename(`${manifest}.moved`, manifest);
+      // The record names no usable URL, so the servers come from the installed plugin trees.
+      spyOn(oauth, "logout").mockResolvedValueOnce({ success: false, error: "disk full" });
+      await expect(restarted.signOutPluginServers()).rejects.toThrow(/disk full/);
+      // A failed sign-out keeps the record: the old grant must not reach the plugin.
+      expect(await pathExists(file)).toBe(true);
+      expect(await oauth.hasAuthTokens({ serverUrl })).toBe(true);
+      expect(await discovered()).toBe(0);
+
+      await restarted.signOutPluginServers();
+      expect(await restarted.pendingSignOutStatus()).toEqual({ kind: "none" });
+      expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
+      expect(await pathExists(file)).toBe(false);
+      expect(await discovered()).toBe(1);
+      // A record of a newer version whose sign-outs this version cannot read stays: it can name
+      // a URL that no current plugin tree has.
+      await fsPromises.writeFile(
+        file,
+        JSON.stringify({ version: 2, signOuts: [{ url: serverUrl }] })
+      );
+      await expect(restarted.signOutPluginServers()).rejects.toThrow(/another Xum version/);
+      expect(await pathExists(file)).toBe(true);
+      // An unmanaged tree whose directory name is not a managed-plugin name does not block it.
+      const handMade = path.join(pluginsDir(), ".hand_made");
+      await fsPromises.mkdir(handMade);
+      await fsPromises.writeFile(
+        path.join(handMade, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "hand-made",
+          version: "1.0.0",
+        })
+      );
+      await fsPromises.copyFile(mcpFile, path.join(handMade, "mcp.json"));
+      // A newer record that still names its URLs is finished like a current one.
+      await fsPromises.writeFile(file, JSON.stringify({ version: 2, urls: [serverUrl] }));
+      await restarted.signOutPluginServers();
+      expect(await pathExists(file)).toBe(false);
+      // A directory at the record path is removed too, or the fence would never open.
+      await fsPromises.mkdir(path.join(file, "junk"), { recursive: true });
+      await restarted.signOutPluginServers();
+      expect(await pathExists(file)).toBe(false);
+      // A damaged current record keeps the URLs it can read: an uninstalled plugin's URL is in
+      // no tree, so the record is its only trace.
+      const logout = spyOn(oauth, "logout");
+      const oldUrl = "https://old.example/mcp";
+      await fsPromises.writeFile(file, JSON.stringify({ version: 1, urls: [oldUrl, 42] }));
+      await restarted.signOutPluginServers();
+      expect(logout.mock.calls.map(([args]) => args.serverUrl)).toContain(oldUrl);
+      logout.mockRestore();
+      // A directory that is not installed and has no manifest is skipped, as discovery skips it.
+      const marketplace = path.join(pluginsDir(), "marketplace");
+      await fsPromises.mkdir(marketplace);
+      await fsPromises.writeFile(path.join(marketplace, "marketplace.json"), "{}");
+      await fsPromises.writeFile(file, "{ not json");
+      await restarted.signOutPluginServers();
+      expect(await pathExists(file)).toBe(false);
+      // A tree that stat cannot reach (EACCES) can load after a repair: the record stays.
+      const locked = path.join(muxRoot, "locked");
+      await fsPromises.mkdir(path.join(locked, "tree"), { recursive: true });
+      await fsPromises.symlink(path.join(locked, "tree"), path.join(pluginsDir(), "linked"));
+      await fsPromises.chmod(locked, 0o000);
+      await fsPromises.writeFile(file, "{ not json");
+      try {
+        await expect(restarted.signOutPluginServers()).rejects.toThrow(/EACCES/);
+        expect(await pathExists(file)).toBe(true);
+      } finally {
+        await fsPromises.chmod(locked, 0o755);
+      }
+      await oauth.dispose();
+    });
+
     test("a record of an unknown version is kept, and discovery stays closed", async () => {
       const { failing, result } = await updateWithFailingSignOut(stopStub);
       await result;
@@ -3364,6 +3481,62 @@ describe("AgentPluginInstallService", () => {
       expect(await discovered()).toBe(0);
     });
 
+    test("an update's own hung sign-out is bounded, and a later pass reuses it (#6627)", async () => {
+      await seedTokens();
+      let logouts = 0;
+      const updater = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 20,
+      });
+      await writeServer("client-a");
+      const preview = await updater.preview({ input: remoteDir });
+      await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      updater.setMcpOauthService({
+        logout: () => {
+          logouts++;
+          return new Promise<never>(() => undefined);
+        },
+        credentialKey: (url: string) => oauth.credentialKey(url),
+      } as unknown as McpOauthService);
+      await writeServer("client-b");
+      const review = await updater.previewUpdate({ name: "demo-plugin" });
+      // The update holds the plugin lock while it signs out: a hung logout must not hold it.
+      await updater.update({
+        name: "demo-plugin",
+        consent: { fromSha: review.fromSha, toSha: review.toSha },
+      });
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+      // The section open's pass waits for the same call instead of starting a second logout.
+      await updater.list();
+      expect(logouts).toBe(1);
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+      await oauth.dispose();
+    });
+
+    test.skipIf(process.platform === "win32")(
+      "a FIFO at the record path does not block a sign-out pass (#6627)",
+      async () => {
+        const { failing, result } = await updateWithFailingSignOut(stopStub);
+        await result;
+        await failing.dispose();
+        const record = path.join(muxRoot, "plugin-sign-outs-pending.json");
+        await fsPromises.rm(record);
+        execFileSync("mkfifo", [record]);
+        const restarted = new AgentPluginInstallService(config, {
+          mcpServerManager: stopStub as unknown as MCPServerManager,
+        });
+        const oauth = new McpOauthService(config, new MCPConfigService(config));
+        restarted.setMcpOauthService(oauth);
+        // The pass holds the plugin lock: a blocked read would hang the section open.
+        await restarted.list();
+        expect(await restarted.pendingSignOutStatus()).toMatchObject({ kind: "broken" });
+        expect(await discovered()).toBe(0);
+        await fsPromises.rm(record);
+        await oauth.dispose();
+      }
+    );
+
     test("the retry wait ignores a wall-clock jump (#6627)", async () => {
       const { failing, result } = await updateWithFailingSignOut(stopStub);
       await result;
@@ -3423,6 +3596,74 @@ describe("AgentPluginInstallService", () => {
         await fsPromises.rm(record);
       }
       await failing.dispose();
+    });
+
+    test("Settings shows a recorded URL without its query, fragment or user info (#6627)", async () => {
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      await fsPromises.writeFile(
+        path.join(muxRoot, "plugin-sign-outs-pending.json"),
+        JSON.stringify({
+          version: 1,
+          urls: [
+            "https://user:pw@mcp.example.com/mcp?api_key=s3cret#frag",
+            "not a url",
+            // A non-HTTP URL nests another URL in its path, user info included.
+            "blob:https://user:pw@mcp.example.com/mcp?key=secret",
+          ],
+        })
+      );
+      const status = await restarted.pendingSignOutStatus();
+      expect(status).toEqual({
+        kind: "pending",
+        servers: ["https://mcp.example.com/mcp?…", "(an unreadable URL)", "(an unreadable URL)"],
+      });
+    });
+
+    test("Settings lists the plugins and the record in one call, with one sign-out attempt (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      let logouts = 0;
+      let fail = true;
+      restarted.setMcpOauthService({
+        logout: (input: { serverUrl: string }) => {
+          logouts++;
+          return fail ? Promise.resolve({ success: false, error: "offline" }) : oauth.logout(input);
+        },
+        credentialKey: (url: string) => oauth.credentialKey(url),
+      } as unknown as McpOauthService);
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      await internals.settledSignOutPasses();
+      // A failing sign-out: the record stays, and the refresh made one attempt (the section open).
+      const atStart = logouts;
+      const fenced = await restarted.listForSettings();
+      await internals.settledSignOutPasses();
+      expect(logouts).toBe(atStart + 1);
+      expect(fenced.pendingSignOuts).toMatchObject({ kind: "pending", lastError: "offline" });
+      const rows = (listed: typeof fenced) => (listed.list.success ? listed.list.data : []);
+      expect(rows(fenced).find((item) => item.name === "demo-plugin")?.present).not.toBe(true);
+      // Within the 30 s wait, a status read starts no retry.
+      expect((await restarted.pendingSignOutStatus()).kind).toBe("pending");
+      await internals.settledSignOutPasses();
+      expect(logouts).toBe(atStart + 1);
+      // The retry clears the record during the list: the call lists once more and shows the row.
+      fail = false;
+      const cleared = await restarted.listForSettings();
+      expect(cleared.pendingSignOuts).toEqual({ kind: "none" });
+      expect(rows(cleared).find((item) => item.name === "demo-plugin")?.present).toBe(true);
+      // A failed list still returns the record: its notice holds the recovery control.
+      await fsPromises.writeFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "{ not json");
+      spyOn(restarted, "list").mockRejectedValueOnce(new Error("registry unreadable"));
+      const failed = await restarted.listForSettings();
+      expect(failed.list).toEqual({ success: false, error: "registry unreadable" });
+      expect(failed.pendingSignOuts.kind).toBe("broken");
+      await oauth.dispose();
     });
 
     test("Settings reads the pending, the failed and the corrupt record (#6627)", async () => {

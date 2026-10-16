@@ -391,6 +391,27 @@ test("reset context and history truncation refuse while the transcript is not ca
   );
 });
 
+// #6627: the palette runs actions without a catch, so a lost connection must still show an
+// error instead of closing the palette with no word on the sign-out.
+test("plugin sign-out command reports a transport failure", async () => {
+  await withTestWindow(async () => {
+    const api = createMockORPCClient({});
+    api.agentPlugins.pendingSignOuts = () =>
+      Promise.resolve({ kind: "pending", servers: ["https://x/mcp"] });
+    api.agentPlugins.signOutPluginServers = () => Promise.reject(new Error("connection lost"));
+    const events = collectCommandEvents();
+    try {
+      const action = getActions({ api, onOpenSettings: mock() }).find(
+        (a) => a.id === CommandIds.pluginsSignOutServers()
+      );
+      await action!.run();
+      expect(events.receivedToasts).toEqual([{ type: "error", message: "connection lost" }]);
+    } finally {
+      events.dispose();
+    }
+  });
+});
+
 test("reset context command dispatches composer and toast outcomes", async () => {
   await withTestWindow(async () => {
     const cases = [

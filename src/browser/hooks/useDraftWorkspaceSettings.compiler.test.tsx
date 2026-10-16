@@ -124,7 +124,7 @@ describe("useDraftWorkspaceSettings under React Compiler", () => {
       // `draft` stands in for the composer text: it changes, the hook inputs do not.
       (props: { draft: string }) => {
         void props.draft;
-        return useCompiledDraftWorkspaceSettings(PROJECT_PATH, BRANCHES, "main");
+        return useCompiledDraftWorkspaceSettings(PROJECT_PATH, BRANCHES, "main", "draft-a");
       },
       { wrapper: Wrapper, initialProps: { draft: "D" } }
     );

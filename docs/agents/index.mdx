@@ -59,7 +59,7 @@ Definitions larger than 1 MB are rejected at parse time. Filenames that don't ma
 
 ### Plugin agents in Claude Code or Cursor format
 
-[Agent plugins](/agents/agent-skills#agent-plugins) can ship `agents/*.md` files. A plugin agent that uses any Xum-only field (`base`, `tools` as an object, `subagent`, `ui`, `ai`, `prompt`, `disabled`) follows the Xum format below, unchanged.
+[Agent plugins](/agents/agent-skills#agent-plugins) can ship `agents/*.md` files. A plugin agent that uses any Xum-only field (`base`, `tools` as an object, `subagent`, `ui`, `ai`, `prompt`, `disabled`) follows the Xum format below, unchanged. If such an agent also has a Claude Code `disallowedTools` list or a `tools` list, Xum skips it with a warning: Xum cannot tell which format the author meant, and ignoring the list would give the agent more tools than its author allowed.
 
 A plugin agent without any of those fields is read as a Claude Code or Cursor subagent. Both tools give such an agent every tool when it omits `tools`, so Xum maps it like this:
 
@@ -72,9 +72,45 @@ A plugin agent without any of those fields is read as a Claude Code or Cursor su
 | `effort` (Claude Code)                                                                                     | `ai.thinkingLevel`, when it is a valid thinking level                                                                        |
 | `is_background`, `background`                                                                              | Ignored. The `task` caller chooses `run_in_background`.                                                                      |
 | Other keys (`maxTurns`, `skills`, `memory`, `hooks`, `mcpServers`, `permissionMode`, `isolation`, `color`) | Ignored, as Xum ignores unknown keys. Claude Code also ignores `hooks`, `mcpServers` and `permissionMode` for plugin agents. |
-| `tools`, `disallowedTools` as a list                                                                       | Not supported yet. Xum skips the agent rather than grant every tool.                                                         |
+| `tools`, `disallowedTools` as a list                                                                       | Translated to Xum tool patterns, see [Claude Code tool lists](#claude-code-tool-lists)                                       |
 
-So `task({ agentId: "<file name>" })` spawns the agent with Exec's tools: it can run shell commands and edit files. The body replaces Exec's prompt. Xum still adds its sub-agent instructions (commit the work so the parent can apply the patch, and report back), because the parent depends on them. The agent does not appear in the agent picker. This mapping applies only to plugin agents. A project or global agent file in the same format keeps the Xum defaults (not runnable, no tools).
+So `task({ agentId: "<file name>" })` spawns the agent with Exec's tools, narrowed by any Claude Code tool list: without one, it can run shell commands and edit files. The body replaces Exec's prompt. Xum still adds its sub-agent instructions (commit the work so the parent can apply the patch, and report back), because the parent depends on them. The agent does not appear in the agent picker. This mapping applies only to plugin agents. A project or global agent file in the same format keeps the Xum defaults (not runnable, no tools).
+
+#### Claude Code tool lists
+
+`tools` (allowlist) and `disallowedTools` (denylist) take Claude Code tool names, as a comma-separated string or a list. In `tools`, only the core tools grant Xum tools, and only the Xum tools that do the same job and no more. A name in `disallowedTools` removes every Xum tool that can do its job, so it can remove more:
+
+| Claude Code name                                                                                                         | Grants (in `tools`)                                 | Removes (in `disallowedTools`)                                                                                                           |
+| ------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `Read`                                                                                                                   | `file_read`, `attach_file`                          | the same                                                                                                                                 |
+| `Edit`, `MultiEdit`                                                                                                      | `file_edit_replace_*` (changes existing files only) | `file_edit_*`, `image_*`, `task_apply_git_patch`                                                                                         |
+| `Write`                                                                                                                  | `file_edit_*`                                       | `file_edit_*`, `image_*`, `task_apply_git_patch`                                                                                         |
+| `Bash`                                                                                                                   | `bash`, `bash_output`, `bash_background_*`          | the same                                                                                                                                 |
+| `WebFetch`                                                                                                               | `web_fetch`                                         | `web_fetch`, `url_context`                                                                                                               |
+| `TodoWrite`                                                                                                              | `todo_write`, `todo_read`                           | the same                                                                                                                                 |
+| `Agent` (or its old name `Task`)                                                                                         | `task`, `task_await`                                | `task`, `task_*`, `workflow_run`, `workflow_resume`                                                                                      |
+| `NotebookEdit`                                                                                                           | nothing                                             | `file_edit_*`, `image_*`, `task_apply_git_patch`                                                                                         |
+| `WebSearch`                                                                                                              | nothing                                             | `web_search`, `google_search`, `x_search`                                                                                                |
+| `TaskCreate`, `TaskUpdate` / `TaskGet`, `TaskList`                                                                       | nothing                                             | `todo_write` / `todo_read`                                                                                                               |
+| `TaskStop`, `SendMessage`, `ListAgents`, `TaskOutput`                                                                    | nothing                                             | `task_stop` and `bash_background_terminate`, the `task_send_message`/`task_message_*` tools, `task_list`, `task_await` and `bash_output` |
+| `Skill`, `ToolSearch`, `Artifact`, `PushNotification`                                                                    | nothing                                             | `agent_skill_read*`/`agent_skill_list`, `tool_catalog_search`, `artifact*`, `notify`                                                     |
+| `AskUserQuestion`, `EnterPlanMode`, `ExitPlanMode`, `Workflow`, `ScheduleWakeup`, `CronCreate`, `CronDelete`, `CronList` | nothing                                             | `ask_user_question`, `propose_plan`, `workflow_run`/`workflow_resume`, `heartbeat`                                                       |
+| `Grep`, `Glob`, `LSP`, `PowerShell`, `Monitor`, `EnterWorktree`, and other Claude Code tools without a Xum tool          | nothing                                             | nothing                                                                                                                                  |
+
+A name outside the core tools grants nothing, because its Xum tools do more than the Claude Code tool. For example, `todo_write` replaces the whole checklist, so `TaskCreate` cannot grant it. `task_send_message` and `task_list` reach workspaces outside the agent tree. `heartbeat` also deletes schedules. Claude Code never gives a sub-agent `AskUserQuestion`, `EnterPlanMode`, `ExitPlanMode`, `Workflow` or `ScheduleWakeup`. The provider-native search tools are not granted, because an MCP tool can have the same name. To search files, list `Bash`.
+
+The rules follow Claude Code:
+
+- With `tools`, the agent gets only the granted Xum tools (within its base, Exec or Explore), and no MCP tools. Xum always keeps `agent_report`, because every sub-agent reports through it.
+- With `disallowedTools`, the agent gets every tool of its base except the removed ones. If both are set, a tool in both lists is removed.
+- The lists restrict this agent only. If it keeps `Agent` (the task tools), it can spawn sub-agents, which get their own tools, as in Claude Code. To restrict the whole tree, also deny `Agent`, or leave it out of `tools`.
+- If no `tools` entry grants a Xum tool, Xum skips the agent with a warning. Claude Code also refuses to launch such an agent.
+- `disallowedTools` names are matched without case (`bash` removes Bash). If Xum cannot read an entry, or does not know the name, it skips the agent with a warning, because the name can stand for a tool Xum has.
+- A removed family such as `task_*` can also remove MCP tools whose server name starts the same way (an MCP server named `task`).
+- A specifier such as `Bash(git push *)` in `disallowedTools` removes the whole tool, as in Claude Code. In `tools`, Xum cannot limit a tool to some of its calls, so it does not grant a tool with a specifier. `Agent(worker)` is the exception: Claude Code ignores its type list in sub-agents, so it grants the task tools. Commas inside a specifier do not split the list.
+- MCP entries (`mcp__<server>`, `mcp__<server>__<tool>`) are not translated yet. In `tools` they grant nothing. In `disallowedTools`, Xum skips the agent with a warning.
+
+A changed list changes the agent's definition, so a plugin update that changes it asks for consent again.
 
 ## File Format
 
@@ -347,9 +383,10 @@ tools:
     # Use tools.remove in child agents to restrict specific tools
     - .*
   remove:
-    # Exec mode doesn't use planning tools
+    # Exec mode doesn't use planning tools. ask_user_question stays available so
+    # interactive exec turns can resolve genuinely balanced decisions with the user
+    # (sub-agents still lose it via the runtime hard-deny in resolveToolPolicy).
     - propose_plan
-    - ask_user_question
     # Global config and catalog tools stay out of general-purpose agents
     - mux_agents_.*
     - agent_skill_write

@@ -14,7 +14,7 @@ import {
   usefulContentShown,
   type Run,
 } from "./pageTimingCore";
-import { probe, STATIC_VIEW_ID } from "./pageTimingProbe";
+import { probe, STATIC_VIEW_IDS } from "./pageTimingProbe";
 
 test("UCS takes the later of Element Timing and visibility, and a static view counts only for UCS (any)", () => {
   const record = {
@@ -216,7 +216,7 @@ describe("the probe's IR check", () => {
 
   /** Starts the probe in IR mode, renders `html`, and waits for its IR (seconds, or null). */
   async function irOf(page: keyof typeof TARGET, html: string, wire: (doc: Document) => void) {
-    probe({ target: TARGET[page], mode: "ir", page, staticViewId: STATIC_VIEW_ID });
+    probe({ target: TARGET[page], mode: "ir", page, staticViewIds: STATIC_VIEW_IDS });
     dom.document.body.innerHTML = html;
     wire(dom.document as unknown as Document);
     for (
@@ -264,6 +264,16 @@ describe("the probe's IR check", () => {
   });
 
   // Catches a probe without a p1r branch: it never clicks, so IR stays null.
+  // Catches a probe that knows only "/"'s view id, or that matches ids by prefix.
+  test.each([
+    ["xum-pre-ws", null],
+    ["xum-pre-other", "ready"],
+  ])("p2: the composer inside #%s is static only for a listed view id", async (id, expected) => {
+    const html = `<div id="${id}"><textarea aria-label="Message"></textarea><button aria-label="Send message">Send</button></div>`;
+    const ir = await irOf("p2", html, () => undefined);
+    expect(ir === null ? null : "ready").toBe(expected);
+  });
+
   test("p1r: one click on Open Provider Settings, ready once the provider settings show", async () => {
     let clicks = () => 0;
     const ir = await irOf("p1r", "<main><button>Open Provider Settings</button></main>", (doc) => {

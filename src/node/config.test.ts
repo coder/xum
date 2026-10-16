@@ -1762,6 +1762,14 @@ describe("Config", () => {
             ],
           ] as unknown as StoredPair[],
       ],
+      [
+        // #6717: the duplicate-id check runs over these ids and finds none.
+        "one key with several rows and unique ids",
+        () =>
+          [
+            ["/home/u/repo", { workspaces: [row("ws-one"), row("ws-two"), row("ws-three")] }],
+          ] as StoredPair[],
+      ],
     ] as const) {
       it(`reads no session metadata and lists no directory on a load with ${name}`, () => {
         writeProjects(stored());
@@ -1938,6 +1946,164 @@ describe("Config", () => {
         );
       }
 
+      // #6717: an earlier build already saved two rows with one id under one stored key. The
+      // loader keeps the first row per id (the row every lookup already used, #4550) and backs
+      // up the original bytes first, also for an identical copy.
+      // Builders: row() and config exist only inside a test. `kept` is a value the kept row holds.
+      const duplicateIdCases: Array<
+        [string, () => { rows: Array<Record<string, unknown>>; kept: string }]
+      > = [
+        ["an identical copy", () => ({ rows: [row("ws-1"), row("ws-1")], kept: "ws-1" })],
+        [
+          "a copy that differs",
+          () => ({
+            rows: [row("ws-1", { title: "first" }), row("ws-1", { title: "second" })],
+            kept: "first",
+          }),
+        ],
+        [
+          "a copy on another checkout path",
+          () => {
+            const elsewhere = path.join(config.srcDir, "repo", "elsewhere");
+            return { rows: [row("ws-1", { path: elsewhere }), row("ws-1")], kept: elsewhere };
+          },
+        ],
+      ];
+      for (const [name, build] of duplicateIdCases) {
+        it(`keeps one row per id and backs up the bytes for ${name} under one key`, async () => {
+          const { rows: stored, kept } = build();
+          fs.writeFileSync(
+            path.join(tempDir, "config.json"),
+            JSON.stringify({
+              projects: [["/home/u/repo", { workspaces: [...stored, row("ws-2")] }]],
+            })
+          );
+          const original = fs.readFileSync(path.join(tempDir, "config.json"));
+          const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+          try {
+            await flushConfigEdits();
+            const saved = readSavedProjects()[0][1].workspaces;
+            expect(saved.map((w) => w.id)).toEqual(["ws-1", "ws-2"]);
+            const keptRow = saved[0] as Record<string, unknown>;
+            expect([keptRow.id, keptRow.title, keptRow.path]).toContain(kept);
+            const backups = aliasConflictBackups();
+            expect(backups).toHaveLength(1);
+            expect(fs.readFileSync(backups[0])).toEqual(original);
+          } finally {
+            errorSpy.mockRestore();
+          }
+        });
+      }
+
+      // #6717/#4550: every row lookup and the task index resolve a repeated id to its first row,
+      // so the heal keeps that row. Keeping the second would turn this root into a child of ws-2.
+      it("keeps the first row's title and parent for a repeated id, and backs up the second", async () => {
+        const second = row("ws-1", { title: "child", parentWorkspaceId: "ws-2" });
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              [
+                "/home/u/repo",
+                { workspaces: [row("ws-1", { title: "root" }), second, row("ws-2")] },
+              ],
+            ],
+          })
+        );
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          await flushConfigEdits();
+          const saved = readSavedProjects()[0][1].workspaces as Array<Record<string, unknown>>;
+          expect(saved.map((w) => [w.id, w.title, w.parentWorkspaceId])).toEqual([
+            ["ws-1", "root", undefined],
+            ["ws-2", undefined, undefined],
+          ]);
+          const backups = aliasConflictBackups();
+          expect(backups).toHaveLength(1);
+          const backedUp = JSON.parse(fs.readFileSync(backups[0], "utf-8")) as {
+            projects: StoredPair[];
+          };
+          expect(backedUp.projects[0][1].workspaces).toContainEqual(second);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
+      it("keeps one row and backs up the bytes for an identical copy inside one alias", async () => {
+        // The alias merge keeps an identical copy once and records no conflict of its own.
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              ["/home/u/repo", { workspaces: [row("ws-1"), row("ws-1")] }],
+              ["/home/u/repo/", { workspaces: [row("ws-2")] }],
+            ],
+          })
+        );
+        const original = fs.readFileSync(path.join(tempDir, "config.json"));
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          await flushConfigEdits();
+          const saved = readSavedProjects();
+          expect(saved).toHaveLength(1);
+          expect(saved[0][1].workspaces.map((w) => w.id)).toEqual(["ws-1", "ws-2"]);
+          const backups = aliasConflictBackups();
+          expect(backups).toHaveLength(1);
+          expect(fs.readFileSync(backups[0])).toEqual(original);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
+      (process.getuid?.() === 0 ? it.skip : it)(
+        "keeps config.json and refuses edits while the duplicate-id backup fails",
+        async () => {
+          const configFile = path.join(tempDir, "config.json");
+          fs.writeFileSync(
+            configFile,
+            JSON.stringify({
+              projects: [["/home/u/repo", { workspaces: [row("ws-1"), row("ws-1")] }]],
+            })
+          );
+          const original = fs.readFileSync(configFile);
+          const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+          fs.chmodSync(tempDir, 0o500);
+          try {
+            const blocked = await config.setUpdateChannel("nightly").then(
+              () => null,
+              (error: unknown) => error
+            );
+            expect(String(blocked)).toContain("could not back them up");
+            expect(fs.readFileSync(configFile)).toEqual(original);
+          } finally {
+            fs.chmodSync(tempDir, 0o700);
+            errorSpy.mockRestore();
+          }
+        }
+      );
+
+      it("writes no backup and makes no save on a load with unique ids under one key", async () => {
+        writeProjects([["/home/u/repo", { workspaces: [row("ws-1"), row("ws-2")] }]]);
+        // One save first, so config.json is canonical and the load runs no one-time migration.
+        await flushConfigEdits();
+        const fresh = new Config(tempDir);
+        const save = spyOn(
+          fresh as unknown as { saveConfig: (...args: unknown[]) => Promise<void> },
+          "saveConfig"
+        );
+        try {
+          fresh.loadConfigOrDefault();
+          // A clean load schedules no save of its own (perf condition d). Edits run one at a
+          // time in order, so once this identity edit is done, any save the load queued is done
+          // too: exactly one save means the load queued none.
+          await fresh.editConfig((cfg) => cfg);
+          expect(save).toHaveBeenCalledTimes(1);
+          expect(aliasConflictBackups()).toHaveLength(0);
+        } finally {
+          save.mockRestore();
+        }
+      });
+
       it("keeps one row and backs up the bytes for a legacy copy under one key", async () => {
         const checkout = checkoutPath();
         const id = config.generateLegacyId("/home/u/repo", checkout);
@@ -1949,6 +2115,39 @@ describe("Config", () => {
           const backups = aliasConflictBackups();
           expect(backups).toHaveLength(1);
           expect(fs.readFileSync(backups[0])).toEqual(original);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
+      // #6717: the heal keeps the first copy, on the other path, so the legacy row must be
+      // matched against the dropped copy first. Else the id migration gives it the same id again.
+      it("drops a legacy copy of a repeated id before it keeps the copy on another path", async () => {
+        const checkout = checkoutPath();
+        const id = config.generateLegacyId("/home/u/repo", checkout);
+        const elsewhere = path.join(config.srcDir, "repo", "elsewhere");
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              [
+                "/home/u/repo",
+                {
+                  workspaces: [
+                    { id, name: "x", path: elsewhere },
+                    { id, name: "x", path: checkout },
+                    { name: "x", path: checkout },
+                  ],
+                },
+              ],
+            ],
+          })
+        );
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          expect(await savedIdsOnCheckout(checkout)).toEqual([]);
+          const saved = readSavedProjects()[0][1].workspaces;
+          expect(saved.map((w) => [w.id, w.path])).toEqual([[id, elsewhere]]);
         } finally {
           errorSpy.mockRestore();
         }
@@ -5916,6 +6115,57 @@ describe("Config", () => {
       const [metadata] = await reloaded.getAllWorkspaceMetadata();
       await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
       expect(row()).toMatchObject({ title: "Renamed", taskTerminalFailure: marker });
+    });
+
+    it("keeps the messaging-tag revocation generation through reload and a metadata write", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              id: "tagged",
+              name: "tagged",
+              path: projectPath,
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              messagingTag: "research",
+              messagingTagGeneration: "gen-1",
+            },
+          ],
+        });
+        return cfg;
+      });
+      const reloaded = new Config(tempDir);
+      const row = () =>
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      // The tag publishes on metadata; its server-owned generation never does.
+      const [metadata] = await reloaded.getAllWorkspaceMetadata();
+      expect(metadata.messagingTag).toBe("research");
+      await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
+      expect(row()).toMatchObject({
+        title: "Renamed",
+        messagingTag: "research",
+        messagingTagGeneration: "gen-1",
+      });
+    });
+
+    it("publishes the config messaging tag for an id-less legacy workspace with metadata.json", async () => {
+      const projectPath = path.join(tempDir, "repo");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [{ path: projectPath, messagingTag: "research" }],
+        });
+        return cfg;
+      });
+      const sessionDir = path.join(config.sessionsDir, "repo");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      // A stale or absent legacy-file tag must never override the config value.
+      fs.writeFileSync(
+        path.join(sessionDir, "metadata.json"),
+        JSON.stringify({ id: "legacy-tag", name: "legacy-tag", messagingTag: "stale" })
+      );
+      const [metadata] = await config.getAllWorkspaceMetadata();
+      expect(metadata).toMatchObject({ id: "legacy-tag", messagingTag: "research" });
     });
 
     it("keeps a parent's reservation tombstones through reload and a metadata write", async () => {

@@ -743,6 +743,27 @@ function createLineHandler(
 }
 
 /**
+ * What the file limit does to a command that is still running; returns whether it stopped it.
+ *
+ * The truncate policy returns the output it kept as a success, so it stops the command itself
+ * (#6732). Cancelling the output streams alone does not stop it reliably: the child's stdout is a
+ * Unix socket, and closing one that still holds unread data gives the writer ECONNRESET, not
+ * SIGPIPE. The command then exits with its own error status (perl: 1), which says nothing about
+ * the command, so the old code reported that cut as a failure. The tmpfile policy reports the
+ * overflow without the exit status, and keeps its old behavior.
+ */
+const AT_FILE_LIMIT: Record<
+  "tmpfile" | "truncate",
+  (running: boolean, stop: () => void) => boolean
+> = {
+  truncate: (running, stop) => {
+    if (running) stop();
+    return running;
+  },
+  tmpfile: () => false,
+};
+
+/**
  * Formats the final bash tool result based on exit code and truncation state
  */
 function formatResult(
@@ -752,9 +773,21 @@ function formatResult(
   overflowReason: string | null,
   wall_duration_ms: number,
   overflowPolicy: "tmpfile" | "truncate",
-  effectiveTimeout: number
+  effectiveTimeout: number,
+  stoppedAtFileLimit = false
 ): BashToolResult {
   const output = lines.join("\n");
+
+  // The truncate policy stopped this command at the file limit, so its status is ours (#6732).
+  if (stoppedAtFileLimit) {
+    return {
+      success: true,
+      output,
+      exitCode: 0,
+      wall_duration_ms,
+      truncated: { reason: overflowReason ?? "unknown reason", totalLines: lines.length },
+    };
+  }
 
   // Check for special error codes from runtime
   if (exitCode === EXIT_CODE_ABORTED) {
@@ -1186,6 +1219,8 @@ ${scriptWithEnv}`;
       // Collect output concurrently from Web Streams to avoid readline race conditions.
       const lines: string[] = [];
       let truncated = false;
+      // Set when the truncate policy stopped the command at the file limit (#6732).
+      let stoppedAtFileLimit = false;
 
       // Helper to trigger display truncation (stop showing to agent, keep collecting)
       const triggerDisplayTruncation = (reason: string) => {
@@ -1197,6 +1232,10 @@ ${scriptWithEnv}`;
 
       // Helper to trigger file truncation (stop collecting, close streams)
       const triggerFileTruncation = (reason: string) => {
+        // Runs once: the line handler stops calling it after the file limit is hit.
+        stoppedAtFileLimit = AT_FILE_LIMIT[overflowPolicy](!exitCodeResolved, () =>
+          wrappedAbortController.abort()
+        );
         truncationState.fileTruncated = true;
         truncationState.displayTruncated = true;
         truncated = true;
@@ -1730,7 +1769,8 @@ File will be automatically cleaned up when stream ends.`;
           overflowReason,
           wall_duration_ms,
           config.overflow_policy ?? "tmpfile",
-          effectiveTimeout
+          effectiveTimeout,
+          stoppedAtFileLimit
         )
       );
     },

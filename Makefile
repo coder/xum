@@ -98,7 +98,7 @@ include fmt.mk
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
-.PHONY: benchmark-terminal bench bench-compare first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e
+.PHONY: benchmark-terminal bench bench-compare first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e generate-phone-chrome check-phone-chrome
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
@@ -318,7 +318,7 @@ build: update-models
 build-renderer dist/cli/index.js dist/cli/api.mjs: update-models
 endif
 
-build-main: node_modules/.installed dist/cli/index.js dist/cli/api.mjs ## Build main process
+build-main: node_modules/.installed dist/cli/index.js dist/cli/api.mjs dist/workers/staticRowTree.worker.js ## Build main process
 
 BUILTIN_AGENTS_GENERATED := src/node/services/agentDefinitions/builtInAgentContent.generated.ts
 BUILTIN_SKILLS_GENERATED := src/node/services/agentSkills/builtInSkillContent.generated.ts
@@ -350,6 +350,11 @@ dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/ve
 dist/cli/api.mjs: src/cli/api.ts src/cli/proxifyOrpc.ts $(TS_SOURCES) node_modules/.installed
 	@echo "Building API CLI (ESM)..."
 	@$(ESBUILD_BIN) src/cli/api.ts $(ESBUILD_CLI_FLAGS)
+
+# Node worker of `xum server` for the static workspace view (see scripts/build-row-tree-worker.ts).
+dist/workers/staticRowTree.worker.js: scripts/build-row-tree-worker.ts $(TS_SOURCES) node_modules/.installed
+	@echo "Building static view row-tree worker..."
+	@bun scripts/build-row-tree-worker.ts $@
 
 build-preload: node_modules/.installed dist/preload.js ## Build preload script
 
@@ -401,6 +406,7 @@ verify-docker-runtime-artifacts: build-docker-runtime ## Verify required Docker 
 	done
 	@test -f dist/runtime/mcpIconDecode.js
 	@test -f dist/runtime/analyticsWorker.js
+	@test -f dist/workers/staticRowTree.worker.js
 	@test -f dist/static/splash.html
 	@test -f dist/typescript-lib/lib.es2023.d.ts.txt
 
@@ -845,6 +851,12 @@ page-timing: node_modules/.installed ## Paired mobile UCS/IR timing of two built
 
 first-run-view-parity: node_modules/.installed ## Static vs live first-run view boxes and screenshots, 4 widths x 2 themes (FIRST_RUN_VIEW_PARITY_ARGS; see scripts/perf/firstRunViewParity.ts)
 	@node --import tsx scripts/perf/firstRunViewParity.ts $(FIRST_RUN_VIEW_PARITY_ARGS)
+
+generate-phone-chrome: build-main build-renderer build-static ## Capture the phone skeleton of the static workspace view from the live page (see scripts/perf/generatePhoneChrome.ts)
+	@bun scripts/perf/generatePhoneChrome.ts $(PHONE_CHROME_ARGS)
+
+check-phone-chrome: node_modules/.installed ## Fail when the built live phone workspace page (run `make build` first) drifted from the checked-in skeleton
+	@bun scripts/perf/generatePhoneChrome.ts --check $(PHONE_CHROME_ARGS)
 
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
 	@# Pin Harbor with the Daytona extra so scheduled ingestion does not break on future CLI or adapter API drift.

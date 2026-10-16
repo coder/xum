@@ -28,6 +28,7 @@ import { createAgentSessionHarness } from "@/node/services/agentSession.testHarn
 import type { TurnCompletion } from "@/node/services/streamManager";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
+import * as attemptSettlements from "@/node/services/subagentAttemptSettlements";
 import { WorkspaceBusyError, workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import { createUnknownSendMessageError } from "@/node/services/utils/sendMessageError";
 import type { TaskService } from "@/node/services/taskService";
@@ -1023,11 +1024,20 @@ describe("task launch races", () => {
           }
         );
 
+        // A loaded runner's disk: the Stop's settlement receipt lands late. A resolved Stop must
+        // still mean the child accepts a message at once (#6727, after the #6677 flake).
+        const realWriteReceipt = attemptSettlements.writeSubagentAttemptSettlementReceipt;
+        spyOn(attemptSettlements, "writeSubagentAttemptSettlementReceipt").mockImplementation(
+          async (params) => {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            return realWriteReceipt(params);
+          }
+        );
+
         await spawn(s.taskService);
         await s.launched;
         await s.launchFailureRecorded;
         await box.stop;
-        await waitForStopRelease(s.taskService);
         expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("interrupted");
         // The session rolled the launch's row back: the brief is kept for the reawakening.
         expect(await s.briefsInHistory()).toBe(0);
@@ -1055,7 +1065,6 @@ describe("task launch races", () => {
       );
       // The user Stops the running child, so the parent's message reawakens it.
       expect((await s.taskService.stopDescendantAgentTask(ROOT, CHILD)).success).toBe(true);
-      await waitForStopRelease(s.taskService);
       expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("interrupted");
 
       const reawakened = await s.taskService.sendMessageToDescendantAgentTask(
@@ -1107,18 +1116,6 @@ async function waitUntil(
     if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
-}
-
-/**
- * A Stop resolves before its latch drops: the release waits for the attempt's settlement receipt
- * to reach disk (recheckWorkspaceStopRelease), and a reawakening sent before that is refused as
- * "A stop is in progress" (#6677). Wait for the release itself, not for time to pass.
- */
-async function waitForStopRelease(taskService: TaskService): Promise<void> {
-  await waitUntil(
-    () => !taskService.isWorkspaceStopInProgress(CHILD),
-    "the Stop to release the child"
-  );
 }
 
 /** Runs `then` each time the launch's private step `method` returns. */

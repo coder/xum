@@ -6077,7 +6077,8 @@ export function useWorkspaceStreamingStats(workspaceId: string): WorkspaceStream
     () => store.getWorkspaceStreamingStats(workspaceId),
     [store, workspaceId]
   );
-  return useSyncExternalStore(subscribe, getSnapshot);
+  // Server rendering of TypewriterMarkdown (static workspace view) needs a server snapshot.
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
 /**

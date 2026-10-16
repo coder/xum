@@ -1,4 +1,5 @@
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
+import type { RowTreeClient } from "@/node/orpc/staticWorkspaceView/rowTreeClient";
 import type { IncomingHttpHeaders } from "http";
 import type {
   Config,
@@ -74,6 +75,8 @@ import type { OrpcEffectServices } from "@/node/orpc/effectContext";
  * service context, `ServiceContainer.runtime.context`).
  */
 export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
+  /** Only `xum server` sets it: the static workspace view's row trees (workspace.history.tail). */
+  rowTreeClient?: RowTreeClient;
   config: Config;
   sessionLocator: WorkspaceSessionLocator;
   providersConfigStore: ProvidersConfigStore;

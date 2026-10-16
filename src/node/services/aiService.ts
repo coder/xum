@@ -39,6 +39,8 @@ export type { StreamMessageOptions } from "./turnRequestBuilder";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
+import { LRUCache } from "lru-cache";
+import { DEBUG_LLM_REQUEST_MAX_WORKSPACES } from "@/constants/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
@@ -151,7 +153,12 @@ export class AIService extends EventEmitter {
   >();
 
   // Debug: captured LLM request payloads for last send per workspace
-  private lastLlmRequestByWorkspace = new Map<string, DebugLlmRequestSnapshot>();
+  // Bounded: each snapshot is a full copy of a request and its response, and an unbounded map
+  // kept one per workspace the server ever sent from (F12, #6754). Removal and archive drop
+  // their entry too (handleWorkspaceMetadata).
+  private readonly lastLlmRequestByWorkspace = new LRUCache<string, DebugLlmRequestSnapshot>({
+    max: DEBUG_LLM_REQUEST_MAX_WORKSPACES,
+  });
 
   constructor(
     config: Config,
@@ -1198,6 +1205,7 @@ export class AIService extends EventEmitter {
       return;
     }
     this.turnRequestBuilder.forgetWorkspace(event.workspaceId);
+    this.lastLlmRequestByWorkspace.delete(event.workspaceId);
   }
 
   async deleteWorkspace(workspaceId: string): Promise<Result<void>> {

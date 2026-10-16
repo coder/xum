@@ -13,6 +13,7 @@ import { getReviewStateStore } from "../../stores/ReviewStateStore";
 import { getPRStatusStoreInstance } from "../../stores/PRStatusStore";
 import { getAppConfigStore } from "../../stores/AppConfigStore";
 import { getDraftStore, useDraftStoreReady } from "../../stores/DraftStore";
+import { getCreationDraftStore } from "../../stores/CreationDraftStore";
 import { getProvidersConfigStore } from "../../stores/ProvidersConfigStore";
 import { ProjectProvider, useProjectContext } from "../../contexts/ProjectContext";
 import { APIProvider, useAPI, useLiveAPI, type APIClient } from "@/browser/contexts/API";
@@ -21,6 +22,7 @@ import { RouterProvider } from "../../contexts/RouterContext";
 import { TerminalRouterProvider } from "../../terminal/TerminalRouterContext";
 import { UpdateRestartOverlay } from "@/browser/components/UpdateRestartOverlay/UpdateRestartOverlay";
 import { removeFirstRunView } from "@/browser/features/SplashScreens/SplashScreenProvider";
+import { removeWorkspaceView } from "@/browser/features/StaticWorkspaceView/removeWorkspaceView";
 
 const USER_PREFERENCES_BOOTSTRAP_TIMEOUT_MS = 2000;
 
@@ -33,6 +35,7 @@ export function FirstRunViewConnectionGuard() {
   const blocked = status === "auth_required" || status === "error" || status === "reconnecting";
   useLayoutEffect(() => {
     if (blocked) removeFirstRunView();
+    if (blocked) removeWorkspaceView(); // the static workspace view (T3 #5971, C step 4) too
   }, [blocked]);
   return null;
 }
@@ -220,6 +223,7 @@ function AppLoaderInner() {
     getProvidersConfigStore().setClient(api ?? null);
     getReviewStateStore().setClient(api ?? null);
     getDraftStore().setClient(api ?? null);
+    getCreationDraftStore().setClient(api ?? null);
     getAgentSkillsStore().setClient(api ?? null);
 
     if (!workspaceContext.loading) {

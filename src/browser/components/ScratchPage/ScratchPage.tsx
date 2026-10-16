@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { getArchivedWorkspacesExpandedKey } from "@/common/constants/storage";
+import {
+  getArchivedWorkspacesExpandedKey,
+  getCreationDraftScopeId,
+} from "@/common/constants/storage";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
@@ -10,6 +13,7 @@ import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/us
 import { LeftSidebarToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
+import { CreationDraftGate } from "@/browser/features/ChatInput/CreationDraftGate";
 import { ChatInput } from "@/browser/features/ChatInput";
 import type { ChatInputAPI, WorkspaceCreatedOptions } from "@/browser/features/ChatInput/types";
 import { hasConfiguredProvider, useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -68,6 +72,10 @@ export function ScratchPage(props: ScratchPageProps) {
     };
   }, [api, archivedExpanded]);
 
+  const creationScopeId = props.pendingDraftId
+    ? getCreationDraftScopeId(props.pendingDraftId)
+    : undefined;
+
   function handleChatReady(api: ChatInputAPI) {
     if (didAutoFocusRef.current) return;
     didAutoFocusRef.current = true;
@@ -75,8 +83,8 @@ export function ScratchPage(props: ScratchPageProps) {
   }
 
   return (
-    <AgentProvider projectPath={SCRATCH_PROJECT_CONFIG_KEY}>
-      <ThinkingProvider projectPath={SCRATCH_PROJECT_CONFIG_KEY}>
+    <AgentProvider projectPath={SCRATCH_PROJECT_CONFIG_KEY} scopeId={creationScopeId}>
+      <ThinkingProvider projectPath={SCRATCH_PROJECT_CONFIG_KEY} scopeId={creationScopeId}>
         {/* No workspace is open, so this page is the one `main` landmark (#5969). */}
         <main className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
           <div
@@ -98,16 +106,22 @@ export function ScratchPage(props: ScratchPageProps) {
                   <ConfigureProvidersPrompt />
                 ) : (
                   <>
-                    <ChatInput
-                      key={`${SCRATCH_PROJECT_CONFIG_KEY}:${props.pendingDraftId ?? "__pending__"}`}
-                      variant="creation"
-                      kind="scratch"
+                    <CreationDraftGate
+                      draftId={props.pendingDraftId}
                       projectPath={SCRATCH_PROJECT_CONFIG_KEY}
-                      projectName={SCRATCH_PROJECT_NAME}
-                      pendingDraftId={props.pendingDraftId}
-                      onReady={handleChatReady}
-                      onWorkspaceCreated={props.onWorkspaceCreated}
-                    />
+                      subProjectPath={null}
+                    >
+                      <ChatInput
+                        key={props.pendingDraftId ?? "__pending__"}
+                        variant="creation"
+                        kind="scratch"
+                        projectPath={SCRATCH_PROJECT_CONFIG_KEY}
+                        projectName={SCRATCH_PROJECT_NAME}
+                        pendingDraftId={props.pendingDraftId}
+                        onReady={handleChatReady}
+                        onWorkspaceCreated={props.onWorkspaceCreated}
+                      />
+                    </CreationDraftGate>
                     {providersLoading ? (
                       <div className="flex items-center justify-center gap-2 py-1.5">
                         <Skeleton className="h-7 w-32" />

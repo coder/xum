@@ -1628,10 +1628,9 @@ export class ProjectService {
   }
 
   /**
-   * Creation drafts are keyed by the owning project; delete them server-side so a removal from
-   * any client (or none mounted) leaves no draft files behind. Best-effort like the secrets
-   * cleanup: the startup GC removes whatever this misses. Returns the deleted drafts, whose
-   * localStorage keys the removing renderer cleans up (its own list may not have hydrated yet).
+   * Delete the creation drafts whose project field is a removed project, server-side, so a
+   * removal from any client (or none mounted) leaves none behind. Best-effort like the secrets
+   * cleanup: a record this misses stays as an orphan file. Returns the deleted drafts.
    */
   private async deleteCreationDrafts(projectPaths: string[]): Promise<RemovedCreationDraft[]> {
     const removed: RemovedCreationDraft[] = [];

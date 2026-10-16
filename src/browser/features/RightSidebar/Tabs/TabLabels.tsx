@@ -183,10 +183,10 @@ interface GoalTabLabelProps {
  * Goal tab label.
  *
  * Subscribes directly to the workspace's sidebar state so the label can apply
- * a semantic accent (`text-success` or `text-warning`) when the workspace
+ * a semantic accent (`text-success-text` or `text-warning`) when the workspace
  * has a *live* goal in chat:
  *
- *   • `text-success` — the goal is running (`status === "active"` &&
+ *   • `text-success-text` — the goal is running (`status === "active"` &&
  *     non-pending). Mirrors the `useActiveGoalCount` /
  *     `ActiveGoalsWarningToast` predicate so a workspace that contributes
  *     to the global "active goals" toast is also the one that lights up
@@ -219,7 +219,7 @@ export const GoalTabLabel: React.FC<GoalTabLabelProps> = ({ workspaceId }) => {
     <span
       className={cn(
         "inline-flex items-center gap-1",
-        isRunning && "text-success",
+        isRunning && "text-success-text",
         isStalled && "text-warning"
       )}
       aria-label={ariaLabel}

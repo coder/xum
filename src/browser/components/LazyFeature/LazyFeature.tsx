@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
-import { Suspense } from "react";
+import { Suspense, useLayoutEffect } from "react";
+import { removeWorkspaceView } from "@/browser/features/StaticWorkspaceView/removeWorkspaceView";
 import { Button } from "../Button/Button";
 import { ErrorBoundary } from "../ErrorBoundary/ErrorBoundary";
 
@@ -17,6 +18,8 @@ interface LazyFeatureProps {
 }
 
 function ReloadFallback(props: { name: string }) {
+  // The static workspace view (T3 #5971) is inert and would hide this recovery UI.
+  useLayoutEffect(() => removeWorkspaceView(), []);
   return (
     <div role="alert" className="text-secondary flex items-center gap-2 text-xs">
       <span>{props.name} failed to load.</span>

@@ -254,6 +254,10 @@
 
   --color-success: hsl(122 39% 45%);
   --color-success-light: hsl(123 46% 60%);
+  /* The success hue, darker: WCAG AA (4.5:1) on every light surface and success tint, down to
+     4.52:1. The success color itself was 2.29-3.1:1 as text (#6882). --color-success stays the
+     fill, border and tint color. */
+  --color-success-text: hsl(122 39% 30%);
   --color-on-success: hsl(0 0% 100%);
 
   --color-danger: hsl(4 78% 52%);
@@ -511,6 +515,9 @@
 
   --color-success: #66800b;
   --color-success-light: color-mix(in srgb, var(--color-success), white 35%);
+  /* Darker green: WCAG AA (4.5:1) on every flexoki-light surface and success tint, down to
+     4.69:1, where #66800b was 3.02:1 (#6882). */
+  --color-success-text: #4d6008;
   --color-on-success: #fffcf0;
 
   --color-danger: #af3029;

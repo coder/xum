@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
+import { isToolEnabledByConfigs } from "@/common/utils/agentTools";
+
 import {
   AgentDefinitionParseError,
   parseAgentDefinitionMarkdown,
@@ -156,11 +158,128 @@ Body
       expect(parse("name: a\nmodel: composer-2", "plugin").ai).toBeUndefined();
     });
 
-    test("a Claude tools or disallowedTools list skips the agent instead of granting every tool", () => {
+    test("Claude tools and disallowedTools lists narrow the base's tools", () => {
+      // todo_sync and github_create_issue stand for MCP tools (`<server>_<tool>`), and so
+      // can url_context: MCP naming reserves only Xum's own tool names.
+      const sample = [
+        "file_read",
+        "attach_file",
+        "file_edit_insert",
+        "file_edit_replace_string",
+        "bash",
+        "bash_output",
+        "task",
+        "task_await",
+        "task_remove",
+        "workflow_run",
+        "web_fetch",
+        "url_context",
+        "todo_write",
+        "todo_read",
+        "todo_sync",
+        "memory",
+        "github_create_issue",
+        "artifact",
+        "artifact_read",
+      ];
+      // Exec enables every tool; the mapped tools.remove patterns narrow it.
+      const toolsOf = (frontmatter: string) => {
+        const tools = parse(frontmatter, "plugin").tools;
+        return sample.filter((tool) =>
+          isToolEnabledByConfigs(tool, [{ add: [".*"] }, ...(tools != null ? [tools] : [])])
+        );
+      };
+      // An allowlist grants only built-in tools, never an MCP tool sharing a prefix (todo_sync).
+      // A specifier still removes the whole tool in disallowedTools, as in Claude Code.
+      expect(
+        toolsOf(
+          "name: a\ntools: Read, Grep, Edit, Write, TodoWrite, Agent(worker), Bash\ndisallowedTools: [Bash(git push *)]"
+        )
+      ).toEqual([
+        "file_read",
+        "attach_file",
+        "file_edit_insert",
+        "file_edit_replace_string",
+        "task",
+        "task_await",
+        "todo_write",
+        "todo_read",
+      ]);
+      // Edit changes existing files only: file_edit_insert also creates files, as Write does.
+      expect(toolsOf("name: a\ntools: Edit, Read")).toEqual([
+        "file_read",
+        "attach_file",
+        "file_edit_replace_string",
+      ]);
+      // Outside the core tools a name grants nothing, because its Xum tools do more than
+      // the Claude tool (Artifact would read pinned shelves, TaskCreate would replace the
+      // whole checklist). Provider-native names are never granted (MCP can reuse them).
+      expect(toolsOf("name: a\ntools: Artifact, TaskCreate, TaskList, WebSearch, Read")).toEqual([
+        "file_read",
+        "attach_file",
+      ]);
+      expect(toolsOf("name: a\ntools: WebFetch")).toEqual(["web_fetch"]);
+      // TaskOutput read background output, as task_await and bash_output do.
+      expect(toolsOf("name: a\ndisallowedTools: TaskOutput")).not.toContain("task_await");
+      // A comma inside a specifier does not split the entry; Agent does not grant workflows.
+      expect(toolsOf("name: a\ntools: Agent(worker, researcher), Read")).toEqual([
+        "file_read",
+        "attach_file",
+        "task",
+        "task_await",
+      ]);
+      // Denying Agent also removes workflows, which spawn sub-agents too.
+      expect(toolsOf("name: a\ndisallowedTools: Agent, SendMessage")).not.toContain("workflow_run");
+      expect(toolsOf("name: a\ndisallowedTools: Write, TodoWrite, WebFetch, bash")).toEqual([
+        "file_read",
+        "attach_file",
+        "task",
+        "task_await",
+        "task_remove",
+        "workflow_run",
+        "todo_sync",
+        "memory",
+        "github_create_issue",
+        "artifact",
+        "artifact_read",
+      ]);
+      // A denylist of tools Xum does not have removes nothing: the agent keeps Exec's tools.
+      expect(parse("name: a\ndisallowedTools: Grep", "plugin").tools).toBeUndefined();
+    });
+
+    test("an allowlist that resolves to no Xum tool skips the agent", () => {
       for (const frontmatter of [
-        "name: a\ntools: Read, Grep",
-        "name: a\ntools: [Read]",
-        "name: a\ndisallowedTools: Write",
+        "name: a\ntools: Grep, Glob",
+        "name: a\ntools: []",
+        "name: a\ntools: Read\ndisallowedTools: Read",
+        // Xum cannot narrow a tool to some of its calls, so it does not grant a specifier.
+        "name: a\ntools: Bash(npm test)",
+        // MCP entries are not translated yet: unresolved in tools, refused in disallowedTools.
+        "name: a\ntools: mcp__github",
+        "name: a\ndisallowedTools: mcp__github",
+        "name: a\ntools: 42",
+        // A denylist entry Xum cannot read must not be dropped: the agent would keep that tool.
+        "name: a\ndisallowedTools: [Write, 42]",
+        "name: a\ndisallowedTools: Bash (git push *)",
+        // An unknown denylist name may be a tool Xum has: refuse instead of keeping it.
+        "name: a\ndisallowedTools: FutureTool",
+        // Claude Code never gives a sub-agent AskUserQuestion, so it does not resolve.
+        "name: a\ntools: AskUserQuestion",
+        // Xum's heartbeat tool also creates schedules, so CronList cannot grant it.
+        "name: a\ntools: CronList",
+        // NotebookEdit edits only notebook cells; Xum's edit tools change any file.
+        "name: a\ntools: NotebookEdit",
+        // task_send_message and task_list reach workspaces outside the agent tree.
+        "name: a\ntools: SendMessage, ListAgents",
+      ]) {
+        expect(() => parse(frontmatter, "plugin")).toThrow(AgentDefinitionParseError);
+      }
+    });
+
+    test("a Xum-format agent with a Claude tool list is skipped instead of ignoring the list", () => {
+      for (const frontmatter of [
+        "name: a\nbase: exec\ndisallowedTools: [Bash]",
+        "name: a\ntools:\n  add: [file_read]\ndisallowedTools: Bash",
       ]) {
         expect(() => parse(frontmatter, "plugin")).toThrow(AgentDefinitionParseError);
       }

@@ -4,6 +4,7 @@ import {
   __resetTokenizerForTests,
   countTokens,
   countTokensBatch,
+  encodingForModel,
   getToolDefinitionTokens,
   getTokenizerForModel,
   loadTokenizerModules,
@@ -11,6 +12,7 @@ import {
 } from "./tokenizer";
 import type { CountTokensBatchInput, EncodingName } from "./tokenizer.worker";
 import * as workerPool from "./workerPool";
+import { log } from "@/node/services/log";
 import { DEFAULT_MODEL, DEFAULT_WARM_MODELS, KNOWN_MODELS } from "@/common/constants/knownModels";
 import { Tokenizer as AiTokenizer, models, type Encoding } from "ai-tokenizer";
 
@@ -240,6 +242,15 @@ describe("tokenizer", () => {
     const tokenizer = await getTokenizerForModel(googleModel);
     expect(typeof tokenizer.encoding).toBe("string");
     expect(tokenizer.encoding.length).toBeGreaterThan(0);
+  });
+
+  test("resolves Google Vertex AI Gemini models to the Gemini API tokenizer without a fallback", () => {
+    const warn = jest.spyOn(log, "warn");
+    expect(encodingForModel("google-vertex:gemini-2.5-pro")).toBe(
+      encodingForModel("google:gemini-2.5-pro")
+    );
+    // An unmapped provider falls back to a guessed tokenizer and warns.
+    expect(warn).not.toHaveBeenCalled();
   });
 
   test("countTokens returns stable values for google gemini 3", async () => {

@@ -124,6 +124,8 @@ interface CreationControlsProps {
   /** Stable project data passed by ChatInput so typing does not subscribe this form to broad contexts. */
   userProjects: Map<string, ProjectConfig>;
   onSelectedProjectPathChange: (path: string) => void;
+  /** The project waits for a send, and for input the composer is still reading. */
+  projectSelectDisabled: boolean;
   /** Project name to display as header */
   projectName: string;
   /** Workspace name/title generation state and actions */
@@ -686,6 +688,7 @@ function CreationControlsContent(props: CreationControlsProps) {
               selected={selected}
               userProjects={props.userProjects}
               onChange={props.onSelectedProjectPathChange}
+              disabled={props.projectSelectDisabled}
             />
           );
         })()}
@@ -700,10 +703,18 @@ function CreationControlsContent(props: CreationControlsProps) {
                 <input
                   id="workspace-name"
                   type="text"
+                  // The placeholder changes with auto-naming, so it cannot be the field's name.
+                  aria-label="Workspace name"
                   value={nameState.name}
                   onChange={handleNameChange}
                   onFocus={handleInputFocus}
-                  placeholder={nameState.isGenerating ? "Generating..." : "workspace-name"}
+                  placeholder={
+                    nameState.isGenerating
+                      ? "Generating..."
+                      : nameState.autoGenerate
+                        ? "Automatic on Send"
+                        : "workspace-name"
+                  }
                   disabled={props.disabled}
                   aria-invalid={nameState.error ? true : undefined}
                   className={cn(
@@ -1120,6 +1131,7 @@ export function CreationControls(props: CreationControlsProps) {
       selectedProjectPath={props.selectedProjectPath}
       userProjects={props.userProjects}
       onSelectedProjectPathChange={props.onSelectedProjectPathChange}
+      projectSelectDisabled={props.projectSelectDisabled}
       projectName={props.projectName}
       nameState={nameState}
       runtimeAvailabilityState={props.runtimeAvailabilityState}

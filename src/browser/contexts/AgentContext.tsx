@@ -55,6 +55,8 @@ type AgentProviderProps =
   | {
       workspaceId?: string;
       projectPath?: string;
+      /** Overrides the choice scope (a creation draft's scope; projectPath still lists agents). */
+      scopeId?: string;
       /**
        * For hosts without WorkspaceProvider (the VS Code webview, #4738): the workspace's persisted
        * agent identity, so the sub-agent lock still applies. Ignored when metadata is available.
@@ -82,6 +84,7 @@ export function AgentProvider(props: AgentProviderProps) {
 function AgentProviderWithState(props: {
   workspaceId?: string;
   projectPath?: string;
+  scopeId?: string;
   workspaceMetaFallback?: Pick<FrontendWorkspaceMetadata, "parentWorkspaceId" | "agentId">;
   children: ReactNode;
 }) {
@@ -96,7 +99,7 @@ function AgentProviderWithState(props: {
       : props.workspaceMetaFallback
     : undefined;
 
-  const scopeId = getScopeId(props.workspaceId, props.projectPath);
+  const scopeId = props.scopeId ?? getScopeId(props.workspaceId, props.projectPath);
   const isProjectScope = !props.workspaceId && Boolean(props.projectPath);
 
   const globalDefaultAgentId =
@@ -142,7 +145,11 @@ function AgentProviderWithState(props: {
   });
 
   const fetchAgents = useCallback(
-    async (projectPath: string | undefined, workspaceId: string | undefined) => {
+    async (
+      projectPath: string | undefined,
+      workspaceId: string | undefined,
+      agentScopeId: string
+    ) => {
       // Each fetch takes the next generation, and only the latest one commits. Two fetches of the
       // same scope can overlap (a plugin-mutation refresh during the initial load, #6629), and an
       // older answer must not replace a newer one.
@@ -164,7 +171,7 @@ function AgentProviderWithState(props: {
         const result = await api.agents.list({ projectPath, workspaceId });
         if (fetchParamsRef.current.generation === generation && isMountedRef.current) {
           setAgents(result);
-          setAgentBases(getScopeId(workspaceId, projectPath), result);
+          setAgentBases(agentScopeId, result);
           setLoadFailed(false);
           setLoaded(true);
         }
@@ -173,7 +180,7 @@ function AgentProviderWithState(props: {
         if (isConnectionLostError(error)) return;
         if (fetchParamsRef.current.generation === generation && isMountedRef.current) {
           setAgents([]);
-          setAgentBases(getScopeId(workspaceId, projectPath), []);
+          setAgentBases(agentScopeId, []);
           setLoadFailed(true);
           setLoaded(true);
         }
@@ -193,8 +200,8 @@ function AgentProviderWithState(props: {
       setLoaded(false);
       setLoadFailed(false);
     }
-    void fetchAgents(props.projectPath, props.workspaceId);
-  }, [fetchAgents, props.projectPath, props.workspaceId]);
+    void fetchAgents(props.projectPath, props.workspaceId, scopeId);
+  }, [fetchAgents, props.projectPath, props.workspaceId, scopeId]);
 
   const refresh = useCallback(async () => {
     if (!props.projectPath && !props.workspaceId) return;
@@ -202,13 +209,13 @@ function AgentProviderWithState(props: {
 
     setRefreshing(true);
     try {
-      await fetchAgents(props.projectPath, props.workspaceId);
+      await fetchAgents(props.projectPath, props.workspaceId, scopeId);
     } finally {
       if (isMountedRef.current) {
         setRefreshing(false);
       }
     }
-  }, [fetchAgents, props.projectPath, props.workspaceId]);
+  }, [fetchAgents, props.projectPath, props.workspaceId, scopeId]);
 
   // Project-scoped providers should inherit the global default agent until a
   // project-scoped preference is explicitly set. Child/subagent workspaces keep

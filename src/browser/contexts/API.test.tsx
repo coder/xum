@@ -70,11 +70,14 @@ let fetchImpl: (input: RequestInfo | URL, init?: RequestInit) => Promise<Respons
 let pingImpl: () => Promise<string> = () => Promise.resolve("pong");
 let storedAuthToken: string | null = null;
 const getStoredAuthTokenMock = mock(() => storedAuthToken);
+// Same signatures as the real helpers, which return the cache-cleanup promise (#6848).
 const setStoredAuthTokenMock = mock((token: string) => {
   storedAuthToken = token;
+  return Promise.resolve();
 });
 const clearStoredAuthTokenMock = mock(() => {
   storedAuthToken = null;
+  return Promise.resolve();
 });
 
 // Restore the real modules after this suite so the transport and auth stubs below cannot

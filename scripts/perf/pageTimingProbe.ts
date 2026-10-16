@@ -2,24 +2,30 @@
  * The in-page probe of the page-timing runner (T3 #5971, plan section 2.3). It runs before any page script
  * and must stay self-contained: the runner serializes it into the page.
  */
+import { FIRST_RUN_VIEW_ID } from "../../src/common/constants/firstRunView";
+import { WORKSPACE_VIEW_ID } from "../../src/common/constants/workspaceView";
 import type { ProbeRecord, TARGET } from "./pageTimingCore";
 import type { Signal } from "./pageTimingStats";
 
-/** A static first view carries this id (plan section 4.3). Its copies count for UCS, never for UCS-live. */
-export const STATIC_VIEW_ID = "xum-pre";
+/**
+ * The static first views (plan section 4.3): "/"'s first-run view and the phone workspace view.
+ * Their copies count for UCS, never for UCS-live. An explicit list, so a future id never counts by
+ * accident.
+ */
+export const STATIC_VIEW_IDS = [FIRST_RUN_VIEW_ID, WORKSPACE_VIEW_ID];
 
 export interface ProbeArg {
   target: (typeof TARGET)[keyof typeof TARGET];
   mode: Signal;
   page: keyof typeof TARGET;
-  staticViewId: string;
+  staticViewIds: string[];
 }
 
 export function probe(arg: ProbeArg) {
   delete (Navigator.prototype as { serviceWorker?: unknown }).serviceWorker; // the auditor's method
   const rec: ProbeRecord = { elementTiming: [], visible: null, visibleLive: null, ir: null };
   Object.assign(window, { __pageTiming: rec });
-  const live = (el: Element) => !el.closest(`#${arg.staticViewId}`);
+  const live = (el: Element) => !arg.staticViewIds.some((id) => el.closest(`#${id}`));
   const targets = () =>
     [...document.querySelectorAll(arg.target.selector)].filter((el) =>
       el.textContent?.startsWith(arg.target.text)

@@ -108,12 +108,13 @@ import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflow
  * exhaustive, so a field added to `ORPCContext` without a tag fails to compile
  * here. `perfFlightRecorder`, `perfCaptures`, `perfReports` and `sessionTapes` are
  * container-owned (constructed directly by ServiceContainer, outside the DI graph) and are
- * checked separately below.
+ * checked separately below. `rowTreeClient` is added by `xum server` only (src/cli/server.ts).
  */
 const ORPC_FIELD_TAGS: Record<
   keyof Omit<
     ORPCContext,
     | "headers"
+    | "rowTreeClient"
     | "effect/context"
     | "effect/wrap"
     | "perfFlightRecorder"

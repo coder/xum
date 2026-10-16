@@ -1,7 +1,7 @@
 import "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import { APIProvider } from "@/browser/contexts/API";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { createTestApiClient } from "@/browser/testUtils";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
@@ -23,13 +23,22 @@ let currentWorkspaceState: {
   autoRetryStatus: { type: "auto-retry-scheduled" | "auto-retry-starting" } | null;
   isStreamStarting: boolean;
   canInterrupt: boolean;
-  messages: Array<{ type: string; compactionRequest?: { parsed: unknown } }>;
+  messages: Array<{
+    type: string;
+    toolCallId?: string;
+    compactionRequest?: { parsed: unknown };
+    askUserQuestionAnswer?: { toolCallId: string; answers: Record<string, string> };
+  }>;
 } = {
   autoRetryStatus: null,
   isStreamStarting: false,
   canInterrupt: false,
   messages: [],
 };
+
+let transcriptCaughtUp = true;
+// False models a host that does not feed WorkspaceStore (the VS Code webview): reads throw.
+let workspaceStoreFed = true;
 
 function createDeferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -69,9 +78,15 @@ const setAutoRetryEnabled = mock((input: unknown) => {
 
 // Inject the client through the real provider: a module mock of contexts/API is process-wide
 // and leaks this partial client into later-evaluated suites.
+const sendMessageData: Record<string, never> = {};
+const sendMessage = mock((_input: unknown) =>
+  Promise.resolve({ success: true as const, data: sendMessageData })
+);
+
 const apiClient = createTestApiClient({
   workspace: {
     answerAskUserQuestion,
+    sendMessage,
     resumeStream,
     setAutoRetryEnabled,
   },
@@ -96,7 +111,12 @@ void mock.module("@/browser/stores/WorkspaceStore", () => ({
   useWorkspaceStoreRaw: () =>
     overlayWorkspaceStoreRaw(actualWorkspaceStore.useWorkspaceStoreRaw(), {
       subscribeKey: (_workspaceId: string, _listener: () => void) => () => undefined,
-      getWorkspaceState: (_workspaceId: string) => currentWorkspaceState,
+      getWorkspaceState: (_workspaceId: string) => {
+        if (!workspaceStoreFed) {
+          throw new Error("Workspace not registered");
+        }
+        return currentWorkspaceState;
+      },
     }),
 }));
 
@@ -115,7 +135,14 @@ describe("AskUserQuestionToolCall", () => {
       messages: [],
     };
 
+    transcriptCaughtUp = true;
+    workspaceStoreFed = true;
+    spyOn(actualWorkspaceStore.workspaceStore, "isWorkspaceTranscriptCaughtUp").mockImplementation(
+      () => transcriptCaughtUp
+    );
+
     answerAskUserQuestion.mockClear();
+    sendMessage.mockClear();
     resumeStream.mockClear();
     setAutoRetryEnabled.mockClear();
   });
@@ -291,6 +318,241 @@ describe("AskUserQuestionToolCall", () => {
       workspaceId: "ws-ask",
       enabled: false,
       persist: false,
+    });
+  });
+
+  describe("non-blocking questions", () => {
+    const questions = [
+      {
+        header: "Choice",
+        question: "Which option?",
+        options: [
+          { label: "First", description: "Use first" },
+          { label: "Second", description: "Use second" },
+        ],
+        multiSelect: false,
+      },
+    ];
+    const asyncResult = {
+      summary: "Questions shown to the user.",
+      ui_only: {
+        ask_user_question: { questions, answers: {}, answerDelivery: "message" as const },
+      },
+    };
+
+    function renderAsyncQuestion() {
+      return renderWithProviders(
+        <AskUserQuestionToolCall
+          args={{ questions }}
+          result={asyncResult}
+          status="completed"
+          toolCallId="ask-async"
+          workspaceId="ws-ask"
+        />
+      );
+    }
+
+    test("sends the answers as a chat message and shows them once accepted", async () => {
+      const view = renderAsyncQuestion();
+
+      fireEvent.click(view.getByText("First"));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+      // No answer row is in the transcript yet (it may be queued, or batched into another
+      // queued message without its metadata): the accepted send alone answers the card.
+      await waitFor(() => expect(view.getByText("User answered")).toBeTruthy());
+      expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      const [input] = sendMessage.mock.calls[0] as [
+        { workspaceId: string; options: { muxMetadata?: unknown } },
+      ];
+      expect(input.workspaceId).toBe("ws-ask");
+      expect(input.options.muxMetadata).toEqual({
+        type: "normal",
+        askUserQuestionAnswer: { toolCallId: "ask-async", answers: { "Which option?": "First" } },
+      });
+      // Ordinary user input, like Codex: no blocked tool call to answer and no stream to resume.
+      expect(answerAskUserQuestion).not.toHaveBeenCalled();
+      expect(resumeStream).not.toHaveBeenCalled();
+      expect(setAutoRetryEnabled).not.toHaveBeenCalled();
+    });
+
+    test("a retry after a lost response reuses the send id", async () => {
+      sendMessage.mockImplementationOnce(() => Promise.reject(new Error("connection lost")));
+      const view = renderAsyncQuestion();
+
+      fireEvent.click(view.getByText("First"));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+      await waitFor(() => expect(view.getByText("connection lost")).toBeTruthy());
+
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+      await waitFor(() => expect(view.getByText("User answered")).toBeTruthy());
+
+      const sendIds = (sendMessage.mock.calls as Array<[{ options: { sendId?: string } }]>).map(
+        ([input]) => input.options.sendId
+      );
+      expect(sendIds).toHaveLength(2);
+      // The backend may have accepted the first send: the same id keeps it to one answer row.
+      expect(sendIds[0]).toBeTruthy();
+      expect(sendIds[1]).toBe(sendIds[0]);
+    });
+
+    test("names picked options by number, even when labels contain commas", async () => {
+      const partsQuestion = {
+        header: "Parts",
+        question: "Which parts?",
+        options: [
+          { label: "Alpha", description: "a" },
+          { label: "Alpha, Beta", description: "b" },
+        ],
+        multiSelect: true,
+      };
+      const view = renderWithProviders(
+        <AskUserQuestionToolCall
+          args={{ questions: [partsQuestion], answers: { "Which parts?": "Alpha, Beta" } }}
+          result={{
+            ...asyncResult,
+            ui_only: {
+              ask_user_question: {
+                questions: [partsQuestion],
+                answers: {},
+                answerDelivery: "message",
+              },
+            },
+          }}
+          status="completed"
+          toolCallId="ask-parts"
+          workspaceId="ws-ask"
+        />
+      );
+
+      // The prefill picks "Alpha" plus the Other text "Beta": flattened, that reads exactly like
+      // the second label, so the message must come from the picks, not the answer string.
+      expect(view.getByDisplayValue("Beta")).toBeTruthy();
+      fireEvent.click(view.getByRole("button", { name: "Next" }));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+      await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+      const [input] = sendMessage.mock.calls[0] as [{ message: string }];
+      expect(input.message).toContain('- Question 1: option 1; other: "Beta"');
+      // Labels are model-authored: none may be promoted into the user-role text.
+      expect(input.message).not.toContain("Alpha");
+    });
+
+    test("shows the latest answers delivered in later user messages", () => {
+      const answerRow = (answer: string) => ({
+        type: "user",
+        askUserQuestionAnswer: { toolCallId: "ask-async", answers: { "Which option?": answer } },
+      });
+      // A correction sent after the first answer supersedes it.
+      currentWorkspaceState = {
+        ...currentWorkspaceState,
+        messages: [answerRow("First"), answerRow("Second")],
+      };
+
+      const view = renderAsyncQuestion();
+      // Answered questions follow the collapsed tool preference; expand to read the answers.
+      fireEvent.click(view.getByText("ask_user_question"));
+
+      expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
+      expect(view.getByText("Second")).toBeTruthy();
+      expect(view.queryByText("First")).toBeNull();
+    });
+
+    test("a later answer row overrides this card's own accepted answer", async () => {
+      const view = renderAsyncQuestion();
+      fireEvent.click(view.getByText("First"));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+      await waitFor(() => expect(view.getByText("User answered")).toBeTruthy());
+
+      // Another client sent a correction.
+      currentWorkspaceState = {
+        ...currentWorkspaceState,
+        messages: [
+          {
+            type: "user",
+            askUserQuestionAnswer: {
+              toolCallId: "ask-async",
+              answers: { "Which option?": "Second" },
+            },
+          },
+        ],
+      };
+      view.rerender(
+        <TooltipProvider>
+          <AskUserQuestionToolCall
+            args={{ questions }}
+            result={asyncResult}
+            status="completed"
+            toolCallId="ask-async"
+            workspaceId="ws-ask"
+          />
+        </TooltipProvider>
+      );
+
+      expect(view.getByText("Second")).toBeTruthy();
+      expect(view.queryByText("First")).toBeNull();
+    });
+
+    test("does not send while the transcript is still replaying", async () => {
+      transcriptCaughtUp = false;
+      const view = renderAsyncQuestion();
+
+      fireEvent.click(view.getByText("First"));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+      await waitFor(() =>
+        expect(view.getByRole("button", { name: "Submit answers" })).toHaveProperty(
+          "disabled",
+          false
+        )
+      );
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(view.queryByText("User answered")).toBeNull();
+    });
+
+    test("closes unanswered questions that left the agent's context", () => {
+      // A compaction (or Start Here, reset) after the question removed it from the model's
+      // context; numbered answers would mean nothing to the model.
+      currentWorkspaceState = {
+        ...currentWorkspaceState,
+        messages: [{ type: "tool", toolCallId: "ask-async" }, { type: "compaction-boundary" }],
+      };
+
+      const view = renderAsyncQuestion();
+      fireEvent.click(view.getByText("ask_user_question"));
+
+      expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
+      expect(view.getByText(/no longer in the agent/)).toBeTruthy();
+    });
+
+    test("rechecks the agent's context right before sending", async () => {
+      const view = renderAsyncQuestion();
+      fireEvent.click(view.getByText("First"));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+      // A compaction lands after the click but before dispatch (while preferences flush): the
+      // rendered card is still open, so only a dispatch-time re-read can catch it.
+      currentWorkspaceState = {
+        ...currentWorkspaceState,
+        messages: [{ type: "tool", toolCallId: "ask-async" }, { type: "compaction-boundary" }],
+      };
+
+      await waitFor(() =>
+        expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull()
+      );
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    test("sends from a host that does not feed WorkspaceStore", async () => {
+      // The VS Code webview renders this card without registering the workspace in the store.
+      workspaceStoreFed = false;
+      const view = renderAsyncQuestion();
+
+      fireEvent.click(view.getByText("First"));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+      await waitFor(() => expect(view.getByText("User answered")).toBeTruthy());
+      expect(sendMessage).toHaveBeenCalledTimes(1);
     });
   });
 });

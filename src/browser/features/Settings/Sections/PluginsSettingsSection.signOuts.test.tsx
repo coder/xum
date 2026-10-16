@@ -10,6 +10,7 @@ import type {
   AgentPluginPendingSignOuts,
 } from "@/common/orpc/schemas/agentPlugins";
 import { PluginsSettingsSection } from "./PluginsSettingsSection";
+import { publishPluginsSectionIntent } from "./pluginsSectionIntents";
 
 let cleanupDom: (() => void) | null = null;
 beforeEach(() => {
@@ -29,19 +30,21 @@ const row = (present: boolean): AgentPluginListItem => ({
   mcpServerCount: 0,
 });
 
-// #6627: opening the section retries the pending sign-outs inside list(). When that retry clears
-// the record, the list was still read behind the fence, so the section must list once more.
-test("a sign-out record that clears during the section open re-lists the plugins", async () => {
+// #6627: one call returns the list and the record. A re-list that fails (a transient backend
+// error) must keep the notice, because the record still hides the managed plugins, and the
+// notice keeps the polling on.
+test("a failed re-list keeps the pending sign-out notice", async () => {
   const api = createMockORPCClient({ agentPlugins: { items: [] } });
-  let record: AgentPluginPendingSignOuts = { kind: "pending", servers: ["https://x/mcp"] };
-  let lists = 0;
-  api.agentPlugins.pendingSignOuts = () => Promise.resolve(record);
-  api.agentPlugins.list = () => {
-    lists++;
-    // The first list runs behind the fence and clears the record (the section-open retry).
-    const fenced = record.kind !== "none";
-    record = { kind: "none" };
-    return Promise.resolve({ success: true as const, data: [row(!fenced)] });
+  const record: AgentPluginPendingSignOuts = { kind: "pending", servers: ["https://x/mcp"] };
+  let calls = 0;
+  api.agentPlugins.listForSettings = () => {
+    calls++;
+    return calls === 1
+      ? Promise.resolve({
+          list: { success: true as const, data: [row(false)] },
+          pendingSignOuts: record,
+        })
+      : Promise.reject(new Error("backend restarting"));
   };
 
   const view = render(
@@ -51,8 +54,11 @@ test("a sign-out record that clears during the section open re-lists the plugins
       </TooltipProvider>
     </APIProvider>
   );
-  await waitFor(() => expect(lists).toBe(2));
-  await waitFor(() => expect(view.container.textContent).toContain("grill"));
-  expect(view.container.textContent).not.toContain("Managed plugins are unavailable");
-  expect(view.container.textContent).not.toMatch(/missing/i);
+  await waitFor(() =>
+    expect(view.container.textContent).toContain("Managed plugins are unavailable")
+  );
+  publishPluginsSectionIntent({ type: "refresh" });
+  await waitFor(() => expect(calls).toBe(2));
+  await waitFor(() => expect(view.container.textContent).toContain("backend restarting"));
+  expect(view.container.textContent).toContain("Managed plugins are unavailable");
 });

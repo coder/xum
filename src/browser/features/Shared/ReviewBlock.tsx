@@ -157,7 +157,7 @@ const ReviewBlockCore: React.FC<ReviewBlockCoreProps> = ({
                     type="button"
                     onClick={onComplete}
                     aria-label="Mark as done"
-                    className="text-muted hover:text-success flex items-center justify-center rounded p-1 transition-colors"
+                    className="text-muted hover:text-success-text flex items-center justify-center rounded p-1 transition-colors"
                   >
                     <Check className="size-3" />
                   </button>

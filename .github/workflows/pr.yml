@@ -116,6 +116,7 @@ jobs:
               - 'scripts/gen_builtin_skills.ts'
               - 'scripts/gen_workflow_runtime_sources.ts'
               - 'scripts/precompress-static.ts'
+              - 'scripts/build-row-tree-worker.ts'
               - 'scripts/check-analytics-worker.cjs'
               - 'docs/**'
               - 'index.html'
@@ -585,6 +586,12 @@ jobs:
           SHARD: ${{ matrix.shard }}
           # No provider secrets here, so the repros' app uses the mock AI.
           BUGBASH_REPROS: ${{ matrix.shard == '1/4' && '1' || '0' }}
+      # The static workspace view's phone skeleton must match the live page (#5971). On drift, the
+      # failure names the element and the command that regenerates the skeleton.
+      # It reuses the `make build` of `make test-e2e` above.
+      - name: Check the phone chrome skeleton
+        if: matrix.os == 'linux' && matrix.shard == '1/4'
+        run: make check-phone-chrome
       - name: Run tests
         if: matrix.os == 'macos'
         env:
@@ -671,6 +678,9 @@ jobs:
       - name: Verify legacy workspace lookups on Windows checkout paths
         shell: pwsh
         run: bun test src/node/config.test.ts -t "legacy rows with a Windows checkout path"
+      - name: Verify a new workspace's projectName on a Windows project path
+        shell: pwsh
+        run: bun test src/node/services/workspaceService.planNamespace.test.ts -t "folder name, not its path"
       - name: Run Windows integration smoke tests
         shell: pwsh
         run: |

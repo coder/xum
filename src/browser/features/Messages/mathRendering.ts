@@ -34,7 +34,13 @@ export function publishKatexPlugins(plugins: Pluggable[]): void {
 
 /** The published KaTeX plugins, or null until the lazy chunk loads (always null for `false`). */
 export function useKatexPlugins(enabled: boolean): KatexPlugins | null {
-  const published = useSyncExternalStore(enabled ? subscribe : subscribeNever, () => katex);
+  const getSnapshot = () => katex;
+  // Server rendering of the markdown components (static workspace view) needs a server snapshot.
+  const published = useSyncExternalStore(
+    enabled ? subscribe : subscribeNever,
+    getSnapshot,
+    getSnapshot
+  );
   return enabled ? published : null;
 }
 

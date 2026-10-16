@@ -44,6 +44,7 @@ import {
   findWorkspaceInConfig,
   projectWorkspace,
   saveWorkspaces,
+  startStopAwaitingRelease,
   streamAbort,
   streamEnd,
   streamError,
@@ -2828,7 +2829,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         "admitted",
         "pending",
       ]);
-      await taskService.stopDescendantAgentTask(rootId, taskId);
+      const { stopped } = await startStopAwaitingRelease(taskService, rootId, taskId);
       // The admitted turn AND the pending obligation keep the record: the Stop cannot release
       // until the turn settles and the pending send is dispositioned.
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(true);
@@ -2844,6 +2845,8 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       pending.onDisposed("refused");
       await settle();
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+      // The Stop resolves only now, once its latch dropped (#6727).
+      expect((await stopped).success).toBe(true);
       expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
       expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
@@ -4093,7 +4096,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
       ).onAdmitted(turn);
       activeTurn = turn;
-      await taskService.stopDescendantAgentTask(rootId, taskId);
+      const { stopped } = await startStopAwaitingRelease(taskService, rootId, taskId);
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(true);
       expect(entryOf(config, taskId)?.taskStatus).toBe("interrupted");
       if (options.successorAdmitted) {
@@ -4115,6 +4118,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       host.settleTurn(taskId, turn);
       await settle();
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+      expect((await stopped).success).toBe(true);
       return {
         taskId,
         attemptA,

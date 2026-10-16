@@ -52,6 +52,8 @@ const backendProxyTarget = `http://${formatHostForUrl(backendProxyHost)}:${backe
 
 const alias: Record<string, string> = {
   "@": path.resolve(__dirname, "./src"),
+  // Node-only SDK; see the stub for why browser bundles never load it.
+  "@ai-sdk/google-vertex": path.resolve(__dirname, "./src/common/mocks/googleVertexStub.ts"),
 };
 
 if (disableMermaid) {

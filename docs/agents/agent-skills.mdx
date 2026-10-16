@@ -156,7 +156,7 @@ Run `sh "${CLAUDE_SKILL_DIR}/scripts/collect.sh"` and summarize its output.
 
 When you invoke a skill (`/{skill-name}` or `$skill-name`), the first line of the skill text the agent gets names the skill's directory (and the plugin root for plugin skills). The agent can then open bundled files without searching for them. If the path contains a backtick, a `<` or `>`, or a control character, that line tells the agent to call `agent_skill_read` for the path instead. Skill text in older messages does not change.
 
-Xum reports a directory only when the path is valid where `bash` runs. Otherwise `skillDir` is absent and `skillDirUnavailable` tells the agent why. For an invoked skill whose files are on the Xum host while `bash` runs elsewhere, the first line says so instead. The agent can still read every bundled file with `agent_skill_read_file`.
+Xum reports a directory only when the path is valid where `bash` runs. Otherwise `skillDir` is absent and `skillDirUnavailable` tells the agent why. For an invoked skill whose files are on the Xum host while `bash` runs elsewhere, the first line says so instead. The agent can still read every bundled file with `agent_skill_read_file`. The copy of a skill that Xum re-injects after compaction keeps this first line, also for a skill the agent read with `agent_skill_read`.
 
 | Skill                                              | Local and worktree workspaces | SSH and Docker workspaces                            | Devcontainer workspaces |
 | -------------------------------------------------- | ----------------------------- | ---------------------------------------------------- | ----------------------- |

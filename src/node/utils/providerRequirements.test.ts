@@ -210,6 +210,96 @@ describe("resolveProviderCredentials - Meta", () => {
   });
 });
 
+describe("resolveProviderCredentials - Google Vertex AI", () => {
+  it.each([
+    {
+      name: "express mode from a saved API key, without a project",
+      config: { apiKey: "vertex-key" },
+      env: {},
+      expected: { isConfigured: true, apiKey: "vertex-key", apiKeySource: "config" },
+    },
+    {
+      name: "ADC from a saved project, location defaulting to global",
+      config: { project: "my-project" },
+      env: {},
+      expected: {
+        isConfigured: true,
+        project: "my-project",
+        location: "global",
+      },
+    },
+    {
+      name: "ADC from env project and location",
+      config: {},
+      env: { GOOGLE_VERTEX_PROJECT: "env-project", GOOGLE_VERTEX_LOCATION: "us-central1" },
+      expected: { isConfigured: true, project: "env-project", location: "us-central1" },
+    },
+    {
+      name: "express mode from the env API key",
+      config: {},
+      env: { GOOGLE_VERTEX_API_KEY: "env-vertex-key" },
+      expected: { isConfigured: true, apiKey: "env-vertex-key", apiKeySource: "env" },
+    },
+    {
+      name: "saved project and location over env values",
+      config: { project: "saved-project", location: "europe-west4" },
+      env: { GOOGLE_VERTEX_PROJECT: "env-project", GOOGLE_VERTEX_LOCATION: "us-central1" },
+      expected: { isConfigured: true, project: "saved-project", location: "europe-west4" },
+    },
+    {
+      name: "the saved key file over GOOGLE_APPLICATION_CREDENTIALS",
+      config: { project: "my-project", keyFilename: "/keys/saved-sa.json" },
+      env: { GOOGLE_APPLICATION_CREDENTIALS: "/keys/env-sa.json" },
+      expected: {
+        isConfigured: true,
+        keyFilename: "/keys/saved-sa.json",
+        keyFilenameSource: "config",
+      },
+    },
+    {
+      name: "a lowercased location, since Vertex location IDs are lowercase",
+      config: { project: "my-project", location: " US-Central1 " },
+      env: {},
+      expected: { isConfigured: true, location: "us-central1" },
+    },
+    {
+      name: "unconfigured with a blank project",
+      config: { project: "   " },
+      env: {},
+      expected: { isConfigured: false, missingRequirement: "project" },
+    },
+    {
+      name: "unconfigured without a project or API key, ignoring Gemini API keys",
+      config: { location: "us-central1" },
+      env: { GOOGLE_GENERATIVE_AI_API_KEY: "gemini-key", GOOGLE_API_KEY: "gemini-key" },
+      expected: { isConfigured: false, missingRequirement: "project" },
+    },
+  ])("$name", ({ config, env, expected }) => {
+    expect(resolveProviderCredentials("google-vertex", config, env)).toMatchObject(expected);
+  });
+
+  it("expands a home-relative service account key file for ADC", () => {
+    const result = resolveProviderCredentials(
+      "google-vertex",
+      { project: "my-project", keyFilename: "~/keys/sa.json" },
+      {}
+    );
+    expect(result.keyFilename).toBe(path.join(os.homedir(), "keys/sa.json"));
+  });
+
+  it("treats the express mode env key as a provider secret", () => {
+    expect(providerSecretEnvVarNames()).toContain("GOOGLE_VERTEX_API_KEY");
+  });
+
+  // The CLI starts only when the env bootstrap yields a configured provider.
+  it.each([
+    { name: "ADC from the env project", env: { GOOGLE_VERTEX_PROJECT: "env-project" } },
+    { name: "express mode from the env API key", env: { GOOGLE_VERTEX_API_KEY: "env-vertex-key" } },
+  ])("bootstraps $name for the CLI", ({ env }) => {
+    expect(hasAnyConfiguredProvider(buildProvidersFromEnv(env))).toBe(true);
+  });
+});
+
 describe("resolveProviderCredentials - Z.ai", () => {
   it("resolves ZAI_API_KEY from the environment", () => {
     const result = resolveProviderCredentials("zai", {}, { ZAI_API_KEY: "zai-test-key" });

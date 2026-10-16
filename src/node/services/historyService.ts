@@ -3264,6 +3264,36 @@ export class HistoryService {
     return this.readPartialFile(workspaceId, { status: true });
   }
 
+  /**
+   * The static workspace view's partial read (workspace.history.tail, #6832): at most `maxBytes` + 1
+   * bytes, so a large partial never costs a full read and parse. "oversized" past `maxBytes`; null
+   * when absent, unreadable or malformed, as readPartial treats those.
+   */
+  async readBoundedPartial(
+    workspaceId: string,
+    maxBytes: number
+  ): Promise<MuxMessage | null | "oversized"> {
+    let handle: fs.FileHandle | undefined;
+    try {
+      handle = await fs.open(this.getPartialPath(workspaceId), "r");
+      const buffer = Buffer.allocUnsafe(maxBytes + 1);
+      let length = 0;
+      // A positioned read can return fewer bytes than asked before EOF (some network filesystems).
+      while (length < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+        if (bytesRead === 0) break;
+        length += bytesRead;
+      }
+      if (length > maxBytes) return "oversized";
+      const message: unknown = JSON.parse(buffer.toString("utf8", 0, length));
+      return isReadableHistoryMessage(message) ? normalizePersistedMessage(message) : null;
+    } catch {
+      return null;
+    } finally {
+      await handle?.close();
+    }
+  }
+
   private async readPartialFile(
     workspaceId: string,
     options: { throwOnError?: boolean; status: boolean }

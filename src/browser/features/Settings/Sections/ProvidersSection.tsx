@@ -28,7 +28,11 @@ import { CSS } from "@dnd-kit/utilities";
 
 import { createEditKeyHandler } from "@/browser/utils/ui/keybinds";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
-import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import {
+  GOOGLE_VERTEX_DEFAULT_LOCATION,
+  PROVIDER_DEFINITIONS,
+  type ProviderName,
+} from "@/common/constants/providers";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { ProviderIcon, ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import { getStoredAuthToken } from "@/browser/components/AuthTokenModal/AuthTokenModal";
@@ -271,6 +275,41 @@ function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo):
     ];
   }
 
+  if (provider === "google-vertex") {
+    // Google Application Default Credentials by default; an API key selects express mode.
+    return [
+      { key: "project", label: "Project", placeholder: "my-gcp-project", type: "text" },
+      {
+        key: "location",
+        label: "Location",
+        placeholder: GOOGLE_VERTEX_DEFAULT_LOCATION,
+        type: "text",
+        optional: true,
+      },
+      {
+        key: "keyFilename",
+        label: "Service account key file",
+        placeholder: "~/.config/gcloud/service-account.json",
+        type: "secret",
+        optional: true,
+      },
+      {
+        key: "apiKey",
+        label: "Express mode API key",
+        placeholder: "GOOGLE_VERTEX_API_KEY",
+        type: "secret",
+        optional: true,
+      },
+      {
+        key: "baseUrl",
+        label: "Base URL",
+        placeholder: "https://aiplatform.googleapis.com/v1/publishers/google",
+        type: "text",
+        optional: true,
+      },
+    ];
+  }
+
   if (provider === "mux-gateway") {
     return [];
   }
@@ -313,6 +352,82 @@ function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo):
       optional: true,
     },
   ];
+}
+
+type ProviderStatusReader<T> = (providerConfig: ProviderConfigInfo) => T | undefined;
+
+// Provider-specific settings the backend reports in a nested status object,
+// keyed by `${provider}.${field}`.
+const NESTED_FIELD_VALUES = new Map<string, ProviderStatusReader<string>>([
+  ["bedrock.region", (info) => info.aws?.region],
+  ["bedrock.profile", (info) => info.aws?.profile],
+  ["google-vertex.project", (info) => info.googleVertex?.project],
+  ["google-vertex.location", (info) => info.googleVertex?.location],
+]);
+
+// Values resolved from env vars, shown when the config value is unset.
+const NESTED_ENV_FIELD_VALUES = new Map<string, ProviderStatusReader<string>>([
+  ["google-vertex.project", (info) => info.googleVertex?.envProject],
+  ["google-vertex.location", (info) => info.googleVertex?.envLocation],
+]);
+
+// Secrets are never sent to the UI, only whether each one is set.
+const NESTED_SECRET_SET_FLAGS = new Map<string, ProviderStatusReader<boolean>>([
+  ["bedrock.bearerToken", (info) => info.aws?.bearerTokenSet],
+  ["bedrock.accessKeyId", (info) => info.aws?.accessKeyIdSet],
+  ["bedrock.secretAccessKey", (info) => info.aws?.secretAccessKeySet],
+  ["google-vertex.keyFilename", (info) => info.googleVertex?.keyFilenameSet],
+]);
+
+function getProviderFieldValue(
+  provider: string,
+  field: string,
+  providerConfig: ProviderConfigInfo
+): string | undefined {
+  const readNested = NESTED_FIELD_VALUES.get(`${provider}.${field}`);
+  if (readNested) return readNested(providerConfig);
+  // Standard fields like baseUrl
+  const value = providerConfig[field as keyof ProviderConfigInfo];
+  return typeof value === "string" ? value : undefined;
+}
+
+function isProviderSecretSet(
+  provider: string,
+  field: string,
+  providerConfig: ProviderConfigInfo
+): boolean {
+  if (field === "apiKey") return providerConfig.apiKeySet ?? false;
+  return NESTED_SECRET_SET_FLAGS.get(`${provider}.${field}`)?.(providerConfig) ?? false;
+}
+
+/**
+ * Where a field's value comes from when it is not saved in config. The API key
+ * note renders here only for providers without a "Get API Key" link, which
+ * already shows it.
+ */
+function getFieldSourceNote(params: {
+  field: string;
+  fieldValue: string | undefined;
+  fieldDisplayValue: string | undefined;
+  fieldIsSet: boolean;
+  hasKeyUrl: boolean;
+  providerInfo: ProviderConfigInfo | undefined;
+}): string | null {
+  const { field, providerInfo } = params;
+  if (field === "apiKey") {
+    if (params.hasKeyUrl || params.fieldIsSet) return null;
+    if (providerInfo?.apiKeySource === "file") return "Set by API key file.";
+    return providerInfo?.apiKeySource === "env" ? "Set by env vars." : null;
+  }
+  if (field === "baseUrl") {
+    return providerInfo?.baseUrlSource === "env" && providerInfo.baseUrlResolved
+      ? "Set by env vars."
+      : null;
+  }
+  if (field === "keyFilename") {
+    return providerInfo?.googleVertex?.envKeyFilenameSet ? "Set by env vars." : null;
+  }
+  return !params.fieldValue && params.fieldDisplayValue ? "Set by env vars." : null;
 }
 
 /**
@@ -1637,25 +1752,19 @@ export function ProvidersSection() {
 
   const getFieldValue = (provider: string, field: string): string | undefined => {
     const providerConfig = config?.[provider];
-    if (!providerConfig) return undefined;
-
-    // For bedrock, check aws nested object for region/profile
-    if (provider === "bedrock" && (field === "region" || field === "profile")) {
-      return field === "region" ? providerConfig.aws?.region : providerConfig.aws?.profile;
-    }
-
-    // For standard fields like baseUrl
-    const value = providerConfig[field as keyof typeof providerConfig];
-    return typeof value === "string" ? value : undefined;
+    return providerConfig ? getProviderFieldValue(provider, field, providerConfig) : undefined;
   };
 
   const getFieldDisplayValue = (provider: string, field: string): string | undefined => {
     const fieldValue = getFieldValue(provider, field);
+    const providerConfig = config?.[provider];
     if (field !== "baseUrl") {
-      return fieldValue;
+      return (
+        fieldValue ??
+        (providerConfig && NESTED_ENV_FIELD_VALUES.get(`${provider}.${field}`)?.(providerConfig))
+      );
     }
 
-    const providerConfig = config?.[provider];
     if (providerConfig?.baseUrlSource && typeof providerConfig.baseUrlResolved === "string") {
       return providerConfig.baseUrlResolved;
     }
@@ -1666,26 +1775,9 @@ export function ProvidersSection() {
   const isFieldSet = (provider: string, field: string, fieldConfig: FieldConfig): boolean => {
     const providerConfig = config?.[provider];
     if (!providerConfig) return false;
-
-    if (fieldConfig.type === "secret") {
-      // For apiKey, we have apiKeySet from the sanitized config
-      if (field === "apiKey") return providerConfig.apiKeySet ?? false;
-
-      // For AWS secrets, check the aws nested object
-      if (provider === "bedrock" && providerConfig.aws) {
-        const { aws } = providerConfig;
-        switch (field) {
-          case "bearerToken":
-            return aws.bearerTokenSet ?? false;
-          case "accessKeyId":
-            return aws.accessKeyIdSet ?? false;
-          case "secretAccessKey":
-            return aws.secretAccessKeySet ?? false;
-        }
-      }
-      return false;
-    }
-    return !!getFieldValue(provider, field);
+    return fieldConfig.type === "secret"
+      ? isProviderSecretSet(provider, field, providerConfig)
+      : !!getProviderFieldValue(provider, field, providerConfig);
   };
 
   const markCustomProviderFieldTouched = (field: keyof typeof customProviderTouchedFields) => {
@@ -2290,6 +2382,14 @@ export function ProvidersSection() {
                         const fieldValue = getFieldValue(provider, fieldConfig.key);
                         const fieldDisplayValue = getFieldDisplayValue(provider, fieldConfig.key);
                         const fieldIsSet = isFieldSet(provider, fieldConfig.key, fieldConfig);
+                        const fieldSourceNote = getFieldSourceNote({
+                          field: fieldConfig.key,
+                          fieldValue,
+                          fieldDisplayValue,
+                          fieldIsSet,
+                          hasKeyUrl: !!providerKeyUrl,
+                          providerInfo,
+                        });
                         const showOpenAIBaseUrlHint =
                           fieldConfig.key === "baseUrl" &&
                           provider === "openai" &&
@@ -2345,7 +2445,7 @@ export function ProvidersSection() {
                                   variant="ghost"
                                   size="icon"
                                   onClick={handleSaveEdit}
-                                  className="h-6 w-6 text-green-500 hover:text-green-400"
+                                  className="text-success-text h-6 w-6"
                                 >
                                   <Check className="h-4 w-4" />
                                 </Button>
@@ -2360,8 +2460,9 @@ export function ProvidersSection() {
                               </div>
                             ) : (
                               <>
-                                <div className="flex items-center justify-between">
-                                  <span className="text-foreground flex items-center gap-1 font-mono text-xs">
+                                <div className="flex items-center justify-between gap-2">
+                                  {/* min-w-0 + break-all: long values (Base URLs) wrap instead of pushing the buttons off-screen on narrow widths. */}
+                                  <span className="text-foreground flex min-w-0 items-center gap-1 font-mono text-xs break-all">
                                     {fieldConfig.type === "secret"
                                       ? fieldIsSet
                                         ? "••••••••"
@@ -2370,7 +2471,7 @@ export function ProvidersSection() {
                                           : "Not set"
                                       : (fieldDisplayValue ?? "Default")}
                                   </span>
-                                  <div className="flex gap-2">
+                                  <div className="flex shrink-0 gap-2">
                                     {(fieldConfig.type === "text"
                                       ? !!fieldValue
                                       : fieldConfig.type === "secret" && fieldIsSet) && (
@@ -2395,11 +2496,9 @@ export function ProvidersSection() {
                                     </Button>
                                   </div>
                                 </div>
-                                {fieldConfig.key === "baseUrl" &&
-                                  config?.[provider]?.baseUrlSource === "env" &&
-                                  config?.[provider]?.baseUrlResolved && (
-                                    <div className="text-muted mt-1 text-xs">Set by env vars.</div>
-                                  )}
+                                {fieldSourceNote && (
+                                  <div className="text-muted mt-1 text-xs">{fieldSourceNote}</div>
+                                )}
                               </>
                             )}
                             {showOpenAIBaseUrlHint && (

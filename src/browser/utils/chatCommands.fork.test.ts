@@ -61,7 +61,7 @@ describe("forkWorkspace", () => {
         subscribe: (_input: void, opts?: { signal?: AbortSignal }) =>
           Promise.resolve(
             (async function* (): AsyncGenerator<DraftEvent> {
-              yield { type: "snapshot", drafts: [], list: { entries: [], revision: 0 } };
+              yield { type: "snapshot", drafts: [] };
               // The store asks for the next event only once it has applied the snapshot.
               markSnapshotApplied();
               await new Promise<void>((resolve) =>

@@ -753,9 +753,10 @@ const AddPluginPanel: React.FC<{
                 </span>{" "}
                 <span className="text-muted">
                   — become agent definitions. An agent in Claude Code or Cursor format (no Xum-only
-                  field such as base or tools) becomes a hidden sub-agent with Exec&apos;s tools. It
-                  can run shell commands, which can change any file. readonly: true removes only the
-                  file edit and task tools.
+                  field such as base) becomes a hidden sub-agent with Exec&apos;s tools, narrowed
+                  only by its Claude Code tools or disallowedTools list. Unless that list removes
+                  Bash, it can run shell commands, which can change any file. readonly: true removes
+                  only the file edit and task tools.
                 </span>
               </p>
             </div>
@@ -1157,61 +1158,81 @@ const UpdateReviewPanel: React.FC<{
   );
 };
 
-/**
- * The plugin list and the pending sign-out status (#6627). Opening the section retries the
- * sign-outs, so the status is read after the list. When the record existed before the list and is
- * gone after it, the list may still hold rows the fence hid: list once more.
- */
-async function listWithSignOuts(api: NonNullable<ReturnType<typeof useAPI>["api"]>) {
-  const readStatus = () => api.agentPlugins.pendingSignOuts().catch(() => null);
-  const before = await readStatus();
-  let result = await api.agentPlugins.list();
-  const signOuts = await readStatus();
-  if (before !== null && before.kind !== "none" && signOuts?.kind === "none")
-    result = await api.agentPlugins.list();
-  return { result, signOuts };
-}
-
-/** How often the section re-reads a pending sign-out record (the backend retries every 30 s). */
+/** How often the section re-lists while a pending sign-out record shows (the backend retries every 30 s). */
 const PENDING_SIGN_OUT_POLL_MS = 30_000;
 
 /**
- * The pending sign-out record (#6627). The section sets it after each list. A background pass
- * (the discovery gate retries every 30 s) can clear or change the record without any section
- * action, so the hook re-reads it while the notice shows.
+ * Re-lists the section while the pending sign-out notice shows (#6627). A background pass (the
+ * discovery gate retries every 30 s) can clear or change the record without any section action.
+ * Each re-list returns the list and the record together, so a failed one changes neither, and
+ * the polling goes on.
  */
-function usePendingSignOuts(
-  api: ReturnType<typeof useAPI>["api"],
-  /** Re-lists the plugins: rows read while the record fenced discovery show as missing. */
-  onCleared: () => void
-): [AgentPluginPendingSignOuts | null, (status: AgentPluginPendingSignOuts | null) => void] {
-  const [status, setStatus] = useState<AgentPluginPendingSignOuts | null>(null);
+function usePollWhileSignOutsPending(
+  status: AgentPluginPendingSignOuts | null,
+  relist: () => void
+): void {
   const shown = status !== null && status.kind !== "none";
-  // The interval reads the latest callback (the section's refresh is a plain handler).
-  const onClearedRef = useRef(onCleared);
-  onClearedRef.current = onCleared;
+  // The interval calls the latest callback (the section's refresh is a plain handler).
+  const relistRef = useRef(relist);
+  relistRef.current = relist;
   useEffect(() => {
-    if (!api || !shown) return;
-    // Each read also lets the backend retry the sign-out (at most every 30 s).
-    const timer = setInterval(() => {
-      api.agentPlugins.pendingSignOuts().then(
-        (next) => {
-          setStatus(next);
-          if (next.kind === "none") onClearedRef.current();
-        },
-        () => undefined
-      );
-    }, PENDING_SIGN_OUT_POLL_MS);
+    if (!shown) return;
+    const timer = setInterval(() => relistRef.current(), PENDING_SIGN_OUT_POLL_MS);
     return () => clearInterval(timer);
-  }, [api, shown]);
-  return [status, setStatus];
+  }, [shown]);
 }
+
+/**
+ * The broken-record notice text and its sign-out control (#6627). A broken record fences the
+ * plugin servers, so Settings → MCP cannot list them. The backend signs out of them from the
+ * plugin trees and deletes the record only after that succeeds.
+ */
+const BrokenSignOutRecord: React.FC<{ reason: string; onCleared: () => void }> = (props) => {
+  const { api } = useAPI();
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
+  const signOut = async () => {
+    if (!api) return;
+    setSigningOut(true);
+    setSignOutError(null);
+    try {
+      const result = await api.agentPlugins.signOutPluginServers();
+      if (result.success) {
+        props.onCleared();
+        // Mounted consumers (skills, slash commands, MCP apps) cached the fenced, empty inventory.
+        publishAgentPluginsMutated();
+      } else setSignOutError(result.error);
+    } catch (error) {
+      setSignOutError(getErrorMessage(error));
+    } finally {
+      setSigningOut(false);
+    }
+  };
+  return (
+    <span className="min-w-0 space-y-2 break-words">
+      <span className="block">Managed plugins are unavailable to agents. {props.reason}</span>
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={signingOut || !api}
+        onClick={() => void signOut()}
+      >
+        {signingOut ? "Signing out…" : "Sign out of plugin MCP servers"}
+      </Button>
+      {signOutError !== null && <span className="block">{signOutError}</span>}
+    </span>
+  );
+};
 
 /**
  * Section notice while a post-update sign-out record exists (#6627). Every discovery gate keeps
  * managed plugins closed until it is gone, and without this notice they only disappear.
  */
-const PendingSignOutNotice: React.FC<{ status: AgentPluginPendingSignOuts | null }> = (props) => {
+const PendingSignOutNotice: React.FC<{
+  status: AgentPluginPendingSignOuts | null;
+  /** Re-lists the plugins after the sign-out deleted the record. */
+  onCleared: () => void;
+}> = (props) => {
   const status = props.status;
   if (status === null || status.kind === "none") return null;
   return (
@@ -1221,9 +1242,7 @@ const PendingSignOutNotice: React.FC<{ status: AgentPluginPendingSignOuts | null
     >
       <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
       {status.kind === "broken" ? (
-        <span className="break-words">
-          Managed plugins are unavailable to agents. {status.reason}
-        </span>
+        <BrokenSignOutRecord reason={status.reason} onCleared={props.onCleared} />
       ) : (
         <span className="space-y-1 break-words">
           <span className="block">
@@ -1416,7 +1435,8 @@ export const PluginsSettingsSection: React.FC = () => {
   const [containerLocation, setContainerLocation] = useState<string | null>(null);
   // The record that keeps managed plugins closed after a failed post-update sign-out (#6627).
   // Lazy: `refresh` is declared below.
-  const [pendingSignOuts, setPendingSignOuts] = usePendingSignOuts(api, () => void refresh());
+  const [pendingSignOuts, setPendingSignOuts] = useState<AgentPluginPendingSignOuts | null>(null);
+  usePollWhileSignOutsPending(pendingSignOuts, () => void refresh());
   // Palette intents (keyboard rule: install/uninstall/update need keyboard
   // paths). The initializer covers palette → fresh mount; the subscription
   // below covers commands invoked while this section is already on screen
@@ -1466,17 +1486,19 @@ export const PluginsSettingsSection: React.FC = () => {
     // response resolving last would resurrect removed rows or old versions.
     const generation = ++listGenerationRef.current;
     try {
-      const { result, signOuts } = await listWithSignOuts(api);
+      // One call returns the list and the record it was read with (#6627). A failed call keeps
+      // the last record, so its notice and the polling stay.
+      const result = await api.agentPlugins.listForSettings();
       if (generation !== listGenerationRef.current) {
         return; // A newer list request superseded this one.
       }
-      setPendingSignOuts(signOuts);
-      if (result.success) {
-        setItems(result.data);
+      setPendingSignOuts(result.pendingSignOuts);
+      if (result.list.success) {
+        setItems(result.list.data);
         setError(null);
       } else {
         setItems([]);
-        setError(result.error);
+        setError(result.list.error);
       }
     } catch (err) {
       if (generation === listGenerationRef.current) {
@@ -1736,7 +1758,7 @@ export const PluginsSettingsSection: React.FC = () => {
           </div>
         )}
 
-        <PendingSignOutNotice status={pendingSignOuts} />
+        <PendingSignOutNotice status={pendingSignOuts} onCleared={() => void refresh()} />
         <ComponentReviewNotice items={items} />
 
         <div className="space-y-2">

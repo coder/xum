@@ -35,6 +35,7 @@ import {
 import { shellQuote } from "@/common/utils/shell";
 import { getErrorMessage } from "@/common/utils/errors";
 import { PlatformPaths } from "@/common/utils/paths";
+import { PlatformPaths as NodePlatformPaths } from "@/node/utils/paths.main";
 import {
   getWorkspaceProjectRepos,
   getWorkspaceProjectStorageKeys,
@@ -661,7 +662,8 @@ export class GitPatchArtifactService {
         return;
       }
 
-      const fallbackName = workspacePath.split("/").pop() ?? workspacePath.split("\\").pop() ?? "";
+      // process.platform aware: the common helper reads navigator, which Node 20 lacks (#6714).
+      const fallbackName = NodePlatformPaths.basename(workspacePath);
       const workspaceName = coerceNonEmptyString(ws.name) ?? coerceNonEmptyString(fallbackName);
       if (!workspaceName) {
         await updateArtifact((existing) =>

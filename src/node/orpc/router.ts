@@ -150,6 +150,7 @@ import {
   subscribeMetadata,
   subscribeOpenSettings,
   subscribeDesignExperiment,
+  subscribeMcpInsufficientScope,
   subscribePerfFlightRecorderStatus,
   subscribeComputerUseStatus,
   subscribeProviderConfig,
@@ -191,6 +192,7 @@ import { throwWorkflowOrpcError } from "./formatOrpcError";
 import { isDraftTooLargeError } from "@/common/utils/drafts";
 import { resolveDraftSends } from "@/node/services/draftSendResolution";
 import type { SendAcceptance } from "@/node/services/draftService";
+import { CreationDraftRejectedError } from "@/node/services/creationDraftService";
 import {
   boundMCPSettingsError,
   mcpSettingsSnapshotForIpc,
@@ -198,6 +200,7 @@ import {
   type MCPSettingsReadSnapshot,
 } from "@/common/utils/mcpSettings";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
+import { readWorkspaceViewTail } from "@/node/services/workspaceViewTail";
 
 /**
  * Transports mask plain errors as "Internal Server Error". The draft size refusal must reach the
@@ -208,6 +211,14 @@ function rethrowDraftTooLarge(error: unknown): never {
     throw new ORPCError("BAD_REQUEST", { message: (error as Error).message });
   }
   throw error;
+}
+
+/** A refused creation draft save needs corrected choices or a reload, never a retry. */
+function rethrowCreationDraftRefusal(error: unknown): never {
+  if (error instanceof CreationDraftRejectedError) {
+    throw new ORPCError("BAD_REQUEST", { message: error.message });
+  }
+  return rethrowDraftTooLarge(error);
 }
 
 /**
@@ -828,18 +839,30 @@ export const router = (authToken?: string) => {
         .input(schemas.drafts.resolveSends.input)
         .output(schemas.drafts.resolveSends.output)
         .handler(({ context, input }) => resolveDraftSends(context, input)),
-      getList: t
-        .input(schemas.drafts.getList.input)
-        .output(schemas.drafts.getList.output)
-        .handler(({ context }) => context.draftService.getList({ strict: true })),
-      putListEntry: t
-        .input(schemas.drafts.putListEntry.input)
-        .output(schemas.drafts.putListEntry.output)
-        .handler(({ context, input }) => context.draftService.putListEntry(input)),
-      importLegacyList: t
-        .input(schemas.drafts.importLegacyList.input)
-        .output(schemas.drafts.importLegacyList.output)
-        .handler(({ context, input }) => context.draftService.importLegacyList(input.entries)),
+      listCreation: t
+        .input(schemas.drafts.listCreation.input)
+        .output(schemas.drafts.listCreation.output)
+        .handler(({ context }) => context.draftService.creation.list()),
+      getCreation: t
+        .input(schemas.drafts.getCreation.input)
+        .output(schemas.drafts.getCreation.output)
+        .handler(({ context, input }) => context.draftService.creation.get(input.scope.draftId)),
+      updateCreation: t
+        .input(schemas.drafts.updateCreation.input)
+        .output(schemas.drafts.updateCreation.output)
+        .handler(({ context, input }) =>
+          context.draftService.creation.update(input).catch(rethrowCreationDraftRefusal)
+        ),
+      deleteCreation: t
+        .input(schemas.drafts.deleteCreation.input)
+        .output(schemas.drafts.deleteCreation.output)
+        .handler(({ context, input }) => context.draftService.creation.delete(input.scope.draftId)),
+      importLegacyCreation: t
+        .input(schemas.drafts.importLegacyCreation.input)
+        .output(schemas.drafts.importLegacyCreation.output)
+        .handler(({ context, input }) =>
+          context.draftService.creation.importLegacy(input).catch(rethrowCreationDraftRefusal)
+        ),
       subscribe: t
         .input(schemas.drafts.subscribe.input)
         .output(schemas.drafts.subscribe.output)
@@ -1449,10 +1472,18 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.agentPluginInstallService.setComponentsResult(input)
         ),
+      listForSettings: t
+        .input(schemas.agentPlugins.listForSettings.input)
+        .output(schemas.agentPlugins.listForSettings.output)
+        .handler(({ context }) => context.agentPluginInstallService.listForSettings()),
       pendingSignOuts: t
         .input(schemas.agentPlugins.pendingSignOuts.input)
         .output(schemas.agentPlugins.pendingSignOuts.output)
         .handler(({ context }) => context.agentPluginInstallService.pendingSignOutStatus()),
+      signOutPluginServers: t
+        .input(schemas.agentPlugins.signOutPluginServers.input)
+        .output(schemas.agentPlugins.signOutPluginServers.output)
+        .handler(({ context }) => context.agentPluginInstallService.signOutPluginServersResult()),
       containerLocation: t
         .input(schemas.agentPlugins.containerLocation.input)
         .output(schemas.agentPlugins.containerLocation.output)
@@ -1494,6 +1525,10 @@ export const router = (authToken?: string) => {
         ),
     },
     mcpOauth: {
+      onInsufficientScope: t
+        .input(schemas.mcpOauth.onInsufficientScope.input)
+        .output(schemas.mcpOauth.onInsufficientScope.output)
+        .handler(({ context, signal }) => subscribeMcpInsufficientScope(context, signal)),
       startDesktopFlow: t
         .input(schemas.mcpOauth.startDesktopFlow.input)
         .output(schemas.mcpOauth.startDesktopFlow.output)
@@ -2262,6 +2297,12 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.workspaceService.setUnrelatedWorkspaceConsent(input.workspaceId, input.enabled)
         ),
+      setMessagingTag: t
+        .input(schemas.workspace.setMessagingTag.input)
+        .output(schemas.workspace.setMessagingTag.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.setMessagingTag(input.workspaceId, input.tag)
+        ),
       setAgentMessageDispatchMode: t
         .input(schemas.workspace.setAgentMessageDispatchMode.input)
         .output(schemas.workspace.setAgentMessageDispatchMode.output)
@@ -2456,6 +2497,11 @@ export const router = (authToken?: string) => {
               windowed: input.windowed === true,
             })
           ),
+        // The static first view's read: bounded and cheap, no replay (see workspaceViewTail.ts).
+        tail: t
+          .input(schemas.workspace.history.tail.input)
+          .output(schemas.workspace.history.tail.output)
+          .handler(({ context, input }) => readWorkspaceViewTail(context, input.workspaceId)),
         lastUserPrompt: t
           .input(schemas.workspace.history.lastUserPrompt.input)
           .output(schemas.workspace.history.lastUserPrompt.output)

@@ -1,10 +1,7 @@
 import { useCallback, useEffect } from "react";
 import type { ProjectConfig } from "@/common/types/project";
 import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
-import { updateUserPreferences } from "@/browser/stores/AppConfigStore";
-import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
-import { getProjectScopeId } from "@/common/constants/storage";
-import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import {
   getFirstTopLevelProjectPath,
   resolveWorkspaceCreationScope,
@@ -13,41 +10,35 @@ import {
 export type StartWorkspaceCreationDetail =
   CustomEventPayloads[typeof CUSTOM_EVENTS.START_WORKSPACE_CREATION];
 
+/**
+ * A prefilled creation opens a new draft holding the prefill (text, model, trunk). The prefill
+ * belongs to that draft: project defaults stay unchanged. Returns the draft id, if one was made.
+ */
 export function persistWorkspaceCreationPrefill(
   projectPath: string,
+  subProjectPath: string | null,
   detail: StartWorkspaceCreationDetail | undefined
-): void {
-  if (!detail) {
-    return;
+): string | undefined {
+  const { startMessage, model, trunkBranch } = detail ?? {};
+  if (startMessage === undefined && model === undefined && trunkBranch === undefined) {
+    return undefined;
   }
-
-  if (detail.startMessage !== undefined) {
-    // The creation composer opened without a draft id edits the project's default creation
-    // draft; WorkspaceContext moves it into a listed creation draft when it creates one.
-    getDraftStore().setText(defaultCreationDraftScope(projectPath), detail.startMessage);
+  const store = getCreationDraftStore();
+  const draftId = store.create(projectPath, subProjectPath, { persist: true, text: startMessage });
+  const draft = store.getView(draftId).draft;
+  if (draft && model !== undefined) {
+    // A prefilled model is an explicit pick, so it leaves Auto (see setWorkspaceModelWithOrigin).
+    store.update(draftId, { ai: { ...draft.ai, model }, auto: { ...draft.auto, model: false } });
   }
-
-  if (detail.model !== undefined) {
-    updateUserPreferences({ ai: { projectDefaults: { [projectPath]: { model: detail.model } } } });
-    // A prefilled model is an explicit pick, so it leaves Auto (see setWorkspaceModelWithOrigin);
-    // otherwise the creation send would treat it as the routing fallback.
-    setAutoRoutingChoice(getProjectScopeId(projectPath), "model", false);
-  }
-
-  if (detail.trunkBranch !== undefined) {
-    const normalizedTrunk = detail.trunkBranch.trim();
-    updateUserPreferences({
-      workspaceCreation: { byProject: { [projectPath]: { trunkBranch: normalizedTrunk || null } } },
-    });
-  }
-
-  // Note: runtime is intentionally NOT persisted here - it's a one-time override.
-  // The default runtime can only be changed via the icon selector.
+  // The runtime is intentionally not prefilled: it is a one-time override.
+  const trunk = trunkBranch?.trim();
+  if (trunk) store.updateExecution(draftId, { trunkBranch: trunk });
+  return draftId;
 }
 
 interface UseStartWorkspaceCreationOptions {
   projects: Map<string, ProjectConfig>;
-  beginWorkspaceCreation: (projectPath: string) => void;
+  beginWorkspaceCreation: (projectPath: string, draftId?: string) => void;
 }
 
 export function useStartWorkspaceCreation({
@@ -66,11 +57,12 @@ export function useStartWorkspaceCreation({
       }
 
       const creationScope = resolveWorkspaceCreationScope(resolvedProjectPath, projects);
-      // Sub-project creation shares the parent project's worktree/settings, so
-      // persisted prefill belongs to the owning parent even when the route opens
-      // the sub-project section.
-      persistWorkspaceCreationPrefill(creationScope.projectPath, detail);
-      beginWorkspaceCreation(creationScope.subProjectPath ?? creationScope.projectPath);
+      const draftId = persistWorkspaceCreationPrefill(
+        creationScope.projectPath,
+        creationScope.subProjectPath ?? null,
+        detail
+      );
+      beginWorkspaceCreation(creationScope.subProjectPath ?? creationScope.projectPath, draftId);
     },
     [projects, beginWorkspaceCreation]
   );

@@ -80,10 +80,26 @@ export function getExplicitGatewayPrefix(modelString: string): ProviderName | un
   return PROVIDER_DEFINITIONS[providerName]?.kind === "gateway" ? providerName : undefined;
 }
 
+/**
+ * Providers served by @ai-sdk/google's Gemini language model: the Gemini API,
+ * and Vertex AI through @ai-sdk/google-vertex. Both take the same Gemini payload.
+ */
+export function isGoogleFamilyProvider(provider: string): provider is "google" | "google-vertex" {
+  return provider === "google" || provider === "google-vertex";
+}
+
+// Providers whose SDK reads providerOptions from a namespace other than the
+// provider name. Saved provider extras must reach that namespace too, not just
+// the built-in reasoning options.
+const SDK_PROVIDER_OPTIONS_NAMESPACES: ReadonlyMap<string, string> = new Map([
+  // Meta reuses the OpenAI Responses adapter.
+  ["meta", "openai"],
+  // Vertex Gemini models read `googleVertex` first, then `vertex`, then `google`.
+  ["google-vertex", "googleVertex"],
+]);
+
 function sdkProviderOptionsNamespace(provider: string): string {
-  // Meta reuses the OpenAI Responses adapter. Saved provider extras must reach
-  // that SDK namespace too, not just the built-in reasoning options.
-  return provider === "meta" ? "openai" : provider;
+  return SDK_PROVIDER_OPTIONS_NAMESPACES.get(provider) ?? provider;
 }
 
 /**

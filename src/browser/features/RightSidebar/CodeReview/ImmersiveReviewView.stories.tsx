@@ -540,7 +540,9 @@ export const ImmersiveNotesSidebarActionFooter: Story = {
     // The notes count badge sits on the same kind of tint over the dark notes panel.
     const pending = await canvas.findAllByText("pending", {}, { timeout: 10_000 });
     const count = await canvas.findByTestId("immersive-notes-count");
-    await expect(textsBelowAaInThemes(() => [...pending, count]).join("\n")).toBe("");
+    // The "checked" badge sits on a success tint; success text on it was 3.71:1 in dark (#6767).
+    const checked = await canvas.findAllByText("checked");
+    await expect(textsBelowAaInThemes(() => [...pending, count, ...checked]).join("\n")).toBe("");
 
     await waitFor(
       () => {

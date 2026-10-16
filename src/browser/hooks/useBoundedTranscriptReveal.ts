@@ -34,6 +34,11 @@ export interface BoundedTranscriptRevealArgs<Row extends RevealRow> {
    * scrolled away from the bottom: the slice detaches instead, so the row being read stays.
    */
   followsTail?: boolean;
+  /**
+   * Ids of the mounted rows the reader can see, read only on the render where a detached slice
+   * loses its start or end row (see `refitDetached`). Without it, no row counts as visible.
+   */
+  readVisibleMessageIds?: () => readonly string[];
 }
 
 export interface BoundedTranscriptReveal {
@@ -99,11 +104,17 @@ interface RevealState {
   endMessageId: string | null;
   endIndexHint: number;
   /**
-   * Ids of the next unmounted rows after the end row, for the fallback when it is gone; [] at the
-   * tail. Ids only, so a detached slice never keeps an obsolete transcript reachable (#6669), and
+   * Ids of the next unmounted rows after the end row, for `refitDetached` when it is gone; [] at
+   * the tail. Ids only, so a detached slice never keeps an obsolete transcript reachable (#6669), and
    * at most `maxMountedRows` of them, so a step costs O(cap), not O(transcript) (#6676 review).
    */
   endRows: readonly string[];
+  /**
+   * Detached, with a cap: ids of the unmounted rows just before the start, nearest first (at most
+   * one cap), taken when the row before the start changes. `refitDetached` never starts the slice
+   * before the nearest of them still present: those rows were never mounted (#6757 review).
+   */
+  startRows: readonly string[];
   /**
    * The start row while it heads a bundle larger than the cap, scanned up to the slice end (the
    * newest row, or a detached end) (#6678 review): the next render scans only the rows appended
@@ -158,42 +169,68 @@ function nearestSafeCutAtOrAfter(index: number, length: number, isSafeCut: IsSaf
   return cut;
 }
 
-/** A detached slice's stored end: its first unmounted row survives deleted mounted rows. */
-function storedSliceEnd(
-  state: RevealState,
-  rows: readonly RevealRow[],
-  isSafeCut: IsSafeCut,
-  /** Where the end goes from its row's index; the vanished-start fallback keeps the index. */
-  nearest: (index: number, length: number, isSafeCut: IsSafeCut) => number = nearestSafeCutAtOrAfter
-) {
-  const { endMessageId: id, endIndexHint: hint, endRows } = state;
-  if (id === null) return rows.length;
-  const found = rows[hint]?.id === id ? hint : rows.findIndex((row) => row.id === id);
-  if (found === -1) return endAtNearestUnmountedRow(rows, endRows, isSafeCut);
+/** A detached slice's stored end; `refitDetached` re-stores it the render its row goes. */
+function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCut: IsSafeCut) {
+  const found = storedEndIndex(state, rows);
+  if (found === -1) return rows.length;
   // A regroup that puts the end row inside a bundle moves the end forward: no mounted row
   // unmounts (cap rule); the bundle mounts whole.
-  return nearest(found, rows.length, isSafeCut);
+  return nearestSafeCutAtOrAfter(found, rows.length, isSafeCut);
 }
 
 /**
- * Where the end goes once its row is gone, even when one reconciliation also deleted mounted rows
- * before it (#6667 review): the nearest still-present row that was unmounted (`endRows`), so
- * mounted rows replaced since stay mounted. If none survives, the slice ends at the tail, which the
- * cap then clamps: unmounting what follows could hide read rows. `endRows` holds one cap of rows.
- * With all of them gone too, the clamp can mount a few more unread rows than the nearest survivor
- * would (as many as the update deleted inside the slice); it never hides one.
+ * Index of the start row, or 0 without one. Tries the index hint before scanning (#4869: the scan
+ * ran over ~620k rows on every reveal step render at 1.24M rows). Appends after the anchor never
+ * shift it; a prepend or deletion above it misses the hint and falls back to the scan.
  */
-function endAtNearestUnmountedRow(
-  rows: readonly RevealRow[],
-  endRows: readonly string[],
-  isSafeCut: IsSafeCut
-): number {
-  const indexById = new Map(rows.map((row, index) => [row.id, index]));
-  for (const id of endRows) {
-    const index = indexById.get(id);
-    if (index !== undefined) return nearestSafeCutAtOrBefore(index, rows.length, isSafeCut);
+function anchorIndexIn(state: RevealState, rows: readonly RevealRow[]): number {
+  const id = state.anchorMessageId;
+  if (id === null) return 0;
+  return rows[state.anchorIndexHint]?.id === id
+    ? state.anchorIndexHint
+    : rows.findIndex((row) => row.id === id);
+}
+
+/** Index of the detached end row (hint first), the length at the tail, or -1 once it is gone. */
+function storedEndIndex(state: RevealState, rows: readonly RevealRow[]): number {
+  const { endMessageId: id, endIndexHint: hint } = state;
+  if (id === null) return rows.length;
+  return rows[hint]?.id === id ? hint : rows.findIndex((row) => row.id === id);
+}
+
+/**
+ * Index of the first of `ids` (in their order) still in `rows`, or -1. One scan; memory O(ids),
+ * not O(rows), for million-row transcripts (#6757 review).
+ */
+function firstPresentIndex(rows: readonly RevealRow[], ids: readonly string[]): number {
+  const rank = new Map(ids.map((id, order) => [id, order]));
+  let best = -1;
+  let bestRank = ids.length;
+  rows.forEach((row, index) => {
+    const order = rank.get(row.id);
+    if (order !== undefined && order < bestRank) [best, bestRank] = [index, order];
+  });
+  return best;
+}
+
+/**
+ * `state` with `startRows` taken before `from` when a detached slice's preceding row changed, and
+ * cleared once attached: only the detached fallback reads it, so the attached path renders as on
+ * main (no extra render per step).
+ */
+function withStartRows(
+  state: RevealState,
+  slice: Pick<RevealSnapshot, "messages" | "fromIndex" | "toIndex">
+): RevealState {
+  const { messages, fromIndex: from } = slice;
+  const max = state.maxMountedRows;
+  if (max === undefined) return state;
+  if (slice.toIndex === messages.length) {
+    return state.startRows.length === 0 ? state : { ...state, startRows: [] };
   }
-  return rows.length;
+  if (messages[from - 1]?.id === state.startRows[0]) return state;
+  const before = messages.slice(Math.max(0, from - max), from).map((row) => row.id);
+  return { ...state, startRows: before.reverse() };
 }
 
 interface SliceEndInputs {
@@ -499,20 +536,76 @@ function revealMoreState(
 }
 
 /**
- * Where the slice starts once its start row is gone. Attached: main's rule, the old index. Detached
- * (#6669 round 7): as many rows before the end as were mounted, so every surviving mounted row
- * stays mounted even when the deleted run put the old start index past the new length. Rows
- * deleted below it mount instead, never more.
+ * One rule for a detached slice whose start or end row an update deleted (F20 PR3a-3b part 2b,
+ * owner design after three fallback findings): every surviving row the reader could see stays
+ * mounted, and no unread row mounts below them. The slice ends right after the last surviving
+ * visible row, or (none survives) at the nearest surviving row after the old end. It starts as far
+ * back as the cap allows, but never before rows that were never mounted (`startRows`). Regroups are
+ * not edge losses: the start snaps back and the end forward, which unmounts no row.
  */
-function vanishedStartFallback(
+function refitDetached(
   state: RevealState,
   messages: readonly RevealRow[],
+  visibleIds: readonly string[],
+  max: number,
   isSafeCut: IsSafeCut
-): number {
-  if (state.endMessageId === null) return state.anchorIndexHint;
-  const mountedBefore = state.endIndexHint - state.anchorIndexHint;
-  // The end row's own index: a safe cut before any regroup in this update (#6742 review).
-  return storedSliceEnd(state, messages, isSafeCut, (index) => index) - mountedBefore;
+): RevealState {
+  const length = messages.length;
+  const [firstVisible, lastVisible] = visibleSpan(messages, visibleIds);
+  const unseen = firstPresentIndex(messages, state.startRows) + 1;
+  const end =
+    lastVisible !== -1
+      ? nearestSafeCutAtOrAfter(lastVisible + 1, length, isSafeCut)
+      : nearestSafeCutAtOrBefore(endFallback(state, messages, unseen), length, isSafeCut);
+  const cut = nearestSafeCutAtOrAfter(Math.max(end - max, unseen), end, isSafeCut);
+  let start = cut < end ? cut : nearestSafeCutAtOrBefore(end - 1, length, isSafeCut);
+  // The snap forward can pass a visible row inside a bundle: start at that bundle's head instead.
+  if (firstVisible !== -1 && start > firstVisible) {
+    start = nearestSafeCutAtOrBefore(firstVisible, length, isSafeCut);
+  }
+  const moved: RevealState = {
+    ...state,
+    anchorMessageId: start === 0 ? null : messages[start].id,
+    anchorIndexHint: start,
+    targetMessageId: null,
+  };
+  return withSliceEnd(moved, messages, end);
+}
+
+/** `state` refitted when it is a detached slice whose start or end row this update deleted. */
+function edgeRefit<Row extends RevealRow>(
+  state: RevealState,
+  args: BoundedTranscriptRevealArgs<Row>,
+  anchorIndex: number
+): RevealState {
+  const max = args.maxMountedRows;
+  if (state.endMessageId === null || max === undefined) return state;
+  if (anchorIndex !== -1 && storedEndIndex(state, args.messages) !== -1) return state;
+  const visible = args.readVisibleMessageIds?.() ?? [];
+  return refitDetached(state, args.messages, visible, max, args.isSafeCut);
+}
+
+/** Indices of the first and last of `ids` in `rows` ([-1, -1] for none), in one scan. */
+function visibleSpan(rows: readonly RevealRow[], ids: readonly string[]): [number, number] {
+  const visible = new Set(ids);
+  let [first, last] = [-1, -1];
+  rows.forEach((row, index) => {
+    if (!visible.has(row.id)) return;
+    if (first === -1) first = index;
+    last = index;
+  });
+  return [first, last];
+}
+
+/**
+ * Where a refit slice ends with no visible row left: the nearest surviving row after the old end.
+ * `endRows` is [] when the end was the newest row then, and rows appended later are unread too, so
+ * without a surviving one the slice ends where the never-mounted older rows stop (`unseen`).
+ */
+function endFallback(state: RevealState, messages: readonly RevealRow[], unseen: number): number {
+  const next = firstPresentIndex(messages, [state.endMessageId ?? "", ...state.endRows]);
+  if (next !== -1) return next;
+  return unseen > 0 ? unseen : messages.length;
 }
 
 interface TailAppend {
@@ -644,16 +737,18 @@ function exceedsOneStep(start: number, end: number, inputs: StepInputs): boolean
  * Whether a tail change restarts the reveal at the tail. A replaced tail (the previous newest row
  * is gone and the newest row is new: edit, truncate, compaction) always does. With a cap, deleting
  * only newest rows does not (`deletedTail`): a retry that removes an error row keeps a reader's
- * place. A bulk arrival (more than one step) restarts unless the slice is held (`holds`: scrolled
- * up, a walk, or detached; #6680 review): it then keeps its start, and past the cap it detaches.
+ * place. Nor does one that also deletes a detached slice's start or end row (`refits`): a truncate
+ * through the slice refits around the rows the reader sees (#6884 review). A bulk arrival (more
+ * than one step) restarts unless the slice is held (`holds`: scrolled up, a walk, or detached;
+ * #6680 review): it then keeps its start, and past the cap it detaches.
  */
 function appendRestarts(
   previousNewestIndex: number,
   length: number,
   inputs: StepInputs,
-  hold: { holds: boolean; deletedTail: boolean }
+  hold: { holds: boolean; deletedTail: boolean; refits: () => boolean }
 ): boolean {
-  if (previousNewestIndex === -1) return !hold.deletedTail;
+  if (previousNewestIndex === -1) return !hold.deletedTail && !hold.refits();
   return !hold.holds && exceedsOneStep(previousNewestIndex + 1, length, inputs);
 }
 
@@ -681,7 +776,13 @@ function tailChange(
       : messages.findIndex((row) => row.id === state.newestMessageId);
   const capped = inputs.maxMountedRows !== undefined;
   const deletedTail = capped && newestId !== undefined && state.tailIds.includes(newestId);
-  const restart = appendRestarts(previousNewestIndex, length, inputs, { holds, deletedTail });
+  // Scans for the edge rows only when the previous newest row is gone (see appendRestarts).
+  const refits = () =>
+    capped &&
+    state.endMessageId !== null &&
+    (anchorIndexIn(state, messages) === -1 || storedEndIndex(state, messages) === -1);
+  const hold = { holds, deletedTail, refits };
+  const restart = appendRestarts(previousNewestIndex, length, inputs, hold);
   // Only rows deleted: nothing was appended.
   return { restart, appendedFrom: previousNewestIndex === -1 ? length : previousNewestIndex + 1 };
 }
@@ -708,6 +809,7 @@ function startState<Row extends RevealRow>(
     endMessageId: null,
     endIndexHint: 0,
     endRows: [],
+    startRows: [],
     tailBundleHeadId: null,
     tailIds: newestIds(messages),
     keptPastCap: false,
@@ -787,24 +889,22 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   // cut at or before its last known index, never to an unbounded jump. A boundary that moved
   // is persisted as the new anchor so it cannot move forward again (see RevealState).
   let fromIndex = 0;
+  let anchorIndex = anchorIndexIn(current, args.messages);
+  const refit = edgeRefit(current, args, anchorIndex);
+  if (refit !== current) {
+    current = refit;
+    setState(current);
+    anchorIndex = current.anchorIndexHint;
+  }
   if (current.anchorMessageId !== null) {
-    // Try the index hint before scanning (#4869: the scan ran over ~620k rows on every reveal
-    // step render at 1.24M rows). Appends after the anchor never shift it; a prepend or deletion
-    // above it misses the hint and falls back to the scan.
-    const anchorId = current.anchorMessageId;
-    const anchorIndex =
-      args.messages[current.anchorIndexHint]?.id === anchorId
-        ? current.anchorIndexHint
-        : args.messages.findIndex((row) => row.id === anchorId);
     if (anchorIndex !== -1 && anchorIndex !== current.anchorIndexHint) {
       // Found by the scan at a shifted index: remember it so the next render hits the hint.
       current = { ...current, anchorIndexHint: anchorIndex };
       setState(current);
     }
+    // Attached, a vanished anchor keeps main's rule: its old index.
     fromIndex = nearestSafeCutAtOrBefore(
-      anchorIndex !== -1
-        ? anchorIndex
-        : vanishedStartFallback(current, args.messages, args.isSafeCut),
+      anchorIndex !== -1 ? anchorIndex : current.anchorIndexHint,
       length,
       args.isSafeCut
     );
@@ -829,8 +929,9 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
     holds
   );
   const toIndex = ended.toIndex;
-  if (ended.state !== current) {
-    current = ended.state;
+  const withRows = withStartRows(ended.state, { messages: args.messages, fromIndex, toIndex });
+  if (withRows !== current) {
+    current = withRows;
     setState(current);
   }
 

@@ -234,7 +234,7 @@ export const AgentPluginPendingSignOutsSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("none") }),
   z.object({
     kind: z.literal("pending"),
-    /** Credential URLs still to sign out. */
+    /** Credential URLs still to sign out, for display: without query, fragment or user info. */
     servers: z.array(z.string()),
     /** Why the last attempt left them, when one ran in this process. */
     lastError: z.string().optional(),

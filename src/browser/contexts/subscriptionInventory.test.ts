@@ -46,6 +46,7 @@ const RESTART_RULES: Record<string, RestartRule> = {
   "src/browser/features/RightSidebar/Workflows/useWorkflowRuns.ts": "effect-deps",
   "src/browser/features/Settings/Sections/BackupSection.tsx": "effect-deps",
   "src/browser/features/Settings/Sections/GeneralSection.tsx": "effect-deps",
+  "src/browser/features/Settings/Sections/MCPSettingsSection.tsx": "effect-deps",
   "src/browser/features/Tools/WorkflowRunToolCall.tsx": "capability-check",
   "src/browser/features/desktop/useDesktopConnection.ts": "holder-backoff",
   "src/browser/hooks/useAutoModelRouting.ts": "effect-deps",

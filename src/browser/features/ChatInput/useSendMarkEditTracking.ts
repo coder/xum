@@ -8,12 +8,13 @@ import { getDraftStore, type DraftStoreScope } from "@/browser/stores/DraftStore
  * a select-all paste of "Fix the bug in parser.ts" over "Fix the bug" looks like typing after it.
  * Native `beforeinput`, because only it runs before the edit, with the selection the edit replaces.
  * The listener is on the document so a remounted textarea stays covered. Vim normal-mode commands
- * edit without `beforeinput`: they keep the text-shape rule (DraftStore followSendMark).
+ * edit without `beforeinput` (#6729): VimTextArea reports them through the returned `onKeyEdit`,
+ * with the same rule.
  */
 export function useSendMarkEditTracking(
   inputRef: RefObject<HTMLTextAreaElement | null>,
   scope: DraftStoreScope
-): void {
+): { onKeyEdit: (previous: string, next: string) => void } {
   // The scope object can change identity on every render: the listener reads the latest one.
   const scopeRef = useRef(scope);
   useEffect(() => {
@@ -29,6 +30,12 @@ export function useSendMarkEditTracking(
     document.addEventListener("beforeinput", onBeforeInput, true);
     return () => document.removeEventListener("beforeinput", onBeforeInput, true);
   }, [inputRef]);
+
+  /** A Vim command changed `previous` to `next`: only an append at the end is typing. */
+  const onKeyEdit = (previous: string, next: string) => {
+    if (!next.startsWith(previous)) getDraftStore().markSendEdited(scopeRef.current);
+  };
+  return { onKeyEdit };
 }
 
 /** An insertion at the end with no selection: the only edit that is typing after the text. */

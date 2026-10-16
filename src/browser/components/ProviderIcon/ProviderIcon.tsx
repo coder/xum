@@ -29,6 +29,7 @@ const PROVIDER_ICONS: Partial<Record<ProviderName, React.FC>> = {
   anthropic: AnthropicIcon,
   openai: OpenAIIcon,
   google: GoogleIcon,
+  "google-vertex": GoogleIcon,
   xai: XAIIcon,
   meta: MetaIcon,
   deepseek: DeepSeekIcon,

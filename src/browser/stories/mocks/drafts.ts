@@ -1,14 +1,24 @@
 import type {
+  CreationDraft,
+  CreationDraftImportLegacyInput,
+  CreationDraftScope,
+  CreationDraftUpdateInput,
   DraftAttachment,
   DraftBeginSendInput,
   DraftEvent,
-  DraftListEntry,
   DraftScope,
   DraftUpdateInput,
   DraftWriteOutput,
 } from "@/common/orpc/schemas/drafts";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { WORKSPACE_DRAFTS_BY_PROJECT_KEY } from "@/common/constants/storage";
 import { removeSentText, takeSentText } from "@/common/utils/composerDraftText";
-import { draftScopeKey, summarizeDraft, toDraftAttachmentMetadata } from "@/common/utils/drafts";
+import {
+  draftScopeKey,
+  summarizeCreationDraft,
+  summarizeDraft,
+  toDraftAttachmentMetadata,
+} from "@/common/utils/drafts";
 
 interface StoredDraft {
   scope: DraftScope;
@@ -35,14 +45,43 @@ let revision = 1;
 export function createMockDraftsApi() {
   const drafts = new Map<string, StoredDraft>();
   const listeners = new Set<(event: DraftEvent) => void>();
-  let listEntries: DraftListEntry[] = [];
-  const isSame = (a: DraftListEntry, b: DraftListEntry) =>
-    a.projectPath === b.projectPath && a.draftId === b.draftId;
-  const setList = (next: DraftListEntry[]): { revision: number } => {
-    listEntries = next;
-    revision++;
-    emit({ type: "list", entries: listEntries, revision });
-    return { revision };
+  const creationDrafts = new Map<string, CreationDraft>();
+  const putCreation = (id: string, patch: Partial<CreationDraft>): CreationDraft => {
+    const next: CreationDraft = {
+      id,
+      projectPath: "",
+      subProjectPath: null,
+      createdAt: 0,
+      text: "",
+      attachments: [],
+      manualName: "",
+      ai: {},
+      intent: {},
+      auto: {},
+      execution: null,
+      ...creationDrafts.get(id),
+      ...patch,
+    };
+    creationDrafts.set(id, next);
+    return next;
+  };
+  // Stories list creation drafts through the legacy list key (stories/helpers/drafts.ts).
+  let seeded = false;
+  const seedListedCreationDrafts = () => {
+    if (seeded) return;
+    seeded = true;
+    const listed = readPersistedState<
+      Record<string, Array<{ draftId: string; subProjectPath?: string | null; createdAt?: number }>>
+    >(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {});
+    for (const [projectPath, entries] of Object.entries(listed)) {
+      for (const entry of entries) {
+        putCreation(entry.draftId, {
+          projectPath,
+          subProjectPath: entry.subProjectPath ?? null,
+          createdAt: entry.createdAt ?? 0,
+        });
+      }
+    }
   };
   const emit = (event: DraftEvent) => {
     for (const listener of listeners) listener(event);
@@ -96,38 +135,32 @@ export function createMockDraftsApi() {
     },
     setSendReceiver: () => Promise.resolve({ revision, present: false }),
     resolveSends: () => Promise.resolve({ statuses: [] }),
-    delete: (input: { scope: DraftScope }) => {
-      const result = write({ scope: input.scope, text: "", attachments: [] });
-      const { scope } = input;
-      if (scope.kind === "creation") {
-        setList(
-          listEntries.filter(
-            (entry) => !isSame(entry, { ...scope, subProjectPath: null, createdAt: 0 })
-          )
-        );
-      }
-      return Promise.resolve(result);
+    delete: (input: { scope: DraftScope }) =>
+      Promise.resolve(write({ scope: input.scope, text: "", attachments: [] })),
+    listCreation: () => {
+      seedListedCreationDrafts();
+      return Promise.resolve({
+        drafts: [...creationDrafts.values()].map(summarizeCreationDraft),
+      });
     },
-    getList: () => Promise.resolve({ entries: listEntries, revision }),
-    putListEntry: (entry: DraftListEntry) => {
-      const existing = listEntries.find((listed) => isSame(listed, entry));
-      return Promise.resolve(
-        setList(
-          existing
-            ? listEntries.map((listed) =>
-                listed === existing ? { ...listed, subProjectPath: entry.subProjectPath } : listed
-              )
-            : [...listEntries, entry]
-        )
-      );
+    getCreation: (input: { scope: CreationDraftScope }) =>
+      Promise.resolve(creationDrafts.get(input.scope.draftId) ?? null),
+    updateCreation: ({ scope, ...patch }: CreationDraftUpdateInput) =>
+      Promise.resolve(summarizeCreationDraft(putCreation(scope.draftId, patch))),
+    deleteCreation: (input: { scope: CreationDraftScope }) => {
+      creationDrafts.delete(input.scope.draftId);
+      return Promise.resolve();
     },
-    importLegacyList: (input: { entries: DraftListEntry[] }) =>
-      Promise.resolve(
-        setList([
-          ...listEntries,
-          ...input.entries.filter((entry) => !listEntries.some((listed) => isSame(listed, entry))),
-        ])
-      ),
+    // Stories seed creation drafts through the legacy localStorage keys (stories/helpers).
+    importLegacyCreation: (input: CreationDraftImportLegacyInput) => {
+      putCreation(input.legacyDraftId, {
+        projectPath: input.projectPath,
+        text: input.text ?? "",
+        attachments: (input.attachments ?? []).filter((a) => a.kind !== "staged"),
+        manualName: input.manualName ?? "",
+      });
+      return Promise.resolve();
+    },
     importLegacy: (input: DraftUpdateInput) => {
       if (drafts.has(draftScopeKey(input.scope))) {
         return Promise.resolve({ result: "present" as const, revision });
@@ -135,9 +168,7 @@ export function createMockDraftsApi() {
       return Promise.resolve({ result: "applied" as const, ...write(input) });
     },
     subscribe: async function* (_input?: void, opts?: { signal?: AbortSignal }) {
-      const queue: DraftEvent[] = [
-        { type: "snapshot", drafts: summaries(), list: { entries: listEntries, revision } },
-      ];
+      const queue: DraftEvent[] = [{ type: "snapshot", drafts: summaries() }];
       let wake: (() => void) | null = null;
       const listener = (event: DraftEvent) => {
         queue.push(event);

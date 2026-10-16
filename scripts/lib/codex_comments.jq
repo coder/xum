@@ -4,7 +4,10 @@
 # Strip only the observed help text: a heading alone must not hide a finding
 # added inside the details section, or a second section appended after it.
 def codex_without_help:
-  sub("^### 🛡️ Codex Security Review( · _Automatically triggered_)?\n\n"; "")
+  # Since 2026-10-15 Codex starts verdicts with one receipt marker. Strip only
+  # one, before the heading, so a second marker still blocks.
+  sub("^<!-- codex-review-receipt:v1 -->\n\n"; "")
+  | sub("^### 🛡️ Codex Security Review( · _Automatically triggered_)?\n\n"; "")
   | rtrimstr("\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n"
     + "[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n"
     + "- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\n"
@@ -22,6 +25,27 @@ def codex_resolved_discussions($bot):
   [.[] | select(.isResolved == true and .comments.nodes[0].author.login == $bot)
     | .comments.nodes[0].fullDatabaseId // empty];
 
+# Input: review thread nodes. Output: per review-state entry, the commits on
+# which Codex has finding threads of that review kind and all are resolved.
+# Threads without a known marker or commit, and other reviewers', never count.
+def codex_resolved_finding_commits($bot):
+  [.[] | select(.comments.nodes[0].author.login == $bot)] as $codex
+  # A marker counts only in its protocol position: security as the first line,
+  # code as the last non-empty line. A body with both is neither, because
+  # findings can quote marker literals.
+  | def finding_kind:
+      (split("\n") | map(rtrimstr("\r"))) as $body_lines
+      | ($body_lines[0] == "<!-- codex-security-review-finding:v1 -->") as $security
+      | (($body_lines | map(select(test("\\S"))) | last) == "<!-- codex-code-review-finding:v1 -->") as $code
+      | if $code == $security then null
+        elif $code then "code_review" else "security_review" end;
+    def cleared($kind):
+      [$codex[] | select(.comments.nodes[0].body | finding_kind == $kind)
+        | {commit: .comments.nodes[0].originalCommit.oid, resolved: (.isResolved == true)}
+        | select(.commit | type == "string")]
+      | group_by(.commit) | map(select(all(.resolved)) | .[0].commit);
+    {code_review: cleared("code_review"), security_review: cleared("security_review")};
+
 def codex_review_row_prefix: "^\\| [^[:alnum:]|]*\\*\\*(Code|Security) Review\\*\\* \\| [^[:alnum:]|]*\\*\\*";
 def codex_review_row_suffix: " \\| `[0-9a-f]+` \\| (Manual request|New commits|Draft marked ready|PR opened) \\|$";
 def codex_relative_time: "<relative-time datetime=\"[0-9TZ:.+-]+\">[0-9TZ:.+-]+</relative-time>";
@@ -37,16 +61,40 @@ def codex_running_row: codex_review_row_prefix + "Running\\*\\* since " + codex_
 # board's metadata; a Completed board for another head is a review of an older
 # push, not of this one. Codex re-reviews on new commits and edits the board in
 # place, so that state is "running" for the current head, never "completed".
-# $resolved is the output of codex_resolved_discussions.
-def codex_summary_status($bot; $head; $resolved):
+# $resolved is the output of codex_resolved_discussions, and $cleared the
+# output of codex_resolved_finding_commits.
+def codex_summary_status($bot; $head; $resolved; $cleared):
   if .author.login != $bot then null
   else
     (.body | codex_without_help) as $body
     | if $body | startswith(codex_summary_marker) then
         (try (
-          ($body | split("\n") | map(select(length > 0))) as $lines
+          ($body | split("\n") | map(select(length > 0))) as $all
+          # Since 2026-10-15 Codex may add a review-state line before the security line.
+          | (if $all[1] | startswith("<!-- codex-review-state:v1 ")
+              then [($all[1] | capture("^<!-- codex-review-state:v1 (?<payload>.*) -->$").payload | fromjson)]
+              else [] end) as $state
+          | ([$all[0]] + $all[(1 + ($state | length)):]) as $lines
           | ($lines[1] | capture("^<!-- codex-security-review:v1 (?<payload>.*) -->$").payload | fromjson) as $security
+          | ([$state[] | .code_review, .security_review]) as $reviews
           | if $lines[0] == codex_summary_marker
+            # Unknown state fields or statuses could be findings. has_any_findings
+            # stays true after findings are resolved, so it is not used.
+            and ($state | all(type == "object" and (keys == ["code_review", "security_review"])))
+            and ($state | all(to_entries | all(
+              .key as $kind | .value
+              | type == "object"
+              and keys == ["commit_sha", "has_any_findings", "has_unresolved_findings", "status"]
+              and (.commit_sha | test("^[0-9a-f]{40}$"))
+              and (.has_any_findings | type == "boolean" or type == "null")
+              # Codex sends null only while a review runs; a completed one must say false.
+              and (.has_unresolved_findings == false
+                or (.has_unresolved_findings == null and .status == "running")
+                # Codex keeps true after its threads are resolved, until it reviews
+                # again (coder/xum#6786). Codex posts its threads before it updates
+                # the board, so this review's resolved threads clear it.
+                or (.has_unresolved_findings == true and (.commit_sha | IN($cleared[$kind][]))))
+              and (.status == "completed" or .status == "running"))))
             # Unknown security fields or statuses could be authoritative findings.
             # In particular, do not interpret an enabled security merge gate here.
             and ($security | type == "object"
@@ -79,6 +127,7 @@ def codex_summary_status($bot; $head; $resolved):
             ))
             then (if $security.status == "running" or ($lines[2:] | any(test(codex_running_row)))
                      or $security.headSha != $head
+                     or ($reviews | any(.status == "running" or .commit_sha != $head))
                   then "running" else "completed" end)
             else null
             end
@@ -91,8 +140,8 @@ def codex_summary_status($bot; $head; $resolved):
 
 # Codex is still reviewing. Callers may wait on this state instead of failing on
 # it, but it never supplies approval: after any wait budget it blocks like before.
-def codex_review_in_progress($bot; $head; $resolved):
-  codex_summary_status($bot; $head; $resolved) == "running";
+def codex_review_in_progress($bot; $head; $resolved; $cleared):
+  codex_summary_status($bot; $head; $resolved; $cleared) == "running";
 
 # Quota exhaustion is not a code finding. Recognize only the bot's known notices
 # so CI can pass when review credits run out, without hiding appended findings.
@@ -107,12 +156,12 @@ def codex_usage_limit($bot):
         + "To continue using code reviews, add credits to your account and enable them for code reviews in your [settings](https://chatgpt.com/codex/cloud/settings/code-review).")
   );
 
-def codex_comment_is_informational($bot; $head; $resolved):
+def codex_comment_is_informational($bot; $head; $resolved; $cleared):
   if .author.login != $bot then false
   else
     (.body | codex_without_help) as $body
     | if $body | startswith(codex_summary_marker) then
-        codex_summary_status($bot; $head; $resolved) == "completed"
+        codex_summary_status($bot; $head; $resolved; $cleared) == "completed"
       else
         codex_usage_limit($bot)
         or ($body | test("Didn.t find any major issues|create a Codex account"))

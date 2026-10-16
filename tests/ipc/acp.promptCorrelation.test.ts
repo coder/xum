@@ -13,6 +13,7 @@ import {
 import { STOP_UNRECORDED_MESSAGE } from "../../src/common/constants/workspace";
 import type { OnChatMode, WorkspaceChatMessage } from "../../src/common/orpc/types";
 import type { AgentSkillListResult } from "../../src/common/types/agentSkill";
+import { applyToolPolicyToNames, type ToolPolicy } from "../../src/common/utils/tools/toolPolicy";
 import { MuxAgent } from "../../src/node/acp/agent";
 import type { ORPCClient, ServerConnection } from "../../src/node/acp/serverConnection";
 
@@ -1088,6 +1089,32 @@ describe("ACP prompt stream correlation", () => {
       stopReason: "end_turn",
       usage: undefined,
     });
+
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
+
+  it("disables ask_user_question for ACP prompt turns, which have no answer path", async () => {
+    const harness = createHarness();
+    const { newSessionResponse, promptPromise, promptCorrelationId } =
+      await createDefaultPromptTurn(harness);
+
+    const lastSend = harness.sendMessageCalls.at(-1);
+    expect(
+      applyToolPolicyToNames(
+        ["ask_user_question", "bash"],
+        lastSend?.options.toolPolicy as ToolPolicy | undefined
+      )
+    ).toEqual(["bash"]);
+
+    harness.pushChatEvent(
+      streamStart(newSessionResponse.sessionId, "assistant-target", {
+        historySequence: 3,
+        acpPromptId: promptCorrelationId,
+      })
+    );
+    harness.pushChatEvent(streamEnd(newSessionResponse.sessionId, "assistant-target"));
+    await expect(promptPromise).resolves.toEqual({ stopReason: "end_turn", usage: undefined });
 
     harness.closeConnection();
     await harness.connectionClosed;
@@ -2333,7 +2360,11 @@ describe("ACP /compact", () => {
         agentId: "compact",
         maxOutputTokens: 1000,
         skipAiSettingsPersistence: true,
-        toolPolicy: [{ regex_match: ".*", action: "disable" }],
+        // ACP appends its per-turn ask_user_question deny to every prompt send.
+        toolPolicy: [
+          { regex_match: ".*", action: "disable" },
+          { regex_match: "ask_user_question", action: "disable" },
+        ],
       });
       // Attachments belong to the follow-up turn, not to the compaction request.
       expect(sent.options.fileParts).toBeUndefined();

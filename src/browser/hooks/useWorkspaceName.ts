@@ -1,19 +1,7 @@
-import { useState, useRef, useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
-import { z } from "zod";
-import { useAPI } from "@/browser/contexts/API";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  createSessionValueStore,
-  truncateStringToChars,
-} from "@/browser/utils/boundedPersistedValue";
-import {
-  WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS,
-  WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS,
-  getWorkspaceNameStateKey,
-} from "@/common/constants/storage";
+import { useState } from "react";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
+import { CREATION_DRAFT_NAME_MAX_CHARS } from "@/constants/drafts";
 import type { NameGenerationError } from "@/common/types/errors";
-import type { WorkspaceNameGenerationRequest } from "@/common/orpc/schemas/api";
-import { createSendId } from "@/common/utils/drafts";
 import {
   validateWorkspaceBranchName,
   validateWorkspaceName,
@@ -25,16 +13,16 @@ export type WorkspaceNameUIError =
   | { kind: "validation"; message: string }
   | { kind: "transport"; message: string };
 
-/**
- * Caller fallbacks for name generation. The backend owns the precedence
- * (configured name_workspace model + thinking first, then its built-in small
- * models); the user's selected model is only a last resort after those.
- */
-function buildNameGenCandidates(userModel: string | undefined): string[] {
-  return userModel ? [userModel] : [];
+/** Workspace identity (name + title) */
+export interface WorkspaceIdentity {
+  /** Short git-safe name (e.g., "plan-a1b2") */
+  name: string;
+  /** Human-readable title (e.g., "Fix plan mode over SSH") */
+  title: string;
 }
 
-function buildFallbackWorkspaceIdentity(message: string): WorkspaceIdentity {
+/** A valid local name for a message, when generation is skipped or fails. */
+export function buildFallbackWorkspaceIdentity(message: string): WorkspaceIdentity {
   const normalized = message
     .trim()
     .replace(/^\/+/, "")
@@ -47,551 +35,53 @@ function buildFallbackWorkspaceIdentity(message: string): WorkspaceIdentity {
   return { name, title: name };
 }
 
-export interface UseWorkspaceNameOptions {
-  /** The user's message to generate a name for */
-  message: string;
-  /** Debounce delay in milliseconds (default: 500) */
-  debounceMs?: number;
-  /** User's selected model to try after the configured and built-in naming models */
-  userModel?: string;
-  /**
-   * Optional storage scope for persisting draft name-generation state.
-   *
-   * When provided (e.g. a draft scopeId), each draft keeps its own auto-naming/manual name state so
-   * switching between drafts doesn't share a single generator or manual-edit mode.
-   */
-  scopeId?: string | null;
-}
-
-/** Generated workspace identity (name + title) */
-const WorkspaceIdentitySchema = z.object({
-  /** Short git-safe name with suffix (e.g., "plan-a1b2") */
-  name: z.string(),
-  /** Human-readable title (e.g., "Fix plan mode over SSH") */
-  title: z.string(),
-});
-
-export type WorkspaceIdentity = z.infer<typeof WorkspaceIdentitySchema>;
-
-/** State and actions for workspace name generation, suitable for passing to components */
+/** State and actions for the creation form's name field (CreationControls). */
 export interface WorkspaceNameState {
-  /** The generated or manually entered name (shown in CreationControls UI) */
+  /** The manual name ("" when the workspace is named on Send). */
   name: string;
-  /** The generated title (only available when auto-generation is enabled) */
   title: string | null;
-  /** Whether name generation is in progress */
+  /** Whether Send is generating the name. */
   isGenerating: boolean;
-  /** Whether auto-generation is enabled */
+  /** Whether Send names the workspace (no manual name). */
   autoGenerate: boolean;
-  /** Error state for generation/validation/transport failures */
   error: WorkspaceNameUIError | null;
-  /** Set whether auto-generation is enabled */
   setAutoGenerate: (enabled: boolean) => void;
-  /** Set manual name (for when auto-generate is off) */
   setName: (name: string) => void;
 }
 
-/** A naming handed to the backend (handOffGeneration). */
-export interface WorkspaceNameHandOff {
-  /** workspace.create's nameGeneration; names the in-flight request the backend takes over. */
-  request: WorkspaceNameGenerationRequest;
-  /** Names the message in the form again: for when no workspace was created to take it. */
-  resume: () => void;
-}
-
-export interface UseWorkspaceNameReturn extends WorkspaceNameState {
-  /** Wait for any pending generation to complete, returns both name and title */
-  waitForGeneration: () => Promise<WorkspaceIdentity | null>;
-  /**
-   * Hand the naming to the backend instead of waiting for it: when auto naming has no identity
-   * generated for exactly the current message, cancel the debounced or in-flight request (its
-   * late result must not land in the form) and return the hand-off. Null otherwise.
-   */
-  handOffGeneration: () => WorkspaceNameHandOff | null;
-}
-
-const WorkspaceNamePersistedStateSchema = z.object({
-  generatedIdentity: WorkspaceIdentitySchema.nullable(),
-  manualName: z.string(),
-  autoGenerate: z.boolean(),
-  lastGeneratedFor: z.string(),
-});
-
-export type WorkspaceNamePersistedState = z.infer<typeof WorkspaceNamePersistedStateSchema>;
-
-/** FNV-1a (32-bit). Only detects changes past the stored prefix; not a security hash. */
-function hashMessage(message: string): string {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < message.length; index++) {
-    hash ^= message.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(16);
-}
-
 /**
- * lastGeneratedFor only detects whether the message changed, so a long message is stored as a
- * bounded fingerprint: the full creation message can be many KB, and the persisted state must fit
- * its localStorage budget. The fingerprint ends with the full message's length and hash, so an
- * edit past the prefix still counts as a change and regenerates the name.
+ * The creation form's name: only a manual name is kept (in the creation draft). With none, the
+ * workspace is named on Send; there is deliberately no preview, cached result or debounce.
  */
-function toStoredMessage(message: string): string {
-  if (JSON.stringify(message).length <= WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS) return message;
-  // The suffix needs no JSON escapes, so the result serializes within the cap (and maps to itself).
-  const suffix = `\u2026#${message.length}:${hashMessage(message)}`;
-  return (
-    truncateStringToChars(message, WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS - suffix.length) + suffix
-  );
-}
-
-/**
- * Whether auto naming still has to name `message`: generation stores lastGeneratedFor together
- * with the identity, so a match means an identity exists for exactly this message.
- */
-function needsGenerationFor(
-  state: Pick<WorkspaceNamePersistedState, "autoGenerate" | "lastGeneratedFor">,
-  message: string
-): boolean {
-  return (
-    state.autoGenerate &&
-    message.trim().length > 0 &&
-    state.lastGeneratedFor !== toStoredMessage(message)
-  );
-}
-
-/**
- * The request a hand-off gives workspace.create. A request still running for exactly `message`
- * goes with it, so the backend takes that result over, even one that lands after the hand-off
- * drops it in the form.
- */
-function buildHandOffRequest(
-  message: string,
-  candidates: string[],
-  running: { message: string; draftNamingId: string } | null
-): WorkspaceNameGenerationRequest {
-  const draftNamingId = running?.message === message ? running.draftNamingId : undefined;
-  return { message, candidates, draftNamingId };
-}
-
-/**
- * Bound the user-input-sized fields of persisted name state so it fits its key budget; also
- * shrinks state that older builds stored unbounded. Returns null when `state` is not name state.
- */
-export function boundWorkspaceNamePersistedState(
-  state: unknown
-): WorkspaceNamePersistedState | null {
-  const parsed = WorkspaceNamePersistedStateSchema.safeParse(state);
-  if (!parsed.success) return null;
+export function useWorkspaceName(options: {
+  manualName: string;
+  /** The creation draft that stores the manual name. */
+  draftId: string;
+  isGenerating: boolean;
+}): WorkspaceNameState {
+  // Focusing the empty field starts a manual name; the draft holds only typed text.
+  const [editing, setEditing] = useState(false);
+  const name = options.manualName;
+  // The draft write lives here, not in the caller (#6843): React Compiler skips
+  // useCreationWorkspace, so a setter defined there gets a new identity every render, and
+  // CreationControls re-rendered on every keystroke. Here the compiler keeps setName and
+  // setAutoGenerate stable for one draft.
+  const draftId = options.draftId;
+  const setManualName = (manualName: string) =>
+    getCreationDraftStore().update(draftId, {
+      manualName: manualName.slice(0, CREATION_DRAFT_NAME_MAX_CHARS),
+    });
+  const validationError = name.trim() ? validateWorkspaceBranchName(name).error : undefined;
   return {
-    ...parsed.data,
-    manualName: truncateStringToChars(
-      parsed.data.manualName,
-      WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS
-    ),
-    lastGeneratedFor: toStoredMessage(parsed.data.lastGeneratedFor),
+    name,
+    title: null,
+    isGenerating: options.isGenerating,
+    autoGenerate: !editing && name.trim().length === 0,
+    error: validationError ? { kind: "validation", message: validationError } : null,
+    setAutoGenerate: (enabled) => {
+      setEditing(!enabled);
+      if (enabled) setManualName("");
+    },
+    setName: setManualName,
   };
-}
-
-// Full manual names whose persisted copy is a bounded prefix (see setNameManual), so they stay
-// visible for the rest of the session, also after the creation controls remount.
-const sessionManualNames = createSessionValueStore<{ name: string; persisted: string }>();
-
-const DEFAULT_PERSISTED_STATE: WorkspaceNamePersistedState = {
-  generatedIdentity: null,
-  manualName: "",
-  autoGenerate: true,
-  lastGeneratedFor: "",
-};
-
-/** The workspace name the creation form shows for persisted name state ("" when none). */
-export function getNameFromPersistedState(state: unknown): string {
-  const parsed = WorkspaceNamePersistedStateSchema.partial().safeParse(state);
-  if (!parsed.success) return "";
-  const { autoGenerate, generatedIdentity, manualName } = parsed.data;
-  return autoGenerate !== false ? (generatedIdentity?.name ?? "") : (manualName ?? "");
-}
-
-/**
- * Extract the display title from persisted workspace name state.
- * Used by DraftAgentListItem to show the title in the sidebar without
- * duplicating knowledge of the persisted state structure.
- *
- * For auto-generated identities, prefers title (human-readable) over name (git-safe branch name).
- * This matches how real workspaces display: metadata.title ?? metadata.name.
- */
-export function getDisplayTitleFromPersistedState(state: unknown): string {
-  const parsed = WorkspaceNamePersistedStateSchema.partial().safeParse(state);
-  if (!parsed.success) {
-    return "";
-  }
-
-  const { autoGenerate, generatedIdentity, manualName } = parsed.data;
-
-  if (autoGenerate !== false) {
-    if (!generatedIdentity) {
-      return "";
-    }
-    // Prefer title (e.g., "Fix plan mode over SSH") over name (e.g., "plan-a1b2")
-    return generatedIdentity.title.trim() || generatedIdentity.name;
-  }
-
-  return manualName ?? "";
-}
-
-/**
- * Hook for managing workspace name generation with debouncing.
- *
- * Automatically generates names as the user types their message,
- * but allows manual override. If the user clears the manual name,
- * auto-generation resumes.
- */
-export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspaceNameReturn {
-  const { message, debounceMs = 500, userModel, scopeId } = options;
-  const { api } = useAPI();
-  const candidates = useMemo(() => buildNameGenCandidates(userModel), [userModel]);
-
-  // Always call usePersistedState, but only *use* it when scopeId is provided.
-  // This prevents draft switching from leaking name state across different creation drafts.
-  const anonymousScopeIdRef = useRef(`__workspaceNameAnon__${Math.random().toString(36).slice(2)}`);
-  const persistedKey = getWorkspaceNameStateKey(scopeId ?? anonymousScopeIdRef.current);
-
-  const [persistedState, setPersistedState] = usePersistedState<WorkspaceNamePersistedState>(
-    persistedKey,
-    DEFAULT_PERSISTED_STATE,
-    { listener: true }
-  );
-  const [localState, setLocalState] =
-    useState<WorkspaceNamePersistedState>(DEFAULT_PERSISTED_STATE);
-
-  const stored = scopeId ? persistedState : localState;
-  const setStored = scopeId ? setPersistedState : setLocalState;
-
-  const { generatedIdentity, manualName, autoGenerate, lastGeneratedFor } = stored;
-
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [error, setError] = useState<WorkspaceNameUIError | null>(null);
-  // Only a bounded prefix of a very long typed name persists; the full name stays visible while the
-  // stored value is still that prefix (another tab's edit wins).
-  const sessionManualName = useSyncExternalStore(sessionManualNames.subscribe, () =>
-    sessionManualNames.get(persistedKey)
-  );
-  const displayedManualName =
-    sessionManualName?.persisted === manualName ? sessionManualName.name : manualName;
-
-  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Message pending in debounce timer (captured at schedule time)
-  const pendingMessageRef = useRef<string>("");
-  // Generation request counter for cancellation
-  const requestIdRef = useRef(0);
-  // Current in-flight generation promise and its resolver
-  const generationPromiseRef = useRef<{
-    promise: Promise<WorkspaceIdentity | null>;
-    resolve: (identity: WorkspaceIdentity | null) => void;
-    requestId: number;
-    message: string;
-    draftNamingId: string;
-  } | null>(null);
-
-  // Name shown in CreationControls UI: generated name when auto, manual when not
-  const name = autoGenerate ? (generatedIdentity?.name ?? "") : displayedManualName;
-  // Derived rather than set on keystrokes so a restored invalid name (e.g. a bounded prefix after a
-  // restart) is flagged right away instead of failing only on submit.
-  const manualNameValidationError =
-    !autoGenerate && name.trim() ? validateWorkspaceBranchName(name).error : undefined;
-  // Title is only shown when auto-generation is enabled (manual mode doesn't have generated title)
-  const title = autoGenerate ? (generatedIdentity?.title ?? null) : null;
-
-  // Cancel any pending generation and resolve waiters with null
-  const cancelPendingGeneration = useCallback(() => {
-    if (debounceTimerRef.current) {
-      clearTimeout(debounceTimerRef.current);
-      debounceTimerRef.current = null;
-      pendingMessageRef.current = "";
-    }
-    // Increment request ID to invalidate any in-flight request
-    const oldRequestId = requestIdRef.current;
-    requestIdRef.current++;
-    // Resolve any waiters so they don't hang forever
-    if (generationPromiseRef.current?.requestId === oldRequestId) {
-      generationPromiseRef.current.resolve(null);
-      generationPromiseRef.current = null;
-      setIsGenerating(false);
-    }
-  }, []);
-
-  // When switching between draft scopes, ensure the "in flight" generation UI doesn't leak.
-  useEffect(() => {
-    cancelPendingGeneration();
-    setIsGenerating(false);
-    setError(null);
-  }, [persistedKey, cancelPendingGeneration]);
-
-  const generateIdentity = useCallback(
-    async (forMessage: string): Promise<WorkspaceIdentity | null> => {
-      if (!api || !forMessage.trim()) {
-        return null;
-      }
-
-      const requestId = ++requestIdRef.current;
-      setIsGenerating(true);
-      setError(null);
-
-      // Create a promise that external callers can wait on
-      let resolvePromise: ((identity: WorkspaceIdentity | null) => void) | undefined;
-      const promise = new Promise<WorkspaceIdentity | null>((resolve) => {
-        resolvePromise = resolve;
-      });
-      // TypeScript doesn't understand the Promise executor runs synchronously
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-      const safeResolve = resolvePromise!;
-      // Any unique ID: a creation that hands this request off names it to the backend.
-      const draftNamingId = createSendId();
-      generationPromiseRef.current = {
-        promise,
-        resolve: safeResolve,
-        requestId,
-        message: forMessage,
-        draftNamingId,
-      };
-
-      try {
-        // Backend prepends the configured naming model and built-in fallbacks, then
-        // tries candidates in order with retry on API errors (createModel resolves routing).
-        const result = await api.nameGeneration.generate({
-          message: forMessage,
-          candidates,
-          draftNamingId,
-        });
-
-        // Check if this request is still current (wasn't cancelled)
-        if (requestId !== requestIdRef.current) {
-          // Don't resolve here - cancellation already resolved the promise
-          return null;
-        }
-
-        if (result.success) {
-          const identity: WorkspaceIdentity = {
-            name: result.data.name,
-            title: result.data.title,
-          };
-
-          setStored((prev) => ({
-            ...prev,
-            generatedIdentity: identity,
-            lastGeneratedFor: toStoredMessage(forMessage),
-          }));
-
-          safeResolve(identity);
-          return identity;
-        }
-
-        const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
-        setStored((prev) => ({
-          ...prev,
-          generatedIdentity: fallbackIdentity,
-          lastGeneratedFor: toStoredMessage(forMessage),
-        }));
-        setError(null);
-        safeResolve(fallbackIdentity);
-        return fallbackIdentity;
-      } catch {
-        if (requestId !== requestIdRef.current) {
-          return null;
-        }
-        const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
-        setStored((prev) => ({
-          ...prev,
-          generatedIdentity: fallbackIdentity,
-          lastGeneratedFor: toStoredMessage(forMessage),
-        }));
-        setError(null);
-        safeResolve(fallbackIdentity);
-        return fallbackIdentity;
-      } finally {
-        if (requestId === requestIdRef.current) {
-          setIsGenerating(false);
-          generationPromiseRef.current = null;
-        }
-      }
-    },
-    [api, setStored, candidates]
-  );
-
-  // Debounced generation effect
-  useEffect(() => {
-    // Don't generate if:
-    // - Auto-generation is disabled
-    // - Message is empty
-    // - Already generated for this message
-    if (!needsGenerationFor({ autoGenerate, lastGeneratedFor }, message)) {
-      // Clear any pending timer since conditions changed
-      if (debounceTimerRef.current) {
-        clearTimeout(debounceTimerRef.current);
-        debounceTimerRef.current = null;
-        pendingMessageRef.current = "";
-      }
-      return;
-    }
-
-    // Cancel any in-flight request since message changed
-    cancelPendingGeneration();
-
-    // Capture message for the debounced callback (avoid stale closure)
-    pendingMessageRef.current = message;
-
-    // Debounce the generation
-    debounceTimerRef.current = setTimeout(() => {
-      const msg = pendingMessageRef.current;
-      debounceTimerRef.current = null;
-      pendingMessageRef.current = "";
-      void generateIdentity(msg);
-    }, debounceMs);
-
-    return () => {
-      if (debounceTimerRef.current) {
-        clearTimeout(debounceTimerRef.current);
-        debounceTimerRef.current = null;
-        pendingMessageRef.current = "";
-      }
-    };
-  }, [
-    message,
-    autoGenerate,
-    lastGeneratedFor,
-    debounceMs,
-    generateIdentity,
-    cancelPendingGeneration,
-  ]);
-
-  // When auto-generate is toggled, handle name preservation
-  const handleSetAutoGenerate = useCallback(
-    (enabled: boolean) => {
-      if (enabled) {
-        // Switching to auto: reset so debounced generation will trigger
-        setStored((prev) => ({ ...prev, autoGenerate: true, lastGeneratedFor: "" }));
-        setError(null);
-        return;
-      }
-
-      // Switching to manual: copy generated name as starting point for editing
-      setStored((prev) => ({
-        ...prev,
-        autoGenerate: false,
-        manualName: prev.generatedIdentity?.name ?? prev.manualName,
-      }));
-    },
-    [setStored]
-  );
-
-  const setNameManual = useCallback(
-    (newName: string) => {
-      const persisted = truncateStringToChars(newName, WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS);
-      sessionManualNames.set(
-        persistedKey,
-        persisted === newName ? undefined : { name: newName, persisted }
-      );
-      setStored((prev) => ({ ...prev, manualName: persisted }));
-      setError(null);
-    },
-    [setStored, persistedKey]
-  );
-
-  const waitForGeneration = useCallback(async (): Promise<WorkspaceIdentity | null> => {
-    // If auto-generate is off, user has provided a manual name
-    // Use that name directly with a generated title from the message
-    if (!autoGenerate) {
-      if (!name.trim()) {
-        setError({ kind: "validation", message: "Please enter a workspace name" });
-        return null;
-      }
-      // Manual name provided — skip LLM call entirely.
-      // The manual name doubles as the display title; users who type a custom
-      // name expect to see exactly that in the sidebar.
-      return { name: name.trim(), title: name.trim() };
-    }
-
-    // Always wait for generation to complete on the full message.
-    // With voice input, the message can go from empty to complete very quickly,
-    // so we must ensure the generated identity reflects the total content.
-
-    // If there's a debounced generation pending, trigger it immediately
-    // Use the captured message from pendingMessageRef to avoid stale closures
-    if (debounceTimerRef.current) {
-      clearTimeout(debounceTimerRef.current);
-      debounceTimerRef.current = null;
-      const msg = pendingMessageRef.current;
-      pendingMessageRef.current = "";
-      if (msg.trim()) {
-        return generateIdentity(msg);
-      }
-    }
-
-    // If generation is in progress, wait for it to complete
-    if (generationPromiseRef.current) {
-      return generationPromiseRef.current.promise;
-    }
-
-    // If we have an identity that was generated for the current message, use it
-    if (generatedIdentity && lastGeneratedFor === toStoredMessage(message)) {
-      return generatedIdentity;
-    }
-
-    // Otherwise generate a fresh identity for the current message
-    if (message.trim()) {
-      return generateIdentity(message);
-    }
-
-    return null;
-  }, [autoGenerate, name, generatedIdentity, lastGeneratedFor, message, generateIdentity]);
-
-  const handOffGeneration = useCallback((): WorkspaceNameHandOff | null => {
-    if (!needsGenerationFor({ autoGenerate, lastGeneratedFor }, message)) return null;
-    const request = buildHandOffRequest(message, candidates, generationPromiseRef.current);
-    cancelPendingGeneration();
-    // A draft switch, an edit or a new request moves the request ID on: then the form has named
-    // (or will name) what it shows, and resuming would cancel that request for a stale message.
-    const handedOffAt = requestIdRef.current;
-    return {
-      request,
-      resume: () => {
-        if (requestIdRef.current !== handedOffAt) return;
-        void generateIdentity(message);
-      },
-    };
-  }, [
-    autoGenerate,
-    message,
-    lastGeneratedFor,
-    cancelPendingGeneration,
-    candidates,
-    generateIdentity,
-  ]);
-
-  return useMemo(
-    () => ({
-      name,
-      title,
-      isGenerating,
-      autoGenerate,
-      error: manualNameValidationError
-        ? { kind: "validation", message: manualNameValidationError }
-        : error,
-      setAutoGenerate: handleSetAutoGenerate,
-      setName: setNameManual,
-      waitForGeneration,
-      handOffGeneration,
-    }),
-    [
-      name,
-      title,
-      isGenerating,
-      autoGenerate,
-      error,
-      manualNameValidationError,
-      handleSetAutoGenerate,
-      setNameManual,
-      waitForGeneration,
-      handOffGeneration,
-    ]
-  );
 }

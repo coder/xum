@@ -2,7 +2,7 @@ import * as path from "path";
 import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
-import { mock } from "bun:test";
+import { mock, spyOn } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { execSync } from "node:child_process";
 
@@ -386,6 +386,38 @@ function withoutTaskTreeLock<A extends unknown[], R>(
     );
     return sink(...args);
   };
+}
+
+/**
+ * Starts a sub-agent Stop and returns once the Stop has done its own work and waits for its
+ * latches to drop (#6727), with the still-pending Stop. For tests that settle what holds a latch
+ * themselves: awaiting the Stop first would wait for that settlement, up to its 40 s bound.
+ */
+export async function startStopAwaitingRelease(
+  taskService: TaskService,
+  ancestorWorkspaceId: string,
+  taskId: string
+): Promise<{ stopped: ReturnType<TaskService["stopDescendantAgentTask"]> }> {
+  const internals = taskService as unknown as {
+    waitForWorkspaceStopsToRelease(ids: readonly string[], deadlineMs: number): Promise<void>;
+  };
+  const realWait = internals.waitForWorkspaceStopsToRelease.bind(taskService);
+  const waiting = Promise.withResolvers<void>();
+  const spy = spyOn(internals, "waitForWorkspaceStopsToRelease").mockImplementation(
+    (ids, deadlineMs) => {
+      spy.mockRestore();
+      waiting.resolve();
+      return realWait(ids, deadlineMs);
+    }
+  );
+  const stopped = taskService.stopDescendantAgentTask(ancestorWorkspaceId, taskId);
+  try {
+    // A Stop that fails (or never latched) resolves without waiting.
+    await Promise.race([waiting.promise, stopped]);
+  } finally {
+    spy.mockRestore();
+  }
+  return { stopped };
 }
 
 export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverrides = {}) {

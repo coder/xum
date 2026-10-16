@@ -46,7 +46,7 @@ import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scope
 import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import {
-  getProjectScopeId,
+  getCreationDraftScopeId,
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
   getWorkspaceLastReadKey,
@@ -77,6 +77,7 @@ import {
 import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { CreationProjectSelect } from "./CreationProjectSelect";
+import { projectRuntimeEnablement } from "./creationDraftProject";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { useComputerUse } from "@/browser/hooks/useComputerUse";
 import { AgentModePicker } from "@/browser/components/AgentModePicker/AgentModePicker";
@@ -164,6 +165,7 @@ import { CreationControls } from "./CreationControls";
 import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
 import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useCoderConfigChangeHandler } from "./useCoderConfigChangeHandler";
+import { useCreationProjectChangeHandler } from "./useCreationProjectChangeHandler";
 import { useCoderWorkspace } from "@/browser/hooks/useCoderWorkspace";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
@@ -340,9 +342,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ? resolveWorkspaceCreationScope(props.projectPath, userProjects, props.pendingSubProjectPath)
       : null;
   const creationParentProjectPath = creationScope?.projectPath ?? "";
+  // The creation composer's AI choices belong to its draft (keyed by id, not project).
+  const creationDraftId = variant === "creation" ? (props.pendingDraftId ?? "") : "";
   const creationSubProjectPath = creationScope?.subProjectPath ?? undefined;
   const creationProject =
     variant === "creation" ? userProjects.get(creationParentProjectPath) : undefined;
+  // A sub-project draft keeps its parent's route, so files, skills and agents come from the parent
+  // (as for main's sidebar New chat on a sub-project). Following the sub-project instead makes the
+  // agent list, its defaults and the agent resets disagree.
   const atMentionProjectPath =
     variant === "creation" && props.kind !== "scratch" ? props.projectPath : null;
   const asyncCommandScopeRef = useRef<{ variant: typeof variant; workspaceId: string | null }>({
@@ -509,8 +516,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const draft = useComposerDraft({
     variant,
     workspaceId,
-    creationProjectPath: creationParentProjectPath,
-    pendingDraftId: variant === "creation" ? (props.pendingDraftId ?? undefined) : undefined,
+    pendingDraftId: creationDraftId,
     attachedReviews: variant === "workspace" ? (props.attachedReviews ?? []) : [],
     pushToast,
   });
@@ -548,7 +554,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   }, []);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // #6585: edits other than typing at the end stop a send in flight from cutting its text.
-  useSendMarkEditTracking(inputRef, draftScope);
+  const sendMarkEdits = useSendMarkEditTracking(inputRef, draftScope);
   const modelSelectorRef = useRef<ModelSelectorRef>(null);
   const powerMode = usePowerMode();
   const handleInputChange = useCallback(
@@ -617,7 +623,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   const { open } = useSettings();
   const { selectedWorkspace, beginWorkspaceCreation, workspaceMetadata } = useWorkspaceContext();
-  const { agentId, currentAgent, agents } = useAgent();
+  const { agentId, currentAgent, agents, loaded: agentsLoaded } = useAgent();
 
   // Use current agent's uiColor, or neutral border until agents load
   const agentColor = currentAgent?.uiColor ?? "var(--color-border-light)";
@@ -676,7 +682,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Get current send message options from shared hook (must be at component top level)
   // For creation variant, use project-scoped key; for workspace, use workspace ID
   const sendOptionsScopeId =
-    variant === "workspace" ? props.workspaceId : getProjectScopeId(creationParentProjectPath);
+    variant === "workspace" ? props.workspaceId : getCreationDraftScopeId(creationDraftId);
   const sendMessageOptions = useSendMessageOptions(sendOptionsScopeId);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const [autoModelRoutingActive, setAutoModelRoutingActive] = useAutoRoutingSelection(
@@ -775,7 +781,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       onModelChange(selectedModel);
     } else {
       const scopeId =
-        variant === "creation" ? getProjectScopeId(creationParentProjectPath) : workspaceId;
+        variant === "creation" ? getCreationDraftScopeId(creationDraftId) : workspaceId;
       if (scopeId) {
         setWorkspaceModelWithOrigin(scopeId, selectedModel, "user");
       }
@@ -814,15 +820,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const openModelSelector = useCallback(() => {
     modelSelectorRef.current?.open();
   }, []);
-  const hasCreationRuntimeOverrides =
-    creationProject?.runtimeOverridesEnabled === true ||
-    Boolean(creationProject?.runtimeEnablement) ||
-    creationProject?.defaultRuntime !== undefined;
   // Keep workspace creation in sync with Settings → Runtimes project overrides.
   const creationRuntimeEnablement =
-    variant === "creation" && hasCreationRuntimeOverrides
-      ? normalizeRuntimeEnablement(creationProject?.runtimeEnablement)
+    variant === "creation"
+      ? projectRuntimeEnablement(creationProject, runtimeEnablement)
       : runtimeEnablement;
+  // Compiler-memoized in its own module; see useCreationProjectChangeHandler for why.
+  const changeCreationProject = useCreationProjectChangeHandler(
+    creationDraftId,
+    userProjects,
+    rawRuntimeEnablement,
+    beginWorkspaceCreation
+  );
   const [hasAttemptedCreateSend, setHasAttemptedCreateSend] = useState(false);
 
   // Creation-specific state (hook always called, but only used when variant === "creation")
@@ -881,6 +890,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     inputRef,
   });
   const sendLocksTyping = typingLock.locksTyping;
+  // A creation Send takes one snapshot of the draft: a file still being read, or speech still
+  // being transcribed, would land after it.
+  const isProcessingAttachments =
+    processingAttachmentCount > 0 || (variant === "creation" && voiceInput.state !== "idle");
+  // Moving to or from Scratch opens another page (a new composer), which would drop a file read
+  // or a recording still in progress, so the project waits for them.
+  const creationProjectLocked = isSendInFlight || isProcessingAttachments;
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
@@ -928,7 +944,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           // routes (deep link to a sub-project, or sidebar "+") collapse here.
           selectedProjectPath: creationSubProjectPath ?? props.projectPath,
           userProjects,
-          onSelectedProjectPathChange: beginWorkspaceCreation,
+          onSelectedProjectPathChange: changeCreationProject,
+          projectSelectDisabled: creationProjectLocked,
           projectName: props.projectName,
           nameState: creationState.nameState,
           runtimeAvailabilityState: creationState.runtimeAvailabilityState,
@@ -973,7 +990,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     props.kind !== "scratch" &&
     creationState.branchLoad !== "loaded" &&
     creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
-  const isProcessingAttachments = processingAttachmentCount > 0;
+  const creationDraftNotSaved = variant === "creation" && draft.saveError !== null;
   // #6423: the same blockers as canSend below, so "Run /init" is off whenever Send is.
   useReportCreationSendBlocked(
     {
@@ -982,6 +999,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       processingAttachments: isProcessingAttachments,
       coderPresetsLoading,
       branchesNotLoaded: creationBranchesLoading,
+      draftNotSaved: creationDraftNotSaved,
     },
     props
   );
@@ -1007,6 +1025,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     !isProcessingAttachments &&
     !coderPresetsLoading &&
     !creationBranchesLoading &&
+    !creationDraftNotSaved &&
     !transcriptBlocksSend &&
     !editPreconditionInvalidated;
   const runningGoalActive =
@@ -1071,6 +1090,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Only treat *real* agent changes as explicit (origin "agent"); everything else is "sync".
   const prevCreationAgentIdRef = useRef<string | null>(null);
   const prevCreationScopeIdRef = useRef<string | null>(null);
+  const prevCreationProjectRef = useRef<string | null>(null);
   // Creation variant: keep the project-scoped model/thinking in sync with global agent defaults
   // so switching agents uses the configured defaults (and respects "inherit" semantics).
   useEffect(() => {
@@ -1081,20 +1101,28 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return;
     }
 
-    const scopeId = getProjectScopeId(creationParentProjectPath);
+    const scopeId = getCreationDraftScopeId(creationDraftId);
 
     const fallbackModel = defaultModel;
 
     const normalizedAgentId = normalizeAgentId(agentId, "exec");
 
+    // Defaults come from the agent's base chain, which needs the list.
+    if (!agentsLoaded) return;
+    const isFirstSync = prevCreationScopeIdRef.current !== scopeId;
+    // A project change resets the agent automatically: that is no pick of the user's.
     const isExplicitAgentSwitch =
-      prevCreationAgentIdRef.current !== null &&
-      prevCreationScopeIdRef.current === scopeId &&
+      !isFirstSync &&
+      prevCreationProjectRef.current === creationParentProjectPath &&
       prevCreationAgentIdRef.current !== normalizedAgentId;
 
     // Update refs for the next run (even if no model changes).
     prevCreationAgentIdRef.current = normalizedAgentId;
     prevCreationScopeIdRef.current = scopeId;
+    prevCreationProjectRef.current = creationParentProjectPath;
+    // The draft owns its choices: after the composer seeds them, only the user's agent pick applies
+    // agent defaults over them (not a move, its agent reset or an agent list reload).
+    if (!isFirstSync && !isExplicitAgentSwitch) return;
 
     const existingModel = readScopedAiDefault(scopeId, "model") ?? fallbackModel;
     const existingThinking = readScopedAiDefault(scopeId, "thinkingLevel") ?? "off";
@@ -1129,7 +1157,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     if (existingReasoning !== resolvedReasoning) {
       markAiSelectionIntent(scopeId, "reasoningMode", resolvedReasoning);
     }
-  }, [agentAiDefaults, agentId, agents, creationParentProjectPath, defaultModel, variant]);
+  }, [
+    agentAiDefaults,
+    agentId,
+    agents,
+    agentsLoaded,
+    creationDraftId,
+    creationParentProjectPath,
+    defaultModel,
+    variant,
+  ]);
 
   const chatDockColumnWidthClass = useChatDockColumnWidthClass();
 
@@ -2132,7 +2169,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // Async phases can outlive the invoking render, so check the live
         // draft: the getDraft closure captured here still reports
         // this render's input and would refuse to restore over a newer draft.
-        if (getDraftStore().getText(draftScope).trim().length === 0) {
+        if (draft.getLiveText().trim().length === 0) {
           setInput(restoreInput);
         } else {
           setDraftReviews(null);
@@ -2894,9 +2931,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // Clear only what this send took: a draft restored meanwhile (an edit completing while
         // this send resolved its options) stays in the composer (#5226).
         const sentAttachmentIds = new Set([...attachments, ...sendAttachments].map(({ id }) => id));
-        // Read before the update below: takeSendMark ends the mark.
-        const take = getDraftStore().takeSendMark(draftScope, input);
         if (!tracksSend) {
+          // An edit send has no beginSend, which takes the mark of every other send (#6729).
+          // Read before the update below: takeSendMark ends the mark.
+          const take = getDraftStore().takeSendMark(draftScope, input);
           setInput((current) => takeSentText(current, input, take));
           taken = { text: input };
         }
@@ -3348,6 +3386,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
           {/* Creation header controls - shown above textarea for creation variant */}
           {creationControlsProps && <CreationControls {...creationControlsProps} />}
+          {creationDraftNotSaved && (
+            <div role="alert" className="text-error mb-2 text-xs">
+              Not saved: {draft.saveError}. Keep this window open.
+            </div>
+          )}
 
           {/* Scratch chats have no CreationControls, but mobile users still
               need the current scope visible and a way to reach a project's
@@ -3358,7 +3401,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               <CreationProjectSelect
                 selected={SCRATCH_PROJECT_CONFIG_KEY}
                 userProjects={userProjects}
-                onChange={beginWorkspaceCreation}
+                onChange={changeCreationProject}
+                disabled={creationProjectLocked}
               />
             </div>
           )}
@@ -3408,9 +3452,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     // Write the draft when focus leaves instead of after the debounce; a failure
                     // keeps the change in the draft store, which retries it.
                     onBlur={() => {
-                      getDraftStore()
-                        .flush(draftScope)
-                        .catch(() => undefined);
+                      draft
+                        .flush()
+                        .catch((error: unknown) =>
+                          console.warn("Failed to save the draft:", error)
+                        );
                     }}
                     onKeyDown={handleKeyDown}
                     onPaste={handlePaste}
@@ -3420,6 +3466,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     onDragOver={handleDragOver}
                     onDrop={handleDrop}
                     onEscapeInNormalMode={handleEscapeInNormalMode}
+                    onKeyEdit={sendMarkEdits.onKeyEdit}
                     suppressKeys={
                       composerSuggestions.isVisible ? COMMAND_SUGGESTION_KEYS : undefined
                     }

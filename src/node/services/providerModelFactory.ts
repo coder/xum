@@ -7,7 +7,8 @@ export {
   normalizeOpenAICompatibleBaseURL,
 } from "@/common/utils/providers/baseUrl";
 import assert from "node:assert";
-import { createHash } from "node:crypto";
+import { createHash, createPrivateKey } from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type {
@@ -136,6 +137,7 @@ import { MUX_GATEWAY_AI_BASE_URL } from "@/common/constants/muxGatewayOAuth";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 import {
+  MAX_CREDENTIAL_FILE_BYTES,
   resolveCustomProviderCredentials,
   resolveProviderCredentials,
   resolveTypeSafeCredentials,
@@ -1125,6 +1127,93 @@ export function requestEndpoint(requestUrl: string): string {
     return `${url.origin}${url.pathname}${hashedQuery(url.search)}`;
   } catch {
     return `unparsed:sha256:${shortHash(requestUrl)}`;
+  }
+}
+
+/** Google Vertex AI: ADC by default, express mode when an API key resolves. */
+function createGoogleVertexModelEffect(
+  providerConfig: ProviderConfig,
+  modelId: string
+): Effect.Effect<Result<LanguageModel, SendMessageError>> {
+  return Effect.gen(function* () {
+    const creds = resolveProviderCredentials("google-vertex", providerConfig);
+    if (!creds.isConfigured) {
+      return Err({ type: "api_key_not_found", provider: "google-vertex" });
+    }
+    // google-auth-library parses the key file only at request time, where a
+    // missing file, a directory or invalid JSON surfaced as a retried request
+    // error whose text echoed the path or the file's first characters. Fail
+    // here instead, with a non-retryable configuration error.
+    const { keyFilename } = creds;
+    if (keyFilename != null && !(yield* Effect.promise(() => isUsableKeyFile(keyFilename)))) {
+      return Err({ type: "api_key_not_found", provider: "google-vertex" });
+    }
+    const { createVertex } = yield* Effect.promise(async () =>
+      PROVIDER_REGISTRY["google-vertex"]()
+    );
+    // Pass only explicit SDK settings: Xum resolved config and env already,
+    // so the SDK must not reread env. An empty apiKey keeps ADC selected
+    // (the SDK falls back to GOOGLE_VERTEX_API_KEY only when undefined).
+    const provider = createVertex({
+      apiKey: creds.apiKey ?? "",
+      project: creds.project,
+      location: creds.location,
+      // google-auth-library reads the env key file itself: its ADC lookup also
+      // applies GOOGLE_CLOUD_QUOTA_PROJECT, which an explicit keyFilename skips.
+      ...(creds.keyFilenameSource === "config" && { googleAuthOptions: { keyFilename } }),
+      ...(creds.baseUrl != null && { baseURL: creds.baseUrl }),
+      headers: providerConfig.headers,
+      fetch: getProviderFetch(providerConfig),
+    });
+    try {
+      return Ok(provider(modelId));
+    } catch (error) {
+      // The SDK rejects some model IDs synchronously (e.g. tuned endpoints/...
+      // models with an express mode API key). That is deterministic for this
+      // model string, so report it as a non-retryable model error.
+      return Err({ type: "invalid_model_string", message: getErrorMessage(error) });
+    }
+  });
+}
+
+async function isUsableKeyFile(filePath: string): Promise<boolean> {
+  let reason: string;
+  try {
+    // Check the type and size before reading: reading a FIFO blocks until a
+    // writer appears, reading a device such as /dev/zero never ends, and a
+    // huge file would be read whole.
+    const fileStat = await stat(filePath);
+    if (!fileStat.isFile()) {
+      reason = "not a regular file";
+    } else if (fileStat.size > MAX_CREDENTIAL_FILE_BYTES) {
+      reason = "too large";
+    } else {
+      const parsed: unknown = JSON.parse(await readFile(filePath, "utf8"));
+      if (!isPlainObject(parsed)) {
+        reason = "not a JSON object";
+      } else if (typeof parsed.private_key === "string" && !isPrivateKey(parsed.private_key)) {
+        // google-auth-library decodes the key only when it signs a token request, and
+        // that decoder error ("DECODER routines::unsupported") read as a retryable API error.
+        reason = "invalid private key";
+      } else {
+        return true;
+      }
+    }
+  } catch (error) {
+    // Only the failure kind: fs messages carry the path, JSON errors quote the file.
+    reason = error instanceof SyntaxError ? "invalid JSON" : "unreadable";
+  }
+  log.warn("Google Vertex AI service account key file is unusable", { reason });
+  return false;
+}
+
+function isPrivateKey(pem: string): boolean {
+  try {
+    createPrivateKey(pem);
+    return true;
+  } catch {
+    // Not logged: the caller logs only the failure kind.
+    return false;
   }
 }
 
@@ -2698,6 +2787,10 @@ export class ProviderModelFactory {
             fetch: providerFetch,
           });
           return Ok(provider(modelId));
+        }
+
+        if (providerName === "google-vertex") {
+          return yield* createGoogleVertexModelEffect(providerConfig, modelId);
         }
 
         // Handle Xum Gateway provider

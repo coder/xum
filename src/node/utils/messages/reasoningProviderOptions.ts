@@ -23,6 +23,29 @@ function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+// Persisted Gemini thought-signature namespace -> metadata namespaces it is read from.
+// @ai-sdk/google-vertex writes response metadata under both `googleVertex` and
+// `vertex` and replays from `googleVertex` first, so one canonical copy is kept.
+const GEMINI_THOUGHT_SIGNATURE_SOURCES = [
+  ["google", ["google"]],
+  ["googleVertex", ["googleVertex", "vertex"]],
+] as const;
+
+function geminiThoughtSignatures(
+  record: Record<string, unknown>
+): Pick<ReasoningProviderMetadata, "google" | "googleVertex"> {
+  const signatures: Pick<ReasoningProviderMetadata, "google" | "googleVertex"> = {};
+  for (const [namespace, sources] of GEMINI_THOUGHT_SIGNATURE_SOURCES) {
+    const thoughtSignature = sources
+      .map((source) => nonEmptyString(asRecord(record[source])?.thoughtSignature))
+      .find((signature) => signature != null);
+    if (thoughtSignature) {
+      signatures[namespace] = { thoughtSignature };
+    }
+  }
+  return signatures;
+}
+
 /**
  * Runtime-validate reasoning replay data into the persisted providerOptions
  * shape, keeping only recognized string/null fields. History rows are read
@@ -50,10 +73,7 @@ export function sanitizeReasoningReplayMetadata(
     options.anthropic = { redactedData: anthropicRedactedData };
   }
 
-  const googleThoughtSignature = nonEmptyString(asRecord(record.google)?.thoughtSignature);
-  if (googleThoughtSignature) {
-    options.google = { thoughtSignature: googleThoughtSignature };
-  }
+  Object.assign(options, geminiThoughtSignatures(record));
 
   for (const provider of ["openai", "xai"] as const) {
     const meta = asRecord(record[provider]);
@@ -100,10 +120,7 @@ export function mergeReasoningProviderOptions(
   if (incoming.anthropic) {
     merged.anthropic = { ...existing.anthropic, ...incoming.anthropic };
   }
-  if (incoming.google) {
-    merged.google = { ...existing.google, ...incoming.google };
-  }
-  for (const provider of ["openai", "xai"] as const) {
+  for (const provider of ["openai", "xai", "google", "googleVertex"] as const) {
     if (!incoming[provider]) continue;
     merged[provider] = { ...existing[provider], ...incoming[provider] };
   }

@@ -2053,6 +2053,20 @@ describe("McpOauthService OAuth flows", () => {
     );
   });
 
+  test("a recorded insufficient_scope prompt notifies subscribers until they unsubscribe (#6739)", () => {
+    // Mounted Settings rows refresh on this signal, keyed like getAuthStatus.
+    const keys: string[] = [];
+    const unsubscribe = service.onInsufficientScope((key) => keys.push(key));
+    service.recordInsufficientScope({
+      serverUrl: "https://x.example/mcp/",
+      scopes: ["files.write"],
+    });
+    expect(keys).toEqual(["https://x.example/mcp"]);
+    unsubscribe();
+    service.recordInsufficientScope({ serverUrl: "https://x.example/mcp", scopes: ["admin"] });
+    expect(keys).toHaveLength(1);
+  });
+
   test("a sign-in whose server renames the granted scopes stays signed in (#6564)", async () => {
     const oauth = { clientId: "c", baseScopes: ["api://app/.default"] };
     // Entra-style: the request names `.default`, the grant lists the permissions.

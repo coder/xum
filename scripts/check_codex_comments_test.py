@@ -50,10 +50,13 @@ def comment(body, author=BOT, created_at=AFTER, minimized=False):
     }
 
 
-def thread(body, author=BOT, resolved=False, created_at=AFTER, discussion="1"):
-    """`discussion` is the root comment ID that board links use (#discussion_r<id>)."""
+def thread(body, author=BOT, resolved=False, created_at=AFTER, discussion="1", commit=None):
+    """`discussion` is the root comment ID that board links use (#discussion_r<id>).
+    `commit` is the commit the root comment was written on."""
     root = comment(body, author, created_at)
     root["fullDatabaseId"] = discussion
+    if commit is not None:
+        root["originalCommit"] = {"oid": commit}
     return {
         "id": "thread",
         "isResolved": resolved,
@@ -217,6 +220,99 @@ else:
             ):
                 with self.subTest(header=header, body=body):
                     self.assert_gate(expected, snapshot([comment(header + body)]))
+
+    def test_receipt_marker_does_not_hide_findings(self):
+        # Since 2026-10-15 Codex prefixes verdicts with a receipt marker. Only one
+        # leading marker is stripped; anything else around it stays blocking.
+        receipt = "<!-- codex-review-receipt:v1 -->\n\n"
+        clean = FIXTURES["receipt_security_no_findings"]["body"]
+        for body, expected in (
+            (clean, 0),
+            (clean + "\n\n[P1] A security issue still needs fixing.", 1),
+            (receipt + clean, 1),
+            (clean.replace(receipt, receipt + "[P1] Found an issue.\n\n"), 1),
+        ):
+            with self.subTest(body=body):
+                self.assert_gate(expected, snapshot([comment(body)]))
+
+    def test_review_state_line_is_fail_closed(self):
+        # Codex added a review-state line to its board on 2026-10-15. Only the
+        # observed keys and statuses count; has_any_findings stays true after
+        # findings are resolved, so only has_unresolved_findings blocks.
+        body = FIXTURES["review_state_summary"]["body"]
+        head = board_head(body)
+        state = re.search(r"<!-- codex-review-state:v1 .* -->\n", body).group(0)
+        security = re.search(r"<!-- codex-security-review:v1 .* -->\n", body).group(0)
+        unresolved = '"has_unresolved_findings":false'
+        for case, changed, expected in (
+            ("observed", body, 0),
+            # Codex sends null while a review runs; a completed review must say false.
+            ("completed, null findings", body.replace(unresolved, '"has_unresolved_findings":null', 1), 1),
+            ("running, null findings", body.replace(
+                unresolved + ',"status":"completed"}', '"has_unresolved_findings":null,"status":"running"}', 1), 10),
+            ("code unresolved", body.replace(unresolved, '"has_unresolved_findings":true', 1), 1),
+            ("security unresolved", body.replace(
+                '"has_unresolved_findings":false,"status":"completed"}}',
+                '"has_unresolved_findings":true,"status":"completed"}}'), 1),
+            ("unknown review key", body.replace(
+                '"status":"completed"},', '"status":"completed","blocking":false},'), 1),
+            ("unknown top key", body.replace('}} -->', '},"merge_gate":{}} -->', 1), 1),
+            ("missing key", body.replace('"has_any_findings":true,', "", 1), 1),
+            ("unknown status", body.replace('"status":"completed"}', '"status":"failed"}', 1), 1),
+            ("non-boolean findings", body.replace(unresolved, '"has_unresolved_findings":0', 1), 1),
+            ("code running", body.replace('"status":"completed"}', '"status":"running"}', 1), 10),
+            ("older commit", body.replace(head, "c" * 40, 1), 10),
+            ("after security line", body.replace(state + security, security + state), 1),
+            ("two state lines", body.replace(state, state + state), 1),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(changed)], head=head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
+
+    def test_resolved_codex_threads_clear_unresolved_review_state(self):
+        # Codex keeps has_unresolved_findings true after its threads are resolved
+        # until it reviews again (seen on coder/xum#6786), like advisory bullets
+        # (coder/xum#5045). Only resolved Codex finding threads of the same review
+        # kind on the reviewed commit clear it; other evidence proves nothing.
+        clean = FIXTURES["review_state_summary"]["body"]
+        head = board_head(clean)
+        code = clean.replace('"has_unresolved_findings":false', '"has_unresolved_findings":true', 1)
+        security = clean.replace(
+            '"has_unresolved_findings":false,"status":"completed"}}',
+            '"has_unresolved_findings":true,"status":"completed"}}',
+        )
+        code_marker = "\n\n<!-- codex-code-review-finding:v1 -->"
+        security_marker = "<!-- codex-security-review-finding:v1 -->\n\n"
+        fixed = thread("[P2] Fixed" + code_marker, resolved=True, commit=head)
+        for case, body, threads, expected in (
+            ("resolved code thread", code, [fixed], 0),
+            ("unresolved Codex thread", code, [fixed, thread("[P2] Open" + code_marker, commit=head)], 1),
+            ("unresolved human thread", code, [fixed, thread("Nit", "human-reviewer")], 0),
+            ("thread on an older commit", code,
+             [thread("[P2] Fixed" + code_marker, resolved=True, commit="c" * 40)], 1),
+            ("thread without a commit", code, [thread("[P2] Fixed" + code_marker, resolved=True)], 1),
+            ("thread without a marker", code, [thread("[P2] Fixed", resolved=True, commit=head)], 1),
+            ("human thread with a marker", code,
+             [thread("[P2] Fixed" + code_marker, "human-reviewer", resolved=True, commit=head)], 1),
+            ("no threads", code, [], 1),
+            ("security flag, code thread", security, [fixed], 1),
+            ("security flag, security thread", security,
+             [thread(security_marker + "[P2] Fixed", resolved=True, commit=head)], 0),
+            # A marker counts only in its protocol position: code last, security first.
+            ("security flag, code thread quoting its marker", security,
+             [thread("[P2] Quotes " + security_marker + "Fixed" + code_marker, resolved=True, commit=head)], 1),
+            ("code flag, security thread quoting its marker", code,
+             [thread(security_marker + "[P2] Quotes " + code_marker + " here", resolved=True, commit=head)], 1),
+            ("marker sharing its line", code,
+             [thread("[P2] Fixed <!-- codex-code-review-finding:v1 -->", resolved=True, commit=head)], 1),
+            ("thread with both markers", security,
+             [thread(security_marker + "[P2] Fixed" + code_marker, resolved=True, commit=head)], 1),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(body)], threads, head=head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
 
     def test_summary_completion_requires_metadata_and_every_review_row(self):
         completed = FIXTURES["summary"]["body"]
@@ -586,7 +682,7 @@ else:
                 + BOT
                 + '"; "'
                 + board_head(FIXTURES["summary"]["body"])
-                + '"; [])]',
+                + '"; []; {code_review: [], security_review: []})]',
             ],
             input=json.dumps(comments),
             text=True,

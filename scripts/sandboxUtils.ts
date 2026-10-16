@@ -160,6 +160,10 @@ function providerCredentialEnvVarNames(): string[] {
 const BEDROCK_CLEAN_ENV_VARS: string[] = [
   ...(PROVIDER_ENV_VARS.bedrock?.region ?? []),
   BEDROCK_AUTH_ENV_VARS.bearerToken,
+  // Google Vertex AI is likewise "configured" from a project env var alone
+  // (credentials flow via Google ADC), so a clean sandbox drops project/location.
+  ...(PROVIDER_ENV_VARS["google-vertex"]?.project ?? []),
+  ...(PROVIDER_ENV_VARS["google-vertex"]?.location ?? []),
 ];
 
 /**

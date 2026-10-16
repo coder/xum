@@ -18,6 +18,7 @@ import {
   writePersistedRawString,
 } from "@/browser/hooks/usePersistedState";
 import { AUTH_TOKEN_KEY } from "@/common/constants/storage";
+import { clearServiceWorkerCaches } from "@/browser/utils/serviceWorkerCache";
 
 interface AuthTokenModalProps {
   isOpen: boolean;
@@ -43,16 +44,24 @@ export function getStoredAuthToken(): string | null {
   return readPersistedRawString(AUTH_TOKEN_KEY);
 }
 
-export function setStoredAuthToken(token: string): void {
+/**
+ * The token is stored at once. The promise settles when the service worker's caches of the
+ * previous session are gone (#6848): await it before connecting or navigating. It never rejects.
+ */
+export function setStoredAuthToken(token: string): Promise<void> {
+  const changed = getStoredAuthToken() !== token;
   writePersistedRawString(AUTH_TOKEN_KEY, token);
+  return changed ? clearServiceWorkerCaches() : Promise.resolve();
 }
 
-export function clearStoredAuthToken(): void {
+/** Logout: the token is removed at once, and the promise settles after the cache cleanup. */
+export function clearStoredAuthToken(): Promise<void> {
   try {
     removePersistedStateKeys([AUTH_TOKEN_KEY]);
   } catch {
     // Ignore storage errors
   }
+  return clearServiceWorkerCaches();
 }
 
 async function parseJsonResponse<T>(response: Response): Promise<T | null> {
@@ -92,9 +101,17 @@ export function AuthTokenModal(props: AuthTokenModalProps) {
   const handleSubmit = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();
-      if (token.trim()) {
-        setStoredAuthToken(token.trim());
-        onSubmit(token.trim());
+      const trimmed = token.trim();
+      if (trimmed) {
+        // Connect only after the previous session's caches are gone (#6848).
+        // The cleanup never rejects today; if it ever does, log it and still connect.
+        setStoredAuthToken(trimmed).then(
+          () => onSubmit(trimmed),
+          (error: unknown) => {
+            console.warn("[AuthTokenModal] Service worker cache cleanup failed:", error);
+            onSubmit(trimmed);
+          }
+        );
       }
     },
     [token, onSubmit]
@@ -213,7 +230,7 @@ export function AuthTokenModal(props: AuthTokenModalProps) {
           return;
         }
 
-        clearStoredAuthToken();
+        await clearStoredAuthToken();
         props.onSessionAuthenticated?.();
       } catch (error) {
         if (isAbortError(error)) {

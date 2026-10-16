@@ -69,7 +69,7 @@ const STYLE_VARIABLES: Record<string, string> = {
   "--color-border-secondary": "--color-border-light",
   "--color-text-info": "--color-accent",
   "--color-text-danger": "--color-danger",
-  "--color-text-success": "--color-success",
+  "--color-text-success": "--color-success-text",
   "--font-sans": "--font-primary",
   "--font-mono": "--font-monospace",
   "--border-radius-md": "--radius",
