@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getAppConfigStore, useAppConfig } from "@/browser/stores/AppConfigStore";
@@ -12,6 +12,12 @@ import { useKatexPlugins } from "./mathRendering";
 // on that path must return its client snapshot there.
 describe("server rendering of the markdown hooks", () => {
   const store = getAppConfigStore();
+  // Preferences with quotes, as other test files in the shard leave them: React escapes them.
+  const before = store.getSnapshot();
+  beforeAll(() =>
+    store.updateOptimistically({ userPreferences: { appearance: { theme: "dark" } } })
+  );
+  afterAll(() => (before ? store.updateOptimistically(before) : store.clearCachedState()));
   const hooks: Array<[name: string, useHook: () => unknown, clientSnapshot: () => unknown]> = [
     [
       "useAppConfig",
@@ -24,7 +30,8 @@ describe("server rendering of the markdown hooks", () => {
   ];
   test.each(hooks)("%s returns its client snapshot", (_name, useHook, clientSnapshot) => {
     const Probe = () => <i>{JSON.stringify(useHook())}</i>;
-    expect(renderToStaticMarkup(<Probe />)).toBe(`<i>${JSON.stringify(clientSnapshot())}</i>`);
+    const expected = renderToStaticMarkup(<i>{JSON.stringify(clientSnapshot())}</i>);
+    expect(renderToStaticMarkup(<Probe />)).toBe(expected);
   });
 
   test("user and assistant markdown render to static markup", () => {
