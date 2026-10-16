@@ -21,6 +21,7 @@ import {
   writeSubagentAttemptSettlementReceipt,
   type SubagentAttemptSettlementSource,
 } from "@/node/services/subagentAttemptSettlements";
+import * as attemptSettlements from "@/node/services/subagentAttemptSettlements";
 import { readSubagentFailureArtifact } from "@/node/services/subagentFailureArtifacts";
 import type { TaskService } from "@/node/services/taskService";
 import { getTaskDepthFromConfig } from "@/node/services/taskUtils";
@@ -60,6 +61,8 @@ interface Internals {
   ownedAttemptByTaskId: Map<string, { attemptId?: string; receiptEligible: boolean }>;
   attemptSettlementByTaskId: Map<string, { attemptId?: string; phase: string; source: string }>;
   workspaceStopRecords: Map<string, unknown>;
+  attemptSettlementListenersByTaskId: Map<string, Set<() => void>>;
+  waitForWorkspaceStopsToRelease: (ids: readonly string[], deadlineMs: number) => Promise<void>;
   releaseSharedDesktopTaskOnUserStop: (taskId: string, abortOrigin: unknown) => Promise<void>;
   resolveStreamAttemptAtEvent: (taskId: string) => unknown;
   failAgentTaskTerminally: (
@@ -391,6 +394,78 @@ describe("TaskService settlement receipt producers (G2)", () => {
         await taskService.readAttemptOutcome(taskId, { requestingWorkspaceId: midId })
       ).toMatchObject({ kind: "terminal-no-report" });
       await expectReceiptEverywhere(config, taskId, attemptId, "execution-settled", true);
+    });
+
+    // #6727: a resolved Stop means its latch dropped, so a send goes in at once. The wait listens
+    // only for the existing release signal: when the latch already dropped it adds no listener
+    // and no timer, and when it does wait, its timer is cleared once the latch drops.
+    test("a Stop resolves after its latch drops, and its release wait arms nothing once released", async () => {
+      const waitsId = "stopwaits";
+      const idleId = "stopidle";
+      const { config } = await setupTree([
+        { id: waitsId, overrides: { taskStatus: "interrupted", taskAttemptId: PREDECESSOR } },
+        { id: idleId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { taskService, svc } = createHarness(config);
+      const attemptId = await ownEligibleAttempt(config, taskService, waitsId);
+      const parentReceipt = getSubagentAttemptSettlementReceiptPath(
+        ownerDir(config, midId),
+        waitsId,
+        attemptId
+      );
+      // A slow disk: the receipt write holds the owned attempt's latch past the Stop's cleanup.
+      const realWrite = attemptSettlements.writeSubagentAttemptSettlementReceipt;
+      spyOn(attemptSettlements, "writeSubagentAttemptSettlementReceipt").mockImplementation(
+        async (params) => {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          return realWrite(params);
+        }
+      );
+      // Timers the release wait arms on entry (synchronously, before its first await), told apart
+      // from the cleanup's own bounds. One listener registration means one loop pass.
+      let inReleaseWait = false;
+      const realWait = svc.waitForWorkspaceStopsToRelease.bind(taskService);
+      spyOn(svc, "waitForWorkspaceStopsToRelease").mockImplementation((ids, deadlineMs) => {
+        inReleaseWait = true;
+        try {
+          return realWait(ids, deadlineMs);
+        } finally {
+          inReleaseWait = false;
+        }
+      });
+      const realSetTimeout = globalThis.setTimeout;
+      const realClearTimeout = globalThis.clearTimeout;
+      const releaseTimers: unknown[] = [];
+      const cleared = new Set<unknown>();
+      spyOn(globalThis, "setTimeout").mockImplementation(((
+        handler: () => void,
+        timeout?: number
+      ) => {
+        const timer = realSetTimeout(handler, timeout);
+        if (inReleaseWait) releaseTimers.push(timer);
+        return timer;
+      }) as typeof setTimeout);
+      spyOn(globalThis, "clearTimeout").mockImplementation(((
+        timer?: ReturnType<typeof setTimeout>
+      ) => {
+        cleared.add(timer);
+        realClearTimeout(timer);
+      }) as typeof clearTimeout);
+      const listenerSets = spyOn(svc.attemptSettlementListenersByTaskId, "set");
+
+      // Nothing holds the idle row's latch past its cleanup: the wait arms nothing.
+      expect((await taskService.stopDescendantAgentTask(rootId, idleId)).success).toBe(true);
+      expect(taskService.isWorkspaceStopInProgress(idleId)).toBe(false);
+      expect(releaseTimers).toHaveLength(0);
+      expect(listenerSets).not.toHaveBeenCalled();
+
+      // The owned attempt waits for its receipt: one listener and one timer, cleared on release.
+      expect((await taskService.stopDescendantAgentTask(rootId, waitsId)).success).toBe(true);
+      expect(taskService.isWorkspaceStopInProgress(waitsId)).toBe(false);
+      expect(existsSync(parentReceipt)).toBe(true);
+      expect(listenerSets.mock.calls.filter((call) => call[0] === waitsId)).toHaveLength(1);
+      expect(releaseTimers).toHaveLength(1);
+      expect(cleared.has(releaseTimers[0])).toBe(true);
     });
 
     test("reservation canceled inside the commit writes the receipt", async () => {
