@@ -16,7 +16,7 @@ export type StaticElement = [tag: string, attributes: Record<string, string>, ..
 
 const BLOCK = ["class", "data-streamdown"];
 
-/** Allowed attributes per tag. A value must also pass ATTRIBUTE_VALUES when that lists the name. */
+/** Allowed attributes per tag. A value must also pass STATIC_TREE_ATTRIBUTE_VALUES when it lists the name. */
 export const STATIC_TREE_TAGS: Readonly<Record<string, readonly string[]>> = {
   div: [...BLOCK, "data-code-language", "style"],
   p: [],
@@ -58,7 +58,7 @@ export const STATIC_TREE_TAGS: Readonly<Record<string, readonly string[]>> = {
   path: ["d"],
 };
 
-const ATTRIBUTE_VALUES: Readonly<Record<string, RegExp>> = {
+export const STATIC_TREE_ATTRIBUTE_VALUES: Readonly<Record<string, RegExp>> = {
   "data-streamdown": /^[a-z0-9-]+$/,
   "data-code-language": /^[\w+-]+$/,
   start: /^\d{1,9}$/,
@@ -97,7 +97,11 @@ function isElementShape(node: unknown, depth: number): node is [string, object, 
 
 function isAllowedAttribute(tag: string, name: string, value: unknown): boolean {
   if (typeof value !== "string" || !STATIC_TREE_TAGS[tag].includes(name)) return false;
-  if (Object.hasOwn(ATTRIBUTE_VALUES, name) && !ATTRIBUTE_VALUES[name].test(value)) return false;
+  if (
+    Object.hasOwn(STATIC_TREE_ATTRIBUTE_VALUES, name) &&
+    !STATIC_TREE_ATTRIBUTE_VALUES[name].test(value)
+  )
+    return false;
   return name !== "class" || value.split(" ").every((c) => STATIC_TREE_CLASSES.has(c));
 }
 
