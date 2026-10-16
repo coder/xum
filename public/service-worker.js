@@ -88,6 +88,28 @@ function isCacheableResponse(response) {
   return !/(^|[\s,])(no-store|private)([\s,=]|$)/.test(cacheControl);
 }
 
+// The server's root-only slash-appending redirect (SLASHLESS_ROOT_REDIRECT_SCRIPT in
+// src/node/orpc/server.ts; serviceWorker.test.ts reads it from there, so a change fails the test).
+const SLASHLESS_ROOT_REDIRECT = /<script>\(\(\)=>\{const pathname=location\.pathname;.*?<\/script>/;
+
+/**
+ * The cached shell was built for the one route it came from: its <base> is relative to that route
+ * and the root copy holds the redirect. A navigation document keeps the requested URL, so offline
+ * the worker points <base> at the scope and drops the redirect. Otherwise a deep route loads its
+ * assets from the wrong folder, or gains a trailing slash that the router does not match.
+ */
+function routeNeutralShell(cachedResponse) {
+  return cachedResponse.text().then(
+    (body) =>
+      new Response(
+        body
+          .replace(SLASHLESS_ROOT_REDIRECT, "")
+          .replace(/<base\b[^>]*>/i, `<base href="${self.registration.scope}" />`),
+        { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } }
+      )
+  );
+}
+
 function offlineResponse() {
   return new Response("Network error and no cached version available", {
     status: 503,
@@ -98,10 +120,10 @@ function offlineResponse() {
 
 /**
  * Network first: store a cacheable answer under `cacheKey`, else answer from this cache.
- * `isCacheable` decides what may be stored. The write runs under `event.waitUntil`, so the
- * browser keeps the worker alive until it ends.
+ * `isCacheable` decides what may be stored, and `fromCache` prepares a cached answer. The write
+ * runs under `event.waitUntil`, so the browser keeps the worker alive until it ends.
  */
-function networkFirst(event, cacheKey, isCacheable) {
+function networkFirst(event, cacheKey, isCacheable, fromCache = (cached) => cached) {
   return fetch(event.request)
     .then((response) => {
       if (isCacheable(response)) {
@@ -119,7 +141,7 @@ function networkFirst(event, cacheKey, isCacheable) {
       caches
         .open(CACHE_NAME)
         .then((cache) => cache.match(cacheKey))
-        .then((cachedResponse) => cachedResponse || offlineResponse())
+        .then((cachedResponse) => (cachedResponse ? fromCache(cachedResponse) : offlineResponse()))
     );
 }
 
@@ -172,7 +194,9 @@ self.addEventListener("fetch", (event) => {
   if (event.request.mode === "navigate") {
     // Every client route loads the same shell; one entry, never keyed by the visited URL.
     // Other navigations (popout pages, files) go to the network untouched.
-    if (isSpaRoute(path)) event.respondWith(networkFirst(event, SHELL_PATH, isShellResponse));
+    if (isSpaRoute(path)) {
+      event.respondWith(networkFirst(event, SHELL_PATH, isShellResponse, routeNeutralShell));
+    }
     return;
   }
 

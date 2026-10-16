@@ -17,6 +17,18 @@ const WORKER_SOURCE = await fs.readFile(
   path.join(import.meta.dir, "../../public/service-worker.js"),
   "utf-8"
 );
+// The root-only redirect the server injects into the shell. Read from the server source (browser
+// code cannot import src/node), so a change to it fails the offline shell test below.
+const SERVER_SOURCE = await fs.readFile(
+  path.join(import.meta.dir, "../node/orpc/server.ts"),
+  "utf-8"
+);
+const SLASHLESS_ROOT_REDIRECT_SCRIPT = /const SLASHLESS_ROOT_REDIRECT_SCRIPT =\s*'([^']+)';/.exec(
+  SERVER_SOURCE
+)?.[1];
+if (SLASHLESS_ROOT_REDIRECT_SCRIPT === undefined) {
+  throw new Error("SLASHLESS_ROOT_REDIRECT_SCRIPT not found in server.ts");
+}
 const ORIGIN = "https://xum.test";
 const ROOT_SCOPE = `${ORIGIN}/`;
 const HASHED_JS = "main-AbCd1234.js";
@@ -284,6 +296,28 @@ describe("service worker caching (#6848)", () => {
     const { response } = await worker.request(`${ORIGIN}/`, { mode: "navigate" });
     // Still the installed shell, not the no-store fetch() answer.
     expect(await response?.text()).toBe("shell");
+  });
+
+  test.each([
+    // The root copy: relative <base> and the slash-appending redirect.
+    ["the root shell", ROOT_SCOPE, `${SLASHLESS_ROOT_REDIRECT_SCRIPT}\n    <base href="./" />`],
+    // A copy refreshed from a deep route under an app-proxy prefix.
+    ["a deep-route shell", `${ORIGIN}/@u/ws/apps/mux/`, '<base href="./../" />'],
+  ])("offline, %s starts a deep route from the scope", async (_l, scope, head) => {
+    const page = `<html><head>${head}<script type="module" src="./${HASHED_JS}"></script></head><body></body></html>`;
+    const storage = new MemoryCacheStorage();
+    storage.network = () => html(page);
+    const worker = await startWorker({ scope, storage });
+    await worker.request(`${scope}workspace/abc`, { mode: "navigate" });
+    worker.offline();
+
+    const { response } = await worker.request(`${scope}workspace/abc`, { mode: "navigate" });
+    const body = (await response?.text()) ?? "";
+    // The document keeps the deep URL, so assets must resolve from the scope, not /workspace/.
+    expect(body).toContain(`<base href="${scope}" />`);
+    expect(body).not.toContain('<base href="./');
+    expect(body).not.toContain("location.replace");
+    expect(body).toContain(`src="./${HASHED_JS}"`);
   });
 
   test("serves the app shell offline for every client route", async () => {
