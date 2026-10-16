@@ -318,7 +318,7 @@ build: update-models
 build-renderer dist/cli/index.js dist/cli/api.mjs: update-models
 endif
 
-build-main: node_modules/.installed dist/cli/index.js dist/cli/api.mjs ## Build main process
+build-main: node_modules/.installed dist/cli/index.js dist/cli/api.mjs dist/workers/staticRowTree.worker.js ## Build main process
 
 BUILTIN_AGENTS_GENERATED := src/node/services/agentDefinitions/builtInAgentContent.generated.ts
 BUILTIN_SKILLS_GENERATED := src/node/services/agentSkills/builtInSkillContent.generated.ts
@@ -350,6 +350,11 @@ dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/ve
 dist/cli/api.mjs: src/cli/api.ts src/cli/proxifyOrpc.ts $(TS_SOURCES) node_modules/.installed
 	@echo "Building API CLI (ESM)..."
 	@$(ESBUILD_BIN) src/cli/api.ts $(ESBUILD_CLI_FLAGS)
+
+# Node worker of `xum server` for the static workspace view (see scripts/build-row-tree-worker.ts).
+dist/workers/staticRowTree.worker.js: scripts/build-row-tree-worker.ts $(TS_SOURCES) node_modules/.installed
+	@echo "Building static view row-tree worker..."
+	@bun scripts/build-row-tree-worker.ts $@
 
 build-preload: node_modules/.installed dist/preload.js ## Build preload script
 
