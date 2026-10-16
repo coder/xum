@@ -401,6 +401,33 @@ describe("useAIViewKeybinds", () => {
     expect(loadOlderHistory.mock.calls.length).toBe(1);
   });
 
+  test("Shift+J shows newer messages only while a callback is provided", () => {
+    const showNewerMessages = mock(() => undefined);
+    const params = {
+      workspaceId: "ws",
+      canInterrupt: false,
+      showRetryBarrier: false,
+      chatInputAPI: { current: null },
+      jumpToBottom: () => undefined,
+      loadOlderHistory: null,
+      handleOpenTerminal: () => undefined,
+      handleOpenInEditor: () => undefined,
+      aggregator: undefined,
+      setEditingMessage: () => undefined,
+      vimEnabled: false,
+    };
+    const press = () =>
+      document.body.dispatchEvent(
+        new window.KeyboardEvent("keydown", { key: "J", shiftKey: true, bubbles: true })
+      );
+    const attached = renderUseAIViewKeybinds({ ...params, showNewerMessages: null });
+    press();
+    attached.unmount();
+    renderUseAIViewKeybinds({ ...params, showNewerMessages });
+    press();
+    expect(showNewerMessages.mock.calls.length).toBe(1);
+  });
+
   test("Escape does not interrupt when immersive review captures Escape", () => {
     const interruptStream = mock(() =>
       Promise.resolve({ success: true as const, data: undefined })

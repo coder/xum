@@ -227,18 +227,39 @@ function visibleHistoryIds(scrollport: HTMLDivElement | null): Set<string> {
   return ids;
 }
 
+/** The ids of the displayed messages inside the scrollport now (see readVisibleMessageIds). */
+function visibleMessageIds(scrollport: HTMLDivElement | null, messages: DisplayedMessage[]) {
+  const seen = visibleHistoryIds(scrollport);
+  return messages
+    .filter((message) => "historyId" in message && seen.has(message.historyId))
+    .map((message) => message.id);
+}
+
+/**
+ * Load older walks past the cap without releasing the bottom lock, and a lock still on pins the
+ * bottom over Show newer's row anchor (DetachedPastCapLocked), so Show newer releases it first.
+ */
+function releaseBottomLock(lock: { autoScroll: boolean; disableAutoScroll: () => void }) {
+  if (lock.autoScroll) lock.disableAutoScroll();
+}
+
 /** Below a detached slice (#4961 F20): mounts the next newer rows (see revealNewer). */
 function ShowNewerMessagesButton(props: { visible: boolean; onClick: () => void }) {
   if (!props.visible) return null;
   return (
     <div className="flex justify-center py-3">
-      <button
-        type="button"
-        onClick={props.onClick}
-        className="text-muted hover:text-foreground text-xs underline underline-offset-2 transition-colors"
+      <TooltipIfPresent
+        tooltip={`Show newer messages (${formatKeybind(KEYBINDS.SHOW_NEWER_MESSAGES)})`}
+        side="bottom"
       >
-        Show newer messages
-      </button>
+        <button
+          type="button"
+          onClick={props.onClick}
+          className="text-muted hover:text-foreground text-xs underline underline-offset-2 transition-colors"
+        >
+          Show newer messages
+        </button>
+      </TooltipIfPresent>
     </div>
   );
 }
@@ -698,12 +719,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     followsTail: autoScroll,
     // Read once, on the render where an edit deletes a detached slice's edge row: the DOM still
     // shows the previous commit, so these are the rows the reader saw (refitDetached keeps them).
-    readVisibleMessageIds: () => {
-      const seen = visibleHistoryIds(contentRef.current);
-      return deferredMessages
-        .filter((message) => "historyId" in message && seen.has(message.historyId))
-        .map((message) => message.id);
-    },
+    readVisibleMessageIds: () => visibleMessageIds(contentRef.current, deferredMessages),
   });
   useLayoutEffect(() => {
     setTranscriptDetached(isTranscriptDetached);
@@ -1374,6 +1390,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Show newer unmounts rows above the reader. Chromium's native scroll anchoring holds the read row
   // (DetachedPastCap); the explicit pin of the last mounted row does not depend on it.
   const handleShowNewerMessages = () => {
+    releaseBottomLock({ autoScroll, disableAutoScroll });
     loadOlderAnchorRef.current = lastRowAnchor(contentRef.current);
     revealNewer();
   };
@@ -1443,6 +1460,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     chatInputAPI,
     jumpToBottom: handleJumpToBottom,
     loadOlderHistory: shouldRenderLoadOlderMessagesButton ? handleLoadOlderHistory : null,
+    showNewerMessages: isTranscriptDetached ? handleShowNewerMessages : null,
     handleOpenTerminal: onOpenTerminal,
     handleOpenInEditor,
     aggregator,

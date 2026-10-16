@@ -27,6 +27,8 @@ interface UseAIViewKeybindsParams {
   chatInputAPI: React.RefObject<ChatInputAPI | null>;
   jumpToBottom: () => void;
   loadOlderHistory: (() => void) | null;
+  /** Mounts the rows below a detached transcript slice; null while the slice is attached. */
+  showNewerMessages?: (() => void) | null;
   handleOpenTerminal: () => void;
   handleOpenInEditor: () => void;
   aggregator: StreamingMessageAggregator | undefined; // For compaction detection
@@ -46,6 +48,7 @@ interface UseAIViewKeybindsParams {
  * - Ctrl+I: Focus chat input
  * - Shift+H: Load older transcript messages (when available)
  * - Shift+G: Jump to bottom
+ * - SHOW_NEWER_MESSAGES: Show newer transcript messages (below a detached slice)
  * - Ctrl+T: Open terminal
  * - Ctrl+Shift+E: Open in editor
  * - Ctrl+C (during compaction in vim mode): Cancel compaction, restore command
@@ -59,6 +62,7 @@ export function useAIViewKeybinds({
   chatInputAPI,
   jumpToBottom,
   loadOlderHistory,
+  showNewerMessages = null,
   handleOpenTerminal,
   handleOpenInEditor,
   aggregator,
@@ -186,15 +190,14 @@ export function useAIViewKeybinds({
         return;
       }
 
-      if (matchesKeybind(e, KEYBINDS.LOAD_OLDER_MESSAGES) && loadOlderHistory) {
+      const transcriptAction = [
+        { keybind: KEYBINDS.LOAD_OLDER_MESSAGES, run: loadOlderHistory },
+        { keybind: KEYBINDS.SHOW_NEWER_MESSAGES, run: showNewerMessages },
+        { keybind: KEYBINDS.JUMP_TO_BOTTOM, run: jumpToBottom },
+      ].find((action) => matchesKeybind(e, action.keybind))?.run;
+      if (transcriptAction) {
         e.preventDefault();
-        loadOlderHistory();
-        return;
-      }
-
-      if (matchesKeybind(e, KEYBINDS.JUMP_TO_BOTTOM)) {
-        e.preventDefault();
-        jumpToBottom();
+        transcriptAction();
       }
     };
 
@@ -212,6 +215,7 @@ export function useAIViewKeybinds({
   }, [
     jumpToBottom,
     loadOlderHistory,
+    showNewerMessages,
     handleOpenTerminal,
     handleOpenInEditor,
     workspaceId,

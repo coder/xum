@@ -41,6 +41,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   TOGGLE_COMPLETED_SUB_AGENTS: "Show/hide sub-agents (in the workspace actions menu)",
   JUMP_TO_BOTTOM: "Jump to bottom",
   LOAD_OLDER_MESSAGES: "Load older messages",
+  SHOW_NEWER_MESSAGES: "Show newer messages",
   NEXT_WORKSPACE: "Next workspace",
   PREV_WORKSPACE: "Previous workspace",
   TOGGLE_SIDEBAR: "Toggle sidebar",
@@ -236,6 +237,7 @@ const KEYBIND_GROUPS: Array<{
       "NAVIGATE_FORWARD",
       "JUMP_TO_BOTTOM",
       "LOAD_OLDER_MESSAGES",
+      "SHOW_NEWER_MESSAGES",
     ],
   },
   {

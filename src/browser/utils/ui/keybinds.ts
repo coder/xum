@@ -476,6 +476,10 @@ export const KEYBINDS = {
   /** Load older transcript messages when pagination is available */
   LOAD_OLDER_MESSAGES: { key: "h", shift: true },
 
+  /** Show newer transcript messages below a detached slice (the pair of LOAD_OLDER_MESSAGES).
+   * Not Shift+L: immersive review's quick like (REVIEW_QUICK_LIKE) uses it. */
+  SHOW_NEWER_MESSAGES: { key: "j", shift: true },
+
   /** Navigate to next workspace in current project */
   NEXT_WORKSPACE: { key: "j", ctrl: true },
 
