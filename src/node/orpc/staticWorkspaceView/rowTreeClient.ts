@@ -8,13 +8,15 @@ import { log } from "@/node/services/log";
 
 /**
  * The main-thread side of the static view row-tree worker (staticRowTree.worker.ts). Only `xum
- * server` creates one: the worker costs about 170 MB while it lives. It never throws and never
- * waits for the cold load: every miss gives null rows, so the static view falls back to the live
- * one and the tail read stays fast.
+ * server` creates one: the worker costs about 170 MB while it lives. It never throws. A read
+ * during the cold load waits for the worker, but never past its request deadline: every miss gives
+ * null rows, so the static view falls back to the live one and the tail read stays bounded.
  */
 export interface RowTreeClient {
   /** One tree per row, or null. */
   render(workspaceId: string, rows: RowTreeRow[]): Promise<Array<StaticNode | null>>;
+  /** Starts the worker ahead of a likely read (a phone's page load); the idle stop still applies. */
+  warm(): void;
   dispose(): void;
 }
 export interface RowTreeRow {
@@ -25,7 +27,10 @@ export interface RowTreeRow {
 export const ROW_TREE_LIMITS = {
   /** Per batch of at most `maxRows`, timed from the worker's "ready", never across its cold load. */
   batchTimeoutMs: 1_000,
-  /** Every request resolves at most this long after it arrives, also while it waits in the queue. */
+  /**
+   * Every request resolves at most this long after it arrives, also while it waits in the queue or
+   * for the cold load (about 300 ms).
+   */
   requestTimeoutMs: 1_500,
   /** At most this many workspaces wait for the worker; a request for one more gets null at once. */
   maxQueued: 8,
@@ -116,12 +121,17 @@ class WorkerRowTreeClient implements RowTreeClient {
       this.memo.set(cacheKey, cached);
       return Promise.resolve(cached.trees);
     }
+    this.warm();
+    // A loading worker sends the queue once ready; with none (backoff, failed start), null at once.
+    if (!this.worker) return Promise.resolve(nulls(rows));
+    return this.enqueue(workspaceId, cacheKey, rows);
+  }
+
+  warm() {
     clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => this.stop(null), this.limits.idleMs);
     this.idleTimer.unref();
     if (!this.worker && Date.now() >= this.backoffUntil) this.start();
-    if (!this.ready) return Promise.resolve(nulls(rows)); // the cold load never delays a read
-    return this.enqueue(workspaceId, cacheKey, rows);
   }
 
   dispose() {
@@ -145,6 +155,7 @@ class WorkerRowTreeClient implements RowTreeClient {
       if (message !== "ready") return this.onReply(message.id, message.trees);
       clearTimeout(this.loadTimer);
       this.ready = true;
+      this.sendNext();
     });
     worker.on("error", (error: Error) => current() && this.stop(`error: ${error.message}`));
     worker.on("exit", (code: number) => current() && this.stop(`exit ${code}`));
@@ -194,7 +205,7 @@ class WorkerRowTreeClient implements RowTreeClient {
   }
 
   private sendNext() {
-    if (this.inFlight) return;
+    if (this.inFlight || !this.ready) return;
     for (const batch of this.queue.values()) {
       this.queue.delete(batch.workspaceId);
       // A request that waited behind an identical one gets that one's trees, not a second render.

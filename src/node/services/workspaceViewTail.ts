@@ -158,8 +158,8 @@ export async function readWorkspaceViewTail(
 
 /**
  * Each drawable row's element tree, rendered by `xum server`'s row-tree worker with the live
- * markdown components. No client (desktop, CLI), a cold or failed worker, and a row the static
- * view cannot draw all give tree: null. The client never throws by contract; the catch keeps a
+ * markdown components. No client (desktop, CLI), a failed worker or one not ready by the request
+ * deadline, and a row the static view cannot draw all give tree: null. The client never throws by contract; the catch keeps a
  * broken worker from ever failing the tail.
  */
 async function withRowTrees(

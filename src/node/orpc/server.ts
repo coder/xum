@@ -42,6 +42,7 @@ import { createFlowControlledWebSocket, type FlowControlObserver } from "@/node/
 import { perfEpochNowMs } from "@/common/utils/perf/clock";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
+import { warmRowTreesForPage } from "@/node/orpc/staticWorkspaceView/pageWarmUp";
 import {
   SERVER_AUTH_SESSION_COOKIE_NAME,
   SERVER_AUTH_SESSION_MAX_AGE_SECONDS,
@@ -1710,6 +1711,12 @@ export async function createOrpcServer({
               ? zlib.gzipSync(html)
               : html
         );
+        warmRowTreesForPage({
+          isWorkspaceRoute,
+          headers: req.headers,
+          client: context.rowTreeClient,
+          isSignedIn: () => isHttpRequestAuthenticated(req),
+        });
         return;
       }
 

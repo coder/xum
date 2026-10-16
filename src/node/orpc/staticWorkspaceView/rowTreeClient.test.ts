@@ -40,7 +40,7 @@ const client = (workerPath: string, limits = {}) => {
   return created;
 };
 const rows: RowTreeRow[] = [{ text: "hi", isUser: true }];
-/** Polls until the worker answers: its start is asynchronous by design (the first read gets null). */
+/** Polls until the worker answers: a read gets null when the worker misses its deadline. */
 const row = (text: string): RowTreeRow[] => [{ text, isUser: true }];
 async function untilTrees(c: RowTreeClient, input = rows, workspaceId = "ws") {
   for (let i = 0; i < 200; i++) {
@@ -52,12 +52,11 @@ async function untilTrees(c: RowTreeClient, input = rows, workspaceId = "ws") {
 }
 
 describe("createRowTreeClient", () => {
-  test("the first read gets null, later reads get trees, and the same rows are memoized", async () => {
+  test("the first read waits for the cold load, and the same rows are memoized", async () => {
     const c = client(
       await fakeWorker("ok", `port.on("message", (m) => reply(m)); port.postMessage("ready");`)
     );
-    expect(await c.render("ws", rows)).toEqual([null]);
-    const trees = await untilTrees(c);
+    const trees = await c.render("ws", rows);
     expect(trees).toEqual([["p", {}, "hi"]]);
     expect(await c.render("ws", rows)).toBe(trees);
     // An edit of the last row keeps its historySequence and the row count, and still misses.
@@ -87,10 +86,8 @@ describe("createRowTreeClient", () => {
       `port.on("message", () => {}); port.postMessage("ready");`
     );
     const c = client(hang, { batchTimeoutMs: 30 });
-    await c.render("ws", rows);
-    await Bun.sleep(200); // ready: a worker that never replies gives no other signal
-    expect(await c.render("ws", rows)).toEqual([null]); // timed out
-    await c.render("ws", rows);
+    expect(await c.render("ws", rows)).toEqual([null]); // posted once ready, then timed out
+    expect(await c.render("ws", rows)).toEqual([null]); // the same on a new worker
     await untilStarts("hang", 2);
 
     const crash = await fakeWorker(
@@ -98,9 +95,9 @@ describe("createRowTreeClient", () => {
       `port.on("message", () => process.exit(1)); port.postMessage("ready");`
     );
     const d = client(crash);
-    await d.render("ws", rows);
-    await Bun.sleep(200);
     expect(await d.render("ws", rows)).toEqual([null]);
+    expect(await d.render("ws", rows)).toEqual([null]);
+    await untilStarts("crash", 2);
   });
 
   test("a load that never finishes backs off after 3 failures", async () => {
@@ -108,11 +105,22 @@ describe("createRowTreeClient", () => {
       loadTimeoutMs: 20,
       backoffMs: 60_000,
     });
-    for (let i = 0; i < 6; i++) {
-      expect(await c.render("ws", rows)).toEqual([null]);
-      await Bun.sleep(60);
-    }
+    for (let i = 0; i < 3; i++) expect(await c.render("ws", rows)).toEqual([null]);
+    await untilStarts("stuck", 3);
+    // In backoff there is no worker to wait for: null at once, not at the request deadline.
+    const started = Date.now();
+    for (let i = 0; i < 3; i++) expect(await c.render("ws", rows)).toEqual([null]);
+    expect(Date.now() - started).toBeLessThan(500);
     expect(await starts("stuck")).toBe(3);
+  });
+
+  test("a read that the cold load outlasts gets null at its deadline", async () => {
+    const c = client(await fakeWorker("slowload", `setInterval(() => {}, 1000);`), {
+      requestTimeoutMs: 50,
+    });
+    const started = Date.now();
+    expect(await c.render("ws", rows)).toEqual([null]);
+    expect(Date.now() - started).toBeLessThan(1_000); // the load timeout is 5 s
   });
 
   test("a reply resets the failure count, so separate crashes never back off", async () => {
@@ -126,18 +134,37 @@ describe("createRowTreeClient", () => {
   });
 
   test("events of a stopped worker are ignored", async () => {
+    // The second worker answers at once but posts "ready" only after 400 ms.
+    const startsFile = JSON.stringify(path.join(dir, "late.starts"));
     const ok = await fakeWorker(
       "late",
-      `port.on("message", (m) => reply(m)); port.postMessage("ready");`
+      `port.on("message", (m) => reply(m));
+const n = require("node:fs").readFileSync(${startsFile}, "utf8").length;
+setTimeout(() => port.postMessage("ready"), n > 1 ? 400 : 0);`
     );
-    const c = client(ok);
-    await c.render("ws", rows);
+    const c = client(ok, { requestTimeoutMs: 100 });
+    c.warm();
     const end = Date.now() + 300;
     while (Date.now() < end); // block until its "ready" is queued
     c.dispose(); // stop it before that "ready" is delivered
     await Bun.sleep(50);
-    // A new worker starts, and this read must not reach it before it is ready.
+    // A new worker starts, and the old "ready" must not send this read to it before its own.
     expect(await c.render("ws", rows)).toEqual([null]);
+    await untilStarts("late", 2);
+  });
+
+  test("warm() starts the worker once, and a warm-up without a read still stops when idle", async () => {
+    const c = client(
+      await fakeWorker("warm", `port.on("message", (m) => reply(m)); port.postMessage("ready");`),
+      { idleMs: 300 }
+    );
+    c.warm();
+    c.warm();
+    await untilStarts("warm", 1);
+    await Bun.sleep(400);
+    c.warm();
+    await untilStarts("warm", 2);
+    expect(await c.render("ws", rows)).toEqual([["p", {}, "hi"]]);
   });
 
   test("an oversized batch gets null before its rows are serialized for the memo key", async () => {
@@ -244,7 +271,7 @@ describe("createRowTreeClient", () => {
     );
     await untilTrees(c);
     await Bun.sleep(80);
-    expect(await c.render("ws", row("other"))).toEqual([null]);
+    expect(await c.render("ws", row("other"))).toEqual([["p", {}, "other"]]); // a new load
     await untilStarts("idle", 2);
   });
 

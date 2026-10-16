@@ -2413,3 +2413,84 @@ describe("createOrpcServer", () => {
     }
   });
 });
+
+// A phone's page load starts the static view's row-tree worker (#5971), only when signed in.
+describe("row-tree warm-up on a phone's workspace page", () => {
+  const PHONE = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Mobile/15E148 Safari/604.1";
+  const DESKTOP = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/140.0 Safari/537.36";
+  const SIGNED_IN = { Cookie: "mux_session=valid" };
+  async function serve(warm: () => void) {
+    return createStaticTestServer({
+      authToken: "test-token",
+      context: {
+        rowTreeClient: { warm, render: () => Promise.resolve([]), dispose: () => undefined },
+        serverAuthService: {
+          validateSessionToken: (token: string) =>
+            Promise.resolve(token === "valid" ? { sessionId: "s" } : null),
+        } as unknown as ORPCContext["serverAuthService"],
+      },
+    });
+  }
+  const get = (baseUrl: string, route: string, headers: Record<string, string>) =>
+    fetch(`${baseUrl}${route}`, { headers: { "Accept-Encoding": "identity", ...headers } });
+  async function untilCalled(fn: ReturnType<typeof mock>) {
+    for (let i = 0; i < 100 && fn.mock.calls.length === 0; i++) await Bun.sleep(10);
+  }
+
+  test("a signed-in phone warms by its UA token or by Sec-CH-UA-Mobile, nothing else does", async () => {
+    const warm = mock(() => undefined);
+    const { server, close } = await serve(warm);
+    try {
+      const url = server.baseUrl;
+      // Plain http on a LAN gets no client hints: the UA token alone must do it.
+      const phones: Array<Record<string, string>> = [
+        { "User-Agent": PHONE },
+        { "User-Agent": DESKTOP, "Sec-CH-UA-Mobile": "?1" },
+      ];
+      for (const phone of phones) {
+        warm.mockClear();
+        const misses: Array<[string, Record<string, string>]> = [
+          ["/workspace/a1b2c3d4e5", phone], // not signed in
+          ["/workspace/a1b2c3d4e5", { ...phone, Cookie: "mux_session=expired" }],
+          ["/workspace/a1b2c3d4e5", { ...SIGNED_IN, "User-Agent": DESKTOP }],
+          ["/project?path=%2Ftmp%2Fp", { ...SIGNED_IN, ...phone }],
+        ];
+        for (const [route, headers] of misses)
+          expect((await get(url, route, headers)).ok).toBe(true);
+        // The misses settle within a few microtasks, well before this request's round trip.
+        expect((await get(url, "/workspace/a1b2c3d4e5", { ...SIGNED_IN, ...phone })).ok).toBe(true);
+        await untilCalled(warm);
+        expect(warm).toHaveBeenCalledTimes(1);
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("the page bytes and headers stay the same, and a failing warm-up is only logged", async () => {
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    const warm = mock(() => {
+      throw new Error("no thread");
+    });
+    const { server, close } = await serve(warm);
+    try {
+      const read = async (userAgent: string) => {
+        const res = await get(server.baseUrl, "/workspace/a1b2c3d4e5", {
+          ...SIGNED_IN,
+          "User-Agent": userAgent,
+        });
+        const headers = Object.fromEntries([...res.headers].filter(([name]) => name !== "date"));
+        return { status: res.status, headers, body: await res.text() };
+      };
+      const desktop = await read(DESKTOP);
+      expect(await read(PHONE)).toEqual(desktop);
+      await untilCalled(warm);
+      for (let i = 0; i < 100 && warn.mock.calls.length === 0; i++) await Bun.sleep(10);
+      expect(warn.mock.calls[0]?.[0]).toBe("Static view row-tree warm-up failed:");
+      expect((await read(PHONE)).status).toBe(200); // the server still serves
+    } finally {
+      warn.mockRestore();
+      await close();
+    }
+  });
+});
