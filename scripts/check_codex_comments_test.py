@@ -267,6 +267,28 @@ else:
                     data = snapshot([comment(changed)], head=head)
                     self.assert_gate(expected, data, cache=data if cached else None)
 
+    def test_resolved_codex_threads_clear_unresolved_review_state(self):
+        # Codex keeps has_unresolved_findings true after its threads are resolved
+        # until it reviews again (seen on coder/xum#6786), like advisory bullets
+        # (coder/xum#5045). Only resolved Codex threads clear it; with no Codex
+        # thread at all, the findings are somewhere the gate cannot see.
+        body = FIXTURES["review_state_summary"]["body"].replace(
+            '"has_unresolved_findings":false', '"has_unresolved_findings":true', 1
+        )
+        head = board_head(body)
+        resolved = thread("[P2] Fixed", resolved=True)
+        for case, threads, expected in (
+            ("resolved Codex thread", [resolved], 0),
+            ("unresolved Codex thread", [resolved, thread("[P2] Still open")], 1),
+            ("unresolved human thread", [resolved, thread("Nit", "human-reviewer")], 0),
+            ("resolved human thread only", [thread("Nit", "human-reviewer", resolved=True)], 1),
+            ("no threads", [], 1),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(body)], threads, head=head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
+
     def test_summary_completion_requires_metadata_and_every_review_row(self):
         completed = FIXTURES["summary"]["body"]
         completed_pr_opened = (
@@ -635,7 +657,7 @@ else:
                 + BOT
                 + '"; "'
                 + board_head(FIXTURES["summary"]["body"])
-                + '"; [])]',
+                + '"; []; false)]',
             ],
             input=json.dumps(comments),
             text=True,

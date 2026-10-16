@@ -483,7 +483,7 @@ CHECK_CODEX_STATUS_ONCE() {
       | select(
           ((.body | codex_without_help | startswith("<!-- codex-pull-request-review-summary -->"))
             or ((.body | codex_without_help | startswith("Security review completed."))
-              and codex_comment_is_informational($bot; $head; []))) | not
+              and codex_comment_is_informational($bot; $head; []; false))) | not
         )] | length
   ')
   codex_response_count_threads=$(echo "$all_threads" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select((.comments.nodes | length) > 0 and .comments.nodes[0].author.login == $bot and .comments.nodes[0].createdAt > $request_at)] | length')
