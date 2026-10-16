@@ -316,7 +316,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   }, []);
 
   return (
-    <AgentProvider projectPath={pendingSubProjectPath ?? projectPath} scopeId={creationScopeId}>
+    <AgentProvider projectPath={projectPath} scopeId={creationScopeId}>
       <ThinkingProvider projectPath={projectPath} scopeId={creationScopeId}>
         {/* Flex container to fill parent space */}
         {/* No workspace is open, so this page is the one `main` landmark (#5969). */}

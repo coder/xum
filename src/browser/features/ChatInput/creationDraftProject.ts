@@ -70,19 +70,14 @@ export function changeCreationDraftProject(
   const target = resolveWorkspaceCreationScope(scope, projects);
   if (!draft) return target.projectPath;
   const targetConfig = projects.get(target.projectPath);
-  // A sub-project switch keeps the parent repository, so its runtime and trunk still apply; its
-  // agents are listed from the sub-project, so another (sub-)project's agent resets.
-  const sameAgents =
-    (target.subProjectPath ?? target.projectPath) === (draft.subProjectPath ?? draft.projectPath);
+  // A sub-project switch keeps the parent repository, so its runtime and trunk still apply.
   const execution =
-    target.projectPath !== draft.projectPath
-      ? choicesForTarget(
+    target.projectPath === draft.projectPath
+      ? draft.execution
+      : choicesForTarget(
           draft.execution,
           targetConfig ? projectRuntimeEnablement(targetConfig, globalEnablement) : null
-        )
-      : draft.execution && !sameAgents
-        ? { ...draft.execution, agent: portableAgent(draft.execution.agent) }
-        : draft.execution;
+        );
   store.update(draftId, { ...target, execution });
   return target.projectPath;
 }

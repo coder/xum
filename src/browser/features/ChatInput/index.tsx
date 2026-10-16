@@ -346,11 +346,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const creationSubProjectPath = creationScope?.subProjectPath ?? undefined;
   const creationProject =
     variant === "creation" ? userProjects.get(creationParentProjectPath) : undefined;
-  // Files and skills come from the picked sub-project; the parent owns runtime settings.
+  // A sub-project draft keeps its parent's route, so files, skills and agents come from the parent
+  // (as for main's sidebar New chat on a sub-project). Following the sub-project instead makes the
+  // agent list, its defaults and the agent resets disagree.
   const atMentionProjectPath =
-    variant === "creation" && props.kind !== "scratch"
-      ? (creationSubProjectPath ?? props.projectPath)
-      : null;
+    variant === "creation" && props.kind !== "scratch" ? props.projectPath : null;
   const asyncCommandScopeRef = useRef<{ variant: typeof variant; workspaceId: string | null }>({
     variant,
     workspaceId: variant === "workspace" ? props.workspaceId : null,
