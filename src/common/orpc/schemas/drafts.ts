@@ -343,6 +343,9 @@ export const CreationDraftImportLegacyInputSchema = z.object({
   text: z.string().optional(),
   attachments: z.array(DraftAttachmentSchema).optional(),
   manualName: z.string().max(CREATION_DRAFT_NAME_MAX_CHARS).optional(),
+  /** From the old localStorage list row (`workspaceDraftsByProject`), when it had one. */
+  subProjectPath: z.string().min(1).nullable().optional(),
+  createdAt: z.number().finite().optional(),
 });
 
 export type DraftScope = z.infer<typeof DraftScopeSchema>;

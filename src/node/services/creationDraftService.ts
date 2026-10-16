@@ -76,6 +76,7 @@ interface ImportedContent {
   text?: string;
   attachments?: DraftAttachment[];
   manualName?: string;
+  subProjectPath?: string | null;
 }
 
 /** Fill the record's empty fields from an old draft; a filled field keeps the record's value. */
@@ -90,6 +91,7 @@ function withImported(current: CreationDraft, incoming: ImportedContent): Creati
     }),
     manualName:
       current.manualName || (incoming.manualName?.slice(0, CREATION_DRAFT_NAME_MAX_CHARS) ?? ""),
+    subProjectPath: current.subProjectPath ?? incoming.subProjectPath ?? null,
   };
 }
 
@@ -250,7 +252,10 @@ export class CreationDraftService {
     await withTargetMutationLock(this.config.rootDir, this.filePathFor(id), async () => {
       const current = await this.readRecord(id);
       await this.writeRecord(
-        withImported(current ?? emptyRecord(id, input.projectPath, Date.now()), input)
+        withImported(
+          current ?? emptyRecord(id, input.projectPath, input.createdAt ?? Date.now()),
+          input
+        )
       );
     });
   }

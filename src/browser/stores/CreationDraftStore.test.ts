@@ -7,7 +7,12 @@ import type {
   CreationDraftUpdateInput,
   DraftAttachment,
 } from "@/common/orpc/schemas/drafts";
-import { getDraftScopeId, getInputKey, getWorkspaceNameStateKey } from "@/common/constants/storage";
+import {
+  getDraftScopeId,
+  getInputKey,
+  getWorkspaceNameStateKey,
+  WORKSPACE_DRAFTS_BY_PROJECT_KEY,
+} from "@/common/constants/storage";
 import { DRAFT_STORE_READY_TIMEOUT_MS } from "@/constants/drafts";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { Config } from "@/node/config";
@@ -333,6 +338,13 @@ describe("CreationDraftStore", () => {
     );
     window.localStorage.setItem(getInputKey(filled), JSON.stringify("older text"));
     window.localStorage.setItem(getInputKey(failing), JSON.stringify("not imported yet"));
+    // The oldest builds' localStorage list row: where the draft targets, and when it was made.
+    window.localStorage.setItem(
+      WORKSPACE_DRAFTS_BY_PROJECT_KEY,
+      JSON.stringify({
+        [PROJECT_A]: [{ draftId: "named", subProjectPath: `${PROJECT_A}/sub`, createdAt: 5 }],
+      })
+    );
     const harness = await createHarness(tempDir, {
       failLegacyImport: "failing",
       seed: async (config) => {
@@ -348,14 +360,19 @@ describe("CreationDraftStore", () => {
     await waitFor(() => store.getListState().status === "ready");
 
     const namedId = creationDraftImportId(PROJECT_A, "named");
-    expect((await service.get(namedId))?.manualName).toBe("typed-name");
+    expect(await service.get(namedId)).toMatchObject({
+      manualName: "typed-name",
+      subProjectPath: `${PROJECT_A}/sub`,
+      createdAt: 5,
+    });
     expect(store.getDraftsByProject()[PROJECT_A]?.map((draft) => draft.draftId)).toContain(namedId);
     expect(window.localStorage.getItem(getWorkspaceNameStateKey(named))).toBeNull();
     expect((await service.get(creationDraftImportId(PROJECT_A, "filled")))?.text).toBe(
       "newer text"
     );
     expect(window.localStorage.getItem(getInputKey(filled))).toBeNull();
-    // A failed import keeps its keys for the next start.
+    // A failed import keeps its keys, and the list rows, for the next start.
     expect(window.localStorage.getItem(getInputKey(failing))).not.toBeNull();
+    expect(window.localStorage.getItem(WORKSPACE_DRAFTS_BY_PROJECT_KEY)).not.toBeNull();
   });
 });

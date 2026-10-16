@@ -96,6 +96,7 @@ import {
   useUserPreferences,
 } from "@/browser/stores/AppConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { getPlaceholderTip } from "./placeholderTips";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -1118,8 +1119,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     prevCreationScopeIdRef.current = scopeId;
     prevCreationProjectRef.current = creationParentProjectPath;
     // The draft owns its choices: after the composer seeds them, only the user's agent pick applies
-    // agent defaults over them (not a move, its agent reset or an agent list reload).
+    // agent defaults over them (not a move, its agent reset, an agent list reload, or reopening
+    // the draft, which remounts this composer).
     if (!isFirstSync && !isExplicitAgentSwitch) return;
+    const storedAi = getCreationDraftStore().getView(creationDraftId).draft?.ai;
+    if (isFirstSync && (storedAi?.model != null || storedAi?.thinkingLevel != null)) return;
 
     const existingModel = readScopedAiDefault(scopeId, "model") ?? fallbackModel;
     const existingThinking = readScopedAiDefault(scopeId, "thinkingLevel") ?? "off";

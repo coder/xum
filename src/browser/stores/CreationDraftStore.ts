@@ -4,6 +4,7 @@ import {
   listPersistedKeys,
   readPersistedState,
   readPersistedString,
+  updatePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
@@ -13,6 +14,7 @@ import {
   getInputKey,
   getPendingScopeId,
   getWorkspaceNameStateKey,
+  WORKSPACE_DRAFTS_BY_PROJECT_KEY,
 } from "@/common/constants/storage";
 import type {
   CreationDraft,
@@ -186,14 +188,52 @@ function readLegacyContent(scopeId: string) {
   return { text: readPersistedString(getInputKey(scopeId)) ?? "", attachments, manualName };
 }
 
+interface LegacyListRow {
+  subProjectPath: string | null;
+  createdAt?: number;
+}
+
+/**
+ * The oldest builds listed drafts in localStorage (`workspaceDraftsByProject`): the row holds a
+ * draft's sub-project and creation time, which its content keys lack. Keyed by legacyListKey.
+ */
+function readLegacyListRows(): Map<string, LegacyListRow> {
+  const rows = new Map<string, LegacyListRow>();
+  const raw = readPersistedState<unknown>(WORKSPACE_DRAFTS_BY_PROJECT_KEY, undefined);
+  if (typeof raw !== "object" || raw === null) return rows;
+  for (const [projectPath, drafts] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(drafts)) continue;
+    for (const draft of drafts as Array<Record<string, unknown> | null>) {
+      if (typeof draft?.draftId !== "string") continue;
+      const { subProjectPath, createdAt } = draft;
+      rows.set(legacyListKey(projectPath, draft.draftId), {
+        subProjectPath:
+          typeof subProjectPath === "string" && subProjectPath.length > 0 ? subProjectPath : null,
+        createdAt:
+          typeof createdAt === "number" && Number.isFinite(createdAt) ? createdAt : undefined,
+      });
+    }
+  }
+  return rows;
+}
+
+function legacyListKey(projectPath: string, legacyDraftId: string): string {
+  return JSON.stringify([projectPath, legacyDraftId]);
+}
+
 /** Import one old scope; its keys (settings included) go once the backend took it. */
-async function importLegacyDraft(client: APIClient, scopeId: string): Promise<void> {
+async function importLegacyDraft(
+  client: APIClient,
+  scopeId: string,
+  listRows: Map<string, LegacyListRow>
+): Promise<void> {
   const scope = parseLegacyScope(scopeId);
   if (!scope) return;
   const content = readLegacyContent(scopeId);
   const hasContent =
     content.text.length > 0 || content.attachments.length > 0 || content.manualName.length > 0;
-  if (hasContent) await client.drafts.importLegacyCreation({ ...scope, ...content });
+  const row = listRows.get(legacyListKey(scope.projectPath, scope.legacyDraftId));
+  if (hasContent) await client.drafts.importLegacyCreation({ ...scope, ...content, ...row });
   deleteWorkspaceStorage(scopeId);
 }
 
@@ -307,12 +347,19 @@ export class CreationDraftStore {
    * of old creation scopes). Keys go only once the backend confirmed the import.
    */
   private async importLegacyDrafts(client: APIClient): Promise<void> {
+    const listRows = readLegacyListRows();
+    let failed = false;
     for (const scopeId of legacyScopeIds()) {
       try {
-        await importLegacyDraft(client, scopeId);
+        await importLegacyDraft(client, scopeId, listRows);
       } catch (error) {
+        failed = true;
         console.warn("Failed to import a legacy creation draft; will retry on next start:", error);
       }
+    }
+    // A row without content keys was an empty draft: nothing to keep.
+    if (!failed && readPersistedString(WORKSPACE_DRAFTS_BY_PROJECT_KEY) !== undefined) {
+      updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, undefined);
     }
   }
 
