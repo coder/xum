@@ -53,5 +53,6 @@ describe("persistWorkspaceCreationPrefill", () => {
 
     expect(draft?.ai.model).toBe("provider:model");
     expect(draft?.auto.model).toBe(false);
+    expect(draft?.intent.model).toBe(true);
   });
 });
