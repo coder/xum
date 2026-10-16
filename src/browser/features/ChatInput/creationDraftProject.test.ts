@@ -31,16 +31,23 @@ describe("changeCreationDraftProject", () => {
     expect(runtimeAfterMove(runtime, target)).toEqual(kept ? runtime : null);
   });
 
-  // A sub-project is the same repository: its host and trunk still apply.
-  test("a sub-project of the same repository keeps the runtime and trunk", () => {
+  // A sub-project is the same repository: its host and trunk still apply. Its agents are its own.
+  test("a sub-project of the same repository keeps the runtime and trunk, not a project agent", () => {
     const store = getCreationDraftStore();
     const draftId = store.create("/projects/a", null);
     const choices = { runtime: { mode: "ssh", host: "a-host" } as const, trunkBranch: "main" };
-    store.updateExecution(draftId, choices);
+    store.updateExecution(draftId, { ...choices, agent: { id: "a-only", scope: "project" } });
     changeCreationDraftProject(draftId, "/projects/a/sub", PROJECTS, DEFAULT_RUNTIME_ENABLEMENT);
     expect(store.getView(draftId).draft).toMatchObject({
       subProjectPath: "/projects/a/sub",
-      execution: choices,
+      execution: { ...choices, agent: null },
+    });
+
+    store.updateExecution(draftId, { agent: { id: "sub-only", scope: "project" } });
+    changeCreationDraftProject(draftId, "/projects/a/sub", PROJECTS, DEFAULT_RUNTIME_ENABLEMENT);
+    expect(store.getView(draftId).draft?.execution?.agent).toEqual({
+      id: "sub-only",
+      scope: "project",
     });
   });
 });
