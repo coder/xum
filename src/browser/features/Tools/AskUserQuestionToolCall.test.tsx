@@ -25,6 +25,8 @@ let currentWorkspaceState: {
   canInterrupt: boolean;
   messages: Array<{
     type: string;
+    id?: string;
+    toolName?: string;
     toolCallId?: string;
     compactionRequest?: { parsed: unknown };
     askUserQuestionAnswer?: { toolCallId: string; answers: Record<string, string> };
@@ -516,7 +518,10 @@ describe("AskUserQuestionToolCall", () => {
       // context; numbered answers would mean nothing to the model.
       currentWorkspaceState = {
         ...currentWorkspaceState,
-        messages: [{ type: "tool", toolCallId: "ask-async" }, { type: "compaction-boundary" }],
+        messages: [
+          { type: "tool", toolName: "ask_user_question", toolCallId: "ask-async" },
+          { type: "compaction-boundary" },
+        ],
       };
 
       const view = renderAsyncQuestion();
@@ -524,6 +529,78 @@ describe("AskUserQuestionToolCall", () => {
 
       expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
       expect(view.getByText(/no longer in the agent/)).toBeTruthy();
+    });
+
+    test("a later question that reuses the tool call id takes over its answers", () => {
+      // Providers may reuse ids (call_0 every turn); the answer message names the call by id, so
+      // the agent reads an answer to it as meant for its latest call.
+      currentWorkspaceState = {
+        ...currentWorkspaceState,
+        messages: [
+          { type: "tool", id: "row-1", toolName: "ask_user_question", toolCallId: "ask-async" },
+          { type: "tool", id: "row-2", toolName: "ask_user_question", toolCallId: "ask-async" },
+          {
+            type: "user",
+            askUserQuestionAnswer: {
+              toolCallId: "ask-async",
+              answers: { "Which option?": "Second" },
+            },
+          },
+        ],
+      };
+      const renderRow = (rowId: string) =>
+        renderWithProviders(
+          <AskUserQuestionToolCall
+            args={{ questions }}
+            result={asyncResult}
+            status="completed"
+            toolCallId="ask-async"
+            workspaceId="ws-ask"
+            rowId={rowId}
+          />
+        );
+
+      const earlier = renderRow("row-1");
+      fireEvent.click(earlier.getByText("ask_user_question"));
+      expect(earlier.getByText(/later question replaced/)).toBeTruthy();
+      expect(earlier.queryByText("User answered")).toBeNull();
+      earlier.unmount();
+
+      const later = renderRow("row-2");
+      fireEvent.click(later.getByText("ask_user_question"));
+      expect(later.getByText("User answered")).toBeTruthy();
+    });
+
+    test("rechecks for a question that reused the tool call id right before sending", async () => {
+      currentWorkspaceState = {
+        ...currentWorkspaceState,
+        messages: [
+          { type: "tool", id: "row-1", toolName: "ask_user_question", toolCallId: "ask-async" },
+        ],
+      };
+      const view = renderWithProviders(
+        <AskUserQuestionToolCall
+          args={{ questions }}
+          result={asyncResult}
+          status="completed"
+          toolCallId="ask-async"
+          workspaceId="ws-ask"
+          rowId="row-1"
+        />
+      );
+      fireEvent.click(view.getByText("First"));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+      // The later call lands while preferences flush: sending would answer it instead.
+      currentWorkspaceState = {
+        ...currentWorkspaceState,
+        messages: [
+          ...currentWorkspaceState.messages,
+          { type: "tool", id: "row-2", toolName: "ask_user_question", toolCallId: "ask-async" },
+        ],
+      };
+
+      await waitFor(() => expect(view.getByText(/later question replaced/)).toBeTruthy());
+      expect(sendMessage).not.toHaveBeenCalled();
     });
 
     test("rechecks the agent's context right before sending", async () => {
@@ -534,7 +611,10 @@ describe("AskUserQuestionToolCall", () => {
       // rendered card is still open, so only a dispatch-time re-read can catch it.
       currentWorkspaceState = {
         ...currentWorkspaceState,
-        messages: [{ type: "tool", toolCallId: "ask-async" }, { type: "compaction-boundary" }],
+        messages: [
+          { type: "tool", toolName: "ask_user_question", toolCallId: "ask-async" },
+          { type: "compaction-boundary" },
+        ],
       };
 
       await waitFor(() =>

@@ -71,6 +71,8 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
           // Identity props (used by bash for live output, ask_user_question for caching)
           workspaceId={workspaceId}
           toolCallId={toolCallId}
+          // Tells apart rows that reuse a tool call id (ask_user_question answers and drafts)
+          rowId={message.id}
           // Workflow-specific
           workflowRunHint={message.workflowRun}
           // Elapsed timers (bash/task_await): start when execute() actually

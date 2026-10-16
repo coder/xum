@@ -4,7 +4,11 @@ import { AlertTriangle, Check } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import { useLiveAPI } from "@/browser/contexts/API";
-import { useNonBlockingQuestionAnswers } from "@/browser/features/Tools/AskUserQuestion/useNonBlockingQuestionAnswers";
+import {
+  CLOSED_UNANSWERED_MESSAGES,
+  type ClosedUnansweredReason,
+  useNonBlockingQuestionAnswers,
+} from "@/browser/features/Tools/AskUserQuestion/useNonBlockingQuestionAnswers";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
@@ -36,7 +40,6 @@ import type {
 } from "@/common/types/tools";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 import {
-  ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE,
   type AskUserQuestionSelection,
   isAsyncAskUserQuestionOutput,
 } from "@/common/utils/tools/askUserQuestionSummary";
@@ -55,8 +58,17 @@ interface CachedState {
   activeIndex: number;
 }
 
-// Cache draft state by toolCallId so it survives workspace switches
+// Cache draft state per question row so it survives workspace switches. Keyed by workspace and
+// row, not by tool call id alone: forks copy rows, and providers may reuse a tool call id.
 const draftStateCache = new Map<string, CachedState>();
+
+function getDraftStateKey(props: {
+  workspaceId?: string;
+  rowId?: string;
+  toolCallId: string;
+}): string {
+  return JSON.stringify([props.workspaceId ?? null, props.rowId ?? null, props.toolCallId]);
+}
 
 function unwrapJsonContainer(value: unknown): unknown {
   if (!value || typeof value !== "object") {
@@ -247,17 +259,17 @@ function AutoResizeTextarea(props: {
 
 /**
  * A finished question: the submitted answers, one row per question with the picked options'
- * descriptions, or a note when a non-blocking question left the agent's context unanswered.
+ * descriptions, or a note when a non-blocking question closed unanswered.
  */
 function AnsweredQuestions(props: {
   result: { questions: AskUserQuestionQuestion[]; answers: Record<string, string> } | null;
-  closedUnanswered: boolean;
+  closedUnanswered: ClosedUnansweredReason | null;
 }): JSX.Element | null {
   const result = props.result;
   if (result == null) {
-    return props.closedUnanswered ? (
+    return props.closedUnanswered !== null ? (
       <div className="text-muted text-[11px] italic">
-        Not answered. {ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE}
+        Not answered. {CLOSED_UNANSWERED_MESSAGES[props.closedUnanswered]}
       </div>
     ) : null;
   }
@@ -308,11 +320,14 @@ export function AskUserQuestionToolCall(props: {
   status: ToolStatus;
   toolCallId: string;
   workspaceId?: string;
+  /** The transcript row's display id: tells apart rows that reuse a tool call id. */
+  rowId?: string;
 }): JSX.Element {
   const argsAnswers = props.args.answers ?? {};
+  const draftStateKey = getDraftStateKey(props);
 
   // Restore from cache if available (survives workspace switches)
-  const cachedState = draftStateCache.get(props.toolCallId);
+  const cachedState = draftStateCache.get(draftStateKey);
 
   const [activeIndex, setActiveIndex] = useState(() => cachedState?.activeIndex ?? 0);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -349,6 +364,7 @@ export function AskUserQuestionToolCall(props: {
     enabled: isAsyncQuestion,
     workspaceId: props.workspaceId,
     toolCallId: props.toolCallId,
+    rowId: props.rowId,
     questions: props.args.questions,
     transcript: workspaceState?.messages,
   });
@@ -493,12 +509,12 @@ export function AskUserQuestionToolCall(props: {
   // Sync draft state to cache so it survives workspace switches
   useEffect(() => {
     if (isAnswering) {
-      draftStateCache.set(props.toolCallId, { draftAnswers, activeIndex });
+      draftStateCache.set(draftStateKey, { draftAnswers, activeIndex });
     } else {
       // Clean up cache once the questions are answered (or the tool failed)
-      draftStateCache.delete(props.toolCallId);
+      draftStateCache.delete(draftStateKey);
     }
-  }, [props.toolCallId, isAnswering, draftAnswers, activeIndex]);
+  }, [draftStateKey, isAnswering, draftAnswers, activeIndex]);
 
   const resultUnwrapped = useMemo(() => {
     if (!props.result) {

@@ -14,53 +14,60 @@ import {
   ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE,
   type AskUserQuestionSelection,
   buildAskUserQuestionAnswerMessage,
-  hasAskUserQuestionLeftContext,
+  ASK_USER_QUESTION_SUPERSEDED_MESSAGE,
+  type AskUserQuestionOccurrenceState,
+  getAskUserQuestionOccurrenceState,
 } from "@/common/utils/tools/askUserQuestionSummary";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
-
-/** The latest answer row for this tool call: a later correction supersedes earlier answers. */
-function findLatestAnswerRow(
-  transcript: readonly DisplayedMessage[],
-  toolCallId: string
-): Record<string, string> | undefined {
-  for (let index = transcript.length - 1; index >= 0; index--) {
-    const message = transcript[index];
-    if (message.type === "user" && message.askUserQuestionAnswer?.toolCallId === toolCallId) {
-      return message.askUserQuestionAnswer.answers;
-    }
-  }
-  return undefined;
-}
 
 interface AnsweredQuestions {
   questions: AskUserQuestionQuestion[];
   answers: Record<string, string>;
 }
 
+/** Why unanswered questions stopped taking answers. */
+export type ClosedUnansweredReason = "left-context" | "superseded";
+
 interface NonBlockingQuestionState {
   /** The questions still take answers. */
   isOpen: boolean;
   /** The answers to show, or null while nothing was answered. */
   answered: AnsweredQuestions | null;
-  /** Unanswered, and a context boundary dropped the question from the agent's context. */
-  closedUnanswered: boolean;
+  /** Set when the questions closed without answers. */
+  closedUnanswered: ClosedUnansweredReason | null;
 }
 
 const NOT_NON_BLOCKING: NonBlockingQuestionState = {
   isOpen: false,
   answered: null,
-  closedUnanswered: false,
+  closedUnanswered: null,
 };
+
+/** The refusal (and closed-card note) for each way unanswered questions close. */
+export const CLOSED_UNANSWERED_MESSAGES: Record<ClosedUnansweredReason, string> = {
+  "left-context": ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE,
+  superseded: ASK_USER_QUESTION_SUPERSEDED_MESSAGE,
+};
+
+function getClosedUnansweredReason(
+  state: AskUserQuestionOccurrenceState
+): ClosedUnansweredReason | null {
+  if (state.superseded) return "superseded";
+  return state.leftContext ? "left-context" : null;
+}
 
 /**
  * Where a non-blocking question stands. A durable answer row wins over this card's own accepted
- * send (another client may have sent a correction); answers name questions and options by
- * number only, so a question that a compaction, Start Here or reset dropped from the agent's
- * context closes unanswered.
+ * send (another client may have sent a correction). Answers name questions and options by
+ * number and the call by its tool call id, so unanswered questions close once a compaction,
+ * Start Here or reset drops them from the agent's context, or once a later question reuses the
+ * tool call id (see getAskUserQuestionOccurrences).
  */
 export function getNonBlockingQuestionState(args: {
   enabled: boolean;
   toolCallId: string;
+  /** The transcript row's display id: tells apart rows that reuse a tool call id. */
+  rowId: string | undefined;
   questions: AskUserQuestionQuestion[];
   transcript: readonly DisplayedMessage[] | undefined;
   sentAnswers: Record<string, string> | null;
@@ -68,17 +75,20 @@ export function getNonBlockingQuestionState(args: {
   if (!args.enabled) {
     return NOT_NON_BLOCKING;
   }
-  const transcript = args.transcript ?? [];
-  const answers = findLatestAnswerRow(transcript, args.toolCallId) ?? args.sentAnswers;
+  const state = getAskUserQuestionOccurrenceState(args.transcript ?? [], {
+    toolCallId: args.toolCallId,
+    rowId: args.rowId,
+  });
+  const answers = state.answers ?? args.sentAnswers;
   if (answers != null) {
     return {
       isOpen: false,
       answered: { questions: args.questions, answers },
-      closedUnanswered: false,
+      closedUnanswered: null,
     };
   }
-  const leftAgentContext = hasAskUserQuestionLeftContext(transcript, args.toolCallId);
-  return { isOpen: !leftAgentContext, answered: null, closedUnanswered: leftAgentContext };
+  const closedUnanswered = getClosedUnansweredReason(state);
+  return { isOpen: closedUnanswered === null, answered: null, closedUnanswered };
 }
 
 /**
@@ -105,6 +115,7 @@ async function dispatchAnswerMessage(args: {
   api: NonNullable<ReturnType<typeof useLiveAPI>>;
   workspaceId: string;
   toolCallId: string;
+  rowId: string | undefined;
   message: string;
   sendId: string;
   answers: Record<string, string>;
@@ -119,10 +130,16 @@ async function dispatchAnswerMessage(args: {
     if (!args.isTranscriptMutationAllowed(args.workspaceId)) {
       return TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE;
     }
-    // The render-time state is a snapshot: a boundary may have landed while the preferences
-    // flushed, so re-read the latest transcript before sending.
-    if (hasAskUserQuestionLeftContext(args.readTranscript(args.workspaceId), args.toolCallId)) {
-      return ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE;
+    // The render-time state is a snapshot: a boundary or a question reusing the tool call id may
+    // have landed while the preferences flushed, so re-read the latest transcript before sending.
+    const closedUnanswered = getClosedUnansweredReason(
+      getAskUserQuestionOccurrenceState(args.readTranscript(args.workspaceId), {
+        toolCallId: args.toolCallId,
+        rowId: args.rowId,
+      })
+    );
+    if (closedUnanswered !== null) {
+      return CLOSED_UNANSWERED_MESSAGES[closedUnanswered];
     }
     const result = await args.api.workspace.sendMessage({
       workspaceId: args.workspaceId,
@@ -155,6 +172,8 @@ export function useNonBlockingQuestionAnswers(props: {
   enabled: boolean;
   workspaceId: string | undefined;
   toolCallId: string;
+  /** The transcript row's display id: tells apart rows that reuse a tool call id. */
+  rowId: string | undefined;
   questions: AskUserQuestionQuestion[];
   transcript: readonly DisplayedMessage[] | undefined;
 }): NonBlockingQuestionState & {
@@ -192,6 +211,7 @@ export function useNonBlockingQuestionAnswers(props: {
       api: liveApi,
       workspaceId: props.workspaceId,
       toolCallId: props.toolCallId,
+      rowId: props.rowId,
       message,
       sendId,
       answers,
@@ -209,6 +229,7 @@ export function useNonBlockingQuestionAnswers(props: {
     ...getNonBlockingQuestionState({
       enabled: props.enabled,
       toolCallId: props.toolCallId,
+      rowId: props.rowId,
       questions: props.questions,
       transcript: props.transcript,
       sentAnswers,

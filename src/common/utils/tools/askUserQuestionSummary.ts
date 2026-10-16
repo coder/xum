@@ -24,20 +24,108 @@ export const ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE =
   "These questions are no longer in the agent's context.";
 
 /**
- * True when a context boundary (compaction, Start Here, reset) follows the question's tool row.
- * Answers name questions and options by number only, so they mean nothing to the model then.
+ * Refusal for a non-blocking answer whose question a later ask_user_question replaced: the later
+ * call reused its tool call id, and the answer message names questions by that id.
  */
-export function hasAskUserQuestionLeftContext(
-  transcript: ReadonlyArray<{ type: string; toolCallId?: string }>,
-  toolCallId: string
-): boolean {
-  const ownRowIndex = transcript.findIndex(
-    (message) => message.type === "tool" && message.toolCallId === toolCallId
+export const ASK_USER_QUESTION_SUPERSEDED_MESSAGE =
+  "A later question replaced these questions, so the agent would read answers as meant for it.";
+
+/** The transcript fields the occurrence scan reads (DisplayedMessage, minimally). */
+export interface AskUserQuestionTranscriptRow {
+  type: string;
+  id?: string;
+  toolName?: string;
+  toolCallId?: string;
+  askUserQuestionAnswer?: AskUserQuestionAnswerMetadata;
+}
+
+/** Where one ask_user_question row stands, from the transcript alone. */
+export interface AskUserQuestionOccurrenceState {
+  /** The latest answer row that belongs to this row, or undefined. */
+  answers: Record<string, string> | undefined;
+  /** A later ask_user_question row reuses this row's tool call id. */
+  superseded: boolean;
+  /** A context boundary (compaction, Start Here, reset) follows this row. */
+  leftContext: boolean;
+}
+
+export interface AskUserQuestionOccurrence<Row extends AskUserQuestionTranscriptRow> {
+  row: Row;
+  index: number;
+  state: AskUserQuestionOccurrenceState;
+}
+
+function isAskUserQuestionRow(row: AskUserQuestionTranscriptRow): boolean {
+  return row.type === "tool" && row.toolName === "ask_user_question";
+}
+
+/**
+ * Every ask_user_question row with its state, in transcript order, in one pass.
+ *
+ * Providers may reuse a tool call id within a workspace (local OpenAI-compatible models often
+ * emit `call_0` every turn), so the id alone does not name a question. Rows are told apart by
+ * position instead, which also covers answer rows persisted before this rule:
+ * - an answer row belongs to the latest ask_user_question row with its id that precedes it;
+ * - a later row with the same id supersedes an earlier one. The answer message names questions
+ *   by id, so the agent reads any answer to that id as meant for its latest call; only the
+ *   latest row may take answers. A superseded row keeps answers it got before.
+ */
+export function getAskUserQuestionOccurrences<Row extends AskUserQuestionTranscriptRow>(
+  transcript: readonly Row[]
+): Array<AskUserQuestionOccurrence<Row>> {
+  const occurrences: Array<AskUserQuestionOccurrence<Row>> = [];
+  const latestByToolCallId = new Map<string, AskUserQuestionOccurrence<Row>>();
+  let lastBoundaryIndex = -1;
+  transcript.forEach((row, index) => {
+    if (row.type === "compaction-boundary") {
+      lastBoundaryIndex = index;
+    } else if (row.askUserQuestionAnswer != null) {
+      const owner = latestByToolCallId.get(row.askUserQuestionAnswer.toolCallId);
+      if (owner) owner.state.answers = row.askUserQuestionAnswer.answers;
+    } else if (isAskUserQuestionRow(row) && row.toolCallId != null) {
+      const toolCallId = row.toolCallId;
+      const previous = latestByToolCallId.get(toolCallId);
+      if (previous) previous.state.superseded = true;
+      const occurrence = {
+        row,
+        index,
+        state: { answers: undefined, superseded: false, leftContext: false },
+      };
+      latestByToolCallId.set(toolCallId, occurrence);
+      occurrences.push(occurrence);
+    }
+  });
+  for (const occurrence of occurrences) {
+    occurrence.state.leftContext = occurrence.index < lastBoundaryIndex;
+  }
+  return occurrences;
+}
+
+/**
+ * The state of one ask_user_question row: the row with `rowId` (a transcript row's display id),
+ * or without one the latest row with `toolCallId`. A row missing from the transcript (a host that
+ * feeds none, or history not loaded yet) is judged by its id alone, as before rows were told apart.
+ */
+export function getAskUserQuestionOccurrenceState(
+  transcript: readonly AskUserQuestionTranscriptRow[],
+  question: { toolCallId: string; rowId?: string }
+): AskUserQuestionOccurrenceState {
+  const own = getAskUserQuestionOccurrences(transcript)
+    .filter(
+      (occurrence) =>
+        occurrence.row.toolCallId === question.toolCallId &&
+        (question.rowId == null || occurrence.row.id === question.rowId)
+    )
+    .at(-1);
+  if (own) return own.state;
+  const answerRow = transcript.findLast(
+    (row) => row.askUserQuestionAnswer?.toolCallId === question.toolCallId
   );
-  return (
-    ownRowIndex !== -1 &&
-    transcript.slice(ownRowIndex + 1).some((message) => message.type === "compaction-boundary")
-  );
+  return {
+    answers: answerRow?.askUserQuestionAnswer?.answers,
+    superseded: false,
+    leftContext: false,
+  };
 }
 
 /** One question's answer as picked on the card: 1-based option numbers plus the user's own text. */
