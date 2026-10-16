@@ -18,6 +18,7 @@ import {
   writePersistedRawString,
 } from "@/browser/hooks/usePersistedState";
 import { AUTH_TOKEN_KEY } from "@/common/constants/storage";
+import { clearServiceWorkerCaches } from "@/browser/utils/serviceWorkerCache";
 
 interface AuthTokenModalProps {
   isOpen: boolean;
@@ -44,7 +45,11 @@ export function getStoredAuthToken(): string | null {
 }
 
 export function setStoredAuthToken(token: string): void {
+  const changed = getStoredAuthToken() !== token;
   writePersistedRawString(AUTH_TOKEN_KEY, token);
+  // #6848: the service worker's caches belong to the previous session. Clearing is best effort
+  // and never fails (it catches), so login does not wait for it.
+  if (changed) void clearServiceWorkerCaches();
 }
 
 export function clearStoredAuthToken(): void {
@@ -53,6 +58,8 @@ export function clearStoredAuthToken(): void {
   } catch {
     // Ignore storage errors
   }
+  // #6848: logout leaves nothing of the session in Cache Storage (best effort, never fails).
+  void clearServiceWorkerCaches();
 }
 
 async function parseJsonResponse<T>(response: Response): Promise<T | null> {

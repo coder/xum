@@ -1,8 +1,79 @@
 // mux Service Worker for PWA support
-const CACHE_NAME = "mux-v2";
-const urlsToCache = ["./", "./index.html"];
+//
+// #6848: the worker caches only an allow-list (the app shell, Vite's content-hashed assets and
+// the shell's own public files),
+// only cacheable responses, and never auth flows, API/oRPC routes or token-bearing URLs. It
+// answers only GET requests and never caches the authenticated non-GET traffic (#5971 relies
+// on that). The app clears every "mux-" cache when the auth token changes or is removed
+// (src/browser/utils/serviceWorkerCache.ts), so keep that prefix.
+const CACHE_NAME = "mux-v3";
+const SHELL_PATH = "./";
+const urlsToCache = [SHELL_PATH, "./index.html"];
 
-// Install event - cache core assets
+// Same rule as isHashedStaticAssetName (src/node/orpc/staticAssets.ts): one path segment named
+// `<name>-<8 char base64url hash>.<ext>`. Such files never change content.
+const HASHED_STATIC_ASSET_NAME = /^[^/]+-[A-Za-z0-9_-]{8}\.[a-z0-9.]+$/;
+// The unhashed public files the shell itself loads (index.html, public/manifest.json and the
+// theme favicons in ThemeContext.tsx). Static build output: no session data.
+const SHELL_PUBLIC_FILES = new Set([
+  "manifest.json",
+  "favicon.ico",
+  "favicon-dark.ico",
+  "apple-touch-icon.png",
+  "icon-192.png",
+  "icon-512.png",
+]);
+// Never cached and never served from the cache: OAuth starts and callbacks (they carry code and
+// state), the REST and oRPC surfaces, and anything with an auth token in the URL.
+const UNCACHEABLE_PREFIXES = ["auth/", "orpc/", "api/"];
+
+/** The request path relative to this worker's scope, or null outside it. */
+function scopedPath(url) {
+  const scope = new URL(self.registration.scope);
+  if (url.origin !== scope.origin || !url.pathname.startsWith(scope.pathname)) return null;
+  return url.pathname.slice(scope.pathname.length);
+}
+
+function isUncacheable(url, path) {
+  if (url.searchParams.has("token")) return true;
+  return UNCACHEABLE_PREFIXES.some((prefix) => path.startsWith(prefix) || `${path}/` === prefix);
+}
+
+/** Only a successful response that the server allows any cache to keep. */
+function isCacheableResponse(response) {
+  if (!response.ok || response.type === "opaque") return false;
+  const cacheControl = (response.headers.get("Cache-Control") || "").toLowerCase();
+  return !/(^|[\s,])(no-store|private)([\s,=]|$)/.test(cacheControl);
+}
+
+function offlineResponse() {
+  return new Response("Network error and no cached version available", {
+    status: 503,
+    statusText: "Service Unavailable",
+    headers: new Headers({ "Content-Type": "text/plain" }),
+  });
+}
+
+/** Network first: store a cacheable answer under `cacheKey`, else answer from this cache. */
+function networkFirst(request, cacheKey) {
+  return fetch(request)
+    .then((response) => {
+      if (isCacheableResponse(response)) {
+        const responseToCache = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(cacheKey, responseToCache));
+      }
+      return response;
+    })
+    .catch(() =>
+      caches
+        .open(CACHE_NAME)
+        .then((cache) => cache.match(cacheKey))
+        .then((cachedResponse) => cachedResponse || offlineResponse())
+    );
+}
+
+// Install event - cache the app shell. The server sends it with no-store, so this is the only
+// copy the offline shell gets; a new worker version refreshes it.
 self.addEventListener("install", (event) => {
   event.waitUntil(
     caches
@@ -12,7 +83,7 @@ self.addEventListener("install", (event) => {
   );
 });
 
-// Activate event - clean up old caches
+// Activate event - clean up old caches (mux-v2 stored every GET response, #6848)
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches
@@ -30,7 +101,7 @@ self.addEventListener("activate", (event) => {
   );
 });
 
-// Fetch event - network first, fallback to cache
+// Fetch event - network first, cache only the allow-list
 self.addEventListener("fetch", (event) => {
   // Skip caching for non-GET requests (POST, PUT, DELETE, etc.)
   // The Cache API only supports GET requests
@@ -39,32 +110,19 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  event.respondWith(
-    fetch(event.request)
-      .then((response) => {
-        // Clone the response before caching
-        const responseToCache = response.clone();
-        caches.open(CACHE_NAME).then((cache) => {
-          cache.put(event.request, responseToCache);
-        });
-        return response;
-      })
-      .catch(() => {
-        // If network fails, try cache
-        return caches.match(event.request).then((cachedResponse) => {
-          // If cache has it, return it; otherwise return a proper error response
-          if (cachedResponse) {
-            return cachedResponse;
-          }
-          // Return a proper Response object for failed requests
-          return new Response("Network error and no cached version available", {
-            status: 503,
-            statusText: "Service Unavailable",
-            headers: new Headers({
-              "Content-Type": "text/plain",
-            }),
-          });
-        });
-      })
-  );
+  const url = new URL(event.request.url);
+  const path = scopedPath(url);
+  // Outside the scope, cross-origin, or an uncacheable route: the browser handles it as if no
+  // worker existed, so nothing is stored and nothing is answered from the cache.
+  if (path === null || isUncacheable(url, path)) return;
+
+  if (event.request.mode === "navigate") {
+    // Every client route loads the same shell; one entry, never keyed by the visited URL.
+    event.respondWith(networkFirst(event.request, SHELL_PATH));
+    return;
+  }
+
+  if (HASHED_STATIC_ASSET_NAME.test(path) || SHELL_PUBLIC_FILES.has(path)) {
+    event.respondWith(networkFirst(event.request, event.request));
+  }
 });
