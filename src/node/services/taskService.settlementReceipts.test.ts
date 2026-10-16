@@ -415,29 +415,32 @@ describe("TaskService settlement receipt producers (G2)", () => {
       );
       // A slow disk: the receipt write holds the owned attempt's latch past the Stop's cleanup.
       const realWrite = attemptSettlements.writeSubagentAttemptSettlementReceipt;
-      spyOn(attemptSettlements, "writeSubagentAttemptSettlementReceipt").mockImplementation(
-        async (params) => {
-          await new Promise((resolve) => setTimeout(resolve, 20));
-          return realWrite(params);
-        }
-      );
+      const writeSpy = spyOn(
+        attemptSettlements,
+        "writeSubagentAttemptSettlementReceipt"
+      ).mockImplementation(async (params) => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return realWrite(params);
+      });
       // Timers the release wait arms on entry (synchronously, before its first await), told apart
       // from the cleanup's own bounds. One listener registration means one loop pass.
       let inReleaseWait = false;
       const realWait = svc.waitForWorkspaceStopsToRelease.bind(taskService);
-      spyOn(svc, "waitForWorkspaceStopsToRelease").mockImplementation((ids, deadlineMs) => {
-        inReleaseWait = true;
-        try {
-          return realWait(ids, deadlineMs);
-        } finally {
-          inReleaseWait = false;
+      const waitSpy = spyOn(svc, "waitForWorkspaceStopsToRelease").mockImplementation(
+        (ids, deadlineMs) => {
+          inReleaseWait = true;
+          try {
+            return realWait(ids, deadlineMs);
+          } finally {
+            inReleaseWait = false;
+          }
         }
-      });
+      );
       const realSetTimeout = globalThis.setTimeout;
       const realClearTimeout = globalThis.clearTimeout;
       const releaseTimers: unknown[] = [];
       const cleared = new Set<unknown>();
-      spyOn(globalThis, "setTimeout").mockImplementation(((
+      const setSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
         handler: () => void,
         timeout?: number
       ) => {
@@ -445,27 +448,34 @@ describe("TaskService settlement receipt producers (G2)", () => {
         if (inReleaseWait) releaseTimers.push(timer);
         return timer;
       }) as typeof setTimeout);
-      spyOn(globalThis, "clearTimeout").mockImplementation(((
+      const clearSpy = spyOn(globalThis, "clearTimeout").mockImplementation(((
         timer?: ReturnType<typeof setTimeout>
       ) => {
         cleared.add(timer);
         realClearTimeout(timer);
       }) as typeof clearTimeout);
       const listenerSets = spyOn(svc.attemptSettlementListenersByTaskId, "set");
+      // This file restores its spies per test (no mock.restore in afterEach).
+      const restoreSpies = () => {
+        for (const spy of [writeSpy, waitSpy, setSpy, clearSpy, listenerSets]) spy.mockRestore();
+      };
+      try {
+        // Nothing holds the idle row's latch past its cleanup: the wait arms nothing.
+        expect((await taskService.stopDescendantAgentTask(rootId, idleId)).success).toBe(true);
+        expect(taskService.isWorkspaceStopInProgress(idleId)).toBe(false);
+        expect(releaseTimers).toHaveLength(0);
+        expect(listenerSets).not.toHaveBeenCalled();
 
-      // Nothing holds the idle row's latch past its cleanup: the wait arms nothing.
-      expect((await taskService.stopDescendantAgentTask(rootId, idleId)).success).toBe(true);
-      expect(taskService.isWorkspaceStopInProgress(idleId)).toBe(false);
-      expect(releaseTimers).toHaveLength(0);
-      expect(listenerSets).not.toHaveBeenCalled();
-
-      // The owned attempt waits for its receipt: one listener and one timer, cleared on release.
-      expect((await taskService.stopDescendantAgentTask(rootId, waitsId)).success).toBe(true);
-      expect(taskService.isWorkspaceStopInProgress(waitsId)).toBe(false);
-      expect(existsSync(parentReceipt)).toBe(true);
-      expect(listenerSets.mock.calls.filter((call) => call[0] === waitsId)).toHaveLength(1);
-      expect(releaseTimers).toHaveLength(1);
-      expect(cleared.has(releaseTimers[0])).toBe(true);
+        // The owned attempt waits for its receipt: one listener and one timer, cleared on release.
+        expect((await taskService.stopDescendantAgentTask(rootId, waitsId)).success).toBe(true);
+        expect(taskService.isWorkspaceStopInProgress(waitsId)).toBe(false);
+        expect(existsSync(parentReceipt)).toBe(true);
+        expect(listenerSets.mock.calls.filter((call) => call[0] === waitsId)).toHaveLength(1);
+        expect(releaseTimers).toHaveLength(1);
+        expect(cleared.has(releaseTimers[0])).toBe(true);
+      } finally {
+        restoreSpies();
+      }
     });
 
     test("reservation canceled inside the commit writes the receipt", async () => {
