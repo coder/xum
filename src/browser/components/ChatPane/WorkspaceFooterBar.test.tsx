@@ -562,7 +562,7 @@ describe("WorkspaceFooterBar at narrow viewports", () => {
     mockFooterContent();
     workspaceMetadata.set(workspaceId, repoMetadata);
     /* eslint-disable @typescript-eslint/no-require-imports */
-    ({ WorkspaceFooterBar } = require("./WorkspaceFooterBar?workspace-footer-bar-test=3") as {
+    ({ WorkspaceFooterBar } = require("./WorkspaceFooterBar?workspace-footer-bar-test=2") as {
       WorkspaceFooterBar: typeof WorkspaceFooterBarComponent;
     });
     /* eslint-enable @typescript-eslint/no-require-imports */
