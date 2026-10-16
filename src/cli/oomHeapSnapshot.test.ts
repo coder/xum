@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { readdirSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -9,6 +8,8 @@ const dirs: string[] = [];
 afterEach(async () => {
   for (const dir of dirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
 });
+
+const SNAPSHOT = "Heap.20261016.130810.2982.0.001.heapsnapshot";
 
 async function setup() {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "oom-heap-snapshot-"));
@@ -30,102 +31,46 @@ async function setup() {
         logs.push(`warn ${message} ${JSON.stringify(meta)}`),
     },
   };
-  return { xumHome, cwd, armed, logs, deps, snapshotDir: path.join(xumHome, "heap-snapshots") };
+  return { cwd, armed, logs, deps, snapshotDir: path.join(xumHome, "heap-snapshots") };
 }
 
 describe("prepareOomHeapSnapshots", () => {
-  test("without the heap-snapshots directory it arms nothing and moves nothing", async () => {
+  test("without the heap-snapshots directory it does not arm", async () => {
     const s = await setup();
-    await fs.writeFile(path.join(s.cwd, "Heap.20261016.130810.2982.0.001.heapsnapshot"), "x");
 
     await prepareOomHeapSnapshots(s.deps);
 
     expect(s.armed).toEqual([]);
-    expect(await fs.readdir(s.cwd)).toEqual(["Heap.20261016.130810.2982.0.001.heapsnapshot"]);
   });
 
-  test("with the directory it arms one snapshot and moves earlier ones there with mode 0600", async () => {
+  test("with the directory and no snapshot it arms once and logs where Node writes", async () => {
     const s = await setup();
     await fs.mkdir(s.snapshotDir, { mode: 0o700 });
-    const snapshot = "Heap.20261016.130810.2982.0.001.heapsnapshot";
-    await fs.writeFile(path.join(s.cwd, snapshot), "snapshot-bytes", { mode: 0o644 });
-    await fs.writeFile(path.join(s.cwd, "unrelated.heapsnapshot"), "keep");
 
     await prepareOomHeapSnapshots(s.deps);
 
     expect(s.armed).toEqual([1]);
-    const moved = path.join(s.snapshotDir, snapshot);
-    expect(await fs.readFile(moved, "utf8")).toBe("snapshot-bytes");
-    expect((await fs.stat(moved)).mode & 0o777).toBe(0o600);
-    // Only Node's own snapshot names move; nothing is deleted.
-    expect(await fs.readdir(s.cwd)).toEqual(["unrelated.heapsnapshot"]);
-    expect(s.logs.some((line) => line.includes(snapshot))).toBe(true);
+    expect(s.logs.some((line) => line.startsWith("info") && line.includes(s.cwd))).toBe(true);
   });
 
-  test("a snapshot with the same name already in the directory is kept, not overwritten", async () => {
-    const s = await setup();
-    await fs.mkdir(s.snapshotDir, { mode: 0o700 });
-    const snapshot = "Heap.20261016.130810.2982.0.001.heapsnapshot";
-    await fs.writeFile(path.join(s.snapshotDir, snapshot), "older");
-    await fs.writeFile(path.join(s.cwd, snapshot), "newer");
+  test.each(["cwd", "snapshot directory"] as const)(
+    "a snapshot already in the %s leaves it unarmed and names the file",
+    async (where) => {
+      const s = await setup();
+      await fs.mkdir(s.snapshotDir, { mode: 0o700 });
+      const file = path.join(where === "cwd" ? s.cwd : s.snapshotDir, SNAPSHOT);
+      await fs.writeFile(file, "kept");
 
-    await prepareOomHeapSnapshots(s.deps);
+      await prepareOomHeapSnapshots(s.deps);
 
-    expect(await fs.readFile(path.join(s.snapshotDir, snapshot), "utf8")).toBe("older");
-    expect(await fs.readFile(path.join(s.cwd, snapshot), "utf8")).toBe("newer");
-  });
+      // A crash loop writes at most one multi-GB file; the existing one is untouched.
+      expect(s.armed).toEqual([]);
+      expect(s.logs.some((line) => line.includes(file))).toBe(true);
+      expect(await fs.readFile(file, "utf8")).toBe("kept");
+    }
+  );
 
-  test("a kept snapshot stops arming, so an OOM loop cannot fill the disk", async () => {
-    const s = await setup();
-    await fs.mkdir(s.snapshotDir, { mode: 0o700 });
-    await fs.writeFile(
-      path.join(s.snapshotDir, "Heap.20261016.130810.2982.0.001.heapsnapshot"),
-      "kept"
-    );
-    const fromLastOom = "Heap.20261017.090000.4000.0.001.heapsnapshot";
-    await fs.writeFile(path.join(s.cwd, fromLastOom), "new");
-
-    await prepareOomHeapSnapshots(s.deps);
-
-    expect(s.armed).toEqual([]);
-    // The snapshot the last OOM wrote is still kept.
-    expect(await fs.readFile(path.join(s.snapshotDir, fromLastOom), "utf8")).toBe("new");
-  });
-
-  test("a symlink with a snapshot name is not moved and its target keeps its mode", async () => {
-    const s = await setup();
-    await fs.mkdir(s.snapshotDir, { mode: 0o700 });
-    const victim = path.join(s.xumHome, "victim");
-    await fs.mkdir(victim, { mode: 0o755 });
-    const victimMode = (await fs.stat(victim)).mode & 0o777;
-    const name = "Heap.20261016.130810.2982.0.001.heapsnapshot";
-    await fs.symlink(victim, path.join(s.cwd, name));
-
-    await prepareOomHeapSnapshots(s.deps);
-
-    // A checkout can hold such a link: following it would chmod an arbitrary target.
-    expect((await fs.stat(victim)).mode & 0o777).toBe(victimMode);
-    expect(await fs.readdir(s.snapshotDir)).toEqual([]);
-    expect((await fs.lstat(path.join(s.cwd, name))).isSymbolicLink()).toBe(true);
-    expect(s.armed).toEqual([1]);
-  });
-
-  test("a hard link with a snapshot name is not moved and its other name keeps its mode", async () => {
-    const s = await setup();
-    await fs.mkdir(s.snapshotDir, { mode: 0o700 });
-    const victim = path.join(s.xumHome, "victim.sh");
-    await fs.writeFile(victim, "#!/bin/sh\n", { mode: 0o700 });
-    const victimMode = (await fs.stat(victim)).mode & 0o777;
-    const name = "Heap.20261016.130810.2982.0.001.heapsnapshot";
-    await fs.link(victim, path.join(s.cwd, name));
-
-    await prepareOomHeapSnapshots(s.deps);
-
-    expect((await fs.stat(victim)).mode & 0o777).toBe(victimMode);
-    expect(await fs.readdir(s.snapshotDir)).toEqual([]);
-  });
-
-  test("a launch directory that is gone does not stop the setup", async () => {
+  test("a failure is logged and does not reject, so startup continues", async () => {
     const s = await setup();
     await fs.mkdir(s.snapshotDir, { mode: 0o700 });
     const deps = {
@@ -137,41 +82,7 @@ describe("prepareOomHeapSnapshots", () => {
 
     await prepareOomHeapSnapshots(deps);
 
-    expect(s.armed).toEqual([1]);
-    expect(s.logs.some((line) => line.startsWith("warn"))).toBe(true);
-  });
-
-  test("the snapshot is armed before any snapshot is moved", async () => {
-    const s = await setup();
-    await fs.mkdir(s.snapshotDir, { mode: 0o700 });
-    await fs.writeFile(path.join(s.cwd, "Heap.20261016.130810.2982.0.001.heapsnapshot"), "x");
-    let movedBeforeArm: string[] | undefined;
-    const deps = {
-      ...s.deps,
-      setHeapSnapshotNearHeapLimit: () => {
-        movedBeforeArm = readdirSync(s.snapshotDir);
-      },
-    };
-
-    await prepareOomHeapSnapshots(deps);
-
-    // Server startup stops waiting after a bound; the snapshot must already be armed then.
-    expect(movedBeforeArm).toEqual([]);
-    expect(await fs.readdir(s.snapshotDir)).toHaveLength(1);
-  });
-
-  test("a failure is logged and does not reject, so startup continues", async () => {
-    const s = await setup();
-    await fs.mkdir(s.snapshotDir, { mode: 0o700 });
-    const deps = {
-      ...s.deps,
-      setHeapSnapshotNearHeapLimit: () => {
-        throw new Error("not supported");
-      },
-    };
-
-    await prepareOomHeapSnapshots(deps);
-
+    expect(s.armed).toEqual([]);
     expect(s.logs.some((line) => line.startsWith("warn"))).toBe(true);
   });
 });

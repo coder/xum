@@ -143,9 +143,8 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   // Opt-in OOM diagnostics (<xum root>/heap-snapshots exists): arm one near-heap-limit snapshot
-  // and move the one a previous OOM left in cwd. Runs only for the process that becomes the
-  // server; it never throws. Bounded: a slow mount must not hold startup, and the moves then
-  // finish in the background.
+  // unless one already exists. Runs only for the process that becomes the server; it never
+  // throws, and a slow filesystem holds startup for at most the bound.
   await raceWithAbortAndTimeout(
     prepareOomHeapSnapshots({
       xumHome,
