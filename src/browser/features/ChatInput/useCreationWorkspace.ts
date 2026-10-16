@@ -71,7 +71,6 @@ import {
   type WorkspaceNameState,
 } from "@/browser/hooks/useWorkspaceName";
 import { getCreationDraftStore, useCreationDraft } from "@/browser/stores/CreationDraftStore";
-import { CREATION_DRAFT_NAME_MAX_CHARS } from "@/constants/drafts";
 import type { WorkspaceNameGenerationRequest } from "@/common/orpc/schemas/api";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
@@ -361,10 +360,7 @@ export function useCreationWorkspace({
   const [isGeneratingName, setIsGeneratingName] = useState(false);
   const workspaceNameState = useWorkspaceName({
     manualName,
-    setManualName: (name) =>
-      getCreationDraftStore().update(draftId ?? "", {
-        manualName: name.slice(0, CREATION_DRAFT_NAME_MAX_CHARS),
-      }),
+    draftId: draftId ?? "",
     isGenerating: isGeneratingName,
   });
 

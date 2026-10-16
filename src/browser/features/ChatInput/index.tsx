@@ -77,7 +77,7 @@ import {
 import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { CreationProjectSelect } from "./CreationProjectSelect";
-import { changeCreationDraftProject, projectRuntimeEnablement } from "./creationDraftProject";
+import { projectRuntimeEnablement } from "./creationDraftProject";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { useComputerUse } from "@/browser/hooks/useComputerUse";
 import { AgentModePicker } from "@/browser/components/AgentModePicker/AgentModePicker";
@@ -165,6 +165,7 @@ import { CreationControls } from "./CreationControls";
 import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
 import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useCoderConfigChangeHandler } from "./useCoderConfigChangeHandler";
+import { useCreationProjectChangeHandler } from "./useCreationProjectChangeHandler";
 import { useCoderWorkspace } from "@/browser/hooks/useCoderWorkspace";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
@@ -824,14 +825,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     variant === "creation"
       ? projectRuntimeEnablement(creationProject, runtimeEnablement)
       : runtimeEnablement;
-  // A project change keeps the same draft (and editor); only its project fields change.
-  const changeCreationProject = (scope: string) => {
-    if (!creationDraftId) return beginWorkspaceCreation(scope);
-    beginWorkspaceCreation(
-      changeCreationDraftProject(creationDraftId, scope, userProjects, runtimeEnablement),
-      creationDraftId
-    );
-  };
+  // Compiler-memoized in its own module; see useCreationProjectChangeHandler for why.
+  const changeCreationProject = useCreationProjectChangeHandler(
+    creationDraftId,
+    userProjects,
+    rawRuntimeEnablement,
+    beginWorkspaceCreation
+  );
   const [hasAttemptedCreateSend, setHasAttemptedCreateSend] = useState(false);
 
   // Creation-specific state (hook always called, but only used when variant === "creation")

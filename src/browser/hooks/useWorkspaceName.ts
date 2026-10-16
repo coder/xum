@@ -1,4 +1,6 @@
 import { useState } from "react";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
+import { CREATION_DRAFT_NAME_MAX_CHARS } from "@/constants/drafts";
 import type { NameGenerationError } from "@/common/types/errors";
 import {
   validateWorkspaceBranchName,
@@ -53,12 +55,22 @@ export interface WorkspaceNameState {
  */
 export function useWorkspaceName(options: {
   manualName: string;
-  setManualName: (name: string) => void;
+  /** The creation draft that stores the manual name. */
+  draftId: string;
   isGenerating: boolean;
 }): WorkspaceNameState {
   // Focusing the empty field starts a manual name; the draft holds only typed text.
   const [editing, setEditing] = useState(false);
   const name = options.manualName;
+  // The draft write lives here, not in the caller (#6843): React Compiler skips
+  // useCreationWorkspace, so a setter defined there gets a new identity every render, and
+  // CreationControls re-rendered on every keystroke. Here the compiler keeps setName and
+  // setAutoGenerate stable for one draft.
+  const draftId = options.draftId;
+  const setManualName = (manualName: string) =>
+    getCreationDraftStore().update(draftId, {
+      manualName: manualName.slice(0, CREATION_DRAFT_NAME_MAX_CHARS),
+    });
   const validationError = name.trim() ? validateWorkspaceBranchName(name).error : undefined;
   return {
     name,
@@ -68,8 +80,8 @@ export function useWorkspaceName(options: {
     error: validationError ? { kind: "validation", message: validationError } : null,
     setAutoGenerate: (enabled) => {
       setEditing(!enabled);
-      if (enabled) options.setManualName("");
+      if (enabled) setManualName("");
     },
-    setName: options.setManualName,
+    setName: setManualName,
   };
 }
