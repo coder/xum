@@ -752,7 +752,8 @@ function formatResult(
   overflowReason: string | null,
   wall_duration_ms: number,
   overflowPolicy: "tmpfile" | "truncate",
-  effectiveTimeout: number
+  effectiveTimeout: number,
+  cutWhileRunning = false
 ): BashToolResult {
   const output = lines.join("\n");
 
@@ -783,8 +784,10 @@ function formatResult(
     };
 
     if (overflowPolicy === "truncate") {
-      // Return all collected lines with truncation marker
-      if (exitCode === 0) {
+      // Return all collected lines with truncation marker. A command whose output we closed
+      // while it ran ends with a status we caused: it dies of SIGPIPE, or, where SIGPIPE is
+      // ignored, gets EPIPE and exits nonzero (perl exits 1). That is not its own failure (#6732).
+      if (exitCode === 0 || cutWhileRunning) {
         return {
           success: true,
           output,
@@ -1186,6 +1189,8 @@ ${scriptWithEnv}`;
       // Collect output concurrently from Web Streams to avoid readline race conditions.
       const lines: string[] = [];
       let truncated = false;
+      // Set when the file limit closed the output before the command exited.
+      let cutWhileRunning = false;
 
       // Helper to trigger display truncation (stop showing to agent, keep collecting)
       const triggerDisplayTruncation = (reason: string) => {
@@ -1197,6 +1202,8 @@ ${scriptWithEnv}`;
 
       // Helper to trigger file truncation (stop collecting, close streams)
       const triggerFileTruncation = (reason: string) => {
+        // Closing the pipes below can end a command that is still writing (#6732).
+        if (!truncationState.fileTruncated) cutWhileRunning = !exitCodeResolved;
         truncationState.fileTruncated = true;
         truncationState.displayTruncated = true;
         truncated = true;
@@ -1730,7 +1737,8 @@ File will be automatically cleaned up when stream ends.`;
           overflowReason,
           wall_duration_ms,
           config.overflow_policy ?? "tmpfile",
-          effectiveTimeout
+          effectiveTimeout,
+          cutWhileRunning
         )
       );
     },
