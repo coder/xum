@@ -11317,16 +11317,25 @@ export class TaskService implements AgentTaskIntegration {
     assert(ancestorWorkspaceId.length > 0, "stopDescendantAgentTask: ancestorWorkspaceId required");
     assert(taskId.length > 0, "stopDescendantAgentTask: taskId required");
 
-    return await this.withTaskTreeLifecycleLock(taskId, () =>
+    // A resolved Stop means the stopped tasks accept a message at once (#6727). Their latches drop
+    // only after the cleanup (Phase C: e.g. once the settlement receipt is on disk), so wait for
+    // that. The bound is terminateAllDescendantAgentTasks' and starts with the Stop: at the
+    // deadline the wait logs and returns, the Stop still resolves, and a send is refused as before.
+    const releaseDeadlineMs = Date.now() + TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS;
+    const stopped = await this.withTaskTreeLifecycleLock(taskId, () =>
       this.stopDescendantAgentTaskUnderLifecycleLock(ancestorWorkspaceId, taskId)
     );
+    if (!stopped.success) return stopped;
+    // Outside the lifecycle lock: nothing that drops a latch can wait behind this Stop.
+    await this.waitForWorkspaceStopsToRelease(stopped.data.latchedTaskIds, releaseDeadlineMs);
+    return Ok({ stoppedTaskIds: stopped.data.stoppedTaskIds });
   }
 
   private async stopDescendantAgentTaskUnderLifecycleLock(
     ancestorWorkspaceId: string,
     taskId: string,
     drainQueue = true
-  ): Promise<Result<{ stoppedTaskIds: string[] }, string>> {
+  ): Promise<Result<{ stoppedTaskIds: string[]; latchedTaskIds: readonly string[] }, string>> {
     const stoppedTaskIds: string[] = [];
     const metadataToEmit = new Set<string>();
     const activeHandlesById = new Map<
@@ -11447,7 +11456,7 @@ export class TaskService implements AgentTaskIntegration {
       await this.emitWorkspaceMetadata(id);
     }
     if (drainQueue) await this.maybeStartQueuedTasks();
-    return Ok({ stoppedTaskIds });
+    return Ok({ stoppedTaskIds, latchedTaskIds: latched });
   }
 
   /**
