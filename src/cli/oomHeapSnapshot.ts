@@ -43,17 +43,23 @@ async function exists(target: string): Promise<boolean> {
   }
 }
 
-/** Moves one snapshot; never deletes a file and never overwrites one already kept. */
+/**
+ * Moves one snapshot; never deletes a file and never overwrites one already kept. Only a regular
+ * file moves: a checkout can hold a symlink with a snapshot name, and following it would chmod
+ * an arbitrary target. Only a same-device rename runs, because a multi-GB copy across devices
+ * would hold server startup; such a snapshot stays where Node wrote it.
+ */
 async function moveSnapshot(source: string, target: string): Promise<void> {
+  if (!(await fs.lstat(source)).isFile()) throw new Error("not a regular file");
   if (await exists(target)) throw new Error(`${target} already exists`);
+  await fs.rename(source, target);
+  // O_NOFOLLOW: chmod the file that was moved, never what a swapped-in link points to.
+  const handle = await fs.open(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try {
-    await fs.rename(source, target);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
-    // Another device: copy, and keep the source (a snapshot is never deleted).
-    await fs.copyFile(source, target, fs.constants.COPYFILE_EXCL);
+    await handle.chmod(0o600);
+  } finally {
+    await handle.close();
   }
-  await fs.chmod(target, 0o600);
 }
 
 /**

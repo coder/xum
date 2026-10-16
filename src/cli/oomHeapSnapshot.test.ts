@@ -74,6 +74,24 @@ describe("prepareOomHeapSnapshots", () => {
     expect(await fs.readFile(path.join(s.cwd, snapshot), "utf8")).toBe("newer");
   });
 
+  test("a symlink with a snapshot name is not moved and its target keeps its mode", async () => {
+    const s = await setup();
+    await fs.mkdir(s.snapshotDir, { mode: 0o700 });
+    const victim = path.join(s.xumHome, "victim");
+    await fs.mkdir(victim, { mode: 0o755 });
+    const victimMode = (await fs.stat(victim)).mode & 0o777;
+    const name = "Heap.20261016.130810.2982.0.001.heapsnapshot";
+    await fs.symlink(victim, path.join(s.cwd, name));
+
+    await prepareOomHeapSnapshots(s.deps);
+
+    // A checkout can hold such a link: following it would chmod an arbitrary target.
+    expect((await fs.stat(victim)).mode & 0o777).toBe(victimMode);
+    expect(await fs.readdir(s.snapshotDir)).toEqual([]);
+    expect((await fs.lstat(path.join(s.cwd, name))).isSymbolicLink()).toBe(true);
+    expect(s.armed).toEqual([1]);
+  });
+
   test("a failure is logged and does not reject, so startup continues", async () => {
     const s = await setup();
     await fs.mkdir(s.snapshotDir, { mode: 0o700 });
