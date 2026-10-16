@@ -29,8 +29,8 @@ const toHtml = ([tag, attrs]: Extract<SkeletonNode, unknown[]>) =>
 describe("phone chrome skeleton", () => {
   test("each slot appears exactly once, in its own tree", () => {
     expect(slots(skeleton.chrome).sort()).toEqual([...CHROME_SLOTS].sort());
-    expect(slots(skeleton.user).sort()).toEqual(["md", "nav", "ts"]);
-    expect(slots(skeleton.assistant).sort()).toEqual(["md", "model", "ts"]);
+    expect(slots(skeleton.user).sort()).toEqual(["actions", "md", "ts"]);
+    expect(slots(skeleton.assistant).sort()).toEqual(["actions", "md", "model", "ts"]);
     expect(new Set([...slots(skeleton.user), ...slots(skeleton.assistant)])).toEqual(
       new Set(ROW_SLOTS)
     );

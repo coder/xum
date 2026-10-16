@@ -50,13 +50,17 @@ async function startServer(root: string, home: string, log: string) {
       (r) => r.ok,
       () => false
     );
-  for (let i = 0; i < 120 && !(await up()); i++) await new Promise((r) => setTimeout(r, 500));
-  assert(await up(), `xum server did not start, see ${log}`);
   const stop = async () => {
     if (server.exitCode !== null || server.signalCode !== null) return;
     process.kill(-server.pid!, "SIGTERM");
     await once(server, "exit");
   };
+  for (let i = 0; i < 120 && !(await up()); i++) await new Promise((r) => setTimeout(r, 500));
+  if (!(await up())) {
+    await stop();
+    const tail = fs.readFileSync(log, "utf8").slice(-2000); // the temp folder goes next
+    throw new Error(`xum server did not start. Its log ends with:\n${tail}`);
+  }
   return { origin, stop };
 }
 
@@ -70,7 +74,7 @@ function capture(placeholder: unknown) {
   const DROP =
     /^(id|role|tabindex|title|for|name|aria-(?!hidden).*|data-testid|data-message-id|data-tutorial|data-state|data-autofocus-state|data-loaded|autocomplete|spellcheck)$/;
   const children = new Map<Element, Node[]>();
-  const swapped = new Map<Element, Node | null>(); // null: the element is left out
+  const swapped = new Map<Element, Node>();
   const MODE_STYLE = /var\(--color-[\w-]*-mode\)/; // the selected agent's color, workspace state
   const one = (selector: string, scope: ParentNode = document) => {
     const found = scope.querySelectorAll(selector);
@@ -91,7 +95,7 @@ function capture(placeholder: unknown) {
   const log = one("[role=log]");
   const convert = (el: Element): Node => {
     const swap = swapped.get(el);
-    if (swap) return swap; // never null here: the caller leaves those elements out
+    if (swap) return swap;
     const tag = el.tagName === "MAIN" ? "div" : el.localName; // one <main>: the boot loader's
     const attrs: Record<string, string> = {};
     for (const a of el.attributes) {
@@ -106,7 +110,7 @@ function capture(placeholder: unknown) {
         if (c.nodeType !== 1 || (c as Element).matches(SKIP)) continue;
         if (el === log && (c as Element).matches("[data-transcript-message]")) {
           if (!kids.some((k) => typeof k === "object" && "slot" in k)) kids.push({ slot: "rows" });
-        } else if (swapped.get(c as Element) !== null) kids.push(convert(c as Element));
+        } else kids.push(convert(c as Element));
       }
     }
     return [tag, attrs, ...kids];
@@ -118,11 +122,8 @@ function capture(placeholder: unknown) {
     slot("[data-message-timestamp]", [{ slot: "ts" }], el);
     // The provider icon and the route text belong to the row's model too.
     if (selector.includes("assistant")) slot("[data-model-display]", [{ slot: "model" }], el);
-    // The prompt arrows depend on the row's place among the prompts: one slot for both.
-    if (selector.includes("user")) {
-      swapped.set(one("button:has(> svg.lucide-chevron-left)", el), { slot: "nav" });
-      swapped.set(one("button:has(> svg.lucide-chevron-right)", el), null);
-    }
+    // The actions depend on the row and the workspace (prompt arrows, no Fork in a scratch one).
+    slot("[data-message-meta-actions]", [{ slot: "actions" }], el);
     return convert(el);
   };
   return {
@@ -174,21 +175,22 @@ async function main() {
     options: { check: { type: "boolean" }, chrome: { type: "string" } },
   });
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "phone-chrome-"));
-  const seed = writeNeutralSeed(path.join(tmp, "seed"));
-  const server = await startServer(seed.root, seed.home, path.join(tmp, "server.log"));
-  const url = `${server.origin}/workspace/${seed.workspaceId}`;
   const trees: string[] = [];
+  let server: Awaited<ReturnType<typeof startServer>> | undefined;
   let browser: Browser | undefined;
-  let wider: string | Error;
+  let wider = "";
   try {
+    const seed = writeNeutralSeed(path.join(tmp, "seed"));
+    server = await startServer(seed.root, seed.home, path.join(tmp, "server.log"));
+    const url = `${server.origin}/workspace/${seed.workspaceId}`;
     browser = await chromium.launch({ executablePath: values.chrome });
     for (const width of PHONE_CHROME_WIDTHS.checked)
       trees.push(await captureAt(browser, url, width));
     // One px past the range must not give the phone tree: the live cutoff moved otherwise.
-    wider = await captureAt(browser, url, PHONE_CHROME_WIDTHS.max + 1).catch((e: Error) => e);
+    wider = await captureAt(browser, url, PHONE_CHROME_WIDTHS.max + 1);
   } finally {
     await browser?.close();
-    await server.stop();
+    await server?.stop();
     fs.rmSync(tmp, { recursive: true, force: true });
   }
   const json = trees[PHONE_CHROME_WIDTHS.checked.indexOf(412)];

@@ -7,8 +7,8 @@
 
 /** Page slots: the workspace title, the project name, the agent mode picker's content, the rows. */
 export const CHROME_SLOTS = ["title", "project", "mode", "rows"] as const;
-/** Row slots: the row tree (renderRowTree), timestamp, model display and the prompt arrows. */
-export const ROW_SLOTS = ["md", "ts", "model", "nav"] as const;
+/** Row slots: the row tree (renderRowTree), timestamp, model display and the action buttons. */
+export const ROW_SLOTS = ["md", "ts", "model", "actions"] as const;
 export type SkeletonSlot = (typeof CHROME_SLOTS)[number] | (typeof ROW_SLOTS)[number];
 
 /** A text node, a slot, or `[tag, attributes, ...children]`. */
