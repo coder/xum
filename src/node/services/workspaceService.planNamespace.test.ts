@@ -224,6 +224,18 @@ describe("same-basename projects share the plan-directory name namespace (#5139)
     const createLocal = (projectPath: string, branchName: string | undefined) =>
       service.create(projectPath, branchName, "main", undefined, { type: "local" });
 
+    // #6714: the new row's projectName names its plan directory, plans/<projectName>/. It must be
+    // the project folder name that the plan-directory checks above use (getProjectName), also for
+    // a Windows path with backslashes. CI's "Test / Windows" job runs this on a real Windows host.
+    test("records the project folder name, not its path, as projectName", async () => {
+      await withTempMuxRoot(async () => {
+        const result = await createLocal(projectB, "folder-name");
+        expect(result.success ? result.data.metadata.projectName : result.error).toBe(
+          path.basename(projectB)
+        );
+      });
+    });
+
     test("/new skips a name a same-basename project uses on the same plan storage, so it inherits no plan", async () => {
       await withTempMuxRoot(async (root) => {
         await addWorkspace(projectA, "aaaaaaaa11", "brave-cows-jump");

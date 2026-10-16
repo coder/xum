@@ -678,6 +678,9 @@ jobs:
       - name: Verify legacy workspace lookups on Windows checkout paths
         shell: pwsh
         run: bun test src/node/config.test.ts -t "legacy rows with a Windows checkout path"
+      - name: Verify a new workspace's projectName on a Windows project path
+        shell: pwsh
+        run: bun test src/node/services/workspaceService.planNamespace.test.ts -t "folder name, not its path"
       - name: Run Windows integration smoke tests
         shell: pwsh
         run: |

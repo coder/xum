@@ -148,6 +148,7 @@ import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { markAppShellReady } from "@/browser/utils/perf/appShellReady";
 import { Err, Ok } from "@/common/types/result";
+import { serverPathLabel } from "@/common/utils/paths";
 
 // T3 #5971 (route split): each page is its own chunk. The workspace page's ErrorBoundary sits inside
 // its chunk, so a failed chunk load reaches PageArea's LazyFeature (Reload, which can recover).
@@ -841,10 +842,7 @@ function AppInner() {
           ? branchResult.recommendedTrunk
           : candidateBranches[0]) ?? null;
       if (!trunkBranch) {
-        const primaryProjectName =
-          primaryProjectPath.split("/").pop() ??
-          primaryProjectPath.split("\\").pop() ??
-          primaryProjectPath;
+        const primaryProjectName = serverPathLabel(primaryProjectPath, primaryProjectPath);
         throw new Error(
           `No branches found for ${primaryProjectName}. Initialize a git repository before creating a multi-project workspace.`
         );
@@ -1636,11 +1634,7 @@ function AppInner() {
             ) : creationProjectPath ? (
               <ProjectPage
                 projectPath={creationProjectPath}
-                projectName={
-                  creationProjectPath.split("/").pop() ??
-                  creationProjectPath.split("\\").pop() ??
-                  "Project"
-                }
+                projectName={serverPathLabel(creationProjectPath, "Project")}
                 leftSidebarCollapsed={sidebarCollapsed}
                 pendingSubProjectPath={pendingNewWorkspaceSubProjectPath}
                 pendingDraftId={pendingNewWorkspaceDraftId}
@@ -1693,8 +1687,7 @@ function AppInner() {
             onClose={() => setMultiProjectWorkspaceModalOpen(false)}
             projectOptions={getTopLevelProjectEntries(userProjects).map(([projectPath]) => ({
               projectPath,
-              projectName:
-                projectPath.split("/").pop() ?? projectPath.split("\\").pop() ?? "Unnamed Project",
+              projectName: serverPathLabel(projectPath, "Unnamed Project"),
             }))}
             onConfirm={createMultiProjectWorkspace}
           />

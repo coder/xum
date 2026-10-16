@@ -6887,8 +6887,9 @@ export class WorkspaceService
         }
       }
 
-      const projectName =
-        owningProjectPath.split("/").pop() ?? owningProjectPath.split("\\").pop() ?? "unknown";
+      // The same name as the plan-directory checks above (getProjectName, process.platform aware):
+      // it names plans/<projectName>/ (#6714).
+      const projectName = getProjectName(owningProjectPath);
 
       const metadata = {
         id: workspaceId,
