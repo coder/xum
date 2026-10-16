@@ -75,6 +75,23 @@ describe("prepareOomHeapSnapshots", () => {
     expect(await fs.readFile(path.join(s.cwd, snapshot), "utf8")).toBe("newer");
   });
 
+  test("a kept snapshot stops arming, so an OOM loop cannot fill the disk", async () => {
+    const s = await setup();
+    await fs.mkdir(s.snapshotDir, { mode: 0o700 });
+    await fs.writeFile(
+      path.join(s.snapshotDir, "Heap.20261016.130810.2982.0.001.heapsnapshot"),
+      "kept"
+    );
+    const fromLastOom = "Heap.20261017.090000.4000.0.001.heapsnapshot";
+    await fs.writeFile(path.join(s.cwd, fromLastOom), "new");
+
+    await prepareOomHeapSnapshots(s.deps);
+
+    expect(s.armed).toEqual([]);
+    // The snapshot the last OOM wrote is still kept.
+    expect(await fs.readFile(path.join(s.snapshotDir, fromLastOom), "utf8")).toBe("new");
+  });
+
   test("a symlink with a snapshot name is not moved and its target keeps its mode", async () => {
     const s = await setup();
     await fs.mkdir(s.snapshotDir, { mode: 0o700 });

@@ -72,12 +72,28 @@ export async function prepareOomHeapSnapshots(deps: OomHeapSnapshotDeps): Promis
   const snapshotDir = path.join(deps.xumHome, OOM_HEAP_SNAPSHOT_DIR_NAME);
   try {
     if (!(await isDirectory(snapshotDir))) return;
-    // Armed before the moves, so a caller that stops waiting on a slow filesystem keeps it.
-    // A CLI --heapsnapshot-near-heap-limit takes precedence; this call then changes nothing.
-    deps.setHeapSnapshotNearHeapLimit(1);
-    deps.log.info("[heap-snapshot] A heap snapshot will be written near the heap limit", {
-      snapshotDir,
-    });
+    // A kept snapshot satisfies the opt-in: an OOM loop must not fill the disk with multi-GB
+    // files (config and session writes would then fail). At most one more, already written to
+    // cwd, moves in below; removing the kept files arms it again.
+    const kept = (await fs.readdir(snapshotDir)).filter((name) =>
+      NODE_HEAP_SNAPSHOT_NAME.test(name)
+    );
+    if (kept.length > 0) {
+      deps.log.info(
+        "[heap-snapshot] Not armed: a heap snapshot is already kept; remove it to arm again",
+        {
+          snapshotDir,
+          files: kept,
+        }
+      );
+    } else {
+      // Armed before the moves, so a caller that stops waiting on a slow filesystem keeps it.
+      // A CLI --heapsnapshot-near-heap-limit takes precedence; this call then changes nothing.
+      deps.setHeapSnapshotNearHeapLimit(1);
+      deps.log.info("[heap-snapshot] A heap snapshot will be written near the heap limit", {
+        snapshotDir,
+      });
+    }
     // Node writes it into the working directory; a launch directory that is gone throws here,
     // after arming.
     const cwd = deps.cwd();
