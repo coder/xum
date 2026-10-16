@@ -244,7 +244,8 @@ describe("service worker caching (#6848)", () => {
     const worker = await startWorker(); // installs "shell"
     // The server sends the shell with no-store; the shell is the one exception.
     worker.setNetwork(() => html("shell v2", { "Cache-Control": "no-store" }));
-    await worker.request(`${ORIGIN}/workspace/abc`, { mode: "navigate" });
+    // A legacy workspace ID can contain dots; the server still answers it with the shell.
+    await worker.request(`${ORIGIN}/workspace/next.js-main`, { mode: "navigate" });
     // An error page must not replace the shell.
     worker.setNetwork(() => new Response("bad gateway", { status: 502 }));
     await worker.request(`${ORIGIN}/`, { mode: "navigate" });
@@ -254,14 +255,26 @@ describe("service worker caching (#6848)", () => {
     expect(await response?.text()).toBe("shell v2");
   });
 
-  test("a navigation to a non-HTML file never replaces the shell", async () => {
-    const worker = await startWorker();
-    worker.setNetwork(() => ok('{"name":"xum"}', { "Content-Type": "application/json" }));
-    await worker.request(`${ORIGIN}/manifest.json`, { mode: "navigate" });
-    worker.offline();
-    const { response } = await worker.request(`${ORIGIN}/settings`, { mode: "navigate" });
-    expect(await response?.text()).toBe("shell");
-  });
+  test.each([
+    [
+      "a non-HTML file",
+      "manifest.json",
+      () => ok('{"name":"xum"}', { "Content-Type": "application/json" }),
+    ],
+    ["the terminal popout", "terminal.html?workspaceId=w&sessionId=s", () => html("terminal page")],
+    ["the desktop popout", "desktop.html?workspaceId=w&instanceId=i", () => html("desktop page")],
+    ["an escaped popout name", "terminal%2Ehtml?workspaceId=w", () => html("terminal page")],
+  ])(
+    "a navigation to %s goes to the network and never replaces the shell",
+    async (_l, path, reply) => {
+      const worker = await startWorker();
+      worker.setNetwork(reply);
+      expect((await worker.request(`${ORIGIN}/${path}`, { mode: "navigate" })).handled).toBe(false);
+      worker.offline();
+      const { response } = await worker.request(`${ORIGIN}/settings`, { mode: "navigate" });
+      expect(await response?.text()).toBe("shell");
+    }
+  );
 
   test("a no-store GET that is not a navigation is still not stored", async () => {
     const worker = await startWorker();

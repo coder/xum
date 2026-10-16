@@ -49,6 +49,25 @@ function isUncacheable(url, path) {
 }
 
 /**
+ * True when the server answers this navigation with the SPA shell. Mirrors the SPA fallback rule
+ * in src/node/orpc/server.ts: index.html, `workspace/<id>` (legacy IDs can contain dots), or a
+ * path with no file extension and no dot segment. Other HTML build entries (terminal.html and
+ * desktop.html popouts) must never replace the shell, or an offline launch opens a popout.
+ */
+function isSpaRoute(path) {
+  if (path === "index.html" || /^workspace\/[^/]+$/.test(path)) return true;
+  // serve-static decodes percent escapes before its lookup (terminal%2Ehtml is terminal.html).
+  let decoded = path;
+  try {
+    decoded = decodeURIComponent(path);
+  } catch {
+    // Not decodable: classify the raw path, as the server does.
+  }
+  const lastSegment = decoded.slice(decoded.lastIndexOf("/") + 1);
+  return !`/${decoded}`.includes("/.") && !lastSegment.includes(".");
+}
+
+/**
  * The shell is the one exception to Cache-Control: the server sends it with no-store, but it
  * holds no session or workspace data (base href, first-run view, module list, font preload, the
  * deployment's proxy URI template). A 200 navigation refreshes the cached copy, so an offline
@@ -152,7 +171,8 @@ self.addEventListener("fetch", (event) => {
 
   if (event.request.mode === "navigate") {
     // Every client route loads the same shell; one entry, never keyed by the visited URL.
-    event.respondWith(networkFirst(event, SHELL_PATH, isShellResponse));
+    // Other navigations (popout pages, files) go to the network untouched.
+    if (isSpaRoute(path)) event.respondWith(networkFirst(event, SHELL_PATH, isShellResponse));
     return;
   }
 
