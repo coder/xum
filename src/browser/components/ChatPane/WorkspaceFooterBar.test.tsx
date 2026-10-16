@@ -626,8 +626,6 @@ describe("WorkspaceFooterBar at narrow viewports", () => {
     renderFooter();
     fireEvent.keyDown(window, { key: "G", ctrlKey: true, shiftKey: true });
 
-    expect(update.mock.calls).toEqual([
-      [{ appearance: { gitStatusIndicatorMode: "divergence" } }],
-    ]);
+    expect(update.mock.calls).toEqual([[{ appearance: { gitStatusIndicatorMode: "divergence" } }]]);
   });
 });

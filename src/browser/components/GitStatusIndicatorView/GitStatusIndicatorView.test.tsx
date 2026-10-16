@@ -144,20 +144,23 @@ describe("GitStatusIndicatorView tap-to-toggle", () => {
   it.each([
     ["line-delta", "Show commits", "divergence"],
     ["divergence", "Show lines", "line-delta"],
-  ] as const)("in %s mode a tap switches modes and keeps the dialog closed", (mode, label, next) => {
-    const onModeChange = mock((_mode: GitStatusIndicatorMode) => undefined);
-    const onOpenChange = mock((_open: boolean) => undefined);
-    const view = renderIndicator(mode, withLinesAndCommits, {
-      tapTogglesMode: true,
-      onModeChange,
-      onOpenChange,
-    });
+  ] as const)(
+    "in %s mode a tap switches modes and keeps the dialog closed",
+    (mode, label, next) => {
+      const onModeChange = mock((_mode: GitStatusIndicatorMode) => undefined);
+      const onOpenChange = mock((_open: boolean) => undefined);
+      const view = renderIndicator(mode, withLinesAndCommits, {
+        tapTogglesMode: true,
+        onModeChange,
+        onOpenChange,
+      });
 
-    fireEvent.click(view.getByRole("button", { name: label }));
+      fireEvent.click(view.getByRole("button", { name: label }));
 
-    expect(onModeChange.mock.calls).toEqual([[next]]);
-    expect(onOpenChange).not.toHaveBeenCalled();
-  });
+      expect(onModeChange.mock.calls).toEqual([[next]]);
+      expect(onOpenChange).not.toHaveBeenCalled();
+    }
+  );
 
   it("opens the divergence dialog instead when tap-to-toggle is off", () => {
     const onModeChange = mock((_mode: GitStatusIndicatorMode) => undefined);
