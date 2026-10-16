@@ -104,7 +104,14 @@ export function AuthTokenModal(props: AuthTokenModalProps) {
       const trimmed = token.trim();
       if (trimmed) {
         // Connect only after the previous session's caches are gone (#6848).
-        void setStoredAuthToken(trimmed).then(() => onSubmit(trimmed));
+        // The cleanup never rejects today; if it ever does, log it and still connect.
+        setStoredAuthToken(trimmed).then(
+          () => onSubmit(trimmed),
+          (error: unknown) => {
+            console.warn("[AuthTokenModal] Service worker cache cleanup failed:", error);
+            onSubmit(trimmed);
+          }
+        );
       }
     },
     [token, onSubmit]

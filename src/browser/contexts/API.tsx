@@ -222,14 +222,20 @@ function toAPIState(state: ConnectionState): APIState {
   }
 }
 
+// The cache cleanup never rejects today (#6848); log rather than drop a future failure.
+function logServiceWorkerCacheCleanupFailure(error: unknown): void {
+  console.warn("[APIProvider] Service worker cache cleanup failed:", error);
+}
+
 function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
   const [state, setState] = useState<ConnectionState>({ status: "connecting" });
   const [authToken, setAuthToken] = useState<string | null>(() => {
     const urlParams = new URLSearchParams(window.location.search);
     const urlToken = urlParams.get("token")?.trim();
     if (urlToken) {
-      // Not awaited: render cannot wait. The cache cleanup still runs (#6848).
-      void setStoredAuthToken(urlToken);
+      // Render cannot await. Safe: only the legacy mux-v2 cache can hold session data, and the
+      // v3 worker's activate deletes it even if this cleanup is cut short (#6848).
+      setStoredAuthToken(urlToken).catch(logServiceWorkerCacheCleanupFailure);
       // Strip token from URL so it doesn't leak into bookmarks, browser
       // history, PWA launch URLs, or Referer headers.
       const cleanUrl = new URL(window.location.href);
@@ -278,7 +284,9 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
   // unmounts behind the token prompt.
   const enterAuthRequired = useCallback((error: string | undefined) => {
     authRequiredRef.current = true;
-    void clearStoredAuthToken();
+    // Safe unawaited: this only shows the token prompt, which caches nothing and navigates
+    // nowhere until the user submits, and the modal awaits its own cleanup then (#6848).
+    clearStoredAuthToken().catch(logServiceWorkerCacheCleanupFailure);
     hasConnectedRef.current = false;
     lastClientRef.current = null;
     setState({ status: "auth_required", error });
@@ -704,7 +712,9 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
   const authenticate = useCallback(
     (token: string) => {
       authProbeAttemptedRef.current = false;
-      void setStoredAuthToken(token);
+      // Safe unawaited: every caller is the token modal's onSubmit, which already awaited
+      // setStoredAuthToken(token), so the token is unchanged here and nothing is cleared (#6848).
+      setStoredAuthToken(token).catch(logServiceWorkerCacheCleanupFailure);
       setAuthToken(token);
       connect(token);
     },
