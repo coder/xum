@@ -194,15 +194,22 @@ class WorkerRowTreeClient implements RowTreeClient {
   }
 
   private sendNext() {
-    const next = this.queue.values().next();
-    if (this.inFlight || next.done) return;
-    assert(this.worker && this.ready, "row-tree batches go only to a ready worker");
-    const batch = next.value;
-    this.queue.delete(batch.workspaceId);
-    const id = this.nextId++;
-    const timer = setTimeout(() => this.stop("batch timeout"), this.limits.batchTimeoutMs);
-    this.inFlight = { id, batch, timer };
-    this.worker.postMessage({ id, rows: batch.rows });
+    if (this.inFlight) return;
+    for (const batch of this.queue.values()) {
+      this.queue.delete(batch.workspaceId);
+      // A request that waited behind an identical one gets that one's trees, not a second render.
+      const cached = this.memo.get(batch.cacheKey);
+      if (cached) {
+        settle(batch, cached.trees);
+        continue;
+      }
+      assert(this.worker && this.ready, "row-tree batches go only to a ready worker");
+      const id = this.nextId++;
+      const timer = setTimeout(() => this.stop("batch timeout"), this.limits.batchTimeoutMs);
+      this.inFlight = { id, batch, timer };
+      this.worker.postMessage({ id, rows: batch.rows });
+      return;
+    }
   }
 
   /** A tree the page may draw: allowed nodes only, and at most `maxTreeBytes`. */

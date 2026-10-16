@@ -220,6 +220,14 @@ describe("createRowTreeClient", () => {
     expect(await untilTrees(c, row("w1"), "w1")).toEqual([["p", {}, "w1"]]);
   });
 
+  test("a request queued behind an identical one gets its trees without a second render", async () => {
+    // 300 ms per render, 450 ms per request: a second render would miss the deadline.
+    const c = client(await fakeWorker("dup", lagging), { requestTimeoutMs: 450 });
+    await untilTrees(c);
+    const both = await Promise.all([c.render("ws", row("dup")), c.render("ws", row("dup"))]);
+    expect(both).toEqual([[["p", {}, "dup"]], [["p", {}, "dup"]]]);
+  });
+
   test("a request for one more workspace than the queue holds gives null at once", async () => {
     const c = client(await fakeWorker("full", lagging), { maxQueued: 2, requestTimeoutMs: 5_000 });
     await untilTrees(c);
