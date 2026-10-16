@@ -1947,8 +1947,8 @@ describe("Config", () => {
       }
 
       // #6717: an earlier build already saved two rows with one id under one stored key. The
-      // loader keeps one row per id (the last variant, at the first row's position, as for
-      // aliases) and backs up the original bytes first, also for an identical copy.
+      // loader keeps the first row per id (the row every lookup already used, #4550) and backs
+      // up the original bytes first, also for an identical copy.
       // Builders: row() and config exist only inside a test. `kept` is a value the kept row holds.
       const duplicateIdCases: Array<
         [string, () => { rows: Array<Record<string, unknown>>; kept: string }]
@@ -1958,14 +1958,14 @@ describe("Config", () => {
           "a copy that differs",
           () => ({
             rows: [row("ws-1", { title: "first" }), row("ws-1", { title: "second" })],
-            kept: "second",
+            kept: "first",
           }),
         ],
         [
           "a copy on another checkout path",
           () => {
             const elsewhere = path.join(config.srcDir, "repo", "elsewhere");
-            return { rows: [row("ws-1"), row("ws-1", { path: elsewhere })], kept: elsewhere };
+            return { rows: [row("ws-1", { path: elsewhere }), row("ws-1")], kept: elsewhere };
           },
         ],
       ];
@@ -2086,8 +2086,8 @@ describe("Config", () => {
         }
       });
 
-      // #6717: the heal keeps the copy on the other path, so the legacy row must be matched
-      // against the dropped copy first. Else the id migration gives it the same id again.
+      // #6717: the heal keeps the first copy, on the other path, so the legacy row must be
+      // matched against the dropped copy first. Else the id migration gives it the same id again.
       it("drops a legacy copy of a repeated id before it keeps the copy on another path", async () => {
         const checkout = checkoutPath();
         const id = config.generateLegacyId("/home/u/repo", checkout);
@@ -2100,8 +2100,8 @@ describe("Config", () => {
                 "/home/u/repo",
                 {
                   workspaces: [
-                    { id, name: "x", path: checkout },
                     { id, name: "x", path: elsewhere },
+                    { id, name: "x", path: checkout },
                     { name: "x", path: checkout },
                   ],
                 },

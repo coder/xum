@@ -684,23 +684,26 @@ describe("TaskService settlement receipt producers (G2)", () => {
       },
     ]);
     // A later duplicate of the mid row names another parent (a corrupt, hand-edited or merged
-    // config). Written and read back through the real Config.
+    // config). Written and read back through the real Config. It sits in another project: the
+    // load keeps only the first row of an id repeated under one project key (#6717).
+    const otherProjectPath = `${projectPath}-other`;
     await config.editConfig((cfg) => {
       const workspaces = cfg.projects.get(projectPath)!.workspaces;
       const mid = workspaces.find((workspace) => workspace.id === midId)!;
       workspaces.push(
         projectWorkspace(projectPath, "stray-root", strayRootId, {
           runtimeConfig: { type: "local" },
-        }),
-        { ...mid, parentWorkspaceId: strayRootId }
+        })
       );
+      cfg.projects.set(otherProjectPath, {
+        workspaces: [{ ...mid, parentWorkspaceId: strayRootId }],
+      });
       return cfg;
     });
     expect(
-      config
-        .loadConfigOrDefault()
-        .projects.get(projectPath)!
-        .workspaces.filter((workspace) => workspace.id === midId)
+      [...config.loadConfigOrDefault().projects.values()]
+        .flatMap((project) => project.workspaces)
+        .filter((workspace) => workspace.id === midId)
     ).toHaveLength(2);
     const { taskService, svc } = createHarness(config);
     expect(

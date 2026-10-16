@@ -1154,12 +1154,12 @@ function aliasEntryDuplicateIds(group: StoredProjectEntry[]): string[] {
 
 /**
  * One stored key can already hold two rows with one workspace id: an earlier build saved them, and
- * no merge repairs them, because neither row is an alias or a legacy copy (#6717). Keep one row
- * per id with the alias merge's rule: an identical copy once, and for rows that differ, the last
- * one at the first row's position. Record a conflict for every repair, an identical copy
- * included, so the original bytes are backed up before any save drops a row. All copies share
- * the id's session folder, so no session history is lost. A copy on another checkout path loses
- * only its config row: its checkout stays on disk and its row stays in the backup.
+ * no merge repairs them, because neither row is an alias or a legacy copy (#6717). Keep the first
+ * row for each id: the row lookups and the task index already resolve a repeated id to its first
+ * row (#4550), so the user sees the same workspace and parent as before. Record a conflict for every repair, an identical copy
+ * included, so the original bytes are backed up before any save drops a row. All copies share the
+ * id's session folder, so no session history is lost. A copy on another checkout path loses only
+ * its config row: its checkout stays on disk and its row stays in the backup.
  */
 function healSingleKeyDuplicateIds(
   key: string,
@@ -1168,8 +1168,14 @@ function healSingleKeyDuplicateIds(
 ): ProjectConfig {
   if (!hasDuplicateRowId(entry.config.workspaces)) return entry.config;
   const duplicatedIds = duplicateRowIds(entry.config.workspaces);
+  const keptIds = new Set<string>();
   // The rows only: settings and trust stay exactly as stored for a single key.
-  entry.config.workspaces = mergeProjectAliases([entry]).config.workspaces;
+  entry.config.workspaces = entry.config.workspaces.filter((workspace) => {
+    if (!workspace.id) return true;
+    if (keptIds.has(workspace.id)) return false;
+    keptIds.add(workspace.id);
+    return true;
+  });
   conflicts.push({ path: key, storedKeys: [entry.storedKey], conflictingIds: duplicatedIds });
   return entry.config;
 }
