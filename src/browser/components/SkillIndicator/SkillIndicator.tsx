@@ -290,8 +290,17 @@ export const SkillIndicator: React.FC<SkillIndicatorProps> = (props) => {
   if (totalCount === 0 && errorCount === 0) {
     // While the list loads, hold the button's slot: the header's right-aligned group would
     // otherwise move every button before this one when the list arrives, under the pointer (#6221).
+    // The slot shows the icon without its count, because an empty slot looked like a layout gap.
     return props.loading ? (
-      <span aria-hidden="true" className={cn("h-6 w-6 shrink-0", props.className)} />
+      <span
+        aria-hidden="true"
+        className={cn(
+          "text-muted flex h-6 w-6 shrink-0 items-center justify-center",
+          props.className
+        )}
+      >
+        <SkillIcon className="h-4.5 w-4.5" />
+      </span>
     ) : null;
   }
 

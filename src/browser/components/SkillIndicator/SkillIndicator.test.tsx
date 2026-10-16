@@ -34,6 +34,8 @@ describe("SkillIndicator while skills load (#6221)", () => {
     expect(placeholder.getAttribute("aria-hidden")).toBe("true");
     expect(placeholder.className).toContain("h-6");
     expect(placeholder.className).toContain("w-6");
+    // An empty box read as a gap in the header, so the slot shows the icon.
+    expect(placeholder.querySelector("svg")).not.toBeNull();
   });
 
   test("renders nothing once the list is known to be empty", () => {
