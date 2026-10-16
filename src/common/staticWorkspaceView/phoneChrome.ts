@@ -5,10 +5,10 @@
  * loads it yet; a later PR's early script builds it with createElement and text nodes only.
  */
 
-/** Page slots: the workspace title, the project name and the transcript rows. */
-export const CHROME_SLOTS = ["title", "project", "rows"] as const;
-/** Row template slots: the row tree (renderRowTree), its timestamp and its model label. */
-export const ROW_SLOTS = ["md", "ts", "model"] as const;
+/** Page slots: the workspace title, the project name, the agent mode picker's content, the rows. */
+export const CHROME_SLOTS = ["title", "project", "mode", "rows"] as const;
+/** Row slots: the row tree (renderRowTree), timestamp, model display and the prompt arrows. */
+export const ROW_SLOTS = ["md", "ts", "model", "nav"] as const;
 export type SkeletonSlot = (typeof CHROME_SLOTS)[number] | (typeof ROW_SLOTS)[number];
 
 /** A text node, a slot, or `[tag, attributes, ...children]`. */
@@ -26,6 +26,7 @@ export interface PhoneChrome {
 /**
  * The live app picks its phone layout in JavaScript: a coarse pointer and at most 480 px
  * (PHONE_HEADER_QUERY, WorkspaceMenuBar.tsx). Captured at 412 px; the generator fails unless every
- * `checked` width gives the same tree. So the view must stay in `min`..`max`, coarse pointer only.
+ * `checked` width gives the same tree and `max` + 1 a different one. So the view must stay in
+ * `min`..`max`, coarse pointer only.
  */
 export const PHONE_CHROME_WIDTHS = { min: 360, max: 480, checked: [360, 390, 412, 480] } as const;

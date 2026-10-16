@@ -70,7 +70,8 @@ function capture(placeholder: unknown) {
   const DROP =
     /^(id|role|tabindex|title|for|name|aria-(?!hidden).*|data-testid|data-message-id|data-tutorial|data-state|data-autofocus-state|data-loaded|autocomplete|spellcheck)$/;
   const children = new Map<Element, Node[]>();
-  const swapped = new Map<Element, Node>();
+  const swapped = new Map<Element, Node | null>(); // null: the element is left out
+  const MODE_STYLE = /var\(--color-[\w-]*-mode\)/; // the selected agent's color, workspace state
   const one = (selector: string, scope: ParentNode = document) => {
     const found = scope.querySelectorAll(selector);
     if (found.length !== 1)
@@ -85,14 +86,19 @@ function capture(placeholder: unknown) {
   slot("[data-component=ModelSelectorGroup] span.truncate", []);
   slot("[data-thinking-label]", []);
   slot("[data-context-usage-percent]", []);
+  slot('[data-component=ChatInputSurface] button[style*="-mode)"]', [{ slot: "mode" }]);
   swapped.set(one('button[aria-label*="skills loaded"]'), placeholder as Node);
   const log = one("[role=log]");
   const convert = (el: Element): Node => {
     const swap = swapped.get(el);
-    if (swap) return swap;
+    if (swap) return swap; // never null here: the caller leaves those elements out
     const tag = el.tagName === "MAIN" ? "div" : el.localName; // one <main>: the boot loader's
     const attrs: Record<string, string> = {};
-    for (const a of el.attributes) if (!DROP.test(a.name)) attrs[a.name] = a.value;
+    for (const a of el.attributes) {
+      if (!DROP.test(a.name) && !(a.name === "style" && MODE_STYLE.test(a.value))) {
+        attrs[a.name] = a.value;
+      }
+    }
     const kids: Node[] = children.get(el) ?? [];
     if (!children.has(el)) {
       for (const c of el.childNodes) {
@@ -100,7 +106,7 @@ function capture(placeholder: unknown) {
         if (c.nodeType !== 1 || (c as Element).matches(SKIP)) continue;
         if (el === log && (c as Element).matches("[data-transcript-message]")) {
           if (!kids.some((k) => typeof k === "object" && "slot" in k)) kids.push({ slot: "rows" });
-        } else kids.push(convert(c as Element));
+        } else if (swapped.get(c as Element) !== null) kids.push(convert(c as Element));
       }
     }
     return [tag, attrs, ...kids];
@@ -110,8 +116,13 @@ function capture(placeholder: unknown) {
     const el = rows.at(-1)!.closest("[data-transcript-message]")!;
     slot(".markdown-content > div", [{ slot: "md" }], el);
     slot("[data-message-timestamp]", [{ slot: "ts" }], el);
-    if (selector.includes("assistant"))
-      slot("[data-model-display] > span.inline", [{ slot: "model" }], el);
+    // The provider icon and the route text belong to the row's model too.
+    if (selector.includes("assistant")) slot("[data-model-display]", [{ slot: "model" }], el);
+    // The prompt arrows depend on the row's place among the prompts: one slot for both.
+    if (selector.includes("user")) {
+      swapped.set(one("button:has(> svg.lucide-chevron-left)", el), { slot: "nav" });
+      swapped.set(one("button:has(> svg.lucide-chevron-right)", el), null);
+    }
     return convert(el);
   };
   return {
@@ -131,15 +142,16 @@ async function captureAt(browser: Browser, url: string, width: number) {
   await page.goto(url);
   await page.waitForSelector('[data-testid=message-window][data-loaded="true"] [data-message-id]');
   await page.waitForSelector('button[aria-label*="skills loaded"]');
-  // Late async updates (git status, usage) must not land in the tree: wait for two equal captures.
-  let previous = "";
+  // Late async updates (git status, usage, the agent's color) must not land in the tree: wait for
+  // two equal captures. A capture that fails (a slot element not there yet) is not settled either.
+  let previous: unknown = "";
   for (let i = 0; i < 40; i++) {
-    const tree = JSON.stringify(await page.evaluate(capture, SKILLS_PLACEHOLDER));
+    const tree = await page.evaluate(capture, SKILLS_PLACEHOLDER).then(JSON.stringify, (e) => e);
     if (tree === previous) return await page.close().then(() => tree);
     previous = tree;
     await page.waitForTimeout(250);
   }
-  throw new Error(`the page at ${width} px never settled`);
+  throw previous instanceof Error ? previous : new Error(`the page at ${width} px never settled`);
 }
 
 /** Where two trees first differ: the key path, the tags on the way and both values; or null. */
@@ -164,22 +176,30 @@ async function main() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "phone-chrome-"));
   const seed = writeNeutralSeed(path.join(tmp, "seed"));
   const server = await startServer(seed.root, seed.home, path.join(tmp, "server.log"));
-  const browser = await chromium.launch({ executablePath: values.chrome });
   const url = `${server.origin}/workspace/${seed.workspaceId}`;
   const trees: string[] = [];
+  let browser: Browser | undefined;
+  let wider: string | Error;
   try {
+    browser = await chromium.launch({ executablePath: values.chrome });
     for (const width of PHONE_CHROME_WIDTHS.checked)
       trees.push(await captureAt(browser, url, width));
+    // One px past the range must not give the phone tree: the live cutoff moved otherwise.
+    wider = await captureAt(browser, url, PHONE_CHROME_WIDTHS.max + 1).catch((e: Error) => e);
   } finally {
-    await browser.close();
+    await browser?.close();
     await server.stop();
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
-  fs.rmSync(tmp, { recursive: true, force: true });
   const json = trees[PHONE_CHROME_WIDTHS.checked.indexOf(412)];
   PHONE_CHROME_WIDTHS.checked.forEach((width, i) => {
     const diff = firstDiff(JSON.parse(json), JSON.parse(trees[i]));
     assert(diff === null, `the ${width} px tree differs from the 412 px tree at ${diff}`);
   });
+  assert(
+    wider !== json,
+    `the phone tree also renders at ${PHONE_CHROME_WIDTHS.max + 1} px: widen PHONE_CHROME_WIDTHS`
+  );
   const escaped = json.replaceAll("<", "\\u003c"); // safe to embed in a <script> later
   if (values.check) {
     const diff = firstDiff(JSON.parse(PHONE_CHROME_JSON), JSON.parse(json));

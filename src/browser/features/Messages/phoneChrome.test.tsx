@@ -29,8 +29,11 @@ const toHtml = ([tag, attrs]: Extract<SkeletonNode, unknown[]>) =>
 describe("phone chrome skeleton", () => {
   test("each slot appears exactly once, in its own tree", () => {
     expect(slots(skeleton.chrome).sort()).toEqual([...CHROME_SLOTS].sort());
-    expect(slots(skeleton.user).sort()).toEqual(["md", "ts"]);
-    expect(slots(skeleton.assistant).sort()).toEqual([...ROW_SLOTS].sort());
+    expect(slots(skeleton.user).sort()).toEqual(["md", "nav", "ts"]);
+    expect(slots(skeleton.assistant).sort()).toEqual(["md", "model", "ts"]);
+    expect(new Set([...slots(skeleton.user), ...slots(skeleton.assistant)])).toEqual(
+      new Set(ROW_SLOTS)
+    );
   });
 
   test("it carries no event handler, URL or text of the seed", async () => {
@@ -38,7 +41,7 @@ describe("phone chrome skeleton", () => {
     for (const [, attrs] of all) {
       for (const [name, value] of Object.entries(attrs)) {
         expect(name).not.toMatch(/^(on|href$|src|action$|formaction$|xlink:)/i);
-        expect(value).not.toMatch(/url\(|javascript:/i);
+        expect(value).not.toMatch(/url\(|javascript:|-mode\)/i); // the agent color is state
       }
     }
     const text = JSON.stringify(skeleton);
