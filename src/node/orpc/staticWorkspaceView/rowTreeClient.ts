@@ -1,4 +1,5 @@
 import assert from "node:assert";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { Worker } from "node:worker_threads";
@@ -12,12 +13,8 @@ import { log } from "@/node/services/log";
  * one and the tail read stays fast.
  */
 export interface RowTreeClient {
-  /** One tree per row, or null. `tailKey` identifies the tail (last historySequence + row count). */
-  render(
-    workspaceId: string,
-    tailKey: string,
-    rows: RowTreeRow[]
-  ): Promise<Array<StaticNode | null>>;
+  /** One tree per row, or null. */
+  render(workspaceId: string, rows: RowTreeRow[]): Promise<Array<StaticNode | null>>;
   dispose(): void;
 }
 export interface RowTreeRow {
@@ -28,6 +25,10 @@ export interface RowTreeRow {
 export const ROW_TREE_LIMITS = {
   /** Per batch of at most `maxRows`, timed from the worker's "ready", never across its cold load. */
   batchTimeoutMs: 1_000,
+  /** Every request resolves at most this long after it arrives, also while it waits in the queue. */
+  requestTimeoutMs: 1_500,
+  /** At most this many workspaces wait for the worker; a request for one more gets null at once. */
+  maxQueued: 8,
   loadTimeoutMs: 5_000,
   idleMs: 10 * 60_000,
   /** After this many failures in a row (crash, timeout, failed load), wait `backoffMs`. */
@@ -59,6 +60,7 @@ interface Batch {
   cacheKey: string;
   rows: RowTreeRow[];
   resolve: (trees: Array<StaticNode | null>) => void;
+  deadline: NodeJS.Timeout;
 }
 interface MemoEntry {
   trees: Array<StaticNode | null>;
@@ -68,6 +70,14 @@ interface MemoEntry {
 const nulls = (rows: RowTreeRow[]) => rows.map((): StaticNode | null => null);
 
 const treeBytes = (tree: StaticNode | null) => Buffer.byteLength(JSON.stringify(tree));
+
+/**
+ * The memo key hashes the rows themselves, the only input of their trees. A key from the last
+ * historySequence and the row count is not enough: HistoryService reuses the sequence numbers of
+ * removed rows, so an edit of the last row keeps both.
+ */
+const memoKey = (workspaceId: string, rows: RowTreeRow[]) =>
+  `${workspaceId}\0${createHash("sha256").update(JSON.stringify(rows)).digest("base64")}`;
 
 export function createRowTreeClient(options: {
   workerPath: string;
@@ -96,8 +106,8 @@ class WorkerRowTreeClient implements RowTreeClient {
     private readonly limits: typeof ROW_TREE_LIMITS
   ) {}
 
-  render(workspaceId: string, tailKey: string, rows: RowTreeRow[]) {
-    const cacheKey = `${workspaceId}\0${tailKey}`;
+  render(workspaceId: string, rows: RowTreeRow[]) {
+    const cacheKey = memoKey(workspaceId, rows);
     const cached = this.memo.get(cacheKey);
     if (cached) {
       this.memo.delete(cacheKey); // re-inserting moves a hit to the newest end (LRU)
@@ -110,9 +120,7 @@ class WorkerRowTreeClient implements RowTreeClient {
     this.idleTimer.unref();
     if (!this.worker && Date.now() >= this.backoffUntil) this.start();
     if (!this.ready) return Promise.resolve(nulls(rows)); // the cold load never delays a read
-    return new Promise<Array<StaticNode | null>>((resolve) =>
-      this.enqueue({ workspaceId, cacheKey, rows, resolve })
-    );
+    return this.enqueue(workspaceId, cacheKey, rows);
   }
 
   dispose() {
@@ -150,10 +158,10 @@ class WorkerRowTreeClient implements RowTreeClient {
     this.ready = false;
     if (this.inFlight) {
       clearTimeout(this.inFlight.timer);
-      this.inFlight.batch.resolve(nulls(this.inFlight.batch.rows));
+      settle(this.inFlight.batch, nulls(this.inFlight.batch.rows));
       this.inFlight = null;
     }
-    for (const batch of this.queue.values()) batch.resolve(nulls(batch.rows));
+    for (const batch of this.queue.values()) settle(batch, nulls(batch.rows));
     this.queue.clear();
     worker?.terminate().catch(() => undefined);
     if (reason === null) return; // the idle stop is not a failure
@@ -164,12 +172,24 @@ class WorkerRowTreeClient implements RowTreeClient {
     }
   }
 
-  private enqueue(batch: Batch) {
-    const older = this.queue.get(batch.workspaceId);
-    older?.resolve(nulls(older.rows)); // a burst of page loads keeps only the newest request
-    this.queue.delete(batch.workspaceId);
-    this.queue.set(batch.workspaceId, batch);
-    this.sendNext();
+  private enqueue(workspaceId: string, cacheKey: string, rows: RowTreeRow[]) {
+    const older = this.queue.get(workspaceId);
+    if (!older && this.queue.size >= this.limits.maxQueued) return Promise.resolve(nulls(rows));
+    if (older) settle(older, nulls(older.rows)); // a burst of page loads keeps only the newest one
+    this.queue.delete(workspaceId);
+    return new Promise<Array<StaticNode | null>>((resolve) => {
+      // The deadline runs from arrival, so a long queue never delays the page. A reply that comes
+      // after it still fills the memo for the next read.
+      const expire = () => {
+        if (this.queue.get(workspaceId) === batch) this.queue.delete(workspaceId);
+        resolve(nulls(rows));
+      };
+      const deadline = setTimeout(expire, this.limits.requestTimeoutMs);
+      deadline.unref();
+      const batch: Batch = { workspaceId, cacheKey, rows, resolve, deadline };
+      this.queue.set(workspaceId, batch);
+      this.sendNext();
+    });
   }
 
   private sendNext() {
@@ -209,7 +229,12 @@ class WorkerRowTreeClient implements RowTreeClient {
     this.failures = 0; // a crash loop on one row still backs off: only a reply resets the count
     const accepted = batch.rows.map((_, i) => this.accept(trees[i]));
     if (!this.memo.has(batch.cacheKey)) this.remember(batch.cacheKey, accepted);
-    batch.resolve(accepted);
+    settle(batch, accepted);
     this.sendNext();
   }
+}
+
+function settle(batch: Batch, trees: Array<StaticNode | null>) {
+  clearTimeout(batch.deadline);
+  batch.resolve(trees);
 }

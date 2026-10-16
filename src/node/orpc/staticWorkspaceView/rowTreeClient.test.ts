@@ -41,9 +41,10 @@ const client = (workerPath: string, limits = {}) => {
 };
 const rows: RowTreeRow[] = [{ text: "hi", isUser: true }];
 /** Polls until the worker answers: its start is asynchronous by design (the first read gets null). */
-async function untilTrees(c: RowTreeClient, key = "k", input = rows) {
+const row = (text: string): RowTreeRow[] => [{ text, isUser: true }];
+async function untilTrees(c: RowTreeClient, input = rows, workspaceId = "ws") {
   for (let i = 0; i < 200; i++) {
-    const trees = await c.render("ws", key, input);
+    const trees = await c.render(workspaceId, input);
     if (trees[0] !== null) return trees;
     await Bun.sleep(10);
   }
@@ -51,16 +52,18 @@ async function untilTrees(c: RowTreeClient, key = "k", input = rows) {
 }
 
 describe("createRowTreeClient", () => {
-  test("the first read gets null, later reads get trees, and a tail key hit is memoized", async () => {
+  test("the first read gets null, later reads get trees, and the same rows are memoized", async () => {
     const c = client(
       await fakeWorker("ok", `port.on("message", (m) => reply(m)); port.postMessage("ready");`)
     );
-    expect(await c.render("ws", "k", rows)).toEqual([null]);
+    expect(await c.render("ws", rows)).toEqual([null]);
     const trees = await untilTrees(c);
     expect(trees).toEqual([["p", {}, "hi"]]);
-    expect(await c.render("ws", "k", rows)).toBe(trees);
-    // An edit of the last row changes the tail key, so the memo misses.
-    expect(await c.render("ws", "k2", [{ text: "edited", isUser: true }])).toEqual([
+    expect(await c.render("ws", rows)).toBe(trees);
+    // An edit of the last row keeps its historySequence and the row count, and still misses.
+    await untilTrees(c, [...row("first"), ...row("last")]);
+    expect(await c.render("ws", [...row("first"), ...row("edited")])).toEqual([
+      ["p", {}, "first"],
       ["p", {}, "edited"],
     ]);
   });
@@ -75,7 +78,7 @@ describe("createRowTreeClient", () => {
     );
     await untilTrees(c);
     const input = ["link", "huge", "ok"].map((text) => ({ text, isUser: false }));
-    expect(await c.render("ws", "k3", input)).toEqual([null, null, ["p", {}]]);
+    expect(await c.render("ws", input)).toEqual([null, null, ["p", {}]]);
   });
 
   test("a batch timeout and a crash give null and start a new worker", async () => {
@@ -84,10 +87,10 @@ describe("createRowTreeClient", () => {
       `port.on("message", () => {}); port.postMessage("ready");`
     );
     const c = client(hang, { batchTimeoutMs: 30 });
-    await c.render("ws", "k", rows);
+    await c.render("ws", rows);
     await Bun.sleep(200); // ready: a worker that never replies gives no other signal
-    expect(await c.render("ws", "k", rows)).toEqual([null]); // timed out
-    await c.render("ws", "k", rows);
+    expect(await c.render("ws", rows)).toEqual([null]); // timed out
+    await c.render("ws", rows);
     await untilStarts("hang", 2);
 
     const crash = await fakeWorker(
@@ -95,9 +98,9 @@ describe("createRowTreeClient", () => {
       `port.on("message", () => process.exit(1)); port.postMessage("ready");`
     );
     const d = client(crash);
-    await d.render("ws", "k", rows);
+    await d.render("ws", rows);
     await Bun.sleep(200);
-    expect(await d.render("ws", "k", rows)).toEqual([null]);
+    expect(await d.render("ws", rows)).toEqual([null]);
   });
 
   test("a load that never finishes backs off after 3 failures", async () => {
@@ -106,7 +109,7 @@ describe("createRowTreeClient", () => {
       backoffMs: 60_000,
     });
     for (let i = 0; i < 6; i++) {
-      expect(await c.render("ws", "k", rows)).toEqual([null]);
+      expect(await c.render("ws", rows)).toEqual([null]);
       await Bun.sleep(60);
     }
     expect(await starts("stuck")).toBe(3);
@@ -116,10 +119,10 @@ describe("createRowTreeClient", () => {
     const body = `port.on("message", (m) => (m.rows[0].text === "boom" ? process.exit(1) : reply(m))); port.postMessage("ready");`;
     const c = client(await fakeWorker("flaky", body), { backoffMs: 60_000 });
     for (let i = 0; i < 4; i++) {
-      await untilTrees(c, `ok${i}`); // a reply after each restart
-      expect(await c.render("ws", `boom${i}`, [{ text: "boom", isUser: true }])).toEqual([null]);
+      await untilTrees(c, row(`ok${i}`)); // a reply after each restart
+      expect(await c.render("ws", row("boom"))).toEqual([null]);
     }
-    await untilTrees(c, "after"); // 4 crashes, never 3 in a row: no backoff
+    await untilTrees(c, row("after")); // 4 crashes, never 3 in a row: no backoff
   });
 
   test("events of a stopped worker are ignored", async () => {
@@ -128,18 +131,18 @@ describe("createRowTreeClient", () => {
       `port.on("message", (m) => reply(m)); port.postMessage("ready");`
     );
     const c = client(ok);
-    await c.render("ws", "k", rows);
+    await c.render("ws", rows);
     const end = Date.now() + 300;
     while (Date.now() < end); // block until its "ready" is queued
     c.dispose(); // stop it before that "ready" is delivered
     await Bun.sleep(50);
     // A new worker starts, and this read must not reach it before it is ready.
-    expect(await c.render("ws", "k", rows)).toEqual([null]);
+    expect(await c.render("ws", rows)).toEqual([null]);
   });
 
   test("a worker that cannot start gives null rows", async () => {
     const c = client("not-a-valid-worker-path.js"); // Worker throws synchronously for this path
-    for (let i = 0; i < 4; i++) expect(await c.render("ws", `k${i}`, rows)).toEqual([null]);
+    for (let i = 0; i < 4; i++) expect(await c.render("ws", rows)).toEqual([null]);
   });
 
   test("the tree byte cap is the configured one, in UTF-8 bytes", async () => {
@@ -151,21 +154,19 @@ describe("createRowTreeClient", () => {
     );
     await untilTrees(c);
     // 70 two-byte characters: 82 UTF-16 code units of JSON, but 152 bytes.
-    expect(await c.render("ws", "wide", [{ text: "é".repeat(70), isUser: true }])).toEqual([null]);
-    expect(await c.render("ws", "narrow", [{ text: "e".repeat(70), isUser: true }])).not.toEqual([
-      null,
-    ]);
+    expect(await c.render("ws", [{ text: "é".repeat(70), isUser: true }])).toEqual([null]);
+    expect(await c.render("ws", [{ text: "e".repeat(70), isUser: true }])).not.toEqual([null]);
   });
 
   test("the memo keeps the most recently used tails within its byte budget", async () => {
     const c = client(
       await fakeWorker("lru", `port.on("message", (m) => reply(m)); port.postMessage("ready");`),
       {
-        memoBytes: 60,
+        memoBytes: 180,
       }
     );
-    const tail = (key: string) => c.render("ws", key, [{ text: key, isUser: true }]);
-    await untilTrees(c, "a", [{ text: "a", isUser: true }]); // each entry is about 20 bytes
+    const tail = (text: string) => c.render("ws", row(text));
+    await untilTrees(c, row("a")); // each entry is 59 bytes: key 47, tree 12
     const a = await tail("a");
     const b = await tail("b");
     expect(await tail("a")).toBe(a); // a hit makes "a" the most recent
@@ -181,8 +182,8 @@ describe("createRowTreeClient", () => {
       `port.on("message", (m) => setTimeout(() => reply(m), 60)); port.postMessage("ready");`
     );
     const c = client(slow, { batchTimeoutMs: 100 });
-    await untilTrees(c, "warm");
-    const trees = await Promise.all(["w1", "w2", "w3"].map((ws) => c.render(ws, "k", rows)));
+    await untilTrees(c);
+    const trees = await Promise.all(["w1", "w2", "w3"].map((ws) => c.render(ws, rows)));
     expect(trees).toEqual([rows, rows, rows].map(() => [["p", {}, "hi"]]));
   });
 
@@ -192,11 +193,29 @@ describe("createRowTreeClient", () => {
       `port.on("message", (m) => setTimeout(() => reply(m), 50)); port.postMessage("ready");`
     );
     const c = client(slow);
-    await untilTrees(c, "warm");
-    const [a, b, n] = await Promise.all(
-      ["a", "b", "c"].map((key) => c.render("ws", key, [{ text: key, isUser: true }]))
-    );
+    await untilTrees(c);
+    const [a, b, n] = await Promise.all(["a", "b", "c"].map((text) => c.render("ws", row(text))));
     expect([a, b, n]).toEqual([[["p", {}, "a"]], [null], [["p", {}, "c"]]]);
+  });
+
+  /** Replies at once to "hi" (the warm-up) and after 300 ms, within the batch timeout, to others. */
+  const lagging = `port.on("message", (m) => setTimeout(() => reply(m), m.rows[0].text === "hi" ? 0 : 300)); port.postMessage("ready");`;
+
+  test("a request gives null at its deadline, also while it waits, and a late reply fills the memo", async () => {
+    const c = client(await fakeWorker("deadline", lagging), { requestTimeoutMs: 50 });
+    await untilTrees(c);
+    const trees = await Promise.all(["w1", "w2", "w3"].map((ws) => c.render(ws, row(ws))));
+    expect(trees).toEqual([[null], [null], [null]]); // w1 was posted, w2 and w3 waited
+    expect(await untilTrees(c, row("w1"), "w1")).toEqual([["p", {}, "w1"]]);
+  });
+
+  test("a request for one more workspace than the queue holds gives null at once", async () => {
+    const c = client(await fakeWorker("full", lagging), { maxQueued: 2, requestTimeoutMs: 5_000 });
+    await untilTrees(c);
+    for (const ws of ["w1", "w2", "w3"]) void c.render(ws, row(ws)); // w1 is posted, 2 wait
+    const started = Date.now();
+    expect(await c.render("w4", row("w4"))).toEqual([null]);
+    expect(Date.now() - started).toBeLessThan(500);
   });
 
   test("the idle stop ends the worker, and the next read starts a new one", async () => {
@@ -206,13 +225,13 @@ describe("createRowTreeClient", () => {
     );
     await untilTrees(c);
     await Bun.sleep(80);
-    expect(await c.render("ws", "other", rows)).toEqual([null]);
+    expect(await c.render("ws", row("other"))).toEqual([null]);
     await untilStarts("idle", 2);
   });
 
   test("the real worker renders a row with the live components", async () => {
     const c = client(defaultRowTreeWorkerPath());
-    const [tree] = await untilTrees(c, "k", [{ text: "a `b`", isUser: false }]);
+    const [tree] = await untilTrees(c, [{ text: "a `b`", isUser: false }]);
     expect(JSON.stringify(tree)).toContain('["code",{},"b"]');
   }, 15_000);
 });
