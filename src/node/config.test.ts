@@ -1995,6 +1995,40 @@ describe("Config", () => {
         });
       }
 
+      // #6717/#4550: every row lookup and the task index resolve a repeated id to its first row,
+      // so the heal keeps that row. Keeping the second would turn this root into a child of ws-2.
+      it("keeps the first row's title and parent for a repeated id, and backs up the second", async () => {
+        const second = row("ws-1", { title: "child", parentWorkspaceId: "ws-2" });
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              [
+                "/home/u/repo",
+                { workspaces: [row("ws-1", { title: "root" }), second, row("ws-2")] },
+              ],
+            ],
+          })
+        );
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          await flushConfigEdits();
+          const saved = readSavedProjects()[0][1].workspaces as Array<Record<string, unknown>>;
+          expect(saved.map((w) => [w.id, w.title, w.parentWorkspaceId])).toEqual([
+            ["ws-1", "root", undefined],
+            ["ws-2", undefined, undefined],
+          ]);
+          const backups = aliasConflictBackups();
+          expect(backups).toHaveLength(1);
+          const backedUp = JSON.parse(fs.readFileSync(backups[0], "utf-8")) as {
+            projects: StoredPair[];
+          };
+          expect(backedUp.projects[0][1].workspaces).toContainEqual(second);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
       it("keeps one row and backs up the bytes for an identical copy inside one alias", async () => {
         // The alias merge keeps an identical copy once and records no conflict of its own.
         fs.writeFileSync(
