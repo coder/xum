@@ -38,9 +38,10 @@ export const WORKSPACE_VIEW_EARLY_SCRIPT = `(() => {
   let failed = false;
   const view = () => document.getElementById(${q(WORKSPACE_VIEW_ID)});
   const fail = () => { failed = true; view()?.remove(); };
-  // The app's modules download while the tail is in flight; only running them waits. Else a page
-  // with no view would start its downloads one tail round trip late (measured: LCP +218 ms on a
-  // tool-heavy seed, +32 ms with these preloads). Low priority, so the tail answer comes first.
+  // The app's modules download only once the app loads, never while the tail is in flight:
+  // Lighthouse's simulated LCP counts every request that starts before the paint, and early
+  // preloads took the seeded phone score from 92 to 78 on the VM. The cost: a page with no view
+  // starts its downloads one tail round trip late.
   let list = null;
   const preload = () => {
     if (list !== null) return list;
@@ -52,9 +53,9 @@ export const WORKSPACE_VIEW_EARLY_SCRIPT = `(() => {
       console.error("workspace view: no usable module list", error);
       return (list = false);
     }
-    for (const href of [...list.preload, list.script]) {
+    for (const href of list.preload) {
       const link = document.createElement("link");
-      Object.assign(link, { rel: "modulepreload", crossOrigin: "", fetchPriority: "low", href });
+      Object.assign(link, { rel: "modulepreload", crossOrigin: "", href });
       document.head.appendChild(link);
     }
     return list;
@@ -80,7 +81,6 @@ export const WORKSPACE_VIEW_EARLY_SCRIPT = `(() => {
   addEventListener("resize", () => phone() || view()?.remove());
   ${VIEW_BUILDER_SOURCE}
   const SKELETON = ${PHONE_CHROME_JSON};
-  preload();
   const token = new URLSearchParams(location.search).get("token")?.trim() || read(${q(AUTH_TOKEN_KEY)});
   const headers = { "Content-Type": "application/json", ...(token ? { Authorization: "Bearer " + token } : {}) };
   const abort = new AbortController();

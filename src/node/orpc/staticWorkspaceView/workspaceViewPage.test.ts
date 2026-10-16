@@ -95,6 +95,10 @@ function run(
     script: () => doc.querySelector('script[type="module"]')!,
     preloads: () =>
       [...doc.querySelectorAll("link[rel=modulepreload]")].map((l) => l.getAttribute("href")),
+    priorities: () =>
+      [...doc.querySelectorAll("link[rel=modulepreload]")].map(
+        (l) => (l as unknown as { fetchPriority?: string }).fetchPriority
+      ),
   };
 }
 
@@ -107,8 +111,8 @@ describe("the workspace view's early script", () => {
       ["http://127.0.0.1/api/workspace/history/tail", '{"workspaceId":"ws1"}'],
     ]);
     expect((page.calls[0].init.headers as Record<string, string>).Authorization).toBe("Bearer t1");
-    // The app downloads while the tail is in flight; it runs only after the view paints.
-    expect(page.preloads()).toEqual(["./api-B.js", "./main-A.js"]);
+    // Nothing of the app downloads before the view paints (Lighthouse counts it into LCP).
+    expect(page.preloads()).toEqual([]);
     expect(page.apps()).toBe(0);
     await page.answer(200, TAIL);
     expect(page.view()?.getAttribute("data-workspace-id")).toBe("ws1");
@@ -118,6 +122,9 @@ describe("the workspace view's early script", () => {
     expect(page.apps()).toBe(0);
     page.flushFrames();
     expect(page.apps()).toBe(1);
+    // With the app: plain preloads of its chunks (the module script itself needs none).
+    expect(page.preloads()).toEqual(["./api-B.js"]);
+    expect(page.priorities()).toEqual([undefined]);
     expect(page.timers.map((t) => [t.ms, t.cleared])).toEqual([
       [1600, true],
       [1000, true],
@@ -175,6 +182,7 @@ describe("the workspace view's early script", () => {
 
   test("with an unusable module list, a tail answer inserts no view", async () => {
     const page = run({ list: "{" });
+    page.timers[1].fn(); // the 1,000 ms app timer finds the list unusable
     await page.answer(200, TAIL);
     expect([page.view() === null, page.apps()]).toEqual([true, 0]);
   });
