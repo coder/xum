@@ -90,7 +90,8 @@ export const VIEW_BUILDER_SOURCE = `const buildWorkspaceView = (() => {
       if (!meta) return null;
       const slots = {
         md: () => md.flatMap((n) => build(n, false, () => [])),
-        ts: () => (row.timestamp === null ? [] : text(time(row.timestamp, now))),
+        // MessageWindow draws no time for a missing or zero timestamp.
+        ts: () => (row.timestamp ? text(time(row.timestamp, now)) : []),
         model: () => (row.role === "assistant" && row.model ? model(row.model) : []),
         actions: () => box(228, 44, true),
       };

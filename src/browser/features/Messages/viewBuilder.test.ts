@@ -164,6 +164,12 @@ describe("buildWorkspaceView", () => {
     expect(view.querySelector("[data-message-timestamp]")!.textContent).toBe(formatTimestamp(ms));
   });
 
+  test.each([null, 0])("draws no time for a timestamp of %p, as MessageWindow does", (ts) => {
+    const { build } = builder();
+    const view = build(skeleton, tail([row("x", true, { timestamp: ts })]), NOW)!;
+    expect(view.querySelector("[data-message-timestamp]")!.textContent).toBe("");
+  });
+
   test("an empty or malformed tail gives no view", () => {
     const { build } = builder();
     for (const bad of [null, {}, tail([]), { title: 1, rows: SEED }]) {
