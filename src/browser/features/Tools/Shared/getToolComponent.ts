@@ -31,7 +31,7 @@ import { IntuitionToolCall } from "../IntuitionToolCall";
 import { WebFetchToolCall } from "../WebFetchToolCall";
 import { WebSearchToolCall } from "../WebSearchToolCall";
 import { GoogleSearchToolCall } from "../GoogleSearchToolCall";
-import { AskUserQuestionToolCall } from "../AskUserQuestionToolCall";
+import { PlacedAskUserQuestionToolCall } from "../AskUserQuestionToolCall";
 import { ProposePlanToolCall } from "../ProposePlanToolCall";
 import { TodoToolCall } from "../TodoToolCall";
 import { StatusSetToolCall } from "../StatusSetToolCall";
@@ -97,7 +97,7 @@ const TOOL_REGISTRY: Record<string, AnyToolComponent> = {
   file_edit_replace_string: FileEditToolCall,
   file_edit_replace_lines: FileEditToolCall,
   file_edit_insert: FileEditToolCall,
-  ask_user_question: AskUserQuestionToolCall,
+  ask_user_question: PlacedAskUserQuestionToolCall,
   propose_plan: ProposePlanToolCall,
   todo_write: TodoToolCall,
   status_set: StatusSetToolCall,
