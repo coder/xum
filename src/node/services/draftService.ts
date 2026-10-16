@@ -756,7 +756,9 @@ export class DraftService extends EventEmitter {
         },
       }
     );
-    assert(revision !== undefined, "writeFileAtomic resolved without running afterRename");
+    // Unset only if the publish step threw before the revision (logged by writeFileAtomic): the
+    // write then rejects, and the client's retry publishes again.
+    assert(revision !== undefined, "the draft file was replaced but not published (see the log)");
     return revision;
   }
 

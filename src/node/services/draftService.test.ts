@@ -254,7 +254,6 @@ describe("DraftService", () => {
       fd: number,
       callback: cjsFs.NoParamCallback
     ) => {
-      // eslint-disable-next-line local/no-sync-fs-methods -- test seam: classify the fd at once.
       if (!cjsFs.fstatSync(fd).isDirectory()) return realFsync(fd, callback);
       void fsyncGate.then(() => realFsync(fd, callback));
     }) as typeof cjsFs.fsync);
