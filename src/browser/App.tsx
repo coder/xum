@@ -1560,6 +1560,7 @@ function AppInner() {
         <div className="mobile-main-content flex min-w-0 flex-1 flex-col overflow-hidden">
           <WindowsToolchainBanner toggleBarSpacer={bannerToggleBarSpacer} />
           <RosettaBanner toggleBarSpacer={bannerToggleBarSpacer} />
+          <WorkspaceViewGuard />
           <PageArea
             pageKey={
               selectedWorkspace || currentWorkspaceId
@@ -1571,7 +1572,6 @@ function AppInner() {
                     : "root"
             }
           >
-            <WorkspaceViewGuard />
             {/* Settings and analytics are modals over whatever page they were opened from, so the
                 page stays mounted underneath them. */}
             {selectedWorkspace ? (

@@ -6,7 +6,6 @@ import "../dom";
 import React from "react";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 
-let mockStatus = "connected";
 let mockRoute: string | null = "ws1";
 let mockMetadata = {
   workspaceMetadata: new Map([["ws1", {}]]),
@@ -14,10 +13,6 @@ let mockMetadata = {
   loaded: true,
   loadError: null as string | null,
 };
-jest.mock("@/browser/contexts/API", () => ({
-  ...jest.requireActual<typeof import("@/browser/contexts/API")>("@/browser/contexts/API"),
-  useAPI: () => ({ status: mockStatus }),
-}));
 jest.mock("@/browser/contexts/RouterContext", () => ({
   ...jest.requireActual<typeof import("@/browser/contexts/RouterContext")>(
     "@/browser/contexts/RouterContext"
@@ -35,11 +30,11 @@ import {
   WorkspaceViewGuard,
   useWorkspaceViewHandoff,
 } from "@/browser/features/StaticWorkspaceView/workspaceViewHandoff";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
 
 const viewShown = () => document.getElementById("xum-pre-ws") != null;
 
 beforeEach(() => {
-  mockStatus = "connected";
   mockRoute = "ws1";
   mockMetadata = {
     workspaceMetadata: new Map([["ws1", {}]]),
@@ -86,22 +81,14 @@ describe("the chat view's handoff", () => {
 
 describe("the app's guard", () => {
   test.each([
-    ["connecting", true],
-    ["connected", true],
-    ["auth_required", false],
-    ["error", false],
-    ["reconnecting", false],
-  ])("with status %s, the view stays: %s", (status, stays) => {
-    mockStatus = status;
-    render(React.createElement(WorkspaceViewGuard));
-    expect(viewShown()).toBe(stays);
-  });
-
-  test.each([
     ["the route shows another workspace", () => (mockRoute = "ws2")],
     ["the route shows another page", () => (mockRoute = null)],
     ["the workspace list loaded without it", () => mockMetadata.workspaceMetadata.clear()],
     ["the workspace list failed to load", () => (mockMetadata.loadError = "offline")],
+    [
+      "its runtime is incompatible, so AIView shows a warning instead of a chat view",
+      () => mockMetadata.workspaceMetadata.set("ws1", { incompatibleRuntime: "newer runtime" }),
+    ],
   ])("the view goes when %s", (_case, arrange) => {
     arrange();
     render(React.createElement(WorkspaceViewGuard));
@@ -123,6 +110,18 @@ describe("the app's guard", () => {
     expect(viewShown()).toBe(true);
     fire();
     expect(viewShown()).toBe(false);
+  });
+
+  test("a failed page's Reload fallback removes the view", () => {
+    const Broken = () => {
+      throw new Error("chunk failed");
+    };
+    const quiet = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    render(
+      React.createElement(LazyFeature, { name: "Page", children: React.createElement(Broken) })
+    );
+    expect(viewShown()).toBe(false);
+    quiet.mockRestore();
   });
 
   test("without a view on the page, the guard does nothing", () => {
