@@ -906,6 +906,38 @@ describe("Config", () => {
     });
   });
 
+  describe("agent resource limits setting", () => {
+    const readPersisted = () =>
+      (
+        JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+          agentResourceLimits?: unknown;
+        }
+      ).agentResourceLimits;
+
+    it("saves the limits that are set and removes the key once none is", async () => {
+      await config.updateAgentResourceLimits({ cpuCores: 2.5, memoryGiB: 8 });
+      expect(new Config(tempDir).loadConfigOrDefault().agentResourceLimits).toEqual({
+        cpuCores: 2.5,
+        memoryGiB: 8,
+      });
+
+      await config.updateAgentResourceLimits({ memoryGiB: 8 });
+      expect(readPersisted()).toEqual({ memoryGiB: 8 });
+
+      await config.updateAgentResourceLimits({});
+      expect(readPersisted()).toBeUndefined();
+      expect(new Config(tempDir).loadConfigOrDefault().agentResourceLimits).toBeUndefined();
+    });
+
+    it("ignores a hand-edited value outside the allowed range", () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ projects: [], agentResourceLimits: { cpuCores: 0, memoryGiB: 8 } })
+      );
+      expect(new Config(tempDir).loadConfigOrDefault().agentResourceLimits).toBeUndefined();
+    });
+  });
+
   describe("persistent sub-agent retention migration", () => {
     it.each([
       ["missing", undefined],

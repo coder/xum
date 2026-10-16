@@ -4,7 +4,9 @@ import * as os from "os";
 import * as path from "path";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
+import { setAgentCgroupEnrollmentTarget } from "./agentCgroupEnrollment";
 import type {
+  InitLogger,
   WorkspaceCreationParams,
   WorkspaceCreationResult,
   WorkspaceInitParams,
@@ -50,6 +52,12 @@ class TestLocalRuntime extends LocalBaseRuntime {
       workspacePath: "/tmp/workspace",
       sourceBranch: "main",
     });
+  }
+}
+
+class InitHookTestRuntime extends TestLocalRuntime {
+  runHook(workspacePath: string, hookPath: string, logger: InitLogger): Promise<void> {
+    return this.runInitHook(workspacePath, hookPath, {}, logger);
   }
 }
 
@@ -220,6 +228,56 @@ describe("LocalBaseRuntime.exec hostEnv", () => {
       } else {
         process.env.XUM_TEST_HOST_SECRET = original;
       }
+    }
+  });
+});
+
+describe("LocalBaseRuntime agent cgroup enrollment", () => {
+  it("moves each command's shell into the agent cgroup before the command runs", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-enroll-"));
+    const procsFile = path.join(dir, "cgroup.procs");
+    setAgentCgroupEnrollmentTarget(procsFile);
+    try {
+      const stream = await new TestLocalRuntime().exec("echo $$", { cwd: dir, timeout: 5 });
+      await stream.stdin.close();
+      const [stdout, exitCode] = await Promise.all([
+        readStreamAsString(stream.stdout),
+        stream.exitCode,
+      ]);
+
+      expect(exitCode).toBe(0);
+      expect(stdout).toMatch(/^\d+\n$/);
+      expect(await fs.readFile(procsFile, "utf-8")).toBe(stdout);
+    } finally {
+      setAgentCgroupEnrollmentTarget(null);
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("moves the init hook's shell into the agent cgroup", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-enroll-"));
+    const procsFile = path.join(dir, "cgroup.procs");
+    const hookPath = path.join(dir, "init");
+    await fs.writeFile(hookPath, '#!/usr/bin/env bash\necho "$$ $PPID"\n', { mode: 0o755 });
+    const stdoutLines: string[] = [];
+    const exitCodes: number[] = [];
+    const logger = {
+      logStep: () => undefined,
+      logStdout: (line: string) => stdoutLines.push(line),
+      logStderr: () => undefined,
+      logComplete: (exitCode: number) => exitCodes.push(exitCode),
+    };
+    setAgentCgroupEnrollmentTarget(procsFile);
+    try {
+      await new InitHookTestRuntime().runHook(dir, hookPath, logger);
+
+      expect(exitCodes).toEqual([0]);
+      // bash may run the hook as its own child or exec it in place.
+      const [hookPid, hookParentPid] = (stdoutLines[0] ?? "").split(" ");
+      expect([hookPid, hookParentPid]).toContain((await fs.readFile(procsFile, "utf-8")).trim());
+    } finally {
+      setAgentCgroupEnrollmentTarget(null);
+      await fs.rm(dir, { recursive: true, force: true });
     }
   });
 });

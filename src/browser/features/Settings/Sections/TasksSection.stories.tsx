@@ -27,6 +27,10 @@ export const Tasks: Story = {
       setup={() =>
         setupSettingsStory({
           taskSettings: { maxParallelAgentTasks: 2, maxTaskNestingDepth: 4 },
+          agentResourceLimits: {
+            limits: { cpuCores: 8, memoryGiB: 16 },
+            status: { state: "active", cgroup: "/xum/xum-agents" },
+          },
           // Reuse this story because the Pixel snapshot budget has no headroom.
           experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
           agentAiDefaults: {
@@ -58,10 +62,17 @@ export const Tasks: Story = {
       await expect(findAutoModelTriggers(canvasElement)).toHaveLength(2);
     });
 
+    await canvas.findByText(/Active: agents share 8 CPU cores and 16 GiB of memory/i);
+    await waitFor(async () => {
+      await expect(canvas.getByLabelText("CPU limit")).toHaveValue(8);
+      await expect(canvas.getByLabelText("Memory limit")).toHaveValue(16);
+    });
+
     await waitFor(() => {
+      // Task settings first, then the CPU and memory limits.
       const inputs = canvas.queryAllByRole("spinbutton");
-      if (inputs.length !== 2) {
-        throw new Error(`Expected 2 task settings inputs, got ${inputs.length}`);
+      if (inputs.length !== 4) {
+        throw new Error(`Expected 4 number inputs, got ${inputs.length}`);
       }
       const maxParallelAgentTasks = (inputs[0] as HTMLInputElement).value;
       const maxTaskNestingDepth = (inputs[1] as HTMLInputElement).value;

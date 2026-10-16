@@ -94,6 +94,7 @@ Use this index to find a page's:
   - **Configuration**
     - MCP Servers (`/config/mcp-servers`) → `references/docs/config/mcp-servers.mdx`: Extend agent capabilities with Model Context Protocol servers
     - Project Secrets (`/config/project-secrets`) → `references/docs/config/project-secrets.mdx`: Manage environment variables and API keys for your projects
+    - Agent Resource Limits (`/config/agent-resource-limits`) → `references/docs/config/agent-resource-limits.mdx`: Set one CPU and memory limit that all local agent commands share
     - Agentic Git Identity (`/config/agentic-git-identity`) → `references/docs/config/agentic-git-identity.mdx`: Configure a separate Git identity for AI-generated commits
     - Keyboard Shortcuts (`/config/keybinds`) → `references/docs/config/keybinds.mdx`: Complete keyboard shortcut reference for Xum
     - Notifications (`/config/notifications`) → `references/docs/config/notifications.mdx`: Configure how agents notify you about important events

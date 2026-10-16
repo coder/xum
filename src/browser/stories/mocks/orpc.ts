@@ -7,6 +7,8 @@ import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults, type GoalDefaults } from 
 import type { GoalBoardSnapshot } from "@/common/types/goal";
 import type { MCPSettingValue, MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
 import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
+import type { AgentResourceLimitsStatus } from "@/common/orpc/schemas/agentResourceLimits";
+import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
 import type { ExperimentId } from "@/common/constants/experiments";
 import type {
   MemoryConsolidationRecordPayload,
@@ -211,6 +213,8 @@ export interface MockORPCClientOptions {
   heartbeatDefaultIntervalMs?: number;
   /** Initial global goal defaults for config.getConfig */
   goalDefaults?: GoalDefaults;
+  /** Agent resource limits and their status (Settings → Agents); off when omitted. */
+  agentResourceLimits?: { limits: AgentResourceLimits; status: AgentResourceLimitsStatus };
   /** Initial auto-model-routing tiers for config.getConfig (defaults when omitted). */
   autoModelRouting?: AutoModelRoutingConfig;
   /**
@@ -554,6 +558,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     heartbeatDefaultPrompt: initialHeartbeatDefaultPrompt,
     heartbeatDefaultIntervalMs: initialHeartbeatDefaultIntervalMs,
     goalDefaults: initialGoalDefaults,
+    agentResourceLimits: initialAgentResourceLimits,
     autoModelRouting: initialAutoModelRouting,
     goalBoardSnapshots = new Map<string, GoalBoardSnapshot>(),
     timelineEvents = [],
@@ -739,6 +744,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let defaultRuntime: RuntimeEnablementId | null = initialDefaultRuntime ?? null;
   let heartbeatDefaultPrompt = initialHeartbeatDefaultPrompt;
   let heartbeatDefaultIntervalMs = initialHeartbeatDefaultIntervalMs;
+  let agentResourceLimitsState = initialAgentResourceLimits ?? {
+    limits: {},
+    status: { state: "off" as const },
+  };
   let goalDefaults = normalizeGoalDefaults(initialGoalDefaults ?? DEFAULT_GOAL_DEFAULTS);
   let autoModelRouting = normalizeAutoModelRoutingConfig(initialAutoModelRouting);
   let routePriority = [...initialRoutePriority];
@@ -2698,6 +2707,19 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             reason: `Unknown tool: ${input.toolName}`,
           },
         }),
+    },
+    agentResourceLimits: {
+      get: () => Promise.resolve(agentResourceLimitsState),
+      set: (limits: AgentResourceLimits) => {
+        agentResourceLimitsState = {
+          limits,
+          status:
+            limits.cpuCores === undefined && limits.memoryGiB === undefined
+              ? { state: "off" }
+              : { state: "active", cgroup: "/xum/xum-agents" },
+        };
+        return Promise.resolve(agentResourceLimitsState);
+      },
     },
     // Memory curation surfaces (Memory tab / Settings → Memory). Backed by
     // the `memoryFiles` option; mutations update the in-memory set so

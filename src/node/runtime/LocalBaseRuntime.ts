@@ -37,6 +37,7 @@ import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildShellExport } from "./shellEnv";
 import { hostChildEnv, sanitizeXumChildEnv } from "./childProcessEnv";
 import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
+import { agentCgroupEnrollmentLine } from "./agentCgroupEnrollment";
 
 /**
  * Acquire a regular file for ReadFileOptions.requireRegularFile.
@@ -250,7 +251,10 @@ export abstract class LocalBaseRuntime implements Runtime {
     const pathEnvPrelude = Object.entries(options.pathEnv ?? {})
       .map(([key, value]) => buildShellExport(key, path.resolve(cwd, expandTilde(value))))
       .join("\n");
-    const spawnArgs = ["-c", `${nonInteractivePrelude}\n${pathEnvPrelude}\n${command}`];
+    const spawnArgs = [
+      "-c",
+      `${agentCgroupEnrollmentLine()}${nonInteractivePrelude}\n${pathEnvPrelude}\n${command}`,
+    ];
 
     const defaultPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
     const callerEnv = options.env ?? {};
@@ -610,7 +614,8 @@ export abstract class LocalBaseRuntime implements Runtime {
 
     return new Promise<void>((resolve) => {
       const bashPath = getBashPath();
-      const proc = spawn(bashPath, ["-c", shellQuote(hookPath)], {
+      const script = `${agentCgroupEnrollmentLine()}${shellQuote(hookPath)}`;
+      const proc = spawn(bashPath, ["-c", script], {
         cwd: workspacePath,
         stdio: ["ignore", "pipe", "pipe"],
         env: {

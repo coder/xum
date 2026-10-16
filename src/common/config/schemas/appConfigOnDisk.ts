@@ -8,6 +8,7 @@ import { CODER_ARCHIVE_BEHAVIORS } from "../coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "../worktreeArchiveBehavior";
 import { UserPreferencesSchema } from "./userPreferences";
 import { TaskSettingsSchema } from "./taskSettings";
+import { AgentResourceLimitsSchema } from "./agentResourceLimits";
 import { SettingsBackupSchema } from "./settingsBackup";
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
@@ -170,6 +171,12 @@ export const AppConfigOnDiskSchema = z
     layoutPresets: z.unknown().optional(),
     userPreferences: UserPreferencesSchema.optional(),
     taskSettings: TaskSettingsSchema.optional(),
+    /**
+     * CPU and memory that all local agent processes share (Linux cgroup v2). Absent = no limit.
+     * `.catch`: a hand-edited value out of range degrades to no limit instead of failing the
+     * whole document.
+     */
+    agentResourceLimits: AgentResourceLimitsSchema.optional().catch(undefined),
     chatTranscriptFullWidth: z.boolean().optional(),
     muxGatewayEnabled: z.boolean().optional(),
     llmDebugLogs: z.boolean().optional(),

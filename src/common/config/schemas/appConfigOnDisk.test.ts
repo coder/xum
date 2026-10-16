@@ -125,6 +125,21 @@ describe("AppConfigOnDiskSchema", () => {
     }
   });
 
+  it("degrades out-of-range agent resource limits instead of rejecting the document", () => {
+    const kept = AppConfigOnDiskSchema.safeParse({ agentResourceLimits: { cpuCores: 2.5 } });
+    expect(kept.success && kept.data.agentResourceLimits).toEqual({ cpuCores: 2.5 });
+
+    const degraded = AppConfigOnDiskSchema.safeParse({
+      agentResourceLimits: { cpuCores: 0, memoryGiB: 8 },
+      defaultModel: "openai:gpt-4o",
+    });
+    expect(degraded.success).toBe(true);
+    if (degraded.success) {
+      expect(degraded.data.agentResourceLimits).toBeUndefined();
+      expect(degraded.data.defaultModel).toBe("openai:gpt-4o");
+    }
+  });
+
   it("degrades a damaged autoModelRouting block instead of rejecting the document", () => {
     const valid = {
       tiers: [

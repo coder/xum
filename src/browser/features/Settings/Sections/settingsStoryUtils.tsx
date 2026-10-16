@@ -10,7 +10,7 @@ import { UILayoutsProvider } from "@/browser/contexts/UILayoutsContext";
 import { WorkspaceProvider } from "@/browser/contexts/WorkspaceContext";
 import { selectWorkspace } from "@/browser/stories/helpers/uiState";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
-import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { createMockORPCClient, type MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import type { ExperimentId } from "@/common/constants/experiments";
@@ -115,6 +115,7 @@ interface SetupSettingsStoryOptions {
   heartbeatDefaultIntervalMs?: number;
   /** Initial global goal defaults for config.getConfig */
   goalDefaults?: GoalDefaults;
+  agentResourceLimits?: MockORPCClientOptions["agentResourceLimits"];
   /** Sessions shown in Settings → Server Access. */
   serverAuthSessions?: ServerAuthSession[];
   /** Initial backend experiment values for config.getConfig */
@@ -137,6 +138,7 @@ export function setupSettingsStory(options: SetupSettingsStoryOptions): APIClien
     heartbeatDefaultPrompt: options.heartbeatDefaultPrompt,
     heartbeatDefaultIntervalMs: options.heartbeatDefaultIntervalMs,
     goalDefaults: options.goalDefaults,
+    agentResourceLimits: options.agentResourceLimits,
     taskSettings: options.taskSettings,
     serverAuthSessions: options.serverAuthSessions,
     experiments: options.experiments,

@@ -58,6 +58,7 @@ import {
 } from "@/common/constants/paths";
 import { createBackendCpuProfiler } from "@/node/services/perf/backendCpuProfiler";
 import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
+import { AgentResourceLimitsService } from "@/node/services/agentResourceLimits/agentResourceLimitsService";
 import { PerfReportService } from "@/node/services/perf/perfReportService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
@@ -283,6 +284,8 @@ export class ServiceContainer {
   // "Report slowness" bundles (same experiment): writes only when asked.
   public readonly perfReports: PerfReportService;
   public readonly sessionTapes: SessionTapeFolderService;
+  // Constructed directly (no DI tag): it needs only the config and holds one config listener.
+  public readonly agentResourceLimits: AgentResourceLimitsService;
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
@@ -327,6 +330,7 @@ export class ServiceContainer {
     this.appFiberScope = get(AppFiberScopeTag);
     this.workflowRuntimeFactory = get(QuickJSRuntimeFactoryTag);
     this.config = get(ConfigTag);
+    this.agentResourceLimits = new AgentResourceLimitsService(this.config);
     this.perfCaptures = new PerfCaptureService({
       dir: getXumPerfCapturesDir(this.config.rootDir),
       recorder: this.perfFlightRecorder,
@@ -460,6 +464,13 @@ export class ServiceContainer {
     // Bash commands that outlived a restart still hold the proxy URL and key: bind the saved
     // port again before clients connect. Best-effort: a proxy problem never blocks startup.
     { name: "bashAiProxy.restore", run: () => this.bashAiProxy.restore(), bestEffort: true },
+    // Before task recovery, so commands of recovered tasks start under the agent resource limit.
+    // Best-effort: a limit that cannot apply is reported in Settings and never blocks startup.
+    {
+      name: "agentResourceLimits.start",
+      run: () => this.agentResourceLimits.start(),
+      bestEffort: true,
+    },
     // Best-effort: a slow or failing recovery (e.g. a large instance re-launching many tasks)
     // must not keep the server from starting, and a fatal timeout crash-loops under a supervisor
     // that restarts xum, re-driving the same partial recovery each time. The listener still waits
@@ -767,6 +778,7 @@ export class ServiceContainer {
       experimentsService: this.experimentsService,
       perfFlightRecorder: this.perfFlightRecorder,
       perfCaptures: this.perfCaptures,
+      agentResourceLimits: this.agentResourceLimits,
       perfReports: this.perfReports,
       sessionTapes: this.sessionTapes,
       sessionUsageService: this.sessionUsageService,
@@ -808,6 +820,7 @@ export class ServiceContainer {
     this.agentStatusService.stop();
     this.perfFlightRecorder.stop();
     await this.perfCaptures.dispose();
+    this.agentResourceLimits.dispose();
     this.idleCompactionService.stop();
     await this.browserBridgeServer.stop();
     await this.bashAiProxy.stop();
@@ -973,6 +986,7 @@ export class ServiceContainer {
     shutdownStep("agentStatusService.stop", () => this.agentStatusService.stop());
     shutdownStep("perfFlightRecorder.stop", () => this.perfFlightRecorder.stop());
     await shutdownStep("perfCaptures.dispose", () => this.perfCaptures.dispose());
+    shutdownStep("agentResourceLimits.dispose", () => this.agentResourceLimits.dispose());
     await shutdownStep("browserBridgeServer.stop", () => this.browserBridgeServer.stop());
     await shutdownStep("bashAiProxy.stop", () => this.bashAiProxy.stop());
     shutdownStep("browserSessionStateHub.dispose", () => this.browserSessionStateHub.dispose());

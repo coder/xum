@@ -96,6 +96,7 @@
             "pages": [
               "config/mcp-servers",
               "config/project-secrets",
+              "config/agent-resource-limits",
               "config/agentic-git-identity",
               "config/keybinds",
               "config/notifications",

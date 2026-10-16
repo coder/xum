@@ -183,6 +183,7 @@ export {
   mcp,
   memory,
   artifacts,
+  agentResourceLimits,
   mcpApps,
   refinements,
   secrets,

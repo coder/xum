@@ -13,6 +13,7 @@ import type {
 } from "@/common/config/schemas/appConfigOnDisk";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import type { SettingsBackup } from "@/common/config/schemas/settingsBackup";
+import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
 import type { z } from "zod";
 import type { ProjectConfigSchema, WorkspaceConfigSchema } from "../orpc/schemas";
 import type { AgentAiDefaults } from "./agentAiDefaults";
@@ -119,6 +120,8 @@ export interface ProjectsConfig {
   heartbeatDefaultPrompt?: string;
   /** Default heartbeat interval used when a workspace heartbeat does not set its own cadence. */
   heartbeatDefaultIntervalMs?: number;
+  /** CPU and memory that all local agent processes share (Linux cgroup v2). Absent = no limit. */
+  agentResourceLimits?: AgentResourceLimits;
   /** Global defaults for new workspace goals. */
   goalDefaults?: GoalDefaults;
   /** Default evaluation model for workflow `evaluate()` steps (Settings → Tasks & Workflows). */

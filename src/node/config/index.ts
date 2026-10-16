@@ -39,6 +39,10 @@ import {
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
 import { PREVIOUS_TASK_SETTINGS_DEFAULTS } from "@/common/config/schemas/taskSettings";
 import {
+  normalizeAgentResourceLimits,
+  type AgentResourceLimits,
+} from "@/common/config/schemas/agentResourceLimits";
+import {
   getDefaultAutoModelRoutingConfig,
   normalizeAutoModelRoutingConfig,
   type AutoModelRoutingConfigInput,
@@ -3130,6 +3134,7 @@ export class Config {
       heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
         parsed.heartbeatDefaultIntervalMs
       ),
+      agentResourceLimits: normalizeAgentResourceLimits(parsed.agentResourceLimits),
       goalDefaults: normalizeGoalDefaults(parsed.goalDefaults),
       evaluationDefaults: normalizeEvaluationDefaults(parsed.evaluationDefaults),
       muxGatewayModels,
@@ -3298,6 +3303,9 @@ export class Config {
       if (heartbeatDefaultIntervalMs !== undefined) {
         data.heartbeatDefaultIntervalMs = heartbeatDefaultIntervalMs;
       }
+
+      // Undefined (no limit set) leaves the key out of the JSON.
+      data.agentResourceLimits = normalizeAgentResourceLimits(config.agentResourceLimits);
 
       if (config.goalDefaults) {
         data.goalDefaults = normalizeGoalDefaults(config.goalDefaults);
@@ -3775,6 +3783,15 @@ export class Config {
     await this.editConfig((config) => {
       if (intervalMs != null) config.heartbeatDefaultIntervalMs = intervalMs;
       else delete config.heartbeatDefaultIntervalMs;
+      return config;
+    });
+  }
+
+  async updateAgentResourceLimits(limits: AgentResourceLimits): Promise<void> {
+    await this.editConfig((config) => {
+      const normalized = normalizeAgentResourceLimits(limits);
+      if (normalized) config.agentResourceLimits = normalized;
+      else delete config.agentResourceLimits;
       return config;
     });
   }
