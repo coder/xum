@@ -2,7 +2,14 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
+import { CONNECTION_LOST_MESSAGE } from "@/browser/contexts/connectionLink";
+import {
+  createControllableAsyncIterable,
+  createTestApiClient,
+  type ControllableAsyncIterable,
+  type TestApiOverrides,
+} from "@/browser/testUtils";
 import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
 import type { AgentResourceLimitsStatus } from "@/common/orpc/schemas/agentResourceLimits";
 import { AgentResourceLimitsSettings } from "./AgentResourceLimitsSettings";
@@ -10,6 +17,34 @@ import { AgentResourceLimitsSettings } from "./AgentResourceLimitsSettings";
 interface LimitsState {
   limits: AgentResourceLimits;
   status: AgentResourceLimitsStatus;
+}
+
+const ACTIVE: AgentResourceLimitsStatus = { state: "active", cgroup: "/xum/xum-agents" };
+
+/** The server's saved limits, the saves it receives, and its config change subscriptions. */
+function createServer(initial: LimitsState) {
+  let saved = initial;
+  const subscriptions: Array<ControllableAsyncIterable<undefined>> = [];
+  const set = mock((limits: AgentResourceLimits) => {
+    saved = { limits, status: ACTIVE };
+    return Promise.resolve(saved);
+  });
+  const overrides = (): TestApiOverrides<APIClient> => ({
+    agentResourceLimits: { get: () => Promise.resolve(saved), set },
+    config: {
+      onConfigChanged: () => {
+        const subscription = createControllableAsyncIterable<undefined>();
+        subscriptions.push(subscription);
+        return Promise.resolve(subscription.iterable);
+      },
+    },
+  });
+  /** Another window or backend saves `next`. */
+  const saveElsewhere = (next: LimitsState) => {
+    saved = next;
+    for (const subscription of subscriptions) subscription.push(undefined);
+  };
+  return { set, overrides, saveElsewhere };
 }
 
 // happy-dom does not deliver React's synthetic onChange for controlled fields, so call the
@@ -24,38 +59,51 @@ function typeInto(input: HTMLInputElement, value: string) {
   act(() => onChange({ target: { value } }));
 }
 
-function renderSettings(initial: LimitsState) {
-  const set = mock((limits: AgentResourceLimits) =>
-    Promise.resolve<LimitsState>({
-      limits,
-      status: { state: "active", cgroup: "/xum/xum-agents" },
-    })
-  );
-  const api = {
-    agentResourceLimits: { get: mock(() => Promise.resolve(initial)), set },
-  } satisfies TestApiOverrides<APIClient>;
-  const view = render(
-    <APIProvider client={createTestApiClient(api)}>
-      <AgentResourceLimitsSettings />
-    </APIProvider>
-  );
+function fields(view: ReturnType<typeof render>) {
   const cpu = () => view.getByLabelText("CPU limit") as HTMLInputElement;
   const memory = () => view.getByLabelText("Memory limit") as HTMLInputElement;
   const edit = (input: HTMLInputElement, value: string) => {
     typeInto(input, value);
     fireEvent.blur(input);
   };
-  return { ...view, set, cpu, memory, edit };
+  return { cpu, memory, edit };
 }
 
+function renderSettings(initial: LimitsState) {
+  const server = createServer(initial);
+  const view = render(
+    <APIProvider client={createTestApiClient(server.overrides())}>
+      <AgentResourceLimitsSettings />
+    </APIProvider>
+  );
+  return { ...view, ...fields(view), set: server.set, saveElsewhere: server.saveElsewhere };
+}
+
+let restoreDom: (() => void) | undefined;
+beforeEach(() => {
+  restoreDom = installDom();
+});
+afterEach(() => {
+  cleanup();
+  restoreDom?.();
+});
+
 describe("AgentResourceLimitsSettings", () => {
-  let restoreDom: (() => void) | undefined;
-  beforeEach(() => {
-    restoreDom = installDom();
-  });
-  afterEach(() => {
-    cleanup();
-    restoreDom?.();
+  test("follows limits saved elsewhere and keeps the field that is being edited", async () => {
+    const view = renderSettings({ limits: { cpuCores: 8, memoryGiB: 16 }, status: ACTIVE });
+    await waitFor(() => expect(view.cpu().value).toBe("8"));
+
+    typeInto(view.memory(), "32");
+    view.saveElsewhere({ limits: { cpuCores: 4, memoryGiB: 16 }, status: ACTIVE });
+
+    await waitFor(() => expect(view.cpu().value).toBe("4"));
+    expect(view.memory().value).toBe("32");
+    view.getByText(/Active: agents share 4 CPU cores and 16 GiB of memory/);
+
+    // The save keeps the CPU limit saved elsewhere.
+    fireEvent.blur(view.memory());
+    await waitFor(() => expect(view.set).toHaveBeenCalledTimes(1));
+    expect(view.set.mock.calls[0]?.[0]).toEqual({ cpuCores: 4, memoryGiB: 32 });
   });
 
   test("shows the saved limits and saves an edited field with the other one", async () => {
@@ -111,5 +159,33 @@ describe("AgentResourceLimitsSettings", () => {
     await waitFor(() => expect(view.set).toHaveBeenCalledTimes(1));
     expect(view.set.mock.calls[0]?.[0]).toEqual({ cpuCores: 2 });
     await view.findByText(/Active: agents share 2 CPU cores/);
+  });
+});
+
+describe.each([...GAP_MODES])("AgentResourceLimitsSettings while reconnecting (%s)", (mode) => {
+  test("saves no edit offline and shows the saved limits again after reconnecting", async () => {
+    const server = createServer({ limits: { cpuCores: 8 }, status: ACTIVE });
+    const harness = createConnectionHarness(mode, server.overrides);
+    const view = render(
+      <harness.Wrapper>
+        <AgentResourceLimitsSettings />
+      </harness.Wrapper>
+    );
+    const { cpu } = fields(view);
+    await waitFor(() => expect(cpu().value).toBe("8"));
+
+    typeInto(cpu(), "4");
+    await harness.drop();
+
+    await waitFor(() => expect(cpu().disabled).toBe(true));
+    // A blur that still reaches the field cannot save.
+    fireEvent.blur(cpu());
+    await view.findByText(CONNECTION_LOST_MESSAGE);
+    expect(server.set).not.toHaveBeenCalled();
+
+    harness.reconnect();
+    await waitFor(() => expect(cpu().value).toBe("8"));
+    expect(cpu().disabled).toBe(false);
+    expect(view.queryByText(CONNECTION_LOST_MESSAGE)).toBeNull();
   });
 });

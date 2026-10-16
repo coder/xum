@@ -2,7 +2,8 @@ import React, { useEffect, useState } from "react";
 import { Button } from "@/browser/components/Button/Button";
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import { Input } from "@/browser/components/Input/Input";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useLiveAPI, type APIClient } from "@/browser/contexts/API";
+import { CONNECTION_LOST_MESSAGE, isStreamFailure } from "@/browser/contexts/connectionLink";
 import {
   AGENT_RESOURCE_LIMITS_RANGE,
   type AgentResourceLimits,
@@ -76,7 +77,50 @@ function describeActiveLimits(limits: AgentResourceLimits): string {
   return parts.join(" and ");
 }
 
-function StatusLine(props: { state: LimitsState; onRetry: () => void }) {
+interface LimitsView {
+  /** The saved limits and their status, as the server last reported them. */
+  state: LimitsState;
+  drafts: Drafts;
+}
+
+/**
+ * The view once the server reports `next`. A field takes the new saved value unless its draft
+ * differs from the value saved before, so a change made elsewhere never replaces an edit in
+ * progress, and the next save sends the current value of the other field.
+ */
+function withAppliedLimits(view: LimitsView | null, next: LimitsState): LimitsView {
+  const drafts = draftsOf(next.limits);
+  for (const { field } of FIELDS) {
+    if (view !== null && parseLimit(field, view.drafts[field]) !== view.state.limits[field]) {
+      drafts[field] = view.drafts[field];
+    }
+  }
+  return { state: next, drafts };
+}
+
+function withDraft(view: LimitsView | null, field: LimitField, draft: string): LimitsView | null {
+  return view && { ...view, drafts: { ...view.drafts, [field]: draft } };
+}
+
+/** Load the limits, and again after every config change, until `signal` aborts. */
+async function followAppliedLimits(
+  api: APIClient,
+  signal: AbortSignal,
+  onLoaded: (state: LimitsState) => void
+): Promise<void> {
+  const load = async () => {
+    const state = await api.agentResourceLimits.get();
+    if (!signal.aborted) onLoaded(state);
+  };
+  // Load only once the subscription is live, so a change made during the load loads again.
+  const changes = await api.config.onConfigChanged(undefined, { signal });
+  await load();
+  for await (const _ of changes) {
+    await load();
+  }
+}
+
+function StatusLine(props: { state: LimitsState; disabled: boolean; onRetry: () => void }) {
   const { limits, status } = props.state;
   if (status.state === "off") {
     return <div className="text-muted text-xs">No limit is set.</div>;
@@ -92,48 +136,52 @@ function StatusLine(props: { state: LimitsState; onRetry: () => void }) {
   return (
     <div className="flex flex-wrap items-center gap-2 text-xs">
       <span className="text-danger-light">Not applied: {status.reason}</span>
-      <Button variant="outline" size="xs" onClick={props.onRetry}>
+      <Button variant="outline" size="xs" disabled={props.disabled} onClick={props.onRetry}>
         Try again
       </Button>
     </div>
   );
 }
 
-/** The saved limits with their status, and the drafts of the two fields. */
+/**
+ * The saved limits with their status and the drafts of the two fields, following changes made
+ * elsewhere. Offline the fields are disabled, since a save could not reach the server.
+ */
 function useAgentResourceLimits() {
-  const { api } = useAPI();
   const liveApi = useLiveAPI();
-  const [state, setState] = useState<LimitsState | null>(null);
-  const [drafts, setDrafts] = useState<Drafts>(draftsOf({}));
+  const [view, setView] = useState<LimitsView | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const request = api?.agentResourceLimits?.get();
-    if (!request) {
+    // API doubles in tests of other settings can omit this namespace.
+    if (liveApi?.agentResourceLimits == null) {
       return;
     }
-    let cancelled = false;
-    request
-      .then((loaded) => {
-        if (cancelled) return;
-        setState(loaded);
-        setDrafts(draftsOf(loaded.limits));
-      })
-      .catch((loadError: unknown) => {
-        if (!cancelled) {
-          setError(`Failed to load agent resource limits: ${getErrorMessage(loadError)}`);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [api]);
+    const controller = new AbortController();
+    let loaded = false;
+    followAppliedLimits(liveApi, controller.signal, (next) => {
+      // Each connection starts from the saved limits: an edit kept from before would look saved.
+      const reset = !loaded;
+      loaded = true;
+      setView((current) => withAppliedLimits(reset ? null : current, next));
+      if (reset) setError(null);
+    }).catch((loadError: unknown) => {
+      if (isStreamFailure(loadError, controller.signal)) {
+        setError(`Failed to load agent resource limits: ${getErrorMessage(loadError)}`);
+      }
+    });
+    return () => controller.abort();
+  }, [liveApi]);
 
   const save = (limits: AgentResourceLimits) => {
-    liveApi?.agentResourceLimits
-      ?.set(limits)
+    if (liveApi == null) {
+      setError(CONNECTION_LOST_MESSAGE);
+      return;
+    }
+    liveApi.agentResourceLimits
+      .set(limits)
       .then((saved) => {
-        setState(saved);
+        setView((current) => withAppliedLimits(current, saved));
         setError(null);
       })
       .catch((saveError: unknown) => {
@@ -141,24 +189,27 @@ function useAgentResourceLimits() {
       });
   };
 
-  return { state, drafts, setDrafts, error, setError, save };
+  const setDraft = (field: LimitField, draft: string) =>
+    setView((current) => withDraft(current, field, draft));
+
+  return { view, setDraft, error, setError, save, disabled: view === null || liveApi == null };
 }
 
 /** Settings > Agents: one CPU and memory limit that all local agent processes share. */
 export function AgentResourceLimitsSettings() {
-  const { state, drafts, setDrafts, error, setError, save } = useAgentResourceLimits();
+  const { view, setDraft, error, setError, save, disabled } = useAgentResourceLimits();
 
   const handleBlur = () => {
-    if (!state) {
+    if (!view) {
       return;
     }
-    const parsed = parseDrafts(drafts);
+    const parsed = parseDrafts(view.drafts);
     if ("error" in parsed) {
       setError(parsed.error);
       return;
     }
     setError(null);
-    if (!sameLimits(parsed.limits, state.limits)) {
+    if (!sameLimits(parsed.limits, view.state.limits)) {
       save(parsed.limits);
     }
   };
@@ -191,12 +242,12 @@ export function AgentResourceLimitsSettings() {
                   max={range.max}
                   step={step}
                   placeholder="None"
-                  value={drafts[field]}
+                  value={view?.drafts[field] ?? ""}
                   onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
-                    setDrafts((current) => ({ ...current, [field]: event.target.value }))
+                    setDraft(field, event.target.value)
                   }
                   onBlur={handleBlur}
-                  disabled={state === null}
+                  disabled={disabled}
                   className="border-border-medium bg-background-secondary h-9 w-24 text-right"
                 />
                 <span className="text-muted w-10 text-sm">{unit}</span>
@@ -204,7 +255,13 @@ export function AgentResourceLimitsSettings() {
             </div>
           );
         })}
-        {state ? <StatusLine state={state} onRetry={() => save(state.limits)} /> : null}
+        {view ? (
+          <StatusLine
+            state={view.state}
+            disabled={disabled}
+            onRetry={() => save(view.state.limits)}
+          />
+        ) : null}
         {error ? <div className="text-danger-light text-xs">{error}</div> : null}
       </div>
     </div>

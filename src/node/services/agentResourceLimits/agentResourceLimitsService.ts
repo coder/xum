@@ -39,7 +39,9 @@ export class AgentResourceLimitsService {
     this.unsubscribe = undefined;
   }
 
-  get(): AgentResourceLimitsState {
+  /** The saved limits and their status, after the applies queued so far. */
+  async get(): Promise<AgentResourceLimitsState> {
+    await this.applying;
     return { limits: this.readLimits(), status: this.status };
   }
 
@@ -58,25 +60,37 @@ export class AgentResourceLimitsService {
 
   private apply(): Promise<void> {
     this.applying = this.applying.then(async () => {
+      const previous = this.status;
       try {
         const limits = this.readLimits();
         const key = JSON.stringify(limits);
-        if (key === this.appliedLimits) {
+        // Limits that failed to apply retry on any config change: Try again in another
+        // backend's Settings saves them unchanged, and this backend sees only the change.
+        if (key === this.appliedLimits && previous.state !== "unavailable") {
           return;
         }
         this.appliedLimits = key;
         const result = await applyAgentCgroupLimits(limits, this.host);
         this.status = result.status;
         setAgentCgroupEnrollmentTarget(result.enrollmentTarget);
-        if (result.status.state === "unavailable") {
-          log.warn("Agent resource limits are not applied", { reason: result.status.reason });
-        }
       } catch (error) {
         this.status = { state: "unavailable", reason: getErrorMessage(error) };
         setAgentCgroupEnrollmentTarget(null);
-        log.error("Failed to apply agent resource limits", { error: getErrorMessage(error) });
+      }
+      if (isNewFailure(previous, this.status)) {
+        log.warn("Agent resource limits are not applied", { reason: this.status.reason });
       }
     });
     return this.applying;
   }
+}
+
+function isNewFailure(
+  previous: AgentResourceLimitsStatus,
+  next: AgentResourceLimitsStatus
+): next is Extract<AgentResourceLimitsStatus, { state: "unavailable" }> {
+  return (
+    next.state === "unavailable" &&
+    (previous.state !== "unavailable" || previous.reason !== next.reason)
+  );
 }

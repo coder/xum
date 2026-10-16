@@ -4,7 +4,6 @@ import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceL
 import type { AgentResourceLimitsStatus } from "@/common/orpc/schemas/agentResourceLimits";
 import { getErrorMessage } from "@/common/utils/errors";
 import { agentCgroupEnrollmentLine } from "@/node/runtime/agentCgroupEnrollment";
-import { log } from "@/node/services/log";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { getBashPath } from "@/node/utils/main/bashPath";
@@ -90,9 +89,10 @@ export async function applyAgentCgroupLimits(
     try {
       await clearAgentCgroupLimits(host);
     } catch (error) {
-      log.warn("Failed to remove the agent resource limits from the agent cgroup", {
-        error: getErrorMessage(error),
-      });
+      // Agent processes still in xum-agents keep the old limits, so report them as a failure.
+      return unavailable(
+        `Could not remove the limits from the agent cgroup: ${getErrorMessage(error)}`
+      );
     }
     return { status: { state: "off" }, enrollmentTarget: null };
   }

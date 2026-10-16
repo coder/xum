@@ -37,6 +37,14 @@ describe("AgentResourceLimitsService", () => {
 
   const cpuMax = () => tree.read("xum/xum-agents", "cpu.max");
   const procsFile = () => path.join(tree.root, "xum", "xum-agents", "cgroup.procs");
+  /** The fake host, but reading /proc/self/cgroup fails while `failing()` is true. */
+  const hostFailingWhile = (failing: () => boolean): AgentCgroupHost => ({
+    ...tree.host,
+    readSelfCgroup: () =>
+      failing()
+        ? Promise.reject(new Error("cannot read /proc/self/cgroup"))
+        : tree.host.readSelfCgroup(),
+  });
 
   it("applies the saved limits at start and again when the setting changes", async () => {
     await config.updateAgentResourceLimits({ cpuCores: 2 });
@@ -44,7 +52,7 @@ describe("AgentResourceLimitsService", () => {
 
     await service.start();
 
-    expect(service.get()).toEqual({
+    expect(await service.get()).toEqual({
       limits: { cpuCores: 2 },
       status: { state: "active", cgroup: "/xum/xum-agents" },
     });
@@ -56,9 +64,22 @@ describe("AgentResourceLimitsService", () => {
     await waitForCondition(async () => (await cpuMax()) === "400000 100000");
 
     await config.updateAgentResourceLimits({});
-    await waitForCondition(() => service?.get().status.state === "off");
+    expect((await service.get()).status).toEqual({ state: "off" });
     expect(await cpuMax()).toBe("max 100000");
     expect(agentCgroupEnrollmentLine()).toBe("");
+  });
+
+  it("reports the status of limits that a config change is still applying", async () => {
+    service = new AgentResourceLimitsService(config, tree.host);
+    await service.start();
+
+    // Settings reloads the limits after each config change, while the apply may still run.
+    await config.updateAgentResourceLimits({ cpuCores: 4 });
+
+    expect(await service.get()).toEqual({
+      limits: { cpuCores: 4 },
+      status: { state: "active", cgroup: "/xum/xum-agents" },
+    });
   });
 
   it("does not touch the cgroup when an unrelated setting changes", async () => {
@@ -77,7 +98,7 @@ describe("AgentResourceLimitsService", () => {
   it("saves and applies the limits it is given", async () => {
     service = new AgentResourceLimitsService(config, tree.host);
     await service.start();
-    expect(service.get().status).toEqual({ state: "off" });
+    expect((await service.get()).status).toEqual({ state: "off" });
 
     const state = await service.set({ cpuCores: 1.5, memoryGiB: 2 });
 
@@ -103,14 +124,10 @@ describe("AgentResourceLimitsService", () => {
 
   it("reports a failed apply and stops moving new commands into the old cgroup", async () => {
     let failing = false;
-    const host: AgentCgroupHost = {
-      ...tree.host,
-      readSelfCgroup: () =>
-        failing
-          ? Promise.reject(new Error("cannot read /proc/self/cgroup"))
-          : tree.host.readSelfCgroup(),
-    };
-    service = new AgentResourceLimitsService(config, host);
+    service = new AgentResourceLimitsService(
+      config,
+      hostFailingWhile(() => failing)
+    );
     await service.set({ cpuCores: 2 });
     expect(agentCgroupEnrollmentLine()).toContain(procsFile());
 
@@ -125,6 +142,24 @@ describe("AgentResourceLimitsService", () => {
     const retried = await service.set({ cpuCores: 3 });
 
     expect(retried.status).toEqual({ state: "active", cgroup: "/xum/xum-agents" });
+    expect(agentCgroupEnrollmentLine()).toContain(procsFile());
+  });
+
+  it("retries limits it could not apply when another backend saves them again", async () => {
+    let failing = true;
+    service = new AgentResourceLimitsService(
+      config,
+      hostFailingWhile(() => failing)
+    );
+    await service.start();
+    expect((await service.set({ cpuCores: 3 })).status.state).toBe("unavailable");
+
+    // Try again in another backend's Settings saves the same limits, which this backend sees
+    // only as a config change.
+    failing = false;
+    await config.updateAgentResourceLimits({ cpuCores: 3 });
+
+    expect((await service.get()).status.state).toBe("active");
     expect(agentCgroupEnrollmentLine()).toContain(procsFile());
   });
 });

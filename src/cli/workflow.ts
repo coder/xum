@@ -25,6 +25,7 @@ import { resolveThinkingInput } from "@/common/utils/thinking/policy";
 import { createConfigStores } from "@/node/config";
 import type { Config, ConfigStores } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { AgentResourceLimitsService } from "@/node/services/agentResourceLimits/agentResourceLimitsService";
 import { AgentSession } from "@/node/services/agentSession";
 import { CodexOauthService } from "@/node/services/codexOauthService";
 import { CoderOauthService } from "@/node/services/coderOauthService";
@@ -98,6 +99,7 @@ interface WorkflowContext {
   codexOauthService: CodexOauthService;
   coderOauthService: CoderOauthService;
   realProviderService: ProviderService;
+  agentResourceLimits: AgentResourceLimitsService;
 }
 
 export async function parseWorkflowArgs(input: ParseWorkflowArgsInput): Promise<unknown> {
@@ -230,6 +232,7 @@ async function disposeWorkflowResources(input: {
   codexOauthService?: CodexOauthService;
   coderOauthService?: CoderOauthService;
   realProviderService?: ProviderService;
+  agentResourceLimits?: AgentResourceLimitsService;
 }): Promise<void> {
   const services = input.services;
   // Same shape as `xum run`'s list: every step is contained, reported, and
@@ -239,6 +242,7 @@ async function disposeWorkflowResources(input: {
       // First: stop the config.json watches before the services go, so no watch callback
       // reaches a torn-down service. A failed setup stops them too.
       { name: "config.stopWatchingConfigFile", run: () => input.config.stopWatchingConfigFile() },
+      { name: "agentResourceLimits.dispose", run: () => input.agentResourceLimits?.dispose() },
       ...(services
         ? [
             // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
@@ -286,6 +290,7 @@ async function disposeWorkflowContext(ctx: WorkflowContext): Promise<void> {
     codexOauthService: ctx.codexOauthService,
     coderOauthService: ctx.coderOauthService,
     realProviderService: ctx.realProviderService,
+    agentResourceLimits: ctx.agentResourceLimits,
   });
 }
 
@@ -303,6 +308,7 @@ async function createWorkflowContext(options: {
   let codexOauthService: CodexOauthService | undefined;
   let coderOauthService: CoderOauthService | undefined;
   let realProviderService: ProviderService | undefined;
+  let agentResourceLimits: AgentResourceLimitsService | undefined;
   try {
     const realStores = createConfigStores();
     const realConfig = realStores.config;
@@ -348,6 +354,10 @@ async function createWorkflowContext(options: {
       realProviderService
     );
     services.turnRequestBuilderBindings.coderOauthService = coderOauthService;
+    // The workflow's agent commands start from this process, so it applies the limits that
+    // Settings saved in the real config, as the server does.
+    agentResourceLimits = new AgentResourceLimitsService(realConfig);
+    await agentResourceLimits.start();
 
     // Const capture: `services` is a `let`, so the deferred sanitize closure
     // below would lose TypeScript's definite-assignment narrowing.
@@ -402,6 +412,7 @@ async function createWorkflowContext(options: {
       codexOauthService,
       coderOauthService,
       realProviderService,
+      agentResourceLimits,
     };
   } catch (error) {
     await disposeWorkflowResources({
@@ -412,6 +423,7 @@ async function createWorkflowContext(options: {
       codexOauthService,
       coderOauthService,
       realProviderService,
+      agentResourceLimits,
     });
     throw error;
   }

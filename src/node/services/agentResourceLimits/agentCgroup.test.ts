@@ -111,6 +111,33 @@ describe("applyAgentCgroupLimits", () => {
     expect(await tree.read("xum/xum-agents", "memory.max")).toBe("max");
   });
 
+  it("reports limits it could not remove, since they still bind the agents in xum-agents", async () => {
+    let denied = false;
+    tree = await createFakeCgroupTree({
+      own: "/xum",
+      cgroups: { xum: { controllers: "cpu" } },
+      beforeWrite: (file) => {
+        if (!denied || !file.endsWith("cpu.max")) return undefined;
+        const error: NodeJS.ErrnoException = new Error("EACCES: permission denied");
+        error.code = "EACCES";
+        return error;
+      },
+    });
+    await applyAgentCgroupLimits({ cpuCores: 2 }, tree.host);
+    denied = true;
+
+    const result = await applyAgentCgroupLimits({}, tree.host);
+
+    expect(result).toEqual({
+      status: {
+        state: "unavailable",
+        reason: "Could not remove the limits from the agent cgroup: EACCES: permission denied",
+      },
+      enrollmentTarget: null,
+    });
+    expect(await tree.read("xum/xum-agents", "cpu.max")).toBe("200000 100000");
+  });
+
   it("touches nothing when no limit is set and xum never created xum-agents", async () => {
     tree = await createFakeCgroupTree({
       own: "/xum",
