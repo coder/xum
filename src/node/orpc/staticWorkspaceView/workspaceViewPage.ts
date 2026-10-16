@@ -33,7 +33,11 @@ export const WORKSPACE_VIEW_TAIL_ABORT_MS = 1_600;
 export const WORKSPACE_VIEW_EARLY_SCRIPT = `(() => {
   const m = /\\/workspace\\/([^/]+)$/.exec(location.pathname);
   let loaded = false;
+  // A failed app (an unusable module list, a module error) can come before a late tail answer,
+  // which then must not insert a view that nothing would remove.
+  let failed = false;
   const view = () => document.getElementById(${q(WORKSPACE_VIEW_ID)});
+  const fail = () => { failed = true; view()?.remove(); };
   // The app's modules download while the tail is in flight; only running them waits. Else a page
   // with no view would start its downloads one tail round trip late (measured: LCP +218 ms on a
   // tool-heavy seed, +32 ms with these preloads). Low priority, so the tail answer comes first.
@@ -44,7 +48,7 @@ export const WORKSPACE_VIEW_EARLY_SCRIPT = `(() => {
       list = JSON.parse(document.getElementById(${q(FIRST_RUN_MODULES_ID)}).textContent);
       if (typeof list.script !== "string" || !Array.isArray(list.preload)) throw new Error("bad list");
     } catch (error) {
-      view()?.remove();
+      fail();
       console.error("workspace view: no usable module list", error);
       return (list = false);
     }
@@ -61,7 +65,7 @@ export const WORKSPACE_VIEW_EARLY_SCRIPT = `(() => {
     if (!preload()) return;
     const script = document.createElement("script");
     Object.assign(script, { type: "module", crossOrigin: "", src: list.script });
-    script.addEventListener("error", () => view()?.remove());
+    script.addEventListener("error", fail);
     const start = () => document.head.appendChild(script);
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
     else start();
@@ -88,7 +92,7 @@ export const WORKSPACE_VIEW_EARLY_SCRIPT = `(() => {
     .then((tail) => {
       clearTimeout(abortTimer);
       const insert = () => {
-        const built = document.documentElement.hasAttribute(${q(WORKSPACE_VIEW_APP_STARTED_ATTR)}) || !phone()
+        const built = failed || document.documentElement.hasAttribute(${q(WORKSPACE_VIEW_APP_STARTED_ATTR)}) || !phone()
           ? null : buildWorkspaceView(SKELETON, tail, Date.now());
         if (!built) return loadApp();
         const root = document.createElement("div");

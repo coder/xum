@@ -25,15 +25,24 @@ const ROW = (
 const TAIL = { title: "seed", project: "p", rows: [ROW("user"), ROW("assistant")] };
 
 function run(
-  o: { path?: string; width?: number; coarse?: boolean; hidden?: boolean; sidebar?: string } = {}
+  o: {
+    path?: string;
+    width?: number;
+    coarse?: boolean;
+    hidden?: boolean;
+    sidebar?: string;
+    list?: string;
+  } = {}
 ) {
   const window = new GlobalWindow({
     url: `http://127.0.0.1${o.path ?? "/workspace/ws1?token=t1"}`,
+    // The app's module "loads" without a fetch; tests dispatch its error themselves.
+    settings: { disableJavaScriptFileLoading: true, handleDisabledFileLoadingAsSuccess: true },
   });
   dom = window;
   const doc = window.document as unknown as Document;
   // The server injects the view only after a <base>, which the POST URL resolves against.
-  doc.head.innerHTML = `<base href="../"><script type="application/json" id="${FIRST_RUN_MODULES_ID}">{"script":"./main-A.js","preload":["./api-B.js"]}</script>`;
+  doc.head.innerHTML = `<base href="../"><script type="application/json" id="${FIRST_RUN_MODULES_ID}">${o.list ?? '{"script":"./main-A.js","preload":["./api-B.js"]}'}</script>`;
   window.localStorage.setItem(AUTH_TOKEN_KEY, "saved");
   if (o.sidebar) window.localStorage.setItem(LEFT_SIDEBAR_COLLAPSED_KEY, o.sidebar);
   Object.defineProperty(doc, "visibilityState", { get: () => (o.hidden ? "hidden" : "visible") });
@@ -153,6 +162,21 @@ describe("the workspace view's early script", () => {
     expect(page.apps()).toBe(1);
     await page.answer(200, TAIL);
     expect(page.view() === null).toBe(false);
+  });
+
+  // The app timer loads the app while the tail is slow; a failure before the answer must stick.
+  test("after a module error, a late tail answer inserts no view", async () => {
+    const page = run();
+    page.timers[1].fn(); // the 1,000 ms app timer
+    page.script().dispatchEvent(new (dom!.Event as unknown as typeof Event)("error"));
+    await page.answer(200, TAIL);
+    expect(page.view() === null).toBe(true);
+  });
+
+  test("with an unusable module list, a tail answer inserts no view", async () => {
+    const page = run({ list: "{" });
+    await page.answer(200, TAIL);
+    expect([page.view() === null, page.apps()]).toEqual([true, 0]);
   });
 
   test("a resize out of the phone widths and a failed app module remove the view", async () => {
