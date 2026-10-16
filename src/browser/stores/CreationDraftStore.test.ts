@@ -61,6 +61,7 @@ async function createHarness(
     /** Saves the backend applies whose reply is then lost. */
     loseUpdateReplies: 0,
     readError: null as Error | null,
+    failReads: 0,
     readGate: Promise.resolve(),
     listGate: Promise.resolve(),
   };
@@ -72,6 +73,10 @@ async function createHarness(
     getCreation: async ({ scope }: { scope: CreationDraftScope }) => {
       await control.readGate;
       if (control.readError) throw control.readError;
+      if (control.failReads > 0) {
+        control.failReads--;
+        throw new Error("connection lost");
+      }
       return service.get(scope.draftId);
     },
     updateCreation: async (input: CreationDraftUpdateInput) => {
@@ -202,7 +207,7 @@ describe("CreationDraftStore", () => {
     expect((await reopen(harness, id, PROJECT_A)).getView(id).draft?.text).toBe("keep me");
   });
 
-  test("a save lost with a replaced connection is retried on the new one", async () => {
+  test("a save or read lost with a replaced connection is retried on the new one", async () => {
     using tempDir = new TestTempDir("creation-store-save-across-reconnect");
     const harness = await createHarness(tempDir);
     const { store, control, service } = harness;
@@ -214,12 +219,29 @@ describe("CreationDraftStore", () => {
     });
     control.failUpdates = 1;
     store.update(id, { text: "typed before the drop" });
-    const flushed = store.flush(id).catch(() => undefined);
+    // Send awaits this flush: it resolves once the new connection saved the edit.
+    const flushed = store.flush(id);
     store.setClient(harness.newClient());
     releaseSave();
     await flushed;
-    await waitFor(() => store.getView(id).saveError === null && !store.getView(id).unsaved);
+    expect(store.getView(id)).toMatchObject({ saveError: null, unsaved: false });
     expect((await service.get(id))?.text).toBe("typed before the drop");
+
+    let releaseRead: () => void = () => undefined;
+    control.readGate = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    control.failReads = 1;
+    const reader = new CreationDraftStore();
+    reader.setClient(harness.newClient());
+    reader.open(id, PROJECT_A);
+    reader.setClient(harness.newClient());
+    releaseRead();
+    await waitFor(() => reader.getView(id).load.status !== "loading");
+    expect(reader.getView(id)).toMatchObject({
+      load: { status: "ready" },
+      draft: { text: "typed before the drop" },
+    });
   });
 
   test("a failed or timed-out read shows Retry and never an editable blank draft", async () => {

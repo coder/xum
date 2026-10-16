@@ -417,6 +417,11 @@ export class CreationDraftStore {
     run().catch((error: unknown) => {
       const entry = this.entries.get(id);
       if (entry?.load.status !== "loading") return;
+      // Lost with a connection that was replaced meanwhile (the reconnect skipped it as loading).
+      if (this.client && this.client !== client) {
+        this.fetch(id);
+        return;
+      }
       entry.load = { status: "loadFailed", message: getErrorMessage(error) };
       this.recompute(id, entry);
     });
@@ -522,13 +527,9 @@ export class CreationDraftStore {
       if (this.entries.get(id) !== entry) return;
       // Later edits win over the fields this save carried.
       entry.pending = { ...patch, ...entry.pending };
-      entry.saveError = getErrorMessage(error);
-      // Lost with a connection that was replaced meanwhile: the reconnect saw no error to retry.
-      if (this.client && this.client !== client) {
-        this.recompute(id, entry);
-        this.flushInBackground(id);
-        return;
-      }
+      // Lost with a connection that was replaced meanwhile: no error, so flush() saves it again on
+      // the new one (a Send awaiting it waits for that save instead of failing).
+      entry.saveError = this.client && this.client !== client ? null : getErrorMessage(error);
     }
     this.recompute(id, entry);
   }
