@@ -738,16 +738,25 @@ export class DraftService extends EventEmitter {
     const file = { version: DRAFT_FILE_VERSION };
     const { pendingSends, ...legacy } = draft;
     await fs.mkdir(path.dirname(filePath), { recursive: true });
+    let revision: number | undefined;
     await writeFileAtomic(
       filePath,
-      JSON.stringify({ ...file, ...legacy, ...(pendingSends.length > 0 ? { pendingSends } : {}) })
+      JSON.stringify({ ...file, ...legacy, ...(pendingSends.length > 0 ? { pendingSends } : {}) }),
+      {
+        // Publish when the file becomes visible, not after the directory fsync: get() reads the
+        // file, and a snapshot (list) reads the index, so both switch to the new draft at once
+        // (#6728). The reply below still waits for the fsync.
+        afterRename: () => {
+          this.scanTouched?.add(key);
+          revision = this.bumpRevision(key);
+          const summary = summarizeDraft(scope, viewOf(draft), revision, pendingSends);
+          this.index.set(key, { summary, filePath });
+          const event: DraftEvent = { type: "changed", ...summary };
+          this.emit(DraftService.CHANGE_EVENT, event);
+        },
+      }
     );
-    this.scanTouched?.add(key);
-    const revision = this.bumpRevision(key);
-    const summary = summarizeDraft(scope, viewOf(draft), revision, pendingSends);
-    this.index.set(key, { summary, filePath });
-    const event: DraftEvent = { type: "changed", ...summary };
-    this.emit(DraftService.CHANGE_EVENT, event);
+    assert(revision !== undefined, "writeFileAtomic resolved without running afterRename");
     return revision;
   }
 

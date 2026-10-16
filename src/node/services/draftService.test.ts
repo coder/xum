@@ -230,6 +230,60 @@ describe("DraftService", () => {
     }
   });
 
+  // #6728: a write published its draft to the index (what a snapshot lists) and its change event
+  // only after the directory fsync, but get() reads the renamed file at once. A window that
+  // subscribed during that fsync showed the old draft. Now all readers switch at the rename, and
+  // the write's reply still waits for the fsync.
+  it("a snapshot during a write's directory fsync shows what get() shows", async () => {
+    using tempDir = new TestTempDir("drafts-snapshot-during-fsync");
+    const { config } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.update({ scope: WORKSPACE_SCOPE, text: "old" });
+    const changed: string[] = [];
+    service.on(DraftService.CHANGE_EVENT, (event: { type: string; text?: string }) => {
+      if (event.type === "changed" && event.text !== undefined) changed.push(event.text);
+    });
+
+    // Hold every directory fsync (the one after the rename) until released.
+    let releaseFsync: () => void = () => undefined;
+    const fsyncGate = new Promise<void>((resolve) => {
+      releaseFsync = resolve;
+    });
+    const realFsync = cjsFs.fsync.bind(cjsFs);
+    const fsyncSpy = spyOn(cjsFs, "fsync").mockImplementation(((
+      fd: number,
+      callback: cjsFs.NoParamCallback
+    ) => {
+      // eslint-disable-next-line local/no-sync-fs-methods -- test seam: classify the fd at once.
+      if (!cjsFs.fstatSync(fd).isDirectory()) return realFsync(fd, callback);
+      void fsyncGate.then(() => realFsync(fd, callback));
+    }) as typeof cjsFs.fsync);
+    try {
+      let replied = false;
+      const writing = service.update({ scope: WORKSPACE_SCOPE, text: "new" }).then((reply) => {
+        replied = true;
+        return reply;
+      });
+      const deadline = Date.now() + 5_000;
+      while ((await service.get(WORKSPACE_SCOPE)).text !== "new") {
+        if (Date.now() > deadline) throw new Error("the rename never happened");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+
+      const snapshot = await service.getSnapshotEvent();
+      expect(snapshot.drafts.map((draft) => draft.text)).toEqual(["new"]);
+      expect(changed).toEqual(["new"]);
+      expect(replied).toBe(false);
+
+      releaseFsync();
+      const reply = await writing;
+      expect(reply.revision).toBe(snapshot.drafts[0].revision);
+    } finally {
+      releaseFsync();
+      fsyncSpy.mockRestore();
+    }
+  });
+
   it("rejects scopes that would resolve outside their storage dir", async () => {
     using tempDir = new TestTempDir("drafts-traversal");
     const { config } = await createHarness(tempDir);
