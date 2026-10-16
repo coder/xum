@@ -16,6 +16,7 @@ export type HeldSidebarInput = () => void;
 // at once and opens the side chat full-screen when no sidebar claims it, as on a narrow layout.
 const SIDEBAR_EVENTS = [
   CUSTOM_EVENTS.OPEN_GOAL_TAB,
+  CUSTOM_EVENTS.OPEN_PLAN_TAB,
   CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
   CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB,
   CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
@@ -26,6 +27,7 @@ const SIDEBAR_EVENTS = [
 const SIDEBAR_KEYBINDS = [
   ...([1, 2, 3, 4, 5, 6, 7, 8, 9] as const).map((n) => KEYBINDS[`SIDEBAR_TAB_${n}`]),
   KEYBINDS.OPEN_ARTIFACTS_TAB,
+  KEYBINDS.OPEN_PLAN_TAB,
   KEYBINDS.CLOSE_TAB,
 ];
 

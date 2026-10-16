@@ -307,7 +307,7 @@ const vimCommandDefinition: SlashCommandDefinition = {
 
 const planOpenCommandDefinition: SlashCommandDefinition = {
   key: "open",
-  description: "Open plan in external editor",
+  description: "Open the plan in the sidebar's Plan tab",
   appendSpace: false,
   handler: (): ParsedCommand => ({ type: "plan-open" }),
 };

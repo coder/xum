@@ -452,6 +452,7 @@ describe("global keybind collisions", () => {
     "TOGGLE_AGENT_INTERFACE_VIEW",
     "TOGGLE_STATUS_TRANSCRIPT_PEEK",
     "STATUS_START_HERE",
+    "OPEN_PLAN_TAB",
     "SIDEBAR_TAB_1",
     "SIDEBAR_TAB_2",
     "SIDEBAR_TAB_3",
