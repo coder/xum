@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { getSendProviderOptions } from "@/common/utils/ai/chatServiceTier";
 import { agentPluginHookService } from "./agentPlugins/hookService";
 import { resolveAgentPluginsMcpContext } from "./agentPlugins/mcpConfig";
 import { eventSpine, type RequestAssembleContext } from "./events/eventSpine";
@@ -128,7 +129,8 @@ export async function summarizeContinuousCompaction(args: {
     workspaceId: args.workspaceId,
     agentInitiated: true,
     thinkingLevel: initialThinkingLevel,
-    providerOptions: options.providerOptions,
+    // Summaries run at the chat's speed, not the provider-wide one.
+    providerOptions: getSendProviderOptions(options),
   });
   if (!created.success) throw new Error(`Cannot create compact model: ${created.error.type}`);
   try {

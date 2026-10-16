@@ -420,10 +420,12 @@ function resolveXAIServiceTier(input: {
     input.configuredTier === "default" || input.configuredTier === "priority"
       ? input.configuredTier
       : undefined;
-  if (!input.followsChat) return { serviceTier: input.requestTier ?? configuredTier };
+  // An explicit request tier wins, also over a live mid-turn chat change.
+  if (input.requestTier != null) return { serviceTier: input.requestTier };
+  if (!input.followsChat) return { serviceTier: configuredTier };
   const getServiceTierOverride = input.getServiceTierOverride;
   return {
-    serviceTier: input.requestTier ?? toXAIServiceTier(input.chatServiceTier) ?? configuredTier,
+    serviceTier: toXAIServiceTier(input.chatServiceTier) ?? configuredTier,
     getLiveServiceTier:
       getServiceTierOverride && (() => toXAIServiceTier(getServiceTierOverride())),
   };

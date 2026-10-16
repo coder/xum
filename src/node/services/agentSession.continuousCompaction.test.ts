@@ -1632,6 +1632,23 @@ describe("AgentSession continuous compaction wiring", () => {
     ];
   }
 
+  test("headless summaries run at the chat's speed", async () => {
+    const { h, args } = await summarySetup();
+    const sdkModel = new MockLanguageModelV3({
+      doStream: () =>
+        Promise.resolve({ stream: simulateReadableStream({ chunks: modelChunks() }) }),
+    });
+    const create = spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok(pinnedSummaryModel(sdkModel, "openai:gpt-4.1"))
+    );
+    await summarizeContinuousCompaction({
+      ...args,
+      compactOptions: { ...args.compactOptions, serviceTier: "priority" },
+    });
+    // The factory maps this tier to Anthropic speed and the xAI tier too.
+    expect(create.mock.calls[0]?.[1]?.providerOptions?.openai?.serviceTier).toBe("priority");
+  });
+
   test("headless summaries use the compact model and account usage with its pinned identity", async () => {
     const { h, args } = await summarySetup();
     args.head.push(

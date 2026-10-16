@@ -3212,7 +3212,8 @@ describe("ProviderModelFactory xAI chat speed", () => {
   const sentTiers = async (
     xaiConfig: Record<string, unknown>,
     modelString: string,
-    tiers: Array<ServiceTier | undefined>
+    tiers: Array<ServiceTier | undefined>,
+    requestTier?: "default" | "priority"
   ): Promise<unknown[]> => {
     let sent: unknown[] = [];
     await withTempConfig(async (_config, factory, _oauth, store) => {
@@ -3221,9 +3222,11 @@ describe("ProviderModelFactory xAI chat speed", () => {
       const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
       const chat: { serviceTier?: ServiceTier } = { serviceTier: tiers[0] };
       try {
-        const result = await factory.createModel(modelString, undefined, {
-          getServiceTierOverride: () => chat.serviceTier,
-        });
+        const result = await factory.createModel(
+          modelString,
+          requestTier != null ? { xai: { serviceTier: requestTier } } : undefined,
+          { getServiceTierOverride: () => chat.serviceTier }
+        );
         if (!result.success) throw new Error(result.error.type);
         for (const tier of tiers) {
           chat.serviceTier = tier;
@@ -3248,6 +3251,12 @@ describe("ProviderModelFactory xAI chat speed", () => {
         "ultrafast",
       ])
     ).toEqual(["priority", "default", "priority", "default"]);
+  });
+
+  it("keeps an explicit xAI request tier over live chat changes", async () => {
+    expect(
+      await sentTiers({}, "xai:grok-4.7", ["priority", "default", "priority"], "default")
+    ).toEqual(["default", "default", "default"]);
   });
 
   it("keeps non-frontier Grok on the provider tier", async () => {

@@ -1,4 +1,5 @@
 import type { CompactionHistoryDeletion } from "./compactionCancellation";
+import { getSendProviderOptions } from "@/common/utils/ai/chatServiceTier";
 import { resolvePlanFileLocation } from "@/node/utils/runtime/planLocation";
 import type { ContinuousCompactionPublication } from "./continuousCompactionJournal";
 import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
@@ -7210,7 +7211,7 @@ export class AgentSession {
         additionalSystemContext: options?.additionalSystemContext,
         additionalSystemInstructions: options?.additionalSystemInstructions,
         maxOutputTokens: options?.maxOutputTokens,
-        muxProviderOptions: this.getSendProviderOptions(options),
+        muxProviderOptions: getSendProviderOptions(options),
         agentInitiated,
         agentId: options?.agentId,
         acpPromptId:
@@ -8248,16 +8249,6 @@ export class AgentSession {
     };
   }
 
-  private getSendProviderOptions(options: SendMessageOptions | undefined) {
-    // The chat's explicit Standard/Fast choice must win over provider-wide defaults.
-    return options?.serviceTier == null
-      ? options?.providerOptions
-      : {
-          ...options.providerOptions,
-          openai: { ...options.providerOptions?.openai, serviceTier: options.serviceTier },
-        };
-  }
-
   private normalizeGatewaySendOptions<T extends SendMessageOptions>(options: T): T {
     const normalizeModelSelection = (modelString: string): string => {
       const trimmedModelString = modelString.trim();
@@ -9097,7 +9088,7 @@ export class AgentSession {
         additionalSystemContext: options?.additionalSystemContext,
         additionalSystemInstructions: options?.additionalSystemInstructions,
         maxOutputTokens: options?.maxOutputTokens,
-        muxProviderOptions: this.getSendProviderOptions(options),
+        muxProviderOptions: getSendProviderOptions(options),
         agentInitiated,
         agentId: options?.agentId,
         acpPromptId,
