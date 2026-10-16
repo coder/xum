@@ -599,7 +599,14 @@ describe("useBoundedTranscriptReveal", () => {
 
     function renderSlice(maxMountedRows?: number, isSafeCut = bundled, messages = rows(LONG)) {
       const frames = manualFrames();
-      let props = { workspaceId: "ws", messages, maxMountedRows, isSafeCut, followsTail: true };
+      let props = {
+        workspaceId: "ws",
+        messages,
+        maxMountedRows,
+        isSafeCut,
+        followsTail: true,
+        readVisibleMessageIds: undefined as (() => readonly string[]) | undefined,
+      };
       const renders: Array<{ from: number; to: number }> = [];
       const view = renderHook(() => {
         const reveal = useBoundedTranscriptReveal(props);
@@ -737,7 +744,7 @@ describe("useBoundedTranscriptReveal", () => {
       expect(props().messages[reveal().toIndex - 1].id).toBe(keptId);
     });
 
-    test("rows replaced inside the slice stay mounted when the end row goes later", () => {
+    test("visible rows replaced inside the slice stay mounted when the end row goes later", () => {
       const { reveal, readBack, setProps, props } = renderSlice(MAX);
       readBack();
       const { toIndex } = reveal();
@@ -745,19 +752,13 @@ describe("useBoundedTranscriptReveal", () => {
         i >= toIndex - 20 && i < toIndex ? { id: `${row.id}-v2` } : row
       );
       setProps({ messages: replaced });
-      setProps({ messages: props().messages.filter((_, i) => i !== toIndex) });
-      expect(reveal().toIndex).toBe(toIndex);
-      // Replace, append, then delete every older newer row at once: nothing the reader kept
-      // unmounts; the slice ends at the tail (the appended rows).
-      setProps({
-        messages: props().messages.map((row, i) => (i === toIndex - 1 ? { id: "v3" } : row)),
-      });
-      setProps({ messages: [...props().messages, ...rows(3, "new")] });
-      const gone = (i: number) =>
-        (i >= toIndex - 30 && i < toIndex - 10) || (i >= toIndex && i < LONG - 1);
-      setProps({ messages: props().messages.filter((_, i) => !gone(i)) });
-      expect(reveal().toIndex).toBe(props().messages.length);
-      expect(props().messages.findIndex((row) => row.id === "v3")).toBe(toIndex - 21);
+      const seen = replaced.slice(toIndex - 20, toIndex).map((row) => row.id);
+      const unread = replaced.slice(toIndex + 1).map((row) => row.id);
+      const messages = replaced.filter((_, i) => i !== toIndex);
+      setProps({ messages, readVisibleMessageIds: () => seen });
+      const mounted = messages.slice(reveal().fromIndex, reveal().toIndex).map((row) => row.id);
+      expect(seen.filter((id) => !mounted.includes(id))).toEqual([]);
+      expect(mounted.filter((id) => unread.includes(id))).toEqual([]);
     });
 
     test("every Load older press mounts at least one budget, also across the cap", () => {
@@ -874,6 +875,8 @@ describe("useBoundedTranscriptReveal", () => {
       function grouped(count = 2000) {
         let messages = rows(count, "r");
         let followsTail = true;
+        // The rows the reader sees (refitDetached reads them on an edge loss).
+        let visible: readonly string[] = [];
         const stats = { calls: 0 };
         const joined = new Set<string>();
         const isSafeCut = (i: number) => {
@@ -888,6 +891,7 @@ describe("useBoundedTranscriptReveal", () => {
             isSafeCut,
             maxMountedRows: CAP,
             followsTail,
+            readVisibleMessageIds: () => visible,
           })
         );
         const reveal = () => view.result.current;
@@ -895,9 +899,13 @@ describe("useBoundedTranscriptReveal", () => {
           while (frames.hasPending()) act(() => frames.flush());
         };
         const mounted = () => messages.slice(reveal().fromIndex, reveal().toIndex).map((r) => r.id);
-        const set = (next: { messages?: Row[]; followsTail?: boolean }, frames = true) => {
+        const set = (
+          next: { messages?: Row[]; followsTail?: boolean; visible?: readonly string[] },
+          frames = true
+        ) => {
           messages = next.messages ?? messages;
           followsTail = next.followsTail ?? followsTail;
+          visible = next.visible ?? visible;
           view.rerender();
           if (frames) runFrames();
         };
@@ -969,10 +977,15 @@ describe("useBoundedTranscriptReveal", () => {
         const before = slice.mounted();
         const { toIndex } = slice.reveal();
         expect(slice.reveal().isDetached).toBe(true);
-        // The end row and the 9 rows after it join the bundle before them, and the start row goes.
+        // The end row and the 9 rows after it join the bundle before them, and the start row goes:
+        // the rows the reader sees stay (refitDetached).
+        const seen = before.slice(-20);
         for (const row of slice.messages().slice(toIndex, toIndex + 10)) slice.joined.add(row.id);
-        slice.set({ messages: slice.messages().filter((row) => row.id !== before[0]) });
-        subset(before.slice(1), slice.mounted());
+        slice.set({
+          messages: slice.messages().filter((row) => row.id !== before[0]),
+          visible: seen,
+        });
+        subset(seen, slice.mounted());
       });
 
       test("a capped transcript that starts fully revealed keeps its rows when a page is prepended", () => {
@@ -1049,7 +1062,8 @@ describe("useBoundedTranscriptReveal", () => {
         const all = slice.messages();
         const kept = all[to - 1].id;
         slice.joined.add(all[to + 1].id);
-        slice.set({ messages: all.filter((_, i) => i < from || i === to - 1 || i > to) });
+        const messages = all.filter((_, i) => i < from || i === to - 1 || i > to);
+        slice.set({ messages, visible: [kept] });
         expect(slice.mounted()).toContain(kept);
       });
 
@@ -1094,7 +1108,8 @@ describe("useBoundedTranscriptReveal", () => {
       // Seeded random operations; after each one that is not a reader request, a checker that
       // reads only the hook's output asserts the cap rule.
       // Seeds 28 and 29 reach check (d) with a held overshoot (they fail without keptPastCap).
-      test.each([1, 2, 3, 4, 28, 29])("invariant: seed %p", (seed) => {
+      // Seeds 9, 11 and 17 reach edge losses that refitDetached handles (#6871 known limit).
+      test.each([1, 2, 3, 4, 9, 11, 17, 28, 29])("invariant: seed %p", (seed) => {
         const slice = grouped();
         slice.set({});
         let state = seed;
@@ -1106,8 +1121,13 @@ describe("useBoundedTranscriptReveal", () => {
         for (let op = 0; op < 300; op += 1) {
           const before = slice.mounted();
           const held = slice.reveal().isDetached || !slice.followsTail();
+          // The reader sees up to 20 mounted rows; derived from op, so the random sequence holds.
+          const seen = before.slice((op * 7) % Math.max(1, before.length)).slice(0, 1 + (op % 20));
+          slice.set({ visible: seen }, false);
           const kind = pick(10);
           const all = slice.messages();
+          const { toIndex: oldTo, isDetached: wasDetached } = slice.reveal();
+          const oldEnd = wasDetached ? all[oldTo].id : null;
           if (kind === 0) slice.append(1 + pick(3), () => random() < 0.5);
           if (kind === 1) slice.append(TRANSCRIPT_REVEAL_CHUNK_ROWS + 5, () => random() < 0.5);
           if (kind === 2) {
@@ -1120,7 +1140,7 @@ describe("useBoundedTranscriptReveal", () => {
           if (kind === 4) slice.set({ followsTail: !slice.followsTail() });
           if (kind === 5) act(() => slice.reveal().revealMore());
           if (kind === 6) act(() => slice.reveal().revealNewer());
-          if (kind === 7) {
+          if (kind === 7 && all.length > 1) {
             const row = all[1 + pick(all.length - 1)].id;
             if (slice.joined.has(row)) slice.joined.delete(row);
             else slice.joined.add(row);
@@ -1157,14 +1177,22 @@ describe("useBoundedTranscriptReveal", () => {
           const ids = slice.messages().map((row) => row.id);
           const { fromIndex: from, toIndex: to } = slice.reveal();
           const after = slice.mounted();
+          // An edge loss: the update deleted a detached slice's start or end row (refitDetached).
+          const lost = oldEnd !== null && (!ids.includes(oldEnd) || !ids.includes(before[0]));
           // Held on both sides of the step: turning followsTail on makes rule 3 apply.
           if (held && (slice.reveal().isDetached || !slice.followsTail())) {
+            // (e) The rows the reader saw stay mounted; on other steps every mounted row does.
             subset(
-              before.filter((row) => ids.includes(row)),
+              (lost ? seen : before).filter((row) => ids.includes(row)),
               after
             );
           }
           expect(isHead(ids, from) && isHead(ids, to)).toBe(true);
+          // (f) An edge loss refits to at most one cap, or to one bundle larger than it.
+          if (lost) {
+            const inner = ids.slice(from + 1, to).filter((row) => !slice.joined.has(row));
+            expect(to - from <= CAP || inner.length === 0).toBe(true);
+          }
           if (to - from > CAP) {
             // Past the cap, rows that mounted in this step lie only in the first or the last
             // mounted bundle, and only one that was partly mounted before (it grew or regrouped
