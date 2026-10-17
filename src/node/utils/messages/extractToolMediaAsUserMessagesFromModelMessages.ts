@@ -361,12 +361,13 @@ async function prepareMessageInlineMedia(message: ModelMessage): Promise<ModelMe
   if (!Array.isArray(message.content)) return message;
   const content: unknown[] = await Promise.all(
     message.content.map((part) =>
-      part.type === "tool-result" ? prepareToolResultInlineMedia(part) : part
+      part.type === "tool-result" ? prepareToolResultInlineMedia(part) : Promise.resolve(part)
     )
   );
   if (content.every((part, index) => part === message.content[index])) return message;
   // The content arrays are structurally identical for both roles (see the main loop).
-  return { ...message, content } as ModelMessage;
+  const rewritten: Record<string, unknown> = { ...message, content };
+  return rewritten as ModelMessage;
 }
 
 async function prepareToolResultInlineMedia(part: ToolResultPart): Promise<ToolResultPart> {
@@ -377,10 +378,8 @@ async function prepareToolResultInlineMedia(part: ToolResultPart): Promise<ToolR
   return { ...part, output: { type: "content", value: prepared } };
 }
 
-function prepareInlineMediaItem(
-  item: ContentOutputItem
-): Promise<ContentOutputItem> | ContentOutputItem {
-  if (!isInlineMediaItem(item)) return item;
+function prepareInlineMediaItem(item: ContentOutputItem): Promise<ContentOutputItem> {
+  if (!isInlineMediaItem(item)) return Promise.resolve(item);
   let prepared = preparedInlineMedia.get(item);
   if (prepared === undefined) {
     prepared = prepareInlineRasterItem(item);
