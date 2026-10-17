@@ -110,7 +110,10 @@ import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import * as systemMessageModule from "./systemMessage";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
-import { DEBUG_LLM_REQUEST_MAX_WORKSPACES } from "@/constants/debugLlmRequest";
+import {
+  DEBUG_LLM_REQUEST_MAX_BYTES,
+  DEBUG_LLM_REQUEST_MAX_WORKSPACES,
+} from "@/constants/debugLlmRequest";
 import { Ok } from "@/common/types/result";
 
 // Captured before any test spies on the module, so a test can still build the
@@ -3409,6 +3412,33 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(snapshotOf(ids[0])).toBeNull();
     expect(snapshotOf(ids.at(-1)!)?.workspaceId).toBe(ids.at(-1));
     expect(snapshotOf(ids[1])?.workspaceId).toBe(ids[1]);
+  });
+
+  it("drops the oldest debug request snapshots once their bytes pass the limit", async () => {
+    using xumHome = new DisposableTempDir("ai-debug-request-bytes");
+    const metadata = createLocalWorkspaceMetadata("debug-request-bytes", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata);
+    // Three requests, far fewer than the workspace cap, that are each over a third of the byte
+    // limit: one long session holding a full context window must not keep the other copies.
+    const large = "x".repeat(Math.ceil(DEBUG_LLM_REQUEST_MAX_BYTES / 2.5));
+    const ids = ["bytes-a", "bytes-b", "bytes-c"];
+    for (const workspaceId of ids) {
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", large)],
+        workspaceId,
+        modelString: "anthropic:claude-sonnet-4-5",
+        thinkingLevel: "off",
+      });
+      expect(result.success).toBe(true);
+    }
+    const snapshotOf = (workspaceId: string) => {
+      const read = harness.service.debugGetLastLlmRequest(workspaceId);
+      if (!read.success) throw new Error(read.error);
+      return read.data;
+    };
+    expect(snapshotOf("bytes-a")).toBeNull();
+    expect(snapshotOf("bytes-b")?.workspaceId).toBe("bytes-b");
+    expect(snapshotOf("bytes-c")?.workspaceId).toBe("bytes-c");
   });
 
   it.each([
