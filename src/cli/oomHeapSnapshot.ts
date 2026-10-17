@@ -22,11 +22,8 @@ export interface OomHeapSnapshotDeps {
   /** Read inside the guarded path: process.cwd() throws when the launch directory is gone. */
   cwd: () => string;
   setHeapSnapshotNearHeapLimit: (limit: number) => void;
-  /** Same shape as the `log` helper's info/warn: a message plus structured details. */
-  log: {
-    info: (message: string, details: OomHeapSnapshotLogDetails) => void;
-    warn: (message: string, details: OomHeapSnapshotLogDetails) => void;
-  };
+  /** Failures go to the `log` helper's warn. */
+  log: { warn: (message: string, details: OomHeapSnapshotLogDetails) => void };
 }
 
 async function isDirectory(target: string): Promise<boolean> {
@@ -35,6 +32,14 @@ async function isDirectory(target: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Same channel as the `xum server` startup banner. `xum server` (CLI mode) logs at "error" by
+ * default, so a log.info line never printed and the live log could not confirm arming.
+ */
+function printStartupLine(message: string, details: OomHeapSnapshotLogDetails): void {
+  console.log(`${message} ${JSON.stringify(details)}`);
 }
 
 async function snapshotsIn(dir: string): Promise<string[]> {
@@ -57,14 +62,17 @@ export async function prepareOomHeapSnapshots(deps: OomHeapSnapshotDeps): Promis
     const cwd = path.resolve(deps.cwd());
     const existing = [...(await snapshotsIn(cwd)), ...(await snapshotsIn(snapshotDir))];
     if (existing.length > 0) {
-      deps.log.info("[heap-snapshot] Not armed: a heap snapshot already exists; remove it to arm", {
-        files: existing,
-      });
+      printStartupLine(
+        "[heap-snapshot] Not armed: a heap snapshot already exists; remove it to arm",
+        {
+          files: existing,
+        }
+      );
       return;
     }
     // A CLI --heapsnapshot-near-heap-limit takes precedence; this call then changes nothing.
     deps.setHeapSnapshotNearHeapLimit(1);
-    deps.log.info("[heap-snapshot] Armed: Node writes a heap snapshot near the heap limit", {
+    printStartupLine("[heap-snapshot] Armed: Node writes a heap snapshot near the heap limit", {
       cwd,
     });
   } catch (error) {
