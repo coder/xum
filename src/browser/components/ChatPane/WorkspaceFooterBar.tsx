@@ -144,16 +144,18 @@ function WorkspaceBranchControls(props: {
   workspaceId: string;
   workspaceName: string;
   devcontainerChip: DevcontainerChip;
+  isNarrow: boolean;
 }) {
-  // The branch is the one footer item that can shrink (its name truncates with an ellipsis), so a
-  // long name no longer pushes the row wider than a phone screen (#5769).
+  // The branch truncates rather than push the row past a phone screen (#5769). Phones give it only
+  // the width the other items leave, so a short repo label stays whole, and drop the wrapper so the
+  // devcontainer chip keeps its full width.
   return (
-    <div className="flex min-w-0 items-center gap-1">
+    <div className={props.isNarrow ? "contents" : "flex min-w-0 items-center gap-1"}>
       <BranchSelector
         key={props.workspaceId}
         workspaceId={props.workspaceId}
         workspaceName={props.workspaceName}
-        className="min-w-0"
+        className={props.isNarrow ? "max-w-max min-w-0 grow basis-0 overflow-hidden" : "min-w-0"}
       />
       {props.devcontainerChip && <FooterDevcontainerChip chip={props.devcontainerChip} />}
     </div>
@@ -196,10 +198,9 @@ function FooterRepositoryLabel(props: {
           rel="noopener noreferrer"
           data-testid="workspace-footer-repository"
           className={cn(
-            "text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 items-center gap-1 rounded-md px-1.5 transition-colors focus-visible:ring-1",
-            // Phones keep the owner/repo whole up to the project label's cap, so the branch after it
-            // gives up the width first. Wider layouts add fixed-width items, so both shrink there.
-            props.isNarrow ? "max-w-40 shrink-0" : "min-w-0"
+            "text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 min-w-0 items-center gap-1 rounded-md px-1.5 transition-colors focus-visible:ring-1",
+            // Phones cap a long owner/repo like the project label, so the branch keeps some room.
+            props.isNarrow && "max-w-40"
           )}
         >
           <Github className="h-3 w-3 shrink-0" aria-hidden="true" />
@@ -473,6 +474,7 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
               workspaceId={props.workspaceId}
               workspaceName={props.workspaceName}
               devcontainerChip={devcontainerChip}
+              isNarrow={isNarrow}
             />
           </>
         )}
