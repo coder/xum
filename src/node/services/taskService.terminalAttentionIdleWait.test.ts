@@ -1,7 +1,7 @@
 import * as path from "path";
 import type { EventEmitter } from "node:events";
 import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
-import { HistoryService } from "@/node/services/historyService";
+import assert from "node:assert";
 import { createAgentSessionHarness } from "@/node/services/agentSession.testHarness";
 import { createWorkspaceServiceForTest } from "@/node/services/workspaceService.testHarness";
 import { waitForCondition } from "@/node/services/testDispatchHelpers";
@@ -62,17 +62,33 @@ describe("TaskService terminal attention idle waits", () => {
     );
 
     // The parent's real session and the real WorkspaceService idle wait: each wait subscribes to
-    // the session's chat-event, so the listener count is the number of live idle waiters.
-    const historyService = new HistoryService(config);
+    // the session's chat-event, so the listener count is the number of live idle waiters. The
+    // mocks resolve the real service at call time, so it can share the harness's HistoryService.
+    let realWorkspaceService: ReturnType<typeof createWorkspaceServiceForTest> | undefined;
+    const real = () => {
+      assert(realWorkspaceService, "the real WorkspaceService is created before any report");
+      return realWorkspaceService;
+    };
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService, resumeStream } = createWorkspaceServiceMocks({
+      hasQueuedMessages: mock((workspaceId: string) => real().hasQueuedMessages(workspaceId)),
+      waitForIdleAndNoQueuedMessages: mock((workspaceId: string) =>
+        real().waitForIdleAndNoQueuedMessages(workspaceId)
+      ),
+    });
+    const { taskService, historyService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
     const parent = await createAgentSessionHarness({
       workspaceId: parentId,
       config,
       historyService,
     });
-    const realWorkspaceService = createWorkspaceServiceForTest({ config, historyService });
+    realWorkspaceService = createWorkspaceServiceForTest({ config, historyService });
     realWorkspaceService.registerSession(parentId, parent.session);
     cleanups.push(async () => {
-      await realWorkspaceService.disposeSession(parentId);
+      await real().disposeSession(parentId);
       await parent.session.dispose();
     });
     // Idle with queued input: busy for terminal attention until the queue clears.
@@ -81,20 +97,6 @@ describe("TaskService terminal attention idle waits", () => {
     const chatListeners = () => emitter.listenerCount("chat-event");
     const baseline = chatListeners();
 
-    const { aiService } = createAIServiceMocks(config);
-    const { workspaceService, resumeStream } = createWorkspaceServiceMocks({
-      hasQueuedMessages: mock((workspaceId: string) =>
-        realWorkspaceService.hasQueuedMessages(workspaceId)
-      ),
-      waitForIdleAndNoQueuedMessages: mock((workspaceId: string) =>
-        realWorkspaceService.waitForIdleAndNoQueuedMessages(workspaceId)
-      ),
-    });
-    const { taskService } = createTaskServiceHarness(config, {
-      historyService,
-      aiService,
-      workspaceService,
-    });
     const drainChains = Reflect.get(taskService, "pendingTerminalAttentionDrainsByOwner") as Map<
       string,
       Promise<void>
