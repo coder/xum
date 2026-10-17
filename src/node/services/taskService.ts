@@ -2314,6 +2314,7 @@ export class TaskService implements AgentTaskIntegration {
   // tests and shutdown can await them; drains are idempotent and re-triggered on owner idle events.
   private readonly pendingTerminalAttentionDrainsByOwner = new Map<string, Promise<void>>();
   private readonly pendingTerminalAttentionDrains = new Set<Promise<void>>();
+  private readonly pendingTerminalAttentionIdleWaitsByOwner = new Map<string, Promise<void>>();
   // Sub-agent terminal notifications this process just enqueued while their owner was streaming,
   // mapped to that owner turn's generation (owner -> notification ID -> turn). The next drain takes
   // the whole map, so each report can cut at most one busy turn, and only the turn that was live
@@ -12874,6 +12875,10 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   private scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId: string): void {
+    // One idle wait per owner: each wait subscribes to the owner session's chat-event, and every
+    // report deferred by a busy owner lands here. The drain it schedules reads every pending
+    // notification from the store, so one wait delivers all of them, in store order.
+    if (this.pendingTerminalAttentionIdleWaitsByOwner.has(ownerWorkspaceId)) return;
     const promise = this.workspaceService
       .waitForIdleAndNoQueuedMessages(ownerWorkspaceId)
       .catch((error: unknown) => {
@@ -12883,11 +12888,17 @@ export class TaskService implements AgentTaskIntegration {
         });
       })
       .then(() => {
+        // Release the slot before scheduling: that drain can find the owner busy again and must
+        // be able to install the next idle wait.
+        if (this.pendingTerminalAttentionIdleWaitsByOwner.get(ownerWorkspaceId) === promise) {
+          this.pendingTerminalAttentionIdleWaitsByOwner.delete(ownerWorkspaceId);
+        }
         this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
       })
       .finally(() => {
         this.pendingTerminalAttentionDrains.delete(promise);
       });
+    this.pendingTerminalAttentionIdleWaitsByOwner.set(ownerWorkspaceId, promise);
     this.pendingTerminalAttentionDrains.add(promise);
   }
 
