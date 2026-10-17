@@ -28,6 +28,8 @@ async function setup() {
     cwd: () => cwd,
     setHeapSnapshotNearHeapLimit: (limit: number) => armed.push(limit),
     log: {
+      info: (message: string, meta: OomHeapSnapshotLogDetails) =>
+        logs.push(`logfile ${message} ${JSON.stringify(meta)}`),
       warn: (message: string, meta: OomHeapSnapshotLogDetails) =>
         logs.push(`warn ${message} ${JSON.stringify(meta)}`),
     },
@@ -57,6 +59,8 @@ describe("prepareOomHeapSnapshots", () => {
 
     expect(s.armed).toEqual([1]);
     expect(s.logs.some((line) => line.startsWith("info") && line.includes(s.cwd))).toBe(true);
+    // The logger keeps the record in mux.log too (it persists info even at the "error" level).
+    expect(s.logs.some((line) => line.startsWith("logfile") && line.includes(s.cwd))).toBe(true);
   });
 
   test.each(["cwd", "snapshot directory"] as const)(
