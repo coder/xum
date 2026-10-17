@@ -112,6 +112,7 @@ export const CommandIds = {
   settingsToggleKeepScreenAwake: () => "settings:toggle-keep-screen-awake" as const,
   settingsToggleBashAiProxy: () => "settings:toggle-bash-ai-proxy" as const,
   openServerWindow: () => "remote-connection:open-server-window" as const,
+  telemetryToggle: () => "settings:telemetry:toggle" as const,
   coderDisconnect: () => "providers:coder:disconnect" as const,
   coderRefreshModels: () => "providers:coder:refresh-models" as const,
   coderRefreshProviders: () => "providers:coder:refresh-providers" as const,

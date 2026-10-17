@@ -177,6 +177,8 @@ export function createTestConfig(overrides: Partial<TestClientConfig> = {}): Tes
     toolSearchEnabled: true,
     bashAiProxyEnabled: false,
     agentHeartbeatsEnabled: false,
+    telemetryEnabled: true,
+    telemetryDisabledByEnv: false,
     goalDefaults: DEFAULT_GOAL_DEFAULTS,
     experiments: {},
     ...overrides,
