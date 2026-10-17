@@ -1,12 +1,7 @@
 import { createContext, useContext } from "react";
 
 import type { DisplayedMessage } from "@/common/types/message";
-import {
-  getAskUserQuestionOccurrences,
-  isAskUserQuestionOccurrenceOpen,
-} from "@/common/utils/tools/askUserQuestionSummary";
-import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
-import { getAcceptedAnswers } from "@/browser/utils/messages/askUserQuestionAcceptedAnswers";
+import { findOpenAskUserQuestions } from "@/browser/utils/messages/openAskUserQuestions";
 
 /**
  * Where an ask_user_question card renders.
@@ -44,44 +39,6 @@ export const AskUserQuestionPlacementProvider = AskUserQuestionPlacementContext.
 
 export function useAskUserQuestionPlacement(): AskUserQuestionPlacement {
   return useContext(AskUserQuestionPlacementContext);
-}
-
-export type AskUserQuestionToolMessage = Extract<DisplayedMessage, { type: "tool" }>;
-
-/**
- * Rows with malformed args render as the generic tool card, which neither takes answers nor
- * releases itself from the dock, so they stay in the transcript (checked last: it parses args).
- */
-function hasValidAskUserQuestionArgs(message: AskUserQuestionToolMessage): boolean {
-  return TOOL_DEFINITIONS.ask_user_question.schema.safeParse(message.args).success;
-}
-
-function isToolRow(message: DisplayedMessage): message is AskUserQuestionToolMessage {
-  return message.type === "tool";
-}
-
-/**
- * The ask_user_question rows that still take answers, in transcript order: a blocking question
- * while its tool call executes, and a non-blocking one until this app accepted its answers, an
- * answer row for it lands, a compaction boundary drops it from the agent's context, or a later
- * question reuses its tool call id. These are the card's own checks on the same row (see
- * getNonBlockingQuestionState): if the two disagreed, a docked card would release a row that
- * this keeps re-adding. One pass, since ChatPane runs it on every streamed delta.
- */
-export function findOpenAskUserQuestions(
-  workspaceId: string,
-  messages: readonly DisplayedMessage[]
-): AskUserQuestionToolMessage[] {
-  return getAskUserQuestionOccurrences(messages)
-    .filter(
-      ({ row, state }) =>
-        isToolRow(row) &&
-        isAskUserQuestionOccurrenceOpen(row, state) &&
-        getAcceptedAnswers({ workspaceId, toolCallId: row.toolCallId, rowId: row.id }) === null
-    )
-    .map(({ row }) => row)
-    .filter(isToolRow)
-    .filter(hasValidAskUserQuestionArgs);
 }
 
 /**

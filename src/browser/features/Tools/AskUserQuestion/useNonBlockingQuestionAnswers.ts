@@ -7,7 +7,7 @@ import {
   getAcceptedAnswers,
   setAcceptedAnswers,
   subscribeAcceptedAnswers,
-} from "@/browser/utils/messages/askUserQuestionAcceptedAnswers";
+} from "@/browser/utils/messages/openAskUserQuestions";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { useHostTranscriptMutationCheck } from "@/browser/utils/transcriptBarrier";
 import type { DisplayedMessage } from "@/common/types/message";

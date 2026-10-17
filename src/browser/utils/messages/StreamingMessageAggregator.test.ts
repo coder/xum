@@ -14,7 +14,7 @@ import { getInterruptionContext } from "@/common/utils/messages/retryEligibility
 import { shouldNotifyOnResponseComplete } from "./responseCompletionMetadata";
 import { MAX_HISTORY_HIDDEN_SEGMENTS } from "./transcriptTruncationPlan";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
-import { setAcceptedAnswers } from "./askUserQuestionAcceptedAnswers";
+import { setAcceptedAnswers } from "./openAskUserQuestions";
 import { canEditDisplayedUserMessage } from "@/browser/utils/chatEditing";
 import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";
 
@@ -5503,7 +5503,11 @@ describe("transcript truncation keeps open questions", () => {
     },
   };
 
-  function loadQuestionThenOutput(answered: boolean, workspaceId?: string) {
+  function loadQuestionThenOutput(
+    answered: boolean,
+    workspaceId?: string,
+    input: Record<string, unknown> = questionInput
+  ) {
     const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT, workspaceId);
     const answerRows = answered
       ? [
@@ -5519,7 +5523,7 @@ describe("transcript truncation keeps open questions", () => {
       : [];
     aggregator.loadHistoricalMessages(
       [
-        historicalToolMessage("question-1", "ask_user_question", questionInput, {
+        historicalToolMessage("question-1", "ask_user_question", input, {
           toolCallId: "ask-1",
           output: asyncOutput,
           historySequence: 1,
@@ -5550,6 +5554,13 @@ describe("transcript truncation keeps open questions", () => {
 
   test("an answered question may be hidden like any older tool row", () => {
     expect(loadQuestionThenOutput(true)).toMatchObject({ truncated: true, questionShown: false });
+  });
+
+  test("a question with malformed args (a generic card, never docked) is not kept", () => {
+    expect(loadQuestionThenOutput(false, undefined, { questions: "not a list" })).toMatchObject({
+      truncated: true,
+      questionShown: false,
+    });
   });
 
   test("an answer the app accepted without an answer row releases the question", () => {

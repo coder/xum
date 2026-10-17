@@ -124,10 +124,8 @@ void mock.module("@/browser/stores/WorkspaceStore", () => ({
 }));
 
 import { AskUserQuestionToolCall, PlacedAskUserQuestionToolCall } from "./AskUserQuestionToolCall";
-import {
-  AskUserQuestionPlacementProvider,
-  findOpenAskUserQuestions,
-} from "./AskUserQuestion/askUserQuestionPlacement";
+import { AskUserQuestionPlacementProvider } from "./AskUserQuestion/askUserQuestionPlacement";
+import { findOpenAskUserQuestions } from "@/browser/utils/messages/openAskUserQuestions";
 
 describe("AskUserQuestionToolCall", () => {
   beforeEach(() => {

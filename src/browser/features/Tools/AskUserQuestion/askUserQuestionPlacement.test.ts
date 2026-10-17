@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
 import type { DisplayedMessage } from "@/common/types/message";
+import { findOpenAskUserQuestions } from "@/browser/utils/messages/openAskUserQuestions";
 import {
-  findOpenAskUserQuestions,
   getTranscriptAskUserQuestionPlacement,
   NO_DOCKED_QUESTIONS,
   reconcileDockedQuestionIds,

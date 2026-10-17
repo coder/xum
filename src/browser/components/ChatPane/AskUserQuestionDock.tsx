@@ -3,15 +3,17 @@ import { useState, useSyncExternalStore } from "react";
 import { ToolMessage } from "@/browser/features/Messages/ToolMessage";
 import {
   AskUserQuestionPlacementProvider,
-  findOpenAskUserQuestions,
   NO_DOCKED_QUESTIONS,
   reconcileDockedQuestionIds,
   releaseDockedQuestionId,
   type AskUserQuestionPlacement,
-  type AskUserQuestionToolMessage,
   type DockedQuestionIds,
 } from "@/browser/features/Tools/AskUserQuestion/askUserQuestionPlacement";
-import { useAcceptedAnswersVersion } from "@/browser/utils/messages/askUserQuestionAcceptedAnswers";
+import {
+  findOpenAskUserQuestions,
+  useAcceptedAnswersVersion,
+  type AskUserQuestionToolMessage,
+} from "@/browser/utils/messages/openAskUserQuestions";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { ChatDockSurface } from "./chatDockColumn";
 
