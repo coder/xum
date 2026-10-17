@@ -19,6 +19,7 @@ import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import type { TestApiOverrides } from "@/browser/testUtils";
 import { GoalDefaultsSection } from "./GoalDefaultsSection";
+import { useGoalDefaults } from "@/browser/utils/goals/useGoalDefaults";
 import { useGoalBoard, type UseGoalBoardResult } from "./useGoalBoard";
 
 /*
@@ -45,6 +46,8 @@ let answerInstructions: () => Promise<unknown>;
 let answerChatInstructions: () => Promise<unknown>;
 let answerOverride: () => Promise<unknown>;
 let savedOverrides: unknown[] = [];
+/** What each goalDefaults.set answers (after it is recorded in savedOverrides). */
+let answerSet: () => Promise<void> = () => Promise.resolve();
 let savedChatInstructions: Array<{ content: string; enabled: boolean }> = [];
 let failChatSave: Error | null = null;
 
@@ -75,7 +78,7 @@ function serverOverrides(): TestApiOverrides<APIClient> {
         get: () => answerOverride(),
         set: (input: unknown) => {
           savedOverrides.push(input);
-          return Promise.resolve();
+          return answerSet();
         },
       },
     },
@@ -204,6 +207,38 @@ describe.each([...GAP_MODES])("loaded panes across a dropped connection (%s)", (
     nextInstructions.resolve({ files: [], totalTokens: 0 });
     nextChatInstructions.resolve({ content: "be precise", enabled: true });
     await waitFor(() => expect(editor.value).toBe("be precise"));
+  });
+
+  // The create forms prefill from these. A read cut off by the drop must not replace the shown
+  // values with the canonical defaults.
+  test("the effective goal defaults keep their values through a reload the drop cut off", async () => {
+    answerOverride = () => Promise.resolve(turnCapOverride(5));
+    const view = renderHook(() => useGoalDefaults("ws-1"), { wrapper: Wrapper });
+    await waitFor(() => expect(view.result.current.defaults.defaultTurnCap).toBe(5));
+
+    answerOverride = pending;
+    await drop();
+    await reconnect();
+    await drop();
+    expect(view.result.current.defaults.defaultTurnCap).toBe(5);
+
+    answerOverride = () => Promise.resolve(turnCapOverride(7));
+    await reconnect();
+    await waitFor(() => expect(view.result.current.defaults.defaultTurnCap).toBe(7));
+  });
+
+  // A server cancel on a live socket is no lost connection: no new client reads again, so the
+  // load must finish (with the fallback), not wait forever.
+  test("the effective goal defaults finish a load that the server cancelled", async () => {
+    answerOverride = () => Promise.resolve(turnCapOverride(5));
+    const view = renderHook(() => useGoalDefaults("ws-1"), { wrapper: Wrapper });
+    await waitFor(() => expect(view.result.current.defaults.defaultTurnCap).toBe(5));
+
+    answerOverride = () =>
+      Promise.reject(new DOMException("cancelled by the server", "AbortError"));
+    act(() => view.result.current.reload());
+    await waitFor(() => expect(view.result.current.isLoading).toBe(false));
+    expect(view.result.current.defaults.defaultTurnCap).toBeNull();
   });
 
   test("the goal defaults keep the override editable while they reload, and an edit wins", async () => {
@@ -337,6 +372,8 @@ describe("loaded panes of another workspace", () => {
     cleanupDom = installDom();
     window.localStorage.clear();
     harness = createConnectionHarness("kept-gap", serverOverrides);
+    savedOverrides = [];
+    answerSet = () => Promise.resolve();
   });
 
   afterEach(() => {
@@ -360,5 +397,35 @@ describe("loaded panes of another workspace", () => {
     view.rerender(<GoalDefaultsSection workspaceId="ws-2" embedded />);
     await waitFor(() => expect(view.queryByText("Loading…")).not.toBeNull());
     expect(view.queryByLabelText("Workspace default goal turn cap")).toBeNull();
+  });
+
+  // Writes run in order, and each writes the whole override. An older write that failed is
+  // superseded by a newer one that succeeded: its error must not stay on screen.
+  test("an older failed write leaves no error after a newer write succeeded", async () => {
+    answerOverride = () => Promise.resolve(turnCapOverride(5));
+    const view = render(<GoalDefaultsSection workspaceId="ws-1" embedded />, {
+      wrapper: Wrapper,
+    });
+    const turnCap = () =>
+      view.getByLabelText("Workspace default goal turn cap") as HTMLInputElement;
+    await waitFor(() => expect(turnCap().value).toBe("5"));
+
+    let failFirst: ((error: Error) => void) | null = null;
+    const answers = [
+      () => new Promise<void>((_resolve, reject) => (failFirst = reject)),
+      () => Promise.resolve(),
+    ];
+    answerSet = () => answers.shift()?.() ?? Promise.resolve();
+    fireEvent.change(turnCap(), { target: { value: "8" } });
+    fireEvent.blur(turnCap());
+    fireEvent.change(turnCap(), { target: { value: "9" } });
+    fireEvent.blur(turnCap());
+    await waitFor(() => expect(failFirst).not.toBeNull());
+
+    act(() => failFirst?.(new Error("write failed")));
+    await waitFor(() => expect(savedOverrides).toHaveLength(2));
+    await flush();
+    expect(view.queryByText("write failed") == null).toBe(true);
+    expect(turnCap().value).toBe("9");
   });
 });
