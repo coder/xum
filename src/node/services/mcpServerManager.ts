@@ -615,7 +615,7 @@ const PENDING_REPAIR_WAIT_MS = 10_000;
  * Bounds one send's wait for first prompt lists (awaitFirstPromptLists): two prompts/list
  * timeouts, the worst case of the earlier two-round wait.
  */
-const FIRST_PROMPT_LIST_WAIT_MS = 2 * PROMPT_LIST_TIMEOUT_MS;
+export const FIRST_PROMPT_LIST_WAIT_MS = 2 * PROMPT_LIST_TIMEOUT_MS;
 /**
  * ONE deadline for a served tool call's complete authorization gate: every
  * wait in it (repair waits, disk re-reads, re-serves, lock acquisition, epoch

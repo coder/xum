@@ -40,6 +40,7 @@ import { createTestPluginInstallEntry } from "./agentPlugins/testFixtures";
 import type { MCPServerInfo } from "@/common/types/mcp";
 import * as mcpSdk from "@/node/services/mcpClient";
 import {
+  FIRST_PROMPT_LIST_WAIT_MS,
   MCP_APP_CATALOG_REFRESH_TIMEOUT_MS,
   MCPServerManager,
   effectiveToolAllowlist,
@@ -3132,6 +3133,59 @@ describe("MCPServerManager", () => {
     ]);
 
     expect(outcome).toBe("settled");
+  });
+
+  // The send joins a refresh that another send started and that never ends, so only the
+  // deadline ends its wait (no refresh of its own can mark the unlisted server as tried).
+  test("the first-list wait ends at its deadline and serves the prompts it has", async () => {
+    const request = workspaceRequest("ws-first-list-deadline");
+    configService.listServers.mockResolvedValue({ a: stdioConfig("cmd-deadline-a") });
+    let listsOfA = 0;
+    servers.serve("cmd-deadline-a", {
+      listPrompts: () => {
+        listsOfA += 1;
+        // Later lists of A (the background refresh of a listed catalog) never settle.
+        return listsOfA === 1
+          ? Promise.resolve([{ name: "a-prompt" }])
+          : new Promise<Array<{ name: string }>>(() => undefined);
+      },
+    });
+    servers.serve("cmd-deadline-b", {
+      listPrompts: () => new Promise<Array<{ name: string }>>(() => undefined),
+    });
+    await manager.getToolsForWorkspace(request);
+    // This send starts the background refresh of A that never ends.
+    await manager.getToolsForWorkspace(request);
+    expect(listsOfA).toBe(2);
+    configService.listServers.mockResolvedValue({
+      a: stdioConfig("cmd-deadline-a"),
+      b: stdioConfig("cmd-deadline-b"),
+    });
+    await manager.warmWorkspaceServers(request);
+    const flush = async () => {
+      for (let turn = 0; turn < 20; turn++) await new Promise((resolve) => setImmediate(resolve));
+    };
+    const startedAt = Date.now();
+    fakeTimers.useFakeTimers();
+    setSystemTime(new Date(startedAt));
+    try {
+      const seen: { prompts: string[] | null } = { prompts: null };
+      void manager.getToolsForWorkspace(request).then((served) => {
+        seen.prompts = served.promptDescriptors.map((prompt) => prompt.promptName);
+      });
+      await flush();
+      fakeTimers.advanceTimersByTime(FIRST_PROMPT_LIST_WAIT_MS - 1);
+      await flush();
+      expect(seen.prompts).toBeNull();
+      fakeTimers.advanceTimersByTime(1);
+      await flush();
+      // B never listed: the send goes out with A's catalog.
+      expect(seen.prompts).toEqual(["a-prompt"]);
+    } finally {
+      const now = Date.now();
+      fakeTimers.useRealTimers();
+      setSystemTime(new Date(now));
+    }
   });
 
   test("overlapping opens of one entry point keep the newest open's result", async () => {
