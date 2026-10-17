@@ -981,6 +981,42 @@ describe("GeneralSection", () => {
       expect(trigger.hasAttribute("disabled")).toBe(true);
     });
 
+    // Settings opened while Xum reconnects: the kept client's read fails at once. That is no
+    // answer and no error to show, and the next client loads the host.
+    test("loads the SSH host once the next client connects after opening offline", async () => {
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => unhandled.push(reason);
+      process.on("unhandledRejection", onUnhandled);
+      try {
+        const setup = createMockAPI({});
+        setup.getSshHostMock.mockResolvedValue("saved-host");
+        mockApi = setup.api;
+        getAppConfigStore().setClient(createTestApiClient(mockApi));
+        const harness = createConnectionHarness(mode, () => mockApi);
+        await harness.drop();
+
+        const view = render(
+          <harness.Wrapper>
+            <ThemeProvider forcedTheme="dark">
+              <GeneralSection />
+            </ThemeProvider>
+          </harness.Wrapper>
+        );
+        await act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+        });
+        expect(view.queryByText("SSH Host")).toBeNull();
+
+        harness.reconnect();
+        const label = await view.findByText("SSH Host");
+        const input = label.parentElement?.parentElement?.querySelector("input");
+        expect(input?.value).toBe("saved-host");
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+      }
+    });
+
     // Offline the loaded values stay, but a control that writes to the server must not look
     // usable: its write could not reach the server.
     test("disables the server-backed controls while offline", async () => {
