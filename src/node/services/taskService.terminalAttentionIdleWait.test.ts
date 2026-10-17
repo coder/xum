@@ -64,10 +64,10 @@ describe("TaskService terminal attention idle waits", () => {
     // The parent's real session and the real WorkspaceService idle wait: each wait subscribes to
     // the session's chat-event, so the listener count is the number of live idle waiters. The
     // mocks resolve the real service at call time, so it can share the harness's HistoryService.
-    let realWorkspaceService: ReturnType<typeof createWorkspaceServiceForTest> | undefined;
+    const holder: { real?: ReturnType<typeof createWorkspaceServiceForTest> } = {};
     const real = () => {
-      assert(realWorkspaceService, "the real WorkspaceService is created before any report");
-      return realWorkspaceService;
+      assert(holder.real, "the real WorkspaceService is created before any report");
+      return holder.real;
     };
     const { aiService } = createAIServiceMocks(config);
     const { workspaceService, resumeStream } = createWorkspaceServiceMocks({
@@ -85,8 +85,8 @@ describe("TaskService terminal attention idle waits", () => {
       config,
       historyService,
     });
-    realWorkspaceService = createWorkspaceServiceForTest({ config, historyService });
-    realWorkspaceService.registerSession(parentId, parent.session);
+    holder.real = createWorkspaceServiceForTest({ config, historyService });
+    holder.real.registerSession(parentId, parent.session);
     cleanups.push(async () => {
       await real().disposeSession(parentId);
       await parent.session.dispose();
