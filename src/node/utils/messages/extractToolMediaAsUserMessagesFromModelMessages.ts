@@ -202,8 +202,9 @@ async function createInlineMediaOutput(
  * Rounds of inline-media preparation per request. Each round prepares only the inline images
  * the cap keeps; an unreadable one becomes a text note and frees its slot, so the next round
  * plans again and prepares the older image that now fits. The bound keeps a flood of corrupt
- * images to a few cap-sized batches of header reads. Past it, a corrupt image can still take a
- * slot (the behavior before inline preparation moved ahead of the cap).
+ * images to a few cap-sized batches of header reads. Past it, an inline image the cap keeps
+ * but no round prepared is evicted instead: unprepared bytes (oversized or unreadable) would
+ * fail every later request, while losing it only costs context.
  */
 const MAX_INLINE_MEDIA_PREPARE_ROUNDS = 3;
 
@@ -213,13 +214,33 @@ async function planWithInlineMedia(input: ModelMessage[]) {
   for (let round = 0; ; round++) {
     const pools = collectToolMedia(messages);
     const plan = planRequestMediaCap(pools);
-    const prepared =
-      round < MAX_INLINE_MEDIA_PREPARE_ROUNDS
-        ? await prepareInlineMediaForProvider(messages, plan.evictedSyntheticParts)
-        : messages;
+    if (round === MAX_INLINE_MEDIA_PREPARE_ROUNDS) {
+      const evicted = new Set(plan.evictedSyntheticParts);
+      for (const item of unpreparedInlineMedia(messages)) evicted.add(item);
+      return { messages, pools, ...plan, evictedSyntheticParts: evicted };
+    }
+    const prepared = await prepareInlineMediaForProvider(messages, plan.evictedSyntheticParts);
     if (prepared === messages) return { messages, pools, ...plan };
     messages = prepared;
   }
+}
+
+/** Inline tool-result media that no preparation round has read (see preparedInlineMedia). */
+function unpreparedInlineMedia(messages: ModelMessage[]): object[] {
+  return messages.flatMap((message) =>
+    (message.role === "assistant" || message.role === "tool") && Array.isArray(message.content)
+      ? message.content.flatMap((part) =>
+          part.type === "tool-result" && part.output.type === "content"
+            ? part.output.value.filter(
+                (item) =>
+                  isInlineMediaItem(item) &&
+                  !isSyntheticToolMediaPart(item) &&
+                  !preparedInlineMedia.has(item)
+              )
+            : []
+        )
+      : []
+  );
 }
 
 /**

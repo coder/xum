@@ -723,6 +723,22 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
     }
   });
 
+  // Past the preparation rounds, an image the cap keeps but nothing prepared must not reach
+  // the provider: an oversized or unreadable one would fail every later request.
+  it("never sends an unprepared inline image after the preparation rounds", async () => {
+    const cap = MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST;
+    const oversized = await pngBase64(9001);
+    const messages = [
+      ...Array.from({ length: cap }, (_, i) => mcpImageCall(i, [oversized])).flat(),
+      // Three cap-sized batches of corrupt images, newest last: each round frees a batch of slots.
+      ...Array.from({ length: 3 * cap }, (_, i) => mcpImageCall(cap + i, ["bm90LWEtcG5n"])).flat(),
+    ];
+
+    const result = await extractToolMediaAsUserMessagesFromModelMessages(messages);
+
+    expect(JSON.stringify(result)).not.toContain(oversized);
+  });
+
   // A corrupt image becomes a text note, so it takes no media slot and must not evict one.
   it("keeps every valid MCP image at the cap when a newer one is unreadable", async () => {
     const valid = await Promise.all(
