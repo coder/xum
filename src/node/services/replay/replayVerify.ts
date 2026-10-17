@@ -398,6 +398,46 @@ export function collectAssistantTurns(historyMessages: MuxMessage[]): AssistantT
 }
 
 /**
+ * Notes for rows a turn's request never saw that sort before that turn's reply: a sub-agent
+ * report TaskService appended after the request read history and before the builder appended
+ * the placeholder. Request building replays such a row after the reply (#6749,
+ * placeRowsAfterTheTurnThatMissedThem). Builds before that change merged it before the reply,
+ * so a request they recorded that includes the row fails the messages check here without a
+ * regression. One note per late row that a later recorded request includes.
+ */
+export function lateRowNotes(turns: AssistantTurn[], historyMessages: MuxMessage[]): string[] {
+  return turns.flatMap((turn) =>
+    rowsTheTurnMissed(turn, historyMessages).flatMap((row) => {
+      // rowsTheTurnMissed keeps only sequenced rows.
+      const sequence = row.metadata?.historySequence ?? Number.POSITIVE_INFINITY;
+      const readers = turns.filter((later) => later.requestHistorySequence >= sequence);
+      if (readers.length === 0) return [];
+      return [
+        `row ${row.id} arrived while the request for assistant row ${turn.message.id} was ` +
+          `built, so it now replays after that reply. Builds before #6749 recorded it before ` +
+          `the reply: a messages mismatch for assistant rows ` +
+          `${readers.map((reader) => reader.message.id).join(", ")} can be this known order change.`,
+      ];
+    })
+  );
+}
+
+/** Non-assistant rows sequenced after the turn's request read history, before its reply. */
+function rowsTheTurnMissed(turn: AssistantTurn, historyMessages: MuxMessage[]): MuxMessage[] {
+  const turnSequence = turn.message.metadata?.historySequence;
+  if (turnSequence == null) return [];
+  return historyMessages.filter((row) => {
+    const sequence = row.metadata?.historySequence;
+    return (
+      row.role !== "assistant" &&
+      sequence != null &&
+      sequence > turn.requestHistorySequence &&
+      sequence < turnSequence
+    );
+  });
+}
+
+/**
  * Load ALL history rows (sealed archive + active chat.jsonl), oldest→newest.
  * Turn-envelope rows and recorded devtools requests span every compaction
  * epoch, so verification must see the full transcript —
@@ -731,6 +771,7 @@ export async function replayVerifySession(params: {
 
   const notes: string[] = [];
   const pairings = pairSessionTurns(envelopes, recorded, turns, notes);
+  notes.push(...lateRowNotes(turns, params.historyMessages));
   const stepPrefix = auditStepPrefixesFromLog(devtoolsLog, params.historyMessages);
 
   const results: ReplayVerifyTurnResult[] = [];

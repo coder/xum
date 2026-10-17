@@ -6492,6 +6492,84 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
   });
 });
 
+// #6749 moves a row that a turn's request never saw to after that turn's reply. It trusts the
+// builder's stamp: a request holds exactly the rows with historySequence <= the placeholder's
+// requestHistorySequence. This runs the real builder (stamp, placeholder append, context
+// assembly) with a row appended while the request is built, as TaskService appends a
+// sub-agent report.
+describe("AIService.streamMessage rows appended while a request is built", () => {
+  afterEach(() => mock.restore());
+
+  it("replays the late row after the reply of the turn that missed it", async () => {
+    const testHistory = await createTestHistoryService();
+    try {
+      const metadata = createLocalWorkspaceMetadata("late-row", testHistory.tempDir);
+      const harness = createBasicAIService(testHistory.tempDir, {
+        historyService: testHistory.historyService,
+      });
+      const prepared: string[][] = [];
+      let appendLateRow = true;
+      stubCommonStreamMessageDependencies({
+        ...harness,
+        metadata,
+        onPrepareMessagesForProvider: (pipelineArgs) => {
+          prepared.push(pipelineArgs.messagesWithSentinel.map((message) => message.id));
+        },
+      });
+      spyOn(harness.historyService, "appendToHistory").mockRestore();
+      spyOn(harness.historyService, "commitPartial").mockRestore();
+      const history = harness.historyService;
+      const workspaceId = metadata.id;
+      const turn = async (messages: MuxMessage[]) => {
+        const result = await harness.service.streamMessage({
+          messages,
+          workspaceId,
+          modelString: "openai:gpt-5.2",
+          thinkingLevel: "off",
+        });
+        expect(result.success).toBe(true);
+      };
+      const rows = async () => {
+        const read = await history.getHistoryFromLatestBoundary(workspaceId);
+        if (!read.success) throw new Error(read.error);
+        return read.data;
+      };
+
+      await history.appendToHistory(workspaceId, createMuxMessage("u1", "user", "Start the job"));
+      const prepare = spyOn(messagePipeline, "prepareMessagesForProvider");
+      const stubbed = prepare.getMockImplementation()!;
+      prepare.mockImplementation(async (pipelineArgs) => {
+        if (appendLateRow) {
+          appendLateRow = false;
+          // After the history read, before the builder appends its placeholder.
+          await history.appendToHistory(
+            workspaceId,
+            createMuxMessage("report", "user", "<mux_subagent_report>done</mux_subagent_report>", {
+              synthetic: true,
+            })
+          );
+        }
+        return stubbed(pipelineArgs);
+      });
+      await turn(await rows());
+      const reply = (await rows()).find((row) => row.role === "assistant")!;
+      await history.updateHistory(workspaceId, {
+        ...reply,
+        parts: [{ type: "text", text: "Started." }],
+      });
+
+      await history.appendToHistory(workspaceId, createMuxMessage("u2", "user", "Status?"));
+      await turn(await rows());
+
+      // The first request saw only u1; the next one carries the report after the reply.
+      expect(prepared[0]).toEqual(["u1"]);
+      expect(prepared[1]).toEqual(["u1", reply.id, "report", "u2"]);
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+});
+
 describe("normalizeAnthropicBaseURL", () => {
   it("appends /v1 to URLs without it", () => {
     expect(normalizeAnthropicBaseURL("https://api.anthropic.com")).toBe(

@@ -27,7 +27,9 @@ import {
   type ReplayFixtureSessionContext,
 } from "./replayFixture";
 import {
+  collectAssistantTurns,
   collectFullHistory,
+  lateRowNotes,
   readRecordedSteps,
   replayVerifySession,
   type ReplayVerifySessionResult,
@@ -56,6 +58,45 @@ async function verify(ctx: ReplayFixtureSessionContext): Promise<ReplayVerifySes
     historyMessages: historyResult.data,
   });
 }
+
+// #6749 replays a row that a turn's request never saw after that turn's reply. Builds before it
+// recorded the next requests with the row merged before the reply, so verification of those
+// requests reports a messages mismatch that is not a regression: the output must say so.
+describe("lateRowNotes", () => {
+  const row = (
+    id: string,
+    role: "user" | "assistant",
+    historySequence: number,
+    requestHistorySequence?: number
+  ) =>
+    createMuxMessage(id, role, id, {
+      historySequence,
+      ...(requestHistorySequence != null ? { requestHistorySequence } : {}),
+    });
+
+  test("names a late row and the recorded requests that include it", () => {
+    const history = [
+      row("u1", "user", 0),
+      row("report", "user", 1),
+      row("a1", "assistant", 2, 0),
+      row("u2", "user", 3),
+      row("a2", "assistant", 4, 3),
+    ];
+    const notes = lateRowNotes(collectAssistantTurns(history), history);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain("report");
+    expect(notes[0]).toContain("a1");
+    expect(notes[0]).toContain("a2");
+  });
+
+  test("stays quiet without a late row or a later request that includes it", () => {
+    const inOrder = [row("u1", "user", 0), row("a1", "assistant", 1, 0)];
+    expect(lateRowNotes(collectAssistantTurns(inOrder), inOrder)).toEqual([]);
+    // The late row exists, but no recorded request contains it yet.
+    const unread = [row("u1", "user", 0), row("report", "user", 1), row("a1", "assistant", 2, 0)];
+    expect(lateRowNotes(collectAssistantTurns(unread), unread)).toEqual([]);
+  });
+});
 
 describe("replayVerifySession pairing", () => {
   test("verifies turns across a compaction boundary from the full history", async () => {
