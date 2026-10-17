@@ -134,7 +134,8 @@ function isToolExecutionContext(value: unknown): value is ToolExecutionContext {
  */
 function estimateDebugSnapshotBytes(snapshot: DebugLlmRequestSnapshot): number {
   try {
-    return Math.max(1, JSON.stringify(snapshot).length);
+    // UTF-8 bytes, not UTF-16 units: a CJK character is one unit but three bytes.
+    return Math.max(1, Buffer.byteLength(JSON.stringify(snapshot), "utf8"));
   } catch {
     return DEBUG_LLM_REQUEST_MAX_BYTES;
   }

@@ -6,7 +6,7 @@
 export const DEBUG_LLM_REQUEST_MAX_WORKSPACES = 16;
 
 /**
- * Byte limit across those snapshots, estimated as each snapshot's JSON length. Sixteen
+ * Byte limit across those snapshots, estimated as each snapshot's JSON size in UTF-8 bytes. Sixteen
  * workspaces near a full context window would otherwise still hold tens of MB. A single
  * snapshot over this limit is not kept.
  */
