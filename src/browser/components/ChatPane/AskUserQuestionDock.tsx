@@ -11,7 +11,7 @@ import {
   type AskUserQuestionToolMessage,
   type DockedQuestionIds,
 } from "@/browser/features/Tools/AskUserQuestion/askUserQuestionPlacement";
-import { useAcceptedAnswersVersion } from "@/browser/features/Tools/AskUserQuestion/useNonBlockingQuestionAnswers";
+import { useAcceptedAnswersVersion } from "@/browser/utils/messages/askUserQuestionAcceptedAnswers";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { ChatDockSurface } from "./chatDockColumn";
 

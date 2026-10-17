@@ -46,6 +46,7 @@ import {
   isCompletedSubagentReportEnvelope,
   parseSubagentReportEnvelope,
 } from "@/common/utils/subagentReportEnvelope";
+import { getAcceptedAnswers } from "@/browser/utils/messages/askUserQuestionAcceptedAnswers";
 import { completeInProgressTodoItems } from "@/common/utils/todoList";
 import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
@@ -287,11 +288,22 @@ const ALWAYS_KEEP_MESSAGE_TYPES = new Set<DisplayedMessage["type"]>([
   "workspace-init",
 ]);
 
-/** Display ids of the ask_user_question rows that still take answers. */
-function getOpenAskUserQuestionRowIds(messages: readonly DisplayedMessage[]): Set<string> {
+/**
+ * Display ids of the ask_user_question rows that still take answers. An answer this app accepted
+ * closes its row even without an answer row (one batched into a queued message never gets one),
+ * or such rows would be kept past the display cap for the rest of the session.
+ */
+function getOpenAskUserQuestionRowIds(
+  workspaceId: string | undefined,
+  messages: readonly DisplayedMessage[]
+): Set<string> {
   const ids = new Set<string>();
   for (const { row, state } of getAskUserQuestionOccurrences(messages)) {
-    if (row.type === "tool" && isAskUserQuestionOccurrenceOpen(row, state)) {
+    if (
+      row.type === "tool" &&
+      isAskUserQuestionOccurrenceOpen(row, state) &&
+      getAcceptedAnswers({ workspaceId, toolCallId: row.toolCallId, rowId: row.id }) === null
+    ) {
       ids.add(row.id);
     }
   }
@@ -303,10 +315,11 @@ function getOpenAskUserQuestionRowIds(messages: readonly DisplayedMessage[]): Se
  * ask_user_question (the chat docks it above the input from this list, so it must stay reachable).
  */
 function buildAlwaysKeepMessage(
+  workspaceId: string | undefined,
   messages: readonly DisplayedMessage[],
   revealTarget: TranscriptRevealTarget | null
 ): (message: DisplayedMessage) => boolean {
-  const openQuestionRowIds = getOpenAskUserQuestionRowIds(messages);
+  const openQuestionRowIds = getOpenAskUserQuestionRowIds(workspaceId, messages);
   return (message) => {
     if (openQuestionRowIds.has(message.id)) return true;
     if (revealTarget == null) return false;
@@ -4072,7 +4085,11 @@ export class StreamingMessageAggregator {
           displayedMessages,
           maxDisplayedMessages: MAX_DISPLAYED_MESSAGES,
           alwaysKeepMessageTypes: ALWAYS_KEEP_MESSAGE_TYPES,
-          shouldAlwaysKeepMessage: buildAlwaysKeepMessage(displayedMessages, revealTarget),
+          shouldAlwaysKeepMessage: buildAlwaysKeepMessage(
+            this.workspaceId,
+            displayedMessages,
+            revealTarget
+          ),
         });
 
         resultMessages =

@@ -23,7 +23,7 @@ import { StreamingBarrier } from "@/browser/features/Messages/ChatBarrier/Stream
 import { RetryBarrier } from "@/browser/features/Messages/ChatBarrier/RetryBarrier";
 import { PinnedTodoList } from "../PinnedTodoList/PinnedTodoList";
 import { AskUserQuestionDock } from "./AskUserQuestionDock";
-import { useAcceptedAnswersVersion } from "@/browser/features/Tools/AskUserQuestion/useNonBlockingQuestionAnswers";
+import { useAcceptedAnswersVersion } from "@/browser/utils/messages/askUserQuestionAcceptedAnswers";
 import {
   AskUserQuestionPlacementProvider,
   getTranscriptAskUserQuestionPlacement,

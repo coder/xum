@@ -6,7 +6,7 @@ import {
   isAskUserQuestionOccurrenceOpen,
 } from "@/common/utils/tools/askUserQuestionSummary";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
-import { getAcceptedAnswers } from "./useNonBlockingQuestionAnswers";
+import { getAcceptedAnswers } from "@/browser/utils/messages/askUserQuestionAcceptedAnswers";
 
 /**
  * Where an ask_user_question card renders.

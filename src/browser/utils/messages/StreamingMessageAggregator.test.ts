@@ -14,6 +14,7 @@ import { getInterruptionContext } from "@/common/utils/messages/retryEligibility
 import { shouldNotifyOnResponseComplete } from "./responseCompletionMetadata";
 import { MAX_HISTORY_HIDDEN_SEGMENTS } from "./transcriptTruncationPlan";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
+import { setAcceptedAnswers } from "./askUserQuestionAcceptedAnswers";
 import { canEditDisplayedUserMessage } from "@/browser/utils/chatEditing";
 import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";
 
@@ -5502,8 +5503,8 @@ describe("transcript truncation keeps open questions", () => {
     },
   };
 
-  function loadQuestionThenOutput(answered: boolean) {
-    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+  function loadQuestionThenOutput(answered: boolean, workspaceId?: string) {
+    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT, workspaceId);
     const answerRows = answered
       ? [
           createMuxMessage("answer-1", "user", "option 1", {
@@ -5535,17 +5536,34 @@ describe("transcript truncation keeps open questions", () => {
       false
     );
     const rows = aggregator.getDisplayedMessages();
+    const question = rows.find((row) => row.type === "tool" && row.toolCallId === "ask-1");
     return {
       truncated: rows.some((row) => row.type === "history-hidden"),
-      questionShown: rows.some((row) => row.type === "tool" && row.toolCallId === "ask-1"),
+      questionShown: question !== undefined,
+      questionRowId: question?.id,
     };
   }
 
   test("an unanswered question stays in the displayed rows", () => {
-    expect(loadQuestionThenOutput(false)).toEqual({ truncated: true, questionShown: true });
+    expect(loadQuestionThenOutput(false)).toMatchObject({ truncated: true, questionShown: true });
   });
 
   test("an answered question may be hidden like any older tool row", () => {
-    expect(loadQuestionThenOutput(true)).toEqual({ truncated: true, questionShown: false });
+    expect(loadQuestionThenOutput(true)).toMatchObject({ truncated: true, questionShown: false });
+  });
+
+  test("an answer the app accepted without an answer row releases the question", () => {
+    // A batched answer rides an earlier queued message, so no answer row ever lands for it.
+    const workspaceId = "ws-truncation-accepted";
+    const before = loadQuestionThenOutput(false, workspaceId);
+    expect(before).toMatchObject({ truncated: true, questionShown: true });
+    setAcceptedAnswers(
+      { workspaceId, toolCallId: "ask-1", rowId: before.questionRowId },
+      { "Which option?": "First" }
+    );
+    expect(loadQuestionThenOutput(false, workspaceId)).toMatchObject({
+      truncated: true,
+      questionShown: false,
+    });
   });
 });
