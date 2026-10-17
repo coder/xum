@@ -49,6 +49,10 @@ import {
 import { completeInProgressTodoItems } from "@/common/utils/todoList";
 import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
+import {
+  getAskUserQuestionOccurrences,
+  isAskUserQuestionOccurrenceOpen,
+} from "@/common/utils/tools/askUserQuestionSummary";
 
 import type {
   WorkspaceChatMessage,
@@ -282,6 +286,42 @@ const ALWAYS_KEEP_MESSAGE_TYPES = new Set<DisplayedMessage["type"]>([
   "plan-display",
   "workspace-init",
 ]);
+
+/** Display ids of the ask_user_question rows that still take answers. */
+function getOpenAskUserQuestionRowIds(messages: readonly DisplayedMessage[]): Set<string> {
+  const ids = new Set<string>();
+  for (const { row, state } of getAskUserQuestionOccurrences(messages)) {
+    if (row.type === "tool" && isAskUserQuestionOccurrenceOpen(row, state)) {
+      ids.add(row.id);
+    }
+  }
+  return ids;
+}
+
+/**
+ * Rows truncation keeps beyond the always-kept types: the reveal target, and every unanswered
+ * ask_user_question (the chat docks it above the input from this list, so it must stay reachable).
+ */
+function buildAlwaysKeepMessage(
+  messages: readonly DisplayedMessage[],
+  revealTarget: TranscriptRevealTarget | null
+): (message: DisplayedMessage) => boolean {
+  const openQuestionRowIds = getOpenAskUserQuestionRowIds(messages);
+  return (message) => {
+    if (openQuestionRowIds.has(message.id)) return true;
+    if (revealTarget == null) return false;
+    const matchesToolCall =
+      revealTarget.toolCallId != null &&
+      message.type === "tool" &&
+      message.toolCallId === revealTarget.toolCallId;
+    return (
+      matchesToolCall ||
+      (revealTarget.messageId != null &&
+        "historyId" in message &&
+        message.historyId === revealTarget.messageId)
+    );
+  };
+}
 
 interface StreamingContext {
   /** Backend timestamp when stream started (Date.now()) */
@@ -4032,15 +4072,7 @@ export class StreamingMessageAggregator {
           displayedMessages,
           maxDisplayedMessages: MAX_DISPLAYED_MESSAGES,
           alwaysKeepMessageTypes: ALWAYS_KEEP_MESSAGE_TYPES,
-          shouldAlwaysKeepMessage: revealTarget
-            ? (message) =>
-                (revealTarget.toolCallId != null &&
-                  message.type === "tool" &&
-                  message.toolCallId === revealTarget.toolCallId) ||
-                (revealTarget.messageId != null &&
-                  "historyId" in message &&
-                  message.historyId === revealTarget.messageId)
-            : undefined,
+          shouldAlwaysKeepMessage: buildAlwaysKeepMessage(displayedMessages, revealTarget),
         });
 
         resultMessages =

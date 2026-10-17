@@ -5476,3 +5476,76 @@ describe("StreamingMessageAggregator in-turn hidden notice rows", () => {
     expect(aggregator.getPendingStreamModel()).toBe(model);
   });
 });
+
+describe("transcript truncation keeps open questions", () => {
+  const questionInput = {
+    questions: [
+      {
+        question: "Which option?",
+        header: "Option",
+        options: [
+          { label: "First", description: "The first option." },
+          { label: "Second", description: "The second option." },
+        ],
+        multiSelect: false,
+      },
+    ],
+  };
+  const asyncOutput = {
+    summary: "Questions shown to the user.",
+    ui_only: {
+      ask_user_question: {
+        questions: questionInput.questions,
+        answers: {},
+        answerDelivery: "message",
+      },
+    },
+  };
+
+  function loadQuestionThenOutput(answered: boolean) {
+    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+    const answerRows = answered
+      ? [
+          createMuxMessage("answer-1", "user", "option 1", {
+            historySequence: 2,
+            timestamp: 2,
+            muxMetadata: {
+              type: "normal",
+              askUserQuestionAnswer: { toolCallId: "ask-1", answers: { "Which option?": "First" } },
+            },
+          }),
+        ]
+      : [];
+    aggregator.loadHistoricalMessages(
+      [
+        historicalToolMessage("question-1", "ask_user_question", questionInput, {
+          toolCallId: "ask-1",
+          output: asyncOutput,
+          historySequence: 1,
+        }),
+        ...answerRows,
+        // Enough later agent output to push the question past the recent-row window.
+        ...Array.from({ length: 70 }, (_, index) =>
+          createMuxMessage(`later-${index}`, "assistant", `later response ${index}`, {
+            historySequence: index + 3,
+            timestamp: index + 3,
+          })
+        ),
+      ],
+      false
+    );
+    const rows = aggregator.getDisplayedMessages();
+    return {
+      truncated: rows.some((row) => row.type === "history-hidden"),
+      questionShown: rows.some((row) => row.type === "tool" && row.toolCallId === "ask-1"),
+    };
+  }
+
+  test("an unanswered question stays in the displayed rows", () => {
+    expect(loadQuestionThenOutput(false)).toEqual({ truncated: true, questionShown: true });
+  });
+
+  test("an answered question may be hidden like any older tool row", () => {
+    expect(loadQuestionThenOutput(true)).toEqual({ truncated: true, questionShown: false });
+  });
+});

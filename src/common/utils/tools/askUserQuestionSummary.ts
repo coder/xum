@@ -102,6 +102,24 @@ export function getAskUserQuestionOccurrences<Row extends AskUserQuestionTranscr
 }
 
 /**
+ * Whether an ask_user_question row still takes answers, from the transcript alone: a blocking
+ * question while its tool call executes, and a non-blocking one until an answer row for it lands,
+ * a later question reuses its tool call id, or a boundary drops it from the agent's context.
+ */
+export function isAskUserQuestionOccurrenceOpen(
+  row: { status?: string; result?: unknown },
+  state: AskUserQuestionOccurrenceState
+): boolean {
+  if (row.status === "executing") return true;
+  return (
+    isAsyncAskUserQuestionOutput(row.result) &&
+    state.answers === undefined &&
+    !state.superseded &&
+    !state.leftContext
+  );
+}
+
+/**
  * The state of one ask_user_question row: the row with `rowId` (a transcript row's display id),
  * or without one the latest row with `toolCallId`. A row missing from the transcript (a host that
  * feeds none, or history not loaded yet) is judged by its id alone, as before rows were told apart.

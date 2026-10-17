@@ -3,7 +3,7 @@ import { createContext, useContext } from "react";
 import type { DisplayedMessage } from "@/common/types/message";
 import {
   getAskUserQuestionOccurrences,
-  isAsyncAskUserQuestionOutput,
+  isAskUserQuestionOccurrenceOpen,
 } from "@/common/utils/tools/askUserQuestionSummary";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getAcceptedAnswers } from "./useNonBlockingQuestionAnswers";
@@ -76,13 +76,8 @@ export function findOpenAskUserQuestions(
     .filter(
       ({ row, state }) =>
         isToolRow(row) &&
-        (row.status === "executing" ||
-          (isAsyncAskUserQuestionOutput(row.result) &&
-            state.answers === undefined &&
-            !state.superseded &&
-            !state.leftContext &&
-            getAcceptedAnswers({ workspaceId, toolCallId: row.toolCallId, rowId: row.id }) ===
-              null))
+        isAskUserQuestionOccurrenceOpen(row, state) &&
+        getAcceptedAnswers({ workspaceId, toolCallId: row.toolCallId, rowId: row.id }) === null
     )
     .map(({ row }) => row)
     .filter(isToolRow)
