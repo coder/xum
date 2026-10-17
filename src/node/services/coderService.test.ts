@@ -1,3 +1,4 @@
+import assert from "node:assert";
 import { EventEmitter } from "events";
 import { Readable } from "stream";
 import { describe, it, expect, vi, beforeEach, afterEach, spyOn, setSystemTime } from "bun:test";
@@ -755,6 +756,35 @@ describe("CoderService", () => {
       expect(thrown instanceof Error ? thrown.message : String(thrown)).toBe(
         "coder ssh --wait failed (exit 1): Connection refused"
       );
+    });
+
+    // Live stderr (2026-10-17): the CLI prints its version-mismatch notice before the cause, so
+    // the joined message buried "agent is shutting down" at the end.
+    it("leads the failure with the CLI's final error line and drops version notices", async () => {
+      const stderr = [
+        "the server is running a development version of Coder (v2.38.0-devel+54ba766f77)",
+        "version mismatch: client v2.36.6+165de21, server v2.38.0-devel+54ba766f77",
+        "download v2.38.0-devel+54ba766f77 with: 'curl -fsSL https://dogfood.cdr.dev/install.sh | sh'",
+        'Encountered an error running "coder ssh", see "coder ssh --help" for more information',
+        "error: agent is shutting down",
+      ].join("\n");
+      mockCoderCommandResult({ exitCode: 1, stderr: `${stderr}\n` });
+
+      let thrown: unknown;
+      try {
+        for await (const _line of service.waitForStartupScripts("my-ws")) {
+          // drain
+        }
+      } catch (error) {
+        thrown = error;
+      }
+
+      assert(thrown instanceof Error, "waitForStartupScripts must throw an Error");
+      expect(thrown.message).toBe(
+        'coder ssh --wait failed (exit 1): agent is shutting down | Encountered an error running "coder ssh", see "coder ssh --help" for more information'
+      );
+      // The log keeps every stderr line, notices included.
+      expect((thrown as Error & { stderr?: string }).stderr).toBe(stderr);
     });
   });
 

@@ -129,6 +129,28 @@ function createGracefulTerminator(
 }
 
 /**
+ * Notices the coder CLI prints before any command when its version differs from the server's.
+ * They are not the failure, so a failure message drops them (the full stderr is kept apart).
+ */
+const CODER_VERSION_NOTICE_LINES = [
+  /^the server is running a development version of Coder \(/,
+  /^version mismatch: client \S+, server \S+$/,
+  /^download \S+ with: '/,
+];
+
+/**
+ * Stderr lines for a failure message: version notices dropped, and the CLI's final `error:`
+ * line (the actual cause, printed last) moved to the front without its prefix.
+ */
+function orderCoderStderrForMessage(lines: readonly string[]): string[] {
+  const kept = lines.filter((line) => !CODER_VERSION_NOTICE_LINES.some((re) => re.test(line)));
+  const causeIndex = kept.findLastIndex((line) => line.startsWith("error: "));
+  if (causeIndex === -1) return kept;
+  const cause = kept[causeIndex].slice("error: ".length);
+  return [cause, ...kept.slice(0, causeIndex), ...kept.slice(causeIndex + 1)];
+}
+
+/**
  * Stream output from a coder CLI command line by line.
  * Yields lines as they arrive from stdout/stderr.
  * Throws on non-zero exit with stderr content in the error message.
@@ -248,8 +270,12 @@ async function* streamCoderCommand(
     }
 
     if (exitCode !== 0) {
-      const errorDetail = stderrLines.length > 0 ? `: ${stderrLines.join(" | ")}` : "";
-      throw new Error(`${errorPrefix} (exit ${String(exitCode)})${errorDetail}`);
+      const causeLines = orderCoderStderrForMessage(stderrLines);
+      const errorDetail = causeLines.length > 0 ? `: ${causeLines.join(" | ")}` : "";
+      // The message leads with the cause; `stderr` keeps every line for the log details.
+      throw Object.assign(new Error(`${errorPrefix} (exit ${String(exitCode)})${errorDetail}`), {
+        stderr: stderrLines.join("\n"),
+      });
     }
   } finally {
     terminator.cleanup();
