@@ -177,6 +177,8 @@ export const AppConfigOnDiskSchema = z
      * whole document.
      */
     agentResourceLimits: AgentResourceLimitsSchema.optional().catch(undefined),
+    /** Apply agentResourceLimits. Absent = off; the limits stay saved while off. */
+    agentResourceLimitsEnabled: z.boolean().optional(),
     chatTranscriptFullWidth: z.boolean().optional(),
     muxGatewayEnabled: z.boolean().optional(),
     llmDebugLogs: z.boolean().optional(),

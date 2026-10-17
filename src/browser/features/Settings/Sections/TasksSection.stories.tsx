@@ -28,6 +28,7 @@ export const Tasks: Story = {
         setupSettingsStory({
           taskSettings: { maxParallelAgentTasks: 2, maxTaskNestingDepth: 4 },
           agentResourceLimits: {
+            enabled: true,
             limits: { cpuCores: 8, memoryGiB: 16 },
             status: { state: "active", cgroup: "/xum/xum-agents" },
           },

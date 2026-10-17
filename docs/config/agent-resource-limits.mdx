@@ -7,14 +7,16 @@ Agents that run in parallel on one machine can use all of its CPU and memory, wh
 
 ## Set the limits
 
-In **Settings → Agents → Resource limits**, enter a **CPU limit** in cores (fractions such as `2.5` work) and a **Memory limit** in GiB. An empty field means no limit. The value saves when you leave the field.
+In **Settings → Agents → Resource limits**, turn on the switch. Then enter a **CPU limit** in cores (fractions such as `2.5` work) and a **Memory limit** in GiB. An empty field means no limit. The value saves when you leave the field.
 
 The line under the fields shows the result:
 
 - **Active**: agent commands share the limits. The line names the cgroup they run in.
 - **Not applied**: the line gives the reason. Fix the cause (see [Status messages](#status-messages)), then click **Try again**.
 
-A changed limit applies at once to agent commands that already run under the limit. Commands that started before you set the first limit keep running without it.
+A changed limit applies at once to agent commands that already run under the limit. Commands that started while no limit applied keep running without one.
+
+To stop the limits for a while, turn off the switch. The limits stop at once, also for agent commands that already run under them. Xum keeps the values, and they apply again when you turn the switch back on.
 
 ## What the limit covers
 
@@ -27,7 +29,7 @@ It does not cover:
 - Xum itself, including the git commands it runs to create and remove worktrees, and repository hooks such as `post-checkout` that those commands run.
 - Docker, dev container, SSH, and Coder workspaces. Their commands run in the container or on the remote machine.
 
-`xum run` and `xum workflow` apply the saved limits to their commands too. Their commands share one limit with the agents of a running Xum only when both use the same base cgroup (see [How Xum sets up the cgroup](#how-xum-sets-up-the-cgroup)), for example when you start them from a shell in `xum-app`.
+While the switch is on, `xum run` and `xum workflow` apply the saved limits to their commands too. Their commands share one limit with the agents of a running Xum only when both use the same base cgroup (see [How Xum sets up the cgroup](#how-xum-sets-up-the-cgroup)), for example when you start them from a shell in `xum-app`.
 
 Things to know about the limits:
 
@@ -43,7 +45,7 @@ A user can move a process into a cgroup only inside a cgroup tree that is delega
 2. Creates the child `xum-agents` and writes the limits to its `cpu.max` and `memory.max`.
 3. Moves each new agent command into `xum-agents` before the command runs.
 
-When you clear the limits, Xum writes `max` to both files. It does not move processes back or delete the cgroups. After the first setup, start other processes in `xum-app`, not in the base cgroup. A Xum that you restart from a shell in `xum-app` uses the same base cgroup again.
+When you clear the limits or turn off the switch, Xum writes `max` to both files. It does not move processes back or delete the cgroups. After the first setup, start other processes in `xum-app`, not in the base cgroup. A Xum that you restart from a shell in `xum-app` uses the same base cgroup again.
 
 ## Start Xum in a delegated cgroup
 

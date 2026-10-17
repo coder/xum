@@ -10,9 +10,12 @@ export const AgentResourceLimitsStatusSchema = z.discriminatedUnion("state", [
 export type AgentResourceLimitsStatus = z.infer<typeof AgentResourceLimitsStatusSchema>;
 
 const AgentResourceLimitsStateSchema = z.object({
+  /** When false, no limit applies, and `limits` stay saved for the next time it is true. */
+  enabled: z.boolean(),
   limits: AgentResourceLimitsSchema,
   status: AgentResourceLimitsStatusSchema,
 });
+export type AgentResourceLimitsState = z.infer<typeof AgentResourceLimitsStateSchema>;
 
 export const agentResourceLimits = {
   get: {
@@ -22,6 +25,11 @@ export const agentResourceLimits = {
   /** Replaces both limits: an omitted field removes that limit. */
   set: {
     input: AgentResourceLimitsSchema,
+    output: AgentResourceLimitsStateSchema,
+  },
+  /** Turns the limits on or off. It does not change them, so a concurrent `set` is kept. */
+  setEnabled: {
+    input: z.object({ enabled: z.boolean() }),
     output: AgentResourceLimitsStateSchema,
   },
 };

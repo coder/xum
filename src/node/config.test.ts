@@ -908,11 +908,10 @@ describe("Config", () => {
 
   describe("agent resource limits setting", () => {
     const readPersisted = () =>
-      (
-        JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-          agentResourceLimits?: unknown;
-        }
-      ).agentResourceLimits;
+      JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        agentResourceLimits?: unknown;
+        agentResourceLimitsEnabled?: unknown;
+      };
 
     it("saves the limits that are set and removes the key once none is", async () => {
       await config.updateAgentResourceLimits({ cpuCores: 2.5, memoryGiB: 8 });
@@ -922,11 +921,25 @@ describe("Config", () => {
       });
 
       await config.updateAgentResourceLimits({ memoryGiB: 8 });
-      expect(readPersisted()).toEqual({ memoryGiB: 8 });
+      expect(readPersisted().agentResourceLimits).toEqual({ memoryGiB: 8 });
 
       await config.updateAgentResourceLimits({});
-      expect(readPersisted()).toBeUndefined();
+      expect(readPersisted().agentResourceLimits).toBeUndefined();
       expect(new Config(tempDir).loadConfigOrDefault().agentResourceLimits).toBeUndefined();
+    });
+
+    it("is off until turned on, and keeps the limits saved while off", async () => {
+      expect(config.loadConfigOrDefault().agentResourceLimitsEnabled).toBeUndefined();
+      await config.updateAgentResourceLimits({ cpuCores: 2 });
+
+      await config.updateAgentResourceLimitsEnabled(true);
+      expect(new Config(tempDir).loadConfigOrDefault().agentResourceLimitsEnabled).toBe(true);
+
+      await config.updateAgentResourceLimitsEnabled(false);
+      expect(readPersisted().agentResourceLimitsEnabled).toBeUndefined();
+      expect(new Config(tempDir).loadConfigOrDefault().agentResourceLimits).toEqual({
+        cpuCores: 2,
+      });
     });
 
     it("ignores a hand-edited value outside the allowed range", () => {

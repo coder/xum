@@ -21,6 +21,7 @@ describe("AgentResourceLimitsService", () => {
   beforeEach(async () => {
     rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-limits-"));
     config = new Config(rootDir);
+    await config.updateAgentResourceLimitsEnabled(true);
     tree = await createFakeCgroupTree({
       own: "/xum",
       cgroups: { xum: { controllers: "cpu memory" } },
@@ -53,6 +54,7 @@ describe("AgentResourceLimitsService", () => {
     await service.start();
 
     expect(await service.get()).toEqual({
+      enabled: true,
       limits: { cpuCores: 2 },
       status: { state: "active", cgroup: "/xum/xum-agents" },
     });
@@ -69,6 +71,26 @@ describe("AgentResourceLimitsService", () => {
     expect(agentCgroupEnrollmentLine()).toBe("");
   });
 
+  it("removes the limits while they are off and applies the saved ones when turned on", async () => {
+    await config.updateAgentResourceLimits({ cpuCores: 2 });
+    service = new AgentResourceLimitsService(config, tree.host);
+    await service.start();
+
+    expect(await service.setEnabled(false)).toEqual({
+      enabled: false,
+      limits: { cpuCores: 2 },
+      status: { state: "off" },
+    });
+    expect(await cpuMax()).toBe("max 100000");
+    expect(agentCgroupEnrollmentLine()).toBe("");
+
+    // Turned on in another window or process, so only the config listener sees it.
+    await config.updateAgentResourceLimitsEnabled(true);
+    await waitForCondition(async () => (await cpuMax()) === "200000 100000");
+    expect((await service.get()).status).toEqual({ state: "active", cgroup: "/xum/xum-agents" });
+    expect(agentCgroupEnrollmentLine()).toContain(procsFile());
+  });
+
   it("reports the status of limits that a config change is still applying", async () => {
     service = new AgentResourceLimitsService(config, tree.host);
     await service.start();
@@ -77,6 +99,7 @@ describe("AgentResourceLimitsService", () => {
     await config.updateAgentResourceLimits({ cpuCores: 4 });
 
     expect(await service.get()).toEqual({
+      enabled: true,
       limits: { cpuCores: 4 },
       status: { state: "active", cgroup: "/xum/xum-agents" },
     });
@@ -103,6 +126,7 @@ describe("AgentResourceLimitsService", () => {
     const state = await service.set({ cpuCores: 1.5, memoryGiB: 2 });
 
     expect(state).toEqual({
+      enabled: true,
       limits: { cpuCores: 1.5, memoryGiB: 2 },
       status: { state: "active", cgroup: "/xum/xum-agents" },
     });

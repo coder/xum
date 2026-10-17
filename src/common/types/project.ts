@@ -122,6 +122,8 @@ export interface ProjectsConfig {
   heartbeatDefaultIntervalMs?: number;
   /** CPU and memory that all local agent processes share (Linux cgroup v2). Absent = no limit. */
   agentResourceLimits?: AgentResourceLimits;
+  /** Apply agentResourceLimits. Absent = off; the limits stay saved while off. */
+  agentResourceLimitsEnabled?: boolean;
   /** Global defaults for new workspace goals. */
   goalDefaults?: GoalDefaults;
   /** Default evaluation model for workflow `evaluate()` steps (Settings → Tasks & Workflows). */

@@ -3135,6 +3135,7 @@ export class Config {
         parsed.heartbeatDefaultIntervalMs
       ),
       agentResourceLimits: normalizeAgentResourceLimits(parsed.agentResourceLimits),
+      agentResourceLimitsEnabled: parseOptionalBoolean(parsed.agentResourceLimitsEnabled),
       goalDefaults: normalizeGoalDefaults(parsed.goalDefaults),
       evaluationDefaults: normalizeEvaluationDefaults(parsed.evaluationDefaults),
       muxGatewayModels,
@@ -3304,8 +3305,9 @@ export class Config {
         data.heartbeatDefaultIntervalMs = heartbeatDefaultIntervalMs;
       }
 
-      // Undefined (no limit set) leaves the key out of the JSON.
+      // Undefined (no limit set, or the limits are off) leaves the key out of the JSON.
       data.agentResourceLimits = normalizeAgentResourceLimits(config.agentResourceLimits);
+      data.agentResourceLimitsEnabled = parseOptionalBoolean(config.agentResourceLimitsEnabled);
 
       if (config.goalDefaults) {
         data.goalDefaults = normalizeGoalDefaults(config.goalDefaults);
@@ -3792,6 +3794,14 @@ export class Config {
       const normalized = normalizeAgentResourceLimits(limits);
       if (normalized) config.agentResourceLimits = normalized;
       else delete config.agentResourceLimits;
+      return config;
+    });
+  }
+
+  async updateAgentResourceLimitsEnabled(enabled: boolean): Promise<void> {
+    await this.editConfig((config) => {
+      if (enabled) config.agentResourceLimitsEnabled = true;
+      else delete config.agentResourceLimitsEnabled;
       return config;
     });
   }

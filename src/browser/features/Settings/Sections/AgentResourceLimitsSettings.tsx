@@ -2,19 +2,15 @@ import React, { useEffect, useState } from "react";
 import { Button } from "@/browser/components/Button/Button";
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import { Input } from "@/browser/components/Input/Input";
+import { Switch } from "@/browser/components/Switch/Switch";
 import { useLiveAPI, type APIClient } from "@/browser/contexts/API";
 import { CONNECTION_LOST_MESSAGE, isStreamFailure } from "@/browser/contexts/connectionLink";
 import {
   AGENT_RESOURCE_LIMITS_RANGE,
   type AgentResourceLimits,
 } from "@/common/config/schemas/agentResourceLimits";
-import type { AgentResourceLimitsStatus } from "@/common/orpc/schemas/agentResourceLimits";
+import type { AgentResourceLimitsState } from "@/common/orpc/schemas/agentResourceLimits";
 import { getErrorMessage } from "@/common/utils/errors";
-
-interface LimitsState {
-  limits: AgentResourceLimits;
-  status: AgentResourceLimitsStatus;
-}
 
 type LimitField = keyof AgentResourceLimits;
 
@@ -79,7 +75,7 @@ function describeActiveLimits(limits: AgentResourceLimits): string {
 
 interface LimitsView {
   /** The saved limits and their status, as the server last reported them. */
-  state: LimitsState;
+  state: AgentResourceLimitsState;
   drafts: Drafts;
 }
 
@@ -88,7 +84,7 @@ interface LimitsView {
  * differs from the value saved before, so a change made elsewhere never replaces an edit in
  * progress, and the next save sends the current value of the other field.
  */
-function withAppliedLimits(view: LimitsView | null, next: LimitsState): LimitsView {
+function withAppliedLimits(view: LimitsView | null, next: AgentResourceLimitsState): LimitsView {
   const drafts = draftsOf(next.limits);
   for (const { field } of FIELDS) {
     if (view !== null && parseLimit(field, view.drafts[field]) !== view.state.limits[field]) {
@@ -106,7 +102,7 @@ function withDraft(view: LimitsView | null, field: LimitField, draft: string): L
 async function followAppliedLimits(
   api: APIClient,
   signal: AbortSignal,
-  onLoaded: (state: LimitsState) => void
+  onLoaded: (state: AgentResourceLimitsState) => void
 ): Promise<void> {
   const load = async () => {
     const state = await api.agentResourceLimits.get();
@@ -120,8 +116,16 @@ async function followAppliedLimits(
   }
 }
 
-function StatusLine(props: { state: LimitsState; disabled: boolean; onRetry: () => void }) {
-  const { limits, status } = props.state;
+function StatusLine(props: {
+  state: AgentResourceLimitsState;
+  disabled: boolean;
+  onRetry: () => void;
+}) {
+  const { enabled, limits, status } = props.state;
+  // While off, the fields still show the saved limits, so "No limit is set." would be wrong.
+  if (!enabled && status.state !== "unavailable") {
+    return null;
+  }
   if (status.state === "off") {
     return <div className="text-muted text-xs">No limit is set.</div>;
   }
@@ -145,7 +149,8 @@ function StatusLine(props: { state: LimitsState; disabled: boolean; onRetry: () 
 
 /**
  * The saved limits with their status and the drafts of the two fields, following changes made
- * elsewhere. Offline the fields are disabled, since a save could not reach the server.
+ * elsewhere. Offline the switch and the fields are disabled, since a save could not reach the
+ * server.
  */
 function useAgentResourceLimits() {
   const api = useLiveAPI();
@@ -173,13 +178,12 @@ function useAgentResourceLimits() {
     return () => controller.abort();
   }, [api]);
 
-  const save = (limits: AgentResourceLimits) => {
+  const send = (request: (client: APIClient) => Promise<AgentResourceLimitsState>) => {
     if (api == null) {
       setError(CONNECTION_LOST_MESSAGE);
       return;
     }
-    api.agentResourceLimits
-      .set(limits)
+    request(api)
       .then((saved) => {
         setView((current) => withAppliedLimits(current, saved));
         setError(null);
@@ -188,16 +192,69 @@ function useAgentResourceLimits() {
         setError(`Failed to save agent resource limits: ${getErrorMessage(saveError)}`);
       });
   };
+  const save = (limits: AgentResourceLimits) =>
+    send((client) => client.agentResourceLimits.set(limits));
+  // A separate request, so a save of the fields that is still on its way is not undone.
+  const setEnabled = (enabled: boolean) =>
+    send((client) => client.agentResourceLimits.setEnabled({ enabled }));
 
   const setDraft = (field: LimitField, draft: string) =>
     setView((current) => withDraft(current, field, draft));
 
-  return { view, setDraft, error, setError, save, disabled: view === null || api == null };
+  return {
+    view,
+    setDraft,
+    error,
+    setError,
+    save,
+    setEnabled,
+    disabled: view === null || api == null,
+  };
+}
+
+/** The CPU and memory fields. They are disabled offline and while the limits are off. */
+function LimitFields(props: {
+  view: LimitsView | null;
+  disabled: boolean;
+  onDraft: (field: LimitField, draft: string) => void;
+  onBlur: () => void;
+}) {
+  const locked = props.disabled || props.view?.state.enabled !== true;
+  return FIELDS.map(({ field, label, unit, step }) => {
+    const range = AGENT_RESOURCE_LIMITS_RANGE[field];
+    const inputId = `agent-resource-limit-${field}`;
+    return (
+      <div key={field} className="flex items-center justify-between gap-4">
+        <label htmlFor={inputId} className="text-foreground min-w-0 flex-1 text-sm">
+          {label}
+        </label>
+        <div className="flex items-center gap-2">
+          <Input
+            id={inputId}
+            type="number"
+            inputMode="decimal"
+            min={range.min}
+            max={range.max}
+            step={step}
+            placeholder="None"
+            value={props.view?.drafts[field] ?? ""}
+            onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
+              props.onDraft(field, event.target.value)
+            }
+            onBlur={props.onBlur}
+            disabled={locked}
+            className="border-border-medium bg-background-secondary h-9 w-24 text-right"
+          />
+          <span className="text-muted w-10 text-sm">{unit}</span>
+        </div>
+      </div>
+    );
+  });
 }
 
 /** Settings > Agents: one CPU and memory limit that all local agent processes share. */
 export function AgentResourceLimitsSettings() {
-  const { view, setDraft, error, setError, save, disabled } = useAgentResourceLimits();
+  const { view, setDraft, error, setError, save, setEnabled, disabled } = useAgentResourceLimits();
 
   const handleBlur = () => {
     if (!view) {
@@ -216,45 +273,26 @@ export function AgentResourceLimitsSettings() {
 
   return (
     <div>
-      <div className="mb-1 flex items-center gap-2">
-        <h3 className="text-foreground text-sm font-medium">Resource limits</h3>
-        <DocsLink path="/config/agent-resource-limits" />
-      </div>
-      <div className="text-muted mb-4 text-xs">
-        CPU and memory that all local agent commands share, on Linux with cgroup v2. Empty means no
-        limit.
+      <div className="mb-4 flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="mb-1 flex items-center gap-2">
+            <h3 className="text-foreground text-sm font-medium">Resource limits</h3>
+            <DocsLink path="/config/agent-resource-limits" />
+          </div>
+          <div className="text-muted text-xs">
+            CPU and memory that all local agent commands share, on Linux with cgroup v2. Empty means
+            no limit.
+          </div>
+        </div>
+        <Switch
+          checked={view?.state.enabled === true}
+          onCheckedChange={setEnabled}
+          disabled={disabled}
+          aria-label="Resource limits"
+        />
       </div>
       <div className="space-y-4">
-        {FIELDS.map(({ field, label, unit, step }) => {
-          const range = AGENT_RESOURCE_LIMITS_RANGE[field];
-          const inputId = `agent-resource-limit-${field}`;
-          return (
-            <div key={field} className="flex items-center justify-between gap-4">
-              <label htmlFor={inputId} className="text-foreground min-w-0 flex-1 text-sm">
-                {label}
-              </label>
-              <div className="flex items-center gap-2">
-                <Input
-                  id={inputId}
-                  type="number"
-                  inputMode="decimal"
-                  min={range.min}
-                  max={range.max}
-                  step={step}
-                  placeholder="None"
-                  value={view?.drafts[field] ?? ""}
-                  onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
-                    setDraft(field, event.target.value)
-                  }
-                  onBlur={handleBlur}
-                  disabled={disabled}
-                  className="border-border-medium bg-background-secondary h-9 w-24 text-right"
-                />
-                <span className="text-muted w-10 text-sm">{unit}</span>
-              </div>
-            </div>
-          );
-        })}
+        <LimitFields view={view} disabled={disabled} onDraft={setDraft} onBlur={handleBlur} />
         {view ? (
           <StatusLine
             state={view.state}

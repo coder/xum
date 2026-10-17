@@ -11,26 +11,29 @@ import {
   type TestApiOverrides,
 } from "@/browser/testUtils";
 import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
-import type { AgentResourceLimitsStatus } from "@/common/orpc/schemas/agentResourceLimits";
+import type {
+  AgentResourceLimitsState,
+  AgentResourceLimitsStatus,
+} from "@/common/orpc/schemas/agentResourceLimits";
 import { AgentResourceLimitsSettings } from "./AgentResourceLimitsSettings";
 
-interface LimitsState {
-  limits: AgentResourceLimits;
-  status: AgentResourceLimitsStatus;
-}
-
 const ACTIVE: AgentResourceLimitsStatus = { state: "active", cgroup: "/xum/xum-agents" };
+const OFF: AgentResourceLimitsStatus = { state: "off" };
 
 /** The server's saved limits, the saves it receives, and its config change subscriptions. */
-function createServer(initial: LimitsState) {
+function createServer(initial: AgentResourceLimitsState) {
   let saved = initial;
   const subscriptions: Array<ControllableAsyncIterable<undefined>> = [];
   const set = mock((limits: AgentResourceLimits) => {
-    saved = { limits, status: ACTIVE };
+    saved = { ...saved, limits, status: saved.enabled ? ACTIVE : OFF };
+    return Promise.resolve(saved);
+  });
+  const setEnabled = mock(({ enabled }: { enabled: boolean }) => {
+    saved = { ...saved, enabled, status: enabled ? ACTIVE : OFF };
     return Promise.resolve(saved);
   });
   const overrides = (): TestApiOverrides<APIClient> => ({
-    agentResourceLimits: { get: () => Promise.resolve(saved), set },
+    agentResourceLimits: { get: () => Promise.resolve(saved), set, setEnabled },
     config: {
       onConfigChanged: () => {
         const subscription = createControllableAsyncIterable<undefined>();
@@ -40,11 +43,11 @@ function createServer(initial: LimitsState) {
     },
   });
   /** Another window or backend saves `next`. */
-  const saveElsewhere = (next: LimitsState) => {
+  const saveElsewhere = (next: AgentResourceLimitsState) => {
     saved = next;
     for (const subscription of subscriptions) subscription.push(undefined);
   };
-  return { set, overrides, saveElsewhere };
+  return { set, setEnabled, overrides, saveElsewhere };
 }
 
 // happy-dom does not deliver React's synthetic onChange for controlled fields, so call the
@@ -62,21 +65,22 @@ function typeInto(input: HTMLInputElement, value: string) {
 function fields(view: ReturnType<typeof render>) {
   const cpu = () => view.getByLabelText("CPU limit") as HTMLInputElement;
   const memory = () => view.getByLabelText("Memory limit") as HTMLInputElement;
+  const toggle = () => view.getByRole("switch", { name: "Resource limits" }) as HTMLButtonElement;
   const edit = (input: HTMLInputElement, value: string) => {
     typeInto(input, value);
     fireEvent.blur(input);
   };
-  return { cpu, memory, edit };
+  return { cpu, memory, toggle, edit };
 }
 
-function renderSettings(initial: LimitsState) {
+function renderSettings(initial: AgentResourceLimitsState) {
   const server = createServer(initial);
   const view = render(
     <APIProvider client={createTestApiClient(server.overrides())}>
       <AgentResourceLimitsSettings />
     </APIProvider>
   );
-  return { ...view, ...fields(view), set: server.set, saveElsewhere: server.saveElsewhere };
+  return { ...view, ...fields(view), ...server };
 }
 
 let restoreDom: (() => void) | undefined;
@@ -90,11 +94,15 @@ afterEach(() => {
 
 describe("AgentResourceLimitsSettings", () => {
   test("follows limits saved elsewhere and keeps the field that is being edited", async () => {
-    const view = renderSettings({ limits: { cpuCores: 8, memoryGiB: 16 }, status: ACTIVE });
+    const view = renderSettings({
+      enabled: true,
+      limits: { cpuCores: 8, memoryGiB: 16 },
+      status: ACTIVE,
+    });
     await waitFor(() => expect(view.cpu().value).toBe("8"));
 
     typeInto(view.memory(), "32");
-    view.saveElsewhere({ limits: { cpuCores: 4, memoryGiB: 16 }, status: ACTIVE });
+    view.saveElsewhere({ enabled: true, limits: { cpuCores: 4, memoryGiB: 16 }, status: ACTIVE });
 
     await waitFor(() => expect(view.cpu().value).toBe("4"));
     expect(view.memory().value).toBe("32");
@@ -108,6 +116,7 @@ describe("AgentResourceLimitsSettings", () => {
 
   test("shows the saved limits and saves an edited field with the other one", async () => {
     const view = renderSettings({
+      enabled: true,
       limits: { cpuCores: 8 },
       status: { state: "active", cgroup: "/xum/xum-agents" },
     });
@@ -126,6 +135,7 @@ describe("AgentResourceLimitsSettings", () => {
 
   test("clears a limit when its field is emptied", async () => {
     const view = renderSettings({
+      enabled: true,
       limits: { cpuCores: 8, memoryGiB: 16 },
       status: { state: "active", cgroup: "/xum/xum-agents" },
     });
@@ -137,8 +147,28 @@ describe("AgentResourceLimitsSettings", () => {
     expect(view.set.mock.calls[0]?.[0]).toEqual({ memoryGiB: 16 });
   });
 
+  test("turns the limits off and on again without changing them", async () => {
+    const view = renderSettings({ enabled: true, limits: { cpuCores: 8 }, status: ACTIVE });
+    await waitFor(() => expect(view.cpu().value).toBe("8"));
+
+    fireEvent.click(view.toggle());
+
+    await waitFor(() => expect(view.toggle().getAttribute("aria-checked")).toBe("false"));
+    expect(view.setEnabled.mock.calls).toEqual([[{ enabled: false }]]);
+    expect(view.cpu().disabled).toBe(true);
+    expect(view.cpu().value).toBe("8");
+    // The status is off, but the field still shows the saved limit.
+    expect(view.queryByText("No limit is set.")).toBeNull();
+
+    fireEvent.click(view.toggle());
+
+    await waitFor(() => expect(view.cpu().disabled).toBe(false));
+    expect(view.setEnabled.mock.calls[1]?.[0]).toEqual({ enabled: true });
+    view.getByText(/Active: agents share 8 CPU cores/);
+  });
+
   test("names the allowed range and saves nothing for a value outside it", async () => {
-    const view = renderSettings({ limits: {}, status: { state: "off" } });
+    const view = renderSettings({ enabled: true, limits: {}, status: { state: "off" } });
     await view.findByText("No limit is set.");
 
     view.edit(view.cpu(), "0.05");
@@ -149,6 +179,7 @@ describe("AgentResourceLimitsSettings", () => {
 
   test("shows why the limits are not applied and applies them again on request", async () => {
     const view = renderSettings({
+      enabled: true,
       limits: { cpuCores: 2 },
       status: { state: "unavailable", reason: "xum runs in cgroup /init.scope." },
     });
@@ -160,24 +191,39 @@ describe("AgentResourceLimitsSettings", () => {
     expect(view.set.mock.calls[0]?.[0]).toEqual({ cpuCores: 2 });
     await view.findByText(/Active: agents share 2 CPU cores/);
   });
+
+  test("shows a failure to remove the limits while they are off", async () => {
+    const view = renderSettings({
+      enabled: false,
+      limits: { cpuCores: 2 },
+      status: { state: "unavailable", reason: "Could not remove the limits: EACCES" },
+    });
+    await view.findByText("Not applied: Could not remove the limits: EACCES");
+
+    fireEvent.click(view.getByRole("button", { name: "Try again" }));
+
+    await waitFor(() => expect(view.queryByText(/Not applied/)).toBeNull());
+    expect(view.set.mock.calls).toEqual([[{ cpuCores: 2 }]]);
+  });
 });
 
 describe.each([...GAP_MODES])("AgentResourceLimitsSettings while reconnecting (%s)", (mode) => {
   test("saves no edit offline and shows the saved limits again after reconnecting", async () => {
-    const server = createServer({ limits: { cpuCores: 8 }, status: ACTIVE });
+    const server = createServer({ enabled: true, limits: { cpuCores: 8 }, status: ACTIVE });
     const harness = createConnectionHarness(mode, server.overrides);
     const view = render(
       <harness.Wrapper>
         <AgentResourceLimitsSettings />
       </harness.Wrapper>
     );
-    const { cpu } = fields(view);
+    const { cpu, toggle } = fields(view);
     await waitFor(() => expect(cpu().value).toBe("8"));
 
     typeInto(cpu(), "4");
     await harness.drop();
 
     await waitFor(() => expect(cpu().disabled).toBe(true));
+    expect(toggle().disabled).toBe(true);
     // A blur that still reaches the field cannot save.
     fireEvent.blur(cpu());
     await view.findByText(CONNECTION_LOST_MESSAGE);
@@ -186,6 +232,7 @@ describe.each([...GAP_MODES])("AgentResourceLimitsSettings while reconnecting (%
     harness.reconnect();
     await waitFor(() => expect(cpu().value).toBe("8"));
     expect(cpu().disabled).toBe(false);
+    expect(toggle().disabled).toBe(false);
     expect(view.queryByText(CONNECTION_LOST_MESSAGE)).toBeNull();
   });
 });

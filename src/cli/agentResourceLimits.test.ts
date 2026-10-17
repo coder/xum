@@ -13,8 +13,9 @@ const MOCK_PROVIDER = "local-mock";
 const MOCK_MODEL = "mock-model";
 
 /**
- * A xum root that saves a CPU limit of 2 cores and trusts `repo`, and a preload that points the
- * CLI's cgroup host at a fake cgroup tree. `cpuMax()` reads the limit the CLI wrote there.
+ * A xum root that saves a CPU limit of 2 cores, turns it on, and trusts `repo`, and a preload
+ * that points the CLI's cgroup host at a fake cgroup tree. `cpuMax()` reads the limit the CLI
+ * wrote there.
  */
 async function prepareHeadlessRoot(tmp: string) {
   const repo = path.join(tmp, "repo");
@@ -22,7 +23,7 @@ async function prepareHeadlessRoot(tmp: string) {
   const treeRootFile = path.join(tmp, "cgroup-root");
   await fs.mkdir(path.join(repo, "workflows"), { recursive: true });
   await fs.mkdir(xumRoot, { recursive: true });
-  await Bun.$`${BUN_EXECUTABLE} -e ${`import { Config } from "./src/node/config"; const c = new Config(); await c.editConfig((cfg) => { cfg.projects.set(process.argv[1], { workspaces: [], trusted: true }); return cfg; }); await c.updateAgentResourceLimits({ cpuCores: 2 });`} ${repo}`
+  await Bun.$`${BUN_EXECUTABLE} -e ${`import { Config } from "./src/node/config"; const c = new Config(); await c.editConfig((cfg) => { cfg.projects.set(process.argv[1], { workspaces: [], trusted: true }); return cfg; }); await c.updateAgentResourceLimits({ cpuCores: 2 }); await c.updateAgentResourceLimitsEnabled(true);`} ${repo}`
     .env({ ...process.env, MUX_ROOT: xumRoot })
     .quiet();
 

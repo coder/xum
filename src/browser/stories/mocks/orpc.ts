@@ -7,7 +7,7 @@ import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults, type GoalDefaults } from 
 import type { GoalBoardSnapshot } from "@/common/types/goal";
 import type { MCPSettingValue, MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
 import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
-import type { AgentResourceLimitsStatus } from "@/common/orpc/schemas/agentResourceLimits";
+import type { AgentResourceLimitsState } from "@/common/orpc/schemas/agentResourceLimits";
 import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
 import type { ExperimentId } from "@/common/constants/experiments";
 import type {
@@ -214,7 +214,7 @@ export interface MockORPCClientOptions {
   /** Initial global goal defaults for config.getConfig */
   goalDefaults?: GoalDefaults;
   /** Agent resource limits and their status (Settings → Agents); off when omitted. */
-  agentResourceLimits?: { limits: AgentResourceLimits; status: AgentResourceLimitsStatus };
+  agentResourceLimits?: AgentResourceLimitsState;
   /** Initial auto-model-routing tiers for config.getConfig (defaults when omitted). */
   autoModelRouting?: AutoModelRoutingConfig;
   /**
@@ -744,10 +744,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let defaultRuntime: RuntimeEnablementId | null = initialDefaultRuntime ?? null;
   let heartbeatDefaultPrompt = initialHeartbeatDefaultPrompt;
   let heartbeatDefaultIntervalMs = initialHeartbeatDefaultIntervalMs;
-  let agentResourceLimitsState = initialAgentResourceLimits ?? {
-    limits: {},
-    status: { state: "off" as const },
-  };
+  let agentResourceLimitsState =
+    initialAgentResourceLimits ?? mockAgentResourceLimitsState(false, {});
   let goalDefaults = normalizeGoalDefaults(initialGoalDefaults ?? DEFAULT_GOAL_DEFAULTS);
   let autoModelRouting = normalizeAutoModelRoutingConfig(initialAutoModelRouting);
   let routePriority = [...initialRoutePriority];
@@ -2711,13 +2709,17 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     agentResourceLimits: {
       get: () => Promise.resolve(agentResourceLimitsState),
       set: (limits: AgentResourceLimits) => {
-        agentResourceLimitsState = {
-          limits,
-          status:
-            limits.cpuCores === undefined && limits.memoryGiB === undefined
-              ? { state: "off" }
-              : { state: "active", cgroup: "/xum/xum-agents" },
-        };
+        agentResourceLimitsState = mockAgentResourceLimitsState(
+          agentResourceLimitsState.enabled,
+          limits
+        );
+        return Promise.resolve(agentResourceLimitsState);
+      },
+      setEnabled: ({ enabled }: { enabled: boolean }) => {
+        agentResourceLimitsState = mockAgentResourceLimitsState(
+          enabled,
+          agentResourceLimitsState.limits
+        );
         return Promise.resolve(agentResourceLimitsState);
       },
     },
@@ -2785,6 +2787,18 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     },
   } as unknown as APIClient;
+}
+
+function mockAgentResourceLimitsState(
+  enabled: boolean,
+  limits: AgentResourceLimits
+): AgentResourceLimitsState {
+  const limited = enabled && (limits.cpuCores !== undefined || limits.memoryGiB !== undefined);
+  return {
+    enabled,
+    limits,
+    status: limited ? { state: "active", cgroup: "/xum/xum-agents" } : { state: "off" },
+  };
 }
 
 /** The layout tool item of a settings tool action, in the server's current mock settings. */

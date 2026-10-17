@@ -3003,6 +3003,10 @@ export const router = (authToken?: string) => {
         .input(schemas.agentResourceLimits.set.input)
         .output(schemas.agentResourceLimits.set.output)
         .handler(({ context, input }) => context.agentResourceLimits.set(input)),
+      setEnabled: t
+        .input(schemas.agentResourceLimits.setEnabled.input)
+        .output(schemas.agentResourceLimits.setEnabled.output)
+        .handler(({ context, input }) => context.agentResourceLimits.setEnabled(input.enabled)),
     },
     perfCaptures: {
       list: t
