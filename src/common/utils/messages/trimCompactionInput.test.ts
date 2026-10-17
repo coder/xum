@@ -271,7 +271,7 @@ describe("trimCompactionInput", () => {
   });
 
   it("counts a record typed media without the media shape as text", async () => {
-    // No data or mediaType: extractToolMediaAsUserMessages leaves it in the tool-result JSON,
+    // No data or mediaType: extractToolMediaAsUserMessagesFromModelMessages leaves it in the tool-result JSON,
     // so the provider receives its 40k characters as text, not as one attachment.
     const messages: MuxMessage[] = [
       createMuxMessage("m-user", "user", "describe"),

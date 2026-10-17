@@ -702,7 +702,7 @@ ${xumTypes}
           // their media/display-file bytes stripped from sandbox-visible
           // values by the bridge; re-attach the originals on this result so
           // the request path delivers media to the model as real attachments
-          // (extractToolMediaAsUserMessages) and the UI renders both kinds
+          // (extractToolMediaAsUserMessagesFromModelMessages) and the UI renders both kinds
           // from the carrier. Drain even for failed evals: received parts are
           // still valid, and leaving them pending would let them leak into a
           // later eval on this runtime.
