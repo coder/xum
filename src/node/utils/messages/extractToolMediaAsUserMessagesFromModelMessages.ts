@@ -34,27 +34,10 @@ type ToolResultOutput = ToolResultPart["output"];
 export async function extractToolMediaAsUserMessagesFromModelMessages(
   input: ModelMessage[]
 ): Promise<ModelMessage[]> {
-  // Inline images are prepared before the cap is planned, so an unreadable one (now a text
-  // note) takes no media slot and evicts nothing.
-  const messages = await prepareInlineMediaForProvider(input);
-  const pools = collectToolMedia(messages);
-  const { extractionsByPart, totalAttachments, reservedMediaParts, syntheticMediaParts } = pools;
-
-  // Request-wide cap (r28 security): capture bounds bytes and per-container
-  // parts, not distinct records, so a looped bridged media tool could
-  // otherwise fan out tens of thousands of synthetic provider parts.
-  // Chronologically OLDEST tool media is dropped first, across both kinds: media already in the
-  // request (synthetic parts, MCP images inside tool results) is evicted, and new extractions
-  // are omitted behind bounded placeholders. One order for both keeps a rebuild (which
-  // extracts every step's media again) and an in-turn step (which sees earlier steps' media as
-  // synthetic parts) dropping the same items.
-  const budget = Math.max(0, MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST - reservedMediaParts);
-  const overBudget = Math.max(0, syntheticMediaParts.length + totalAttachments - budget);
-  const { evictedSyntheticParts, omittedByPart } = planMediaCap(pools.order, overBudget);
-  const nothingToRewrite =
-    extractionsByPart.size === 0 &&
-    evictedSyntheticParts.size === 0 &&
-    pools.inlineToolResultMedia === 0;
+  const { messages, pools, evictedSyntheticParts, omittedByPart } =
+    await planWithInlineMedia(input);
+  const { extractionsByPart } = pools;
+  const nothingToRewrite = extractionsByPart.size === 0 && evictedSyntheticParts.size === 0;
   if (nothingToRewrite) return messages;
 
   const result: ModelMessage[] = [];
@@ -216,6 +199,48 @@ async function createInlineMediaOutput(
 }
 
 /**
+ * Rounds of inline-media preparation per request. Each round prepares only the inline images
+ * the cap keeps; an unreadable one becomes a text note and frees its slot, so the next round
+ * plans again and prepares the older image that now fits. The bound keeps a flood of corrupt
+ * images to a few cap-sized batches of header reads. Past it, a corrupt image can still take a
+ * slot (the behavior before inline preparation moved ahead of the cap).
+ */
+const MAX_INLINE_MEDIA_PREPARE_ROUNDS = 3;
+
+/** Plans the cap and prepares the inline media it keeps (see MAX_INLINE_MEDIA_PREPARE_ROUNDS). */
+async function planWithInlineMedia(input: ModelMessage[]) {
+  let messages = input;
+  for (let round = 0; ; round++) {
+    const pools = collectToolMedia(messages);
+    const plan = planRequestMediaCap(pools);
+    const prepared =
+      round < MAX_INLINE_MEDIA_PREPARE_ROUNDS
+        ? await prepareInlineMediaForProvider(messages, plan.evictedSyntheticParts)
+        : messages;
+    if (prepared === messages) return { messages, pools, ...plan };
+    messages = prepared;
+  }
+}
+
+/**
+ * Request-wide cap (r28 security): capture bounds bytes and per-container parts, not distinct
+ * records, so a looped bridged media tool could otherwise fan out tens of thousands of
+ * synthetic provider parts. Chronologically OLDEST tool media is dropped first, across both
+ * kinds: media already in the request (synthetic parts, MCP images inside tool results) is
+ * evicted, and new extractions are omitted behind bounded placeholders. One order for both
+ * keeps a rebuild (which extracts every step's media again) and an in-turn step (which sees
+ * earlier steps' media as synthetic parts) dropping the same items.
+ */
+function planRequestMediaCap(pools: ToolMediaPools) {
+  const budget = Math.max(0, MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST - pools.reservedMediaParts);
+  const overBudget = Math.max(
+    0,
+    pools.syntheticMediaParts.length + pools.totalAttachments - budget
+  );
+  return planMediaCap(pools.order, overBudget);
+}
+
+/**
  * Pass 1 of extractToolMediaAsUserMessagesFromModelMessages: the tool-result parts to extract
  * and the media the request already carries, split into the cap's pools.
  */
@@ -228,7 +253,6 @@ function collectToolMedia(messages: ModelMessage[]) {
     totalAttachments: 0,
     reservedMediaParts: 0,
     syntheticMediaParts: [],
-    inlineToolResultMedia: 0,
     order: [],
   };
   for (const message of messages) {
@@ -256,8 +280,6 @@ interface ToolMediaPools {
   totalAttachments: number;
   reservedMediaParts: number;
   syntheticMediaParts: unknown[];
-  /** Media items tool results carry inline (see collectToolResultMedia). */
-  inlineToolResultMedia: number;
   /** Evictable media and extractions in message order, oldest first (see planMediaCap). */
   order: Array<{ key: object; count: number; extraction: boolean }>;
 }
@@ -300,9 +322,7 @@ function collectToolResultMedia(part: ToolResultPart, pools: ToolMediaPools): vo
     // see holdsDeferredProviderToolCall). Both are evictable oldest-first like synthetic tool
     // media, or a screenshot loop could pass the provider's limit, and a rebuild (which
     // extracts that media again) and an in-turn step would drop different items.
-    const inlineMedia = inlineToolResultMedia(part.output);
-    pools.inlineToolResultMedia += inlineMedia.length;
-    addEvictableMedia(pools, inlineMedia);
+    addEvictableMedia(pools, inlineToolResultMedia(part.output));
     return;
   }
   // This part is extracted again, which leaves its inline media in place: it reserves its share.
@@ -337,7 +357,7 @@ function evictToolResultMedia(part: ToolResultPart, evicted: ReadonlySet<unknown
 }
 
 /**
- * Prepared inline media by original item. StreamManager runs this transform before every step
+ * Prepared inline media by item (original or rewritten). StreamManager runs this transform before every step
  * on the same growing message list, and the SDK keeps each step's tool-result items (and the
  * earlier step transforms keep media item identity), so a screenshot loop reads each image
  * header once instead of once per step. A rebuild creates new items: once per request.
@@ -351,17 +371,27 @@ const preparedInlineMedia = new WeakMap<object, Promise<ContentOutputItem>>();
  * replay. The in-turn step and the rebuild both run it, so a provider-ready image keeps the
  * same bytes in both. Returns the same array when nothing changes.
  */
-async function prepareInlineMediaForProvider(messages: ModelMessage[]): Promise<ModelMessage[]> {
-  const result = await Promise.all(messages.map(prepareMessageInlineMedia));
+async function prepareInlineMediaForProvider(
+  messages: ModelMessage[],
+  evicted: ReadonlySet<unknown>
+): Promise<ModelMessage[]> {
+  const result = await Promise.all(
+    messages.map((message) => prepareMessageInlineMedia(message, evicted))
+  );
   return result.every((message, index) => message === messages[index]) ? messages : result;
 }
 
-async function prepareMessageInlineMedia(message: ModelMessage): Promise<ModelMessage> {
+async function prepareMessageInlineMedia(
+  message: ModelMessage,
+  evicted: ReadonlySet<unknown>
+): Promise<ModelMessage> {
   if (message.role !== "assistant" && message.role !== "tool") return message;
   if (!Array.isArray(message.content)) return message;
   const content: unknown[] = await Promise.all(
     message.content.map((part) =>
-      part.type === "tool-result" ? prepareToolResultInlineMedia(part) : Promise.resolve(part)
+      part.type === "tool-result"
+        ? prepareToolResultInlineMedia(part, evicted)
+        : Promise.resolve(part)
     )
   );
   if (content.every((part, index) => part === message.content[index])) return message;
@@ -370,10 +400,16 @@ async function prepareMessageInlineMedia(message: ModelMessage): Promise<ModelMe
   return rewritten as ModelMessage;
 }
 
-async function prepareToolResultInlineMedia(part: ToolResultPart): Promise<ToolResultPart> {
+async function prepareToolResultInlineMedia(
+  part: ToolResultPart,
+  evicted: ReadonlySet<unknown>
+): Promise<ToolResultPart> {
   if (part.output.type !== "content") return part;
   const value = part.output.value;
-  const prepared = await Promise.all(value.map(prepareInlineMediaItem));
+  // Evicted items never reach the provider: leave them for evictToolResultMedia, unread.
+  const prepared = await Promise.all(
+    value.map((item) => (evicted.has(item) ? Promise.resolve(item) : prepareInlineMediaItem(item)))
+  );
   if (prepared.every((item, index) => item === value[index])) return part;
   return { ...part, output: { type: "content", value: prepared } };
 }
@@ -382,7 +418,12 @@ function prepareInlineMediaItem(item: ContentOutputItem): Promise<ContentOutputI
   if (!isInlineMediaItem(item)) return Promise.resolve(item);
   let prepared = preparedInlineMedia.get(item);
   if (prepared === undefined) {
-    prepared = prepareInlineRasterItem(item);
+    prepared = prepareInlineRasterItem(item).then((result) => {
+      // The SDK can carry the transformed step messages into the next step, so a resized
+      // item comes back under its new identity: it is provider-ready too.
+      if (result !== item) preparedInlineMedia.set(result, Promise.resolve(result));
+      return result;
+    });
     preparedInlineMedia.set(item, prepared);
   }
   return prepared;

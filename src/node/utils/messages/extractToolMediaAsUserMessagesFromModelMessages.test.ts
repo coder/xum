@@ -692,6 +692,37 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
     }
   });
 
+  // Only media that can still reach the provider is worth decoding: a long screenshot history
+  // (or a hostile MCP server) must not make a rebuild inspect hundreds of evicted images.
+  it("prepares only the inline MCP images the cap keeps", async () => {
+    const total = MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST + 8;
+    const png = await pngBase64(10);
+    // Distinct item objects with the same bytes: the cache must not hide the extra work.
+    const messages = Array.from({ length: total }, (_, i) => mcpImageCall(i, [png])).flat();
+    const prepare = jest.spyOn(toolResultAttachments, "prepareExtractedToolAttachmentForProvider");
+    try {
+      await extractToolMediaAsUserMessagesFromModelMessages(messages);
+      expect(prepare).toHaveBeenCalledTimes(MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST);
+    } finally {
+      prepare.mockRestore();
+    }
+  });
+
+  // The SDK can carry the transformed messages into the next step, so a resized image arrives
+  // as the rewritten item: it must not be read again.
+  it("does not prepare a resized MCP image again on the next step", async () => {
+    const step1 = await extractToolMediaAsUserMessagesFromModelMessages(
+      mcpImageCall(0, [await pngBase64(9001)])
+    );
+    const prepare = jest.spyOn(toolResultAttachments, "prepareExtractedToolAttachmentForProvider");
+    try {
+      await extractToolMediaAsUserMessagesFromModelMessages(step1);
+      expect(prepare).not.toHaveBeenCalled();
+    } finally {
+      prepare.mockRestore();
+    }
+  });
+
   // A corrupt image becomes a text note, so it takes no media slot and must not evict one.
   it("keeps every valid MCP image at the cap when a newer one is unreadable", async () => {
     const valid = await Promise.all(
