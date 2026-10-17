@@ -86,6 +86,8 @@ async function settle(promise: Promise<unknown>) {
 class StallableRenewalStore extends WorkflowRunStore {
   private renewalStall: Promise<void> | null = null;
   private readonly releaseStall = createDeferred();
+  private readonly renewalEnteredStall = createDeferred();
+  private readonly renewalRefused = createDeferred();
 
   stallRenewals(): void {
     this.renewalStall = this.releaseStall.promise;
@@ -95,9 +97,31 @@ class StallableRenewalStore extends WorkflowRunStore {
     this.releaseStall.resolve();
   }
 
+  /**
+   * Resolves once a renewal tick is stuck in the stall. The runner learns of a lost lease only
+   * from a renewal tick (every staleLeaseMs / 2), and a fast host can finish B's whole run before
+   * A's first tick (#6898): with no renewal in flight, ending the stall would tell A nothing.
+   */
+  async renewalStalled(): Promise<void> {
+    await this.renewalEnteredStall.promise;
+  }
+
+  /**
+   * Ends the stall and returns once the runner has marked its lease lost: the refused renewal
+   * reaches markLeaseLost through the runner's promise chain, which drains before the next
+   * macrotask. Call renewalStalled() first.
+   */
+  async loseLease(): Promise<void> {
+    this.releaseStall.resolve();
+    await this.renewalRefused.promise;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
   override async renewLease(runId: string, ownerId: string, nowMs?: number): Promise<boolean> {
     if (this.renewalStall != null) {
+      this.renewalEnteredStall.resolve();
       await this.renewalStall;
+      this.renewalRefused.resolve();
       return false;
     }
     return await super.renewLease(runId, ownerId, nowMs);
@@ -287,14 +311,16 @@ describe("replacing one retired attempt across runners (G2)", () => {
       storeA.stallRenewals();
       const runA = settle(runner(storeA, a.service, OWNER_A).run(RUN_ID));
       await aClaimed.promise;
+      await storeA.renewalStalled();
 
       const runB = await settle(runner(storeB, b.service, OWNER_B, 60_000).run(RUN_ID));
       expect(runB).toEqual({
         kind: "resolved",
         value: { reportMarkdown: "Final: report from replacementb" },
       });
+      // A sees its lost lease before it resumes: the lease, not only the claim, stops it here.
+      await storeA.loseLease();
       resumeA.resolve();
-      storeA.unstallRenewals();
       await runA;
 
       // Exactly one published child, and the journal names it; A never reached a reservation.
@@ -365,11 +391,13 @@ describe("replacing one retired attempt across runners (G2)", () => {
       storeA.stallRenewals();
       const runA = settle(runner(storeA, a.service, OWNER_A).run(RUN_ID));
       await aCheckpointed.promise;
+      await storeA.renewalStalled();
       expect((await settle(runner(storeB, b.service, OWNER_B, 60_000).run(RUN_ID))).kind).toBe(
         "rejected"
       );
+      // A must see its lost lease, so its run stops R_A and leaves R_A's receipt (asserted below).
+      await storeA.loseLease();
       resumeA.resolve();
-      storeA.unstallRenewals();
       await runA;
       expect(publishedReplacements(config)).toEqual(["replacementa"]);
 
