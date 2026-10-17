@@ -42,6 +42,7 @@ import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
+import { getViewedTerminalSessionIds } from "@/browser/terminal/terminalViews";
 import { getErrorMessage } from "@/common/utils/errors";
 import { showFeedbackToast } from "@/browser/utils/feedbackToast";
 import { openSideChat } from "@/browser/utils/chatCommands";
@@ -952,13 +953,16 @@ export function useLlmDebugLogsEnabled(api: APIClient | null): boolean | null {
 /**
  * The layout update that matches the terminal tabs of `layoutAtRequestStart` to the backend's
  * sessions, or null when they already match: missing sessions get a tab, and tabs whose session
- * is gone ("ghost" tabs) are removed.
+ * is gone ("ghost" tabs) are removed. A tab whose session a mounted view shows
+ * (`viewedSessionIds`) is not a ghost: its view gets the exit report, writes the exit line and
+ * closes the tab itself.
  */
 function reconcileTerminalTabs(
   layoutAtRequestStart: RightSidebarLayoutState,
-  backendSessionIds: string[]
+  backendSessionIds: string[],
+  viewedSessionIds: string[]
 ): ((prev: RightSidebarLayoutState) => RightSidebarLayoutState) | null {
-  const backendSessionSet = new Set(backendSessionIds);
+  const keptSessionSet = new Set([...backendSessionIds, ...viewedSessionIds]);
 
   // Get current terminal tabs in layout
   const currentTabs = collectAllTabs(layoutAtRequestStart.root);
@@ -973,7 +977,7 @@ function reconcileTerminalTabs(
   // Find tabs for sessions that no longer exist in backend (remove them)
   const ghostTabs = currentTerminalTabs.filter((tab) => {
     const sessionId = getTerminalSessionId(tab);
-    return sessionId && !backendSessionSet.has(sessionId);
+    return sessionId && !keptSessionSet.has(sessionId);
   });
 
   if (missingSessions.length === 0 && ghostTabs.length === 0) return null;
@@ -1003,7 +1007,9 @@ export function useTerminalSessionSync(
 ): void {
   // Sync terminal tabs with backend sessions on workspace mount.
   // - Adds tabs for backend sessions that don't have tabs (restore after reload)
-  // - Removes "ghost" tabs for sessions that no longer exist (cleanup after app restart)
+  // - Removes "ghost" tabs for sessions that no longer exist (cleanup after app restart), but
+  //   not a tab a mounted view shows: after a server restart that view writes the exit line
+  //   and then closes the tab, and removing it here first would drop that line.
   // Runs only on workspace change, not layout change (layout.root as a dependency would
   // loop), so it snapshots the layout through a ref when the request starts. Comparing the
   // backend list with that snapshot (not the latest layout) keeps terminals created or
@@ -1023,7 +1029,12 @@ export function useTerminalSessionSync(
       .then((backendSessionIds) => {
         if (cancelled) return;
 
-        const reconcile = reconcileTerminalTabs(layoutAtRequestStart, backendSessionIds);
+        // The views mounted when the list arrives: a newer view also waits for its exit report.
+        const reconcile = reconcileTerminalTabs(
+          layoutAtRequestStart,
+          backendSessionIds,
+          getViewedTerminalSessionIds()
+        );
         if (reconcile) setLayout(reconcile);
       })
       // A lost connection is no answer: the next client runs this sync again. The kept client's
