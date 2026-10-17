@@ -40,7 +40,10 @@ export type { StreamMessageOptions } from "./turnRequestBuilder";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import { LRUCache } from "lru-cache";
-import { DEBUG_LLM_REQUEST_MAX_WORKSPACES } from "@/constants/debugLlmRequest";
+import {
+  DEBUG_LLM_REQUEST_MAX_BYTES,
+  DEBUG_LLM_REQUEST_MAX_WORKSPACES,
+} from "@/constants/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
@@ -125,6 +128,19 @@ function isToolExecutionContext(value: unknown): value is ToolExecutionContext {
   );
 }
 
+/**
+ * One JSON pass per set, the same order of cost as the structuredClone every set already does.
+ * A snapshot JSON cannot serialize (a BigInt) counts as the whole limit, so it is kept alone.
+ */
+function estimateDebugSnapshotBytes(snapshot: DebugLlmRequestSnapshot): number {
+  try {
+    // UTF-8 bytes, not UTF-16 units: a CJK character is one unit but three bytes.
+    return Math.max(1, Buffer.byteLength(JSON.stringify(snapshot), "utf8"));
+  } catch {
+    return DEBUG_LLM_REQUEST_MAX_BYTES;
+  }
+}
+
 export class AIService extends EventEmitter {
   private readonly streamManager: StreamManager;
   private readonly turnRequestBuilder: TurnRequestBuilder;
@@ -153,11 +169,13 @@ export class AIService extends EventEmitter {
   >();
 
   // Debug: captured LLM request payloads for last send per workspace
-  // Bounded: each snapshot is a full copy of a request and its response, and an unbounded map
-  // kept one per workspace the server ever sent from (F12, #6754). Removal and archive drop
-  // their entry too (handleWorkspaceMetadata).
+  // Bounded by count and by bytes: each snapshot is a full copy of a request and its response,
+  // and an unbounded map kept one per workspace the server ever sent from (F12, #6754). Removal
+  // and archive drop their entry too (handleWorkspaceMetadata).
   private readonly lastLlmRequestByWorkspace = new LRUCache<string, DebugLlmRequestSnapshot>({
     max: DEBUG_LLM_REQUEST_MAX_WORKSPACES,
+    maxSize: DEBUG_LLM_REQUEST_MAX_BYTES,
+    sizeCalculation: estimateDebugSnapshotBytes,
   });
 
   constructor(
