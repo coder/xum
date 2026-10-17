@@ -1,4 +1,4 @@
-import { describe, expect, it } from "@jest/globals";
+import { describe, expect, it, jest } from "@jest/globals";
 import type { ModelMessage, ToolResultPart } from "ai";
 import { convertToModelMessages } from "ai";
 import sharp from "sharp";
@@ -8,9 +8,38 @@ import {
   MAX_IMAGE_DIMENSION,
 } from "@/common/constants/imageAttachments";
 import { expectContentOutputValue } from "./testToolOutputHelpers";
+import * as toolResultAttachments from "./toolResultAttachments";
 import { createOmittedToolAttachmentText } from "./toolResultAttachments";
 import { extractToolMediaAsUserMessages } from "./extractToolMediaAsUserMessages";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "./extractToolMediaAsUserMessagesFromModelMessages";
+
+/** One MCP call whose result keeps its images inline, as mcpToModelOutput emits them. */
+function mcpImageCall(index: number, images: string[]): ModelMessage[] {
+  return [
+    {
+      role: "assistant",
+      content: [{ type: "tool-call", toolCallId: `mcp-${index}`, toolName: "shot", input: {} }],
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: `mcp-${index}`,
+          toolName: "shot",
+          output: {
+            type: "content",
+            value: images.map((data) => ({
+              type: "file",
+              mediaType: "image/png",
+              data: { type: "data", data },
+            })),
+          },
+        } as unknown as ToolResultPart,
+      ],
+    },
+  ];
+}
 
 /** A real PNG: the extraction replaces unreadable image bytes with a note. */
 async function pngBase64(width: number): Promise<string> {
@@ -649,6 +678,40 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
 
   // MCP images skip extraction, so the request must still resize oversized ones and replace
   // unreadable ones, or a persisted bad screenshot fails every later request.
+  // StreamManager runs this transform before every step on the same growing message list, so
+  // a screenshot loop would otherwise decode every earlier image again on each step.
+  it("prepares each inline MCP image once across steps", async () => {
+    const step1 = mcpImageCall(0, [await pngBase64(10)]);
+    const step2 = [...step1, ...mcpImageCall(1, [await pngBase64(11)])];
+    const prepare = jest.spyOn(toolResultAttachments, "prepareExtractedToolAttachmentForProvider");
+    try {
+      await extractToolMediaAsUserMessagesFromModelMessages(step1);
+      await extractToolMediaAsUserMessagesFromModelMessages(step2);
+      expect(prepare).toHaveBeenCalledTimes(2);
+    } finally {
+      prepare.mockRestore();
+    }
+  });
+
+  // A corrupt image becomes a text note, so it takes no media slot and must not evict one.
+  it("keeps every valid MCP image at the cap when a newer one is unreadable", async () => {
+    const valid = await Promise.all(
+      Array.from({ length: MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST }, (_, i) => pngBase64(i + 1))
+    );
+    const messages = [
+      ...valid.flatMap((data, i) => mcpImageCall(i, [data])),
+      ...mcpImageCall(valid.length, ["bm90LWEtcG5n"]),
+    ];
+
+    const serialized = JSON.stringify(
+      await extractToolMediaAsUserMessagesFromModelMessages(messages)
+    );
+
+    for (const data of valid) expect(serialized).toContain(data);
+    expect(serialized).not.toContain(createOmittedToolAttachmentText(1));
+    expect(serialized).toContain("Image attachment omitted");
+  });
+
   it("self-heals MCP images kept inside tool results", async () => {
     const valid = await pngBase64(10);
     const oversized = await pngBase64(9001);

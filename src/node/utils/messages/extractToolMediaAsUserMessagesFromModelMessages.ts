@@ -32,8 +32,11 @@ type ToolResultOutput = ToolResultPart["output"];
  * holdsDeferredProviderToolCall).
  */
 export async function extractToolMediaAsUserMessagesFromModelMessages(
-  messages: ModelMessage[]
+  input: ModelMessage[]
 ): Promise<ModelMessage[]> {
+  // Inline images are prepared before the cap is planned, so an unreadable one (now a text
+  // note) takes no media slot and evicts nothing.
+  const messages = await prepareInlineMediaForProvider(input);
   const pools = collectToolMedia(messages);
   const { extractionsByPart, totalAttachments, reservedMediaParts, syntheticMediaParts } = pools;
 
@@ -88,9 +91,9 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
         }
         const extracted = extractionsByPart.get(part);
         if (extracted === undefined) {
-          const prepared = await prepareInlineToolResultMedia(part, evictedSyntheticParts);
-          if (prepared !== part) changedMessage = true;
-          return prepared;
+          const evicted = evictToolResultMedia(part, evictedSyntheticParts);
+          if (evicted !== part) changedMessage = true;
+          return evicted;
         }
 
         changedMessage = true;
@@ -315,35 +318,76 @@ function collectToolResultMedia(part: ToolResultPart, pools: ToolMediaPools): vo
 /** Media items a tool result carries inline (see collectToolResultMedia). */
 function inlineToolResultMedia(output: ToolResultOutput): object[] {
   if (output.type !== "content") return [];
-  return output.value.filter((item) => {
-    const type = (item as { type?: unknown }).type;
-    return type === "file" || type === "file-data" || type === "image-data";
-  });
+  return output.value.filter(isInlineMediaItem);
+}
+
+function isInlineMediaItem(item: ContentOutputItem): boolean {
+  const type = (item as { type?: unknown }).type;
+  return type === "file" || type === "file-data" || type === "image-data";
+}
+
+/** Replaces evicted inline media of one tool result with one cap note (same part if none). */
+function evictToolResultMedia(part: ToolResultPart, evicted: ReadonlySet<unknown>): ToolResultPart {
+  if (evicted.size === 0 || part.output.type !== "content") return part;
+  const value = part.output.value;
+  const kept = value.filter((item) => !evicted.has(item));
+  const evictedHere = value.length - kept.length;
+  if (evictedHere === 0) return part;
+  const note = { type: "text" as const, text: createOmittedToolAttachmentText(evictedHere) };
+  return { ...part, output: { type: "content", value: [...kept, note] } };
 }
 
 /**
- * Replaces evicted inline media of one tool result with one cap note and prepares the rest for
- * the provider (same part if nothing changes). MCP images skip extraction, so this is their
- * only self-healing: the MuxMessage-level extraction that once ran on replay resized oversized
- * images and replaced unreadable ones. The in-turn step and the rebuild both run it, so a
- * provider-ready image keeps the same bytes in both.
+ * Prepared inline media by original item. StreamManager runs this transform before every step
+ * on the same growing message list, and the SDK keeps each step's tool-result items (and the
+ * earlier step transforms keep media item identity), so a screenshot loop reads each image
+ * header once instead of once per step. A rebuild creates new items: once per request.
  */
-async function prepareInlineToolResultMedia(
-  part: ToolResultPart,
-  evicted: ReadonlySet<unknown>
-): Promise<ToolResultPart> {
+const preparedInlineMedia = new WeakMap<object, Promise<ContentOutputItem>>();
+
+/**
+ * Prepares the media tool results carry inline (see collectToolResultMedia) for the provider.
+ * MCP images skip extraction, so this is their only self-healing: oversized images are resized
+ * and unreadable ones become a text note, as the MuxMessage-level extraction once did on
+ * replay. The in-turn step and the rebuild both run it, so a provider-ready image keeps the
+ * same bytes in both. Returns the same array when nothing changes.
+ */
+async function prepareInlineMediaForProvider(messages: ModelMessage[]): Promise<ModelMessage[]> {
+  const result = await Promise.all(messages.map(prepareMessageInlineMedia));
+  return result.every((message, index) => message === messages[index]) ? messages : result;
+}
+
+async function prepareMessageInlineMedia(message: ModelMessage): Promise<ModelMessage> {
+  if (message.role !== "assistant" && message.role !== "tool") return message;
+  if (!Array.isArray(message.content)) return message;
+  const content: unknown[] = await Promise.all(
+    message.content.map((part) =>
+      part.type === "tool-result" ? prepareToolResultInlineMedia(part) : part
+    )
+  );
+  if (content.every((part, index) => part === message.content[index])) return message;
+  // The content arrays are structurally identical for both roles (see the main loop).
+  return { ...message, content } as ModelMessage;
+}
+
+async function prepareToolResultInlineMedia(part: ToolResultPart): Promise<ToolResultPart> {
   if (part.output.type !== "content") return part;
   const value = part.output.value;
-  const kept = await Promise.all(
-    value.filter((item) => !evicted.has(item)).map(prepareInlineRasterItem)
-  );
-  const evictedHere = value.length - kept.length;
-  if (evictedHere === 0 && kept.every((item, index) => item === value[index])) return part;
-  const note = { type: "text" as const, text: createOmittedToolAttachmentText(evictedHere) };
-  return {
-    ...part,
-    output: { type: "content", value: evictedHere > 0 ? [...kept, note] : kept },
-  };
+  const prepared = await Promise.all(value.map(prepareInlineMediaItem));
+  if (prepared.every((item, index) => item === value[index])) return part;
+  return { ...part, output: { type: "content", value: prepared } };
+}
+
+function prepareInlineMediaItem(
+  item: ContentOutputItem
+): Promise<ContentOutputItem> | ContentOutputItem {
+  if (!isInlineMediaItem(item)) return item;
+  let prepared = preparedInlineMedia.get(item);
+  if (prepared === undefined) {
+    prepared = prepareInlineRasterItem(item);
+    preparedInlineMedia.set(item, prepared);
+  }
+  return prepared;
 }
 
 /**
