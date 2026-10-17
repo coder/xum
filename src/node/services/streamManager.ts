@@ -1203,11 +1203,15 @@ function hasErrorType(data: unknown): data is { error: { type?: string } } {
 }
 
 /**
- * The error type of an Anthropic error body embedded in a stream error's text. A proxy in
- * front of Anthropic can wrap the provider's error event in a generic one, as in
- * `unknown stream error: received error while streaming: {"type":"error","error":{...}}`.
+ * The error type of an Anthropic error body embedded in a generic stream error's text. A proxy
+ * in front of Anthropic can wrap the provider's error event in a generic one (`type: "error"`),
+ * as in `unknown stream error: received error while streaming: {"type":"error","error":{...}}`.
+ * Only that wrapper counts: a typed error (an invalid_request_error) can echo request text,
+ * such as a tool description, that holds an overload body.
  */
-function embeddedAnthropicErrorType(message: string): string | undefined {
+function wrappedAnthropicErrorType(error: StreamProviderError): string | undefined {
+  if (error.type !== "error") return undefined;
+  const message = error.message;
   const start = message.indexOf("{");
   if (start < 0) return undefined;
   try {
@@ -1235,7 +1239,7 @@ function isAnthropicOverloadError(error: unknown): boolean {
     return (
       error.statusCode === 529 ||
       error.type === "overloaded_error" ||
-      embeddedAnthropicErrorType(error.message) === "overloaded_error"
+      wrappedAnthropicErrorType(error) === "overloaded_error"
     );
   }
   return false;

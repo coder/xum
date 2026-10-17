@@ -1289,21 +1289,26 @@ describe("StreamManager - Anthropic mid-stream overload", () => {
     });
   });
 
-  test("an error event that only mentions overloaded_error in its text keeps its own message", async () => {
-    const harness = createRecoveryHarness();
-    await harness.run({
-      workspaceId: "anthropic-not-overload",
-      model: anthropicStreamFailingWith({
-        type: "invalid_request_error",
-        message: "tool description: retry on overloaded_error",
-      }),
-      modelString: "anthropic:claude-opus-5-5",
-      attempts: [realSdkAttempt],
-    });
+  // Validation messages can echo request text (a tool description), which can hold an
+  // overload body. Only the generic wrapper's embedded body counts.
+  test.each([
+    ["mentions", "tool description: retry on overloaded_error"],
+    ["embeds", 'tool description: {"error":{"type":"overloaded_error"}}'],
+  ])(
+    "an invalid_request_error whose text %s overloaded_error keeps its own message",
+    async (_name, message) => {
+      const harness = createRecoveryHarness();
+      await harness.run({
+        workspaceId: "anthropic-not-overload",
+        model: anthropicStreamFailingWith({ type: "invalid_request_error", message }),
+        modelString: "anthropic:claude-opus-5-5",
+        attempts: [realSdkAttempt],
+      });
 
-    expect(harness.errors()).toHaveLength(1);
-    expect(harness.errors()[0]?.error).toContain("retry on overloaded_error");
-  });
+      expect(harness.errors()).toHaveLength(1);
+      expect(harness.errors()[0]?.error).toBe(message);
+    }
+  );
 });
 
 describe("StreamManager - Anthropic thinking signature recovery", () => {
