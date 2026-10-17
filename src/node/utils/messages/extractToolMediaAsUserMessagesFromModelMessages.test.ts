@@ -10,7 +10,6 @@ import {
 import { expectContentOutputValue } from "./testToolOutputHelpers";
 import * as toolResultAttachments from "./toolResultAttachments";
 import { createOmittedToolAttachmentText } from "./toolResultAttachments";
-import { extractToolMediaAsUserMessages } from "./extractToolMediaAsUserMessages";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "./extractToolMediaAsUserMessagesFromModelMessages";
 
 /** One MCP call whose result keeps its images inline, as mcpToModelOutput emits them. */
@@ -359,8 +358,8 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
     // r34: history-level extraction can saturate the request-wide cap with
     // synthetic tool media. Those parts must be evictable (oldest-first) so a
     // screenshot produced by the CURRENT tool call still reaches the next
-    // step — end-to-end through convertToModelMessages so the marker contract
-    // (providerMetadata -> providerOptions) is what's actually validated.
+    // step. The history runs through convertToModelMessages and this same
+    // extractor, so the marker it sets (providerOptions) is what's validated.
     // PDFs pass through provider preparation unchanged (no raster decode),
     // giving distinct real file parts after conversion.
     const oldPayload = (i: number) =>
@@ -389,9 +388,9 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
         metadata: { timestamp: 1 },
       },
     ];
-    const historyMessages = await convertToModelMessages(
+    const historyMessages = await extractToolMediaAsUserMessagesFromModelMessages(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument
-      (await extractToolMediaAsUserMessages(historyInput)) as any
+      await convertToModelMessages(historyInput as any)
     );
     const syntheticHistoryMedia = historyMessages
       .flatMap((message): unknown[] => (Array.isArray(message.content) ? message.content : []))

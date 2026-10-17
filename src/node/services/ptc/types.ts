@@ -76,7 +76,7 @@ export type PTCExecutionResult = CodeExecutionResult;
  *   retaining them matches what classic-mode records already expose.
  * - Media-bearing results: any bridged MCP tool may return a content
  *   container carrying base64 media. Request-time extraction
- *   (extractToolMediaAsUserMessages) turns nested media into model-visible
+ *   (extractToolMediaAsUserMessagesFromModelMessages) turns nested media into model-visible
  *   multimodal attachments — impossible if capture bounding or compaction
  *   already dropped the payload, which would leave RLM users unable to see
  *   bridged screenshots/images at all. Media size is host-tool-produced (the

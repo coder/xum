@@ -222,8 +222,7 @@ async function createInlineMediaOutput(
 function collectToolMedia(messages: ModelMessage[]) {
   // Pass 1 — extract once per tool-result part. The request-wide media cap
   // needs the TOTAL before any emission so the NEWEST attachments survive,
-  // and the extraction walk must not run twice per part (see the MuxMessage
-  // variant in extractToolMediaAsUserMessages.ts).
+  // and the extraction walk must not run twice per part.
   const pools: ToolMediaPools = {
     extractionsByPart: new Map(),
     totalAttachments: 0,

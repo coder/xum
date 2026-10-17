@@ -857,15 +857,6 @@ function isAttachmentPlaceholderPart(value: unknown): boolean {
   );
 }
 
-export function createDataUrlForExtractedAttachment(attachment: ExtractedToolAttachment): string {
-  if (attachment.mediaType === SVG_MEDIA_TYPE) {
-    const svgText = Buffer.from(attachment.data, "base64").toString("utf8");
-    return `data:${SVG_MEDIA_TYPE},${encodeURIComponent(svgText)}`;
-  }
-
-  return `data:${attachment.mediaType};base64,${attachment.data}`;
-}
-
 function createInlineSvgAttachmentText(attachment: ExtractedToolAttachment): string {
   if (attachment.mediaType !== SVG_MEDIA_TYPE) {
     throw new Error(`Expected an SVG attachment, got '${attachment.mediaType}'`);
