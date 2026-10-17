@@ -6561,6 +6561,9 @@ describe("AIService.streamMessage rows appended while a request is built", () =>
       await history.appendToHistory(workspaceId, createMuxMessage("u2", "user", "Status?"));
       await turn(await rows());
 
+      // The report really arrived inside the build window: it sorts before the reply.
+      const report = (await rows()).find((r) => r.id === "report")!;
+      expect(report.metadata!.historySequence!).toBeLessThan(reply.metadata!.historySequence!);
       // The first request saw only u1; the next one carries the report after the reply.
       expect(prepared[0]).toEqual(["u1"]);
       expect(prepared[1]).toEqual(["u1", reply.id, "report", "u2"]);
