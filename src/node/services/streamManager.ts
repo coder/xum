@@ -1191,6 +1191,56 @@ export interface StreamManagerOptions {
   tokenTracker?: StreamManagerTokenTracker;
 }
 
+/** `{ error: { type } }`, the error body shape of Anthropic's API. */
+function hasErrorType(data: unknown): data is { error: { type?: string } } {
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    "error" in data &&
+    typeof data.error === "object" &&
+    data.error !== null
+  );
+}
+
+/**
+ * The error type of an Anthropic error body embedded in a stream error's text. A proxy in
+ * front of Anthropic can wrap the provider's error event in a generic one, as in
+ * `unknown stream error: received error while streaming: {"type":"error","error":{...}}`.
+ */
+function embeddedAnthropicErrorType(message: string): string | undefined {
+  const start = message.indexOf("{");
+  if (start < 0) return undefined;
+  try {
+    const body: unknown = JSON.parse(message.slice(start));
+    return hasErrorType(body) ? body.error.type : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isOverloadedApiCallError(error: APICallError): boolean {
+  return (
+    error.statusCode === 529 ||
+    (hasErrorType(error.data) && error.data.error.type === "overloaded_error")
+  );
+}
+
+/** An Anthropic overload (HTTP 529 / overloaded_error), before the request or mid-stream. */
+function isAnthropicOverloadError(error: unknown): boolean {
+  if (APICallError.isInstance(error)) return isOverloadedApiCallError(error);
+  if (RetryError.isInstance(error)) {
+    return APICallError.isInstance(error.lastError) && isOverloadedApiCallError(error.lastError);
+  }
+  if (StreamProviderError.isInstance(error)) {
+    return (
+      error.statusCode === 529 ||
+      error.type === "overloaded_error" ||
+      embeddedAnthropicErrorType(error.message) === "overloaded_error"
+    );
+  }
+  return false;
+}
+
 export class StreamManager {
   private workspaceStreams = new Map<WorkspaceId, WorkspaceStreamInfo>();
   private readonly pendingStreamStarts = new Map<
@@ -5667,32 +5717,7 @@ export class StreamManager {
     const canonicalModel = normalizeToCanonical(streamInfo.model);
     const isAnthropic = canonicalModel.startsWith("anthropic:");
 
-    const hasErrorProperty = (data: unknown): data is { error: { type?: string } } => {
-      return (
-        typeof data === "object" &&
-        data !== null &&
-        "error" in data &&
-        typeof data.error === "object" &&
-        data.error !== null
-      );
-    };
-
-    const isOverloadedApiCallError = (apiError: APICallError): boolean => {
-      return (
-        apiError.statusCode === 529 ||
-        (hasErrorProperty(apiError.data) && apiError.data.error.type === "overloaded_error")
-      );
-    };
-
-    const isAnthropicOverloaded =
-      isAnthropic &&
-      ((APICallError.isInstance(actualError) && isOverloadedApiCallError(actualError)) ||
-        (RetryError.isInstance(actualError) &&
-          actualError.lastError &&
-          APICallError.isInstance(actualError.lastError) &&
-          isOverloadedApiCallError(actualError.lastError)));
-
-    if (isAnthropicOverloaded) {
+    if (isAnthropic && isAnthropicOverloadError(actualError)) {
       errorMessage = "Anthropic is temporarily overloaded (HTTP 529). Please try again later.";
       errorType = "server_error";
     }

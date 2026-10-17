@@ -1222,6 +1222,90 @@ describe("StreamManager - stream error classification", () => {
   });
 });
 
+describe("StreamManager - Anthropic mid-stream overload", () => {
+  /** A real Anthropic model whose stream starts, then sends one SSE `error` event. */
+  function anthropicStreamFailingWith(error: Record<string, unknown>) {
+    const events = [
+      {
+        type: "message_start",
+        message: {
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          model: "claude-opus-5-5",
+          content: [],
+          stop_reason: null,
+          usage: { input_tokens: 10, output_tokens: 0 },
+        },
+      },
+      { type: "error", error },
+    ];
+    return createAnthropic({
+      apiKey: "test-key",
+      fetch: Object.assign(
+        () =>
+          Promise.resolve(
+            new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+              headers: { "content-type": "text/event-stream" },
+            })
+          ),
+        { preconnect: fetch.preconnect.bind(fetch) }
+      ),
+    })("claude-opus-5-5");
+  }
+  /** Forwards the request to the real SDK, so the stream error is built as in production. */
+  const realSdkAttempt: Attempt = async function* (options) {
+    const result = aiSdk.streamText({ model: options.model, prompt: "continue", maxRetries: 0 });
+    yield* result.fullStream;
+  };
+
+  // Seen live: a proxy in front of Anthropic wraps the provider's overloaded_error event in
+  // the message of a generic `error`, so the SDK's StreamProviderError has no 529 status, is
+  // not retryable, and showed the raw "unknown stream error" text.
+  const wrappedOverload = {
+    type: "error",
+    message:
+      'unknown stream error: received error while streaming: {"type":"error","error":{"details":null,"type":"overloaded_error","message":"Overloaded"},"request_id":"req_1"}\n',
+  };
+  // The SDK's own form of the same event: type overloaded_error, status 529.
+  const nativeOverload = { type: "overloaded_error", message: "Overloaded" };
+
+  test.each([
+    ["a proxy-wrapped", wrappedOverload],
+    ["a native", nativeOverload],
+  ])("%s overloaded_error event is reported like an HTTP 529", async (_name, error) => {
+    const harness = createRecoveryHarness();
+    await harness.run({
+      workspaceId: "anthropic-overload",
+      model: anthropicStreamFailingWith(error),
+      modelString: "anthropic:claude-opus-5-5",
+      attempts: [realSdkAttempt],
+    });
+
+    expect(harness.errors()).toHaveLength(1);
+    expect(harness.errors()[0]).toMatchObject({
+      error: "Anthropic is temporarily overloaded (HTTP 529). Please try again later.",
+      errorType: "server_error",
+    });
+  });
+
+  test("an error event that only mentions overloaded_error in its text keeps its own message", async () => {
+    const harness = createRecoveryHarness();
+    await harness.run({
+      workspaceId: "anthropic-not-overload",
+      model: anthropicStreamFailingWith({
+        type: "invalid_request_error",
+        message: "tool description: retry on overloaded_error",
+      }),
+      modelString: "anthropic:claude-opus-5-5",
+      attempts: [realSdkAttempt],
+    });
+
+    expect(harness.errors()).toHaveLength(1);
+    expect(harness.errors()[0]?.error).toContain("retry on overloaded_error");
+  });
+});
+
 describe("StreamManager - Anthropic thinking signature recovery", () => {
   // Verbatim shape from an Opus 5.5 route without the drop_block control, after
   // a memory write changed the system prompt and tool list between turns.
