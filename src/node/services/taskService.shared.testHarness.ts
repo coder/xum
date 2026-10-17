@@ -181,6 +181,8 @@ export async function startWorkspaceTurnForTest(
     isStreaming?: ReturnType<typeof mock>;
     hasQueuedMessages?: ReturnType<typeof mock>;
     hasPendingQueuedOrPreparingTurn?: ReturnType<typeof mock>;
+    onWorkspaceTurnSettled?: ReturnType<typeof mock>;
+    onQueuedMessageChanged?: ReturnType<typeof mock>;
     hasPendingBashMonitorWakeContinuation?: ReturnType<typeof mock>;
     hasPendingWorkspaceTurnContinuation?: ReturnType<typeof mock>;
     getQueueCutCutter?: ReturnType<typeof mock>;
