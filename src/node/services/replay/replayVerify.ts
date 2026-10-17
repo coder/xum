@@ -402,15 +402,21 @@ export function collectAssistantTurns(historyMessages: MuxMessage[]): AssistantT
  * report TaskService appended after the request read history and before the builder appended
  * the placeholder. Request building replays such a row after the reply (#6749,
  * placeRowsAfterTheTurnThatMissedThem). Builds before that change merged it before the reply,
- * so a request they recorded that includes the row fails the messages check here without a
- * regression. One note per late row that a later recorded request includes.
+ * so a recorded request that includes the row fails the messages check here without a
+ * regression. `recordedTurns` are the turns paired with a recorded request; a reader is one of
+ * them whose epoch slice (sliceEpochForTurn) still holds the row. One note per late row with
+ * a reader.
  */
-export function lateRowNotes(turns: AssistantTurn[], historyMessages: MuxMessage[]): string[] {
+export function lateRowNotes(
+  turns: AssistantTurn[],
+  recordedTurns: AssistantTurn[],
+  historyMessages: MuxMessage[]
+): string[] {
   return turns.flatMap((turn) =>
     rowsTheTurnMissed(turn, historyMessages).flatMap((row) => {
-      // rowsTheTurnMissed keeps only sequenced rows.
-      const sequence = row.metadata?.historySequence ?? Number.POSITIVE_INFINITY;
-      const readers = turns.filter((later) => later.requestHistorySequence >= sequence);
+      const readers = recordedTurns.filter((later) =>
+        sliceEpochForTurn(historyMessages, later.requestHistorySequence).includes(row)
+      );
       if (readers.length === 0) return [];
       return [
         `row ${row.id} arrived while the request for assistant row ${turn.message.id} was ` +
@@ -419,6 +425,15 @@ export function lateRowNotes(turns: AssistantTurn[], historyMessages: MuxMessage
           `${readers.map((reader) => reader.message.id).join(", ")} can be this known order change.`,
       ];
     })
+  );
+}
+
+/** Turns paired with a recorded request and an envelope: the ones verification compares. */
+function recordedPairingTurns(pairings: TurnPairing[]): AssistantTurn[] {
+  return pairings.flatMap((pairing) =>
+    pairing.skipReason == null && pairing.envelope != null && pairing.record != null
+      ? (pairing.turn ?? [])
+      : []
   );
 }
 
@@ -771,7 +786,7 @@ export async function replayVerifySession(params: {
 
   const notes: string[] = [];
   const pairings = pairSessionTurns(envelopes, recorded, turns, notes);
-  notes.push(...lateRowNotes(turns, params.historyMessages));
+  notes.push(...lateRowNotes(turns, recordedPairingTurns(pairings), params.historyMessages));
   const stepPrefix = auditStepPrefixesFromLog(devtoolsLog, params.historyMessages);
 
   const results: ReplayVerifyTurnResult[] = [];

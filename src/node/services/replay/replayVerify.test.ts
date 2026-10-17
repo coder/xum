@@ -14,7 +14,8 @@ import { describe, expect, test } from "bun:test";
 import { tool, type Tool } from "ai";
 import { z } from "zod";
 import type { DevToolsStep } from "@/common/types/devtools";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { TOOL_SEARCH_TOOL_NAME } from "@/common/utils/tools/toolCatalog";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { emitTurnEnvelope } from "@/node/services/turnEnvelope";
@@ -74,15 +75,16 @@ describe("lateRowNotes", () => {
       ...(requestHistorySequence != null ? { requestHistorySequence } : {}),
     });
 
+  const notesFor = (history: MuxMessage[], recordedIds?: string[]) => {
+    const turns = collectAssistantTurns(history);
+    const recorded = turns.filter((turn) => recordedIds?.includes(turn.message.id) ?? true);
+    return lateRowNotes(turns, recorded, history);
+  };
+  const lateReport = [row("u1", "user", 0), row("report", "user", 1), row("a1", "assistant", 2, 0)];
+
   test("names a late row and the recorded requests that include it", () => {
-    const history = [
-      row("u1", "user", 0),
-      row("report", "user", 1),
-      row("a1", "assistant", 2, 0),
-      row("u2", "user", 3),
-      row("a2", "assistant", 4, 3),
-    ];
-    const notes = lateRowNotes(collectAssistantTurns(history), history);
+    const history = [...lateReport, row("u2", "user", 3), row("a2", "assistant", 4, 3)];
+    const notes = notesFor(history);
     expect(notes).toHaveLength(1);
     expect(notes[0]).toContain("report");
     expect(notes[0]).toContain("a1");
@@ -90,11 +92,19 @@ describe("lateRowNotes", () => {
   });
 
   test("stays quiet without a late row or a later request that includes it", () => {
-    const inOrder = [row("u1", "user", 0), row("a1", "assistant", 1, 0)];
-    expect(lateRowNotes(collectAssistantTurns(inOrder), inOrder)).toEqual([]);
+    expect(notesFor([row("u1", "user", 0), row("a1", "assistant", 1, 0)])).toEqual([]);
     // The late row exists, but no recorded request contains it yet.
-    const unread = [row("u1", "user", 0), row("report", "user", 1), row("a1", "assistant", 2, 0)];
-    expect(lateRowNotes(collectAssistantTurns(unread), unread)).toEqual([]);
+    expect(notesFor(lateReport)).toEqual([]);
+    // The later turn has no recorded request (logging off or truncated): nothing to explain.
+    const unrecorded = [...lateReport, row("u2", "user", 3), row("a2", "assistant", 4, 3)];
+    expect(notesFor(unrecorded, ["a1"])).toEqual([]);
+    // A context reset after the late row: the later request's epoch no longer holds it.
+    const reset = createMuxMessage("reset", "assistant", "", {
+      historySequence: 3,
+      contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+    });
+    const afterReset = [...lateReport, reset, row("u2", "user", 4), row("a2", "assistant", 5, 4)];
+    expect(notesFor(afterReset)).toEqual([]);
   });
 });
 
