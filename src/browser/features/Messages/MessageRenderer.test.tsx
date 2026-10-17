@@ -6,7 +6,10 @@ import { TooltipProvider } from "@radix-ui/react-tooltip";
 import type { DisplayedMessage } from "@/common/types/message";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { formatAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
-import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
+import {
+  BACKGROUND_WORK_WAKE_OPENINGS,
+  TODO_TURN_END_NUDGE,
+} from "@/common/utils/machineTurnPrompts";
 import { buildWorkflowResultContextMessage } from "@/common/utils/workflowRunMessages";
 import { MessageRenderer } from "./MessageRenderer";
 import { parseSubagentReportEnvelope } from "./SubagentReportMessageContent";
@@ -688,6 +691,53 @@ describe("MessageRenderer background work wake rows", () => {
 
     fireEvent.click(getByRole("button", { name: /show details/i }));
     expect(queryByText(/wfr_test123/)).toBeDefined();
+  });
+});
+
+describe("MessageRenderer TODO nudge rows", () => {
+  beforeEach(() => {
+    saveDomGlobals();
+    globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
+    globalThis.document = globalThis.window.document;
+    globalThis.localStorage = globalThis.window.localStorage;
+  });
+
+  afterEach(() => {
+    cleanup();
+    restoreDomGlobals();
+  });
+
+  function renderNudge(content: string, isSynthetic: boolean) {
+    const message: DisplayedMessage = {
+      type: "user",
+      id: "todo-nudge",
+      historyId: "todo-nudge",
+      content,
+      historySequence: 40,
+      ...(isSynthetic ? { isSynthetic: true } : {}),
+    };
+    return render(
+      <TooltipProvider>
+        <MessageRenderer message={message} />
+      </TooltipProvider>
+    );
+  }
+
+  test("collapses the synthetic nudge and keeps its prompt on demand", () => {
+    const view = renderNudge(TODO_TURN_END_NUDGE, true);
+    expect(view.container.querySelector("[data-todo-turn-end-nudge]")).not.toBeNull();
+    expect(view.queryByText(/todo_write/)).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: /show details/i }));
+    expect(view.getByText(/todo_write/)).toBeDefined();
+  });
+
+  test("keeps a full bubble for typed lookalikes and plugin-joined prompts", () => {
+    const typed = renderNudge(TODO_TURN_END_NUDGE, false);
+    expect(typed.container.querySelector("[data-todo-turn-end-nudge]")).toBeNull();
+    cleanup();
+    const joined = renderNudge(`Run the failing tests again.\n\n${TODO_TURN_END_NUDGE}`, true);
+    expect(joined.container.querySelector("[data-todo-turn-end-nudge]")).toBeNull();
+    expect(joined.getByText(/Run the failing tests again/)).toBeDefined();
   });
 });
 

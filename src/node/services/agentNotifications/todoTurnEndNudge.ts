@@ -4,21 +4,10 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import { TURN_STOP_PROMPT_MAX_CHARS } from "@/node/services/agentPlugins/promptHooks";
 import { isSuccessfulToolResult } from "@/node/services/aiServiceEventGuards";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import { TODO_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
 
-/**
- * The turn-end todo nudge. TodoListReminderSource only speaks inside tool results, from the 5th
- * tool call after a todo_write on, so a model that writes a list, makes a few calls and then
- * ends its turn with text leaves the pinned list stale (pstack dogfood: "1 in progress, 5
- * pending" after a finished fix). AgentSession sends this prompt as a turn.stop continuation, at
- * most once per user turn, so the model can bring the list up to date before the turn ends.
- *
- * The prompt is constant on purpose: the todo text is model-written (a prompt injection can put
- * instructions there), so it must not come back as a user row. The model already sees its own
- * todo_write calls in context.
- */
-export const TODO_TURN_END_NUDGE = `<notification>
-You ended your turn, but your TODO list still has pending or in-progress items. Update it now with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. If an item is still open on purpose, keep it and say why in one sentence. Do not start new work.
-</notification>`;
+// The prompt text lives in common code so the transcript can render it as a compact row.
+export { TODO_TURN_END_NUDGE };
 
 /**
  * The tool policy of a nudge-only continuation: todo_write and nothing else, so the extra turn

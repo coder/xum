@@ -8,7 +8,8 @@ import { UserMessage, type UserMessageNavigation } from "./UserMessage";
 import { AgentPeerMessage } from "./AgentPeerMessage";
 import { BashMonitorWakeMessage } from "./BashMonitorWakeMessage";
 import { CollapsibleMachineMessage } from "./CollapsibleMachineMessage";
-import { AlertTriangle, MessageSquare } from "lucide-react";
+import { AlertTriangle, ListTodo, MessageSquare } from "lucide-react";
+import { TODO_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
 import {
   BackgroundWorkWakeMessage,
   getBackgroundWorkWakeSummary,
@@ -136,6 +137,17 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               summary="Agent message notification"
               icon={<MessageSquare aria-hidden="true" className="size-3.5 shrink-0" />}
               marker="agent-peer-message-trigger"
+              className={className}
+            />
+          ) : message.isSynthetic === true && message.content === TODO_TURN_END_NUDGE ? (
+            // Xum's turn-end TODO nudge is constant control text, not user input. Exact match
+            // only: a nudge joined to a plugin's turn.stop prompt keeps the full bubble so the
+            // plugin's text stays visible.
+            <CollapsibleMachineMessage
+              content={message.content}
+              summary="Asked the agent to update its TODO list"
+              icon={<ListTodo aria-hidden="true" className="size-3.5 shrink-0" />}
+              marker="todo-turn-end-nudge"
               className={className}
             />
           ) : backgroundWorkWakeSummary != null ? (

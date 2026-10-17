@@ -33,7 +33,10 @@ import {
   createWebSearchTool,
 } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
-import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
+import {
+  BACKGROUND_WORK_WAKE_OPENINGS,
+  TODO_TURN_END_NUDGE,
+} from "@/common/utils/machineTurnPrompts";
 import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
 const meta = { ...appMeta, title: "App/Chat/Messages" };
@@ -684,6 +687,12 @@ export const SyntheticAutoResumeMessages: AppStory = {
                 synthetic: true,
               }
             ),
+            // Turn-end TODO nudge: a compact machine row, not a user bubble.
+            createUserMessage("msg-10", TODO_TURN_END_NUDGE, {
+              historySequence: 11,
+              timestamp: STABLE_TIMESTAMP - 30000,
+              synthetic: true,
+            }),
           ],
         });
       }}
