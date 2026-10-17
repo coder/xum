@@ -578,10 +578,10 @@ describe("WorkspaceFooterBar at narrow viewports", () => {
     cleanupDom = null;
   });
 
-  it("drops the branch, drift label, usage stats and last prompt but keeps the repo label", () => {
+  it("drops the drift label, usage stats and last prompt but keeps the repo label and branch", () => {
     const { container, queryByTestId } = renderFooter();
 
-    expect(BranchSelectorModule.BranchSelector).not.toHaveBeenCalled();
+    expect(BranchSelectorModule.BranchSelector).toHaveBeenCalled();
     expect(container.textContent).not.toContain("Lines");
     expect(container.textContent).not.toContain("tok");
     expect(container.textContent).not.toContain("t/s");
@@ -601,7 +601,6 @@ describe("WorkspaceFooterBar at narrow viewports", () => {
 
   it("makes the diff numbers toggle the drift mode until the viewport widens", () => {
     const { container } = renderFooter();
-    expect(BranchSelectorModule.BranchSelector).not.toHaveBeenCalled();
     expect(lastGitStatusIndicatorProps()?.tapTogglesMode).toBe(true);
 
     viewportIsNarrow = false;
@@ -609,7 +608,6 @@ describe("WorkspaceFooterBar at narrow viewports", () => {
       for (const listener of viewportListeners) listener();
     });
 
-    expect(BranchSelectorModule.BranchSelector).toHaveBeenCalled();
     expect(container.textContent).toContain("Lines");
     expect(lastGitStatusIndicatorProps()?.tapTogglesMode).toBe(false);
   });

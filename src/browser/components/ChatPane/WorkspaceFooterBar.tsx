@@ -144,14 +144,7 @@ function WorkspaceBranchControls(props: {
   workspaceId: string;
   workspaceName: string;
   devcontainerChip: DevcontainerChip;
-  isNarrow: boolean;
 }) {
-  // Phones show the branch in the header's workspace details instead, keeping only the
-  // devcontainer chip because it reports live runtime state.
-  if (props.isNarrow) {
-    return props.devcontainerChip && <FooterDevcontainerChip chip={props.devcontainerChip} />;
-  }
-
   // The branch is the one footer item that can shrink (its name truncates with an ellipsis), so a
   // long name no longer pushes the row wider than a phone screen (#5769).
   return (
@@ -180,7 +173,11 @@ function FooterDevcontainerChip(props: { chip: NonNullable<DevcontainerChip> }) 
   );
 }
 
-function FooterRepositoryLabel(props: { workspaceId: string; projectLabel: string }) {
+function FooterRepositoryLabel(props: {
+  workspaceId: string;
+  projectLabel: string;
+  isNarrow: boolean;
+}) {
   const workspacePR = useWorkspacePR(props.workspaceId);
 
   if (!workspacePR) {
@@ -198,7 +195,12 @@ function FooterRepositoryLabel(props: { workspaceId: string; projectLabel: strin
           target="_blank"
           rel="noopener noreferrer"
           data-testid="workspace-footer-repository"
-          className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 min-w-0 items-center gap-1 rounded-md px-1.5 transition-colors focus-visible:ring-1"
+          className={cn(
+            "text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 items-center gap-1 rounded-md px-1.5 transition-colors focus-visible:ring-1",
+            // Phones keep the owner/repo whole up to the project label's cap, so the branch after it
+            // gives up the width first. Wider layouts add fixed-width items, so both shrink there.
+            props.isNarrow ? "max-w-40 shrink-0" : "min-w-0"
+          )}
         >
           <Github className="h-3 w-3 shrink-0" aria-hidden="true" />
           {/* Truncates like the branch name, so a long owner/repo fits a phone screen (#5769). */}
@@ -462,12 +464,15 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
               showMultiProjectStatus={showMultiProjectStatus}
               isNarrow={isNarrow}
             />
-            <FooterRepositoryLabel workspaceId={props.workspaceId} projectLabel={projectLabel} />
+            <FooterRepositoryLabel
+              workspaceId={props.workspaceId}
+              projectLabel={projectLabel}
+              isNarrow={isNarrow}
+            />
             <WorkspaceBranchControls
               workspaceId={props.workspaceId}
               workspaceName={props.workspaceName}
               devcontainerChip={devcontainerChip}
-              isNarrow={isNarrow}
             />
           </>
         )}

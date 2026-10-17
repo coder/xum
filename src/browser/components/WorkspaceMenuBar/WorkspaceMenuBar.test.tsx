@@ -742,7 +742,6 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
     render(<WorkspaceMenuBar {...defaultProps} />);
 
-    // The selector, not just the name: phones have no footer branch selector to switch from.
     const branchSelector = BranchSelectorModule.BranchSelector as unknown as {
       mock: { calls: Array<[{ workspaceId: string; workspaceName: string }]> };
     };

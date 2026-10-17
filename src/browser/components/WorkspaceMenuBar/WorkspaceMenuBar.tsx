@@ -133,10 +133,9 @@ function getPhoneHeaderSnapshot(): boolean {
 }
 
 /**
- * The full selector, not just the name: phones drop the footer's branch selector, so this is
- * their only way to switch branches. Mounted like the footer's: for every repository workspace,
- * because it loads its own branch (waking a stopped runtime when opened), and keyed by workspace
- * so a header kept across a workspace switch never offers the previous workspace's branches.
+ * Mounted like the footer's selector: for every repository workspace, because it loads its own
+ * branch (waking a stopped runtime when opened), and keyed by workspace so a header kept across a
+ * workspace switch never offers the previous workspace's branches.
  */
 function WorkspaceDetailsBranch(props: {
   workspaceId: string;

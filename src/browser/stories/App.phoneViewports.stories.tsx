@@ -437,15 +437,6 @@ export const IPhone17ProMaxTouchTargetRows: AppStory = {
           workspaceName: "mobile-touch",
           projectName: "mux",
           messages: [...MESSAGES],
-          // Phone widths drop the footer's branch button, so a detected PR supplies the
-          // repository link as the footer's touch target at every width.
-          executeBash: (_workspaceId, script) =>
-            Promise.resolve({
-              success: true as const,
-              output: script.includes("gh pr view") ? PR_DETECTION_JSON : "",
-              exitCode: 0,
-              wall_duration_ms: 5,
-            }),
         })
       }
     />
