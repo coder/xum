@@ -147,15 +147,18 @@ function WorkspaceBranchControls(props: {
   isNarrow: boolean;
 }) {
   // The branch truncates rather than push the row past a phone screen (#5769). Phones give it only
-  // the width the other items leave, so a short repo label stays whole, and drop the wrapper so the
-  // devcontainer chip keeps its full width.
+  // the width the other items leave, so a short repo label stays whole, but never less than a touch
+  // target, so a full row truncates the repo label rather than clip the branch button. Phones also
+  // drop the copy button, whose touch target would take the name's room (the header's details
+  // popover still copies the branch), and the wrapper, so the devcontainer chip keeps its width.
   return (
     <div className={props.isNarrow ? "contents" : "flex min-w-0 items-center gap-1"}>
       <BranchSelector
         key={props.workspaceId}
         workspaceId={props.workspaceId}
         workspaceName={props.workspaceName}
-        className={props.isNarrow ? "max-w-max min-w-0 grow basis-0 overflow-hidden" : "min-w-0"}
+        className={props.isNarrow ? "max-w-max min-w-11 grow basis-0" : "min-w-0"}
+        showCopyButton={!props.isNarrow}
       />
       {props.devcontainerChip && <FooterDevcontainerChip chip={props.devcontainerChip} />}
     </div>

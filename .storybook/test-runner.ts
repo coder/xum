@@ -2,6 +2,7 @@ import type { TestRunnerConfig } from "@storybook/test-runner";
 // This hook is reloaded between Jest suites in the same worker. Importing @playwright/test
 // initializes a second test runner and fails on reload; use browser waits and Node assertions.
 import assert from "node:assert/strict";
+import { MOBILE_TOUCH_TARGET_PX } from "../src/constants/layout";
 
 // Real :hover for the primary-button contrast stories (#6022). A play runs inside the page and
 // cannot set :hover, so only stories under this id prefix get two page-level helpers backed by
@@ -12,6 +13,64 @@ const hoverReady = new WeakSet<object>();
 // 16 swipes cover it with room to spare.
 const MAX_TOUCH_SWIPES = 16;
 
+type StoryPage = Parameters<NonNullable<TestRunnerConfig["postVisit"]>>[0];
+
+const PHONE_FOOTER_TOUCH_STORY = "app-phoneviewports-overflow--footer-touch-targets";
+
+/**
+ * On a phone with a coarse pointer, globals.css raises every footer control to a touch target,
+ * and the branch gets only the width the rest of the row leaves. A full row on the narrowest
+ * phone must truncate labels, never clip a control: a clipped target is hidden or partly hidden
+ * but still takes taps. Plays cannot emulate the pointer.
+ */
+async function assertPhoneFooterTouchTargets(page: StoryPage) {
+  const client = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    await page.setViewportSize({ width: 320, height: 700 });
+    await page.waitForFunction(() => matchMedia("(pointer: coarse)").matches, undefined, {
+      timeout: 5000,
+    });
+    const row = page.locator('[data-testid="workspace-footer-bar"] > div');
+    // Phones drop the drift mode label, so once it is gone the row has its phone layout.
+    await row
+      .getByRole("button", { name: "Lines", exact: true })
+      .waitFor({ state: "detached", timeout: 5000 });
+    const problems = await row.evaluate((rowElement, minTarget) => {
+      const found: string[] = [];
+      for (const target of rowElement.querySelectorAll<HTMLElement>("button, a")) {
+        const box = target.getBoundingClientRect();
+        // Not displayed at this width.
+        if (box.width === 0) continue;
+        const name = target.getAttribute("aria-label") ?? target.textContent ?? target.tagName;
+        if (box.width < minTarget) found.push(`${name} is ${Math.round(box.width)}px wide`);
+        let left = box.left;
+        let right = box.right;
+        for (let el = target.parentElement; el; el = el.parentElement) {
+          if (getComputedStyle(el).overflowX !== "visible") {
+            const clip = el.getBoundingClientRect();
+            left = Math.max(left, clip.left);
+            right = Math.min(right, clip.right);
+          }
+          if (el === rowElement) break;
+        }
+        const visible = Math.max(0, right - left);
+        if (visible < box.width - 0.5) {
+          found.push(`${name} shows ${Math.round(visible)} of ${Math.round(box.width)}px`);
+        }
+      }
+      return found;
+    }, MOBILE_TOUCH_TARGET_PX);
+    // Compare a string: the page's array has another realm's prototype, so deepEqual always fails.
+    assert.equal(problems.join("; "), "", "Footer touch targets must stay whole on a small phone");
+  } finally {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+    if (viewport) await page.setViewportSize(viewport);
+  }
+}
+
 const config: TestRunnerConfig = {
   async preVisit(page, context) {
     // exposeFunction throws on a second registration, so register once per Playwright page.
@@ -21,6 +80,12 @@ const config: TestRunnerConfig = {
     await page.exposeFunction("__storybookUnhover", () => page.mouse.move(0, 0));
   },
   async postVisit(page, context) {
+    if (context.id === PHONE_FOOTER_TOUCH_STORY) {
+      if (page.context().browser()?.browserType().name() === "chromium") {
+        await assertPhoneFooterTouchTargets(page);
+      }
+      return;
+    }
     if (context.id === "app-rightsidebar-stable-tab-controls--wide") {
       if (page.context().browser()?.browserType().name() !== "chromium") return;
       // A tablet (coarse pointer above the phone breakpoint) gets no global 44px button floor,
