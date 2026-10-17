@@ -22,6 +22,12 @@ import { EditCutoffBarrier } from "@/browser/features/Messages/ChatBarrier/EditC
 import { StreamingBarrier } from "@/browser/features/Messages/ChatBarrier/StreamingBarrier";
 import { RetryBarrier } from "@/browser/features/Messages/ChatBarrier/RetryBarrier";
 import { PinnedTodoList } from "../PinnedTodoList/PinnedTodoList";
+import { AskUserQuestionDock } from "./AskUserQuestionDock";
+import { useAcceptedAnswersVersion } from "@/browser/utils/messages/openAskUserQuestions";
+import {
+  AskUserQuestionPlacementProvider,
+  getTranscriptAskUserQuestionPlacement,
+} from "@/browser/features/Tools/AskUserQuestion/askUserQuestionPlacement";
 import { ChatInputDecorationStackLane, TranscriptTailStackLane } from "./LayoutStackLane";
 import { computeChatViewReveal, useChatViewDataReady } from "./useChatViewDataReady";
 import { TranscriptHydrationSkeleton } from "./TranscriptHydrationSkeleton";
@@ -725,6 +731,15 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     setTranscriptDetached(isTranscriptDetached);
   }, [isTranscriptDetached, setTranscriptDetached]);
   const revealedMessages = mountedSlice(deferredMessages, revealFromIndex, revealToIndex);
+  // An accepted non-blocking answer closes its question without any transcript change.
+  useAcceptedAnswersVersion();
+  // Open ask_user_question forms live in the composer dock (sticky to the bottom of the chat) and
+  // their transcript rows render as stubs.
+  const askUserQuestionPlacement = getTranscriptAskUserQuestionPlacement({
+    workspaceId,
+    transcriptOnly,
+    transcripts: [transformedMessages, deferredMessages],
+  });
   const hasCommittedTranscriptRow =
     !showTranscriptHydrationPlaceholder && revealedMessages.length > 0;
   // Chat-switch User Timing (#4504): first transcript row painted after a switch. The commit
@@ -1718,13 +1733,15 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                         </TooltipIfPresent>
                       </div>
                     )}
-                    <TranscriptBundleRows
-                      workspaceId={workspaceId}
-                      messages={revealedMessages}
-                      indexOffset={revealFromIndex}
-                      bundles={transcriptBundles}
-                      renderMessageAtIndex={renderMessageAtIndex}
-                    />
+                    <AskUserQuestionPlacementProvider value={askUserQuestionPlacement}>
+                      <TranscriptBundleRows
+                        workspaceId={workspaceId}
+                        messages={revealedMessages}
+                        indexOffset={revealFromIndex}
+                        bundles={transcriptBundles}
+                        renderMessageAtIndex={renderMessageAtIndex}
+                      />
+                    </AskUserQuestionPlacementProvider>
                     <ShowNewerMessagesButton
                       visible={isTranscriptDetached}
                       onClick={handleShowNewerMessages}
@@ -2134,6 +2151,18 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       ),
     });
   }
+  // Open questions sit closest to the composer: they wait on the user, like the next message.
+  // Self-gating (renders nothing without an open question) and keyed by workspace, since the
+  // dock retains closed cards for the visit (see AskUserQuestionDock). Like the queued message it
+  // is synchronous chat state, and it must not wait for the reveal: the transcript stubs these
+  // rows from the first render, so the form never moves between instances mid-answer.
+  decorationEntries.push(
+    createChatInputDecorationStackItem({
+      key: "ask-user-question",
+      revealBeforeReady: true,
+      node: <AskUserQuestionDock key={props.workspaceId} workspaceId={props.workspaceId} />,
+    })
+  );
   // Keep decorations in the in-flow composer dock so height changes reserve
   // transcript clearance in the same layout pass.
 

@@ -1,8 +1,13 @@
-import { useRef, useState } from "react";
+import { useRef, useSyncExternalStore } from "react";
 
 import { useLiveAPI } from "@/browser/contexts/API";
 import { flushUserPreferences } from "@/browser/stores/AppConfigStore";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import {
+  getAcceptedAnswers,
+  setAcceptedAnswers,
+  subscribeAcceptedAnswers,
+} from "@/browser/utils/messages/openAskUserQuestions";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { useHostTranscriptMutationCheck } from "@/browser/utils/transcriptBarrier";
 import type { DisplayedMessage } from "@/common/types/message";
@@ -186,11 +191,9 @@ export function useNonBlockingQuestionAnswers(props: {
   const liveApi = useLiveAPI();
   const workspaceStore = useWorkspaceStoreRaw();
   const isTranscriptMutationAllowed = useHostTranscriptMutationCheck();
-  // Answers whose message the backend accepted. Like Codex, the question is then done from this
-  // card's view; the message is ordinary input, so a queued one the user withdraws (Stop) comes
-  // back to the composer like any queued message. This also covers a message batched into an
-  // earlier queued one, whose metadata the queue does not keep.
-  const [sentAnswers, setSentAnswers] = useState<Record<string, string> | null>(null);
+  const sentAnswers = useSyncExternalStore(subscribeAcceptedAnswers, () =>
+    getAcceptedAnswers(props)
+  );
   // The idempotency id of the last unconfirmed send. A retry of the same message reuses it, so
   // a lost success response cannot produce a second answer row (the backend never appends a
   // second row for an id a row already carries).
@@ -220,7 +223,7 @@ export function useNonBlockingQuestionAnswers(props: {
     });
     if (error == null) {
       pendingSendRef.current = null;
-      setSentAnswers(answers);
+      setAcceptedAnswers(props, answers);
     }
     return error;
   };
