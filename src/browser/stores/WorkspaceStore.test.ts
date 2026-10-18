@@ -1680,23 +1680,26 @@ describe("WorkspaceStore", () => {
     it.each([
       ["desktop", true, [0]],
       ["browser", false, []],
-    ] as const)("requests the tool cards on selection in %s mode", async (_mode, desktop, calls) => {
-      const workspaceId = `tool-cards-on-select-${String(desktop)}`;
-      createAndAddWorkspace(store, workspaceId, {}, false);
-      await tick(0);
-      onChatCallsAtToolCardRequest.length = 0;
-      const api = global.window.api as { getIsRosetta?: () => Promise<boolean> };
-      if (desktop) api.getIsRosetta = () => Promise.resolve(false);
-      try {
-        store.setActiveWorkspaceId(workspaceId);
+    ] as const)(
+      "requests the tool cards on selection in %s mode",
+      async (_mode, desktop, calls) => {
+        const workspaceId = `tool-cards-on-select-${String(desktop)}`;
+        createAndAddWorkspace(store, workspaceId, {}, false);
         await tick(0);
-        // Desktop: one request, made before the onChat subscription started.
-        expect(onChatCallsAtToolCardRequest).toEqual([...calls]);
-        expect(mockOnChat).toHaveBeenCalled();
-      } finally {
-        delete api.getIsRosetta;
+        onChatCallsAtToolCardRequest.length = 0;
+        const api = global.window.api as { getIsRosetta?: () => Promise<boolean> };
+        if (desktop) api.getIsRosetta = () => Promise.resolve(false);
+        try {
+          store.setActiveWorkspaceId(workspaceId);
+          await tick(0);
+          // Desktop: one request, made before the onChat subscription started.
+          expect(onChatCallsAtToolCardRequest).toEqual([...calls]);
+          expect(mockOnChat).toHaveBeenCalled();
+        } finally {
+          delete api.getIsRosetta;
+        }
       }
-    });
+    );
     it("does not start onChat until workspace becomes active", async () => {
       const workspaceId = "inactive-workspace";
       createAndAddWorkspace(store, workspaceId, {}, false);
