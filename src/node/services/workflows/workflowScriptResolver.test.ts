@@ -504,8 +504,15 @@ describe("resolveWorkflowScript", () => {
       // A removed script stays removed: its copy does not bring it back.
       await fs.rm(path.join(skillDir, "workflow.js"));
       await expect(resolve("skill://greet/workflow.js")).rejects.toThrow(/ENOENT|no such file/i);
-      // Without a copy, a changed script does not run at all.
-      await fs.rm(path.join(tempDir.path, "plugin-approved-copies"), { recursive: true });
+      // A copy that no longer matches its record does not run, and neither does no copy at all.
+      const copiesDir = path.join(tempDir.path, "plugin-approved-copies");
+      const [copiesFile] = await fs.readdir(copiesDir);
+      const copies = path.join(copiesDir, copiesFile);
+      await fs.writeFile(copies, (await fs.readFile(copies, "utf8")).replace("plugin-v1", "evil"));
+      await expect(resolve("plugin://my-plugin/release.js")).rejects.toThrow(
+        "has not been reviewed on this install"
+      );
+      await fs.rm(copiesDir, { recursive: true });
       await expect(resolve("plugin://my-plugin/release.js")).rejects.toThrow(
         "has not been reviewed on this install"
       );

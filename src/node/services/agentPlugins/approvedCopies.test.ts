@@ -116,9 +116,13 @@ describe("approved copies store", () => {
 
   test.each([
     ["malformed JSON", (target: string) => fsPromises.writeFile(target, "{ not json")],
+    // Valid copies, padded past the bound: only the size refuses them.
     [
       "an oversized file",
-      (target: string) => fsPromises.truncate(target, MAX_APPROVED_COPIES_FILE_BYTES + 1),
+      async (target: string) => {
+        const text = await fsPromises.readFile(target, "utf8");
+        await fsPromises.writeFile(target, text.padEnd(MAX_APPROVED_COPIES_FILE_BYTES + 1, " "));
+      },
     ],
     [
       "a directory",
