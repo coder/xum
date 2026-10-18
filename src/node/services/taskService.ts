@@ -1269,6 +1269,44 @@ function isIdleLegacyStartupTask(
   return state === "idle" && pendingGuidanceCount === 0 && lacksLegacyRestartEvidence(task, state);
 }
 
+/** Model settings of a startup re-drive send: the task's own, as a manual resume would use. */
+function startupRedriveSendOptions(task: AgentTaskWorkspaceEntry) {
+  const agentId = resolveTaskAgentIdForResume(task);
+  return {
+    model: task.taskModelString ?? defaultModel,
+    agentId,
+    thinkingLevel: task.taskThinkingLevel,
+    reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
+    serviceTier: ServiceTierSchema.safeParse(resolveWorkspaceAISettings(task, agentId)?.serviceTier)
+      .data,
+  };
+}
+
+type StartupRedriveOutcome = "resumed" | "failed" | "skipped";
+
+type StartupAttemptRotation = "committed" | "moved" | "skipped";
+
+/**
+ * The per-row CAS of a startup attempt rotation, applied inside the batch's config transform.
+ * `moved`: the row no longer matches the recovery snapshot. `skipped`: the row is gone, being
+ * removed, or a workflow claim retired its attempt.
+ */
+function rotateStartupAttemptInRow(
+  row: WorkspaceConfigEntry | undefined,
+  snapshot: Pick<WorkspaceConfigEntry, "taskAttemptId" | "taskStatus">,
+  attemptId: string
+): StartupAttemptRotation {
+  if (row == null || row.taskAttemptRetiredBy != null || row.pendingRemoval != null) {
+    return "skipped";
+  }
+  if (row.taskAttemptId !== snapshot.taskAttemptId || row.taskStatus !== snapshot.taskStatus) {
+    return "moved";
+  }
+  row.taskAttemptId = attemptId;
+  row.taskAttemptUnproven = true;
+  return "committed";
+}
+
 function isWorkspaceBusyIdleOnlySend(error: unknown): boolean {
   return (
     error != null &&
@@ -4354,61 +4392,285 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Startup re-drive of a `running`/`awaiting_report` task (recoverInterruptedTasks): the previous
-   * process may still hold an admitted execution, so the re-driven work is a new, UNOWNED and
+   * Startup re-drive of `running`/`awaiting_report` tasks (recoverInterruptedTasks): the previous
+   * process may still hold an admitted execution, so each re-driven task gets a new, UNOWNED and
    * unproven attempt — the CAS rotates the id and sets the marker; no ownership, no receipts.
-   * `snapshot` is the row the recovery pass decided on: the CAS refuses (false) when the row
+   * All rows are rotated in ONE config write: a write per row rewrote the whole file once per task
+   * (#6511). Each `snapshot` is the row the recovery pass decided on, and the CAS skips a row that
    * moved since (another writer admitted or stopped the task — re-driving it would dispatch a
-   * duplicate under an id nobody decided on), when a workflow claim retired the attempt, or
-   * when the write fails.
+   * duplicate under an id nobody decided on), whose attempt a workflow claim retired, or that is
+   * being removed. In-memory attempt state is published only after the write landed; a failed
+   * write rotates nothing. Returns the new attempt id of every row it rotated.
    */
-  private async rotateAttemptForStartupRedrive(
-    taskId: string,
-    snapshot: Pick<WorkspaceConfigEntry, "taskAttemptId" | "taskStatus">
-  ): Promise<string | undefined> {
-    const attemptId = newTaskAttemptId();
-    let committed = false;
-    let moved = false;
+  private async rotateAttemptsForStartupRedrive(
+    snapshots: ReadonlyArray<
+      Pick<WorkspaceConfigEntry, "taskAttemptId" | "taskStatus"> & { id: string }
+    >
+  ): Promise<Map<string, string>> {
+    const rotated = new Map<string, string>();
+    if (snapshots.length === 0) return rotated;
+    const attemptIds = new Map(snapshots.map((snapshot) => [snapshot.id, newTaskAttemptId()]));
+    const outcomes = new Map<string, StartupAttemptRotation>();
+    // One row edit whose updater rotates every row: editWorkspaceEntry hands its updater the whole
+    // config of the write. The edit is keyed by a pending row, so a key row that was removed
+    // meanwhile is marked skipped and the next one keys a new edit (one write per removed row).
+    let pending = [...snapshots];
     try {
-      await this.editWorkspaceEntry(
-        taskId,
-        (ws) => {
-          if (ws.taskAttemptRetiredBy != null || ws.pendingRemoval != null) return;
-          if (
-            ws.taskAttemptId !== snapshot.taskAttemptId ||
-            ws.taskStatus !== snapshot.taskStatus
-          ) {
-            moved = true;
-            return;
-          }
-          ws.taskAttemptId = attemptId;
-          ws.taskAttemptUnproven = true;
-          committed = true;
-        },
-        { allowMissing: true }
-      );
+      while (pending.length > 0) {
+        const batch = pending;
+        const found = await this.editWorkspaceEntry(
+          batch[0].id,
+          (_keyRow, config) => {
+            // editConfig can re-run the transform on fresh bytes; only the last run counts.
+            for (const snapshot of batch) {
+              const attemptId = attemptIds.get(snapshot.id);
+              assert(attemptId != null, "rotateAttemptsForStartupRedrive: attempt id is minted");
+              const row = findWorkspaceEntry(config, snapshot.id)?.workspace;
+              outcomes.set(snapshot.id, rotateStartupAttemptInRow(row, snapshot, attemptId));
+            }
+          },
+          { allowMissing: true }
+        );
+        if (found) break;
+        outcomes.set(batch[0].id, "skipped");
+        pending = batch.slice(1);
+      }
     } catch (error: unknown) {
-      log.warn("[startup] failed to rotate the attempt id before re-driving a task; skipping", {
-        taskId,
+      log.warn("[startup] failed to rotate attempt ids before re-driving tasks; skipping them", {
+        taskIds: snapshots.map((snapshot) => snapshot.id),
         error,
       });
-      return undefined;
+      return rotated;
     }
-    if (moved) {
-      log.info("[startup] task skipped: its row moved after the recovery snapshot", { taskId });
-      return undefined;
+    this.publishStartupAttemptRotations(snapshots, outcomes, attemptIds, rotated);
+    return rotated;
+  }
+
+  /** Publishes the in-memory side of the rotations a batch committed, and logs the skipped rows. */
+  private publishStartupAttemptRotations(
+    snapshots: ReadonlyArray<{ id: string }>,
+    outcomes: ReadonlyMap<string, StartupAttemptRotation>,
+    attemptIds: ReadonlyMap<string, string>,
+    rotated: Map<string, string>
+  ): void {
+    for (const snapshot of snapshots) {
+      const outcome = outcomes.get(snapshot.id);
+      const attemptId = attemptIds.get(snapshot.id);
+      if (outcome === "committed" && attemptId != null) {
+        this.publishAttemptRotation(snapshot.id, attemptId);
+        rotated.set(snapshot.id, attemptId);
+      } else if (outcome === "moved") {
+        log.info("[startup] task skipped: its row moved after the recovery snapshot", {
+          taskId: snapshot.id,
+        });
+      } else {
+        log.info(
+          "[startup] task skipped: a workflow claim retired its attempt, or it is being removed",
+          { taskId: snapshot.id }
+        );
+      }
     }
-    if (!committed) {
-      log.info(
-        "[startup] task skipped: a workflow claim retired its attempt, or it is being removed",
+  }
+
+  /**
+   * Whether a startup re-drive decided before the batch rotation still applies: the sends of the
+   * rows before it can have finished or stopped this one in the meantime.
+   */
+  private startupRedriveRowUnchanged(task: AgentTaskWorkspaceEntry & { id: string }): boolean {
+    const latest = findWorkspaceEntry(this.config.loadConfigOrDefault(), task.id)?.workspace;
+    return latest != null && latest.taskStatus === task.taskStatus;
+  }
+
+  /**
+   * The pending compaction follow-up of a running task's startup re-drive. An active or
+   * question-parked task has none to restore: nothing is dispatched.
+   */
+  private dispatchRunningStartupFollowUp(
+    redrive: { task: { id: string }; alreadyStreaming: boolean; queueOnly: boolean },
+    attemptId: string
+  ): Promise<Result<boolean>> {
+    return redrive.alreadyStreaming || redrive.queueOnly
+      ? Promise.resolve(Ok(false))
+      : this.dispatchFencedStartupCompactionFollowUp(redrive.task.id, attemptId);
+  }
+
+  /** A fenced admission for one startup send, bound to the attempt rotated for this decision. */
+  private admitStartupSend(taskId: string, attemptId: string): TurnAdmissionToken | undefined {
+    const admission = this.admitTaskWorkspaceTurn(taskId, {
+      acceptanceOrigin: "automatic",
+      expectedAttemptId: attemptId,
+    });
+    return admission.kind === "admitted" ? admission.token : undefined;
+  }
+
+  /**
+   * Startup re-drive of one `awaiting_report` task: its pending compaction follow-up, else the
+   * completion-tool prompt. `attemptId` is the attempt the batch rotated for it; every send is
+   * fenced to it.
+   */
+  private async redriveAwaitingReportStartupTask(
+    task: AgentTaskWorkspaceEntry & { id: string },
+    attemptId: string
+  ): Promise<StartupRedriveOutcome> {
+    if (!this.startupRedriveRowUnchanged(task)) return "skipped";
+    const followUp = await this.dispatchFencedStartupCompactionFollowUp(task.id, attemptId);
+    if (!followUp.success) return "failed";
+    if (followUp.data) return "resumed";
+    // The completion prompt is fenced to the attempt this decision rotated, like every other
+    // startup send: bound here (refused once another writer's attempt owns the row) and carried
+    // through the prompt helper's own awaits as its token, so a rotation landing during them
+    // refuses the send at the gates instead of the handoff adopting the successor.
+    const completionAdmission = this.admitTaskWorkspaceTurn(task.id, {
+      acceptanceOrigin: "automatic",
+      expectedAttemptId: attemptId,
+    });
+    if (completionAdmission.kind !== "admitted") return "failed";
+    const resumed = await this.promptTaskForRequiredCompletionTool(task.id, {
+      reason: "startup",
+      fence: { turnAdmission: completionAdmission.token, attemptId },
+      // The fence carries the attempt (see the option's doc).
+      expectedAttemptId: null,
+    });
+    return resumed ? "resumed" : "failed";
+  }
+
+  /**
+   * Startup re-drive of one `running` task: its pending compaction follow-up, its pending
+   * guidance, or the restart nudge. `attemptId` is the attempt the batch rotated for it; every
+   * send is fenced to it.
+   */
+  private async redriveRunningStartupTask(
+    redrive: {
+      task: AgentTaskWorkspaceEntry & { id: string };
+      alreadyStreaming: boolean;
+      queueOnly: boolean;
+    },
+    attemptId: string,
+    state: StartupRecoveryState | undefined
+  ): Promise<StartupRedriveOutcome> {
+    const { task, queueOnly } = redrive;
+    if (!this.startupRedriveRowUnchanged(task)) return "skipped";
+    const pendingGuidance = task.taskPendingGuidance ?? [];
+
+    // Restore compaction intent before new guidance/nudges make its tail stale.
+    // Guidance then queues behind that continuation without losing either payload.
+    const followUp = await this.dispatchRunningStartupFollowUp(redrive, attemptId);
+    if (!followUp.success) return "failed";
+    if (followUp.data && pendingGuidance.length === 0) return "resumed";
+    // Every further send of this decision is fenced to the attempt rotated for it: bound here
+    // (refused once another writer's attempt owns the row) and carried as the send's token, so
+    // the handoff never adopts a successor and a Stop captures the obligation.
+    const fenceStartupSend = () => this.admitStartupSend(task.id, attemptId);
+    const sendOptions = startupRedriveSendOptions(task);
+    if (pendingGuidance.length > 0) {
+      return this.replayStartupGuidance(
+        task,
+        pendingGuidance,
+        sendOptions,
+        queueOnly,
+        fenceStartupSend
+      );
+    }
+
+    // Legacy tasks lack active-status evidence. Durable compaction/guidance above still wins.
+    if (lacksLegacyRestartEvidence(task, state)) return "skipped";
+    return this.sendStartupRestartNudge(task, sendOptions, fenceStartupSend);
+  }
+
+  /** Replays a running task's durable guidance on startup, each send fenced by `fence`. */
+  private async replayStartupGuidance(
+    task: AgentTaskWorkspaceEntry & { id: string },
+    pendingGuidance: NonNullable<AgentTaskWorkspaceEntry["taskPendingGuidance"]>,
+    sendOptions: ReturnType<typeof startupRedriveSendOptions>,
+    queueOnly: boolean,
+    fenceStartupSend: () => TurnAdmissionToken | undefined
+  ): Promise<StartupRedriveOutcome> {
+    let sendResult: Result<void, SendMessageError> = Ok(undefined);
+    for (const guidance of pendingGuidance) {
+      const token = fenceStartupSend();
+      if (token == null) {
+        sendResult = Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
+        break;
+      }
+      sendResult = await this.workspaceService.sendMessage(
+        task.id,
+        `Updated guidance from parent:\n\n${guidance.message}`,
+        { ...sendOptions, queueDispatchMode: guidance.queueDispatchMode },
         {
-          taskId,
+          ...this.taskGuidanceSendOptions(task.id, guidance.id, task.taskStatus ?? "running"),
+          restoreQueued: queueOnly,
+          turnAdmission: token,
+          admissionStale: () => token.admissionStale(),
         }
       );
-      return undefined;
+      if (!sendResult.success) break;
     }
-    this.publishAttemptRotation(taskId, attemptId);
-    return attemptId;
+    if (!sendResult.success) {
+      log.error("Failed to replay pending task guidance on startup", {
+        taskId: task.id,
+        error: sendResult.error,
+      });
+      return "failed";
+    }
+    return "resumed";
+  }
+
+  /** Sends the restart nudge to a running task on startup, fenced by `fence`. */
+  private async sendStartupRestartNudge(
+    task: AgentTaskWorkspaceEntry & { id: string },
+    sendOptions: ReturnType<typeof startupRedriveSendOptions>,
+    fenceStartupSend: () => TurnAdmissionToken | undefined
+  ): Promise<StartupRedriveOutcome> {
+    const isPlanLike = await this.isPlanLikeTaskWorkspace({
+      projectPath: task.projectPath,
+      workspace: task,
+    });
+
+    const logContext = {
+      taskId: task.id,
+      taskName: task.name,
+      projectPath: task.projectPath,
+      model: sendOptions.model,
+      agentId: sendOptions.agentId,
+      isPlanLike,
+    };
+    log.info("[startup] Resuming running task", logContext);
+    const resumeStartedAt = Date.now();
+    const restartCompletionInstruction = isPlanLike
+      ? "When you have a final plan, call propose_plan exactly once."
+      : "When you have a final answer, return it in your final assistant message.";
+    const nudgeToken = fenceStartupSend();
+    const sendResult =
+      nudgeToken == null
+        ? Err<SendMessageError>({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE })
+        : await this.workspaceService.sendMessage(
+            task.id,
+            "Xum restarted while this task was running. Continue where you left off. " +
+              restartCompletionInstruction,
+            sendOptions,
+            {
+              acceptanceOrigin: "automatic",
+              synthetic: true,
+              agentInitiated: true,
+              taskTurnKind: "recovery",
+              // Accepted is enough; stream startup must not gate the listener (see
+              // recoverInterruptedTasks).
+              startStreamInBackground: true,
+              turnAdmission: nudgeToken,
+              admissionStale: () => nudgeToken.admissionStale(),
+            }
+          );
+    const durationMs = Date.now() - resumeStartedAt;
+    if (!sendResult.success) {
+      log.error("Failed to resume running task on startup", {
+        ...logContext,
+        durationMs,
+        error: sendResult.error,
+      });
+      return "failed";
+    }
+    log.info("[startup] Resumed running task", { ...logContext, durationMs });
+    return "resumed";
   }
 
   /**
@@ -5864,6 +6126,10 @@ export class TaskService implements AgentTaskIntegration {
     let skippedAwaitingReportAlreadyBusy = 0;
     let failedAwaitingReportCount = 0;
 
+    // Each pass decides every row first, rotates the attempts of the rows it re-drives in ONE
+    // config write, then sends. A rotation per row wrote the whole config file once per task, the
+    // largest cost left in this window on a large config (#6511).
+    const awaitingReportRedrives: Array<(typeof eligible)[number] & { id: string }> = [];
     for (const task of awaitingReportTasks) {
       if (!task.id) continue;
       if (cancelled("awaiting-report")) return;
@@ -5883,49 +6149,24 @@ export class TaskService implements AgentTaskIntegration {
         skippedAwaitingReportAlreadyBusy += 1;
         continue;
       }
-
-      // Admission classification: startup re-drive = new UNOWNED attempt (rotate + mark) before
-      // the first send below; the sends are then fenced against the fresh id at the handoff.
-      // Guarded by the recovery snapshot (`task`), not a re-read: a row that moved meanwhile was
-      // admitted or stopped by another writer and must not be re-driven.
       // Retry a goal pause the previous process owed before re-driving the task.
       await this.settleChildGoalPause(task.id);
-      const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(task.id, task);
-      if (rotatedAttemptId == null) {
-        failedAwaitingReportCount += 1;
-        continue;
-      }
-      const followUp = await this.dispatchFencedStartupCompactionFollowUp(
-        task.id,
-        rotatedAttemptId
-      );
-      if (!followUp.success) failedAwaitingReportCount += 1;
-      else if (followUp.data) resumedAwaitingReportCount += 1;
-      if (!followUp.success || followUp.data) continue;
-      // The completion prompt is fenced to the attempt this decision rotated, like every other
-      // startup send: bound here (refused once another writer's attempt owns the row) and carried
-      // through the prompt helper's own awaits as its token, so a rotation landing during them
-      // refuses the send at the gates instead of the handoff adopting the successor.
-      const completionAdmission = this.admitTaskWorkspaceTurn(task.id, {
-        acceptanceOrigin: "automatic",
-        expectedAttemptId: rotatedAttemptId,
-      });
-      if (completionAdmission.kind !== "admitted") {
-        failedAwaitingReportCount += 1;
-        continue;
-      }
-      const resumed = await this.promptTaskForRequiredCompletionTool(task.id, {
-        reason: "startup",
-        fence: { turnAdmission: completionAdmission.token, attemptId: rotatedAttemptId },
-        // The fence carries the attempt (see the option's doc).
-        expectedAttemptId: null,
-      });
-      if (!resumed) {
-        failedAwaitingReportCount += 1;
-        continue;
-      }
+      awaitingReportRedrives.push({ ...task, id: task.id });
+    }
 
-      resumedAwaitingReportCount += 1;
+    // Admission classification: startup re-drive = new UNOWNED attempt (rotate + mark) before
+    // the first send below; the sends are then fenced against the fresh id at the handoff.
+    // Guarded by the recovery snapshot (`task`), not a re-read: a row that moved meanwhile was
+    // admitted or stopped by another writer and must not be re-driven.
+    const awaitingReportAttempts =
+      await this.rotateAttemptsForStartupRedrive(awaitingReportRedrives);
+    for (const task of awaitingReportRedrives) {
+      if (cancelled("awaiting-report")) return;
+      const attemptId = awaitingReportAttempts.get(task.id);
+      const outcome =
+        attemptId == null ? "failed" : await this.redriveAwaitingReportStartupTask(task, attemptId);
+      if (outcome === "resumed") resumedAwaitingReportCount += 1;
+      else if (outcome === "failed") failedAwaitingReportCount += 1;
     }
 
     let resumedRunningCount = 0;
@@ -5933,6 +6174,11 @@ export class TaskService implements AgentTaskIntegration {
     let skippedRunningAlreadyStreaming = 0;
     let failedRunningCount = 0;
 
+    const runningRedrives: Array<{
+      task: (typeof eligible)[number] & { id: string };
+      alreadyStreaming: boolean;
+      queueOnly: boolean;
+    }> = [];
     for (const task of runningTasks) {
       if (!task.id) continue;
       if (cancelled("running")) return;
@@ -5956,138 +6202,29 @@ export class TaskService implements AgentTaskIntegration {
         skippedRunningDueToActiveDescendants += 1;
         continue;
       }
-      // Decided before the attempt rotation below: that rotation writes the whole config file,
-      // and a large config with many legacy rows outlived the startup step bound (#6511).
+      // Decided before the attempt rotation below: a rotation is a config write, and a large
+      // config with many legacy rows outlived the startup step bound (#6511).
       if (isIdleLegacyStartupTask(task, states.get(task.id), pendingGuidance.length)) continue;
-
-      // Admission classification: startup re-drive (compaction follow-up, guidance replay or the
-      // restart nudge) = new UNOWNED attempt; rotate + mark once before the first send, guarded
-      // by the recovery snapshot (`task`) like the awaiting-report re-drive above.
       // Retry a goal pause the previous process owed before re-driving the task.
       await this.settleChildGoalPause(task.id);
-      const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(task.id, task);
-      if (rotatedAttemptId == null) {
-        failedRunningCount += 1;
-        continue;
-      }
+      runningRedrives.push({ task: { ...task, id: task.id }, alreadyStreaming, queueOnly });
+    }
 
-      // Restore compaction intent before new guidance/nudges make its tail stale.
-      // Guidance then queues behind that continuation without losing either payload.
-      const followUp =
-        alreadyStreaming || queueOnly
-          ? Ok(false)
-          : await this.dispatchFencedStartupCompactionFollowUp(task.id, rotatedAttemptId);
-      if (!followUp.success) failedRunningCount += 1;
-      else if (followUp.data && pendingGuidance.length === 0) resumedRunningCount += 1;
-      if (!followUp.success || (followUp.data && pendingGuidance.length === 0)) continue;
-      // Every further send of this decision is fenced to the attempt rotated for it: bound here
-      // (refused once another writer's attempt owns the row) and carried as the send's token, so
-      // the handoff never adopts a successor and a Stop captures the obligation.
-      const startupTaskId = task.id;
-      const fenceStartupSend = (): TurnAdmissionToken | undefined => {
-        const admission = this.admitTaskWorkspaceTurn(startupTaskId, {
-          acceptanceOrigin: "automatic",
-          expectedAttemptId: rotatedAttemptId,
-        });
-        return admission.kind === "admitted" ? admission.token : undefined;
-      };
-      const model = task.taskModelString ?? defaultModel;
-      const agentId = resolveTaskAgentIdForResume(task);
-      const sendOptions = {
-        model,
-        agentId,
-        thinkingLevel: task.taskThinkingLevel,
-        reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
-        serviceTier: ServiceTierSchema.safeParse(
-          resolveWorkspaceAISettings(task, agentId)?.serviceTier
-        ).data,
-      };
-      if (pendingGuidance.length > 0) {
-        let sendResult: Result<void, SendMessageError> = Ok(undefined);
-        for (const guidance of pendingGuidance) {
-          const token = fenceStartupSend();
-          if (token == null) {
-            sendResult = Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
-            break;
-          }
-          sendResult = await this.workspaceService.sendMessage(
-            task.id,
-            `Updated guidance from parent:\n\n${guidance.message}`,
-            { ...sendOptions, queueDispatchMode: guidance.queueDispatchMode },
-            {
-              ...this.taskGuidanceSendOptions(task.id, guidance.id, task.taskStatus ?? "running"),
-              restoreQueued: queueOnly,
-              turnAdmission: token,
-              admissionStale: () => token.admissionStale(),
-            }
-          );
-          if (!sendResult.success) break;
-        }
-        if (!sendResult.success) {
-          failedRunningCount += 1;
-          log.error("Failed to replay pending task guidance on startup", {
-            taskId: task.id,
-            error: sendResult.error,
-          });
-          continue;
-        }
-        resumedRunningCount += 1;
-        continue;
-      }
-
-      // Legacy tasks lack active-status evidence. Durable compaction/guidance above still wins.
-      if (lacksLegacyRestartEvidence(task, states.get(task.id))) continue;
-      const isPlanLike = await this.isPlanLikeTaskWorkspace({
-        projectPath: task.projectPath,
-        workspace: task,
-      });
-
-      const logContext = {
-        taskId: task.id,
-        taskName: task.name,
-        projectPath: task.projectPath,
-        model,
-        agentId,
-        isPlanLike,
-      };
-      log.info("[startup] Resuming running task", logContext);
-      const resumeStartedAt = Date.now();
-      const restartCompletionInstruction = isPlanLike
-        ? "When you have a final plan, call propose_plan exactly once."
-        : "When you have a final answer, return it in your final assistant message.";
-      const nudgeToken = fenceStartupSend();
-      const sendResult =
-        nudgeToken == null
-          ? Err<SendMessageError>({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE })
-          : await this.workspaceService.sendMessage(
-              task.id,
-              "Xum restarted while this task was running. Continue where you left off. " +
-                restartCompletionInstruction,
-              sendOptions,
-              {
-                acceptanceOrigin: "automatic",
-                synthetic: true,
-                agentInitiated: true,
-                taskTurnKind: "recovery",
-                // Accepted is enough; stream startup must not gate the listener (see method doc).
-                startStreamInBackground: true,
-                turnAdmission: nudgeToken,
-                admissionStale: () => nudgeToken.admissionStale(),
-              }
-            );
-      const durationMs = Date.now() - resumeStartedAt;
-      if (!sendResult.success) {
-        failedRunningCount += 1;
-        log.error("Failed to resume running task on startup", {
-          ...logContext,
-          durationMs,
-          error: sendResult.error,
-        });
-        continue;
-      }
-
-      resumedRunningCount += 1;
-      log.info("[startup] Resumed running task", { ...logContext, durationMs });
+    // Admission classification: startup re-drive (compaction follow-up, guidance replay or the
+    // restart nudge) = new UNOWNED attempt; rotate + mark once before the first send, guarded
+    // by the recovery snapshot (`task`) like the awaiting-report re-drive above.
+    const runningAttempts = await this.rotateAttemptsForStartupRedrive(
+      runningRedrives.map((redrive) => redrive.task)
+    );
+    for (const redrive of runningRedrives) {
+      if (cancelled("running")) return;
+      const attemptId = runningAttempts.get(redrive.task.id);
+      const outcome =
+        attemptId == null
+          ? "failed"
+          : await this.redriveRunningStartupTask(redrive, attemptId, states.get(redrive.task.id));
+      if (outcome === "resumed") resumedRunningCount += 1;
+      else if (outcome === "failed") failedRunningCount += 1;
     }
 
     log.info("[startup] TaskService.recoverInterruptedTasks completed", {

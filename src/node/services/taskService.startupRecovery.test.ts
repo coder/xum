@@ -1204,6 +1204,57 @@ describe("TaskService", () => {
     expect(messagedWorkspaceIds).not.toContain(streamingTaskId);
   });
 
+  // Each re-driven row gets a fresh attempt before its first send. One config write per row
+  // rewrote the whole config file once per task, the largest cost left in the startup window on
+  // a large config (#6511): the rotations are one write per pass.
+  test("startup rotates the attempts of all re-driven running tasks in one config write", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-batch-rotation";
+    const childIds = ["child-batch-a", "child-batch-b", "child-batch-c"];
+    const previousAttempt = (index: number) => `att_00000000000000c${index}`;
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        ...childIds.map((id, index) =>
+          projectWorkspace(projectPath, id, id, {
+            parentWorkspaceId,
+            agentId: "exec",
+            agentType: "exec",
+            taskStatus: "running",
+            taskModelString: "openai:gpt-5.2",
+            taskAttemptId: previousAttempt(index),
+          })
+        ),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const edits = spyOn(config, "editConfig");
+    try {
+      await taskService.recoverInterruptedTasks();
+      expect(edits).toHaveBeenCalledTimes(1);
+    } finally {
+      edits.mockRestore();
+    }
+
+    const messaged = (sendMessage as unknown as { mock: { calls: unknown[][] } }).mock.calls.map(
+      (call) => call[0]
+    );
+    expect(messaged).toEqual(childIds);
+    const attempts = childIds.map((id) => findWorkspaceInConfig(config, id)?.taskAttemptId);
+    expect(new Set(attempts).size).toBe(childIds.length);
+    childIds.forEach((id, index) => {
+      expect(attempts[index]).not.toBe(previousAttempt(index));
+      expect(findWorkspaceInConfig(config, id)?.taskAttemptUnproven).toBe(true);
+    });
+  });
+
   // A legacy row (no taskStatus) is re-driven only for an interrupted tail, a pending compaction
   // follow-up or pending guidance. Startup used to rotate the attempt of every such row (one full
   // config.json write each) before it skipped the idle ones: on a large config that alone outlived
