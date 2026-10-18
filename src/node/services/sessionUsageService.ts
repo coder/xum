@@ -149,8 +149,13 @@ type InFlightUsageFile = z.infer<typeof InFlightUsageFileSchema>;
 interface InFlightUsageEntry {
   key: string;
   filePath: string;
-  /** Undefined when the file content is malformed. */
+  /** Undefined when the file content is malformed or the file is unreadable. */
   file: InFlightUsageFile | undefined;
+  /**
+   * A read error (EIO, EMFILE...): the file can belong to a running stream, so it is left
+   * alone and not counted, but its key still guards pruning.
+   */
+  unreadable: boolean;
 }
 
 /**
@@ -196,10 +201,17 @@ function withSettledInFlightKey(file: SessionUsageFile, key: string): void {
   file.settledInFlightKeys = keys;
 }
 
-/** Keeps the newest keys, and every key whose in-flight file still exists on disk. */
-function pruneSettledInFlightKeys(file: SessionUsageFile, keysWithFiles: Set<string>): void {
+/**
+ * Keeps the newest keys, and every key whose in-flight file still exists on disk. Without a
+ * directory listing (`entries` undefined) it keeps every key.
+ */
+function pruneSettledInFlightKeys(
+  file: SessionUsageFile,
+  entries: InFlightUsageEntry[] | undefined
+): void {
   const keys = file.settledInFlightKeys;
-  if (!keys || keys.length <= SETTLED_IN_FLIGHT_KEYS_LIMIT) return;
+  if (!keys || keys.length <= SETTLED_IN_FLIGHT_KEYS_LIMIT || !entries) return;
+  const keysWithFiles = new Set(entries.map((entry) => entry.key));
   const firstKept = keys.length - SETTLED_IN_FLIGHT_KEYS_LIMIT;
   file.settledInFlightKeys = keys.filter(
     (key, index) => index >= firstKept || keysWithFiles.has(key)
@@ -280,14 +292,24 @@ export class SessionUsageService {
     if (keys?.size === 0) this.liveInFlightKeys.delete(workspaceId);
   }
 
-  private async readInFlightEntries(workspaceId: string): Promise<InFlightUsageEntry[]> {
+  /**
+   * Every in-flight file of the workspace, or undefined when the directory cannot be listed
+   * (a read error): callers then count none and prune no settled key, and retry next read.
+   */
+  private async readInFlightEntries(
+    workspaceId: string
+  ): Promise<InFlightUsageEntry[] | undefined> {
     const dir = path.join(this.config.sessionsDir, workspaceId, IN_FLIGHT_USAGE_DIR);
     let names: string[];
     try {
       names = await fs.readdir(dir);
     } catch (error) {
       if (isErrnoWithCode(error, "ENOENT")) return [];
-      throw error;
+      log.warn("Failed to list in-flight usage files; retrying on a later read", {
+        workspaceId,
+        error,
+      });
+      return undefined;
     }
     const entries: InFlightUsageEntry[] = [];
     for (const name of names.sort()) {
@@ -297,7 +319,12 @@ export class SessionUsageService {
       const filePath = path.join(dir, name);
       const file = await readInFlightUsageFile(filePath);
       // "missing": settled or discarded since the readdir.
-      if (file !== "missing" && file !== "unreadable") entries.push({ key, filePath, file });
+      if (file === "missing") continue;
+      entries.push(
+        file === "unreadable"
+          ? { key, filePath, file: undefined, unreadable: true }
+          : { key, filePath, file, unreadable: false }
+      );
     }
     return entries;
   }
@@ -308,6 +335,7 @@ export class SessionUsageService {
    * same pid with another owner ID is an earlier process whose pid this one reuses).
    */
   private isOrphan(workspaceId: string, entry: InFlightUsageEntry): boolean {
+    if (entry.unreadable) return false;
     const owner = entry.file?.owner;
     if (!owner) return true;
     if (owner.id === this.inFlightOwnerId) {
@@ -325,12 +353,12 @@ export class SessionUsageService {
   private foldOrphanedInFlightUsage(
     workspaceId: string,
     ledger: SessionUsageFile,
-    entries: InFlightUsageEntry[]
+    entries: InFlightUsageEntry[] | undefined
   ): { foldedCount: number; filesToDelete: string[] } {
     const settledKeys = new Set(ledger.settledInFlightKeys ?? []);
     let foldedCount = 0;
     const filesToDelete: string[] = [];
-    for (const entry of entries) {
+    for (const entry of entries ?? []) {
       if (!this.isOrphan(workspaceId, entry)) continue;
       filesToDelete.push(entry.filePath);
       if (!entry.file) {
@@ -350,13 +378,13 @@ export class SessionUsageService {
   private addRunningStreamsToView(
     workspaceId: string,
     ledger: SessionUsageFile,
-    entries: InFlightUsageEntry[],
+    entries: InFlightUsageEntry[] | undefined,
     includeOwnLiveStreams: boolean
   ): { view: SessionUsageFile; addedCount: number } {
     const settledKeys = new Set(ledger.settledInFlightKeys ?? []);
     const view = structuredClone(ledger);
     let addedCount = 0;
-    for (const entry of entries) {
+    for (const entry of entries ?? []) {
       if (!entry.file || settledKeys.has(entry.key)) continue;
       const ownLive =
         entry.file.owner.id === this.inFlightOwnerId && !this.isOrphan(workspaceId, entry);
@@ -438,7 +466,7 @@ export class SessionUsageService {
       if (settlesKey !== undefined) {
         withSettledInFlightKey(current, settlesKey);
       }
-      pruneSettledInFlightKeys(current, new Set(entries.map((entry) => entry.key)));
+      pruneSettledInFlightKeys(current, entries);
       await this.writeFile(workspaceId, current);
       // Ledger first, then the files: a crash in between leaves settled keys (counted once).
       if (settlesKey !== undefined) {
@@ -915,7 +943,7 @@ export class SessionUsageService {
     return this.fileLocks.withLock(workspaceId, async () => {
       const settled = await this.readSettledLedgerLocked(workspaceId);
       const entries = await this.readInFlightEntries(workspaceId);
-      if (entries.length === 0) {
+      if (entries?.length === 0) {
         return settled;
       }
       const ledger = settled ?? this.createEmptyUsageFile();
@@ -925,7 +953,7 @@ export class SessionUsageService {
         entries
       );
       if (foldedCount > 0) {
-        pruneSettledInFlightKeys(ledger, new Set(entries.map((entry) => entry.key)));
+        pruneSettledInFlightKeys(ledger, entries);
         await this.writeFile(workspaceId, ledger);
       }
       await this.deleteFiles(filesToDelete);
@@ -1002,12 +1030,7 @@ export class SessionUsageService {
           settled = undefined;
         }
         // Lock-free and read-only: killed streams are added to the view, not folded.
-        let entries: InFlightUsageEntry[] = [];
-        try {
-          entries = await this.readInFlightEntries(workspaceId);
-        } catch (error) {
-          log.warn("Failed to read in-flight usage files", { workspaceId, error });
-        }
+        const entries = await this.readInFlightEntries(workspaceId);
         const { view, addedCount } = this.addRunningStreamsToView(
           workspaceId,
           settled ?? this.createEmptyUsageFile(),
@@ -1108,7 +1131,7 @@ export class SessionUsageService {
     rebuilt: SessionUsageFile,
     messageIdsWithUsage: Set<string>
   ): Promise<void> {
-    for (const entry of await this.readInFlightEntries(workspaceId)) {
+    for (const entry of (await this.readInFlightEntries(workspaceId)) ?? []) {
       const messageId = entry.file?.messageId;
       if (messageId && messageIdsWithUsage.has(messageId) && this.isOrphan(workspaceId, entry)) {
         withSettledInFlightKey(rebuilt, entry.key);

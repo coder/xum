@@ -117,22 +117,42 @@ describe("SessionUsageService in-flight usage", () => {
     expect(tokens(await readLedgerOnDisk())).toBe(165);
   });
 
-  it("settled files that outlive many failed deletes are still counted once", async () => {
-    // Each settle crashes (here: fails) between its ledger write and its file delete, more
-    // times than the settled-key list keeps by default.
-    const rm = spyOn(fs, "rm").mockRejectedValue(new Error("EIO"));
-    try {
-      for (let index = 0; index < 70; index++) {
-        const key = `key-${index}`;
-        await service.recordInFlightUsage(workspaceId, key, `msg-${index}`, MODEL, usage(1, 0));
-        await service.recordUsage(workspaceId, MODEL, usage(1, 0), { settlesInFlightKey: key });
+  for (const readsFail of [false, true]) {
+    it(`settled files that outlive many failed deletes are still counted once (reads fail: ${readsFail})`, async () => {
+      // Each settle crashes (here: fails) between its ledger write and its file delete, more
+      // times than the settled-key list keeps by default. With reads failing too, the
+      // unreadable files must still keep their keys.
+      const rm = spyOn(fs, "rm").mockRejectedValue(new Error("EIO"));
+      const realReadFile = fs.readFile;
+      const readFile = spyOn(fs, "readFile").mockImplementation(((
+        ...args: Parameters<typeof fs.readFile>
+      ) =>
+        readsFail && typeof args[0] === "string" && args[0].includes("session-usage.in-flight")
+          ? Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }))
+          : realReadFile(...args)) as typeof fs.readFile);
+      try {
+        for (let index = 0; index < 70; index++) {
+          const key = `key-${index}`;
+          await service.recordInFlightUsage(workspaceId, key, `msg-${index}`, MODEL, usage(1, 0));
+          await service.recordUsage(workspaceId, MODEL, usage(1, 0), { settlesInFlightKey: key });
+        }
+      } finally {
+        rm.mockRestore();
+        readFile.mockRestore();
       }
-    } finally {
-      rm.mockRestore();
-    }
-    expect(await inFlightFiles()).toHaveLength(70);
-    expect(tokens(await restartedService().getSessionUsage(workspaceId))).toBe(70);
-    expect(await inFlightFiles()).toEqual([]);
+      expect(await inFlightFiles()).toHaveLength(70);
+      expect(tokens(await restartedService().getSessionUsage(workspaceId))).toBe(70);
+      expect(await inFlightFiles()).toEqual([]);
+    });
+  }
+
+  it("an unlistable in-flight directory does not fail reads or settles", async () => {
+    await service.recordUsage(workspaceId, MODEL, usage(10, 1));
+    // A plain file where the directory belongs: readdir fails with ENOTDIR.
+    await fs.writeFile(inFlightDir(), "");
+    expect(tokens(await service.getSessionUsage(workspaceId))).toBe(11);
+    await service.recordUsage(workspaceId, MODEL, usage(5, 0));
+    expect(tokens(await service.getSessionUsage(workspaceId))).toBe(16);
   });
 
   it("a settle folds older leftovers in the same ledger write", async () => {
