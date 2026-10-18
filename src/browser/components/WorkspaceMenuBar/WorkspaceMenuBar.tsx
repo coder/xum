@@ -21,10 +21,8 @@ import {
   updateUserPreferences,
   useUserPreferences,
 } from "@/browser/stores/AppConfigStore";
-import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
-import { WorkspaceUnrelatedMessagingDialog } from "../WorkspaceUnrelatedMessagingModal/WorkspaceUnrelatedMessagingDialog";
-import { WorkspaceMCPModal } from "../WorkspaceMCPModal/WorkspaceMCPModal";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
+import { LazyFeature } from "../LazyFeature/LazyFeature";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
 import { Checkbox } from "../Checkbox/Checkbox";
 import {
@@ -105,6 +103,31 @@ interface WorkspaceMenuBarProps {
 }
 
 import { useArchiveWorkspaceConfirmation } from "@/browser/hooks/useArchiveWorkspaceConfirmation";
+
+// T3 #5971: these modals (and the MCP app frame the MCP modal renders) load on their first open.
+// Imported statically, they were part of the workspace page chunk a phone downloads before the
+// composer works (~39 KB brotli).
+const WorkspaceHeartbeatModal = React.lazy(async () => ({
+  default: (await import("../WorkspaceHeartbeatModal")).WorkspaceHeartbeatModal,
+}));
+const WorkspaceUnrelatedMessagingDialog = React.lazy(async () => ({
+  default: (await import("../WorkspaceUnrelatedMessagingModal/WorkspaceUnrelatedMessagingDialog"))
+    .WorkspaceUnrelatedMessagingDialog,
+}));
+const WorkspaceMCPModal = React.lazy(async () => ({
+  default: (await import("../WorkspaceMCPModal/WorkspaceMCPModal")).WorkspaceMCPModal,
+}));
+
+/**
+ * Renders a lazy modal from its first open on, and keeps it mounted after that, so its close
+ * still animates. No loading fallback: a dialog has no box to reserve, and it appears once its
+ * chunk arrives. A failed load shows LazyFeature's Reload message.
+ */
+function LazySettingsModal(props: { name: string; open: boolean; children: React.ReactNode }) {
+  const [mounted, setMounted] = useState(false);
+  if (props.open && !mounted) setMounted(true);
+  return mounted ? <LazyFeature name={props.name}>{props.children}</LazyFeature> : null;
+}
 
 function setWorkspaceNotifyOnResponse(workspaceId: string, enabled: boolean): void {
   updateUserPreferences({
@@ -1013,28 +1036,34 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           </TooltipContent>
         </Tooltip>
       )}
-      <WorkspaceHeartbeatModal
-        workspaceId={workspaceId}
-        open={heartbeatModalOpen}
-        onOpenChange={setHeartbeatModalOpen}
-      />
-      <WorkspaceUnrelatedMessagingDialog
-        // Remount per workspace: the keyed open state above only closes the dialog, while
-        // the modal's own pending/error state and in-flight request id would otherwise
-        // survive the switch and surface in the next workspace's dialog.
-        key={workspaceId}
-        workspaceId={workspaceId}
-        runtimeConfig={runtimeConfig}
-        workspace={workspaceEntry}
-        open={unrelatedMessagingModalOpen}
-        onOpenChange={(open) => setUnrelatedMessagingWorkspaceId(open ? workspaceId : null)}
-      />
-      <WorkspaceMCPModal
-        workspaceId={workspaceId}
-        projectPath={projectPath}
-        open={mcpModalOpen}
-        onOpenChange={setMcpModalOpen}
-      />
+      <LazySettingsModal name="Heartbeat settings" open={heartbeatModalOpen}>
+        <WorkspaceHeartbeatModal
+          workspaceId={workspaceId}
+          open={heartbeatModalOpen}
+          onOpenChange={setHeartbeatModalOpen}
+        />
+      </LazySettingsModal>
+      <LazySettingsModal name="Messaging settings" open={unrelatedMessagingModalOpen}>
+        <WorkspaceUnrelatedMessagingDialog
+          // Remount per workspace: the keyed open state above only closes the dialog, while
+          // the modal's own pending/error state and in-flight request id would otherwise
+          // survive the switch and surface in the next workspace's dialog.
+          key={workspaceId}
+          workspaceId={workspaceId}
+          runtimeConfig={runtimeConfig}
+          workspace={workspaceEntry}
+          open={unrelatedMessagingModalOpen}
+          onOpenChange={(open) => setUnrelatedMessagingWorkspaceId(open ? workspaceId : null)}
+        />
+      </LazySettingsModal>
+      <LazySettingsModal name="MCP settings" open={mcpModalOpen}>
+        <WorkspaceMCPModal
+          workspaceId={workspaceId}
+          projectPath={projectPath}
+          open={mcpModalOpen}
+          onOpenChange={setMcpModalOpen}
+        />
+      </LazySettingsModal>
       <DebugLlmRequestModal
         workspaceId={workspaceId}
         open={debugLlmRequestOpen}

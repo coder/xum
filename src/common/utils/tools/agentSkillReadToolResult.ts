@@ -3,7 +3,7 @@ import { AgentSkillPackageSchema } from "@/common/orpc/schemas/agentSkill";
 
 // Its own module because the renderer entry (StreamingMessageAggregator) parses this result:
 // importing it from toolDefinitions.ts put every tool schema on every page's first load, about
-// 24 KB of brotli a phone downloads before the composer works (#5971). toolDefinitions.ts
+// 23 KB of brotli a phone downloads before the composer works (#5971). toolDefinitions.ts
 // re-exports it.
 
 /**

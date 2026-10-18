@@ -361,6 +361,11 @@ function getLastUnrelatedMessagingModalProps() {
   return spy.mock.calls.at(-1)?.[0];
 }
 
+// The dialog loads on its first open (#5971), so before that it is not rendered at all.
+function messagingDialogOpen(): boolean {
+  return getLastUnrelatedMessagingModalProps()?.open === true;
+}
+
 /**
  * Replace window.matchMedia so viewport-gated actions can be exercised per test.
  * `matches` is re-read on every access and registered change listeners are returned
@@ -1074,32 +1079,35 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       opener: "keyboard shortcut",
       open: () => fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true }),
     },
-  ])("closes the consent dialog opened from the $opener when switching workspaces", ({ open }) => {
-    const view = render(<WorkspaceMenuBar {...defaultProps} />);
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+  ])(
+    "closes the consent dialog opened from the $opener when switching workspaces",
+    async ({ open }) => {
+      const view = render(<WorkspaceMenuBar {...defaultProps} />);
+      expect(messagingDialogOpen()).toBe(false);
 
-    act(() => {
-      open();
-    });
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
-    const staleOnOpenChange = getLastUnrelatedMessagingModalProps()!.onOpenChange;
+      act(() => {
+        open();
+      });
+      await waitFor(() => expect(messagingDialogOpen()).toBe(true));
+      const staleOnOpenChange = getLastUnrelatedMessagingModalProps()!.onOpenChange;
 
-    // Consent is granted per recipient workspace. Selecting another workspace while App
-    // reuses this menu bar must close the dialog so the switch cannot be flipped against
-    // the workspace the user navigated to.
-    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+      // Consent is granted per recipient workspace. Selecting another workspace while App
+      // reuses this menu bar must close the dialog so the switch cannot be flipped against
+      // the workspace the user navigated to.
+      view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+      expect(messagingDialogOpen()).toBe(false);
 
-    // A callback retained from the first workspace's dialog cannot reopen it here either.
-    act(() => {
-      staleOnOpenChange(true);
-    });
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+      // A callback retained from the first workspace's dialog cannot reopen it here either.
+      act(() => {
+        staleOnOpenChange(true);
+      });
+      expect(messagingDialogOpen()).toBe(false);
 
-    // Returning does not resurrect it: the retained id is cleared on leave.
-    view.rerender(<WorkspaceMenuBar {...defaultProps} />);
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
-  });
+      // Returning does not resurrect it: the retained id is cleared on leave.
+      view.rerender(<WorkspaceMenuBar {...defaultProps} />);
+      expect(messagingDialogOpen()).toBe(false);
+    }
+  );
 
   it("gives each workspace its own consent dialog so a pending request cannot leak across a switch", async () => {
     // Real-shaped client whose calls stay pending until the test settles them.
@@ -1126,6 +1134,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     act(() => {
       menuAction("configureMessaging")?.(document.body);
     });
+    await view.findByRole("switch", { name: CONSENT_SWITCH_NAME });
     // Workspace A: start a request and leave it in flight (switch locked, "Saving" shown).
     fireEvent.click(view.getByRole("switch", { name: CONSENT_SWITCH_NAME }));
     expect(requests).toHaveLength(1);
@@ -1172,6 +1181,35 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(view.queryByRole("alert")).toBeNull();
   });
 
+  it("mounts a settings modal on its first open and keeps it mounted after close", async () => {
+    // Lazy (#5971): nothing renders while closed, and the dialog stays mounted after its first
+    // open, so its close animation still runs.
+    const mcpCalls = () =>
+      (
+        WorkspaceMCPModalModule.WorkspaceMCPModal as unknown as {
+          mock: { calls: Array<[{ open: boolean; onOpenChange: (open: boolean) => void }]> };
+        }
+      ).mock.calls;
+    render(<WorkspaceMenuBar {...defaultProps} />);
+    expect(mcpCalls()).toHaveLength(0);
+    expect(getLastUnrelatedMessagingModalProps()).toBeUndefined();
+
+    // One opens from its keyboard shortcut, one from the menu: both must work on first use.
+    act(() => {
+      fireEvent.keyDown(window, { key: "M", ctrlKey: true, shiftKey: true });
+      menuAction("configureMessaging")?.(document.body);
+    });
+    await waitFor(() => expect(mcpCalls().at(-1)?.[0].open).toBe(true));
+    await waitFor(() => expect(messagingDialogOpen()).toBe(true));
+
+    act(() => {
+      mcpCalls().at(-1)![0].onOpenChange(false);
+      getLastUnrelatedMessagingModalProps()!.onOpenChange(false);
+    });
+    expect(mcpCalls().at(-1)?.[0].open).toBe(false);
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+  });
+
   it("ignores the consent shortcut while another modal is open", () => {
     // A real open modal built from the shared primitives (overlay inline: the Radix Portal does
     // not render in happy-dom). Like the MCP and heartbeat dialogs at runtime, nothing here
@@ -1191,7 +1229,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
     });
 
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
+    expect(messagingDialogOpen()).toBe(false);
   });
 
   // Unrelated delivery requires local or worktree runtimes on BOTH endpoints (TaskService
@@ -1203,16 +1241,19 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     { runtime: "project-dir local", runtimeConfig: { type: "local" } },
     { runtime: "legacy local worktree", runtimeConfig: { type: "local", srcBaseDir: "/tmp/src" } },
     { runtime: "canonical default (unset)", runtimeConfig: undefined },
-  ])("offers the consent action and shortcut for $runtime workspaces", ({ runtimeConfig }) => {
-    render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
+  ])(
+    "offers the consent action and shortcut for $runtime workspaces",
+    async ({ runtimeConfig }) => {
+      render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
 
-    expect(typeof menuAction("configureMessaging")).toBe("function");
-    act(() => {
-      fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
-    });
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
-    expect(getLastUnrelatedMessagingModalProps()?.consentSupported).toBe(true);
-  });
+      expect(typeof menuAction("configureMessaging")).toBe("function");
+      act(() => {
+        fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
+      });
+      await waitFor(() => expect(messagingDialogOpen()).toBe(true));
+      expect(getLastUnrelatedMessagingModalProps()?.consentSupported).toBe(true);
+    }
+  );
 
   it.each<{ runtime: string; runtimeConfig: RuntimeConfig }>([
     { runtime: "SSH", runtimeConfig: { type: "ssh", host: "dev.example", srcBaseDir: "/srv/src" } },
@@ -1225,16 +1266,19 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       runtime: "devcontainer",
       runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
     },
-  ])("opens the dialog without the consent switch for $runtime workspaces", ({ runtimeConfig }) => {
-    render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
+  ])(
+    "opens the dialog without the consent switch for $runtime workspaces",
+    async ({ runtimeConfig }) => {
+      render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
 
-    expect(typeof menuAction("configureMessaging")).toBe("function");
-    act(() => {
-      fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
-    });
-    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
-    expect(getLastUnrelatedMessagingModalProps()?.consentSupported).toBe(false);
-  });
+      expect(typeof menuAction("configureMessaging")).toBe("function");
+      act(() => {
+        fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
+      });
+      await waitFor(() => expect(messagingDialogOpen()).toBe(true));
+      expect(getLastUnrelatedMessagingModalProps()?.consentSupported).toBe(false);
+    }
+  );
 
   it("offers no Sidebar row when immersive review hides the sidebar", () => {
     stubMatchMedia(() => false);
