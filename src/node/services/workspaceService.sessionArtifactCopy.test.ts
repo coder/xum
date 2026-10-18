@@ -188,10 +188,12 @@ describe("WorkspaceService remove rolls child report dirs into the parent", () =
       const index = JSON.parse(raw ?? "{}") as {
         artifactsByChildTaskId?: Record<string, { parentWorkspaceId?: string } | null>;
       };
-      expect({ kind, entries: index.artifactsByChildTaskId }).toEqual({
+      const entries = index.artifactsByChildTaskId ?? {};
+      expect({
         kind,
-        entries: { "task-ok": expect.objectContaining({ parentWorkspaceId: parentId }) },
-      });
+        taskIds: Object.keys(entries),
+        parent: entries["task-ok"]?.parentWorkspaceId,
+      }).toEqual({ kind, taskIds: ["task-ok"], parent: parentId });
     }
   });
 });
