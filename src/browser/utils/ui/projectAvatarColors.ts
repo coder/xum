@@ -5,6 +5,8 @@
  * meets WCAG AA for normal text (4.5:1), whatever color the user typed.
  */
 
+import { resolveSectionColor } from "@/common/constants/ui";
+
 export type ProjectAvatarMode = "dark" | "light";
 
 export interface ProjectAvatarColors {
@@ -171,6 +173,14 @@ export function getProjectAvatarColors(
     foreground = toHex(oklchToRgb({ l: letterL, c: letterChroma, h: base.h }));
   }
   return { background, foreground };
+}
+
+/** The project's configured color when it has one (hex or palette name), else `fallback`. */
+export function resolveProjectAvatarColor(
+  configured: string | null | undefined,
+  fallback: string
+): string {
+  return configured ? resolveSectionColor(configured) : fallback;
 }
 
 /**

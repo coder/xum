@@ -161,10 +161,16 @@ import {
   resolveSectionColor,
   SECTION_COLOR_PALETTE,
 } from "@/common/constants/ui";
-import { getHashedProjectColor } from "@/browser/utils/ui/projectAvatarColors";
+import {
+  getHashedProjectColor,
+  resolveProjectAvatarColor,
+} from "@/browser/utils/ui/projectAvatarColors";
 
-/** Flat sidebar section heading ("Pinned", "Recent"). */
-function FlatSectionLabel(props: { label: string; isFirst: boolean }) {
+/** Flat sidebar section heading ("Pinned", "Recent"), shown only above a non-empty section. */
+function FlatSectionLabel(props: { label: string; rowCount: number; isFirst: boolean }) {
+  if (props.rowCount === 0) {
+    return null;
+  }
   return (
     <div
       className={cn(
@@ -1759,7 +1765,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     const name = config?.displayName ?? getProjectFallbackLabel(projectPath);
     return {
       name,
-      color: config?.color ? resolveSectionColor(config.color) : getHashedProjectColor(name),
+      color: resolveProjectAvatarColor(config?.color, getHashedProjectColor(name)),
     };
   };
   // Flat mode drops the section headers that used to convey sub-project
@@ -1779,7 +1785,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     return {
       name: `${parentBadge.name} / ${getProjectDisplayName(subProjectPath, config)}`,
       // The avatar shows the parent's letter, so an uncolored sub-project keeps the parent's color.
-      color: config.color ? resolveSectionColor(config.color) : parentBadge.color,
+      color: resolveProjectAvatarColor(config.color, parentBadge.color),
     };
   };
   // The _multi bucket is a system key excluded from userProjects, so both
@@ -2397,19 +2403,20 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     }
   };
 
-  const hasPinnedFlatRows = visiblePinnedFlatWorkspaces.length > 0;
   const flatSidebarContent = (
     <div className="px-1.5 py-1">
-      {hasPinnedFlatRows && <FlatSectionLabel label="Pinned" isFirst />}
+      <FlatSectionLabel label="Pinned" rowCount={visiblePinnedFlatWorkspaces.length} isFirst />
       {renderCoalescedWorkspaceList(visiblePinnedFlatWorkspaces, flatRowsForDisplay, {
         tierKeyPrefix: "flat",
         depthByWorkspaceId: flatDepthByWorkspaceId,
         baseRowMetaByWorkspaceId: flatRowMetaByWorkspaceId,
         renderRow: renderFlatRow,
       })}
-      {(flatDrafts.length > 0 || visibleUnpinnedFlatWorkspaces.length > 0) && (
-        <FlatSectionLabel label="Recent" isFirst={!hasPinnedFlatRows} />
-      )}
+      <FlatSectionLabel
+        label="Recent"
+        rowCount={flatDrafts.length + visibleUnpinnedFlatWorkspaces.length}
+        isFirst={visiblePinnedFlatWorkspaces.length === 0}
+      />
       {flatDrafts.map(({ projectPath, draft }, index) => {
         const promotedMetadata = flatDraftPromotionsByDraftId.get(draft.draftId);
         if (promotedMetadata) {
