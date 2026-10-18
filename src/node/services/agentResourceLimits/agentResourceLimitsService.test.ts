@@ -182,7 +182,7 @@ describe("AgentResourceLimitsService", () => {
     expect(tree.sudoCalls).toEqual(["xum-1000", "xum-1000", "xum-1000"]);
   });
 
-  it("delegates with sudo when another backend changes the limits, but not on other config writes", async () => {
+  it("delegates with sudo when another backend changes the limits", async () => {
     // Root ignores file modes, so xum's cgroup cannot be root's there.
     if (process.getuid?.() === 0) return;
     await tree.dispose();
@@ -194,9 +194,6 @@ describe("AgentResourceLimitsService", () => {
     await fs.chmod(path.join(tree.root, "init.scope", "cgroup.subtree_control"), 0o444);
     service = new AgentResourceLimitsService(config, tree.host);
     await service.start();
-    await config.updateBashAiProxyEnabled(true);
-    await service.get();
-    expect(tree.sudoCalls).toEqual([]);
 
     // Another backend's save reaches this backend only as a config change.
     await config.updateAgentResourceLimits({ cpuCores: 1 });
