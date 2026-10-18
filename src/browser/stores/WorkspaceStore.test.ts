@@ -94,17 +94,17 @@ interface LoadMoreResponse {
 
 // Mock client
 // eslint-disable-next-line require-yield
-const mockOnChat = mock(async function* (
+async function* idleOnChat(
   _input?: { workspaceId: string; mode?: unknown },
   options?: { signal?: AbortSignal }
 ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
   // Keep the iterator open until the store aborts it (prevents retry-loop noise in tests).
   await waitForAbortSignal(options?.signal);
-});
+}
+const mockOnChat = mock(idleOnChat);
 
-const mockGetSessionUsage = mock((_input: { workspaceId: string }) =>
-  Promise.resolve<unknown>(undefined)
-);
+const noSessionUsage = (_input: { workspaceId: string }) => Promise.resolve<unknown>(undefined);
+const mockGetSessionUsage = mock(noSessionUsage);
 const mockHistoryLoadMore = mock(
   (_input?: {
     workspaceId: string;
@@ -797,11 +797,17 @@ describe("WorkspaceStore", () => {
   let mockOnModelUsed: Mock<(model: string) => void>;
 
   beforeEach(() => {
-    mockOnChat.mockClear();
-    mockGetSessionUsage.mockClear();
+    // Reset, not just clear: many tests install a lasting mockImplementation (openChat,
+    // mockBackgroundActivityTransition), and a leftover one feeds events into the next
+    // test, which then fails or passes depending on test order (`bun test --seed <n>`).
+    mockOnChat.mockReset();
+    mockOnChat.mockImplementation(idleOnChat);
+    mockGetSessionUsage.mockReset();
+    mockGetSessionUsage.mockImplementation(noSessionUsage);
+    mockActivitySubscribe.mockReset();
+    mockActivitySubscribe.mockImplementation(idleActivitySubscription);
     mockHistoryLoadMore.mockClear();
     mockActivityList.mockClear();
-    mockActivitySubscribe.mockClear();
     mockTerminalActivitySubscribe.mockClear();
     mockGetProvidersConfig.mockClear();
     mockOnProvidersConfigChanged.mockClear();
@@ -7759,13 +7765,17 @@ describe("WorkspaceStore", () => {
     it("ignores an extra unsubscribe call once every listener is gone", () => {
       const workspaceId = "stats-underflow";
       const warn = spyOn(console, "warn").mockImplementation(() => undefined);
-      createAndAddWorkspace(store, workspaceId, {}, false);
-      const unsubscribe = store.subscribeStats(workspaceId, () => undefined);
-      unsubscribe();
+      try {
+        createAndAddWorkspace(store, workspaceId, {}, false);
+        const unsubscribe = store.subscribeStats(workspaceId, () => undefined);
+        unsubscribe();
 
-      unsubscribe();
-      expect(warn).toHaveBeenCalledTimes(1);
-      warn.mockRestore();
+        unsubscribe();
+        expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        // Restore even when an assertion fails, so later tests keep their warnings.
+        warn.mockRestore();
+      }
 
       // The count did not go negative: the next listener subscribes again.
       store.subscribeStats(workspaceId, () => undefined);
@@ -7818,15 +7828,18 @@ describe("WorkspaceStore", () => {
     it("logs a failed subscription and keeps showing no snapshot", async () => {
       const workspaceId = "stats-error";
       const warn = spyOn(console, "warn").mockImplementation(() => undefined);
-      const failure = new Error("stats gone");
-      mockStatsSubscribe.mockImplementationOnce(() => Promise.reject(failure));
-      createAndAddWorkspace(store, workspaceId, {}, false);
-      store.subscribeStats(workspaceId, () => undefined);
+      try {
+        const failure = new Error("stats gone");
+        mockStatsSubscribe.mockImplementationOnce(() => Promise.reject(failure));
+        createAndAddWorkspace(store, workspaceId, {}, false);
+        store.subscribeStats(workspaceId, () => undefined);
 
-      expect(await waitUntil(() => warn.mock.calls.length > 0)).toBe(true);
-      // The log carries the error itself, not just a message.
-      expect(warn.mock.calls[0]).toContain(failure);
-      warn.mockRestore();
+        expect(await waitUntil(() => warn.mock.calls.length > 0)).toBe(true);
+        // The log carries the error itself, not just a message.
+        expect(warn.mock.calls[0]).toContain(failure);
+      } finally {
+        warn.mockRestore();
+      }
       expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
     });
   });
