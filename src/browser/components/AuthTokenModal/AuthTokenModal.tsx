@@ -72,6 +72,29 @@ async function parseJsonResponse<T>(response: Response): Promise<T | null> {
   }
 }
 
+/**
+ * Stores a submitted token and connects with it once the previous session's caches are gone
+ * (#6848). Each submission waits for its own cleanup, and the cleanups can settle out of order
+ * (#6878): only the latest submission connects, so an older token never replaces a newer one.
+ */
+function useSubmitLatestToken(onSubmit: (token: string) => void) {
+  const latestSubmissionRef = useRef(0);
+  return useCallback(
+    (token: string) => {
+      const submission = ++latestSubmissionRef.current;
+      const connectIfLatest = () => {
+        if (submission === latestSubmissionRef.current) onSubmit(token);
+      };
+      // The cleanup never rejects today; if it ever does, log it and still connect.
+      setStoredAuthToken(token).then(connectIfLatest, (error: unknown) => {
+        console.warn("[AuthTokenModal] Service worker cache cleanup failed:", error);
+        connectIfLatest();
+      });
+    },
+    [onSubmit]
+  );
+}
+
 export function AuthTokenModal(props: AuthTokenModalProps) {
   const [token, setToken] = useState("");
   const [githubDeviceFlowEnabled, setGithubDeviceFlowEnabled] = useState(false);
@@ -87,6 +110,7 @@ export function AuthTokenModal(props: AuthTokenModalProps) {
   const waitAbortControllerRef = useRef<AbortController | null>(null);
 
   const { onSubmit } = props;
+  const submitToken = useSubmitLatestToken(onSubmit);
 
   const clearGithubLoginUi = useCallback(() => {
     setGithubLoginStatus("idle");
@@ -102,19 +126,9 @@ export function AuthTokenModal(props: AuthTokenModalProps) {
     (e: React.FormEvent) => {
       e.preventDefault();
       const trimmed = token.trim();
-      if (trimmed) {
-        // Connect only after the previous session's caches are gone (#6848).
-        // The cleanup never rejects today; if it ever does, log it and still connect.
-        setStoredAuthToken(trimmed).then(
-          () => onSubmit(trimmed),
-          (error: unknown) => {
-            console.warn("[AuthTokenModal] Service worker cache cleanup failed:", error);
-            onSubmit(trimmed);
-          }
-        );
-      }
+      if (trimmed) submitToken(trimmed);
     },
-    [token, onSubmit]
+    [token, submitToken]
   );
 
   useEffect(() => {
