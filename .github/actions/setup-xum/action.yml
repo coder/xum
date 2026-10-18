@@ -40,12 +40,18 @@ runs:
       shell: bash
       run: echo "version=$(node --version)" >> $GITHUB_OUTPUT
 
+    # Every key below hashes the three tracked lockfiles by literal path, never '**/bun.lock'.
+    # A glob walks the whole checkout, and after the node_modules restore that is ~100k files:
+    # 8-9 s per key on macOS, and the walk once failed the job with "Fail to hash files under
+    # directory" (#6979). Literal paths are only stat'ed. hashFiles hashes files in pattern
+    # order, and this order matches the glob's (alphabetical), so the keys stay the same.
+    # Add new lockfiles here.
     - name: Cache node_modules
       id: cache-node-modules
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: node_modules
-        key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ steps.bun-version.outputs.version }}-node-${{ steps.node-version.outputs.version }}-node-modules-${{ hashFiles('**/bun.lock') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ steps.bun-version.outputs.version }}-node-${{ steps.node-version.outputs.version }}-node-modules-${{ hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-bun-${{ steps.bun-version.outputs.version }}-node-${{ steps.node-version.outputs.version }}-node-modules-
 
@@ -67,7 +73,7 @@ runs:
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ~/.bun/install/cache
-        key: ${{ runner.os }}-bun-cache-${{ hashFiles('**/bun.lock') }}
+        key: ${{ runner.os }}-bun-cache-${{ hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock') }}
         restore-keys: |
           ${{ runner.os }}-bun-cache-
 
@@ -93,7 +99,7 @@ runs:
           ~/.cache/electron
           ~/Library/Caches/electron
           ~/AppData/Local/electron/Cache
-        key: ${{ runner.os }}-${{ runner.arch }}-electron-${{ hashFiles('**/bun.lock') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-electron-${{ hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-electron-
 
@@ -105,6 +111,6 @@ runs:
           ~/.cache/electron-builder
           ~/Library/Caches/electron-builder
           ~/AppData/Local/electron-builder/Cache
-        key: ${{ runner.os }}-${{ runner.arch }}-electron-builder-${{ hashFiles('**/bun.lock') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-electron-builder-${{ hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-electron-builder-
