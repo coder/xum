@@ -124,7 +124,8 @@ body {
 
   button,
   a,
-  [role="button"] {
+  [role="button"],
+  .mobile-touch-target {
     /* Keep in sync with globals.css (MOBILE_TOUCH_TARGET_PX). */
     min-height: 44px;
     min-width: 44px;
