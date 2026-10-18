@@ -128,9 +128,10 @@ function SidebarInput(props: { held: HeldSidebarInput[]; mode: "hold" | "replay"
 }
 
 /**
- * While the sidebar chunk loads: keep the first authoritative active workflow-run count. RightSidebar
+ * While the sidebar chunk loads: keep the lowest authoritative active workflow-run count. RightSidebar
  * compares against it once it mounts, so a run that started meanwhile still switches to the
- * Workflows tab (#6208), and a run already active stays on the persisted tab.
+ * Workflows tab (#6208), even after an earlier run ended (the lowest is then 0). A run active the
+ * whole time keeps the persisted tab.
  */
 function WorkflowRunBaseline(props: {
   workspaceId: string;
@@ -138,12 +139,12 @@ function WorkflowRunBaseline(props: {
 }) {
   const count = useOptionalWorkspaceSidebarState(props.workspaceId)?.activeWorkflowRunCount ?? 0;
   const authoritative = useWorkspaceActivityAuthoritative();
-  const reportedRef = useRef(false);
+  const lowestRef = useRef<number | null>(null);
   const onBaseline = props.onBaseline;
   useEffect(() => {
-    if (!authoritative || reportedRef.current) return;
-    reportedRef.current = true;
-    onBaseline(count);
+    if (!authoritative) return;
+    lowestRef.current = Math.min(lowestRef.current ?? count, count);
+    onBaseline(lowestRef.current);
   }, [authoritative, count, onBaseline]);
   return null;
 }

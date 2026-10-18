@@ -311,7 +311,7 @@ interface RightSidebarProps {
   /** Sidebar shortcuts while the narrow layout hides the sidebar: show it full-screen. */
   onRequestFullscreen?: () => void;
   /**
-   * The first authoritative active workflow-run count WorkspaceShell saw while this lazy chunk
+   * The lowest authoritative active workflow-run count WorkspaceShell saw while this lazy chunk
    * loaded (#6208), or null. A run that started meanwhile still switches to the Workflows tab.
    */
   workflowRunBaseline?: number | null;

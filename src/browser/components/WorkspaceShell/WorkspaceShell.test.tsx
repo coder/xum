@@ -770,6 +770,18 @@ describe("WorkspaceShell loading placeholders", () => {
       expect(mountedWorkflowRunBaseline).toBe(0);
     });
 
+    it("counts a run that started after an earlier run ended while the chunk loads", async () => {
+      setWorkflowRuns(true, 1); // a run is active when the workspace opens
+      const gate = gateSidebar();
+      render(<WorkspaceShell {...defaultProps} />);
+      setWorkflowRuns(true, 0); // it ends
+      setWorkflowRuns(true, 1); // and a new one starts
+
+      await gate.load();
+
+      expect(mountedWorkflowRunBaseline).toBe(0);
+    });
+
     it("does not hold the menu bar's events while the layout hides the sidebar", async () => {
       // Stands in for the narrow-layout CSS that hides the loading box.
       const narrowLayout = document.createElement("style");
