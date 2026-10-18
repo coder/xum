@@ -1095,7 +1095,7 @@ describe("useAutoScroll", () => {
 
   test("hiding the chat keeps the reading row for when it shows again", () => {
     const { metrics, rows, heights, rectAt } = renderTranscript([300, 300, 300, 300], 256);
-    const layout = rows.map((row) => row.getBoundingClientRect);
+    const layout = rows.map((row) => row.getBoundingClientRect.bind(row));
     // display: none (immersive review): no layout box, so every rect reads 0.
     metrics.setClientHeight(0);
     for (const row of rows) row.getBoundingClientRect = () => rectAt(0, 0);
