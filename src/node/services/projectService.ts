@@ -2099,6 +2099,18 @@ export class ProjectService {
     });
   }
 
+  async setIcon(projectPath: string, icon: string | null | undefined): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.icon = icon ?? undefined;
+      return config;
+    });
+  }
+
   async setCustomInstructions(
     projectPath: string,
     customInstructions: string | null | undefined

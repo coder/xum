@@ -112,6 +112,7 @@ interface AgentListItemBaseProps {
   // Stable primitives (not an object) so React Compiler can skip unchanged rows.
   projectBadgeName?: string;
   projectBadgeColor?: string;
+  projectBadgeIcon?: string;
 }
 
 /** Props for regular (persisted) workspace items */
@@ -183,7 +184,7 @@ const SHOW_INLINE_ACTIONS_ON_WIDE_TOUCH =
 // their background in `--row-bg` so the avatar dot's ring and the action scrim match it in every
 // state (rest, hover, focus, selected, menu open).
 const AVATAR_ROW_BASE_CLASSES =
-  "group/row relative grid grid-cols-[22px_minmax(0,1fr)] gap-x-2.5 rounded-md p-2 select-none bg-(--row-bg) transition-colors duration-150";
+  "group/row relative grid grid-cols-[22px_minmax(0,1fr)] items-center gap-x-2.5 rounded-md p-2 select-none bg-(--row-bg) transition-colors duration-150";
 const AVATAR_ROW_ACTIVE_BG = "[--row-bg:var(--color-surface-secondary)]";
 const AVATAR_ROW_REST_BG =
   "[--row-bg:var(--color-surface-primary)] hover:[--row-bg:var(--color-surface-secondary)] focus-within:[--row-bg:var(--color-surface-secondary)]";
@@ -216,7 +217,10 @@ function RowActionOverlay(props: {
   return (
     <div
       className={cn(
-        "absolute top-[5px] right-1.5 z-10 flex items-center gap-1 pl-6 transition-opacity duration-100",
+        // The 24px buttons center on the title line. A one-line row centers its 18px title on the
+        // 22px avatar (title center 19px below the row top); a two-line row's title starts at the
+        // 8px padding edge (center 17px).
+        "absolute top-[7px] right-1.5 z-10 group-has-[[data-row-subtitle]]/row:top-[5px] flex items-center gap-1 pl-6 transition-opacity duration-100",
         props.forceVisible === true
           ? "opacity-100"
           : cn(
@@ -502,6 +506,7 @@ function RegularRowLeadingSlot(props: {
   isPinned: boolean;
   avatarName: string | undefined;
   avatarColor: string | undefined;
+  avatarIcon: string | undefined;
   showCompletedChildrenIndicator: boolean;
   showHeartbeatFallback: boolean;
   showQuickArchiveButton: boolean;
@@ -520,6 +525,7 @@ function RegularRowLeadingSlot(props: {
       <ProjectAvatar
         name={props.avatarName}
         color={props.avatarColor}
+        icon={props.avatarIcon}
         testId={`workspace-project-avatar-${props.workspaceId}`}
         corner={
           completedChildrenIndicator != null ? (
@@ -893,7 +899,10 @@ function DraftRowText(props: {
         </span>
       </div>
       {props.draft.promptPreview.length > 0 && (
-        <span className={cn("block truncate text-left text-xs leading-4", textColorClass)}>
+        <span
+          className={cn("block truncate text-left text-xs leading-4", textColorClass)}
+          data-row-subtitle
+        >
           {props.draft.promptPreview}
         </span>
       )}
@@ -960,6 +969,7 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
         <ProjectAvatar
           name={props.projectBadgeName}
           color={props.projectBadgeColor}
+          icon={props.projectBadgeIcon}
           testId={`workspace-project-avatar-draft-${draft.draftId}`}
         />
       ) : (
@@ -1478,6 +1488,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
           isPinned={isPinned}
           avatarName={avatarName}
           avatarColor={props.projectBadgeColor}
+          avatarIcon={props.projectBadgeIcon}
           showCompletedChildrenIndicator={showCompletedChildrenIndicator}
           showHeartbeatFallback={shouldShowHeartbeatFallback}
           showQuickArchiveButton={shouldShowQuickArchiveButton}
@@ -1632,6 +1643,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
               id={secondaryStatusDescriptionId}
               className="min-w-0"
               data-testid={`workspace-secondary-row-${workspaceId}`}
+              data-row-subtitle
             >
               {isRemoving ? (
                 <div className="text-muted flex min-w-0 items-center gap-1.5 text-xs">

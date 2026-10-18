@@ -1641,6 +1641,12 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.projectService.setColor(input.projectPath, input.color)
         ),
+      setIcon: t
+        .input(schemas.projects.setIcon.input)
+        .output(schemas.projects.setIcon.output)
+        .handler(({ context, input }) =>
+          context.projectService.setIcon(input.projectPath, input.icon)
+        ),
       setCustomInstructions: t
         .input(schemas.projects.setCustomInstructions.input)
         .output(schemas.projects.setCustomInstructions.output)

@@ -2423,6 +2423,26 @@ exit 1
       ]);
     });
 
+    it("setIcon stores an icon name and null clears it", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [] });
+        return current;
+      });
+
+      await service.setIcon(projectPath, "rocket");
+      expect(new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.icon).toBe(
+        "rocket"
+      );
+
+      await service.setIcon(projectPath, null);
+      const [listed] = service.list().filter(([listedPath]) => listedPath === projectPath);
+      expect(listed?.[1]).not.toHaveProperty("icon");
+      expect(new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)).not.toHaveProperty(
+        "icon"
+      );
+    });
+
     it("validates, writes, and clears code workspace sync paths", async () => {
       const projectPath = path.join(tempDir, "project");
       await fs.mkdir(projectPath, { recursive: true });

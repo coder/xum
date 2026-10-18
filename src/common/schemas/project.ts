@@ -404,6 +404,11 @@ export const ProjectConfigSchema = z.object({
   color: z.string().optional().meta({
     description: "Project folder accent color (hex value like #5a9bd4 or preset name)",
   }),
+  // A plain string, not the picker enum, so an unknown name never fails the projects.list output.
+  icon: z.string().optional().meta({
+    description:
+      'Lucide icon name shown instead of the project\'s initial in the flat sidebar (e.g. "rocket")',
+  }),
   /**
    * Parent project path when this project is a one-level sub-project. Parentage is
    * re-derived from registered paths during project load/list so stale persisted

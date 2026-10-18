@@ -2426,6 +2426,29 @@ describe("Config", () => {
         "a.code-workspace"
       );
     });
+
+    it("discards malformed icons and keeps any icon name string", () => {
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+          projects: [
+            ["/home/user/number", { workspaces: [], icon: 42 }],
+            ["/home/user/blank", { workspaces: [], icon: "   " }],
+            ["/home/user/valid", { workspaces: [], icon: "rocket" }],
+            // A newer version's icon survives a downgrade; the sidebar shows the initial for it.
+            ["/home/user/unknown", { workspaces: [], icon: "not-an-icon" }],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.projects.get("/home/user/number")?.icon).toBeUndefined();
+      expect(loaded.projects.get("/home/user/blank")?.icon).toBeUndefined();
+      expect(loaded.projects.get("/home/user/valid")?.icon).toBe("rocket");
+      expect(loaded.projects.get("/home/user/unknown")?.icon).toBe("not-an-icon");
+    });
   });
 
   describe("legacy workflow schedule cleanup", () => {

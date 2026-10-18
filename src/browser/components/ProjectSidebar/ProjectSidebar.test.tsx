@@ -166,6 +166,7 @@ interface MockAgentListItemProps {
   rowRenderMeta?: AgentRowRenderMeta;
   projectBadgeName?: string;
   projectBadgeColor?: string;
+  projectBadgeIcon?: string;
   delegatedActivity?: { activeCount: number; queuedCount: number };
   hiddenSubAgentsSummary?: WorkspaceSubAgentsSummary;
   getWorkflowRunName?: (runId: string) => string | undefined;
@@ -310,6 +311,7 @@ function createProjectContextValue(
     updateSecrets: () => Promise.resolve(),
     updateDisplayName: () => resolveVoidResult(),
     updateColor: () => resolveVoidResult(),
+    updateIcon: () => resolveVoidResult(),
     updateCustomInstructions: () => resolveVoidResult(),
     updateCodeWorkspaceSyncPath: () => resolveVoidResult(),
     assignWorkspaceToSubProject: () => resolveVoidResult(),
@@ -387,6 +389,7 @@ function installProjectSidebarTestDoubles() {
           data-row-kind={props.rowRenderMeta?.rowKind ?? "unknown"}
           data-connector-layout={props.subAgentConnectorLayout ?? "default"}
           data-project-badge-color={props.projectBadgeColor}
+          data-project-badge-icon={props.projectBadgeIcon}
           data-completed-expanded={String(props.completedChildrenExpanded ?? false)}
           data-delegated-active={String(props.delegatedActivity?.activeCount ?? 0)}
           data-delegated-queued={String(props.delegatedActivity?.queuedCount ?? 0)}
@@ -1551,6 +1554,55 @@ describe("ProjectSidebar flat chat list", () => {
     ).toBeTruthy();
   });
 
+  test("flat rows carry their project's icon, and sub-project rows inherit the parent's", () => {
+    const parentChat = { ...createWorkspace("parent-chat"), projects: singleProjectRefs };
+    const subChat = {
+      ...createWorkspace("sub-chat", { subProjectPath: "/projects/demo-project/features" }),
+      projects: singleProjectRefs,
+    };
+    const otherChat = {
+      ...createWorkspace("other-chat"),
+      projects: undefined,
+      projectPath: "/projects/other",
+      projectName: "other",
+    };
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { displayName: "Demo", icon: "rocket", workspaces: [] }],
+        [
+          "/projects/demo-project/features",
+          {
+            displayName: "Features",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+        ["/projects/other", { displayName: "Other", workspaces: [] }],
+      ]),
+    });
+
+    const now = Date.now();
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([
+            ["/projects/demo-project", [parentChat, subChat]],
+            ["/projects/other", [otherChat]],
+          ])
+        }
+        workspaceRecency={{ "parent-chat": now, "sub-chat": now, "other-chat": now }}
+      />
+    );
+
+    const avatarIcon = (workspaceId: string) =>
+      view.getByTestId(agentItemTestId(workspaceId)).dataset.projectBadgeIcon;
+    expect(avatarIcon("parent-chat")).toBe("rocket");
+    expect(avatarIcon("sub-chat")).toBe("rocket");
+    expect(avatarIcon("other-chat")).toBeUndefined();
+  });
+
   test("coalesces best-of children into a task group in the flat list", () => {
     const parentWorkspace = {
       ...createWorkspace("parent", { title: "Parent workspace" }),
@@ -2348,6 +2400,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
       updateSecrets: () => Promise.resolve(),
       updateDisplayName: () => resolveVoidResult(),
       updateColor: () => resolveVoidResult(),
+      updateIcon: () => resolveVoidResult(),
       updateCustomInstructions: () => resolveVoidResult(),
       updateCodeWorkspaceSyncPath: () => resolveVoidResult(),
       assignWorkspaceToSubProject: () => resolveVoidResult(),
@@ -2942,6 +2995,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
       updateSecrets: () => Promise.resolve(),
       updateDisplayName: () => resolveVoidResult(),
       updateColor: () => resolveVoidResult(),
+      updateIcon: () => resolveVoidResult(),
       updateCustomInstructions: () => resolveVoidResult(),
       updateCodeWorkspaceSyncPath: () => resolveVoidResult(),
       assignWorkspaceToSubProject: () => resolveVoidResult(),
@@ -3210,6 +3264,7 @@ describe("ProjectSidebar project actions menu", () => {
       "Manage secrets",
       "Instructions",
       "Change color",
+      "Change icon",
       "Delete...",
     ]);
   });
@@ -3330,6 +3385,72 @@ describe("ProjectSidebar project actions menu", () => {
       expect(removeProjectCalls).toEqual([{ path: demoProjectPath, options: undefined }]);
     });
     expect(view.queryByTestId("project-delete-confirmation-modal")).toBeNull();
+  });
+
+  test("the icon panel sets a project icon and clears it back to the initial", async () => {
+    const updateIcon = mock((_projectPath: string, _icon: string | null) => resolveVoidResult());
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([[demoProjectPath, { workspaces: [] }]]),
+      updateIcon,
+    });
+
+    const view = renderSidebar();
+
+    fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Change icon" }));
+    // Without a stored icon the initial is the current choice.
+    expect(
+      view.getByRole("button", { name: "Use project initial" }).getAttribute("aria-pressed")
+    ).toBe("true");
+    fireEvent.click(view.getByRole("button", { name: "Set project icon to Rocket" }));
+
+    await waitFor(() => {
+      expect(updateIcon.mock.calls).toEqual([[demoProjectPath, "rocket"]]);
+    });
+    // Like a color swatch, a pick closes the panel but keeps the menu open.
+    expect(view.queryByRole("group", { name: "Project icon" })).toBeNull();
+    expect(view.getByTestId("project-actions-menu")).toBeTruthy();
+
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([[demoProjectPath, { workspaces: [], icon: "rocket" }]]),
+      updateIcon,
+    });
+    view.rerender(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map()}
+        workspaceRecency={{}}
+      />
+    );
+
+    fireEvent.click(view.getByRole("button", { name: "Change icon" }));
+    expect(
+      view.getByRole("button", { name: "Set project icon to Rocket" }).getAttribute("aria-pressed")
+    ).toBe("true");
+    fireEvent.click(view.getByRole("button", { name: "Use project initial" }));
+
+    await waitFor(() => {
+      expect(updateIcon.mock.calls).toEqual([
+        [demoProjectPath, "rocket"],
+        [demoProjectPath, null],
+      ]);
+    });
+  });
+
+  test("the icon and color panels replace each other", () => {
+    const view = renderSidebar();
+
+    fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Change color" }));
+    expect(view.getByRole("button", { name: "Set project color to Blue" })).toBeTruthy();
+
+    fireEvent.click(view.getByRole("button", { name: "Change icon" }));
+    expect(view.getByRole("group", { name: "Project icon" })).toBeTruthy();
+    expect(view.queryByRole("button", { name: "Set project color to Blue" })).toBeNull();
+
+    fireEvent.click(view.getByRole("button", { name: "Change color" }));
+    expect(view.queryByRole("group", { name: "Project icon" })).toBeNull();
   });
 
   test("reopening the color picker does not apply stale pending color", async () => {

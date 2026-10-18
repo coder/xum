@@ -22,6 +22,7 @@ import type { ProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { getFirstTopLevelProjectPath } from "@/common/utils/subProjects";
+import type { ProjectIconName } from "@/common/constants/projectIcons";
 import {
   normalizeProjectPathForComparison,
   resolveProjectPathFromProjectQuery,
@@ -99,6 +100,7 @@ export interface ProjectContext {
   updateSecrets: (projectPath: string, secrets: Secret[]) => Promise<void>;
   updateDisplayName: (projectPath: string, displayName: string | null) => Promise<Result<void>>;
   updateColor: (projectPath: string, color: string | null) => Promise<Result<void>>;
+  updateIcon: (projectPath: string, icon: ProjectIconName | null) => Promise<Result<void>>;
   updateCustomInstructions: (
     projectPath: string,
     customInstructions: string | null
@@ -622,6 +624,17 @@ export function ProjectProvider(props: { children: ReactNode }) {
       updateSecrets,
       updateDisplayName,
       updateColor,
+      // Inline for the same reason as updateCodeWorkspaceSyncPath below.
+      updateIcon: async (projectPath: string, icon: ProjectIconName | null): Promise<Result<void>> => {
+        if (!liveApi) return { success: false, error: "API not connected" };
+        try {
+          await liveApi.projects.setIcon({ projectPath, icon });
+          await refreshProjects();
+          return { success: true, data: undefined };
+        } catch (error) {
+          return { success: false, error: getErrorMessage(error) };
+        }
+      },
       updateCustomInstructions,
       // Defined inline (not useCallback): the repo bans new manual useCallback
       // memoization, and inlining keeps exhaustive-deps satisfied via `liveApi`.

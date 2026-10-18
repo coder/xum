@@ -16,6 +16,7 @@ import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constant
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { MAX_RENDERED_MODELS } from "@/common/constants/ui";
+import { PROJECT_ICON_NAMES } from "@/common/constants/projectIcons";
 import {
   MAX_STAGED_ATTACHMENT_BASE64_CHARS,
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
@@ -1004,6 +1005,15 @@ export const projects = {
       .object({
         projectPath: z.string(),
         color: z.string().nullish(),
+      })
+      .passthrough(),
+    output: z.void(),
+  },
+  setIcon: {
+    input: z
+      .object({
+        projectPath: z.string(),
+        icon: z.enum(PROJECT_ICON_NAMES).nullish(),
       })
       .passthrough(),
     output: z.void(),

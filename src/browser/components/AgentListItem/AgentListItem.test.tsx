@@ -324,6 +324,7 @@ function renderWorkspaceItem(
     onToggleCompletedChildren?: (workspaceId: string) => void;
     onSelectWorkspace?: (selection: WorkspaceSelection) => void;
     projectBadgeName?: string;
+    projectBadgeIcon?: string;
   } = {}
 ) {
   const metadata = options.metadata ?? createMetadata();
@@ -333,6 +334,7 @@ function renderWorkspaceItem(
       projectPath={metadata.projectPath}
       projectName={metadata.projectName}
       projectBadgeName={options.projectBadgeName}
+      projectBadgeIcon={options.projectBadgeIcon}
       isSelected={options.isSelected ?? false}
       isArchiving={options.isArchiving}
       depth={options.depth ?? options.rowRenderMeta?.depth}
@@ -402,6 +404,26 @@ describe("AgentListItem", () => {
     expect(
       view.getByRole("button", { name: `Workspace actions for ${TEST_WORKSPACE_TITLE}` })
     ).toBeTruthy();
+  });
+
+  test("an avatar row shows the project's chosen icon instead of the monogram", () => {
+    const { view } = renderWorkspaceItem({ projectBadgeName: "Project", projectBadgeIcon: "rocket" });
+
+    const avatar = view.getByTestId(`workspace-project-avatar-${TEST_WORKSPACE_ID}`);
+    expect(avatar.querySelector("svg")).not.toBeNull();
+    expect(avatar.textContent).toBe("");
+  });
+
+  test("an avatar row with an unknown icon name falls back to the monogram", () => {
+    // config.json is hand-editable and a newer version may add icons this one lacks.
+    const { view } = renderWorkspaceItem({
+      projectBadgeName: "Project",
+      projectBadgeIcon: "not-an-icon",
+    });
+
+    const avatar = view.getByTestId(`workspace-project-avatar-${TEST_WORKSPACE_ID}`);
+    expect(avatar.querySelector("svg")).toBeNull();
+    expect(avatar.textContent).toBe("P");
   });
 
   test("pinned rows show the inline pin icon only outside the avatar layout", () => {

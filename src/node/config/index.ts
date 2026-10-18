@@ -936,6 +936,7 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     projectKind?: unknown;
     customInstructions?: unknown;
     codeWorkspaceSyncPath?: unknown;
+    icon?: unknown;
   };
   const runtimeEnablement = normalizeRuntimeEnablementOverrides(record.runtimeEnablement);
   const defaultRuntime = normalizeRuntimeEnablementId(record.defaultRuntime);
@@ -987,6 +988,14 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     next.codeWorkspaceSyncPath = record.codeWorkspaceSyncPath;
   } else {
     delete next.codeWorkspaceSyncPath;
+  }
+
+  // Same hand-edit hazard. Unknown names are kept so a newer version's icon survives a downgrade;
+  // the sidebar shows the initial for them.
+  if (typeof record.icon === "string" && record.icon.trim()) {
+    next.icon = record.icon;
+  } else {
+    delete next.icon;
   }
 
   // Legacy named workflow schedules are intentionally dropped while workflow

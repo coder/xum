@@ -223,6 +223,7 @@ function WorkspaceRow(props: {
       projectName={PROJECT_NAME}
       projectBadgeName={props.project?.name}
       projectBadgeColor={props.project?.color}
+      projectBadgeIcon={props.project?.icon}
       depth={props.rowRenderMeta?.depth}
       rowRenderMeta={props.rowRenderMeta}
       completedChildrenExpanded={props.completedChildrenExpanded}
@@ -241,22 +242,25 @@ function WorkspaceRow(props: {
 interface FlatProject {
   name: string;
   color: string;
+  icon?: string;
 }
 const CODER_PROJECT: FlatProject = { name: "coder", color: "#e54545" };
 const XUM_PROJECT: FlatProject = { name: "xum", color: "#4ab5a7" };
 const DOGFOOD_PROJECT: FlatProject = { name: "dogfood", color: "#4caf7c" };
+const ROCKET_PROJECT: FlatProject = { name: "launchpad", color: "#5a9bd4", icon: "rocket" };
 
-function DraftRow(props: { project?: FlatProject }) {
+function DraftRow(props: { project?: FlatProject; promptPreview?: string }) {
   return (
     <AgentListItem
       variant="draft"
       projectBadgeName={props.project?.name}
       projectBadgeColor={props.project?.color}
+      projectBadgeIcon={props.project?.icon}
       draft={{
         draftId: "draft-state",
         draftNumber: 1,
         title: "Draft agent workflow",
-        promptPreview: "",
+        promptPreview: props.promptPreview ?? "",
         onOpen: () => undefined,
         onDelete: () => undefined,
       }}
@@ -306,6 +310,10 @@ function renderStatesGallery() {
       </GallerySection>
       <GallerySection label="Flat: Draft">
         <DraftRow project={DOGFOOD_PROJECT} />
+      </GallerySection>
+      <GallerySection label="Flat: Project icon">
+        <WorkspaceRow workspace={STORY_WORKSPACES[2]} project={ROCKET_PROJECT} />
+        <DraftRow project={ROCKET_PROJECT} promptPreview="Plan the launch checklist" />
       </GallerySection>
     </StoryScaffold>
   );
@@ -556,9 +564,69 @@ export const BashMonitorWaiting: Story = {
   render: renderBashMonitorWaiting,
 };
 
+const ALIGNMENT_TOLERANCE_PX = 0.5;
+
+function centerY(rect: DOMRect): number {
+  return rect.top + rect.height / 2;
+}
+
+/**
+ * Checks every flat (avatar) row: the avatar centers on the text block (title alone or title plus
+ * subtitle), and the hover action button centers on the title line.
+ */
+function assertAvatarRowsAligned(canvasElement: HTMLElement): void {
+  let oneLineRows = 0;
+  let twoLineRows = 0;
+  for (const row of canvasElement.querySelectorAll<HTMLElement>('[role="button"]')) {
+    const avatar = row.querySelector('[data-testid^="workspace-project-avatar-"]');
+    if (avatar == null) continue;
+    const textColumn = Array.from(row.children).find(
+      (child) => getComputedStyle(child).position !== "absolute" && !child.contains(avatar)
+    );
+    // Measure the lines, not the column: a stretched grid item would hide misalignment.
+    const titleLine = textColumn?.firstElementChild;
+    const lastLine = textColumn?.lastElementChild;
+    const actionButton = row.querySelector(
+      'button[aria-label^="Workspace actions for"], button[aria-label^="Delete workspace draft"]'
+    );
+    const label = row.getAttribute("aria-label") ?? "row";
+    if (titleLine == null || lastLine == null || actionButton == null) {
+      throw new Error(`${label}: missing text column, title line, or action button`);
+    }
+    const titleRect = titleLine.getBoundingClientRect();
+    const textBottom = lastLine.getBoundingClientRect().bottom;
+    const isTwoLine = textBottom - titleRect.bottom > ALIGNMENT_TOLERANCE_PX;
+    if (isTwoLine) twoLineRows++;
+    else oneLineRows++;
+
+    const textCenter = (titleRect.top + textBottom) / 2;
+    const avatarCenter = centerY(avatar.getBoundingClientRect());
+    if (Math.abs(avatarCenter - textCenter) > ALIGNMENT_TOLERANCE_PX) {
+      throw new Error(
+        `${label}: avatar center ${avatarCenter} is not centered on the text (${textCenter})`
+      );
+    }
+    const actionCenter = centerY(actionButton.getBoundingClientRect());
+    if (Math.abs(actionCenter - centerY(titleRect)) > ALIGNMENT_TOLERANCE_PX) {
+      throw new Error(
+        `${label}: action center ${actionCenter} is not on the title line (${centerY(titleRect)})`
+      );
+    }
+  }
+  if (oneLineRows === 0 || twoLineRows === 0) {
+    throw new Error(
+      `Expected one-line and two-line avatar rows, got ${oneLineRows} and ${twoLineRows}`
+    );
+  }
+}
+
 export const States: Story = {
   args: undefined as never,
   render: renderStatesGallery,
+  play: async ({ canvasElement }) => {
+    // Status lines arrive through persisted state and the store, so wait for the layout to settle.
+    await waitFor(() => assertAvatarRowsAligned(canvasElement));
+  },
 };
 
 // Idle seen vs unread are kept as separate stories: both drive the same
