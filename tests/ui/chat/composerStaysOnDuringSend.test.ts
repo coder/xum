@@ -131,6 +131,26 @@ function pressVimKeys(app: AppHarness, keys: string[]) {
   for (const key of keys) fireEvent.keyDown(composer(app), { key });
 }
 
+/**
+ * Types `key` where the textarea caret is, as a browser does: the input event reports the caret
+ * after the key. (fireEvent.input would move the caret to the end first.)
+ */
+function typeAtCaret(app: AppHarness, key: string) {
+  const textarea = composer(app);
+  const view = textarea.ownerDocument.defaultView as unknown as typeof globalThis;
+  const caret = textarea.selectionStart;
+  const next = textarea.value.slice(0, caret) + key + textarea.value.slice(textarea.selectionEnd);
+  const setValue = Object.getOwnPropertyDescriptor(
+    view.HTMLTextAreaElement.prototype,
+    "value"
+  )?.set;
+  act(() => {
+    setValue?.call(textarea, next);
+    textarea.setSelectionRange(caret + key.length, caret + key.length);
+    textarea.dispatchEvent(new view.Event("input", { bubbles: true }));
+  });
+}
+
 /** Types `text` one key at a time at the end of the textarea. */
 function typeIntoTextarea(app: AppHarness, text: string) {
   for (const key of text) {
@@ -333,6 +353,39 @@ describe("composer during an unsettled send (#6259)", () => {
       expect(composer(app).value).toBe("ac");
     } finally {
       act(() => updateUserPreferences({ appearance: { vimEnabled: false } }));
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // #6944: the text can shrink between Vim keys (a send took its draft, another window wrote).
+  test("a Vim key in visual mode after the text shrank is still a command", async () => {
+    const app = await createAppHarness({ branchPrefix: "composer-vim-visual-shrink" });
+    const scope = { kind: "workspace" as const, workspaceId: app.workspaceId };
+    try {
+      act(() => updateUserPreferences({ appearance: { vimEnabled: true } }));
+      await waitFor(() => expect(getUserPreferences().appearance?.vimEnabled).toBe(true), WAIT);
+      await app.chat.typeWithoutSending("abc");
+      pressVimKeys(app, ["Escape", "v"]);
+      act(() => getDraftStore().setText(scope, "x"));
+      // `d` deletes the visual selection, clamped to the shorter text.
+      pressVimKeys(app, ["d"]);
+      expect(composer(app).value).toBe("");
+    } finally {
+      act(() => updateUserPreferences({ appearance: { vimEnabled: false } }));
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // #6944: a symbol command typed mid-text becomes its symbol; the next key goes right after it,
+  // not to the end of the text.
+  test("the key after a symbol conversion mid-text lands after the symbol", async () => {
+    const app = await createAppHarness({ branchPrefix: "composer-symbol-caret" });
+    try {
+      await app.chat.typeWithoutSending("a b");
+      composer(app).setSelectionRange(1, 1);
+      for (const key of ["\\", "i", "n", " ", "x"]) typeAtCaret(app, key);
+      expect(composer(app).value).toBe("a∈ x b");
+    } finally {
       await app.dispose();
     }
   }, 120_000);
