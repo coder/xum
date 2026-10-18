@@ -47,12 +47,12 @@ export function listAgentTaskWorkspaces(config: ProjectsConfig): AgentTaskWorksp
 }
 
 /**
- * Duplicate workspace ids (#4550): config neither rejects nor repairs them, so every id resolves
- * to its FIRST row in config order, the row findWorkspaceEntry returns. Later duplicates are
- * ignored here, including a later task row whose first occurrence is not a task. Otherwise the
- * ancestor chains that fan out reports, tombstones and settlement receipts, and the subtrees that
- * cascades walk, would follow a row that no lookup names. The rule is deterministic and keeps the
- * duplicate rows on disk untouched.
+ * Duplicate workspace ids (#4550): config repairs a repeated id under one project key on load
+ * (#6717), but not an id repeated across project keys. So every id resolves to its FIRST row in
+ * config order, the row findWorkspaceEntry returns. Later duplicates are ignored here, including
+ * a later task row whose first occurrence is not a task. Otherwise the ancestor chains that fan
+ * out reports, tombstones and settlement receipts, and the subtrees that cascades walk, would
+ * follow a row that no lookup names. The rule is deterministic, and the index changes no rows.
  */
 export function buildAgentTaskIndex(config: ProjectsConfig): AgentTaskIndex {
   const byId = new Map<string, AgentTaskWorkspaceEntry>();
