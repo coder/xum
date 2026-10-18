@@ -86,8 +86,8 @@ describeIntegration("creation composer caret and draft edits (#6974)", () => {
   // CreationDraftStore.update returns early for an id with no draft (#6974 item 3). A mounted
   // composer never reaches that return: CreationDraftGate renders it only for a loaded draft and
   // takes it down in the render right after the delete, before the next key event (the store
-  // notifies synchronously). What still reaches it is a late writer, such as a name generation
-  // that settles after the delete: the return keeps it from bringing the draft back.
+  // notifies synchronously). What can still reach it is a write after the delete from code that
+  // still holds the old id: the return keeps that write from bringing the draft back.
   test("a deleted draft takes its composer down, and a late edit does not bring it back", async () => {
     const { view, cleanupDom, draftId } = await openCreationView();
     const store = getCreationDraftStore();
