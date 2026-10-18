@@ -47,7 +47,11 @@ const HOT_COMPONENTS: Record<string, readonly string[]> = {
     "SubAgentTasksContent",
   ],
   "src/browser/components/ProjectSidebar/ProjectSidebar.tsx": ["ProjectSidebarInner"],
-  "src/browser/components/AgentListItem/AgentListItem.tsx": ["AgentListItemInner"],
+  "src/browser/components/AgentListItem/AgentListItem.tsx": [
+    "AgentListItemInner",
+    // Renders on every sidebar row (#6982).
+    "WorkspaceRowMenu",
+  ],
   "src/browser/components/AppLoader/AppLoader.tsx": [
     "AppLoader",
     "AppLoaderInner",
@@ -197,7 +201,7 @@ function main(): void {
         reasons
           ? `${key} is skipped by React Compiler:\n    ${[...new Set(reasons)].join("\n    ")}`
           : `${key} was not compiled and reported no error. If it was renamed or moved, ` +
-            `update HOT_COMPONENTS; a hook that calls no other hooks needs a "use memo" directive.`
+              `update HOT_COMPONENTS; a hook that calls no other hooks needs a "use memo" directive.`
       );
     }
   }

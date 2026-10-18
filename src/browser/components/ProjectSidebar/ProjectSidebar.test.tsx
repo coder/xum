@@ -5,7 +5,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import * as ReactDndModule from "react-dnd";
 import * as ReactDndHtml5BackendModule from "react-dnd-html5-backend";
-import * as ReactColorfulModule from "react-colorful";
+import * as LazyHexColorPickerModule from "@/browser/components/LazyHexColorPicker/LazyHexColorPicker";
 import { installDom } from "../../../../tests/ui/dom";
 import { EXPANDED_PROJECTS_KEY } from "@/common/constants/storage";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
@@ -176,7 +176,7 @@ interface MockAgentListItemProps {
   onCancelCreation?: (workspaceId: string) => Promise<void>;
 }
 
-type HexColorPickerProps = ComponentProps<typeof ReactColorfulModule.HexColorPicker>;
+type HexColorPickerProps = ComponentProps<typeof LazyHexColorPickerModule.LazyHexColorPicker>;
 
 let renderRealAgentListItems = false;
 let latestArchiveWorkspaceHandler:
@@ -508,7 +508,11 @@ function installProjectSidebarTestDoubles() {
     currentOffset: null,
   })) as unknown as typeof ReactDndModule.useDragLayer);
   spyOn(ReactDndHtml5BackendModule, "getEmptyImage").mockImplementation(() => new Image());
-  spyOn(ReactColorfulModule, "HexColorPicker").mockImplementation(((props: HexColorPickerProps) => (
+  // Mock the lazy wrapper, not react-colorful: React.lazy keeps the first export it resolves for
+  // the whole process, so a per-test spy on react-colorful only reaches the first test (#6982).
+  spyOn(LazyHexColorPickerModule, "LazyHexColorPicker").mockImplementation(((
+    props: HexColorPickerProps
+  ) => (
     <button
       type="button"
       data-testid="hex-color-picker"
@@ -518,7 +522,7 @@ function installProjectSidebarTestDoubles() {
     >
       mock color picker
     </button>
-  )) as typeof ReactColorfulModule.HexColorPicker);
+  )) as typeof LazyHexColorPickerModule.LazyHexColorPicker);
 
   spyOn(DesktopTitlebarModule, "isDesktopMode").mockImplementation(() => false);
   spyOn(ThemeContextModule, "useTheme").mockImplementation(() => ({

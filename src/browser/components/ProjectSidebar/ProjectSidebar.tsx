@@ -155,7 +155,7 @@ import {
 } from "@/common/constants/multiProject";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { HexColorPicker } from "react-colorful";
+import { LazyHexColorPicker } from "@/browser/components/LazyHexColorPicker/LazyHexColorPicker";
 import {
   DEFAULT_SECTION_COLOR,
   resolveSectionColor,
@@ -3631,7 +3631,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                   ))}
                 </div>
                 <div className="section-color-picker">
-                  <HexColorPicker
+                  <LazyHexColorPicker
                     color={projectColorPickerValue}
                     onChange={(newColor) => {
                       setProjectColorHexInput(newColor);

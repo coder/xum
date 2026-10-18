@@ -692,7 +692,8 @@ function WorkspaceRowMenu(props: {
   isSelected: boolean;
   children: React.ReactNode;
 }) {
-  const { ctxMenu } = props;
+  // Destructured: reading `props.triggerRef` in render makes React Compiler skip this component.
+  const { ctxMenu, triggerRef } = props;
   const setContentRef = useHiddenFirstFrameRef(ctxMenu.isOpen);
   const placement = ctxMenu.position ? MENU_AT_CURSOR_PLACEMENT : MENU_AT_TRIGGER_PLACEMENT;
   const triggerClasses = getRowMenuTriggerClasses(props.isAvatarRow, ctxMenu.isOpen);
@@ -715,7 +716,7 @@ function WorkspaceRowMenu(props: {
       )}
       <PopoverTrigger asChild>
         <button
-          ref={props.triggerRef}
+          ref={triggerRef}
           className={triggerClasses.button}
           onClick={(e) => e.stopPropagation()}
           aria-label={`Workspace actions for ${props.displayTitle}`}
