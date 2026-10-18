@@ -32,7 +32,8 @@ done
 echo "$3" > "$1/xum-app/cgroup.procs"`;
 /**
  * The error of each host's last failed sudo delegation. Applies that may not run sudo report it,
- * so the status keeps the sudo error until an apply that may run sudo succeeds or fails again.
+ * so the status keeps the sudo error until an apply that may run sudo succeeds or fails again, or
+ * the limits are cleared, after which the old sudo error no longer describes them.
  */
 const failedSudoDelegations = new WeakMap<AgentCgroupHost, string>();
 
