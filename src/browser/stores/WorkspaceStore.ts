@@ -589,6 +589,91 @@ function getBufferedActiveStreamStart(
 }
 
 /**
+ * The stream identity a workspace shows. The live aggregator is trusted once it is active and
+ * caught up; before that, a buffered replayed stream-start, then the activity snapshot.
+ */
+function resolveWorkspaceStreamIdentity(input: {
+  aggregator: StreamingMessageAggregator;
+  useAggregatorState: boolean;
+  hasInterruptibleActiveStream: boolean;
+  bufferedActiveStreamStart: Pick<StreamStartEvent, "model" | "thinkingLevel"> | null;
+  activity: WorkspaceActivitySnapshot | undefined;
+}): Pick<WorkspaceState, "canInterrupt" | "currentModel" | "currentThinkingLevel"> {
+  const {
+    aggregator,
+    useAggregatorState,
+    hasInterruptibleActiveStream,
+    bufferedActiveStreamStart,
+    activity,
+  } = input;
+  const canInterrupt = useAggregatorState
+    ? hasInterruptibleActiveStream
+    : bufferedActiveStreamStart !== null
+      ? true
+      : (activity?.streaming ?? hasInterruptibleActiveStream);
+  const currentModel = useAggregatorState
+    ? (aggregator.getCurrentModel() ?? null)
+    : (bufferedActiveStreamStart?.model ??
+      activity?.lastModel ??
+      aggregator.getCurrentModel() ??
+      null);
+  const currentThinkingLevel = useAggregatorState
+    ? (aggregator.getCurrentThinkingLevel() ?? null)
+    : (bufferedActiveStreamStart?.thinkingLevel ??
+      activity?.lastThinkingLevel ??
+      aggregator.getCurrentThinkingLevel() ??
+      null);
+  return { canInterrupt, currentModel, currentThinkingLevel };
+}
+
+/** The newer of the aggregator's and the activity snapshot's recency, when either has one. */
+function mergeRecencyTimestamp(
+  aggregatorRecency: number | null,
+  activityRecency: number | undefined
+): number | null {
+  return aggregatorRecency === null
+    ? (activityRecency ?? null)
+    : Math.max(aggregatorRecency, activityRecency ?? aggregatorRecency);
+}
+
+/** Transcript hydration flags of an onChat replay (skeleton, stale cached rows, since catch-up). */
+function resolveTranscriptHydrationState(input: {
+  aggregator: StreamingMessageAggregator;
+  transient: WorkspaceChatTransientState;
+  isActiveWorkspace: boolean;
+  hasRunningInitMessage: boolean;
+  displayedMessages: DisplayedMessage[];
+}): Pick<WorkspaceState, "isHydratingTranscript" | "isTranscriptStale" | "isIncrementalCatchUp"> {
+  const { aggregator, transient, isActiveWorkspace, hasRunningInitMessage, displayedMessages } =
+    input;
+  // Only actively running init output should bypass transcript hydration. Completed init
+  // rows are still replayed, but they should not suppress the normal catch-up placeholder
+  // for stale cached transcript content on reconnect.
+  const isHydratingTranscript =
+    isActiveWorkspace &&
+    transient.isHydratingTranscript &&
+    !transient.caughtUp &&
+    !hasRunningInitMessage;
+  // Only painted rows can be stale; an empty transcript hydrates through the skeleton
+  // regardless. A full replay rebuilds the transcript from scratch, so the one row it
+  // can apply before caught-up (the replayed init card bypasses buffering) is partial
+  // too, whereas a since replay's cached init-only transcript is trustworthy.
+  const displayedOnlyReplayedInitCards =
+    transient.fullReplayInFlight &&
+    displayedMessages.every((message) => message.type === "workspace-init");
+  const isTranscriptStale =
+    isHydratingTranscript &&
+    displayedMessages.length > 0 &&
+    !transient.staleSkeletonExpired &&
+    (transient.cachedTranscriptStale || displayedOnlyReplayedInitCards);
+  const isIncrementalCatchUp =
+    isHydratingTranscript &&
+    !transient.fullReplayInFlight &&
+    getOnChatReplayMode(aggregator)?.type === "since";
+  return { isHydratingTranscript, isTranscriptStale, isIncrementalCatchUp };
+}
+
+/**
  * Message whose content the buffered stream replay rebuilds: the server replays stream-start
  * (replay: true) and then the parts after the stream cursor, or every part when it applied no
  * cursor. A replayed history row for the same message must not seed that rebuild.
@@ -2636,59 +2721,32 @@ export class WorkspaceStore {
       // activity snapshot's streaming state, which is updated via the lightweight activity
       // subscription for all workspaces.
       const useAggregatorState = isActiveWorkspace && transient.caughtUp;
-      const canInterrupt = useAggregatorState
-        ? hasInterruptibleActiveStream
-        : bufferedActiveStreamStart !== null
-          ? true
-          : (activity?.streaming ?? hasInterruptibleActiveStream);
-      const currentModel = useAggregatorState
-        ? (aggregator.getCurrentModel() ?? null)
-        : (bufferedActiveStreamStart?.model ??
-          activity?.lastModel ??
-          aggregator.getCurrentModel() ??
-          null);
-      const currentThinkingLevel = useAggregatorState
-        ? (aggregator.getCurrentThinkingLevel() ?? null)
-        : (bufferedActiveStreamStart?.thinkingLevel ??
-          activity?.lastThinkingLevel ??
-          aggregator.getCurrentThinkingLevel() ??
-          null);
+      const { canInterrupt, currentModel, currentThinkingLevel } = resolveWorkspaceStreamIdentity({
+        aggregator,
+        useAggregatorState,
+        hasInterruptibleActiveStream,
+        bufferedActiveStreamStart,
+        activity,
+      });
       const activePendingStreamStartTime = isActiveWorkspace ? pendingStreamStartTime : null;
-      const aggregatorRecency = aggregator.getRecencyTimestamp();
-      const recencyTimestamp =
-        aggregatorRecency === null
-          ? (activity?.recency ?? null)
-          : Math.max(aggregatorRecency, activity?.recency ?? aggregatorRecency);
+      const recencyTimestamp = mergeRecencyTimestamp(
+        aggregator.getRecencyTimestamp(),
+        activity?.recency
+      );
       // Keep the startup barrier mounted until stream-start makes the turn interruptible;
       // stream-lifecycle can report "streaming" slightly earlier.
       const isStreamStarting =
         isActiveWorkspace &&
         !canInterrupt &&
         (streamLifecycle?.phase === "preparing" || activePendingStreamStartTime !== null);
-      // Only actively running init output should bypass transcript hydration. Completed init
-      // rows are still replayed, but they should not suppress the normal catch-up placeholder
-      // for stale cached transcript content on reconnect.
-      const isHydratingTranscript =
-        isActiveWorkspace &&
-        transient.isHydratingTranscript &&
-        !transient.caughtUp &&
-        !hasRunningInitMessage;
-      // Only painted rows can be stale; an empty transcript hydrates through the skeleton
-      // regardless. A full replay rebuilds the transcript from scratch, so the one row it
-      // can apply before caught-up (the replayed init card bypasses buffering) is partial
-      // too, whereas a since replay's cached init-only transcript is trustworthy.
-      const displayedOnlyReplayedInitCards =
-        transient.fullReplayInFlight &&
-        displayedMessages.every((message) => message.type === "workspace-init");
-      const isTranscriptStale =
-        isHydratingTranscript &&
-        displayedMessages.length > 0 &&
-        !transient.staleSkeletonExpired &&
-        (transient.cachedTranscriptStale || displayedOnlyReplayedInitCards);
-      const isIncrementalCatchUp =
-        isHydratingTranscript &&
-        !transient.fullReplayInFlight &&
-        getOnChatReplayMode(aggregator)?.type === "since";
+      const { isHydratingTranscript, isTranscriptStale, isIncrementalCatchUp } =
+        resolveTranscriptHydrationState({
+          aggregator,
+          transient,
+          isActiveWorkspace,
+          hasRunningInitMessage,
+          displayedMessages,
+        });
       const aggregatorTodos = aggregator.getCurrentTodos();
       const agentStatus = resolveSidebarAgentStatus({
         useAggregatorState,
