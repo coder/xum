@@ -186,6 +186,7 @@ describe("applyAgentCgroupLimits", () => {
         ["io.max", ""],
         ["io.prio.class", "no-change"],
         ["io.weight", "default 100"],
+        ["memory.high", "max"],
         ["memory.max", "max"],
         ["memory.oom.group", "0"],
         ["memory.zswap.writeback", "1"],
@@ -240,7 +241,6 @@ describe("applyAgentCgroupLimits", () => {
 
     it.each([
       ["cpu.max", "50000 100000"],
-      ["memory.max", "1073741824"],
       ["hugetlb.2MB.max", "0"],
       ["misc.max", "sev max\nsev_es 3"],
       ["cpu.weight", "50"],
