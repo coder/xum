@@ -401,6 +401,11 @@ describe("applyAgentCgroupLimits", () => {
       expect(after.status).toHaveProperty("reason", expect.stringMatching(sudoFailed));
       expect(tree.sudoCalls).toEqual(["xum"]);
       expect(tree.writes).toEqual([]);
+
+      // Clearing the limits forgets the sudo error, which described the old limits.
+      await applyAgentCgroupLimits({}, tree.host);
+      const cleared = await applyAgentCgroupLimits({ cpuCores: 2 }, tree.host);
+      expect(cleared.status).toHaveProperty("reason", expect.stringMatching(cannotManage));
     });
 
     it("a test command that did not join xum-agents", async () => {

@@ -214,6 +214,18 @@ describe("AgentResourceLimitsService", () => {
     expect(tree.sudoCalls).toEqual(["init.scope"]);
   });
 
+  it("checks support for the saved limits, also while they are off", async () => {
+    await tree.dispose();
+    tree = await createFakeCgroupTree({ own: "/xum", cgroups: { xum: { controllers: "memory" } } });
+    await config.updateAgentResourceLimits({ memoryGiB: 2 });
+    await config.updateAgentResourceLimitsEnabled(false);
+    service = new AgentResourceLimitsService(config, tree.host);
+    await service.start();
+
+    // A memory limit needs no cpu controller, so Settings must not report one missing.
+    expect((await service.get()).support).toEqual({ state: "ready", cgroup: "/xum" });
+  });
+
   it("saves and applies the limits it is given", async () => {
     service = new AgentResourceLimitsService(config, tree.host);
     await service.start();

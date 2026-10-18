@@ -213,18 +213,43 @@ describe("AgentResourceLimitsSettings", () => {
     await view.findByText(/Active: agents share 2 CPU cores/);
   });
 
-  test("tells before the limits are on that applying them takes the cgroup with sudo", async () => {
-    const view = renderSettings({
-      enabled: false,
-      limits: { cpuCores: 2 },
-      status: OFF,
-      support: { state: "sudo", cgroup: "/init.scope" },
-    });
+  const SUDO: AgentResourceLimitsSupport = { state: "sudo", cgroup: "/init.scope" };
+  test.each<
+    [
+      string,
+      Pick<AgentResourceLimitsState, "enabled" | "limits">,
+      AgentResourceLimitsSupport,
+      string,
+    ]
+  >([
+    [
+      "takes the cgroup with sudo",
+      { enabled: false, limits: { cpuCores: 2 } },
+      SUDO,
+      "/init.scope/xum-app",
+    ],
+    [
+      "takes the cgroup with sudo, also while on with no limit set",
+      { enabled: true, limits: {} },
+      SUDO,
+      "/init.scope/xum-app",
+    ],
+    // Unlike an unsupported OS, the limits can apply once xum runs elsewhere.
+    [
+      "cannot work where xum runs now",
+      { enabled: false, limits: { cpuCores: 2 } },
+      { state: "unavailable", reason: "xum runs in the root cgroup." },
+      "Not available: xum runs in the root cgroup.",
+    ],
+  ])(
+    "tells before any limit applies that applying them %s, and keeps the switch usable",
+    async (_name, setting, support, note) => {
+      const view = renderSettings({ ...setting, status: OFF, support });
 
-    await view.findByText("/init.scope/xum-app");
-    view.getByText("/init.scope");
-    expect(view.toggle().disabled).toBe(false);
-  });
+      await view.findByText(note);
+      expect(view.toggle().disabled).toBe(false);
+    }
+  );
 
   test("keeps the limits off where none can apply, and says why", async () => {
     const reason = "Agent resource limits need Linux with cgroup v2.";
