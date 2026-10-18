@@ -44,6 +44,7 @@ import {
   PendingStops,
   stopMarkedCommand,
   withExecMarker,
+  withoutExecMarkerKey,
 } from "./remoteExecMarker";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildGuardedCommand, buildShellExport, buildShellPathExport } from "./shellEnv";
@@ -140,11 +141,12 @@ export abstract class RemoteRuntime implements Runtime {
     parts.push(this.cdCommand(options.cwd));
 
     // Add environment variable exports (user env first, then non-interactive overrides)
-    const envVars = { ...options.env, ...NON_INTERACTIVE_ENV_VARS };
+    // The marker key is reserved: a caller's export would hide the command from an abort's stop.
+    const envVars = withoutExecMarkerKey({ ...options.env, ...NON_INTERACTIVE_ENV_VARS });
     for (const [key, value] of Object.entries(envVars)) {
       parts.push(buildShellExport(key, value, (envValue) => shescape.quote(envValue)));
     }
-    for (const [key, value] of Object.entries(options.pathEnv ?? {})) {
+    for (const [key, value] of Object.entries(withoutExecMarkerKey(options.pathEnv ?? {}))) {
       parts.push(buildShellPathExport(key, value, (envValue) => shescape.quote(envValue)));
     }
 

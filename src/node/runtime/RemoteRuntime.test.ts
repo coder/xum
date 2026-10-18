@@ -249,17 +249,28 @@ function markedPids(marker: string): number[] {
 describe("RemoteRuntime abort stops the remote command (#6923)", () => {
   // Killing the local client left the remote command running (docker exec passes no signal). The
   // stand-in "remote" here is a local sh, whose SIGTERM leaves its children running the same way.
-  it.skipIf(process.platform !== "linux")(
-    "an abort stops every process that carries the exec's marker",
-    async () => {
+  // A caller's XUM_EXEC_ID export would replace the marker and hide the command from the stop.
+  it.skipIf(process.platform !== "linux").each([
+    // Without a timeout there is no `timeout` wrapper, which would pass the TERM on itself.
+    ["no caller env", undefined],
+    ["a caller env that sets the marker key, and no timeout", { XUM_EXEC_ID: "spoofed" }],
+  ] as const)(
+    "an abort stops every process that carries the exec's marker (%s)",
+    async (_name, env) => {
       const loginDir = await fs.mkdtemp(path.join(os.tmpdir(), "remote-abort-"));
       const runtime = new RecordingShellRemoteRuntime(loginDir);
       const abort = new AbortController();
       try {
-        const stream = await runtime.exec("sleep 30; sleep 30", {
+        // Unique durations find these sleeps whatever their environment holds.
+        const seconds = 3000 + Math.floor(Math.random() * 900);
+        const sleeps = () =>
+          spawnSync("pgrep", ["-f", `^sleep (${seconds}|${seconds + 1})$`], { encoding: "utf-8" })
+            .stdout.split("\n")
+            .filter(Boolean);
+        const stream = await runtime.exec(`sleep ${seconds}; sleep ${seconds + 1}`, {
           cwd: loginDir,
           abortSignal: abort.signal,
-          timeout: 60,
+          ...(env ? { env } : { timeout: 60 }),
         });
         const marker = /env '(XUM_EXEC_ID=[0-9a-f-]{36})'/.exec(runtime.fullCommands[0] ?? "")?.[1];
         expect(marker).toBeDefined();
@@ -275,6 +286,7 @@ describe("RemoteRuntime abort stops the remote command (#6923)", () => {
         expect(runtime.fullCommands[1]).toContain(marker!);
         expect(runtime.fullCommands[1]).not.toMatch(new RegExp(`^env '${marker!}'`));
         expect(markedPids(marker!)).toEqual([]);
+        expect(sleeps()).toEqual([]);
       } finally {
         await fs.rm(loginDir, { recursive: true, force: true });
       }

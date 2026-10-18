@@ -5,6 +5,7 @@ import {
   createExecMarker,
   NO_PROC_MESSAGE,
   withExecMarker,
+  withoutExecMarkerKey,
 } from "./remoteExecMarker";
 
 function alive(pid: number): boolean {
@@ -106,6 +107,39 @@ describe("remoteExecMarker", () => {
       }
     }
   );
+
+  // An abort right after exec returned can run the stop before the command is visible.
+  it.skipIf(process.platform !== "linux")(
+    "stops a marked command that starts shortly after the stop began",
+    async () => {
+      const marker = createExecMarker();
+      const kill = spawn("sh", ["-c", buildMarkerKillScript(marker)], { stdio: "ignore" });
+      const killed = new Promise<number | null>((resolve) => kill.on("exit", resolve));
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const late = spawn("sh", ["-c", withExecMarker(marker, "sleep 30")], {
+        stdio: "ignore",
+        detached: true,
+      });
+      try {
+        expect(await killed).toBe(0);
+        expect(await waitFor(() => markedPids(marker).length === 0, 3_000)).toBe(true);
+      } finally {
+        if (late.pid !== undefined) {
+          try {
+            process.kill(-late.pid, "SIGKILL");
+          } catch {
+            // Already gone.
+          }
+        }
+      }
+    }
+  );
+
+  it("drops a caller's value for the reserved marker key", () => {
+    expect(withoutExecMarkerKey({ XUM_EXEC_ID: "spoofed", OTHER: "kept" })).toEqual({
+      OTHER: "kept",
+    });
+  });
 
   it("exits 0 with a message when the host has no /proc", () => {
     const script = buildMarkerKillScript(createExecMarker()).replace(

@@ -259,13 +259,16 @@ describe("DevcontainerRuntime.exec output streams", () => {
       let child: ChildProcess | undefined;
       const spawnSpy = spyOn(devcontainerCli, "spawnDevcontainer").mockImplementation(
         (_args, options) => {
+          // A later spawn is the abort's in-container stop (#6923); nothing to stop here.
+          if (child) return spawn("true", [], options);
           child = spawn("sleep", ["30"], options);
           return child;
         }
       );
       const abort = new AbortController();
+      const runtime = createRuntime({ currentWorkspacePath: os.tmpdir() });
       try {
-        const stream = await createRuntime({ currentWorkspacePath: os.tmpdir() }).exec("sleep 30", {
+        const stream = await runtime.exec("sleep 30", {
           cwd: os.tmpdir(),
           abortSignal: abort.signal,
         });
@@ -276,12 +279,76 @@ describe("DevcontainerRuntime.exec output streams", () => {
         expect(() => child?.stderr?.emit("data", Buffer.from("late"))).not.toThrow();
         abort.abort();
         await stream.exitCode;
+        await runtime.awaitPendingStops();
       } finally {
         spawnSpy.mockRestore();
         child?.kill("SIGKILL");
       }
     }
   );
+});
+
+describe("DevcontainerRuntime.exec stops the command in the container (#6923)", () => {
+  // The stop is a second `devcontainer exec` with a 10 s timeout. A hung container engine makes
+  // it time out too, and its own cleanup must not start yet another stop.
+  it.skipIf(process.platform === "win32")(
+    "a stop that times out starts no further stop",
+    async () => {
+      const spawned: ChildProcess[] = [];
+      const spawnSpy = spyOn(devcontainerCli, "spawnDevcontainer").mockImplementation(
+        (_args, options) => {
+          const child = spawn("sleep", ["30"], options);
+          spawned.push(child);
+          return child;
+        }
+      );
+      const abort = new AbortController();
+      const runtime = createRuntime({ currentWorkspacePath: os.tmpdir() });
+      try {
+        const stream = await runtime.exec("sleep 30", {
+          cwd: os.tmpdir(),
+          abortSignal: abort.signal,
+        });
+        abort.abort();
+        await stream.exitCode;
+        expect(spawned).toHaveLength(2);
+        // The stop hangs until its own 10 s timeout ends it.
+        await runtime.awaitPendingStops();
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(spawned).toHaveLength(2);
+      } finally {
+        spawnSpy.mockRestore();
+        for (const child of spawned) child.kill("SIGKILL");
+      }
+    },
+    { timeout: 20_000 }
+  );
+
+  // A caller's XUM_EXEC_ID would replace the marker and hide the command from the stop.
+  it("passes the marker and drops a caller's value for its key", async () => {
+    let args: string[] = [];
+    const spawnSpy = spyOn(devcontainerCli, "spawnDevcontainer").mockImplementation(
+      (spawnArgs, options) => {
+        args = spawnArgs;
+        return spawn("true", [], options);
+      }
+    );
+    try {
+      const stream = await createRuntime({ currentWorkspacePath: os.tmpdir() }).exec("true", {
+        cwd: os.tmpdir(),
+        env: { XUM_EXEC_ID: "spoofed", OTHER: "kept" },
+      });
+      await stream.exitCode;
+      const remoteEnv = args.filter((_arg, i) => args[i - 1] === "--remote-env");
+      expect(remoteEnv.filter((entry) => entry.startsWith("XUM_EXEC_ID="))).toHaveLength(1);
+      expect(remoteEnv.find((entry) => entry.startsWith("XUM_EXEC_ID="))).toMatch(
+        /^XUM_EXEC_ID=[0-9a-f-]{36}$/
+      );
+      expect(remoteEnv).toContain("OTHER=kept");
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
 });
 
 describe("DevcontainerRuntime.exec multi-line commands", () => {

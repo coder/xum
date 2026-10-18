@@ -14,6 +14,16 @@ import { log } from "@/node/services/log";
  */
 export type ExecMarker = `XUM_EXEC_ID=${string}`;
 
+/** The variable that carries the marker; reserved, so a caller's env cannot replace it. */
+export const EXEC_MARKER_ENV_KEY = "XUM_EXEC_ID";
+
+/** `env` without the reserved marker key: a caller's value would hide the command from a stop. */
+export function withoutExecMarkerKey<T>(env: Record<string, T>): Record<string, T> {
+  if (!(EXEC_MARKER_ENV_KEY in env)) return env;
+  const { [EXEC_MARKER_ENV_KEY]: _dropped, ...rest } = env;
+  return rest;
+}
+
 const MARKER_PATTERN = /^XUM_EXEC_ID=[0-9a-f-]{36}$/;
 
 /** A new marker; unique per exec, so a kill never reaches another exec's processes. */
@@ -36,20 +46,25 @@ export function withExecMarker(marker: ExecMarker, command: string): string {
 export const NO_PROC_MESSAGE = "no /proc; cannot stop the aborted command";
 
 /**
- * POSIX sh that sends SIGTERM to every process whose environment holds exactly `marker`, then
- * SIGKILL after 1 s to the ones left. Without /proc (a macOS host) it prints NO_PROC_MESSAGE to
- * stderr and exits 0: the command keeps running there.
+ * POSIX sh that sends SIGTERM to every process whose environment holds `marker`, then SIGKILL
+ * after 1 s to the ones left. Without /proc (a macOS host) it prints NO_PROC_MESSAGE to stderr
+ * and exits 0: the command keeps running there.
  */
 export function buildMarkerKillScript(marker: ExecMarker): string {
   assertExecMarker(marker);
-  // The kill command itself carries another marker, so it never matches itself.
+  // The kill command itself carries another marker, and `m` is not exported, so it never
+  // matches itself. One grep scans every environ (no process per pid on a busy host); a
+  // substring match is exact enough, since the marker holds a fresh UUID.
   return [
     `m='${marker}'`,
     `if [ ! -d /proc/self ]; then echo '${NO_PROC_MESSAGE}' >&2; exit 0; fi`,
-    "marked() { for d in /proc/[0-9]*; do " +
-      'if tr "\\000" "\\n" < "$d/environ" 2>/dev/null | grep -qxF "$m"; then echo "${d#/proc/}"; fi; ' +
-      "done; }",
-    'p=$(marked); [ -z "$p" ] && exit 0',
+    'marked() { for f in $(grep -lF -- "$m" /proc/[0-9]*/environ 2>/dev/null); do ' +
+      'p=${f#/proc/}; echo "${p%/environ}"; done; }',
+    // An abort right after exec returned can come before the command is visible: wait up to
+    // about 2 s for it to appear.
+    "p=$(marked); n=0",
+    'while [ -z "$p" ] && [ $n -lt 10 ]; do sleep 0.2; p=$(marked); n=$((n + 1)); done',
+    '[ -z "$p" ] && exit 0',
     "kill -TERM $p 2>/dev/null",
     "sleep 1",
     'p=$(marked); [ -n "$p" ] && kill -KILL $p 2>/dev/null',
