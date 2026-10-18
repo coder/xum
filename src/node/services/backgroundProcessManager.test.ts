@@ -1674,43 +1674,49 @@ describe("BackgroundProcessManager", () => {
       expect(event.payload.terminal?.status).toBe("exited");
     });
 
-    it("does not advance the shown frontier across lines a prior filtered read consumed", async () => {
-      // Regression for the drain-time suppression edge case Codex flagged: outputBytesRead is a
-      // shared cursor, so a filtered read that consumes a matched complete line (without ever
-      // showing it) advances the cursor past that line while leaving shownThroughOffset behind. A
-      // later unfiltered read with no new output must not let the frontier jump that gap -- else
-      // getSettledShownThroughOffset would report the filtered-out line as shown and the drain gate
-      // would supersede the only wake for output the agent never saw.
-      const result = await manager.spawn(
-        runtime,
-        testWorkspaceId,
-        "printf 'ERR boom\\nDONE\\n'; sleep 5",
-        { cwd: process.cwd(), displayName: "frontier-gap-filtered" }
-      );
-      expect(result.success).toBe(true);
-      if (!result.success) return;
+    it(
+      "does not advance the shown frontier across lines a prior filtered read consumed",
+      async () => {
+        // Regression for the drain-time suppression edge case Codex flagged: outputBytesRead is a
+        // shared cursor, so a filtered read that consumes a matched complete line (without ever
+        // showing it) advances the cursor past that line while leaving shownThroughOffset behind. A
+        // later unfiltered read with no new output must not let the frontier jump that gap -- else
+        // getSettledShownThroughOffset would report the filtered-out line as shown and the drain gate
+        // would supersede the only wake for output the agent never saw.
+        const result = await manager.spawn(
+          runtime,
+          testWorkspaceId,
+          "printf 'ERR boom\\nDONE\\n'; sleep 5",
+          { cwd: process.cwd(), displayName: "frontier-gap-filtered" }
+        );
+        expect(result.success).toBe(true);
+        if (!result.success) return;
 
-      // Filtered read consumes both complete lines (cursor advances to 14) but shows only "DONE".
-      const filtered = await manager.getOutput(result.processId, "DONE", false, 2);
-      expect(filtered.success).toBe(true);
-      if (filtered.success) {
-        expect(filtered.output).toContain("DONE");
-        expect(filtered.output).not.toContain("ERR boom");
-      }
-      let proc = await manager.getProcess(result.processId);
-      expect(proc?.outputBytesRead ?? 0).toBeGreaterThanOrEqual(14);
-      expect(proc?.shownThroughOffset ?? -1).toBe(0);
+        // Filtered read consumes both complete lines (cursor advances to 14) but shows only "DONE".
+        // The read returns as soon as "DONE" arrives. Its budget only has to outlast a slow spawn:
+        // 2 s was too short on a loaded CI runner, and the read came back empty.
+        const filtered = await manager.getOutput(result.processId, "DONE", false, 20);
+        expect(filtered.success).toBe(true);
+        if (filtered.success) {
+          expect(filtered.output).toContain("DONE");
+          expect(filtered.output).not.toContain("ERR boom");
+        }
+        let proc = await manager.getProcess(result.processId);
+        expect(proc?.outputBytesRead ?? 0).toBeGreaterThanOrEqual(14);
+        expect(proc?.shownThroughOffset ?? -1).toBe(0);
 
-      // Unfiltered read finds no new output; the contiguity guard must keep the frontier pinned.
-      const unfiltered = await manager.getOutput(result.processId, undefined, false, 1);
-      expect(unfiltered.success).toBe(true);
-      proc = await manager.getProcess(result.processId);
-      expect(proc?.shownThroughOffset ?? -1).toBe(0);
-      // The delivery gate therefore still treats the filtered-out ERR line as unshown.
-      expect(await manager.getSettledShownThroughOffset(result.processId)).toBe(0);
+        // Unfiltered read finds no new output; the contiguity guard must keep the frontier pinned.
+        const unfiltered = await manager.getOutput(result.processId, undefined, false, 1);
+        expect(unfiltered.success).toBe(true);
+        proc = await manager.getProcess(result.processId);
+        expect(proc?.shownThroughOffset ?? -1).toBe(0);
+        // The delivery gate therefore still treats the filtered-out ERR line as unshown.
+        expect(await manager.getSettledShownThroughOffset(result.processId)).toBe(0);
 
-      await manager.terminate(result.processId, { monitorDisposition: "discard" });
-    });
+        await manager.terminate(result.processId, { monitorDisposition: "discard" });
+      },
+      { timeout: 30_000 }
+    );
 
     it("strips ANSI before matching and emitting matched lines", async () => {
       const eventPromise = waitForMonitorMatch(manager);
