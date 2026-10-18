@@ -80,10 +80,25 @@ import {
   type ControllableAsyncIterable,
   type TestApiOverrides,
 } from "@/browser/testUtils";
+import * as RealToolCardsStore from "@/browser/features/Tools/Shared/toolCardsStore";
+import { restoreModulesAfterSuite } from "../../../tests/ui/moduleMocks";
 import {
   shouldNotifyOnResponseComplete,
   type ResponseCompleteEvent,
 } from "@/browser/utils/messages/responseCompletionMetadata";
+
+// Counts the store's tool-card requests (#6823) and records how many onChat calls preceded each.
+// The real request still runs, so every other test sees the real store.
+const realToolCardsStore = { ...RealToolCardsStore };
+const onChatCallsAtToolCardRequest: number[] = [];
+restoreModulesAfterSuite([["@/browser/features/Tools/Shared/toolCardsStore", realToolCardsStore]]);
+void mock.module("@/browser/features/Tools/Shared/toolCardsStore", () => ({
+  ...realToolCardsStore,
+  requestToolCards: () => {
+    onChatCallsAtToolCardRequest.push(mockOnChat.mock.calls.length);
+    realToolCardsStore.requestToolCards();
+  },
+}));
 
 interface LoadMoreResponse {
   messages: WorkspaceChatMessage[];
@@ -1660,6 +1675,28 @@ describe("WorkspaceStore", () => {
   });
 
   describe("active workspace subscriptions", () => {
+    // #6823: on desktop the lazy cards' chunk evaluated after the first rows committed, so tool
+    // rows showed header-only cards for 1-2 frames. Selection starts it before any chat event.
+    it.each([
+      ["desktop", true, [0]],
+      ["browser", false, []],
+    ] as const)("requests the tool cards on selection in %s mode", async (_mode, desktop, calls) => {
+      const workspaceId = `tool-cards-on-select-${String(desktop)}`;
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      await tick(0);
+      onChatCallsAtToolCardRequest.length = 0;
+      const api = global.window.api as { getIsRosetta?: () => Promise<boolean> };
+      if (desktop) api.getIsRosetta = () => Promise.resolve(false);
+      try {
+        store.setActiveWorkspaceId(workspaceId);
+        await tick(0);
+        // Desktop: one request, made before the onChat subscription started.
+        expect(onChatCallsAtToolCardRequest).toEqual([...calls]);
+        expect(mockOnChat).toHaveBeenCalled();
+      } finally {
+        delete api.getIsRosetta;
+      }
+    });
     it("does not start onChat until workspace becomes active", async () => {
       const workspaceId = "inactive-workspace";
       createAndAddWorkspace(store, workspaceId, {}, false);
