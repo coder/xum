@@ -161,6 +161,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "Set by a delegated task(kind: workspace, mode: new) in the same write that registers this target, and dropped once the creating handle's record persists. Binds the row to its handle and owner: the public create API cannot write it (#4983). interruptedAt is added by the startup resolver when the creator died before the record persisted.",
   }),
+  bornWithoutDelegation: z.literal(true).optional().meta({
+    description:
+      "Set by the public create and createScratch in the same write that registers a row without a delegatedCreation mark, and never added or cleared later. Only a mode new task creation writes a creating workspace-turn record, so a row with this stamp has no workspace turn (#5569). Rows from other paths, and older rows, lack it.",
+  }),
   agentMessageDispatchMode: AgentMessageDispatchModeSchema.optional().meta({
     description: AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
   }),

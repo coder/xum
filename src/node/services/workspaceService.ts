@@ -6528,7 +6528,8 @@ export class WorkspaceService
                   ownerWorkspaceId: delegatedCreation.ownerWorkspaceId,
                 },
               }
-            : {}),
+            : // #5569: born without delegation, so no workspace turn can ever target it.
+              { bornWithoutDelegation: true as const }),
         });
         config.projects.set(SCRATCH_PROJECT_CONFIG_KEY, scratchProject);
         return config;
@@ -7009,7 +7010,8 @@ export class WorkspaceService
                     ownerWorkspaceId: delegatedCreation.ownerWorkspaceId,
                   },
                 }
-              : {}),
+              : // #5569: the same birth fact as createScratch's stamp.
+                { bornWithoutDelegation: true as const }),
           });
           return config;
         });
