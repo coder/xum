@@ -504,6 +504,12 @@ describe("resolveWorkflowScript", () => {
       // A removed script stays removed: its copy does not bring it back.
       await fs.rm(path.join(skillDir, "workflow.js"));
       await expect(resolve("skill://greet/workflow.js")).rejects.toThrow(/ENOENT|no such file/i);
+      // An emptied script counts as removed too (review skips it), so its copy does not run.
+      await fs.writeFile(path.join(pluginDir, "workflows", "release.js"), "");
+      await expect(resolve("plugin://my-plugin/release.js")).rejects.toThrow(
+        "has not been reviewed on this install"
+      );
+      await fs.writeFile(path.join(pluginDir, "workflows", "release.js"), "const v = 'plugin-v2';");
       // A copy that no longer matches its record does not run, and neither does no copy at all.
       const copiesDir = path.join(tempDir.path, "plugin-approved-copies");
       const [copiesFile] = await fs.readdir(copiesDir);

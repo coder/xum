@@ -338,7 +338,9 @@ export async function consentedPluginWorkflowSource(
   input: { file: string; source: string }
 ): Promise<string | undefined> {
   if (isPluginWorkflowConsented(plugin.componentConsent, input)) return input.source;
-  if (plugin.approvedCopies === undefined) return undefined;
+  // Review and the sweep skip an empty script as absent (installService collectWorkflowScripts),
+  // so it gets no review row and loses its copy: it stays refused like a removed file.
+  if (plugin.approvedCopies === undefined || input.source.length === 0) return undefined;
   const copy = getOwn((await readApprovedCopies(plugin.approvedCopies)).workflows, input.file);
   if (copy === undefined || !isWorkflowCopyVerified(plugin.componentConsent, input.file, copy)) {
     return undefined;
