@@ -1,7 +1,7 @@
 import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { act, cleanup, render, waitFor } from "@testing-library/react";
+import { act, cleanup, render } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { installDom } from "../../../../tests/ui/dom";
 import { AuthTokenModal } from "./AuthTokenModal";
@@ -64,12 +64,36 @@ describe("AuthTokenModal token submission", () => {
       cleanups[1]([]);
       await Promise.resolve();
     });
-    await waitFor(() => expect(submitted).toEqual(["token-b"]));
+    // token-b also waits for token-a's cleanup, which is still running.
+    expect(submitted).toEqual([]);
     await act(async () => {
       cleanups[0]([]);
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
     expect(submitted).toEqual(["token-b"]);
+  });
+
+  test("a repeated token waits for the cleanup the first submit started (#6878)", async () => {
+    const cleanups = installControlledCaches();
+    const submitted: string[] = [];
+    const view = render(<AuthTokenModal isOpen onSubmit={(token) => submitted.push(token)} />);
+    const input = view.getByPlaceholderText("Enter auth token");
+    const user = userEvent.setup({ document: input.ownerDocument });
+
+    await user.type(input, "token-a{Enter}");
+    // The token is already stored, so this submit starts no cleanup of its own.
+    await user.type(input, "{Enter}");
+    expect(cleanups).toHaveLength(1);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(submitted).toEqual([]);
+
+    await act(async () => {
+      cleanups[0]([]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(submitted).toEqual(["token-a"]);
   });
 });
