@@ -166,8 +166,11 @@ import {
   resolveProjectAvatarColor,
 } from "@/browser/utils/ui/projectAvatarColors";
 
-/** Flat sidebar section heading ("Pinned", "Recent"), shown only above a non-empty section. */
-function FlatSectionLabel(props: { label: string; rowCount: number; isFirst: boolean }) {
+/**
+ * Flat sidebar section heading ("Pinned", "Recent"), shown only above a non-empty section. A
+ * label with rows above it gets more top spacing to separate it from them.
+ */
+function FlatSectionLabel(props: { label: string; rowCount: number; rowsAbove: number }) {
   if (props.rowCount === 0) {
     return null;
   }
@@ -175,7 +178,7 @@ function FlatSectionLabel(props: { label: string; rowCount: number; isFirst: boo
     <div
       className={cn(
         "font-monospace text-muted px-2 pb-1 text-[10.5px] tracking-[0.06em] uppercase",
-        props.isFirst ? "pt-2.5" : "pt-3.5"
+        props.rowsAbove === 0 ? "pt-2.5" : "pt-3.5"
       )}
     >
       {props.label}
@@ -2447,11 +2450,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           />
         );
       })}
-      {/* Drafts lead without a label; the first label shown gets the top spacing. */}
+      {/* Drafts lead the list without a section label of their own. */}
       <FlatSectionLabel
         label="Pinned"
         rowCount={visiblePinnedFlatWorkspaces.length}
-        isFirst={flatDrafts.length === 0}
+        rowsAbove={flatDrafts.length}
       />
       {renderCoalescedWorkspaceList(visiblePinnedFlatWorkspaces, flatRowsForDisplay, {
         tierKeyPrefix: "flat",
@@ -2462,7 +2465,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       <FlatSectionLabel
         label="Recent"
         rowCount={visibleUnpinnedFlatWorkspaces.length}
-        isFirst={flatDrafts.length === 0 && visiblePinnedFlatWorkspaces.length === 0}
+        rowsAbove={flatDrafts.length + visiblePinnedFlatWorkspaces.length}
       />
       {renderCoalescedWorkspaceList(visibleUnpinnedFlatWorkspaces, flatRowsForDisplay, {
         tierKeyPrefix: "flat",
