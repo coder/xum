@@ -1031,7 +1031,7 @@ describe("useAutoScroll", () => {
   });
 
   // #6773 hold while scrolled up. Rows are stacked in document order; the scrollport's top is 0.
-  function renderTranscript(heights: number[], scrollTop: number) {
+  function renderTranscript(heights: number[], scrollTop: number, dockTop = 400) {
     const { result } = renderHook(() => useAutoScroll());
     const element = document.createElement("div");
     const metrics = attachScrollMetrics(element, {
@@ -1044,8 +1044,10 @@ describe("useAutoScroll", () => {
       return { ...r, toJSON: () => r };
     };
     element.getBoundingClientRect = () => rectAt(0, 400);
-    const content = document.createElement("div");
-    element.append(content);
+    const [content, sentinel, dock] = [1, 2, 3].map(() => document.createElement("div"));
+    dock.getBoundingClientRect = () => rectAt(dockTop, 400 - dockTop);
+    element.append(content, sentinel, dock);
+    document.body.append(element); // the hold skips rows that are not connected
     const rows: HTMLElement[] = [];
     const mount = (index: number, height: number) => {
       const row = document.createElement("div");
@@ -1060,23 +1062,22 @@ describe("useAutoScroll", () => {
       heights.splice(index, 0, height);
       metrics.setScrollHeight(heights.reduce((sum, h) => sum + h, 0));
     };
-    const initial = heights.splice(0);
-    initial.forEach((height, index) => mount(index, height));
+    heights.splice(0).forEach((height, index) => mount(index, height));
     metrics.setScrollTop(scrollTop);
     act(() => {
       (result.current.contentRef as MutableRefObject<HTMLDivElement | null>).current = element;
+      (result.current.sentinelRef as MutableRefObject<HTMLDivElement | null>).current = sentinel;
       // Released (scrolled up): the observer effect re-runs with the ref attached.
       result.current.disableAutoScroll();
     });
-    return { metrics, rows, heights, mount };
+    return { metrics, rows, heights, mount, rectAt };
   }
 
   test("rows mounted above with the caller's anchor correction move nothing more", () => {
     // Load older / Show newer: ChatPane's layout effect restores its anchor row before the
     // ResizeObserver runs, so the held row is already back in place and the hold writes nothing.
     const { metrics, rows, mount } = renderTranscript([300, 300, 300, 300], 256);
-    const held = rows[1];
-    const heldTop = held.getBoundingClientRect().top;
+    const [held, heldTop] = [rows[1], rows[1].getBoundingClientRect().top];
     mount(0, 500);
     metrics.setScrollTop(256 + 500);
     act(() => triggerResizeObserver());
@@ -1084,12 +1085,26 @@ describe("useAutoScroll", () => {
     expect(held.getBoundingClientRect().top).toBe(heldTop);
   });
 
-  test("with no row starting in view, growth is left to native anchoring", () => {
-    // One tall row fills the view: there is no row to hold, so the hook writes nothing.
-    const { metrics, heights } = renderTranscript([300, 2000, 300], 400);
-    heights[1] += 397;
-    metrics.setScrollHeight(2997);
+  test("a row that starts under the composer dock is not held", () => {
+    // No row starts in the readable view: growth inside row 0 is left to native anchoring.
+    const { metrics, heights } = renderTranscript([600, 300, 300], 280, 300);
+    heights[0] += 100;
     act(() => triggerResizeObserver());
-    expect(metrics.scrollTop).toBe(400);
+    expect(metrics.scrollTop).toBe(280);
+  });
+
+  test("hiding the chat keeps the reading row for when it shows again", () => {
+    const { metrics, rows, heights, rectAt } = renderTranscript([300, 300, 300, 300], 256);
+    const layout = rows.map((row) => row.getBoundingClientRect);
+    // display: none (immersive review): no layout box, so every rect reads 0.
+    metrics.setClientHeight(0);
+    for (const row of rows) row.getBoundingClientRect = () => rectAt(0, 0);
+    act(() => triggerResizeObserver());
+    expect(metrics.scrollTop).toBe(256);
+    metrics.setClientHeight(400);
+    rows.forEach((row, index) => (row.getBoundingClientRect = layout[index]));
+    heights[0] += 100;
+    act(() => triggerResizeObserver());
+    expect(metrics.scrollTop).toBe(356);
   });
 });

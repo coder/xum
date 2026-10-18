@@ -1,11 +1,4 @@
-import type {
-  KeyboardEvent,
-  MouseEvent,
-  MutableRefObject,
-  RefObject,
-  UIEvent,
-  WheelEvent,
-} from "react";
+import type { KeyboardEvent, MouseEvent, UIEvent, WheelEvent } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 const BOTTOM_LOCK_EPSILON_PX = 1;
@@ -43,8 +36,15 @@ export const TRANSCRIPT_ROW_SELECTOR = "[data-message-id]";
  * which is also top order, so a binary search reads O(log n) rects. Null when no row starts in
  * view (one tall row fills it): native anchoring then keeps the position, as before #6773.
  */
-function findReadingRow(scrollport: HTMLElement): { element: HTMLElement; top: number } | null {
+function findReadingRow(
+  scrollport: HTMLElement,
+  sentinel: HTMLElement | null
+): { element: HTMLElement; top: number } | null {
   const view = scrollport.getBoundingClientRect();
+  // A row that starts under the sticky composer dock (the sentinel's next sibling, see ChatPane)
+  // is not readable.
+  const dockTop = sentinel?.nextElementSibling?.getBoundingClientRect().top ?? view.bottom;
+  const viewBottom = Math.min(view.bottom, dockTop);
   const rows = scrollport.querySelectorAll<HTMLElement>(TRANSCRIPT_ROW_SELECTOR);
   let low = 0;
   let high = rows.length;
@@ -56,7 +56,15 @@ function findReadingRow(scrollport: HTMLElement): { element: HTMLElement; top: n
   const element = rows[low] as HTMLElement | undefined;
   if (!element) return null;
   const top = element.getBoundingClientRect().top;
-  return top < view.bottom ? { element, top } : null;
+  return top < viewBottom ? { element, top } : null;
+}
+
+/**
+ * A hidden chat (display: none, e.g. immersive review) has no layout box and reads every rect as
+ * 0, so the hold keeps its snapshot unchanged until the chat shows again.
+ */
+function isLaidOut(scrollport: HTMLElement | null): scrollport is HTMLElement {
+  return scrollport !== null && scrollport.clientHeight > 0;
 }
 
 /**
@@ -65,17 +73,21 @@ function findReadingRow(scrollport: HTMLElement): { element: HTMLElement; top: n
  * that row moved since, then records again.
  */
 function useReadingRowHold(
-  contentRef: RefObject<HTMLDivElement | null>,
-  lastScrollTopRef: MutableRefObject<number>
+  contentRef: { readonly current: HTMLDivElement | null },
+  sentinelRef: { readonly current: HTMLDivElement | null },
+  lastScrollTopRef: { current: number }
 ) {
   const readingRowRef = useRef<{ element: HTMLElement; top: number } | null>(null);
   const snapshotReadingRow = useCallback(() => {
-    readingRowRef.current = contentRef.current ? findReadingRow(contentRef.current) : null;
-  }, [contentRef]);
+    const scrollContainer = contentRef.current;
+    if (!isLaidOut(scrollContainer)) return;
+    readingRowRef.current = findReadingRow(scrollContainer, sentinelRef.current);
+  }, [contentRef, sentinelRef]);
   const holdReadingRow = useCallback(() => {
     const scrollContainer = contentRef.current;
     const reading = readingRowRef.current;
-    if (scrollContainer && reading?.element.isConnected) {
+    if (!isLaidOut(scrollContainer)) return;
+    if (reading?.element.isConnected) {
       const delta = reading.element.getBoundingClientRect().top - reading.top;
       if (delta !== 0) {
         scrollContainer.scrollTop += delta;
@@ -194,7 +206,11 @@ export function useAutoScroll() {
   // what lets a slow wheel-up gesture release the lock on the first tick
   // without the relock heuristic snapping it back to the bottom mid-gesture.
   const lastScrollTopRef = useRef(0);
-  const { snapshotReadingRow, holdReadingRow } = useReadingRowHold(contentRef, lastScrollTopRef);
+  const { snapshotReadingRow, holdReadingRow } = useReadingRowHold(
+    contentRef,
+    sentinelRef,
+    lastScrollTopRef
+  );
 
   const setAutoScrollEnabled = useCallback((enabled: boolean) => {
     autoScrollRef.current = enabled;

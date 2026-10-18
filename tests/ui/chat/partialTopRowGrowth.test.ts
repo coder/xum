@@ -2,27 +2,19 @@ import "../dom";
 
 import { act, fireEvent, waitFor } from "@testing-library/react";
 
-// App-level UI tests render the loader shell first, so stub Lottie before importing the
-// harness to keep happy-dom from tripping over lottie-web's canvas bootstrap.
-jest.mock("lottie-react", () => ({
-  __esModule: true,
-  default: () => null,
-}));
+// App-level UI tests render the loader shell first: stub Lottie before importing the harness.
+jest.mock("lottie-react", () => ({ __esModule: true, default: () => null }));
 
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness } from "../harness";
 import { mockScrollMetrics } from "../scrollMetrics";
 
-// #6773: while the reader is scrolled up, a row whose top is above the view grows (KaTeX, a
-// Mermaid diagram or an image arriving late). Chrome anchors to the row's visible part, so growth
-// below that anchor pushed every row below it down by the growth. happy-dom has no layout and no
-// native anchoring: a small layout model stands in for both, and the test delivers the
-// ResizeObserver signal that the growth produces in a browser. The pixel proof is in the PR.
-
-const PAD_TOP = 15;
-const VIEW_HEIGHT = 400;
-const ROW_HEIGHT = 300;
-const GROWTH = 397;
+// #6773: while the reader is scrolled up, a row whose top is above the view grows (late KaTeX,
+// Mermaid or an image). Chrome anchors to the row's visible part, so growth below that anchor
+// pushed every row below it down. happy-dom has no layout and no native anchoring: a layout model
+// stands in for both, and the test delivers the ResizeObserver signal the growth produces in a
+// browser. The pixel proof is in the PR.
+const [PAD_TOP, VIEW_HEIGHT, ROW_HEIGHT, GROWTH] = [15, 400, 300, 397];
 
 const observers = new Set<{ callback: ResizeObserverCallback; targets: Element[] }>();
 class CapturingResizeObserver {
@@ -31,13 +23,9 @@ class CapturingResizeObserver {
     this.entry = { callback, targets: [] };
     observers.add(this.entry);
   }
-  observe(target: Element): void {
-    this.entry.targets.push(target);
-  }
-  unobserve(): void {}
-  disconnect(): void {
-    observers.delete(this.entry);
-  }
+  observe = (target: Element) => void this.entry.targets.push(target);
+  unobserve = () => undefined;
+  disconnect = () => void observers.delete(this.entry);
 }
 
 function rect(top: number, height: number): DOMRect {
@@ -59,20 +47,22 @@ describe("Growth inside a partly visible top row while scrolled up (#6773)", () 
       const originalResizeObserver = window.ResizeObserver;
       const app = await createAppHarness({ branchPrefix: "partial-top-row-growth" });
       try {
-        await app.chat.send("First message for the top-row growth test");
-        await app.chat.expectStreamComplete();
-        await app.chat.send("Second message for the top-row growth test");
-        await app.chat.expectStreamComplete();
-
-        const messageWindow = app.view.container.querySelector<HTMLDivElement>(
+        for (const text of ["First message", "Second message"]) {
+          await app.chat.send(`${text} for the top-row growth test`);
+          await app.chat.expectStreamComplete();
+        }
+        const container = app.view.container;
+        const messageWindow = container.querySelector<HTMLDivElement>(
           '[data-testid="message-window"]'
         );
-        if (!messageWindow) throw new Error("Message window not found");
+        const dock = container.querySelector<HTMLElement>('[data-testid="chat-composer-dock"]');
+        if (!messageWindow || !dock) throw new Error("Message window or composer dock not found");
         const content = messageWindow.firstElementChild as HTMLElement;
         const rows = Array.from(messageWindow.querySelectorAll<HTMLElement>("[data-message-id]"));
         expect(rows.length).toBeGreaterThanOrEqual(3);
 
-        // Layout model: rows stacked in document order under the scrollport's top padding.
+        // Layout model: rows stacked in document order under the scrollport's top padding; the
+        // composer dock sits below the view.
         const heights = rows.map(() => ROW_HEIGHT);
         const totalHeight = () => PAD_TOP + heights.reduce((sum, h) => sum + h, 0);
         const port = mockScrollMetrics(messageWindow, {
@@ -80,13 +70,13 @@ describe("Growth inside a partly visible top row while scrolled up (#6773)", () 
           clientHeight: VIEW_HEIGHT,
         });
         messageWindow.getBoundingClientRect = () => rect(0, VIEW_HEIGHT);
+        dock.getBoundingClientRect = () => rect(VIEW_HEIGHT, 0);
         rows.forEach((row, index) => {
           row.getBoundingClientRect = () => {
             const above = heights.slice(0, index).reduce((sum, h) => sum + h, 0);
             return rect(PAD_TOP + above - port.getScrollTop(), heights[index]);
           };
         });
-
         window.ResizeObserver = CapturingResizeObserver as unknown as typeof ResizeObserver;
         globalThis.ResizeObserver = window.ResizeObserver;
 
