@@ -11562,6 +11562,10 @@ export class TaskService implements AgentTaskIntegration {
           { allowMissing: true }
         );
         this.markWorkspaceStopPersisted(id);
+        // A deferred child stream end cancels on this notification (its epoch moved), so its
+        // pending decision cannot hold the latch when the removal below keeps the workspace
+        // (#6920). The Stop and terminate-all paths notify through recordTaskInterrupted.
+        this.notifyAttemptSettlementListeners(id);
       }
     } finally {
       // Phase B: every stop at once, bounded per child and in aggregate; a timed-out stop keeps
