@@ -176,7 +176,12 @@ describe("WorkspaceService remove rolls child report dirs into the parent", () =
         path.join(childDir, `${kind}.json`),
         JSON.stringify({
           version: 1,
-          artifactsByChildTaskId: { "task-null": null, "task-ok": valid("task-ok") },
+          artifactsByChildTaskId: {
+            "task-null": null,
+            // The report merge reads ancestorWorkspaceIds, so an entry without it is malformed.
+            ...(kind === "subagent-reports" ? { "task-empty": {} } : {}),
+            "task-ok": valid("task-ok"),
+          },
         })
       );
     }
