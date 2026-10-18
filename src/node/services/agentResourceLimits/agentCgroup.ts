@@ -108,8 +108,13 @@ export const linuxAgentCgroupHost: AgentCgroupHost = {
       ],
       { signal: timeout }
     );
+    // The result settles only once sudo's pipes close, and a root descendant that outlives the
+    // SIGTERM can hold them open, so the timeout also settles the call on its own.
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      timeout.addEventListener("abort", () => reject(new Error("sudo timed out")), { once: true });
+    });
     try {
-      await sudo.result;
+      await Promise.race([sudo.result, timedOut]);
     } catch (error) {
       if (timeout.aborted) {
         log.debug("sudo was stopped after its timeout", { error: getErrorMessage(error) });

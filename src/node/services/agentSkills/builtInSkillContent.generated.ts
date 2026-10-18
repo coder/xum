@@ -4335,7 +4335,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "All Xum servers that one user starts this way on a host share `/xum-<uid>/xum-agents`. The limits that a server applied last bind the agent commands of all of them, while the other servers still show their own limits.",
       "",
-      "Xum does this only when the switch is on and a limit is set. It runs sudo at startup, when you turn the switch on, when you save a limit, and when you click **Try again**. Other config changes do not run sudo; the status keeps the last sudo error. If sudo fails, the status adds the sudo error to the message. Xum stops sudo after 10 seconds, and the status then says `sudo did not finish within 10 seconds.`",
+      "Xum does this only when the switch is on and a limit is set. It runs sudo only when it applies the limits at startup or for your action in Settings: the switch, a saved limit, or **Try again**. Other config changes do not run sudo; the status keeps the last sudo error. If sudo fails, the status adds the sudo error to the message. Xum stops sudo after 10 seconds, and the status then says `sudo did not finish within 10 seconds.`",
       "",
       "Xum does not use sudo on a host with systemd, or when its cgroup is not a top-level cgroup, for example in a container whose cgroup is `/docker/<id>`. In those cases, use the steps below. If sudo asks for a password, the [sudo steps](#with-sudo-containers-and-coder-workspaces) work only from a shell where you can type that password before you start Xum. If you cannot, ask an admin to put them in the workspace's startup script.",
       "",
