@@ -28,9 +28,9 @@ export class AgentResourceLimitsService {
 
   async start(): Promise<void> {
     this.unsubscribe ??= this.config.onConfigChanged(() => {
-      void this.apply();
+      void this.apply({ trySudo: false });
     });
-    await this.apply();
+    await this.apply({ trySudo: true });
   }
 
   dispose(): void {
@@ -49,14 +49,14 @@ export class AgentResourceLimitsService {
     // The save notifies the config listener, whose apply then runs even for unchanged limits.
     this.appliedLimits = undefined;
     await this.config.updateAgentResourceLimits(limits);
-    await this.apply();
+    await this.apply({ trySudo: true });
     return this.get();
   }
 
   /** Turns the saved limits on or off, without changing them. */
   async setEnabled(enabled: boolean): Promise<AgentResourceLimitsState> {
     await this.config.updateAgentResourceLimitsEnabled(enabled);
-    await this.apply();
+    await this.apply({ trySudo: true });
     return this.get();
   }
 
@@ -68,7 +68,8 @@ export class AgentResourceLimitsService {
     };
   }
 
-  private apply(): Promise<void> {
+  /** `trySudo`: see applyAgentCgroupLimits; config-change applies never run sudo. */
+  private apply(options: { trySudo: boolean }): Promise<void> {
     this.applying = this.applying.then(async () => {
       const previous = this.status;
       try {
@@ -82,7 +83,7 @@ export class AgentResourceLimitsService {
           return;
         }
         this.appliedLimits = key;
-        const result = await applyAgentCgroupLimits(applied, this.host);
+        const result = await applyAgentCgroupLimits(applied, this.host, options);
         this.status = result.status;
         setAgentCgroupEnrollmentTarget(result.enrollmentTarget);
       } catch (error) {

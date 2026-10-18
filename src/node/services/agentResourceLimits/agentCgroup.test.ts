@@ -188,7 +188,9 @@ describe("applyAgentCgroupLimits", () => {
         sudoWorks: true,
       });
 
-      const result = await applyAgentCgroupLimits({ cpuCores: 1, memoryGiB: 1.1 }, tree.host);
+      const result = await applyAgentCgroupLimits({ cpuCores: 1, memoryGiB: 1.1 }, tree.host, {
+        trySudo: true,
+      });
 
       expect(result).toEqual({
         status: { state: "active", cgroup: "/xum-1000/xum-agents" },
@@ -213,7 +215,7 @@ describe("applyAgentCgroupLimits", () => {
       if (isRoot) return;
       tree = await createUnmanageableTree({ sudoWorks: true, ...options });
 
-      const result = await applyAgentCgroupLimits({ cpuCores: 1 }, tree.host);
+      const result = await applyAgentCgroupLimits({ cpuCores: 1 }, tree.host, { trySudo: true });
 
       expect(result.status.state).toBe("unavailable");
       expect(result.status).toHaveProperty(
@@ -283,14 +285,23 @@ describe("applyAgentCgroupLimits", () => {
       if (process.getuid?.() === 0) return;
       tree = await createFakeCgroupTree({ own: "/xum", cgroups: { xum: { controllers: "cpu" } } });
       await fs.chmod(path.join(tree.root, "xum", "cgroup.subtree_control"), 0o444);
-      const result = await applyAgentCgroupLimits({ cpuCores: 2 }, tree.host);
-      expect(result.status.state).toBe("unavailable");
-      expect(result.status).toHaveProperty(
-        "reason",
-        expect.stringMatching(
-          /^xum runs in cgroup \/xum, which the user running xum cannot manage .*\. Start xum in a cgroup delegated to that user\. Delegating \/xum-1000 with sudo failed: sudo: a password is required$/
-        )
-      );
+      const cannotManage =
+        /^xum runs in cgroup \/xum, which the user running xum cannot manage .*\. Start xum in a cgroup delegated to that user\.$/;
+      const sudoFailed =
+        /^xum runs in cgroup \/xum, which the user running xum cannot manage .*\. Start xum in a cgroup delegated to that user\. Delegating \/xum-1000 with sudo failed: sudo: a password is required$/;
+
+      // An apply that may not run sudo, such as one after an unrelated config write.
+      const before = await applyAgentCgroupLimits({ cpuCores: 2 }, tree.host);
+      expect(before.status).toHaveProperty("reason", expect.stringMatching(cannotManage));
+      expect(tree.sudoCalls).toEqual([]);
+
+      const tried = await applyAgentCgroupLimits({ cpuCores: 2 }, tree.host, { trySudo: true });
+      expect(tried.status).toHaveProperty("reason", expect.stringMatching(sudoFailed));
+      expect(tree.sudoCalls).toEqual(["xum-1000"]);
+
+      // Later applies that may not run sudo keep reporting its error.
+      const after = await applyAgentCgroupLimits({ cpuCores: 3 }, tree.host);
+      expect(after.status).toHaveProperty("reason", expect.stringMatching(sudoFailed));
       expect(tree.sudoCalls).toEqual(["xum-1000"]);
       expect(tree.writes).toEqual([]);
       await expect(fs.access(path.join(tree.root, "xum-1000"))).rejects.toThrow("ENOENT");
