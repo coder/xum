@@ -1891,19 +1891,26 @@ export class AgentPluginInstallService {
     // In-process queue first (cheap), then the cross-process lock: a second
     // process sharing rootDir must not interleave its read-modify-write of
     // plugins.json (or its directory moves) with ours.
-    const locked = async (): Promise<T> => {
-      const release = await acquirePluginMutationLock(this.config.rootDir, {
-        timeoutMs: MUTATION_LOCK_ACQUIRE_TIMEOUT_MS,
-      });
-      try {
-        return await fn();
-      } finally {
-        await release();
-      }
-    };
-    const run = this.mutationQueue.then(locked, locked);
+    return this.runQueued(() => this.withMutationLock(fn));
+  }
+
+  /** This process's mutation queue only: `fn` takes the cross-process lock itself if it must. */
+  private runQueued<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.mutationQueue.then(fn, fn);
+    // The caller gets a rejection through `run`; the queue only orders the next mutation.
     this.mutationQueue = run.catch(() => undefined);
     return run;
+  }
+
+  private async withMutationLock<T>(fn: () => Promise<T>): Promise<T> {
+    const release = await acquirePluginMutationLock(this.config.rootDir, {
+      timeoutMs: MUTATION_LOCK_ACQUIRE_TIMEOUT_MS,
+    });
+    try {
+      return await fn();
+    } finally {
+      await release();
+    }
   }
 
   /**
@@ -6050,19 +6057,23 @@ export class AgentPluginInstallService {
    */
   private async sweepApprovedCopiesAtStartup(): Promise<void> {
     try {
-      // Most starts have nothing to save: the mutation lock is taken only when a sweep would
-      // write, and the sweep then runs again under it.
-      const outdated = new Set<string>();
-      for (const entry of await this.readRegistry("lenient")) {
-        if (await approvedCopiesOutdated(await this.approvedCopiesSweep(entry))) {
-          outdated.add(entry.name);
-        }
-      }
-      if (outdated.size === 0) return;
-      await this.runExclusive(async () => {
+      // In this process's mutation queue, so the check never reads a tree in the middle of one of
+      // its mutations (which would look outdated and take the lock after it). Most starts have
+      // nothing to save: the cross-process lock is taken only when a sweep would write, and the
+      // sweep then runs again under it (another process may have changed the trees meanwhile).
+      await this.runQueued(async () => {
+        const outdated = new Set<string>();
         for (const entry of await this.readRegistry("lenient")) {
-          if (outdated.has(entry.name)) await this.sweepApprovedCopies(entry);
+          if (await approvedCopiesOutdated(await this.approvedCopiesSweep(entry))) {
+            outdated.add(entry.name);
+          }
         }
+        if (outdated.size === 0) return;
+        await this.withMutationLock(async () => {
+          for (const entry of await this.readRegistry("lenient")) {
+            if (outdated.has(entry.name)) await this.sweepApprovedCopies(entry);
+          }
+        });
       });
     } catch (error) {
       log.warn("Failed to save the approved copies of installed plugins at startup", {
