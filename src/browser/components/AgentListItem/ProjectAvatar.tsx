@@ -1,7 +1,7 @@
 import React from "react";
 
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
-import { useOptionalThemeMode } from "@/browser/contexts/ThemeContext";
+import { useTheme } from "@/browser/contexts/ThemeContext";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { getProjectAvatarColors, getProjectMonogram } from "@/browser/utils/ui/projectAvatarColors";
 import { DEFAULT_SECTION_COLOR } from "@/common/constants/ui";
@@ -19,10 +19,10 @@ export function ProjectAvatar(props: {
   /** Status dot or icon pinned to the bottom-right corner. */
   corner?: React.ReactNode;
 }) {
-  const theme = useOptionalThemeMode();
+  const { theme } = useTheme();
   const colors = getProjectAvatarColors(
     props.color ?? DEFAULT_SECTION_COLOR,
-    theme != null && isLightThemeMode(theme) ? "light" : "dark"
+    isLightThemeMode(theme) ? "light" : "dark"
   );
   return (
     <div className="relative mt-0.5 h-[22px] w-[22px] shrink-0">

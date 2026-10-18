@@ -5,6 +5,7 @@ import { cleanup, render, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import { APIContext } from "@/browser/contexts/API";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import * as RealProjectContextModule from "@/browser/contexts/ProjectContext";
 import type * as ReactDndModuleType from "react-dnd";
 import type * as ReactDndHtml5BackendModuleType from "react-dnd-html5-backend";
@@ -287,19 +288,22 @@ function installAgentListItemTestDoubles() {
 
 // Rows render without a backend: inject an unavailable API through the real context
 // instead of mocking the API module (process-wide module mocks leak into later suites).
-function UnavailableAPIWrapper(props: { children: ReactNode }) {
+// Rows always render under the app's ThemeProvider, so the tests provide one too.
+function RowProvidersWrapper(props: { children: ReactNode }) {
   return (
-    <APIContext.Provider
-      value={{
-        api: null,
-        status: "error",
-        error: "API unavailable",
-        authenticate: () => undefined,
-        retry: () => undefined,
-      }}
-    >
-      {props.children}
-    </APIContext.Provider>
+    <ThemeProvider forcedTheme="dark">
+      <APIContext.Provider
+        value={{
+          api: null,
+          status: "error",
+          error: "API unavailable",
+          authenticate: () => undefined,
+          retry: () => undefined,
+        }}
+      >
+        {props.children}
+      </APIContext.Provider>
+    </ThemeProvider>
   );
 }
 
@@ -346,7 +350,7 @@ function renderWorkspaceItem(
       onArchiveWorkspace={() => Promise.resolve()}
       onCancelCreation={() => Promise.resolve()}
     />,
-    { wrapper: UnavailableAPIWrapper }
+    { wrapper: RowProvidersWrapper }
   );
 
   return {
@@ -1137,7 +1141,7 @@ describe("AgentListItem", () => {
         onCancelCreation={() => Promise.resolve()}
       />
     );
-    const view = render(renderItem(), { wrapper: UnavailableAPIWrapper });
+    const view = render(renderItem(), { wrapper: RowProvidersWrapper });
     const getRow = () =>
       view.container.querySelector<HTMLElement>(
         `[data-workspace-id="${metadata.id}"][role="button"]`

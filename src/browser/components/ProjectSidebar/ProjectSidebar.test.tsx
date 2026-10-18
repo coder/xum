@@ -11,7 +11,11 @@ import { EXPANDED_PROJECTS_KEY } from "@/common/constants/storage";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
-import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
+import {
+  SCRATCH_PROJECT_CONFIG_KEY,
+  SCRATCH_PROJECT_NAME,
+  SCRATCH_SIDEBAR_SECTION_ID,
+} from "@/common/constants/scratch";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type {
@@ -161,6 +165,7 @@ interface MockAgentListItemProps {
   depth?: number;
   rowRenderMeta?: AgentRowRenderMeta;
   projectBadgeName?: string;
+  projectBadgeColor?: string;
   delegatedActivity?: { activeCount: number; queuedCount: number };
   hiddenSubAgentsSummary?: WorkspaceSubAgentsSummary;
   getWorkflowRunName?: (runId: string) => string | undefined;
@@ -381,6 +386,7 @@ function installProjectSidebarTestDoubles() {
           data-shared-below={String(props.rowRenderMeta?.sharedTrunkActiveBelowRow ?? false)}
           data-row-kind={props.rowRenderMeta?.rowKind ?? "unknown"}
           data-connector-layout={props.subAgentConnectorLayout ?? "default"}
+          data-project-badge-color={props.projectBadgeColor}
           data-completed-expanded={String(props.completedChildrenExpanded ?? false)}
           data-delegated-active={String(props.delegatedActivity?.activeCount ?? 0)}
           data-delegated-queued={String(props.delegatedActivity?.queuedCount ?? 0)}
@@ -1466,6 +1472,78 @@ describe("ProjectSidebar flat chat list", () => {
     ).toBeTruthy();
     expect(
       within(view.getByTestId(agentItemTestId("stale-section"))).getByText("Demo")
+    ).toBeTruthy();
+  });
+
+  test("tells uncolored projects apart by avatar color, and gives scratch chats an avatar identity", () => {
+    const parentChat = { ...createWorkspace("parent-chat"), projects: singleProjectRefs };
+    const subChat = {
+      ...createWorkspace("sub-chat", { subProjectPath: "/projects/demo-project/features" }),
+      projects: singleProjectRefs,
+    };
+    const otherChat = {
+      ...createWorkspace("other-chat"),
+      projects: undefined,
+      projectPath: "/projects/other",
+      projectName: "other",
+    };
+    const scratchPath = "/home/user/.xum/scratch/scratch-chat";
+    const scratchChat: FrontendWorkspaceMetadata = {
+      kind: "scratch",
+      id: "scratch-chat",
+      name: "scratch-scratch-chat",
+      title: "Explore an idea",
+      projectName: "Scratch",
+      projectPath: scratchPath,
+      namedWorkspacePath: scratchPath,
+      runtimeConfig: { type: "local" },
+    };
+    // No project has a configured color.
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { displayName: "Demo", workspaces: [] }],
+        [
+          "/projects/demo-project/features",
+          {
+            displayName: "Features",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+        ["/projects/other", { displayName: "Other", workspaces: [] }],
+      ]),
+    });
+
+    const now = Date.now();
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([
+            ["/projects/demo-project", [parentChat, subChat]],
+            ["/projects/other", [otherChat]],
+            [SCRATCH_PROJECT_CONFIG_KEY, [scratchChat]],
+          ])
+        }
+        workspaceRecency={{
+          "parent-chat": now,
+          "sub-chat": now,
+          "other-chat": now,
+          "scratch-chat": now,
+        }}
+      />
+    );
+
+    const avatarColor = (workspaceId: string) =>
+      view.getByTestId(agentItemTestId(workspaceId)).dataset.projectBadgeColor;
+    // Different projects get different colors without the user picking any.
+    expect(avatarColor("other-chat")).not.toBe(avatarColor("parent-chat"));
+    // The sub-project avatar shows the parent's letter, so it keeps the parent's color too.
+    expect(avatarColor("sub-chat")).toBe(avatarColor("parent-chat"));
+    // Scratch chats have no project but still get an avatar identity.
+    expect(
+      within(view.getByTestId(agentItemTestId("scratch-chat"))).getByText(SCRATCH_PROJECT_NAME)
     ).toBeTruthy();
   });
 

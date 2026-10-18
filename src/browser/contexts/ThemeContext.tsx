@@ -231,8 +231,3 @@ export function useTheme(): ThemeContextValue {
   }
   return context;
 }
-
-/** The resolved theme, or null outside a ThemeProvider (rows rendered on their own in tests). */
-export function useOptionalThemeMode(): ThemeMode | null {
-  return useContext(ThemeContext)?.theme ?? null;
-}

@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { DEFAULT_SECTION_COLOR, SECTION_COLOR_PALETTE } from "@/common/constants/ui";
 import {
-  PROJECT_AVATAR_MIN_CONTRAST,
   getContrastRatio,
   getHashedProjectColor,
   getProjectAvatarColors,
@@ -9,6 +8,9 @@ import {
 } from "./projectAvatarColors";
 
 const HEX = /^#[0-9a-f]{6}$/;
+
+// WCAG 2.x AA for normal text, written out so the bar does not move with the module's constant.
+const WCAG_AA_NORMAL_TEXT = 4.5;
 
 // Palette colors, the custom extremes a user can type, and a sweep of hues and lightnesses so
 // no mid-tone corner of the color picker escapes the guarantee.
@@ -21,6 +23,19 @@ const sweep = Array.from({ length: 24 }, (_, hue) =>
 ).flat();
 const INPUTS = [...SECTION_COLOR_PALETTE.map(([, hex]) => hex), "#000000", "#ffffff", ...sweep];
 
+// The sweep below measures with getContrastRatio, so pin it to published WCAG values first.
+describe("getContrastRatio", () => {
+  test.each([
+    { foreground: "#000000", background: "#ffffff", ratio: 21 },
+    { foreground: "#ffffff", background: "#000000", ratio: 21 },
+    { foreground: "#767676", background: "#ffffff", ratio: 4.54 },
+    { foreground: "#777777", background: "#ffffff", ratio: 4.48 },
+    { foreground: "#ff0000", background: "#ffffff", ratio: 4 },
+  ])("$foreground on $background is $ratio:1", ({ foreground, background, ratio }) => {
+    expect(getContrastRatio(foreground, background)).toBeCloseTo(ratio, 2);
+  });
+});
+
 describe("getProjectAvatarColors", () => {
   test.each(["dark", "light"] as const)(
     "every input gets an opaque pair at WCAG AA in %s mode",
@@ -29,7 +44,7 @@ describe("getProjectAvatarColors", () => {
         const colors = getProjectAvatarColors(input, mode);
         const ratio = getContrastRatio(colors.foreground, colors.background);
         const opaque = HEX.test(colors.background) && HEX.test(colors.foreground);
-        return opaque && ratio >= PROJECT_AVATAR_MIN_CONTRAST
+        return opaque && ratio >= WCAG_AA_NORMAL_TEXT
           ? []
           : [`${input}: ${colors.foreground} on ${colors.background} = ${ratio.toFixed(2)}`];
       });

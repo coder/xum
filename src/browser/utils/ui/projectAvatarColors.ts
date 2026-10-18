@@ -15,7 +15,7 @@ export interface ProjectAvatarColors {
 }
 
 /** WCAG AA for normal text; the 11px letter is not "large text". */
-export const PROJECT_AVATAR_MIN_CONTRAST = 4.5;
+const PROJECT_AVATAR_MIN_CONTRAST = 4.5;
 
 interface Oklch {
   l: number;
