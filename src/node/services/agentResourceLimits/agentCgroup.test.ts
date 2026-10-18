@@ -218,7 +218,9 @@ describe("applyAgentCgroupLimits", () => {
       expect(result.status.state).toBe("unavailable");
       expect(result.status).toHaveProperty(
         "reason",
-        expect.stringMatching(/cannot manage \(.*\)\. Start xum in a cgroup delegated to that user\.$/)
+        expect.stringMatching(
+          /cannot manage \(.*\)\. Start xum in a cgroup delegated to that user\.$/
+        )
       );
       expect(tree.sudoCalls).toEqual([]);
     });
