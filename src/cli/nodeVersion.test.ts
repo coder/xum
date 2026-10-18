@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import * as fs from "fs";
+import * as fs from "fs/promises";
 import * as path from "path";
 import { MIN_NODE_MAJOR, nodeVersionWarning, warnIfUnsupportedNode } from "./nodeVersion";
 
@@ -40,9 +40,9 @@ test("warnIfUnsupportedNode writes only to stderr, so stdout output such as xum 
   }
 });
 
-test("package.json engines.node matches MIN_NODE_MAJOR", () => {
+test("package.json engines.node matches MIN_NODE_MAJOR", async () => {
   const pkg = JSON.parse(
-    fs.readFileSync(path.join(import.meta.dir, "..", "..", "package.json"), "utf-8")
+    await fs.readFile(path.join(import.meta.dir, "..", "..", "package.json"), "utf-8")
   ) as { engines?: { node?: string } };
   expect(pkg.engines?.node).toBe(`>=${MIN_NODE_MAJOR}`);
 });

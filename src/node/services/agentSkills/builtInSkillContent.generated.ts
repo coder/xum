@@ -8344,6 +8344,8 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "npm install -g @coder/xum",
       "```",
       "",
+      "The CLI and `xum server` need Node 22 or newer. On an older Node, the CLI prints a warning at startup.",
+      "",
       "The legacy `mux` package and command forward to the matching Xum release during the transition. See [Mux compatibility](/reference/mux-compatibility) for storage, environment-variable, and downgrade details.",
       "",
       "This is ideal for CI/CD pipelines and scripted automation. See the [CLI documentation](/reference/cli) for all available commands and options.",
