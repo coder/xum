@@ -83,6 +83,8 @@ describe("getProjectMonogram", () => {
     // A decomposed accent stays on its letter, with or without a precomposed form.
     { name: "e\u0301clair", monogram: "\u00c9" },
     { name: "q\u0303uiz", monogram: "Q\u0303" },
+    // Marks past the second would stack outside the avatar.
+    { name: "q\u0303\u0304\u0305\u0306uiz", monogram: "Q\u0303\u0304" },
     // The avatar fits one character, even when uppercasing expands the letter.
     { name: "ßeta", monogram: "S" },
     { name: "\u01f0ava", monogram: "J\u030c" },

@@ -198,12 +198,13 @@ export function getHashedProjectColor(name: string): string {
 }
 
 /**
- * The avatar letter: the name's first Unicode letter or digit, uppercased, with its accents. NFC
- * keeps a decomposed accent on its letter. An uppercase that expands ("ß" -> "SS", "ŉ" -> "ʼN")
- * keeps only its first capital, since the avatar fits one character.
+ * The avatar letter: the name's first Unicode letter or digit, uppercased, with up to two of its
+ * accents. NFC keeps a decomposed accent on its letter; more marks ("zalgo" text) would stack
+ * outside the avatar. An uppercase that expands ("ß" -> "SS", "ŉ" -> "ʼN") keeps only its first
+ * capital, since the avatar fits one character.
  */
 export function getProjectMonogram(name: string): string {
-  const match = /([\p{L}\p{N}])(\p{M}*)/u.exec(name.normalize("NFC"));
+  const match = /([\p{L}\p{N}])(\p{M}{0,2})/u.exec(name.normalize("NFC"));
   if (match == null) {
     return "#";
   }
