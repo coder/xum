@@ -64,7 +64,7 @@ test("only the workspace page imports the Markdown stack statically", async () =
 });
 
 // T3 (#5971): the tool cards (and motion/framer-motion and markdown-it with them) are a lazy chunk that
-// the workspace page loads only for chats with tool calls (see toolCardsStore).
+// the workspace page loads only for chats with tool calls, and on desktop at selection (see toolCardsStore).
 test("the workspace page loads the tool cards lazily", async () => {
   const LAZY =
     /\/(src\/browser\/features\/Tools\/Shared\/getToolComponent\.ts|node_modules\/(motion|markdown-it)\/)/;

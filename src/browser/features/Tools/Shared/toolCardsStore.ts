@@ -5,8 +5,8 @@ import type { getToolComponent } from "./getToolComponent";
 import type { ProposePlanToolCall } from "../ProposePlanToolCall";
 
 // The tool cards (getToolComponent's registry, ~150 KB brotli with markdown-it and framer-motion)
-// are off the workspace page's first load (T3, #5971): a chat without tool calls never fetches
-// them. The lazy chunk (toolCardsLoader) publishes them here, and each tool row re-renders in
+// are off the workspace page's first load (T3, #5971): in the browser a chat without tool calls
+// never fetches them. Desktop requests them when a workspace is selected (#6823). The lazy chunk (toolCardsLoader) publishes them here, and each tool row re-renders in
 // place: rows never suspend, because a Suspense swap replaces every DOM node of its subtree.
 // This module has no UI imports, so WorkspaceStore can request the chunk from event code.
 export interface ToolCards {

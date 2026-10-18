@@ -109,6 +109,7 @@ import {
   type LiveBashOutputView,
 } from "@/browser/utils/messages/liveBashOutputBuffer";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { getAutoRetryKey, getPinnedTodoExpandedKey } from "@/common/constants/storage";
 import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
 import { trackStreamCompleted } from "@/common/telemetry";
@@ -1781,6 +1782,11 @@ export class WorkspaceStore {
     if (workspaceId) {
       // Chat-switch User Timing origin (#4504): every switch milestone is measured from here.
       markChatSwitchStart(workspaceId);
+      // #6823: on desktop the lazy tool cards' chunk, requested at the first replayed tool row,
+      // evaluated after the first rows committed (header-only cards for 1-2 frames). Request it
+      // before the replay keeps the main thread busy. Not in the browser: a chat without tool
+      // calls must not download the cards there (T3 #5971, see toolCardsStore).
+      if (isDesktopMode()) requestToolCards();
     }
     this.ensureOnChatSubscriptions();
 
