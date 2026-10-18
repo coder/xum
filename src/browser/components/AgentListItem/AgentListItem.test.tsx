@@ -430,6 +430,18 @@ describe("AgentListItem", () => {
       sidebar: { awaitingUserQuestion: true },
       dot: ".bg-border-pending",
     },
+    {
+      state: "error",
+      unread: false,
+      sidebar: { lastAbortReason: { reason: "system" as const, at: 0 } },
+      dot: ".bg-content-destructive",
+    },
+    {
+      state: "waiting",
+      unread: false,
+      sidebar: { activeBashMonitorCount: 1 },
+      dot: ".bg-backgrounded",
+    },
   ])("pinned avatar rows hide only the idle dot: $state", (testCase) => {
     const renderAvatarRow = (pinnedAt?: string) => {
       mockWorkspaceUnreadState = createWorkspaceUnreadState({ isUnread: testCase.unread });

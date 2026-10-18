@@ -304,12 +304,6 @@ function renderStatesGallery() {
       <GallerySection label="Flat: Idle">
         <WorkspaceRow workspace={STORY_WORKSPACES[2]} project={DOGFOOD_PROJECT} />
       </GallerySection>
-      <GallerySection label="Flat: Error">
-        <WorkspaceRow workspace={STORY_WORKSPACES[3]} project={XUM_PROJECT} />
-      </GallerySection>
-      <GallerySection label="Flat: Question">
-        <WorkspaceRow workspace={STORY_WORKSPACES[4]} project={CODER_PROJECT} />
-      </GallerySection>
       <GallerySection label="Flat: Draft">
         <DraftRow project={DOGFOOD_PROJECT} />
       </GallerySection>

@@ -80,6 +80,11 @@ describe("getProjectMonogram", () => {
     { name: "  _coder", monogram: "C" },
     { name: "2026 roadmap", monogram: "2" },
     { name: "ñandú", monogram: "Ñ" },
+    // A decomposed accent stays on its letter, with or without a precomposed form.
+    { name: "e\u0301clair", monogram: "\u00c9" },
+    { name: "q\u0303uiz", monogram: "Q\u0303" },
+    // The avatar fits one character, even when uppercasing expands the letter.
+    { name: "ßeta", monogram: "S" },
     { name: "", monogram: "#" },
     { name: "---", monogram: "#" },
   ])("$name -> $monogram", ({ name, monogram }) => {
