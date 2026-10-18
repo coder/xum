@@ -28,8 +28,7 @@ interface FakeRequest {
   mode: string;
 }
 
-// A promise lets a test hold a response back. Install (addAll) needs a plain Response.
-type Network = (request: FakeRequest | string) => Response | Promise<Response>;
+type Network = (request: FakeRequest | string) => Response;
 
 const html = (body: string, headers: Record<string, string> = {}) =>
   new Response(body, { status: 200, headers: { "Content-Type": "text/html", ...headers } });
@@ -68,7 +67,6 @@ class MemoryCacheStorage {
           addAll: (urls: string[]) => {
             for (const url of urls) {
               const response = this.network(url);
-              if (!(response instanceof Response)) throw new TypeError("addAll: async network");
               if (!response.ok) return Promise.reject(new TypeError(`addAll: ${response.status}`));
               entries.set(this.keyOf(base, url), response);
             }
@@ -332,105 +330,17 @@ describe("service worker caching (#6848)", () => {
   });
 });
 
-describe("old releases' hashed files are evicted (#6867)", () => {
-  const IMMUTABLE = { "Cache-Control": "public, max-age=31536000, immutable" };
-  const shellLoading = (...names: string[]) =>
-    html(
-      `<html><head>${names.map((n) => `<script type="module" src="./${n}"></script>`).join("")}` +
-        `<script type="application/json" id="m">["./${names[0]}"]</script></head></html>`
-    );
-  let shell: () => Response | Promise<Response>;
-  const network: Network = (request) => {
-    const url = typeof request === "string" ? request : request.url;
-    const isShell = url === ROOT_SCOPE || url === "./" || url.endsWith("index.html");
-    return isShell ? shell() : ok(`asset ${url}`, IMMUTABLE);
-  };
-  const hashedIn = (worker: { storage: MemoryCacheStorage; cacheName: string }) =>
-    worker.storage
-      .urlsIn(worker.cacheName)
-      .map((url) => url.slice(ORIGIN.length + 1))
-      .filter((name) => /-[A-Za-z0-9_-]{8}\./.test(name));
-
-  /** Installs release 1 and caches its entry chunk, a lazy chunk and the manifest. */
-  async function startRelease1() {
-    shell = () => shellLoading("main-AAAAAAAA.js", "main-AAAAAAAA.css");
-    const storage = new MemoryCacheStorage();
-    storage.network = network;
-    const worker = await startWorker({ storage });
-    for (const name of [
-      "main-AAAAAAAA.js",
-      "main-AAAAAAAA.css",
-      "lazy-BBBBBBBB.js",
-      "manifest.json",
-    ]) {
-      await worker.request(`${ORIGIN}/${name}`);
-    }
-    return worker;
-  }
-
-  test("a new release's shell evicts the hashed files it does not load", async () => {
-    const worker = await startRelease1();
-    shell = () => shellLoading("main-CCCCCCCC.js");
-    await worker.request(ROOT_SCOPE, { mode: "navigate" });
-    expect(hashedIn(worker)).toEqual([]);
-    // The shell and the public files stay.
-    expect(worker.storage.urlsIn(worker.cacheName)).toEqual(
-      [ROOT_SCOPE, `${ORIGIN}/index.html`, `${ORIGIN}/manifest.json`].sort()
-    );
-
-    await worker.request(`${ORIGIN}/main-CCCCCCCC.js`);
-    expect(hashedIn(worker)).toEqual(["main-CCCCCCCC.js"]);
-  });
-
-  test("a reload of the same release evicts nothing, lazy chunks included", async () => {
-    const worker = await startRelease1();
-    await worker.request(ROOT_SCOPE, { mode: "navigate" });
-    expect(hashedIn(worker)).toEqual(["lazy-BBBBBBBB.js", "main-AAAAAAAA.css", "main-AAAAAAAA.js"]);
-  });
-
-  test("a 200 HTML page that loads no hashed file evicts nothing", async () => {
-    const worker = await startRelease1();
-    // For example an app proxy's sign-in page at the root.
-    shell = () => html("<html><body>Sign in</body></html>");
-    await worker.request(ROOT_SCOPE, { mode: "navigate" });
-    expect(hashedIn(worker)).toEqual(["lazy-BBBBBBBB.js", "main-AAAAAAAA.css", "main-AAAAAAAA.js"]);
-  });
-
-  test("the new shell is stored even when the cached shell cannot be read", async () => {
-    const worker = await startRelease1();
-    const broken = new ReadableStream({ start: (controller) => controller.error(new Error("io")) });
-    worker.storage.stores.get(worker.cacheName)?.set(ROOT_SCOPE, new Response(broken));
-    shell = () => shellLoading("main-CCCCCCCC.js");
-    await worker.request(ROOT_SCOPE, { mode: "navigate" });
-    worker.offline();
-    const { response } = await worker.request(ROOT_SCOPE, { mode: "navigate" });
-    expect(await response?.text()).toContain("main-CCCCCCCC.js");
-  });
-
-  test("a file stored after the navigation started is kept", async () => {
-    const worker = await startRelease1();
-    let sendShell = (_response: Response) => undefined as void;
-    shell = () => new Promise<Response>((resolve) => (sendShell = resolve));
-    const navigation = worker.request(ROOT_SCOPE, { mode: "navigate" });
-    // Stored while the new shell is still on its way, so after the eviction's key list was read.
-    await worker.request(`${ORIGIN}/lazy-EEEEEEEE.js`);
-    sendShell(shellLoading("main-CCCCCCCC.js"));
-    await navigation;
-    expect(hashedIn(worker)).toEqual(["lazy-EEEEEEEE.js"]);
-  });
-});
-
 describe("auth token changes clear the service worker caches (#6848)", () => {
   const otherScope = `${ORIGIN}/@u/other/apps/mux/`;
   let storage: MemoryCacheStorage;
 
   /**
-   * A previous session's state: the shell and an asset here, a legacy cache, an older generation
-   * of this scope, another scope.
+   * A previous session's state: the shell and an asset here, a legacy cache, another scope, and
+   * a newer generation of this scope (a worker that updated while this tab runs an older bundle).
    */
   function seedPreviousSession() {
     storage.seed("mux-v2", [`${ORIGIN}/api/docs`]);
-    storage.seed(`mux-v1:${ROOT_SCOPE}`, [`${ORIGIN}/old`]);
+    storage.seed(`mux-v4:${ROOT_SCOPE}`, [`${ORIGIN}/main-NewerGen.js`]);
     storage.seed(cacheNameFor(ROOT_SCOPE), [
       ROOT_SCOPE,
       `${ORIGIN}/index.html`,
@@ -441,11 +351,11 @@ describe("auth token changes clear the service worker caches (#6848)", () => {
 
   function expectCleared() {
     expect(storage.stores.has("mux-v2")).toBe(false);
-    expect(storage.stores.has(`mux-v1:${ROOT_SCOPE}`)).toBe(false);
-    // #6876: the current cache holds only static build output and stays the offline start.
+    // #6876: this scope's caches hold only static build output and stay the offline start.
     expect(storage.urlsIn(cacheNameFor(ROOT_SCOPE))).toEqual(
       [ROOT_SCOPE, `${ORIGIN}/index.html`, `${ORIGIN}/${HASHED_JS}`].sort()
     );
+    expect(storage.urlsIn(`mux-v4:${ROOT_SCOPE}`)).toEqual([`${ORIGIN}/main-NewerGen.js`]);
     expect(storage.urlsIn(cacheNameFor(otherScope))).toEqual([`${otherScope}${HASHED_JS}`]);
   }
 
@@ -466,10 +376,18 @@ describe("auth token changes clear the service worker caches (#6848)", () => {
     restoreDomGlobals();
   });
 
-  test("logout keeps this scope's current cache and finishes before its promise settles", async () => {
+  test("logout keeps this scope's caches and finishes before its promise settles", async () => {
     seedPreviousSession();
+    // #6867: the cleanup must not grow with the cache, so it never opens a cache to walk it.
+    const view = storage.view(ROOT_SCOPE);
+    let opened = 0;
+    Object.defineProperty(globalThis, "caches", {
+      configurable: true,
+      value: { ...view, open: (name: string) => (opened++, view.open(name)) },
+    });
     await clearStoredAuthToken();
     expectCleared();
+    expect(opened).toBe(0);
   });
 
   test("a new token clears the previous session; the same token again does not", async () => {
@@ -492,7 +410,7 @@ describe("auth token changes clear the service worker caches (#6848)", () => {
     worker.offline();
     const { response } = await worker.request(`${ORIGIN}/`, { mode: "navigate" });
     expect(await response?.text()).toBe("shell");
-    // #6876: the worker's own cache, whatever its generation, survives the logout.
+    // #6876: the asset survives the logout, whatever the worker's cache generation is.
     expect(await (await worker.request(`${ORIGIN}/${HASHED_JS}`)).response?.text()).toBe(
       "app code"
     );

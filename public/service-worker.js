@@ -4,9 +4,9 @@
 // the shell's own public files),
 // only cacheable responses, and never auth flows, API/oRPC routes or token-bearing URLs. It
 // answers only GET requests and never caches the authenticated non-GET traffic (#5971 relies
-// on that). When the auth token changes or is removed, the app deletes the legacy caches and
-// this scope's other generations, and keeps this one (src/browser/utils/serviceWorkerCache.ts):
-// keep the "mux-v" prefix, and bump CURRENT_CACHE_GENERATION there together with CACHE_NAME.
+// on that). When the auth token changes or is removed, the app deletes the other "mux-" caches
+// and every entry of this one except the shell (src/browser/utils/serviceWorkerCache.ts), so
+// keep that prefix and the SHELL_PATH key.
 // One cache per registration scope: app-proxy deployments run several workers on one origin, and
 // Cache Storage is origin-wide. Older generations of this scope and the unscoped legacy caches
 // ("mux-v2" stored every GET response) are dropped on activate.
@@ -69,53 +69,6 @@ function isCacheableResponse(response) {
   return !/(^|[\s,])(no-store|private)([\s,=]|$)/.test(cacheControl);
 }
 
-// #6867: hashed file names in the shell HTML: module scripts, stylesheets, preloads and the
-// first-run module list. Lazy chunks and CSS-only fonts are not listed there.
-const HASHED_NAME_IN_HTML = /[^\s"'<>/()=]+-[A-Za-z0-9_-]{8}\.[a-z0-9]+(?:\.[a-z0-9]+)*/g;
-
-function referencedAssets(html) {
-  return new Set(html.match(HASHED_NAME_IN_HTML) || []);
-}
-
-/**
- * #6867: Vite gives every release new hashed names, and nothing else evicts the old ones. When a
- * refreshed shell loads other hashed files than the cached one (a new release), drop every hashed
- * file that was cached before this navigation and that the new shell does not load. The cache then
- * holds about one release. A lazy chunk or font of the new release that was cached earlier goes too;
- * the app fetches it again on next use. Within one release the shell's file list does not change,
- * so a normal reload evicts nothing. `before` is the key list read when the navigation started:
- * the new page's own files are stored only after it has the response, so none of them are in it.
- */
-function storeShell(cache, response, before) {
-  const copy = response.clone();
-  // The shell write never depends on the eviction: a failed read only skips the eviction.
-  return cache
-    .match(SHELL_PATH)
-    .then((cached) => (cached ? cached.text() : null))
-    .catch(() => null)
-    .then((cachedHtml) =>
-      cache
-        .put(SHELL_PATH, response)
-        .then(() => evictOldRelease(cache, copy, cachedHtml, before).catch(() => undefined))
-    );
-}
-
-function evictOldRelease(cache, response, cachedHtml, before) {
-  return Promise.all([response.text(), before]).then(([html, requests]) => {
-    const next = referencedAssets(html);
-    // A 200 HTML page that loads no hashed file (a proxy's sign-in page) is not a release.
-    if (cachedHtml === null || next.size === 0) return undefined;
-    const previous = referencedAssets(cachedHtml);
-    if (previous.size === next.size && [...next].every((name) => previous.has(name)))
-      return undefined;
-    const stale = requests.filter((request) => {
-      const path = scopedPath(new URL(request.url));
-      return path !== null && HASHED_STATIC_ASSET_NAME.test(path) && !next.has(path);
-    });
-    return Promise.all(stale.map((request) => cache.delete(request)));
-  });
-}
-
 function offlineResponse() {
   return new Response("Network error and no cached version available", {
     status: 503,
@@ -126,15 +79,10 @@ function offlineResponse() {
 
 /**
  * Network first: store a cacheable answer under `cacheKey`, else answer from this cache.
- * `isCacheable` decides what may be stored, and `write` stores it. The write runs under
- * `event.waitUntil`, so the browser keeps the worker alive until it ends.
+ * `isCacheable` decides what may be stored. The write runs under `event.waitUntil`, so the
+ * browser keeps the worker alive until it ends.
  */
-function networkFirst(
-  event,
-  cacheKey,
-  isCacheable,
-  write = (cache, response) => cache.put(cacheKey, response)
-) {
+function networkFirst(event, cacheKey, isCacheable) {
   return fetch(event.request)
     .then((response) => {
       if (isCacheable(response)) {
@@ -142,7 +90,7 @@ function networkFirst(
         event.waitUntil(
           caches
             .open(CACHE_NAME)
-            .then((cache) => write(cache, responseToCache))
+            .then((cache) => cache.put(cacheKey, responseToCache))
             .catch(() => undefined)
         );
       }
@@ -207,18 +155,7 @@ self.addEventListener("fetch", (event) => {
     // the shell for the route it answers: a route-relative <base>, and at the root a redirect and
     // a first-run loader that needs it. So the cached root copy is correct only at the root.
     // Every other navigation (deep routes, popout pages, files) goes to the network untouched.
-    if (path === "") {
-      // Read before the response reaches the page (see storeShell). Not awaited: off the load path.
-      const before = caches
-        .open(CACHE_NAME)
-        .then((cache) => cache.keys())
-        .catch(() => []);
-      event.respondWith(
-        networkFirst(event, SHELL_PATH, isShellResponse, (cache, response) =>
-          storeShell(cache, response, before)
-        )
-      );
-    }
+    if (path === "") event.respondWith(networkFirst(event, SHELL_PATH, isShellResponse));
     return;
   }
 
