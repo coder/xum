@@ -1756,6 +1756,61 @@ describe("WorkspaceStore", () => {
       }
     );
 
+    it("drops the kept pre-replay usage when a full replay attempt ends before caught-up", async () => {
+      // A full replay keeps the last usage on screen until caught-up; if the attempt ends
+      // first, that snapshot must go so stale live usage is not shown while retries continue.
+      const workspaceId = "workspace-usage-snapshot-retry";
+      const attempts = Array.from({ length: 3 }, () =>
+        createControllableAsyncIterable<WorkspaceChatMessage>()
+      );
+      let subscriptions = 0;
+      mockOnChat.mockImplementation(async function* (input, options) {
+        if (input?.workspaceId !== workspaceId) {
+          await waitForAbortSignal(options?.signal);
+          return;
+        }
+        const events = attempts[subscriptions++];
+        options?.signal?.addEventListener("abort", () => events.close(), { once: true });
+        yield* events.iterable;
+      });
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => subscriptions === 1)).toBe(true);
+      attempts[0].push(caughtUpEvent());
+      attempts[0].push({
+        type: "stream-start",
+        workspaceId,
+        messageId: "msg-live",
+        historySequence: 1,
+        model: "anthropic:claude-sonnet-4-20250514",
+        startTime: 1_000,
+      });
+      attempts[0].push({
+        type: "usage-delta",
+        workspaceId,
+        messageId: "msg-live",
+        usage: { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 },
+        cumulativeUsage: { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 },
+      });
+      expect(
+        await waitUntil(() => store.getWorkspaceUsage(workspaceId).liveUsage !== undefined)
+      ).toBe(true);
+
+      attempts[0].close();
+      expect(await waitUntil(() => subscriptions === 2)).toBe(true);
+      // The retry is a full replay that has not caught up: the snapshot stands in.
+      expect(store.getWorkspaceUsage(workspaceId).liveUsage).toBeDefined();
+
+      let usageNotified = false;
+      const unsubscribe = store.subscribeUsage(workspaceId, () => {
+        usageNotified = true;
+      });
+      attempts[1].close();
+      expect(await waitUntil(() => usageNotified)).toBe(true);
+      expect(store.getWorkspaceUsage(workspaceId).liveUsage).toBeUndefined();
+      unsubscribe();
+      mockChatScript([], { keepOpen: true });
+    });
+
     it("keeps transcript hydration active across full replay resets", async () => {
       const workspaceId = "workspace-full-replay-hydration";
 
@@ -5722,6 +5777,47 @@ describe("WorkspaceStore", () => {
       const state = store.getWorkspaceState(workspaceId);
       expect(state.loadingOlderHistory).toBe(false);
       expect(state.hasOlderHistory).toBe(false);
+    });
+
+    it("an onChat attempt that ends clears the older-history spinner and keeps the cursor", async () => {
+      const workspaceId = "history-pagination-attempt-end";
+      const attempts = Array.from({ length: 2 }, () =>
+        createControllableAsyncIterable<WorkspaceChatMessage>()
+      );
+      let subscriptions = 0;
+      mockOnChat.mockImplementation(async function* (input, options) {
+        if (input?.workspaceId !== workspaceId) {
+          await waitForAbortSignal(options?.signal);
+          return;
+        }
+        const events = attempts[subscriptions++];
+        options?.signal?.addEventListener("abort", () => events.close(), { once: true });
+        yield* events.iterable;
+      });
+      // The load never answers: only the attempt's end can clear the spinner.
+      mockHistoryLoadMore.mockReturnValueOnce(new Promise<LoadMoreResponse>(() => undefined));
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => subscriptions === 1)).toBe(true);
+      attempts[0].push(createHistoryMessageEvent("msg-newer", 5));
+      attempts[0].push({
+        type: "caught-up",
+        historyReplayStatus: "complete",
+        hasOlderHistory: true,
+      });
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
+        true
+      );
+      const pendingLoad = store.loadOlderHistory(workspaceId);
+      expect(pendingLoad).toBeInstanceOf(Promise);
+      expect(store.getWorkspaceState(workspaceId).loadingOlderHistory).toBe(true);
+
+      attempts[0].close();
+      expect(await waitUntil(() => !store.getWorkspaceState(workspaceId).loadingOlderHistory)).toBe(
+        true
+      );
+      // Reconnect retries keep pagination: a since caught-up omits hasOlderHistory.
+      expect(store.getWorkspaceState(workspaceId).hasOlderHistory).toBe(true);
+      mockChatScript([], { keepOpen: true });
     });
 
     it("ignores stale load-more responses after pagination state changes", async () => {
