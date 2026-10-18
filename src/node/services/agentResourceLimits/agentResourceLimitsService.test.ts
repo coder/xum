@@ -12,6 +12,8 @@ import type { AgentCgroupHost } from "./agentCgroup";
 import { AgentResourceLimitsService } from "./agentResourceLimitsService";
 import { createFakeCgroupTree, type FakeCgroupTree } from "./testHelpers";
 
+const READY = { state: "ready", cgroup: "/xum" } as const;
+
 describe("AgentResourceLimitsService", () => {
   let rootDir: string;
   let config: Config;
@@ -57,6 +59,7 @@ describe("AgentResourceLimitsService", () => {
       enabled: true,
       limits: { cpuCores: 2 },
       status: { state: "active", cgroup: "/xum/xum-agents" },
+      support: READY,
     });
     expect(await cpuMax()).toBe("200000 100000");
     expect(agentCgroupEnrollmentLine()).toContain(procsFile());
@@ -80,6 +83,7 @@ describe("AgentResourceLimitsService", () => {
       enabled: false,
       limits: { cpuCores: 2 },
       status: { state: "off" },
+      support: READY,
     });
     expect(await cpuMax()).toBe("max 100000");
     expect(agentCgroupEnrollmentLine()).toBe("");
@@ -102,6 +106,7 @@ describe("AgentResourceLimitsService", () => {
       enabled: true,
       limits: { cpuCores: 4 },
       status: { state: "active", cgroup: "/xum/xum-agents" },
+      support: READY,
     });
   });
 
@@ -134,7 +139,11 @@ describe("AgentResourceLimitsService", () => {
 
     await service.start();
 
-    expect((await service.get()).status).toEqual({ state: "off" });
+    // Settings can tell before the limits are on that applying them takes sudo.
+    expect(await service.get()).toMatchObject({
+      status: { state: "off" },
+      support: { state: "sudo", cgroup: "/init.scope" },
+    });
     expect(tree.sudoCalls).toEqual([]);
 
     // xum restarts with the limits turned on.
@@ -143,11 +152,11 @@ describe("AgentResourceLimitsService", () => {
     service = new AgentResourceLimitsService(config, tree.host);
     await service.start();
 
-    expect((await service.get()).status).toEqual({
-      state: "active",
-      cgroup: "/xum-1000/xum-agents",
+    expect(await service.get()).toMatchObject({
+      status: { state: "active", cgroup: "/init.scope/xum-agents" },
+      support: { state: "ready", cgroup: "/init.scope" },
     });
-    expect(tree.sudoCalls).toEqual(["xum-1000"]);
+    expect(tree.sudoCalls).toEqual(["init.scope"]);
   });
 
   it("runs sudo once per user action, and not for config writes that keep the limits", async () => {
@@ -172,14 +181,14 @@ describe("AgentResourceLimitsService", () => {
       "reason",
       expect.stringContaining(sudoFailed)
     );
-    expect(tree.sudoCalls).toEqual(["xum-1000"]);
+    expect(tree.sudoCalls).toEqual(["init.scope"]);
 
     // Try again saves the unchanged limits.
     await service.set({ cpuCores: 1, memoryGiB: 2 });
-    expect(tree.sudoCalls).toEqual(["xum-1000", "xum-1000"]);
+    expect(tree.sudoCalls).toEqual(["init.scope", "init.scope"]);
     await service.setEnabled(false);
     await service.setEnabled(true);
-    expect(tree.sudoCalls).toEqual(["xum-1000", "xum-1000", "xum-1000"]);
+    expect(tree.sudoCalls).toEqual(["init.scope", "init.scope", "init.scope"]);
   });
 
   it("delegates with sudo when another backend changes the limits", async () => {
@@ -200,9 +209,9 @@ describe("AgentResourceLimitsService", () => {
 
     expect((await service.get()).status).toEqual({
       state: "active",
-      cgroup: "/xum-1000/xum-agents",
+      cgroup: "/init.scope/xum-agents",
     });
-    expect(tree.sudoCalls).toEqual(["xum-1000"]);
+    expect(tree.sudoCalls).toEqual(["init.scope"]);
   });
 
   it("saves and applies the limits it is given", async () => {
@@ -216,6 +225,7 @@ describe("AgentResourceLimitsService", () => {
       enabled: true,
       limits: { cpuCores: 1.5, memoryGiB: 2 },
       status: { state: "active", cgroup: "/xum/xum-agents" },
+      support: READY,
     });
     expect(new Config(rootDir).loadConfigOrDefault().agentResourceLimits).toEqual({
       cpuCores: 1.5,

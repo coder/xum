@@ -14,11 +14,13 @@ import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceL
 import type {
   AgentResourceLimitsState,
   AgentResourceLimitsStatus,
+  AgentResourceLimitsSupport,
 } from "@/common/orpc/schemas/agentResourceLimits";
 import { AgentResourceLimitsSettings } from "./AgentResourceLimitsSettings";
 
 const ACTIVE: AgentResourceLimitsStatus = { state: "active", cgroup: "/xum/xum-agents" };
 const OFF: AgentResourceLimitsStatus = { state: "off" };
+const READY: AgentResourceLimitsSupport = { state: "ready", cgroup: "/xum" };
 
 /** The server's saved limits, the saves it receives, and its config change subscriptions. */
 function createServer(initial: AgentResourceLimitsState) {
@@ -98,11 +100,17 @@ describe("AgentResourceLimitsSettings", () => {
       enabled: true,
       limits: { cpuCores: 8, memoryGiB: 16 },
       status: ACTIVE,
+      support: READY,
     });
     await waitFor(() => expect(view.cpu().value).toBe("8"));
 
     typeInto(view.memory(), "32");
-    view.saveElsewhere({ enabled: true, limits: { cpuCores: 4, memoryGiB: 16 }, status: ACTIVE });
+    view.saveElsewhere({
+      enabled: true,
+      limits: { cpuCores: 4, memoryGiB: 16 },
+      status: ACTIVE,
+      support: READY,
+    });
 
     await waitFor(() => expect(view.cpu().value).toBe("4"));
     expect(view.memory().value).toBe("32");
@@ -119,6 +127,7 @@ describe("AgentResourceLimitsSettings", () => {
       enabled: true,
       limits: { cpuCores: 8 },
       status: { state: "active", cgroup: "/xum/xum-agents" },
+      support: READY,
     });
     await waitFor(() => expect(view.cpu().value).toBe("8"));
     expect(view.memory().value).toBe("");
@@ -138,6 +147,7 @@ describe("AgentResourceLimitsSettings", () => {
       enabled: true,
       limits: { cpuCores: 8, memoryGiB: 16 },
       status: { state: "active", cgroup: "/xum/xum-agents" },
+      support: READY,
     });
     await waitFor(() => expect(view.cpu().value).toBe("8"));
 
@@ -148,7 +158,12 @@ describe("AgentResourceLimitsSettings", () => {
   });
 
   test("turns the limits off and on again without changing them", async () => {
-    const view = renderSettings({ enabled: true, limits: { cpuCores: 8 }, status: ACTIVE });
+    const view = renderSettings({
+      enabled: true,
+      limits: { cpuCores: 8 },
+      status: ACTIVE,
+      support: READY,
+    });
     await waitFor(() => expect(view.cpu().value).toBe("8"));
 
     fireEvent.click(view.toggle());
@@ -168,7 +183,12 @@ describe("AgentResourceLimitsSettings", () => {
   });
 
   test("names the allowed range and saves nothing for a value outside it", async () => {
-    const view = renderSettings({ enabled: true, limits: {}, status: { state: "off" } });
+    const view = renderSettings({
+      enabled: true,
+      limits: {},
+      status: { state: "off" },
+      support: READY,
+    });
     await view.findByText("No limit is set.");
 
     view.edit(view.cpu(), "0.05");
@@ -182,6 +202,7 @@ describe("AgentResourceLimitsSettings", () => {
       enabled: true,
       limits: { cpuCores: 2 },
       status: { state: "unavailable", reason: "xum runs in cgroup /init.scope." },
+      support: READY,
     });
     await view.findByText("Not applied: xum runs in cgroup /init.scope.");
 
@@ -192,11 +213,43 @@ describe("AgentResourceLimitsSettings", () => {
     await view.findByText(/Active: agents share 2 CPU cores/);
   });
 
+  test("tells before the limits are on that applying them takes the cgroup with sudo", async () => {
+    const view = renderSettings({
+      enabled: false,
+      limits: { cpuCores: 2 },
+      status: OFF,
+      support: { state: "sudo", cgroup: "/init.scope" },
+    });
+
+    await view.findByText("/init.scope/xum-app");
+    view.getByText("/init.scope");
+    expect(view.toggle().disabled).toBe(false);
+  });
+
+  test("keeps the limits off where none can apply, and says why", async () => {
+    const reason = "Agent resource limits need Linux with cgroup v2.";
+    const view = renderSettings({
+      enabled: true,
+      limits: { cpuCores: 2 },
+      status: { state: "unavailable", reason },
+      support: { state: "unsupported", reason },
+    });
+    await view.findByText(`Not applied: ${reason}`);
+
+    // Limits that are on can still be turned off; then the switch stays off.
+    fireEvent.click(view.toggle());
+
+    await waitFor(() => expect(view.toggle().disabled).toBe(true));
+    expect(view.setEnabled.mock.calls).toEqual([[{ enabled: false }]]);
+    view.getByText(new RegExp(reason.replaceAll(".", "\\.")));
+  });
+
   test("shows a failure to remove the limits while they are off", async () => {
     const view = renderSettings({
       enabled: false,
       limits: { cpuCores: 2 },
       status: { state: "unavailable", reason: "Could not remove the limits: EACCES" },
+      support: READY,
     });
     await view.findByText("Not applied: Could not remove the limits: EACCES");
 
@@ -209,7 +262,12 @@ describe("AgentResourceLimitsSettings", () => {
 
 describe.each([...GAP_MODES])("AgentResourceLimitsSettings while reconnecting (%s)", (mode) => {
   test("saves no edit offline and shows the saved limits again after reconnecting", async () => {
-    const server = createServer({ enabled: true, limits: { cpuCores: 8 }, status: ACTIVE });
+    const server = createServer({
+      enabled: true,
+      limits: { cpuCores: 8 },
+      status: ACTIVE,
+      support: READY,
+    });
     const harness = createConnectionHarness(mode, server.overrides);
     const view = render(
       <harness.Wrapper>

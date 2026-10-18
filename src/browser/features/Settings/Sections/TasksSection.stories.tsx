@@ -31,6 +31,7 @@ export const Tasks: Story = {
             enabled: true,
             limits: { cpuCores: 8, memoryGiB: 16 },
             status: { state: "active", cgroup: "/xum/xum-agents" },
+            support: { state: "ready", cgroup: "/xum" },
           },
           // Reuse this story because the Pixel snapshot budget has no headroom.
           experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },

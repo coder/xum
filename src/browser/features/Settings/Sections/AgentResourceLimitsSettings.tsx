@@ -9,7 +9,10 @@ import {
   AGENT_RESOURCE_LIMITS_RANGE,
   type AgentResourceLimits,
 } from "@/common/config/schemas/agentResourceLimits";
-import type { AgentResourceLimitsState } from "@/common/orpc/schemas/agentResourceLimits";
+import type {
+  AgentResourceLimitsState,
+  AgentResourceLimitsSupport,
+} from "@/common/orpc/schemas/agentResourceLimits";
 import { getErrorMessage } from "@/common/utils/errors";
 
 type LimitField = keyof AgentResourceLimits;
@@ -116,18 +119,41 @@ async function followAppliedLimits(
   }
 }
 
+/** What applying the limits takes here, shown while none applies; nothing when they just apply. */
+function SupportNote(props: { support: AgentResourceLimitsSupport }) {
+  const { support } = props;
+  if (support.state === "ready") {
+    return null;
+  }
+  if (support.state === "sudo") {
+    return (
+      <div className="text-muted text-xs">
+        To apply limits, Xum gives cgroup <span className="font-mono">{support.cgroup}</span> to its
+        user with sudo, then moves every process in that cgroup into{" "}
+        <span className="font-mono">{support.cgroup}/xum-app</span>.
+      </div>
+    );
+  }
+  return <div className="text-muted text-xs">Not available: {support.reason}</div>;
+}
+
 function StatusLine(props: {
   state: AgentResourceLimitsState;
   disabled: boolean;
   onRetry: () => void;
 }) {
-  const { enabled, limits, status } = props.state;
+  const { enabled, limits, status, support } = props.state;
   // While off, the fields still show the saved limits, so "No limit is set." would be wrong.
   if (!enabled && status.state !== "unavailable") {
-    return null;
+    return <SupportNote support={support} />;
   }
   if (status.state === "off") {
-    return <div className="text-muted text-xs">No limit is set.</div>;
+    return (
+      <>
+        <div className="text-muted text-xs">No limit is set.</div>
+        <SupportNote support={support} />
+      </>
+    );
   }
   if (status.state === "active") {
     return (
@@ -287,7 +313,10 @@ export function AgentResourceLimitsSettings() {
         <Switch
           checked={view?.state.enabled === true}
           onCheckedChange={setEnabled}
-          disabled={disabled}
+          // A switch that is on stays usable, so limits turned on elsewhere can be turned off.
+          disabled={
+            disabled || (view?.state.support.state === "unsupported" && !view.state.enabled)
+          }
           aria-label="Resource limits"
         />
       </div>

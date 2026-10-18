@@ -7,7 +7,12 @@ import { getErrorMessage } from "@/common/utils/errors";
 import type { Config } from "@/node/config";
 import { setAgentCgroupEnrollmentTarget } from "@/node/runtime/agentCgroupEnrollment";
 import { log } from "@/node/services/log";
-import { applyAgentCgroupLimits, linuxAgentCgroupHost, type AgentCgroupHost } from "./agentCgroup";
+import {
+  applyAgentCgroupLimits,
+  checkAgentCgroupSupport,
+  linuxAgentCgroupHost,
+  type AgentCgroupHost,
+} from "./agentCgroup";
 
 /**
  * Keeps the agent cgroup in line with the `agentResourceLimits` and `agentResourceLimitsEnabled`
@@ -42,10 +47,15 @@ export class AgentResourceLimitsService {
     this.unsubscribe = undefined;
   }
 
-  /** The saved setting and its status, after the applies queued so far. */
+  /** The saved setting, its status, and what applying it takes, after the applies queued so far. */
   async get(): Promise<AgentResourceLimitsState> {
     await this.applying;
-    return { ...this.readSetting(), status: this.status };
+    const setting = this.readSetting();
+    return {
+      ...setting,
+      status: this.status,
+      support: await checkAgentCgroupSupport(setting.limits, this.host),
+    };
   }
 
   /** Saves `limits` and applies them, even when unchanged, so saving again retries a failure. */
@@ -66,7 +76,7 @@ export class AgentResourceLimitsService {
     return this.get();
   }
 
-  private readSetting(): Omit<AgentResourceLimitsState, "status"> {
+  private readSetting(): Pick<AgentResourceLimitsState, "enabled" | "limits"> {
     const config = this.config.loadConfigOrDefault();
     return {
       enabled: config.agentResourceLimitsEnabled === true,

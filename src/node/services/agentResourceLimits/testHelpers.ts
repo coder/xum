@@ -98,14 +98,22 @@ export async function createFakeCgroupTree(options: {
     await fs.appendFile(target, `${pid}\n`);
   };
 
-  let own = options.own;
+  /** The cgroup whose `cgroup.procs` lists this process, as the kernel's /proc/self/cgroup. */
+  const ownCgroup = async () => {
+    for (const file of await allProcsFiles()) {
+      if ((await readWords(file)).includes(String(process.pid))) {
+        return `/${path.relative(root, path.dirname(file))}`;
+      }
+    }
+    return options.own;
+  };
   const writes: FakeCgroupTree["writes"] = [];
   const sudoCalls: string[] = [];
   const host: AgentCgroupHost = {
     platform: options.platform ?? "linux",
     cgroupRoot: root,
     uid: 1000,
-    readSelfCgroup: () => Promise.resolve(`0::${own}\n`),
+    readSelfCgroup: async () => `0::${await ownCgroup()}\n`,
     writeFile: async (file, value) => {
       const failure = options.beforeWrite?.(file, value);
       if (failure) {
@@ -134,29 +142,16 @@ export async function createFakeCgroupTree(options: {
         options.probe?.(procsFile) ?? `0::/${path.relative(root, path.dirname(procsFile))}\n`
       ),
     isSystemdBooted: () => Promise.resolve(options.systemdBooted ?? false),
-    // What the sudo script does as root: create the cgroup and its xum-app child unless they
-    // exist (their files stay as they are), give them to the user, and move xum into xum-app.
+    // What the sudo step does as root: give the cgroup to the user, which makes it writable.
     delegateWithSudo: async (cgroupDir) => {
       sudoCalls.push(path.relative(root, cgroupDir));
       if (options.sudoWorks !== true) {
         throw new Error("sudo: a password is required");
       }
-      const cgroup = `/${path.relative(root, cgroupDir)}`;
-      for (const [dir, spec] of [
-        [cgroup, { controllers: "cpu memory" }],
-        [`${cgroup}/xum-app`, {}],
-      ] as const) {
-        try {
-          await fs.access(dirOf(dir));
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-            throw error;
-          }
-          await createCgroup(dir, spec);
-        }
+      await fs.chmod(cgroupDir, 0o755);
+      for (const name of ["cgroup.procs", "cgroup.subtree_control"]) {
+        await fs.chmod(path.join(cgroupDir, name), 0o644);
       }
-      await movePid(path.join(dirOf(`${cgroup}/xum-app`), "cgroup.procs"), String(process.pid));
-      own = `${cgroup}/xum-app`;
     },
   };
 

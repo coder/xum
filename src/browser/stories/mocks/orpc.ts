@@ -2798,6 +2798,7 @@ function mockAgentResourceLimitsState(
     enabled,
     limits,
     status: limited ? { state: "active", cgroup: "/xum/xum-agents" } : { state: "off" },
+    support: { state: "ready", cgroup: "/xum" },
   };
 }
 

@@ -9,11 +9,31 @@ export const AgentResourceLimitsStatusSchema = z.discriminatedUnion("state", [
 ]);
 export type AgentResourceLimitsStatus = z.infer<typeof AgentResourceLimitsStatusSchema>;
 
+/**
+ * What applying the saved limits takes where the backend runs now. The backend checks it without
+ * changing anything, so clients can show it before the limits are turned on.
+ */
+export const AgentResourceLimitsSupportSchema = z.discriminatedUnion("state", [
+  /** No limit can apply on this OS or kernel, for example on macOS and Windows. */
+  z.object({ state: z.literal("unsupported"), reason: z.string() }),
+  /** Limits cannot apply where xum runs now; `reason` says what to change. */
+  z.object({ state: z.literal("unavailable"), reason: z.string() }),
+  /** Agent processes join the `xum-agents` child of the base cgroup `cgroup`. */
+  z.object({ state: z.literal("ready"), cgroup: z.string() }),
+  /**
+   * As for ready, but xum first gives `cgroup` to its user with `sudo -n`, and then moves every
+   * process of `cgroup`, also those of other users, into its child `xum-app`.
+   */
+  z.object({ state: z.literal("sudo"), cgroup: z.string() }),
+]);
+export type AgentResourceLimitsSupport = z.infer<typeof AgentResourceLimitsSupportSchema>;
+
 const AgentResourceLimitsStateSchema = z.object({
   /** When false, no limit applies, and `limits` stay saved for the next time it is true. */
   enabled: z.boolean(),
   limits: AgentResourceLimitsSchema,
   status: AgentResourceLimitsStatusSchema,
+  support: AgentResourceLimitsSupportSchema,
 });
 export type AgentResourceLimitsState = z.infer<typeof AgentResourceLimitsStateSchema>;
 
