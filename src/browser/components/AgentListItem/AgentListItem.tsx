@@ -803,6 +803,7 @@ function DraftRowActions(props: {
   projectPath: string;
   ctxMenu: UseContextMenuPositionReturn;
   isAvatarRow: boolean;
+  isSelected: boolean;
 }) {
   const { draft, ctxMenu } = props;
   const actions = (
@@ -860,7 +861,8 @@ function DraftRowActions(props: {
   );
 
   return props.isAvatarRow ? (
-    <RowActionOverlay revealOnWideTouch hideOnNarrowTouch>
+    // Same touch rule as the chat kebab: tablets show it on the selected row only.
+    <RowActionOverlay revealOnWideTouch={props.isSelected} hideOnNarrowTouch>
       {actions}
     </RowActionOverlay>
   ) : (
@@ -968,6 +970,7 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
         projectPath={projectPath}
         ctxMenu={ctxMenu}
         isAvatarRow={isAvatarRow}
+        isSelected={isSelected}
       />
     </div>
   );
