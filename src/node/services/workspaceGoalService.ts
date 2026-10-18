@@ -3347,21 +3347,28 @@ export class WorkspaceGoalService {
     includeLiveStreams = false
   ): Promise<{ totalUsd: number; hasLedger: boolean }> {
     assert(this.sessionUsage, "readGoalLedgerUsd requires the session usage ledger");
-    const options = { includeLiveStreams };
-    const parent = (await this.sessionUsage.getSessionUsageBatch([workspaceId], options))[
-      workspaceId
-    ];
-    const rolledUpFrom = parent?.rolledUpFrom ?? {};
-    let totalUsd =
-      ledgerFileUsd(parent) -
-      unattributedRollupUsd(rolledUpFrom, goal.createdAtMs, attributedChildren);
-    // A rolled-up child is in the parent's byModel already; read only the others.
-    const liveChildren = attributedChildren.filter((childId) => rolledUpFrom[childId] == null);
-    if (liveChildren.length > 0) {
-      const children = await this.sessionUsage.getSessionUsageBatch(liveChildren, options);
-      for (const childId of liveChildren) totalUsd += ledgerFileUsd(children[childId]);
+    // The batch read does not validate the files: a malformed ledger (a null byModel entry)
+    // throws in sumUsageHistory. Treat it as no ledger: the goal charges as before.
+    try {
+      const options = { includeLiveStreams };
+      const parent = (await this.sessionUsage.getSessionUsageBatch([workspaceId], options))[
+        workspaceId
+      ];
+      const rolledUpFrom = parent?.rolledUpFrom ?? {};
+      let totalUsd =
+        ledgerFileUsd(parent) -
+        unattributedRollupUsd(rolledUpFrom, goal.createdAtMs, attributedChildren);
+      // A rolled-up child is in the parent's byModel already; read only the others.
+      const liveChildren = attributedChildren.filter((childId) => rolledUpFrom[childId] == null);
+      if (liveChildren.length > 0) {
+        const children = await this.sessionUsage.getSessionUsageBatch(liveChildren, options);
+        for (const childId of liveChildren) totalUsd += ledgerFileUsd(children[childId]);
+      }
+      return { totalUsd, hasLedger: parent !== undefined };
+    } catch (error) {
+      log.warn("Failed to read the cost ledger for goal accounting", { workspaceId, error });
+      return { totalUsd: 0, hasLedger: false };
     }
-    return { totalUsd, hasLedger: parent !== undefined };
   }
 
   /**
@@ -6246,6 +6253,9 @@ export class WorkspaceGoalService {
         status: "active",
         updatedAtMs: now,
         completionSummary: undefined,
+        // Spend while the goal sat in upcoming was another goal's: writeGoal re-pins the
+        // baseline at the ledger now, keeping the cost the goal already recorded.
+        ledgerBaselineUsd: undefined,
         requireUserAcknowledgmentSinceMs: null,
         // The user is the only caller of board promotion — an explicit
         // activation consent (see stampUserActivation).
@@ -6421,6 +6431,8 @@ export class WorkspaceGoalService {
       status: "active",
       updatedAtMs: now,
       completionSummary: undefined,
+      // See promoteUpcomingGoal: re-pinned at the ledger now.
+      ledgerBaselineUsd: undefined,
       requireUserAcknowledgmentSinceMs: null,
       // Auto-promotion is not user consent: clear any stale activation stamp
       // a previously user-activated (then demoted) goal may still carry so the

@@ -277,6 +277,44 @@ describe("WorkspaceGoalService ledger cost", () => {
     expect((await service.getGoal(workspaceId))?.costCents).toBe(150);
   });
 
+  test("a malformed ledger does not break goal reads; the goal charges as before", async () => {
+    await usage.recordUsage(workspaceId, MODEL, costing(0.1));
+    const service = newGoalService();
+    const created = await setGoalOk(service, { workspaceId, objective: "Robust" });
+    await fs.writeFile(
+      path.join(config.sessionsDir, workspaceId, "session-usage.json"),
+      JSON.stringify({ byModel: { [MODEL]: null }, version: 1 })
+    );
+    expect((await service.getGoal(workspaceId))?.costCents).toBe(0);
+    const next = await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    expect(next?.costCents).toBe(100);
+  });
+
+  test("a goal promoted back from upcoming does not pay for the other goal's spend", async () => {
+    await usage.recordUsage(workspaceId, MODEL, costing(0.1));
+    const service = newGoalService();
+    const first = await setGoalOk(service, { workspaceId, objective: "First" });
+    await usage.recordUsage(workspaceId, MODEL, costing(1));
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1,
+      streamStartedAtMs: first.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    const second = await service.addUpcomingGoal({ workspaceId, objective: "Second" });
+    // Promoting the second goal demotes the first; the second spends $2.
+    await service.promoteUpcomingGoal(workspaceId, second.goalId);
+    await usage.recordUsage(workspaceId, MODEL, costing(2));
+    const promotedBack = await service.promoteUpcomingGoal(workspaceId, first.goalId);
+    expect(promotedBack?.costCents).toBe(100);
+    expect((await service.getGoal(workspaceId))?.costCents).toBe(100);
+  });
+
   test("a goal written before the baseline existed keeps its cost and then follows the ledger", async () => {
     await usage.recordUsage(workspaceId, MODEL, costing(10));
     const service = newGoalService();
