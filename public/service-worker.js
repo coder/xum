@@ -87,24 +87,32 @@ function referencedAssets(html) {
  * the new page's own files are stored only after it has the response, so none of them are in it.
  */
 function storeShell(cache, response, before) {
-  return Promise.all([
-    response.clone().text(),
-    cache.match(SHELL_PATH).then((cached) => (cached ? cached.text() : null)),
-    before,
-  ]).then(([html, cachedHtml, requests]) => {
+  const copy = response.clone();
+  // The shell write never depends on the eviction: a failed read only skips the eviction.
+  return cache
+    .match(SHELL_PATH)
+    .then((cached) => (cached ? cached.text() : null))
+    .catch(() => null)
+    .then((cachedHtml) =>
+      cache
+        .put(SHELL_PATH, response)
+        .then(() => evictOldRelease(cache, copy, cachedHtml, before).catch(() => undefined))
+    );
+}
+
+function evictOldRelease(cache, response, cachedHtml, before) {
+  return Promise.all([response.text(), before]).then(([html, requests]) => {
     const next = referencedAssets(html);
-    const previous = cachedHtml === null ? next : referencedAssets(cachedHtml);
-    const newRelease = previous.size !== next.size || [...next].some((name) => !previous.has(name));
-    const stale = newRelease
-      ? requests.filter((request) => {
-          const path = scopedPath(new URL(request.url));
-          return path !== null && HASHED_STATIC_ASSET_NAME.test(path) && !next.has(path);
-        })
-      : [];
-    return Promise.all([
-      cache.put(SHELL_PATH, response),
-      ...stale.map((request) => cache.delete(request)),
-    ]);
+    // A 200 HTML page that loads no hashed file (a proxy's sign-in page) is not a release.
+    if (cachedHtml === null || next.size === 0) return undefined;
+    const previous = referencedAssets(cachedHtml);
+    if (previous.size === next.size && [...next].every((name) => previous.has(name)))
+      return undefined;
+    const stale = requests.filter((request) => {
+      const path = scopedPath(new URL(request.url));
+      return path !== null && HASHED_STATIC_ASSET_NAME.test(path) && !next.has(path);
+    });
+    return Promise.all(stale.map((request) => cache.delete(request)));
   });
 }
 

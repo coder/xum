@@ -388,6 +388,25 @@ describe("old releases' hashed files are evicted (#6867)", () => {
     expect(hashedIn(worker)).toEqual(["lazy-BBBBBBBB.js", "main-AAAAAAAA.css", "main-AAAAAAAA.js"]);
   });
 
+  test("a 200 HTML page that loads no hashed file evicts nothing", async () => {
+    const worker = await startRelease1();
+    // For example an app proxy's sign-in page at the root.
+    shell = () => html("<html><body>Sign in</body></html>");
+    await worker.request(ROOT_SCOPE, { mode: "navigate" });
+    expect(hashedIn(worker)).toEqual(["lazy-BBBBBBBB.js", "main-AAAAAAAA.css", "main-AAAAAAAA.js"]);
+  });
+
+  test("the new shell is stored even when the cached shell cannot be read", async () => {
+    const worker = await startRelease1();
+    const broken = new ReadableStream({ start: (controller) => controller.error(new Error("io")) });
+    worker.storage.stores.get(worker.cacheName)?.set(ROOT_SCOPE, new Response(broken));
+    shell = () => shellLoading("main-CCCCCCCC.js");
+    await worker.request(ROOT_SCOPE, { mode: "navigate" });
+    worker.offline();
+    const { response } = await worker.request(ROOT_SCOPE, { mode: "navigate" });
+    expect(await response?.text()).toContain("main-CCCCCCCC.js");
+  });
+
   test("a file stored after the navigation started is kept", async () => {
     const worker = await startRelease1();
     let sendShell = (_response: Response) => undefined as void;
