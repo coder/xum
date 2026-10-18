@@ -265,6 +265,9 @@
      4.52:1. The success color itself was 2.29-3.1:1 as text (#6882). --color-success stays the
      fill, border and tint color. */
   --color-success-text: hsl(122 39% 30%);
+  /* Text-only variant of --color-success-light (diff "+N" counts). The light success-light was
+     2.08:1 on white, so light themes use the success text color (#6885). */
+  --color-success-light-text: var(--color-success-text);
   --color-on-success: hsl(0 0% 100%);
 
   --color-danger: hsl(4 78% 52%);
@@ -525,6 +528,7 @@
   /* Darker green: WCAG AA (4.5:1) on every flexoki-light surface and success tint, down to
      4.69:1, where #66800b was 3.02:1 (#6882). */
   --color-success-text: #4d6008;
+  --color-success-light-text: var(--color-success-text);
   --color-on-success: #fffcf0;
 
   --color-danger: #af3029;

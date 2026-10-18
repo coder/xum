@@ -82,7 +82,7 @@ function getFileChangeBadge(
 } {
   switch (changeType) {
     case "added":
-      return { label: "A", className: "text-success-light", title: "Added" };
+      return { label: "A", className: "text-success-light-text", title: "Added" };
     case "deleted":
       return { label: "D", className: "text-danger", title: "Deleted" };
     case "renamed":
@@ -263,7 +263,7 @@ const TreeNodeContent: React.FC<{
                     (isOpen ? (
                       <span>+{node.totalStats.additions}</span>
                     ) : (
-                      <span className="text-success-light">+{node.totalStats.additions}</span>
+                      <span className="text-success-light-text">+{node.totalStats.additions}</span>
                     ))}
                   {node.totalStats.deletions > 0 &&
                     (isOpen ? (
@@ -324,7 +324,7 @@ const TreeNodeContent: React.FC<{
             </TooltipIfPresent>
             <span className="ml-auto flex items-center gap-2 text-[11px]">
               {node.stats?.additions ? (
-                <span className="text-success-light">+{node.stats.additions}</span>
+                <span className="text-success-light-text">+{node.stats.additions}</span>
               ) : null}
               {node.stats?.deletions ? (
                 <span className="text-warning-light">-{node.stats.deletions}</span>

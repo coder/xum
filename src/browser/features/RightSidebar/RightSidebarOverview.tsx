@@ -234,7 +234,7 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
                 <span className="counter-nums flex items-center gap-1.5">
                   {gitStatus != null && (
                     <>
-                      <span className="text-success-light">
+                      <span className="text-success-light-text">
                         +{gitStatus.outgoingAdditions.toLocaleString()}
                       </span>
                       <span className="text-danger-light">

@@ -11,6 +11,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { renderLegendLabel } from "@/browser/features/Analytics/chartLegend";
 import {
   ANALYTICS_CHART_COLORS,
   CHART_AXIS_STROKE,
@@ -145,7 +146,7 @@ function ChartBlock(props: {
         stroke={CHART_AXIS_STROKE}
       />
       <Tooltip cursor={{ fill: "var(--color-hover)" }} contentStyle={CHART_TOOLTIP_CONTENT_STYLE} />
-      {y.length > 1 && <Legend wrapperStyle={{ fontSize: "11px" }} />}
+      {y.length > 1 && <Legend wrapperStyle={{ fontSize: "11px" }} formatter={renderLegendLabel} />}
     </>
   );
   const color = (index: number) => ANALYTICS_CHART_COLORS[index % ANALYTICS_CHART_COLORS.length];

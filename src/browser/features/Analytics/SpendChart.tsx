@@ -8,6 +8,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { renderLegendLabel } from "./chartLegend";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import type { SpendOverTimeItem } from "@/browser/hooks/useAnalytics";
 import {
@@ -115,7 +116,7 @@ export function SpendChart(props: SpendChartProps) {
                 cursor={{ fill: "var(--color-hover)" }}
                 contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
               />
-              <Legend wrapperStyle={{ fontSize: "11px" }} />
+              <Legend wrapperStyle={{ fontSize: "11px" }} formatter={renderLegendLabel} />
               {models.map((model, index) => (
                 <Bar
                   key={model}

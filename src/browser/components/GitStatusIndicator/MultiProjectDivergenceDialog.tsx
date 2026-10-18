@@ -26,7 +26,9 @@ function formatLineDelta(additions: number, deletions: number): React.ReactNode 
 
   return (
     <span className="counter-nums inline-flex items-center gap-2 whitespace-nowrap">
-      <span className={cn(additions > 0 ? "text-success-light" : "text-muted")}>+{additions}</span>
+      <span className={cn(additions > 0 ? "text-success-light-text" : "text-muted")}>
+        +{additions}
+      </span>
       <span className={cn(deletions > 0 ? "text-warning-light" : "text-muted")}>-{deletions}</span>
     </span>
   );

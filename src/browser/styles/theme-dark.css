@@ -254,6 +254,9 @@
     /* Success as a text color. The dark themes' success already reaches WCAG AA as text, so it is
        the same color here. The light themes set a darker one (#6882). */
     --color-success-text: var(--color-success);
+    /* Text-only variant of --color-success-light. Dark keeps the lighter green: it reaches AA as
+       text. The light themes set the success text color (#6885). */
+    --color-success-light-text: var(--color-success-light);
     --color-on-success: hsl(0 0% 100%);
 
     --color-danger: hsl(4 90% 58%); /* #f44336 - error red */

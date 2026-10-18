@@ -14,6 +14,7 @@ import type {
   TimingDistribution,
   TokensByModelItem,
 } from "@/browser/hooks/useAnalytics";
+import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { NOW, createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
@@ -1058,5 +1059,16 @@ export const StatsDashboard: Story = {
         throw new Error("Expected agent-cost chart to render populated data");
       }
     });
+
+    // Recharts colors legend labels with their series color by default. Several series colors
+    // were below WCAG AA as text, in every theme (#6885).
+    const dialog = await findAnalyticsDialog(canvasElement);
+    const legendLabels = () => [
+      ...dialog.querySelectorAll<HTMLElement>(".recharts-legend-item-text"),
+    ];
+    await waitFor(() => {
+      if (legendLabels().length < 5) throw new Error("expected 5+ chart legend labels");
+    });
+    await expect(textsBelowAaInThemes(legendLabels).join("\n")).toBe("");
   },
 };
