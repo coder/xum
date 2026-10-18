@@ -16,8 +16,7 @@
     "/*.mjs",
     "!/eslint.config.mjs",
     "/vite.config.ts",
-    "/electron.vite.config.ts",
-    "/src/browser/main.tsx"
+    "/electron.vite.config.ts"
   ],
   "rules": {
     "constructor-super": "error",

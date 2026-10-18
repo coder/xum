@@ -109,7 +109,6 @@ export default defineConfig([
       "!eslint.config.mjs",
       "vite.config.ts",
       "electron.vite.config.ts",
-      "src/browser/main.tsx",
     ],
   },
   js.configs.recommended,
