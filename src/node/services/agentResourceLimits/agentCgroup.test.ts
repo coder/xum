@@ -171,15 +171,33 @@ describe("applyAgentCgroupLimits", () => {
     it("on a host without systemd", async () => {
       if (isRoot) return;
       tree = await createUnmanageableTree({ sudoWorks: true });
-      // The kernel's defaults: the cgroup itself sets no limit that leaving it would drop.
+      // The kernel's defaults, so the cgroup itself sets no limit that leaving it would drop, and
+      // files that hold no limit: a memory protection, a pressure trigger, and a counter.
       for (const [file, value] of [
-        ["cpu.max", "max 100000\n"],
-        ["memory.max", "max\n"],
-        ["cpuset.cpus", "\n"],
+        ["cpu.idle", "0"],
+        ["cpu.max", "max 100000"],
+        ["cpu.max.burst", "0"],
+        ["cpu.uclamp.max", "max"],
+        ["cpu.weight", "100"],
+        ["cpu.weight.nice", "0"],
+        ["cpuset.cpus", ""],
+        ["cpuset.cpus.partition", "member"],
+        ["hugetlb.2MB.max", "max"],
         ["io.max", ""],
+        ["io.prio.class", "no-change"],
+        ["io.weight", "default 100"],
+        ["memory.max", "max"],
+        ["memory.oom.group", "0"],
+        ["memory.zswap.writeback", "1"],
+        ["misc.max", "sev max\nsev_es max"],
+        ["rdma.max", "mlx4_0 hca_handle=max hca_object=max"],
+        ["memory.low", "1073741824"],
+        ["cpu.pressure", "some avg10=0.00 avg60=0.00 avg300=0.00 total=1"],
+        ["memory.current", "4096"],
       ]) {
-        await fs.writeFile(path.join(tree.root, "init.scope", file), value);
+        await fs.writeFile(path.join(tree.root, "init.scope", file), `${value}\n`);
       }
+      await fs.chmod(path.join(tree.root, "init.scope", "memory.current"), 0o444);
 
       const result = await applyAgentCgroupLimits({ cpuCores: 1, memoryGiB: 1.1 }, tree.host, {
         trySudo: true,
@@ -223,6 +241,11 @@ describe("applyAgentCgroupLimits", () => {
     it.each([
       ["cpu.max", "50000 100000"],
       ["memory.max", "1073741824"],
+      ["hugetlb.2MB.max", "0"],
+      ["misc.max", "sev max\nsev_es 3"],
+      ["cpu.weight", "50"],
+      ["io.weight", "default 100\n8:0 200"],
+      ["io.prio.class", "idle"],
       ["cpuset.cpus", "0-1"],
     ])("not when xum's cgroup has its own %s, which leaving it would drop", async (file, value) => {
       if (isRoot) return;
@@ -233,10 +256,8 @@ describe("applyAgentCgroupLimits", () => {
 
       expect(result.status).toEqual({
         state: "unavailable",
-        reason: expect.stringMatching(
-          new RegExp(
-            `Start xum in a cgroup delegated to that user\\. xum does not move to its own cgroup with sudo, because cgroup /init\\.scope sets ${file.replace(".", "\\.")} to ${value}\\.$`
-          )
+        reason: expect.stringContaining(
+          `Start xum in a cgroup delegated to that user. xum does not move to its own cgroup with sudo, because cgroup /init.scope sets ${file} to ${value.replaceAll("\n", " ")}.`
         ) as string,
       });
       expect(tree.sudoCalls).toEqual([]);

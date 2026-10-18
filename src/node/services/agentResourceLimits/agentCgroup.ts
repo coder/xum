@@ -37,20 +37,22 @@ echo "$3" > "$1/xum-app/cgroup.procs"`;
  */
 const failedSudoDelegations = new WeakMap<AgentCgroupHost, string>();
 /**
- * Limit files of xum's own cgroup, each unlimited when empty or when its first word is `max`. A
- * process that moves to a sibling cgroup leaves these limits behind: only common ancestors keep
- * constraining it.
+ * Files of a cgroup that hold no setting that limits its processes: the core `cgroup.*` files,
+ * pressure triggers and peak counters (writable, but they report on the cgroup), and protections
+ * such as memory.min and cpu.uclamp.min, which only guarantee a cgroup resources, so leaving them
+ * loses a guarantee rather than escaping a limit.
  */
-const OWN_LIMIT_FILES = [
-  "cpu.max",
-  "memory.max",
-  "memory.high",
-  "memory.swap.max",
-  "pids.max",
-  "cpuset.cpus",
-  "cpuset.mems",
-  "io.max",
-];
+const NOT_A_LIMIT = /^cgroup\.|\.(pressure|peak|min|low)$/;
+/** The kernel's defaults of the settings that are neither a `.max` or `.high` limit nor a weight. */
+const DEFAULT_SETTINGS = new Map([
+  ["cpu.idle", "0"],
+  ["cpu.max.burst", "0"],
+  ["cpu.weight.nice", "0"],
+  ["cpuset.cpus.partition", "member"],
+  ["io.prio.class", "no-change"],
+  ["memory.oom.group", "0"],
+  ["memory.zswap.writeback", "1"],
+]);
 
 type Controller = "cpu" | "memory";
 
@@ -283,24 +285,61 @@ async function findSudoDelegationTarget(
   return `/xum-${host.uid}`;
 }
 
-/** The first limit that the cgroup at `dir` sets itself, as `<file> to <value>`, or null. */
+/**
+ * The first setting of the cgroup at `dir` that may limit its processes, as `<file> to <value>`,
+ * or null. A process that moves to a sibling cgroup leaves its old cgroup's settings behind: only
+ * common ancestors keep constraining it. So each setting must be known to limit nothing, and a
+ * setting that xum does not know counts as a limit unless it is empty.
+ */
 async function findOwnLimit(dir: string): Promise<string | null> {
-  for (const file of OWN_LIMIT_FILES) {
+  for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+    if (!entry.isFile() || NOT_A_LIMIT.test(entry.name)) {
+      continue;
+    }
+    const file = path.join(dir, entry.name);
     let value: string;
     try {
-      value = (await fs.readFile(path.join(dir, file), "utf-8")).trim();
+      // Only files that are both readable and writable hold settings: the others report on the
+      // cgroup or trigger an action.
+      if (((await fs.stat(file)).mode & 0o600) !== 0o600) {
+        continue;
+      }
+      value = (await fs.readFile(file, "utf-8")).trim();
     } catch (error) {
-      // A controller's files exist only while the parent enables it for this cgroup.
+      // A controller's files go away when the parent disables it for this cgroup.
       if (hasErrorCode(error, "ENOENT")) {
         continue;
       }
       throw error;
     }
-    if (value !== "" && value.split(/\s+/)[0] !== "max") {
-      return `${file} to ${value}`;
+    if (!isUnlimited(entry.name, value)) {
+      return `${entry.name} to ${value.replace(/\s+/g, " ")}`;
     }
   }
   return null;
+}
+
+/** Whether the setting `name`, holding `value`, leaves the processes of its cgroup unlimited. */
+function isUnlimited(name: string, value: string): boolean {
+  // Lists such as cpuset.cpus, io.max, and misc.max are empty when they set nothing.
+  if (value === "") {
+    return true;
+  }
+  // A limit sets nothing at `max` (`max 100000` in cpu.max), and a line of per-device or
+  // per-resource limits, such as `8:0 rbps=max wbps=max` or `sev max`, when each of them is `max`.
+  if (/\.(max|high)$/.test(name)) {
+    return value.split("\n").every((line) => {
+      const [first, ...limits] = line.trim().split(/\s+/);
+      return (
+        first === "max" || (limits.length > 0 && limits.every((word) => /(^|=)max$/.test(word)))
+      );
+    });
+  }
+  // The default weight is 100 (`default 100` in io.weight), with no weight for a single device.
+  if (name.endsWith(".weight")) {
+    return /^(default )?100$/.test(value);
+  }
+  return DEFAULT_SETTINGS.get(name) === value;
 }
 
 /** Why the user running xum cannot manage the cgroup at `baseDir`, or null when it can. */
