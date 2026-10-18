@@ -224,6 +224,38 @@ describe("SessionUsageService in-flight usage", () => {
     expect(await inFlightFiles()).toEqual([]);
   });
 
+  it("a read error leaves a killed stream's file for the next read", async () => {
+    await service.recordInFlightUsage(workspaceId, "key-a", "msg-a", MODEL, usage(100, 10));
+    const restarted = restartedService();
+    const realReadFile = fs.readFile;
+    const readFile = spyOn(fs, "readFile").mockImplementation(((
+      ...args: Parameters<typeof fs.readFile>
+    ) =>
+      String(args[0]).includes("session-usage.in-flight")
+        ? Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }))
+        : realReadFile(...args)) as typeof fs.readFile);
+    try {
+      expect(tokens(await restarted.getSessionUsage(workspaceId))).toBe(0);
+    } finally {
+      readFile.mockRestore();
+    }
+    expect(await inFlightFiles()).toEqual(["key-a.json"]);
+    expect(tokens(await restarted.getSessionUsage(workspaceId))).toBe(110);
+  });
+
+  it("a failed discard keeps the stream out of this process's reads", async () => {
+    await service.recordUsage(workspaceId, MODEL, usage(10, 1));
+    await service.recordInFlightUsage(workspaceId, "key-a", "msg-a", MODEL, usage(100, 10));
+    const rm = spyOn(fs, "rm").mockRejectedValueOnce(new Error("EIO"));
+    try {
+      await expect(service.discardInFlightUsage(workspaceId, "key-a")).rejects.toThrow("EIO");
+    } finally {
+      rm.mockRestore();
+    }
+    expect(tokens(await service.getSessionUsage(workspaceId))).toBe(11);
+    expect(tokens(await readLedgerOnDisk())).toBe(11);
+  });
+
   it("a corrupt in-flight file is removed without breaking reads", async () => {
     await service.recordUsage(workspaceId, MODEL, usage(10, 1));
     await fs.mkdir(inFlightDir(), { recursive: true });

@@ -149,19 +149,33 @@ type InFlightUsageFile = z.infer<typeof InFlightUsageFileSchema>;
 interface InFlightUsageEntry {
   key: string;
   filePath: string;
-  /** Undefined when the file is unreadable or malformed. */
+  /** Undefined when the file content is malformed. */
   file: InFlightUsageFile | undefined;
 }
 
-/** The parsed file; undefined when it is unreadable or malformed. */
+/**
+ * The parsed file, or undefined when its content is malformed. "unreadable" (a read error
+ * such as EIO or EMFILE) leaves the file alone for a later read: it can belong to a running
+ * stream.
+ */
 async function readInFlightUsageFile(
   filePath: string
-): Promise<InFlightUsageFile | undefined | "missing"> {
+): Promise<InFlightUsageFile | undefined | "missing" | "unreadable"> {
+  let raw: string;
   try {
-    const raw: unknown = JSON.parse(await fs.readFile(filePath, "utf-8"));
-    return InFlightUsageFileSchema.safeParse(raw).data;
+    raw = await fs.readFile(filePath, "utf-8");
   } catch (error) {
-    return isErrnoWithCode(error, "ENOENT") ? "missing" : undefined;
+    if (isErrnoWithCode(error, "ENOENT")) return "missing";
+    log.warn("Failed to read an in-flight usage file; leaving it for a later read", {
+      filePath,
+      error,
+    });
+    return "unreadable";
+  }
+  try {
+    return InFlightUsageFileSchema.safeParse(JSON.parse(raw)).data;
+  } catch {
+    return undefined;
   }
 }
 
@@ -283,7 +297,7 @@ export class SessionUsageService {
       const filePath = path.join(dir, name);
       const file = await readInFlightUsageFile(filePath);
       // "missing": settled or discarded since the readdir.
-      if (file !== "missing") entries.push({ key, filePath, file });
+      if (file !== "missing" && file !== "unreadable") entries.push({ key, filePath, file });
     }
     return entries;
   }
@@ -320,7 +334,7 @@ export class SessionUsageService {
       if (!this.isOrphan(workspaceId, entry)) continue;
       filesToDelete.push(entry.filePath);
       if (!entry.file) {
-        log.warn("Removing unreadable in-flight usage file", { workspaceId, key: entry.key });
+        log.warn("Removing malformed in-flight usage file", { workspaceId, key: entry.key });
         continue;
       }
       if (settledKeys.has(entry.key)) continue;
@@ -479,8 +493,10 @@ export class SessionUsageService {
   async discardInFlightUsage(workspaceId: string, key: string): Promise<void> {
     const filePath = this.getInFlightFilePath(workspaceId, key);
     return this.fileLocks.withLock(workspaceId, async () => {
-      this.forgetLiveKey(workspaceId, key);
+      // Disk first: if the delete fails, the key stays live, so no read in this process folds
+      // usage that was meant to be dropped (a restart then counts it: it was billed).
       await fs.rm(filePath, { force: true });
+      this.forgetLiveKey(workspaceId, key);
     });
   }
 
