@@ -17,7 +17,7 @@ import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelp
 
 /**
  * AI-generated sidebar status: emoji + short verb-led phrase, matching
- * WorkspaceAgentStatus so the frontend renders it through the same
+ * ExtensionAgentStatus so the frontend renders it through the same
  * WorkspaceStatusIndicator path as displayStatus / todoStatus.
  */
 export interface WorkspaceAgentStatusPayload {

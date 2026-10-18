@@ -69,6 +69,7 @@ import { codexPluginHookService } from "@/node/services/agentPlugins/codexHookSe
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
+import type { ExtensionAgentStatus } from "@/node/utils/extensionMetadata";
 import {
   AgentSession,
   clearProviderConfigFixableAbandonMarkers,
@@ -1047,11 +1048,6 @@ function withEffectiveHeartbeatInterval(
   return { ...settings, intervalMs: settings.intervalMs ?? defaultIntervalMs };
 }
 
-interface WorkspaceAgentStatus {
-  emoji: string;
-  message: string;
-  url?: string;
-}
 type WorkspaceRuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
 
 /** Narrow DevTools cleanup surface used on archive/remove and by the startup sweep. */
@@ -1732,7 +1728,7 @@ async function copyDirIfMissingBestEffort(params: {
       }
     }
 
-    await fsPromises.mkdir(path.dirname(params.destDir), { recursive: true });
+    // fs.cp creates missing parent folders of destDir itself (Node and Bun).
     await fsPromises.cp(params.srcDir, params.destDir, { recursive: true });
   } catch (error: unknown) {
     if (isErrnoWithCode(error, "ENOENT")) {
@@ -5241,7 +5237,7 @@ export class WorkspaceService
 
   public async updateAgentStatus(
     workspaceId: string,
-    agentStatus: WorkspaceAgentStatus | null
+    agentStatus: ExtensionAgentStatus | null
   ): Promise<void> {
     await this.emitWorkspaceActivityUpdate(workspaceId, "update workspace agent status", () =>
       this.extensionMetadata.setAgentStatus(workspaceId, agentStatus)
@@ -14897,12 +14893,7 @@ export class WorkspaceService
         const allMetadataUpdated = await this.config.getAllWorkspaceMetadata();
         const updatedMetadata = allMetadataUpdated.find((m) => m.id === sourceWorkspaceId) ?? null;
         const enrichedMetadata = this.enrichMaybeFrontendMetadata(updatedMetadata);
-        const sourceSession = this.sessions.get(sourceWorkspaceId);
-        if (sourceSession) {
-          sourceSession.emitMetadata(enrichedMetadata);
-        } else {
-          this.emit("metadata", { workspaceId: sourceWorkspaceId, metadata: enrichedMetadata });
-        }
+        this.publishWorkspaceMetadata(sourceWorkspaceId, enrichedMetadata);
       };
 
       // The fork's registration also marked its source as sharing the Coder workspace (#5114).
