@@ -172,9 +172,13 @@ describe("applyAgentCgroupLimits", () => {
       if (isRoot) return;
       tree = await createUnmanageableTree({ sudoWorks: true });
       // The kernel's defaults, so the cgroup itself sets no limit that leaving it would drop, and
-      // entries that hold no limit: a memory protection, a pressure trigger, a counter, and a
-      // child cgroup.
+      // entries that hold no limit: the thread list, a memory protection, a pressure trigger, a
+      // counter, and a child cgroup.
       for (const [file, value] of [
+        ["cgroup.freeze", "0"],
+        ["cgroup.max.depth", "max"],
+        ["cgroup.max.descendants", "max"],
+        ["cgroup.type", "domain"],
         ["cpu.idle", "0"],
         ["cpu.max", "max 100000"],
         ["cpu.max.burst", "0"],
@@ -193,6 +197,7 @@ describe("applyAgentCgroupLimits", () => {
         ["memory.zswap.writeback", "1"],
         ["misc.max", "sev max\nsev_es max"],
         ["rdma.max", "mlx4_0 hca_handle=max hca_object=max"],
+        ["cgroup.threads", "1"],
         ["memory.low", "1073741824"],
         ["cpu.pressure", "some avg10=0.00 avg60=0.00 avg300=0.00 total=1"],
         ["memory.current", "4096"],
@@ -248,6 +253,7 @@ describe("applyAgentCgroupLimits", () => {
       ["cpu.weight", "50"],
       ["io.weight", "default 100\n8:0 200"],
       ["io.prio.class", "idle"],
+      ["cgroup.max.descendants", "10"],
       ["cpuset.cpus", "0-1"],
     ])("not when xum's cgroup has its own %s, which leaving it would drop", async (file, value) => {
       if (isRoot) return;

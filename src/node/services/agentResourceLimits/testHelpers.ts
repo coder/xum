@@ -49,10 +49,10 @@ export async function createFakeCgroupTree(options: {
   await fs.writeFile(path.join(root, "cgroup.controllers"), "cpu io memory pids\n");
   const createCgroup = async (cgroup: string, spec: FakeCgroup) => {
     await fs.mkdir(dirOf(cgroup), { recursive: true });
-    await fs.writeFile(
-      path.join(dirOf(cgroup), "cgroup.controllers"),
-      `${spec.controllers ?? ""}\n`
-    );
+    const controllersFile = path.join(dirOf(cgroup), "cgroup.controllers");
+    await fs.writeFile(controllersFile, `${spec.controllers ?? ""}\n`);
+    // Read-only, as the kernel's: it lists what the parent enables, not a setting of the cgroup.
+    await fs.chmod(controllersFile, 0o444);
     await fs.writeFile(
       path.join(dirOf(cgroup), "cgroup.subtree_control"),
       `${spec.subtreeControl ?? ""}\n`
