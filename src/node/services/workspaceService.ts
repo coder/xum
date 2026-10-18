@@ -2144,7 +2144,9 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
         workspaceSessionDir: params.parentSessionDir,
         update: (parentFile) => {
           for (const [taskId, childEntry] of childEntries) {
-            if (!taskId) continue;
+            // Self-healing: the index is read without per-entry validation. A malformed entry
+            // (e.g. null) would throw below and drop every other entry of this rollup, so skip it.
+            if (!taskId || childEntry == null || typeof childEntry !== "object") continue;
 
             const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
             const childUpdated = coerceUpdatedAtMs(childEntry);
@@ -2225,7 +2227,9 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
         workspaceSessionDir: params.parentSessionDir,
         update: (parentFile) => {
           for (const [taskId, childEntry] of childEntries) {
-            if (!taskId) continue;
+            // Self-healing: the index is read without per-entry validation. A malformed entry
+            // (e.g. null) would throw below and drop every other entry of this rollup, so skip it.
+            if (!taskId || childEntry == null || typeof childEntry !== "object") continue;
 
             const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
             const childUpdated = coerceUpdatedAtMs(childEntry);
