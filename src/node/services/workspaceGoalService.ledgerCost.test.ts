@@ -281,9 +281,13 @@ describe("WorkspaceGoalService ledger cost", () => {
     await usage.recordUsage(workspaceId, MODEL, costing(0.1));
     const service = newGoalService();
     const created = await setGoalOk(service, { workspaceId, objective: "Robust" });
+    const ledgerPath = path.join(config.sessionsDir, workspaceId, "session-usage.json");
+    await fs.writeFile(ledgerPath, JSON.stringify({ byModel: { [MODEL]: null }, version: 1 }));
+    expect((await service.getGoal(workspaceId))?.costCents).toBe(0);
+    const stringCost = { ...costing(1), input: { tokens: 1, cost_usd: "1" } };
     await fs.writeFile(
-      path.join(config.sessionsDir, workspaceId, "session-usage.json"),
-      JSON.stringify({ byModel: { [MODEL]: null }, version: 1 })
+      ledgerPath,
+      JSON.stringify({ byModel: { [MODEL]: stringCost }, version: 1 })
     );
     expect((await service.getGoal(workspaceId))?.costCents).toBe(0);
     const next = await service.recordStreamAccounting({
@@ -313,6 +317,25 @@ describe("WorkspaceGoalService ledger cost", () => {
     const promotedBack = await service.promoteUpcomingGoal(workspaceId, first.goalId);
     expect(promotedBack?.costCents).toBe(100);
     expect((await service.getGoal(workspaceId))?.costCents).toBe(100);
+  });
+
+  test("an unreadable attributed child does not rebase the goal downward", async () => {
+    await usage.recordUsage(workspaceId, MODEL, costing(0.1));
+    const service = newGoalService();
+    await setGoalOk(service, { workspaceId, objective: "Partial read" });
+    await usage.recordUsage(childId, MODEL, costing(3));
+    await service.attributeChildReport({
+      parentWorkspaceId: workspaceId,
+      childWorkspaceId: childId,
+      childCostCents: 300,
+    });
+    const childLedger = path.join(config.sessionsDir, childId, "session-usage.json");
+    const saved = await fs.readFile(childLedger, "utf-8");
+    await fs.writeFile(childLedger, "{corrupt");
+    expect((await service.getGoal(workspaceId))?.costCents).toBe(300);
+    // Readable again: the child counts once, not twice.
+    await fs.writeFile(childLedger, saved);
+    expect((await service.getGoal(workspaceId))?.costCents).toBe(300);
   });
 
   test("a goal written before the baseline existed keeps its cost and then follows the ledger", async () => {

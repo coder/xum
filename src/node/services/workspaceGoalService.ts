@@ -77,6 +77,7 @@ import {
   type GoalStreamOriginKind,
 } from "./goalContinuationPolicy";
 import type { SessionUsageFile, SessionUsageService } from "./sessionUsageService";
+import { SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 
 const GOAL_FILE = "goal.json";
@@ -104,8 +105,15 @@ const GOAL_HISTORY_RENDER_CAP = 200;
 
 const MICRO_CENTS_PER_USD = 100 * MICRO_CENTS_PER_CENT;
 
-function ledgerFileUsd(file: SessionUsageFile | undefined): number {
-  return getTotalCost(sumUsageHistory(Object.values(file?.byModel ?? {}))) ?? 0;
+/**
+ * A ledger file's total cost, or undefined when it is missing or malformed. The batch read
+ * does not validate files, and a null entry or a string cost would throw or turn the goal's
+ * cost into garbage.
+ */
+function ledgerFileUsd(file: SessionUsageFile | undefined): number | undefined {
+  const parsed = SessionUsageFileSchema.safeParse(file);
+  if (!parsed.success) return undefined;
+  return getTotalCost(sumUsageHistory(Object.values(parsed.data.byModel))) ?? 0;
 }
 
 /**
@@ -3347,28 +3355,29 @@ export class WorkspaceGoalService {
     includeLiveStreams = false
   ): Promise<{ totalUsd: number; hasLedger: boolean }> {
     assert(this.sessionUsage, "readGoalLedgerUsd requires the session usage ledger");
-    // The batch read does not validate the files: a malformed ledger (a null byModel entry)
-    // throws in sumUsageHistory. Treat it as no ledger: the goal charges as before.
-    try {
-      const options = { includeLiveStreams };
-      const parent = (await this.sessionUsage.getSessionUsageBatch([workspaceId], options))[
-        workspaceId
-      ];
-      const rolledUpFrom = parent?.rolledUpFrom ?? {};
-      let totalUsd =
-        ledgerFileUsd(parent) -
-        unattributedRollupUsd(rolledUpFrom, goal.createdAtMs, attributedChildren);
-      // A rolled-up child is in the parent's byModel already; read only the others.
-      const liveChildren = attributedChildren.filter((childId) => rolledUpFrom[childId] == null);
-      if (liveChildren.length > 0) {
-        const children = await this.sessionUsage.getSessionUsageBatch(liveChildren, options);
-        for (const childId of liveChildren) totalUsd += ledgerFileUsd(children[childId]);
-      }
-      return { totalUsd, hasLedger: parent !== undefined };
-    } catch (error) {
-      log.warn("Failed to read the cost ledger for goal accounting", { workspaceId, error });
+    const options = { includeLiveStreams };
+    const parent = (await this.sessionUsage.getSessionUsageBatch([workspaceId], options))[
+      workspaceId
+    ];
+    const parentUsd = ledgerFileUsd(parent);
+    // A rolled-up child is in the parent's byModel already; read only the others.
+    const rolledUpFrom = parent?.rolledUpFrom ?? {};
+    const liveChildren = attributedChildren.filter((childId) => rolledUpFrom[childId] == null);
+    const children =
+      liveChildren.length > 0
+        ? await this.sessionUsage.getSessionUsageBatch(liveChildren, options)
+        : {};
+    const childUsds = liveChildren.map((childId) => ledgerFileUsd(children[childId]));
+    // A missing or malformed ledger, or an unreadable child (a partial total would rebase the
+    // goal downward and charge the child twice once it reads again): no usable sample.
+    if (parentUsd === undefined || childUsds.includes(undefined)) {
       return { totalUsd: 0, hasLedger: false };
     }
+    const totalUsd =
+      parentUsd -
+      unattributedRollupUsd(rolledUpFrom, goal.createdAtMs, attributedChildren) +
+      childUsds.reduce<number>((sum, usd) => sum + (usd ?? 0), 0);
+    return { totalUsd, hasLedger: true };
   }
 
   /**
