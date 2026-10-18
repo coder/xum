@@ -379,6 +379,32 @@ describe("StreamManager - TTFT metadata persistence", () => {
     );
   });
 
+  test("a failed final ledger write keeps the turn's finished steps in session-usage.json", async () => {
+    const workspaceId = "in-flight-ledger-write-failure-workspace";
+    const sessionUsageService = new SessionUsageService(historyConfig, historyService);
+    spyOn(sessionUsageService, "recordUsage").mockRejectedValueOnce(new Error("disk full"));
+    const stepUsage = { inputTokens: 1_000, outputTokens: 100, totalTokens: 1_100 };
+    await completeTurnAndReadMessage({
+      workspaceId,
+      messageId: "in-flight-ledger-write-failure-message",
+      streamManager: createStreamManagerForTests(historyService, {
+        sessionUsageService,
+        streamText: scriptedStreamText([
+          {
+            chunks: [text("working"), finishStep(stepUsage), STOP_FINISH],
+            usage: stepUsage,
+            steps: [{ usage: stepUsage }],
+          },
+        ]),
+      }),
+      chunks: [],
+    });
+
+    // The in-flight entry is the only durable record of the step: nothing may discard it.
+    const onDisk = ledgerTotals(await readLedgerFile(historyConfig.sessionsDir, workspaceId));
+    expect(onDisk.tokens).toBe(stepUsage.totalTokens);
+  });
+
   test("emits and persists routeProvider from initial stream metadata", async () => {
     const events: TurnEngineEvent[] = [];
     const updatedMessage = await completeTurnAndReadMessage({

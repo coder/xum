@@ -2775,9 +2775,9 @@ export class StreamManager {
     logLevel: "warn" | "error",
     streamInfo?: Pick<WorkspaceStreamInfo, "workspaceName" | "metadataModel">,
     settlesInFlightStreamId?: string
-  ): Promise<boolean> {
+  ): Promise<"recorded" | "skipped" | "failed"> {
     if (!this.sessionUsageService || !usage) {
-      return false;
+      return "skipped";
     }
     const messageUsage = createDisplayUsage(
       usage,
@@ -2786,7 +2786,7 @@ export class StreamManager {
       streamInfo?.metadataModel
     );
     if (!messageUsage) {
-      return false;
+      return "skipped";
     }
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     const ledgerModel = this.usageAttributionModel(model, streamInfo?.metadataModel);
@@ -2797,10 +2797,10 @@ export class StreamManager {
         messageUsage,
         ...(settlesInFlightStreamId !== undefined ? [{ settlesInFlightStreamId }] : [])
       );
-      return true;
+      return "recorded";
     } catch (error) {
       (logLevel === "error" ? workspaceLog.error : workspaceLog.warn)(logMessage, { error });
-      return false;
+      return "failed";
     }
   }
 
@@ -2852,11 +2852,12 @@ export class StreamManager {
     usage: LanguageModelV2Usage | undefined,
     providerMetadata: Record<string, unknown> | undefined,
     logMessage: string,
-    logLevel: "warn" | "error"
+    logLevel: "warn" | "error",
+    model: string = streamInfo.model
   ): Promise<void> {
-    const recorded = await this.recordSessionUsage(
+    const result = await this.recordSessionUsage(
       workspaceId,
-      streamInfo.model,
+      model,
       usage,
       providerMetadata,
       logMessage,
@@ -2864,11 +2865,13 @@ export class StreamManager {
       streamInfo,
       streamInfo.hasInFlightSessionUsage === true ? streamInfo.messageId : undefined
     );
-    if (recorded) {
-      streamInfo.hasInFlightSessionUsage = false;
-    } else {
+    if (result === "skipped") {
       await this.discardInFlightSessionUsage(workspaceId, streamInfo);
+      return;
     }
+    // "recorded" replaced the in-flight entry. On "failed" the in-flight entry stays in the
+    // file: it is then the only durable record of the finished steps, so nothing discards it.
+    streamInfo.hasInFlightSessionUsage = false;
   }
 
   /**
@@ -4307,14 +4310,16 @@ export class StreamManager {
       return;
     }
 
-    await this.recordSessionUsage(
+    // Replaces the attempt's in-flight entry in the same write: a separate add and discard
+    // would count the attempt twice if Xum stopped between them.
+    await this.settleSessionUsage(
       workspaceId,
-      refusedModel,
+      streamInfo,
       usage,
       providerMetadata,
       "Failed to record refused-attempt session usage (fallback unaffected)",
       "warn",
-      streamInfo
+      refusedModel
     );
   }
 
@@ -4336,14 +4341,16 @@ export class StreamManager {
       return;
     }
 
-    await this.recordSessionUsage(
+    // Replaces the attempt's in-flight entry in the same write: a separate add and discard
+    // would count the attempt twice if Xum stopped between them.
+    await this.settleSessionUsage(
       workspaceId,
-      refusedModel,
+      streamInfo,
       usage,
       providerMetadata,
       "Failed to record terminal-refusal session usage",
       "warn",
-      streamInfo
+      refusedModel
     );
   }
 
