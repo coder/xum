@@ -1255,6 +1255,53 @@ describe("TaskService", () => {
     });
   });
 
+  // The rotations of a pass land before its sends, so every row decided for a re-drive must still
+  // get its send: an earlier row's send must not strand it, and a turn that a later row started in
+  // the meantime must keep it from getting a second, synthetic one.
+  test.each(["earlier send throws", "later row becomes busy"] as const)(
+    "batched startup re-drives stay per row (%s)",
+    async (variant) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const parentWorkspaceId = "parent-batch-per-row";
+      const [first, second] = ["child-batch-first", "child-batch-second"];
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentWorkspaceId),
+          ...[first, second].map((id) =>
+            projectWorkspace(projectPath, id, id, {
+              parentWorkspaceId,
+              agentId: "exec",
+              agentType: "exec",
+              taskStatus: "running",
+              taskModelString: "openai:gpt-5.2",
+            })
+          ),
+        ],
+        testTaskSettings()
+      );
+      let secondBusy = false;
+      const sendMessage = mock((workspaceId: string): Promise<Result<void>> => {
+        if (workspaceId !== first) return Promise.resolve(Ok(undefined));
+        if (variant === "earlier send throws") return Promise.reject(new Error("send threw"));
+        secondBusy = true;
+        return Promise.resolve(Ok(undefined));
+      });
+      const { workspaceService } = createWorkspaceServiceMocks({
+        sendMessage,
+        isBusyForMessage: mock((workspaceId: string) => workspaceId === second && secondBusy),
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      await taskService.recoverInterruptedTasks();
+
+      const messaged = sendMessage.mock.calls.map((call) => call[0]);
+      expect(messaged).toEqual(variant === "earlier send throws" ? [first, second] : [first]);
+    }
+  );
+
   // A legacy row (no taskStatus) is re-driven only for an interrupted tail, a pending compaction
   // follow-up or pending guidance. Startup used to rotate the attempt of every such row (one full
   // config.json write each) before it skipped the idle ones: on a large config that alone outlived

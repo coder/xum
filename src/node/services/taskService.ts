@@ -4421,7 +4421,6 @@ export class TaskService implements AgentTaskIntegration {
         const found = await this.editWorkspaceEntry(
           batch[0].id,
           (_keyRow, config) => {
-            // editConfig can re-run the transform on fresh bytes; only the last run counts.
             for (const snapshot of batch) {
               const attemptId = attemptIds.get(snapshot.id);
               assert(attemptId != null, "rotateAttemptsForStartupRedrive: attempt id is minted");
@@ -4494,6 +4493,39 @@ export class TaskService implements AgentTaskIntegration {
       : this.dispatchFencedStartupCompactionFollowUp(redrive.task.id, attemptId);
   }
 
+  /**
+   * A running re-drive re-checked against live state before its send: null when the row changed,
+   * or when a turn started since the decision and the re-drive has no guidance to queue (only
+   * guidance may queue behind an active turn). Otherwise the re-drive with its live activity.
+   */
+  private refreshRunningStartupRedrive<
+    T extends { task: AgentTaskWorkspaceEntry & { id: string }; alreadyStreaming: boolean },
+  >(redrive: T): T | null {
+    if (!this.startupRedriveRowUnchanged(redrive.task)) return null;
+    const alreadyStreaming =
+      redrive.alreadyStreaming ||
+      this.aiService.isStreaming(redrive.task.id) ||
+      this.workspaceService.isBusyForMessage(redrive.task.id);
+    const hasGuidance = (redrive.task.taskPendingGuidance?.length ?? 0) > 0;
+    return alreadyStreaming && !hasGuidance ? null : { ...redrive, alreadyStreaming };
+  }
+
+  /**
+   * Runs one startup re-drive send step. A throw fails only that row: the batch already rotated
+   * the attempts of the rows after it, so aborting the pass would leave them without their send.
+   */
+  private async runStartupRedrive(
+    taskId: string,
+    redrive: () => Promise<StartupRedriveOutcome>
+  ): Promise<StartupRedriveOutcome> {
+    try {
+      return await redrive();
+    } catch (error: unknown) {
+      log.warn("[startup] task re-drive failed", { taskId, error });
+      return "failed";
+    }
+  }
+
   /** A fenced admission for one startup send, bound to the attempt rotated for this decision. */
   private admitStartupSend(taskId: string, attemptId: string): TurnAdmissionToken | undefined {
     const admission = this.admitTaskWorkspaceTurn(taskId, {
@@ -4512,7 +4544,11 @@ export class TaskService implements AgentTaskIntegration {
     task: AgentTaskWorkspaceEntry & { id: string },
     attemptId: string
   ): Promise<StartupRedriveOutcome> {
-    if (!this.startupRedriveRowUnchanged(task)) return "skipped";
+    // A turn started since the decision owns the task now: its stream end re-enters completion
+    // recovery (see the busy check where the row was decided).
+    if (!this.startupRedriveRowUnchanged(task) || this.workspaceService.isBusyForMessage(task.id)) {
+      return "skipped";
+    }
     const followUp = await this.dispatchFencedStartupCompactionFollowUp(task.id, attemptId);
     if (!followUp.success) return "failed";
     if (followUp.data) return "resumed";
@@ -4548,13 +4584,14 @@ export class TaskService implements AgentTaskIntegration {
     attemptId: string,
     state: StartupRecoveryState | undefined
   ): Promise<StartupRedriveOutcome> {
-    const { task, queueOnly } = redrive;
-    if (!this.startupRedriveRowUnchanged(task)) return "skipped";
+    const live = this.refreshRunningStartupRedrive(redrive);
+    if (live == null) return "skipped";
+    const { task, queueOnly } = live;
     const pendingGuidance = task.taskPendingGuidance ?? [];
 
     // Restore compaction intent before new guidance/nudges make its tail stale.
     // Guidance then queues behind that continuation without losing either payload.
-    const followUp = await this.dispatchRunningStartupFollowUp(redrive, attemptId);
+    const followUp = await this.dispatchRunningStartupFollowUp(live, attemptId);
     if (!followUp.success) return "failed";
     if (followUp.data && pendingGuidance.length === 0) return "resumed";
     // Every further send of this decision is fenced to the attempt rotated for it: bound here
@@ -6164,7 +6201,11 @@ export class TaskService implements AgentTaskIntegration {
       if (cancelled("awaiting-report")) return;
       const attemptId = awaitingReportAttempts.get(task.id);
       const outcome =
-        attemptId == null ? "failed" : await this.redriveAwaitingReportStartupTask(task, attemptId);
+        attemptId == null
+          ? "failed"
+          : await this.runStartupRedrive(task.id, () =>
+              this.redriveAwaitingReportStartupTask(task, attemptId)
+            );
       if (outcome === "resumed") resumedAwaitingReportCount += 1;
       else if (outcome === "failed") failedAwaitingReportCount += 1;
     }
@@ -6222,7 +6263,9 @@ export class TaskService implements AgentTaskIntegration {
       const outcome =
         attemptId == null
           ? "failed"
-          : await this.redriveRunningStartupTask(redrive, attemptId, states.get(redrive.task.id));
+          : await this.runStartupRedrive(redrive.task.id, () =>
+              this.redriveRunningStartupTask(redrive, attemptId, states.get(redrive.task.id))
+            );
       if (outcome === "resumed") resumedRunningCount += 1;
       else if (outcome === "failed") failedRunningCount += 1;
     }
