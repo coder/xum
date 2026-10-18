@@ -1512,20 +1512,9 @@ describe("ProjectSidebar flat chat list", () => {
     expect(view.getByTestId(agentItemTestId("parent"))).toBeTruthy();
   });
 
-  // Drafts lead the list in both sidebar modes, above pinned chats.
-  test.each([
-    { mode: "flat list", sidebarFlatMode: true },
-    { mode: "project view", sidebarFlatMode: false },
-  ])("renders drafts above the pinned block in the $mode", ({ sidebarFlatMode }) => {
-    const pinned = {
-      ...createWorkspace("pinned-chat", { title: "Pinned chat" }),
-      projects: singleProjectRefs,
-      pinnedAt: "2026-01-01T00:00:00.000Z",
-    };
-    const regular = {
-      ...createWorkspace("regular-chat", { title: "Regular chat" }),
-      projects: singleProjectRefs,
-    };
+  const mockDraftActions = (
+    workspaceDraftsByProject: Record<string, Array<Record<string, unknown>>>
+  ) =>
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
@@ -1540,17 +1529,35 @@ describe("ProjectSidebar flat chat list", () => {
           refreshWorkspaceMetadata: () => Promise.resolve(),
           pendingNewWorkspaceProject: null,
           pendingNewWorkspaceDraftId: null,
-          workspaceDraftsByProject: {
-            "/projects/demo-project": [
-              { draftId: "draft-order", createdAt: Date.now(), manualName: "" },
-            ],
-          },
+          workspaceDraftsByProject,
           workspaceDraftPromotionsByProject: {},
           createWorkspaceDraft: () => undefined,
           openWorkspaceDraft: () => undefined,
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
+  const renderedRowIds = (container: HTMLElement) =>
+    Array.from(
+      container.querySelectorAll('[data-testid^="agent-item-"], [data-testid^="draft-item-"]')
+    ).map((row) => row.getAttribute("data-testid"));
+
+  // Drafts lead the list in both sidebar modes, above pinned chats.
+  test.each([
+    { mode: "flat list", sidebarFlatMode: true },
+    { mode: "project view", sidebarFlatMode: false },
+  ])("renders drafts above the pinned block in the $mode", ({ sidebarFlatMode }) => {
+    const pinned = {
+      ...createWorkspace("pinned-chat", { title: "Pinned chat" }),
+      projects: singleProjectRefs,
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const regular = {
+      ...createWorkspace("regular-chat", { title: "Regular chat" }),
+      projects: singleProjectRefs,
+    };
+    mockDraftActions({
+      "/projects/demo-project": [{ draftId: "draft-order", createdAt: Date.now(), manualName: "" }],
+    });
     setSidebarPreferences({ sidebarFlatMode });
 
     const view = render(
@@ -1562,13 +1569,63 @@ describe("ProjectSidebar flat chat list", () => {
       />
     );
 
-    const rows = Array.from(
-      view.container.querySelectorAll('[data-testid^="agent-item-"], [data-testid^="draft-item-"]')
-    ).map((row) => row.getAttribute("data-testid"));
-    expect(rows).toEqual([
+    expect(renderedRowIds(view.container)).toEqual([
       "draft-item-draft-order",
       agentItemTestId("pinned-chat"),
       agentItemTestId("regular-chat"),
+    ]);
+  });
+
+  test("renders drafts first in the unsectioned zone and in their sub-project in the project view", () => {
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { workspaces: [] }],
+        [
+          "section-1",
+          {
+            displayName: "Section 1",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+      ]),
+    });
+    const pinned = {
+      ...createWorkspace("pinned-chat", { title: "Pinned chat" }),
+      projects: singleProjectRefs,
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const sectionChat = {
+      ...createWorkspace("section-chat", { title: "Section chat", subProjectPath: "section-1" }),
+      projects: singleProjectRefs,
+    };
+    mockDraftActions({
+      "/projects/demo-project": [
+        { draftId: "draft-unsectioned", createdAt: Date.now(), manualName: "" },
+        {
+          draftId: "draft-in-section",
+          createdAt: Date.now(),
+          manualName: "",
+          subProjectPath: "section-1",
+        },
+      ],
+    });
+    setSidebarPreferences({ sidebarFlatMode: false });
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [pinned, sectionChat]]])}
+        workspaceRecency={{ "pinned-chat": Date.now(), "section-chat": Date.now() }}
+      />
+    );
+
+    expect(renderedRowIds(view.container)).toEqual([
+      "draft-item-draft-unsectioned",
+      agentItemTestId("pinned-chat"),
+      "draft-item-draft-in-section",
+      agentItemTestId("section-chat"),
     ]);
   });
 
