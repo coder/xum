@@ -18,7 +18,9 @@ rules live in `scripts/crap/policy.ts` with thresholds in
   Exit 0 pass, 1 violations, 2 tool error.
 - The agent hook: after a `git commit` or `git push` bash call, Xum appends the
   report to the tool result (warn mode). In block mode the hook stops the
-  command before it runs. `scripts/crap/agent-gate.sh` holds the mode.
+  command before it runs. `scripts/crap/agent-gate.sh` holds the mode. A bash
+  call that exits non-zero gets no report, even when a `git commit` in it
+  succeeded before a later command failed. Run `make crap-check` then.
 - CI: the `Quality / CRAP` job summary and its annotations. It is informational.
 
 Without coverage, scores are CC. With `--coverage <lcov>`, scores are CRAP.

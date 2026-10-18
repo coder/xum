@@ -60,7 +60,10 @@ fi
 # - A user hook that is this file (a symlink, or a project at the Xum home).
 # - The user's hook shares this hook's time limit (Xum kills a tool_post after
 #   10 s), so after a slow CRAP report it has less time than on its own.
-# A missing or non-executable tool_post means Xum would not run it either.
+# - A non-executable user hook. Xum on its own would run it and append the
+#   shell's "Permission denied" (exit 126) to every tool result. This hook
+#   skips it instead, so only this repo hides that setup error.
+# A missing tool_post means Xum would not run one either.
 run_user_tool_post() {
   case ${XUM_RUNTIME:-} in
     local | worktree) ;;
