@@ -1769,9 +1769,14 @@ export const TabsReachableUnderWideTitlebarInset: Story = {
     const canvas = within(canvasElement);
     const stats = await canvas.findByRole("tab", { name: /^stats/i, selected: true });
     const review = await canvas.findByRole("tab", { name: /^review/i });
-    await expectSelectedTabVisible(canvasElement);
+    // The capped inset leaves the strip 10rem. After "+", All tabs and the collapse button, the
+    // row is narrower than one tab, so the selected tab only has to stay under the pointer, and
+    // All tabs must stay clickable: it reaches every tab.
     await waitFor(() => {
       if (!isHitTarget(stats)) throw new Error("selected tab is not under the pointer");
+      if (!isHitTarget(canvas.getByRole("button", { name: "All tabs" }))) {
+        throw new Error("All tabs is not under the pointer");
+      }
     });
     // Like Playwright: bring the other tab into view, then it must take the click.
     review.scrollIntoView({ block: "nearest", inline: "nearest" });

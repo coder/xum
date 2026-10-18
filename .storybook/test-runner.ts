@@ -2,14 +2,14 @@ import type { TestRunnerConfig } from "@storybook/test-runner";
 // This hook is reloaded between Jest suites in the same worker. Importing @playwright/test
 // initializes a second test runner and fails on reload; use browser waits and Node assertions.
 import assert from "node:assert/strict";
-import { MOBILE_TOUCH_TARGET_PX } from "../src/constants/layout";
+import { MOBILE_TOUCH_TARGET_PX, TABLET_TOUCH_TARGET_PX } from "../src/constants/layout";
 
 // Real :hover for the primary-button contrast stories (#6022). A play runs inside the page and
 // cannot set :hover, so only stories under this id prefix get two page-level helpers backed by
 // Playwright. All other stories run exactly as before.
 const HOVER_STORY_PREFIX = "app-primarybuttoncontrast--";
 const hoverReady = new WeakSet<object>();
-// The Narrow story's strip scrolls up to 621 px, and the shortest swipe seen moved it 56 px:
+// The Narrow story's strip scrolls up to 669 px, and the shortest swipe seen moved it 56 px:
 // 16 swipes cover it with room to spare.
 const MAX_TOUCH_SWIPES = 16;
 
@@ -71,6 +71,62 @@ async function assertPhoneFooterTouchTargets(page: StoryPage) {
   }
 }
 
+const TOUCH_RESIZE_STORY = "app-seededworkspacea11y--narrow-sidebar-dark";
+
+/**
+ * A finger must drag the right sidebar's resize handle: a touch drag fires no mouse events, and
+ * iPads report a coarse pointer even with a trackpad. Plays dispatch synthetic events, so only
+ * browser input proves the handle takes a touch drag (and that the page does not pan instead).
+ */
+async function assertTouchResizesRightSidebar(page: StoryPage) {
+  const client = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  // The drag persists the new width; restore storage for the stories that run after this one.
+  const storage = await page.evaluate(() => Object.entries(localStorage));
+  const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    await page.setViewportSize({ width: 1200, height: 900 });
+    await page.waitForFunction(() => matchMedia("(pointer: coarse)").matches, undefined, {
+      timeout: 5000,
+    });
+    const before = await sidebar.boundingBox();
+    const handle = await page.locator("[data-sidebar-resize-handle]").boundingBox();
+    if (!before || !handle) throw new Error("Right sidebar or its resize handle is missing");
+    const x = handle.x + handle.width / 2;
+    const y = handle.y + handle.height / 2;
+    await client.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x, y }] });
+    for (let step = 1; step <= 4; step++) {
+      // A frame per move: the drag listeners attach in an effect after the touch starts.
+      await page.evaluate(
+        () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      );
+      await client.send("Input.dispatchTouchEvent", {
+        type: "touchMove",
+        touchPoints: [{ x: x - 20 * step, y }],
+      });
+    }
+    await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    // Dragging the left-edge handle 80 px left widens the sidebar by as much.
+    await page.waitForFunction(
+      (start) => {
+        const element = document.querySelector('[aria-label="Workspace insights"]');
+        return element != null && element.getBoundingClientRect().width >= start + 60;
+      },
+      before.width,
+      { timeout: 5000 }
+    );
+  } finally {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+    if (viewport) await page.setViewportSize(viewport);
+    await page.evaluate((entries) => {
+      localStorage.clear();
+      for (const [key, value] of entries) localStorage.setItem(key, value);
+    }, storage);
+  }
+}
+
 const config: TestRunnerConfig = {
   async preVisit(page, context) {
     // exposeFunction throws on a second registration, so register once per Playwright page.
@@ -86,24 +142,44 @@ const config: TestRunnerConfig = {
       }
       return;
     }
+    if (context.id === TOUCH_RESIZE_STORY) {
+      if (page.context().browser()?.browserType().name() === "chromium") {
+        await assertTouchResizesRightSidebar(page);
+      }
+      return;
+    }
     if (context.id === "app-rightsidebar-stable-tab-controls--wide") {
       if (page.context().browser()?.browserType().name() !== "chromium") return;
-      // A tablet (coarse pointer above the phone breakpoint) gets no global 44px button floor,
-      // so the collapse button must size itself for touch. Plays cannot emulate the pointer.
+      // A tablet (coarse pointer above the phone breakpoint) gets no global 44px button floor.
+      // Its strip keeps the desktop height (44px rows made it far taller than the header), so
+      // the controls must size themselves to the 24px minimum. Plays cannot emulate the pointer.
       const client = await page.context().newCDPSession(page);
       const viewport = page.viewportSize();
+      const strip = page.getByRole("tablist").locator("..");
       try {
-        await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
         await page.setViewportSize({ width: 1200, height: 900 });
+        const desktop = await strip.boundingBox();
+        await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
         await page.waitForFunction(() => matchMedia("(pointer: coarse)").matches, undefined, {
           timeout: 5000,
         });
-        const box = await page.getByRole("button", { name: "Collapse sidebar" }).boundingBox();
-        if (!box) throw new Error("Collapse sidebar button is missing");
-        assert(
-          box.width >= 44 && box.height >= 44,
-          `Collapse target is ${box.width}x${box.height}`
-        );
+        const tablet = await strip.boundingBox();
+        if (!desktop || !tablet) throw new Error("Tab strip is missing");
+        assert.equal(tablet.height, desktop.height, "Touch must not grow the tablet tab strip");
+        for (const name of [
+          "Close New tab",
+          "Close Instructions",
+          "New tab",
+          "All tabs",
+          "Collapse sidebar",
+        ]) {
+          const box = await page.getByRole("button", { name, exact: true }).boundingBox();
+          if (!box) throw new Error(`${name} button is missing`);
+          assert(
+            box.width >= TABLET_TOUCH_TARGET_PX && box.height >= TABLET_TOUCH_TARGET_PX,
+            `${name} target is ${box.width}x${box.height}`
+          );
+        }
       } finally {
         await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
         await client.detach();
@@ -173,12 +249,13 @@ const config: TestRunnerConfig = {
           }
           await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
           await row.and(page.locator("[data-scroll-settled]")).waitFor({ timeout: 5000 });
+          // The tap below lands 20 px into the last tab's visible part: on a phone, a long title
+          // can be wider than the row, so the tab's own left edge never scrolls into view.
           const reachedLastTab = await row.evaluate((el) => {
             const last = Array.from(el.querySelectorAll('[role="tab"]')).at(-1);
             if (!last) return false;
             const bounds = el.getBoundingClientRect();
-            const tapX = last.getBoundingClientRect().left + 20;
-            return tapX >= bounds.left && tapX < bounds.right;
+            return Math.max(last.getBoundingClientRect().left, bounds.left) + 20 < bounds.right;
           });
           if (reachedLastTab) break;
         }
@@ -196,11 +273,11 @@ const config: TestRunnerConfig = {
         const last = await tabs.last().boundingBox();
         const bounds = await row.boundingBox();
         if (!last || !bounds) throw new Error("Scrolled tab is missing");
-        assert(last.x + 20 >= bounds.x, "Last tab must be inside the left edge");
-        assert(last.x + 20 < bounds.x + bounds.width, "Last tab must be inside the right edge");
+        const tapX = Math.max(last.x, bounds.x) + 20;
+        assert(tapX < bounds.x + bounds.width, "Last tab must be inside the right edge");
         await client.send("Input.dispatchTouchEvent", {
           type: "touchStart",
-          touchPoints: [{ x: last.x + 20, y: last.y + last.height / 2 }],
+          touchPoints: [{ x: tapX, y: last.y + last.height / 2 }],
         });
         await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
         await tabs.last().and(page.locator('[aria-selected="true"]')).waitFor({ timeout: 5000 });

@@ -11,7 +11,7 @@ interface LeftSidebarProps {
   onToggleCollapsed: () => void;
   widthPx?: number;
   isResizing?: boolean;
-  onStartResize?: (e: React.MouseEvent) => void;
+  onStartResize?: (e: React.PointerEvent) => void;
   sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>;
   workspaceRecency: Record<string, number>;
 }
@@ -100,10 +100,10 @@ export function LeftSidebar(props: LeftSidebarProps) {
           <div
             data-testid="left-sidebar-resize-handle"
             className={cn(
-              "absolute right-0 top-0 bottom-0 w-0.5 z-10 cursor-col-resize transition-[background] duration-150",
+              "absolute right-0 top-0 bottom-0 w-0.5 z-10 cursor-col-resize touch-none transition-[background] duration-150",
               isResizing ? "bg-accent" : "bg-border-light hover:bg-accent"
             )}
-            onMouseDown={(e) => onStartResize(e)}
+            onPointerDown={(e) => onStartResize(e)}
           />
         )}
       </div>

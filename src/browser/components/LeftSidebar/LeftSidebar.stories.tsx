@@ -65,7 +65,7 @@ interface LeftSidebarStoryOverrides {
   collapsed?: boolean;
   widthPx?: number;
   isResizing?: boolean;
-  onStartResize?: (e: React.MouseEvent) => void;
+  onStartResize?: (e: React.PointerEvent) => void;
   onToggleCollapsed?: () => void;
 }
 

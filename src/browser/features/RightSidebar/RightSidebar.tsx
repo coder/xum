@@ -261,9 +261,14 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
               // (0.75rem), so it sits evenly in the corner.
               isDesktop ? "top-12" : "top-11",
             ]
-          : // No width transition: expanding swaps the floating card for the docked panel, and
-            // animating the width between those two layouts reads as the card stretching.
-            "bg-surface-primary flex-shrink-0 overflow-hidden border-l"
+          : [
+              // No width transition: expanding swaps the floating card for the docked panel, and
+              // animating the width between those two layouts reads as the card stretching.
+              "bg-surface-primary flex-shrink-0 overflow-hidden border-l",
+              // On coarse pointers the resize handle is a wider strip that draws the divider line
+              // on its right edge, where the tab strip's bottom border meets it.
+              "[@media(pointer:coarse)]:has-[[data-sidebar-resize-handle]]:border-l-0",
+            ]
       )}
       style={collapsed ? undefined : { width, maxWidth: "100%" }}
       role={role}
@@ -288,7 +293,7 @@ interface RightSidebarProps {
   /** Custom width in pixels (persisted per-tab, provided by AIView) */
   width?: number;
   /** Drag start handler for resize */
-  onStartResize?: (e: React.MouseEvent) => void;
+  onStartResize?: (e: React.PointerEvent) => void;
   /** Whether currently resizing */
   isResizing?: boolean;
   /** Callback when user adds a review note from Code Review tab */
@@ -589,6 +594,8 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
     // with index + close/pop-out actions) — see `tabRegistry.tsx` for why
     // terminals stay outside the static registry.
     let label: React.ReactNode;
+    // The All tabs menu shows `label` unless it holds buttons (a menu row cannot nest them).
+    let menuLabel: React.ReactNode | undefined;
     if (isNewTab(tab)) {
       label = <NewTabLabel />;
     } else if (isBaseTabId(tab)) {
@@ -596,14 +603,16 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
       label = <Label workspaceId={props.workspaceId} reviewStats={props.reviewStats} />;
     } else if (isTerminal) {
       const terminalIndex = props.terminalTabOrder.get(tab) ?? 0;
+      const dynamicTitle = props.terminalTitles.get(tab);
       label = (
         <TerminalTabLabel
-          dynamicTitle={props.terminalTitles.get(tab)}
+          dynamicTitle={dynamicTitle}
           terminalIndex={terminalIndex}
           onPopOut={() => props.onPopOutTerminal(tab)}
           onClose={() => props.onCloseTerminal(tab)}
         />
       );
+      menuLabel = <TerminalTabLabel dynamicTitle={dynamicTitle} terminalIndex={terminalIndex} />;
     } else if (getAppViewTabKey(tab) != null) {
       label = (
         <AppViewTabLabel workspaceId={props.workspaceId} toolCallId={appViewTabToolCallId(tab)} />
@@ -615,6 +624,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           onClose={() => props.onCloseSideChat(tab)}
         />
       );
+      menuLabel = <SideChatTabLabel workspaceId={sideChatWorkspaceId} />;
     } else {
       label = tab;
     }
@@ -626,6 +636,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
         selected: props.node.activeTab === tab,
         onSelect: () => selectTab(tab),
         label,
+        menuLabel,
         tooltip,
         tab,
         // Every tab is closeable; terminal and side chat labels render their own X (closing
@@ -2615,13 +2626,29 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             {/* Resize handle (left edge); full-screen mode has nothing to resize. */}
             {onStartResize && !fullscreen && (
               <div
+                data-sidebar-resize-handle=""
                 className={cn(
-                  "w-0.5 flex-shrink-0 z-10 transition-[background] duration-150 cursor-col-resize",
-                  isResizing ? "bg-accent" : "bg-border-light hover:bg-accent"
+                  // touch-none: a touch drag on the handle resizes instead of panning the page.
+                  "group/resize z-10 flex w-0.5 flex-shrink-0 cursor-col-resize touch-none justify-center",
+                  // A 2px line is too thin to grab with a finger, and iPads report a coarse
+                  // pointer even with a trackpad: coarse pointers get a wider strip with a grip.
+                  // The sidebar's divider line moves to the strip's right edge (SidebarContainer
+                  // drops its own), so the tab strip's bottom border still meets it.
+                  "[@media(pointer:coarse)]:border-border-light [@media(pointer:coarse)]:w-3 [@media(pointer:coarse)]:border-r"
                 )}
-                // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-                onMouseDown={(e) => onStartResize(e as unknown as React.MouseEvent)}
-              />
+                onPointerDown={onStartResize}
+              >
+                <span
+                  aria-hidden="true"
+                  className={cn(
+                    "w-full transition-[background] duration-150",
+                    "[@media(pointer:coarse)]:my-auto [@media(pointer:coarse)]:h-10 [@media(pointer:coarse)]:w-1 [@media(pointer:coarse)]:rounded-full",
+                    isResizing
+                      ? "bg-accent"
+                      : "bg-border-light group-hover/resize:bg-accent [@media(pointer:coarse)]:bg-border-darker"
+                  )}
+                />
+              </div>
             )}
 
             <div className="flex min-h-0 min-w-0 flex-1 flex-col">

@@ -12,7 +12,11 @@ import {
 import { createWorkspace } from "@/browser/stories/mocks/workspaces";
 import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import type { TabType } from "@/browser/types/rightSidebar";
-import { MOBILE_TOUCH_TARGET_PX } from "@/constants/layout";
+import {
+  MOBILE_TOUCH_TARGET_PX,
+  NARROW_VIEWPORT_MAX_WIDTH_PX,
+  TABLET_TOUCH_TARGET_PX,
+} from "@/constants/layout";
 import { RightSidebarTabStrip, type RightSidebarTabStripItem } from "./RightSidebarTabStrip";
 import {
   NewTabLabel,
@@ -37,19 +41,16 @@ const METADATA: WorkspaceMetadataContextValue = {
   loadError: null,
 };
 
-function StripFixture(props: { width: number; collapsible: boolean }) {
+function StripFixture(props: { width: number; collapsible: boolean; tabs?: TabType[] }) {
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
   const [selected, setSelected] = useState<TabType>("new");
   const [closed, setClosed] = useState<TabType[]>([]);
-  const [order, setOrder] = useState<TabType[]>([
-    "new",
-    "instructions",
-    "side:side-title",
-    "terminal:long-title",
-  ]);
+  const [order, setOrder] = useState<TabType[]>(
+    props.tabs ?? ["new", "instructions", "side:side-title", "terminal:long-title"]
+  );
   const close = (tab: TabType) => setClosed((prev) => [...prev, tab]);
   const definitions: Array<
-    Pick<RightSidebarTabStripItem, "tab" | "label" | "tooltip" | "closeLabel">
+    Pick<RightSidebarTabStripItem, "tab" | "label" | "menuLabel" | "tooltip" | "closeLabel">
   > = [
     { tab: "new", label: <NewTabLabel />, tooltip: "Open a tool", closeLabel: "Close New tab" },
     {
@@ -66,6 +67,7 @@ function StripFixture(props: { width: number; collapsible: boolean }) {
           onClose={() => close("side:side-title")}
         />
       ),
+      menuLabel: <SideChatTabLabel workspaceId={SIDE_WORKSPACE.id} />,
       tooltip: <SideChatTabTitle workspaceId={SIDE_WORKSPACE.id} />,
     },
     {
@@ -78,6 +80,7 @@ function StripFixture(props: { width: number; collapsible: boolean }) {
           onClose={() => close("terminal:long-title")}
         />
       ),
+      menuLabel: <TerminalTabLabel dynamicTitle={LONG_TITLE} terminalIndex={0} />,
       tooltip: LONG_TITLE,
     },
   ];
@@ -175,12 +178,17 @@ async function checkStableControls(canvasElement: HTMLElement) {
     await expect(closeRect.bottom).toBeLessThanOrEqual(rowRect.bottom);
     // Pixel does not emulate touch. This contract also runs in a coarse-pointer browser at
     // phone and wide tablet widths: static/New targets must fit even beyond mobile CSS's cap.
+    // Phones get the 44px touch floor. Tablets keep desktop-height rows (44px rows made the
+    // strip far taller than the header), so their X only has to meet the 24px minimum.
     if (
       window.matchMedia("(pointer: coarse)").matches &&
       ["new", "instructions"].includes(tab.id)
     ) {
-      await expect(closeRect.width).toBeGreaterThanOrEqual(MOBILE_TOUCH_TARGET_PX);
-      await expect(closeRect.height).toBeGreaterThanOrEqual(MOBILE_TOUCH_TARGET_PX);
+      const minTarget = window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches
+        ? MOBILE_TOUCH_TARGET_PX
+        : TABLET_TOUCH_TARGET_PX;
+      await expect(closeRect.width).toBeGreaterThanOrEqual(minTarget);
+      await expect(closeRect.height).toBeGreaterThanOrEqual(minTarget);
     }
     const text = label.querySelector("span.truncate") ?? label;
     await expect(text.getBoundingClientRect().right).toBeLessThanOrEqual(
@@ -222,6 +230,45 @@ async function checkNewTabButton(canvasElement: HTMLElement, overflowing: boolea
   }
 }
 
+/** A tab scrolled out of the row is one pick away in the All tabs menu. */
+async function checkTabListMenu(canvasElement: HTMLElement) {
+  const canvas = within(canvasElement);
+  const row = canvas.getByRole("tablist");
+  const tabs = within(row).getAllByRole("tab");
+  const target = tabs[0];
+  await userEvent.click(tabs[tabs.length - 1]);
+  await waitFor(() =>
+    expect(target.getBoundingClientRect().right).toBeLessThanOrEqual(
+      row.getBoundingClientRect().left
+    )
+  );
+
+  await userEvent.click(canvas.getByRole("button", { name: "All tabs" }));
+  // The menu renders in a portal, outside the canvas.
+  const menu = await within(document.body).findByRole("dialog", { name: "All tabs" });
+  const rows = within(menu).getAllByRole("button");
+  await expect(rows).toHaveLength(tabs.length);
+  // It opens on the selected tab's row, like a select, and arrow keys move between rows.
+  await waitFor(() => expect(rows[rows.length - 1]).toHaveFocus());
+  await expect(rows[rows.length - 1]).toHaveAttribute("aria-current", "true");
+  await userEvent.keyboard("{ArrowUp}");
+  await expect(rows[rows.length - 2]).toHaveFocus();
+
+  await userEvent.click(rows[0]);
+  await waitFor(() =>
+    expect(within(document.body).queryByRole("dialog", { name: "All tabs" })).toBeNull()
+  );
+  await expect(target).toHaveAttribute("aria-selected", "true");
+  // Focus moves to the picked tab, not back to the menu button.
+  await expect(target).toHaveFocus();
+  await waitFor(async () => {
+    const bounds = row.getBoundingClientRect();
+    const picked = target.getBoundingClientRect();
+    await expect(picked.left).toBeGreaterThanOrEqual(bounds.left - 0.5);
+    await expect(picked.right).toBeLessThanOrEqual(bounds.right + 0.5);
+  });
+}
+
 export const Narrow: Story = {
   // No collapse button, like the phone full-screen strip (the test-runner swipes this one at
   // phone width, see .storybook/test-runner.ts).
@@ -229,27 +276,41 @@ export const Narrow: Story = {
   play: async ({ canvasElement }) => {
     await checkStableControls(canvasElement);
     await checkNewTabButton(canvasElement, true);
+    await checkTabListMenu(canvasElement);
+  },
+};
+export const SingleTab: Story = {
+  // One tab leaves nothing to pick, so the strip has no All tabs button.
+  args: { width: 300, collapsible: true, tabs: ["new"] },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expect(canvas.getAllByRole("tab")).toHaveLength(1);
+    await expect(canvas.getByRole("button", { name: "Collapse sidebar" })).toBeVisible();
+    await expect(canvas.queryByRole("button", { name: "All tabs" })).toBeNull();
   },
 };
 export const Wide: Story = {
-  // Wide enough for every tab beside "+" and the collapse button.
+  // Wide enough for every tab beside "+", All tabs and the collapse button.
   args: { width: 1000, collapsible: true },
   play: async ({ canvasElement }) => {
     await checkStableControls(canvasElement);
     await checkNewTabButton(canvasElement, false);
-    // The collapse button holds the strip's right end, past the free space after "+".
+    // All tabs and the collapse button hold the strip's right end, past the free space after "+".
     const canvas = within(canvasElement);
     const plus = canvas.getByRole("button", { name: "New tab" }).getBoundingClientRect();
+    const allTabs = canvas.getByRole("button", { name: "All tabs" }).getBoundingClientRect();
     const collapse = canvas
       .getByRole("button", { name: "Collapse sidebar" })
       .getBoundingClientRect();
     const strip = canvas.getByRole("tablist").parentElement!.getBoundingClientRect();
-    await expect(collapse.left - plus.right).toBeGreaterThan(8);
+    await expect(allTabs.left - plus.right).toBeGreaterThan(8);
+    await expect(collapse.left - allTabs.right).toBeGreaterThanOrEqual(0);
+    await expect(collapse.left - allTabs.right).toBeLessThanOrEqual(8);
     await expect(strip.right - collapse.right).toBeLessThanOrEqual(9);
   },
 };
 export const Cramped: Story = {
-  // A split pane at its minimum width (15% of a 300 px sidebar) has no room for both buttons.
+  // A split pane at its minimum width (15% of a 300 px sidebar) has no room for all buttons.
   args: { width: 45, collapsible: true },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);

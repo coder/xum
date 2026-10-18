@@ -16,6 +16,10 @@ export const CHAT_DOCK_GUTTER_CLASS = "px-[15px]";
 // Minimum height globals.css gives touch targets on coarse-pointer viewports. Shared so tests can
 // reproduce that environment, which Storybook and Pixel cannot: neither emulates `pointer: coarse`.
 export const MOBILE_TOUCH_TARGET_PX = 44;
+// Touch target above the phone breakpoint (tablets), where globals.css sets no touch floor: the
+// WCAG 2.2 target-size minimum. The right sidebar tab strip's `[@media(pointer:coarse)]:min-h-6`
+// and `min-w-6` classes repeat this literal (Tailwind scans source text).
+export const TABLET_TOUCH_TARGET_PX = 24;
 
 // Width at or below which the app switches to its narrow layout (overlaying sidebar, PR badge in the
 // workspace header instead of the footer info bar). Tailwind arbitrary variants cannot read a TS
