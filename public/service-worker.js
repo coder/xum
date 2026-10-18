@@ -131,10 +131,11 @@ function precacheFile(cache, name) {
 }
 
 // Install event - cache the app shell and this build's first-load files (#6867). The server sends
-// the shell with no-store, so a root navigation refreshes it later. The shell and the entry file
-// are required: activate deletes the previous build's cache, so without them the next offline
-// start would fail. Then the install fails, drops its partial cache, and the previous worker
-// stays in control until the next update check. Any other first-load file may fail on its own.
+// the shell with no-store, so a root navigation refreshes it later. The shell and every module of
+// the first-load graph are required: activate deletes the previous build's cache, so without them
+// the next offline start would fail. Then the install fails, drops its partial cache, and the
+// previous worker stays in control until the next update check. The stylesheet and the font may
+// fail on their own.
 self.addEventListener("install", (event) => {
   event.waitUntil(
     caches
@@ -147,15 +148,20 @@ self.addEventListener("install", (event) => {
           })
         );
         const files = PRECACHE.map((name) => precacheFile(cache, name));
-        const entry = files[PRECACHE.indexOf(ENTRY_FILE)] || Promise.resolve();
-        return Promise.all([shell, entry, Promise.allSettled(files)]);
+        // Every module of the static first-load graph is required (the entry imports them).
+        const required = [shell, ...files.filter((_, i) => PRECACHE[i].endsWith(".js"))];
+        // Wait for every write first, so the failure delete below never races a late put.
+        return Promise.allSettled([shell, ...files]).then(() => Promise.all(required));
       })
       .then(
         () => self.skipWaiting(),
         (error) =>
-          caches.delete(CACHE_NAME).then(() => {
-            throw error;
-          })
+          // Unstamped workers all share the "dev" cache, which may be the active one.
+          BUILD_ID === "dev"
+            ? Promise.reject(error)
+            : caches.delete(CACHE_NAME).then(() => {
+                throw error;
+              })
       )
   );
 });

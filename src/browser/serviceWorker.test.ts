@@ -343,7 +343,9 @@ describe("service worker caching (#6848)", () => {
 describe("one cache per build (#6867)", () => {
   const IMMUTABLE = { "Cache-Control": "public, max-age=31536000, immutable" };
   const CSS = "main-AbCd1234.css";
-  const stampFor = (buildId: string, precache = [HASHED_JS, CSS]): ServiceWorkerStamp => ({
+  // A module the entry imports statically.
+  const VENDOR = "vendor-VeNd1234.js";
+  const stampFor = (buildId: string, precache = [HASHED_JS, VENDOR, CSS]): ServiceWorkerStamp => ({
     buildId,
     entryFile: HASHED_JS,
     precache,
@@ -376,7 +378,7 @@ describe("one cache per build (#6867)", () => {
     const storage = withNetwork(release);
     const worker = await startWorker({ storage, stamp: stampFor("bbbbbbbbbbbb") });
     expect(storage.urlsIn(worker.cacheName)).toEqual(
-      [ROOT_SCOPE, `${ORIGIN}/${HASHED_JS}`, `${ORIGIN}/${CSS}`].sort()
+      [ROOT_SCOPE, `${ORIGIN}/${HASHED_JS}`, `${ORIGIN}/${VENDOR}`, `${ORIGIN}/${CSS}`].sort()
     );
     const priorities = storage.fetchLog.map((entry) => [entry.url, entry.init?.priority]);
     expect(priorities).toContainEqual([HASHED_JS, "low"]);
@@ -399,7 +401,9 @@ describe("one cache per build (#6867)", () => {
     const worker = await startWorker({ storage, stamp: stampFor("bbbbbbbbbbbb") });
     // Activate ran: the old cache is gone.
     expect([...storage.stores.keys()]).toEqual([worker.cacheName]);
-    expect(storage.urlsIn(worker.cacheName)).toEqual([ROOT_SCOPE, `${ORIGIN}/${HASHED_JS}`].sort());
+    expect(storage.urlsIn(worker.cacheName)).toEqual(
+      [ROOT_SCOPE, `${ORIGIN}/${HASHED_JS}`, `${ORIGIN}/${VENDOR}`].sort()
+    );
   });
 
   const redirectedShell = () => {
@@ -418,6 +422,8 @@ describe("one cache per build (#6867)", () => {
     ["an unreachable shell", "./", failing],
     // A rolling deploy: another replica does not have this build's entry file yet.
     ["a missing entry file", HASHED_JS, () => new Response("not found", { status: 404 })],
+    // The entry imports it statically, so the cached entry cannot start without it.
+    ["a missing first-load module", VENDOR, () => new Response("not found", { status: 404 })],
   ])("install fails on %s and keeps the previous build's cache", async (_l, failingPath, reply) => {
     const storage = withNetwork((request) =>
       request === failingPath ? reply() : release(request)
@@ -427,6 +433,15 @@ describe("one cache per build (#6867)", () => {
     expect(worker.installed).toBe(false);
     // The partial cache is gone, and the previous build still starts offline.
     expect([...storage.stores.keys()]).toEqual([`mux-v3:${ROOT_SCOPE}`]);
+  });
+
+  test("a failed install of the unstamped dev worker keeps the shared dev cache", async () => {
+    const storage = withNetwork(failing);
+    storage.seed(cacheNameFor(ROOT_SCOPE), [ROOT_SCOPE]);
+    const worker = await startWorker({ storage });
+    expect(worker.installed).toBe(false);
+    // Every dev worker uses this name, so it may be the active worker's cache.
+    expect(storage.urlsIn(cacheNameFor(ROOT_SCOPE))).toEqual([ROOT_SCOPE]);
   });
 });
 
