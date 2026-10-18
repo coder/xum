@@ -213,12 +213,16 @@ function WorkspaceRow(props: {
   rowRenderMeta?: AgentRowRenderMeta;
   completedChildrenExpanded?: boolean;
   onToggleCompletedChildren?: (workspaceId: string) => void;
+  /** Flat-mode project identity: renders the avatar layout. */
+  project?: FlatProject;
 }) {
   return (
     <AgentListItem
       metadata={props.workspace}
       projectPath={PROJECT_PATH}
       projectName={PROJECT_NAME}
+      projectBadgeName={props.project?.name}
+      projectBadgeColor={props.project?.color}
       depth={props.rowRenderMeta?.depth}
       rowRenderMeta={props.rowRenderMeta}
       completedChildrenExpanded={props.completedChildrenExpanded}
@@ -233,10 +237,21 @@ function WorkspaceRow(props: {
   );
 }
 
-function DraftRow() {
+// The design handoff's sample projects, in their palette colors.
+interface FlatProject {
+  name: string;
+  color: string;
+}
+const CODER_PROJECT: FlatProject = { name: "coder", color: "#e54545" };
+const XUM_PROJECT: FlatProject = { name: "xum", color: "#4ab5a7" };
+const DOGFOOD_PROJECT: FlatProject = { name: "dogfood", color: "#4caf7c" };
+
+function DraftRow(props: { project?: FlatProject }) {
   return (
     <AgentListItem
       variant="draft"
+      projectBadgeName={props.project?.name}
+      projectBadgeColor={props.project?.color}
       draft={{
         draftId: "draft-state",
         draftNumber: 1,
@@ -278,6 +293,19 @@ function renderStatesGallery() {
       </GallerySection>
       <GallerySection label="Draft">
         <DraftRow />
+      </GallerySection>
+      {/* Flat sidebar mode: project avatar with the status dot on its corner. */}
+      <GallerySection label="Flat: Selected">
+        <WorkspaceRow workspace={STORY_WORKSPACES[0]} isSelected project={XUM_PROJECT} />
+      </GallerySection>
+      <GallerySection label="Flat: Active (streaming)">
+        <WorkspaceRow workspace={STORY_WORKSPACES[1]} project={CODER_PROJECT} />
+      </GallerySection>
+      <GallerySection label="Flat: Idle">
+        <WorkspaceRow workspace={STORY_WORKSPACES[2]} project={DOGFOOD_PROJECT} />
+      </GallerySection>
+      <GallerySection label="Flat: Draft">
+        <DraftRow project={DOGFOOD_PROJECT} />
       </GallerySection>
     </StoryScaffold>
   );

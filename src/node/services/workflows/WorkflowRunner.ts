@@ -503,6 +503,22 @@ function isAgentReportWaitTimeoutError(error: unknown): boolean {
   return isErrorWithName(error, "AgentReportWaitTimeoutError");
 }
 
+/** Milliseconds left until an ISO deadline (at least 1), or the fallback when none is usable. */
+function remainingMsUntilDeadline(
+  deadlineIso: string | undefined,
+  fallbackMs: number,
+  nowMs: number
+): number {
+  if (deadlineIso == null) {
+    return fallbackMs;
+  }
+  const parsedDeadlineMs = Date.parse(deadlineIso);
+  if (!Number.isFinite(parsedDeadlineMs)) {
+    return fallbackMs;
+  }
+  return Math.max(1, parsedDeadlineMs - nowMs);
+}
+
 function buildWorkflowAgentTimeoutFinalizationToken(
   runId: string,
   step: { spec: WorkflowAgentSpec; inputHash: string; taskId: string },
@@ -2230,24 +2246,12 @@ export class WorkflowRunner {
         throw error;
       }
     };
-    const remainingMsUntil = (deadlineIso: string | undefined, fallbackMs: number): number => {
-      if (deadlineIso == null) {
-        return fallbackMs;
-      }
-      const parsedDeadlineMs = Date.parse(deadlineIso);
-      if (!Number.isFinite(parsedDeadlineMs)) {
-        return fallbackMs;
-      }
-      return Math.max(1, parsedDeadlineMs - this.clock.nowMs());
-    };
+    const remainingMsUntil = (deadlineIso: string | undefined, fallbackMs: number): number =>
+      remainingMsUntilDeadline(deadlineIso, fallbackMs, this.clock.nowMs());
     const tryReadAcceptedReport = async (): Promise<WorkflowAgentResult | null> => {
-      const completedStep = await this.runStore.getCompletedStep(
-        runId,
-        step.spec.id,
-        step.inputHash
-      );
-      if (completedStep?.result != null) {
-        return { ...completedStep.result, taskId: step.taskId };
+      const acceptedResult = await this.readCompletedAgentStepResult(runId, step);
+      if (acceptedResult != null) {
+        return acceptedResult;
       }
       try {
         return await waitForReport(1);
@@ -2261,36 +2265,12 @@ export class WorkflowRunner {
         return acceptedReportBeforeHardTimeout;
       }
 
-      const errorMessage = `Workflow agent step ${step.spec.id} exceeded its soft timeout (${timeout.softMs}ms) and did not produce a valid final response within the grace period (${timeout.graceMs}ms).`;
-      const hardTimedOutAt = this.clock.nowIso();
-      await this.recordStepTimeoutMetadata(runId, {
-        stepId: step.spec.id,
-        inputHash: step.inputHash,
-        taskId: step.taskId,
-        startedAt: step.startedAt,
-        timeout: { hardTimedOutAt },
-      });
-      await this.appendEvent(runId, {
-        sequence: sequence.next(),
-        type: "timeout",
-        at: hardTimedOutAt,
-        stepId: step.spec.id,
-        taskId: step.taskId,
-        phase: "hard",
-        details: { error: errorMessage },
-      });
-      await this.recordTaskEventIfMissing(runId, sequence, {
-        stepId: step.spec.id,
-        taskId: step.taskId,
-        title: step.spec.title,
-        status: "timed_out",
-      });
-      await this.taskAdapter.failAgentTaskForHardTimeout?.(step.taskId, {
-        workflowRunId: runId,
-        stepId: step.spec.id,
-        inputHash: step.inputHash,
-        reason: errorMessage,
-      });
+      const { errorMessage, hardTimedOutAt } = await this.recordAgentStepHardTimeout(
+        runId,
+        sequence,
+        step,
+        timeout
+      );
       const acceptedReportAfterHardTimeout = await tryReadAcceptedReport();
       if (acceptedReportAfterHardTimeout != null) {
         return acceptedReportAfterHardTimeout;
@@ -2305,37 +2285,14 @@ export class WorkflowRunner {
       });
       throw createWorkflowAgentHardTimeoutError(errorMessage);
     };
-    const buildHardDeadlineFromNow = (): string =>
-      new Date(this.clock.nowMs() + timeout.graceMs).toISOString();
-    const recordFinalizationPromptAccepted = async (
+    const recordFinalizationPromptAccepted = (
       finalizationToken: string | undefined,
       finalizationResult: "prompted" | "queued" | "already_reported" | "not_active"
-    ): Promise<string> => {
-      const finalizationPromptSentAt = this.clock.nowIso();
-      const hardDeadlineAt = buildHardDeadlineFromNow();
-      step.leaseGuard.throwIfLost();
-      await this.recordStepTimeoutMetadata(runId, {
-        stepId: step.spec.id,
-        inputHash: step.inputHash,
-        taskId: step.taskId,
-        startedAt: step.startedAt,
-        timeout: {
-          ...(finalizationToken != null ? { finalizationToken } : {}),
-          finalizationPromptSentAt,
-          hardDeadlineAt,
-        },
+    ): Promise<string> =>
+      this.recordAgentFinalizationPromptAccepted(runId, sequence, step, timeout, {
+        finalizationToken,
+        finalizationResult,
       });
-      await this.appendEvent(runId, {
-        sequence: sequence.next(),
-        type: "timeout",
-        at: finalizationPromptSentAt,
-        stepId: step.spec.id,
-        taskId: step.taskId,
-        phase: "finalization_prompt_sent",
-        details: { result: finalizationResult },
-      });
-      return hardDeadlineAt;
-    };
     const waitDuringGrace = async (graceTimeoutMs: number): Promise<WorkflowAgentResult> => {
       try {
         const result = await waitForReport(graceTimeoutMs);
@@ -2402,26 +2359,66 @@ export class WorkflowRunner {
       }
     }
 
-    const completedAfterSoftTimeout = await this.runStore.getCompletedStep(
-      runId,
-      step.spec.id,
-      step.inputHash
-    );
-    if (completedAfterSoftTimeout?.result != null) {
-      return { ...completedAfterSoftTimeout.result, taskId: step.taskId };
+    const completedAfterSoftTimeout = await this.readCompletedAgentStepResult(runId, step);
+    if (completedAfterSoftTimeout != null) {
+      return completedAfterSoftTimeout;
     }
 
     assert(
       this.taskAdapter.requestAgentFinalReportForTimeout != null,
       "WorkflowRunner timeout wait requires requestAgentFinalReportForTimeout"
     );
+    const { finalizationToken, hardDeadlineAt } = await this.recordAgentStepSoftTimeout(
+      runId,
+      sequence,
+      step,
+      timeout
+    );
+
+    const finalizationResult = await this.taskAdapter.requestAgentFinalReportForTimeout(
+      step.taskId,
+      {
+        workflowRunId: runId,
+        stepId: step.spec.id,
+        inputHash: step.inputHash,
+        finalizationToken,
+        finalInstructions: timeout.finalInstructions,
+      }
+    );
+    if (finalizationResult === "already_reported") {
+      return await waitForReport(timeout.graceMs);
+    }
+    const acceptedHardDeadlineAt =
+      finalizationResult === "prompted"
+        ? await recordFinalizationPromptAccepted(finalizationToken, finalizationResult)
+        : hardDeadlineAt;
+
+    return await waitDuringGrace(remainingMsUntil(acceptedHardDeadlineAt, timeout.graceMs));
+  }
+
+  /** The step's journaled result when another writer already accepted the child's report. */
+  private async readCompletedAgentStepResult(
+    runId: string,
+    step: { spec: WorkflowAgentSpec; inputHash: string; taskId: string }
+  ): Promise<WorkflowAgentResult | null> {
+    const completedStep = await this.runStore.getCompletedStep(runId, step.spec.id, step.inputHash);
+    return completedStep?.result != null ? { ...completedStep.result, taskId: step.taskId } : null;
+  }
+
+  /** Journals a soft timeout: the grace deadline and token the finalization prompt carries. */
+  private async recordAgentStepSoftTimeout(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    step: { spec: WorkflowAgentSpec; inputHash: string; startedAt: string; taskId: string },
+    timeout: WorkflowAgentTimeoutSpec
+  ): Promise<{ finalizationToken: string; hardDeadlineAt: string }> {
     const softTimedOutAt = this.clock.nowIso();
     const finalizationToken = buildWorkflowAgentTimeoutFinalizationToken(
       runId,
       step,
       softTimedOutAt
     );
-    const hardDeadlineAt = buildHardDeadlineFromNow();
+    const hardDeadlineAt = new Date(this.clock.nowMs() + timeout.graceMs).toISOString();
     await this.recordStepTimeoutMetadata(runId, {
       stepId: step.spec.id,
       inputHash: step.inputHash,
@@ -2448,26 +2445,92 @@ export class WorkflowRunner {
       title: step.spec.title,
       status: "finalizing",
     });
+    return { finalizationToken, hardDeadlineAt };
+  }
 
-    const finalizationResult = await this.taskAdapter.requestAgentFinalReportForTimeout(
-      step.taskId,
-      {
-        workflowRunId: runId,
-        stepId: step.spec.id,
-        inputHash: step.inputHash,
-        finalizationToken,
-        finalInstructions: timeout.finalInstructions,
-      }
-    );
-    if (finalizationResult === "already_reported") {
-      return await waitForReport(timeout.graceMs);
+  /** Journals an accepted finalization prompt; the grace period restarts now. */
+  private async recordAgentFinalizationPromptAccepted(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    step: {
+      spec: WorkflowAgentSpec;
+      inputHash: string;
+      startedAt: string;
+      taskId: string;
+      leaseGuard: WorkflowRunnerLeaseGuard;
+    },
+    timeout: WorkflowAgentTimeoutSpec,
+    prompt: {
+      finalizationToken: string | undefined;
+      finalizationResult: "prompted" | "queued" | "already_reported" | "not_active";
     }
-    const acceptedHardDeadlineAt =
-      finalizationResult === "prompted"
-        ? await recordFinalizationPromptAccepted(finalizationToken, finalizationResult)
-        : hardDeadlineAt;
+  ): Promise<string> {
+    const finalizationPromptSentAt = this.clock.nowIso();
+    const hardDeadlineAt = new Date(this.clock.nowMs() + timeout.graceMs).toISOString();
+    step.leaseGuard.throwIfLost();
+    await this.recordStepTimeoutMetadata(runId, {
+      stepId: step.spec.id,
+      inputHash: step.inputHash,
+      taskId: step.taskId,
+      startedAt: step.startedAt,
+      timeout: {
+        ...(prompt.finalizationToken != null
+          ? { finalizationToken: prompt.finalizationToken }
+          : {}),
+        finalizationPromptSentAt,
+        hardDeadlineAt,
+      },
+    });
+    await this.appendEvent(runId, {
+      sequence: sequence.next(),
+      type: "timeout",
+      at: finalizationPromptSentAt,
+      stepId: step.spec.id,
+      taskId: step.taskId,
+      phase: "finalization_prompt_sent",
+      details: { result: prompt.finalizationResult },
+    });
+    return hardDeadlineAt;
+  }
 
-    return await waitDuringGrace(remainingMsUntil(acceptedHardDeadlineAt, timeout.graceMs));
+  /** Journals a hard timeout and asks the task adapter to fail the child. */
+  private async recordAgentStepHardTimeout(
+    runId: string,
+    sequence: WorkflowEventSequence,
+    step: { spec: WorkflowAgentSpec; inputHash: string; startedAt: string; taskId: string },
+    timeout: WorkflowAgentTimeoutSpec
+  ): Promise<{ errorMessage: string; hardTimedOutAt: string }> {
+    const errorMessage = `Workflow agent step ${step.spec.id} exceeded its soft timeout (${timeout.softMs}ms) and did not produce a valid final response within the grace period (${timeout.graceMs}ms).`;
+    const hardTimedOutAt = this.clock.nowIso();
+    await this.recordStepTimeoutMetadata(runId, {
+      stepId: step.spec.id,
+      inputHash: step.inputHash,
+      taskId: step.taskId,
+      startedAt: step.startedAt,
+      timeout: { hardTimedOutAt },
+    });
+    await this.appendEvent(runId, {
+      sequence: sequence.next(),
+      type: "timeout",
+      at: hardTimedOutAt,
+      stepId: step.spec.id,
+      taskId: step.taskId,
+      phase: "hard",
+      details: { error: errorMessage },
+    });
+    await this.recordTaskEventIfMissing(runId, sequence, {
+      stepId: step.spec.id,
+      taskId: step.taskId,
+      title: step.spec.title,
+      status: "timed_out",
+    });
+    await this.taskAdapter.failAgentTaskForHardTimeout?.(step.taskId, {
+      workflowRunId: runId,
+      stepId: step.spec.id,
+      inputHash: step.inputHash,
+      reason: errorMessage,
+    });
+    return { errorMessage, hardTimedOutAt };
   }
 
   private async runOrResumeAgentStep(

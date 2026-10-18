@@ -80,10 +80,25 @@ import {
   type ControllableAsyncIterable,
   type TestApiOverrides,
 } from "@/browser/testUtils";
+import * as RealToolCardsStore from "@/browser/features/Tools/Shared/toolCardsStore";
+import { restoreModulesAfterSuite } from "../../../tests/ui/moduleMocks";
 import {
   shouldNotifyOnResponseComplete,
   type ResponseCompleteEvent,
 } from "@/browser/utils/messages/responseCompletionMetadata";
+
+// Counts the store's tool-card requests (#6823) and records how many onChat calls preceded each.
+// The real request still runs, so every other test sees the real store.
+const realToolCardsStore = { ...RealToolCardsStore };
+const onChatCallsAtToolCardRequest: number[] = [];
+restoreModulesAfterSuite([["@/browser/features/Tools/Shared/toolCardsStore", realToolCardsStore]]);
+void mock.module("@/browser/features/Tools/Shared/toolCardsStore", () => ({
+  ...realToolCardsStore,
+  requestToolCards: () => {
+    onChatCallsAtToolCardRequest.push(mockOnChat.mock.calls.length);
+    realToolCardsStore.requestToolCards();
+  },
+}));
 
 interface LoadMoreResponse {
   messages: WorkspaceChatMessage[];
@@ -94,17 +109,17 @@ interface LoadMoreResponse {
 
 // Mock client
 // eslint-disable-next-line require-yield
-const mockOnChat = mock(async function* (
+async function* idleOnChat(
   _input?: { workspaceId: string; mode?: unknown },
   options?: { signal?: AbortSignal }
 ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
   // Keep the iterator open until the store aborts it (prevents retry-loop noise in tests).
   await waitForAbortSignal(options?.signal);
-});
+}
+const mockOnChat = mock(idleOnChat);
 
-const mockGetSessionUsage = mock((_input: { workspaceId: string }) =>
-  Promise.resolve<unknown>(undefined)
-);
+const noSessionUsage = (_input: { workspaceId: string }) => Promise.resolve<unknown>(undefined);
+const mockGetSessionUsage = mock(noSessionUsage);
 const mockHistoryLoadMore = mock(
   (_input?: {
     workspaceId: string;
@@ -797,11 +812,17 @@ describe("WorkspaceStore", () => {
   let mockOnModelUsed: Mock<(model: string) => void>;
 
   beforeEach(() => {
-    mockOnChat.mockClear();
-    mockGetSessionUsage.mockClear();
+    // Reset, not just clear: many tests install a lasting mockImplementation (openChat,
+    // mockBackgroundActivityTransition), and a leftover one feeds events into the next
+    // test, which then fails or passes depending on test order (`bun test --seed <n>`).
+    mockOnChat.mockReset();
+    mockOnChat.mockImplementation(idleOnChat);
+    mockGetSessionUsage.mockReset();
+    mockGetSessionUsage.mockImplementation(noSessionUsage);
+    mockActivitySubscribe.mockReset();
+    mockActivitySubscribe.mockImplementation(idleActivitySubscription);
     mockHistoryLoadMore.mockClear();
     mockActivityList.mockClear();
-    mockActivitySubscribe.mockClear();
     mockTerminalActivitySubscribe.mockClear();
     mockGetProvidersConfig.mockClear();
     mockOnProvidersConfigChanged.mockClear();
@@ -1660,6 +1681,31 @@ describe("WorkspaceStore", () => {
   });
 
   describe("active workspace subscriptions", () => {
+    // #6823: on desktop the lazy cards' chunk evaluated after the first rows committed, so tool
+    // rows showed header-only cards for 1-2 frames. Selection starts it before any chat event.
+    it.each([
+      ["desktop", true, [0]],
+      ["browser", false, []],
+    ] as const)(
+      "requests the tool cards on selection in %s mode",
+      async (_mode, desktop, calls) => {
+        const workspaceId = `tool-cards-on-select-${String(desktop)}`;
+        createAndAddWorkspace(store, workspaceId, {}, false);
+        await tick(0);
+        onChatCallsAtToolCardRequest.length = 0;
+        const api = global.window.api as { getIsRosetta?: () => Promise<boolean> };
+        if (desktop) api.getIsRosetta = () => Promise.resolve(false);
+        try {
+          store.setActiveWorkspaceId(workspaceId);
+          await tick(0);
+          // Desktop: one request, made before the onChat subscription started.
+          expect(onChatCallsAtToolCardRequest).toEqual([...calls]);
+          expect(mockOnChat).toHaveBeenCalled();
+        } finally {
+          delete api.getIsRosetta;
+        }
+      }
+    );
     it("does not start onChat until workspace becomes active", async () => {
       const workspaceId = "inactive-workspace";
       createAndAddWorkspace(store, workspaceId, {}, false);
@@ -1709,6 +1755,61 @@ describe("WorkspaceStore", () => {
         mockChatScript([], { keepOpen: true });
       }
     );
+
+    it("drops the kept pre-replay usage when a full replay attempt ends before caught-up", async () => {
+      // A full replay keeps the last usage on screen until caught-up; if the attempt ends
+      // first, that snapshot must go so stale live usage is not shown while retries continue.
+      const workspaceId = "workspace-usage-snapshot-retry";
+      const attempts = Array.from({ length: 3 }, () =>
+        createControllableAsyncIterable<WorkspaceChatMessage>()
+      );
+      let subscriptions = 0;
+      mockOnChat.mockImplementation(async function* (input, options) {
+        if (input?.workspaceId !== workspaceId) {
+          await waitForAbortSignal(options?.signal);
+          return;
+        }
+        const events = attempts[subscriptions++];
+        options?.signal?.addEventListener("abort", () => events.close(), { once: true });
+        yield* events.iterable;
+      });
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => subscriptions === 1)).toBe(true);
+      attempts[0].push(caughtUpEvent());
+      attempts[0].push({
+        type: "stream-start",
+        workspaceId,
+        messageId: "msg-live",
+        historySequence: 1,
+        model: "anthropic:claude-sonnet-4-20250514",
+        startTime: 1_000,
+      });
+      attempts[0].push({
+        type: "usage-delta",
+        workspaceId,
+        messageId: "msg-live",
+        usage: { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 },
+        cumulativeUsage: { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 },
+      });
+      expect(
+        await waitUntil(() => store.getWorkspaceUsage(workspaceId).liveUsage !== undefined)
+      ).toBe(true);
+
+      attempts[0].close();
+      expect(await waitUntil(() => subscriptions === 2)).toBe(true);
+      // The retry is a full replay that has not caught up: the snapshot stands in.
+      expect(store.getWorkspaceUsage(workspaceId).liveUsage).toBeDefined();
+
+      let usageNotified = false;
+      const unsubscribe = store.subscribeUsage(workspaceId, () => {
+        usageNotified = true;
+      });
+      attempts[1].close();
+      expect(await waitUntil(() => usageNotified)).toBe(true);
+      expect(store.getWorkspaceUsage(workspaceId).liveUsage).toBeUndefined();
+      unsubscribe();
+      mockChatScript([], { keepOpen: true });
+    });
 
     it("keeps transcript hydration active across full replay resets", async () => {
       const workspaceId = "workspace-full-replay-hydration";
@@ -5678,6 +5779,47 @@ describe("WorkspaceStore", () => {
       expect(state.hasOlderHistory).toBe(false);
     });
 
+    it("an onChat attempt that ends clears the older-history spinner and keeps the cursor", async () => {
+      const workspaceId = "history-pagination-attempt-end";
+      const attempts = Array.from({ length: 2 }, () =>
+        createControllableAsyncIterable<WorkspaceChatMessage>()
+      );
+      let subscriptions = 0;
+      mockOnChat.mockImplementation(async function* (input, options) {
+        if (input?.workspaceId !== workspaceId) {
+          await waitForAbortSignal(options?.signal);
+          return;
+        }
+        const events = attempts[subscriptions++];
+        options?.signal?.addEventListener("abort", () => events.close(), { once: true });
+        yield* events.iterable;
+      });
+      // The load never answers: only the attempt's end can clear the spinner.
+      mockHistoryLoadMore.mockReturnValueOnce(new Promise<LoadMoreResponse>(() => undefined));
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => subscriptions === 1)).toBe(true);
+      attempts[0].push(createHistoryMessageEvent("msg-newer", 5));
+      attempts[0].push({
+        type: "caught-up",
+        historyReplayStatus: "complete",
+        hasOlderHistory: true,
+      });
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
+        true
+      );
+      const pendingLoad = store.loadOlderHistory(workspaceId);
+      expect(pendingLoad).toBeInstanceOf(Promise);
+      expect(store.getWorkspaceState(workspaceId).loadingOlderHistory).toBe(true);
+
+      attempts[0].close();
+      expect(await waitUntil(() => !store.getWorkspaceState(workspaceId).loadingOlderHistory)).toBe(
+        true
+      );
+      // Reconnect retries keep pagination: a since caught-up omits hasOlderHistory.
+      expect(store.getWorkspaceState(workspaceId).hasOlderHistory).toBe(true);
+      mockChatScript([], { keepOpen: true });
+    });
+
     it("ignores stale load-more responses after pagination state changes", async () => {
       const workspaceId = "history-pagination-stale-response";
       const send = openChat(workspaceId);
@@ -7759,13 +7901,17 @@ describe("WorkspaceStore", () => {
     it("ignores an extra unsubscribe call once every listener is gone", () => {
       const workspaceId = "stats-underflow";
       const warn = spyOn(console, "warn").mockImplementation(() => undefined);
-      createAndAddWorkspace(store, workspaceId, {}, false);
-      const unsubscribe = store.subscribeStats(workspaceId, () => undefined);
-      unsubscribe();
+      try {
+        createAndAddWorkspace(store, workspaceId, {}, false);
+        const unsubscribe = store.subscribeStats(workspaceId, () => undefined);
+        unsubscribe();
 
-      unsubscribe();
-      expect(warn).toHaveBeenCalledTimes(1);
-      warn.mockRestore();
+        unsubscribe();
+        expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        // Restore even when an assertion fails, so later tests keep their warnings.
+        warn.mockRestore();
+      }
 
       // The count did not go negative: the next listener subscribes again.
       store.subscribeStats(workspaceId, () => undefined);
@@ -7818,15 +7964,18 @@ describe("WorkspaceStore", () => {
     it("logs a failed subscription and keeps showing no snapshot", async () => {
       const workspaceId = "stats-error";
       const warn = spyOn(console, "warn").mockImplementation(() => undefined);
-      const failure = new Error("stats gone");
-      mockStatsSubscribe.mockImplementationOnce(() => Promise.reject(failure));
-      createAndAddWorkspace(store, workspaceId, {}, false);
-      store.subscribeStats(workspaceId, () => undefined);
+      try {
+        const failure = new Error("stats gone");
+        mockStatsSubscribe.mockImplementationOnce(() => Promise.reject(failure));
+        createAndAddWorkspace(store, workspaceId, {}, false);
+        store.subscribeStats(workspaceId, () => undefined);
 
-      expect(await waitUntil(() => warn.mock.calls.length > 0)).toBe(true);
-      // The log carries the error itself, not just a message.
-      expect(warn.mock.calls[0]).toContain(failure);
-      warn.mockRestore();
+        expect(await waitUntil(() => warn.mock.calls.length > 0)).toBe(true);
+        // The log carries the error itself, not just a message.
+        expect(warn.mock.calls[0]).toContain(failure);
+      } finally {
+        warn.mockRestore();
+      }
       expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
     });
   });
@@ -8355,6 +8504,76 @@ describe("WorkspaceStore", () => {
       await tick(10);
 
       expect(store.getWorkflowToolLiveRun(workspaceId, "call-workflow-3")).toBeNull();
+    });
+  });
+
+  describe("live tool state after a delete", () => {
+    const runningToolPart = (toolCallId: string, toolName: string) => ({
+      type: "dynamic-tool" as const,
+      toolCallId,
+      toolName,
+      state: "input-available" as const,
+      input: {},
+    });
+
+    it("prunes live bash output and workflow runs of deleted tool calls and keeps the rest", async () => {
+      const workspaceId = "live-tool-state-delete";
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+      const run = createWorkflowRunRecord({ id: "wfr_live_delete", workspaceId });
+
+      await send(
+        caughtUpEvent(),
+        {
+          type: "message",
+          id: "kept-turn",
+          role: "assistant",
+          parts: [
+            runningToolPart("call-bash-kept", "bash"),
+            {
+              ...runningToolPart("call-code", "code_execution"),
+              // Kernel-nested calls key their live state by their own ids.
+              nestedCalls: [
+                {
+                  toolCallId: "call-nested-workflow",
+                  toolName: "workflow_run",
+                  state: "input-available",
+                },
+                { toolCallId: "call-nested-bash", toolName: "bash", state: "input-available" },
+              ],
+            },
+          ],
+          metadata: { historySequence: 1, timestamp: 1 },
+        },
+        {
+          type: "message",
+          id: "deleted-turn",
+          role: "assistant",
+          parts: [
+            runningToolPart("call-bash-deleted", "bash"),
+            runningToolPart("call-workflow-deleted", "workflow_run"),
+          ],
+          metadata: { historySequence: 2, timestamp: 2 },
+        },
+        bashOutputEvent(workspaceId, "call-bash-kept", "kept output"),
+        bashOutputEvent(workspaceId, "call-nested-bash", "nested output"),
+        bashOutputEvent(workspaceId, "call-bash-deleted", "deleted output"),
+        workflowRunAttachedEvent(workspaceId, "call-nested-workflow", run.id, 3, run),
+        workflowRunAttachedEvent(workspaceId, "call-workflow-deleted", run.id, 4, run)
+      );
+      expect(store.getBashToolLiveOutput(workspaceId, "call-bash-deleted")).not.toBeNull();
+      expect(store.getWorkflowToolLiveRun(workspaceId, "call-workflow-deleted")).not.toBeNull();
+
+      await send({ type: "delete", historySequences: [2] });
+
+      expect(store.getBashToolLiveOutput(workspaceId, "call-bash-deleted")).toBeNull();
+      expect(store.getWorkflowToolLiveRun(workspaceId, "call-workflow-deleted")).toBeNull();
+      expect(store.getBashToolLiveOutput(workspaceId, "call-bash-kept")).not.toBeNull();
+      expect(store.getBashToolLiveOutput(workspaceId, "call-nested-bash")).not.toBeNull();
+      expect(store.getWorkflowToolLiveRun(workspaceId, "call-nested-workflow")).toEqual({
+        runId: run.id,
+        run,
+      });
     });
   });
 

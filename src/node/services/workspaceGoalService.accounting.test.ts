@@ -95,7 +95,9 @@ describe("WorkspaceGoalService", () => {
     });
   });
 
-  test("paused goals ignore later stream accounting", async () => {
+  test("a paused goal is charged the cost of the user's own turn, without a turn", async () => {
+    // The user's message pauses the goal (pausedBy "manual_user"), and the worker turn it
+    // starts is real spend on the goal's work: the cost counts, the turn cap does not.
     const created = await setGoalOk(service, {
       workspaceId,
       objective: "User clarification mid-goal",
@@ -114,19 +116,42 @@ describe("WorkspaceGoalService", () => {
       streamOriginKind: "user",
     });
 
-    expect(updated).toMatchObject({ costCents: 0, turnsUsed: 0, status: "paused" });
+    expect(updated).toMatchObject({ costCents: 42, turnsUsed: 0, status: "paused" });
+    expect(await service.getGoal(workspaceId)).toMatchObject({ costCents: 42, status: "paused" });
   });
 
-  test("paused goals ignore maintenance stream accounting (heartbeats / wake turns)", async () => {
-    // Regression: paused goals were charged turns/cost (and updatedAtMs bumped)
-    // by every background wake turn ("other") and scheduled heartbeat, making
-    // maintenance turns look like they had just touched the paused goal.
+  test("spend while paused counts against the budget when the goal resumes", async () => {
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Spend while paused",
+      budgetCents: 40,
+    });
+    await setGoalOk(service, { workspaceId, objective: created.objective, status: "paused" });
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 0.42,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "user",
+    });
+
+    const resumed = await service.setGoal({
+      workspaceId,
+      objective: created.objective,
+      status: "active",
+    });
+    expect(resumed).toMatchObject({ success: true, data: { status: "budget_limited" } });
+  });
+
+  test("paused goals are charged maintenance stream cost without turns or a touch", async () => {
+    // Regression: paused goals were charged turns (and updatedAtMs bumped) by every
+    // background wake turn ("other") and scheduled heartbeat, making maintenance turns
+    // look like they had just touched the paused goal. The spend itself still counts.
     const created = await setGoalOk(service, {
       workspaceId,
       objective: "Paused during maintenance",
       turnCap: 3,
     });
-    await setGoalOk(service, {
+    const paused = await setGoalOk(service, {
       workspaceId,
       objective: created.objective,
       status: "paused",
@@ -139,7 +164,12 @@ describe("WorkspaceGoalService", () => {
       streamOriginKind: "other",
     });
 
-    expect(updated).toMatchObject({ costCents: 0, turnsUsed: 0, status: "paused" });
+    expect(updated).toMatchObject({
+      costCents: 42,
+      turnsUsed: 0,
+      status: "paused",
+      updatedAtMs: paused.updatedAtMs,
+    });
   });
 
   test("budget-limited goals ignore maintenance stream accounting", async () => {

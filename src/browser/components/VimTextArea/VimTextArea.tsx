@@ -179,7 +179,8 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
         text: value,
         cursor,
         mode: vimMode,
-        visualAnchor,
+        // #6944: like the cursor, the anchor can sit past a text that shrank between keys.
+        visualAnchor: visualAnchor === null ? null : clampVimPosition(visualAnchor, value, vimMode),
         yankBuffer: yankBufferRef.current,
         desiredColumn,
         lastFind: lastFindRef.current,
@@ -366,6 +367,11 @@ function vimCursorFor(input: {
 }): number {
   const usesVimCursor = input.mode === "visual" || input.mode === "visualLine";
   const cursor = usesVimCursor ? input.vimCursor : input.domCursor;
-  const max = input.mode === "insert" ? input.text.length : Math.max(0, input.text.length - 1);
-  return Math.max(0, Math.min(cursor, max));
+  return clampVimPosition(cursor, input.text, input.mode);
+}
+
+/** A position inside `text` for `mode`: outside insert mode it never sits past the last character. */
+function clampVimPosition(position: number, text: string, mode: vim.VimMode): number {
+  const max = mode === "insert" ? text.length : Math.max(0, text.length - 1);
+  return Math.max(0, Math.min(position, max));
 }

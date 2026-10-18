@@ -907,6 +907,21 @@ function normalizePersistedWorkspace(
   return nextWorkspace;
 }
 
+/**
+ * #5569: only `true` on a row without a creation mark is a birth stamp. Anything else (hand edit,
+ * corruption) reads as absent, so the active-turn lookup falls back to its global scan. Runs before
+ * normalizePersistedWorkspace, so a malformed mark (dropped there) still cancels the stamp.
+ */
+function normalizeBirthStamp(
+  workspace: ProjectConfig["workspaces"][number]
+): ProjectConfig["workspaces"][number] {
+  const stamp: unknown = workspace.bornWithoutDelegation;
+  if (!Object.hasOwn(workspace, "bornWithoutDelegation")) return workspace;
+  if (stamp === true && workspace.delegatedCreation === undefined) return workspace;
+  const { bornWithoutDelegation: _dropped, ...rest } = workspace;
+  return rest;
+}
+
 function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectConfig {
   // Per-project runtime overrides are optional; keep config.json sparse by persisting only explicit
   // overrides (false enablement + explicit default runtime selections).
@@ -947,7 +962,9 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
   }
 
   const workspaces = Array.isArray(record.workspaces) ? record.workspaces : [];
-  next.workspaces = workspaces.map(normalizePersistedWorkspace);
+  next.workspaces = workspaces.map((workspace) =>
+    normalizePersistedWorkspace(normalizeBirthStamp(workspace))
+  );
 
   const projectKind = normalizeProjectKind(record.projectKind);
   if (projectKind !== undefined) {
@@ -5578,6 +5595,8 @@ export class Config {
           // or in-flight tagged sends would read a spurious revocation.
           messagingTagGeneration: existing.messagingTagGeneration,
           delegatedCreation: existing.delegatedCreation,
+          // Written only at birth (#5569): kept from the row, never taken from metadata.
+          bornWithoutDelegation: existing.bornWithoutDelegation,
           // Monotone (#5174): a metadata round trip never un-marks a migrated plan.
           remotePlanMigrated: existing.remotePlanMigrated,
         };

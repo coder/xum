@@ -2565,6 +2565,89 @@ describe("Config", () => {
     });
   });
 
+  describe("birth stamp of a root created without delegation (#5569)", () => {
+    const row = (id: string, extra: Record<string, unknown>) => ({
+      path: `/repo/${id}`,
+      id,
+      name: id,
+      createdAt: "2025-01-01T00:00:00.000Z",
+      runtimeConfig: { type: "local" as const },
+      ...extra,
+    });
+    const stamped = (cfg: Config) =>
+      (cfg.loadConfigOrDefault().projects.get("/repo")?.workspaces ?? []).map((workspace) => [
+        workspace.id,
+        Object.hasOwn(workspace, "bornWithoutDelegation"),
+      ]);
+
+    it("keeps only `true` on a row without a creation mark while loading", () => {
+      const mark = { handleId: "wst_1", ownerWorkspaceId: "owner" };
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: [
+                  row("ws-true", { bornWithoutDelegation: true }),
+                  row("ws-false", { bornWithoutDelegation: false }),
+                  row("ws-str", { bornWithoutDelegation: "yes" }),
+                  // Only a hand edit writes both; the stamp then reads as absent.
+                  row("ws-marked", { bornWithoutDelegation: true, delegatedCreation: mark }),
+                  row("ws-bad-mark", { bornWithoutDelegation: true, delegatedCreation: "wst_1" }),
+                ],
+              },
+            ],
+          ],
+        })
+      );
+
+      expect(stamped(config)).toEqual([
+        ["ws-true", true],
+        ["ws-false", false],
+        ["ws-str", false],
+        ["ws-marked", false],
+        ["ws-bad-mark", false],
+      ]);
+    });
+
+    it("a metadata write keeps a stored stamp and never adds one", async () => {
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/repo", {
+          workspaces: [row("born", { bornWithoutDelegation: true }), row("plain", {})],
+        });
+        return cfg;
+      });
+      const reloaded = new Config(tempDir);
+      for (const metadata of await reloaded.getAllWorkspaceMetadata()) {
+        // Metadata never carries the stamp. Production never builds this input: it only proves
+        // addWorkspace reads the stamp from the stored row, not from its metadata argument.
+        const withStamp: WorkspaceMetadata & { bornWithoutDelegation: true } = {
+          ...metadata,
+          bornWithoutDelegation: true,
+        };
+        await reloaded.addWorkspace("/repo", { ...withStamp, title: "Renamed" });
+      }
+      const plain = (await reloaded.getAllWorkspaceMetadata()).find((m) => m.id === "plain");
+      if (plain == null) throw new Error("plain row missing from metadata");
+      // A new row registered from metadata (fork, legacy re-registration) is never stamped.
+      const copy: WorkspaceMetadata & { bornWithoutDelegation: true } = {
+        ...plain,
+        id: "copy",
+        name: "copy",
+        bornWithoutDelegation: true,
+      };
+      await reloaded.addWorkspace("/repo", copy);
+
+      expect(stamped(new Config(tempDir))).toEqual([
+        ["born", true],
+        ["plain", false],
+        ["copy", false],
+      ]);
+    });
+  });
+
   describe("downgrade-safe Cyber reasoning mode", () => {
     const writeRawConfig = (doc: unknown) =>
       fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(doc));

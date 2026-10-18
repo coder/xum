@@ -47,7 +47,7 @@ import {
   parseSubagentReportEnvelope,
 } from "@/common/utils/subagentReportEnvelope";
 import { completeInProgressTodoItems } from "@/common/utils/todoList";
-import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/toolDefinitions";
+import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/agentSkillReadToolResult";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 
 import type {

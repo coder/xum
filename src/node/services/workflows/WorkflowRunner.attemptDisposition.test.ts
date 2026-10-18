@@ -873,6 +873,232 @@ describe("WorkflowRunner attempt disposition", () => {
     }
   });
 
+  describe("pipeline() resume of a checkpointed step (nonblocking start)", () => {
+    // pipeline() starts its agents through __workflowAgentStart, a separate resume path from
+    // agent(): each test seeds one checkpoint for the single stage and resumes the run.
+    const PIPELINE_SOURCE = `export default function workflow({ agent, pipeline }) {
+  const [summary] = pipeline(["only"], () => agent("Summarize durable workflows", { id: "summarize" }));
+  return { reportMarkdown: "Final: " + summary };
+}
+`;
+    const SEEDED_STARTED_AT = "2026-05-29T00:00:00.500Z";
+    const RUNNER_NOW = "2026-05-29T00:00:01.000Z";
+
+    /** Records reservations and waits; the reservation always creates `task_new`. */
+    function recordingAdapter(overrides: Partial<WorkflowTaskAdapter>) {
+      const reservations: Array<{ ids: string[]; retires: unknown }> = [];
+      const waitedFor: string[] = [];
+      const adapter: WorkflowTaskAdapter = {
+        async runAgent() {
+          throw new Error("pipeline must reserve through createAgentTasks");
+        },
+        async createAgentTasks(specs, lifecycle) {
+          reservations.push({ ids: specs.map((spec) => spec.id), retires: lifecycle?.retires });
+          await lifecycle?.onTaskCreated?.(0, "task_new");
+          return [{ taskId: "task_new", status: "running" }];
+        },
+        async waitForAgentTask(taskId) {
+          waitedFor.push(taskId);
+          return report(taskId);
+        },
+        ...overrides,
+      };
+      return { adapter, reservations, waitedFor };
+    }
+
+    async function resume(store: WorkflowRunStore, adapter: WorkflowTaskAdapter) {
+      await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:00.750Z");
+      return createRunner(store, adapter, { runnerId: "runner-b" }).run(RUN_ID, {
+        allowResumeFromInterrupted: true,
+      });
+    }
+
+    test.each<[string, string | undefined, string[][]]>([
+      [
+        "with a task, backfilling its missing completed event",
+        "task_prior",
+        [["task_prior", "completed"]],
+      ],
+      ["without a task, adding no task event", undefined, []],
+    ])(
+      "a completed step replays its stored result %s, and starts or awaits no child",
+      async (_label, taskId, expectedTaskEvents) => {
+        using tmp = new DisposableTempDir("workflow-runner-pipeline-resume-completed");
+        const store = await createStore(tmp.path, PIPELINE_SOURCE);
+        await store.appendStatus(RUN_ID, "running", "2026-05-29T00:00:00.100Z");
+        await store.recordStepCompleted(RUN_ID, {
+          stepId: summarizeSpec.id,
+          inputHash: summarizeHash,
+          ...(taskId != null ? { taskId } : {}),
+          result: report("task_prior"),
+          startedAt: SEEDED_STARTED_AT,
+          completedAt: "2026-05-29T00:00:00.600Z",
+        });
+        const { adapter, reservations, waitedFor } = recordingAdapter({});
+
+        await expect(resume(store, adapter)).resolves.toEqual({
+          reportMarkdown: "Final: report from task_prior",
+        });
+        expect(reservations).toEqual([]);
+        expect(waitedFor).toEqual([]);
+        expect(taskEvents((await store.getRun(RUN_ID)).events)).toEqual(expectedTaskEvents);
+      }
+    );
+
+    test("a started step whose child already reported adopts the report without a wait or a new child", async () => {
+      using tmp = new DisposableTempDir("workflow-runner-pipeline-resume-adopt");
+      const store = await createStore(tmp.path, PIPELINE_SOURCE);
+      await seedPriorAttempt(store, "task_prior");
+      const { adapter, reservations, waitedFor } = recordingAdapter({
+        readSettledAgentResult: async (taskId) => ({ kind: "reported", report: report(taskId) }),
+      });
+
+      await expect(resume(store, adapter)).resolves.toEqual({
+        reportMarkdown: "Final: report from task_prior",
+      });
+      expect(reservations).toEqual([]);
+      expect(waitedFor).toEqual([]);
+      const run = await store.getRun(RUN_ID);
+      expect(run.steps).toMatchObject([{ taskId: "task_prior", status: "completed" }]);
+      expect(taskEvents(run.events)).toEqual([
+        ["task_prior", "started"],
+        ["task_prior", "completed"],
+      ]);
+    });
+
+    test("a started step whose child is live reattaches and waits for that child", async () => {
+      using tmp = new DisposableTempDir("workflow-runner-pipeline-resume-reattach");
+      const store = await createStore(tmp.path, PIPELINE_SOURCE);
+      await seedPriorAttempt(store, "task_prior");
+      const { adapter, reservations, waitedFor } = recordingAdapter({
+        readSettledAgentResult: async () => ({ kind: "live", executionId: "exec_prior" }),
+      });
+
+      await expect(resume(store, adapter)).resolves.toEqual({
+        reportMarkdown: "Final: report from task_prior",
+      });
+      expect(reservations).toEqual([]);
+      expect(waitedFor).toEqual(["task_prior"]);
+      expect((await store.getRun(RUN_ID)).steps).toMatchObject([
+        { taskId: "task_prior", status: "completed" },
+      ]);
+    });
+
+    test("a started step whose child ended without a report is replaced once, retiring the claimed child", async () => {
+      using tmp = new DisposableTempDir("workflow-runner-pipeline-resume-replace");
+      const store = await createStore(tmp.path, PIPELINE_SOURCE);
+      await seedPriorAttempt(store, "task_prior");
+      const { adapter, reservations, waitedFor } = recordingAdapter({
+        readSettledAgentResult: async () => ({
+          kind: "terminal-no-report",
+          attemptId: PRIOR_ATTEMPT,
+        }),
+        claimRetiredAttempt: async () => ({ success: true, nonce: "nonce-1" }),
+      });
+
+      await expect(resume(store, adapter)).resolves.toEqual({
+        reportMarkdown: "Final: report from task_new",
+      });
+      expect(reservations).toEqual([
+        {
+          ids: ["summarize"],
+          retires: [{ taskId: "task_prior", attemptId: PRIOR_ATTEMPT, nonce: "nonce-1" }],
+        },
+      ]);
+      expect(waitedFor).toEqual(["task_new"]);
+      const run = await store.getRun(RUN_ID);
+      // A replacement is a new attempt: it starts now, not at the prior checkpoint's time.
+      expect(run.steps).toMatchObject([
+        { taskId: "task_new", status: "completed", startedAt: RUNNER_NOW },
+      ]);
+      expect(taskEvents(run.events)).toEqual([
+        ["task_prior", "failed"],
+        ["task_new", "started"],
+        ["task_new", "completed"],
+      ]);
+    });
+
+    test("a started step naming an unpublished child tombstones it and runs fresh, retiring nothing", async () => {
+      using tmp = new DisposableTempDir("workflow-runner-pipeline-resume-fresh");
+      const store = await createStore(tmp.path, PIPELINE_SOURCE);
+      await seedPriorAttempt(store, "task_prior");
+      const tombstoned: string[] = [];
+      const { adapter, reservations } = recordingAdapter({
+        readSettledAgentResult: async () => ({
+          kind: "indeterminate",
+          reason: "no task record",
+          code: "no-record",
+        }),
+        tombstoneUnpublishedTask: async (taskId) => {
+          tombstoned.push(taskId);
+          return { success: true };
+        },
+      });
+
+      await expect(resume(store, adapter)).resolves.toEqual({
+        reportMarkdown: "Final: report from task_new",
+      });
+      expect(tombstoned).toEqual(["task_prior"]);
+      expect(reservations).toEqual([{ ids: ["summarize"], retires: undefined }]);
+    });
+
+    test("a failed step whose child ended is retired and re-run, keeping the step's first start time", async () => {
+      using tmp = new DisposableTempDir("workflow-runner-pipeline-resume-failed-retire");
+      const store = await createStore(tmp.path, PIPELINE_SOURCE);
+      await seedPriorAttempt(store, "task_prior");
+      await store.recordStepFailed(RUN_ID, {
+        stepId: summarizeSpec.id,
+        inputHash: summarizeHash,
+        taskId: "task_prior",
+        error: "agent summarize task task_prior ended without a report",
+        startedAt: SEEDED_STARTED_AT,
+        completedAt: "2026-05-29T00:00:00.600Z",
+      });
+      const { adapter, reservations } = recordingAdapter({
+        readSettledAgentResult: async () => ({
+          kind: "terminal-no-report",
+          attemptId: PRIOR_ATTEMPT,
+        }),
+        claimRetiredAttempt: async () => ({ success: true, nonce: "nonce-1" }),
+      });
+
+      await expect(resume(store, adapter)).resolves.toEqual({
+        reportMarkdown: "Final: report from task_new",
+      });
+      expect(reservations).toEqual([
+        {
+          ids: ["summarize"],
+          retires: [{ taskId: "task_prior", attemptId: PRIOR_ATTEMPT, nonce: "nonce-1" }],
+        },
+      ]);
+      expect((await store.getRun(RUN_ID)).steps).toMatchObject([
+        { taskId: "task_new", status: "completed", startedAt: SEEDED_STARTED_AT },
+      ]);
+    });
+
+    test("a failed step whose child is still live stays unresolved and starts nothing", async () => {
+      using tmp = new DisposableTempDir("workflow-runner-pipeline-resume-failed-live");
+      const store = await createStore(tmp.path, PIPELINE_SOURCE);
+      await seedPriorAttempt(store, "task_prior");
+      await store.recordStepFailed(RUN_ID, {
+        stepId: summarizeSpec.id,
+        inputHash: summarizeHash,
+        taskId: "task_prior",
+        error: "agent summarize task task_prior ended without a report",
+        startedAt: SEEDED_STARTED_AT,
+        completedAt: "2026-05-29T00:00:00.600Z",
+      });
+      const { adapter, reservations } = recordingAdapter({
+        readSettledAgentResult: async () => ({ kind: "live", executionId: "exec_prior" }),
+      });
+
+      await expect(resume(store, adapter)).rejects.toThrow(
+        /previous attempt task_prior is unresolved/
+      );
+      expect(reservations).toEqual([]);
+    });
+  });
+
   test("already-active errors name the lease owner and its freshness", async () => {
     using tmp = new DisposableTempDir("workflow-runner-already-active");
     const store = await createStore(tmp.path);

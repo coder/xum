@@ -161,4 +161,44 @@ describe("WorkspaceService remove rolls child report dirs into the parent", () =
       logError.mockRestore();
     }
   });
+  // Self-healing: the index files are read without per-entry validation, so a corrupted file can
+  // hold a null entry. That entry must not drop the rollup of every other task in the same file.
+  test("a null index entry is skipped and the other entries still reach the parent index", async () => {
+    const valid = (taskId: string) => ({
+      childTaskId: taskId,
+      parentWorkspaceId: childId,
+      createdAtMs: 1,
+      updatedAtMs: 2,
+      ancestorWorkspaceIds: [childId, parentId],
+    });
+    for (const kind of ["subagent-reports", "subagent-transcripts"]) {
+      await writeFile(
+        path.join(childDir, `${kind}.json`),
+        JSON.stringify({
+          version: 1,
+          artifactsByChildTaskId: {
+            "task-null": null,
+            // The report merge reads ancestorWorkspaceIds, so an entry without it is malformed.
+            ...(kind === "subagent-reports" ? { "task-empty": {} } : {}),
+            "task-ok": valid("task-ok"),
+          },
+        })
+      );
+    }
+
+    await removeChild();
+
+    for (const kind of ["subagent-reports", "subagent-transcripts"]) {
+      const raw = await readOrNull(path.join(parentDir, `${kind}.json`));
+      const index = JSON.parse(raw ?? "{}") as {
+        artifactsByChildTaskId?: Record<string, { parentWorkspaceId?: string } | null>;
+      };
+      const entries = index.artifactsByChildTaskId ?? {};
+      expect({
+        kind,
+        taskIds: Object.keys(entries),
+        parent: entries["task-ok"]?.parentWorkspaceId,
+      }).toEqual({ kind, taskIds: ["task-ok"], parent: parentId });
+    }
+  });
 });

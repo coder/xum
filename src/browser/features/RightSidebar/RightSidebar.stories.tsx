@@ -34,6 +34,7 @@ import { AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { createWorkspace } from "@/browser/stories/mocks/workspaces";
 import { blurActiveElement } from "@/browser/stories/storyPlayHelpers";
 import { setupSimpleChatStory, setupStreamingChatStory } from "@/browser/stories/helpers/chatSetup";
+import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { setHunkFirstSeen } from "@/browser/stories/helpers/reviews";
 import { collapseLeftSidebar, expandRightSidebar } from "@/browser/stories/helpers/uiState";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -1166,6 +1167,31 @@ export const ReviewTabWithFileFilter: Story = {
     });
     await expect(filterIndicator).toBeInTheDocument();
     await expect(filterIndicator).toHaveTextContent("Button.tsx");
+
+    // In the light themes, the warning "-N" counts and "M" letters were 1.54:1 on white, and every
+    // colored text on the selected file row was below WCAG AA, down to 1.16:1. The filter chip
+    // shares the row's tint, and its "✕" was 2.85:1 (#6935).
+    const tree = await canvas.findByTestId("review-file-tree");
+    const selectedName = await within(tree).findByText("Button.tsx");
+    // The selected row is the nearest ancestor that paints a background: the selection tint.
+    let selectedRow = selectedName.parentElement;
+    while (selectedRow && getComputedStyle(selectedRow).backgroundColor === "rgba(0, 0, 0, 0)") {
+      selectedRow = selectedRow.parentElement;
+    }
+    if (!selectedRow || !tree.contains(selectedRow)) throw new Error("No selected-row tint found");
+    const row = selectedRow;
+    // The file-type icon is aria-hidden: the file name next to it carries the same information.
+    const rowTexts = () =>
+      [...row.querySelectorAll<HTMLElement>("*")].filter(
+        (element) => !element.closest("[aria-hidden='true']") && element.childElementCount === 0
+      );
+    const deletionCounts = () => canvas.getAllByText(/^[-−]\d+$|^M$/);
+    await expect(
+      textsBelowAaInThemes(() => [
+        filterIndicator,
+        ...new Set([...rowTexts(), ...deletionCounts()]),
+      ]).join("\n")
+    ).toBe("");
   },
 };
 

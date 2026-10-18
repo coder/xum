@@ -69,6 +69,7 @@ import { codexPluginHookService } from "@/node/services/agentPlugins/codexHookSe
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
+import type { ExtensionAgentStatus } from "@/node/utils/extensionMetadata";
 import {
   AgentSession,
   clearProviderConfigFixableAbandonMarkers,
@@ -1047,11 +1048,6 @@ function withEffectiveHeartbeatInterval(
   return { ...settings, intervalMs: settings.intervalMs ?? defaultIntervalMs };
 }
 
-interface WorkspaceAgentStatus {
-  emoji: string;
-  message: string;
-  url?: string;
-}
 type WorkspaceRuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
 
 /** Narrow DevTools cleanup surface used on archive/remove and by the startup sweep. */
@@ -1732,7 +1728,7 @@ async function copyDirIfMissingBestEffort(params: {
       }
     }
 
-    await fsPromises.mkdir(path.dirname(params.destDir), { recursive: true });
+    // fs.cp creates missing parent folders of destDir itself (Node and Bun).
     await fsPromises.cp(params.srcDir, params.destDir, { recursive: true });
   } catch (error: unknown) {
     if (isErrnoWithCode(error, "ENOENT")) {
@@ -1746,6 +1742,17 @@ async function copyDirIfMissingBestEffort(params: {
       error: getErrorMessage(error),
     });
   }
+}
+
+/**
+ * Index entries a rollup can merge: a non-empty task id and an object value. Self-healing: the
+ * index files are read without per-entry validation, and one malformed entry (e.g. null) would
+ * throw in the merge and drop every other entry of the rollup.
+ */
+function mergeableIndexEntries<T>(entries: Array<[string, T]>): Array<[string, T]> {
+  return entries.filter(
+    ([taskId, entry]) => taskId.length > 0 && entry != null && typeof entry === "object"
+  );
 }
 
 function coerceUpdatedAtMs(entry: { createdAtMs?: number; updatedAtMs?: number }): number {
@@ -2143,9 +2150,11 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
         workspaceId: params.parentWorkspaceId,
         workspaceSessionDir: params.parentSessionDir,
         update: (parentFile) => {
-          for (const [taskId, childEntry] of childEntries) {
-            if (!taskId) continue;
-
+          // rollUpAncestorWorkspaceIds reads the array, so an entry without one is skipped too.
+          const mergeable = mergeableIndexEntries(childEntries).filter(([, entry]) =>
+            Array.isArray(entry.ancestorWorkspaceIds)
+          );
+          for (const [taskId, childEntry] of mergeable) {
             const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
             const childUpdated = coerceUpdatedAtMs(childEntry);
             const existingUpdated = existing ? coerceUpdatedAtMs(existing) : -1;
@@ -2224,9 +2233,7 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
         workspaceId: params.parentWorkspaceId,
         workspaceSessionDir: params.parentSessionDir,
         update: (parentFile) => {
-          for (const [taskId, childEntry] of childEntries) {
-            if (!taskId) continue;
-
+          for (const [taskId, childEntry] of mergeableIndexEntries(childEntries)) {
             const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
             const childUpdated = coerceUpdatedAtMs(childEntry);
             const existingUpdated = existing ? coerceUpdatedAtMs(existing) : -1;
@@ -5241,7 +5248,7 @@ export class WorkspaceService
 
   public async updateAgentStatus(
     workspaceId: string,
-    agentStatus: WorkspaceAgentStatus | null
+    agentStatus: ExtensionAgentStatus | null
   ): Promise<void> {
     await this.emitWorkspaceActivityUpdate(workspaceId, "update workspace agent status", () =>
       this.extensionMetadata.setAgentStatus(workspaceId, agentStatus)
@@ -6528,7 +6535,8 @@ export class WorkspaceService
                   ownerWorkspaceId: delegatedCreation.ownerWorkspaceId,
                 },
               }
-            : {}),
+            : // #5569: born without delegation, so no workspace turn can ever target it.
+              { bornWithoutDelegation: true as const }),
         });
         config.projects.set(SCRATCH_PROJECT_CONFIG_KEY, scratchProject);
         return config;
@@ -7009,7 +7017,8 @@ export class WorkspaceService
                     ownerWorkspaceId: delegatedCreation.ownerWorkspaceId,
                   },
                 }
-              : {}),
+              : // #5569: the same birth fact as createScratch's stamp.
+                { bornWithoutDelegation: true as const }),
           });
           return config;
         });
@@ -14897,12 +14906,7 @@ export class WorkspaceService
         const allMetadataUpdated = await this.config.getAllWorkspaceMetadata();
         const updatedMetadata = allMetadataUpdated.find((m) => m.id === sourceWorkspaceId) ?? null;
         const enrichedMetadata = this.enrichMaybeFrontendMetadata(updatedMetadata);
-        const sourceSession = this.sessions.get(sourceWorkspaceId);
-        if (sourceSession) {
-          sourceSession.emitMetadata(enrichedMetadata);
-        } else {
-          this.emit("metadata", { workspaceId: sourceWorkspaceId, metadata: enrichedMetadata });
-        }
+        this.publishWorkspaceMetadata(sourceWorkspaceId, enrichedMetadata);
       };
 
       // The fork's registration also marked its source as sharing the Coder workspace (#5114).

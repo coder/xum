@@ -6,7 +6,7 @@ import { getCreationDraftScopeId } from "@/common/constants/storage";
 import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { markAiSelectionIntent } from "./aiSelectionIntent";
 import { setWorkspaceServiceTier } from "./fastModeServiceTier";
-import { readScopedAiDefault, writeScopedAiDefault } from "./scopedAiDefaults";
+import { readScopeAgentId, readScopedAiDefault, writeScopedAiDefault } from "./scopedAiDefaults";
 import { getWorkspaceAiSelection } from "./workspaceAiSettingsSync";
 
 const PROJECT = "/projects/with-defaults";
@@ -39,6 +39,24 @@ describe("readScopedAiDefault for a creation draft", () => {
 
     store.update(draftId, { ai: { model: "anthropic:claude-sonnet-4-5" } });
     expect(readScopedAiDefault(scopeId, "model")).toBe("anthropic:claude-sonnet-4-5");
+  });
+
+  test("a draft without an agent pick shows the global agent, not a stale project agent", () => {
+    getAppConfigStore().updateOptimistically({
+      userPreferences: {
+        ai: {
+          globalDefaults: { agentId: "plan" },
+          projectDefaults: { [PROJECT]: { agentId: "ask" } },
+        },
+      },
+    });
+    const store = getCreationDraftStore();
+    const scopeId = getCreationDraftScopeId(store.create(PROJECT, null));
+    expect(readScopedAiDefault(scopeId, "agentId")).toBeUndefined();
+    expect(readScopeAgentId(scopeId)).toBe("plan");
+
+    writeScopedAiDefault(scopeId, "agentId", "ask");
+    expect(readScopeAgentId(scopeId)).toBe("ask");
   });
 
   // Speed and Pro/Cyber follow the same draft ownership as the thinking level (#6620).

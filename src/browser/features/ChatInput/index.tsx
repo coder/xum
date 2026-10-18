@@ -7,6 +7,7 @@ import React, {
   useMemo,
   useSyncExternalStore,
 } from "react";
+import { flushSync } from "react-dom";
 import {
   isInitialStagingLocked,
   subscribeInitialStagingLock,
@@ -602,16 +603,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const converted =
         convertSymbolCommandAtCursor(next, caret) ?? convertTerminatedSymbolCommand(next, caret);
       if (converted) {
-        setInput(converted.text);
-        const newCursor = converted.cursor;
-        requestAnimationFrame(() => {
-          const el = inputRef.current;
-          if (!el || el.disabled) {
-            return;
-          }
-          el.selectionStart = newCursor;
-          el.selectionEnd = newCursor;
-        });
+        // #6944: commit the converted text now and put the caret after the symbol before the
+        // next key. Writing the value moves the caret to the end; a frame later was too late for
+        // a fast next key, which then landed at the end.
+        flushSync(() => setInput(converted.text));
+        const el = inputRef.current;
+        if (el && !el.disabled) {
+          el.selectionStart = converted.cursor;
+          el.selectionEnd = converted.cursor;
+        }
         return { text: converted.text, cursor: converted.cursor };
       }
 

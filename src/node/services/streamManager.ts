@@ -1,4 +1,5 @@
 import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/streamStopCause";
+import { randomUUID } from "crypto";
 import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
 import {
@@ -311,8 +312,6 @@ export interface SettledStepBudget {
    * preflight will compute it. Absent when no context budget applies.
    */
   nextRequestTokens?: number;
-  /** The appended-message part of `nextRequestTokens`; absent when it was a full count. */
-  nextRequestDeltaTokens?: number;
   sessionHistoryAvailable: boolean;
   /** The step's request advertised `new_context`, so the final prompt can be acted on. */
   newContextAvailable: boolean;
@@ -1003,6 +1002,9 @@ interface WorkspaceStreamInfo {
   // Track if a previousResponseId retry happened after a step completed so
   // stream-end uses cumulative usage instead of the retried step's totalUsage.
   didRetryPreviousResponseIdAtStep: boolean;
+  // Key of this attempt's in-flight usage file (SessionUsageService.recordInFlightUsage);
+  // set by the first finished step, cleared when the attempt settles or is discarded.
+  inFlightUsageKey?: string;
   // Track when Xum restarted the stream after an empty-output completion so
   // stream-end prefers cumulative usage across attempts instead of the final
   // attempt's totalUsage only.
@@ -2595,14 +2597,13 @@ export class StreamManager {
 
       // Record session usage for aborted streams (mirrors stream-end path)
       // This ensures tokens consumed before abort are tracked for cost display
-      await this.recordSessionUsage(
+      await this.settleSessionUsage(
         workspaceId,
-        streamInfo.model,
+        streamInfo,
         usage,
         providerMetadata,
         "Failed to record session usage on abort",
-        "error",
-        streamInfo
+        "error"
       );
 
       // Stamp the aborted turn's usage onto the partial message BEFORE committing
@@ -2772,10 +2773,11 @@ export class StreamManager {
     providerMetadata: Record<string, unknown> | undefined,
     logMessage: string,
     logLevel: "warn" | "error",
-    streamInfo?: Pick<WorkspaceStreamInfo, "workspaceName" | "metadataModel">
-  ): Promise<void> {
+    streamInfo?: Pick<WorkspaceStreamInfo, "workspaceName" | "metadataModel">,
+    settlesInFlightKey?: string
+  ): Promise<"recorded" | "skipped" | "failed"> {
     if (!this.sessionUsageService || !usage) {
-      return;
+      return "skipped";
     }
     const messageUsage = createDisplayUsage(
       usage,
@@ -2784,14 +2786,146 @@ export class StreamManager {
       streamInfo?.metadataModel
     );
     if (!messageUsage) {
-      return;
+      return "skipped";
     }
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     const ledgerModel = this.usageAttributionModel(model, streamInfo?.metadataModel);
     try {
-      await this.sessionUsageService.recordUsage(workspaceId as string, ledgerModel, messageUsage);
+      await this.sessionUsageService.recordUsage(
+        workspaceId as string,
+        ledgerModel,
+        messageUsage,
+        settlesInFlightKey !== undefined ? { settlesInFlightKey } : undefined
+      );
+      return "recorded";
     } catch (error) {
       (logLevel === "error" ? workspaceLog.error : workspaceLog.warn)(logMessage, { error });
+      return "failed";
+    }
+  }
+
+  /**
+   * After each finished step, write the attempt's priced cumulative usage to its own
+   * in-flight file, so a Xum restart mid-turn loses at most the unfinished step. Priced like
+   * the abort path. One write per finished step, never per token.
+   */
+  private async recordInFlightSessionUsage(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<void> {
+    if (!this.sessionUsageService || !hasTokenUsage(streamInfo.cumulativeUsage)) {
+      return;
+    }
+    const usage = createDisplayUsage(
+      streamInfo.cumulativeUsage,
+      streamInfo.model,
+      markProviderMetadataCostsIncluded(
+        streamInfo.cumulativeProviderMetadata,
+        streamInfo.initialMetadata?.costsIncluded
+      ),
+      streamInfo.metadataModel
+    );
+    if (!usage) {
+      return;
+    }
+    const key = streamInfo.inFlightUsageKey ?? randomUUID();
+    try {
+      await this.sessionUsageService.recordInFlightUsage(
+        workspaceId as string,
+        key,
+        streamInfo.messageId,
+        this.usageAttributionModel(streamInfo.model, streamInfo.metadataModel),
+        usage
+      );
+      streamInfo.inFlightUsageKey = key;
+    } catch (error) {
+      this.getWorkspaceLogger(workspaceId, streamInfo).warn(
+        "Failed to record in-flight session usage",
+        { error }
+      );
+    }
+  }
+
+  /**
+   * Record the attempt's final usage. The same ledger write marks its in-flight file settled
+   * (then the file is deleted), so a crash at any point counts the attempt once.
+   */
+  private async settleSessionUsage(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    usage: LanguageModelV2Usage | undefined,
+    providerMetadata: Record<string, unknown> | undefined,
+    logMessage: string,
+    logLevel: "warn" | "error",
+    model: string = streamInfo.model
+  ): Promise<void> {
+    const key = streamInfo.inFlightUsageKey;
+    // Cleared first: a later step (a fallback after a refusal) starts a new in-flight file.
+    streamInfo.inFlightUsageKey = undefined;
+    const result = await this.recordSessionUsage(
+      workspaceId,
+      model,
+      usage,
+      providerMetadata,
+      logMessage,
+      logLevel,
+      streamInfo,
+      key
+    );
+    if (key === undefined) {
+      return;
+    }
+    if (result === "skipped") {
+      await this.discardInFlightKey(workspaceId, streamInfo, key);
+    } else if (result === "failed") {
+      // The file is the only durable record of the finished steps: keep it, and let the
+      // next ledger read fold it.
+      this.sessionUsageService?.releaseInFlightUsage(workspaceId as string, key);
+    }
+  }
+
+  /**
+   * The attempt ends without usage to record (its usage is dropped, or recorded through
+   * another path): delete its in-flight file. Totals match those before in-flight files.
+   */
+  private async discardInFlightSessionUsage(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<void> {
+    const key = streamInfo.inFlightUsageKey;
+    if (key === undefined) {
+      return;
+    }
+    streamInfo.inFlightUsageKey = undefined;
+    await this.discardInFlightKey(workspaceId, streamInfo, key);
+  }
+
+  /**
+   * A terminal path that recorded no usage (e.g. a completion with no parts) leaves no
+   * in-flight file. An abort is not terminal yet here: cleanupAbortedStream settles it after
+   * processing ends, and until then the file is its only durable record.
+   */
+  private async discardUnsettledSessionUsage(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<void> {
+    if (streamInfo.terminalCompletion != null) {
+      await this.discardInFlightSessionUsage(workspaceId, streamInfo);
+    }
+  }
+
+  private async discardInFlightKey(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    key: string
+  ): Promise<void> {
+    try {
+      await this.sessionUsageService?.discardInFlightUsage(workspaceId as string, key);
+    } catch (error) {
+      this.getWorkspaceLogger(workspaceId, streamInfo).warn(
+        "Failed to discard in-flight session usage",
+        { error }
+      );
     }
   }
 
@@ -3015,7 +3149,6 @@ export class StreamManager {
                   createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step)
                 );
           const nextRequestTokens = nextRequest?.estimate;
-          const nextRequestDeltaTokens = nextRequest?.delta;
           const { decision, continuationEntryId } = await request.onStepSettled({
             model: request.modelString,
             usage: normalizeUsage(step.usage),
@@ -3023,7 +3156,6 @@ export class StreamManager {
             ...size,
             toolResultTokens,
             ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
-            ...(nextRequestDeltaTokens != null ? { nextRequestDeltaTokens } : {}),
             sessionHistoryAvailable: request.tools?.session_history != null,
             newContextAvailable: request.tools?.new_context != null,
             newContextRequested: step.toolResults.some(
@@ -4194,14 +4326,14 @@ export class StreamManager {
       return;
     }
 
-    await this.recordSessionUsage(
+    await this.settleSessionUsage(
       workspaceId,
-      refusedModel,
+      streamInfo,
       usage,
       providerMetadata,
       "Failed to record refused-attempt session usage (fallback unaffected)",
       "warn",
-      streamInfo
+      refusedModel
     );
   }
 
@@ -4223,14 +4355,14 @@ export class StreamManager {
       return;
     }
 
-    await this.recordSessionUsage(
+    await this.settleSessionUsage(
       workspaceId,
-      refusedModel,
+      streamInfo,
       usage,
       providerMetadata,
       "Failed to record terminal-refusal session usage",
       "warn",
-      streamInfo
+      refusedModel
     );
   }
 
@@ -5273,6 +5405,7 @@ export class StreamManager {
                 });
                 streamInfo.currentStepStartIndex = streamInfo.parts.length;
                 this.emitTurnEvent(usageEvent);
+                await this.recordInFlightSessionUsage(workspaceId, streamInfo);
                 await this.checkSoftCancelStream(workspaceId, streamInfo);
                 break;
               }
@@ -5496,14 +5629,13 @@ export class StreamManager {
 
               // Update cumulative session usage (if service is available)
               // Wrapped in try-catch: usage recording is non-critical and shouldn't block stream completion
-              await this.recordSessionUsage(
+              await this.settleSessionUsage(
                 workspaceId,
-                streamInfo.model,
+                streamInfo,
                 totalUsage,
                 providerMetadata,
                 "Failed to record session usage (stream completion unaffected)",
-                "warn",
-                streamInfo
+                "warn"
               );
             }
 
@@ -5589,6 +5721,7 @@ export class StreamManager {
       ) {
         this.workspaceStreams.delete(workspaceId);
       }
+      await this.discardUnsettledSessionUsage(workspaceId, streamInfo);
 
       // Lifecycle spine event: emitted from the guaranteed-cleanup path so
       // EVERY terminal outcome (completion, abort/Escape, provider failure)
@@ -5810,15 +5943,17 @@ export class StreamManager {
           : undefined,
         streamInfo.initialMetadata?.costsIncluded
       );
-      await this.recordSessionUsage(
+      await this.settleSessionUsage(
         workspaceId,
-        streamInfo.model,
+        streamInfo,
         cumulativeErrorUsage,
         cumulativeErrorProviderMetadata,
         "Failed to record session usage for errored stream",
-        "warn",
-        streamInfo
+        "warn"
       );
+    } else {
+      // Refusals recorded their own usage above: drop any in-flight copy.
+      await this.discardInFlightSessionUsage(workspaceId, streamInfo);
     }
     const errorUsage = terminalRefusalUsage ?? cumulativeErrorUsage;
     const errorProviderMetadata =
@@ -5948,6 +6083,8 @@ export class StreamManager {
     streamInfo.lastPartialWriteTime = 0;
 
     if (!preserveUsage) {
+      // The dropped attempt's usage is not recorded (refused attempts settled their own).
+      await this.discardInFlightSessionUsage(workspaceId, streamInfo);
       streamInfo.cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
       streamInfo.cumulativeProviderMetadata = undefined;
       streamInfo.terminalRefusalUsage = undefined;

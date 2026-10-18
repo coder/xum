@@ -695,7 +695,6 @@ describe("anchored request estimate (#4858)", () => {
     expect(anchored).toEqual({
       estimate: 1000 + deltaOnly,
       hardCeiling: getContextBudgetHardCeiling(200_000),
-      delta: deltaOnly,
     });
     expect(anchored!.estimate).toBeLessThan(full);
   });
@@ -789,8 +788,7 @@ describe("anchored request estimate (#4858)", () => {
     expect(measured!.exceeded != null).toBe(limit < 200_000);
   });
 
-  // The refusal is serialized to the frontend as a SendMessageError: the anchored path's
-  // `delta` must not leak into it.
+  // The refusal is serialized to the frontend as a SendMessageError.
   test("an anchored over-ceiling refusal carries only the refusal fields", async () => {
     const opts = { ...options, modelContextLimit: 4_000 };
     const heavyAnchor = createContextBudgetAnchor(
@@ -798,25 +796,12 @@ describe("anchored request estimate (#4858)", () => {
       { usage: { ...usage, inputTokens: 5_000 } }
     )!;
     const measured = (await measureAssembledRequestBudgetForModel(payload, opts, heavyAnchor))!;
-    expect(measured.delta).toBeDefined();
     expect(measured.exceeded).toStrictEqual({
       type: "context_budget_exceeded",
       model,
       estimate: measured.estimate,
       hardCeiling: getContextBudgetHardCeiling(4_000),
     });
-  });
-
-  test("an exact append reports the counted delta; a rewritten prefix reports none", async () => {
-    const appended = (await measureAssembledRequestBudgetForModel(payload, options, anchor))!;
-    expect(appended.delta).toBeDefined();
-    expect(anchor.providerTokens + appended.delta!).toBe(appended.estimate);
-    const rewritten = { ...payload, messages: [{ ...prefix[0] }, prefix[1], ...delta] };
-    const full = (await measureAssembledRequestBudgetForModel(rewritten, options, anchor))!;
-    expect(full.delta).toBeUndefined();
-    expect(full.estimate).toBe(
-      (await estimateAssembledRequestTokensForModel(rewritten, options))!.estimate
-    );
   });
 });
 

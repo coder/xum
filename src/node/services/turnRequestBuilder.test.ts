@@ -433,22 +433,6 @@ describe("TurnRequestBuilder assembled preflight", () => {
     const off = await assembleBudgetCheckedPromptPayload(request, { enabled: false });
     expect(off.contextBudgetEstimate).toBeUndefined();
   });
-
-  it("measure-only mode returns the over-ceiling estimate instead of refusing", async () => {
-    const refused = await assembleBudgetCheckedPromptPayload(options(), { enabled: true }).catch(
-      (error: unknown) => error
-    );
-    if (!(refused instanceof ContextBudgetExceededError)) throw new Error("Expected refusal");
-    const measured = await assembleBudgetCheckedPromptPayload(options(), {
-      enabled: true,
-      measureOnly: true,
-    });
-    expect(measured.contextBudgetEstimate).toBe(refused.details.estimate);
-    const unchecked = await assembleBudgetCheckedPromptPayload(options(), { enabled: false });
-    expect(measured.messages).toEqual(unchecked.messages);
-    expect(measured.system).toEqual(unchecked.system);
-    expect(Object.keys(measured.tools ?? {})).toEqual(Object.keys(unchecked.tools ?? {}));
-  });
 });
 
 describe("TurnRequestBuilder tool scope", () => {

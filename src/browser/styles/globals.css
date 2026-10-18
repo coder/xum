@@ -277,6 +277,10 @@
 
   --color-warning: hsl(45 100% 50%);
   --color-warning-light: hsl(38 100% 70%);
+  /* Text-only variant of --color-warning-light (diff "-N" counts, "M" status letters). The light
+     warning-light was 1.54:1 on white; this one reaches WCAG AA down to the selected-row tint,
+     4.86:1 (#6935). */
+  --color-warning-light-text: hsl(38 100% 26%);
   --color-warning-text: var(--color-review-warning);
 
   --color-code-type: hsl(200 84% 28%);
@@ -299,7 +303,8 @@
   --color-selection: hsl(204 100% 45% / 0.3);
   --color-vim-status: hsl(210 18% 32% / 0.6);
   --color-code-keyword-overlay-light: hsl(210 88% 28% / 0.16);
-  --color-code-keyword-overlay: hsl(210 88% 28% / 0.32);
+  /* Selected review file row. At 0.32 the row's colored texts could not reach WCAG AA on it (#6935). */
+  --color-code-keyword-overlay: hsl(210 88% 28% / 0.16);
 
   --color-info-light: hsl(5 90% 70%);
   --color-info-yellow: hsl(38 100% 60%);
@@ -538,6 +543,9 @@
 
   --color-warning: #ad8301;
   --color-warning-light: color-mix(in srgb, var(--color-warning), white 35%);
+  /* Darker warning for text: WCAG AA down to the selected-row tint, 4.80:1, where warning-light
+     was 1.27:1 (#6935). */
+  --color-warning-light-text: color-mix(in srgb, var(--color-warning), black 30%);
 
   --color-code-type: #24837b;
   --color-code-keyword: #205ea6;
@@ -562,7 +570,7 @@
   --color-selection: hsl(from var(--color-accent) h s l / 0.25);
   --color-vim-status: hsl(from var(--color-foreground) h s l / 0.35);
   --color-code-keyword-overlay-light: hsl(from var(--color-code-keyword) h s l / 0.16);
-  --color-code-keyword-overlay: hsl(from var(--color-code-keyword) h s l / 0.32);
+  --color-code-keyword-overlay: hsl(from var(--color-code-keyword) h s l / 0.16); /* #6935 */
 
   --color-info: #24837b;
   --color-info-light: color-mix(in srgb, var(--color-info), white 35%);

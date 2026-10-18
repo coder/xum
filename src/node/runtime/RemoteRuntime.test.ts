@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -161,6 +161,10 @@ class SleepingRemoteRuntime extends TestRemoteRuntime {
   spawned: ReturnType<typeof spawn> | undefined;
 
   protected override spawnRemoteProcess(): Promise<SpawnResult> {
+    // A later exec is the abort's remote stop (#6923); it has nothing to stop here.
+    if (this.spawned) {
+      return Promise.resolve({ process: spawn("true", [], { stdio: ["pipe", "pipe", "pipe"] }) });
+    }
     this.spawned = spawn("sleep", ["30"], { stdio: ["pipe", "pipe", "pipe"] });
     return Promise.resolve({ process: this.spawned });
   }
@@ -194,6 +198,7 @@ describe("RemoteRuntime abort cancels the underlying command", () => {
     abort.abort();
     expect(await stream.exitCode).toBe(EXIT_CODE_ABORTED);
     expect(runtime.spawned?.signalCode).toBe("SIGTERM");
+    await runtime.awaitPendingStops();
   });
 });
 
@@ -215,6 +220,92 @@ describe("RemoteRuntime.exec output streams", () => {
     } finally {
       abort.abort();
       await stream.exitCode;
+    }
+  });
+});
+
+/** ShellRemoteRuntime that records the full remote commands it spawns. */
+class RecordingShellRemoteRuntime extends ShellRemoteRuntime {
+  readonly fullCommands: string[] = [];
+
+  protected override spawnRemoteProcess(...args: unknown[]): Promise<SpawnResult> {
+    if (typeof args[0] === "string") this.fullCommands.push(args[0]);
+    return super.spawnRemoteProcess(...args);
+  }
+}
+
+/** Pids whose environment holds exactly `marker` (Linux /proc), other than this process. */
+function markedPids(marker: string): number[] {
+  const out = spawnSync("sh", ["-c", `grep -lzxF '${marker}' /proc/[0-9]*/environ 2>/dev/null`], {
+    encoding: "utf-8",
+  }).stdout;
+  return out
+    .split("\n")
+    .filter(Boolean)
+    .map((file) => Number(file.split("/")[2]))
+    .filter((pid) => pid !== process.pid);
+}
+
+describe("RemoteRuntime abort stops the remote command (#6923)", () => {
+  // Killing the local client left the remote command running (docker exec passes no signal). The
+  // stand-in "remote" here is a local sh, whose SIGTERM leaves its children running the same way.
+  // A caller's XUM_EXEC_ID export would replace the marker and hide the command from the stop.
+  it.skipIf(process.platform !== "linux").each([
+    // Without a timeout there is no `timeout` wrapper, which would pass the TERM on itself.
+    ["no caller env", undefined],
+    ["a caller env that sets the marker key, and no timeout", { XUM_EXEC_ID: "spoofed" }],
+  ] as const)(
+    "an abort stops every process that carries the exec's marker (%s)",
+    async (_name, env) => {
+      const loginDir = await fs.mkdtemp(path.join(os.tmpdir(), "remote-abort-"));
+      const runtime = new RecordingShellRemoteRuntime(loginDir);
+      const abort = new AbortController();
+      try {
+        // Unique durations find these sleeps whatever their environment holds.
+        const seconds = 3000 + Math.floor(Math.random() * 900);
+        const sleeps = () =>
+          spawnSync("pgrep", ["-f", `^sleep (${seconds}|${seconds + 1})$`], { encoding: "utf-8" })
+            .stdout.split("\n")
+            .filter(Boolean);
+        const stream = await runtime.exec(`sleep ${seconds}; sleep ${seconds + 1}`, {
+          cwd: loginDir,
+          abortSignal: abort.signal,
+          ...(env ? { env } : { timeout: 60 }),
+        });
+        const marker = /env '(XUM_EXEC_ID=[0-9a-f-]{36})'/.exec(runtime.fullCommands[0] ?? "")?.[1];
+        expect(marker).toBeDefined();
+        const deadline = Date.now() + 3_000;
+        while (markedPids(marker!).length === 0 && Date.now() < deadline) await Bun.sleep(20);
+        expect(markedPids(marker!).length).toBeGreaterThan(0);
+
+        abort.abort();
+        expect(await stream.exitCode).toBe(EXIT_CODE_ABORTED);
+        await runtime.awaitPendingStops();
+        // One stop exec, with its own marker.
+        expect(runtime.fullCommands).toHaveLength(2);
+        expect(runtime.fullCommands[1]).toContain(marker!);
+        expect(runtime.fullCommands[1]).not.toMatch(new RegExp(`^env '${marker!}'`));
+        expect(markedPids(marker!)).toEqual([]);
+        expect(sleeps()).toEqual([]);
+      } finally {
+        await fs.rm(loginDir, { recursive: true, force: true });
+      }
+    }
+  );
+
+  // The env prefix changes nothing a caller sees (#6923).
+  it("a command that is not aborted keeps its stdout, stderr and exit code", async () => {
+    const loginDir = await fs.mkdtemp(path.join(os.tmpdir(), "remote-plain-"));
+    const runtime = new RecordingShellRemoteRuntime(loginDir);
+    try {
+      const result = await execBuffered(runtime, "echo out; echo err >&2; exit 7", {
+        cwd: loginDir,
+        timeout: 10,
+      });
+      expect([result.stdout, result.stderr, result.exitCode]).toEqual(["out\n", "err\n", 7]);
+      expect(runtime.fullCommands).toHaveLength(1);
+    } finally {
+      await fs.rm(loginDir, { recursive: true, force: true });
     }
   });
 });

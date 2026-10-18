@@ -109,6 +109,7 @@ import {
   type LiveBashOutputView,
 } from "@/browser/utils/messages/liveBashOutputBuffer";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { getAutoRetryKey, getPinnedTodoExpandedKey } from "@/common/constants/storage";
 import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
 import { trackStreamCompleted } from "@/common/telemetry";
@@ -585,6 +586,91 @@ function getBufferedActiveStreamStart(
     model: activeStreamStart.model,
     thinkingLevel: activeStreamStart.thinkingLevel,
   };
+}
+
+/**
+ * The stream identity a workspace shows. The live aggregator is trusted once it is active and
+ * caught up; before that, a buffered replayed stream-start, then the activity snapshot.
+ */
+function resolveWorkspaceStreamIdentity(input: {
+  aggregator: StreamingMessageAggregator;
+  useAggregatorState: boolean;
+  hasInterruptibleActiveStream: boolean;
+  bufferedActiveStreamStart: Pick<StreamStartEvent, "model" | "thinkingLevel"> | null;
+  activity: WorkspaceActivitySnapshot | undefined;
+}): Pick<WorkspaceState, "canInterrupt" | "currentModel" | "currentThinkingLevel"> {
+  const {
+    aggregator,
+    useAggregatorState,
+    hasInterruptibleActiveStream,
+    bufferedActiveStreamStart,
+    activity,
+  } = input;
+  const canInterrupt = useAggregatorState
+    ? hasInterruptibleActiveStream
+    : bufferedActiveStreamStart !== null
+      ? true
+      : (activity?.streaming ?? hasInterruptibleActiveStream);
+  const currentModel = useAggregatorState
+    ? (aggregator.getCurrentModel() ?? null)
+    : (bufferedActiveStreamStart?.model ??
+      activity?.lastModel ??
+      aggregator.getCurrentModel() ??
+      null);
+  const currentThinkingLevel = useAggregatorState
+    ? (aggregator.getCurrentThinkingLevel() ?? null)
+    : (bufferedActiveStreamStart?.thinkingLevel ??
+      activity?.lastThinkingLevel ??
+      aggregator.getCurrentThinkingLevel() ??
+      null);
+  return { canInterrupt, currentModel, currentThinkingLevel };
+}
+
+/** The newer of the aggregator's and the activity snapshot's recency, when either has one. */
+function mergeRecencyTimestamp(
+  aggregatorRecency: number | null,
+  activityRecency: number | undefined
+): number | null {
+  return aggregatorRecency === null
+    ? (activityRecency ?? null)
+    : Math.max(aggregatorRecency, activityRecency ?? aggregatorRecency);
+}
+
+/** Transcript hydration flags of an onChat replay (skeleton, stale cached rows, since catch-up). */
+function resolveTranscriptHydrationState(input: {
+  aggregator: StreamingMessageAggregator;
+  transient: WorkspaceChatTransientState;
+  isActiveWorkspace: boolean;
+  hasRunningInitMessage: boolean;
+  displayedMessages: DisplayedMessage[];
+}): Pick<WorkspaceState, "isHydratingTranscript" | "isTranscriptStale" | "isIncrementalCatchUp"> {
+  const { aggregator, transient, isActiveWorkspace, hasRunningInitMessage, displayedMessages } =
+    input;
+  // Only actively running init output should bypass transcript hydration. Completed init
+  // rows are still replayed, but they should not suppress the normal catch-up placeholder
+  // for stale cached transcript content on reconnect.
+  const isHydratingTranscript =
+    isActiveWorkspace &&
+    transient.isHydratingTranscript &&
+    !transient.caughtUp &&
+    !hasRunningInitMessage;
+  // Only painted rows can be stale; an empty transcript hydrates through the skeleton
+  // regardless. A full replay rebuilds the transcript from scratch, so the one row it
+  // can apply before caught-up (the replayed init card bypasses buffering) is partial
+  // too, whereas a since replay's cached init-only transcript is trustworthy.
+  const displayedOnlyReplayedInitCards =
+    transient.fullReplayInFlight &&
+    displayedMessages.every((message) => message.type === "workspace-init");
+  const isTranscriptStale =
+    isHydratingTranscript &&
+    displayedMessages.length > 0 &&
+    !transient.staleSkeletonExpired &&
+    (transient.cachedTranscriptStale || displayedOnlyReplayedInitCards);
+  const isIncrementalCatchUp =
+    isHydratingTranscript &&
+    !transient.fullReplayInFlight &&
+    getOnChatReplayMode(aggregator)?.type === "since";
+  return { isHydratingTranscript, isTranscriptStale, isIncrementalCatchUp };
 }
 
 /**
@@ -1781,6 +1867,11 @@ export class WorkspaceStore {
     if (workspaceId) {
       // Chat-switch User Timing origin (#4504): every switch milestone is measured from here.
       markChatSwitchStart(workspaceId);
+      // #6823: on desktop the lazy tool cards' chunk, requested at the first replayed tool row,
+      // evaluated after the first rows committed (header-only cards for 1-2 frames). Request it
+      // before the replay keeps the main thread busy. Not in the browser: a chat without tool
+      // calls must not download the cards there (T3 #5971, see toolCardsStore).
+      if (isDesktopMode()) requestToolCards();
     }
     this.ensureOnChatSubscriptions();
 
@@ -2630,59 +2721,32 @@ export class WorkspaceStore {
       // activity snapshot's streaming state, which is updated via the lightweight activity
       // subscription for all workspaces.
       const useAggregatorState = isActiveWorkspace && transient.caughtUp;
-      const canInterrupt = useAggregatorState
-        ? hasInterruptibleActiveStream
-        : bufferedActiveStreamStart !== null
-          ? true
-          : (activity?.streaming ?? hasInterruptibleActiveStream);
-      const currentModel = useAggregatorState
-        ? (aggregator.getCurrentModel() ?? null)
-        : (bufferedActiveStreamStart?.model ??
-          activity?.lastModel ??
-          aggregator.getCurrentModel() ??
-          null);
-      const currentThinkingLevel = useAggregatorState
-        ? (aggregator.getCurrentThinkingLevel() ?? null)
-        : (bufferedActiveStreamStart?.thinkingLevel ??
-          activity?.lastThinkingLevel ??
-          aggregator.getCurrentThinkingLevel() ??
-          null);
+      const { canInterrupt, currentModel, currentThinkingLevel } = resolveWorkspaceStreamIdentity({
+        aggregator,
+        useAggregatorState,
+        hasInterruptibleActiveStream,
+        bufferedActiveStreamStart,
+        activity,
+      });
       const activePendingStreamStartTime = isActiveWorkspace ? pendingStreamStartTime : null;
-      const aggregatorRecency = aggregator.getRecencyTimestamp();
-      const recencyTimestamp =
-        aggregatorRecency === null
-          ? (activity?.recency ?? null)
-          : Math.max(aggregatorRecency, activity?.recency ?? aggregatorRecency);
+      const recencyTimestamp = mergeRecencyTimestamp(
+        aggregator.getRecencyTimestamp(),
+        activity?.recency
+      );
       // Keep the startup barrier mounted until stream-start makes the turn interruptible;
       // stream-lifecycle can report "streaming" slightly earlier.
       const isStreamStarting =
         isActiveWorkspace &&
         !canInterrupt &&
         (streamLifecycle?.phase === "preparing" || activePendingStreamStartTime !== null);
-      // Only actively running init output should bypass transcript hydration. Completed init
-      // rows are still replayed, but they should not suppress the normal catch-up placeholder
-      // for stale cached transcript content on reconnect.
-      const isHydratingTranscript =
-        isActiveWorkspace &&
-        transient.isHydratingTranscript &&
-        !transient.caughtUp &&
-        !hasRunningInitMessage;
-      // Only painted rows can be stale; an empty transcript hydrates through the skeleton
-      // regardless. A full replay rebuilds the transcript from scratch, so the one row it
-      // can apply before caught-up (the replayed init card bypasses buffering) is partial
-      // too, whereas a since replay's cached init-only transcript is trustworthy.
-      const displayedOnlyReplayedInitCards =
-        transient.fullReplayInFlight &&
-        displayedMessages.every((message) => message.type === "workspace-init");
-      const isTranscriptStale =
-        isHydratingTranscript &&
-        displayedMessages.length > 0 &&
-        !transient.staleSkeletonExpired &&
-        (transient.cachedTranscriptStale || displayedOnlyReplayedInitCards);
-      const isIncrementalCatchUp =
-        isHydratingTranscript &&
-        !transient.fullReplayInFlight &&
-        getOnChatReplayMode(aggregator)?.type === "since";
+      const { isHydratingTranscript, isTranscriptStale, isIncrementalCatchUp } =
+        resolveTranscriptHydrationState({
+          aggregator,
+          transient,
+          isActiveWorkspace,
+          hasRunningInitMessage,
+          displayedMessages,
+        });
       const aggregatorTodos = aggregator.getCurrentTodos();
       const agentStatus = resolveSidebarAgentStatus({
         useAggregatorState,
@@ -4512,54 +4576,8 @@ export class WorkspaceStore {
         isCaughtUpMessage(event) && event.historyReplayStatus === "complete",
       getClient: async (attemptSignal) => this.client ?? (await this.waitForClient(attemptSignal)),
       getClientChangeSignal: () => this.clientChangeController.signal,
-      subscribe: async (client, attemptSignal, abortAttempt) => {
-        const transient = this.chatTransientState.get(workspaceId);
-        if (transient) {
-          transient.caughtUp = false;
-          transient.historyVerified = false;
-          // Every attempt replays, including retries that keep the same client and cached rows.
-          if (!transient.isHydratingTranscript) {
-            transient.isHydratingTranscript = true;
-            this.states.bump(workspaceId);
-          }
-          if (transient.cachedTranscriptStale) {
-            this.armStaleSkeletonDeadline(workspaceId);
-          }
-        }
-        const aggregator = this.aggregators.get(workspaceId);
-        let mode: OnChatMode | undefined;
-        const attemptContext: OnChatAttemptContext = { abort: abortAttempt, loopSignal: signal };
-        // A refresh request pending at attempt start owns this attempt (and every retry the
-        // loop makes until it settles); its caught-up is the request's fresh baseline.
-        const refreshRequest = this.transcriptRefreshRequests.get(workspaceId);
-        if (refreshRequest) attemptContext.refreshRequest = refreshRequest;
-        this.currentOnChatAttempts.set(workspaceId, attemptContext);
-        if (aggregator) {
-          mode = getOnChatReplayMode(aggregator);
-          if (mode?.type === "since") {
-            attemptContext.since = {
-              requestedAnchorSequence: mode.cursor.history.historySequence,
-              localActiveStreamMessageId: mode.cursor.stream?.messageId,
-            };
-          }
-        }
-        const { input, legacyAutoRetryEnabled } = buildOnChatInput(workspaceId, mode);
-        const iterator = await client.workspace.onChat(input, { signal: attemptSignal });
-        // The backend took over the legacy setting: drop it only after the subscribe succeeded.
-        if (legacyAutoRetryEnabled !== undefined)
-          updatePersistedState<boolean | undefined>(getAutoRetryKey(workspaceId), undefined);
-        const isFullReplay = !mode || mode.type === "full";
-        if (isFullReplay) this.resetChatStateForReplay(workspaceId);
-        const established = this.chatTransientState.get(workspaceId);
-        if (established) {
-          established.onChatIteratorOpen = true;
-          established.fullReplayInFlight = isFullReplay;
-          if (isFullReplay) {
-            this.armStaleSkeletonDeadline(workspaceId);
-          }
-        }
-        return { events: iterator, context: attemptContext };
-      },
+      subscribe: (client, attemptSignal, abortAttempt) =>
+        this.openOnChatAttempt(workspaceId, signal, client, attemptSignal, abortAttempt),
       onEvent: (data, attemptContext, attemptSignal) =>
         queueMicrotask(() => {
           if (!signal.aborted && !attemptSignal.aborted)
@@ -4575,32 +4593,7 @@ export class WorkspaceStore {
         ),
       onError: (error, { attemptAborted }) =>
         this.handleOnChatError(workspaceId, error, attemptAborted),
-      onAttemptFinished: () => {
-        // The transport withholds this callback once the loop signal is aborted, so the entry
-        // is this loop's own attempt; the guard keeps that true by construction should a
-        // replacement loop (switch away and back) ever register first.
-        if (this.currentOnChatAttempts.get(workspaceId)?.loopSignal === signal) {
-          this.currentOnChatAttempts.delete(workspaceId);
-        }
-        if (!this.isWorkspaceRegistered(workspaceId)) return;
-        this.clearReplayBuffers(workspaceId);
-        // An attempt that ended without caught-up (transport error, stall watchdog) opens
-        // the replay gate anyway, so deferred git/PR probes cannot wait forever on retries.
-        const openedReplayGate = this.chatReplayPendingWorkspaces.delete(workspaceId);
-        const transient = this.chatTransientState.get(workspaceId);
-        if (transient) {
-          // Backoff is still catch-up; cleared stream buffers must also invalidate cached barriers.
-          transient.isHydratingTranscript = true;
-        }
-        if (transient || openedReplayGate) {
-          this.states.bump(workspaceId);
-        }
-        if (transient && !transient.caughtUp && this.preReplayUsageSnapshot.delete(workspaceId))
-          this.usageStore.bump(workspaceId);
-        const existingPagination =
-          this.historyPagination.get(workspaceId) ?? createInitialHistoryPaginationState();
-        this.historyPagination.set(workspaceId, { ...existingPagination, loading: false });
-      },
+      onAttemptFinished: () => this.finishOnChatAttempt(workspaceId, signal),
     });
     // The loop is over (signal aborted, client gone, or a stop from onError): no attempt of
     // this loop can deliver a baseline anymore. Switch/dispose already settled `cancelled`;
@@ -4615,6 +4608,93 @@ export class WorkspaceStore {
         error: TRANSCRIPT_REFRESH_SUBSCRIPTION_ENDED_ERROR,
       });
     }
+  }
+
+  /**
+   * Open one onChat attempt of the subscription loop: mark the transcript as hydrating, tag the
+   * attempt (refresh ownership, since cursor), subscribe, and reset for a full replay.
+   */
+  private async openOnChatAttempt(
+    workspaceId: string,
+    signal: AbortSignal,
+    client: RouterClient<AppRouter>,
+    attemptSignal: AbortSignal,
+    abortAttempt: () => void
+  ): Promise<{ events: AsyncIterable<WorkspaceChatMessage>; context: OnChatAttemptContext }> {
+    const transient = this.chatTransientState.get(workspaceId);
+    if (transient) {
+      transient.caughtUp = false;
+      transient.historyVerified = false;
+      // Every attempt replays, including retries that keep the same client and cached rows.
+      if (!transient.isHydratingTranscript) {
+        transient.isHydratingTranscript = true;
+        this.states.bump(workspaceId);
+      }
+      if (transient.cachedTranscriptStale) {
+        this.armStaleSkeletonDeadline(workspaceId);
+      }
+    }
+    const aggregator = this.aggregators.get(workspaceId);
+    let mode: OnChatMode | undefined;
+    const attemptContext: OnChatAttemptContext = { abort: abortAttempt, loopSignal: signal };
+    // A refresh request pending at attempt start owns this attempt (and every retry the
+    // loop makes until it settles); its caught-up is the request's fresh baseline.
+    const refreshRequest = this.transcriptRefreshRequests.get(workspaceId);
+    if (refreshRequest) attemptContext.refreshRequest = refreshRequest;
+    this.currentOnChatAttempts.set(workspaceId, attemptContext);
+    if (aggregator) {
+      mode = getOnChatReplayMode(aggregator);
+      if (mode?.type === "since") {
+        attemptContext.since = {
+          requestedAnchorSequence: mode.cursor.history.historySequence,
+          localActiveStreamMessageId: mode.cursor.stream?.messageId,
+        };
+      }
+    }
+    const { input, legacyAutoRetryEnabled } = buildOnChatInput(workspaceId, mode);
+    const iterator = await client.workspace.onChat(input, { signal: attemptSignal });
+    // The backend took over the legacy setting: drop it only after the subscribe succeeded.
+    if (legacyAutoRetryEnabled !== undefined)
+      updatePersistedState<boolean | undefined>(getAutoRetryKey(workspaceId), undefined);
+    const isFullReplay = !mode || mode.type === "full";
+    if (isFullReplay) this.resetChatStateForReplay(workspaceId);
+    const established = this.chatTransientState.get(workspaceId);
+    if (established) {
+      established.onChatIteratorOpen = true;
+      established.fullReplayInFlight = isFullReplay;
+      if (isFullReplay) {
+        this.armStaleSkeletonDeadline(workspaceId);
+      }
+    }
+    return { events: iterator, context: attemptContext };
+  }
+
+  /** Clean up after one onChat attempt ended, before the loop retries (or stops). */
+  private finishOnChatAttempt(workspaceId: string, signal: AbortSignal): void {
+    // The transport withholds this callback once the loop signal is aborted, so the entry
+    // is this loop's own attempt; the guard keeps that true by construction should a
+    // replacement loop (switch away and back) ever register first.
+    if (this.currentOnChatAttempts.get(workspaceId)?.loopSignal === signal) {
+      this.currentOnChatAttempts.delete(workspaceId);
+    }
+    if (!this.isWorkspaceRegistered(workspaceId)) return;
+    this.clearReplayBuffers(workspaceId);
+    // An attempt that ended without caught-up (transport error, stall watchdog) opens
+    // the replay gate anyway, so deferred git/PR probes cannot wait forever on retries.
+    const openedReplayGate = this.chatReplayPendingWorkspaces.delete(workspaceId);
+    const transient = this.chatTransientState.get(workspaceId);
+    if (transient) {
+      // Backoff is still catch-up; cleared stream buffers must also invalidate cached barriers.
+      transient.isHydratingTranscript = true;
+    }
+    if (transient || openedReplayGate) {
+      this.states.bump(workspaceId);
+    }
+    if (transient && !transient.caughtUp && this.preReplayUsageSnapshot.delete(workspaceId))
+      this.usageStore.bump(workspaceId);
+    const existingPagination =
+      this.historyPagination.get(workspaceId) ?? createInitialHistoryPaginationState();
+    this.historyPagination.set(workspaceId, { ...existingPagination, loading: false });
   }
 
   /**
