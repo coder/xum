@@ -3397,7 +3397,8 @@ describe("ProjectSidebar project actions menu", () => {
     const initialInput = view.container.querySelector<HTMLInputElement>('input[type="text"]');
     expect(initialInput?.value).toBe("#6b7280");
 
-    fireEvent.click(view.getByTestId("hex-color-picker"));
+    // The picker may load after the popover opens (#6982), so wait for it.
+    fireEvent.click(await view.findByTestId("hex-color-picker"));
 
     await waitFor(() => {
       const input = view.container.querySelector<HTMLInputElement>('input[type="text"]');
