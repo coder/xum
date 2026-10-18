@@ -6,6 +6,7 @@
 import type { SSHServerConfig } from "../runtime/test-fixtures/ssh-fixture";
 import { sshConnectionPool } from "../../src/node/runtime/sshConnectionPool";
 import { isInitOutput } from "@/common/orpc/types";
+import type { InitStateManager } from "../../src/node/services/initStateManager";
 import type { StreamCollector } from "./streamCollector";
 
 export interface SshStepContext {
@@ -32,6 +33,30 @@ export function describeSsh(sshConfig: SSHServerConfig | undefined, ctx: SshStep
     // CI runs the default OpenSSH transport. The SSH2 pool exposes no health to read.
     `OpenSSH pool: ${JSON.stringify(health ?? null)}`
   );
+}
+
+/**
+ * #6870: the backend's own view of a workspace's init, with each line's offset from the init
+ * start. It tells a stuck init (status running: the last line names the step, `idleMs` says how
+ * long it has been silent) from an init that ended while the test's subscriber missed init-end.
+ */
+export function describeBackendInit(
+  initStateManager: InitStateManager,
+  workspaceId: string,
+  nowMs = Date.now()
+): string {
+  const state = initStateManager.getInitState(workspaceId);
+  if (state == null) return "Backend init state: none.";
+  const lastAt = state.lines.at(-1)?.timestamp ?? state.startTime;
+  const summary = {
+    status: state.status,
+    phase: state.phase,
+    exitCode: state.exitCode,
+    runMs: (state.endTime ?? nowMs) - state.startTime,
+    idleMs: state.endTime == null ? nowMs - lastAt : undefined,
+    lines: state.lines.slice(-8).map((l) => `+${l.timestamp - state.startTime} ${l.line}`),
+  };
+  return `Backend init state: ${JSON.stringify(summary)}`;
 }
 
 /**

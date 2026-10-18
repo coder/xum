@@ -22,13 +22,25 @@ import * as path from "path";
 import * as os from "os";
 import { exec } from "child_process";
 import { promisify } from "util";
-import { shouldRunIntegrationTests, createTestEnvironment, cleanupTestEnvironment } from "../setup";
+import {
+  shouldRunIntegrationTests,
+  createTestEnvironment,
+  cleanupTestEnvironment,
+  type TestEnvironment,
+} from "../setup";
 import {
   generateBranchName,
   cleanupTempGitRepo,
-  waitForInitComplete,
   trustProject,
+  createStreamCollector,
 } from "../helpers";
+import {
+  describeBackendInit,
+  describeSsh,
+  initOutputLines,
+  runWatchedSshTest,
+  type SshStepContext,
+} from "../sshStepWatchdog";
 import { detectDefaultTrunkBranch } from "../../../src/node/git";
 import {
   isDockerAvailable,
@@ -43,7 +55,14 @@ import { ssh2ConnectionPool } from "../../../src/node/runtime/SSH2ConnectionPool
 const execAsync = promisify(exec);
 
 const TEST_TIMEOUT_MS = 60000;
-const SSH_INIT_WAIT_MS = 15000; // SSH init includes sync + checkout, needs more time
+// #6870: in 37 passing CI runs this whole file took 6.8-9.2 s, its container start and both ssh
+// inits included. One merge-queue run missed the old 15 s init wait, and that message did not say
+// whether init was stuck or slow. The budget matches the other ssh tests (#6588). An init slower
+// than SSH_INIT_SLOW_MS still passes but prints its timeline to stderr (CI's --silent drops
+// console output, not stderr).
+const SSH_INIT_BUDGET_MS = 40_000;
+const SSH_INIT_SLOW_MS = 15_000;
+const SSH_WATCHDOG_MS = TEST_TIMEOUT_MS - 10_000;
 const ORIGIN_COMMIT_MARKER = "ORIGIN_ONLY_COMMIT_MARKER";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -457,9 +476,49 @@ describeIntegration("Origin fetch ordering during workspace creation", () => {
       };
     };
 
+    /** Runs an ssh test body under the step watchdog (sshStepWatchdog.ts). */
+    const watched = (body: (ctx: SshStepContext) => Promise<void>) => async (): Promise<void> =>
+      runWatchedSshTest(SSH_WATCHDOG_MS, () => sshConfig, body);
+
+    /**
+     * Waits for init-end within its budget and requires exit code 0. A miss names the stuck
+     * step: the init lines this test saw, the SSH pool's health and the backend's init state.
+     */
+    const waitForSshInit = async (
+      env: TestEnvironment,
+      workspaceId: string,
+      ctx: SshStepContext
+    ): Promise<void> => {
+      ctx.step = "wait for init-end";
+      const collector = createStreamCollector(env.orpc, workspaceId);
+      collector.start();
+      ctx.initLines = () => initOutputLines(collector);
+      const startedAt = Date.now();
+      try {
+        const end = await collector.waitForEvent("init-end", SSH_INIT_BUDGET_MS);
+        const backend = () => describeBackendInit(env.services.initStateManager, workspaceId);
+        if (end == null) {
+          const message = `ssh init did not end within ${SSH_INIT_BUDGET_MS} ms (#6870). ${describeSsh(sshConfig, ctx)}. ${backend()}`;
+          // Also on stderr now: a cleanup that hangs next would leave only the watchdog's message.
+          process.stderr.write(`${message}\n`);
+          throw new Error(message);
+        }
+        const waitedMs = Date.now() - startedAt;
+        if (waitedMs > SSH_INIT_SLOW_MS) {
+          process.stderr.write(`ssh init ended after ${waitedMs} ms (#6870). ${backend()}\n`);
+        }
+        const exitCode = (end as { exitCode?: number }).exitCode;
+        if (exitCode !== 0) {
+          throw new Error(`ssh init failed with exit code ${String(exitCode)}. ${backend()}`);
+        }
+      } finally {
+        collector.stop();
+      }
+    };
+
     test.concurrent(
       "creates workspace from bundled local state when origin is inaccessible from remote",
-      async () => {
+      watched(async (ctx) => {
         const env = await createTestEnvironment();
         const { repoPath, originPath, trunkBranch } = await createRepoWithAheadOrigin();
 
@@ -469,6 +528,7 @@ describeIntegration("Origin fetch ordering during workspace creation", () => {
 
           // Create workspace - origin fetch will fail (local path inaccessible from SSH),
           // but workspace should still be created from bundled local state
+          ctx.step = "create workspace";
           await trustProject(env, repoPath);
           const result = await env.orpc.workspace.create({
             projectPath: repoPath,
@@ -484,10 +544,10 @@ describeIntegration("Origin fetch ordering during workspace creation", () => {
 
           const workspaceId = result.metadata.id;
 
-          // Wait for SSH init to complete
-          await waitForInitComplete(env, workspaceId, SSH_INIT_WAIT_MS);
+          await waitForSshInit(env, workspaceId, ctx);
 
           // Verify workspace has the local state (Initial commit)
+          ctx.step = "run git log";
           const execResult = await env.orpc.workspace.executeBash({
             workspaceId,
             script: `git log --oneline | head -3`,
@@ -502,18 +562,20 @@ describeIntegration("Origin fetch ordering during workspace creation", () => {
           expect(execResult.data.output).toContain("Initial commit");
 
           // Cleanup workspace
+          ctx.step = "remove workspace";
           await env.orpc.workspace.remove({ workspaceId });
         } finally {
+          ctx.step = "clean up";
           await cleanupTestEnvironment(env);
           await cleanupTestRepos(repoPath, originPath);
         }
-      },
+      }),
       TEST_TIMEOUT_MS
     );
 
     test.concurrent(
       "gracefully handles unreachable origin URL",
-      async () => {
+      watched(async (ctx) => {
         const env = await createTestEnvironment();
 
         // Create a repo with a fake origin URL
@@ -537,6 +599,7 @@ describeIntegration("Origin fetch ordering during workspace creation", () => {
           const branchName = generateBranchName("ssh-unreachable-origin");
           const runtimeConfig = getSSHRuntimeConfig();
 
+          ctx.step = "create workspace";
           await trustProject(env, repoPath);
           const result = await env.orpc.workspace.create({
             projectPath: repoPath,
@@ -553,8 +616,9 @@ describeIntegration("Origin fetch ordering during workspace creation", () => {
           const workspaceId = result.metadata.id;
 
           // Wait for init and verify workspace is usable
-          await waitForInitComplete(env, workspaceId, SSH_INIT_WAIT_MS);
+          await waitForSshInit(env, workspaceId, ctx);
 
+          ctx.step = "run cat README.md";
           const execResult = await env.orpc.workspace.executeBash({
             workspaceId,
             script: `cat README.md`,
@@ -565,12 +629,14 @@ describeIntegration("Origin fetch ordering during workspace creation", () => {
             expect((execResult.data.output ?? "").trim()).toBe("initial");
           }
 
+          ctx.step = "remove workspace";
           await env.orpc.workspace.remove({ workspaceId });
         } finally {
+          ctx.step = "clean up";
           await cleanupTestEnvironment(env);
           await cleanupTempGitRepo(repoPath);
         }
-      },
+      }),
       TEST_TIMEOUT_MS
     );
   });
