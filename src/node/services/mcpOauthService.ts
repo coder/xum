@@ -284,12 +284,6 @@ function pluginClient(
   };
 }
 
-/**
- * A URL whose serialization is the configured string. The SDK sends `resource.href` in the
- * authorization, token and refresh requests, and `new URL("https://api.example.com").href`
- * appends a slash: an authorization server that compares RFC 8707 resources exactly rejects
- * that. The value is still validated as a URL by the constructor.
- */
 // Keyed by instance instead of a `#raw` field: Bun (through 1.4.3) emits a `#private` field
 // natively, and any class with one makes Bun's coverage read every line of this file as hit
 // (oven-sh/bun#41528). A WeakMap keeps the value off the object like the field did.
@@ -300,6 +294,12 @@ function rawHref(url: ExactResourceURL): string {
   return raw;
 }
 
+/**
+ * A URL whose serialization is the configured string. The SDK sends `resource.href` in the
+ * authorization, token and refresh requests, and `new URL("https://api.example.com").href`
+ * appends a slash: an authorization server that compares RFC 8707 resources exactly rejects
+ * that. The value is still validated as a URL by the constructor.
+ */
 class ExactResourceURL extends URL {
   constructor(raw: string) {
     super(raw);
