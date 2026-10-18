@@ -122,6 +122,11 @@ function subtractLongContextTokens(
   };
 }
 
+/** An unpriced part added no cost to the total; an unpriced total stays unpriced. */
+function subtractCost(total: number | undefined, part: number | undefined): number | undefined {
+  return total === undefined || part === undefined ? total : total - part;
+}
+
 /**
  * `total` minus `part`, where `part` was earlier summed into `total` with sumUsageHistory.
  * Keeps total's flags (unknown costs, gateway billing, tier): the remaining entries carry them too.
@@ -129,12 +134,9 @@ function subtractLongContextTokens(
 function subtractUsage(total: ChatUsageDisplay, part: ChatUsageDisplay): ChatUsageDisplay {
   const result: ChatUsageDisplay = { ...total };
   for (const key of USAGE_COMPONENTS) {
-    const totalCost = total[key].cost_usd;
-    const partCost = part[key].cost_usd;
     result[key] = {
       tokens: total[key].tokens - part[key].tokens,
-      // An unpriced part added no cost to the total.
-      cost_usd: totalCost === undefined || partCost === undefined ? totalCost : totalCost - partCost,
+      cost_usd: subtractCost(total[key].cost_usd, part[key].cost_usd),
     };
   }
   const cacheCreate1hTokens = (total.cacheCreate1hTokens ?? 0) - (part.cacheCreate1hTokens ?? 0);

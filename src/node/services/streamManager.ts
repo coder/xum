@@ -5687,10 +5687,9 @@ export class StreamManager {
         this.workspaceStreams.delete(workspaceId);
       }
       // A terminal path that recorded no usage (e.g. a completion with no parts) must not
-      // leave its in-flight usage in the ledger. Aborts settle later, in cleanupAbortedStream.
-      if (streamInfo.terminalCompletion != null) {
-        await this.discardInFlightSessionUsage(workspaceId, streamInfo);
-      }
+      // leave its in-flight usage in the ledger. A no-op once the usage settled. Aborts
+      // settle after this (cleanupAbortedStream) and then record the whole usage.
+      await this.discardInFlightSessionUsage(workspaceId, streamInfo);
 
       // Lifecycle spine event: emitted from the guaranteed-cleanup path so
       // EVERY terminal outcome (completion, abort/Escape, provider failure)
