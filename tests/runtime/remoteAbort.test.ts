@@ -16,7 +16,7 @@ import { shouldRunIntegrationTests } from "../testUtils";
 import { DockerRuntime } from "@/node/runtime/DockerRuntime";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import { createSSHTransport } from "@/node/runtime/transports";
-import type { Runtime } from "@/node/runtime/Runtime";
+import type { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { EXIT_CODE_ABORTED } from "@/common/constants/exitCodes";
 import { sshConnectionPool } from "@/node/runtime/sshConnectionPool";
 import { ssh2ConnectionPool } from "@/node/runtime/SSH2ConnectionPool";
@@ -25,7 +25,7 @@ const describeIntegration = shouldRunIntegrationTests() ? describe : describe.sk
 
 let sshConfig: SSHServerConfig | undefined;
 
-function sshRuntime(config: SSHServerConfig, useSSH2: boolean): Runtime {
+function sshRuntime(config: SSHServerConfig, useSSH2: boolean): RemoteRuntime {
   const runtimeConfig = {
     host: "testuser@localhost",
     srcBaseDir: config.workdir,
@@ -67,7 +67,7 @@ describeIntegration("RemoteRuntime abort stops the remote command (#6923)", () =
     ssh2ConnectionPool.clearAllHealthForTests();
   });
 
-  const cases: [string, (config: SSHServerConfig) => { runtime: Runtime; cwd: string }][] = [
+  const cases: [string, (config: SSHServerConfig) => { runtime: RemoteRuntime; cwd: string }][] = [
     [
       "Docker",
       (config) => ({
@@ -108,5 +108,6 @@ describeIntegration("RemoteRuntime abort stops the remote command (#6923)", () =
     );
     expect(remoteProcesses(config.containerId, needle)).toEqual([]);
     expect(gone).toBe(true);
+    await runtime.awaitPendingStops();
   });
 });
