@@ -50,15 +50,16 @@ const cases: Array<{ name: string; state: WorkspaceActionsState; groups: Workspa
     {
       name: "sidebar, root workspace",
       state: sidebar({}),
-      groups: [TITLE, SETTINGS, ["togglePinned"], ["fork", "archive"]],
+      groups: [["togglePinned"], TITLE, SETTINGS, ["fork", "archive"]],
     },
     {
       name: "sidebar, root with a running devcontainer, read, with completed sub-agents",
       state: sidebar({ isRuntimeRunning: true, canMarkUnread: true, canToggleSubAgents: true }),
       groups: [
+        ["togglePinned"],
         TITLE,
         SETTINGS,
-        ["togglePinned", "markUnread", "toggleSubAgents"],
+        ["markUnread", "toggleSubAgents"],
         ["fork", "stopRuntime", "archive"],
       ],
     },
@@ -75,7 +76,7 @@ const cases: Array<{ name: string; state: WorkspaceActionsState; groups: Workspa
     {
       name: "sidebar, scratch chat",
       state: sidebar({ workspace: scratch }),
-      groups: [TITLE, SETTINGS, ["togglePinned"], ["archive"]],
+      groups: [["togglePinned"], TITLE, SETTINGS, ["archive"]],
     },
     {
       name: "sidebar, archived workspace",
@@ -147,7 +148,8 @@ describe("getWorkspaceActionGroups", () => {
   });
 
   // The issue's promise: apart from the view items (top bar) and the row items (sidebar), both
-  // menus show the same actions in the same order for the same workspace.
+  // menus show the same actions in the same order for the same workspace. Pin is the one
+  // deliberate exception to the order: the sidebar lists it first (flat rows have no pin icon).
   const SURFACE_ONLY = new Set<WorkspaceActionId>([
     "immersiveReview",
     "touchFullscreenReview",
@@ -156,10 +158,15 @@ describe("getWorkspaceActionGroups", () => {
     "markUnread",
     "toggleSubAgents",
   ]);
-  const shared = (state: WorkspaceActionsState) =>
-    getWorkspaceActionGroups(state)
+  const shared = (state: WorkspaceActionsState) => {
+    const ids = getWorkspaceActionGroups(state)
       .flat()
       .filter((id) => !SURFACE_ONLY.has(id));
+    return {
+      pinnable: ids.includes("togglePinned"),
+      order: ids.filter((id) => id !== "togglePinned"),
+    };
+  };
 
   test.each([
     { name: "root", workspace: root, showsSubAgent: false },

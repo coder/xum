@@ -1,6 +1,9 @@
 import { useTitleEdit } from "@/browser/contexts/WorkspaceTitleEditContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
+import {
+  useContextMenuPosition,
+  type UseContextMenuPositionReturn,
+} from "@/browser/hooks/useContextMenuPosition";
 import {
   getWorkspaceStreamingStatusPhase,
   useWorkspaceStreamingStatusPhase,
@@ -26,16 +29,18 @@ import { useDrag, useDrop } from "react-dnd";
 import type { DropTargetMonitor } from "react-dnd";
 import { getEmptyImage } from "react-dnd-html5-backend";
 import { SubAgentListItem } from "./SubAgentListItem";
+import { AvatarCornerIcon, ProjectAvatar } from "./ProjectAvatar";
 import {
   LEADING_SLOT_CONTAINER_CLASSES,
   LEADING_SLOT_CONTAINER_STYLE,
   STATUS_DOT_SLOT_CONTAINER_CLASSES,
+  AvatarStatusDot,
   StatusDot,
   isStatusDotVisible,
   type VisualState,
 } from "./StatusDot";
 
-import { Tooltip, TooltipTrigger, TooltipContent, TooltipIfPresent } from "../Tooltip/Tooltip";
+import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { Popover, PopoverContent, PopoverTrigger, PopoverAnchor } from "../Popover/Popover";
 import { PositionedMenu, PositionedMenuItem } from "../PositionedMenu/PositionedMenu";
 import {
@@ -174,6 +179,62 @@ const HIDE_INLINE_ACTIONS_ON_MOBILE_TOUCH =
 const SHOW_INLINE_ACTIONS_ON_WIDE_TOUCH =
   "[@media(min-width:769px)_and_(hover:none)_and_(pointer:coarse)]:opacity-100";
 
+// Flat-mode rows (design "2a"): a project avatar column and a full-width text column. Rows keep
+// their background in `--row-bg` so the avatar dot's ring and the action scrim match it in every
+// state (rest, hover, focus, selected, menu open).
+const AVATAR_ROW_BASE_CLASSES =
+  "group/row relative grid grid-cols-[22px_minmax(0,1fr)] gap-x-2.5 rounded-md p-2 select-none bg-(--row-bg) transition-colors duration-150";
+const AVATAR_ROW_ACTIVE_BG = "[--row-bg:var(--color-surface-secondary)]";
+const AVATAR_ROW_REST_BG =
+  "[--row-bg:var(--color-surface-primary)] hover:[--row-bg:var(--color-surface-secondary)] focus-within:[--row-bg:var(--color-surface-secondary)]";
+
+function getAvatarRowClasses(isHighlighted: boolean): string {
+  return cn(AVATAR_ROW_BASE_CLASSES, isHighlighted ? AVATAR_ROW_ACTIVE_BG : AVATAR_ROW_REST_BG);
+}
+
+const AVATAR_ROW_ACTION_BUTTON_CLASSES = "h-6 w-6 rounded-[5px] hover:bg-hover";
+
+// Hidden actions are never an invisible tap target: they take pointer events only while shown.
+const ROW_ACTION_OVERLAY_REVEAL =
+  "pointer-events-none opacity-0 group-hover/row:pointer-events-auto group-hover/row:opacity-100 group-focus-within/row:pointer-events-auto group-focus-within/row:opacity-100";
+const ROW_ACTION_OVERLAY_WIDE_TOUCH_REVEAL =
+  "[@media(min-width:769px)_and_(hover:none)_and_(pointer:coarse)]:pointer-events-auto [@media(min-width:769px)_and_(hover:none)_and_(pointer:coarse)]:opacity-100";
+
+/**
+ * Avatar rows' actions float over the end of the title on a scrim that fades in from the left,
+ * so the title keeps the full row width while the actions are hidden.
+ */
+function RowActionOverlay(props: {
+  children: React.ReactNode;
+  /** Shown regardless of hover/focus (menu open, deleting spinner). */
+  forceVisible?: boolean;
+  /** Touch tablets have no hover; show the actions there without it. */
+  revealOnWideTouch?: boolean;
+  /** Touch phones open the same actions by long-press. */
+  hideOnNarrowTouch?: boolean;
+}) {
+  return (
+    <div
+      className={cn(
+        "absolute top-[5px] right-1.5 z-10 flex items-center gap-1 pl-6 transition-opacity duration-100",
+        props.forceVisible === true
+          ? "opacity-100"
+          : cn(
+              ROW_ACTION_OVERLAY_REVEAL,
+              props.revealOnWideTouch === true && ROW_ACTION_OVERLAY_WIDE_TOUCH_REVEAL
+            ),
+        props.hideOnNarrowTouch === true && HIDE_INLINE_ACTIONS_ON_MOBILE_TOUCH
+      )}
+      style={{
+        backgroundImage:
+          "linear-gradient(90deg, transparent, var(--row-bg, var(--color-surface-secondary)) 22px)",
+      }}
+    >
+      {props.children}
+    </div>
+  );
+}
+
 function getVisualState(opts: {
   awaitingUserQuestion: boolean;
   isInitializing: boolean;
@@ -214,9 +275,13 @@ function getVisualState(opts: {
   return opts.isUnread ? "idle" : "seen";
 }
 
-function HeartbeatFallbackIcon() {
+function HeartbeatFallbackIcon(props: { className?: string }) {
   return (
-    <HeartPulse aria-hidden="true" className="text-muted h-4 w-4" data-testid="heartbeat-icon" />
+    <HeartPulse
+      aria-hidden="true"
+      className={cn("text-muted h-4 w-4", props.className)}
+      data-testid="heartbeat-icon"
+    />
   );
 }
 
@@ -428,14 +493,415 @@ function ActionButtonWrapper(props: { children: React.ReactNode; className?: str
   );
 }
 
+/** Leading column of a persisted row: the project avatar (flat mode) or the status slot. */
+function RegularRowLeadingSlot(props: {
+  workspaceId: string;
+  displayTitle: string;
+  visualState: VisualState;
+  isSubAgentRow: boolean;
+  isPinned: boolean;
+  avatarName: string | undefined;
+  avatarColor: string | undefined;
+  showCompletedChildrenIndicator: boolean;
+  showHeartbeatFallback: boolean;
+  showQuickArchiveButton: boolean;
+  onArchiveWorkspace: (button: HTMLElement) => void;
+}) {
+  const completedChildrenIndicator = props.showCompletedChildrenIndicator ? (
+    <ChevronDown
+      aria-hidden="true"
+      className={cn("text-muted", props.avatarName != null ? "h-2.5 w-2.5" : "h-3 w-3")}
+      data-testid={`completed-children-expanded-indicator-${props.workspaceId}`}
+    />
+  ) : undefined;
+
+  if (props.avatarName != null) {
+    return (
+      <ProjectAvatar
+        name={props.avatarName}
+        color={props.avatarColor}
+        testId={`workspace-project-avatar-${props.workspaceId}`}
+        corner={
+          completedChildrenIndicator != null ? (
+            <AvatarCornerIcon>{completedChildrenIndicator}</AvatarCornerIcon>
+          ) : props.showHeartbeatFallback ? (
+            <AvatarCornerIcon>
+              <HeartbeatFallbackIcon className="h-2.5 w-2.5" />
+            </AvatarCornerIcon>
+          ) : (
+            // Pinned chats keep their section calm: only attention states show there.
+            <AvatarStatusDot state={props.visualState} hideIdle={props.isPinned} />
+          )
+        }
+      />
+    );
+  }
+  if (props.showHeartbeatFallback) {
+    return (
+      <div className={STATUS_DOT_SLOT_CONTAINER_CLASSES} style={LEADING_SLOT_CONTAINER_STYLE}>
+        <HeartbeatFallbackIcon />
+      </div>
+    );
+  }
+  if (props.showQuickArchiveButton) {
+    return (
+      <QuickArchiveButton
+        displayTitle={props.displayTitle}
+        onArchiveWorkspace={props.onArchiveWorkspace}
+      />
+    );
+  }
+  return (
+    <StatusDot
+      state={props.visualState}
+      isSubAgent={props.isSubAgentRow}
+      overlay={completedChildrenIndicator}
+    />
+  );
+}
+
+function getCancelCreationButtonClasses(isAvatarRow: boolean, isRemoving: boolean): string {
+  return cn(
+    "text-muted inline-flex items-center justify-center border-none bg-transparent p-0 transition-colors duration-200",
+    isAvatarRow ? AVATAR_ROW_ACTION_BUTTON_CLASSES : "h-4 w-4",
+    // Keep cancel affordance hidden until row-hover while initializing,
+    // but force it visible as a spinner once deletion starts. Avatar rows
+    // reveal the whole overlay instead of the button.
+    isRemoving
+      ? "cursor-default opacity-100"
+      : cn(
+          "cursor-pointer hover:text-destructive",
+          !isAvatarRow && "opacity-0 focus-visible:opacity-100"
+        )
+  );
+}
+
+/** Initializing rows: a hover-revealed cancel button that turns into a spinner while deleting. */
+function CancelCreationButton(props: {
+  workspaceId: string;
+  displayTitle: string;
+  isRemoving: boolean;
+  isAvatarRow: boolean;
+  onCancelCreation: (workspaceId: string) => Promise<void>;
+}) {
+  const { isRemoving } = props;
+  const button = (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          className={getCancelCreationButtonClasses(props.isAvatarRow, isRemoving)}
+          disabled={isRemoving}
+          onKeyDown={stopKeyboardPropagation}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (isRemoving) return;
+            void props.onCancelCreation(props.workspaceId);
+          }}
+          aria-label={
+            isRemoving
+              ? `Deleting workspace ${props.displayTitle}`
+              : `Cancel workspace creation ${props.displayTitle}`
+          }
+          data-workspace-id={props.workspaceId}
+        >
+          {isRemoving ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : (
+            <Trash2 className="h-4 w-4 shrink-0" strokeWidth={1.8} />
+          )}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent align="start">
+        {isRemoving ? "Deleting..." : "Cancel creation"}
+      </TooltipContent>
+    </Tooltip>
+  );
+  return props.isAvatarRow ? (
+    <RowActionOverlay forceVisible={isRemoving}>{button}</RowActionOverlay>
+  ) : (
+    <ActionButtonWrapper className="mt-0 self-center">{button}</ActionButtonWrapper>
+  );
+}
+
+/**
+ * Hide menu content for one frame while Radix/Floating UI recalculates anchor
+ * placement. This avoids first-frame flashes at stale trigger/fallback coords.
+ */
+function useHiddenFirstFrameRef(isOpen: boolean) {
+  const frameRef = useRef<number | null>(null);
+  return useCallback(
+    (node: HTMLDivElement | null) => {
+      if (frameRef.current !== null) {
+        cancelAnimationFrame(frameRef.current);
+        frameRef.current = null;
+      }
+
+      if (!node || !isOpen) {
+        return;
+      }
+
+      node.style.visibility = "hidden";
+      frameRef.current = requestAnimationFrame(() => {
+        frameRef.current = null;
+        if (!node.isConnected) {
+          return;
+        }
+        node.style.visibility = "visible";
+      });
+    },
+    [isOpen]
+  );
+}
+
+const MENU_AT_CURSOR_PLACEMENT = { align: "start", side: "right", sideOffset: 0 } as const;
+const MENU_AT_TRIGGER_PLACEMENT = { align: "end", side: "bottom", sideOffset: 6 } as const;
+
+function getRowMenuTriggerClasses(
+  isAvatarRow: boolean,
+  isOpen: boolean
+): { button: string; icon: string } {
+  const base =
+    "text-muted hover:text-foreground inline-flex cursor-pointer items-center justify-center border-none bg-transparent p-0 transition-colors duration-200";
+  if (isAvatarRow) {
+    // Avatar rows reveal the whole overlay instead of the button.
+    return { button: cn(base, AVATAR_ROW_ACTION_BUTTON_CLASSES), icon: "h-3.5 w-3.5 shrink-0" };
+  }
+  return {
+    button: cn(
+      base,
+      "h-4 w-4",
+      isOpen ? "opacity-100" : "opacity-0",
+      HIDE_INLINE_ACTIONS_ON_MOBILE_TOUCH,
+      SHOW_INLINE_ACTIONS_ON_WIDE_TOUCH
+    ),
+    icon: "h-4 w-4 shrink-0",
+  };
+}
+
+/**
+ * The row's overflow menu: opens from the kebab button (dropdown) or right-click/long-press
+ * (positioned). Uses a Popover so it can anchor at either the trigger button or the cursor.
+ */
+function WorkspaceRowMenu(props: {
+  ctxMenu: UseContextMenuPositionReturn;
+  triggerRef: React.Ref<HTMLButtonElement>;
+  workspaceId: string;
+  displayTitle: string;
+  isAvatarRow: boolean;
+  isSelected: boolean;
+  children: React.ReactNode;
+}) {
+  const { ctxMenu } = props;
+  const setContentRef = useHiddenFirstFrameRef(ctxMenu.isOpen);
+  const placement = ctxMenu.position ? MENU_AT_CURSOR_PLACEMENT : MENU_AT_TRIGGER_PLACEMENT;
+  const triggerClasses = getRowMenuTriggerClasses(props.isAvatarRow, ctxMenu.isOpen);
+
+  const menu = (
+    <Popover open={ctxMenu.isOpen} onOpenChange={ctxMenu.onOpenChange}>
+      {/* When opened via right-click/long-press, anchor at cursor position */}
+      {ctxMenu.position && (
+        <PopoverAnchor asChild>
+          <span
+            style={{
+              position: "fixed",
+              left: ctxMenu.position.x,
+              top: ctxMenu.position.y,
+              width: 0,
+              height: 0,
+            }}
+          />
+        </PopoverAnchor>
+      )}
+      <PopoverTrigger asChild>
+        <button
+          ref={props.triggerRef}
+          className={triggerClasses.button}
+          onClick={(e) => e.stopPropagation()}
+          aria-label={`Workspace actions for ${props.displayTitle}`}
+          data-workspace-id={props.workspaceId}
+        >
+          <EllipsisVertical className={triggerClasses.icon} strokeWidth={1.8} />
+        </button>
+      </PopoverTrigger>
+
+      <PopoverContent
+        ref={setContentRef}
+        {...placement}
+        // Size to the widest row ("Archive workspace" + its shortcut overflowed a
+        // fixed 250px), but never wider than the viewport, like the menu bar's menu.
+        className="bg-surface-primary w-max max-w-[calc(100vw-1rem)] min-w-[250px]! p-1"
+        onClick={(event: React.MouseEvent<HTMLDivElement>) => {
+          event.stopPropagation();
+        }}
+      >
+        {props.children}
+      </PopoverContent>
+    </Popover>
+  );
+
+  return props.isAvatarRow ? (
+    // Touch tablets have no hover: only the selected row shows its kebab there.
+    <RowActionOverlay
+      forceVisible={ctxMenu.isOpen}
+      revealOnWideTouch={props.isSelected}
+      hideOnNarrowTouch
+    >
+      {menu}
+    </RowActionOverlay>
+  ) : (
+    <ActionButtonWrapper>{menu}</ActionButtonWrapper>
+  );
+}
+
+function getRowStateClasses(opts: {
+  isDragging: boolean;
+  isRemoving: boolean;
+  isArchiving: boolean;
+  isDisabled: boolean;
+}): string {
+  return cn(
+    opts.isDragging && "opacity-50",
+    opts.isRemoving && "opacity-70",
+    opts.isArchiving && "pointer-events-none opacity-70",
+    opts.isDisabled ? "cursor-default" : "cursor-pointer"
+  );
+}
+
+function getRegularRowClasses(opts: {
+  isAvatarRow: boolean;
+  /** Avatar rows: selected, or their menu is open. */
+  isHighlighted: boolean;
+  sectionId: string | undefined;
+  isDragging: boolean;
+  isRemoving: boolean;
+  isArchiving: boolean;
+  isDisabled: boolean;
+}): string {
+  if (opts.isAvatarRow) {
+    return cn(getAvatarRowClasses(opts.isHighlighted), getRowStateClasses(opts));
+  }
+  return cn(
+    LIST_ITEM_BASE_CLASSES,
+    "group/row",
+    // No left margin — status dot aligns with the project folder icon.
+    // Section members get a small indent for visual grouping.
+    opts.sectionId != null ? "ml-2" : "ml-0",
+    // Keep hover styles enabled for initializing workspaces so the row feels interactive.
+    !opts.isArchiving && "pl-1 hover:bg-surface-secondary [&:hover_button]:opacity-100",
+    getRowStateClasses(opts),
+    opts.isHighlighted && "bg-surface-secondary"
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Draft Workspace Item (UI-only placeholder)
 // ─────────────────────────────────────────────────────────────────────────────
 
+function DraftRowActions(props: {
+  draft: DraftWorkspaceData;
+  projectPath: string;
+  ctxMenu: UseContextMenuPositionReturn;
+  isAvatarRow: boolean;
+}) {
+  const { draft, ctxMenu } = props;
+  const actions = (
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            className={cn(
+              "text-muted hover:text-content-destructive inline-flex cursor-pointer items-center justify-center border-none bg-transparent p-0 transition-colors duration-200",
+              // Avatar rows reveal the whole overlay instead of the button.
+              props.isAvatarRow
+                ? AVATAR_ROW_ACTION_BUTTON_CLASSES
+                : cn(
+                    "h-4 w-4 opacity-0",
+                    // Keep long-press as the compact mobile affordance on narrow
+                    // touch layouts, but show the button on wider touch screens so
+                    // it never becomes an invisible tappable hotspot.
+                    HIDE_INLINE_ACTIONS_ON_MOBILE_TOUCH,
+                    SHOW_INLINE_ACTIONS_ON_WIDE_TOUCH
+                  )
+            )}
+            onKeyDown={stopKeyboardPropagation}
+            onClick={(e) => {
+              e.stopPropagation();
+              draft.onDelete();
+            }}
+            aria-label={`Delete workspace draft ${draft.draftNumber}`}
+            data-project-path={props.projectPath}
+            data-draft-id={draft.draftId}
+          >
+            <Trash className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent align="start">Delete draft</TooltipContent>
+      </Tooltip>
+
+      {/* Mobile: context menu opened by long-press / right-click */}
+      <PositionedMenu
+        open={ctxMenu.isOpen}
+        onOpenChange={ctxMenu.onOpenChange}
+        position={ctxMenu.position}
+        className="w-[150px]"
+      >
+        <PositionedMenuItem
+          icon={<Trash className="h-4 w-4 shrink-0" strokeWidth={1.8} />}
+          label="Delete draft"
+          onClick={() => {
+            ctxMenu.close();
+            draft.onDelete();
+          }}
+        />
+      </PositionedMenu>
+    </>
+  );
+
+  return props.isAvatarRow ? (
+    <RowActionOverlay revealOnWideTouch hideOnNarrowTouch>
+      {actions}
+    </RowActionOverlay>
+  ) : (
+    <ActionButtonWrapper>{actions}</ActionButtonWrapper>
+  );
+}
+
+function DraftRowText(props: {
+  draft: DraftWorkspaceData;
+  isSelected: boolean;
+  isAvatarRow: boolean;
+}) {
+  const textColorClass = props.isSelected ? "text-content-primary" : "text-muted";
+  return (
+    <div
+      className={cn("flex min-w-0 flex-col", props.isAvatarRow ? "gap-[3px]" : "flex-1 gap-0.5")}
+    >
+      <div
+        className={cn(
+          "flex min-w-0 items-center gap-1 text-[14px]",
+          props.isAvatarRow ? "leading-[18px]" : "leading-6"
+        )}
+      >
+        <PenLine className={cn("h-3 w-3 shrink-0", textColorClass)} strokeWidth={1.8} />
+        <span className={cn("min-w-0 truncate text-left italic", textColorClass)}>
+          {props.draft.title}
+        </span>
+      </div>
+      {props.draft.promptPreview.length > 0 && (
+        <span className={cn("block truncate text-left text-xs leading-4", textColorClass)}>
+          {props.draft.promptPreview}
+        </span>
+      )}
+    </div>
+  );
+}
+
 function DraftAgentListItemInner(props: DraftAgentListItemProps) {
   const { projectPath, isSelected, depth, sectionId, draft } = props;
   const paddingLeft = getSidebarItemPaddingLeft(depth);
-  const hasPromptPreview = draft.promptPreview.length > 0;
+  const isAvatarRow = props.projectBadgeName != null;
   const draftBorderStyle: React.CSSProperties = {
     backgroundImage: [
       "repeating-linear-gradient(to right, var(--color-border) 0 5px, transparent 5px 10px)",
@@ -452,12 +918,18 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
   return (
     <div
       className={cn(
-        LIST_ITEM_BASE_CLASSES,
-        sectionId != null ? "ml-2" : "ml-0",
-        "cursor-pointer pl-1 hover:bg-surface-secondary [&:hover_button]:opacity-100",
-        isSelected && "bg-surface-secondary"
+        isAvatarRow
+          ? getAvatarRowClasses(isSelected)
+          : cn(
+              LIST_ITEM_BASE_CLASSES,
+              sectionId != null ? "ml-2" : "ml-0",
+              "pl-1 hover:bg-surface-secondary [&:hover_button]:opacity-100",
+              isSelected && "bg-surface-secondary"
+            ),
+        "cursor-pointer"
       )}
-      style={{ paddingLeft, ...draftBorderStyle }}
+      // Avatar rows are flat-mode roots: their padding is fixed, not depth-indented.
+      style={isAvatarRow ? draftBorderStyle : { paddingLeft, ...draftBorderStyle }}
       onClick={() => {
         if (ctxMenu.suppressClickIfLongPress()) return;
         draft.onOpen();
@@ -481,102 +953,22 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
       data-project-path={projectPath}
       data-draft-id={draft.draftId}
     >
-      <StatusDot state="idle" isDraft />
-      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <div className="flex min-w-0 items-center gap-1 text-[14px] leading-6">
-          <PenLine
-            className={cn("h-3 w-3 shrink-0", isSelected ? "text-content-primary" : "text-muted")}
-            strokeWidth={1.8}
-          />
-          <span
-            className={cn(
-              "min-w-0 truncate text-left italic",
-              isSelected ? "text-content-primary" : "text-muted"
-            )}
-          >
-            {draft.title}
-          </span>
-          {props.projectBadgeName != null && (
-            // The badge width cap can truncate hierarchical "Parent / Sub"
-            // names, so the shared tooltip keeps the full label reachable.
-            // text-foreground: the badge tint is the project color at 12.5% alpha, so full-strength
-            // text reaches WCAG AA on every color in every theme; text-secondary did not (#5978).
-            <TooltipIfPresent tooltip={props.projectBadgeName}>
-              <span
-                data-testid={`workspace-project-badge-draft-${draft.draftId}`}
-                className="text-foreground max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
-                style={
-                  props.projectBadgeColor != null
-                    ? {
-                        backgroundColor: `${props.projectBadgeColor}20`,
-                        borderColor: `${props.projectBadgeColor}40`,
-                      }
-                    : undefined
-                }
-              >
-                {props.projectBadgeName}
-              </span>
-            </TooltipIfPresent>
-          )}
-        </div>
-        {hasPromptPreview && (
-          <span
-            className={cn(
-              "block truncate text-left text-xs leading-4",
-              isSelected ? "text-content-primary" : "text-muted"
-            )}
-          >
-            {draft.promptPreview}
-          </span>
-        )}
-      </div>
-
-      <ActionButtonWrapper>
-        {/* Inline delete button stays hidden only on the narrow touch sidebar. */}
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              className={cn(
-                "text-muted hover:text-content-destructive inline-flex h-4 w-4 cursor-pointer items-center justify-center border-none bg-transparent p-0 opacity-0 transition-colors duration-200",
-                // Keep long-press as the compact mobile affordance on narrow
-                // touch layouts, but show the button on wider touch screens so
-                // it never becomes an invisible tappable hotspot.
-                HIDE_INLINE_ACTIONS_ON_MOBILE_TOUCH,
-                SHOW_INLINE_ACTIONS_ON_WIDE_TOUCH
-              )}
-              onKeyDown={stopKeyboardPropagation}
-              onClick={(e) => {
-                e.stopPropagation();
-                draft.onDelete();
-              }}
-              aria-label={`Delete workspace draft ${draft.draftNumber}`}
-              data-project-path={projectPath}
-              data-draft-id={draft.draftId}
-            >
-              <Trash className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent align="start">Delete draft</TooltipContent>
-        </Tooltip>
-
-        {/* Mobile: context menu opened by long-press / right-click */}
-        <PositionedMenu
-          open={ctxMenu.isOpen}
-          onOpenChange={ctxMenu.onOpenChange}
-          position={ctxMenu.position}
-          className="w-[150px]"
-        >
-          <PositionedMenuItem
-            icon={<Trash className="h-4 w-4 shrink-0" strokeWidth={1.8} />}
-            label="Delete draft"
-            onClick={() => {
-              ctxMenu.close();
-              draft.onDelete();
-            }}
-          />
-        </PositionedMenu>
-      </ActionButtonWrapper>
+      {props.projectBadgeName != null ? (
+        <ProjectAvatar
+          name={props.projectBadgeName}
+          color={props.projectBadgeColor}
+          testId={`workspace-project-avatar-draft-${draft.draftId}`}
+        />
+      ) : (
+        <StatusDot state="idle" isDraft />
+      )}
+      <DraftRowText draft={draft} isSelected={isSelected} isAvatarRow={isAvatarRow} />
+      <DraftRowActions
+        draft={draft}
+        projectPath={projectPath}
+        ctxMenu={ctxMenu}
+        isAvatarRow={isAvatarRow}
+      />
     </div>
   );
 }
@@ -655,38 +1047,12 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   // their hooks or subscriptions (#6202).
   const [openModal, setOpenModal] = useState<"heartbeat" | "mcp" | "messaging" | null>(null);
   const overflowMenuButtonRef = useRef<HTMLButtonElement | null>(null);
-  const overflowMenuFrameRef = useRef<number | null>(null);
 
   // Context menu via right-click / long-press. The hook manages position + long-press state.
   // The regular item also has a ⋮ trigger button, so we bridge the hook's isOpen into a
   // Popover that can be anchored either at the cursor position or the trigger button.
   const canOpenMenu = useCallback(() => !isDisabled && !isEditing, [isDisabled, isEditing]);
   const ctxMenu = useContextMenuPosition({ longPress: true, canOpen: canOpenMenu });
-  // Hide menu content for one frame while Radix/Floating UI recalculates anchor
-  // placement. This avoids first-frame flashes at stale trigger/fallback coords.
-  const setOverflowMenuContentRef = useCallback(
-    (node: HTMLDivElement | null) => {
-      if (overflowMenuFrameRef.current !== null) {
-        cancelAnimationFrame(overflowMenuFrameRef.current);
-        overflowMenuFrameRef.current = null;
-      }
-
-      if (!node || !ctxMenu.isOpen) {
-        return;
-      }
-
-      node.style.visibility = "hidden";
-      overflowMenuFrameRef.current = requestAnimationFrame(() => {
-        overflowMenuFrameRef.current = null;
-        if (!node.isConnected) {
-          return;
-        }
-        node.style.visibility = "visible";
-      });
-    },
-    [ctxMenu.isOpen]
-  );
-
   useEffect(() => {
     if (isEditing) {
       ctxMenu.close();
@@ -825,6 +1191,10 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     hasError,
   });
   const isSubAgentRow = rowRenderMeta?.rowKind === "subagent";
+  // Flat mode passes a project identity for root rows; those render the avatar layout. Sub-agent
+  // rows keep their nested connector layout.
+  const avatarName = isSubAgentRow ? undefined : props.projectBadgeName;
+  const isAvatarRow = avatarName != null;
   const showsVisibleStatusDot = isStatusDotVisible(visualState, false, isSubAgentRow);
   const hasStatusText =
     shouldShowHiddenSubAgentsStatus ||
@@ -853,7 +1223,9 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     canToggleCompletedChildren && isCompletedChildrenExpanded && !showsVisibleStatusDot;
   // Keep one-click archive in the empty "seen" slot for regular workspaces, but leave
   // sub-agents on the existing status-dot lifecycle because parent cleanup owns them.
+  // Avatar rows have no empty slot for it; archive stays in the menu and its keybind.
   const shouldShowQuickArchiveButton =
+    !isAvatarRow &&
     !isDisabled &&
     !isEditing &&
     !isSubAgentRow &&
@@ -979,21 +1351,18 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     <React.Fragment>
       <div
         ref={attachRowDndRef}
-        className={cn(
-          LIST_ITEM_BASE_CLASSES,
-          "group/row",
-          // No left margin — status dot aligns with the project folder icon.
-          // Section members get a small indent for visual grouping.
-          sectionId != null ? "ml-2" : "ml-0",
-          isDragging && "opacity-50",
-          isRemoving && "opacity-70",
-          // Keep hover styles enabled for initializing workspaces so the row feels interactive.
-          !isArchiving && "pl-1 hover:bg-surface-secondary [&:hover_button]:opacity-100",
-          isArchiving && "pointer-events-none opacity-70",
-          isDisabled ? "cursor-default" : "cursor-pointer",
-          isSelected && !isDisabled && "bg-surface-secondary"
-        )}
-        style={{ paddingLeft }}
+        className={getRegularRowClasses({
+          isAvatarRow,
+          // Avatar rows keep the hover background while their menu is open.
+          isHighlighted: (isSelected && !isDisabled) || (isAvatarRow && ctxMenu.isOpen),
+          sectionId,
+          isDragging,
+          isRemoving,
+          isArchiving: isArchiving === true,
+          isDisabled,
+        })}
+        // Avatar rows are flat-mode roots: their padding is fixed, not depth-indented.
+        style={isAvatarRow ? undefined : { paddingLeft }}
         onClick={(event) => {
           if (isDisabled) return;
           if (isEventFromDialogPortal(event.target)) return;
@@ -1097,174 +1466,86 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
             )}
           />
         )}
-        {shouldShowHeartbeatFallback ? (
-          <div className={STATUS_DOT_SLOT_CONTAINER_CLASSES} style={LEADING_SLOT_CONTAINER_STYLE}>
-            <HeartbeatFallbackIcon />
-          </div>
-        ) : shouldShowQuickArchiveButton ? (
-          <QuickArchiveButton
-            displayTitle={displayTitle}
-            onArchiveWorkspace={(button) => {
-              void onArchiveWorkspace(workspaceId, button);
-            }}
-          />
-        ) : (
-          <StatusDot
-            state={visualState}
-            isSubAgent={isSubAgentRow}
-            overlay={
-              showCompletedChildrenIndicator ? (
-                <ChevronDown
-                  aria-hidden="true"
-                  className="text-muted h-3 w-3"
-                  data-testid={`completed-children-expanded-indicator-${workspaceId}`}
-                />
-              ) : undefined
-            }
-          />
-        )}
+        <RegularRowLeadingSlot
+          workspaceId={workspaceId}
+          displayTitle={displayTitle}
+          visualState={visualState}
+          isSubAgentRow={isSubAgentRow}
+          isPinned={isPinned}
+          avatarName={avatarName}
+          avatarColor={props.projectBadgeColor}
+          showCompletedChildrenIndicator={showCompletedChildrenIndicator}
+          showHeartbeatFallback={shouldShowHeartbeatFallback}
+          showQuickArchiveButton={shouldShowQuickArchiveButton}
+          onArchiveWorkspace={(button) => {
+            void onArchiveWorkspace(workspaceId, button);
+          }}
+        />
 
         {/* Action button: cancel/delete spinner for initializing workspaces, overflow menu otherwise */}
         {isInitializing ? (
-          <ActionButtonWrapper className="mt-0 self-center">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  className={cn(
-                    "text-muted inline-flex h-4 w-4 items-center justify-center border-none bg-transparent p-0 transition-colors duration-200",
-                    // Keep cancel affordance hidden until row-hover while initializing,
-                    // but force it visible as a spinner once deletion starts.
-                    isRemoving
-                      ? "cursor-default opacity-100"
-                      : "cursor-pointer opacity-0 hover:text-destructive focus-visible:opacity-100"
-                  )}
-                  disabled={isRemoving}
-                  onKeyDown={stopKeyboardPropagation}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (isRemoving) return;
-                    void onCancelCreation(workspaceId);
-                  }}
-                  aria-label={
-                    isRemoving
-                      ? `Deleting workspace ${displayTitle}`
-                      : `Cancel workspace creation ${displayTitle}`
-                  }
-                  data-workspace-id={workspaceId}
-                >
-                  {isRemoving ? (
-                    <Loader2 className="h-3 w-3 animate-spin" />
-                  ) : (
-                    <Trash2 className="h-4 w-4 shrink-0" strokeWidth={1.8} />
-                  )}
-                </button>
-              </TooltipTrigger>
-              <TooltipContent align="start">
-                {isRemoving ? "Deleting..." : "Cancel creation"}
-              </TooltipContent>
-            </Tooltip>
-          </ActionButtonWrapper>
+          <CancelCreationButton
+            workspaceId={workspaceId}
+            displayTitle={displayTitle}
+            isRemoving={isRemoving}
+            isAvatarRow={isAvatarRow}
+            onCancelCreation={onCancelCreation}
+          />
         ) : isDisabled ? (
           // Invisible spacer preserves title alignment during archive/remove transitions
-          <div className="order-last ml-auto h-4 w-4 shrink-0" />
+          !isAvatarRow && <div className="order-last ml-auto h-4 w-4 shrink-0" />
         ) : (
           !isEditing && (
-            <ActionButtonWrapper>
-              {/* Overflow menu: opens from ⋮ button (dropdown) or right-click/long-press (positioned).
-                  Uses a Popover so it can anchor at either the trigger button or the cursor. */}
-              <Popover open={ctxMenu.isOpen} onOpenChange={ctxMenu.onOpenChange}>
-                {/* When opened via right-click/long-press, anchor at cursor position */}
-                {ctxMenu.position && (
-                  <PopoverAnchor asChild>
-                    <span
-                      style={{
-                        position: "fixed",
-                        left: ctxMenu.position.x,
-                        top: ctxMenu.position.y,
-                        width: 0,
-                        height: 0,
-                      }}
-                    />
-                  </PopoverAnchor>
-                )}
-                <PopoverTrigger asChild>
-                  <button
-                    ref={overflowMenuButtonRef}
-                    className={cn(
-                      "text-muted hover:text-foreground inline-flex h-4 w-4 cursor-pointer items-center justify-center border-none bg-transparent p-0 transition-colors duration-200",
-                      ctxMenu.isOpen ? "opacity-100" : "opacity-0",
-                      HIDE_INLINE_ACTIONS_ON_MOBILE_TOUCH,
-                      SHOW_INLINE_ACTIONS_ON_WIDE_TOUCH
-                    )}
-                    onClick={(e) => e.stopPropagation()}
-                    aria-label={`Workspace actions for ${displayTitle}`}
-                    data-workspace-id={workspaceId}
-                  >
-                    <EllipsisVertical className="h-4 w-4 shrink-0" strokeWidth={1.8} />
-                  </button>
-                </PopoverTrigger>
-
-                <PopoverContent
-                  ref={setOverflowMenuContentRef}
-                  align={ctxMenu.position ? "start" : "end"}
-                  side={ctxMenu.position ? "right" : "bottom"}
-                  sideOffset={ctxMenu.position ? 0 : 6}
-                  // Size to the widest row ("Archive workspace" + its shortcut overflowed a
-                  // fixed 250px), but never wider than the viewport, like the menu bar's menu.
-                  className="bg-surface-primary w-max max-w-[calc(100vw-1rem)] min-w-[250px]! p-1"
-                  onClick={(event: React.MouseEvent<HTMLDivElement>) => {
-                    event.stopPropagation();
-                  }}
-                >
-                  <WorkspaceActionsMenuContent
-                    state={{
-                      surface: "sidebar",
-                      workspace: metadata,
-                      showsSubAgent: isSubAgentRow,
-                      isRuntimeRunning,
-                      canMarkUnread: !isSelected && !isUnread,
-                      canToggleSubAgents: canToggleCompletedChildren,
-                    }}
-                    actions={{
-                      editTitle: startEditing,
-                      generateTitle: () => requestGenerateWorkspaceTitle(workspaceId),
-                      configureMcp: () => setOpenModal("mcp"),
-                      configureHeartbeat: () => setOpenModal("heartbeat"),
-                      configureMessaging: () => setOpenModal("messaging"),
-                      togglePinned: setWorkspacePinned
-                        ? () => {
-                            // Fire-and-forget: optimistic reorder happens synchronously
-                            // inside setWorkspacePinned; errors are logged there.
-                            void setWorkspacePinned(workspaceId, !isPinned);
-                          }
-                        : undefined,
-                      // Reset the read marker to epoch so existing activity is treated as unseen.
-                      markUnread: () =>
-                        updatePersistedState(getWorkspaceLastReadKey(workspaceId), 0),
-                      toggleSubAgents: toggleCompletedChildren,
-                      fork: (anchorEl) => void onForkWorkspace(workspaceId, anchorEl),
-                      stopRuntime: onStopRuntime
-                        ? () =>
-                            void onStopRuntime(
-                              workspaceId,
-                              overflowMenuButtonRef.current ?? undefined
-                            )
-                        : undefined,
-                      archive: (anchorEl) => void onArchiveWorkspace(workspaceId, anchorEl),
-                    }}
-                    isPinned={isPinned}
-                    subAgentsExpanded={isCompletedChildrenExpanded}
-                    onCloseMenu={() => ctxMenu.close()}
-                  />
-                </PopoverContent>
-              </Popover>
-            </ActionButtonWrapper>
+            <WorkspaceRowMenu
+              ctxMenu={ctxMenu}
+              triggerRef={overflowMenuButtonRef}
+              workspaceId={workspaceId}
+              displayTitle={displayTitle}
+              isAvatarRow={isAvatarRow}
+              isSelected={isSelected}
+            >
+              <WorkspaceActionsMenuContent
+                state={{
+                  surface: "sidebar",
+                  workspace: metadata,
+                  showsSubAgent: isSubAgentRow,
+                  isRuntimeRunning,
+                  canMarkUnread: !isSelected && !isUnread,
+                  canToggleSubAgents: canToggleCompletedChildren,
+                }}
+                actions={{
+                  editTitle: startEditing,
+                  generateTitle: () => requestGenerateWorkspaceTitle(workspaceId),
+                  configureMcp: () => setOpenModal("mcp"),
+                  configureHeartbeat: () => setOpenModal("heartbeat"),
+                  configureMessaging: () => setOpenModal("messaging"),
+                  togglePinned: setWorkspacePinned
+                    ? () => {
+                        // Fire-and-forget: optimistic reorder happens synchronously
+                        // inside setWorkspacePinned; errors are logged there.
+                        void setWorkspacePinned(workspaceId, !isPinned);
+                      }
+                    : undefined,
+                  // Reset the read marker to epoch so existing activity is treated as unseen.
+                  markUnread: () => updatePersistedState(getWorkspaceLastReadKey(workspaceId), 0),
+                  toggleSubAgents: toggleCompletedChildren,
+                  fork: (anchorEl) => void onForkWorkspace(workspaceId, anchorEl),
+                  stopRuntime: onStopRuntime
+                    ? () =>
+                        void onStopRuntime(workspaceId, overflowMenuButtonRef.current ?? undefined)
+                    : undefined,
+                  archive: (anchorEl) => void onArchiveWorkspace(workspaceId, anchorEl),
+                }}
+                isPinned={isPinned}
+                subAgentsExpanded={isCompletedChildrenExpanded}
+                onCloseMenu={() => ctxMenu.close()}
+              />
+            </WorkspaceRowMenu>
           )
         )}
 
         {/* Keep title row anchored so status dot/title align across single+double-line states. */}
-        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <div className={cn("flex min-w-0 flex-col", isAvatarRow ? "gap-[3px]" : "flex-1 gap-0.5")}>
           <div
             className={cn(
               // Keep the title column shrinkable on narrow/mobile viewports so the
@@ -1288,7 +1569,8 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
               <div className="flex min-w-0 items-baseline gap-1.5">
                 <span
                   className={cn(
-                    "min-w-0 truncate text-left text-[14px] leading-6 transition-colors duration-200",
+                    "min-w-0 truncate text-left text-[14px] transition-colors duration-200",
+                    isAvatarRow ? "leading-[18px]" : "leading-6",
                     groupLabel && !suppressGroupMemberTitle ? "max-w-[45%] shrink-0" : "flex-1",
                     !isDisabled && "cursor-pointer",
                     (isGeneratingTitle || isPendingAutoTitle) && "italic",
@@ -1297,27 +1579,6 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                 >
                   {suppressGroupMemberTitle ? memberOnlyLabel : workspaceTitle}
                 </span>
-                {props.projectBadgeName != null && (
-                  // The badge width cap can truncate hierarchical "Parent / Sub"
-                  // names, so the shared tooltip keeps the full label reachable.
-                  // text-foreground reaches WCAG AA on every project tint (#5978), as on drafts.
-                  <TooltipIfPresent tooltip={props.projectBadgeName}>
-                    <span
-                      data-testid={`workspace-project-badge-${workspaceId}`}
-                      className="text-foreground max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
-                      style={
-                        props.projectBadgeColor != null
-                          ? {
-                              backgroundColor: `${props.projectBadgeColor}20`,
-                              borderColor: `${props.projectBadgeColor}40`,
-                            }
-                          : undefined
-                      }
-                    >
-                      {props.projectBadgeName}
-                    </span>
-                  </TooltipIfPresent>
-                )}
                 {groupLabel && !suppressGroupMemberTitle && (
                   <span
                     data-testid={`workspace-scope-label-${workspaceId}`}
@@ -1331,7 +1592,8 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
 
             {!isInitializing && !isEditing && (
               <div className="flex items-center gap-1">
-                {isPinned && (
+                {/* Avatar rows show pinning by their section instead. */}
+                {isPinned && !isAvatarRow && (
                   <Pin className="text-muted h-3 w-3 shrink-0" aria-label="Pinned" role="img" />
                 )}
                 {shouldShowInlineArchivingStatus ? (

@@ -143,7 +143,11 @@ import { getProjectDisplayName, getSubProjectsForParent } from "@/common/utils/s
 import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
-import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
+import {
+  SCRATCH_PROJECT_CONFIG_KEY,
+  SCRATCH_PROJECT_NAME,
+  SCRATCH_SIDEBAR_SECTION_ID,
+} from "@/common/constants/scratch";
 import type { CreationDraftSummary } from "@/common/orpc/schemas/drafts";
 import {
   MULTI_PROJECT_CONFIG_KEY,
@@ -152,7 +156,26 @@ import {
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { HexColorPicker } from "react-colorful";
-import { resolveSectionColor, SECTION_COLOR_PALETTE } from "@/common/constants/ui";
+import {
+  DEFAULT_SECTION_COLOR,
+  resolveSectionColor,
+  SECTION_COLOR_PALETTE,
+} from "@/common/constants/ui";
+import { getHashedProjectColor } from "@/browser/utils/ui/projectAvatarColors";
+
+/** Flat sidebar section heading ("Pinned", "Recent"). */
+function FlatSectionLabel(props: { label: string; isFirst: boolean }) {
+  return (
+    <div
+      className={cn(
+        "font-monospace text-muted px-2 pb-1 text-[10.5px] tracking-[0.06em] uppercase",
+        props.isFirst ? "pt-2.5" : "pt-3.5"
+      )}
+    >
+      {props.label}
+    </div>
+  );
+}
 
 interface SectionConfig {
   id: string;
@@ -1729,11 +1752,14 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // rename, color, delete) so core project operations stay reachable via
   // mouse/touch without leaving flat mode.
   const projectHeaderPaths = sortedProjectPaths;
+  // Flat rows identify their project by a monogram avatar, so projects without a configured
+  // color get a stable hashed one instead of all sharing the default gray.
   const getProjectBadge = (projectPath: string): { name: string; color: string } => {
     const config = userProjects.get(projectPath);
+    const name = config?.displayName ?? getProjectFallbackLabel(projectPath);
     return {
-      name: config?.displayName ?? getProjectFallbackLabel(projectPath),
-      color: resolveSectionColor(config?.color),
+      name,
+      color: config?.color ? resolveSectionColor(config.color) : getHashedProjectColor(name),
     };
   };
   // Flat mode drops the section headers that used to convey sub-project
@@ -1749,18 +1775,23 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     if (typeof subProjectPath !== "string") return undefined;
     const config = userProjects.get(subProjectPath);
     if (config?.parentProjectPath !== parentProjectPath) return undefined;
+    const parentBadge = getProjectBadge(parentProjectPath);
     return {
-      name: `${getProjectBadge(parentProjectPath).name} / ${getProjectDisplayName(subProjectPath, config)}`,
-      color: resolveSectionColor(config.color),
+      name: `${parentBadge.name} / ${getProjectDisplayName(subProjectPath, config)}`,
+      // The avatar shows the parent's letter, so an uncolored sub-project keeps the parent's color.
+      color: config.color ? resolveSectionColor(config.color) : parentBadge.color,
     };
   };
   // The _multi bucket is a system key excluded from userProjects, so both
   // chats and drafts label it explicitly instead of leaking the internal key.
-  const multiProjectBadge = { name: "Multi-project", color: resolveSectionColor(undefined) };
+  const multiProjectBadge = { name: "Multi-project", color: DEFAULT_SECTION_COLOR };
+  // Scratch chats get a neutral identity too, so every flat root row carries an avatar.
+  const scratchBadge = { name: SCRATCH_PROJECT_NAME, color: DEFAULT_SECTION_COLOR };
   const getFlatProjectBadge = (
     workspace: FrontendWorkspaceMetadata
   ): { name: string; color: string } | undefined => {
-    if (workspace.parentWorkspaceId != null || workspace.kind === "scratch") return undefined;
+    if (workspace.parentWorkspaceId != null) return undefined;
+    if (workspace.kind === "scratch") return scratchBadge;
     if (isMultiProject(workspace)) {
       return multiProjectBadge;
     }
@@ -1774,7 +1805,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     subProjectPath: string | null | undefined
   ): { name: string; color: string } | undefined =>
     projectPath === SCRATCH_PROJECT_CONFIG_KEY
-      ? undefined
+      ? scratchBadge
       : projectPath === MULTI_PROJECT_CONFIG_KEY
         ? multiProjectBadge
         : (resolveSubProjectBadge(projectPath, subProjectPath) ?? getProjectBadge(projectPath));
@@ -2366,14 +2397,19 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     }
   };
 
+  const hasPinnedFlatRows = visiblePinnedFlatWorkspaces.length > 0;
   const flatSidebarContent = (
-    <div className="py-1">
+    <div className="px-1.5 py-1">
+      {hasPinnedFlatRows && <FlatSectionLabel label="Pinned" isFirst />}
       {renderCoalescedWorkspaceList(visiblePinnedFlatWorkspaces, flatRowsForDisplay, {
         tierKeyPrefix: "flat",
         depthByWorkspaceId: flatDepthByWorkspaceId,
         baseRowMetaByWorkspaceId: flatRowMetaByWorkspaceId,
         renderRow: renderFlatRow,
       })}
+      {(flatDrafts.length > 0 || visibleUnpinnedFlatWorkspaces.length > 0) && (
+        <FlatSectionLabel label="Recent" isFirst={!hasPinnedFlatRows} />
+      )}
       {flatDrafts.map(({ projectPath, draft }, index) => {
         const promotedMetadata = flatDraftPromotionsByDraftId.get(draft.draftId);
         if (promotedMetadata) {

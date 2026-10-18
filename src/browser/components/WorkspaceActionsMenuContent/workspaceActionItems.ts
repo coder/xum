@@ -59,8 +59,9 @@ export type WorkspaceActionsState = SidebarActionsState | TopBarActionsState;
 
 /**
  * The one decision of which items each menu shows, in the approved group order: Title,
- * Settings, View (top bar only), Sidebar row, Lifecycle. Empty groups are dropped, so the menu draws a
- * separator only between groups that show.
+ * Settings, View (top bar only), Sidebar row, Lifecycle. The sidebar row menu leads with Pin in a
+ * group of its own: flat sidebar rows have no inline pin icon, so pinning lives first in the menu.
+ * Empty groups are dropped, so the menu draws a separator only between groups that show.
  */
 export function getWorkspaceActionGroups(state: WorkspaceActionsState): WorkspaceActionId[][] {
   // Heartbeats never fire for sub-agent workspaces.
@@ -70,7 +71,9 @@ export function getWorkspaceActionGroups(state: WorkspaceActionsState): Workspac
   const hasRepository = hasWorkspaceRepository(state.workspace);
   const topBar = state.surface === "topbar" ? state : null;
   const sidebar = state.surface === "sidebar" ? state : null;
+  const canPin = state.workspace != null && isWorkspacePinnable(state.workspace);
   const groups: Array<Array<WorkspaceActionId | false>> = [
+    [sidebar != null && canPin && "togglePinned"],
     // The top bar edits the title in the header itself, so it works with the row hidden (#6328).
     ["editTitle", "generateTitle"],
     ["configureMcp", !isSubAgent && "configureHeartbeat", "configureMessaging"],
@@ -83,7 +86,7 @@ export function getWorkspaceActionGroups(state: WorkspaceActionsState): Workspac
         ]
       : [],
     [
-      state.workspace != null && isWorkspacePinnable(state.workspace) && "togglePinned",
+      topBar != null && canPin && "togglePinned",
       sidebar?.canMarkUnread === true && "markUnread",
       sidebar?.canToggleSubAgents === true && "toggleSubAgents",
     ],

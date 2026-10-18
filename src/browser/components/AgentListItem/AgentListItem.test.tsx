@@ -384,15 +384,68 @@ describe("AgentListItem", () => {
     mock.restore();
   });
 
-  test("exposes the full project badge label through the shared tooltip", () => {
-    // The badge's width cap end-truncates hierarchical "Parent / Sub" names,
-    // so the shared tooltip wrapper must carry the full label.
-    const badgeName = "Parent Project With A Long Name / Frontend";
+  test("an avatar row shows the project's monogram and the full name in the shared tooltip", () => {
+    // The 22px avatar shows one letter, so the shared tooltip must carry the whole
+    // hierarchical "Parent / Sub" name.
+    const badgeName = "parent Project With A Long Name / Frontend";
     const { view } = renderWorkspaceItem({ projectBadgeName: badgeName });
 
-    const badge = view.getByTestId(`workspace-project-badge-${TEST_WORKSPACE_ID}`);
-    const tooltip = badge.closest('[data-testid="badge-tooltip"]');
+    const avatar = view.getByTestId(`workspace-project-avatar-${TEST_WORKSPACE_ID}`);
+    expect(avatar.textContent).toBe("P");
+    const tooltip = avatar.closest('[data-testid="badge-tooltip"]');
     expect(tooltip?.getAttribute("data-tooltip-content")).toBe(badgeName);
+    // tests/ui drive the row menu through this label in both layouts.
+    expect(
+      view.getByRole("button", { name: `Workspace actions for ${TEST_WORKSPACE_TITLE}` })
+    ).toBeTruthy();
+  });
+
+  test("pinned rows show the inline pin icon only outside the avatar layout", () => {
+    // Flat (avatar) rows show pinning by their Pinned section; grouped rows keep the icon.
+    const metadata = createMetadata({ pinnedAt: "2026-01-01T00:00:00.000Z" });
+    const grouped = renderWorkspaceItem({ metadata });
+    expect(grouped.view.queryByRole("img", { name: "Pinned" })).not.toBeNull();
+    cleanup();
+
+    const flat = renderWorkspaceItem({ metadata, projectBadgeName: "Project" });
+    expect(flat.view.getByTestId(`workspace-project-avatar-${TEST_WORKSPACE_ID}`)).toBeTruthy();
+    expect(flat.view.queryByRole("img", { name: "Pinned" })).toBeNull();
+  });
+
+  test.each([
+    { state: "unread idle", unread: true, sidebar: {}, dot: ".bg-surface-invert-secondary" },
+    {
+      state: "streaming",
+      unread: false,
+      sidebar: { canInterrupt: true },
+      dot: ".workspace-status-dot-active",
+    },
+    {
+      state: "question",
+      unread: false,
+      sidebar: { awaitingUserQuestion: true },
+      dot: ".bg-border-pending",
+    },
+  ])("pinned avatar rows hide only the idle dot: $state", (testCase) => {
+    const renderAvatarRow = (pinnedAt?: string) => {
+      mockWorkspaceUnreadState = createWorkspaceUnreadState({ isUnread: testCase.unread });
+      mockWorkspaceSidebarState = createWorkspaceSidebarState(testCase.sidebar);
+      const { view } = renderWorkspaceItem({
+        metadata: createMetadata({ pinnedAt }),
+        projectBadgeName: "Project",
+      });
+      expect(view.getByTestId(`workspace-project-avatar-${TEST_WORKSPACE_ID}`)).toBeTruthy();
+      return view.container.querySelector(testCase.dot);
+    };
+
+    expect(renderAvatarRow()).not.toBeNull();
+    cleanup();
+    const pinnedDot = renderAvatarRow("2026-01-01T00:00:00.000Z");
+    if (testCase.state === "unread idle") {
+      expect(pinnedDot).toBeNull();
+    } else {
+      expect(pinnedDot).not.toBeNull();
+    }
   });
 
   test("falls back to the row's sub-project scope for drag section identity", () => {

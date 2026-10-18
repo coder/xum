@@ -1570,6 +1570,55 @@ describe("ProjectSidebar flat chat list", () => {
     ]);
   });
 
+  test("labels the Pinned and Recent sections and moves a chat between them on pin", () => {
+    const newer = {
+      ...createWorkspace("newer-chat", { title: "Newer chat" }),
+      projects: singleProjectRefs,
+    };
+    const older = {
+      ...createWorkspace("older-chat", { title: "Older chat" }),
+      projects: singleProjectRefs,
+    };
+    const now = Date.now();
+    const renderFlatList = (workspaces: FrontendWorkspaceMetadata[]) => (
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", workspaces]])}
+        workspaceRecency={{ "newer-chat": now, "older-chat": now - 60_000 }}
+      />
+    );
+    // Section labels and rows in document order.
+    const listOrder = () => {
+      const nodes = [
+        ...view.container.querySelectorAll<HTMLElement>('[data-testid^="agent-item-"]'),
+        ...view.queryAllByText(/^(Pinned|Recent)$/),
+      ];
+      nodes.sort((a, b) =>
+        a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+      );
+      return nodes.map((node) => node.getAttribute("data-testid") ?? node.textContent);
+    };
+
+    const view = render(renderFlatList([newer, older]));
+    // No pinned chat, no Pinned section.
+    const unpinnedOrder = ["Recent", agentItemTestId("newer-chat"), agentItemTestId("older-chat")];
+    expect(listOrder()).toEqual(unpinnedOrder);
+
+    // Pinning (the optimistic pinnedAt) moves the chat into Pinned at once.
+    view.rerender(renderFlatList([newer, { ...older, pinnedAt: "2026-01-01T00:00:00.000Z" }]));
+    expect(listOrder()).toEqual([
+      "Pinned",
+      agentItemTestId("older-chat"),
+      "Recent",
+      agentItemTestId("newer-chat"),
+    ]);
+
+    // Unpinning returns it to its recency position in Recent.
+    view.rerender(renderFlatList([newer, older]));
+    expect(listOrder()).toEqual(unpinnedOrder);
+  });
+
   test("renders a promoted flat draft once as the live workspace row", () => {
     const promotedWorkspace = {
       ...createWorkspace("promoted", { title: "Promoted chat" }),
