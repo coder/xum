@@ -8,6 +8,7 @@ import { DevcontainerRuntime } from "./DevcontainerRuntime";
 import type { ExecOptions, ExecStream } from "./Runtime";
 import { MISSING_CWD_COMMANDS, MULTI_LINE_COMMAND_CASES } from "./testRemoteRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
+import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 
 interface RuntimeState {
   remoteHomeDir?: string;
@@ -322,6 +323,35 @@ describe("DevcontainerRuntime.exec stops the command in the container (#6923)", 
       }
     },
     { timeout: 20_000 }
+  );
+
+  // DevcontainerRuntime has no remote timeout wrapper: a timed-out command kept running in the
+  // container too, so its timeout starts the same stop as an abort.
+  it.skipIf(process.platform === "win32")(
+    "a timed-out command starts one stop for its marker",
+    async () => {
+      const spawned: Array<{ args: string[]; child: ChildProcess }> = [];
+      const spawnSpy = spyOn(devcontainerCli, "spawnDevcontainer").mockImplementation(
+        (spawnArgs, options) => {
+          const child = spawn(spawned.length === 0 ? "sleep" : "true", ["30"], options);
+          spawned.push({ args: spawnArgs, child });
+          return child;
+        }
+      );
+      const runtime = createRuntime({ currentWorkspacePath: os.tmpdir() });
+      try {
+        const stream = await runtime.exec("sleep 30", { cwd: os.tmpdir(), timeout: 0.2 });
+        expect(await stream.exitCode).toBe(EXIT_CODE_TIMEOUT);
+        await runtime.awaitPendingStops();
+        expect(spawned).toHaveLength(2);
+        const marker = spawned[0].args.find((arg) => arg.startsWith("XUM_EXEC_ID="));
+        expect(marker).toMatch(/^XUM_EXEC_ID=[0-9a-f-]{36}$/);
+        expect(spawned[1].args.join(" ")).toContain(marker!);
+      } finally {
+        spawnSpy.mockRestore();
+        for (const { child } of spawned) child.kill("SIGKILL");
+      }
+    }
   );
 
   // A caller's XUM_EXEC_ID would replace the marker and hide the command from the stop.

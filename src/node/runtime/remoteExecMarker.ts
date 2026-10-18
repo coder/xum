@@ -63,7 +63,8 @@ export function buildMarkerKillScript(marker: ExecMarker): string {
     // An abort right after exec returned can come before the command is visible: wait up to
     // about 2 s for it to appear.
     "p=$(marked); n=0",
-    'while [ -z "$p" ] && [ $n -lt 10 ]; do sleep 0.2; p=$(marked); n=$((n + 1)); done',
+    // `sleep 0.2` falls back to whole seconds where sleep takes no fractions.
+    'while [ -z "$p" ] && [ $n -lt 10 ]; do sleep 0.2 2>/dev/null || sleep 1; p=$(marked); n=$((n + 1)); done',
     '[ -z "$p" ] && exit 0',
     "kill -TERM $p 2>/dev/null",
     "sleep 1",
