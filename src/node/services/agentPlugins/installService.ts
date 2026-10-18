@@ -5988,7 +5988,11 @@ export class AgentPluginInstallService {
   private approvedCopiesSource(
     entry: Pick<AgentPluginInstallEntry, "name" | "installedAt">
   ): ApprovedCopiesSource {
-    return { xumHome: this.config.rootDir, pluginName: entry.name, installedAt: entry.installedAt };
+    return {
+      xumHome: this.config.rootDir,
+      instancePath: this.targetPathFor(entry.name),
+      installedAt: entry.installedAt,
+    };
   }
 
   /**

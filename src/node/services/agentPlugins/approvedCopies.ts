@@ -82,9 +82,14 @@ export interface ApprovedCopies {
 
 /** Where one managed install keeps its copies (AgentPluginInfo.approvedCopies). */
 export interface ApprovedCopiesSource {
+  /** The Xum home, lexical or its realpath: it only locates the copies directory. */
   xumHome: string;
-  /** The registry name: the instance identity is `<xumHome>/plugins/<name>`, as for hook trust. */
-  pluginName: string;
+  /**
+   * The lexical install path `<xumHome>/plugins/<name>`: the instance identity, as for hook trust
+   * and MCP server keys. Never a realpath: with a symlinked Xum home it would name another file
+   * than the one the install service writes.
+   */
+  instancePath: string;
   /** The registry entry's `installedAt`: copies of another install never apply. */
   installedAt: string;
 }
@@ -100,10 +105,7 @@ export function getApprovedCopiesPath(xumHome: string, instanceId: string): stri
 }
 
 function copiesFileOf(source: ApprovedCopiesSource): string {
-  const instanceId = computePluginInstanceId(
-    path.join(source.xumHome, "plugins", source.pluginName)
-  );
-  return getApprovedCopiesPath(source.xumHome, instanceId);
+  return getApprovedCopiesPath(source.xumHome, computePluginInstanceId(source.instancePath));
 }
 
 /** This install's copies; none when the file is missing, malformed, oversized or for another install. */

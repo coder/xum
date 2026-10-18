@@ -70,7 +70,7 @@ describe("approved copies store", () => {
   let xumHome: string;
   const source = (installedAt = "2026-01-01T00:00:00.000Z"): ApprovedCopiesSource => ({
     xumHome,
-    pluginName: "demo",
+    instancePath: path.join(xumHome, "plugins", "demo"),
     installedAt,
   });
   const file = () =>

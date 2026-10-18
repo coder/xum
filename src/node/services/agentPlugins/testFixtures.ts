@@ -169,7 +169,7 @@ export async function saveApprovedCopies(args: {
   await updateApprovedCopies({
     source: {
       xumHome: args.xumHome,
-      pluginName: args.entry.name,
+      instancePath: path.join(args.xumHome, "plugins", args.entry.name),
       installedAt: args.entry.installedAt,
     },
     consent,

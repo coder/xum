@@ -810,7 +810,9 @@ async function resolveAgentPluginContainerPath(containerPath: string): Promise<s
 function managedPluginFields(
   entryName: string,
   imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,
-  registryPath: string | undefined
+  registryPath: string | undefined,
+  /** The lexical `<container>/<entryName>`: the instance identity (approvedCopies.ts). */
+  instancePath: string
 ): Pick<
   AgentPluginInfo,
   "componentPolicy" | "componentConsent" | "approvedCopies" | "importedComponents"
@@ -830,7 +832,11 @@ function managedPluginFields(
       ? {
           componentPolicy: { registryPath, name: entryName },
           componentConsent: imports.consentByName.get(entryName) ?? noComponentConsent(),
-          ...approvedCopiesField(registryPath, entryName, imports.installedAtByName.get(entryName)),
+          ...approvedCopiesField(
+            registryPath,
+            instancePath,
+            imports.installedAtByName.get(entryName)
+          ),
         }
       : {}),
   };
@@ -839,11 +845,11 @@ function managedPluginFields(
 /** The copies location of a managed install; none for a row without a readable install time. */
 function approvedCopiesField(
   registryPath: string,
-  pluginName: string,
+  instancePath: string,
   installedAt: string | undefined
 ): Pick<AgentPluginInfo, "approvedCopies"> {
   return installedAt !== undefined
-    ? { approvedCopies: { xumHome: path.dirname(registryPath), pluginName, installedAt } }
+    ? { approvedCopies: { xumHome: path.dirname(registryPath), instancePath, installedAt } }
     : {};
 }
 
@@ -1110,7 +1116,10 @@ export async function discoverAgentPlugins(
             managedPluginFields(
               entryName,
               snapshot.imports,
-              groups.get(canonicalPath)?.registryPath
+              groups.get(canonicalPath)?.registryPath,
+              // Lexical, like the MCP server keys: the install service names the install by
+              // the configured home, which can be a symlink to the registry's realpath.
+              path.join(container.path, entryName)
             )
           );
         }

@@ -30,10 +30,12 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 
 describe("AgentPluginInstallService approved copies", () => {
   let xumRoot: string;
+  /** The configured Xum home: `xumRoot`, or a symlink to it. */
+  let home: string;
   let remoteDir: string;
   let service: AgentPluginInstallService;
   const copiesFile = () =>
-    getApprovedCopiesPath(xumRoot, computePluginInstanceId(path.join(xumRoot, "plugins", "demo")));
+    getApprovedCopiesPath(home, computePluginInstanceId(path.join(home, "plugins", "demo")));
 
   async function writeFiles(pluginDir: string, version: string): Promise<void> {
     await fsPromises.writeFile(
@@ -54,7 +56,7 @@ describe("AgentPluginInstallService approved copies", () => {
 
   /** An edit in the installed plugin folder: nobody approved it. */
   const editInstalled = (version: string) =>
-    writeFiles(path.join(xumRoot, "plugins", "demo"), version);
+    writeFiles(path.join(home, "plugins", "demo"), version);
 
   async function install(
     importedComponents?: Parameters<AgentPluginInstallService["install"]>[0]["importedComponents"]
@@ -69,22 +71,22 @@ describe("AgentPluginInstallService approved copies", () => {
 
   /** What an agent gets now: the skill's description and the workflow's source. */
   async function served(): Promise<{ skill: string | undefined; workflow: string }> {
-    const runtime = new LocalRuntime(xumRoot);
+    const runtime = new LocalRuntime(home);
     const roots = {
       projectRoot: "",
-      globalRoot: path.join(xumRoot, "skills"),
+      globalRoot: path.join(home, "skills"),
       universalRoot: "",
-      globalPluginRoots: [path.join(xumRoot, "plugins")],
+      globalPluginRoots: [path.join(home, "plugins")],
     };
-    const { skills } = await discoverAgentSkills(runtime, xumRoot, { roots });
-    const read = await readAgentSkill(runtime, xumRoot, SkillNameSchema.parse("greet"), { roots });
+    const { skills } = await discoverAgentSkills(runtime, home, { roots });
+    const read = await readAgentSkill(runtime, home, SkillNameSchema.parse("greet"), { roots });
     expect(skills.find((skill) => skill.name === "greet")?.description).toBe(
       read.package.frontmatter.description
     );
     const workflow = await resolveWorkflowScript({
       scriptPath: "plugin://demo/hello.js",
       runtime,
-      workspacePath: xumRoot,
+      workspacePath: home,
       projectTrusted: false,
       roots,
     });
@@ -93,6 +95,7 @@ describe("AgentPluginInstallService approved copies", () => {
 
   beforeEach(async () => {
     xumRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), "xum-approved-copies-"));
+    home = xumRoot;
     remoteDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "xum-approved-copies-remote-"));
     service = new AgentPluginInstallService(new Config(xumRoot), {});
     await git(remoteDir, "init", "-q", "-b", "main");
@@ -108,6 +111,7 @@ describe("AgentPluginInstallService approved copies", () => {
   });
 
   afterEach(async () => {
+    await fsPromises.rm(`${xumRoot}-link`, { force: true });
     await fsPromises.rm(xumRoot, { recursive: true, force: true });
     await fsPromises.rm(remoteDir, { recursive: true, force: true });
   });
@@ -182,6 +186,19 @@ describe("AgentPluginInstallService approved copies", () => {
     expect(await internals.reconciliationState).toBe(true);
     await internals.startupApprovedCopiesSweep;
 
+    await editInstalled("v2");
+    const approved = await served();
+    expect(approved.skill).toBe("v1");
+    expect(approved.workflow).toContain('"v1"');
+  });
+
+  test("a symlinked Xum home serves the approved version too", async () => {
+    // Discovery reads the plugin through the home's realpath; both sides must still name the
+    // same copies file.
+    home = `${xumRoot}-link`;
+    await fsPromises.symlink(xumRoot, home);
+    service = new AgentPluginInstallService(new Config(home), {});
+    await install();
     await editInstalled("v2");
     const approved = await served();
     expect(approved.skill).toBe("v1");
