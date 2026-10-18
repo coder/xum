@@ -569,7 +569,7 @@ async function retryBudgetFromHistory(
 /**
  * Shared assembly path for primary, fallback, and thinking-rebuild provider attempts.
  * `contextBudgetEstimate` is the full estimate the check enforced (undefined when the budget is
- * off or the limit is unknown). `measureOnly` returns that estimate instead of throwing.
+ * off or the limit is unknown).
  */
 export async function assembleBudgetCheckedPromptPayload(
   options: Parameters<typeof assemblePromptPayload>[0],
@@ -577,7 +577,6 @@ export async function assembleBudgetCheckedPromptPayload(
     enabled: boolean;
     providerOptions?: MuxProviderOptions;
     activeTools?: readonly string[];
-    measureOnly?: boolean;
   }
 ): Promise<
   Awaited<ReturnType<typeof assemblePromptPayload>> & {
@@ -615,7 +614,7 @@ export async function assembleBudgetCheckedPromptPayload(
       activeTools: budget.activeTools,
     });
     contextBudgetEstimate = measured?.estimate;
-    if (measured?.exceeded && !budget.measureOnly) {
+    if (measured?.exceeded) {
       throw new ContextBudgetExceededError(measured.exceeded);
     }
   }
