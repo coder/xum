@@ -16,7 +16,7 @@ test(
     await browser.keyboard.press("Control+Shift+K");
     await expect(screen.getByTestId("artifacts-panel")).toBeFocused();
 
-    // The issue's steps: Shift+Tab past the strip's Collapse sidebar and New tab buttons
+    // The issue's steps: Shift+Tab past the strip's Collapse sidebar and All tabs buttons
     // reaches the tab's X.
     await browser.keyboard.press("Shift+Tab");
     await browser.keyboard.press("Shift+Tab");

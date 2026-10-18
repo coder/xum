@@ -27,6 +27,16 @@ export async function openAnalyticsDialog(container: HTMLElement): Promise<HTMLE
   return within(body).findByRole("dialog", { name: "Analytics" }, { timeout: 30000 });
 }
 
+/**
+ * Open (or show) the New tab of the right sidebar pane inside `scope`: its strip offers it only
+ * as the last row of the All tabs menu, which renders in a portal outside `scope`.
+ */
+export async function openSidebarNewTab(scope: HTMLElement): Promise<void> {
+  fireEvent.click(await within(scope).findByRole("button", { name: "All tabs" }));
+  const menu = await within(scope.ownerDocument.body).findByRole("dialog", { name: "All tabs" });
+  fireEvent.click(within(menu).getByRole("button", { name: "New tab" }));
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // REFRESH BUTTON HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════

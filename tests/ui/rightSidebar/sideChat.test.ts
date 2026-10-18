@@ -30,6 +30,7 @@ import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { preloadTestModules } from "../../ipc/setup";
 import { createStreamCollector } from "../../ipc/streamCollector";
 import { createAppHarness, type AppHarness } from "../harness";
+import { openSidebarNewTab } from "../helpers";
 
 const SIDE_PANE_SELECTOR = `[${SIDE_CHAT_PANE_ATTR}]`;
 const COMPOSER_SELECTOR = 'textarea[aria-label="Message"]';
@@ -194,7 +195,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       act(() => getDraftStore().setText({ kind: "workspace", workspaceId: firstId }, firstDraft));
       await waitFor(() => expect(getSideComposer(app, firstId).value).toBe(firstDraft));
 
-      fireEvent.click(within(pane).getByRole("button", { name: "New tab" }));
+      await openSidebarNewTab(pane);
       fireEvent.click(await within(pane).findByRole("button", { name: "Side chat" }));
       const secondId = await waitFor(
         async () => {
@@ -252,7 +253,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       const sidebar = app.view.container.querySelector<HTMLElement>(
         '[aria-label="Workspace insights"]'
       )!;
-      fireEvent.click(await within(sidebar).findByRole("button", { name: "New tab" }));
+      await openSidebarNewTab(sidebar);
       const row = await within(sidebar).findByRole("button", { name: "Side chat" });
       fireEvent.click(row);
       fireEvent.click(row);

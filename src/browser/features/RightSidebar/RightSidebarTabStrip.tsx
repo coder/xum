@@ -5,13 +5,14 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/To
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { useDroppable, useDndContext } from "@dnd-kit/core";
-import { Check, ChevronDown, PanelRightClose, Plus, X } from "lucide-react";
-import type { TabType } from "@/browser/types/rightSidebar";
-import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { Check, ChevronDown, PanelRightClose, X } from "lucide-react";
+import { isNewTab, type TabType } from "@/browser/types/rightSidebar";
+import { formatKeybind, formatKeybindForAria, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
   isDesktopMode,
   DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
 } from "@/browser/hooks/useDesktopTitlebar";
+import { NewTabLabel } from "./Tabs/TabLabels";
 
 // Re-export for consumers that import from this file
 export { getTabName } from "./Tabs";
@@ -49,8 +50,8 @@ interface RightSidebarTabStripProps {
   ariaLabel?: string;
   /** Unique ID of this tabset (for drag/drop) */
   tabsetId: string;
-  /** Called when user clicks the "+" button to open (or show) this tabset's New tab */
-  onAddNewTab?: () => void;
+  /** The All tabs menu's New tab row: open (or show) this tabset's New tab */
+  onAddNewTab: () => void;
   /** Collapses the sidebar. Only the strip at the sidebar's top-right corner gets it. */
   onCollapseSidebar?: () => void;
 }
@@ -202,7 +203,7 @@ export function isSidebarControlTarget(target: EventTarget): boolean {
 }
 
 /**
- * Icon buttons after the tabs ("+", All tabs, collapse). Coarse pointers get a 24px target:
+ * Icon buttons after the tabs (All tabs, collapse). Coarse pointers get a 24px target:
  * tablets have no global touch floor (phones get 44px from it).
  */
 function stripIconButtonClassName(isDesktop: boolean): string {
@@ -214,7 +215,6 @@ function stripIconButtonClassName(isDesktop: boolean): string {
 
 const StripIconButton: React.FC<{
   label: string;
-  shortcut?: string;
   isDesktop: boolean;
   sidebarControl?: boolean;
   onClick: () => void;
@@ -232,12 +232,7 @@ const StripIconButton: React.FC<{
         {props.children}
       </button>
     </TooltipTrigger>
-    <TooltipContent side="bottom">
-      {props.label}
-      {props.shortcut != null && (
-        <span className="mobile-hide-shortcut-hints"> ({props.shortcut})</span>
-      )}
-    </TooltipContent>
+    <TooltipContent side="bottom">{props.label}</TooltipContent>
   </Tooltip>
 );
 
@@ -253,45 +248,58 @@ function handleTabListArrowKeys(event: React.KeyboardEvent<HTMLElement>): void {
   rows[Math.min(Math.max(next, 0), rows.length - 1)]?.focus();
 }
 
-/** One tab's row in the All tabs menu; a check marks the selected tab. */
-const TabListMenuRow: React.FC<{ item: RightSidebarTabStripItem; onPick: () => void }> = (
-  props
-) => (
+/** A row of the All tabs menu; a check marks the selected tab. */
+const TabListMenuRow: React.FC<{
+  label: React.ReactNode;
+  selected: boolean;
+  disabled?: boolean;
+  keyShortcuts?: string;
+  onPick: () => void;
+  children?: React.ReactNode;
+}> = (props) => (
   <button
     type="button"
-    disabled={props.item.disabled}
-    aria-current={props.item.selected || undefined}
+    disabled={props.disabled}
+    aria-current={props.selected || undefined}
+    aria-keyshortcuts={props.keyShortcuts}
     className="text-content-secondary hover:bg-hover focus:bg-hover flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-xs outline-none disabled:opacity-50"
     onClick={props.onPick}
   >
-    <Check className={cn("h-3 w-3 shrink-0", !props.item.selected && "invisible")} />
-    <span className="flex min-w-0 items-center gap-1.5 truncate">
-      {props.item.menuLabel ?? props.item.label}
-    </span>
+    <Check className={cn("h-3 w-3 shrink-0", !props.selected && "invisible")} />
+    <span className="flex min-w-0 items-center gap-1.5 truncate">{props.label}</span>
+    {props.children}
   </button>
 );
 
 /**
  * Lists every tab in the strip, so a tab scrolled out of the row is one pick away (a narrow
- * pane shows only a tab or two, and touch users may not know the row scrolls).
+ * pane shows only a tab or two, and touch users may not know the row scrolls). Its last row
+ * opens (or shows) the New tab, which therefore has no row among the tabs.
  */
-const TabListMenu: React.FC<{ items: RightSidebarTabStripItem[]; isDesktop: boolean }> = (
-  props
-) => {
+const TabListMenu: React.FC<{
+  items: RightSidebarTabStripItem[];
+  isDesktop: boolean;
+  onAddNewTab: () => void;
+}> = (props) => {
   const [open, setOpen] = React.useState(false);
   const [tooltipOpen, setTooltipOpen] = React.useState(false);
   const contentRef = React.useRef<HTMLDivElement>(null);
-  // A pick moves focus to the picked tab (and a terminal tab then focuses its terminal), so
-  // closing must not send focus back to this button.
-  const pickedRef = React.useRef(false);
 
+  const tabRows = props.items.filter((item) => !isNewTab(item.tab));
+  const newTabSelected = props.items.some((item) => isNewTab(item.tab) && item.selected);
+
+  // A pick moves focus out of the menu (to the tab, or into the New tab's launcher), so Radix
+  // does not send it back to this button on close.
   const pick = (item: RightSidebarTabStripItem) => {
-    pickedRef.current = true;
     setOpen(false);
     item.onSelect();
     // The strip scrolls the selected tab into view itself; focus() would also scroll the
     // sidebar's overflow-hidden ancestors.
     document.getElementById(item.id)?.focus({ preventScroll: true });
+  };
+  const pickNewTab = () => {
+    setOpen(false);
+    props.onAddNewTab();
   };
 
   return (
@@ -321,46 +329,60 @@ const TabListMenu: React.FC<{ items: RightSidebarTabStripItem[]; isDesktop: bool
           event.preventDefault();
           contentRef.current?.querySelector<HTMLElement>('[aria-current="true"]')?.focus();
         }}
-        onCloseAutoFocus={(event) => {
-          if (!pickedRef.current) return;
-          pickedRef.current = false;
-          event.preventDefault();
-        }}
         onKeyDown={handleTabListArrowKeys}
       >
-        {props.items.map((item) => (
-          <TabListMenuRow key={item.id} item={item} onPick={() => pick(item)} />
+        {tabRows.map((item) => (
+          <TabListMenuRow
+            key={item.id}
+            label={item.menuLabel ?? item.label}
+            selected={item.selected}
+            disabled={item.disabled}
+            onPick={() => pick(item)}
+          />
         ))}
+        {tabRows.length > 0 && (
+          <div role="separator" className="border-separator-light my-1 border-t" />
+        )}
+        <TabListMenuRow
+          label={<NewTabLabel />}
+          selected={newTabSelected}
+          keyShortcuts={formatKeybindForAria(KEYBINDS.NEW_SIDEBAR_TAB)}
+          onPick={pickNewTab}
+        >
+          {/* Screen readers get it from aria-keyshortcuts. Phones have no keyboard: hidden. */}
+          <span
+            aria-hidden="true"
+            className="text-muted mobile-hide-shortcut-hints ml-auto shrink-0 pl-2 text-[10px]"
+          >
+            ({formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB)})
+          </span>
+        </TabListMenuRow>
       </PopoverContent>
     </Popover>
   );
 };
 
-/** The strip's right end, past the free space after "+": All tabs and the collapse button. */
+/** The strip's right end, past the free space after the tabs: All tabs and the collapse button. */
 const StripEndControls: React.FC<{
   items: RightSidebarTabStripItem[];
   isDesktop: boolean;
+  onAddNewTab: () => void;
   onCollapseSidebar?: () => void;
-}> = (props) => {
-  // A single tab leaves nothing to pick.
-  const showTabList = props.items.length >= 2;
-  if (!showTabList && !props.onCollapseSidebar) return null;
-  return (
-    <div className="ml-auto flex shrink-0 items-center gap-1">
-      {showTabList && <TabListMenu items={props.items} isDesktop={props.isDesktop} />}
-      {props.onCollapseSidebar && (
-        <StripIconButton
-          label="Collapse sidebar"
-          isDesktop={props.isDesktop}
-          sidebarControl
-          onClick={props.onCollapseSidebar}
-        >
-          <PanelRightClose className="h-3.5 w-3.5" />
-        </StripIconButton>
-      )}
-    </div>
-  );
-};
+}> = (props) => (
+  <div className="ml-auto flex shrink-0 items-center gap-1">
+    <TabListMenu items={props.items} isDesktop={props.isDesktop} onAddNewTab={props.onAddNewTab} />
+    {props.onCollapseSidebar && (
+      <StripIconButton
+        label="Collapse sidebar"
+        isDesktop={props.isDesktop}
+        sidebarControl
+        onClick={props.onCollapseSidebar}
+      >
+        <PanelRightClose className="h-3.5 w-3.5" />
+      </StripIconButton>
+    )}
+  </div>
+);
 
 /** Width of the `.scroll-fade-x` edge fade (scrollbar-none.css): a tab under it looks cut off. */
 const SCROLL_FADE_PX = 24;
@@ -378,14 +400,18 @@ function revealSelectedTab(row: HTMLElement): void {
   const tabStart = tabRect.left - rowRect.left + row.scrollLeft;
   const tabEnd = tabStart + tabRect.width;
   const maxScroll = row.scrollWidth - row.clientWidth;
+  // A tab too wide for both fade margins gets smaller ones, so it fits whole (its X included)
+  // when the row can hold it. A tab wider than the row keeps its start clear of the fade.
+  const spare = row.clientWidth - tabRect.width;
+  const margin = spare < 0 ? SCROLL_FADE_PX : Math.min(SCROLL_FADE_PX, spare / 2);
   let next = row.scrollLeft;
   // A fade only shows on a side with more content past it, so the first and last tabs need
   // no margin (the clamp below lets them reach the very edge).
-  if (tabEnd + SCROLL_FADE_PX > row.scrollLeft + row.clientWidth) {
-    next = tabEnd + SCROLL_FADE_PX - row.clientWidth;
+  if (tabEnd + margin > row.scrollLeft + row.clientWidth) {
+    next = tabEnd + margin - row.clientWidth;
   }
-  if (tabStart - SCROLL_FADE_PX < next) {
-    next = tabStart - SCROLL_FADE_PX;
+  if (tabStart - margin < next) {
+    next = tabStart - margin;
   }
   next = Math.max(0, Math.min(maxScroll, next));
   if (Math.abs(next - row.scrollLeft) >= 1) row.scrollLeft = next;
@@ -454,9 +480,8 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
         isDesktop && "titlebar-drag"
       )}
     >
-      {/* One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges).
-          It is only as wide as its tabs, so "+" follows the last tab; once they overflow, the
-          row shrinks and scrolls while "+", outside it, stays in view. */}
+      {/* One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges)
+          while the controls after it stay in view. */}
       <div
         ref={scrollRowRef}
         data-tab-scroll-row
@@ -474,17 +499,12 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
           />
         ))}
       </div>
-      {onAddNewTab && (
-        <StripIconButton
-          label="New tab"
-          shortcut={formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB)}
-          isDesktop={isDesktop}
-          onClick={onAddNewTab}
-        >
-          <Plus className="h-3.5 w-3.5" />
-        </StripIconButton>
-      )}
-      <StripEndControls items={items} isDesktop={isDesktop} onCollapseSidebar={onCollapseSidebar} />
+      <StripEndControls
+        items={items}
+        isDesktop={isDesktop}
+        onAddNewTab={onAddNewTab}
+        onCollapseSidebar={onCollapseSidebar}
+      />
     </div>
   );
 };

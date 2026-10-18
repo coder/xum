@@ -510,22 +510,25 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
     },
   };
 
-  /** Open a tool from the right sidebar's New tab launcher ("+" first adds/shows the New tab). */
+  /**
+   * Open a tool from the right sidebar's New tab launcher. The New tab row at the bottom of the
+   * strip's All tabs menu first adds or shows the New tab.
+   */
   async function openFromNewTab(toolName: string): Promise<void> {
+    const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
     // Tools are opt-in now: wait for either the collapsed expand action or the open strip.
     const expandButton = page.getByRole("button", { name: /^Expand (right )?sidebar$/ });
-    const addButton = page
-      .getByRole("complementary", { name: "Workspace insights" })
-      .getByRole("button", { name: "New tab", exact: true })
-      .first();
-    await expect(expandButton.or(addButton)).toBeVisible();
+    const menuButton = sidebar.getByRole("button", { name: "All tabs", exact: true }).first();
+    await expect(expandButton.or(menuButton)).toBeVisible();
     if (await expandButton.isVisible()) await expandButton.click();
-    await expect(addButton).toBeVisible();
-    await addButton.click();
-    const row = page
-      .getByRole("complementary", { name: "Workspace insights" })
-      .getByRole("tabpanel")
-      .getByRole("button", { name: toolName, exact: true });
+    await expect(menuButton).toBeVisible();
+    await menuButton.click();
+    // The menu renders in a portal, outside the sidebar.
+    await page
+      .getByRole("dialog", { name: "All tabs" })
+      .getByRole("button", { name: "New tab", exact: true })
+      .click();
+    const row = sidebar.getByRole("tabpanel").getByRole("button", { name: toolName, exact: true });
     await expect(row).toBeVisible();
     await row.click();
   }
@@ -550,7 +553,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
     },
 
     async addTerminal(): Promise<void> {
-      // The sidebar's "+" opens a New tab; its launcher's Terminal row creates the terminal.
+      // A New tab's launcher (opened from the All tabs menu) has the Terminal row.
       await openFromNewTab("Terminal");
       // Wait for a terminal tab to appear (name may be "Terminal" or include cwd path)
       // and be selected. Only terminal tabs have a "Close terminal" button.

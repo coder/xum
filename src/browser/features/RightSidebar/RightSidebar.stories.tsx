@@ -32,7 +32,7 @@ import { createAssistantMessage, createUserMessage } from "@/browser/stories/moc
 import type { MockSessionUsage } from "@/browser/stories/mocks/orpc";
 import { AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { createWorkspace } from "@/browser/stories/mocks/workspaces";
-import { blurActiveElement } from "@/browser/stories/storyPlayHelpers";
+import { blurActiveElement, openSidebarNewTab } from "@/browser/stories/storyPlayHelpers";
 import { setupSimpleChatStory, setupStreamingChatStory } from "@/browser/stories/helpers/chatSetup";
 import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { setHunkFirstSeen } from "@/browser/stories/helpers/reviews";
@@ -206,7 +206,7 @@ function seedSidebarLayout(workspaceId: string, tabs: TabType[], activeTab: TabT
 
 /**
  * The selected tab lies fully inside its strip's scroll viewport (not cut off at an edge or
- * hidden behind "+"). Retries because labels grow after mount (cost badge, counts) and the
+ * hidden behind All tabs). Retries because labels grow after mount (cost badge, counts) and the
  * strip re-scrolls when they do. Stories using it fix the sidebar width themselves, so this
  * holds at any test-runner viewport size.
  */
@@ -1585,15 +1585,27 @@ export const NewTabLauncher: Story = {
           document.activeElement === tab || panel?.contains(document.activeElement)
         ).toBe(true);
       });
-      await userEvent.click(canvas.getByRole("button", { name: "New tab" }));
+      await openSidebarNewTab(canvasElement);
     }
+    // The New tab row hands focus to the launcher, which keeps it after the menu unmounts: Radix
+    // refocuses the menu button on a timer then if focus is still inside the menu.
+    const launcherHasFocus = () =>
+      canvasElement
+        .querySelector('[role="tabpanel"][id$="-panel-new"]')
+        ?.contains(document.activeElement) === true;
+    await waitFor(() => expect(launcherHasFocus()).toBe(true));
+    await waitFor(() =>
+      expect(within(document.body).queryByRole("dialog", { name: "All tabs" })).toBeNull()
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await expect(launcherHasFocus()).toBe(true);
   },
 };
 
 /**
  * The New tab launcher at the sidebar's minimum width (300px), next to more open tabs than fit:
  * launcher rows wrap their descriptions instead of overflowing, and the strip stays one row
- * that scrolls sideways (hidden scrollbar, faded edges) with "+" pinned at the end.
+ * that scrolls sideways (hidden scrollbar, faded edges) with All tabs pinned at the end.
  */
 export const NewTabLauncherNarrow: Story = {
   // Match Pixel's named desktop exactly; the global Storybook "desktop" is smaller.
@@ -1721,7 +1733,7 @@ export const ManyTabsSingleRow: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await canvas.findByRole("tab", { name: /^timeline/i, selected: true });
-    await canvas.findByRole("button", { name: "New tab" });
+    await canvas.findByRole("button", { name: "All tabs" });
     // Wait for the cost badge: it widens Stats after mount, pushing the selected tab right.
     await canvas.findByRole("tab", { name: /stats.*\$0\.34/i });
     await expectSelectedTabVisible(canvasElement);
@@ -1769,9 +1781,8 @@ export const TabsReachableUnderWideTitlebarInset: Story = {
     const canvas = within(canvasElement);
     const stats = await canvas.findByRole("tab", { name: /^stats/i, selected: true });
     const review = await canvas.findByRole("tab", { name: /^review/i });
-    // The capped inset leaves the strip 10rem. After "+", All tabs and the collapse button, the
-    // row is narrower than one tab, so the selected tab only has to stay under the pointer, and
-    // All tabs must stay clickable: it reaches every tab.
+    await expectSelectedTabVisible(canvasElement);
+    // All tabs must stay clickable too: it reaches every tab and the New tab.
     await waitFor(() => {
       if (!isHitTarget(stats)) throw new Error("selected tab is not under the pointer");
       if (!isHitTarget(canvas.getByRole("button", { name: "All tabs" }))) {

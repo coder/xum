@@ -25,7 +25,7 @@ import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
-import { waitForChatInputAutofocusDone } from "./storyPlayHelpers.js";
+import { openSidebarNewTab, waitForChatInputAutofocusDone } from "./storyPlayHelpers.js";
 
 export default {
   ...appMeta,
@@ -166,7 +166,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await expect(sidebar.contains(document.activeElement)).toBe(true);
 
     // Its New tab launcher opens the tools that have no tab yet, Browser among them.
-    await userEvent.click(within(sidebar).getByRole("button", { name: "New tab" }));
+    await openSidebarNewTab(sidebar);
     await userEvent.click(await within(sidebar).findByRole("button", { name: /^Browser/ }));
     await expect(within(sidebar).getByRole("tab", { name: /Browser/ })).toHaveAttribute(
       "aria-selected",

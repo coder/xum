@@ -169,7 +169,6 @@ const config: TestRunnerConfig = {
         for (const name of [
           "Close New tab",
           "Close Instructions",
-          "New tab",
           "All tabs",
           "Collapse sidebar",
         ]) {

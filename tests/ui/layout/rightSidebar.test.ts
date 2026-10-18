@@ -28,7 +28,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 
 import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
-import { cleanupView, setupWorkspaceView } from "../helpers";
+import { cleanupView, openSidebarNewTab, setupWorkspaceView } from "../helpers";
 import {
   RIGHT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_TAB_KEY,
@@ -215,11 +215,9 @@ describeIntegration("RightSidebar (UI)", () => {
   const getTabs = (sidebar: HTMLElement) =>
     Array.from(sidebar.querySelectorAll<HTMLElement>('[role="tab"]'));
 
-  /** "+" opens the New tab; its launcher lists the tools. */
+  /** The All tabs menu's New tab row opens the New tab; its launcher lists the tools. */
   async function openLauncher(sidebar: HTMLElement): Promise<HTMLElement> {
-    fireEvent.click(
-      await findRequiredElement(sidebar, 'button[aria-label="New tab"]', "New tab button not found")
-    );
+    await openSidebarNewTab(sidebar);
     return findSidebarPanel(sidebar, "-panel-new");
   }
 
@@ -751,7 +749,7 @@ describeIntegration("RightSidebar (UI)", () => {
       fireEvent.click(reviewTab);
       await findSidebarPanel(sidebar, "review");
 
-      // Create a terminal via "+" (New tab) and its launcher, and verify its content
+      // Create a terminal from a New tab's launcher, and verify its content
       const terminalTab = await createTerminalTab(sidebar);
 
       await waitFor(() => {

@@ -43,7 +43,7 @@ const METADATA: WorkspaceMetadataContextValue = {
 
 function StripFixture(props: { width: number; collapsible: boolean; tabs?: TabType[] }) {
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
-  const [selected, setSelected] = useState<TabType>("new");
+  const [selected, setSelected] = useState<TabType>(props.tabs?.[0] ?? "new");
   const [closed, setClosed] = useState<TabType[]>([]);
   const [order, setOrder] = useState<TabType[]>(
     props.tabs ?? ["new", "instructions", "side:side-title", "terminal:long-title"]
@@ -122,7 +122,12 @@ function StripFixture(props: { width: number; collapsible: boolean; tabs?: TabTy
               <RightSidebarTabStrip
                 items={items}
                 tabsetId="fixture"
-                onAddNewTab={() => setSelected("new")}
+                onAddNewTab={() => {
+                  // Like the sidebar: show the New tab, adding it first when the strip has none.
+                  setOrder((prev) => (prev.includes("new") ? prev : [...prev, "new"]));
+                  setClosed((prev) => prev.filter((tab) => tab !== "new"));
+                  setSelected("new");
+                }}
                 onCollapseSidebar={props.collapsible ? () => undefined : undefined}
               />
             </SortableContext>
@@ -209,20 +214,19 @@ async function checkStableControls(canvasElement: HTMLElement) {
   await expect(canvas.getAllByText(LONG_TITLE).length).toBeGreaterThanOrEqual(2);
 }
 
-/** "+" follows the last tab; tabs that overflow scroll in their row without pushing it away. */
-async function checkNewTabButton(canvasElement: HTMLElement, overflowing: boolean) {
+/** Tabs that overflow scroll in their row without pushing All tabs out of the strip. */
+async function checkAllTabsButton(canvasElement: HTMLElement, overflowing: boolean) {
   const canvas = within(canvasElement);
   const row = canvas.getByRole("tablist");
   const tabs = within(row).getAllByRole("tab");
-  const plusButton = canvas.getByRole("button", { name: "New tab" });
-  const plus = plusButton.getBoundingClientRect();
+  const menuButton = canvas.getByRole("button", { name: "All tabs" });
+  const menu = menuButton.getBoundingClientRect();
   const rowRect = row.getBoundingClientRect();
   await expect(row.scrollWidth > row.clientWidth).toBe(overflowing);
-  await expect(plus.left - rowRect.right).toBeGreaterThanOrEqual(0);
-  await expect(plus.left - rowRect.right).toBeLessThanOrEqual(8);
-  await expect(plus.right).toBeLessThanOrEqual(row.parentElement!.getBoundingClientRect().right);
-  const hit = document.elementFromPoint(plus.left + plus.width / 2, plus.top + plus.height / 2);
-  await expect(hit != null && plusButton.contains(hit)).toBe(true);
+  await expect(menu.left - rowRect.right).toBeGreaterThanOrEqual(0);
+  await expect(menu.right).toBeLessThanOrEqual(row.parentElement!.getBoundingClientRect().right);
+  const hit = document.elementFromPoint(menu.left + menu.width / 2, menu.top + menu.height / 2);
+  await expect(hit != null && menuButton.contains(hit)).toBe(true);
   if (!overflowing) {
     await expect(rowRect.right - tabs[tabs.length - 1].getBoundingClientRect().right).toBeLessThan(
       1
@@ -230,12 +234,33 @@ async function checkNewTabButton(canvasElement: HTMLElement, overflowing: boolea
   }
 }
 
-/** A tab scrolled out of the row is one pick away in the All tabs menu. */
+async function openTabListMenu(canvasElement: HTMLElement): Promise<HTMLElement> {
+  await userEvent.click(within(canvasElement).getByRole("button", { name: "All tabs" }));
+  // The menu renders in a portal, outside the canvas.
+  return within(document.body).findByRole("dialog", { name: "All tabs" });
+}
+
+async function waitForTabListMenuClosed() {
+  await waitFor(() =>
+    expect(within(document.body).queryByRole("dialog", { name: "All tabs" })).toBeNull()
+  );
+}
+
+async function expectFullyInRow(row: HTMLElement, tab: HTMLElement) {
+  await waitFor(async () => {
+    const bounds = row.getBoundingClientRect();
+    const rect = tab.getBoundingClientRect();
+    await expect(rect.left).toBeGreaterThanOrEqual(bounds.left - 0.5);
+    await expect(rect.right).toBeLessThanOrEqual(bounds.right + 0.5);
+  });
+}
+
+/** A tab scrolled out of the row is one pick away in the All tabs menu, and so is the New tab. */
 async function checkTabListMenu(canvasElement: HTMLElement) {
   const canvas = within(canvasElement);
   const row = canvas.getByRole("tablist");
   const tabs = within(row).getAllByRole("tab");
-  const target = tabs[0];
+  const [newTab, target] = tabs;
   await userEvent.click(tabs[tabs.length - 1]);
   await waitFor(() =>
     expect(target.getBoundingClientRect().right).toBeLessThanOrEqual(
@@ -243,30 +268,32 @@ async function checkTabListMenu(canvasElement: HTMLElement) {
     )
   );
 
-  await userEvent.click(canvas.getByRole("button", { name: "All tabs" }));
-  // The menu renders in a portal, outside the canvas.
-  const menu = await within(document.body).findByRole("dialog", { name: "All tabs" });
+  let menu = await openTabListMenu(canvasElement);
+  // One row per tab but the New tab, which the last row stands for.
   const rows = within(menu).getAllByRole("button");
   await expect(rows).toHaveLength(tabs.length);
-  // It opens on the selected tab's row, like a select, and arrow keys move between rows.
-  await waitFor(() => expect(rows[rows.length - 1]).toHaveFocus());
-  await expect(rows[rows.length - 1]).toHaveAttribute("aria-current", "true");
+  await expect(rows[rows.length - 1]).toHaveAccessibleName("New tab");
+  // It opens on the selected (last) tab's row, like a select, and arrow keys move between rows.
+  const selectedRow = rows[rows.length - 2];
+  await waitFor(() => expect(selectedRow).toHaveFocus());
+  await expect(selectedRow).toHaveAttribute("aria-current", "true");
   await userEvent.keyboard("{ArrowUp}");
-  await expect(rows[rows.length - 2]).toHaveFocus();
+  await expect(rows[rows.length - 3]).toHaveFocus();
+  await userEvent.keyboard("{ArrowDown}{ArrowDown}");
+  await expect(rows[rows.length - 1]).toHaveFocus();
 
   await userEvent.click(rows[0]);
-  await waitFor(() =>
-    expect(within(document.body).queryByRole("dialog", { name: "All tabs" })).toBeNull()
-  );
+  await waitForTabListMenuClosed();
   await expect(target).toHaveAttribute("aria-selected", "true");
   // Focus moves to the picked tab, not back to the menu button.
   await expect(target).toHaveFocus();
-  await waitFor(async () => {
-    const bounds = row.getBoundingClientRect();
-    const picked = target.getBoundingClientRect();
-    await expect(picked.left).toBeGreaterThanOrEqual(bounds.left - 0.5);
-    await expect(picked.right).toBeLessThanOrEqual(bounds.right + 0.5);
-  });
+  await expectFullyInRow(row, target);
+
+  menu = await openTabListMenu(canvasElement);
+  await userEvent.click(within(menu).getByRole("button", { name: "New tab" }));
+  await waitForTabListMenuClosed();
+  await expect(newTab).toHaveAttribute("aria-selected", "true");
+  await expectFullyInRow(row, newTab);
 }
 
 export const Narrow: Story = {
@@ -275,35 +302,50 @@ export const Narrow: Story = {
   args: { width: 300, collapsible: false },
   play: async ({ canvasElement }) => {
     await checkStableControls(canvasElement);
-    await checkNewTabButton(canvasElement, true);
+    await checkAllTabsButton(canvasElement, true);
     await checkTabListMenu(canvasElement);
   },
 };
 export const SingleTab: Story = {
-  // One tab leaves nothing to pick, so the strip has no All tabs button.
-  args: { width: 300, collapsible: true, tabs: ["new"] },
+  // All tabs stays with one tab: its menu holds the New tab.
+  args: { width: 300, collapsible: true, tabs: ["instructions"] },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(canvas.getAllByRole("tab")).toHaveLength(1);
     await expect(canvas.getByRole("button", { name: "Collapse sidebar" })).toBeVisible();
-    await expect(canvas.queryByRole("button", { name: "All tabs" })).toBeNull();
+    const menu = await openTabListMenu(canvasElement);
+    await expect(within(menu).getAllByRole("button")).toHaveLength(2);
+    await userEvent.click(within(menu).getByRole("button", { name: "New tab" }));
+    await waitForTabListMenuClosed();
+    await expect(canvas.getAllByRole("tab")).toHaveLength(2);
+    await expect(canvas.getByRole("tab", { name: /^New tab/ })).toHaveAttribute(
+      "aria-selected",
+      "true"
+    );
   },
 };
 export const Wide: Story = {
-  // Wide enough for every tab beside "+", All tabs and the collapse button.
+  // Wide enough for every tab beside All tabs and the collapse button.
   args: { width: 1000, collapsible: true },
   play: async ({ canvasElement }) => {
     await checkStableControls(canvasElement);
-    await checkNewTabButton(canvasElement, false);
-    // All tabs and the collapse button hold the strip's right end, past the free space after "+".
+    await checkAllTabsButton(canvasElement, false);
+    // All tabs and the collapse button hold the strip's right end, past the free space after
+    // the tabs. They are its only buttons outside the tabs: New tab lives in the All tabs menu.
     const canvas = within(canvasElement);
-    const plus = canvas.getByRole("button", { name: "New tab" }).getBoundingClientRect();
+    const tablist = canvas.getByRole("tablist");
+    const stripButtons = within(tablist.parentElement!)
+      .getAllByRole("button")
+      .filter((button) => !tablist.contains(button))
+      .map((button) => button.getAttribute("aria-label"));
+    await expect(stripButtons).toEqual(["All tabs", "Collapse sidebar"]);
+    const row = tablist.getBoundingClientRect();
     const allTabs = canvas.getByRole("button", { name: "All tabs" }).getBoundingClientRect();
     const collapse = canvas
       .getByRole("button", { name: "Collapse sidebar" })
       .getBoundingClientRect();
-    const strip = canvas.getByRole("tablist").parentElement!.getBoundingClientRect();
-    await expect(allTabs.left - plus.right).toBeGreaterThan(8);
+    const strip = tablist.parentElement!.getBoundingClientRect();
+    await expect(allTabs.left - row.right).toBeGreaterThan(8);
     await expect(collapse.left - allTabs.right).toBeGreaterThanOrEqual(0);
     await expect(collapse.left - allTabs.right).toBeLessThanOrEqual(8);
     await expect(strip.right - collapse.right).toBeLessThanOrEqual(9);

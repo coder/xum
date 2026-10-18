@@ -387,7 +387,7 @@ interface RightSidebarTabsetNodeProps {
   setLayout: (updater: (prev: RightSidebarLayoutState) => RightSidebarLayoutState) => void;
   /** Handler to pop out a terminal tab to a separate window */
   onPopOutTerminal: (tab: TabType) => void;
-  /** Handler for the strip's "+" button: open (or show) this tabset's New tab */
+  /** The strip's New tab row (All tabs menu): open (or show) this tabset's New tab */
   onAddNewTab: (tabsetId: string) => void;
   /** Set only for the tabset whose strip shows the sidebar's collapse button */
   onCollapseSidebar?: () => void;
@@ -403,7 +403,7 @@ interface RightSidebarTabsetNodeProps {
   isOnlyTabset: boolean;
   /** Tools the New tab launcher offers, in order (already filtered for availability) */
   launcherTools: BaseTabType[];
-  /** Tabset whose New tab launcher should take focus once shown (after "+" or the shortcut) */
+  /** Tabset whose New tab launcher should take focus once shown (after its row or the shortcut) */
   launcherAutoFocusTabsetId: string | null;
   onLauncherAutoFocusConsumed: () => void;
   /** Handler to close a terminal tab */
@@ -1162,7 +1162,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     setReviewPanelStats(stats ? { total: stats.total, read: stats.read } : null);
   }, []);
 
-  // Tabset whose New tab launcher should focus its first row once shown ("+" or the shortcut).
+  // Tabset whose New tab launcher should focus its first row once shown (its strip's New tab row
+  // or the shortcut).
   const [launcherAutoFocusTabsetId, setLauncherAutoFocusTabsetId] = React.useState<string | null>(
     null
   );
@@ -2170,8 +2171,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     [setLayout]
   );
 
-  // "+" in a strip (tabsetId) or the shortcut (focused tabset): show that tabset's New tab and
-  // move focus into its launcher.
+  // A strip's New tab row (tabsetId) or the shortcut (focused tabset): show that tabset's New
+  // tab and move focus into its launcher.
   const handleAddNewTab = React.useCallback(
     (tabsetId?: string) => {
       const targetId = tabsetId ?? getBaseLayout().focusedTabsetId;

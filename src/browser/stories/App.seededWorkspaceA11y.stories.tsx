@@ -85,7 +85,7 @@ async function expectOneMainLandmark(canvasElement: HTMLElement) {
   await expect(within(mains[0]).queryByRole("contentinfo")).toBeNull();
 }
 
-/** Space between the right sidebar's tabs and the "+" button. */
+/** Space between the right sidebar's tab row and the All tabs button. */
 const TAB_GAP_PX = 4;
 
 /** WCAG 2.2 target-size minimum (Lighthouse `target-size`). */
@@ -98,7 +98,7 @@ async function expectSeededPageAudits(canvasElement: HTMLElement) {
   const composer = await canvas.findByRole("textbox", { name: "Message" }, { timeout: 15_000 });
   await expect(composer).not.toHaveAttribute("aria-expanded");
 
-  // aria-required-children: the tablist owns only tabs. The "+" button stays next to it.
+  // aria-required-children: the tablist owns only tabs. The All tabs button stays next to it.
   const tablist = await canvas.findByRole("tablist", { name: "Sidebar views" });
   await expect(within(tablist).getAllByRole("tab").length).toBeGreaterThan(0);
   const nonTabChildren = Array.from(
@@ -109,18 +109,18 @@ async function expectSeededPageAudits(canvasElement: HTMLElement) {
   await expect(nonTabChildren).toEqual([]);
   const tabStrip = tablist.parentElement;
   if (!tabStrip) throw new Error("Tab strip not rendered");
-  const addTab = within(tabStrip).getByRole("button", { name: "New tab" });
-  // The launcher replaces direct terminal creation but must remain outside the tablist.
+  const allTabs = within(tabStrip).getByRole("button", { name: "All tabs" });
   // The sidebar fades in, so wait for it before checking visibility.
-  await waitFor(() => expect(addTab).toBeVisible());
+  await waitFor(() => expect(allTabs).toBeVisible());
   // The tablist renders its own box: Safari has dropped the role of `display: contents`
   // elements, which have no client rects (#5962).
   await expect(tablist.getClientRects().length).toBeGreaterThan(0);
-  // The launcher stays beside the scrolling row, not after an offscreen last tab.
+  // It stays beside the scrolling row, not after an offscreen last tab.
   const row = tablist.getBoundingClientRect();
-  const add = addTab.getBoundingClientRect();
-  await expect(Math.abs(add.left - (row.right + TAB_GAP_PX))).toBeLessThan(1);
-  await expect(Math.abs(add.top + add.height / 2 - (row.top + row.height / 2))).toBeLessThan(1);
+  const menu = allTabs.getBoundingClientRect();
+  await expect(menu.left).toBeGreaterThanOrEqual(row.right + TAB_GAP_PX - 1);
+  await expect(menu.right).toBeLessThanOrEqual(tabStrip.getBoundingClientRect().right);
+  await expect(Math.abs(menu.top + menu.height / 2 - (row.top + row.height / 2))).toBeLessThan(1);
 
   // button-name: icon-only and combobox triggers need a name of their own.
   await expect(await canvas.findByRole("button", { name: "Open in editor" })).toBeVisible();
@@ -152,8 +152,8 @@ export const Dark = contractStory("dark");
 
 /**
  * Narrowest right sidebar (#5962). The right sidebar is hidden at phone width, so its narrowest
- * real layout is the minimum sidebar width. Open tabs scroll within one row while "+" stays
- * visible beside it; neither the row nor the launcher may overflow the sidebar.
+ * real layout is the minimum sidebar width. Open tabs scroll within one row while All tabs stays
+ * visible beside it; neither may overflow the sidebar.
  */
 const NARROW_SIDEBAR_WIDTH_PX = 300;
 
@@ -195,26 +195,27 @@ const narrowSidebarStory = (theme: ThemeMode): AppStory => ({
     );
     await expect(tablist.getClientRects().length).toBeGreaterThan(0);
     const tabs = within(tablist).getAllByRole("tab");
-    const addTab = within(sidebar).getByRole("button", { name: "New tab" });
-    await waitFor(() => expect(addTab).toBeVisible());
+    const allTabs = within(sidebar).getByRole("button", { name: "All tabs" });
+    await waitFor(() => expect(allTabs).toBeVisible());
     const bounds = sidebar.getBoundingClientRect();
-    for (const element of [tablist, addTab]) {
+    for (const element of [tablist, allTabs]) {
       const rect = element.getBoundingClientRect();
       await expect(rect.left).toBeGreaterThanOrEqual(bounds.left);
       await expect(rect.right).toBeLessThanOrEqual(bounds.right);
     }
     await expect(tablist.scrollWidth).toBeGreaterThan(tablist.clientWidth);
     const rows = new Set(
-      [...tabs, addTab].map((element) => {
+      [...tabs, allTabs].map((element) => {
         const rect = element.getBoundingClientRect();
         return Math.round(rect.top + rect.height / 2);
       })
     );
     await expect(rows.size).toBe(1);
-    await expect(tablist).not.toContainElement(addTab);
+    await expect(tablist).not.toContainElement(allTabs);
+    // The overflowing row fills the strip up to All tabs.
     const row = tablist.getBoundingClientRect();
-    const add = addTab.getBoundingClientRect();
-    await expect(Math.abs(add.left - (row.right + TAB_GAP_PX))).toBeLessThan(1);
+    const menu = allTabs.getBoundingClientRect();
+    await expect(Math.abs(menu.left - (row.right + TAB_GAP_PX))).toBeLessThan(1);
   },
 });
 
