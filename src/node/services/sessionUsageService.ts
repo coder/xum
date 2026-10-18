@@ -377,6 +377,14 @@ export class SessionUsageService {
     });
   }
 
+  /**
+   * Keep a stream's in-flight usage in the file as settled spend (its final write failed):
+   * forget it in memory only, so getSessionUsage stops subtracting it.
+   */
+  releaseInFlightUsage(workspaceId: string, streamId: string): void {
+    this.deleteInFlightEntry(workspaceId, streamId);
+  }
+
   private deleteInFlightEntry(workspaceId: string, streamId: string): void {
     const streams = this.inFlightUsage.get(workspaceId);
     streams?.delete(streamId);

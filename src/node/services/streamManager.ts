@@ -2870,7 +2870,11 @@ export class StreamManager {
       return;
     }
     // "recorded" replaced the in-flight entry. On "failed" the in-flight entry stays in the
-    // file: it is then the only durable record of the finished steps, so nothing discards it.
+    // file as the only durable record of the finished steps: nothing discards it, and
+    // in-process readers count it as settled.
+    if (result === "failed" && streamInfo.hasInFlightSessionUsage === true) {
+      this.sessionUsageService?.releaseInFlightUsage(workspaceId as string, streamInfo.messageId);
+    }
     streamInfo.hasInFlightSessionUsage = false;
   }
 

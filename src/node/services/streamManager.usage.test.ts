@@ -403,6 +403,10 @@ describe("StreamManager - TTFT metadata persistence", () => {
     // The in-flight entry is the only durable record of the step: nothing may discard it.
     const onDisk = ledgerTotals(await readLedgerFile(historyConfig.sessionsDir, workspaceId));
     expect(onDisk.tokens).toBe(stepUsage.totalTokens);
+    // The stream ended, so the Costs tab and XUM_COSTS_USD count it too.
+    expect(ledgerTotals(await sessionUsageService.getSessionUsage(workspaceId)).tokens).toBe(
+      stepUsage.totalTokens
+    );
   });
 
   test("emits and persists routeProvider from initial stream metadata", async () => {
