@@ -23,6 +23,7 @@ import {
 } from "@/browser/stores/AppConfigStore";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { LazyFeature } from "../LazyFeature/LazyFeature";
+import { Dialog, DialogOverlay, DialogPortal } from "../Dialog/Dialog";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
 import { Checkbox } from "../Checkbox/Checkbox";
 import {
@@ -126,10 +127,18 @@ const WorkspaceMCPModal = React.lazy(async () => ({
 function LazySettingsModal(props: { name: string; open: boolean; children: React.ReactNode }) {
   const [mounted, setMounted] = useState(false);
   if (props.open && !mounted) setMounted(true);
-  // While the chunk loads, an invisible open-overlay marker makes isDialogOpen() true, so global
-  // shortcuts (e.g. the messaging dialog's) cannot open a second modal over this one.
+  // While the chunk loads, nothing may open a second modal over this one. The dialog's own
+  // backdrop blocks pointer access (a second pick from Workspace actions), and the hidden
+  // open-overlay marker makes isDialogOpen() true for the global shortcuts.
   const pending = props.open ? (
-    <div {...{ [MODAL_DIALOG_OVERLAY_ATTRIBUTE]: "" }} data-state="open" hidden />
+    <>
+      <div {...{ [MODAL_DIALOG_OVERLAY_ATTRIBUTE]: "" }} data-state="open" hidden />
+      <Dialog open>
+        <DialogPortal>
+          <DialogOverlay />
+        </DialogPortal>
+      </Dialog>
+    </>
   ) : null;
   return mounted ? (
     <LazyFeature name={props.name} fallback={pending}>

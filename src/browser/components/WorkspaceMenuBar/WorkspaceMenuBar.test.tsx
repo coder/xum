@@ -73,6 +73,8 @@ void mock.module("@/browser/components/Dialog/Dialog", () => ({
   DialogTitle: (props: { children: ReactNode; className?: string }) => (
     <h2 className={props.className}>{props.children}</h2>
   ),
+  DialogPortal: (props: { children: ReactNode }) => <>{props.children}</>,
+  DialogOverlay: () => <div data-testid="dialog-backdrop" />,
 }));
 
 // Captured before any spy is installed so the integration test can render the real modal
@@ -1210,19 +1212,27 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
   });
 
-  it("ignores the consent shortcut while another settings modal is still loading", async () => {
+  it("blocks pointer and shortcut access to a second modal while a settings modal is loading", async () => {
     // The heartbeat modal: no other test opens it, so its lazy chunk is still pending here.
-    render(<WorkspaceMenuBar {...defaultProps} />);
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    expect(view.queryByTestId("dialog-backdrop")).toBeNull();
     act(() => {
-      fireEvent.keyDown(window, { key: "H", ctrlKey: true, shiftKey: true });
+      menuAction("configureHeartbeat")?.(document.body);
     });
-    // The heartbeat dialog's overlay does not exist yet, only its pending marker.
+    // Until the chunk arrives, the dialog's backdrop takes the pointer, so a second pick from
+    // Workspace actions cannot reach the menu (happy-dom does not hit-test, so check the backdrop).
+    expect(view.queryByTestId("dialog-backdrop")).not.toBeNull();
+    // The heartbeat dialog's own overlay does not exist yet, only the pending marker.
     act(() => {
       fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
     });
-    await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+    // The first import of the real heartbeat modal can take over a second here.
+    await waitFor(() => expect(view.queryByTestId("dialog-backdrop")).toBeNull(), {
+      timeout: 10_000,
+    });
+    expect(view.getByText("Configure heartbeat")).not.toBeNull();
     expect(messagingDialogOpen()).toBe(false);
-  });
+  }, 20_000);
 
   it("ignores the consent shortcut while another modal is open", () => {
     // A real open modal built from the shared primitives (overlay inline: the Radix Portal does
