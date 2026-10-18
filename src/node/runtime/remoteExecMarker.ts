@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import assert from "@/common/utils/assert";
+import { log } from "@/node/services/log";
 
 /**
  * Marks every process of one remote exec so an abort can stop them on the remote side (#6923).
@@ -54,4 +55,61 @@ export function buildMarkerKillScript(marker: ExecMarker): string {
     'p=$(marked); [ -n "$p" ] && kill -KILL $p 2>/dev/null',
     "exit 0",
   ].join("\n");
+}
+
+/**
+ * The stops that aborts started and that have not finished. A runtime keeps one, so its callers
+ * (and tests) can wait for them (awaitPendingStops) while an abort's result never waits.
+ */
+export class PendingStops {
+  private readonly stops = new Set<Promise<void>>();
+
+  /** Keeps `stop` observable until it settles, and logs a rejection. */
+  track(stop: Promise<void>, label: string): void {
+    this.stops.add(stop);
+    stop
+      .catch((error: unknown) => log.warn(`${label}: stopping an aborted command failed`, error))
+      .finally(() => this.stops.delete(stop));
+  }
+
+  async settled(): Promise<void> {
+    await Promise.allSettled([...this.stops]);
+  }
+}
+
+/**
+ * Runs the kill script for `marker` through `exec`, drains it, and logs when it could not stop
+ * the command (a failure, or a host without /proc). Never throws.
+ */
+export async function stopMarkedCommand(
+  exec: (script: string) => Promise<ExecStreamLike>,
+  marker: ExecMarker,
+  label: string
+): Promise<void> {
+  try {
+    const stream = await exec(buildMarkerKillScript(marker));
+    await stream.stdin.close().catch(() => undefined);
+    const [exitCode, stderr] = await Promise.all([
+      stream.exitCode,
+      readAll(stream.stderr),
+      readAll(stream.stdout),
+    ]);
+    if (exitCode !== 0 || stderr.includes(NO_PROC_MESSAGE)) {
+      log.warn(`${label}: could not stop an aborted command`, { exitCode, stderr: stderr.trim() });
+    }
+  } catch (error) {
+    log.warn(`${label}: could not stop an aborted command`, error);
+  }
+}
+
+/** The parts of an ExecStream that stopMarkedCommand reads. */
+export interface ExecStreamLike {
+  stdout: ReadableStream<Uint8Array>;
+  stderr: ReadableStream<Uint8Array>;
+  stdin: WritableStream<Uint8Array>;
+  exitCode: Promise<number>;
+}
+
+async function readAll(stream: ReadableStream<Uint8Array>): Promise<string> {
+  return new Response(stream).text();
 }

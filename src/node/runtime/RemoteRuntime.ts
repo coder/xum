@@ -38,13 +38,12 @@ import { log } from "@/node/services/log";
 import { attachStreamErrorHandler } from "@/node/utils/streamErrors";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { DisposableProcess } from "@/node/utils/disposableExec";
-import { shescape, streamToString } from "./streamUtils";
+import { shescape } from "./streamUtils";
 import {
-  buildMarkerKillScript,
   createExecMarker,
-  NO_PROC_MESSAGE,
+  PendingStops,
+  stopMarkedCommand,
   withExecMarker,
-  type ExecMarker,
 } from "./remoteExecMarker";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildGuardedCommand, buildShellExport, buildShellPathExport } from "./shellEnv";
@@ -83,8 +82,8 @@ export interface SpawnResult {
  * Abstract base class for remote execution runtimes.
  */
 export abstract class RemoteRuntime implements Runtime {
-  /** Remote stops started by aborts and not finished yet (see stopMarkedCommand). */
-  private readonly pendingStops = new Set<Promise<void>>();
+  /** Remote stops started by aborts and not finished yet (#6923). */
+  private readonly pendingStops = new PendingStops();
 
   /**
    * Spawn the external process for command execution.
@@ -258,7 +257,14 @@ export abstract class RemoteRuntime implements Runtime {
         // signal; an OpenSSH client's exit sends none), so stop it by its marker (#6923). The
         // abort's result does not wait for this: the caller asked to stop, and a slow or broken
         // remote must not delay that answer. Failures are logged inside stopMarkedCommand.
-        this.trackStop(this.stopMarkedCommand(marker));
+        this.pendingStops.track(
+          stopMarkedCommand(
+            (script) => this.exec(script, { cwd: "/", timeout: 10 }),
+            marker,
+            this.commandPrefix
+          ),
+          this.commandPrefix
+        );
 
         const hardKillHandle = setTimeout(() => {
           const hasExited = childProcess.exitCode !== null || childProcess.signalCode !== null;
@@ -401,43 +407,9 @@ export abstract class RemoteRuntime implements Runtime {
     return { stdout, stderr, stdin, exitCode, duration };
   }
 
-  /** Keeps `stop` observable until it settles (awaitPendingStops). It never rejects. */
-  private trackStop(stop: Promise<void>): void {
-    this.pendingStops.add(stop);
-    stop
-      .catch((error: unknown) =>
-        log.warn(`${this.commandPrefix}: stopping an aborted command failed`, error)
-      )
-      .finally(() => this.pendingStops.delete(stop));
-  }
-
   /** Resolves once every remote stop started by an abort so far has finished. */
-  async awaitPendingStops(): Promise<void> {
-    await Promise.allSettled([...this.pendingStops]);
-  }
-
-  /**
-   * Best effort: signal the remote processes that carry `marker` (TERM, then KILL after 1 s).
-   * Never throws. A host without /proc logs a warning, and the command keeps running there.
-   */
-  private async stopMarkedCommand(marker: ExecMarker): Promise<void> {
-    try {
-      const stream = await this.exec(buildMarkerKillScript(marker), { cwd: "/", timeout: 10 });
-      await stream.stdin.close().catch(() => undefined);
-      const [exitCode, stderr] = await Promise.all([
-        stream.exitCode,
-        streamToString(stream.stderr),
-        streamToString(stream.stdout),
-      ]);
-      if (exitCode !== 0 || stderr.includes(NO_PROC_MESSAGE)) {
-        log.warn(`${this.commandPrefix}: could not stop an aborted command`, {
-          exitCode,
-          stderr: stderr.trim(),
-        });
-      }
-    } catch (error) {
-      log.warn(`${this.commandPrefix}: could not stop an aborted command`, error);
-    }
+  awaitPendingStops(): Promise<void> {
+    return this.pendingStops.settled();
   }
 
   private async resolveFilePath(filePath: string, abortSignal?: AbortSignal): Promise<string> {

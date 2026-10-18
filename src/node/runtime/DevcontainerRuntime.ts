@@ -48,6 +48,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { isGitRepository, stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
+import { createExecMarker, PendingStops, stopMarkedCommand } from "./remoteExecMarker";
 import {
   buildRegularFileReadCommand,
   CAT_VIA_EXEC_COMMAND,
@@ -95,6 +96,8 @@ export function containerLabel(workspacePath: string): string {
 export class DevcontainerRuntime extends LocalBaseRuntime {
   private readonly worktreeManager: WorktreeManager;
   private readonly configPath: string;
+  /** In-container stops started by aborts and timeouts and not finished yet (#6923). */
+  private readonly pendingStops = new PendingStops();
 
   // Cached env used for credential forwarding
   private lastCredentialEnv?: Record<string, string>;
@@ -509,6 +512,11 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     });
   }
 
+  /** Resolves once every in-container stop started so far has finished. */
+  awaitPendingStops(): Promise<void> {
+    return this.pendingStops.settled();
+  }
+
   /**
    * Execute a command inside the devcontainer.
    * Overrides LocalBaseRuntime.exec() to use `devcontainer exec`.
@@ -547,6 +555,10 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     for (const [key, value] of Object.entries(envVars)) {
       args.push("--remote-env", `${key}=${value}`);
     }
+    // Every process of this exec in the container carries the marker, so an abort or timeout can
+    // stop them: killing the local `devcontainer exec` leaves them running (#6923).
+    const marker = createExecMarker();
+    args.push("--remote-env", marker);
 
     // Build the full command with cd
     // Map host workspace path to container path; fall back to container workspace if unmappable
@@ -578,6 +590,16 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
       if (childProcess.pid === undefined) return;
       killProcessTree(childProcess.pid);
       forceCloseStdio(childProcess);
+      // Stop the command inside the container too (#6923). The abort's or timeout's result does
+      // not wait for this, so a slow or broken container cannot delay it; failures are logged.
+      this.pendingStops.track(
+        stopMarkedCommand(
+          (script) => this.exec(script, { cwd: workspaceFolder, timeout: 10 }),
+          marker,
+          "Devcontainer"
+        ),
+        "Devcontainer"
+      );
     });
 
     // Convert Node.js streams to Web Streams. Not Readable.toWeb: on Bun 1.4.3 it can throw an

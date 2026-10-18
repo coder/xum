@@ -5,7 +5,10 @@
  * One SSH test container serves all three paths: SSH (OpenSSH and the SSH2 transport) through
  * its port, Docker through `docker exec <container>`.
  */
-import { execFileSync } from "child_process";
+import { execFileSync, spawnSync } from "child_process";
+import * as fs from "fs/promises";
+import * as os from "os";
+import * as path from "path";
 import {
   isDockerAvailable,
   startSSHServer,
@@ -13,6 +16,7 @@ import {
   type SSHServerConfig,
 } from "./test-fixtures/ssh-fixture";
 import { shouldRunIntegrationTests } from "../testUtils";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { DockerRuntime } from "@/node/runtime/DockerRuntime";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import { createSSHTransport } from "@/node/runtime/transports";
@@ -22,6 +26,8 @@ import { sshConnectionPool } from "@/node/runtime/sshConnectionPool";
 import { ssh2ConnectionPool } from "@/node/runtime/SSH2ConnectionPool";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
+// The devcontainer case needs the Dev Containers CLI, which CI images may not have.
+const hasDevcontainerCli = spawnSync("devcontainer", ["--version"]).status === 0;
 
 let sshConfig: SSHServerConfig | undefined;
 
@@ -110,4 +116,56 @@ describeIntegration("RemoteRuntime abort stops the remote command (#6923)", () =
     expect(gone).toBe(true);
     await runtime.awaitPendingStops();
   });
+
+  // DevcontainerRuntime kills only the local `devcontainer exec`; the command it started in the
+  // container kept running, also after a timeout (it has no remote timeout wrapper).
+  (hasDevcontainerCli ? test : test.skip)(
+    "Devcontainer: an aborted sleep is gone from the container",
+    async () => {
+      const folder = await fs.mkdtemp(path.join(os.tmpdir(), "remote-abort-devcontainer-"));
+      const configPath = path.join(folder, ".devcontainer", "devcontainer.json");
+      await fs.mkdir(path.dirname(configPath));
+      await fs.writeFile(
+        configPath,
+        JSON.stringify({ image: "mux-ssh-test", overrideCommand: true, remoteUser: "root" })
+      );
+      const runtime = new DevcontainerRuntime({ srcBaseDir: os.tmpdir(), configPath });
+      runtime.setCurrentWorkspacePath(folder);
+      try {
+        const up = spawnSync("devcontainer", ["up", "--workspace-folder", folder], {
+          encoding: "utf-8",
+        });
+        expect(up.status).toBe(0);
+        await runtime.ensureReady({});
+        const containerId = execFileSync(
+          "docker",
+          ["ps", "-q", "--filter", `label=devcontainer.local_folder=${folder}`],
+          { encoding: "utf-8" }
+        ).trim();
+        expect(containerId).not.toBe("");
+        const needle = `sleep ${3000 + Math.floor(Math.random() * 900)}`;
+        const abort = new AbortController();
+        const stream = await runtime.exec(needle, {
+          cwd: folder,
+          abortSignal: abort.signal,
+          timeout: 120,
+        });
+        expect(await waitFor(() => remoteProcesses(containerId, needle).length > 0, 10_000)).toBe(
+          true
+        );
+
+        abort.abort();
+        expect(await stream.exitCode).toBe(EXIT_CODE_ABORTED);
+        await runtime.awaitPendingStops();
+        expect(remoteProcesses(containerId, needle)).toEqual([]);
+      } finally {
+        spawnSync("sh", [
+          "-c",
+          `docker rm -f $(docker ps -aq --filter label=devcontainer.local_folder=${folder})`,
+        ]);
+        await fs.rm(folder, { recursive: true, force: true });
+      }
+    },
+    180_000
+  );
 });
