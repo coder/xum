@@ -13,6 +13,7 @@ import { act, fireEvent, waitFor } from "@testing-library/react";
 
 import { getUserPreferences, updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getDraftStore } from "@/browser/stores/DraftStore";
+import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
@@ -243,6 +244,60 @@ describe("composer during an unsettled send (#6259)", () => {
       await app.chat.typeWithoutSending("yes");
       pressVimKeys(app, ["Escape", "c", "c"]);
       expect(composer(app).value).toBe("");
+    } finally {
+      act(() => updateUserPreferences({ appearance: { vimEnabled: false } }));
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // #6866 item 1: in Vim mode the interrupt key is Ctrl+C, so Escape in the composer during a
+  // stream switches to normal mode and leaves the stream running. The non-Vim composer opts in to
+  // Escape interrupts (data-escape-interrupts-stream), checked as the control.
+  test("Escape during a stream switches Vim to normal mode and does not interrupt", async () => {
+    const app = await createAppHarness({ branchPrefix: "composer-vim-escape-stream" });
+    const workspaceService = app.env.services.workspaceService;
+    const interrupt = jest.spyOn(workspaceService, "interruptStream");
+    try {
+      act(() => updateUserPreferences({ appearance: { vimEnabled: true } }));
+      await waitFor(() => expect(getUserPreferences().appearance?.vimEnabled).toBe(true), WAIT);
+      await app.chat.send("[mock:long-stream] keep going");
+      await waitFor(
+        () =>
+          expect(workspaceStore.getWorkspaceSidebarState(app.workspaceId).canInterrupt).toBe(true),
+        WAIT
+      );
+      await waitFor(() => expect(composer(app).disabled).toBe(false), WAIT);
+      composer(app).focus();
+      fireEvent.keyDown(composer(app), { key: "Escape" });
+      fireEvent.keyDown(composer(app), { key: "i" });
+      typeIntoTextarea(app, "x");
+      expect(composer(app).value).toBe("x");
+      expect(interrupt).not.toHaveBeenCalled();
+
+      act(() => updateUserPreferences({ appearance: { vimEnabled: false } }));
+      await waitFor(() => expect(getUserPreferences().appearance?.vimEnabled).toBe(false), WAIT);
+      fireEvent.keyDown(composer(app), { key: "Escape" });
+      await waitFor(() => expect(interrupt).toHaveBeenCalled(), WAIT);
+    } finally {
+      interrupt.mockRestore();
+      act(() => updateUserPreferences({ appearance: { vimEnabled: false } }));
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // Keys typed in insert mode move the real caret: an Escape that comes before the deferred move
+  // starts from the typed position, not from the Vim cursor before the typing.
+  test("Vim keys after fast typing start from the typed caret", async () => {
+    const app = await createAppHarness({ branchPrefix: "composer-vim-typed-caret" });
+    try {
+      act(() => updateUserPreferences({ appearance: { vimEnabled: true } }));
+      await waitFor(() => expect(getUserPreferences().appearance?.vimEnabled).toBe(true), WAIT);
+      await app.chat.typeWithoutSending("abc");
+      pressVimKeys(app, ["Escape", "A"]);
+      typeIntoTextarea(app, "d");
+      // Escape puts the cursor on "d"; `x` deletes it.
+      pressVimKeys(app, ["Escape", "x"]);
+      expect(composer(app).value).toBe("abc");
     } finally {
       act(() => updateUserPreferences({ appearance: { vimEnabled: false } }));
       await app.dispose();

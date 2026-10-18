@@ -295,9 +295,13 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
           <textarea
             ref={textareaRef}
             value={value}
-            onChange={(e) =>
-              onChange(e.target.value, e.target.selectionStart ?? e.target.value.length)
-            }
+            onChange={(e) => {
+              // Typed text lands at the real caret, so that caret is the cursor again: a pending
+              // Vim caret move from before the typing must not apply (#6866).
+              selectionPendingRef.current = false;
+              selectionGenerationRef.current++;
+              onChange(e.target.value, e.target.selectionStart ?? e.target.value.length);
+            }}
             onKeyDown={handleKeyDownInternal}
             // Keep the empty natural height at one line (textareas default to rows=2) so
             // useAutoResizeTextarea can leave empty drafts to CSS sizing without measuring.
