@@ -4,16 +4,21 @@
 // the shell's own public files),
 // only cacheable responses, and never auth flows, API/oRPC routes or token-bearing URLs. It
 // answers only GET requests and never caches the authenticated non-GET traffic (#5971 relies
-// on that). When the auth token changes or is removed, the app deletes the other "mux-" caches
-// and every entry of this one except the shell (src/browser/utils/serviceWorkerCache.ts), so
-// keep that prefix and the SHELL_PATH key.
-// One cache per registration scope: app-proxy deployments run several workers on one origin, and
-// Cache Storage is origin-wide. Older generations of this scope and the unscoped legacy caches
-// ("mux-v2" stored every GET response) are dropped on activate.
-const CACHE_NAME = `mux-v3:${self.registration.scope}`;
+// on that). When the auth token changes or is removed, the app deletes the legacy unscoped
+// "mux-v<N>" caches and keeps this scope's (src/browser/utils/serviceWorkerCache.ts), so keep
+// the scoped "mux-v...:<scope>" name.
+// One cache per registration scope and build: app-proxy deployments run several workers on one
+// origin, and Cache Storage is origin-wide. #6867: scripts/stamp-service-worker.ts writes the
+// build's values into the three lines below, so each release ships a byte-different worker. The
+// browser's update check installs it, and activate drops every other cache of this scope (older
+// builds and their hashed files) and the unscoped legacy caches ("mux-v2" stored every GET
+// response). Unstamped (the Vite dev server), the values below keep one "dev" cache.
+const BUILD_ID = "dev";
+const ENTRY_FILE = "";
+const PRECACHE = [];
+const CACHE_NAME = `mux-v4-${BUILD_ID}:${self.registration.scope}`;
 const LEGACY_CACHE_NAME = /^mux-v\d+$/;
 const SHELL_PATH = "./";
-const urlsToCache = [SHELL_PATH, "./index.html"];
 
 // Same rule as isHashedStaticAssetName (src/node/orpc/staticAssets.ts): one path segment named
 // `<name>-<8 char base64url hash>.<ext>`. Such files never change content.
@@ -104,13 +109,41 @@ function networkFirst(event, cacheKey, isCacheable) {
     );
 }
 
-// Install event - cache the app shell. The server sends it with no-store, so this is the only
-// copy the offline shell gets; a new worker version refreshes it.
+/**
+ * Install accepts the shell by the fetch handler's rule, and also only when it is not a redirect
+ * and loads this build's entry file: a proxy's 200 sign-in page at "./" is not the shell.
+ */
+function isInstallShell(response) {
+  if (!isShellResponse(response) || response.redirected) return Promise.resolve(false);
+  if (ENTRY_FILE === "") return Promise.resolve(true);
+  return response
+    .clone()
+    .text()
+    .then((html) => html.includes(ENTRY_FILE));
+}
+
+// Install event - cache the app shell and this build's first-load files (#6867). The server sends
+// the shell with no-store, so a root navigation refreshes it later. No file can fail the install:
+// a worker that never installs would leave an older one (and its caches) in control.
 self.addEventListener("install", (event) => {
   event.waitUntil(
     caches
       .open(CACHE_NAME)
-      .then((cache) => cache.addAll(urlsToCache))
+      .then((cache) =>
+        Promise.allSettled([
+          fetch(SHELL_PATH).then((response) =>
+            isInstallShell(response).then((accepted) =>
+              accepted ? cache.put(SHELL_PATH, response) : undefined
+            )
+          ),
+          // Low priority, so the live page's requests go first. HTTP cache hits are used.
+          ...PRECACHE.map((name) =>
+            fetch(name, { priority: "low" }).then((response) =>
+              isCacheableResponse(response) ? cache.put(name, response) : undefined
+            )
+          ),
+        ])
+      )
       .then(() => self.skipWaiting())
   );
 });

@@ -112,7 +112,7 @@ function htmlRoots(distDir: string): string[] {
 }
 
 /** Follows static imports only: dynamic `import()` and `__vite__mapDeps` strings are not first load. */
-function firstLoadFiles(distDir: string): Map<string, string> {
+export function firstLoadFiles(distDir: string): Map<string, string> {
   const transpiler = new Bun.Transpiler({ loader: "js" });
   const code = new Map<string, string>();
   const queue = htmlRoots(distDir);

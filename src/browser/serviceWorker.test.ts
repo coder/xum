@@ -8,6 +8,7 @@ import * as path from "node:path";
 import * as vm from "node:vm";
 import { GlobalWindow } from "happy-dom";
 import { restoreDomGlobals, saveDomGlobals } from "../../tests/ui/domGlobals";
+import { stampServiceWorker, type ServiceWorkerStamp } from "../../scripts/stamp-service-worker";
 import {
   clearStoredAuthToken,
   setStoredAuthToken,
@@ -20,7 +21,8 @@ const WORKER_SOURCE = await fs.readFile(
 const ORIGIN = "https://xum.test";
 const ROOT_SCOPE = `${ORIGIN}/`;
 const HASHED_JS = "main-AbCd1234.js";
-const cacheNameFor = (scope: string) => `mux-v3:${scope}`;
+// An unstamped worker (the Vite dev server) uses the "dev" build id.
+const cacheNameFor = (scope: string, build = "dev") => `mux-v4-${build}:${scope}`;
 
 interface FakeRequest {
   url: string;
@@ -39,6 +41,8 @@ const ok = (body: string, headers: Record<string, string> = {}) =>
 class MemoryCacheStorage {
   readonly stores = new Map<string, Map<string, Response>>();
   network: Network = () => html("shell");
+  /** Every worker fetch with its init, e.g. the precache priority. */
+  readonly fetchLog: Array<{ url: string; init?: RequestInit }> = [];
 
   private keyOf(base: string, key: FakeRequest | string): string {
     return typeof key === "string" ? new URL(key, base).href : key.url;
@@ -96,7 +100,9 @@ class MemoryCacheStorage {
 }
 
 /** Loads the worker for a scope, runs install and activate, and dispatches fetch events. */
-async function startWorker(options: { scope?: string; storage?: MemoryCacheStorage } = {}) {
+async function startWorker(
+  options: { scope?: string; storage?: MemoryCacheStorage; stamp?: ServiceWorkerStamp } = {}
+) {
   const scope = options.scope ?? ROOT_SCOPE;
   const storage = options.storage ?? new MemoryCacheStorage();
   const caches = storage.view(new URL("service-worker.js", scope).href);
@@ -108,10 +114,12 @@ async function startWorker(options: { scope?: string; storage?: MemoryCacheStora
     skipWaiting: () => Promise.resolve(),
     clients: { claim: () => Promise.resolve() },
   };
-  vm.runInNewContext(WORKER_SOURCE, {
+  const source = options.stamp ? stampServiceWorker(WORKER_SOURCE, options.stamp) : WORKER_SOURCE;
+  vm.runInNewContext(source, {
     self,
     caches,
-    fetch: (request: FakeRequest | string) => {
+    fetch: (request: FakeRequest | string, init?: RequestInit) => {
+      storage.fetchLog.push({ url: typeof request === "string" ? request : request.url, init });
       try {
         return Promise.resolve(storage.network(request));
       } catch (error) {
@@ -150,7 +158,7 @@ async function startWorker(options: { scope?: string; storage?: MemoryCacheStora
 
   return {
     storage,
-    cacheName: cacheNameFor(scope),
+    cacheName: cacheNameFor(scope, options.stamp?.buildId),
     request,
     setNetwork: (next: Network) => {
       storage.network = next;
@@ -174,12 +182,7 @@ describe("service worker caching (#6848)", () => {
 
     // A deep route is left to the browser, so it adds no entry; the root shares "./".
     expect(worker.storage.urlsIn(worker.cacheName)).toEqual(
-      [
-        ROOT_SCOPE,
-        `${ORIGIN}/index.html`,
-        `${ORIGIN}/${HASHED_JS}`,
-        `${ORIGIN}/manifest.json`,
-      ].sort()
+      [ROOT_SCOPE, `${ORIGIN}/${HASHED_JS}`, `${ORIGIN}/manifest.json`].sort()
     );
   });
 
@@ -320,6 +323,8 @@ describe("service worker caching (#6848)", () => {
     const otherScope = `${ORIGIN}/@u/other/apps/mux/`;
     storage.seed("mux-v2", [`${ORIGIN}/secret`]);
     storage.seed(`mux-v1:${ROOT_SCOPE}`, [`${ORIGIN}/old`]);
+    // #6867: the fixed-name cache of the previous design, with every release's files in it.
+    storage.seed(`mux-v3:${ROOT_SCOPE}`, [`${ORIGIN}/main-OldRel01.js`]);
     storage.seed(cacheNameFor(otherScope), [`${otherScope}${HASHED_JS}`]);
     storage.seed("other-app", [`${ORIGIN}/their-file`]);
     await startWorker({ storage });
@@ -327,6 +332,91 @@ describe("service worker caching (#6848)", () => {
     expect([...storage.stores.keys()].sort()).toEqual(
       [cacheNameFor(otherScope), cacheNameFor(ROOT_SCOPE), "other-app"].sort()
     );
+  });
+});
+
+describe("one cache per build (#6867)", () => {
+  const IMMUTABLE = { "Cache-Control": "public, max-age=31536000, immutable" };
+  const CSS = "main-AbCd1234.css";
+  const stampFor = (buildId: string, precache = [HASHED_JS, CSS]): ServiceWorkerStamp => ({
+    buildId,
+    entryFile: HASHED_JS,
+    precache,
+  });
+  const shellPage = () =>
+    html(`<html><head><script type="module" src="./${HASHED_JS}"></script></head></html>`);
+  /** The shell at "./", the build's files elsewhere. */
+  const release: Network = (request) => {
+    const url = typeof request === "string" ? new URL(request, ROOT_SCOPE).href : request.url;
+    return url === ROOT_SCOPE ? shellPage() : ok(`file ${url}`, IMMUTABLE);
+  };
+  const withNetwork = (network: Network) => {
+    const storage = new MemoryCacheStorage();
+    storage.network = network;
+    return storage;
+  };
+
+  test("a new build's worker drops the previous build's cache and its hashed files", async () => {
+    const storage = withNetwork(release);
+    const buildA = await startWorker({ storage, stamp: stampFor("aaaaaaaaaaaa", []) });
+    await buildA.request(`${ORIGIN}/lazy-OldRel01.js`);
+    expect(storage.storedUrls()).toContain(`${ORIGIN}/lazy-OldRel01.js`);
+
+    const buildB = await startWorker({ storage, stamp: stampFor("bbbbbbbbbbbb", []) });
+    expect([...storage.stores.keys()]).toEqual([buildB.cacheName]);
+    expect(storage.storedUrls()).not.toContain(`${ORIGIN}/lazy-OldRel01.js`);
+  });
+
+  test("install stores the shell and precaches the first-load files at low priority", async () => {
+    const storage = withNetwork(release);
+    const worker = await startWorker({ storage, stamp: stampFor("bbbbbbbbbbbb") });
+    expect(storage.urlsIn(worker.cacheName)).toEqual(
+      [ROOT_SCOPE, `${ORIGIN}/${HASHED_JS}`, `${ORIGIN}/${CSS}`].sort()
+    );
+    const priorities = storage.fetchLog.map((entry) => [entry.url, entry.init?.priority]);
+    expect(priorities).toContainEqual([HASHED_JS, "low"]);
+    expect(priorities).toContainEqual([CSS, "low"]);
+
+    // Offline, the next start has the shell and its entry files.
+    worker.offline();
+    expect((await worker.request(ROOT_SCOPE, { mode: "navigate" })).response?.status).toBe(200);
+    expect(await (await worker.request(`${ORIGIN}/${HASHED_JS}`)).response?.text()).toContain(
+      "file"
+    );
+  });
+
+  test("install still activates when a precache fetch fails", async () => {
+    const storage = withNetwork((request) => {
+      if (request === CSS) throw new TypeError("Failed to fetch");
+      return release(request);
+    });
+    storage.seed(`mux-v3:${ROOT_SCOPE}`, [`${ORIGIN}/main-OldRel01.js`]);
+    const worker = await startWorker({ storage, stamp: stampFor("bbbbbbbbbbbb") });
+    // Activate ran: the old cache is gone.
+    expect([...storage.stores.keys()]).toEqual([worker.cacheName]);
+    expect(storage.urlsIn(worker.cacheName)).toEqual([ROOT_SCOPE, `${ORIGIN}/${HASHED_JS}`].sort());
+  });
+
+  const redirectedShell = () => {
+    const response = shellPage();
+    Object.defineProperty(response, "redirected", { value: true });
+    return response;
+  };
+  test.each([
+    // A proxy's sign-in page answers "./" with a 200 HTML page (the #6929 case).
+    ["a 200 sign-in page", () => html("<html><body>Sign in</body></html>")],
+    ["a redirected shell", redirectedShell],
+    [
+      "an error page",
+      () =>
+        new Response(shellPage().body, { status: 502, headers: { "Content-Type": "text/html" } }),
+    ],
+  ])("install never stores %s as the shell, and still activates", async (_l, page) => {
+    const storage = withNetwork((request) => (request === "./" ? page() : release(request)));
+    storage.seed(`mux-v3:${ROOT_SCOPE}`, [ROOT_SCOPE]);
+    const worker = await startWorker({ storage, stamp: stampFor("bbbbbbbbbbbb") });
+    expect([...storage.stores.keys()]).toEqual([worker.cacheName]);
+    expect(storage.urlsIn(worker.cacheName)).not.toContain(ROOT_SCOPE);
   });
 });
 

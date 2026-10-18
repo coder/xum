@@ -301,8 +301,13 @@ rlm-eval: ## Run the RLM lever eval against a running dev-server sandbox (see sc
 start: node_modules/.installed build-main build-preload build-static ## Build and start Electron app
 	@NODE_ENV=development XUM_PROFILE_REACT=$(XUM_PROFILE_REACT) bunx electron --remote-debugging-port=9222 .
 
+# #6867: the shipped worker must carry a build id, or every release shares one cache again.
+SERVICE_WORKER_STAMP_CHECK = grep -Eq '^const BUILD_ID = "[0-9a-f]{12}";$$' dist/service-worker.js || \
+	{ echo "dist/service-worker.js has no build id (scripts/stamp-service-worker.ts did not run)"; exit 1; }
+
 ## Build targets (can run in parallel)
 build: node_modules/.installed src/version.ts build-renderer build-main build-preload build-icons build-static ## Build all targets
+	@$(SERVICE_WORKER_STAMP_CHECK)
 
 .PHONY: update-models
 update-models: node_modules/.installed ## Fetch latest LiteLLM model data, validate it, update models.json if changed
@@ -371,12 +376,15 @@ build-renderer: node_modules/.installed src/version.ts ## Build renderer process
 	@echo "Building renderer..."
 	@bun x vite build
 	@bun scripts/precompress-static.ts dist
+	@# #6867: one service worker cache per build (needs the built index.html and the .br files).
+	@bun scripts/stamp-service-worker.ts dist
 
 build-static: ## Copy static assets to dist
 	@echo "Copying static assets..."
 	@mkdir -p dist
 	@cp static/splash.html dist/splash.html
-	@cp -r public/* dist/
+	@# Not public/service-worker.js: build-renderer's Vite copy is stamped with the build (#6867).
+	@find public -mindepth 1 -maxdepth 1 ! -name service-worker.js -exec cp -r {} dist/ \;
 	@# Copy TypeScript lib files for PTC runtime type validation (es5 through es2023).
 	@# electron-builder ignores .d.ts files by default and this cannot be overridden:
 	@# https://github.com/electron-userland/electron-builder/issues/5064
@@ -398,6 +406,7 @@ build-static: ## Copy static assets to dist
 build-docker-runtime: build-main build-renderer build-static dist/runtime/server-bundle.js dist/runtime/tokenizer.worker.js dist/runtime/mcpIconDecode.js dist/runtime/analyticsWorker.js dist/static/.copied ## Build Docker runtime artifacts
 
 verify-docker-runtime-artifacts: build-docker-runtime ## Verify required Docker runtime artifacts exist
+	@$(SERVICE_WORKER_STAMP_CHECK)
 	@test -f dist/runtime/server-bundle.js
 	@test -f dist/runtime/tokenizer.worker.js
 	@for e in $(TOKENIZER_ENCODINGS); do \
