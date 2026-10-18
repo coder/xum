@@ -67,7 +67,7 @@ describeIntegration("RemoteRuntime abort stops the remote command (#6923)", () =
     ssh2ConnectionPool.clearAllHealthForTests();
   });
 
-  const cases: Array<[string, (config: SSHServerConfig) => { runtime: Runtime; cwd: string }]> = [
+  const cases: [string, (config: SSHServerConfig) => { runtime: Runtime; cwd: string }][] = [
     [
       "Docker",
       (config) => ({
