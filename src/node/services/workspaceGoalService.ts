@@ -6296,7 +6296,9 @@ export class WorkspaceGoalService {
           await this.appendGoalHistoryEntry(workspaceId, currentActive, "completed");
           nextUpcoming = board.upcoming;
         } else {
-          nextUpcoming = [currentActive, ...board.upcoming];
+          // Re-cost first: promotion re-pins the baseline from the stored cost, so ledger-only
+          // spend since the last normalization would otherwise be forgiven.
+          nextUpcoming = [await this.withLedgerCost(workspaceId, currentActive), ...board.upcoming];
         }
       } else {
         nextUpcoming = board.upcoming;

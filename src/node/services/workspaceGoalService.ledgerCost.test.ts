@@ -310,13 +310,15 @@ describe("WorkspaceGoalService ledger cost", () => {
       streamStartedAtMs: first.createdAtMs + 1,
       streamOriginKind: "goal_continuation",
     });
+    // Headless spend lands after the last accounting: the first goal still owes it.
+    await usage.recordUsage(workspaceId, MODEL, costing(0.25), { skipLastRequestUpdate: true });
     const second = await service.addUpcomingGoal({ workspaceId, objective: "Second" });
     // Promoting the second goal demotes the first; the second spends $2.
     await service.promoteUpcomingGoal(workspaceId, second.goalId);
     await usage.recordUsage(workspaceId, MODEL, costing(2));
     const promotedBack = await service.promoteUpcomingGoal(workspaceId, first.goalId);
-    expect(promotedBack?.costCents).toBe(100);
-    expect((await service.getGoal(workspaceId))?.costCents).toBe(100);
+    expect(promotedBack?.costCents).toBe(125);
+    expect((await service.getGoal(workspaceId))?.costCents).toBe(125);
   });
 
   test("an unreadable attributed child does not rebase the goal downward", async () => {
