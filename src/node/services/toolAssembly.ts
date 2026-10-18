@@ -96,6 +96,12 @@ export interface ApplyToolPolicyAndExperimentsOptions {
   switchableAgentToolPolicies?: ToolPolicy[];
   /** Active agent id, named in the refusal of a disallowed call. */
   activeAgentId?: string;
+  /**
+   * Narrows which tools may run without changing which are advertised, so the tools block (and
+   * the prompt cache) stays the previous turn's: the turn-end todo nudge. A tool this policy
+   * denies keeps its name, description and schema; its execute returns `refusal(name)`.
+   */
+  executionGate?: { policy: ToolPolicy; refusal: (toolName: string) => string };
   /** PTC experiment flags. */
   experiments?: {
     tokenBudget?: boolean;
@@ -134,14 +140,32 @@ export function persistentSandboxMountsEnabled(): boolean {
 }
 
 /** Same name, description and schema; execute refuses before any side effect (#5253). */
-function refuseToolForAgent(name: string, tool: Tool, activeAgentId: string): Tool {
+function refuseTool(tool: Tool, error: string): Tool {
   const refused = cloneToolPreservingDescriptors(tool);
-  refused.execute = () =>
-    Promise.resolve({
-      success: false,
-      error: `Tool '${name}' is not allowed in ${activeAgentId} mode. Switch agents to use it.`,
-    });
+  refused.execute = () => Promise.resolve({ success: false, error });
   return refused;
+}
+
+/**
+ * Applies an execution gate (see ApplyToolPolicyAndExperimentsOptions.executionGate). Like the
+ * #5253 refusals, it runs on every channel: direct calls, the PTC bridge and MCP tools.
+ */
+function applyExecutionGate(
+  tools: Record<string, Tool>,
+  gate: NonNullable<ApplyToolPolicyAndExperimentsOptions["executionGate"]>
+): Record<string, Tool> {
+  const allowed = new Set(applyToolPolicyToNames(Object.keys(tools), gate.policy));
+  return Object.fromEntries(
+    Object.entries(tools).map(([name, tool]) => {
+      // A provider-executed tool (native web_search, web_fetch) has no local execute to
+      // refuse, and removing it would change the tools block. It stays usable: it reads the
+      // web, but cannot run commands or edit files.
+      if (allowed.has(name) || (tool.type === "provider" && tool.execute == null)) {
+        return [name, tool];
+      }
+      return [name, refuseTool(tool, gate.refusal(name))];
+    })
+  );
 }
 
 /**
@@ -173,7 +197,10 @@ function applySwitchableAgentPolicies(
       // memory must not see it: memory stays absent (and so does intuition,
       // which reads memory directly). One cache miss on such a switch.
       if (name === "memory") continue;
-      result[name] = refuseToolForAgent(name, tool, activeAgentId);
+      result[name] = refuseTool(
+        tool,
+        `Tool '${name}' is not allowed in ${activeAgentId} mode. Switch agents to use it.`
+      );
     }
   }
   // Keep the input record's order so the advertised order does not depend on
@@ -184,6 +211,25 @@ function applySwitchableAgentPolicies(
       return tool === undefined ? [] : [[name, tool] as const];
     })
   );
+}
+
+/** The policy step: the advertised tools, then the execution gate's refusals. */
+function applyPolicyStep(
+  tools: Record<string, Tool>,
+  opts: ApplyToolPolicyAndExperimentsOptions
+): Record<string, Tool> {
+  const advertised =
+    opts.switchableAgentToolPolicies === undefined
+      ? applyToolPolicy(tools, opts.effectiveToolPolicy)
+      : applySwitchableAgentPolicies(
+          tools,
+          opts.effectiveToolPolicy,
+          opts.switchableAgentToolPolicies,
+          opts.activeAgentId ?? "the current"
+        );
+  return opts.executionGate === undefined
+    ? advertised
+    : applyExecutionGate(advertised, opts.executionGate);
 }
 
 /**
@@ -205,15 +251,7 @@ export async function applyToolPolicyAndExperiments(
 ): Promise<Record<string, Tool>> {
   const { allTools, extraTools, effectiveToolPolicy, experiments, emitNestedToolEvent, sandbox } =
     opts;
-  const applyPolicy = (tools: Record<string, Tool>): Record<string, Tool> =>
-    opts.switchableAgentToolPolicies === undefined
-      ? applyToolPolicy(tools, effectiveToolPolicy)
-      : applySwitchableAgentPolicies(
-          tools,
-          effectiveToolPolicy,
-          opts.switchableAgentToolPolicies,
-          opts.activeAgentId ?? "the current"
-        );
+  const applyPolicy = (tools: Record<string, Tool>) => applyPolicyStep(tools, opts);
 
   // Merge in extra tools (e.g., CLI-specific tools like set_exit_code).
   // These bypass policy filtering since they're injected by the runtime, not user config.

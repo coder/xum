@@ -12,11 +12,67 @@ export { TODO_TURN_END_NUDGE };
 /**
  * The tool policy of a nudge-only continuation: todo_write and nothing else, so the extra turn
  * cannot run commands or edit files. Appended to the agent's policy, it only disables: it never
- * enables a tool, so an agent that denies todo_write keeps that deny.
+ * enables a tool, so an agent that denies todo_write keeps that deny. The request builder
+ * enforces it at execution, not by hiding tools (see splitTodoTurnEndNudgePolicy).
  */
 export const TODO_TURN_END_NUDGE_TOOL_POLICY: ToolPolicy = [
   { regex_match: "(?!todo_write$).*", action: "disable" },
 ];
+
+/**
+ * The nudge's rules as an execution gate (see applyToolPolicyAndExperiments): every tool the
+ * turn before advertised stays advertised, and each one but todo_write returns this refusal.
+ */
+export const TODO_TURN_END_NUDGE_EXECUTION_GATE = {
+  policy: TODO_TURN_END_NUDGE_TOOL_POLICY,
+  refusal: (toolName: string) =>
+    `Tool '${toolName}' is not allowed in the turn-end todo nudge. Only todo_write runs in this turn.`,
+};
+
+/** A caller tool policy split for the request builder (see splitTodoTurnEndNudgePolicy). */
+export interface TodoTurnEndNudgeSplit {
+  /** The caller policy the turn's tools are advertised under. */
+  callerToolPolicy: ToolPolicy | undefined;
+  /** Set on a nudge turn: tool assembly refuses, at execution, what the gate denies. */
+  executionGate: typeof TODO_TURN_END_NUDGE_EXECUTION_GATE | undefined;
+}
+
+/**
+ * Splits the nudge's trailing rules off a caller tool policy. Advertising only todo_write
+ * changed the tools block, which sits first in the Anthropic prompt cache, so each nudge
+ * rewrote the whole cached history twice (once for the nudge, once for the next turn). The
+ * request builder now advertises the tools under the rest of the policy and enforces the nudge
+ * rules at execution. The rules stay in the persisted policy, so a retried, restarted or
+ * compacted nudge (and an older Xum) still narrows.
+ */
+export function splitTodoTurnEndNudgePolicy(policy: ToolPolicy | undefined): TodoTurnEndNudgeSplit {
+  const ruleCount = TODO_TURN_END_NUDGE_TOOL_POLICY.length;
+  const isNudgeTail =
+    policy != null &&
+    policy.length >= ruleCount &&
+    policy
+      .slice(-ruleCount)
+      .every(
+        (rule, index) =>
+          rule.regex_match === TODO_TURN_END_NUDGE_TOOL_POLICY[index].regex_match &&
+          rule.action === TODO_TURN_END_NUDGE_TOOL_POLICY[index].action
+      );
+  if (!isNudgeTail) return { callerToolPolicy: policy, executionGate: undefined };
+  const rest = policy.slice(0, -ruleCount);
+  return {
+    // mergeTurnStopContinuation appends to `callerToolPolicy ?? []`: an empty rest was no policy.
+    callerToolPolicy: rest.length > 0 ? rest : undefined,
+    executionGate: TODO_TURN_END_NUDGE_EXECUTION_GATE,
+  };
+}
+
+/** The policy that decides what may run: the advertised policy plus the gate's rules. */
+export function withExecutionGate(
+  policy: ToolPolicy | undefined,
+  gate: TodoTurnEndNudgeSplit["executionGate"]
+): ToolPolicy | undefined {
+  return gate == null ? policy : [...(policy ?? []), ...gate.policy];
+}
 
 /** A todo_write call that ran and succeeded; a refused or failed call is not a list write. */
 function isSuccessfulTodoWrite(call: { toolName: string; state: string; output?: unknown }) {

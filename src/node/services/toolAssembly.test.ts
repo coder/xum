@@ -10,6 +10,7 @@ import { z } from "zod";
 import type { Tool } from "ai";
 
 import { applyToolPolicyAndExperiments } from "./toolAssembly";
+import { TODO_TURN_END_NUDGE_EXECUTION_GATE } from "./agentNotifications/todoTurnEndNudge";
 import { buildToolsetManifest } from "./turnEnvelope";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -401,6 +402,53 @@ describe("one tool set across agent-mode switches (#5253)", () => {
       error: "Tool 'mutate' is not allowed in plan mode. Switch agents to use it.",
     });
     expect(calls).toEqual([]);
+  });
+});
+
+describe("turn-end todo nudge execution gate", () => {
+  test("keeps the advertised tools and refuses every call but todo_write, nested ones too", async () => {
+    const calls: string[] = [];
+    const recordingTool = (name: string): Tool =>
+      ({
+        description: name,
+        inputSchema: z.object({}),
+        execute: () => {
+          calls.push(name);
+          return Promise.resolve({ success: true });
+        },
+      }) as unknown as Tool;
+    const allTools: Record<string, Tool> = {
+      mutate: recordingTool("mutate"),
+      todo_write: recordingTool("todo_write"),
+      native_search: { type: "provider", id: "test.search", args: {} } as unknown as Tool,
+    };
+    const assemble = (executionGate?: typeof TODO_TURN_END_NUDGE_EXECUTION_GATE) =>
+      applyToolPolicyAndExperiments({
+        allTools,
+        effectiveToolPolicy: undefined,
+        experiments: { programmaticToolCalling: true },
+        emitNestedToolEvent: () => undefined,
+        executionGate,
+      });
+    const turn = await assemble();
+    const nudge = await assemble(TODO_TURN_END_NUDGE_EXECUTION_GATE);
+    const shape = (tools: Record<string, Tool>) =>
+      JSON.stringify(Object.entries(tools).map(([name, tool]) => [name, tool.description]));
+    expect(shape(nudge)).toBe(shape(turn));
+    // mutate is bridged into code_execution; todo_write stays direct.
+    expect(Object.keys(nudge).sort()).toEqual(["code_execution", "native_search", "todo_write"]);
+
+    const callOptions = { toolCallId: "test-call-id", messages: [], context: undefined };
+    const nested = (await nudge.code_execution.execute!(
+      { code: "return mux.mutate({});" },
+      callOptions
+    )) as { result?: unknown };
+    expect(nested.result).toEqual({
+      success: false,
+      error: TODO_TURN_END_NUDGE_EXECUTION_GATE.refusal("mutate"),
+    });
+    expect(await nudge.todo_write.execute!({}, callOptions)).toEqual({ success: true });
+    expect(calls).toEqual(["todo_write"]);
   });
 });
 

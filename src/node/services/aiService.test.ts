@@ -16,7 +16,11 @@ import {
   ProviderModelFactory,
 } from "./providerModelFactory";
 import { createTestHistoryService } from "./testHistoryService";
-import { buildRequiredToolPatterns } from "@/common/utils/tools/toolPolicy";
+import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import {
+  mergeTurnStopContinuation,
+  TODO_TURN_END_NUDGE_EXECUTION_GATE,
+} from "@/node/services/agentNotifications/todoTurnEndNudge";
 import { HistoryService } from "./historyService";
 import { CompactionCancellation } from "./compactionCancellation";
 import { InitStateManager } from "./initStateManager";
@@ -4110,6 +4114,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       toolSearch?: boolean;
       failedMcpServers?: string[];
       agentId?: string;
+      toolPolicy?: ToolPolicy;
       // Earlier turns, sent before the latest user message.
       history?: MuxMessage[];
     }
@@ -4211,6 +4216,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           modelString: KNOWN_MODELS.SONNET.id,
           thinkingLevel: "off",
           agentId: state.agentId ?? "exec",
+          toolPolicy: state.toolPolicy,
           contextBudgetRolloverAvailable: state.rolloverAvailable === true,
           workspaceGoalService: goalService,
         });
@@ -4311,6 +4317,55 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       // Expected difference until #5292: the system prompt still carries the
       // active agent's instructions. Flip this once #5292 lands.
       expect(stableSystemRow(plan)).not.toBe(stableSystemRow(exec));
+    });
+
+    // The nudge used to advertise only todo_write, so each nudge rewrote the
+    // whole cached history twice: once for itself, once for the next turn.
+    it("keeps the request prefix on a turn-end todo nudge and runs only todo_write", async () => {
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      // The policy AgentSession queues the nudge with.
+      const nudge = mergeTurnStopContinuation({
+        hookPrompt: null,
+        todoNudge: true,
+        callerToolPolicy: undefined,
+      });
+      const {
+        requests: [turn, nudgeTurn],
+      } = await streamPair(xumHome.path, [{}, { toolPolicy: nudge?.optionOverrides?.toolPolicy }]);
+      expect(breakpointTools(turn)).toHaveLength(1);
+      expect(toolBlock(nudgeTurn)).toBe(toolBlock(turn));
+      expect(stableSystemRow(nudgeTurn)).toBe(stableSystemRow(turn));
+      expect(systemTail(nudgeTurn)).toBe(systemTail(turn));
+      expect(JSON.stringify(nudgeTurn.providerOptions)).toBe(JSON.stringify(turn.providerOptions));
+      expect(nudgeTurn.forcedFirstStepToolNames).toBeUndefined();
+
+      // Built-in, memory and MCP tools refuse before any side effect.
+      const callOptions = { toolCallId: "call-1", messages: [], context: undefined };
+      const target = path.join(xumHome.path, "project", "created-by-nudge.txt");
+      const nudgeTools = nudgeTurn.tools ?? {};
+      for (const [name, input] of [
+        ["bash", { script: `touch ${target}`, timeout_secs: 5, display_name: "t" }],
+        [
+          "file_edit_insert",
+          { path: target, content: "x", insert_after: null, insert_before: null },
+        ],
+        ["memory", { command: "view", path: "/memories/global/" }],
+        ["alpha_lookup", {}],
+      ] as const) {
+        expect(await nudgeTools[name].execute!(input, callOptions)).toEqual({
+          success: false,
+          error: TODO_TURN_END_NUDGE_EXECUTION_GATE.refusal(name),
+        });
+      }
+      expect(await fs.stat(target).catch(() => null)).toBeNull();
+      // Native web search runs on the provider: it stays (it cannot run commands or edit files).
+      expect(nudgeTools.web_search?.type).toBe("provider");
+      expect(
+        await nudgeTools.todo_write.execute!(
+          { todos: [{ content: "Verify the fix", status: "in_progress" }] },
+          callOptions
+        )
+      ).toMatchObject({ success: true });
     });
 
     // Native deferred loading (#5262, #5297): a search loads a tool through a

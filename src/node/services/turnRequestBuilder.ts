@@ -230,6 +230,10 @@ import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import { getAnthropicCacheTtl, supportsAnthropicCache } from "@/common/utils/ai/cacheStrategy";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
+import {
+  splitTodoTurnEndNudgePolicy,
+  withExecutionGate,
+} from "./agentNotifications/todoTurnEndNudge";
 import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
 import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
 import {
@@ -1854,6 +1858,7 @@ export class TurnRequestBuilder {
     // One cache per request: resolution, plan handoff, prompt body, and
     // sub-agent discovery share definition reads; the next turn starts fresh.
     const agentDefinitionCache = new AgentDefinitionRequestCache();
+    const todoNudge = splitTodoTurnEndNudgePolicy(toolPolicy);
     const resolveAgentForStreamStartedAt = Date.now();
     const agentResult = await resolveAgentForStream({
       workspaceId,
@@ -1865,7 +1870,8 @@ export class TurnRequestBuilder {
       // Goal kind survives retries, restart resumes and compaction follow-ups (#5402).
       automaticGoalTurn: goalTurnKind != null,
       disableWorkspaceAgents: disableWorkspaceAgents ?? false,
-      callerToolPolicy: toolPolicy,
+      // The turn-end todo nudge advertises the turn's tools and refuses them at execution.
+      callerToolPolicy: todoNudge.callerToolPolicy,
       cfg,
       emitError: (event) => {
         if (!context.admissionOnly) this.dependencies.emit("error", event);
@@ -1894,9 +1900,12 @@ export class TurnRequestBuilder {
     } = agentResult.data;
     // Side conversations must not inherit completion requirements for work in the main chat.
     // Grants cap the tools; keep normal enable/disable policy but never require recovery calls.
-    const effectiveToolPolicy = isSideChat
+    // What the model is offered. Everything that decides what may run uses
+    // effectiveToolPolicy, which adds a nudge turn's rules back.
+    const advertisedToolPolicy = isSideChat
       ? agentToolPolicy?.filter((rule) => rule.action !== "require")
       : agentToolPolicy;
+    const effectiveToolPolicy = withExecutionGate(advertisedToolPolicy, todoNudge.executionGate);
     const switchableAgents = isSideChat
       ? resolvedSwitchableAgents?.map((agent) => ({
           ...agent,
@@ -2959,9 +2968,10 @@ export class TurnRequestBuilder {
           ),
           // Runtime extras may shadow a granted built-in name with arbitrary execution.
           extraTools: isSideChat ? undefined : this.dependencies.bindings.extraTools,
-          effectiveToolPolicy,
+          effectiveToolPolicy: advertisedToolPolicy,
           switchableAgentToolPolicies: switchableAgents?.map((agent) => agent.toolPolicy),
           activeAgentId: effectiveAgentId,
+          executionGate: todoNudge.executionGate,
           // Side chats expose granted reads directly, not an executable PTC/RLM bridge.
           experiments: isSideChat
             ? { ...experiments, programmaticToolCalling: false, rlm: false }
@@ -2985,11 +2995,12 @@ export class TurnRequestBuilder {
         if (attemptTools.memory === undefined) delete attemptTools.intuition;
         // #5253: the advertised union can hold refusal stubs, so presence no
         // longer means the ACTIVE agent may use a tool; guidance follows the
-        // active policy.
+        // active policy. A nudge turn keeps the turn's guidance, so its system
+        // prompt stays the cached one.
         const activeAgentAllows = (name: string): boolean =>
           attemptTools[name] !== undefined &&
           (switchableAgents === undefined ||
-            applyToolPolicyToNames([name], effectiveToolPolicy).length > 0);
+            applyToolPolicyToNames([name], advertisedToolPolicy).length > 0);
 
         // Same predicate and model as the tools cache breakpoint
         // (applyCacheControlToTools), so "caches the tools block" and "keeps the
@@ -3002,7 +3013,7 @@ export class TurnRequestBuilder {
         // #5253: classify by every switchable agent's require rules, like PTC
         // promotion, so a tool required in one mode is not deferred in another.
         const toolSearchPolicy =
-          switchableAgents?.flatMap((agent) => agent.toolPolicy) ?? effectiveToolPolicy;
+          switchableAgents?.flatMap((agent) => agent.toolPolicy) ?? advertisedToolPolicy;
         const toolSearchPromptCacheActive =
           supportsAnthropicCache(seed.rawModelString, seed.providersConfig) &&
           effectiveMuxProviderOptions.anthropic?.disableBetaFeatures !== true &&
