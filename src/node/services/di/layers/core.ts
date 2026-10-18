@@ -550,7 +550,6 @@ export const CoreWiringLive: Layer.Layer<
     const secretsStore = yield* SecretsStoreTag;
     const extensionMetadata = yield* ExtensionMetadata;
     const workspaceGoalService = yield* WorkspaceGoal;
-    const sessionUsageService = yield* SessionUsage;
     const workspaceMcpOverridesService = yield* WorkspaceMcpOverrides;
     const turnRequestBuilderBindings = yield* TurnRequestBuilderBindingsTag;
     const streamManager = yield* StreamManagerTag;
@@ -572,11 +571,6 @@ export const CoreWiringLive: Layer.Layer<
     // every persisted entry carries an inline id); only id-less legacy entries
     // require the authoritative enumeration. Throws propagate: unknowable
     // registration keeps the tombstone.
-    // A turn killed by a restart never reaches stream end, where the goal is charged.
-    sessionUsageService.setKilledStreamUsageListener((event) =>
-      workspaceGoalService.chargeKilledStreamUsage(event)
-    );
-
     extensionMetadata.setRegistrationProbe(async (workspaceId) => {
       const evidence = config.readPersistedWorkspaceIdEvidence();
       if (evidence.ids.has(workspaceId)) {
