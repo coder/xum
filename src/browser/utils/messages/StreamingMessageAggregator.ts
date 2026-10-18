@@ -600,6 +600,18 @@ function foldAgentPeerTriggers(messages: DisplayedMessage[]): DisplayedMessage[]
   );
 }
 
+/** Throttle window for init-output cache invalidation (see initOutputThrottleTimer). */
+const INIT_OUTPUT_THROTTLE_MS = 100;
+
+/** Tools whose replayed outputs feed aggregator derived state (see processToolResult). */
+const DERIVED_STATE_TOOL_NAMES = new Set([
+  "todo_write",
+  "propose_plan",
+  "status_set",
+  "agent_skill_read",
+  "review_pane_update",
+]);
+
 export class StreamingMessageAggregator {
   private messages = new Map<string, MuxMessage>();
   private activeStreams = new Map<string, StreamingContext>();
@@ -744,7 +756,6 @@ export class StreamingMessageAggregator {
 
   // Throttle init-output cache invalidation to avoid re-render per line during fast streaming
   private initOutputThrottleTimer: ReturnType<typeof setTimeout> | null = null;
-  private static readonly INIT_OUTPUT_THROTTLE_MS = 100;
 
   // Track when we're waiting for stream-start after user message
   // Prevents retry barrier flash during normal send flow
@@ -1374,15 +1385,6 @@ export class StreamingMessageAggregator {
     }
   }
 
-  /** Tools whose replayed outputs feed aggregator derived state (see processToolResult). */
-  private static readonly DERIVED_STATE_TOOL_NAMES = new Set([
-    "todo_write",
-    "propose_plan",
-    "status_set",
-    "agent_skill_read",
-    "review_pane_update",
-  ]);
-
   private messageContributesDerivedState(message: MuxMessage): boolean {
     if (message.metadata?.agentSkillSnapshot != null) {
       return true;
@@ -1391,7 +1393,7 @@ export class StreamingMessageAggregator {
       (part) =>
         isDynamicToolPart(part) &&
         part.state === "output-available" &&
-        StreamingMessageAggregator.DERIVED_STATE_TOOL_NAMES.has(part.toolName)
+        DERIVED_STATE_TOOL_NAMES.has(part.toolName)
     );
   }
 
@@ -3236,7 +3238,7 @@ export class StreamingMessageAggregator {
       // Throttle cache invalidation during fast streaming to avoid re-render per line.
       this.initOutputThrottleTimer ??= setTimeout(
         () => this.flushPendingInitOutput(),
-        StreamingMessageAggregator.INIT_OUTPUT_THROTTLE_MS
+        INIT_OUTPUT_THROTTLE_MS
       );
       return true;
     }
@@ -3246,7 +3248,7 @@ export class StreamingMessageAggregator {
         this.initState.progress = { label: data.label, percent: data.percent };
         this.initOutputThrottleTimer ??= setTimeout(
           () => this.flushPendingInitOutput(),
-          StreamingMessageAggregator.INIT_OUTPUT_THROTTLE_MS
+          INIT_OUTPUT_THROTTLE_MS
         );
       }
       return true;

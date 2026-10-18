@@ -7,7 +7,7 @@ import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
 import type { DraftAttachment, DraftScope } from "@/common/orpc/schemas/drafts";
-import { DraftService } from "./draftService";
+import { DRAFT_CHANGE_EVENT, DraftService } from "./draftService";
 
 const WORKSPACE_ID = "draft-ws";
 const WORKSPACE_SCOPE: DraftScope = { kind: "workspace", workspaceId: WORKSPACE_ID };
@@ -240,7 +240,7 @@ describe("DraftService", () => {
     const service = new DraftService(config);
     await service.update({ scope: WORKSPACE_SCOPE, text: "old" });
     const changed: string[] = [];
-    service.on(DraftService.CHANGE_EVENT, (event: { type: string; text?: string }) => {
+    service.on(DRAFT_CHANGE_EVENT, (event: { type: string; text?: string }) => {
       if (event.type === "changed" && event.text !== undefined) changed.push(event.text);
     });
 

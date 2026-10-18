@@ -484,10 +484,17 @@ function normalizeBackupSettings(settings: SettingsBackupInput): SettingsBackupI
   return parsed.data;
 }
 
-export class BackupService {
-  /** Keeps quick switches among recent repository settings from forcing a fresh clone. */
-  static readonly RETAINED_INACTIVE_CACHES = 2;
+/** Keeps quick switches among recent repository settings from forcing a fresh clone. */
+const RETAINED_INACTIVE_CACHES = 2;
 
+/**
+ * A snapshot is an unredacted copy of the whole local payload, and one is kept per restore as
+ * its only recovery path, so they would otherwise grow without limit. Older ones are dropped
+ * once this many newer released recovery points exist.
+ */
+export const RETAINED_SNAPSHOTS = 3;
+
+export class BackupService {
   private readonly locks = new MutexMap<string>();
 
   /**
@@ -1384,7 +1391,7 @@ export class BackupService {
     }
     inactive.sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name));
 
-    const stale = inactive.slice(BackupService.RETAINED_INACTIVE_CACHES);
+    const stale = inactive.slice(RETAINED_INACTIVE_CACHES);
     for (const cache of stale) {
       await discardInactiveCache(cache.cachePath).catch(() => undefined);
     }
@@ -1450,13 +1457,6 @@ export class BackupService {
     return persisted;
   }
 
-  /**
-   * A snapshot is an unredacted copy of the whole local payload, and one is kept per restore as
-   * its only recovery path, so they would otherwise grow without limit. Older ones are dropped
-   * once this many newer released recovery points exist.
-   */
-  static readonly RETAINED_SNAPSHOTS = 3;
-
   private async reapOldSnapshots(cacheRoot: string, keepFrom: string): Promise<void> {
     const entries = await fs.readdir(cacheRoot, { withFileTypes: true }).catch(() => []);
     const released = new Set(
@@ -1474,7 +1474,7 @@ export class BackupService {
       .map((entry) => entry.name)
       .filter((name) => name !== keepName && released.has(name))
       .sort((a, b) => (snapshotOrder(a) < snapshotOrder(b) ? 1 : -1));
-    for (const stale of reapable.slice(BackupService.RETAINED_SNAPSHOTS - 1)) {
+    for (const stale of reapable.slice(RETAINED_SNAPSHOTS - 1)) {
       // Per entry, because one snapshot nobody can delete must not stop the rest from being
       // reclaimed, and the restore it belongs to has already returned either way.
       await fs

@@ -12,7 +12,7 @@ import type { FilePart } from "@/common/orpc/types";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { Config } from "@/node/config";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
-import { DraftService } from "@/node/services/draftService";
+import { DRAFT_CHANGE_EVENT, DraftService } from "@/node/services/draftService";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { resolveDraftSends } from "@/node/services/draftSendResolution";
 import type { WorkspaceService } from "@/node/services/workspaceService";
@@ -136,7 +136,7 @@ async function createHarness(tempDir: TestTempDir) {
         queue.push(event);
         wake?.();
       };
-      service.on(DraftService.CHANGE_EVENT, listener);
+      service.on(DRAFT_CHANGE_EVENT, listener);
       queue.unshift(await service.getSnapshotEvent());
       return (async function* () {
         try {
@@ -153,7 +153,7 @@ async function createHarness(tempDir: TestTempDir) {
             });
           }
         } finally {
-          service.off(DraftService.CHANGE_EVENT, listener);
+          service.off(DRAFT_CHANGE_EVENT, listener);
         }
       })();
     },

@@ -296,9 +296,9 @@ function validPendingSends(raw: unknown, draft: Draft, filePath: string): Pendin
 /** Thrown for a scope whose id would resolve outside its storage dir. */
 class InvalidDraftScopeError extends Error {}
 
-export class DraftService extends EventEmitter {
-  static readonly CHANGE_EVENT = "change";
+export const DRAFT_CHANGE_EVENT = "change";
 
+export class DraftService extends EventEmitter {
   private readonly config: Config;
   readonly creation: CreationDraftService;
   /**
@@ -732,7 +732,7 @@ export class DraftService extends EventEmitter {
       const revision = this.bumpRevision(key);
       this.index.delete(key);
       const event: DraftEvent = { type: "deleted", scope, revision };
-      this.emit(DraftService.CHANGE_EVENT, event);
+      this.emit(DRAFT_CHANGE_EVENT, event);
       return revision;
     }
     const file = { version: DRAFT_FILE_VERSION };
@@ -752,7 +752,7 @@ export class DraftService extends EventEmitter {
           const summary = summarizeDraft(scope, viewOf(draft), revision, pendingSends);
           this.index.set(key, { summary, filePath });
           const event: DraftEvent = { type: "changed", ...summary };
-          this.emit(DraftService.CHANGE_EVENT, event);
+          this.emit(DRAFT_CHANGE_EVENT, event);
         },
       }
     );

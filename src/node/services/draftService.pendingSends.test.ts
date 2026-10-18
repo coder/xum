@@ -14,7 +14,7 @@ import type {
   DraftScope,
   PendingSend,
 } from "@/common/orpc/schemas/drafts";
-import { DraftService } from "./draftService";
+import { DRAFT_CHANGE_EVENT, DraftService } from "./draftService";
 import { resolveDraftSends } from "./draftSendResolution";
 import type { WorkspaceService } from "./workspaceService";
 
@@ -35,7 +35,7 @@ async function createHarness(tempDir: TestTempDir) {
   const file = path.join(config.sessionsDir, WORKSPACE_ID, "draft.json");
   const service = new DraftService(config);
   const events: DraftEvent[] = [];
-  service.on(DraftService.CHANGE_EVENT, (event: DraftEvent) => events.push(event));
+  service.on(DRAFT_CHANGE_EVENT, (event: DraftEvent) => events.push(event));
   return { config, file, service, events };
 }
 

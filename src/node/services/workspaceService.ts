@@ -2593,6 +2593,8 @@ function finalizeAskUserQuestionMessage(
   });
 }
 
+const EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP = 1024;
+
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class WorkspaceService
   extends EventEmitter
@@ -11816,8 +11818,6 @@ export class WorkspaceService
    */
   private readonly externalEditorRollbackTombstones = new Map<string, string>();
 
-  private static readonly EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP = 1024;
-
   /**
    * Record that the user is opening this workspace in an external editor. Refuses while an
    * agent-driven archive is gating the workspace: the check shares the synchronous block with
@@ -11872,10 +11872,7 @@ export class WorkspaceService
       // (see externalEditorRollbackTombstones). Already-redeemed or never-recorded tokens
       // leave an unredeemable tombstone the FIFO cap eventually evicts.
       this.externalEditorRollbackTombstones.set(launchToken, workspaceId);
-      if (
-        this.externalEditorRollbackTombstones.size >
-        WorkspaceService.EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP
-      ) {
+      if (this.externalEditorRollbackTombstones.size > EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP) {
         const oldest = this.externalEditorRollbackTombstones.keys().next().value;
         if (oldest != null) {
           this.externalEditorRollbackTombstones.delete(oldest);

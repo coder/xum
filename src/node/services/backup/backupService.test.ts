@@ -17,6 +17,7 @@ import {
   type BackupProjectImporter,
   type BackupProjectRegistrar,
   BackupServiceError,
+  RETAINED_SNAPSHOTS,
   type BackupGitRepo,
   type BackupPayloadStore,
   type PreparedBackupRepository,
@@ -253,7 +254,7 @@ describe("BackupService", () => {
     if (!first.success) throw new Error(first.error.message);
     // The path handed to the caller has to stay readable for as many later restores as the
     // retention promises, which is what makes it usable after the call returns.
-    for (let later = 0; later < BackupService.RETAINED_SNAPSHOTS - 1; later++) {
+    for (let later = 0; later < RETAINED_SNAPSHOTS - 1; later++) {
       const next = await service.restore(SETTINGS);
       if (!next.success) throw new Error(next.error.message);
       expect(await fs.readFile(path.join(first.data.snapshotPath, "AGENTS.md"), "utf8")).toBe(

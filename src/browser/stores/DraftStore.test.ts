@@ -9,7 +9,7 @@ import { DRAFT_STORE_READY_TIMEOUT_MS, MAX_DRAFT_JSON_BYTES } from "@/constants/
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { Config } from "@/node/config";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
-import { DraftService } from "@/node/services/draftService";
+import { DRAFT_CHANGE_EVENT, DraftService } from "@/node/services/draftService";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { installDom } from "../../../tests/ui/dom";
@@ -100,7 +100,7 @@ function createClient(service: DraftService) {
         queue.push(event);
         wake?.();
       };
-      service.on(DraftService.CHANGE_EVENT, listener);
+      service.on(DRAFT_CHANGE_EVENT, listener);
       queue.unshift(await service.getSnapshotEvent());
       return (async function* () {
         try {
@@ -118,7 +118,7 @@ function createClient(service: DraftService) {
             });
           }
         } finally {
-          service.off(DraftService.CHANGE_EVENT, listener);
+          service.off(DRAFT_CHANGE_EVENT, listener);
         }
       })();
     },
