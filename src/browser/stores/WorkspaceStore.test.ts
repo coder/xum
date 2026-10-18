@@ -1756,6 +1756,27 @@ describe("WorkspaceStore", () => {
       }
     );
 
+    it("shows a replayed stream-start as interruptible before caught-up", async () => {
+      // The buffered replay is the only stream signal here: no activity snapshot, and the
+      // aggregator applies nothing until caught-up.
+      const workspaceId = "workspace-buffered-stream-start";
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+      await send({
+        type: "stream-start",
+        workspaceId,
+        messageId: "msg-replayed",
+        historySequence: 1,
+        model: "openai:gpt-4o-mini",
+        startTime: 1_000,
+      });
+
+      const state = store.getWorkspaceState(workspaceId);
+      expect(state.isTranscriptCaughtUp).toBe(false);
+      expect(state.canInterrupt).toBe(true);
+      expect(state.currentModel).toBe("openai:gpt-4o-mini");
+    });
+
     it("keeps transcript hydration active across full replay resets", async () => {
       const workspaceId = "workspace-full-replay-hydration";
 
