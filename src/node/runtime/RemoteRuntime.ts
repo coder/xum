@@ -290,7 +290,8 @@ export abstract class RemoteRuntime implements Runtime {
 
     // Convert Node.js streams to Web Streams. Not Readable.toWeb: on Bun 1.4.3 it can throw an
     // uncaught error when the bash tool cancels a reader on output overflow (nodeReadableToWeb).
-    assert(childProcess.stdout && childProcess.stderr, "spawned with piped stdout and stderr");
+    assert(childProcess.stdout, "spawned with piped stdout");
+    assert(childProcess.stderr, "spawned with piped stderr");
     const stdout = nodeReadableToWeb(childProcess.stdout);
     const stderr = nodeReadableToWeb(childProcess.stderr);
 
