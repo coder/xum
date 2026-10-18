@@ -304,40 +304,34 @@ describe("composer during an unsettled send (#6259)", () => {
     }
   }, 120_000);
 
-  // Several keys can come before their caret moves run. An older caret move that runs between two
-  // keys must not move the cursor back for the next key.
-  test("an older Vim caret move does not undo a newer one", async () => {
-    const app = await createAppHarness({ branchPrefix: "composer-vim-caret-order" });
-    const realSetTimeout = globalThis.setTimeout;
-    let held: (() => void)[] | null = null;
-    const spy = jest.spyOn(globalThis, "setTimeout").mockImplementation(((
-      callback: () => void,
-      delay?: number
-    ) => {
-      if (held !== null && (delay ?? 0) === 0) {
-        held.push(callback);
-        return 0;
-      }
-      return realSetTimeout(callback, delay);
-    }) as typeof setTimeout);
+  // A caret the browser moves itself (Home, arrows, a click) is the cursor for the next Vim key.
+  test("a Vim key after a native caret move starts from that caret", async () => {
+    const app = await createAppHarness({ branchPrefix: "composer-vim-native-caret" });
     try {
       act(() => updateUserPreferences({ appearance: { vimEnabled: true } }));
       await waitFor(() => expect(getUserPreferences().appearance?.vimEnabled).toBe(true), WAIT);
       await app.chat.typeWithoutSending("abc");
-      held = [];
-      pressVimKeys(app, ["Escape"]);
-      const afterEscape = held;
-      held = [];
-      pressVimKeys(app, ["h"]);
-      const afterH = held;
-      held = null;
-      // Escape's caret move runs, then `x` comes before the move of `h`.
-      act(() => afterEscape.forEach((run) => run()));
-      pressVimKeys(app, ["x"]);
-      act(() => afterH.forEach((run) => run()));
+      pressVimKeys(app, ["Escape", "i"]);
+      // Home in insert mode: the browser moves the caret to the start of the line.
+      composer(app).setSelectionRange(0, 0);
+      pressVimKeys(app, ["Escape", "x"]);
+      expect(composer(app).value).toBe("bc");
+    } finally {
+      act(() => updateUserPreferences({ appearance: { vimEnabled: false } }));
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // Each key moves the DOM caret before the next one: a fast `h` then `x` deletes "b".
+  test("fast Vim keys each start from the previous key's cursor", async () => {
+    const app = await createAppHarness({ branchPrefix: "composer-vim-caret-order" });
+    try {
+      act(() => updateUserPreferences({ appearance: { vimEnabled: true } }));
+      await waitFor(() => expect(getUserPreferences().appearance?.vimEnabled).toBe(true), WAIT);
+      await app.chat.typeWithoutSending("abc");
+      pressVimKeys(app, ["Escape", "h", "x"]);
       expect(composer(app).value).toBe("ac");
     } finally {
-      spy.mockRestore();
       act(() => updateUserPreferences({ appearance: { vimEnabled: false } }));
       await app.dispose();
     }

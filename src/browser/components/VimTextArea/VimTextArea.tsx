@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useAutoResizeTextarea } from "@/browser/hooks/useAutoResizeTextarea";
 import * as vim from "@/browser/utils/vim";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
@@ -96,11 +96,10 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
     const insertStartSnapshotRef = useRef<vim.VimHistorySnapshot | null>(null);
     const lastEditRef = useRef<vim.LastEdit | null>(null);
     const cursorRef = useRef<number>(0);
-    // #6866: the DOM caret moves to the Vim cursor in a timeout after each handled key. Until the
-    // newest move runs, the next key must read the cursor from cursorRef, not from the DOM
-    // selection. Each move carries its generation: an older one that runs late does nothing.
-    const selectionGenerationRef = useRef(0);
-    const selectionPendingRef = useRef(false);
+    // #6866: the DOM caret must reach the Vim cursor before the next key, which reads it. A key that
+    // changed the text moves it once the new value is rendered (the layout effect below); the
+    // value write puts the caret at the end. A timeout here let fast keys read a stale caret.
+    const pendingSelectionRef = useRef<{ text: string; state: vim.VimState } | null>(null);
 
     useAutoResizeTextarea(textareaRef, value, 50, rest.className);
 
@@ -112,14 +111,8 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
       return { start: el.selectionStart, end: el.selectionEnd };
     };
 
-    const applyDomSelection = (
-      next: Pick<vim.VimState, "cursor" | "mode" | "visualAnchor">,
-      generation: number
-    ) => {
-      if (generation !== selectionGenerationRef.current) return;
-      selectionPendingRef.current = false;
+    const applyDomSelection = (next: Pick<vim.VimState, "cursor" | "mode" | "visualAnchor">) => {
       const el = textareaRef.current;
-      // Unmounted before the timeout ran.
       if (!el) return;
       const domText = el.value;
       const clamp = (pos: number) => Math.max(0, Math.min(domText.length, pos));
@@ -177,7 +170,6 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
         text: value,
         domCursor: withSelection().start,
         vimCursor: cursorRef.current,
-        selectionPending: selectionPendingRef.current,
       });
 
       // Keep the cursor ref in sync for mode transitions (normal -> visual, etc.).
@@ -261,11 +253,19 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
         setPending(newState.pending);
       }
 
-      // Apply DOM selection after React state updates (important for mode transitions)
-      selectionPendingRef.current = true;
-      const generation = ++selectionGenerationRef.current;
-      setTimeout(() => applyDomSelection(newState, generation), 0);
+      // Move the DOM caret now, or once the changed text is rendered (see pendingSelectionRef).
+      if (newState.text === value) applyDomSelection(newState);
+      else pendingSelectionRef.current = { text: newState.text, state: newState };
     };
+
+    // Runs after every commit, before the browser handles the next key. Only for the text the key
+    // produced: a parent that rewrote or refused it leaves the caret where the browser put it.
+    useLayoutEffect(() => {
+      const pendingSelection = pendingSelectionRef.current;
+      if (pendingSelection === null) return;
+      pendingSelectionRef.current = null;
+      if (pendingSelection.text === value) applyDomSelection(pendingSelection.state);
+    });
 
     const textareaStyle: React.CSSProperties = {
       // Mirror textarea defaults in inline styles so ghost hint overlay can reuse exact metrics.
@@ -295,13 +295,9 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
           <textarea
             ref={textareaRef}
             value={value}
-            onChange={(e) => {
-              // Typed text lands at the real caret, so that caret is the cursor again: a pending
-              // Vim caret move from before the typing must not apply (#6866).
-              selectionPendingRef.current = false;
-              selectionGenerationRef.current++;
-              onChange(e.target.value, e.target.selectionStart ?? e.target.value.length);
-            }}
+            onChange={(e) =>
+              onChange(e.target.value, e.target.selectionStart ?? e.target.value.length)
+            }
             onKeyDown={handleKeyDownInternal}
             // Keep the empty natural height at one line (textareas default to rows=2) so
             // useAutoResizeTextarea can leave empty drafts to CSS sizing without measuring.
@@ -357,20 +353,18 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
 VimTextArea.displayName = "VimTextArea";
 
 /**
- * The cursor a key starts from. Visual modes and a DOM selection not yet moved to the Vim cursor
- * (#6866: a key right after Escape on a busy page) use the Vim cursor. Clamped to the text: it
- * can change between keys (a send took its draft), and a normal-mode cursor never sits past the
- * last character.
+ * The cursor a key starts from: the DOM caret, which the browser moves itself too (Home, arrows,
+ * a click), or the Vim cursor in visual modes, where the DOM shows a range. Clamped to the text
+ * (#6866): it can change between keys (a send took its draft, a value write put the caret at the
+ * end), and a normal-mode cursor never sits past the last character.
  */
 function vimCursorFor(input: {
   mode: vim.VimMode;
   text: string;
   domCursor: number;
   vimCursor: number;
-  selectionPending: boolean;
 }): number {
-  const usesVimCursor =
-    input.selectionPending || input.mode === "visual" || input.mode === "visualLine";
+  const usesVimCursor = input.mode === "visual" || input.mode === "visualLine";
   const cursor = usesVimCursor ? input.vimCursor : input.domCursor;
   const max = input.mode === "insert" ? input.text.length : Math.max(0, input.text.length - 1);
   return Math.max(0, Math.min(cursor, max));
