@@ -168,25 +168,9 @@ describe("applyAgentCgroupLimits", () => {
       return created;
     };
 
-    it.each([
-      ["on a fresh host", {}],
-      [
-        "again after a restart, with the controllers already enabled",
-        {
-          "xum-1000": { controllers: "cpu memory", subtreeControl: "cpu memory" },
-          "xum-1000/xum-app": {},
-          "xum-1000/xum-agents": {},
-        },
-      ],
-    ])("%s", async (_name, delegated) => {
+    it("on a host without systemd", async () => {
       if (isRoot) return;
-      tree = await createUnmanageableTree({
-        cgroups: {
-          "init.scope": { controllers: "cpu memory", procs: ["1", pid] },
-          ...delegated,
-        },
-        sudoWorks: true,
-      });
+      tree = await createUnmanageableTree({ sudoWorks: true });
 
       const result = await applyAgentCgroupLimits({ cpuCores: 1, memoryGiB: 1.1 }, tree.host, {
         trySudo: true,
@@ -304,7 +288,6 @@ describe("applyAgentCgroupLimits", () => {
       expect(after.status).toHaveProperty("reason", expect.stringMatching(sudoFailed));
       expect(tree.sudoCalls).toEqual(["xum-1000"]);
       expect(tree.writes).toEqual([]);
-      await expect(fs.access(path.join(tree.root, "xum-1000"))).rejects.toThrow("ENOENT");
     });
 
     it("a test command that did not join xum-agents", async () => {

@@ -118,7 +118,7 @@ describe("AgentResourceLimitsService", () => {
     expect(tree.writes.length - writesAfterStart).toBe(1);
   });
 
-  it("calls sudo only once the limits are turned on", async () => {
+  it("delegates with sudo at start, but not while the limits are off", async () => {
     // Root ignores file modes, so xum's cgroup cannot be root's there.
     if (process.getuid?.() === 0) return;
     await tree.dispose();
@@ -137,7 +137,13 @@ describe("AgentResourceLimitsService", () => {
     expect((await service.get()).status).toEqual({ state: "off" });
     expect(tree.sudoCalls).toEqual([]);
 
-    expect((await service.setEnabled(true)).status).toEqual({
+    // xum restarts with the limits turned on.
+    service.dispose();
+    await config.updateAgentResourceLimitsEnabled(true);
+    service = new AgentResourceLimitsService(config, tree.host);
+    await service.start();
+
+    expect((await service.get()).status).toEqual({
       state: "active",
       cgroup: "/xum-1000/xum-agents",
     });
