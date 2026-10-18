@@ -102,6 +102,10 @@ const GOAL_HISTORY_FILE = "goal-history.jsonl";
 // on disk in the JSONL but are simply not surfaced to the UI.
 const GOAL_HISTORY_RENDER_CAP = 200;
 
+const MICRO_CENTS_PER_USD = 100 * MICRO_CENTS_PER_CENT;
+/** Float noise between a baseline and the cost it was pinned from; far below a cent. */
+const LEDGER_REGRESSION_TOLERANCE_MICRO_CENTS = 1_000;
+
 function costUsdToMicroCents(costUsd: number | null | undefined): number {
   return Math.max(0, Math.round((costUsd ?? 0) * 100 * MICRO_CENTS_PER_CENT));
 }
@@ -3275,16 +3279,29 @@ export class WorkspaceGoalService {
     goal: GoalRecordV1,
     fallbackDeltaMicroCents: number,
     attributedChildren: readonly string[] = goal.attributedChildren
-  ): Promise<Pick<GoalRecordV1, "costCents" | "costMicroCents">> {
+  ): Promise<Pick<GoalRecordV1, "costCents" | "costMicroCents" | "ledgerBaselineUsd">> {
     const baselineUsd = goal.ledgerBaselineUsd;
     if (baselineUsd === undefined || !this.sessionUsage) {
       return this.applyCostAccounting(goal, fallbackDeltaMicroCents);
     }
-    const { totalUsd } = await this.readGoalLedgerUsd(workspaceId, attributedChildren);
-    const costMicroCents = Math.max(
-      getGoalCostMicroCents(goal),
-      costUsdToMicroCents(totalUsd - baselineUsd)
-    );
+    const { totalUsd, hasLedger } = await this.readGoalLedgerUsd(workspaceId, attributedChildren);
+    // No ledger file (deleted, e.g. by a config migration, until a read rebuilds it): charge
+    // this event as before, and measure again once the ledger is back.
+    if (!hasLedger) return this.applyCostAccounting(goal, fallbackDeltaMicroCents);
+    const storedMicroCents = getGoalCostMicroCents(goal);
+    const derivedMicroCents = costUsdToMicroCents(totalUsd - baselineUsd);
+    if (derivedMicroCents + LEDGER_REGRESSION_TOLERANCE_MICRO_CENTS < storedMicroCents) {
+      // The ledger went backwards (rebuilt from history without headless or rolled-up spend,
+      // or a child's ledger vanished). Charge this event as before and rebase on the new
+      // ledger, so later spend counts again instead of hiding below the old baseline.
+      const chargedMicroCents = storedMicroCents + fallbackDeltaMicroCents;
+      return {
+        costCents: Math.round(chargedMicroCents / MICRO_CENTS_PER_CENT),
+        costMicroCents: chargedMicroCents,
+        ledgerBaselineUsd: totalUsd - chargedMicroCents / MICRO_CENTS_PER_USD,
+      };
+    }
+    const costMicroCents = Math.max(storedMicroCents, derivedMicroCents);
     return { costCents: Math.round(costMicroCents / MICRO_CENTS_PER_CENT), costMicroCents };
   }
 
@@ -3353,8 +3370,7 @@ export class WorkspaceGoalService {
     // later, or a rebuild would count all earlier spend as the goal's. Until then the goal
     // charges stream ends as before.
     if (!hasLedger) return goal;
-    const ledgerBaselineUsd =
-      ledgerUsd - getGoalCostMicroCents(goal) / (100 * MICRO_CENTS_PER_CENT);
+    const ledgerBaselineUsd = ledgerUsd - getGoalCostMicroCents(goal) / MICRO_CENTS_PER_USD;
     return { ...goal, ledgerBaselineUsd };
   }
 

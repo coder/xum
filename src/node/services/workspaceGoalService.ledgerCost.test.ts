@@ -209,6 +209,41 @@ describe("WorkspaceGoalService ledger cost", () => {
     expect(second?.costCents).toBe(150);
   });
 
+  test("a goal keeps counting after its ledger is deleted and rebuilt lower", async () => {
+    // Headless spend is in the ledger but not in history, so a rebuild comes back lower.
+    await usage.recordUsage(workspaceId, MODEL, costing(5), { skipLastRequestUpdate: true });
+    const service = newGoalService();
+    const created = await setGoalOk(service, { workspaceId, objective: "Survive" });
+    await fs.rm(path.join(config.sessionsDir, workspaceId, "session-usage.json"));
+
+    // While the ledger is missing, the stream end charges as before.
+    const missing = await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    expect(missing?.costCents).toBe(100);
+
+    // The rebuilt ledger restarts below the old baseline: the goal rebases on it.
+    await usage.recordUsage(workspaceId, MODEL, costing(1));
+    const rebased = await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1,
+      streamStartedAtMs: created.createdAtMs + 2,
+      streamOriginKind: "goal_continuation",
+    });
+    expect(rebased?.costCents).toBe(200);
+    await usage.recordUsage(workspaceId, MODEL, costing(0.5));
+    const later = await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 99,
+      streamStartedAtMs: created.createdAtMs + 3,
+      streamOriginKind: "goal_continuation",
+    });
+    expect(later?.costCents).toBe(250);
+  });
+
   test("a goal written before the baseline existed keeps its cost and then follows the ledger", async () => {
     await usage.recordUsage(workspaceId, MODEL, costing(10));
     const service = newGoalService();
