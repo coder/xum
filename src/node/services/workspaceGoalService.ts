@@ -3313,9 +3313,16 @@ export class WorkspaceGoalService {
     return totalUsd;
   }
 
-  /** Re-reads a non-running goal's cost from the ledger; writes only when it changed. */
+  /**
+   * Re-reads a paused goal's cost from the ledger; writes only when it changed. Only paused:
+   * a write of a budget_limited or complete goal bumps terminalStatusGenerations, which would
+   * make a captured budget wrap-up admission stale. Those goals follow the ledger on their
+   * next goal-driven accounting.
+   */
   private async recostIdleGoal(workspaceId: string, goal: GoalRecordV1): Promise<GoalRecordV1> {
-    if (goal.ledgerBaselineUsd === undefined || !this.sessionUsage) return goal;
+    if (goal.status !== "paused" || goal.ledgerBaselineUsd === undefined || !this.sessionUsage) {
+      return goal;
+    }
     const cost = await this.accountGoalCost(workspaceId, goal, 0);
     if (cost.costMicroCents === getGoalCostMicroCents(goal)) return goal;
     const next = GoalRecordV1Schema.parse({ ...goal, ...cost });
@@ -5202,8 +5209,8 @@ export class WorkspaceGoalService {
               : originKind;
           this.recordLastGoalStream(input.workspaceId, stampOriginKind, current.goalId);
         }
-        // The goal's cost still follows the ledger (spend while paused counts), without a
-        // turn, an updatedAtMs bump or a budget transition: resuming re-checks the budget.
+        // A paused goal's cost still follows the ledger (spend while paused counts), without
+        // a turn, an updatedAtMs bump or a budget transition: resuming re-checks the budget.
         const recosted = await this.recostIdleGoal(input.workspaceId, current);
         await this.pushSnapshot(input.workspaceId, recosted);
         return recosted;
