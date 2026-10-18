@@ -13,6 +13,8 @@ import {
   startWorkspaceTurnForTest,
 } from "@/node/services/workspaceTurnManager.testHarness";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
+import { resolveWorkspaceTurnOwners } from "@/node/services/workspaceTurnOwners";
+import type { ProjectsConfig } from "@/common/types/project";
 import { Ok, type Result } from "@/common/types/result";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 import { createMuxMessage } from "@/common/types/message";
@@ -645,6 +647,27 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
       workspaceTurnRecord("fixedtie", "fixedtieb", handle(), "starting", { createdAt: at(2) })
     );
 
+    // #5569 S2: roots stamped at birth (bornWithoutDelegation) answer "no turn" with no file read.
+    const stamped = new Set(["stampedroot", "stampedtagged"]);
+    rows.push(
+      { dir: "sr", id: "stampedroot", options: { bornWithoutDelegation: true } },
+      // Copied claim tags naming an owner that has records never outrank the stamp.
+      {
+        dir: "st",
+        id: "stampedtagged",
+        options: { bornWithoutDelegation: true, ...claimTag("own0") },
+      },
+      // A stamp on an agent row is ignored: its ancestors hold its records.
+      {
+        dir: "sa",
+        id: "stampedagent",
+        options: { bornWithoutDelegation: true, parentWorkspaceId: "own1" },
+      }
+    );
+    records.push(
+      workspaceTurnRecord("own1", "stampedagent", handle(), "running", { createdAt: at(1) })
+    );
+
     const kinds = [
       "claimedTag",
       "claimedMark",
@@ -737,6 +760,10 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
     const oracleStore = new TaskHandleStore(config);
     const backendA = createWorkspaceTurnManagerHarness(config).taskService;
     const scans = globalScans(backendA);
+    const listings = spyOn(
+      workspaceTurnManagerInternals(backendA).taskHandleStore,
+      "listWorkspaceTurns"
+    );
 
     expect(rows.length).toBeGreaterThanOrEqual(40);
     const agentTasks = new Set(
@@ -753,6 +780,7 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
           record.createdAt === expected?.createdAt
       );
       const scansBefore = scans.mock.calls.length;
+      const listingsBefore = listings.mock.calls.length;
       const actual = await lookup(backendA, id);
       expect({ id, handle: actual?.taskHandleId, owner: actual?.ownerWorkspaceId }).toEqual({
         id,
@@ -761,9 +789,74 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
       });
       expect({ id, scans: scans.mock.calls.length - scansBefore }).toEqual({
         id,
-        scans: confirmed.has(id) || (agentTasks.has(id) && !tiedAcrossOwners) ? 0 : 1,
+        scans:
+          confirmed.has(id) || stamped.has(id) || (agentTasks.has(id) && !tiedAcrossOwners) ? 0 : 1,
       });
+      if (stamped.has(id))
+        expect({ id, listings: listings.mock.calls.length - listingsBefore }).toEqual({
+          id,
+          listings: 0,
+        });
     }
+  });
+
+  test("T16: a stamped copy beside a delegated row with the same ID falls back to the global scan", async () => {
+    // Hand edit across project aliases: trusting the stamped row would hide the delegated turn.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const otherProjectPath = path.join(rootDir, "repo2");
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "owner", "owner"),
+        projectWorkspace(projectPath, "target", "target", { bornWithoutDelegation: true }),
+      ],
+      {
+        taskSettings: testTaskSettings(),
+        extraProjects: [
+          [
+            otherProjectPath,
+            {
+              trusted: true,
+              workspaces: [
+                projectWorkspace(otherProjectPath, "target", "target", claimTag("owner")),
+              ],
+            },
+          ],
+        ],
+      }
+    );
+    const store = new TaskHandleStore(config);
+    for (const record of createdAndRunning("owner", "target"))
+      await store.upsertWorkspaceTurn(record);
+    const backendA = createWorkspaceTurnManagerHarness(config).taskService;
+    const scans = globalScans(backendA);
+
+    expect(await lookup(backendA, "target")).toMatchObject({ ownerWorkspaceId: "owner" });
+    expect(scans).toHaveBeenCalledTimes(1);
+  });
+
+  test("T14: the birth stamp counts only on the single root row of its ID, never over a mark", () => {
+    // In memory, because config load already drops a stamp beside a mark (normalizeBirthStamp).
+    const resolve = (rows: WorkspaceConfigEntry[], id = "r") => {
+      const config: ProjectsConfig = { projects: new Map([["/p", { workspaces: rows }]]) };
+      return resolveWorkspaceTurnOwners(config, id).kind;
+    };
+    const row = (options: Partial<WorkspaceConfigEntry>, id = "r") =>
+      projectWorkspace("/p", id, id, options);
+    const mark = { handleId: "wst_c", ownerWorkspaceId: "own" };
+
+    expect(resolve([row({ bornWithoutDelegation: true })])).toBe("none");
+    expect(resolve([row({ bornWithoutDelegation: true, ...claimTag("own") })])).toBe("none");
+    expect(resolve([row({ bornWithoutDelegation: true, delegatedCreation: mark })])).toBe(
+      "creator"
+    );
+    expect(
+      resolve([row({ bornWithoutDelegation: true, parentWorkspaceId: "own" }), row({}, "own")])
+    ).toBe("ancestors");
+    expect(resolve([row({ bornWithoutDelegation: true }), row(claimTag("own"))])).toBe("fallback");
+    expect(resolve([row({ bornWithoutDelegation: true })], "missing")).toBe("fallback");
   });
 
   /**
@@ -1000,6 +1093,38 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
       const settle = await settleChildUnderParent(config, mode, mode === "busy" ? 3 : 1);
       expect(settle.scans).toBe(0);
       expect(settle.reads).toBeLessThanOrEqual(settle.lookups * rootFiles + 30);
+    }
+  );
+
+  // T15 (S2): under a root stamped at birth, the whole settle reads no turn file at all.
+  test.each(["fg", "bg", "busy"] as const)(
+    "T15: a sub-agent settle under a stamped user root reads no turn file (%s)",
+    async (mode) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "other", "other"),
+          projectWorkspace(projectPath, "parent", "parent", { bornWithoutDelegation: true }),
+          projectWorkspace(projectPath, "child", "child", {
+            parentWorkspaceId: "parent",
+            agentType: "explore",
+            taskStatus: "running",
+          }),
+        ],
+        testTaskSettings()
+      );
+      const store = new TaskHandleStore(config);
+      for (let index = 0; index < 40; index++) {
+        await store.upsertWorkspaceTurn(
+          workspaceTurnRecord("other", `othert${index}`, `wst_o${index}`, "completed")
+        );
+      }
+
+      const settle = await settleChildUnderParent(config, mode, mode === "busy" ? 2 : 1);
+      expect({ scans: settle.scans, reads: settle.reads }).toEqual({ scans: 0, reads: 0 });
     }
   );
 });
