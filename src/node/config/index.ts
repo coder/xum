@@ -1526,7 +1526,7 @@ function projectNameOfEntry(
   const workspaceProjects = workspace.projects?.length ? workspace.projects : undefined;
   return workspaceProjects
     ? workspaceProjects.map((projectRef) => projectRef.projectName).join("+")
-    : PlatformPaths.getProjectName(configProjectPath);
+    : NodePlatformPaths.getProjectName(configProjectPath);
 }
 
 /**
