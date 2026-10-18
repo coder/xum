@@ -764,6 +764,52 @@ const AT_FILE_LIMIT: Record<
 };
 
 /**
+ * The result when waiting for the command failed (a stream read or the exit status rejected).
+ * A user abort wins. Then our own stop at the file limit: it can make a read or the exit status
+ * fail (a RemoteRuntime child that errors after the kill), which says nothing about the command,
+ * so the result stays the truncated success (#6873). Otherwise the failure itself.
+ */
+function failedWaitResult(
+  err: unknown,
+  state: {
+    aborted: boolean;
+    stoppedAtFileLimit: boolean;
+    lines: string[];
+    overflowReason: string | null;
+    overflowPolicy: "tmpfile" | "truncate";
+    effectiveTimeout: number;
+    wall_duration_ms: number;
+  }
+): BashToolResult {
+  if (state.aborted) {
+    return {
+      success: false,
+      error: "Command execution was aborted",
+      exitCode: -1,
+      wall_duration_ms: state.wall_duration_ms,
+    };
+  }
+  if (state.stoppedAtFileLimit) {
+    return formatResult(
+      EXIT_CODE_ABORTED,
+      state.lines,
+      true,
+      state.overflowReason,
+      state.wall_duration_ms,
+      state.overflowPolicy,
+      state.effectiveTimeout,
+      true
+    );
+  }
+  return {
+    success: false,
+    error: `Failed to execute command: ${getErrorMessage(err)}`,
+    exitCode: -1,
+    wall_duration_ms: state.wall_duration_ms,
+  };
+}
+
+/**
  * Formats the final bash tool result based on exit code and truncation state
  */
 function formatResult(
@@ -1669,21 +1715,17 @@ ${scriptWithEnv}`;
         // Unregister on error
         fgRegistration?.unregister();
 
-        // Check if this was an abort
-        if (abortSignal?.aborted) {
-          return withNotice({
-            success: false,
-            error: "Command execution was aborted",
-            exitCode: -1,
+        return withNotice(
+          failedWaitResult(err, {
+            aborted: abortSignal?.aborted === true,
+            stoppedAtFileLimit,
+            lines,
+            overflowReason,
+            overflowPolicy,
+            effectiveTimeout,
             wall_duration_ms: Math.round(performance.now() - startTime),
-          });
-        }
-        return withNotice({
-          success: false,
-          error: `Failed to execute command: ${getErrorMessage(err)}`,
-          exitCode: -1,
-          wall_duration_ms: Math.round(performance.now() - startTime),
-        });
+          })
+        );
       } finally {
         stopLiveOutput(true);
       }

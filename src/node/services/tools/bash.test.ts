@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, it, expect, spyOn } from "bun:test";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { ShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { buildBashToolDescription, createBashTool } from "./bash";
 import type { BashOutputEvent } from "@/common/types/stream";
 import type { ProjectRef } from "@/common/types/workspace";
 import type { BashToolArgs, BashToolResult } from "@/common/types/tools";
 import { BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
+import { EXIT_CODE_ABORTED } from "@/common/constants/exitCodes";
 import { shellQuote } from "@/common/utils/shell";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import * as path from "path";
@@ -548,6 +550,101 @@ describe("bash tool", () => {
     },
     { timeout: 20_000 }
   );
+
+  // #6873: after the truncate policy stops a command, a stream read or the exit status can fail
+  // because of that stop: RemoteRuntime rejects its exit status when the child errors after our
+  // kill (an SSH2 channel that closes without an exit status), and a stream can error instead of
+  // ending. That failure says nothing about the command, so the result stays the truncated
+  // success instead of "Failed to execute command".
+  it.each([
+    ["a stream read rejects", "stream"],
+    ["the exit status rejects", "exit"],
+  ] as const)(
+    "keeps the truncated success when %s after the stop at the file limit",
+    async (_name, failure) => {
+      const encoder = new TextEncoder();
+      using tempDir = new TestTempDir("test-bash-truncate-stop-failure");
+      // A real runtime for the tool's own file checks; only the command's streams are scripted.
+      class StoppedCommandRuntime extends LocalRuntime {
+        override exec(_command: string, options: ExecOptions): Promise<ExecStream> {
+          const signal = options.abortSignal;
+          const failAfterStop = new Error("SSH2 channel failed after the stop");
+          return Promise.resolve({
+            stdout: new ReadableStream<Uint8Array>({
+              start(controller) {
+                // 1.17 MB: over the 1 MB file limit, and the command keeps running.
+                for (let i = 0; i < 1300; i++)
+                  controller.enqueue(encoder.encode(`${"A".repeat(900)}\n`));
+              },
+            }),
+            // Still open when the stop comes; errors on it in the "stream" case.
+            stderr: new ReadableStream<Uint8Array>({
+              start(controller) {
+                signal?.addEventListener("abort", () => {
+                  if (failure === "stream") controller.error(failAfterStop);
+                  else controller.close();
+                });
+              },
+            }),
+            stdin: new WritableStream(),
+            exitCode: new Promise<number>((resolve, reject) => {
+              signal?.addEventListener("abort", () => {
+                if (failure === "exit") reject(failAfterStop);
+                else resolve(EXIT_CODE_ABORTED);
+              });
+            }),
+            duration: Promise.resolve(0),
+          });
+        }
+      }
+      // An empty, trusted directory: no git discovery or hook runs before the command.
+      const config = createTestToolConfig(tempDir.path);
+      config.runtime = new StoppedCommandRuntime(tempDir.path);
+      config.trusted = true;
+      config.overflow_policy = "truncate";
+      const tool = createBashTool(config);
+
+      const result = (await tool.execute!(
+        { script: "flood", timeout_secs: 30, run_in_background: false, display_name: "test" },
+        mockToolCallOptions
+      )) as BashToolResult;
+
+      expect(result).toMatchObject({ success: true, exitCode: 0 });
+      if (result.success && "truncated" in result) {
+        expect(result.truncated?.reason).toContain("exceed");
+      }
+      expect(result.output?.length).toBeGreaterThan(1000000);
+    }
+  );
+
+  // #6873: SSH and Docker share RemoteRuntime.exec, which stops a command with SIGTERM to its
+  // client and reports EXIT_CODE_ABORTED. The truncate policy's stop must give the same result
+  // there as on a local runtime: the kept output, as a success.
+  it("stops a command at the file limit through RemoteRuntime.exec", async () => {
+    using tempDir = new TestTempDir("test-bash-truncate-stop-remote");
+    const config = createTestToolConfig(tempDir.path);
+    config.runtime = new ShellRemoteRuntime(tempDir.path);
+    config.trusted = true;
+    config.overflow_policy = "truncate";
+    const tool = createBashTool(config);
+
+    const result = (await tool.execute!(
+      {
+        script:
+          "trap '' PIPE; perl -e '$| = 1; for (1..1300) { print \"A\" x 900 . \"\\n\" }' 2>/dev/null; exit 42",
+        timeout_secs: 30,
+        run_in_background: false,
+        display_name: "test",
+      },
+      mockToolCallOptions
+    )) as BashToolResult;
+
+    expect(result).toMatchObject({ success: true, exitCode: 0 });
+    if (result.success && "truncated" in result) {
+      expect(result.truncated?.reason).toContain("exceed");
+    }
+    expect(result.output?.length).toBeGreaterThan(1000000);
+  });
 
   it("should reject single overlong line before storing it (IPC mode)", async () => {
     const tempDir = new TestTempDir("test-bash-overlong-line");
