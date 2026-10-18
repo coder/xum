@@ -518,9 +518,9 @@ describe("resolveWorkflowScript", () => {
             containment: { kind: "none" },
           },
         });
-        expect(listed.map((workflow) => workflow.scriptPath)).toEqual(
-          expect.arrayContaining(["plugin://my-plugin/release.js", "skill://greet/workflow.js"])
-        );
+        const listedPaths = listed.map((workflow) => workflow.scriptPath);
+        expect(listedPaths).toContain("plugin://my-plugin/release.js");
+        expect(listedPaths).toContain("skill://greet/workflow.js");
         const copiesOpens = opens.mock.calls.filter(([file]) =>
           String(file).includes("plugin-approved-copies")
         );
