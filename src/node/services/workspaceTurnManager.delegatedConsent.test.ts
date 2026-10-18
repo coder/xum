@@ -797,19 +797,27 @@ describe("delegated target default consent (#4453)", () => {
 
   // #5569 (user-created roots): the active-turn lookup may answer "no turn" for a root that was
   // born without delegation only while these birth facts hold.
+  /** The TARGET row as the first config write that makes it visible left it. */
+  function recordFirstVisibleTarget(config: Config) {
+    const firstVisible: unknown[] = [];
+    const edit = config.editConfig.bind(config);
+    spyOn(config, "editConfig").mockImplementation(async (...args) => {
+      await edit(...args);
+      const row = findWorkspaceEntry(config.loadConfigOrDefault(), TARGET)?.workspace;
+      if (row != null && firstVisible.length === 0) {
+        firstVisible.push({
+          mark: row.delegatedCreation,
+          tags: row.tags,
+          stamp: row.bornWithoutDelegation,
+        });
+      }
+    });
+    return firstVisible;
+  }
   for (const owner of ["project", "scratch"] as const) {
     test(`a mode new target's first config write already binds its creator (${owner} owner, #5569)`, async () => {
       const a = owner === "project" ? await setUp() : await setUpScratchOwner();
-      const firstVisible: unknown[] = [];
-      const edit = a.config.editConfig.bind(a.config);
-      spyOn(a.config, "editConfig").mockImplementation(async (...args) => {
-        await edit(...args);
-        const row = findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)?.workspace;
-        if (row != null && firstVisible.length === 0) {
-          firstVisible.push({ mark: row.delegatedCreation, tags: row.tags });
-        }
-      });
-
+      const firstVisible = recordFirstVisibleTarget(a.config);
       await start(a.manager, a.parentId, { mode: "new" });
 
       expect(firstVisible).toEqual([
@@ -820,8 +828,13 @@ describe("delegated target default consent (#4453)", () => {
             "mux.taskOwnerWorkspaceId": a.parentId,
             "mux.taskTurnId": "turn",
           },
+          stamp: undefined,
         },
       ]);
+      // The stamp is written only at birth, so a delegated target never gets one later either.
+      expect(
+        findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)?.workspace
+      ).not.toHaveProperty("bornWithoutDelegation");
     });
   }
 
@@ -832,6 +845,7 @@ describe("delegated target default consent (#4453)", () => {
       // The owner has a running turn on another target it created.
       await start(a.manager, a.parentId, { mode: "new" });
       const tags = { "mux.taskHandleId": "wst_handle", "mux.taskOwnerWorkspaceId": a.parentId };
+      const firstVisible = recordFirstVisibleTarget(a.config);
       const born =
         birth === "create"
           ? await a.real.create(
@@ -849,6 +863,10 @@ describe("delegated target default consent (#4453)", () => {
       // Its background init must not outlive the test's temp root.
       await a.initStateManager.waitForInit(TARGET);
       expect(mark(a.config)).toBeUndefined();
+      // S1: the birth write itself stamps it, even with the copied claim tags.
+      expect(firstVisible).toEqual([{ mark: undefined, tags, stamp: true }]);
+      const bornRow = findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)?.workspace;
+      expect(bornRow?.bornWithoutDelegation).toBe(true);
 
       const refused = await createTurn(a.manager, a.parentId, {
         mode: "existing",
