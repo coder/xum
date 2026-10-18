@@ -169,6 +169,7 @@ import {
 } from "@/browser/utils/ui/projectAvatarColors";
 import { ProjectIconPicker } from "@/browser/components/ProjectIconPicker/ProjectIconPicker";
 import type { ProjectIconName } from "@/common/constants/projectIcons";
+import type { ProjectConfig } from "@/common/types/project";
 
 /**
  * Flat sidebar section heading ("Pinned", "Recent"), shown only above a non-empty section. A
@@ -380,6 +381,50 @@ function getProjectFallbackLabel(projectPath: string): string {
   const abbreviatedPath = PlatformPaths.abbreviate(projectPath);
   const { basename } = PlatformPaths.splitAbbreviated(abbreviatedPath);
   return basename;
+}
+
+function getProjectAvatarName(projectPath: string, config: ProjectConfig | null | undefined) {
+  return config?.displayName ?? getProjectFallbackLabel(projectPath);
+}
+
+function buildProjectBadge(
+  projectPath: string,
+  config: ProjectConfig | undefined
+): FlatProjectBadge {
+  const name = getProjectAvatarName(projectPath, config);
+  return {
+    name,
+    color: resolveProjectAvatarColor(config?.color, getHashedProjectColor(name)),
+    icon: config?.icon,
+  };
+}
+
+/** The project menu's icon panel. It saves the pick itself. */
+function ProjectIconMenuPanel(props: {
+  projectPath: string | null;
+  config: ProjectConfig | null;
+  /** Like a color swatch: a pick closes the panel and keeps the menu open. */
+  onPicked: () => void;
+}) {
+  const { updateIcon } = useProjectContext();
+  if (props.projectPath === null) return null;
+  const projectPath = props.projectPath;
+  const selectIcon = async (icon: ProjectIconName | null) => {
+    props.onPicked();
+    const result = await updateIcon(projectPath, icon);
+    if (!result.success) {
+      console.error("Failed to update project icon:", result.error);
+    }
+  };
+  return (
+    <ProjectIconPicker
+      icon={props.config?.icon}
+      monogram={getProjectMonogram(getProjectAvatarName(projectPath, props.config))}
+      onSelect={(icon) => {
+        void selectIcon(icon);
+      }}
+    />
+  );
 }
 
 function getProjectNameFromPath(path: string): string {
@@ -723,7 +768,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     getRemovalBlockers,
     updateDisplayName,
     updateColor: updateProjectColor,
-    updateIcon: updateProjectIcon,
     assignWorkspaceToSubProject,
   } = useProjectContext();
 
@@ -1485,30 +1529,12 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     });
   }, [projectMenuResolvedColor, projectMenuTargetPath]);
 
+  // The menu item is disabled without a target. Both panels share the menu, so opening one
+  // closes the other.
   const handleProjectMenuIconClick = () => {
-    if (!projectMenuTargetPath) {
-      return;
-    }
-    setShowProjectIconPicker((prev) => {
-      const next = !prev;
-      if (next) {
-        setShowProjectColorPicker(false);
-        setProjectColorPickerDirty(false);
-      }
-      return next;
-    });
-  };
-
-  const handleProjectIconSelect = async (icon: ProjectIconName | null) => {
-    if (!projectMenuTargetPath) {
-      return;
-    }
-    // Like a color swatch: the panel closes and the menu stays open.
-    setShowProjectIconPicker(false);
-    const result = await updateProjectIcon(projectMenuTargetPath, icon);
-    if (!result.success) {
-      console.error("Failed to update project icon:", result.error);
-    }
+    setShowProjectIconPicker((prev) => !prev);
+    setShowProjectColorPicker(false);
+    setProjectColorPickerDirty(false);
   };
 
   const handleProjectColorChange = useCallback(
@@ -1810,15 +1836,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const projectHeaderPaths = sortedProjectPaths;
   // Flat rows identify their project by a monogram avatar, so projects without a configured
   // color get a stable hashed one instead of all sharing the default gray.
-  const getProjectBadge = (projectPath: string): FlatProjectBadge => {
-    const config = userProjects.get(projectPath);
-    const name = config?.displayName ?? getProjectFallbackLabel(projectPath);
-    return {
-      name,
-      color: resolveProjectAvatarColor(config?.color, getHashedProjectColor(name)),
-      icon: config?.icon,
-    };
-  };
+  const getProjectBadge = (projectPath: string): FlatProjectBadge =>
+    buildProjectBadge(projectPath, userProjects.get(projectPath));
   // Flat mode drops the section headers that used to convey sub-project
   // scope, so rows scoped to a valid sub-project badge with a hierarchical
   // "Parent / Sub" label: sub-project names are only unique within their
@@ -3723,16 +3742,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                 handleProjectMenuIconClick();
               }}
             />
-            {showProjectIconPicker && projectMenuTargetPath !== null && (
-              <ProjectIconPicker
-                icon={projectMenuTargetConfig?.icon}
-                monogram={getProjectMonogram(
-                  projectMenuTargetConfig?.displayName ??
-                    getProjectFallbackLabel(projectMenuTargetPath)
-                )}
-                onSelect={(icon) => {
-                  void handleProjectIconSelect(icon);
-                }}
+            {showProjectIconPicker && (
+              <ProjectIconMenuPanel
+                projectPath={projectMenuTargetPath}
+                config={projectMenuTargetConfig}
+                onPicked={() => setShowProjectIconPicker(false)}
               />
             )}
             <Separator />

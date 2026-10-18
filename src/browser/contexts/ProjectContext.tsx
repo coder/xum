@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI, type APIClient } from "@/browser/contexts/API";
 import type { ProjectConfig } from "@/common/types/project";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { z } from "zod";
@@ -139,6 +139,22 @@ function toNonEmptyTrimmed(value?: string | null): string | null {
 
 function findSystemProjectPath(projects: Map<string, ProjectConfig>): string | null {
   return [...projects.entries()].find(([, cfg]) => cfg.projectKind === "system")?.[0] ?? null;
+}
+
+/** One project-settings write followed by a project list refresh, as a Result. */
+async function runProjectMutation(
+  liveApi: APIClient | null,
+  refreshProjects: () => Promise<void>,
+  mutate: (api: APIClient) => Promise<void>
+): Promise<Result<void>> {
+  if (!liveApi) return { success: false, error: "API not connected" };
+  try {
+    await mutate(liveApi);
+    await refreshProjects();
+    return { success: true, data: undefined };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
 }
 
 export function ProjectProvider(props: { children: ReactNode }) {
@@ -624,36 +640,17 @@ export function ProjectProvider(props: { children: ReactNode }) {
       updateSecrets,
       updateDisplayName,
       updateColor,
-      // Inline for the same reason as updateCodeWorkspaceSyncPath below.
-      updateIcon: async (
-        projectPath: string,
-        icon: ProjectIconName | null
-      ): Promise<Result<void>> => {
-        if (!liveApi) return { success: false, error: "API not connected" };
-        try {
-          await liveApi.projects.setIcon({ projectPath, icon });
-          await refreshProjects();
-          return { success: true, data: undefined };
-        } catch (error) {
-          return { success: false, error: getErrorMessage(error) };
-        }
-      },
       updateCustomInstructions,
       // Defined inline (not useCallback): the repo bans new manual useCallback
       // memoization, and inlining keeps exhaustive-deps satisfied via `liveApi`.
-      updateCodeWorkspaceSyncPath: async (
-        projectPath: string,
-        codeWorkspaceSyncPath: string | null
-      ): Promise<Result<void>> => {
-        if (!liveApi) return { success: false, error: "API not connected" };
-        try {
-          await liveApi.projects.setCodeWorkspaceSyncPath({ projectPath, codeWorkspaceSyncPath });
-          await refreshProjects();
-          return { success: true, data: undefined };
-        } catch (error) {
-          return { success: false, error: getErrorMessage(error) };
-        }
-      },
+      updateIcon: (projectPath: string, icon: ProjectIconName | null) =>
+        runProjectMutation(liveApi, refreshProjects, (api) =>
+          api.projects.setIcon({ projectPath, icon })
+        ),
+      updateCodeWorkspaceSyncPath: (projectPath: string, codeWorkspaceSyncPath: string | null) =>
+        runProjectMutation(liveApi, refreshProjects, (api) =>
+          api.projects.setCodeWorkspaceSyncPath({ projectPath, codeWorkspaceSyncPath })
+        ),
       assignWorkspaceToSubProject,
     }),
     [

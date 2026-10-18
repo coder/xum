@@ -922,6 +922,12 @@ function normalizeBirthStamp(
   return rest;
 }
 
+const HAND_EDITABLE_STRING_PROJECT_FIELDS = [
+  "customInstructions",
+  "codeWorkspaceSyncPath",
+  "icon",
+] as const;
+
 function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectConfig {
   // Per-project runtime overrides are optional; keep config.json sparse by persisting only explicit
   // overrides (false enablement + explicit default runtime selections).
@@ -974,28 +980,18 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     delete next.projectKind;
   }
 
-  // config.json is hand-editable: a non-string customInstructions would fail
+  // config.json is hand-editable: a non-string value in these fields would fail
   // the projects.list output schema (z.string()) and brick the whole project
   // list, so discard malformed values here where both load and save pass.
-  if (typeof record.customInstructions === "string" && record.customInstructions.trim()) {
-    next.customInstructions = record.customInstructions;
-  } else {
-    delete next.customInstructions;
-  }
-
-  // Same hand-edit hazard as customInstructions above.
-  if (typeof record.codeWorkspaceSyncPath === "string" && record.codeWorkspaceSyncPath.trim()) {
-    next.codeWorkspaceSyncPath = record.codeWorkspaceSyncPath;
-  } else {
-    delete next.codeWorkspaceSyncPath;
-  }
-
-  // Same hand-edit hazard. Unknown names are kept so a newer version's icon survives a downgrade;
+  // Unknown icon names are kept so a newer version's icon survives a downgrade;
   // the sidebar shows the initial for them.
-  if (typeof record.icon === "string" && record.icon.trim()) {
-    next.icon = record.icon;
-  } else {
-    delete next.icon;
+  for (const field of HAND_EDITABLE_STRING_PROJECT_FIELDS) {
+    const value = record[field];
+    if (typeof value === "string" && value.trim()) {
+      next[field] = value;
+    } else {
+      delete next[field];
+    }
   }
 
   // Legacy named workflow schedules are intentionally dropped while workflow
