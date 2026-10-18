@@ -6,6 +6,7 @@ import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataServi
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import { writeSubagentAttemptSettlementReceipt } from "@/node/services/subagentAttemptSettlements";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { StreamEndEvent } from "@/common/types/stream";
 import { createMuxMessage } from "@/common/types/message";
@@ -1176,6 +1177,54 @@ describe("TaskService child goals", () => {
     expect(resumed.success ? null : JSON.stringify(resumed.error)).toContain("required report");
     expect((await t.goals.getGoal(childId))?.status).toBe("paused");
     expect(t.sends()).toHaveLength(0);
+  });
+
+  // #6864: a deferred stream end waits for its accounting without a bound, and the attempt's
+  // pending stream-end decision holds the Stop's latch. The Stop's interrupt bumps the stop epoch
+  // and notifies the attempt's listeners, which cancels the wait, re-runs the stream end and
+  // resolves the decision. A resolved Stop waits for its latch (#6727): without that
+  // cancellation it would be held to its 40 s deadline.
+  test("a Stop of a child whose stream end is deferred releases without the accounting", async () => {
+    // An owned, receipt-eligible attempt (proven by the predecessor's receipt), so the latch
+    // waits for its stream-end decision.
+    const t = await setup({ taskStatus: "interrupted" });
+    const seeded = await writeSubagentAttemptSettlementReceipt({
+      ownerWorkspaceSessionDirs: [path.join(t.config.sessionsDir, parentId)],
+      receipt: {
+        taskId: childId,
+        attemptId: "att_00000000000000c1",
+        parentWorkspaceId: parentId,
+        source: "idle-settled",
+        settledAt: "2026-10-01T00:00:00.000Z",
+      },
+    });
+    expect(seeded.success).toBe(true);
+    expect(await t.taskService.markInterruptedTaskRunning(childId)).toBe(true);
+    const internal = t.taskService as unknown as {
+      ownedAttemptByTaskId: Map<string, { receiptEligible: boolean }>;
+      streamEndDecisionsByTaskId: Map<string, Array<{ outcome: string }>>;
+    };
+    expect(internal.ownedAttemptByTaskId.get(childId)?.receiptEligible).toBe(true);
+    await t.setChildGoal();
+    const realWait = t.goals.waitForStreamAccountingReceipt.bind(t.goals);
+    spyOn(t.goals, "waitForStreamAccountingReceipt").mockImplementation((workspaceId, messageId) =>
+      realWait(workspaceId, messageId, 20)
+    );
+    // The accounting receipt never settles in this test.
+    t.goals.beginStreamAccountingReceipt(childId, "assistant-1");
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+    expect(t.child()?.taskStatus).toBe("running");
+    expect(internal.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual([
+      "pending",
+    ]);
+
+    expect(await t.taskService.stopDescendantAgentTask(parentId, childId)).toEqual({
+      success: true,
+      data: { stoppedTaskIds: [childId] },
+    });
+    expect(t.taskService.isWorkspaceStopInProgress(childId)).toBe(false);
+    expect(internal.streamEndDecisionsByTaskId.has(childId)).toBe(false);
+    expect(t.child()?.taskStatus).toBe("interrupted");
   });
 
   test("unsettled accounting defers the stream end without finalizing; its settlement resumes it", async () => {

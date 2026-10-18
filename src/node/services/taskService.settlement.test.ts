@@ -1344,25 +1344,45 @@ describe("TaskService", () => {
     });
 
     // #6727: the Stop waits for its latches, but never past its deadline (40 s from the Stop's
-    // start). The clock jumps past it while a hung stop still holds the latch.
+    // start). A hung stop holds the latch. When the Stop enters its release wait, the clock moves
+    // to 5 ms before the deadline and then runs on in real time, so the wait arms a 5 ms timer,
+    // wakes at the deadline and returns (#6864: the order no longer rests on microtask timing).
     test("a Stop whose latch never drops still resolves at its release deadline", async () => {
       const childId = "task-release-deadline";
       const { config } = await setupTree([childId]);
       const { stopStream, pending } = controlledStopStream(new Set([childId]));
+      // The clock jumps 1 s when the Stop's cleanup reaches the hung stop, so a deadline taken at
+      // the release wait (not at the Stop's start) would show.
+      const realNow = Date.now.bind(Date);
+      let offsetMs = 0;
+      const jumpingStopStream = mock((...args: Parameters<typeof stopStream>) => {
+        if (args[0] === childId) offsetMs += 1_000;
+        return stopStream(...args);
+      });
       const { aiService } = createAIServiceMocks(config, {
-        stopStream,
+        stopStream: jumpingStopStream,
         isStreaming: mock(() => true),
       });
       const { taskService } = createTaskServiceHarness(config, { aiService });
+      // Shortened: the hung stop's own cleanup bounds. The release wait's timer is the 5 ms below.
       const restoreTimers = shortenTerminationTimers();
-      const startedAt = Date.now();
-      let pastDeadline = false;
-      const clock = spyOn(Date, "now").mockImplementation(() =>
-        pastDeadline ? startedAt + TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS + 1 : startedAt
-      );
+      const clock = spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
       try {
-        const { stopped } = await startStopAwaitingRelease(taskService, rootId, childId);
-        pastDeadline = true;
+        const before = Date.now();
+        let deadlineMs: number | undefined;
+        const { stopped } = await startStopAwaitingRelease(taskService, rootId, childId, {
+          onWait: (deadline) => {
+            deadlineMs = deadline;
+            offsetMs = deadline - 5 - realNow();
+          },
+        });
+        // The deadline is 40 s from the Stop's start: before the 1 s jump.
+        expect(deadlineMs).toBeGreaterThanOrEqual(
+          before + TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS
+        );
+        expect(deadlineMs).toBeLessThan(
+          before + 1_000 + TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS
+        );
         expect((await stopped).success).toBe(true);
         // Resolved at the deadline: the hung stop still holds the latch.
         expect(taskService.isWorkspaceStopInProgress(childId)).toBe(true);
@@ -1493,18 +1513,12 @@ describe("TaskService", () => {
         const restoreEdit = removeEntryOnFirstConfigWrite(config, childId);
         const restoreTimers = shortenTerminationTimers();
         try {
-          let stopping: ReturnType<typeof taskService.stopDescendantAgentTask> | undefined;
-          if (cascade === "stop") {
-            // The Stop waits for the latches below to drop (#6727): check them before it resolves.
-            ({ stopped: stopping } = await startStopAwaitingRelease(taskService, rootId, childId));
-          } else {
-            // The hung child stop is reported as a timeout (its workspace is kept in place).
-            const terminated = await taskService.terminateDescendantAgentTask(rootId, childId);
-            expect(terminated.success).toBe(false);
-            if (!terminated.success) {
-              expect(terminated.error).toContain(`Timed out stopping task stream (${childId})`);
-            }
-          }
+          // The Stop waits for the latches below to drop (#6727), so its result is checked after
+          // them. The terminate returns first.
+          const result =
+            cascade === "stop"
+              ? (await startStopAwaitingRelease(taskService, rootId, childId)).stopped
+              : Promise.resolve(await taskService.terminateDescendantAgentTask(rootId, childId));
           restoreEdit();
           expect(findWorkspaceInConfig(config, childId)).toBeUndefined();
           // No status was left to persist for the vanished child, yet its captured owner is
@@ -1517,12 +1531,16 @@ describe("TaskService", () => {
           pending.get(childId)!.resolve(Ok(undefined));
           await new Promise((resolve) => setTimeout(resolve, 0));
           expect(taskService.isWorkspaceStopInProgress(childId)).toBe(false);
-          if (stopping != null) {
-            expect(await stopping).toEqual({
-              success: true,
-              data: { stoppedTaskIds: [grandchildId] },
-            });
-          }
+          const settled = await result;
+          const outcome = settled.success
+            ? { stopped: settled.data }
+            : { timedOut: settled.error.includes(`Timed out stopping task stream (${childId})`) };
+          expect(outcome).toEqual(
+            cascade === "stop"
+              ? { stopped: { stoppedTaskIds: [grandchildId] } }
+              : // The hung child stop is reported as a timeout (its workspace is kept in place).
+                { timedOut: true }
+          );
         } finally {
           restoreEdit();
           restoreTimers();
