@@ -7,7 +7,7 @@ import type { HistoryService } from "./historyService";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
-import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
+import type { ChatUsageDisplay, LongContextTokens } from "@/common/utils/tokens/usageAggregator";
 import { sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getAssistantMessageModelUsages } from "@/common/utils/tokens/messageModelUsages";
@@ -95,11 +95,101 @@ export interface SessionUsageFile {
  *
  * Replaces O(n) message iteration with a persistent JSON file that stores
  * per-model usage breakdowns. Usage is accumulated on stream-end, never
- * subtracted, making costs immune to message deletion.
+ * subtracted, making costs immune to message deletion. The file also holds
+ * running streams' usage, step by step (recordInFlightUsage), so a long turn
+ * shows its spend and a crash or restart loses at most the unfinished step.
+ * In-process readers (getSessionUsage) still see only settled usage.
  */
+/** A running stream's priced cumulative usage, already added to its byModel bucket. */
+interface InFlightUsage {
+  model: string;
+  usage: ChatUsageDisplay;
+}
+
+const USAGE_COMPONENTS = ["input", "cached", "cacheCreate", "output", "reasoning"] as const;
+
+function subtractLongContextTokens(
+  total: LongContextTokens,
+  part: LongContextTokens
+): LongContextTokens {
+  const minus = (a: number, b: number) => Math.max(0, a - b);
+  return {
+    input: minus(total.input, part.input),
+    cached: minus(total.cached, part.cached),
+    cacheCreate: minus(total.cacheCreate, part.cacheCreate),
+    cacheCreate1h: minus(total.cacheCreate1h, part.cacheCreate1h),
+    output: minus(total.output, part.output),
+  };
+}
+
+/**
+ * `total` minus `part`, where `part` was earlier summed into `total` with sumUsageHistory.
+ * Keeps total's flags (unknown costs, gateway billing, tier): the remaining entries carry them too.
+ */
+function subtractUsage(total: ChatUsageDisplay, part: ChatUsageDisplay): ChatUsageDisplay {
+  const result: ChatUsageDisplay = { ...total };
+  for (const key of USAGE_COMPONENTS) {
+    const totalCost = total[key].cost_usd;
+    const partCost = part[key].cost_usd;
+    result[key] = {
+      tokens: total[key].tokens - part[key].tokens,
+      // An unpriced part added no cost to the total.
+      cost_usd: totalCost === undefined || partCost === undefined ? totalCost : totalCost - partCost,
+    };
+  }
+  const cacheCreate1hTokens = (total.cacheCreate1hTokens ?? 0) - (part.cacheCreate1hTokens ?? 0);
+  if (cacheCreate1hTokens > 0) {
+    result.cacheCreate1hTokens = cacheCreate1hTokens;
+  } else {
+    delete result.cacheCreate1hTokens;
+  }
+  if (total.longContextTokens && part.longContextTokens) {
+    result.longContextTokens = subtractLongContextTokens(
+      total.longContextTokens,
+      part.longContextTokens
+    );
+  }
+  return result;
+}
+
+function hasNoTokens(usage: ChatUsageDisplay): boolean {
+  return USAGE_COMPONENTS.every((key) => usage[key].tokens === 0);
+}
+
+/** Adds (or, with "subtract", removes) one in-flight entry in `file`'s byModel. */
+function applyInFlightUsage(
+  file: SessionUsageFile,
+  entry: InFlightUsage,
+  direction: "add" | "subtract"
+): void {
+  const existing = file.byModel[entry.model];
+  if (direction === "add") {
+    file.byModel[entry.model] = existing
+      ? (sumUsageHistory([existing, entry.usage]) ?? entry.usage)
+      : entry.usage;
+    return;
+  }
+  if (!existing) {
+    return;
+  }
+  const remaining = subtractUsage(existing, entry.usage);
+  // A bucket that only ever held this stream's usage leaves no empty model row behind.
+  if (hasNoTokens(remaining)) {
+    delete file.byModel[entry.model];
+  } else {
+    file.byModel[entry.model] = remaining;
+  }
+}
+
 export class SessionUsageService {
   private readonly SESSION_USAGE_FILE = "session-usage.json";
   private readonly fileLocks = workspaceFileLocks;
+  /**
+   * workspaceId → streamId → usage of running streams that session-usage.json already
+   * holds (recordInFlightUsage). In memory only: after a restart the file keeps that
+   * usage as the dead stream's spend, which is the point.
+   */
+  private readonly inFlightUsage = new Map<string, Map<string, InFlightUsage>>();
   private readonly config: Config;
   private readonly historyService: HistoryService;
   private readonly getProvidersConfig: () => ProvidersConfigMap | null;
@@ -180,19 +270,105 @@ export class SessionUsageService {
        * for the user's actual last agent turn.
        */
       skipLastRequestUpdate?: boolean;
+      /**
+       * This is the final usage of a stream that recorded in-flight usage: replace that
+       * entry in the same write, so the stream counts exactly once.
+       */
+      settlesInFlightStreamId?: string;
     }
   ): Promise<void> {
     return this.fileLocks.withLock(workspaceId, async () => {
       const current = await this.readFile(workspaceId);
-      const existing = current.byModel[model];
+      const streamId = options?.settlesInFlightStreamId;
+      const inFlight =
+        streamId === undefined ? undefined : this.inFlightUsage.get(workspaceId)?.get(streamId);
+      if (inFlight) {
+        applyInFlightUsage(current, inFlight, "subtract");
+      }
       // CRITICAL: Accumulate, don't overwrite
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-      current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
+      applyInFlightUsage(current, { model, usage }, "add");
       if (options?.skipLastRequestUpdate !== true) {
         current.lastRequest = { model, usage, timestamp: Date.now() };
       }
       await this.writeFile(workspaceId, current);
+      if (streamId !== undefined) {
+        this.deleteInFlightEntry(workspaceId, streamId);
+      }
     });
+  }
+
+  /**
+   * Record a running stream's priced cumulative usage so far, replacing the stream's
+   * previous in-flight entry. Before this, the file changed only when a stream ended:
+   * a long turn read $0 for its whole run and a restart lost all of its spend.
+   * The stream ends by passing `settlesInFlightStreamId` to recordUsage, or by
+   * discardInFlightUsage when its usage is not recorded at all.
+   */
+  async recordInFlightUsage(
+    workspaceId: string,
+    streamId: string,
+    model: string,
+    usage: ChatUsageDisplay
+  ): Promise<void> {
+    assert(streamId.length > 0, "recordInFlightUsage requires a streamId");
+    return this.fileLocks.withLock(workspaceId, async () => {
+      const current = await this.readFile(workspaceId);
+      const previous = this.inFlightUsage.get(workspaceId)?.get(streamId);
+      if (previous) {
+        applyInFlightUsage(current, previous, "subtract");
+      }
+      const next = { model, usage };
+      applyInFlightUsage(current, next, "add");
+      await this.writeFile(workspaceId, current);
+      // Only after the write: the map must always describe what the file holds.
+      let streams = this.inFlightUsage.get(workspaceId);
+      if (!streams) {
+        streams = new Map();
+        this.inFlightUsage.set(workspaceId, streams);
+      }
+      streams.set(streamId, next);
+    });
+  }
+
+  /** Remove a stream's in-flight usage from the file (the stream records no usage). */
+  async discardInFlightUsage(workspaceId: string, streamId: string): Promise<void> {
+    if (!this.inFlightUsage.get(workspaceId)?.has(streamId)) {
+      return;
+    }
+    return this.fileLocks.withLock(workspaceId, async () => {
+      const inFlight = this.inFlightUsage.get(workspaceId)?.get(streamId);
+      if (!inFlight) {
+        return;
+      }
+      const current = await this.readFile(workspaceId);
+      applyInFlightUsage(current, inFlight, "subtract");
+      await this.writeFile(workspaceId, current);
+      this.deleteInFlightEntry(workspaceId, streamId);
+    });
+  }
+
+  private deleteInFlightEntry(workspaceId: string, streamId: string): void {
+    const streams = this.inFlightUsage.get(workspaceId);
+    streams?.delete(streamId);
+    if (streams?.size === 0) {
+      this.inFlightUsage.delete(workspaceId);
+    }
+  }
+
+  /**
+   * The file minus running streams' in-flight usage. The Costs tab adds the live stream
+   * on top of this view (and its own copy at stream end), so it must exclude that stream.
+   */
+  private withoutInFlightUsage(workspaceId: string, file: SessionUsageFile): SessionUsageFile {
+    const streams = this.inFlightUsage.get(workspaceId);
+    if (!streams) {
+      return file;
+    }
+    const settled: SessionUsageFile = { ...file, byModel: { ...file.byModel } };
+    for (const inFlight of streams.values()) {
+      applyInFlightUsage(settled, inFlight, "subtract");
+    }
+    return settled;
   }
 
   /**
@@ -598,7 +774,7 @@ export class SessionUsageService {
       try {
         const filePath = this.getFilePath(workspaceId);
         const data = await fs.readFile(filePath, "utf-8");
-        return JSON.parse(data) as SessionUsageFile;
+        return this.withoutInFlightUsage(workspaceId, JSON.parse(data) as SessionUsageFile);
       } catch (error) {
         // File missing or corrupted - try to rebuild from messages
         if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
@@ -631,6 +807,8 @@ export class SessionUsageService {
   async resetSessionUsage(workspaceId: string, forkedAt?: number): Promise<void> {
     return this.fileLocks.withLock(workspaceId, async () => {
       await this.writeFile(workspaceId, { ...this.createEmptyUsageFile(), forkedAt });
+      // The new file holds no in-flight usage to subtract later.
+      this.inFlightUsage.delete(workspaceId);
     });
   }
 
@@ -649,7 +827,10 @@ export class SessionUsageService {
         try {
           const filePath = this.getFilePath(workspaceId);
           const data = await fs.readFile(filePath, "utf-8");
-          results[workspaceId] = JSON.parse(data) as SessionUsageFile;
+          results[workspaceId] = this.withoutInFlightUsage(
+            workspaceId,
+            JSON.parse(data) as SessionUsageFile
+          );
         } catch {
           results[workspaceId] = undefined;
         }
@@ -730,6 +911,8 @@ export class SessionUsageService {
     }
 
     await this.writeFile(workspaceId, result);
+    // History holds no in-flight usage, so neither does the rebuilt file.
+    this.inFlightUsage.delete(workspaceId);
     log.info(`Rebuilt session-usage.json for ${workspaceId} from ${messages.length} messages`);
   }
 

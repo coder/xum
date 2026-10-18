@@ -1003,6 +1003,8 @@ interface WorkspaceStreamInfo {
   // Track if a previousResponseId retry happened after a step completed so
   // stream-end uses cumulative usage instead of the retried step's totalUsage.
   didRetryPreviousResponseIdAtStep: boolean;
+  // session-usage.json holds this stream's in-flight usage (recordInFlightSessionUsage).
+  hasInFlightSessionUsage?: boolean;
   // Track when Xum restarted the stream after an empty-output completion so
   // stream-end prefers cumulative usage across attempts instead of the final
   // attempt's totalUsage only.
@@ -2595,14 +2597,13 @@ export class StreamManager {
 
       // Record session usage for aborted streams (mirrors stream-end path)
       // This ensures tokens consumed before abort are tracked for cost display
-      await this.recordSessionUsage(
+      await this.settleSessionUsage(
         workspaceId,
-        streamInfo.model,
+        streamInfo,
         usage,
         providerMetadata,
         "Failed to record session usage on abort",
-        "error",
-        streamInfo
+        "error"
       );
 
       // Stamp the aborted turn's usage onto the partial message BEFORE committing
@@ -2772,10 +2773,11 @@ export class StreamManager {
     providerMetadata: Record<string, unknown> | undefined,
     logMessage: string,
     logLevel: "warn" | "error",
-    streamInfo?: Pick<WorkspaceStreamInfo, "workspaceName" | "metadataModel">
-  ): Promise<void> {
+    streamInfo?: Pick<WorkspaceStreamInfo, "workspaceName" | "metadataModel">,
+    settlesInFlightStreamId?: string
+  ): Promise<boolean> {
     if (!this.sessionUsageService || !usage) {
-      return;
+      return false;
     }
     const messageUsage = createDisplayUsage(
       usage,
@@ -2784,14 +2786,109 @@ export class StreamManager {
       streamInfo?.metadataModel
     );
     if (!messageUsage) {
-      return;
+      return false;
     }
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     const ledgerModel = this.usageAttributionModel(model, streamInfo?.metadataModel);
     try {
-      await this.sessionUsageService.recordUsage(workspaceId as string, ledgerModel, messageUsage);
+      await this.sessionUsageService.recordUsage(
+        workspaceId as string,
+        ledgerModel,
+        messageUsage,
+        ...(settlesInFlightStreamId !== undefined ? [{ settlesInFlightStreamId }] : [])
+      );
+      return true;
     } catch (error) {
       (logLevel === "error" ? workspaceLog.error : workspaceLog.warn)(logMessage, { error });
+      return false;
+    }
+  }
+
+  /**
+   * Write the stream's priced cumulative usage to session-usage.json after each finished
+   * step, so a long turn's spend is readable while it runs and a crash or restart loses at
+   * most the unfinished step. Priced like the abort path; the terminal path replaces it
+   * with the turn's final usage (settleSessionUsage).
+   */
+  private async recordInFlightSessionUsage(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<void> {
+    if (!this.sessionUsageService || !hasTokenUsage(streamInfo.cumulativeUsage)) {
+      return;
+    }
+    const usage = createDisplayUsage(
+      streamInfo.cumulativeUsage,
+      streamInfo.model,
+      markProviderMetadataCostsIncluded(
+        streamInfo.cumulativeProviderMetadata,
+        streamInfo.initialMetadata?.costsIncluded
+      ),
+      streamInfo.metadataModel
+    );
+    if (!usage) {
+      return;
+    }
+    try {
+      await this.sessionUsageService.recordInFlightUsage(
+        workspaceId as string,
+        streamInfo.messageId,
+        this.usageAttributionModel(streamInfo.model, streamInfo.metadataModel),
+        usage
+      );
+      streamInfo.hasInFlightSessionUsage = true;
+    } catch (error) {
+      this.getWorkspaceLogger(workspaceId, streamInfo).warn(
+        "Failed to record in-flight session usage",
+        { error }
+      );
+    }
+  }
+
+  /** Record the stream's final usage, replacing its in-flight usage in the same write. */
+  private async settleSessionUsage(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    usage: LanguageModelV2Usage | undefined,
+    providerMetadata: Record<string, unknown> | undefined,
+    logMessage: string,
+    logLevel: "warn" | "error"
+  ): Promise<void> {
+    const recorded = await this.recordSessionUsage(
+      workspaceId,
+      streamInfo.model,
+      usage,
+      providerMetadata,
+      logMessage,
+      logLevel,
+      streamInfo,
+      streamInfo.hasInFlightSessionUsage === true ? streamInfo.messageId : undefined
+    );
+    if (recorded) {
+      streamInfo.hasInFlightSessionUsage = false;
+    } else {
+      await this.discardInFlightSessionUsage(workspaceId, streamInfo);
+    }
+  }
+
+  private async discardInFlightSessionUsage(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<void> {
+    if (!this.sessionUsageService || streamInfo.hasInFlightSessionUsage !== true) {
+      return;
+    }
+    try {
+      await this.sessionUsageService.discardInFlightUsage(
+        workspaceId as string,
+        streamInfo.messageId
+      );
+      streamInfo.hasInFlightSessionUsage = false;
+    } catch (error) {
+      this.getWorkspaceLogger(workspaceId, streamInfo).warn(
+        "Failed to discard in-flight session usage",
+        { error }
+      );
     }
   }
 
@@ -5273,6 +5370,7 @@ export class StreamManager {
                 });
                 streamInfo.currentStepStartIndex = streamInfo.parts.length;
                 this.emitTurnEvent(usageEvent);
+                await this.recordInFlightSessionUsage(workspaceId, streamInfo);
                 await this.checkSoftCancelStream(workspaceId, streamInfo);
                 break;
               }
@@ -5496,14 +5594,13 @@ export class StreamManager {
 
               // Update cumulative session usage (if service is available)
               // Wrapped in try-catch: usage recording is non-critical and shouldn't block stream completion
-              await this.recordSessionUsage(
+              await this.settleSessionUsage(
                 workspaceId,
-                streamInfo.model,
+                streamInfo,
                 totalUsage,
                 providerMetadata,
                 "Failed to record session usage (stream completion unaffected)",
-                "warn",
-                streamInfo
+                "warn"
               );
             }
 
@@ -5588,6 +5685,11 @@ export class StreamManager {
         this.workspaceStreams.get(workspaceId) === streamInfo
       ) {
         this.workspaceStreams.delete(workspaceId);
+      }
+      // A terminal path that recorded no usage (e.g. a completion with no parts) must not
+      // leave its in-flight usage in the ledger. Aborts settle later, in cleanupAbortedStream.
+      if (streamInfo.terminalCompletion != null) {
+        await this.discardInFlightSessionUsage(workspaceId, streamInfo);
       }
 
       // Lifecycle spine event: emitted from the guaranteed-cleanup path so
@@ -5810,15 +5912,17 @@ export class StreamManager {
           : undefined,
         streamInfo.initialMetadata?.costsIncluded
       );
-      await this.recordSessionUsage(
+      await this.settleSessionUsage(
         workspaceId,
-        streamInfo.model,
+        streamInfo,
         cumulativeErrorUsage,
         cumulativeErrorProviderMetadata,
         "Failed to record session usage for errored stream",
-        "warn",
-        streamInfo
+        "warn"
       );
+    } else {
+      // Refusals already recorded their own usage (see above): drop the in-flight copy.
+      await this.discardInFlightSessionUsage(workspaceId, streamInfo);
     }
     const errorUsage = terminalRefusalUsage ?? cumulativeErrorUsage;
     const errorProviderMetadata =
@@ -5948,6 +6052,8 @@ export class StreamManager {
     streamInfo.lastPartialWriteTime = 0;
 
     if (!preserveUsage) {
+      // The discarded attempt's usage is not recorded (refused attempts record their own).
+      await this.discardInFlightSessionUsage(workspaceId, streamInfo);
       streamInfo.cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
       streamInfo.cumulativeProviderMetadata = undefined;
       streamInfo.terminalRefusalUsage = undefined;

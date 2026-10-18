@@ -10,7 +10,7 @@ import type { MuxMessage } from "@/common/types/message";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import { StreamManager, type TurnEngineEvent, type TurnExecutionOptions } from "./streamManager";
-import { SessionUsageService } from "./sessionUsageService";
+import { SessionUsageService, type SessionUsageFile } from "./sessionUsageService";
 import { createTestHistoryService } from "./testHistoryService";
 import type { HistoryService } from "./historyService";
 import { countTokens } from "@/node/utils/main/tokenizer";
@@ -18,6 +18,7 @@ import { createStreamManagerForTests } from "./streamManager.testHarness";
 import {
   installStreamManagerTestHistory,
   historyService,
+  historyConfig,
   createTestLanguageModel,
   testStartOptions,
   REFUSAL_FINISH,
@@ -115,6 +116,43 @@ function costAboveRequestPrices(message: MuxMessage, steps: Array<Record<string,
     steps.map((usage) => createDisplayUsage(usage, LONG_CONTEXT_MODEL)!)
   );
   return (getTotalCost(turn) ?? NaN) - (getTotalCost(requests) ?? NaN);
+}
+
+/** session-usage.json as it is on disk: the state a Xum restart keeps. */
+async function readLedgerFile(sessionsDir: string, workspaceId: string) {
+  try {
+    const raw = await fs.readFile(path.join(sessionsDir, workspaceId, "session-usage.json"), "utf-8");
+    return JSON.parse(raw) as SessionUsageFile;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+/** Tokens and cost summed over every model bucket of a ledger. */
+function ledgerTotals(ledger: SessionUsageFile | undefined) {
+  const total = sumUsageHistory(Object.values(ledger?.byModel ?? {}));
+  return {
+    tokens: total
+      ? total.input.tokens +
+        total.cached.tokens +
+        total.cacheCreate.tokens +
+        total.output.tokens +
+        total.reasoning.tokens
+      : 0,
+    cost: getTotalCost(total) ?? 0,
+  };
+}
+
+/** What the ledger must hold for one turn: its persisted usage, priced once. */
+function expectedTurnTotals(message: MuxMessage) {
+  const usage = createDisplayUsage(
+    message.metadata?.usage,
+    KNOWN_MODELS.SONNET.id,
+    message.metadata?.providerMetadata
+  );
+  if (!usage) throw new Error(`Expected billed usage on ${message.id}`);
+  return ledgerTotals({ byModel: { [KNOWN_MODELS.SONNET.id]: usage }, version: 1 });
 }
 
 /** The turn's only sidecar row: a duplicate write would double-count the spend. */
@@ -285,6 +323,57 @@ describe("StreamManager - TTFT metadata persistence", () => {
     });
 
     expect(costAboveRequestPrices(message, steps)).toBeCloseTo(0, 12);
+  });
+
+  test("session-usage.json holds each finished step while the turn runs and the turn once at its end", async () => {
+    // A long turn used to read $0 in session-usage.json until it ended, and a Xum restart
+    // mid-turn lost all of its spend: the ledger was written only at stream end.
+    const workspaceId = "in-flight-ledger-completed-workspace";
+    const sessionUsageService = new SessionUsageService(historyConfig, historyService);
+    const stepUsage = { inputTokens: 1_000, outputTokens: 100, totalTokens: 1_100 };
+    let afterFirstStep: SessionUsageFile | undefined;
+    let settledAfterFirstStep: SessionUsageFile | undefined;
+    const message = await completeTurnAndReadMessage({
+      workspaceId,
+      messageId: "in-flight-ledger-completed-message",
+      streamManager: createStreamManagerForTests(historyService, {
+        sessionUsageService,
+        streamText: scriptedStreamText([
+          {
+            chunks: [
+              text("working"),
+              finishStep(stepUsage),
+              async () => {
+                afterFirstStep = await readLedgerFile(historyConfig.sessionsDir, workspaceId);
+                settledAfterFirstStep = await sessionUsageService.getSessionUsage(workspaceId);
+              },
+              finishStep(stepUsage),
+              STOP_FINISH,
+            ],
+            usage: { inputTokens: 2_000, outputTokens: 200, totalTokens: 2_200 },
+            steps: [{ usage: stepUsage }, { usage: stepUsage }],
+          },
+        ]),
+      }),
+      chunks: [],
+    });
+
+    const firstStep = ledgerTotals({
+      byModel: { [KNOWN_MODELS.SONNET.id]: createDisplayUsage(stepUsage, KNOWN_MODELS.SONNET.id)! },
+      version: 1,
+    });
+    expect(ledgerTotals(afterFirstStep).tokens).toBe(firstStep.tokens);
+    expect(ledgerTotals(afterFirstStep).cost).toBeCloseTo(firstStep.cost, 12);
+    // The Costs tab adds the live stream on top of getSessionUsage: that view excludes it.
+    expect(ledgerTotals(settledAfterFirstStep).tokens).toBe(0);
+
+    const turn = expectedTurnTotals(message);
+    const onDisk = ledgerTotals(await readLedgerFile(historyConfig.sessionsDir, workspaceId));
+    expect(onDisk.tokens).toBe(turn.tokens);
+    expect(onDisk.cost).toBeCloseTo(turn.cost, 12);
+    expect(ledgerTotals(await sessionUsageService.getSessionUsage(workspaceId)).tokens).toBe(
+      turn.tokens
+    );
   });
 
   test("emits and persists routeProvider from initial stream metadata", async () => {
@@ -610,6 +699,40 @@ describe("StreamManager - aborted stream usage persistence", () => {
     expect(partial?.metadata?.contextUsage).toMatchObject(ABORT_STEP_USAGE);
   });
 
+  test("a running turn's finished steps are in session-usage.json before it ends, and counted once after an abort", async () => {
+    // The held stream stands in for a turn that a Xum restart kills: only what is on
+    // disk survives, so the ledger file must already hold every finished step.
+    const { historyService: hs, config, cleanup } = await createTestHistoryService();
+    try {
+      const sessionUsageService = new SessionUsageService(config, hs);
+      const workspaceId = "in-flight-ledger-abort-workspace";
+      const messageId = "in-flight-ledger-abort-message";
+      const { streamManager, completion } = await startHeldTurnForTests({
+        workspaceId,
+        messageId,
+        history: hs,
+        sessionUsageService,
+        chunks: [partialText, finishStep(ABORT_STEP_USAGE), finishStep(ABORT_STEP_USAGE)],
+      });
+
+      const running = ledgerTotals(await readLedgerFile(config.sessionsDir, workspaceId));
+      expect(running.tokens).toBe(2 * ABORT_STEP_USAGE.totalTokens);
+      expect(running.cost).toBeGreaterThan(0);
+      expect(ledgerTotals(await sessionUsageService.getSessionUsage(workspaceId)).tokens).toBe(0);
+
+      await streamManager.stopStream(workspaceId, { abortReason: "user" });
+      expect((await completion).status).toBe("aborted");
+
+      const turn = expectedTurnTotals(await readHistoryMessage(hs, workspaceId, messageId));
+      const settled = ledgerTotals(await readLedgerFile(config.sessionsDir, workspaceId));
+      expect(settled.tokens).toBe(turn.tokens);
+      expect(settled.cost).toBeCloseTo(turn.cost, 12);
+      expect(settled.cost).toBeCloseTo(running.cost, 12);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("an aborted turn prices each finished step at its own context tier", async () => {
     const workspaceId = "long-context-abort-workspace";
     const messageId = "long-context-abort-message";
@@ -933,6 +1056,33 @@ describe("StreamManager - aborted stream usage persistence", () => {
       const partial = await hs.readPartial(workspaceId);
       expect(partial?.metadata?.usage).toBeUndefined();
       expect(partial?.parts).toMatchObject([{ type: "text" }]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("an errored turn's in-flight steps are replaced by its usage, counted once", async () => {
+    const { historyService: hs, config, cleanup } = await createTestHistoryService();
+    try {
+      const sessionUsageService = new SessionUsageService(config, hs);
+      const workspaceId = "in-flight-ledger-error-workspace";
+      await runFailingTurnForTests({
+        history: hs,
+        sessionUsageService,
+        workspaceId,
+        messageId: "in-flight-ledger-error-message",
+        chunks: [
+          { type: "text-delta", text: "partial answer before failure" },
+          finishStep({ inputTokens: 900, outputTokens: 40, totalTokens: 940 }),
+        ],
+        error: "stream truncated",
+      });
+
+      const ledger = await readLedgerFile(config.sessionsDir, workspaceId);
+      expect(ledgerTotals(ledger).tokens).toBe(940);
+      expect(ledgerTotals(await sessionUsageService.getSessionUsage(workspaceId))).toEqual(
+        ledgerTotals(ledger)
+      );
     } finally {
       await cleanup();
     }

@@ -12,11 +12,12 @@ import type {
   ModelFallbackPrepareOptions,
   StreamManager,
 } from "./streamManager";
-import type { SessionUsageService } from "./sessionUsageService";
+import { SessionUsageService } from "./sessionUsageService";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import {
   installStreamManagerTestHistory,
   historyService,
+  historyConfig,
   createTestLanguageModel,
   REFUSAL_FINISH,
   STOP_FINISH,
@@ -259,6 +260,49 @@ describe("StreamManager - refusal usage attribution", () => {
       "refused_stream",
       "errored_stream",
     ]);
+  });
+
+  test("a refused attempt's in-flight steps count once, under the refused model, after the fallback completes", async () => {
+    // Each finished step lands in session-usage.json while the turn runs. The refusal hop
+    // then records the refused attempt itself, so its in-flight copy must go away.
+    const sessionUsageService = new SessionUsageService(historyConfig, historyService);
+    const workspaceId = "ws-refusal-in-flight-ledger";
+    const streamManager = createStreamManagerForTests(historyService, {
+      sessionUsageService,
+      streamText: scriptedStreamText([
+        {
+          chunks: [
+            { type: "finish-step", usage: { inputTokens: 500, outputTokens: 0, totalTokens: 500 } },
+            REFUSAL_FINISH,
+          ],
+          usage: { inputTokens: 500, outputTokens: 0, totalTokens: 500 },
+        },
+        {
+          chunks: [
+            { type: "finish-step", usage: { inputTokens: 300, outputTokens: 20, totalTokens: 320 } },
+            { type: "text-delta", text: "done" },
+            STOP_FINISH,
+          ],
+          usage: { inputTokens: 300, outputTokens: 20, totalTokens: 320 },
+        },
+      ]),
+    });
+
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId,
+      modelString: KNOWN_MODELS.SONNET.id,
+      modelFallback: preparedFallback(),
+    });
+    expect(completion.status).toBe("completed");
+
+    const ledger = await sessionUsageService.getSessionUsage(workspaceId);
+    const tokensByModel = Object.fromEntries(
+      Object.entries(ledger?.byModel ?? {}).map(([model, usage]) => [
+        model,
+        usage.input.tokens + usage.output.tokens,
+      ])
+    );
+    expect(tokensByModel).toEqual({ [KNOWN_MODELS.SONNET.id]: 500, "openai:gpt-5.6-luna": 320 });
   });
 
   test("ledger key uses the stream's pinned metadata identity when instance metadata is gone", async () => {
