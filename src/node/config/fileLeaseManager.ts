@@ -5,7 +5,7 @@ import { getXumHome } from "@/common/constants/paths";
 import { log } from "@/node/services/log";
 import { ensurePrivateDirSync } from "@/node/utils/fs";
 
-export function isProcessAlive(pid: number): boolean {
+function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;

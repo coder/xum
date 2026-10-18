@@ -23,7 +23,11 @@ import {
   ChatUsageDisplaySchema,
   SessionUsageTokenStatsCacheSchema,
 } from "@/common/orpc/schemas/chatStats";
-import { isProcessAlive } from "@/node/config/fileLeaseManager";
+import {
+  getSelfIdentity,
+  judgeHolder,
+  parseProcessIdentity,
+} from "@/node/utils/concurrency/processLiveness";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import type { TokenConsumer } from "@/common/types/chatStats";
 import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
@@ -124,8 +128,16 @@ const IN_FLIGHT_KEY_PATTERN = /^[A-Za-z0-9-]+$/;
 
 const InFlightUsageFileSchema = z.object({
   version: z.literal(1),
-  /** The Xum process writing this file while its stream runs. */
-  owner: z.object({ pid: z.number(), id: z.string() }),
+  /**
+   * The Xum process writing this file while its stream runs: its pid and process identity
+   * (judged by processLiveness.judgeHolder, the death rule Xum's cross-process locks use),
+   * plus an ID unique to the SessionUsageService instance.
+   */
+  owner: z.object({
+    pid: z.number(),
+    id: z.string(),
+    identity: z.record(z.string(), z.unknown()).optional(),
+  }),
   messageId: z.string(),
   model: z.string(),
   /** The stream attempt's cumulative usage over its finished steps, priced. */
@@ -278,8 +290,8 @@ export class SessionUsageService {
 
   /**
    * A stream whose writer is gone: written by this process and no longer running (its
-   * final ledger write failed), or by a Xum process that has exited. The same pid with
-   * another owner ID is an earlier process whose pid this one reuses.
+   * final ledger write failed), or by a Xum process with positive evidence of death (the
+   * same pid with another owner ID is an earlier process whose pid this one reuses).
    */
   private isOrphan(workspaceId: string, entry: InFlightUsageEntry): boolean {
     const owner = entry.file?.owner;
@@ -287,7 +299,8 @@ export class SessionUsageService {
     if (owner.id === this.inFlightOwnerId) {
       return !(this.liveInFlightKeys.get(workspaceId)?.has(entry.key) ?? false);
     }
-    return owner.pid === process.pid || !isProcessAlive(owner.pid);
+    const identity = owner.identity ? parseProcessIdentity(owner.identity) : undefined;
+    return judgeHolder({ pid: owner.pid, identity }, false).dead;
   }
 
   /**
@@ -441,7 +454,11 @@ export class SessionUsageService {
       liveKeys.add(key);
       const file: InFlightUsageFile = {
         version: 1,
-        owner: { pid: process.pid, id: this.inFlightOwnerId },
+        owner: {
+          pid: process.pid,
+          id: this.inFlightOwnerId,
+          identity: { ...getSelfIdentity() },
+        },
         messageId,
         model,
         usage,

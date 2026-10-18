@@ -7,6 +7,7 @@ import type { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { createMuxMessage } from "@/common/types/message";
 import { SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
+import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
 import { sumUsageHistory, type ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 
 const MODEL = "anthropic:claude-sonnet-4-5";
@@ -199,9 +200,10 @@ describe("SessionUsageService in-flight usage", () => {
     await service.recordUsage(workspaceId, MODEL, usage(10, 1));
     await fs.mkdir(inFlightDir(), { recursive: true });
     // process.ppid is alive (it started this test run) and is not this process.
+    const identity = { ...getSelfIdentity(), birth: linuxBirth(process.ppid) };
     const foreign = {
       version: 1,
-      owner: { pid: process.ppid, id: "other-xum" },
+      owner: { pid: process.ppid, id: "other-xum", identity },
       messageId: "msg-other",
       model: MODEL,
       usage: usage(100, 10),
