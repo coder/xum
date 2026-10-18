@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test";
 
+import { CODER_GATEWAY_DEFAULT_PROVIDER_NAMES } from "@/common/constants/coderOAuth";
 import type { CoderGatewayProvider } from "@/common/constants/coderOAuth";
 import {
+  probeCoderGatewayProviders,
   readPriorCoderCatalog,
   reconcileProviderCatalog,
   type PriorCoderCatalog,
@@ -13,6 +15,31 @@ const custom: CoderGatewayProvider = { name: "corp", type: "openai" };
 function prior(overrides: Partial<PriorCoderCatalog> = {}): PriorCoderCatalog {
   return { known: true, discovered: [], stale: [], providers: [], ...overrides };
 }
+
+describe("probeCoderGatewayProviders", () => {
+  it("probes the default names when nothing is stored", () => {
+    const probed = probeCoderGatewayProviders(undefined);
+    expect(probed.map((provider) => provider.name)).toEqual([
+      ...CODER_GATEWAY_DEFAULT_PROVIDER_NAMES,
+    ]);
+    expect(probed.every((provider) => provider.type === provider.name)).toBe(true);
+  });
+
+  it("lets stored discovery replace a default and additionalProviders replace both", () => {
+    const probed = probeCoderGatewayProviders({
+      discoveredProviders: [
+        { name: "anthropic", type: "openai-compat" },
+        { name: "corp", type: "anthropic" },
+      ],
+      additionalProviders: [custom, { name: 3 }],
+    });
+    const byName = new Map(probed.map((provider) => [provider.name, provider.type]));
+    expect(byName.get("anthropic")).toBe("openai-compat");
+    expect(byName.get("corp")).toBe("openai");
+    // One entry per name: overrides replace, never duplicate.
+    expect(probed.length).toBe(new Set(probed.map((provider) => provider.name)).size);
+  });
+});
 
 describe("readPriorCoderCatalog", () => {
   it("reads the catalog markers and keeps only string IDs", () => {

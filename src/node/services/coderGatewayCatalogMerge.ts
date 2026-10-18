@@ -6,7 +6,10 @@
  * lock. The rules that decide what each provider contributes live here so they
  * can be tested without the OAuth service, the lock or the network.
  */
-import { parseCoderGatewayProviders } from "@/common/constants/coderOAuth";
+import {
+  CODER_GATEWAY_DEFAULT_PROVIDER_NAMES,
+  parseCoderGatewayProviders,
+} from "@/common/constants/coderOAuth";
 import type { CoderGatewayProvider } from "@/common/constants/coderOAuth";
 
 /** One provider catalog request, classified (see fetchProviderCatalogEffect). */
@@ -55,6 +58,28 @@ export function readPriorCoderCatalog(
     stale: stringEntries(section?.staleDiscoveredModels),
     providers: parseCoderGatewayProviders(section?.discoveredProviders),
   };
+}
+
+/**
+ * The provider set to probe when the admin-only listing is unavailable. For
+ * the same name a later source wins: stored discovery metadata (its type may
+ * come from an authoritative listing) replaces the name === type default, and
+ * the user-managed additionalProviders win over both.
+ */
+export function probeCoderGatewayProviders(
+  section: Record<string, unknown> | undefined
+): CoderGatewayProvider[] {
+  const known = new Map<string, CoderGatewayProvider>();
+  for (const name of CODER_GATEWAY_DEFAULT_PROVIDER_NAMES) {
+    known.set(name, { name, type: name });
+  }
+  for (const provider of [
+    ...parseCoderGatewayProviders(section?.discoveredProviders),
+    ...parseCoderGatewayProviders(section?.additionalProviders),
+  ]) {
+    known.set(provider.name, provider);
+  }
+  return [...known.values()];
 }
 
 function idsUnderProvider(ids: string[], providerName: string): string[] {

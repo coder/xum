@@ -27,7 +27,6 @@ import {
   coderAibridgeBaseUrl,
   CODER_AI_PROVIDERS_PATH,
   CODER_BUILDINFO_PATH,
-  CODER_GATEWAY_DEFAULT_PROVIDER_NAMES,
   coderGatewayWireProtocol,
   parseCoderGatewayProviders,
   CODER_OAUTH_CALLBACK_PATH,
@@ -41,6 +40,7 @@ import type { WindowService } from "@/node/services/windowService";
 import { log } from "@/node/services/log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import {
+  probeCoderGatewayProviders,
   readPriorCoderCatalog,
   reconcileProviderCatalog,
 } from "@/node/services/coderGatewayCatalogMerge";
@@ -2512,25 +2512,13 @@ export class CoderOauthService {
       // default-named deployments; custom-named instances stay reachable via
       // the user-managed additionalProviders escape hatch.
       const authoritative = listing.kind === "ok";
-      let providers: CoderGatewayProvider[];
-      if (authoritative) {
-        providers = listing.providers;
-      } else {
-        const section = self.providersConfigStore.loadProvidersConfig()?.coder as
-          | Record<string, unknown>
-          | undefined;
-        const known = new Map<string, CoderGatewayProvider>();
-        for (const name of CODER_GATEWAY_DEFAULT_PROVIDER_NAMES) {
-          known.set(name, { name, type: name });
-        }
-        for (const provider of [
-          ...parseCoderGatewayProviders(section?.discoveredProviders),
-          ...parseCoderGatewayProviders(section?.additionalProviders),
-        ]) {
-          known.set(provider.name, provider);
-        }
-        providers = [...known.values()];
-      }
+      const providers: CoderGatewayProvider[] = authoritative
+        ? listing.providers
+        : probeCoderGatewayProviders(
+            self.providersConfigStore.loadProvidersConfig()?.coder as
+              | Record<string, unknown>
+              | undefined
+          );
 
       // Provider catalogs are independent: fetch them concurrently and bound
       // each request, so one stalled provider can neither delay nor starve a
