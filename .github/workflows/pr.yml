@@ -681,6 +681,9 @@ jobs:
       - name: Verify a new workspace's projectName on a Windows project path
         shell: pwsh
         run: bun test src/node/services/workspaceService.planNamespace.test.ts -t "folder name, not its path"
+      - name: Verify projectName on a Windows server without navigator
+        shell: pwsh
+        run: bun test src/node/config.test.ts -t "names the project by its folder, not its path"
       - name: Run Windows integration smoke tests
         shell: pwsh
         run: |

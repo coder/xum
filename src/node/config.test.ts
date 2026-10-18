@@ -1277,6 +1277,45 @@ describe("Config", () => {
     });
   });
 
+  // #6932: the common PlatformPaths picks its separator from navigator.platform. A Windows server
+  // process without a global navigator (Node 20) took every project path as POSIX, so
+  // projectName, which also names plans/<projectName>/, was the whole path.
+  describe("projectName on a Windows server without navigator", () => {
+    const onWindows = process.platform === "win32" ? it : it.skip;
+
+    onWindows("names the project by its folder, not its path", async () => {
+      const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+      Object.defineProperty(globalThis, "navigator", { value: undefined, configurable: true });
+      try {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              [
+                "C:\\Users\\u\\repo",
+                {
+                  workspaces: [
+                    {
+                      id: "ws-1",
+                      name: "feature-x",
+                      path: "C:\\Users\\u\\.xum\\src\\repo\\feature-x",
+                    },
+                  ],
+                },
+              ],
+            ],
+          })
+        );
+        const metadata = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+        expect(metadata.map((meta) => meta.projectName)).toEqual(["repo"]);
+      } finally {
+        if (navigatorDescriptor)
+          Object.defineProperty(globalThis, "navigator", navigatorDescriptor);
+        else delete (globalThis as { navigator?: unknown }).navigator;
+      }
+    });
+  });
+
   // Stored keys that normalize to the same project path ("aliases", e.g. "/repo" and "/repo/").
   // The loader used to build `new Map(pairs)`, so the last alias silently replaced the others
   // and the next save dropped their workspace rows.
