@@ -288,7 +288,7 @@ describe("applyAgentCgroupLimits", () => {
       expect(result.status).toHaveProperty(
         "reason",
         expect.stringMatching(
-          /^xum runs in cgroup \/xum, which the user running xum cannot manage .* sudo could not delegate \/xum-1000: sudo: a password is required$/
+          /^xum runs in cgroup \/xum, which the user running xum cannot manage .*\. Start xum in a cgroup delegated to that user\. Delegating \/xum-1000 with sudo failed: sudo: a password is required$/
         )
       );
       expect(tree.sudoCalls).toEqual(["xum-1000"]);

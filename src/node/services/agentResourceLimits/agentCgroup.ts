@@ -30,6 +30,13 @@ for dir in "$1" "$1/xum-app"; do
   chown "$2" "$dir" "$dir/cgroup.procs" "$dir/cgroup.subtree_control" "$dir/cgroup.threads"
 done
 echo "$3" > "$1/xum-app/cgroup.procs"`;
+/**
+ * The sudo failure of each host's last delegation attempt, with the limits it was for. Every
+ * config write re-applies limits that are not applied, and on a host where sudo needs a password
+ * each attempt can add an auth-log entry or incident mail, so xum tries sudo only once for each
+ * limits change, each time the limits are turned on, and at startup.
+ */
+const failedSudoDelegations = new WeakMap<AgentCgroupHost, { limits: string; error: string }>();
 
 type Controller = "cpu" | "memory";
 
@@ -84,6 +91,8 @@ export const linuxAgentCgroupHost: AgentCgroupHost = {
     }
   },
   delegateWithSudo: async (cgroupDir) => {
+    const timeout = AbortSignal.timeout(PROBE_TIMEOUT_MS);
+    // The tree kill also closes the pipes that a hung descendant of sudo still holds.
     using sudo = execFileAsync(
       "sudo",
       [
@@ -96,9 +105,18 @@ export const linuxAgentCgroupHost: AgentCgroupHost = {
         String(linuxAgentCgroupHost.uid),
         String(process.pid),
       ],
-      { timeoutMs: PROBE_TIMEOUT_MS }
+      { signal: timeout, killTreeOnTermination: true }
     );
-    await sudo.result;
+    try {
+      await sudo.result;
+    } catch (error) {
+      if (timeout.aborted) {
+        throw new Error(`sudo did not finish within ${PROBE_TIMEOUT_MS / 1000} seconds.`, {
+          cause: error,
+        });
+      }
+      throw error;
+    }
   },
 };
 
@@ -133,6 +151,7 @@ export async function applyAgentCgroupLimits(
 ): Promise<AgentCgroupResult> {
   const needed = neededControllers(limits);
   if (needed.length === 0) {
+    failedSudoDelegations.delete(host);
     try {
       await clearAgentCgroupLimits(host);
     } catch (error) {
@@ -148,7 +167,7 @@ export async function applyAgentCgroupLimits(
   if (typeof found !== "string") {
     return found;
   }
-  const base = await findManageableBase(found, host);
+  const base = await findManageableBase(found, limits, host);
   if (typeof base !== "string") {
     return base;
   }
@@ -180,6 +199,7 @@ function neededControllers(limits: AgentResourceLimits): Controller[] {
  */
 async function findManageableBase(
   base: string,
+  limits: AgentResourceLimits,
   host: AgentCgroupHost
 ): Promise<string | AgentCgroupResult> {
   const accessError = await findAccessError(path.join(host.cgroupRoot, base));
@@ -191,10 +211,17 @@ async function findManageableBase(
   if (delegated === null) {
     return unavailable(reason);
   }
+  const limitsKey = JSON.stringify(limits);
+  const failed = failedSudoDelegations.get(host);
+  if (failed?.limits === limitsKey) {
+    return unavailable(sudoFailedReason(reason, delegated, failed.error));
+  }
   try {
     await host.delegateWithSudo(path.join(host.cgroupRoot, delegated));
   } catch (error) {
-    return unavailable(`${reason} sudo could not delegate ${delegated}: ${getErrorMessage(error)}`);
+    const sudoError = getErrorMessage(error);
+    failedSudoDelegations.set(host, { limits: limitsKey, error: sudoError });
+    return unavailable(sudoFailedReason(reason, delegated, sudoError));
   }
   log.info("Delegated a cgroup to xum with sudo", { cgroup: delegated });
   const moved = await findBaseCgroup(host);
@@ -242,6 +269,10 @@ async function findAccessError(baseDir: string): Promise<string | null> {
 
 function cannotManageReason(base: string, accessError: string): string {
   return `xum runs in cgroup ${base}, which the user running xum cannot manage (${accessError}). Start xum in a cgroup delegated to that user.`;
+}
+
+function sudoFailedReason(reason: string, delegated: string, sudoError: string): string {
+  return `${reason} Delegating ${delegated} with sudo failed: ${sudoError}`;
 }
 
 /** Why the base cgroup lacks a controller that the limits need, or null when it has them. */

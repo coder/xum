@@ -144,6 +144,34 @@ describe("AgentResourceLimitsService", () => {
     expect(tree.sudoCalls).toEqual(["xum-1000"]);
   });
 
+  it("tries a failing sudo once per limits change, not on every config write", async () => {
+    // Root ignores file modes, so xum's cgroup cannot be root's there.
+    if (process.getuid?.() === 0) return;
+    await tree.dispose();
+    tree = await createFakeCgroupTree({
+      own: "/init.scope",
+      cgroups: { "init.scope": { controllers: "cpu memory", procs: [String(process.pid)] } },
+    });
+    await fs.chmod(path.join(tree.root, "init.scope", "cgroup.subtree_control"), 0o444);
+    service = new AgentResourceLimitsService(config, tree.host);
+    await service.start();
+
+    const state = await service.set({ cpuCores: 1, memoryGiB: 2 });
+    await config.updateBashAiProxyEnabled(true);
+    await service.get();
+
+    expect(state.status).toHaveProperty(
+      "reason",
+      expect.stringContaining("with sudo failed: sudo: a password is required")
+    );
+    expect(tree.sudoCalls).toEqual(["xum-1000"]);
+
+    await service.set({ cpuCores: 2, memoryGiB: 2 });
+    await service.setEnabled(false);
+    await service.setEnabled(true);
+    expect(tree.sudoCalls).toEqual(["xum-1000", "xum-1000", "xum-1000"]);
+  });
+
   it("saves and applies the limits it is given", async () => {
     service = new AgentResourceLimitsService(config, tree.host);
     await service.start();
