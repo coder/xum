@@ -2155,7 +2155,6 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
         workspaceSessionDir: params.parentSessionDir,
         update: (parentFile) => {
           for (const [taskId, childEntry] of mergeableIndexEntries(childEntries)) {
-
             const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
             const childUpdated = coerceUpdatedAtMs(childEntry);
             const existingUpdated = existing ? coerceUpdatedAtMs(existing) : -1;
@@ -2235,7 +2234,6 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
         workspaceSessionDir: params.parentSessionDir,
         update: (parentFile) => {
           for (const [taskId, childEntry] of mergeableIndexEntries(childEntries)) {
-
             const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
             const childUpdated = coerceUpdatedAtMs(childEntry);
             const existingUpdated = existing ? coerceUpdatedAtMs(existing) : -1;
