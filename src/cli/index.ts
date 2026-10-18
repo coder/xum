@@ -35,6 +35,7 @@ import {
   isElectronLaunchArg,
 } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
+import { warnIfUnsupportedNode } from "./nodeVersion";
 
 import { cleanupObsoleteXumBinArtifacts } from "@/common/constants/paths";
 import { initializeXumHomeTransition } from "@/node/compat/xumTransition";
@@ -43,6 +44,8 @@ void bootstrapCli();
 
 async function bootstrapCli(): Promise<void> {
   try {
+    // One stderr line on a Node older than xum server supports (#6968). It never exits.
+    warnIfUnsupportedNode();
     const transition = await initializeXumHomeTransition();
     cleanupObsoleteXumBinArtifacts(transition.activePath);
   } catch {
