@@ -186,6 +186,11 @@ describe("discoverAgentPlugins", () => {
           importedComponents: selection,
         });
         expect(plugins[0].rootPath).toBe(plugins[1].rootPath);
+        // Each view names its own approved copies, by its lexical path (like its MCP keys).
+        expect(plugins.map((plugin) => plugin.approvedCopies?.instancePath)).toEqual([
+          path.join(alias, "managed"),
+          path.join(owner, "managed"),
+        ]);
         expect(reads.mock.calls.filter(([file]) => file === registryPath)).toHaveLength(1);
         expect(opens.mock.calls.filter(([file]) => file === manifestPath)).toHaveLength(1);
       } finally {

@@ -151,12 +151,7 @@ export async function saveApprovedCopies(args: {
     fs.readFile(path.join(args.pluginDir, relativePath), "utf8");
   const skills: ApprovedCopies["skills"] = {};
   for (const [name, fingerprint] of Object.entries(consent.skills)) {
-    const relativeDir = path.join("skills", name);
-    skills[name] = {
-      fingerprint,
-      relativeDir,
-      content: await read(path.join(relativeDir, "SKILL.md")),
-    };
+    skills[name] = { fingerprint, content: await read(path.join("skills", name, "SKILL.md")) };
   }
   const workflows: ApprovedCopies["workflows"] = {};
   for (const [file, fingerprint] of Object.entries(consent.workflows)) {

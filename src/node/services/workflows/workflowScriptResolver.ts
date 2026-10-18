@@ -14,7 +14,10 @@ import {
   type AgentPluginInfo,
 } from "@/node/services/agentPlugins/discovery";
 import { isPluginWorkflowConsented } from "@/node/services/agentPlugins/componentConsent";
-import { consentedPluginWorkflowSource } from "@/node/services/agentPlugins/approvedCopies";
+import {
+  consentedPluginWorkflowSource,
+  type ApprovedCopiesReads,
+} from "@/node/services/agentPlugins/approvedCopies";
 import { pluginSkillScriptKey } from "@/node/services/agentPlugins/workflowFiles";
 import { isValidAgentPluginName } from "@/node/services/agentPlugins/manifest";
 import {
@@ -65,6 +68,8 @@ export interface ResolveWorkflowScriptInput {
   containment?: ProjectSkillContainment;
   /** Separate skill I/O context when workflow files execute in another runtime. */
   skillStorageContext?: SkillStorageContext;
+  /** Shared by the resolutions of one listing: each install's approved copies are read once. */
+  approvedCopiesReads?: ApprovedCopiesReads;
 }
 
 const SKILL_SCRIPT_PATH_PREFIX = "skill://";
@@ -217,7 +222,8 @@ async function resolveSkillWorkflowScript(
   const source = await reviewedSkillScriptSource(
     resolvedSkill,
     parsed.relativePath,
-    await readFileString(skillRuntime, resolvedPath)
+    await readFileString(skillRuntime, resolvedPath),
+    input.approvedCopiesReads
   );
   return buildResolvedScript({
     requestedScriptPath: input.scriptPath,
@@ -369,7 +375,12 @@ async function resolvePluginWorkflowScript(
   } catch (error) {
     throw new Error(`Plugin workflow script not readable: ${getErrorMessage(error)}`);
   }
-  const source = await reviewedWorkflowSource(plugin, parsed.relativePath, liveSource);
+  const source = await reviewedWorkflowSource(
+    plugin,
+    parsed.relativePath,
+    liveSource,
+    input.approvedCopiesReads
+  );
   return buildResolvedScript({
     requestedScriptPath: input.scriptPath,
     canonicalScriptPath: `${PLUGIN_SCRIPT_PATH_PREFIX}${plugin.name}/${parsed.relativePath}`,
@@ -410,13 +421,15 @@ async function reviewedSkillScriptSource(
     "pluginConsent" | "pluginApprovedCopies" | "pluginRoot" | "pluginName" | "skillDir"
   >,
   relativePath: string,
-  source: string
+  source: string,
+  reads: ApprovedCopiesReads | undefined
 ): Promise<string> {
   if (skill.pluginConsent === undefined || skill.pluginRoot === undefined) return source;
   const file = pluginSkillScriptKey(skill.pluginRoot, path.join(skill.skillDir, relativePath));
   const reviewed = await consentedPluginWorkflowSource(
     { componentConsent: skill.pluginConsent, approvedCopies: skill.pluginApprovedCopies },
-    { file, source }
+    { file, source },
+    reads
   );
   if (reviewed !== undefined) return reviewed;
   throw unreviewedWorkflowError(file, skill.pluginName ?? "?");
@@ -502,9 +515,10 @@ function assertWorkflowReviewed(plugin: AgentPluginInfo, file: string, source: s
 async function reviewedWorkflowSource(
   plugin: AgentPluginInfo,
   file: string,
-  source: string
+  source: string,
+  reads: ApprovedCopiesReads | undefined
 ): Promise<string> {
-  const reviewed = await consentedPluginWorkflowSource(plugin, { file, source });
+  const reviewed = await consentedPluginWorkflowSource(plugin, { file, source }, reads);
   if (reviewed !== undefined) return reviewed;
   throw unreviewedWorkflowError(file, plugin.name);
 }

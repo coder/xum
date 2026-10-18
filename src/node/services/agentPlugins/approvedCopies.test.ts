@@ -17,7 +17,6 @@ import { computePluginInstanceId } from "./mcpConfig";
 
 const skill = (fingerprint: string, content = `content ${fingerprint}`) => ({
   fingerprint,
-  relativeDir: "skills/x",
   content,
 });
 const script = (fingerprint: string) => ({ fingerprint, source: `source ${fingerprint}` });

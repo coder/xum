@@ -3,6 +3,7 @@ import type { AvailableWorkflow } from "@/common/types/workflow";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
+import type { ApprovedCopiesReads } from "@/node/services/agentPlugins/approvedCopies";
 import {
   listPluginWorkflowFiles,
   SKILL_WORKFLOW_ENTRY,
@@ -80,6 +81,7 @@ export async function discoverWorkflowScripts(
     log.warn(`Workflow script discovery: failed to enumerate skills: ${getErrorMessage(error)}`);
   }
 
+  const approvedCopiesReads: ApprovedCopiesReads = new Map();
   const tryPush = async (available: AvailableWorkflow[], scriptPath: string): Promise<void> => {
     try {
       const resolved = await resolveWorkflowScript({
@@ -89,6 +91,7 @@ export async function discoverWorkflowScripts(
         projectSearchRoot: input.projectSearchRoot,
         projectTrusted: input.projectTrusted,
         skillStorageContext: input.skillStorageContext,
+        approvedCopiesReads,
       });
       const descriptor = buildWorkflowScriptDescriptor(resolved);
       // Pre-run phase preview. An invalid meta.phases declaration must not hide

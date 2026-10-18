@@ -3,11 +3,12 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import type { ApprovedCopiesReads } from "@/node/services/agentPlugins/approvedCopies";
 import {
   createTestPluginInstallEntry,
   reviewedComponentConsent,
@@ -484,7 +485,7 @@ describe("resolveWorkflowScript", () => {
         JSON.stringify({ plugins: [entry] })
       );
       await saveApprovedCopies({ xumHome: tempDir.path, pluginDir, entry });
-      const resolve = (scriptPath: string) =>
+      const resolve = (scriptPath: string, approvedCopiesReads?: ApprovedCopiesReads) =>
         resolveWorkflowScript({
           scriptPath,
           runtime: new LocalRuntime(tempDir.path),
@@ -494,12 +495,29 @@ describe("resolveWorkflowScript", () => {
             ...createIsolatedAgentSkillsRoots(tempDir.path),
             globalPluginRoots: [container],
           },
+          ...(approvedCopiesReads !== undefined ? { approvedCopiesReads } : {}),
         });
 
       await fs.writeFile(path.join(pluginDir, "workflows", "release.js"), "const v = 'plugin-v2';");
       await fs.writeFile(path.join(skillDir, "workflow.js"), "const v = 'skill-v2';");
       expect((await resolve("plugin://my-plugin/release.js")).source).toContain("plugin-v1");
       expect((await resolve("skill://greet/workflow.js")).source).toContain("skill-v1");
+
+      // A listing resolves each script on its own; sharing its reads opens the copies file once.
+      const opens = spyOn(fs, "open");
+      try {
+        const reads: ApprovedCopiesReads = new Map();
+        expect((await resolve("plugin://my-plugin/release.js", reads)).source).toContain(
+          "plugin-v1"
+        );
+        expect((await resolve("skill://greet/workflow.js", reads)).source).toContain("skill-v1");
+        const copiesOpens = opens.mock.calls.filter(([file]) =>
+          String(file).includes("plugin-approved-copies")
+        );
+        expect(copiesOpens).toHaveLength(1);
+      } finally {
+        opens.mockRestore();
+      }
 
       // A removed script stays removed: its copy does not bring it back.
       await fs.rm(path.join(skillDir, "workflow.js"));

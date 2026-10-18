@@ -175,6 +175,37 @@ describe("AgentPluginInstallService approved copies", () => {
     expect((await served()).skill).toBe("v1");
   });
 
+  test("a skill moved to another directory gets no approved copy", async () => {
+    await install();
+    // An edit nobody approved: the skill moves to another skills root, its SKILL.md unchanged.
+    const pluginDir = path.join(home, "plugins", "demo");
+    await fsPromises.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "demo",
+        version: "1.0.0",
+        contributes: { skills: "moved" },
+      })
+    );
+    await fsPromises.mkdir(path.join(pluginDir, "moved"));
+    await fsPromises.rename(
+      path.join(pluginDir, "skills", "greet"),
+      path.join(pluginDir, "moved", "greet")
+    );
+
+    // The approved version was in skills/greet, a directory that is gone: like a removed skill.
+    await expect(served()).rejects.toThrow("Agent skill not found: greet");
+    const skillRows = async () =>
+      (await service.previewComponentReview({ name: "demo" })).changes
+        .filter((change) => change.component?.kind === "skills")
+        .map((change) => change.before);
+    const withCopies = await skillRows();
+    await fsPromises.rm(copiesFile());
+    expect(withCopies).toHaveLength(1);
+    expect(withCopies).toEqual(await skillRows());
+  });
+
   test("a restart saves the copies of an install approved by a build without them", async () => {
     await install();
     await fsPromises.rm(copiesFile());

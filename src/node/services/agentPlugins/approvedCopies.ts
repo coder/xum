@@ -7,18 +7,21 @@
  *
  *   <xumHome>/plugin-approved-copies/<instanceId>.json
  *     { version: 1, installedAt,
- *       skills: { <name>: { fingerprint, relativeDir, content } },
+ *       skills: { <name>: { fingerprint, content } },
  *       workflows: { <consent key>: { fingerprint, source } } }
  *
  * - A copy serves only after the current build's load-time predicate passes on its content
  *   against the current record, so a tampered, stale or drifted copy fails closed (blocked).
+ *   A skill copy is checked as if it were the live SKILL.md in the live skill's directory, so
+ *   a skill moved to another directory gets no copy, like a removed one.
  * - Known limit: the check uses this build's fingerprint, so a newer Xum that fingerprints
  *   unchanged files differently, or a component with no record at all, still needs a review.
  * - Bound to one installation by `installedAt`, like the hook trust file (pluginHookTrust.ts): a
  *   reinstall never inherits copies. Same file rules (pluginStateFiles.ts).
  * - Only the SKILL.md and the script source are copied. Other files of a skill directory stay
  *   live; consent does not cover them either.
- * - A live file that is missing or unreadable is not replaced by its copy: removal wins.
+ * - A live file that is missing, unreadable, invalid or empty is not replaced by its copy
+ *   (removal wins): the review and the sweep do not see such a component either.
  */
 import * as path from "node:path";
 import { z } from "zod";
@@ -57,11 +60,7 @@ const COPIES_FILE_LABEL = {
 /** Far above a real plugin's skills and scripts; a larger file is malformed (and never written). */
 export const MAX_APPROVED_COPIES_FILE_BYTES = 32 * 1024 * 1024;
 
-const SkillCopySchema = z.object({
-  fingerprint: z.string(),
-  relativeDir: z.string(),
-  content: z.string(),
-});
+const SkillCopySchema = z.object({ fingerprint: z.string(), content: z.string() });
 const WorkflowCopySchema = z.object({ fingerprint: z.string(), source: z.string() });
 /** Entries are checked one by one (validEntries), so one malformed entry drops only itself. */
 const CopiesFileSchema = z.object({
@@ -74,7 +73,7 @@ const CopiesFileSchema = z.object({
 export type ApprovedSkillCopy = z.infer<typeof SkillCopySchema>;
 export type ApprovedWorkflowCopy = z.infer<typeof WorkflowCopySchema>;
 export interface ApprovedCopies {
-  /** By skill name. `relativeDir` is the skill directory relative to the plugin root. */
+  /** By skill name: the SKILL.md content. */
   skills: Record<string, ApprovedSkillCopy>;
   /** By workflow consent key (componentConsent `workflows`). */
   workflows: Record<string, ApprovedWorkflowCopy>;
@@ -112,6 +111,26 @@ function copiesFileOf(source: ApprovedCopiesSource): string {
 export async function readApprovedCopies(source: ApprovedCopiesSource): Promise<ApprovedCopies> {
   const copies = await readCopiesFile(copiesFileOf(source), source.installedAt);
   return copies === "newer-version" ? noApprovedCopies() : copies;
+}
+
+/**
+ * The copies read so far by a batch of lookups that each discover the plugin again (the workflow
+ * listing resolves every script on its own), so each install's file is read once per batch.
+ */
+export type ApprovedCopiesReads = Map<string, Promise<ApprovedCopies>>;
+
+function readApprovedCopiesOnce(
+  reads: ApprovedCopiesReads | undefined,
+  source: ApprovedCopiesSource
+): Promise<ApprovedCopies> {
+  if (reads === undefined) return readApprovedCopies(source);
+  const key = `${copiesFileOf(source)}\0${source.installedAt}`;
+  let read = reads.get(key);
+  if (read === undefined) {
+    read = readApprovedCopies(source);
+    reads.set(key, read);
+  }
+  return read;
 }
 
 /**
@@ -272,40 +291,39 @@ export function pluginSkillConsentGate(plugin: {
   return gate;
 }
 
-export interface ConsentedPluginSkill {
-  parsed: ParsedSkillMarkdown;
-  /** The live skill directory, or the plugin root plus the copy's recorded directory. */
-  skillDir: string;
-}
-
 /**
- * The skill to serve: the live parse when it passes the consent gate, else the approved copy when
- * it verifies, else null (the skill does not load). Every reader of a plugin skill calls it.
+ * The skill to serve from `skillDir`: the live parse when it passes the consent gate, else the
+ * approved copy when it verifies there, else null (the skill does not load). Every reader of a
+ * plugin skill calls it.
  */
 export async function consentedPluginSkill(
   gate: PluginSkillConsentGate | undefined,
   skillDir: string,
   parsed: ParsedSkillMarkdown
-): Promise<ConsentedPluginSkill | null> {
+): Promise<ParsedSkillMarkdown | null> {
   if (
     gate === undefined ||
     isPluginSkillConsented(gate, skillDir, skillConsentFrontmatter(parsed), parsed.body)
   ) {
-    return { parsed, skillDir };
+    return parsed;
   }
   const name = parsed.frontmatter.name;
   const copy = getOwn((await gate.loadApprovedCopies?.())?.skills ?? {}, name);
-  const verified = copy === undefined ? null : verifySkillCopy(gate, name, copy);
+  const verified = copy === undefined ? null : verifySkillCopy(gate, name, copy, skillDir);
   if (verified !== null) log.debug("Serving the approved copy of a changed plugin skill", { name });
   return verified;
 }
 
-/** The copy's parse when the current build's predicate passes on it; null otherwise. */
+/**
+ * The copy's parse when the current build's predicate passes on it as the SKILL.md of the live
+ * `skillDir` (canonical, like the gate's plugin root); null otherwise.
+ */
 function verifySkillCopy(
   gate: PluginSkillConsentGate,
   name: string,
-  copy: ApprovedSkillCopy
-): ConsentedPluginSkill | null {
+  copy: ApprovedSkillCopy,
+  skillDir: string
+): ParsedSkillMarkdown | null {
   const directoryName = SkillNameSchema.safeParse(name);
   if (!directoryName.success) return null;
   let parsed: ParsedSkillMarkdown;
@@ -320,9 +338,8 @@ function verifySkillCopy(
     log.debug("Approved plugin skill copy does not parse; not serving it", { name, error });
     return null;
   }
-  const skillDir = path.join(gate.pluginRoot, copy.relativeDir);
   return isPluginSkillConsented(gate, skillDir, skillConsentFrontmatter(parsed), parsed.body)
-    ? { parsed, skillDir }
+    ? parsed
     : null;
 }
 
@@ -338,13 +355,15 @@ interface WorkflowConsentSource {
  */
 export async function consentedPluginWorkflowSource(
   plugin: WorkflowConsentSource,
-  input: { file: string; source: string }
+  input: { file: string; source: string },
+  reads?: ApprovedCopiesReads
 ): Promise<string | undefined> {
   if (isPluginWorkflowConsented(plugin.componentConsent, input)) return input.source;
   // Review and the sweep skip an empty script as absent (installService collectWorkflowScripts),
   // so it gets no review row and loses its copy: it stays refused like a removed file.
   if (plugin.approvedCopies === undefined || input.source.length === 0) return undefined;
-  const copy = getOwn((await readApprovedCopies(plugin.approvedCopies)).workflows, input.file);
+  const copies = await readApprovedCopiesOnce(reads, plugin.approvedCopies);
+  const copy = getOwn(copies.workflows, input.file);
   if (copy === undefined || !isWorkflowCopyVerified(plugin.componentConsent, input.file, copy)) {
     return undefined;
   }
@@ -367,18 +386,23 @@ export interface VerifiedApprovedCopies {
 }
 
 /**
- * The names whose copy verifies against `consent` (the review marks them: the approved version
- * stays in use until the user approves the new one).
+ * The names whose copy verifies against `consent`, a skill copy as the SKILL.md of the live skill
+ * of its name. The review marks them: the approved version stays in use until the user approves
+ * the new one.
  */
 export function verifiedApprovedCopies(
   copies: ApprovedCopies,
   consent: ComponentConsent | undefined,
-  pluginRoot: string
+  pluginRoot: string,
+  /** The live skills by name, with their directory relative to the plugin root. */
+  liveSkills: ReadonlyMap<string, { relativeDir: string }>
 ): VerifiedApprovedCopies {
   const gate = pluginSkillConsentGate({ rootPath: pluginRoot, componentConsent: consent });
-  const skills = Object.entries(copies.skills).filter(
-    ([name, copy]) => gate !== undefined && verifySkillCopy(gate, name, copy) !== null
-  );
+  const skills = Object.entries(copies.skills).filter(([name, copy]) => {
+    const live = liveSkills.get(name);
+    if (gate === undefined || live === undefined) return false;
+    return verifySkillCopy(gate, name, copy, path.join(pluginRoot, live.relativeDir)) !== null;
+  });
   const workflows = Object.entries(copies.workflows).filter(([file, copy]) =>
     isWorkflowCopyVerified(consent, file, copy)
   );

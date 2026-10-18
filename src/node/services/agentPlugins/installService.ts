@@ -404,7 +404,7 @@ type CollectedPluginSkill = AgentPluginPreviewSkill & {
   consentFingerprint: string;
   /** The fingerprinted fields as text (componentConsent.ts skillConsentDetail), built on demand. */
   consentDetail: () => string;
-  /** The skill directory relative to the plugin root, and the raw SKILL.md: an approved copy. */
+  /** The raw SKILL.md (an approved copy) and its directory relative to the plugin root. */
   approvedCopy: { relativeDir: string; content: string };
   whenToUse?: string;
   advertise?: boolean;
@@ -1204,6 +1204,8 @@ interface SurfaceSkill {
   fingerprint: string;
   consentFingerprint: string;
   display: string;
+  /** The skill directory relative to the plugin root: an approved copy serves only there. */
+  relativeDir: string;
   /** Every fingerprinted field as text, built on demand for a review row (see reviewText). */
   consentDetail: () => string;
 }
@@ -2636,6 +2638,7 @@ export class AgentPluginInstallService {
         ...describeSkillAdvertisement(skill),
         consentFingerprint: skill.consentFingerprint,
         consentDetail: skill.consentDetail,
+        relativeDir: skill.approvedCopy.relativeDir,
       });
     }
     const ambiguousAgents = new Set<string>();
@@ -5980,7 +5983,8 @@ export class AgentPluginInstallService {
     const served = verifiedApprovedCopies(
       await readApprovedCopies(this.approvedCopiesSource(entry)),
       entry.componentConsent,
-      plugin.rootPath
+      plugin.rootPath,
+      surface.skills
     );
     // An agent a second file disabled after install has no fingerprint, so only this row shows it.
     const changes = [
@@ -6042,7 +6046,7 @@ export class AgentPluginInstallService {
       skills: Object.fromEntries(
         skills.map((skill) => [
           skill.name,
-          { fingerprint: skill.consentFingerprint, ...skill.approvedCopy },
+          { fingerprint: skill.consentFingerprint, content: skill.approvedCopy.content },
         ])
       ),
       workflows: Object.fromEntries(

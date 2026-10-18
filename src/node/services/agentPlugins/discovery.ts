@@ -811,7 +811,7 @@ function managedPluginFields(
   entryName: string,
   imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,
   registryPath: string | undefined,
-  /** The lexical `<container>/<entryName>`: the instance identity (approvedCopies.ts). */
+  /** The lexical `<container>/<entryName>` of the reading view (logicalPluginView renames it). */
   instancePath: string
 ): Pick<
   AgentPluginInfo,
@@ -840,6 +840,25 @@ function managedPluginFields(
         }
       : {}),
   };
+}
+
+/**
+ * One container's view of a physical plugin (read once, then shared by its views). Its approved
+ * copies are named by the view's lexical `<container>/<entryName>`, like the MCP server keys and
+ * hook trust: the install service names the install by the configured home, which can be a
+ * symlink to the registry's realpath, and another alias of the directory gets its own identity
+ * (without copies, so a changed component stays blocked there).
+ */
+function logicalPluginView(
+  plugin: AgentPluginInfo,
+  container: AgentPluginContainer,
+  instancePath: string
+): AgentPluginInfo {
+  const view = { ...plugin, containerPath: container.path, scope: container.scope };
+  if (plugin.approvedCopies !== undefined) {
+    view.approvedCopies = { ...plugin.approvedCopies, instancePath };
+  }
+  return view;
 }
 
 /** The copies location of a managed install; none for a row without a readable install time. */
@@ -1100,6 +1119,7 @@ export async function discoverAgentPlugins(
     for (const entryName of snapshot.entryNames) {
       if (projectMetadataIndex === 0) canonicalProjectPluginNames.add(entryName);
       else if (projectMetadataIndex === 1 && canonicalProjectPluginNames.has(entryName)) continue;
+      const instancePath = path.join(container.path, entryName);
       let plugin = snapshot.plugins.get(entryName);
       if (plugin === undefined) {
         plugin = await discoverPluginAt({
@@ -1117,15 +1137,12 @@ export async function discoverAgentPlugins(
               entryName,
               snapshot.imports,
               groups.get(canonicalPath)?.registryPath,
-              // Lexical, like the MCP server keys: the install service names the install by
-              // the configured home, which can be a symlink to the registry's realpath.
-              path.join(container.path, entryName)
+              instancePath
             )
           );
         }
       }
-      if (plugin)
-        plugins.push({ ...plugin, containerPath: container.path, scope: container.scope });
+      if (plugin) plugins.push(logicalPluginView(plugin, container, instancePath));
     }
   }
 

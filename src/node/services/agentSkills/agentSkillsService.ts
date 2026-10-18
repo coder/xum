@@ -740,19 +740,18 @@ async function readSkillDescriptorFromDir(
 
   try {
     // A changed managed skill serves its approved copy while the new version awaits review.
-    const served = await consentedPluginSkill(
+    const parsed = await consentedPluginSkill(
       options?.skillConsent,
       skillDir,
       parseSkillMarkdown({ content, byteSize, directoryName, allowDisplayName: true })
     );
-    if (served === null) {
+    if (parsed === null) {
       pushInvalidSkill(
         "This plugin skill has not been reviewed on this install, so it does not load.",
         "Open Settings → Plugins and select Review on the plugin."
       );
       return null;
     }
-    const { parsed } = served;
 
     const descriptor: AgentSkillDescriptor = {
       name: parsed.frontmatter.name,
@@ -1096,13 +1095,12 @@ async function readAgentSkillFromDir(
   }
   // An unreviewed plugin skill without a verified approved copy reads like a missing one, so a
   // lower-scope skill can serve.
-  const served = await consentedPluginSkill(
+  const parsed = await consentedPluginSkill(
     skillConsent,
     skillDir,
     parseSkillMarkdown({ content, byteSize, directoryName, allowDisplayName: true })
   );
-  if (served === null) return null;
-  const { parsed } = served;
+  if (parsed === null) return null;
 
   const pkg: AgentSkillPackage = {
     scope,
@@ -1120,7 +1118,7 @@ async function readAgentSkillFromDir(
 
   return {
     package: validated.data,
-    skillDir: served.skillDir,
+    skillDir,
     sourceRuntime: runtime,
     ...(pluginRoot != null ? { pluginRoot } : {}),
   };

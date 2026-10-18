@@ -142,7 +142,7 @@ async function readSkillDescriptor(
 
   try {
     // A changed managed skill lists its approved copy while the new version awaits review.
-    const served = await consentedPluginSkill(
+    const parsed = await consentedPluginSkill(
       skillConsent,
       skillDir,
       parseSkillMarkdown({
@@ -153,11 +153,10 @@ async function readSkillDescriptor(
         allowDisplayName: true,
       })
     );
-    if (served === null) {
+    if (parsed === null) {
       log.warn(`Skipping ${scope} plugin skill '${directoryName}': not reviewed on this install`);
       return null;
     }
-    const { parsed } = served;
 
     const descriptorResult = AgentSkillDescriptorSchema.safeParse({
       name: parsed.frontmatter.name,
