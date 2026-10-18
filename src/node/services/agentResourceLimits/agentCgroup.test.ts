@@ -172,7 +172,8 @@ describe("applyAgentCgroupLimits", () => {
       if (isRoot) return;
       tree = await createUnmanageableTree({ sudoWorks: true });
       // The kernel's defaults, so the cgroup itself sets no limit that leaving it would drop, and
-      // files that hold no limit: a memory protection, a pressure trigger, and a counter.
+      // entries that hold no limit: a memory protection, a pressure trigger, a counter, and a
+      // child cgroup.
       for (const [file, value] of [
         ["cpu.idle", "0"],
         ["cpu.max", "max 100000"],
@@ -199,6 +200,7 @@ describe("applyAgentCgroupLimits", () => {
         await fs.writeFile(path.join(tree.root, "init.scope", file), `${value}\n`);
       }
       await fs.chmod(path.join(tree.root, "init.scope", "memory.current"), 0o444);
+      await fs.mkdir(path.join(tree.root, "init.scope", "child"));
 
       const result = await applyAgentCgroupLimits({ cpuCores: 1, memoryGiB: 1.1 }, tree.host, {
         trySudo: true,
