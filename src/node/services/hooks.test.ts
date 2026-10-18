@@ -1002,6 +1002,53 @@ echo "GOT_RESULT=$RESULT" >&2
       expect(hook.stderr).toContain('GOT_RESULT={"streaming":true}');
     });
 
+    test("a tool_hook spawn aborted by the caller is not logged as an error, a timeout still is", async () => {
+      const hookPath = path.join(tempDir, ".xum", "tool_hook");
+      await fs.mkdir(path.dirname(hookPath), { recursive: true });
+      await fs.writeFile(hookPath, "#!/bin/bash\necho $MUX_EXEC\nread RESULT\n");
+      await fs.chmod(hookPath, 0o755);
+      const context = {
+        tool: "test",
+        toolInput: "{}",
+        workspaceId: "test",
+        projectDir: tempDir,
+      };
+      let toolExecuted = false;
+      const executeTool = () => {
+        toolExecuted = true;
+        return Promise.resolve({ success: true });
+      };
+      const logError = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        // Cancelled tool call (user interrupt): the spawn is refused, which is expected.
+        const cancelled = await runWithHook(
+          runtime,
+          hookPath,
+          { ...context, abortSignal: AbortSignal.abort() },
+          executeTool
+        );
+        expect(cancelled.hook.success).toBe(false);
+        expect(logError).not.toHaveBeenCalled();
+
+        // The hook's own pre-phase timeout aborts the same internal signal; that stays an error.
+        const slowSpawn = Object.create(runtime) as LocalRuntime;
+        slowSpawn.exec = (_command, options) =>
+          new Promise((_resolve, reject) => {
+            options.abortSignal?.addEventListener("abort", () =>
+              reject(new Error("spawn aborted"))
+            );
+          });
+        const timedOut = await runWithHook(slowSpawn, hookPath, context, executeTool, {
+          preHookTimeoutMs: 10,
+        });
+        expect(timedOut.hook.stderr).toContain("spawn aborted");
+        expect(logError).toHaveBeenCalledTimes(1);
+        expect(toolExecuted).toBe(false);
+      } finally {
+        logError.mockRestore();
+      }
+    });
+
     test("times out when pre-hook takes too long (does not run tool)", async () => {
       const hookDir = path.join(tempDir, ".mux");
       const hookPath = path.join(hookDir, "tool_hook");

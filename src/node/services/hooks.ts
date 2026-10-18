@@ -324,7 +324,9 @@ export async function runWithHook<T>(
       clearTimeout(preTimeoutHandle);
       preTimeoutHandle = undefined;
     }
-    log.error("[hooks] Failed to spawn hook", { hookPath, error: err });
+    // context.abortSignal is the caller's cancel. The internal controller also aborts on the
+    // pre-hook timeout, which must stay an error.
+    logHookFailure("Tool hook", hookPath, err, context.abortSignal);
     if (toolInputPath) {
       try {
         await execBuffered(runtime, `rm -f ${shellQuote(toolInputPath)}`, {
@@ -768,7 +770,7 @@ export async function runPostHook(
 }
 
 function logHookFailure(
-  phase: "Pre-hook" | "Post-hook",
+  phase: "Tool hook" | "Pre-hook" | "Post-hook",
   hookPath: string,
   err: unknown,
   abortSignal: AbortSignal | undefined
