@@ -151,6 +151,79 @@ describe("applyAgentCgroupLimits", () => {
     expect(tree.writes).toEqual([]);
   });
 
+  describe("delegates a cgroup with sudo when xum's top-level cgroup is root's", () => {
+    // Root ignores file modes, so xum's cgroup cannot be root's there.
+    const isRoot = process.getuid?.() === 0;
+    const pid = String(process.pid);
+    const createUnmanageableTree = async (
+      options: Partial<Parameters<typeof createFakeCgroupTree>[0]>
+    ) => {
+      const own = options.own ?? "/init.scope";
+      const created = await createFakeCgroupTree({
+        own,
+        cgroups: { "init.scope": { controllers: "cpu memory", procs: ["1", pid] } },
+        ...options,
+      });
+      await fs.chmod(path.join(created.root, own, "cgroup.subtree_control"), 0o444);
+      return created;
+    };
+
+    it.each([
+      ["on a fresh host", {}],
+      [
+        "again after a restart, with the controllers already enabled",
+        {
+          "xum-1000": { controllers: "cpu memory", subtreeControl: "cpu memory" },
+          "xum-1000/xum-app": {},
+          "xum-1000/xum-agents": {},
+        },
+      ],
+    ])("%s", async (_name, delegated) => {
+      if (isRoot) return;
+      tree = await createUnmanageableTree({
+        cgroups: {
+          "init.scope": { controllers: "cpu memory", procs: ["1", pid] },
+          ...delegated,
+        },
+        sudoWorks: true,
+      });
+
+      const result = await applyAgentCgroupLimits({ cpuCores: 1, memoryGiB: 1.1 }, tree.host);
+
+      expect(result).toEqual({
+        status: { state: "active", cgroup: "/xum-1000/xum-agents" },
+        enrollmentTarget: path.join(tree.root, "xum-1000", "xum-agents", "cgroup.procs"),
+      });
+      expect(await tree.read("xum-1000/xum-app", "cgroup.procs")).toBe(`${pid}\n`);
+      expect(await tree.read("init.scope", "cgroup.procs")).toBe("1\n");
+      expect(await tree.read("xum-1000/xum-agents", "cpu.max")).toBe("100000 100000");
+      expect(await tree.read("xum-1000/xum-agents", "memory.max")).toBe(MEMORY_1_1_GIB);
+    });
+
+    it.each([
+      ["not on a systemd host", { systemdBooted: true }],
+      [
+        "not for a nested cgroup, whose sibling would leave the container",
+        {
+          own: "/docker/abc",
+          cgroups: { "docker/abc": { controllers: "cpu memory", procs: [pid] } },
+        },
+      ],
+    ])("%s", async (_name, options) => {
+      if (isRoot) return;
+      tree = await createUnmanageableTree({ sudoWorks: true, ...options });
+
+      const result = await applyAgentCgroupLimits({ cpuCores: 1 }, tree.host);
+
+      expect(result.status.state).toBe("unavailable");
+      expect(result.status).toHaveProperty(
+        "reason",
+        expect.stringMatching(/cannot manage \(.*\)\. Start xum in a cgroup delegated to that user\.$/)
+      );
+      expect(tree.sudoCalls).toEqual([]);
+    });
+  });
+
   describe("reports why the limits cannot apply", () => {
     it.each([
       ["not Linux", "darwin" as const, "/xum", "Agent resource limits need Linux with cgroup v2."],
@@ -203,7 +276,7 @@ describe("applyAgentCgroupLimits", () => {
       expect(tree.writes).toEqual([]);
     });
 
-    it("a cgroup the user cannot manage", async () => {
+    it("a cgroup the user cannot manage, when sudo cannot delegate one either", async () => {
       // Root ignores file modes, so the check cannot fail there.
       if (process.getuid?.() === 0) return;
       tree = await createFakeCgroupTree({ own: "/xum", cgroups: { xum: { controllers: "cpu" } } });
@@ -212,9 +285,13 @@ describe("applyAgentCgroupLimits", () => {
       expect(result.status.state).toBe("unavailable");
       expect(result.status).toHaveProperty(
         "reason",
-        expect.stringContaining("xum runs in cgroup /xum, which the user running xum cannot manage")
+        expect.stringMatching(
+          /^xum runs in cgroup \/xum, which the user running xum cannot manage .* sudo could not delegate \/xum-1000: sudo: a password is required$/
+        )
       );
+      expect(tree.sudoCalls).toEqual(["xum-1000"]);
       expect(tree.writes).toEqual([]);
+      await expect(fs.access(path.join(tree.root, "xum-1000"))).rejects.toThrow("ENOENT");
     });
 
     it("a test command that did not join xum-agents", async () => {

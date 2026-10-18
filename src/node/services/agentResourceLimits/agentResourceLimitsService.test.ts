@@ -118,6 +118,32 @@ describe("AgentResourceLimitsService", () => {
     expect(tree.writes.length - writesAfterStart).toBe(1);
   });
 
+  it("calls sudo only once the limits are turned on", async () => {
+    // Root ignores file modes, so xum's cgroup cannot be root's there.
+    if (process.getuid?.() === 0) return;
+    await tree.dispose();
+    tree = await createFakeCgroupTree({
+      own: "/init.scope",
+      cgroups: { "init.scope": { controllers: "cpu memory", procs: [String(process.pid)] } },
+      sudoWorks: true,
+    });
+    await fs.chmod(path.join(tree.root, "init.scope", "cgroup.subtree_control"), 0o444);
+    await config.updateAgentResourceLimits({ cpuCores: 2 });
+    await config.updateAgentResourceLimitsEnabled(false);
+    service = new AgentResourceLimitsService(config, tree.host);
+
+    await service.start();
+
+    expect((await service.get()).status).toEqual({ state: "off" });
+    expect(tree.sudoCalls).toEqual([]);
+
+    expect((await service.setEnabled(true)).status).toEqual({
+      state: "active",
+      cgroup: "/xum-1000/xum-agents",
+    });
+    expect(tree.sudoCalls).toEqual(["xum-1000"]);
+  });
+
   it("saves and applies the limits it is given", async () => {
     service = new AgentResourceLimitsService(config, tree.host);
     await service.start();
