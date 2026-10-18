@@ -140,12 +140,9 @@ function typeAtCaret(app: AppHarness, key: string) {
   const view = textarea.ownerDocument.defaultView as unknown as typeof globalThis;
   const caret = textarea.selectionStart;
   const next = textarea.value.slice(0, caret) + key + textarea.value.slice(textarea.selectionEnd);
-  const setValue = Object.getOwnPropertyDescriptor(
-    view.HTMLTextAreaElement.prototype,
-    "value"
-  )?.set;
   act(() => {
-    setValue?.call(textarea, next);
+    // The prototype setter, as the browser's own edit: React's value tracker then sees a change.
+    Reflect.set(view.HTMLTextAreaElement.prototype, "value", next, textarea);
     textarea.setSelectionRange(caret + key.length, caret + key.length);
     textarea.dispatchEvent(new view.Event("input", { bubbles: true }));
   });
