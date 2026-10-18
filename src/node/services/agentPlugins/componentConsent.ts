@@ -22,6 +22,7 @@ import type {
 import { getOwn } from "@/common/utils/getOwn";
 import { stableStringify } from "@/common/utils/stableStringify";
 import { skillDynamicDirectiveCommands } from "@/node/services/agentSkills/skillDynamicContext";
+import type { ApprovedCopies } from "./approvedCopies";
 import type { AgentPluginSlashCommandContribution } from "./manifest";
 
 /**
@@ -515,21 +516,14 @@ export interface PluginSkillConsentGate {
   /** Canonical plugin root: skill directories are fingerprinted relative to it. */
   pluginRoot: string;
   consented: Readonly<Record<string, string>>;
-}
-
-/** The skill gate of a discovered plugin. Only managed plugins carry consent records, so get one. */
-export function pluginSkillConsentGate(plugin: {
-  rootPath: string;
-  componentConsent?: ComponentConsent;
-}): PluginSkillConsentGate | undefined {
-  return plugin.componentConsent !== undefined
-    ? { pluginRoot: plugin.rootPath, consented: plugin.componentConsent.skills }
-    : undefined;
+  /** The install's approved copies (approvedCopies.ts), read when a live skill fails its check. */
+  loadApprovedCopies?: () => Promise<ApprovedCopies>;
 }
 
 /**
  * The one load-time skill predicate (#6498): every reader of a plugin skill (the skill index,
- * agent_skill_read, agent_skill_list, `skill://` scripts) calls it with the frontmatter it parsed.
+ * agent_skill_read, agent_skill_list, `skill://` scripts) calls it with the frontmatter it parsed,
+ * through consentedPluginSkill (approvedCopies.ts), which also checks an approved copy with it.
  * `skillDir` must be canonical, like `pluginRoot`, so the relative path matches the install review.
  */
 export function isPluginSkillConsented(

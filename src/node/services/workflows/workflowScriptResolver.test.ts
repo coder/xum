@@ -9,6 +9,11 @@ import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import {
+  createTestPluginInstallEntry,
+  reviewedComponentConsent,
+  saveApprovedCopies,
+} from "@/node/services/agentPlugins/testFixtures";
+import {
   TestTempDir,
   TrueRemotePathMappedRuntime,
   createIsolatedAgentSkillsRoots,
@@ -454,6 +459,56 @@ describe("resolveWorkflowScript", () => {
       await expect(
         resolveWorkflowScript({ ...input, scriptPath: "plugin://my-plugin/release.ts" })
       ).rejects.toThrow(".js");
+    });
+
+    test("a changed managed plugin script runs the approved source until its review", async () => {
+      using tempDir = new TestTempDir("workflow-script-plugin-approved-copy");
+      // The managed container of the Xum home that owns plugins.json (the skills roots' parent).
+      const container = path.join(tempDir.path, "plugins");
+      await writePluginWithWorkflow(container, "my-plugin", "release.js", "const v = 'plugin-v1';");
+      const pluginDir = path.join(container, "my-plugin");
+      const skillDir = path.join(pluginDir, "skills", "greet");
+      await writeWorkflowFile(
+        skillDir,
+        "SKILL.md",
+        "---\nname: greet\ndescription: g\n---\nBody\n"
+      );
+      await writeWorkflowFile(skillDir, "workflow.js", "const v = 'skill-v1';");
+      const entry = createTestPluginInstallEntry(
+        "my-plugin",
+        undefined,
+        await reviewedComponentConsent({ pluginDir })
+      );
+      await fs.writeFile(
+        path.join(tempDir.path, "plugins.json"),
+        JSON.stringify({ plugins: [entry] })
+      );
+      await saveApprovedCopies({ xumHome: tempDir.path, pluginDir, entry });
+      const resolve = (scriptPath: string) =>
+        resolveWorkflowScript({
+          scriptPath,
+          runtime: new LocalRuntime(tempDir.path),
+          workspacePath: tempDir.path,
+          projectTrusted: false,
+          roots: {
+            ...createIsolatedAgentSkillsRoots(tempDir.path),
+            globalPluginRoots: [container],
+          },
+        });
+
+      await fs.writeFile(path.join(pluginDir, "workflows", "release.js"), "const v = 'plugin-v2';");
+      await fs.writeFile(path.join(skillDir, "workflow.js"), "const v = 'skill-v2';");
+      expect((await resolve("plugin://my-plugin/release.js")).source).toContain("plugin-v1");
+      expect((await resolve("skill://greet/workflow.js")).source).toContain("skill-v1");
+
+      // A removed script stays removed: its copy does not bring it back.
+      await fs.rm(path.join(skillDir, "workflow.js"));
+      await expect(resolve("skill://greet/workflow.js")).rejects.toThrow(/ENOENT|no such file/i);
+      // Without a copy, a changed script does not run at all.
+      await fs.rm(path.join(tempDir.path, "plugin-approved-copies"), { recursive: true });
+      await expect(resolve("plugin://my-plugin/release.js")).rejects.toThrow(
+        "has not been reviewed on this install"
+      );
     });
 
     test("rejects nested plugin workflow paths the consent surface never names", async () => {

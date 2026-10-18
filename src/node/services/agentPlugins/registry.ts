@@ -99,12 +99,15 @@ export async function readPluginComponentImports(registryFile: string): Promise<
    * fingerprint is recorded here. A missing record (every install from before #6498) is empty.
    */
   consentByName: Map<string, ComponentConsent>;
+  /** Install time by plugin name: it binds the install's approved copies (approvedCopies.ts). */
+  installedAtByName: Map<string, string>;
   hasUnidentifiedEntries: boolean;
 } | null> {
   try {
     const { rawEntries } = await readPluginRegistryDocument(registryFile, "strict");
     const byName = new Map<string, AgentPluginImportedComponents | undefined>();
     const consentByName = new Map<string, ComponentConsent>();
+    const installedAtByName = new Map<string, string>();
     let hasUnidentifiedEntries = false;
     for (const raw of rawEntries) {
       const name = registryRowName(raw);
@@ -126,6 +129,7 @@ export async function readPluginComponentImports(registryFile: string): Promise<
       } else {
         byName.set(name, parsed.data.importedComponents);
         consentByName.set(name, parsed.data.componentConsent ?? noComponentConsent());
+        installedAtByName.set(name, parsed.data.installedAt);
       }
     }
     if (hasUnidentifiedEntries) {
@@ -136,7 +140,7 @@ export async function readPluginComponentImports(registryFile: string): Promise<
         }
       );
     }
-    return { byName, consentByName, hasUnidentifiedEntries };
+    return { byName, consentByName, installedAtByName, hasUnidentifiedEntries };
   } catch (error) {
     log.warn("Plugin component imports unavailable; suppressing skills and MCP servers", {
       registryFile,

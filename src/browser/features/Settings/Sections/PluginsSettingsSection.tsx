@@ -1272,9 +1272,10 @@ const ComponentReviewNotice: React.FC<{ items: AgentPluginListItem[] | null }> =
       <span className="break-words">
         Some plugins have components (such as skills, MCP servers or workflow scripts) that you have
         not reviewed on this install. Xum loads a plugin component only after you approve its
-        current version, so these do not load until you review them. After an upgrade, each plugin
-        needs this review once. Select Review on each plugin marked &quot;needs review&quot; to
-        approve them.
+        current version. A skill or workflow script that changed after you approved it keeps working
+        in the version you approved. Other components do not load until you review them. After an
+        upgrade, each plugin needs this review once. Select Review on each plugin marked &quot;needs
+        review&quot; to approve them.
       </span>
     </div>
   );

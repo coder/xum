@@ -54,11 +54,7 @@ import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { ensureRuntimePathWithinWorkspace } from "@/node/services/tools/runtimeSkillPathUtils";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
-import {
-  AgentSkillParseError,
-  parseSkillMarkdown,
-  skillConsentFrontmatter,
-} from "./parseSkillMarkdown";
+import { AgentSkillParseError, parseSkillMarkdown } from "./parseSkillMarkdown";
 import { getBuiltInSkillByName, getBuiltInSkillDescriptors } from "./builtInSkillDefinitions";
 import type { ProjectSkillContainment } from "./skillStorageContext";
 import {
@@ -67,12 +63,15 @@ import {
   readPluginFileWithinRootCapped,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
 } from "@/node/services/agentPlugins/discovery";
-import {
-  isPluginSkillConsented,
-  pluginSkillConsentGate,
-  type ComponentConsent,
-  type PluginSkillConsentGate,
+import type {
+  ComponentConsent,
+  PluginSkillConsentGate,
 } from "@/node/services/agentPlugins/componentConsent";
+import {
+  consentedPluginSkill,
+  pluginSkillConsentGate,
+  type ApprovedCopiesSource,
+} from "@/node/services/agentPlugins/approvedCopies";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import {
   getCanonicalProjectMetadataRelativePath,
@@ -252,6 +251,8 @@ interface AgentSkillScanCandidate {
   skillConsent?: PluginSkillConsentGate;
   /** Managed plugins only: every consent record, for the skill's workflow script (#6629). */
   pluginConsent?: ComponentConsent | undefined;
+  /** Managed plugins only: the install's approved copies, for the skill's workflow script. */
+  pluginApprovedCopies?: ApprovedCopiesSource | undefined;
 }
 
 /**
@@ -323,6 +324,7 @@ async function buildPluginScanCandidates(args: {
         importedSkills,
         skillConsent,
         pluginConsent: plugin.componentConsent,
+        pluginApprovedCopies: plugin.approvedCopies,
       }))
     );
   }
@@ -737,26 +739,20 @@ async function readSkillDescriptorFromDir(
   }
 
   try {
-    const parsed = parseSkillMarkdown({
-      content,
-      byteSize,
-      directoryName,
-      allowDisplayName: true,
-    });
-    if (
-      !isPluginSkillConsented(
-        options?.skillConsent,
-        skillDir,
-        skillConsentFrontmatter(parsed),
-        parsed.body
-      )
-    ) {
+    // A changed managed skill serves its approved copy while the new version awaits review.
+    const served = await consentedPluginSkill(
+      options?.skillConsent,
+      skillDir,
+      parseSkillMarkdown({ content, byteSize, directoryName, allowDisplayName: true })
+    );
+    if (served === null) {
       pushInvalidSkill(
         "This plugin skill has not been reviewed on this install, so it does not load.",
         "Open Settings → Plugins and select Review on the plugin."
       );
       return null;
     }
+    const { parsed } = served;
 
     const descriptor: AgentSkillDescriptor = {
       name: parsed.frontmatter.name,
@@ -1035,15 +1031,22 @@ export interface ResolvedAgentSkill {
    * script against them (#6629). Absent for unmanaged plugins and non-plugin skills.
    */
   pluginConsent?: ComponentConsent | undefined;
+  /** A managed plugin skill's approved copies: the `skill://` resolver falls back to them. */
+  pluginApprovedCopies?: ApprovedCopiesSource | undefined;
 }
 
 /** Stamp a plugin skill's provenance on its read result (see ResolvedAgentSkill.pluginName). */
 function withPluginName(
   resolved: ResolvedAgentSkill | null,
-  candidate: { pluginName?: string; pluginConsent?: ComponentConsent | undefined }
+  candidate: Pick<AgentSkillScanCandidate, "pluginName" | "pluginConsent" | "pluginApprovedCopies">
 ): ResolvedAgentSkill | null {
   if (resolved == null || candidate.pluginName == null) return resolved;
-  return { ...resolved, pluginName: candidate.pluginName, pluginConsent: candidate.pluginConsent };
+  return {
+    ...resolved,
+    pluginName: candidate.pluginName,
+    pluginConsent: candidate.pluginConsent,
+    pluginApprovedCopies: candidate.pluginApprovedCopies,
+  };
 }
 
 /** Read a non-plugin SKILL.md for a direct skill read; every failure throws. */
@@ -1091,15 +1094,15 @@ async function readAgentSkillFromDir(
   } else {
     ({ content, byteSize } = await readRuntimeSkillFile(runtime, skillFilePath));
   }
-  const parsed = parseSkillMarkdown({
-    content,
-    byteSize,
-    directoryName,
-    allowDisplayName: true,
-  });
-  // An unreviewed plugin skill reads like a missing one, so a lower-scope skill can serve.
-  if (!isPluginSkillConsented(skillConsent, skillDir, skillConsentFrontmatter(parsed), parsed.body))
-    return null;
+  // An unreviewed plugin skill without a verified approved copy reads like a missing one, so a
+  // lower-scope skill can serve.
+  const served = await consentedPluginSkill(
+    skillConsent,
+    skillDir,
+    parseSkillMarkdown({ content, byteSize, directoryName, allowDisplayName: true })
+  );
+  if (served === null) return null;
+  const { parsed } = served;
 
   const pkg: AgentSkillPackage = {
     scope,
@@ -1117,7 +1120,7 @@ async function readAgentSkillFromDir(
 
   return {
     package: validated.data,
-    skillDir,
+    skillDir: served.skillDir,
     sourceRuntime: runtime,
     ...(pluginRoot != null ? { pluginRoot } : {}),
   };

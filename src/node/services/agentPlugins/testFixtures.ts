@@ -16,8 +16,10 @@ import {
   workflowConsentFingerprint,
   agentConsentFingerprint,
   slashCommandConsentFingerprint,
+  noComponentConsent,
   type ComponentConsent,
 } from "./componentConsent";
+import { updateApprovedCopies, type ApprovedCopies } from "./approvedCopies";
 import { discoverAgentPluginAt, type AgentPluginScope } from "./discovery";
 import { getPluginDataPath, loadPluginMcpServers, resolvePluginInstanceId } from "./mcpConfig";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
@@ -132,4 +134,46 @@ export async function reviewedComponentConsent(args: {
     consent.slashCommands[command.name] = slashCommandConsentFingerprint(command);
   }
   return consent;
+}
+
+/**
+ * Save the approved copies an approval sweep saves (approvedCopies.ts) for every skill and
+ * workflow script `entry` records, read from `pluginDir` now: what the user approved is what is
+ * on disk at this point. Assumes skills under `skills/<name>`.
+ */
+export async function saveApprovedCopies(args: {
+  xumHome: string;
+  pluginDir: string;
+  entry: AgentPluginInstallEntry;
+}): Promise<void> {
+  const consent = args.entry.componentConsent ?? noComponentConsent();
+  const read = (relativePath: string) =>
+    fs.readFile(path.join(args.pluginDir, relativePath), "utf8");
+  const skills: ApprovedCopies["skills"] = {};
+  for (const [name, fingerprint] of Object.entries(consent.skills)) {
+    const relativeDir = path.join("skills", name);
+    skills[name] = {
+      fingerprint,
+      relativeDir,
+      content: await read(path.join(relativeDir, "SKILL.md")),
+    };
+  }
+  const workflows: ApprovedCopies["workflows"] = {};
+  for (const [file, fingerprint] of Object.entries(consent.workflows)) {
+    // Top-level scripts are keyed by file name, skill scripts by their plugin-relative path.
+    workflows[file] = {
+      fingerprint,
+      source: await read(file.includes("/") ? file : path.join("workflows", file)),
+    };
+  }
+  await updateApprovedCopies({
+    source: {
+      xumHome: args.xumHome,
+      pluginName: args.entry.name,
+      installedAt: args.entry.installedAt,
+    },
+    consent,
+    selection: args.entry.importedComponents,
+    live: { skills, workflows },
+  });
 }

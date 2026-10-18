@@ -15,6 +15,7 @@ import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFi
 import { isMutationEpochUnreadable, readContainerMutationState } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginComponentImports } from "./registry";
 import { noComponentConsent, type ComponentConsent } from "./componentConsent";
+import type { ApprovedCopiesSource } from "./approvedCopies";
 import {
   isPlainObject,
   isValidAgentPluginName,
@@ -228,6 +229,11 @@ export interface AgentPluginInfo {
    * an install without records gets empty ones, so nothing of it loads until reviewed.
    */
   componentConsent?: ComponentConsent;
+  /**
+   * Managed plugins only: where the install keeps the approved copies a changed skill or workflow
+   * script falls back to (approvedCopies.ts). Set with componentConsent.
+   */
+  approvedCopies?: ApprovedCopiesSource;
   name: string;
   scope: AgentPluginScope;
   /** Canonical (realpath) plugin root directory. */
@@ -805,7 +811,10 @@ function managedPluginFields(
   entryName: string,
   imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,
   registryPath: string | undefined
-): Pick<AgentPluginInfo, "componentPolicy" | "componentConsent" | "importedComponents"> {
+): Pick<
+  AgentPluginInfo,
+  "componentPolicy" | "componentConsent" | "approvedCopies" | "importedComponents"
+> {
   // A corrupt registry, or an unidentified row that can own the directory: nothing loads, also
   // nothing the picker does not select (workflows, #6629).
   const nothing = {
@@ -821,9 +830,21 @@ function managedPluginFields(
       ? {
           componentPolicy: { registryPath, name: entryName },
           componentConsent: imports.consentByName.get(entryName) ?? noComponentConsent(),
+          ...approvedCopiesField(registryPath, entryName, imports.installedAtByName.get(entryName)),
         }
       : {}),
   };
+}
+
+/** The copies location of a managed install; none for a row without a readable install time. */
+function approvedCopiesField(
+  registryPath: string,
+  pluginName: string,
+  installedAt: string | undefined
+): Pick<AgentPluginInfo, "approvedCopies"> {
+  return installedAt !== undefined
+    ? { approvedCopies: { xumHome: path.dirname(registryPath), pluginName, installedAt } }
+    : {};
 }
 
 export async function discoverAgentPlugins(

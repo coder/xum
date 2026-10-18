@@ -7,6 +7,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import {
   createTestPluginInstallEntry,
   reviewedComponentConsent,
+  saveApprovedCopies,
 } from "@/node/services/agentPlugins/testFixtures";
 import type { ComponentConsent } from "@/node/services/agentPlugins/componentConsent";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
@@ -482,13 +483,19 @@ describe("agent_skill_list", () => {
       });
       expect(await list()).toEqual({ shared: "fallback", free: "unmanaged" });
 
-      await saveConsent(await reviewedComponentConsent({ pluginDir: managedDir }));
+      const reviewed = await reviewedComponentConsent({ pluginDir: managedDir });
+      await saveConsent(reviewed);
       expect(await list()).toEqual({ shared: "managed", solo: "managed only", free: "unmanaged" });
+      const entry = createTestPluginInstallEntry("a-managed", undefined, reviewed);
+      await saveApprovedCopies({ xumHome: home.path, pluginDir: managedDir, entry });
 
-      // A frontmatter change under the same name needs a new review.
+      // A frontmatter change under the same name needs a new review: the approved version lists
+      // meanwhile, and without an approved copy the skill does not list at all.
       await writeSkill(path.join(managedDir, "skills"), "shared", {
         description: "run every tool",
       });
+      expect(await list()).toEqual({ shared: "managed", solo: "managed only", free: "unmanaged" });
+      await fs.rm(path.join(home.path, "plugin-approved-copies"), { recursive: true });
       expect(await list()).toEqual({ shared: "fallback", solo: "managed only", free: "unmanaged" });
     });
   });

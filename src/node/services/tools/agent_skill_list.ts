@@ -19,21 +19,18 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry";
 import { discoverAgentPlugins } from "@/node/services/agentPlugins/discovery";
+import type { PluginSkillConsentGate } from "@/node/services/agentPlugins/componentConsent";
 import {
-  isPluginSkillConsented,
+  consentedPluginSkill,
   pluginSkillConsentGate,
-  type PluginSkillConsentGate,
-} from "@/node/services/agentPlugins/componentConsent";
+} from "@/node/services/agentPlugins/approvedCopies";
 import {
   discoverAgentSkills,
   requireReachableSkills,
   getDefaultAgentSkillsRoots,
   getProjectSkillRoots,
 } from "@/node/services/agentSkills/agentSkillsService";
-import {
-  parseSkillMarkdown,
-  skillConsentFrontmatter,
-} from "@/node/services/agentSkills/parseSkillMarkdown";
+import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
@@ -144,19 +141,23 @@ async function readSkillDescriptor(
   if (file === null) return null;
 
   try {
-    const parsed = parseSkillMarkdown({
-      content: file.content,
-      byteSize: file.byteSize,
-      directoryName,
-      // Agree with discovery; the display name stays out of this model-facing output.
-      allowDisplayName: true,
-    });
-    if (
-      !isPluginSkillConsented(skillConsent, skillDir, skillConsentFrontmatter(parsed), parsed.body)
-    ) {
+    // A changed managed skill lists its approved copy while the new version awaits review.
+    const served = await consentedPluginSkill(
+      skillConsent,
+      skillDir,
+      parseSkillMarkdown({
+        content: file.content,
+        byteSize: file.byteSize,
+        directoryName,
+        // Agree with discovery; the display name stays out of this model-facing output.
+        allowDisplayName: true,
+      })
+    );
+    if (served === null) {
       log.warn(`Skipping ${scope} plugin skill '${directoryName}': not reviewed on this install`);
       return null;
     }
+    const { parsed } = served;
 
     const descriptorResult = AgentSkillDescriptorSchema.safeParse({
       name: parsed.frontmatter.name,
@@ -344,13 +345,15 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           }
           // Per-skill containment anchors at the plugin root (§4.1).
           const importedSkills = plugin.importedComponents?.skills;
+          // One gate per plugin: its approved copies are read at most once per listing.
+          const skillConsent = pluginSkillConsentGate(plugin);
           roots.push(
             ...plugin.skillsDirs.map((skillsRoot) => ({
               skillsRoot,
               containmentRoot: plugin.rootPath,
               scope: plugin.scope,
               importedSkills,
-              skillConsent: pluginSkillConsentGate(plugin),
+              skillConsent,
             }))
           );
         }

@@ -7,6 +7,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import {
   createTestPluginInstallEntry,
   reviewedComponentConsent,
+  saveApprovedCopies,
 } from "@/node/services/agentPlugins/testFixtures";
 import type { ComponentConsent } from "@/node/services/agentPlugins/componentConsent";
 import { SkillNameSchema } from "@/common/orpc/schemas";
@@ -1682,6 +1683,62 @@ describe("agentSkillsService agent plugins", () => {
     const tampered = await state();
     expect(tampered.read.solo).toBe("not found");
     expect(Object.keys(tampered.listed)).not.toContain("solo");
+  });
+
+  test("a changed managed plugin skill serves the version the user approved until its review", async () => {
+    using tmp = new DisposableTempDir("plugin-skill-approved-copy");
+    const container = path.join(tmp.path, "plugins");
+    const managedDir = await writePlugin(container, "a-managed", [
+      { name: "shared", description: "approved" },
+    ]);
+    await writePlugin(container, "b-unmanaged", [{ name: "shared", description: "fallback" }]);
+    const entry = createTestPluginInstallEntry(
+      "a-managed",
+      undefined,
+      await reviewedComponentConsent({ pluginDir: managedDir })
+    );
+    await fs.writeFile(path.join(tmp.path, "plugins.json"), JSON.stringify({ plugins: [entry] }));
+    await saveApprovedCopies({ xumHome: tmp.path, pluginDir: managedDir, entry });
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+    const state = async () => {
+      const { skills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+      const read = await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("shared"), {
+        roots,
+      });
+      return {
+        listed: skills.find((skill) => skill.name === "shared")?.description,
+        read: read.package.frontmatter.description,
+        body: read.package.body.trim(),
+        skillDir: read.skillDir,
+      };
+    };
+    const approved = {
+      listed: "approved",
+      read: "approved",
+      body: "Body",
+      skillDir: path.join(await fs.realpath(managedDir), "skills", "shared"),
+    };
+
+    // A frontmatter edit (and a body edit with it): the approved SKILL.md serves, whole.
+    const skillFile = path.join(managedDir, "skills", "shared", "SKILL.md");
+    await fs.writeFile(skillFile, "---\nname: shared\ndescription: run every tool\n---\nNew\n");
+    expect(await state()).toEqual(approved);
+
+    // A copy that no longer matches its record does not serve: the skill reads as missing.
+    const copiesDir = path.join(tmp.path, "plugin-approved-copies");
+    const [copiesFile] = await fs.readdir(copiesDir);
+    const copies = path.join(copiesDir, copiesFile);
+    const saved = await fs.readFile(copies, "utf8");
+    await fs.writeFile(copies, saved.replace("description: approved", "description: tampered"));
+    expect((await state()).listed).toBe("fallback");
+    await fs.rm(copies);
+    expect((await state()).read).toBe("fallback");
   });
 
   // The display name replaces `name` in the parsed frontmatter, so the consent fingerprint must

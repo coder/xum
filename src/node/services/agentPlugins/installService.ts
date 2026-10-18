@@ -141,6 +141,17 @@ import {
   type PluginHookTrustState,
 } from "./pluginHookTrust";
 import {
+  approvedCopiesOutdated,
+  noApprovedCopies,
+  readApprovedCopies,
+  removeApprovedCopies,
+  updateApprovedCopies,
+  verifiedApprovedCopies,
+  type ApprovedCopies,
+  type ApprovedCopiesSource,
+  type ApprovedCopiesSweep,
+} from "./approvedCopies";
+import {
   assertNoAgentPluginUrlCredentials,
   isFullCommitSha,
   normalizeAgentPluginSubpath,
@@ -392,6 +403,8 @@ type CollectedPluginSkill = AgentPluginPreviewSkill & {
   consentFingerprint: string;
   /** The fingerprinted fields as text (componentConsent.ts skillConsentDetail), built on demand. */
   consentDetail: () => string;
+  /** The skill directory relative to the plugin root, and the raw SKILL.md: an approved copy. */
+  approvedCopy: { relativeDir: string; content: string };
   whenToUse?: string;
   advertise?: boolean;
   paths?: string[];
@@ -573,7 +586,8 @@ function consentAfterReview(
 
 /**
  * Component review rows: imported skills and MCP servers whose current consent fingerprint has
- * no matching record. `before` says whether the user ever reviewed the component on this install.
+ * no matching record. `before` says whether the user ever reviewed the component on this install,
+ * and whether its approved copy stays in use until this review (`served`, approvedCopies.ts).
  */
 function unreviewedRows(
   entry: AgentPluginInstallEntry,
@@ -583,15 +597,18 @@ function unreviewedRows(
     workflows: Map<string, SurfaceWhole>;
     agents: Map<string, SurfaceWhole>;
     slashCommands: Map<string, SurfaceWhole>;
-  }
+  },
+  served: { skills: ReadonlySet<string>; workflows: ReadonlySet<string> }
 ): AgentPluginCapabilityChange[] {
   return [
-    ...[...surface.skills].flatMap(([name, item]) => unreviewedRow(entry, "skills", name, item)),
+    ...[...surface.skills].flatMap(([name, item]) =>
+      unreviewedRow(entry, "skills", name, item, served.skills.has(name))
+    ),
     ...[...surface.servers].flatMap(([name, item]) =>
       unreviewedRow(entry, "mcpServers", name, item)
     ),
     ...[...surface.workflows].flatMap(([name, item]) =>
-      unreviewedRow(entry, "workflows", name, item)
+      unreviewedRow(entry, "workflows", name, item, served.workflows.has(name))
     ),
     ...[...surface.agents].flatMap(([name, item]) => unreviewedRow(entry, "agents", name, item)),
     ...[...surface.slashCommands].flatMap(([name, item]) =>
@@ -618,11 +635,16 @@ function reviewedBefore(
     : "Not reviewed on this install";
 }
 
+/** `before` of a changed skill or workflow script whose approved copy serves meanwhile. */
+const APPROVED_COPY_IN_USE =
+  "Changed since you reviewed it. Until you approve this version, Xum uses the version you approved.";
+
 function unreviewedRow(
   entry: AgentPluginInstallEntry,
   kind: keyof ComponentConsent,
   name: string,
-  item: SurfaceSkill | SurfaceServer | SurfaceWhole
+  item: SurfaceSkill | SurfaceServer | SurfaceWhole,
+  approvedCopyInUse = false
 ): AgentPluginCapabilityChange[] {
   const imported = isImportedComponent(entry.importedComponents, kind, name);
   const fingerprint = item.consentFingerprint;
@@ -630,7 +652,9 @@ function unreviewedRow(
   return [
     {
       summary: `${COMPONENT_LABELS[kind]} '${showInvisibleControls(name)}' needs review`,
-      before: reviewedBefore(entry.componentConsent, kind, name),
+      before: approvedCopyInUse
+        ? APPROVED_COPY_IN_USE
+        : reviewedBefore(entry.componentConsent, kind, name),
       after: reviewText(item),
       component: { kind, name, fingerprint },
     },
@@ -764,8 +788,13 @@ function consentAtInstall(
 
 function omitConsentFingerprint(
   skill: CollectedPluginSkill
-): Omit<CollectedPluginSkill, "consentFingerprint" | "consentDetail"> {
-  const { consentFingerprint, consentDetail: _consentDetail, ...rest } = skill;
+): Omit<CollectedPluginSkill, "consentFingerprint" | "consentDetail" | "approvedCopy"> {
+  const {
+    consentFingerprint,
+    consentDetail: _consentDetail,
+    approvedCopy: _approvedCopy,
+    ...rest
+  } = skill;
   assert(consentFingerprint.length > 0, "collected skills carry a consent fingerprint");
   return rest;
 }
@@ -1586,6 +1615,8 @@ export class AgentPluginInstallService {
    * succeeds. Never rejects (startup must not crash the app).
    */
   private reconciliationState: Promise<boolean>;
+  /** The one startup sweep of approved copies (sweepApprovedCopiesAtStartup). */
+  private startupApprovedCopiesSweep: Promise<void> | undefined;
 
   constructor(
     private readonly config: Config,
@@ -1667,6 +1698,9 @@ export class AgentPluginInstallService {
     // Started, not awaited: a slow or failed sign-out must not latch journal health (a
     // timed-out recovery stores false until the next section open). The record is its own fence.
     this.startPendingSignOutPass({ retryNow: true });
+    // Once per process, after a clean recovery (trees are then where the registry says), and not
+    // awaited: the discovery gate must not wait for it.
+    if (allConsumed) this.startupApprovedCopiesSweep ??= this.sweepApprovedCopiesAtStartup();
     return allConsumed;
   }
 
@@ -2826,7 +2860,7 @@ export class AgentPluginInstallService {
   private async collectWorkflowScripts(
     plugin: AgentPluginInfo,
     warnings: string[]
-  ): Promise<Array<SurfaceWhole & { file: string }>> {
+  ): Promise<Array<SurfaceWhole & { file: string; source: string }>> {
     const targets = [
       ...(await listPluginWorkflowFiles(plugin.workflowsDir)).map((file) => ({
         file,
@@ -2839,13 +2873,14 @@ export class AgentPluginInstallService {
         display: `Skill workflow script ${script.file}`,
       })),
     ];
-    const scripts: Array<SurfaceWhole & { file: string }> = [];
+    const scripts: Array<SurfaceWhole & { file: string; source: string }> = [];
     for (const target of targets) {
       const source = await readWorkflowScriptForReview(plugin.rootPath, target, warnings);
       if (source === undefined || source.length === 0) continue;
       const input = { file: target.file, source };
       scripts.push({
         file: target.file,
+        source,
         consentFingerprint: workflowConsentFingerprint(input),
         display: target.display,
         consentDetail: () => workflowConsentDetail(input),
@@ -2960,13 +2995,15 @@ export class AgentPluginInstallService {
           allowDisplayName: true,
         });
         warnings.push(...displayNameWarnings(label, dirName, parsed.displayName));
+        const relativeDir = path.relative(pluginRoot, path.join(skillsDir, dirName));
         skills.push({
           name: parsed.frontmatter.name,
           ...skillConsentFields({
-            relativeDir: path.relative(pluginRoot, path.join(skillsDir, dirName)),
+            relativeDir,
             frontmatter: skillConsentFrontmatter(parsed),
             body: parsed.body,
           }),
+          approvedCopy: { relativeDir, content },
           // The commands the skill can run when invoked (#6617): shown, then fingerprinted.
           ...directivesField(skillReviewDirectives(parsed.body)),
           ...(parsed.frontmatter.description !== undefined
@@ -3472,6 +3509,7 @@ export class AgentPluginInstallService {
         await fsPromises
           .rm(path.join(targetPath, PROMOTION_MARKER_FILE), { force: true })
           .catch(() => undefined);
+        await this.sweepApprovedCopies(entry);
         log.info(`Installed agent plugin '${name}' at ${args.expectedSha.slice(0, 12)}`);
         return entry;
       } finally {
@@ -4302,7 +4340,9 @@ export class AgentPluginInstallService {
           };
         })
       );
-      return { data: { ...entry, importedComponents, componentConsent }, changed: true };
+      const saved = { ...entry, importedComponents, componentConsent };
+      await this.sweepApprovedCopies(saved);
+      return { data: saved, changed: true };
     });
     if (!changed) return { data };
     // Persist first and release the mutation lock: reconciliation rediscovers current policy.
@@ -5047,9 +5087,10 @@ export class AgentPluginInstallService {
         delete commitEnvelope.pendingOverridePrunes;
       }
       try {
-        // Before the commit, so a failure leaves trust cleared (fail closed) rather than kept
-        // for a later install under this name.
+        // Before the commit, so a failure leaves trust and approved copies cleared (fail closed)
+        // rather than kept for a later install under this name.
         await removePluginHookTrust(this.config.rootDir, this.instanceIdFor(entry.name));
+        await removeApprovedCopies(this.config.rootDir, this.instanceIdFor(entry.name));
         await this.writeRegistry(
           commitEnvelope,
           rawRegistry.filter((rawEntry) => this.rawEntryName(rawEntry) !== entry.name)
@@ -5896,7 +5937,9 @@ export class AgentPluginInstallService {
             : raw
         )
       );
-      return { ...entry, componentConsent };
+      const reviewed = { ...entry, componentConsent };
+      await this.sweepApprovedCopies(reviewed);
+      return reviewed;
     });
     // Newly consented servers can start: reconcile after the lock, like setComponents. The
     // consent is committed, so a reconcile failure is a warning, not a failed review.
@@ -5925,13 +5968,102 @@ export class AgentPluginInstallService {
       targetPath,
       warnings
     );
+    // Skills and scripts whose approved copy serves until this review (approvedCopies.ts).
+    const served = verifiedApprovedCopies(
+      await readApprovedCopies(this.approvedCopiesSource(entry)),
+      entry.componentConsent,
+      plugin.rootPath
+    );
     // An agent a second file disabled after install has no fingerprint, so only this row shows it.
     const changes = [
-      ...unreviewedRows(entry, surface),
+      ...unreviewedRows(entry, surface, served),
       ...ambiguousAgentChanges(surface.ambiguousAgents, undefined),
     ];
     assertReviewFits(changes);
     return { changes, warnings };
+  }
+
+  /** Where this install keeps its approved copies (approvedCopies.ts). */
+  private approvedCopiesSource(
+    entry: Pick<AgentPluginInstallEntry, "name" | "installedAt">
+  ): ApprovedCopiesSource {
+    return { xumHome: this.config.rootDir, pluginName: entry.name, installedAt: entry.installedAt };
+  }
+
+  /**
+   * Save the approved copies of this install's skills and workflow scripts from its live tree
+   * (approvedCopies.ts), so a later change to them falls back to what the user approved. Runs in
+   * the mutation lock after each approval. Best effort: a failure is logged and never fails the
+   * committed mutation (the components then block until reviewed, as without copies).
+   */
+  private async sweepApprovedCopies(entry: AgentPluginInstallEntry): Promise<void> {
+    try {
+      await updateApprovedCopies(await this.approvedCopiesSweep(entry));
+    } catch (error) {
+      log.warn("Failed to save the approved copies of a plugin", {
+        name: entry.name,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  private async approvedCopiesSweep(entry: AgentPluginInstallEntry): Promise<ApprovedCopiesSweep> {
+    return {
+      source: this.approvedCopiesSource(entry),
+      consent: entry.componentConsent,
+      selection: entry.importedComponents,
+      live: await this.liveApprovedCopies(entry.name),
+    };
+  }
+
+  /** The installed tree's skills and workflow scripts; none when the tree is gone or invalid. */
+  private async liveApprovedCopies(name: string): Promise<ApprovedCopies> {
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: this.targetPathFor(name),
+      scope: "global",
+    });
+    if (plugin === null || plugin.name !== name) return noApprovedCopies();
+    const warnings: string[] = [];
+    const skills = await this.collectSkillsFromRoots(plugin, warnings);
+    const workflows = await this.collectWorkflowScripts(plugin, warnings);
+    return {
+      skills: Object.fromEntries(
+        skills.map((skill) => [
+          skill.name,
+          { fingerprint: skill.consentFingerprint, ...skill.approvedCopy },
+        ])
+      ),
+      workflows: Object.fromEntries(
+        workflows.map((w) => [w.file, { fingerprint: w.consentFingerprint, source: w.source }])
+      ),
+    };
+  }
+
+  /**
+   * One sweep of every install after the first clean crash recovery, so installs approved by an
+   * older build get their copies too. Never rejects: startup must not fail on it.
+   */
+  private async sweepApprovedCopiesAtStartup(): Promise<void> {
+    try {
+      // Most starts have nothing to save: the mutation lock is taken only when a sweep would
+      // write, and the sweep then runs again under it.
+      const outdated = new Set<string>();
+      for (const entry of await this.readRegistry("lenient")) {
+        if (await approvedCopiesOutdated(await this.approvedCopiesSweep(entry))) {
+          outdated.add(entry.name);
+        }
+      }
+      if (outdated.size === 0) return;
+      await this.runExclusive(async () => {
+        for (const entry of await this.readRegistry("lenient")) {
+          if (outdated.has(entry.name)) await this.sweepApprovedCopies(entry);
+        }
+      });
+    } catch (error) {
+      log.warn("Failed to save the approved copies of installed plugins at startup", {
+        error: getErrorMessage(error),
+      });
+    }
   }
 
   async previewUpdate(args: { name: string }): Promise<AgentPluginUpdateReview> {
@@ -6035,6 +6167,9 @@ export class AgentPluginInstallService {
         // after the swap, leaves them for the next start (#6122).
         const resets = [...new Set(signInResets)];
         recordedSignOuts = await this.recordPendingSignOuts(resets);
+        // Before the swap: a change this update does not approve falls back to the approved
+        // version of the old tree.
+        await this.sweepApprovedCopies(entry);
 
         await this.removeDir(path.join(stagedDir, ".git"));
 
@@ -6240,6 +6375,7 @@ export class AgentPluginInstallService {
           await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
         }
 
+        await this.sweepApprovedCopies(updated);
         log.info(
           `Updated agent plugin '${entry.name}' ${entry.lockedSha.slice(0, 12)} → ${targetSha.slice(0, 12)}`
         );

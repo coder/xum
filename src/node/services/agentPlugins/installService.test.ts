@@ -1810,16 +1810,16 @@ describe("AgentPluginInstallService", () => {
     // The install recorded the script its preview named.
     expect((await resolve()).source).toContain("name: 'run'");
 
-    // A changed script under the same name does not run until its review.
+    // A changed script under the same name does not run until its review: the approved one
+    // runs meanwhile (approvedCopies.ts).
     const installedScript = path.join(pluginsDir(), "demo-plugin", "workflows", "run.js");
     await fsPromises.writeFile(installedScript, "export const meta = { name: 'other' };\n");
-    await expect(resolve()).rejects.toThrow("has not been reviewed on this install");
+    expect((await resolve()).source).toContain("name: 'run'");
     expect((await service.list())[0].reviewRequiredCount).toBe(1);
     const review = await approveReview();
     expect(review.changes).toHaveLength(1);
     expect(review.changes[0]).toMatchObject({
       summary: "Workflow 'run.js' needs review",
-      before: "Changed since you reviewed it",
       component: { kind: "workflows", name: "run.js" },
     });
     expect(review.changes[0]?.after).toContain("name: 'other'");
@@ -2087,14 +2087,13 @@ describe("AgentPluginInstallService", () => {
       "has not been reviewed on this install"
     );
 
-    // Changed bytes under an unchanged SKILL.md do not run until their review.
+    // Changed bytes under an unchanged SKILL.md do not run until their review: the approved
+    // bytes run meanwhile (approvedCopies.ts).
     await fsPromises.writeFile(
       path.join(pluginsDir(), "demo-plugin", "skills", "greet", "workflow.js"),
       "export const meta = { name: 'greet' }; // changed\n"
     );
-    await expect(resolve("skill://greet/workflow.js")).rejects.toThrow(
-      "has not been reviewed on this install"
-    );
+    expect((await resolve("skill://greet/workflow.js")).source).not.toContain("// changed");
     const review = await service.previewComponentReview({ name: "demo-plugin" });
     expect(review.changes.map((change) => change.summary)).toEqual([
       "Workflow 'skills/greet/workflow.js' needs review",
