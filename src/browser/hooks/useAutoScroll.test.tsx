@@ -1029,4 +1029,65 @@ describe("useAutoScroll", () => {
     // disconnect() nulls the captured callback, so no stray pin can fire after teardown.
     expect(resizeObserverCallback).toBeNull();
   });
+
+  // #6773 hold while scrolled up. Rows are stacked in document order; the scrollport's top is 0.
+  function renderTranscript(heights: number[], scrollTop: number) {
+    const { result } = renderHook(() => useAutoScroll());
+    const element = document.createElement("div");
+    const metrics = attachScrollMetrics(element, {
+      scrollHeight: heights.reduce((sum, h) => sum + h, 0),
+      clientHeight: 400,
+      initialScrollTop: scrollTop,
+    });
+    const rectAt = (top: number, height: number) =>
+      ({ top, bottom: top + height, height, left: 0, right: 0, width: 0, x: 0, y: top }) as DOMRect;
+    element.getBoundingClientRect = () => rectAt(0, 400);
+    const content = document.createElement("div");
+    element.append(content);
+    const rows: HTMLElement[] = [];
+    const mount = (index: number, height: number) => {
+      const row = document.createElement("div");
+      row.setAttribute("data-message-id", `row-${rows.length}`);
+      row.getBoundingClientRect = () => {
+        const at = rows.indexOf(row);
+        const above = heights.slice(0, at).reduce((sum, h) => sum + h, 0);
+        return rectAt(above - metrics.getScrollTop(), heights[at]);
+      };
+      content.insertBefore(row, rows[index] ?? null);
+      rows.splice(index, 0, row);
+      heights.splice(index, 0, height);
+      metrics.setScrollHeight(heights.reduce((sum, h) => sum + h, 0));
+    };
+    const initial = heights.splice(0);
+    initial.forEach((height, index) => mount(index, height));
+    metrics.setScrollTop(scrollTop);
+    act(() => {
+      (result.current.contentRef as MutableRefObject<HTMLDivElement | null>).current = element;
+      // Released (scrolled up): the observer effect re-runs with the ref attached.
+      result.current.disableAutoScroll();
+    });
+    return { metrics, rows, heights, mount };
+  }
+
+  test("rows mounted above with the caller's anchor correction move nothing more", () => {
+    // Load older / Show newer: ChatPane's layout effect restores its anchor row before the
+    // ResizeObserver runs, so the held row is already back in place and the hold writes nothing.
+    const { metrics, rows, mount } = renderTranscript([300, 300, 300, 300], 256);
+    const held = rows[1];
+    const heldTop = held.getBoundingClientRect().top;
+    mount(0, 500);
+    metrics.setScrollTop(256 + 500);
+    act(() => triggerResizeObserver());
+    expect(metrics.scrollTop).toBe(756);
+    expect(held.getBoundingClientRect().top).toBe(heldTop);
+  });
+
+  test("with no row starting in view, growth is left to native anchoring", () => {
+    // One tall row fills the view: there is no row to hold, so the hook writes nothing.
+    const { metrics, heights } = renderTranscript([300, 2000, 300], 400);
+    heights[1] += 397;
+    metrics.setScrollHeight(2997);
+    act(() => triggerResizeObserver());
+    expect(metrics.scrollTop).toBe(400);
+  });
 });
