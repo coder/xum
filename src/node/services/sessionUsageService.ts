@@ -146,6 +146,16 @@ const InFlightUsageFileSchema = z.object({
 });
 type InFlightUsageFile = z.infer<typeof InFlightUsageFileSchema>;
 
+/**
+ * A stream that a killed Xum process left behind, just folded into the ledger: its finished
+ * steps' usage and when its last step finished. Sent once per fold, after the ledger write.
+ */
+export interface KilledStreamUsageEvent {
+  workspaceId: string;
+  usage: ChatUsageDisplay;
+  lastStepAtMs: number;
+}
+
 interface InFlightUsageEntry {
   key: string;
   filePath: string;
@@ -235,6 +245,7 @@ export class SessionUsageService {
   private readonly inFlightOwnerId = randomUUID();
   /** In-flight keys of streams this process is still running, per workspace. */
   private readonly liveInFlightKeys = new Map<string, Set<string>>();
+  private killedStreamUsageListener?: (event: KilledStreamUsageEvent) => Promise<unknown>;
 
   constructor(
     config: Config,
@@ -266,6 +277,34 @@ export class SessionUsageService {
       return [];
     }
     return messages;
+  }
+
+  /**
+   * The goal charges a killed stream's usage here (CoreWiringLive): that stream never reached
+   * the stream end that charges every other turn. Called after the fold's ledger write and
+   * outside the ledger lock, so a crash in between can miss the charge but never repeat it
+   * (the next fold finds the key settled). This process's own leftovers are not sent: their
+   * stream end already ran.
+   */
+  setKilledStreamUsageListener(
+    listener: (event: KilledStreamUsageEvent) => Promise<unknown>
+  ): void {
+    this.killedStreamUsageListener = listener;
+  }
+
+  private async notifyKilledStreams(
+    workspaceId: string,
+    killed: InFlightUsageFile[]
+  ): Promise<void> {
+    const listener = this.killedStreamUsageListener;
+    if (!listener) return;
+    for (const file of killed) {
+      try {
+        await listener({ workspaceId, usage: file.usage, lastStepAtMs: file.updatedAt });
+      } catch (error) {
+        log.warn("Failed to charge a killed stream's usage to the goal", { workspaceId, error });
+      }
+    }
   }
 
   private getFilePath(workspaceId: string): string {
@@ -354,10 +393,11 @@ export class SessionUsageService {
     workspaceId: string,
     ledger: SessionUsageFile,
     entries: InFlightUsageEntry[] | undefined
-  ): { foldedCount: number; filesToDelete: string[] } {
+  ): { foldedCount: number; filesToDelete: string[]; killed: InFlightUsageFile[] } {
     const settledKeys = new Set(ledger.settledInFlightKeys ?? []);
     let foldedCount = 0;
     const filesToDelete: string[] = [];
+    const killed: InFlightUsageFile[] = [];
     for (const entry of entries ?? []) {
       if (!this.isOrphan(workspaceId, entry)) continue;
       filesToDelete.push(entry.filePath);
@@ -370,8 +410,9 @@ export class SessionUsageService {
       withSettledInFlightKey(ledger, entry.key);
       settledKeys.add(entry.key);
       foldedCount++;
+      if (entry.file.owner.id !== this.inFlightOwnerId) killed.push(entry.file);
     }
-    return { foldedCount, filesToDelete };
+    return { foldedCount, filesToDelete, killed };
   }
 
   /** A stream this process is still running (the Costs tab counts it from stream events). */
@@ -457,10 +498,11 @@ export class SessionUsageService {
     }
   ): Promise<void> {
     const settlesKey = options?.settlesInFlightKey;
-    return this.fileLocks.withLock(workspaceId, async () => {
+    const killed = await this.fileLocks.withLock(workspaceId, async () => {
       const current = await this.readFile(workspaceId);
       const entries = await this.readInFlightEntries(workspaceId);
-      const { filesToDelete } = this.foldOrphanedInFlightUsage(workspaceId, current, entries);
+      const folded = this.foldOrphanedInFlightUsage(workspaceId, current, entries);
+      const { filesToDelete } = folded;
       // CRITICAL: Accumulate, don't overwrite
       addModelUsage(current.byModel, model, usage);
       if (options?.skipLastRequestUpdate !== true) {
@@ -477,7 +519,9 @@ export class SessionUsageService {
         filesToDelete.push(this.getInFlightFilePath(workspaceId, settlesKey));
       }
       await this.deleteFiles(filesToDelete);
+      return folded.killed;
     });
+    await this.notifyKilledStreams(workspaceId, killed);
   }
 
   /**
@@ -943,14 +987,14 @@ export class SessionUsageService {
     workspaceId: string,
     options?: { includeLiveStreams?: boolean }
   ): Promise<SessionUsageFile | undefined> {
-    return this.fileLocks.withLock(workspaceId, async () => {
+    const { result, killed } = await this.fileLocks.withLock(workspaceId, async () => {
       const settled = await this.readSettledLedgerLocked(workspaceId);
       const entries = await this.readInFlightEntries(workspaceId);
       if (entries?.length === 0) {
-        return settled;
+        return { result: settled, killed: [] };
       }
       const ledger = settled ?? this.createEmptyUsageFile();
-      const { foldedCount, filesToDelete } = this.foldOrphanedInFlightUsage(
+      const { foldedCount, filesToDelete, killed } = this.foldOrphanedInFlightUsage(
         workspaceId,
         ledger,
         entries
@@ -966,8 +1010,13 @@ export class SessionUsageService {
         entries,
         options?.includeLiveStreams === true
       );
-      return settled === undefined && foldedCount === 0 && addedCount === 0 ? undefined : view;
+      return {
+        result: settled === undefined && foldedCount === 0 && addedCount === 0 ? undefined : view,
+        killed,
+      };
     });
+    await this.notifyKilledStreams(workspaceId, killed);
+    return result;
   }
 
   /** The settled ledger (rebuilt from history when missing or corrupt). Caller holds the lock. */
