@@ -1169,7 +1169,8 @@ export const ReviewTabWithFileFilter: Story = {
     await expect(filterIndicator).toHaveTextContent("Button.tsx");
 
     // In the light themes, the warning "-N" counts and "M" letters were 1.54:1 on white, and every
-    // colored text on the selected file row was below WCAG AA, down to 1.16:1 (#6935).
+    // colored text on the selected file row was below WCAG AA, down to 1.16:1. The filter chip
+    // shares the row's tint, and its "✕" was 2.85:1 (#6935).
     const tree = await canvas.findByTestId("review-file-tree");
     const selectedName = await within(tree).findByText("Button.tsx");
     // The selected row is the nearest ancestor that paints a background: the selection tint.
@@ -1186,7 +1187,10 @@ export const ReviewTabWithFileFilter: Story = {
       );
     const deletionCounts = () => canvas.getAllByText(/^[-−]\d+$|^M$/);
     await expect(
-      textsBelowAaInThemes(() => [...new Set([...rowTexts(), ...deletionCounts()])]).join("\n")
+      textsBelowAaInThemes(() => [
+        filterIndicator,
+        ...new Set([...rowTexts(), ...deletionCounts()]),
+      ]).join("\n")
     ).toBe("");
   },
 };

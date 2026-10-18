@@ -269,7 +269,7 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
   const statusColor = isWorking ? "text-accent-text" : "text-muted";
   const dirtyColor = isWorking ? "text-git-dirty" : "text-muted";
   const additionsColor = isWorking ? "text-success-light-text" : "text-muted";
-  const deletionsColor = isWorking ? "text-warning-light" : "text-muted";
+  const deletionsColor = isWorking ? "text-warning-light-text" : "text-muted";
 
   // Dialog content with git divergence details
   const dialogContent = (

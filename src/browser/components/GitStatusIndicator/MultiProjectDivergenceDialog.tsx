@@ -29,7 +29,9 @@ function formatLineDelta(additions: number, deletions: number): React.ReactNode 
       <span className={cn(additions > 0 ? "text-success-light-text" : "text-muted")}>
         +{additions}
       </span>
-      <span className={cn(deletions > 0 ? "text-warning-light" : "text-muted")}>-{deletions}</span>
+      <span className={cn(deletions > 0 ? "text-warning-light-text" : "text-muted")}>
+        -{deletions}
+      </span>
     </span>
   );
 }

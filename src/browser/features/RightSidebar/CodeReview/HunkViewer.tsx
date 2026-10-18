@@ -422,7 +422,7 @@ export const HunkViewer = React.memo<HunkViewerProps>(
             {!isPureRename && (
               <>
                 {additions > 0 && <span className="text-success-light-text">+{additions}</span>}
-                {deletions > 0 && <span className="text-warning-light">−{deletions}</span>}
+                {deletions > 0 && <span className="text-warning-light-text">−{deletions}</span>}
               </>
             )}
             <Tooltip>

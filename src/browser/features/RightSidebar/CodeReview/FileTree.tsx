@@ -94,7 +94,7 @@ function getFileChangeBadge(
     case "modified":
       return {
         label: "M",
-        className: "text-warning-light",
+        className: "text-warning-light-text",
         title: "Modified",
       };
   }
@@ -269,7 +269,7 @@ const TreeNodeContent: React.FC<{
                     (isOpen ? (
                       <span>-{node.totalStats.deletions}</span>
                     ) : (
-                      <span className="text-warning-light">-{node.totalStats.deletions}</span>
+                      <span className="text-warning-light-text">-{node.totalStats.deletions}</span>
                     ))}
                 </span>
               )}
@@ -327,7 +327,7 @@ const TreeNodeContent: React.FC<{
                 <span className="text-success-light-text">+{node.stats.additions}</span>
               ) : null}
               {node.stats?.deletions ? (
-                <span className="text-warning-light">-{node.stats.deletions}</span>
+                <span className="text-warning-light-text">-{node.stats.deletions}</span>
               ) : null}
               {fileChangeBadge ? (
                 <Tooltip>
@@ -450,7 +450,8 @@ export const FileTree: React.FC<FileTreeExternalProps> = ({
                 onClick={() => onSelectFile(null)}
               >
                 <span className="max-w-[120px] truncate">{filterDisplayName}</span>
-                <span className="text-muted">✕</span>
+                {/* text-muted was 2.85:1 on the selection tint in light (#6935). */}
+                <span className="text-foreground">✕</span>
               </button>
             </TooltipIfPresent>
           )}

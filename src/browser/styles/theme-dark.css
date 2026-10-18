@@ -266,6 +266,9 @@
 
     --color-warning: hsl(45 100% 51%); /* #ffc107 - warning yellow */
     --color-warning-light: hsl(0 91% 71%); /* #f87171 - lighter warning/error */
+    /* Text-only variant of --color-warning-light. Dark keeps the same color: it reaches AA as
+       text. The light themes set a darker one (#6935). */
+    --color-warning-light-text: var(--color-warning-light);
     --color-warning-text: var(--color-warning);
 
     /* Code syntax highlighting */
