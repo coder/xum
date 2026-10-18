@@ -56,12 +56,9 @@ const execAsync = promisify(exec);
 
 const TEST_TIMEOUT_MS = 60000;
 // #6870: in 37 passing CI runs this whole file took 6.8-9.2 s, its container start and both ssh
-// inits included. One merge-queue run missed the old 15 s init wait, and that message did not say
-// whether init was stuck or slow. The budget matches the other ssh tests (#6588). An init slower
-// than SSH_INIT_SLOW_MS still passes but prints its timeline to stderr (CI's --silent drops
-// console output, not stderr).
-const SSH_INIT_BUDGET_MS = 40_000;
-const SSH_INIT_SLOW_MS = 15_000;
+// inits included, so 15 s is enough for a normal init. One merge-queue run missed it, and the old
+// message did not say where init was. A miss now prints the backend's init state.
+const SSH_INIT_BUDGET_MS = 15_000;
 const SSH_WATCHDOG_MS = TEST_TIMEOUT_MS - 10_000;
 const ORIGIN_COMMIT_MARKER = "ORIGIN_ONLY_COMMIT_MARKER";
 
@@ -493,7 +490,6 @@ describeIntegration("Origin fetch ordering during workspace creation", () => {
       const collector = createStreamCollector(env.orpc, workspaceId);
       collector.start();
       ctx.initLines = () => initOutputLines(collector);
-      const startedAt = Date.now();
       try {
         const end = await collector.waitForEvent("init-end", SSH_INIT_BUDGET_MS);
         const backend = () => describeBackendInit(env.services.initStateManager, workspaceId);
@@ -502,10 +498,6 @@ describeIntegration("Origin fetch ordering during workspace creation", () => {
           // Also on stderr now: a cleanup that hangs next would leave only the watchdog's message.
           process.stderr.write(`${message}\n`);
           throw new Error(message);
-        }
-        const waitedMs = Date.now() - startedAt;
-        if (waitedMs > SSH_INIT_SLOW_MS) {
-          process.stderr.write(`ssh init ended after ${waitedMs} ms (#6870). ${backend()}\n`);
         }
         const exitCode = (end as { exitCode?: number }).exitCode;
         if (exitCode !== 0) {
