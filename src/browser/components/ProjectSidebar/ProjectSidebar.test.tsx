@@ -352,7 +352,10 @@ function installProjectSidebarTestDoubles() {
     AgentListItem: (props: MockAgentListItemProps) => {
       if (props.draft) {
         return (
-          <div data-testid={`draft-item-${props.draft.draftId}`}>
+          <div
+            data-testid={`draft-item-${props.draft.draftId}`}
+            data-project-badge-icon={props.projectBadgeIcon}
+          >
             {props.draft.title ?? "Draft"}
             {props.projectBadgeName != null && <span>{props.projectBadgeName}</span>}
           </div>
@@ -1554,7 +1557,7 @@ describe("ProjectSidebar flat chat list", () => {
     ).toBeTruthy();
   });
 
-  test("flat rows carry their project's icon, and sub-project rows inherit the parent's", () => {
+  test("flat rows and drafts carry their project's icon, and sub-project rows inherit the parent's", () => {
     const parentChat = { ...createWorkspace("parent-chat"), projects: singleProjectRefs };
     const subChat = {
       ...createWorkspace("sub-chat", { subProjectPath: "/projects/demo-project/features" }),
@@ -1566,6 +1569,9 @@ describe("ProjectSidebar flat chat list", () => {
       projectPath: "/projects/other",
       projectName: "other",
     };
+    mockDraftActions({
+      "/projects/demo-project": [{ draftId: "icon-draft", createdAt: Date.now(), manualName: "" }],
+    });
     projectContextValue = createProjectContextValue({
       userProjects: new Map([
         ["/projects/demo-project", { displayName: "Demo", icon: "rocket", workspaces: [] }],
@@ -1601,6 +1607,7 @@ describe("ProjectSidebar flat chat list", () => {
     expect(avatarIcon("parent-chat")).toBe("rocket");
     expect(avatarIcon("sub-chat")).toBe("rocket");
     expect(avatarIcon("other-chat")).toBeUndefined();
+    expect(view.getByTestId("draft-item-icon-draft").dataset.projectBadgeIcon).toBe("rocket");
   });
 
   test("coalesces best-of children into a task group in the flat list", () => {

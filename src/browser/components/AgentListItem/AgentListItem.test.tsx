@@ -406,13 +406,40 @@ describe("AgentListItem", () => {
     ).toBeTruthy();
   });
 
-  test("an avatar row shows the project's chosen icon instead of the monogram", () => {
-    const { view } = renderWorkspaceItem({
-      projectBadgeName: "Project",
-      projectBadgeIcon: "rocket",
-    });
+  test.each([
+    {
+      rowKind: "chat",
+      renderRow: () =>
+        renderWorkspaceItem({ projectBadgeName: "Project", projectBadgeIcon: "rocket" }).view,
+      avatarTestId: `workspace-project-avatar-${TEST_WORKSPACE_ID}`,
+    },
+    {
+      rowKind: "draft",
+      renderRow: () =>
+        render(
+          <AgentListItem
+            variant="draft"
+            projectPath="/projects/demo"
+            isSelected={false}
+            projectBadgeName="Project"
+            projectBadgeIcon="rocket"
+            draft={{
+              draftId: "icon-draft",
+              draftNumber: 1,
+              title: "Draft",
+              promptPreview: "",
+              onOpen: () => undefined,
+              onDelete: () => undefined,
+            }}
+          />,
+          { wrapper: RowProvidersWrapper }
+        ),
+      avatarTestId: "workspace-project-avatar-draft-icon-draft",
+    },
+  ])("a $rowKind avatar row shows the project's chosen icon instead of the monogram", (row) => {
+    const view = row.renderRow();
 
-    const avatar = view.getByTestId(`workspace-project-avatar-${TEST_WORKSPACE_ID}`);
+    const avatar = view.getByTestId(row.avatarTestId);
     expect(avatar.querySelector("svg")).not.toBeNull();
     expect(avatar.textContent).toBe("");
   });
