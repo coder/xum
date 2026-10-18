@@ -1,7 +1,9 @@
 import * as fs from "fs/promises";
 import { canBindMountHostPathsIntoContainers } from "./runtimeScratchDir";
 import * as path from "path";
-import { Readable, Writable } from "stream";
+import { Writable } from "stream";
+import assert from "@/common/utils/assert";
+import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
 import type {
   RuntimeCreateFlags,
   WorkspaceCreationParams,
@@ -578,11 +580,11 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
       forceCloseStdio(childProcess);
     });
 
-    // Convert Node.js streams to Web Streams (casts required for ExecStream compatibility)
-    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stdout = Readable.toWeb(childProcess.stdout!) as unknown as ReadableStream<Uint8Array>; // eslint-disable-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stderr = Readable.toWeb(childProcess.stderr!) as unknown as ReadableStream<Uint8Array>; // eslint-disable-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+    // Convert Node.js streams to Web Streams. Not Readable.toWeb: on Bun 1.4.3 it can throw an
+    // uncaught error when the bash tool cancels a reader on output overflow (nodeReadableToWeb).
+    assert(childProcess.stdout && childProcess.stderr, "spawned with piped stdout and stderr");
+    const stdout = nodeReadableToWeb(childProcess.stdout);
+    const stderr = nodeReadableToWeb(childProcess.stderr);
     // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const stdin = Writable.toWeb(childProcess.stdin!) as unknown as WritableStream<Uint8Array>; // eslint-disable-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
 

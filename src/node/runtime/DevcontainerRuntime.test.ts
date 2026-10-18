@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { execFileSync } from "child_process";
+import { type ChildProcess, execFileSync, spawn } from "child_process";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -245,6 +245,41 @@ describe("DevcontainerRuntime.exec pathEnv", () => {
         { XUM_TEST_INSIDE: `${hostWorkspace}/nested/file` }
       );
       expect(unknown).toContain(`XUM_TEST_INSIDE=${hostWorkspace}/nested/file`);
+    }
+  );
+});
+
+describe("DevcontainerRuntime.exec output streams", () => {
+  // Bun 1.4.3: a child pipe can emit `data` after the caller cancelled its reader (the bash tool
+  // does on output overflow). Readable.toWeb then enqueues on a closed controller and throws from
+  // the emitter, an uncaught exception that ends the CLI (nodeReadableToWeb).
+  it.skipIf(process.platform === "win32")(
+    "drops output that arrives after the caller cancels its readers",
+    async () => {
+      let child: ChildProcess | undefined;
+      const spawnSpy = spyOn(devcontainerCli, "spawnDevcontainer").mockImplementation(
+        (_args, options) => {
+          child = spawn("sleep", ["30"], options);
+          return child;
+        }
+      );
+      const abort = new AbortController();
+      try {
+        const stream = await createRuntime({ currentWorkspacePath: os.tmpdir() }).exec("sleep 30", {
+          cwd: os.tmpdir(),
+          abortSignal: abort.signal,
+        });
+        expect(child).toBeDefined();
+        await stream.stdout.cancel();
+        await stream.stderr.cancel();
+        expect(() => child?.stdout?.emit("data", Buffer.from("late"))).not.toThrow();
+        expect(() => child?.stderr?.emit("data", Buffer.from("late"))).not.toThrow();
+        abort.abort();
+        await stream.exitCode;
+      } finally {
+        spawnSpy.mockRestore();
+        child?.kill("SIGKILL");
+      }
     }
   );
 });

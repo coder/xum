@@ -197,6 +197,28 @@ describe("RemoteRuntime abort cancels the underlying command", () => {
   });
 });
 
+describe("RemoteRuntime.exec output streams", () => {
+  // Bun 1.4.3: a child pipe can emit `data` after the caller cancelled its reader (the bash tool
+  // does on output overflow). Readable.toWeb then enqueues on a closed controller and throws from
+  // the emitter, an uncaught exception that ends the CLI (nodeReadableToWeb).
+  it("drops output that arrives after the caller cancels its readers", async () => {
+    const runtime = new SleepingRemoteRuntime();
+    const abort = new AbortController();
+    const stream = await runtime.exec("sleep 30", { cwd: "/workspace", abortSignal: abort.signal });
+    const child = runtime.spawned;
+    expect(child).toBeDefined();
+    try {
+      await stream.stdout.cancel();
+      await stream.stderr.cancel();
+      expect(() => child?.stdout?.emit("data", Buffer.from("late"))).not.toThrow();
+      expect(() => child?.stderr?.emit("data", Buffer.from("late"))).not.toThrow();
+    } finally {
+      abort.abort();
+      await stream.exitCode;
+    }
+  });
+});
+
 describe("RemoteRuntime.writeFile", () => {
   it("does not start a remote write command when aborted before the first write", async () => {
     const runtime = new RecordingRemoteRuntime();
