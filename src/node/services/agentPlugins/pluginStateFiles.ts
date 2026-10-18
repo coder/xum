@@ -7,6 +7,7 @@
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import { log } from "@/node/services/log";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { isPlainObject } from "./manifest";
 
@@ -33,7 +34,7 @@ export async function readBoundedStateFile(
     );
     return await readOpenStateFile(handle, file, maxBytes, label);
   } catch (error) {
-    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+    if (!hasErrorCode(error, "ENOENT")) {
       log.warn(`${label.file} is unreadable; ${label.failClosed}`, { file, error });
     }
     return undefined;
@@ -102,7 +103,7 @@ async function lstatOrNull(entry: string): Promise<Stats | null> {
   try {
     return await fs.lstat(entry);
   } catch (error) {
-    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+    if (!hasErrorCode(error, "ENOENT")) {
       log.debug("Plugin state entry cannot be inspected", { entry, error });
     }
     return null;
@@ -150,7 +151,7 @@ export async function writeStateFile(
  * directory, is removed as a link, so no write or delete reaches outside the store (Codex
  * PRRT_kwDOPxxmWM6sRsEy). `rm` without `recursive` never follows it to its target.
  */
-export async function removeWrongKindStateRoot(root: string, storeLabel: string): Promise<void> {
+async function removeWrongKindStateRoot(root: string, storeLabel: string): Promise<void> {
   const existing = await lstatOrNull(root);
   if (existing === null || existing.isDirectory()) return;
   // A symlink set up on purpose is not followed either: writes must stay inside Xum home.

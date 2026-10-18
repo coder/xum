@@ -150,6 +150,7 @@ import {
   type ApprovedCopies,
   type ApprovedCopiesSource,
   type ApprovedCopiesSweep,
+  type VerifiedApprovedCopies,
 } from "./approvedCopies";
 import {
   assertNoAgentPluginUrlCredentials,
@@ -598,7 +599,7 @@ function unreviewedRows(
     agents: Map<string, SurfaceWhole>;
     slashCommands: Map<string, SurfaceWhole>;
   },
-  served: { skills: ReadonlySet<string>; workflows: ReadonlySet<string> }
+  served: VerifiedApprovedCopies
 ): AgentPluginCapabilityChange[] {
   return [
     ...[...surface.skills].flatMap(([name, item]) =>

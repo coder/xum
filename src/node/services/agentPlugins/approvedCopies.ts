@@ -259,14 +259,15 @@ export function pluginSkillConsentGate(plugin: {
 }): PluginSkillConsentGate | undefined {
   if (plugin.componentConsent === undefined) return undefined;
   const source = plugin.approvedCopies;
-  let loaded: Promise<ApprovedCopies> | undefined;
-  return {
+  const gate: PluginSkillConsentGate = {
     pluginRoot: plugin.rootPath,
     consented: plugin.componentConsent.skills,
-    ...(source !== undefined
-      ? { loadApprovedCopies: () => (loaded ??= readApprovedCopies(source)) }
-      : {}),
   };
+  if (source !== undefined) {
+    let loaded: Promise<ApprovedCopies> | undefined;
+    gate.loadApprovedCopies = () => (loaded ??= readApprovedCopies(source));
+  }
+  return gate;
 }
 
 export interface ConsentedPluginSkill {
@@ -358,6 +359,11 @@ function isWorkflowCopyVerified(
   return consent !== undefined && isPluginWorkflowConsented(consent, { file, source: copy.source });
 }
 
+export interface VerifiedApprovedCopies {
+  skills: ReadonlySet<string>;
+  workflows: ReadonlySet<string>;
+}
+
 /**
  * The names whose copy verifies against `consent` (the review marks them: the approved version
  * stays in use until the user approves the new one).
@@ -366,7 +372,7 @@ export function verifiedApprovedCopies(
   copies: ApprovedCopies,
   consent: ComponentConsent | undefined,
   pluginRoot: string
-): { skills: ReadonlySet<string>; workflows: ReadonlySet<string> } {
+): VerifiedApprovedCopies {
   const gate = pluginSkillConsentGate({ rootPath: pluginRoot, componentConsent: consent });
   const skills = Object.entries(copies.skills).filter(
     ([name, copy]) => gate !== undefined && verifySkillCopy(gate, name, copy) !== null
