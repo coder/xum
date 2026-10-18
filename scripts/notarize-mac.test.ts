@@ -38,7 +38,8 @@ let savedEnv: Record<string, string | undefined>;
 interface FakeTools {
   /** Exit code of each `xcrun stapler staple` call in order; the last one repeats. */
   stapleCodes: number[];
-  validateCode?: number;
+  /** The same for `xcrun stapler validate`; default: always 0. */
+  validateCodes?: number[];
   /** `status` in the JSON that `xcrun notarytool submit --wait` prints. */
   notaryStatus?: string;
 }
@@ -50,8 +51,12 @@ interface FakeTools {
 function installFakeTools(tools: FakeTools): void {
   const binDir = path.join(tempDir, "bin");
   fs.mkdirSync(binDir, { recursive: true });
-  const stapleCodesFile = path.join(tempDir, "staple-codes");
-  fs.writeFileSync(stapleCodesFile, tools.stapleCodes.join("\n") + "\n");
+  for (const [action, codes] of [
+    ["staple", tools.stapleCodes],
+    ["validate", tools.validateCodes ?? [0]],
+  ] as const) {
+    fs.writeFileSync(path.join(tempDir, `${action}-codes`), codes.join("\n") + "\n");
+  }
   const log = `echo "$(basename "$0") $*|$(pwd)" >> "${callLog}"`;
   const xcrun = `#!/usr/bin/env bash
 ${log}
@@ -59,12 +64,12 @@ case "$1 $2" in
   "--find notarytool") echo /usr/bin/notarytool; exit 0 ;;
   "notarytool submit") echo '{"id":"fake-id","status":"${tools.notaryStatus ?? "Accepted"}","message":"fake"}'; exit 0 ;;
   "notarytool log") echo '{}'; exit 0 ;;
-  "stapler validate") echo "fake validate output"; exit ${tools.validateCode ?? 0} ;;
-  "stapler staple")
-    count=$(grep -c '^xcrun stapler staple' "${callLog}")
-    code=$(sed -n "\${count}p" "${stapleCodesFile}")
-    [ -n "$code" ] || code=$(tail -n 1 "${stapleCodesFile}")
-    echo "fake staple output, call $count"
+  "stapler staple"|"stapler validate")
+    codes="${tempDir}/$2-codes"
+    count=$(grep -c "^xcrun stapler $2" "${callLog}")
+    code=$(sed -n "\${count}p" "$codes")
+    [ -n "$code" ] || code=$(tail -n 1 "$codes")
+    echo "fake $2 output, call $count"
     exit "$code" ;;
 esac
 echo "unexpected xcrun call: $*" >&2
@@ -166,12 +171,25 @@ test("code 68 on every attempt is a hard failure after the last one", async () =
   );
 });
 
-test("a stapled ticket that fails validation is a hard failure", async () => {
-  installFakeTools({ stapleCodes: [0], validateCode: 65 });
+test("a validation that gets code 68 is retried like the staple, without a new staple", async () => {
+  installFakeTools({ stapleCodes: [0], validateCodes: [68, 0] });
+
+  await notarizeMac.stapleWithRetry(appPath, { attempts: 5, delayMs: 0 });
+
+  expect(stapleCalls().map((call) => call.command)).toEqual([
+    "xcrun stapler staple -v Xum.app",
+    "xcrun stapler validate -v Xum.app",
+    "xcrun stapler validate -v Xum.app",
+  ]);
+});
+
+test("a validation that fails with another code is a hard failure at once", async () => {
+  installFakeTools({ stapleCodes: [0], validateCodes: [65, 0] });
 
   const error = await rejection(notarizeMac.stapleWithRetry(appPath, { attempts: 5, delayMs: 0 }));
 
-  expect(error.message).toContain("failed validation with code: 65");
+  expect(error.message).toContain("failed validation on attempt 1 of 5 with code: 65");
+  expect(stapleCalls().filter((call) => call.command.includes("validate"))).toHaveLength(1);
 });
 
 const macContext = (): AfterSignContext => ({
