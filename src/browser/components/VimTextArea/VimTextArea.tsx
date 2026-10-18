@@ -96,6 +96,9 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
     const insertStartSnapshotRef = useRef<vim.VimHistorySnapshot | null>(null);
     const lastEditRef = useRef<vim.LastEdit | null>(null);
     const cursorRef = useRef<number>(0);
+    // #6866: the DOM caret moves to the Vim cursor in a timeout after each handled key. Until it
+    // does, the next key must read the cursor from cursorRef, not from the DOM selection.
+    const selectionPendingRef = useRef(false);
 
     useAutoResizeTextarea(textareaRef, value, 50, rest.className);
 
@@ -108,8 +111,10 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
     };
 
     const applyDomSelection = (next: Pick<vim.VimState, "cursor" | "mode" | "visualAnchor">) => {
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-      const el = textareaRef.current!;
+      selectionPendingRef.current = false;
+      const el = textareaRef.current;
+      // Unmounted before the timeout ran.
+      if (!el) return;
       const domText = el.value;
       const clamp = (pos: number) => Math.max(0, Math.min(domText.length, pos));
 
@@ -161,9 +166,13 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
       if (suppressSet.has(e.key)) return;
 
       // Build current Vim state
-      const selection = withSelection();
-      const cursor =
-        vimMode === "visual" || vimMode === "visualLine" ? cursorRef.current : selection.start;
+      const cursor = vimCursorFor({
+        mode: vimMode,
+        text: value,
+        domCursor: withSelection().start,
+        vimCursor: cursorRef.current,
+        selectionPending: selectionPendingRef.current,
+      });
 
       // Keep the cursor ref in sync for mode transitions (normal -> visual, etc.).
       cursorRef.current = cursor;
@@ -247,6 +256,7 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
       }
 
       // Apply DOM selection after React state updates (important for mode transitions)
+      selectionPendingRef.current = true;
       setTimeout(() => applyDomSelection(newState), 0);
     };
 
@@ -334,3 +344,23 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
 );
 
 VimTextArea.displayName = "VimTextArea";
+
+/**
+ * The cursor a key starts from. Visual modes and a DOM selection not yet moved to the Vim cursor
+ * (#6866: a key right after Escape on a busy page) use the Vim cursor. Clamped to the text: it
+ * can change between keys (a send took its draft), and a normal-mode cursor never sits past the
+ * last character.
+ */
+function vimCursorFor(input: {
+  mode: vim.VimMode;
+  text: string;
+  domCursor: number;
+  vimCursor: number;
+  selectionPending: boolean;
+}): number {
+  const usesVimCursor =
+    input.selectionPending || input.mode === "visual" || input.mode === "visualLine";
+  const cursor = usesVimCursor ? input.vimCursor : input.domCursor;
+  const max = input.mode === "insert" ? input.text.length : Math.max(0, input.text.length - 1);
+  return Math.max(0, Math.min(cursor, max));
+}

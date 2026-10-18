@@ -1308,10 +1308,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Method to restore text to input (used by compaction cancel)
   const restoreText = useCallback(
     (text: string) => {
+      // #6866: a replace is not typing, even when its text starts with the sent text: a send not
+      // yet taken removes nothing from it.
+      getDraftStore().markSendEdited(draftScope);
       setInput(() => text);
       focusMessageInput();
     },
-    [focusMessageInput, setInput]
+    [draftScope, focusMessageInput, setInput]
   );
 
   // Method to append text to input (used by Code Review notes)

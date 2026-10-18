@@ -13,6 +13,7 @@ import { act, fireEvent, waitFor } from "@testing-library/react";
 
 import { getUserPreferences, updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getDraftStore } from "@/browser/stores/DraftStore";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
 
@@ -47,6 +48,15 @@ function holdFirstReply(app: AppHarness) {
       await Promise.allSettled([first]);
     },
   };
+}
+
+/** The composer suggestion row that shows `label`, if any. */
+function suggestionOption(app: AppHarness, label: string): Element | null {
+  return (
+    [...app.view.container.ownerDocument.querySelectorAll('[role="option"]')].find((option) =>
+      (option.textContent ?? "").includes(label)
+    ) ?? null
+  );
 }
 
 function composer(app: AppHarness): HTMLTextAreaElement {
@@ -113,6 +123,11 @@ function editTextarea(
     );
   });
   if (edit.value !== textarea.value) fireEvent.input(textarea, { target: { value: edit.value } });
+}
+
+/** Vim keys through VimTextArea's key handler, with no wait in between. */
+function pressVimKeys(app: AppHarness, keys: string[]) {
+  for (const key of keys) fireEvent.keyDown(composer(app), { key });
 }
 
 /** Types `text` one key at a time at the end of the textarea. */
@@ -218,6 +233,22 @@ describe("composer during an unsettled send (#6259)", () => {
     }
   }, 120_000);
 
+  // #6866: VimTextArea moves the DOM caret after a key in a timeout. A key that comes first (a
+  // busy page, a fast typist) is still a Vim command, not typed text.
+  test("a Vim command right after Escape is a command, not text", async () => {
+    const app = await createAppHarness({ branchPrefix: "composer-vim-fast-keys" });
+    try {
+      act(() => updateUserPreferences({ appearance: { vimEnabled: true } }));
+      await waitFor(() => expect(getUserPreferences().appearance?.vimEnabled).toBe(true), WAIT);
+      await app.chat.typeWithoutSending("yes");
+      pressVimKeys(app, ["Escape", "c", "c"]);
+      expect(composer(app).value).toBe("");
+    } finally {
+      act(() => updateUserPreferences({ appearance: { vimEnabled: false } }));
+      await app.dispose();
+    }
+  }, 120_000);
+
   // Commands clear or replace the composer text themselves, so a slash send keeps the lock until
   // it took its draft.
   test("a slash command send still locks typing until it took its draft", async () => {
@@ -288,19 +319,83 @@ describe("composer during an unsettled send (#6259)", () => {
     test("a Vim cc and a retyped text keep what was typed", async () => {
       const value = await editBeforeTake(
         "yes",
-        async (app) => {
-          for (const key of ["Escape", "c", "c"]) {
-            fireEvent.keyDown(composer(app), { key });
-            // VimTextArea moves the DOM caret in a timeout after each key, as a person's next
-            // key would find it.
-            await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
-          }
+        (app) => {
+          // #6866: no wait between keys. The page is busy right after Enter, so the next key
+          // arrives before VimTextArea's deferred caret move.
+          pressVimKeys(app, ["Escape", "c", "c"]);
           expect(composer(app).value).toBe("");
           typeIntoTextarea(app, "yes please");
         },
         { vim: true }
       );
       expect(value).toBe("yes please");
+    }, 120_000);
+
+    // #6866: an append is typing, also from Vim: the sent text goes and the appended text stays.
+    test("a Vim o or p at the end counts as typing after the sent text", async () => {
+      const opened = await editBeforeTake(
+        "yes",
+        (app) => {
+          pressVimKeys(app, ["Escape", "o"]);
+          typeIntoTextarea(app, "more");
+        },
+        { vim: true }
+      );
+      expect(opened).toBe("\nmore");
+      const pasted = await editBeforeTake(
+        "yes",
+        (app) => pressVimKeys(app, ["Escape", "y", "y", "p"]),
+        { vim: true }
+      );
+      // `yy` yanks "yes" and `p` pastes it after the cursor, at the end: "yesyes".
+      expect(pasted).toBe("yes");
+    }, 120_000);
+
+    // #6866: code-driven edits fire no beforeinput. A replace (analytics drill-down, Compact &
+    // retry, Run /init) is not typing, even when its text starts with the sent text.
+    test("a replace of the composer text keeps the whole new text", async () => {
+      const value = await editBeforeTake("yes", () => {
+        act(() => {
+          window.dispatchEvent(
+            createCustomEvent(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, {
+              text: "yes please",
+              mode: "replace",
+            })
+          );
+        });
+      });
+      expect(value).toBe("yes please");
+    }, 120_000);
+
+    // Appends (a quote, a palette insert, dictation) and an accepted suggestion at the end are
+    // typing after the sent text: the sent text goes, the added text stays.
+    test("an append and an accepted suggestion keep the added text", async () => {
+      const appended = await editBeforeTake("yes", () => {
+        act(() => {
+          window.dispatchEvent(
+            createCustomEvent(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, { text: "> quoted", mode: "append" })
+          );
+        });
+      });
+      expect(appended).toBe("\n\n> quoted");
+      const accepted = await editBeforeTake("yes", async (app) => {
+        typeIntoTextarea(app, " @READ");
+        await waitFor(() => expect(suggestionOption(app, "README.md")).not.toBeNull(), WAIT);
+        fireEvent.keyDown(composer(app), { key: "Tab" });
+        await waitFor(() => expect(composer(app).value).toBe("yes @README.md "), WAIT);
+      });
+      expect(accepted).toBe(" @README.md ");
+    }, 120_000);
+
+    // History recall (ArrowUp) works only from an empty composer, which the window after Enter
+    // never shows without an edit first: no edit opens, and the take stays exact.
+    test("ArrowUp after Enter opens no edit and the take is exact", async () => {
+      const value = await editBeforeTake("yes", (app) => {
+        fireEvent.keyDown(composer(app), { key: "ArrowUp" });
+        expect(composer(app).getAttribute("aria-label")).toBe("Message");
+        typeIntoTextarea(app, "x");
+      });
+      expect(value).toBe("x");
     }, 120_000);
 
     test("deleting the sent text and typing it again keeps what was typed", async () => {
