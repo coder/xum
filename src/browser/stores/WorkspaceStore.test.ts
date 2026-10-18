@@ -8411,6 +8411,76 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  describe("live tool state after a delete", () => {
+    const runningToolPart = (toolCallId: string, toolName: string) => ({
+      type: "dynamic-tool" as const,
+      toolCallId,
+      toolName,
+      state: "input-available" as const,
+      input: {},
+    });
+
+    it("prunes live bash output and workflow runs of deleted tool calls and keeps the rest", async () => {
+      const workspaceId = "live-tool-state-delete";
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+      const run = createWorkflowRunRecord({ id: "wfr_live_delete", workspaceId });
+
+      await send(
+        caughtUpEvent(),
+        {
+          type: "message",
+          id: "kept-turn",
+          role: "assistant",
+          parts: [
+            runningToolPart("call-bash-kept", "bash"),
+            {
+              ...runningToolPart("call-code", "code_execution"),
+              // Kernel-nested calls key their live state by their own ids.
+              nestedCalls: [
+                {
+                  toolCallId: "call-nested-workflow",
+                  toolName: "workflow_run",
+                  state: "input-available",
+                },
+                { toolCallId: "call-nested-bash", toolName: "bash", state: "input-available" },
+              ],
+            },
+          ],
+          metadata: { historySequence: 1, timestamp: 1 },
+        },
+        {
+          type: "message",
+          id: "deleted-turn",
+          role: "assistant",
+          parts: [
+            runningToolPart("call-bash-deleted", "bash"),
+            runningToolPart("call-workflow-deleted", "workflow_run"),
+          ],
+          metadata: { historySequence: 2, timestamp: 2 },
+        },
+        bashOutputEvent(workspaceId, "call-bash-kept", "kept output"),
+        bashOutputEvent(workspaceId, "call-nested-bash", "nested output"),
+        bashOutputEvent(workspaceId, "call-bash-deleted", "deleted output"),
+        workflowRunAttachedEvent(workspaceId, "call-nested-workflow", run.id, 3, run),
+        workflowRunAttachedEvent(workspaceId, "call-workflow-deleted", run.id, 4, run)
+      );
+      expect(store.getBashToolLiveOutput(workspaceId, "call-bash-deleted")).not.toBeNull();
+      expect(store.getWorkflowToolLiveRun(workspaceId, "call-workflow-deleted")).not.toBeNull();
+
+      await send({ type: "delete", historySequences: [2] });
+
+      expect(store.getBashToolLiveOutput(workspaceId, "call-bash-deleted")).toBeNull();
+      expect(store.getWorkflowToolLiveRun(workspaceId, "call-workflow-deleted")).toBeNull();
+      expect(store.getBashToolLiveOutput(workspaceId, "call-bash-kept")).not.toBeNull();
+      expect(store.getBashToolLiveOutput(workspaceId, "call-nested-bash")).not.toBeNull();
+      expect(store.getWorkflowToolLiveRun(workspaceId, "call-nested-workflow")).toEqual({
+        runId: run.id,
+        run,
+      });
+    });
+  });
+
   describe("task-created events", () => {
     it("exposes live taskId while the task tool is running", async () => {
       const workspaceId = "task-created-workspace-1";
