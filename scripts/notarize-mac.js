@@ -17,8 +17,9 @@
  *
  * Credentials: the App Store Connect API key that scripts/setup-macos-signing.sh exports
  * (APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER). Without them the hook skips notarization,
- * as electron-builder did. Other electron-builder credential kinds (APPLE_ID, keychain profile)
- * fail the build instead of shipping an app that is silently not notarized.
+ * as electron-builder did. Other electron-builder credential kinds (APPLE_ID with
+ * APPLE_APP_SPECIFIC_PASSWORD, or a keychain profile), even half of a pair, fail the build instead
+ * of shipping an app that is silently not notarized.
  */
 
 const { spawn } = require("child_process");
@@ -109,7 +110,9 @@ async function notarizeMac(context) {
 
   const { APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER } = process.env;
   if (!APPLE_API_KEY && !APPLE_API_KEY_ID && !APPLE_API_ISSUER) {
-    if (process.env.APPLE_ID || process.env.APPLE_KEYCHAIN_PROFILE) {
+    // electron-builder notarized with (or failed on half of) these; never skip them silently.
+    const otherCredentials = ["APPLE_ID", "APPLE_APP_SPECIFIC_PASSWORD", "APPLE_KEYCHAIN_PROFILE"];
+    if (otherCredentials.some((name) => process.env[name])) {
       throw new Error(
         "scripts/notarize-mac.js supports only API key notarization (APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER)"
       );

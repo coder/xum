@@ -26,6 +26,7 @@ const CREDENTIAL_ENV = [
   "APPLE_API_KEY_ID",
   "APPLE_API_ISSUER",
   "APPLE_ID",
+  "APPLE_APP_SPECIFIC_PASSWORD",
   "APPLE_KEYCHAIN_PROFILE",
 ] as const;
 
@@ -235,6 +236,13 @@ test("the hook refuses credentials it cannot notarize with instead of skipping",
 
   delete process.env.APPLE_API_KEY_ID;
   process.env.APPLE_ID = "dev@example.com";
+  expect((await rejection(notarizeMac.default(macContext()))).message).toContain(
+    "supports only API key notarization"
+  );
+
+  // Half of the app-specific password pair is a configuration error, not "no credentials".
+  delete process.env.APPLE_ID;
+  process.env.APPLE_APP_SPECIFIC_PASSWORD = "fake-password";
   expect((await rejection(notarizeMac.default(macContext()))).message).toContain(
     "supports only API key notarization"
   );
