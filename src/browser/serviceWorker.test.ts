@@ -136,8 +136,12 @@ async function startWorker(
     listeners.get(type)?.({ waitUntil: (promise: Promise<unknown>) => pending.push(promise) });
     await Promise.all(pending);
   };
-  await lifecycle("install");
-  await lifecycle("activate");
+  // As in a browser: a failed install never activates, and the previous worker stays.
+  const installed = await lifecycle("install").then(
+    () => true,
+    () => false
+  );
+  if (installed) await lifecycle("activate");
 
   /** One fetch event. `handled` is false when the worker left it to the browser. */
   const request = async (url: string, init: { method?: string; mode?: string } = {}) => {
@@ -157,6 +161,7 @@ async function startWorker(
   };
 
   return {
+    installed,
     storage,
     cacheName: cacheNameFor(scope, options.stamp?.buildId),
     request,
@@ -402,21 +407,26 @@ describe("one cache per build (#6867)", () => {
     Object.defineProperty(response, "redirected", { value: true });
     return response;
   };
+  const failing = () => {
+    throw new TypeError("Failed to fetch");
+  };
   test.each([
     // A proxy's sign-in page answers "./" with a 200 HTML page (the #6929 case).
-    ["a 200 sign-in page", () => html("<html><body>Sign in</body></html>")],
-    ["a redirected shell", redirectedShell],
-    [
-      "an error page",
-      () =>
-        new Response(shellPage().body, { status: 502, headers: { "Content-Type": "text/html" } }),
-    ],
-  ])("install never stores %s as the shell, and still activates", async (_l, page) => {
-    const storage = withNetwork((request) => (request === "./" ? page() : release(request)));
-    storage.seed(`mux-v3:${ROOT_SCOPE}`, [ROOT_SCOPE]);
+    ["a 200 sign-in page at ./", "./", () => html("<html><body>Sign in</body></html>")],
+    ["a redirected shell", "./", redirectedShell],
+    ["an error page at ./", "./", () => new Response("bad gateway", { status: 502 })],
+    ["an unreachable shell", "./", failing],
+    // A rolling deploy: another replica does not have this build's entry file yet.
+    ["a missing entry file", HASHED_JS, () => new Response("not found", { status: 404 })],
+  ])("install fails on %s and keeps the previous build's cache", async (_l, failingPath, reply) => {
+    const storage = withNetwork((request) =>
+      request === failingPath ? reply() : release(request)
+    );
+    storage.seed(`mux-v3:${ROOT_SCOPE}`, [ROOT_SCOPE, `${ORIGIN}/main-OldRel01.js`]);
     const worker = await startWorker({ storage, stamp: stampFor("bbbbbbbbbbbb") });
-    expect([...storage.stores.keys()]).toEqual([worker.cacheName]);
-    expect(storage.urlsIn(worker.cacheName)).not.toContain(ROOT_SCOPE);
+    expect(worker.installed).toBe(false);
+    // The partial cache is gone, and the previous build still starts offline.
+    expect([...storage.stores.keys()]).toEqual([`mux-v3:${ROOT_SCOPE}`]);
   });
 });
 

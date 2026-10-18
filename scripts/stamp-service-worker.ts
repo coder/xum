@@ -44,14 +44,25 @@ export function stampServiceWorker(source: string, stamp: ServiceWorkerStamp): s
   return stamped;
 }
 
+// Every HTML entry of vite.config.ts: the worker caches the hashed files of all of them, so a
+// release that changes only a popout page must still ship a new worker.
+const HTML_ENTRIES = ["index.html", "terminal.html", "desktop.html"];
+
 /**
- * The stamp for a built dist: the id is a hash of the built index.html (it lists the hashed entry
- * files, and the server rewrites only per request), the entry is its module script, and the
- * precache list is its first-load module graph, its stylesheets and the first-view font.
+ * The stamp for a built dist: the id is a hash of the built HTML entries (they list the hashed
+ * entry files, and the server rewrites only per request), the entry is index.html's module
+ * script, and the precache list is its first-load module graph, its stylesheets and the
+ * first-view font.
  */
 export function stampForDist(distDir: string): ServiceWorkerStamp {
   const html = fs.readFileSync(path.join(distDir, "index.html"), "utf-8");
-  const buildId = crypto.createHash("sha256").update(html).digest("hex").slice(0, 12);
+  const hash = crypto.createHash("sha256");
+  for (const name of HTML_ENTRIES) {
+    const file = path.join(distDir, name);
+    // The name separates the entries, so moving bytes between files changes the id too.
+    if (fs.existsSync(file)) hash.update(`${name}\0`).update(fs.readFileSync(file));
+  }
+  const buildId = hash.digest("hex").slice(0, 12);
   const entryFile = /<script\b[^>]*type="module"[^>]*src="(?:\.\/)?([^"]+)"/.exec(html)?.[1];
   if (entryFile === undefined) throw new Error(`${distDir}/index.html has no module script`);
 

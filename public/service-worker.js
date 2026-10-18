@@ -122,29 +122,41 @@ function isInstallShell(response) {
     .then((html) => html.includes(ENTRY_FILE));
 }
 
+function precacheFile(cache, name) {
+  // Low priority, so the live page's requests go first. HTTP cache hits are used.
+  return fetch(name, { priority: "low" }).then((response) => {
+    if (!isCacheableResponse(response)) throw new Error(`precache ${name}: ${response.status}`);
+    return cache.put(name, response);
+  });
+}
+
 // Install event - cache the app shell and this build's first-load files (#6867). The server sends
-// the shell with no-store, so a root navigation refreshes it later. No file can fail the install:
-// a worker that never installs would leave an older one (and its caches) in control.
+// the shell with no-store, so a root navigation refreshes it later. The shell and the entry file
+// are required: activate deletes the previous build's cache, so without them the next offline
+// start would fail. Then the install fails, drops its partial cache, and the previous worker
+// stays in control until the next update check. Any other first-load file may fail on its own.
 self.addEventListener("install", (event) => {
   event.waitUntil(
     caches
       .open(CACHE_NAME)
-      .then((cache) =>
-        Promise.allSettled([
-          fetch(SHELL_PATH).then((response) =>
-            isInstallShell(response).then((accepted) =>
-              accepted ? cache.put(SHELL_PATH, response) : undefined
-            )
-          ),
-          // Low priority, so the live page's requests go first. HTTP cache hits are used.
-          ...PRECACHE.map((name) =>
-            fetch(name, { priority: "low" }).then((response) =>
-              isCacheableResponse(response) ? cache.put(name, response) : undefined
-            )
-          ),
-        ])
+      .then((cache) => {
+        const shell = fetch(SHELL_PATH).then((response) =>
+          isInstallShell(response).then((accepted) => {
+            if (!accepted) throw new Error("install: ./ is not this build's shell");
+            return cache.put(SHELL_PATH, response);
+          })
+        );
+        const files = PRECACHE.map((name) => precacheFile(cache, name));
+        const entry = files[PRECACHE.indexOf(ENTRY_FILE)] || Promise.resolve();
+        return Promise.all([shell, entry, Promise.allSettled(files)]);
+      })
+      .then(
+        () => self.skipWaiting(),
+        (error) =>
+          caches.delete(CACHE_NAME).then(() => {
+            throw error;
+          })
       )
-      .then(() => self.skipWaiting())
   );
 });
 

@@ -50,13 +50,18 @@ describe("stampForDist (#6867)", () => {
     expect(stamp.buildId).toMatch(/^[0-9a-f]{12}$/);
   });
 
-  test("the build id changes with the built index.html and only with it", () => {
+  test("the build id changes with the built HTML entries and only with them", () => {
     writeBuild();
+    write("terminal.html", `<script type="module" src="./terminal-TeRm1234.js"></script>`);
     const first = stampForDist(dist).buildId;
     write("lazy-LaZy1234.js", "export const l = 2;\n");
     expect(stampForDist(dist).buildId).toBe(first);
+    // A release that changes only a popout page still ships a new worker.
+    write("terminal.html", `<script type="module" src="./terminal-NeWw1234.js"></script>`);
+    const popoutOnly = stampForDist(dist).buildId;
+    expect(popoutOnly).not.toBe(first);
     writeBuild("main-NeWw1234.js");
-    expect(stampForDist(dist).buildId).not.toBe(first);
+    expect(stampForDist(dist).buildId).not.toBe(popoutOnly);
   });
 
   test("fails the build when a first-load file is outside the hashed allow-list", () => {
