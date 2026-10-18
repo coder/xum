@@ -1077,6 +1077,69 @@ describe("AIService turn engine events", () => {
     expect(clearPendingRunMetadataSpy).toHaveBeenCalledTimes(1);
     expect(clearPendingRunMetadataSpy).toHaveBeenLastCalledWith(workspaceId, "stream-token");
   });
+
+  // #6912: the debug view (/debug-llm-request) shows the request the turn sent and the response
+  // stream-end delivered, as copies that later changes to either cannot reach.
+  it("keeps copies of the sent request and the stream-end response for the debug view", async () => {
+    using harness = await createForwardingHarness("ai-service-debug-snapshot-response");
+    const { service, startStreamCalls, emitEngineEvent, trackedMessageId } = harness;
+    const sent = startStreamCalls[0].messages;
+    const sentCopy = structuredClone(sent);
+    const parts: StreamEndEvent["parts"] = [{ type: "text", text: "answer" }];
+    await emitEngineEvent({
+      type: "stream-end",
+      workspaceId,
+      messageId: trackedMessageId,
+      metadata: {
+        model: "openai:gpt-5.2",
+        usage: { inputTokens: 7, outputTokens: 1, totalTokens: 8 },
+      },
+      parts,
+    });
+    // Mutate the turn's inputs and the event after stream-end.
+    (sent.at(-1) as { content: unknown }).content = "changed";
+    (parts[0] as { text: string }).text = "changed";
+    const read = service.debugGetLastLlmRequest(workspaceId);
+    if (!read.success) throw new Error(read.error);
+    expect(read.data?.messages).toEqual(sentCopy);
+    expect(read.data?.response?.parts).toEqual([{ type: "text", text: "answer" }]);
+    expect(read.data?.response?.metadata).toEqual({
+      model: "openai:gpt-5.2",
+      usage: { inputTokens: 7, outputTokens: 1, totalTokens: 8 },
+    });
+  });
+
+  it("counts the stream-end response toward the debug snapshot byte limit", async () => {
+    using harness = await createForwardingHarness("ai-service-debug-snapshot-response-bytes");
+    const { service, startStreamCalls, emitEngineEvent } = harness;
+    // Two requests that fit together (0.9 of the limit). The response attached to the second
+    // one pushes the total over it, so the older snapshot must go.
+    const third = "x".repeat(Math.ceil(DEBUG_LLM_REQUEST_MAX_BYTES * 0.45));
+    for (const id of ["bytes-a", "bytes-b"]) {
+      const result = await service.streamMessage({
+        messages: [createMuxMessage(`user-${id}`, "user", third)],
+        workspaceId: id,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+      });
+      expect(result.success).toBe(true);
+    }
+    const snapshotOf = (id: string) => {
+      const read = service.debugGetLastLlmRequest(id);
+      if (!read.success) throw new Error(read.error);
+      return read.data;
+    };
+    expect(snapshotOf("bytes-a")?.workspaceId).toBe("bytes-a");
+    await emitEngineEvent({
+      type: "stream-end",
+      workspaceId: "bytes-b",
+      messageId: startStreamCalls.at(-1)!.messageId,
+      metadata: { model: "openai:gpt-5.2" },
+      parts: [{ type: "text", text: "y".repeat(Math.ceil(DEBUG_LLM_REQUEST_MAX_BYTES * 0.2)) }],
+    });
+    expect(snapshotOf("bytes-b")?.response).toBeDefined();
+    expect(snapshotOf("bytes-a")).toBeNull();
+  });
 });
 
 describe("AIService.createModel (Codex OAuth routing)", () => {
