@@ -1066,9 +1066,9 @@ function idRowIdsByPath(workspaces: ProjectConfig["workspaces"]): Map<string, st
  */
 function dropLegacyDuplicateRows(
   workspaces: ProjectConfig["workspaces"],
-  resolveLegacyId: (workspace: Workspace) => string | undefined
+  resolveLegacyId: (workspace: Workspace) => string | undefined,
+  idsByPath = idRowIdsByPath(workspaces)
 ): string[] {
-  const idsByPath = idRowIdsByPath(workspaces);
   const dropped: string[] = [];
   for (let index = workspaces.length - 1; index >= 0; index--) {
     const workspace = workspaces[index];
@@ -1220,15 +1220,20 @@ function buildProjectsFromStoredEntries(
       continue;
     }
     const storedKeys = group.map((entry) => entry.storedKey);
+    // Legacy copies first, against the id rows of every alias (#6869): the merge can drop the
+    // only id row on a legacy row's path, and the id migration would then give that legacy row
+    // the same id again.
+    const idsByPath = idRowIdsByPath(group.flatMap((entry) => entry.config.workspaces));
+    const legacyIds = group.flatMap((entry) =>
+      dropLegacyDuplicateRows(
+        entry.config.workspaces,
+        (workspace) => resolveLegacyId(key, workspace),
+        idsByPath
+      )
+    );
     const merged = mergeProjectAliases(group);
     const conflictingIds = [
-      ...new Set([
-        ...merged.conflictingIds,
-        ...aliasEntryDuplicateIds(group),
-        ...dropLegacyDuplicateRows(merged.config.workspaces, (workspace) =>
-          resolveLegacyId(key, workspace)
-        ),
-      ]),
+      ...new Set([...merged.conflictingIds, ...aliasEntryDuplicateIds(group), ...legacyIds]),
     ];
     if (conflictingIds.length > 0) {
       conflicts.push({ path: key, storedKeys, conflictingIds });

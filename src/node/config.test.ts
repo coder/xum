@@ -1808,6 +1808,24 @@ describe("Config", () => {
           ] as unknown as StoredPair[],
       ],
       [
+        // #6869: the alias group's legacy check runs before the merge, but no id row in any alias
+        // shares the legacy row's path, so no legacy id is resolved.
+        "two aliases with a legacy row on its own path",
+        () =>
+          [
+            ["/home/u/repo", { workspaces: [row("ws-one")] }],
+            [
+              "/home/u/repo/",
+              {
+                workspaces: [
+                  row("ws-two"),
+                  { name: "legacy", path: path.join(config.srcDir, "repo", "legacy") },
+                ],
+              },
+            ],
+          ] as unknown as StoredPair[],
+      ],
+      [
         // #6717: the duplicate-id check runs over these ids and finds none.
         "one key with several rows and unique ids",
         () =>
