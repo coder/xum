@@ -110,8 +110,6 @@ describe("useDraftWorkspaceSettings", () => {
     });
   });
 
-  // A stale project agent (nothing writes it since drafts own their choices) must not override
-  // the Settings default agent that new chats start with.
   test("an unpicked draft agent uses the global default over a stale project agent", async () => {
     const projectPath = "/tmp/project";
 

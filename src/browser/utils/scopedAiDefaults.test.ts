@@ -41,8 +41,6 @@ describe("readScopedAiDefault for a creation draft", () => {
     expect(readScopedAiDefault(scopeId, "model")).toBe("anthropic:claude-sonnet-4-5");
   });
 
-  // Nothing writes project agent defaults since drafts own their choices, so a stored one is a
-  // stale leftover the user cannot see; it must not override the Settings default agent.
   test("a draft without an agent pick shows the global agent, not a stale project agent", () => {
     getAppConfigStore().updateOptimistically({
       userPreferences: {
