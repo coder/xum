@@ -85,6 +85,10 @@ describe("getProjectMonogram", () => {
     { name: "q\u0303uiz", monogram: "Q\u0303" },
     // The avatar fits one character, even when uppercasing expands the letter.
     { name: "ßeta", monogram: "S" },
+    { name: "\u01f0ava", monogram: "J\u030c" },
+    { name: "\u0149ame", monogram: "N" },
+    // Letters without case stay as they are.
+    { name: "日本語", monogram: "日" },
     { name: "", monogram: "#" },
     { name: "---", monogram: "#" },
   ])("$name -> $monogram", ({ name, monogram }) => {
