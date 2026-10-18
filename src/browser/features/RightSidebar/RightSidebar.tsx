@@ -310,6 +310,11 @@ interface RightSidebarProps {
   onCloseFullscreen?: () => void;
   /** Sidebar shortcuts while the narrow layout hides the sidebar: show it full-screen. */
   onRequestFullscreen?: () => void;
+  /**
+   * The first authoritative active workflow-run count WorkspaceShell saw while this lazy chunk
+   * loaded (#6208), or null. A run that started meanwhile still switches to the Workflows tab.
+   */
+  workflowRunBaseline?: number | null;
 }
 
 /**
@@ -1121,6 +1126,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   fullscreen = false,
   onCloseFullscreen,
   onRequestFullscreen,
+  workflowRunBaseline = null,
 }) => {
   // Trigger for focusing Review panel (preserves hunk selection)
   const [focusTrigger, _setFocusTrigger] = React.useState(0);
@@ -1644,7 +1650,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // un-collapse a collapsed sidebar.
   const activeWorkflowRunCount = sidebarState?.activeWorkflowRunCount ?? 0;
   const activityAuthoritative = useWorkspaceActivityAuthoritative();
-  const previousActiveWorkflowRunCountRef = React.useRef<number | null>(null);
+  // Starts from WorkspaceShell's count from while this chunk loaded, if it saw one (#6208).
+  const previousActiveWorkflowRunCountRef = React.useRef(workflowRunBaseline);
   React.useEffect(() => {
     // Before an AUTHORITATIVE activity snapshot the store reports 0 for every
     // workspace — both pre-hydration and after a failure-path self-heal (which marks
