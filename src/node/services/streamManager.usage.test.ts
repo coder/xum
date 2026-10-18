@@ -121,7 +121,10 @@ function costAboveRequestPrices(message: MuxMessage, steps: Array<Record<string,
 /** session-usage.json as it is on disk: the state a Xum restart keeps. */
 async function readLedgerFile(sessionsDir: string, workspaceId: string) {
   try {
-    const raw = await fs.readFile(path.join(sessionsDir, workspaceId, "session-usage.json"), "utf-8");
+    const raw = await fs.readFile(
+      path.join(sessionsDir, workspaceId, "session-usage.json"),
+      "utf-8"
+    );
     return JSON.parse(raw) as SessionUsageFile;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;

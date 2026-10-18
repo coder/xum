@@ -279,7 +279,10 @@ describe("StreamManager - refusal usage attribution", () => {
         },
         {
           chunks: [
-            { type: "finish-step", usage: { inputTokens: 300, outputTokens: 20, totalTokens: 320 } },
+            {
+              type: "finish-step",
+              usage: { inputTokens: 300, outputTokens: 20, totalTokens: 320 },
+            },
             { type: "text-delta", text: "done" },
             STOP_FINISH,
           ],
