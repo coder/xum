@@ -166,9 +166,12 @@ describe("AgentResourceLimitsService", () => {
     await config.updateBashAiProxyEnabled(true);
     const afterUnrelatedWrite = await service.get();
 
-    const sudoFailed = expect.stringContaining("with sudo failed: sudo: a password is required");
-    expect(state.status).toHaveProperty("reason", sudoFailed);
-    expect(afterUnrelatedWrite.status).toHaveProperty("reason", sudoFailed);
+    const sudoFailed = "with sudo failed: sudo: a password is required";
+    expect(state.status).toHaveProperty("reason", expect.stringContaining(sudoFailed));
+    expect(afterUnrelatedWrite.status).toHaveProperty(
+      "reason",
+      expect.stringContaining(sudoFailed)
+    );
     expect(tree.sudoCalls).toEqual(["xum-1000"]);
 
     // Try again saves the unchanged limits.
