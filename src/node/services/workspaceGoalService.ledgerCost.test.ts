@@ -13,6 +13,7 @@ import { WorkspaceGoalService } from "./workspaceGoalService";
 import { SessionUsageService } from "./sessionUsageService";
 import { createTestHistoryService } from "./testHistoryService";
 import type { HistoryService } from "./historyService";
+import { createMuxMessage } from "@/common/types/message";
 import { setGoalOk, PROJECT_PATH, analyticsMock } from "./workspaceGoalService.testHarness";
 
 const MODEL = "anthropic:claude-sonnet-4-5";
@@ -122,6 +123,7 @@ describe("WorkspaceGoalService ledger cost", () => {
   });
 
   test("a budget is enforced on the ledger cost", async () => {
+    await usage.recordUsage(workspaceId, MODEL, costing(0.1));
     const service = newGoalService();
     const created = await setGoalOk(service, {
       workspaceId,
@@ -161,6 +163,50 @@ describe("WorkspaceGoalService ledger cost", () => {
       streamOriginKind: "goal_continuation",
     });
     expect(after?.costCents).toBe(400);
+  });
+
+  test("after a restart, a killed turn's spend counts before the next turn is admitted", async () => {
+    await usage.recordUsage(workspaceId, MODEL, costing(0.1));
+    const service = newGoalService();
+    await setGoalOk(service, { workspaceId, objective: "Bounded", budgetCents: 100 });
+    await usage.recordUsage(workspaceId, MODEL, costing(0.5));
+    // The last turn was killed after finished steps worth $0.75.
+    await usage.recordInFlightUsage(workspaceId, "key-killed", "msg-killed", MODEL, costing(0.75));
+    usage = new SessionUsageService(config, historyService);
+    // getGoal runs the same limit normalization the continuation dispatch runs.
+    const recovered = await newGoalService().getGoal(workspaceId);
+    expect(recovered).toMatchObject({ status: "budget_limited", costCents: 125 });
+  });
+
+  test("a goal created while the ledger is missing does not count earlier spend after a rebuild", async () => {
+    const message = createMuxMessage("earlier-turn", "assistant", "done", {
+      model: MODEL,
+      usage: { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 },
+    });
+    const appended = await historyService.appendToHistory(workspaceId, message);
+    if (!appended.success) throw new Error(appended.error);
+    const service = newGoalService();
+    const created = await setGoalOk(service, { workspaceId, objective: "Fresh start" });
+
+    // A read rebuilds the ledger from history: the earlier turn costs dollars.
+    const rebuilt = await usage.getSessionUsage(workspaceId);
+    expect(Object.keys(rebuilt?.byModel ?? {})).not.toHaveLength(0);
+    await usage.recordUsage(workspaceId, MODEL, costing(1));
+    const first = await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    expect(first?.costCents).toBe(100);
+    await usage.recordUsage(workspaceId, MODEL, costing(0.5));
+    const second = await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 99,
+      streamStartedAtMs: created.createdAtMs + 2,
+      streamOriginKind: "goal_continuation",
+    });
+    expect(second?.costCents).toBe(150);
   });
 
   test("a goal written before the baseline existed keeps its cost and then follows the ledger", async () => {

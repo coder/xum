@@ -2955,7 +2955,10 @@ export class WorkspaceGoalService {
         preReadChatTailMode != null && current.goalId === preRead?.goalId
           ? preReadChatTailMode
           : null;
-      const budgetNormalized = applyBudgetDrivenStatus(current, { nowMs: Date.now() });
+      // Re-cost from the ledger first: after a restart, a killed turn's in-flight spend must
+      // count before the budget check admits another paid turn.
+      const recosted = await this.withLedgerCost(workspaceId, current);
+      const budgetNormalized = applyBudgetDrivenStatus(recosted, { nowMs: Date.now() });
       const next = chatTailMode
         ? this.applyChatTailGoalMode(workspaceId, budgetNormalized, chatTailMode)
         : budgetNormalized;
@@ -3277,10 +3280,10 @@ export class WorkspaceGoalService {
     if (baselineUsd === undefined || !this.sessionUsage) {
       return this.applyCostAccounting(goal, fallbackDeltaMicroCents);
     }
-    const ledgerUsd = await this.readGoalLedgerUsd(workspaceId, attributedChildren);
+    const { totalUsd } = await this.readGoalLedgerUsd(workspaceId, attributedChildren);
     const costMicroCents = Math.max(
       getGoalCostMicroCents(goal),
-      costUsdToMicroCents(ledgerUsd - baselineUsd)
+      costUsdToMicroCents(totalUsd - baselineUsd)
     );
     return { costCents: Math.round(costMicroCents / MICRO_CENTS_PER_CENT), costMicroCents };
   }
@@ -3296,7 +3299,7 @@ export class WorkspaceGoalService {
     workspaceId: string,
     attributedChildren: readonly string[],
     includeLiveStreams = false
-  ): Promise<number> {
+  ): Promise<{ totalUsd: number; hasLedger: boolean }> {
     assert(this.sessionUsage, "readGoalLedgerUsd requires the session usage ledger");
     const usageByWorkspace = await this.sessionUsage.getSessionUsageBatch(
       [workspaceId, ...attributedChildren],
@@ -3310,24 +3313,28 @@ export class WorkspaceGoalService {
       // A rolled-up child is in the parent's byModel already.
       if (parent?.rolledUpFrom?.[childId] == null) totalUsd += ledgerUsd(usageByWorkspace[childId]);
     }
-    return totalUsd;
+    return { totalUsd, hasLedger: parent !== undefined };
   }
 
   /**
-   * Re-reads a paused goal's cost from the ledger; writes only when it changed. Only paused:
-   * a write of a budget_limited or complete goal bumps terminalStatusGenerations, which would
-   * make a captured budget wrap-up admission stale. Those goals follow the ledger on their
-   * next goal-driven accounting.
+   * The goal with its cost re-read from the ledger (the same object when it did not change).
+   * Only active and paused goals: a write of a budget_limited or complete goal bumps
+   * terminalStatusGenerations, which would make a captured budget wrap-up admission stale.
+   * Those goals follow the ledger on their next goal-driven accounting.
    */
-  private async recostIdleGoal(workspaceId: string, goal: GoalRecordV1): Promise<GoalRecordV1> {
-    if (goal.status !== "paused" || goal.ledgerBaselineUsd === undefined || !this.sessionUsage) {
-      return goal;
-    }
+  private async withLedgerCost(workspaceId: string, goal: GoalRecordV1): Promise<GoalRecordV1> {
+    const eligible = goal.status === "active" || goal.status === "paused";
+    if (!eligible || goal.ledgerBaselineUsd === undefined || !this.sessionUsage) return goal;
     const cost = await this.accountGoalCost(workspaceId, goal, 0);
     if (cost.costMicroCents === getGoalCostMicroCents(goal)) return goal;
-    const next = GoalRecordV1Schema.parse({ ...goal, ...cost });
-    await this.writeGoal(workspaceId, next);
-    return next;
+    return GoalRecordV1Schema.parse({ ...goal, ...cost });
+  }
+
+  /** withLedgerCost, written to goal.json when the cost changed. */
+  private async writeLedgerCost(workspaceId: string, goal: GoalRecordV1): Promise<GoalRecordV1> {
+    const recosted = await this.withLedgerCost(workspaceId, goal);
+    if (recosted !== goal) await this.writeGoal(workspaceId, recosted);
+    return recosted;
   }
 
   /**
@@ -3337,7 +3344,15 @@ export class WorkspaceGoalService {
    */
   private async withLedgerBaseline(workspaceId: string, goal: GoalRecordV1): Promise<GoalRecordV1> {
     if (goal.ledgerBaselineUsd !== undefined || !this.sessionUsage) return goal;
-    const ledgerUsd = await this.readGoalLedgerUsd(workspaceId, goal.attributedChildren, true);
+    const { totalUsd: ledgerUsd, hasLedger } = await this.readGoalLedgerUsd(
+      workspaceId,
+      goal.attributedChildren,
+      true
+    );
+    // No ledger yet (none written, or missing until a read rebuilds it from history): pin
+    // later, or a rebuild would count all earlier spend as the goal's. Until then the goal
+    // charges stream ends as before.
+    if (!hasLedger) return goal;
     const ledgerBaselineUsd =
       ledgerUsd - getGoalCostMicroCents(goal) / (100 * MICRO_CENTS_PER_CENT);
     return { ...goal, ledgerBaselineUsd };
@@ -5211,7 +5226,7 @@ export class WorkspaceGoalService {
         }
         // A paused goal's cost still follows the ledger (spend while paused counts), without
         // a turn, an updatedAtMs bump or a budget transition: resuming re-checks the budget.
-        const recosted = await this.recostIdleGoal(input.workspaceId, current);
+        const recosted = await this.writeLedgerCost(input.workspaceId, current);
         await this.pushSnapshot(input.workspaceId, recosted);
         return recosted;
       }
