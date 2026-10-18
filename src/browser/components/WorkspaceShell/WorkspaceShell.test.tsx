@@ -5,7 +5,7 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getReviewImmersiveKey, RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { useEffect, type MutableRefObject } from "react";
+import { useEffect, useSyncExternalStore, type MutableRefObject } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import * as RealLottieModule from "lottie-react";
 import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
@@ -52,6 +52,19 @@ function gateSidebar() {
     });
   return { load: () => finish("loaded"), fail: () => finish("failed") };
 }
+// The store's activity snapshot as the shell sees it (#6208 item 1). Set with setWorkflowRuns.
+let workflowRuns = { authoritative: true, sidebarState: { activeWorkflowRunCount: 0 } };
+const workflowRunListeners = new Set<() => void>();
+function subscribeWorkflowRuns(listener: () => void) {
+  workflowRunListeners.add(listener);
+  return () => workflowRunListeners.delete(listener);
+}
+function setWorkflowRuns(authoritative: boolean, activeWorkflowRunCount: number) {
+  workflowRuns = { authoritative, sidebarState: { activeWorkflowRunCount } };
+  act(() => workflowRunListeners.forEach((listener) => listener()));
+}
+// The workflow-run baseline the stub sidebar received when it mounted.
+let mountedWorkflowRunBaseline: number | null | undefined;
 // What the stub sidebar's own window listeners received, in order.
 const sidebarInput: string[] = [];
 const SIDEBAR_EVENT_TYPES = [
@@ -100,6 +113,10 @@ function installTestDoubles() {
       isStreamStarting: false,
       ...workspaceState,
     }),
+    useOptionalWorkspaceSidebarState: () =>
+      useSyncExternalStore(subscribeWorkflowRuns, () => workflowRuns.sidebarState),
+    useWorkspaceActivityAuthoritative: () =>
+      useSyncExternalStore(subscribeWorkflowRuns, () => workflowRuns.authoritative),
   }));
 }
 
@@ -124,6 +141,7 @@ void mock.module("@/browser/components/ChatPane/ChatPane", () => ({
 void mock.module("@/browser/features/RightSidebar/RightSidebar", () => ({
   RightSidebar: (props: {
     addTerminalRef: MutableRefObject<(() => void) | null>;
+    workflowRunBaseline?: number | null;
     fullscreen?: boolean;
     onCloseFullscreen?: () => void;
   }) => {
@@ -135,6 +153,8 @@ void mock.module("@/browser/features/RightSidebar/RightSidebar", () => ({
     props.addTerminalRef.current = addTerminalMock;
     // Like RightSidebar, it subscribes to its shortcuts and events in an effect.
     useEffect(() => {
+      // Like RightSidebar, it reads the baseline in its first effect.
+      mountedWorkflowRunBaseline = props.workflowRunBaseline;
       const onKey = (e: KeyboardEvent) => {
         if (e.ctrlKey || e.shiftKey) sidebarInput.push(`key:${e.ctrlKey ? "ctrl+" : ""}${e.key}`);
       };
@@ -145,7 +165,7 @@ void mock.module("@/browser/features/RightSidebar/RightSidebar", () => ({
         window.removeEventListener("keydown", onKey);
         for (const type of SIDEBAR_EVENT_TYPES) window.removeEventListener(type, onEvent);
       };
-    }, []);
+    }, [props.workflowRunBaseline]);
     return (
       <div
         data-testid="right-sidebar"
@@ -281,6 +301,8 @@ describe("WorkspaceShell loading placeholders", () => {
     rightSidebarDisplay = "flex";
     sidebarGate = null;
     sidebarInput.length = 0;
+    workflowRuns = { authoritative: true, sidebarState: { activeWorkflowRunCount: 0 } };
+    mountedWorkflowRunBaseline = undefined;
   });
 
   it("keeps the chat pane mounted during hydration in web mode", () => {
@@ -733,6 +755,51 @@ describe("WorkspaceShell loading placeholders", () => {
       window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onEvent);
       window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onEvent);
       consoleError.mockRestore();
+    });
+
+    it("hands the sidebar the run count from before a run started, so it opens Workflows", async () => {
+      setWorkflowRuns(false, 0); // no activity snapshot yet: the 0 is not real
+      const gate = gateSidebar();
+      render(<WorkspaceShell {...defaultProps} />);
+      setWorkflowRuns(true, 0); // the first snapshot sets the baseline
+      setWorkflowRuns(true, 1); // a workflow run starts while the chunk loads
+
+      await gate.load();
+
+      // RightSidebar switches to the Workflows tab on a 0 -> 1 change from this baseline.
+      expect(mountedWorkflowRunBaseline).toBe(0);
+    });
+
+    it("does not hold the menu bar's events while the layout hides the sidebar", async () => {
+      // Stands in for the narrow-layout CSS that hides the loading box.
+      const narrowLayout = document.createElement("style");
+      narrowLayout.textContent = ".mobile-hide-right-sidebar { display: none; }";
+      document.head.appendChild(narrowLayout);
+      // WorkspaceMenuBar's phone listeners, subscribed before the hold. For an event dispatched on
+      // window, Chromium runs window listeners in registration order (the hold cannot stop these,
+      // and the replay delivers a second time), happy-dom runs capture first (the hold delays them).
+      const menuBar: string[] = [];
+      const onEvent = (e: Event) => menuBar.push(e.type);
+      window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onEvent);
+      window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onEvent);
+      const gate = gateSidebar();
+      render(<WorkspaceShell {...defaultProps} />);
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.OPEN_ARTIFACT, { workspaceId: "w" } as never)
+      );
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId: "w" } as never)
+      );
+      const atOnce = [...menuBar];
+
+      await gate.load();
+
+      // Once each, at once: a replay would reopen a full-screen view the user already closed.
+      const once = [CUSTOM_EVENTS.OPEN_ARTIFACT, CUSTOM_EVENTS.OPEN_MCP_APP_VIEW];
+      expect({ atOnce, afterLoad: menuBar }).toEqual({ atOnce: once, afterLoad: once });
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onEvent);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onEvent);
+      narrowLayout.remove();
     });
   });
 });
