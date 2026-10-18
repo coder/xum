@@ -1848,7 +1848,10 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     color: DEFAULT_SECTION_COLOR,
   };
   // Scratch chats get a neutral identity too, so every flat root row carries an avatar.
-  const scratchBadge: FlatProjectBadge = { name: SCRATCH_PROJECT_NAME, color: DEFAULT_SECTION_COLOR };
+  const scratchBadge: FlatProjectBadge = {
+    name: SCRATCH_PROJECT_NAME,
+    color: DEFAULT_SECTION_COLOR,
+  };
   const getFlatProjectBadge = (
     workspace: FrontendWorkspaceMetadata
   ): FlatProjectBadge | undefined => {

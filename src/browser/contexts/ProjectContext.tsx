@@ -625,7 +625,10 @@ export function ProjectProvider(props: { children: ReactNode }) {
       updateDisplayName,
       updateColor,
       // Inline for the same reason as updateCodeWorkspaceSyncPath below.
-      updateIcon: async (projectPath: string, icon: ProjectIconName | null): Promise<Result<void>> => {
+      updateIcon: async (
+        projectPath: string,
+        icon: ProjectIconName | null
+      ): Promise<Result<void>> => {
         if (!liveApi) return { success: false, error: "API not connected" };
         try {
           await liveApi.projects.setIcon({ projectPath, icon });

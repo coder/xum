@@ -2438,9 +2438,9 @@ exit 1
       await service.setIcon(projectPath, null);
       const [listed] = service.list().filter(([listedPath]) => listedPath === projectPath);
       expect(listed?.[1]).not.toHaveProperty("icon");
-      expect(new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)).not.toHaveProperty(
-        "icon"
-      );
+      expect(
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)
+      ).not.toHaveProperty("icon");
     });
 
     it("validates, writes, and clears code workspace sync paths", async () => {

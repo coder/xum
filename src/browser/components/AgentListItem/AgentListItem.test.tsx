@@ -407,7 +407,10 @@ describe("AgentListItem", () => {
   });
 
   test("an avatar row shows the project's chosen icon instead of the monogram", () => {
-    const { view } = renderWorkspaceItem({ projectBadgeName: "Project", projectBadgeIcon: "rocket" });
+    const { view } = renderWorkspaceItem({
+      projectBadgeName: "Project",
+      projectBadgeIcon: "rocket",
+    });
 
     const avatar = view.getByTestId(`workspace-project-avatar-${TEST_WORKSPACE_ID}`);
     expect(avatar.querySelector("svg")).not.toBeNull();

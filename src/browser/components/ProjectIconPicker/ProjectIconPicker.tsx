@@ -9,7 +9,9 @@ import {
 const TILE_CLASSES = "flex h-[22px] w-[22px] items-center justify-center rounded-md";
 
 function tileStateClasses(isSelected: boolean): string {
-  return isSelected ? "bg-hover text-foreground" : "text-muted hover:bg-hover hover:text-foreground";
+  return isSelected
+    ? "bg-hover text-foreground"
+    : "text-muted hover:bg-hover hover:text-foreground";
 }
 
 /** The project menu's icon panel: the initial plus every pickable lucide icon. */
