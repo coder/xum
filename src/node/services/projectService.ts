@@ -1801,6 +1801,11 @@ export class ProjectService {
           "user.name=mux",
           "-c",
           "user.email=mux@localhost",
+          // No `git maintenance run --auto --detach` after the commit: a repository with one
+          // empty commit needs none, and a failed create deletes this directory right after
+          // the commit, while that detached git would still be using it.
+          "-c",
+          "maintenance.auto=false",
           "commit",
           "--allow-empty",
           "-m",

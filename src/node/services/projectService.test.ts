@@ -2293,6 +2293,26 @@ exit 1
       expect(branchResult.recommendedTrunk).toBe("main");
     });
 
+    // A failed create removes the directory right after the initial commit. A detached
+    // `git maintenance run --auto` from that commit was still using the repository then, and
+    // Bun's recursive fs.rm can stop early without an error when an entry it listed is
+    // removed meanwhile, so the "fails initGit create without leaving .git" test saw the
+    // directory survive about 1 run in 40 with git 2.55.
+    it("starts no background git maintenance that outlives the initial commit", async () => {
+      const testDir = path.join(tempDir, "no-maintenance");
+      await fs.mkdir(testDir);
+      const tracePath = path.join(tempDir, "git-trace2.json");
+
+      const result = await withEnv({ GIT_TRACE2_EVENT: tracePath }, () => service.gitInit(testDir));
+
+      expect(result.success).toBe(true);
+      // The commit writes the child_start event for a maintenance child before it exits, so
+      // the child shows up here even if it detached and has not run yet.
+      const trace = await fs.readFile(tracePath, "utf-8");
+      expect(trace).toContain('"hierarchy":"commit"');
+      expect(trace).not.toContain('"maintenance"');
+    });
+
     it("succeeds for unborn git repo (git init but no commits)", async () => {
       const testDir = path.join(tempDir, "unborn-git");
       await fs.mkdir(testDir);
