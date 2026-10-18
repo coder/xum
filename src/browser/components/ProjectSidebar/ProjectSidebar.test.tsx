@@ -1512,7 +1512,11 @@ describe("ProjectSidebar flat chat list", () => {
     expect(view.getByTestId(agentItemTestId("parent"))).toBeTruthy();
   });
 
-  test("keeps the pinned block above drafts in the flat list", () => {
+  // Drafts lead the list in both sidebar modes, above pinned chats.
+  test.each([
+    { mode: "flat list", sidebarFlatMode: true },
+    { mode: "project view", sidebarFlatMode: false },
+  ])("renders drafts above the pinned block in the $mode", ({ sidebarFlatMode }) => {
     const pinned = {
       ...createWorkspace("pinned-chat", { title: "Pinned chat" }),
       projects: singleProjectRefs,
@@ -1547,7 +1551,7 @@ describe("ProjectSidebar flat chat list", () => {
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
-    setSidebarPreferences({ sidebarFlatMode: true });
+    setSidebarPreferences({ sidebarFlatMode });
 
     const view = render(
       <ProjectSidebar
@@ -1558,14 +1562,12 @@ describe("ProjectSidebar flat chat list", () => {
       />
     );
 
-    // Pinned chats keep the top of the flat list: a new draft slots in
-    // between the pinned block and the unpinned chats, never above pins.
     const rows = Array.from(
       view.container.querySelectorAll('[data-testid^="agent-item-"], [data-testid^="draft-item-"]')
     ).map((row) => row.getAttribute("data-testid"));
     expect(rows).toEqual([
-      agentItemTestId("pinned-chat"),
       "draft-item-draft-order",
+      agentItemTestId("pinned-chat"),
       agentItemTestId("regular-chat"),
     ]);
   });

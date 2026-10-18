@@ -1560,9 +1560,10 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     expandedCompletedParentIds,
     { isWorkspaceLiveActive, hasActiveBashMonitor }
   );
-  // Pinned-at-the-top invariant vs drafts: pinned roots (their subtrees stay
-  // adjacent and never age out) render as their own segment above the draft
-  // rows, so adding a draft never displaces the user's pinned chats.
+  // Drafts render first, above the pinned block, so the chat being composed is
+  // always at the top of the list (project view orders them the same way).
+  // Pinned roots (their subtrees stay adjacent and never age out) still render
+  // as one segment above the unpinned rows.
   const flatPinnedRowIds = new Set<string>();
   if (flatSidebarEnabled) {
     let inPinnedSubtree = false;
@@ -2368,12 +2369,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const flatSidebarContent = (
     <div className="py-1">
-      {renderCoalescedWorkspaceList(visiblePinnedFlatWorkspaces, flatRowsForDisplay, {
-        tierKeyPrefix: "flat",
-        depthByWorkspaceId: flatDepthByWorkspaceId,
-        baseRowMetaByWorkspaceId: flatRowMetaByWorkspaceId,
-        renderRow: renderFlatRow,
-      })}
       {flatDrafts.map(({ projectPath, draft }, index) => {
         const promotedMetadata = flatDraftPromotionsByDraftId.get(draft.draftId);
         if (promotedMetadata) {
@@ -2414,6 +2409,12 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             }}
           />
         );
+      })}
+      {renderCoalescedWorkspaceList(visiblePinnedFlatWorkspaces, flatRowsForDisplay, {
+        tierKeyPrefix: "flat",
+        depthByWorkspaceId: flatDepthByWorkspaceId,
+        baseRowMetaByWorkspaceId: flatRowMetaByWorkspaceId,
+        renderRow: renderFlatRow,
       })}
       {renderCoalescedWorkspaceList(visibleUnpinnedFlatWorkspaces, flatRowsForDisplay, {
         tierKeyPrefix: "flat",
