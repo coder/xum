@@ -1210,6 +1210,20 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
   });
 
+  it("ignores the consent shortcut while another settings modal is still loading", async () => {
+    // The heartbeat modal: no other test opens it, so its lazy chunk is still pending here.
+    render(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      fireEvent.keyDown(window, { key: "H", ctrlKey: true, shiftKey: true });
+    });
+    // The heartbeat dialog's overlay does not exist yet, only its pending marker.
+    act(() => {
+      fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
+    });
+    await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+    expect(messagingDialogOpen()).toBe(false);
+  });
+
   it("ignores the consent shortcut while another modal is open", () => {
     // A real open modal built from the shared primitives (overlay inline: the Radix Portal does
     // not render in happy-dom). Like the MCP and heartbeat dialogs at runtime, nothing here

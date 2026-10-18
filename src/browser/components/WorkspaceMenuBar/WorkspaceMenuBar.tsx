@@ -30,6 +30,7 @@ import {
   isBrowserViewportFocused,
   isDesktopViewportFocused,
   isDialogOpen,
+  MODAL_DIALOG_OVERLAY_ATTRIBUTE,
   isEditableElement,
   isTerminalFocused,
   KEYBINDS,
@@ -120,13 +121,21 @@ const WorkspaceMCPModal = React.lazy(async () => ({
 
 /**
  * Renders a lazy modal from its first open on, and keeps it mounted after that, so its close
- * still animates. No loading fallback: a dialog has no box to reserve, and it appears once its
- * chunk arrives. A failed load shows LazyFeature's Reload message.
+ * still animates. A failed load shows LazyFeature's Reload message.
  */
 function LazySettingsModal(props: { name: string; open: boolean; children: React.ReactNode }) {
   const [mounted, setMounted] = useState(false);
   if (props.open && !mounted) setMounted(true);
-  return mounted ? <LazyFeature name={props.name}>{props.children}</LazyFeature> : null;
+  // While the chunk loads, an invisible open-overlay marker makes isDialogOpen() true, so global
+  // shortcuts (e.g. the messaging dialog's) cannot open a second modal over this one.
+  const pending = props.open ? (
+    <div {...{ [MODAL_DIALOG_OVERLAY_ATTRIBUTE]: "" }} data-state="open" hidden />
+  ) : null;
+  return mounted ? (
+    <LazyFeature name={props.name} fallback={pending}>
+      {props.children}
+    </LazyFeature>
+  ) : null;
 }
 
 function setWorkspaceNotifyOnResponse(workspaceId: string, enabled: boolean): void {
