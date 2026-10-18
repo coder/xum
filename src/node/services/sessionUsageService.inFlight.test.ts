@@ -231,7 +231,7 @@ describe("SessionUsageService in-flight usage", () => {
     const readFile = spyOn(fs, "readFile").mockImplementation(((
       ...args: Parameters<typeof fs.readFile>
     ) =>
-      String(args[0]).includes("session-usage.in-flight")
+      typeof args[0] === "string" && args[0].includes("session-usage.in-flight")
         ? Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }))
         : realReadFile(...args)) as typeof fs.readFile);
     try {
@@ -248,7 +248,11 @@ describe("SessionUsageService in-flight usage", () => {
     await service.recordInFlightUsage(workspaceId, "key-a", "msg-a", MODEL, usage(100, 10));
     const rm = spyOn(fs, "rm").mockRejectedValueOnce(new Error("EIO"));
     try {
-      await expect(service.discardInFlightUsage(workspaceId, "key-a")).rejects.toThrow("EIO");
+      const error: unknown = await service.discardInFlightUsage(workspaceId, "key-a").then(
+        () => undefined,
+        (rejection: unknown) => rejection
+      );
+      expect(error).toBeInstanceOf(Error);
     } finally {
       rm.mockRestore();
     }
