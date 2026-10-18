@@ -38,11 +38,13 @@ echo "$3" > "$1/xum-app/cgroup.procs"`;
 const failedSudoDelegations = new WeakMap<AgentCgroupHost, string>();
 /**
  * Files of a cgroup that hold no setting that limits its processes: the lists of its processes and
- * threads, pressure triggers and peak counters (writable, but they report on the cgroup), and
- * protections such as memory.min and cpu.uclamp.min, which only guarantee a cgroup resources, so
- * leaving them loses a guarantee rather than escaping a limit.
+ * threads, pressure triggers and peak counters (writable, but they report on the cgroup), and the
+ * protections, which only guarantee a cgroup resources, so leaving them loses a guarantee rather
+ * than escaping a limit. The protections are named one by one, because io.low of older kernels is
+ * a limit.
  */
-const NOT_A_LIMIT = /^cgroup\.(procs|threads)$|\.(pressure|peak|min|low)$/;
+const NOT_A_LIMIT =
+  /^(cgroup\.(procs|threads)|memory\.(min|low)|dmem\.(min|low)|cpu\.uclamp\.min)$|\.(pressure|peak)$/;
 /** The kernel's defaults of the settings that are neither a `.max` or `.high` limit nor a weight. */
 const DEFAULT_SETTINGS = new Map([
   ["cgroup.freeze", "0"],
