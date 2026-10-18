@@ -3,6 +3,7 @@ import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import { describe, expect, mock, test } from "bun:test";
 import { asSchema, generateText, type Tool } from "ai";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createVertex } from "@ai-sdk/google-vertex";
 import { z } from "zod";
 import * as fs from "fs/promises";
@@ -565,126 +566,71 @@ describe("getToolsForModel", () => {
     expect((await run(streamTool, "screenshot")).error).toMatch(/turned off by the user/);
   });
 
-  test("adds native Google Search and URL Context only for Gemini 3 models", async () => {
-    const runtime = new LocalRuntime(process.cwd());
-    const initStateManager = createInitStateManager();
-
-    const gemini25Tools = await getToolsForModel(
-      "google:gemini-2.5-pro",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-      },
-      "ws-1",
-      initStateManager
-    );
-    expect(gemini25Tools.google_search).toBeUndefined();
-    expect(gemini25Tools.url_context).toBeUndefined();
-
-    const gemini4Tools = await getToolsForModel(
-      "google:gemini-4-pro",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-      },
-      "ws-1",
-      initStateManager
-    );
-    expect(gemini4Tools.google_search).toBeUndefined();
-    expect(gemini4Tools.url_context).toBeUndefined();
-
-    const gemini35Tools = await getToolsForModel(
-      "google:gemini-3.5-flash",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-      },
-      "ws-1",
-      initStateManager
-    );
-    const namespacedGemini35Tools = await getToolsForModel(
-      "google:models/gemini-3.5-flash",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-      },
-      "ws-1",
-      initStateManager
-    );
-    expect(namespacedGemini35Tools.google_search).toBeDefined();
-    expect(namespacedGemini35Tools.url_context).toBeDefined();
-
-    expect(gemini35Tools.google_search).toBeDefined();
-    expect(gemini35Tools.url_context).toBeDefined();
-
-    // Vertex AI serves the same Gemini models, so it gets the same native tools.
-    const vertexGemini35Tools = await getToolsForModel(
-      "google-vertex:gemini-3.5-flash",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-      },
-      "ws-1",
-      initStateManager
-    );
-    expect(vertexGemini35Tools.google_search).toBeDefined();
-    expect(vertexGemini35Tools.url_context).toBeDefined();
-  });
-
-  // @ai-sdk/google picks tool support from the model ID it sends: native tools on an
-  // alias ID it does not see as Gemini 3 would drop every tool from the request.
+  // Gemini's built-in googleSearch tool (which needs includeServerSideToolInvocations) broke
+  // its implicit caching, so Gemini requests carry function tools only.
   test.each([
-    { name: "a Gemini 3 model", wireModelId: "gemini-3.5-flash", nativeTools: true },
-    {
-      name: "a Treat as alias of a Gemini 3 model",
-      wireModelId: "team-gemini",
-      nativeTools: false,
-    },
-  ])("sends Xum's function tools to Vertex AI for $name", async ({ wireModelId, nativeTools }) => {
+    { provider: "google", modelId: "gemini-4-argon" },
+    { provider: "google", modelId: "gemini-3.8-flash" },
+    { provider: "google-vertex", modelId: "gemini-4-argon" },
+    { provider: "google-vertex", modelId: "gemini-3.8-flash" },
+  ])("sends $provider:$modelId only function tools", async ({ provider, modelId }) => {
     const tools = await getToolsForModel(
-      `google-vertex:${wireModelId}`,
+      `${provider}:${modelId}`,
       {
         cwd: process.cwd(),
         runtime: new LocalRuntime(process.cwd()),
         runtimeTempDir: "/tmp",
         workspaceId: "ws-1",
-        capabilityModelString: "google-vertex:gemini-3.5-flash",
       },
       "ws-1",
-      createInitStateManager()
+      createInitStateManager(),
+      undefined,
+      {
+        github_list_issues: {
+          description: "List issues",
+          inputSchema: z.object({}),
+          execute: mock(() => Promise.resolve({})),
+        },
+      }
     );
-    let sentTools: Array<Record<string, unknown>> = [];
+    const providerTools = Object.entries(tools).filter(([, tool]) => tool.type === "provider");
+    expect(providerTools.map(([name]) => name)).toEqual([]);
+
+    interface GeminiRequestBody {
+      tools?: Array<{ functionDeclarations?: Array<{ name: string }> }>;
+      toolConfig?: { includeServerSideToolInvocations?: boolean };
+    }
+    let body: GeminiRequestBody = {};
     const fakeFetchImpl = (_input: RequestInfo | URL, init?: RequestInit) => {
       if (typeof init?.body !== "string") {
         throw new Error("Expected a JSON string request body");
       }
-      const body = JSON.parse(init.body) as { tools?: Array<Record<string, unknown>> };
-      sentTools = body.tools ?? [];
+      body = JSON.parse(init.body) as GeminiRequestBody;
       const reply = {
         candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
       };
       return Promise.resolve(Response.json(reply));
     };
     // Keep Bun's fetch extensions (preconnect) that `typeof fetch` expects.
-    const vertex = createVertex({
-      apiKey: "test-key",
-      fetch: Object.assign(fakeFetchImpl, fetch) as typeof fetch,
-    });
+    const fakeFetch = Object.assign(fakeFetchImpl, fetch) as typeof fetch;
+    const model =
+      provider === "google"
+        ? createGoogleGenerativeAI({ apiKey: "test-key", fetch: fakeFetch })(modelId)
+        : createVertex({ apiKey: "test-key", fetch: fakeFetch })(modelId);
 
-    await generateText({ model: vertex(wireModelId), prompt: "hello", tools, maxRetries: 0 });
+    await generateText({ model, prompt: "hello", tools, maxRetries: 0 });
 
-    expect(sentTools.some((entry) => "functionDeclarations" in entry)).toBe(true);
-    expect(sentTools.some((entry) => "googleSearch" in entry)).toBe(nativeTools);
+    const sentTools = body.tools ?? [];
+    expect(sentTools.flatMap((entry) => Object.keys(entry))).toEqual(["functionDeclarations"]);
+    expect(body.toolConfig?.includeServerSideToolInvocations).toBeUndefined();
+    // Every tool Xum built reaches Gemini as a function, MCP tools and the client web_fetch included.
+    const declaredNames = sentTools
+      .flatMap((entry) => entry.functionDeclarations ?? [])
+      .map((declaration) => declaration.name);
+    expect(declaredNames.sort()).toEqual(Object.keys(tools).sort());
+    for (const name of ["bash", "file_read", "web_fetch", "github_list_issues"]) {
+      expect(declaredNames).toContain(name);
+    }
   });
 
   test("adds xAI native web and X search tools for Grok 4.5", async () => {
@@ -1057,10 +1003,14 @@ describe("getToolsForModel", () => {
       )) as FetchResult;
     }
 
-    test("a blocking tool_pre hook denies Claude 4.6+ fetches", async () => {
+    test("a blocking tool_pre hook denies Claude 4.6+ and Gemini fetches", async () => {
       await withProject(async (dir) => {
         await writePreHook(dir, 'echo "egress blocked" >&2\nexit 1');
-        for (const model of ["anthropic:claude-sonnet-5-5", "anthropic:claude-haiku-5-5"]) {
+        for (const model of [
+          "anthropic:claude-sonnet-5-5",
+          "anthropic:claude-haiku-5-5",
+          "google:gemini-4-argon",
+        ]) {
           const result = await fetchWith((await toolsFor(model, dir, true)).web_fetch);
           expect({ model, error: result.error }).toEqual({ model, error: "egress blocked" });
         }
@@ -1085,15 +1035,6 @@ describe("getToolsForModel", () => {
       });
     });
 
-    test("trusted projects drop Google URL Context but keep native search", async () => {
-      await withProject(async (dir) => {
-        const tools = await toolsFor("google:gemini-3.5-flash", dir, true);
-        expect(tools.url_context).toBeUndefined();
-        expect(tools.google_search).toBeDefined();
-        expect(tools.web_fetch?.execute).toBeDefined();
-      });
-    });
-
     test("untrusted projects keep the provider-native fetch tools", async () => {
       await withProject(async (dir) => {
         // Hooks never run in untrusted projects, so a hook file changes nothing.
@@ -1104,7 +1045,6 @@ describe("getToolsForModel", () => {
             id: "anthropic.web_fetch_20250910",
           });
         }
-        expect((await toolsFor("google:gemini-3.5-flash", dir, false)).url_context).toBeDefined();
       });
     });
   });

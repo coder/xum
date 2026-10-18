@@ -80,10 +80,7 @@ import {
 import { NotificationEngine } from "@/node/services/agentNotifications/NotificationEngine";
 import { TodoListReminderSource } from "@/node/services/agentNotifications/sources/TodoListReminderSource";
 import { HomeClutterReminderSource } from "@/node/services/agentNotifications/sources/HomeClutterReminderSource";
-import {
-  getAvailableTools,
-  supportsGoogleNativeToolsWithFunctionTools,
-} from "@/common/utils/tools/toolDefinitions";
+import { getAvailableTools } from "@/common/utils/tools/toolDefinitions";
 import { sanitizeMCPToolsForOpenAI } from "@/common/utils/tools/schemaSanitizer";
 import type { ToolSearchRuntime } from "@/common/utils/tools/toolCatalog";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
@@ -1103,7 +1100,7 @@ export async function getToolsForModel(
   // Tool hooks (.xum/tool_pre, .xum/tool_post) can run only here (trusted project). A
   // provider-native tool runs on the provider, so no hook can gate it. While hooks can run,
   // fetch goes through Xum's hook-wrapped client web_fetch instead of native fetch
-  // (Anthropic web_fetch_20250910, Google url_context), so every fetch is gated, including
+  // (Anthropic web_fetch_20250910), so every fetch is gated, including
   // after a hook is added mid-turn: withHooks finds hook files again on each call. User
   // decision (#5840, Option A): trusted projects lose native fetch even with no hook file.
   // Native web search has no client version and stays unhooked.
@@ -1193,28 +1190,8 @@ export async function getToolsForModel(
         break;
       }
 
-      case "google":
-      case "google-vertex": {
-        // The wire model ID, unlike the OpenAI and xAI branches: @ai-sdk/google picks tool
-        // support from the ID it sends, and for an ID it does not see as Gemini 3 (a "Treat
-        // as" alias) it drops provider tools and every function tool with them. The
-        // allowlist below still removes these tools when the capability model lacks them.
-        if (supportsGoogleNativeToolsWithFunctionTools(modelId)) {
-          // @ai-sdk/google-vertex re-exports these same tool factories (tools are
-          // matched by id, not provider instance), so one import serves both.
-          const { google } = await import("@ai-sdk/google");
-          allTools = {
-            ...baseTools,
-            ...(mcpTools ?? {}),
-            // Google exposes native Search and URL Context as provider-executed tools for
-            // Gemini 3+. These coexist with Xum function tools in the standard streaming API.
-            google_search: google.tools.googleSearch({}) as Tool,
-            // URL Context fetches on Google's side, past tool hooks; client web_fetch covers it.
-            ...(!hooksCanRun && { url_context: google.tools.urlContext({}) as Tool }),
-          };
-        }
-        break;
-      }
+      // Gemini (google, google-vertex) gets no built-in tools: google_search broke Gemini's
+      // implicit caching, and agents never called it or url_context.
     }
   } catch (error) {
     // If tools aren't available, just use base tools

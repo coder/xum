@@ -3,7 +3,6 @@ import { INSTANCE_DISCOVERY_MAX_LIMIT } from "@/constants/agentMessaging";
 import {
   buildTaskToolAgentArgsSchema,
   getAvailableTools,
-  supportsGoogleNativeToolsWithFunctionTools,
   TaskToolArgsSchema,
   TaskRetitleToolArgsSchema,
   TaskWorkspaceLifecycleToolArgsSchema,
@@ -874,24 +873,6 @@ describe("TOOL_DEFINITIONS", () => {
     expect(enabledTools).toContain("workflow_resume");
   });
 
-  it("gates native Google tools to Gemini 3 models and Gemini 4 Argon", () => {
-    expect(getAvailableTools("google:gemini-2.5-pro")).not.toContain("google_search");
-    expect(getAvailableTools("google:gemini-2.5-pro")).not.toContain("url_context");
-    expect(getAvailableTools("google:gemini-4-pro")).not.toContain("google_search");
-    expect(getAvailableTools("google:gemini-4-pro")).not.toContain("url_context");
-
-    for (const modelString of [
-      "google:gemini-3.1-pro-preview",
-      "google:gemini-3.5-flash",
-      "google:models/gemini-3.5-flash",
-      "google:gemini-4-argon",
-    ]) {
-      const tools = getAvailableTools(modelString);
-      expect(tools).toContain("google_search");
-      expect(tools).toContain("url_context");
-    }
-  });
-
   it("exposes xAI native search tools only for frontier Grok", () => {
     for (const modelString of [
       "xai:grok-4.7",
@@ -906,14 +887,6 @@ describe("TOOL_DEFINITIONS", () => {
       );
     }
     expect(getAvailableTools("xai:grok-4-1-fast")).not.toContain("x_search");
-  });
-
-  it("classifies Gemini 3 as supporting mixed native Google and function tools", () => {
-    expect(supportsGoogleNativeToolsWithFunctionTools("gemini-2.5-pro")).toBe(false);
-    expect(supportsGoogleNativeToolsWithFunctionTools("gemini-3.1-pro-preview")).toBe(true);
-    expect(supportsGoogleNativeToolsWithFunctionTools("gemini-3.5-flash")).toBe(true);
-    expect(supportsGoogleNativeToolsWithFunctionTools("models/gemini-3.5-flash")).toBe(true);
-    expect(supportsGoogleNativeToolsWithFunctionTools("gemini-4-pro")).toBe(false);
   });
 
   it("agent_skill_write schema rejects an advertise tool argument (advertise is authored in content)", () => {

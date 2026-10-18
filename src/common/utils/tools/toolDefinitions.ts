@@ -3520,19 +3520,6 @@ export function getToolSchemas(): Record<string, ToolSchema> {
 }
 
 /**
- * Google's mixed built-in + function tool path is supported for Gemini 3 and Gemini 4 Argon.
- * Keep native Google tools gated here so the prompt allowlist matches the actual toolset.
- */
-export function supportsGoogleNativeToolsWithFunctionTools(modelId: string): boolean {
-  const bareModelId = modelId.split("/").pop() ?? modelId;
-  // Gemini 4 Argon documents Search grounding and URL context alongside function calling,
-  // and @ai-sdk/google gives every post-2.x Gemini ID the mixed native/function
-  // serialization (includeServerSideToolInvocations). Other Gemini 4 IDs stay off until
-  // their docs list the same tools.
-  return /^gemini-(?:3(?:[.-]|$)|4-argon)/.test(bareModelId);
-}
-
-/**
  * Get which tools are available for a given model
  * @param modelString The model string (e.g., "anthropic:claude-opus-4-1")
  * @returns Array of tool names available for the model
@@ -3570,7 +3557,7 @@ export function getAvailableTools(
     enableMuxGlobalAgentsTools?: boolean;
   }
 ): string[] {
-  const [provider, modelId = ""] = modelString.split(":");
+  const [provider] = modelString.split(":");
   const enableAgentReport = options?.enableAgentReport ?? true;
   const enableFamilyMessaging = options?.enableFamilyMessaging ?? false;
   const enableAnalyticsQuery = options?.enableAnalyticsQuery ?? true;
@@ -3660,12 +3647,6 @@ export function getAvailableTools(
       return isGrokFrontierModel(modelString)
         ? [...baseTools, "web_search", "x_search"]
         : baseTools;
-    case "google":
-    case "google-vertex":
-      if (supportsGoogleNativeToolsWithFunctionTools(modelId)) {
-        return [...baseTools, "google_search", "url_context"];
-      }
-      return baseTools;
     default:
       return baseTools;
   }

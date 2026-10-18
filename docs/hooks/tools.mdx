@@ -209,8 +209,8 @@ Keep hooks fast—if you need longer operations, consider running them asynchron
 
 Some models get tools that run on the provider's servers instead of in Xum. Hooks cannot see those calls.
 
-- **Web fetch is always hooked.** In trusted projects (the only projects where hooks run), Xum gives every model its own `web_fetch`, so `tool_pre` and `tool_post` run for every fetch. Claude's native web fetch and Gemini's URL Context are not offered there.
-- **Native web search is not hooked.** `web_search` (Claude, OpenAI, Grok), `x_search` (Grok) and `google_search` (Gemini) run on the provider, and hooks never run for them. Do not rely on a hook to restrict web search.
+- **Web fetch is always hooked.** In trusted projects (the only projects where hooks run), Xum gives every model its own `web_fetch`, so `tool_pre` and `tool_post` run for every fetch. Claude's native web fetch is not offered there.
+- **Native web search is not hooked.** `web_search` (Claude, OpenAI, Grok) and `x_search` (Grok) run on the provider, and hooks never run for them. Do not rely on a hook to restrict web search.
 
 </Accordion>
 

@@ -76,9 +76,9 @@ const CLAUDE_TOOLS: Readonly<Record<string, ClaudeToolMapping>> = {
   // NotebookEdit edits only notebook cells; Xum's edit tools change any file.
   NotebookEdit: denyOnly(FILE_CHANGE_TOOLS),
   Bash: same(BASH_TOOLS),
-  // url_context (Gemini) and web_search/google_search/x_search are provider-native
-  // tools. MCP naming reserves only Xum's own tool names, so an MCP tool can
-  // carry one of these names: they are removed but never granted.
+  // web_search and x_search are provider-native tools. Xum does not send Gemini's
+  // url_context and google_search, but MCP naming reserves only Xum's own tool names, so
+  // an MCP tool can carry any of these names: they are removed but never granted.
   WebFetch: { allow: ["web_fetch"], deny: ["web_fetch", "url_context"] },
   WebSearch: denyOnly(["web_search", "google_search", "x_search"]),
   // TaskCreate/TaskGet/TaskList/TaskUpdate replace TodoWrite as Claude Code's checklist.
