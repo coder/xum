@@ -6022,7 +6022,7 @@ export class AgentPluginInstallService {
       pluginDir: this.targetPathFor(name),
       scope: "global",
     });
-    if (plugin === null || plugin.name !== name) return noApprovedCopies();
+    if (plugin?.name !== name) return noApprovedCopies();
     const warnings: string[] = [];
     const skills = await this.collectSkillsFromRoots(plugin, warnings);
     const workflows = await this.collectWorkflowScripts(plugin, warnings);
