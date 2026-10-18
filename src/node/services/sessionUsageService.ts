@@ -374,6 +374,11 @@ export class SessionUsageService {
     return { foldedCount, filesToDelete };
   }
 
+  /** A stream this process is still running (the Costs tab counts it from stream events). */
+  private isOwnLiveStream(workspaceId: string, entry: InFlightUsageEntry): boolean {
+    return entry.file?.owner.id === this.inFlightOwnerId && !this.isOrphan(workspaceId, entry);
+  }
+
   /** The view a reader gets: the settled ledger plus running streams it must count. */
   private addRunningStreamsToView(
     workspaceId: string,
@@ -386,9 +391,7 @@ export class SessionUsageService {
     let addedCount = 0;
     for (const entry of entries ?? []) {
       if (!entry.file || settledKeys.has(entry.key)) continue;
-      const ownLive =
-        entry.file.owner.id === this.inFlightOwnerId && !this.isOrphan(workspaceId, entry);
-      if (ownLive && !includeOwnLiveStreams) continue;
+      if (!includeOwnLiveStreams && this.isOwnLiveStream(workspaceId, entry)) continue;
       addModelUsage(view.byModel, entry.file.model, entry.file.usage);
       addedCount++;
     }
