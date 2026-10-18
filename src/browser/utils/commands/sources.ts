@@ -197,6 +197,7 @@ import {
   getPresetForSlot,
 } from "@/browser/utils/uiLayouts";
 import { formatProjectHierarchyLabel, getTopLevelProjectEntries } from "@/common/utils/subProjects";
+import { serverPathLabel } from "@/common/utils/paths";
 import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLayouts";
 import {
   hasTab,
@@ -730,7 +731,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
 
     // Remove current workspace (rename action intentionally omitted until we add a proper modal)
     if (selected?.namedWorkspacePath) {
-      const workspaceDisplayName = `${selected.projectName}/${selected.namedWorkspacePath.split("/").pop() ?? selected.namedWorkspacePath}`;
+      // A server path: on a Windows server it uses "\\" (#6856).
+      const workspaceDisplayName = `${selected.projectName}/${serverPathLabel(selected.namedWorkspacePath, selected.namedWorkspacePath)}`;
       const selectedMeta = p.workspaceMetadata.get(selected.workspaceId);
       if (selectedMeta?.sideChatParentWorkspaceId == null) {
         list.push({
@@ -763,8 +765,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             run: async () => {
               const branchName =
                 selectedMeta?.name ??
-                selected.namedWorkspacePath.split("/").pop() ??
-                selected.namedWorkspacePath;
+                serverPathLabel(selected.namedWorkspacePath, selected.namedWorkspacePath);
               const ok = await p.confirmDialog(
                 removeWorkspaceConfirmOptions("Remove current workspace?", {
                   name: branchName,
@@ -2255,7 +2256,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           ],
           onSubmit: async (vals) => {
             const projectPath = vals.projectPath;
-            const projectName = projectPath.split("/").pop() ?? projectPath;
+            const projectName = serverPathLabel(projectPath, projectPath);
 
             const ok = await p.confirmDialog({
               title: `Archive merged workspaces in ${projectName}?`,
@@ -2272,7 +2273,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     ];
 
     for (const [projectPath] of p.userProjects.entries()) {
-      const projectName = projectPath.split("/").pop() ?? projectPath;
+      const projectName = serverPathLabel(projectPath, projectPath);
       list.push({
         id: CommandIds.projectRemove(projectPath),
         title: `Remove Project ${projectName}…`,

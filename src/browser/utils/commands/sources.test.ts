@@ -477,6 +477,32 @@ test("buildCoreSources includes create/switch workspace actions", () => {
   expect(titles.includes("Open Terminal Window for Workspace…")).toBe(true);
 });
 
+// #6856: on a Windows server, paths use "\\". The titles name the last segment, not the path.
+test("project and workspace commands name Windows server paths by their last segment", async () => {
+  const projectPath = "C:\\Users\\u\\repo";
+  const namedWorkspacePath = "C:\\Users\\u\\.xum\\src\\repo\\feat-x";
+  const userProjects = new Map<string, ProjectConfig>([
+    [projectPath, { workspaces: [{ path: namedWorkspacePath }] }],
+  ]);
+  const confirmTitles: string[] = [];
+  const actions = getActions({
+    userProjects,
+    selectedWorkspace: { projectPath, projectName: "repo", namedWorkspacePath, workspaceId: "w1" },
+    confirmDialog: (options: ConfirmDialogOptions) => {
+      confirmTitles.push(options.title);
+      return Promise.resolve(false);
+    },
+  });
+  expect(actions.find((a) => a.id === CommandIds.projectRemove(projectPath))?.title).toBe(
+    "Remove Project repo…"
+  );
+  expect(actions.find((a) => a.id === CommandIds.workspaceRemove())?.subtitle).toBe("repo/feat-x");
+  await actions
+    .find((a) => a.id === CommandIds.workspaceArchiveMergedInProject())
+    ?.prompt?.onSubmit({ projectPath });
+  expect(confirmTitles).toEqual(["Archive merged workspaces in repo?"]);
+});
+
 test("appearance commands offer auto when a manual theme is selected", () => {
   const actions = getActions({ themePreference: "dark" });
 
