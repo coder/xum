@@ -16,7 +16,8 @@ export function nodeVersionWarning(
 ): string | undefined {
   if ("electron" in versions || "bun" in versions) return undefined;
   const nodeVersion = versions.node;
-  const major = Number(/^(\d+)\./.exec(nodeVersion ?? "")?.[1]);
+  if (nodeVersion === undefined) return undefined;
+  const major = Number(/^(\d+)\./.exec(nodeVersion)?.[1]);
   if (!Number.isInteger(major) || major >= MIN_NODE_MAJOR) return undefined;
   return `xum: Node ${nodeVersion} is not supported. xum server needs Node ${MIN_NODE_MAJOR} or newer. Some features fail on older versions.`;
 }
