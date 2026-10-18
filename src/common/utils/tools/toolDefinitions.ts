@@ -47,11 +47,8 @@ import {
 import { ArtifactKindSchema } from "@/common/orpc/schemas/artifacts";
 import { z } from "zod";
 import { AgentIdSchema } from "@/common/schemas/ids";
-import {
-  AgentSkillPackageSchema,
-  SkillLookupNameSchema,
-  SkillNameSchema,
-} from "@/common/orpc/schemas/agentSkill";
+import { SkillLookupNameSchema, SkillNameSchema } from "@/common/orpc/schemas/agentSkill";
+import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/agentSkillReadToolResult";
 import {
   BestOfGroupSchema,
   WorkspaceHeartbeatSettingsSchema,
@@ -2223,26 +2220,7 @@ export const AttachFileToolResultSchema = z.union([
     .strict(),
 ]);
 
-/**
- * Agent Skill read tool result - full SKILL.md package or error.
- */
-export const AgentSkillReadToolResultSchema = z.union([
-  z.object({
-    success: z.literal(true),
-    skill: AgentSkillPackageSchema,
-    // Optional: results persisted before these fields existed lack them.
-    /** Absolute skill directory, valid where the workspace's bash runs. */
-    skillDir: z.string().optional(),
-    /** Agent Plugin skills only: absolute plugin root, valid where bash runs. */
-    pluginRoot: z.string().optional(),
-    /** Why `skillDir` is absent (built-in skill, or files not where bash runs). */
-    skillDirUnavailable: z.string().optional(),
-  }),
-  z.object({
-    success: z.literal(false),
-    error: z.string(),
-  }),
-]);
+export { AgentSkillReadToolResultSchema };
 
 /**
  * agent_skill_read_file result: file_read's, plus the plugin sibling note
