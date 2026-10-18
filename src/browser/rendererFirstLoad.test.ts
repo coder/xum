@@ -75,4 +75,26 @@ describe("renderer first load", () => {
     expect(closure.has("src/browser/components/CommandPalette/LazyCommandPalette.tsx")).toBe(true);
     expect(closure.has("src/browser/components/CommandPalette/CommandPalette.tsx")).toBe(false);
   }, 60_000);
+
+  test("the workspace page's static imports do not reach the workspace-menu modals", async () => {
+    // App.tsx starts the workspace page chunk (loadAIView() -> AIView) while the entry boots, so a
+    // phone downloads both closures before the composer works. WorkspaceMenuBar mounted these
+    // modals closed, which put them and the MCP app frame (~39 KB brotli) in that download.
+    const closure = new Set([
+      ...(await staticImportClosure("src/browser/main.tsx")),
+      ...(await staticImportClosure("src/browser/components/AIView/AIView.tsx")),
+    ]);
+    expect(closure.has("src/browser/components/WorkspaceMenuBar/WorkspaceMenuBar.tsx")).toBe(true);
+    const forbidden = [
+      "src/browser/components/WorkspaceHeartbeatModal/",
+      // Not the whole folder: WorkspaceContext needs settingsToolRuns.ts on every page.
+      "src/browser/components/WorkspaceMCPModal/WorkspaceMCPModal.tsx",
+      "src/browser/components/WorkspaceMCPModal/MCPSettingsToolActionRow.tsx",
+      "src/browser/components/WorkspaceUnrelatedMessagingModal/",
+      "src/browser/features/RightSidebar/ArtifactsTab/McpAppFrame",
+    ];
+    expect([...closure].filter((file) => forbidden.some((dir) => file.startsWith(dir)))).toEqual(
+      []
+    );
+  }, 60_000);
 });
