@@ -33,6 +33,7 @@ import {
   removeWorkspaceFromTestConfig,
 } from "@/node/services/taskService.shared.testHarness";
 import type { Config } from "@/node/config";
+import { settleArchivedSharedDesktopTask } from "@/node/services/desktop/DesktopInputCoordinator";
 
 // Sub-agent goals: TaskService alone drives a child's turns, so the child's goal loop (continue,
 // silent completion, one budget wrap-up, report) is arbitrated at the task's stream end, before
@@ -1311,6 +1312,37 @@ describe("TaskService child goals", () => {
     expect(t.sends()).toHaveLength(0);
     expect(await t.parentReports()).toHaveLength(0);
   });
+
+  // #6967: archiving a shared-desktop child writes `interrupted` outside TaskService
+  // (settleArchivedSharedDesktopTask), so nothing cancels a deferred stream end. A later Stop or
+  // parent interrupt then finds the status already interrupted and skips its interrupt
+  // notification: its latch must still drop without the accounting (never settled here).
+  test.each(["stop", "terminate-all"] as const)(
+    "a %s of an archived child whose stream end is deferred releases its latch",
+    async (kind) => {
+      const { t, internal } = await deferStreamEndOfOwnedAttempt();
+      await t.editChild((workspace) => {
+        workspace.taskDesktopOwnerWorkspaceId = parentId;
+        workspace.archivedAt = "2026-10-01T00:00:02.000Z";
+        expect(settleArchivedSharedDesktopTask(workspace)).toBe(true);
+      });
+      await t.taskService.settleOwedChildGoalPause(childId);
+      expect(t.child()?.taskStatus).toBe("interrupted");
+
+      // A resolved Stop waits for its latch (#6727), up to 40 s: bound it well below that.
+      const stopped = (
+        kind === "stop"
+          ? t.taskService.stopDescendantAgentTask(parentId, childId)
+          : t.taskService.terminateAllDescendantAgentTasks(parentId)
+      ).then(() => "resolved");
+      const held = new Promise((resolve) => setTimeout(() => resolve("held"), 1_000));
+      expect(await Promise.race([stopped, held])).toBe("resolved");
+      await waitForCondition(() => !t.taskService.isWorkspaceStopInProgress(childId), {
+        timeoutMs: 1_000,
+      });
+      expect(internal.streamEndDecisionsByTaskId.has(childId)).toBe(false);
+    }
+  );
 
   test("unsettled accounting defers the stream end without finalizing; its settlement resumes it", async () => {
     const t = await setup();
