@@ -35,22 +35,36 @@ describe("AgentPluginInstallService approved copies", () => {
   const copiesFile = () =>
     getApprovedCopiesPath(xumRoot, computePluginInstanceId(path.join(xumRoot, "plugins", "demo")));
 
-  async function writeVersion(version: string): Promise<void> {
+  async function writeFiles(pluginDir: string, version: string): Promise<void> {
     await fsPromises.writeFile(
-      path.join(remoteDir, "skills", "greet", "SKILL.md"),
+      path.join(pluginDir, "skills", "greet", "SKILL.md"),
       `---\nname: greet\ndescription: ${version}\n---\n${version}-BODY\n`
     );
     await fsPromises.writeFile(
-      path.join(remoteDir, "workflows", "hello.js"),
+      path.join(pluginDir, "workflows", "hello.js"),
       `export default function workflow() { return "${version}"; }\n`
     );
+  }
+
+  async function writeVersion(version: string): Promise<void> {
+    await writeFiles(remoteDir, version);
     await git(remoteDir, "add", "-A");
     await git(remoteDir, "commit", "-q", "-m", version);
   }
 
-  async function install(): Promise<void> {
+  /** An edit in the installed plugin folder: nobody approved it. */
+  const editInstalled = (version: string) =>
+    writeFiles(path.join(xumRoot, "plugins", "demo"), version);
+
+  async function install(
+    importedComponents?: Parameters<AgentPluginInstallService["install"]>[0]["importedComponents"]
+  ): Promise<void> {
     const preview = await service.preview({ input: remoteDir });
-    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+      ...(importedComponents !== undefined ? { importedComponents } : {}),
+    });
   }
 
   /** What an agent gets now: the skill's description and the workflow's source. */
@@ -135,6 +149,43 @@ describe("AgentPluginInstallService approved copies", () => {
     const reviewed = await served();
     expect(reviewed.skill).toBe("v2");
     expect(reviewed.workflow).toContain('"v2"');
+
+    // That approval saved v2: a later unapproved edit falls back to v2, not to v1.
+    await editInstalled("v3");
+    const afterEdit = await served();
+    expect(afterEdit.skill).toBe("v2");
+    expect(afterEdit.workflow).toContain('"v2"');
+  });
+
+  test("a skill imported after install keeps the version approved at import", async () => {
+    await install({ skills: [], mcpServers: [] });
+    const inventory = await service.getComponents({ name: "demo" });
+    await service.setComponents({
+      name: "demo",
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: inventory.importedComponents ?? null,
+      importedComponents: { skills: ["greet"], mcpServers: [] },
+    });
+    await editInstalled("v2");
+    expect((await served()).skill).toBe("v1");
+  });
+
+  test("a restart saves the copies of an install approved by a build without them", async () => {
+    await install();
+    await fsPromises.rm(copiesFile());
+    const restarted = new AgentPluginInstallService(new Config(xumRoot), {});
+    const internals = restarted as unknown as {
+      reconciliationState: Promise<boolean>;
+      startupApprovedCopiesSweep: Promise<void> | undefined;
+    };
+    expect(await internals.reconciliationState).toBe(true);
+    await internals.startupApprovedCopiesSweep;
+
+    await editInstalled("v2");
+    const approved = await served();
+    expect(approved.skill).toBe("v1");
+    expect(approved.workflow).toContain('"v1"');
   });
 
   test("uninstall removes the copies, and a reinstall saves its own", async () => {
