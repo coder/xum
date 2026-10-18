@@ -41,7 +41,6 @@ import {
   UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
 } from "@/common/utils/goals/budgetPricing";
 import type { SendMessageError } from "@/common/types/errors";
-import { getTotalCost, type ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
 import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
@@ -5168,39 +5167,6 @@ export class WorkspaceGoalService {
     await this.writeGoal(input.workspaceId, charged);
     await this.pushSnapshot(input.workspaceId, charged);
     return charged;
-  }
-
-  /**
-   * Charges the finished steps of a turn that a Xum restart killed (it never reached the
-   * stream end that recordStreamAccounting runs on). SessionUsageService calls this once per
-   * leftover in-flight file, after folding it into the ledger. Like a user-origin stream end:
-   * cost only, no turn, and a budget hit does not start an autonomous wrap-up turn.
-   * complete and budget_limited goals are not charged (#6980 deferred re-costing terminal
-   * goals); the file has no stream start, so usage whose last step finished before the goal
-   * was created is skipped.
-   */
-  async chargeKilledStreamUsage(input: {
-    workspaceId: string;
-    usage: ChatUsageDisplay;
-    lastStepAtMs: number;
-  }): Promise<GoalRecordV1 | null> {
-    assert(input.workspaceId.trim().length > 0, "chargeKilledStreamUsage requires workspaceId");
-    const costMicroCents = costUsdToMicroCents(getTotalCost(input.usage) ?? 0);
-    if (costMicroCents <= 0) return null;
-    return this.fileLocks.withLock(input.workspaceId, async () => {
-      const current = await this.readGoalFile(input.workspaceId);
-      if (!current || current.createdAtMs > input.lastStepAtMs) return null;
-      if (current.status !== "active" && current.status !== "paused") return null;
-      const accounted = GoalRecordV1Schema.parse({
-        ...current,
-        ...this.applyCostAccounting(current, costMicroCents),
-      });
-      const next = applyBudgetDrivenStatus(accounted, { originKind: "user", nowMs: Date.now() });
-      await this.writeGoal(input.workspaceId, next);
-      await this.pushSnapshot(input.workspaceId, next);
-      this.emitBudgetLimited(input.workspaceId, next, current.status);
-      return next;
-    });
   }
 
   /**
