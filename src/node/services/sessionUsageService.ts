@@ -154,8 +154,25 @@ function subtractUsage(total: ChatUsageDisplay, part: ChatUsageDisplay): ChatUsa
   return result;
 }
 
-function hasNoTokens(usage: ChatUsageDisplay): boolean {
-  return USAGE_COMPONENTS.every((key) => usage[key].tokens === 0);
+/** No tokens and no cost: zero-token rows can still carry exact billed cost (xAI). */
+function isEmptyUsage(usage: ChatUsageDisplay): boolean {
+  return USAGE_COMPONENTS.every(
+    (key) => usage[key].tokens === 0 && Math.abs(usage[key].cost_usd ?? 0) < 1e-12
+  );
+}
+
+/**
+ * True when summing `entry` into `bucket` keeps the bucket's pricing flags. Subtraction
+ * cannot undo merged flags (e.g. one gateway-billed entry marks the whole bucket
+ * costsIncluded), so an in-flight entry is only written into a bucket it cannot re-flag.
+ */
+function keepsUsageFlags(bucket: ChatUsageDisplay | undefined, entry: ChatUsageDisplay): boolean {
+  return (
+    bucket === undefined ||
+    ((bucket.costsIncluded === true) === (entry.costsIncluded === true) &&
+      (bucket.hasUnknownCosts === true) === (entry.hasUnknownCosts === true) &&
+      bucket.serviceTier === entry.serviceTier)
+  );
 }
 
 /** Adds (or, with "subtract", removes) one in-flight entry in `file`'s byModel. */
@@ -176,7 +193,7 @@ function applyInFlightUsage(
   }
   const remaining = subtractUsage(existing, entry.usage);
   // A bucket that only ever held this stream's usage leaves no empty model row behind.
-  if (hasNoTokens(remaining)) {
+  if (isEmptyUsage(remaining)) {
     delete file.byModel[entry.model];
   } else {
     file.byModel[entry.model] = remaining;
@@ -320,16 +337,27 @@ export class SessionUsageService {
         applyInFlightUsage(current, previous, "subtract");
       }
       const next = { model, usage };
-      applyInFlightUsage(current, next, "add");
+      // A mixed-flag bucket keeps the old behavior: the stream counts only when it settles.
+      const writesNext = keepsUsageFlags(current.byModel[model], usage);
+      if (writesNext) {
+        applyInFlightUsage(current, next, "add");
+      }
       await this.writeFile(workspaceId, current);
       // Only after the write: the map must always describe what the file holds.
-      let streams = this.inFlightUsage.get(workspaceId);
-      if (!streams) {
-        streams = new Map();
-        this.inFlightUsage.set(workspaceId, streams);
+      this.deleteInFlightEntry(workspaceId, streamId);
+      if (writesNext) {
+        this.setInFlightEntry(workspaceId, streamId, next);
       }
-      streams.set(streamId, next);
     });
+  }
+
+  private setInFlightEntry(workspaceId: string, streamId: string, entry: InFlightUsage): void {
+    let streams = this.inFlightUsage.get(workspaceId);
+    if (!streams) {
+      streams = new Map();
+      this.inFlightUsage.set(workspaceId, streams);
+    }
+    streams.set(streamId, entry);
   }
 
   /** Remove a stream's in-flight usage from the file (the stream records no usage). */
@@ -354,6 +382,12 @@ export class SessionUsageService {
     streams?.delete(streamId);
     if (streams?.size === 0) {
       this.inFlightUsage.delete(workspaceId);
+    }
+  }
+
+  private addInFlightUsage(workspaceId: string, file: SessionUsageFile): void {
+    for (const inFlight of this.inFlightUsage.get(workspaceId)?.values() ?? []) {
+      applyInFlightUsage(file, inFlight, "add");
     }
   }
 
@@ -783,7 +817,7 @@ export class SessionUsageService {
           const messages = await this.collectFullHistory(workspaceId);
           if (messages.length > 0) {
             await this.rebuildFromMessagesInternal(workspaceId, messages);
-            return this.readFile(workspaceId);
+            return this.withoutInFlightUsage(workspaceId, await this.readFile(workspaceId));
           }
           return undefined; // Truly empty session
         }
@@ -792,7 +826,7 @@ export class SessionUsageService {
         const messages = await this.collectFullHistory(workspaceId);
         if (messages.length > 0) {
           await this.rebuildFromMessagesInternal(workspaceId, messages);
-          return this.readFile(workspaceId);
+          return this.withoutInFlightUsage(workspaceId, await this.readFile(workspaceId));
         }
         return undefined;
       }
@@ -912,9 +946,10 @@ export class SessionUsageService {
       };
     }
 
+    // History does not hold running streams yet: put their in-flight usage back, or a crash
+    // before their next step would lose it.
+    this.addInFlightUsage(workspaceId, result);
     await this.writeFile(workspaceId, result);
-    // History holds no in-flight usage, so neither does the rebuilt file.
-    this.inFlightUsage.delete(workspaceId);
     log.info(`Rebuilt session-usage.json for ${workspaceId} from ${messages.length} messages`);
   }
 

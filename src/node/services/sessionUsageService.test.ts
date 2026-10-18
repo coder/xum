@@ -371,6 +371,57 @@ describe("SessionUsageService", () => {
       expect(newEntry.model).toBe(model);
     });
   });
+  describe("in-flight usage", () => {
+    const model = "anthropic:claude-sonnet-4-20250514";
+    const readRaw = async (workspaceId: string) =>
+      JSON.parse(
+        await fs.readFile(path.join(config.sessionsDir, workspaceId, "session-usage.json"), "utf-8")
+      ) as { byModel: Record<string, ChatUsageDisplay> };
+
+    it("leaves a bucket's pricing flags alone when the stream's flags differ", async () => {
+      // Subtraction cannot undo merged flags: a gateway-billed stream must not mark the
+      // direct-API bucket costsIncluded (which would stop repricing it) even after a discard.
+      const workspaceId = "in-flight-flags";
+      await service.recordUsage(workspaceId, model, createUsageWithCosts(100, 10, 0.1, 0.01));
+      await service.recordInFlightUsage(workspaceId, "stream-1", model, {
+        ...createUsage(50, 5),
+        costsIncluded: true,
+      });
+
+      expect((await service.getSessionUsage(workspaceId))?.byModel[model]?.costsIncluded).toBe(
+        undefined
+      );
+      await service.discardInFlightUsage(workspaceId, "stream-1");
+      const bucket = (await readRaw(workspaceId)).byModel[model];
+      expect(bucket?.costsIncluded).toBeUndefined();
+      expect(bucket?.input.tokens).toBe(100);
+    });
+
+    it("keeps a zero-token billed bucket when a stream's in-flight usage is removed", async () => {
+      const workspaceId = "in-flight-zero-token-cost";
+      const billedWithoutTokens: ChatUsageDisplay = {
+        ...createUsage(0, 0),
+        output: { tokens: 0, cost_usd: 0.25 },
+      };
+      await service.recordUsage(workspaceId, model, billedWithoutTokens);
+      await service.recordInFlightUsage(workspaceId, "stream-1", model, createUsage(40, 4));
+      await service.discardInFlightUsage(workspaceId, "stream-1");
+
+      expect((await readRaw(workspaceId)).byModel[model]?.output.cost_usd).toBeCloseTo(0.25, 12);
+    });
+
+    it("puts running streams' usage back into a ledger rebuilt from history", async () => {
+      const workspaceId = "in-flight-rebuild";
+      await service.recordInFlightUsage(workspaceId, "stream-1", model, createUsage(70, 7));
+      // An unreadable file is rebuilt from history, which does not hold the running turn.
+      await fs.writeFile(path.join(config.sessionsDir, workspaceId, "session-usage.json"), "{");
+      await historyService.appendToHistory(workspaceId, createMuxMessage("u1", "user", "hi"));
+
+      expect((await service.getSessionUsage(workspaceId))?.byModel[model]).toBeUndefined();
+      expect((await readRaw(workspaceId)).byModel[model]?.input.tokens).toBe(70);
+    });
+  });
+
   describe("recordUsage", () => {
     it("should accumulate usage for same model (not overwrite)", async () => {
       const workspaceId = "test-workspace";
