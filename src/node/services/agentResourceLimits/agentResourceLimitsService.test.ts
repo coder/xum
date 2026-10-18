@@ -150,7 +150,7 @@ describe("AgentResourceLimitsService", () => {
     expect(tree.sudoCalls).toEqual(["xum-1000"]);
   });
 
-  it("runs sudo only for applies a user asked for, not on every config write", async () => {
+  it("runs sudo once per user action, and not for config writes that keep the limits", async () => {
     // Root ignores file modes, so xum's cgroup cannot be root's there.
     if (process.getuid?.() === 0) return;
     await tree.dispose();
@@ -180,6 +180,32 @@ describe("AgentResourceLimitsService", () => {
     await service.setEnabled(false);
     await service.setEnabled(true);
     expect(tree.sudoCalls).toEqual(["xum-1000", "xum-1000", "xum-1000"]);
+  });
+
+  it("delegates with sudo when another backend changes the limits, but not on other config writes", async () => {
+    // Root ignores file modes, so xum's cgroup cannot be root's there.
+    if (process.getuid?.() === 0) return;
+    await tree.dispose();
+    tree = await createFakeCgroupTree({
+      own: "/init.scope",
+      cgroups: { "init.scope": { controllers: "cpu memory", procs: [String(process.pid)] } },
+      sudoWorks: true,
+    });
+    await fs.chmod(path.join(tree.root, "init.scope", "cgroup.subtree_control"), 0o444);
+    service = new AgentResourceLimitsService(config, tree.host);
+    await service.start();
+    await config.updateBashAiProxyEnabled(true);
+    await service.get();
+    expect(tree.sudoCalls).toEqual([]);
+
+    // Another backend's save reaches this backend only as a config change.
+    await config.updateAgentResourceLimits({ cpuCores: 1 });
+
+    expect((await service.get()).status).toEqual({
+      state: "active",
+      cgroup: "/xum-1000/xum-agents",
+    });
+    expect(tree.sudoCalls).toEqual(["xum-1000"]);
   });
 
   it("saves and applies the limits it is given", async () => {

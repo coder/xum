@@ -36,6 +36,21 @@ echo "$3" > "$1/xum-app/cgroup.procs"`;
  * the limits are cleared, after which the old sudo error no longer describes them.
  */
 const failedSudoDelegations = new WeakMap<AgentCgroupHost, string>();
+/**
+ * Limit files of xum's own cgroup, each unlimited when empty or when its first word is `max`. A
+ * process that moves to a sibling cgroup leaves these limits behind: only common ancestors keep
+ * constraining it.
+ */
+const OWN_LIMIT_FILES = [
+  "cpu.max",
+  "memory.max",
+  "memory.high",
+  "memory.swap.max",
+  "pids.max",
+  "cpuset.cpus",
+  "cpuset.mems",
+  "io.max",
+];
 
 type Controller = "cpu" | "memory";
 
@@ -221,6 +236,12 @@ async function findManageableBase(
   if (delegated === null) {
     return unavailable(reason);
   }
+  const ownLimit = await findOwnLimit(path.join(host.cgroupRoot, base));
+  if (ownLimit !== null) {
+    return unavailable(
+      `${reason} xum does not move to its own cgroup with sudo, because cgroup ${base} sets ${ownLimit}.`
+    );
+  }
   if (!trySudo) {
     const failed = failedSudoDelegations.get(host);
     return unavailable(failed === undefined ? reason : sudoFailedReason(reason, delegated, failed));
@@ -260,6 +281,26 @@ async function findSudoDelegationTarget(
     return null;
   }
   return `/xum-${host.uid}`;
+}
+
+/** The first limit that the cgroup at `dir` sets itself, as `<file> to <value>`, or null. */
+async function findOwnLimit(dir: string): Promise<string | null> {
+  for (const file of OWN_LIMIT_FILES) {
+    let value: string;
+    try {
+      value = (await fs.readFile(path.join(dir, file), "utf-8")).trim();
+    } catch (error) {
+      // A controller's files exist only while the parent enables it for this cgroup.
+      if (hasErrorCode(error, "ENOENT")) {
+        continue;
+      }
+      throw error;
+    }
+    if (value !== "" && value.split(/\s+/)[0] !== "max") {
+      return `${file} to ${value}`;
+    }
+  }
+  return null;
 }
 
 /** Why the user running xum cannot manage the cgroup at `baseDir`, or null when it can. */

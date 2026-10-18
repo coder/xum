@@ -171,6 +171,15 @@ describe("applyAgentCgroupLimits", () => {
     it("on a host without systemd", async () => {
       if (isRoot) return;
       tree = await createUnmanageableTree({ sudoWorks: true });
+      // The kernel's defaults: the cgroup itself sets no limit that leaving it would drop.
+      for (const [file, value] of [
+        ["cpu.max", "max 100000\n"],
+        ["memory.max", "max\n"],
+        ["cpuset.cpus", "\n"],
+        ["io.max", ""],
+      ]) {
+        await fs.writeFile(path.join(tree.root, "init.scope", file), value);
+      }
 
       const result = await applyAgentCgroupLimits({ cpuCores: 1, memoryGiB: 1.1 }, tree.host, {
         trySudo: true,
@@ -208,6 +217,28 @@ describe("applyAgentCgroupLimits", () => {
           /cannot manage \(.*\)\. Start xum in a cgroup delegated to that user\.$/
         )
       );
+      expect(tree.sudoCalls).toEqual([]);
+    });
+
+    it.each([
+      ["cpu.max", "50000 100000"],
+      ["memory.max", "1073741824"],
+      ["cpuset.cpus", "0-1"],
+    ])("not when xum's cgroup has its own %s, which leaving it would drop", async (file, value) => {
+      if (isRoot) return;
+      tree = await createUnmanageableTree({ sudoWorks: true });
+      await fs.writeFile(path.join(tree.root, "init.scope", file), `${value}\n`);
+
+      const result = await applyAgentCgroupLimits({ cpuCores: 1 }, tree.host, { trySudo: true });
+
+      expect(result.status).toEqual({
+        state: "unavailable",
+        reason: expect.stringMatching(
+          new RegExp(
+            `Start xum in a cgroup delegated to that user\\. xum does not move to its own cgroup with sudo, because cgroup /init\\.scope sets ${file.replace(".", "\\.")} to ${value}\\.$`
+          )
+        ) as string,
+      });
       expect(tree.sudoCalls).toEqual([]);
     });
   });
