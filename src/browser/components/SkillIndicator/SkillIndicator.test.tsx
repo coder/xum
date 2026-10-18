@@ -1,8 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import fs from "node:fs";
+import path from "node:path";
 import { cleanup, render } from "@testing-library/react";
+import postcss from "postcss";
+import { MOBILE_TOUCH_TARGET_PX } from "@/constants/layout";
 import { installDom } from "../../../../tests/ui/dom";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { SkillIndicator } from "./SkillIndicator";
+
+const GLOBALS_CSS = path.join(import.meta.dirname, "../../styles/globals.css");
 
 describe("SkillIndicator while skills load (#6221)", () => {
   let cleanupDom: (() => void) | null = null;
@@ -36,6 +42,42 @@ describe("SkillIndicator while skills load (#6221)", () => {
     expect(placeholder.className).toContain("w-6");
     // An empty box read as a gap in the header, so the slot shows the icon.
     expect(placeholder.querySelector("svg")).not.toBeNull();
+  });
+
+  test("gets the same phone touch-target minimum as the loaded button (#6841)", async () => {
+    // happy-dom cannot match a coarse-pointer media query, so read the phone rules from
+    // globals.css and ask which ones raise the placeholder and the loaded button to the 44px
+    // floor. A placeholder narrower than the button moved every header icon after it on load.
+    const css = postcss.parse(await fs.promises.readFile(GLOBALS_CSS, "utf8"));
+    const floorSelectors: string[] = [];
+    css.walkAtRules("media", (media) => {
+      if (!/max-width:\s*768px\).*\(pointer:\s*coarse/.test(media.params)) return;
+      media.walkRules((rule) => {
+        let raisesWidth = false;
+        rule.walkDecls("min-width", (decl) => {
+          raisesWidth ||= decl.value === `${MOBILE_TOUCH_TARGET_PX}px`;
+        });
+        if (raisesWidth) floorSelectors.push(rule.selector);
+      });
+    });
+    expect(floorSelectors.length).toBeGreaterThan(0);
+    const raisedBy = (el: Element) => floorSelectors.filter((s) => el.matches(s));
+
+    const placeholder = renderIndicator(true).getByTestId("slot").children[0];
+    const placeholderRules = raisedBy(placeholder);
+    cleanup();
+    const loaded = render(
+      <TooltipProvider>
+        <SkillIndicator
+          loadedSkills={[]}
+          availableSkills={[{ name: "tdd", description: "tdd", scope: "global" }]}
+        />
+      </TooltipProvider>
+    ).getByRole("button");
+    const buttonRules = raisedBy(loaded);
+
+    expect(buttonRules.length).toBeGreaterThan(0);
+    expect(placeholderRules).toEqual(buttonRules);
   });
 
   test("renders nothing once the list is known to be empty", () => {

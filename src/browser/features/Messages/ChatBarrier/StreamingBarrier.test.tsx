@@ -78,10 +78,9 @@ const actualWorkspaceStore = { ...RealWorkspaceStoreModule };
 // The overlay also changes the store identity, so it must stay local to this suite.
 restoreModulesAfterSuite([["@/browser/stores/WorkspaceStore", { ...actualWorkspaceStore }]]);
 
-// Overlay (not replace) the raw store: bun evaluates every test file before running tests
-// and static import bindings freeze at eval time, so this file-scope mock is what any
-// later-evaluated file in the same bun process gets forever. A bare fake missing store
-// methods breaks those files' cleanup and cascades.
+// Overlay (not replace) the raw store: this file-scope mock stays in place for the whole
+// file, and for every later test file if the restore does not run. A bare fake missing
+// store methods breaks those files' cleanup and cascades.
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   ...actualWorkspaceStore,
   useWorkspaceState: () => currentWorkspaceState,
@@ -133,9 +132,9 @@ void mock.module("@/browser/contexts/SettingsContext", () => ({
 
 // No usePersistedState module mock: in a fresh happy-dom localStorage the real
 // readPersistedState/readPersistedString already return the defaults this suite relied on,
-// and a partial module replacement here leaks process-wide (bun evaluates every test file
-// before running tests), deleting exports that later-evaluated suites need (seen as
-// GeneralSection/MemoryTab CI failures).
+// and a partial module replacement here leaks process-wide (a module mock outlives its
+// test file, and a mock that loads the module first fixes its export list), deleting
+// exports that later suites need (seen as GeneralSection/MemoryTab CI failures).
 
 // A snapshot, not a require("...?real=1") copy, which would replace useModelsFromSettings.test.ts's
 // coverage in the shard (see actualWorkspaceStore above).

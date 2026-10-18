@@ -6,6 +6,7 @@ import {
   matchesKeybind,
   matchesNewSidebarTabKeybind,
 } from "@/browser/utils/ui/keybinds";
+import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 
 /** Replays one held input. WorkspaceShell queues these while the right sidebar's chunk loads. */
 export type HeldSidebarInput = () => void;
@@ -55,16 +56,30 @@ export function holdSidebarInput(held: HeldSidebarInput[]): () => void {
       node.dispatchEvent(new window.KeyboardEvent("keydown", init));
     });
   };
-  const holdEvent = (e: Event) => {
-    e.stopImmediatePropagation();
-    const detail: unknown = e instanceof window.CustomEvent ? e.detail : undefined;
-    held.push(() => window.dispatchEvent(new window.CustomEvent(e.type, { detail })));
-  };
+  const holdEvent = holdEventInto(held);
   window.addEventListener("keydown", holdKey, true);
   for (const type of SIDEBAR_EVENTS) window.addEventListener(type, holdEvent, true);
   return () => {
     window.removeEventListener("keydown", holdKey, true);
     for (const type of SIDEBAR_EVENTS) window.removeEventListener(type, holdEvent, true);
+  };
+}
+
+function holdEventInto(held: HeldSidebarInput[]): (e: Event) => void {
+  return (e) => {
+    // While the layout hides the sidebar, RightSidebar ignores these two and WorkspaceMenuBar acts
+    // on them. Chromium may already have run the menu bar's listener (window listeners run in
+    // registration order at the window target), so a replay would act twice (#6208).
+    const menuBarEvent =
+      e.type === CUSTOM_EVENTS.OPEN_ARTIFACT || e.type === CUSTOM_EVENTS.OPEN_MCP_APP_VIEW;
+    if (
+      menuBarEvent &&
+      isWorkspaceRightSidebarHidden(document.querySelector("[data-workspace-shell]"))
+    )
+      return;
+    e.stopImmediatePropagation();
+    const detail: unknown = e instanceof window.CustomEvent ? e.detail : undefined;
+    held.push(() => window.dispatchEvent(new window.CustomEvent(e.type, { detail })));
   };
 }
 

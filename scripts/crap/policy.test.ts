@@ -204,6 +204,15 @@ describe("new functions", () => {
       ).toEqual([["new-function", "violation", key("feat")]]);
     });
 
+    test("does not count a deleted function's CC as a drop", () => {
+      // Only kept functions pay. Deleting old (CC 12) while adding piece (CC 12) keeps
+      // the total CC, so net-extraction relief does not apply either.
+      const head = [row("big", 40, [1, 99]), row("piece", 12, [100, 140])];
+      expect(verdicts([...base, row("old", 12, [100, 140])], head)).toEqual([
+        ["new-function", "violation", key("piece")],
+      ]);
+    });
+
     test("is aggregate, like net-extraction relief: a large enough cut pays for new code", () => {
       // The gate cannot tell a move from a cut plus new code. Net-extraction
       // relief already warns at a cut of 13; move relief warns at 11.

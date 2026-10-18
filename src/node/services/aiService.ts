@@ -133,12 +133,33 @@ function isToolExecutionContext(value: unknown): value is ToolExecutionContext {
  * A snapshot JSON cannot serialize (a BigInt) counts as the whole limit, so it is kept alone.
  */
 function estimateDebugSnapshotBytes(snapshot: DebugLlmRequestSnapshot): number {
+  return jsonBytes(snapshot) ?? DEBUG_LLM_REQUEST_MAX_BYTES;
+}
+
+/** UTF-8 bytes of the value's JSON, or undefined when JSON cannot serialize it (a BigInt). */
+function jsonBytes(value: unknown): number | undefined {
   try {
     // UTF-8 bytes, not UTF-16 units: a CJK character is one unit but three bytes.
-    return Math.max(1, Buffer.byteLength(JSON.stringify(snapshot), "utf8"));
+    return Math.max(1, Buffer.byteLength(JSON.stringify(value), "utf8"));
   } catch {
-    return DEBUG_LLM_REQUEST_MAX_BYTES;
+    return undefined;
   }
+}
+
+/** `{...request, response}` serializes as the request's JSON plus this key and the response. */
+const RESPONSE_FIELD_JSON_BYTES = Buffer.byteLength(',"response":', "utf8");
+
+/**
+ * JSON bytes of `{...request, response}` from the request's stored size, without serializing
+ * the request again. Any doubt (no stored size, a request or response JSON cannot serialize)
+ * returns undefined, so the cache measures the whole snapshot as before.
+ */
+function attachedSnapshotBytes(requestBytes: number | undefined, response: unknown) {
+  if (requestBytes == null || requestBytes >= DEBUG_LLM_REQUEST_MAX_BYTES) return undefined;
+  const responseBytes = jsonBytes(response);
+  return responseBytes == null
+    ? undefined
+    : requestBytes + RESPONSE_FIELD_JSON_BYTES + responseBytes;
 }
 
 export class AIService extends EventEmitter {
@@ -371,27 +392,7 @@ export class AIService extends EventEmitter {
     if (event.type === "stream-end") {
       this.clearTrackedPendingDevToolsRunMetadata(event.messageId);
 
-      try {
-        const snapshot = this.lastLlmRequestByWorkspace.get(event.workspaceId);
-        if (snapshot) {
-          const shouldAttach = snapshot.messageId === event.messageId || snapshot.messageId == null;
-          if (shouldAttach) {
-            const updated: DebugLlmRequestSnapshot = {
-              ...snapshot,
-              response: {
-                capturedAt: Date.now(),
-                metadata: event.metadata,
-                parts: event.parts,
-              },
-            };
-
-            this.lastLlmRequestByWorkspace.set(event.workspaceId, structuredClone(updated));
-          }
-        }
-      } catch (error) {
-        const errMsg = getErrorMessage(error);
-        log.warn("Failed to capture debug LLM response snapshot", { error: errMsg });
-      }
+      this.attachDebugLlmResponse(event);
 
       this.emit("stream-end", event);
       return;
@@ -406,6 +407,39 @@ export class AIService extends EventEmitter {
     }
 
     this.emit(event.type, event);
+  }
+
+  /** Adds stream-end's response to the workspace's debug LLM request snapshot. */
+  private attachDebugLlmResponse(event: Extract<TurnEngineEvent, { type: "stream-end" }>): void {
+    try {
+      const snapshot = this.lastLlmRequestByWorkspace.get(event.workspaceId);
+      if (snapshot == null) return;
+      if (snapshot.messageId != null && snapshot.messageId !== event.messageId) return;
+      // The request half is already this cache's own copy (the turn builder cloned it), so
+      // copy and measure only the response. Re-cloning and re-serializing the whole request
+      // here doubled the per-turn event-loop cost at a full context (#6912).
+      const response = structuredClone({
+        capturedAt: Date.now(),
+        metadata: event.metadata,
+        parts: event.parts,
+      });
+      // The size stored with the request. Not used when a response is already attached,
+      // because that size counts the earlier response too.
+      const size = attachedSnapshotBytes(
+        snapshot.response == null
+          ? this.lastLlmRequestByWorkspace.info(event.workspaceId)?.size
+          : undefined,
+        response
+      );
+      this.lastLlmRequestByWorkspace.set(
+        event.workspaceId,
+        { ...snapshot, response },
+        size == null ? undefined : { size }
+      );
+    } catch (error) {
+      const errMsg = getErrorMessage(error);
+      log.warn("Failed to capture debug LLM response snapshot", { error: errMsg });
+    }
   }
 
   private createSettledTurnHandle(messageId: string, completion: TurnCompletion): TurnStreamHandle {

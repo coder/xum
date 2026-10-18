@@ -80,10 +80,25 @@ import {
   type ControllableAsyncIterable,
   type TestApiOverrides,
 } from "@/browser/testUtils";
+import * as RealToolCardsStore from "@/browser/features/Tools/Shared/toolCardsStore";
+import { restoreModulesAfterSuite } from "../../../tests/ui/moduleMocks";
 import {
   shouldNotifyOnResponseComplete,
   type ResponseCompleteEvent,
 } from "@/browser/utils/messages/responseCompletionMetadata";
+
+// Counts the store's tool-card requests (#6823) and records how many onChat calls preceded each.
+// The real request still runs, so every other test sees the real store.
+const realToolCardsStore = { ...RealToolCardsStore };
+const onChatCallsAtToolCardRequest: number[] = [];
+restoreModulesAfterSuite([["@/browser/features/Tools/Shared/toolCardsStore", realToolCardsStore]]);
+void mock.module("@/browser/features/Tools/Shared/toolCardsStore", () => ({
+  ...realToolCardsStore,
+  requestToolCards: () => {
+    onChatCallsAtToolCardRequest.push(mockOnChat.mock.calls.length);
+    realToolCardsStore.requestToolCards();
+  },
+}));
 
 interface LoadMoreResponse {
   messages: WorkspaceChatMessage[];
@@ -94,17 +109,17 @@ interface LoadMoreResponse {
 
 // Mock client
 // eslint-disable-next-line require-yield
-const mockOnChat = mock(async function* (
+async function* idleOnChat(
   _input?: { workspaceId: string; mode?: unknown },
   options?: { signal?: AbortSignal }
 ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
   // Keep the iterator open until the store aborts it (prevents retry-loop noise in tests).
   await waitForAbortSignal(options?.signal);
-});
+}
+const mockOnChat = mock(idleOnChat);
 
-const mockGetSessionUsage = mock((_input: { workspaceId: string }) =>
-  Promise.resolve<unknown>(undefined)
-);
+const noSessionUsage = (_input: { workspaceId: string }) => Promise.resolve<unknown>(undefined);
+const mockGetSessionUsage = mock(noSessionUsage);
 const mockHistoryLoadMore = mock(
   (_input?: {
     workspaceId: string;
@@ -797,11 +812,17 @@ describe("WorkspaceStore", () => {
   let mockOnModelUsed: Mock<(model: string) => void>;
 
   beforeEach(() => {
-    mockOnChat.mockClear();
-    mockGetSessionUsage.mockClear();
+    // Reset, not just clear: many tests install a lasting mockImplementation (openChat,
+    // mockBackgroundActivityTransition), and a leftover one feeds events into the next
+    // test, which then fails or passes depending on test order (`bun test --seed <n>`).
+    mockOnChat.mockReset();
+    mockOnChat.mockImplementation(idleOnChat);
+    mockGetSessionUsage.mockReset();
+    mockGetSessionUsage.mockImplementation(noSessionUsage);
+    mockActivitySubscribe.mockReset();
+    mockActivitySubscribe.mockImplementation(idleActivitySubscription);
     mockHistoryLoadMore.mockClear();
     mockActivityList.mockClear();
-    mockActivitySubscribe.mockClear();
     mockTerminalActivitySubscribe.mockClear();
     mockGetProvidersConfig.mockClear();
     mockOnProvidersConfigChanged.mockClear();
@@ -1660,6 +1681,31 @@ describe("WorkspaceStore", () => {
   });
 
   describe("active workspace subscriptions", () => {
+    // #6823: on desktop the lazy cards' chunk evaluated after the first rows committed, so tool
+    // rows showed header-only cards for 1-2 frames. Selection starts it before any chat event.
+    it.each([
+      ["desktop", true, [0]],
+      ["browser", false, []],
+    ] as const)(
+      "requests the tool cards on selection in %s mode",
+      async (_mode, desktop, calls) => {
+        const workspaceId = `tool-cards-on-select-${String(desktop)}`;
+        createAndAddWorkspace(store, workspaceId, {}, false);
+        await tick(0);
+        onChatCallsAtToolCardRequest.length = 0;
+        const api = global.window.api as { getIsRosetta?: () => Promise<boolean> };
+        if (desktop) api.getIsRosetta = () => Promise.resolve(false);
+        try {
+          store.setActiveWorkspaceId(workspaceId);
+          await tick(0);
+          // Desktop: one request, made before the onChat subscription started.
+          expect(onChatCallsAtToolCardRequest).toEqual([...calls]);
+          expect(mockOnChat).toHaveBeenCalled();
+        } finally {
+          delete api.getIsRosetta;
+        }
+      }
+    );
     it("does not start onChat until workspace becomes active", async () => {
       const workspaceId = "inactive-workspace";
       createAndAddWorkspace(store, workspaceId, {}, false);
@@ -7759,13 +7805,17 @@ describe("WorkspaceStore", () => {
     it("ignores an extra unsubscribe call once every listener is gone", () => {
       const workspaceId = "stats-underflow";
       const warn = spyOn(console, "warn").mockImplementation(() => undefined);
-      createAndAddWorkspace(store, workspaceId, {}, false);
-      const unsubscribe = store.subscribeStats(workspaceId, () => undefined);
-      unsubscribe();
+      try {
+        createAndAddWorkspace(store, workspaceId, {}, false);
+        const unsubscribe = store.subscribeStats(workspaceId, () => undefined);
+        unsubscribe();
 
-      unsubscribe();
-      expect(warn).toHaveBeenCalledTimes(1);
-      warn.mockRestore();
+        unsubscribe();
+        expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        // Restore even when an assertion fails, so later tests keep their warnings.
+        warn.mockRestore();
+      }
 
       // The count did not go negative: the next listener subscribes again.
       store.subscribeStats(workspaceId, () => undefined);
@@ -7818,15 +7868,18 @@ describe("WorkspaceStore", () => {
     it("logs a failed subscription and keeps showing no snapshot", async () => {
       const workspaceId = "stats-error";
       const warn = spyOn(console, "warn").mockImplementation(() => undefined);
-      const failure = new Error("stats gone");
-      mockStatsSubscribe.mockImplementationOnce(() => Promise.reject(failure));
-      createAndAddWorkspace(store, workspaceId, {}, false);
-      store.subscribeStats(workspaceId, () => undefined);
+      try {
+        const failure = new Error("stats gone");
+        mockStatsSubscribe.mockImplementationOnce(() => Promise.reject(failure));
+        createAndAddWorkspace(store, workspaceId, {}, false);
+        store.subscribeStats(workspaceId, () => undefined);
 
-      expect(await waitUntil(() => warn.mock.calls.length > 0)).toBe(true);
-      // The log carries the error itself, not just a message.
-      expect(warn.mock.calls[0]).toContain(failure);
-      warn.mockRestore();
+        expect(await waitUntil(() => warn.mock.calls.length > 0)).toBe(true);
+        // The log carries the error itself, not just a message.
+        expect(warn.mock.calls[0]).toContain(failure);
+      } finally {
+        warn.mockRestore();
+      }
       expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
     });
   });

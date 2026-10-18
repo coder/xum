@@ -295,7 +295,7 @@ export const SkillIndicator: React.FC<SkillIndicatorProps> = (props) => {
       <span
         aria-hidden="true"
         className={cn(
-          "text-muted flex h-6 w-6 shrink-0 items-center justify-center",
+          "text-muted mobile-touch-target flex h-6 w-6 shrink-0 items-center justify-center",
           props.className
         )}
       >

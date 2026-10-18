@@ -609,6 +609,9 @@ describe("task git patch engine", () => {
         stdio: "ignore",
       }
     );
+    // `git init` creates `.git/info` only from its template; a global
+    // `init.templateDir` without that folder leaves it missing.
+    await fsPromises.mkdir(path.join(targetRepo, ".git", "info"), { recursive: true });
     await fsPromises.writeFile(
       path.join(targetRepo, ".git", "info", "attributes"),
       "*.md merge=evil\n",
@@ -763,6 +766,9 @@ describe("task git patch engine", () => {
       stdio: "ignore",
     });
     execSync("git config filter.evil.required true", { cwd: targetRepo, stdio: "ignore" });
+    // `git init` creates `.git/info` only from its template; a global
+    // `init.templateDir` without that folder leaves it missing.
+    await fsPromises.mkdir(path.join(targetRepo, ".git", "info"), { recursive: true });
     await fsPromises.writeFile(
       path.join(targetRepo, ".git", "info", "attributes"),
       "*.md filter=evil\n",

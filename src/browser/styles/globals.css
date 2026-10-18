@@ -930,8 +930,11 @@ body,
 
   button,
   a,
-  [role="button"] {
-    /* Keep in sync with MOBILE_TOUCH_TARGET_PX, which tests use to reproduce this rule. */
+  [role="button"],
+  .mobile-touch-target {
+    /* Keep in sync with MOBILE_TOUCH_TARGET_PX, which tests use to reproduce this rule.
+       .mobile-touch-target: an inert placeholder that holds a button's slot while it loads gets
+       the button's size, or the header icons after it jump when the button arrives (#6841). */
     min-height: 44px;
     min-width: 44px;
   }

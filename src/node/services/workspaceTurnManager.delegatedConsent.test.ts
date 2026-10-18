@@ -12,6 +12,7 @@ import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { workspace as workspaceApi } from "@/common/orpc/schemas/api";
 import { createMuxMessage } from "@/common/types/message";
 import { HistoryService } from "@/node/services/historyService";
+import { TaskHandleStore } from "@/node/services/taskHandleStore";
 import { InitStateManager } from "@/node/services/initStateManager";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import {
@@ -793,4 +794,75 @@ describe("delegated target default consent (#4453)", () => {
     expect(mark(a.config)?.interruptedAt).toBeString();
     await a.finish();
   });
+
+  // #5569 (user-created roots): the active-turn lookup may answer "no turn" for a root that was
+  // born without delegation only while these birth facts hold.
+  for (const owner of ["project", "scratch"] as const) {
+    test(`a mode new target's first config write already binds its creator (${owner} owner, #5569)`, async () => {
+      const a = owner === "project" ? await setUp() : await setUpScratchOwner();
+      const firstVisible: unknown[] = [];
+      const edit = a.config.editConfig.bind(a.config);
+      spyOn(a.config, "editConfig").mockImplementation(async (...args) => {
+        await edit(...args);
+        const row = findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)?.workspace;
+        if (row != null && firstVisible.length === 0) {
+          firstVisible.push({ mark: row.delegatedCreation, tags: row.tags });
+        }
+      });
+
+      await start(a.manager, a.parentId, { mode: "new" });
+
+      expect(firstVisible).toEqual([
+        {
+          mark: { handleId: "wst_handle", ownerWorkspaceId: a.parentId },
+          tags: {
+            "mux.taskHandleId": "wst_handle",
+            "mux.taskOwnerWorkspaceId": a.parentId,
+            "mux.taskTurnId": "turn",
+          },
+        },
+      ]);
+    });
+  }
+
+  for (const birth of ["create", "createScratch"] as const) {
+    test(`a root born without delegation never gets a turn, even with copied claim tags (${birth}, #5569)`, async () => {
+      const other = "bbbbbbbbbb";
+      const a = await setUp({ stableIds: ["handle", "turn", other, TARGET, "handle2", "turn2"] });
+      // The owner has a running turn on another target it created.
+      await start(a.manager, a.parentId, { mode: "new" });
+      const tags = { "mux.taskHandleId": "wst_handle", "mux.taskOwnerWorkspaceId": a.parentId };
+      const born =
+        birth === "create"
+          ? await a.real.create(
+              a.projectPath,
+              "public",
+              "main",
+              undefined,
+              { type: "local" },
+              undefined,
+              false,
+              tags
+            )
+          : await a.real.createScratch(undefined, tags);
+      expect(born.success ? born.data.metadata.id : born.error).toBe(TARGET);
+      // Its background init must not outlive the test's temp root.
+      await a.initStateManager.waitForInit(TARGET);
+      expect(mark(a.config)).toBeUndefined();
+
+      const refused = await createTurn(a.manager, a.parentId, {
+        mode: "existing",
+        workspaceId: TARGET,
+      });
+      expect(refused.success ? "" : refused.error).toContain("invalid_scope");
+
+      // Same answer as the global scan: the owner's only records target the other workspace.
+      const records = await new TaskHandleStore(a.config).listAllWorkspaceTurns();
+      expect(records.map((record) => record.workspaceId)).toEqual([other]);
+      expect(await a.manager.getActiveWorkspaceTurnMuxMetadataForWorkspace(TARGET)).toBeUndefined();
+      expect(await a.manager.getActiveWorkspaceTurnMuxMetadataForWorkspace(other)).toMatchObject({
+        taskHandleId: "wst_handle",
+      });
+    });
+  }
 });

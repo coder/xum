@@ -311,8 +311,6 @@ export interface SettledStepBudget {
    * preflight will compute it. Absent when no context budget applies.
    */
   nextRequestTokens?: number;
-  /** The appended-message part of `nextRequestTokens`; absent when it was a full count. */
-  nextRequestDeltaTokens?: number;
   sessionHistoryAvailable: boolean;
   /** The step's request advertised `new_context`, so the final prompt can be acted on. */
   newContextAvailable: boolean;
@@ -3015,7 +3013,6 @@ export class StreamManager {
                   createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step)
                 );
           const nextRequestTokens = nextRequest?.estimate;
-          const nextRequestDeltaTokens = nextRequest?.delta;
           const { decision, continuationEntryId } = await request.onStepSettled({
             model: request.modelString,
             usage: normalizeUsage(step.usage),
@@ -3023,7 +3020,6 @@ export class StreamManager {
             ...size,
             toolResultTokens,
             ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
-            ...(nextRequestDeltaTokens != null ? { nextRequestDeltaTokens } : {}),
             sessionHistoryAvailable: request.tools?.session_history != null,
             newContextAvailable: request.tools?.new_context != null,
             newContextRequested: step.toolResults.some(

@@ -26,7 +26,11 @@ import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { PopoverError } from "../PopoverError/PopoverError";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext";
-import { useWorkspaceShellStatus } from "@/browser/stores/WorkspaceStore";
+import {
+  useOptionalWorkspaceSidebarState,
+  useWorkspaceActivityAuthoritative,
+  useWorkspaceShellStatus,
+} from "@/browser/stores/WorkspaceStore";
 import { useReviews } from "@/browser/hooks/useReviews";
 import type { ReviewNoteData } from "@/common/types/review";
 import { ConnectionStatusToast } from "../ConnectionStatusToast/ConnectionStatusToast";
@@ -124,6 +128,28 @@ function SidebarInput(props: { held: HeldSidebarInput[]; mode: "hold" | "replay"
 }
 
 /**
+ * While the sidebar chunk loads: keep the lowest authoritative active workflow-run count. RightSidebar
+ * compares against it once it mounts, so a run that started meanwhile still switches to the
+ * Workflows tab (#6208), even after an earlier run ended (the lowest is then 0). A run active the
+ * whole time keeps the persisted tab.
+ */
+function WorkflowRunBaseline(props: {
+  workspaceId: string;
+  onBaseline: (activeWorkflowRunCount: number) => void;
+}) {
+  const count = useOptionalWorkspaceSidebarState(props.workspaceId)?.activeWorkflowRunCount ?? 0;
+  const authoritative = useWorkspaceActivityAuthoritative();
+  const lowestRef = useRef<number | null>(null);
+  const onBaseline = props.onBaseline;
+  useEffect(() => {
+    if (!authoritative) return;
+    lowestRef.current = Math.min(lowestRef.current ?? count, count);
+    onBaseline(lowestRef.current);
+  }, [authoritative, count, onBaseline]);
+  return null;
+}
+
+/**
  * The full-screen sidebar's Close button while its chunk loads or after it fails (phones, where
  * Escape is rarely at hand). Like RightSidebar's full-screen view, it makes the covered workspace
  * inert and moves focus in.
@@ -175,6 +201,8 @@ function LazyRightSidebar(
   props: React.ComponentProps<typeof RightSidebar> & { held: HeldSidebarInput[] }
 ) {
   const { held, ...sidebarProps } = props;
+  // Per workspace: the shell keys this component by workspace.
+  const [workflowRunBaseline, setWorkflowRunBaseline] = useState<number | null>(null);
   const collapsed = readPersistedState(
     RIGHT_SIDEBAR_COLLAPSED_KEY,
     RIGHT_SIDEBAR_DEFAULT_COLLAPSED
@@ -211,6 +239,7 @@ function LazyRightSidebar(
   const pending = (
     <>
       <SidebarInput held={held} mode="hold" />
+      <WorkflowRunBaseline workspaceId={props.workspaceId} onBaseline={setWorkflowRunBaseline} />
       {(props.fullscreen === true || props.immersiveHidden === true) && (
         <span role="status">Loading sidebar...</span>
       )}
@@ -218,7 +247,7 @@ function LazyRightSidebar(
   );
   return (
     <LazyFeature name="Sidebar" frame={frame} fallback={pending}>
-      <RightSidebar {...sidebarProps} />
+      <RightSidebar {...sidebarProps} workflowRunBaseline={workflowRunBaseline} />
       <SidebarInput held={held} mode="replay" />
     </LazyFeature>
   );
