@@ -117,6 +117,7 @@ const IN_FLIGHT_USAGE_DIR = "session-usage.in-flight";
 /**
  * A key only needs to outlive the crash window between a settle's ledger write and its
  * file delete: every settle and read folds leftovers first, so a short list is enough.
+ * Keys whose file still exists are never pruned (pruneSettledInFlightKeys).
  */
 const SETTLED_IN_FLIGHT_KEYS_LIMIT = 64;
 const IN_FLIGHT_KEY_PATTERN = /^[A-Za-z0-9-]+$/;
@@ -166,7 +167,17 @@ function addModelUsage(
 function withSettledInFlightKey(file: SessionUsageFile, key: string): void {
   const keys = (file.settledInFlightKeys ?? []).filter((existing) => existing !== key);
   keys.push(key);
-  file.settledInFlightKeys = keys.slice(-SETTLED_IN_FLIGHT_KEYS_LIMIT);
+  file.settledInFlightKeys = keys;
+}
+
+/** Keeps the newest keys, and every key whose in-flight file still exists on disk. */
+function pruneSettledInFlightKeys(file: SessionUsageFile, keysWithFiles: Set<string>): void {
+  const keys = file.settledInFlightKeys;
+  if (!keys || keys.length <= SETTLED_IN_FLIGHT_KEYS_LIMIT) return;
+  const firstKept = keys.length - SETTLED_IN_FLIGHT_KEYS_LIMIT;
+  file.settledInFlightKeys = keys.filter(
+    (key, index) => index >= firstKept || keysWithFiles.has(key)
+  );
 }
 
 /**
@@ -329,9 +340,14 @@ export class SessionUsageService {
     return { view, addedCount };
   }
 
+  /** Best-effort: the ledger is already written, and a file left behind has a settled key. */
   private async deleteFiles(filePaths: string[]): Promise<void> {
     for (const filePath of filePaths) {
-      await fs.rm(filePath, { force: true });
+      try {
+        await fs.rm(filePath, { force: true });
+      } catch (error) {
+        log.warn("Failed to delete a settled in-flight usage file", { filePath, error });
+      }
     }
   }
 
@@ -395,6 +411,7 @@ export class SessionUsageService {
       if (settlesKey !== undefined) {
         withSettledInFlightKey(current, settlesKey);
       }
+      pruneSettledInFlightKeys(current, new Set(entries.map((entry) => entry.key)));
       await this.writeFile(workspaceId, current);
       // Ledger first, then the files: a crash in between leaves settled keys (counted once).
       if (settlesKey !== undefined) {
@@ -419,7 +436,9 @@ export class SessionUsageService {
     const filePath = this.getInFlightFilePath(workspaceId, key);
     return this.fileLocks.withLock(workspaceId, async () => {
       // Live before the write: a concurrent read must never fold a running stream.
-      this.liveKeys(workspaceId).add(key);
+      const liveKeys = this.liveKeys(workspaceId);
+      const wasLive = liveKeys.has(key);
+      liveKeys.add(key);
       const file: InFlightUsageFile = {
         version: 1,
         owner: { pid: process.pid, id: this.inFlightOwnerId },
@@ -428,8 +447,14 @@ export class SessionUsageService {
         usage,
         updatedAt: Date.now(),
       };
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await writeFileAtomic(filePath, JSON.stringify(file));
+      try {
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await writeFileAtomic(filePath, JSON.stringify(file));
+      } catch (error) {
+        // A failed first write leaves no file, and the caller keeps no key to release.
+        if (!wasLive) this.forgetLiveKey(workspaceId, key);
+        throw error;
+      }
     });
   }
 
@@ -867,6 +892,7 @@ export class SessionUsageService {
         entries
       );
       if (foldedCount > 0) {
+        pruneSettledInFlightKeys(ledger, new Set(entries.map((entry) => entry.key)));
         await this.writeFile(workspaceId, ledger);
       }
       await this.deleteFiles(filesToDelete);

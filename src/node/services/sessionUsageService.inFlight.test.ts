@@ -1,6 +1,6 @@
 import * as path from "path";
 import * as fs from "fs/promises";
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { SessionUsageService, type SessionUsageFile } from "./sessionUsageService";
 import { createTestHistoryService } from "./testHistoryService";
 import type { HistoryService } from "./historyService";
@@ -114,6 +114,24 @@ describe("SessionUsageService in-flight usage", () => {
     expect(tokens(await restarted.getSessionUsage(workspaceId))).toBe(165);
     expect(await inFlightFiles()).toEqual([]);
     expect(tokens(await readLedgerOnDisk())).toBe(165);
+  });
+
+  it("settled files that outlive many failed deletes are still counted once", async () => {
+    // Each settle crashes (here: fails) between its ledger write and its file delete, more
+    // times than the settled-key list keeps by default.
+    const rm = spyOn(fs, "rm").mockRejectedValue(new Error("EIO"));
+    try {
+      for (let index = 0; index < 70; index++) {
+        const key = `key-${index}`;
+        await service.recordInFlightUsage(workspaceId, key, `msg-${index}`, MODEL, usage(1, 0));
+        await service.recordUsage(workspaceId, MODEL, usage(1, 0), { settlesInFlightKey: key });
+      }
+    } finally {
+      rm.mockRestore();
+    }
+    expect(await inFlightFiles()).toHaveLength(70);
+    expect(tokens(await restartedService().getSessionUsage(workspaceId))).toBe(70);
+    expect(await inFlightFiles()).toEqual([]);
   });
 
   it("a settle folds older leftovers in the same ledger write", async () => {
