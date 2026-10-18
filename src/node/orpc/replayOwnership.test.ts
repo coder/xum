@@ -252,8 +252,9 @@ test("an aborted replay cannot publish its delayed window to another subscriber"
 // and on Node 24+ (AsyncContextFrame, the default there, and Electron 44 runs Node 24). Only
 // Bun 1.3.13 and older and Node 22 hide it from that continuation too. Bun 1.4.2 adopted Node
 // 24's semantics, so no upstream fix will lift this gate (checked 2026-10-15).
-// Removal trigger: the tripwire in the test fails. Then the pinned Bun hides the resumed store
-// again: make the release assertion unconditional and delete this probe and the tripwire.
+// Removal trigger: the probe stops matching the version rule (BUN_KEEPS_RESUMED_STORE_SINCE), so
+// the tripwire in the test fails. If the pinned Bun then hides the resumed store again, make the
+// release assertion unconditional and delete this probe and the tripwire.
 const BUN_KEEPS_RESUMED_STORE_SINCE = "1.4.2";
 async function disableHidesResumedStore(): Promise<boolean> {
   const storage = new AsyncLocalStorage<object>();

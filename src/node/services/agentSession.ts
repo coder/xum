@@ -2162,8 +2162,11 @@ export class AgentSession {
       try {
         this.coordinator.dispose();
       } finally {
-        // Release Node's async-context registration only after late replay events
-        // are suppressed; disabling while merely closing could broadcast them live.
+        // disable() hides the replay store from code that runs after it. A replay
+        // continuation that was already waiting still sees its store on Node 24 (Electron 44)
+        // and Bun 1.4.2+, so emitChatEvent's early return after dispose is what drops late
+        // replay events. Disable only after that latch: disabling while merely closing
+        // could broadcast them live.
         if (this.coordinator.disposed) this.replayPublication.disable();
       }
     });
