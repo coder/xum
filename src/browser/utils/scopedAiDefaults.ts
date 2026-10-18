@@ -52,8 +52,11 @@ function selectServerDefault<F extends ScopedAiField>(
 
 /**
  * A creation draft owns its choices (the record): they travel with a project change and never
- * write the project's defaults. A field the draft never set (an imported old draft has none) shows
- * its project's default, as the old composer did.
+ * write the project's defaults. A model or thinking level the draft never set (an imported old
+ * draft has none) shows its project's default, as the old composer did. The agent is not filled
+ * from the project: nothing writes project agent defaults since drafts own their choices, so a
+ * stored one is a stale leftover the user cannot see or clear. New chats follow the Settings
+ * default agent instead (AgentContext falls back to it).
  */
 function readCreationDraftDefault<F extends ScopedAiField>(
   draftId: string,
@@ -66,7 +69,7 @@ function readCreationDraftDefault<F extends ScopedAiField>(
   const value: AiDefaults = {
     model: draft.ai.model ?? project?.model,
     thinkingLevel: draft.ai.thinkingLevel ?? project?.thinkingLevel,
-    agentId: draft.execution?.agent?.id ?? project?.agentId,
+    agentId: draft.execution?.agent?.id,
   };
   return value[field];
 }

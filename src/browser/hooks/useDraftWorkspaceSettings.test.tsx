@@ -110,13 +110,15 @@ describe("useDraftWorkspaceSettings", () => {
     });
   });
 
-  test("prefers project agent over global default", async () => {
+  // A stale project agent (nothing writes it since drafts own their choices) must not override
+  // the Settings default agent that new chats start with.
+  test("an unpicked draft agent uses the global default over a stale project agent", async () => {
     const projectPath = "/tmp/project";
 
     const wrapper = createWrapper(projectPath, {
       ai: {
-        globalDefaults: { agentId: "ask" },
-        projectDefaults: { [projectPath]: { agentId: "plan" } },
+        globalDefaults: { agentId: "plan" },
+        projectDefaults: { [projectPath]: { agentId: "ask" } },
       },
     });
 
@@ -129,6 +131,13 @@ describe("useDraftWorkspaceSettings", () => {
 
     await waitFor(() => {
       expect(result.current.settings.agentId).toBe("plan");
+    });
+
+    act(() => {
+      getCreationDraftStore().updateExecution(draftId, { agent: { id: "ask", scope: "project" } });
+    });
+    await waitFor(() => {
+      expect(result.current.settings.agentId).toBe("ask");
     });
   });
 

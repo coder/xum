@@ -239,10 +239,9 @@ export function useDraftWorkspaceSettings(
     WORKSPACE_DEFAULTS.agentId;
   const choices = useDraftChoices(draftId);
   const execution = choices.execution;
-  const projectAgentId = useUserPreferences(
-    (preferences) => preferences.ai?.projectDefaults?.[projectPath]?.agentId
-  );
-  const draftAgentId = choices.agentId ?? projectAgentId;
+  // Not the project's stored agent: it is a stale leftover nothing writes anymore, and new chats
+  // follow the Settings default agent, matching the picker (scopedAiDefaults).
+  const draftAgentId = choices.agentId;
   const agentId =
     typeof draftAgentId === "string" && draftAgentId.trim().length > 0
       ? coerceAgentId(draftAgentId)

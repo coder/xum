@@ -1146,9 +1146,7 @@ export function TasksSection() {
           <div className="flex items-center justify-between gap-4">
             <div className="flex-1">
               <div className="text-foreground text-sm">Default new-workspace agent</div>
-              <div className="text-muted text-xs">
-                Applies when a project does not have its own agent preference yet.
-              </div>
+              <div className="text-muted text-xs">New chats start with this agent.</div>
             </div>
             <Select
               value={newWorkspaceDefaultAgentId}
