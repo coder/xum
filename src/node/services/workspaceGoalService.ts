@@ -76,6 +76,8 @@ import {
   type GoalContinuationSkipReason,
   type GoalStreamOriginKind,
 } from "./goalContinuationPolicy";
+import type { SessionUsageFile, SessionUsageService } from "./sessionUsageService";
+import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 
 const GOAL_FILE = "goal.json";
 const GOAL_BOARD_FILE = "goal-board.json";
@@ -606,6 +608,11 @@ export interface WorkspaceGoalServiceOptions {
   allowUserOriginBudgetWrapup?: boolean;
   /** Prevent setGoal from queuing an automatic kickoff when the CLI sends its own message. */
   suppressKickoffContinuation?: boolean;
+  /**
+   * The workspace cost ledger. With it, a goal's cost is the ledger total minus the goal's
+   * ledgerBaselineUsd; without it (unit tests), stream ends and child reports add their cost.
+   */
+  sessionUsage?: Pick<SessionUsageService, "getSessionUsageBatch">;
 }
 
 export class WorkspaceGoalService {
@@ -613,6 +620,7 @@ export class WorkspaceGoalService {
   private readonly continuationCooldownMs: number;
   private readonly allowUserOriginBudgetWrapup: boolean;
   private readonly suppressKickoffContinuation: boolean;
+  private readonly sessionUsage?: Pick<SessionUsageService, "getSessionUsageBatch">;
   private readonly pendingGoalMutations = new Map<string, PendingGoalMutation>();
   private readonly pendingGoalSnapshots = new Map<string, GoalSnapshot>();
   private readonly liveGoalPreviewSnapshots = new Map<string, GoalSnapshot>();
@@ -829,6 +837,7 @@ export class WorkspaceGoalService {
       options.continuationCooldownMs ?? DEFAULT_GOAL_CONTINUATION_COOLDOWN_MS;
     this.allowUserOriginBudgetWrapup = options.allowUserOriginBudgetWrapup === true;
     this.suppressKickoffContinuation = options.suppressKickoffContinuation === true;
+    this.sessionUsage = options.sessionUsage;
     assert(
       Number.isFinite(this.continuationCooldownMs) && this.continuationCooldownMs >= 0,
       "WorkspaceGoalService requires a non-negative continuation cooldown"
@@ -1489,7 +1498,8 @@ export class WorkspaceGoalService {
     return status === "active" ? applyBudgetDrivenStatus(goal, { nowMs: Date.now() }) : goal;
   }
 
-  private async writeGoal(workspaceId: string, goal: GoalRecordV1): Promise<void> {
+  private async writeGoal(workspaceId: string, goalToWrite: GoalRecordV1): Promise<void> {
+    const goal = await this.withLedgerBaseline(workspaceId, goalToWrite);
     const filePath = this.getFilePath(workspaceId);
     await fs.mkdir(path.dirname(filePath), { recursive: true });
     await writeFileAtomic(filePath, `${JSON.stringify(goal, null, 2)}\n`, "utf-8");
@@ -3248,6 +3258,82 @@ export class WorkspaceGoalService {
       costCents: Math.round(costMicroCents / MICRO_CENTS_PER_CENT),
       costMicroCents,
     };
+  }
+
+  /**
+   * The goal's durable cost: the workspace ledger total minus the goal's baseline, so a turn
+   * killed by a restart, spend while paused and attributed children all count, whatever
+   * stream end charged. It never goes down (a rebuilt or missing ledger cannot relax a
+   * budget). A goal without a baseline yet (an older Xum wrote it) adds `fallbackDeltaMicroCents`
+   * as before; its next write pins the baseline at that cost.
+   */
+  private async accountGoalCost(
+    workspaceId: string,
+    goal: GoalRecordV1,
+    fallbackDeltaMicroCents: number,
+    attributedChildren: readonly string[] = goal.attributedChildren
+  ): Promise<Pick<GoalRecordV1, "costCents" | "costMicroCents">> {
+    const baselineUsd = goal.ledgerBaselineUsd;
+    if (baselineUsd === undefined || !this.sessionUsage) {
+      return this.applyCostAccounting(goal, fallbackDeltaMicroCents);
+    }
+    const ledgerUsd = await this.readGoalLedgerUsd(workspaceId, attributedChildren);
+    const costMicroCents = Math.max(
+      getGoalCostMicroCents(goal),
+      costUsdToMicroCents(ledgerUsd - baselineUsd)
+    );
+    return { costCents: Math.round(costMicroCents / MICRO_CENTS_PER_CENT), costMicroCents };
+  }
+
+  /**
+   * Ledger total (USD) a goal is measured on: the workspace's session-usage.json (including
+   * killed turns' in-flight files and rolled-up children) plus attributed children not yet
+   * rolled up. Lock-free (atomic-rename reads), so it is safe under the goal file lock, which
+   * is the same per-workspace lock SessionUsageService takes. A missing ledger counts as 0
+   * (the cost never goes down, see accountGoalCost). `includeLiveStreams` also counts this process's running streams (baselines).
+   */
+  private async readGoalLedgerUsd(
+    workspaceId: string,
+    attributedChildren: readonly string[],
+    includeLiveStreams = false
+  ): Promise<number> {
+    assert(this.sessionUsage, "readGoalLedgerUsd requires the session usage ledger");
+    const usageByWorkspace = await this.sessionUsage.getSessionUsageBatch(
+      [workspaceId, ...attributedChildren],
+      { includeLiveStreams }
+    );
+    const parent = usageByWorkspace[workspaceId];
+    const ledgerUsd = (file: SessionUsageFile | undefined) =>
+      getTotalCost(sumUsageHistory(Object.values(file?.byModel ?? {}))) ?? 0;
+    let totalUsd = ledgerUsd(parent);
+    for (const childId of attributedChildren) {
+      // A rolled-up child is in the parent's byModel already.
+      if (parent?.rolledUpFrom?.[childId] == null) totalUsd += ledgerUsd(usageByWorkspace[childId]);
+    }
+    return totalUsd;
+  }
+
+  /** Re-reads a non-running goal's cost from the ledger; writes only when it changed. */
+  private async recostIdleGoal(workspaceId: string, goal: GoalRecordV1): Promise<GoalRecordV1> {
+    if (goal.ledgerBaselineUsd === undefined || !this.sessionUsage) return goal;
+    const cost = await this.accountGoalCost(workspaceId, goal, 0);
+    if (cost.costMicroCents === getGoalCostMicroCents(goal)) return goal;
+    const next = GoalRecordV1Schema.parse({ ...goal, ...cost });
+    await this.writeGoal(workspaceId, next);
+    return next;
+  }
+
+  /**
+   * Pins ledgerBaselineUsd on a goal that has none (a new goal, or one an older Xum wrote) so
+   * its current cost is the ledger total minus the baseline. The baseline counts this
+   * process's running streams: steps finished before a goal created mid-turn are not its spend.
+   */
+  private async withLedgerBaseline(workspaceId: string, goal: GoalRecordV1): Promise<GoalRecordV1> {
+    if (goal.ledgerBaselineUsd !== undefined || !this.sessionUsage) return goal;
+    const ledgerUsd = await this.readGoalLedgerUsd(workspaceId, goal.attributedChildren, true);
+    const ledgerBaselineUsd =
+      ledgerUsd - getGoalCostMicroCents(goal) / (100 * MICRO_CENTS_PER_CENT);
+    return { ...goal, ledgerBaselineUsd };
   }
 
   private emitBudgetLimited(
@@ -5116,8 +5202,11 @@ export class WorkspaceGoalService {
               : originKind;
           this.recordLastGoalStream(input.workspaceId, stampOriginKind, current.goalId);
         }
-        await this.pushSnapshot(input.workspaceId, current);
-        return current;
+        // The goal's cost still follows the ledger (spend while paused counts), without a
+        // turn, an updatedAtMs bump or a budget transition: resuming re-checks the budget.
+        const recosted = await this.recostIdleGoal(input.workspaceId, current);
+        await this.pushSnapshot(input.workspaceId, recosted);
+        return recosted;
       }
 
       // Only count goal-attributable turns. A rare `user`-origin stream that
@@ -5125,7 +5214,7 @@ export class WorkspaceGoalService {
       const turnsDelta = originKind === "user" ? 0 : 1;
       const accounted = GoalRecordV1Schema.parse({
         ...current,
-        ...this.applyCostAccounting(current, costMicroCentsThisStream),
+        ...(await this.accountGoalCost(input.workspaceId, current, costMicroCentsThisStream)),
         turnsUsed: current.turnsUsed + turnsDelta,
         updatedAtMs: Date.now(),
       });
@@ -5182,11 +5271,17 @@ export class WorkspaceGoalService {
         return skippedChildAttribution(current);
       }
 
+      const attributedChildren = [...current.attributedChildren, input.childWorkspaceId];
       const accounted = GoalRecordV1Schema.parse({
         ...current,
-        ...this.applyCostAccounting(current, input.childCostCents * MICRO_CENTS_PER_CENT),
+        ...(await this.accountGoalCost(
+          input.parentWorkspaceId,
+          current,
+          input.childCostCents * MICRO_CENTS_PER_CENT,
+          attributedChildren
+        )),
         turnsUsed: current.turnsUsed + 1,
-        attributedChildren: [...current.attributedChildren, input.childWorkspaceId],
+        attributedChildren,
         updatedAtMs: Date.now(),
       });
       // Tag the budget-limit transition so post-restart recovery knows the

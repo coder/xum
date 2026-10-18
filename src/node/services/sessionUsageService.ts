@@ -1017,7 +1017,9 @@ export class SessionUsageService {
    * Optimized for displaying costs in archived workspaces list.
    */
   async getSessionUsageBatch(
-    workspaceIds: string[]
+    workspaceIds: string[],
+    /** Also add this process's running streams (see getSessionUsage). */
+    options?: { includeLiveStreams?: boolean }
   ): Promise<Record<string, SessionUsageFile | undefined>> {
     const results: Record<string, SessionUsageFile | undefined> = {};
     // Read files in parallel without rebuilding from messages (archived workspaces
@@ -1038,7 +1040,7 @@ export class SessionUsageService {
           workspaceId,
           settled ?? this.createEmptyUsageFile(),
           entries,
-          false
+          options?.includeLiveStreams === true
         );
         results[workspaceId] = settled === undefined && addedCount === 0 ? undefined : view;
       })

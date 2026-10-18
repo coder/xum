@@ -250,7 +250,7 @@ export const TurnRequestBuilderBindingsLive = Layer.sync(
 );
 
 // ---------------------------------------------------------------------------
-// S2a — need S1 leaves.
+// S2a — need S1 leaves (WorkspaceGoal also needs SessionUsage).
 // ---------------------------------------------------------------------------
 
 // Providers config accessor enables mappedToModel alias resolution for
@@ -269,12 +269,14 @@ export const WorkspaceGoalLive = Layer.effect(
   WorkspaceGoal,
   Effect.gen(function* () {
     const opts = yield* CoreOptionsTag;
+    const sessionUsage = yield* SessionUsage;
     return new WorkspaceGoalService(
       yield* ConfigTag,
       yield* History,
       yield* ExtensionMetadata,
       opts.analyticsService,
-      opts.goalServiceOptions,
+      // A goal's cost is measured on the workspace cost ledger.
+      { ...opts.goalServiceOptions, sessionUsage },
       yield* ProvidersConfigStoreTag
     );
   })
@@ -732,7 +734,10 @@ const S1 = Layer.mergeAll(
   IdleDispatcherLive,
   TurnRequestBuilderBindingsLive
 );
-const S2a = Layer.mergeAll(SessionUsageLive, WorkspaceGoalLive).pipe(Layer.provideMerge(S1));
+// WorkspaceGoal measures goal cost on the SessionUsage ledger.
+const S2a = WorkspaceGoalLive.pipe(
+  Layer.provideMerge(SessionUsageLive.pipe(Layer.provideMerge(S1)))
+);
 const S2b = StreamManagerLive.pipe(Layer.provideMerge(S2a));
 const S3 = AILive.pipe(Layer.provideMerge(S2b));
 const S4 = Layer.mergeAll(MemoryConsolidationLive, MCPConfigLive, ContextManagementLive).pipe(

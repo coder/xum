@@ -44,6 +44,12 @@ export const GoalRecordV1Schema = z.object({
   // Total cost in millionths of a cent. Public snapshots still expose whole
   // cents, but persisted goal accounting must not discard sub-cent turns.
   costMicroCents: z.number().int().nonnegative().optional(),
+  // Workspace cost-ledger total (USD) the goal's cost is measured from: its cost is the
+  // ledger total now (session-usage.json, killed turns' in-flight files, attributed
+  // children) minus this. Pinned at the first write (creation, or the first write of a goal
+  // an older Xum wrote, so its stream-end-charged cost carries over). Optional: older Xum
+  // drops it, and the next write pins it again from the cost it kept.
+  ledgerBaselineUsd: z.number().finite().optional(),
   turnsUsed: z.number().int().nonnegative(),
   attributedChildren: z.array(z.string()),
   budgetLimitInjectedForGoalId: z.string().uuid().nullable(),
