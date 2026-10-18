@@ -3250,7 +3250,13 @@ export class TaskService implements AgentTaskIntegration {
   /** Phase A recorded a durable stop marker for this workspace (see WorkspaceStopRecord). */
   private markWorkspaceStopPersisted(workspaceId: string): void {
     const record = this.workspaceStopRecords.get(workspaceId);
-    if (record != null) record.stopPersisted = true;
+    if (record == null) return;
+    record.stopPersisted = true;
+    // A deferred child stream end cancels on this notification (the stop is in progress), so its
+    // pending decision cannot hold the latch. Every caller runs after its durable status write,
+    // on every branch, including those that skip recordTaskInterrupted: a terminate whose removal
+    // keeps the workspace (#6920), or a status already interrupted by an archive (#6967).
+    this.notifyAttemptSettlementListeners(workspaceId);
   }
 
   /**
@@ -11562,10 +11568,6 @@ export class TaskService implements AgentTaskIntegration {
           { allowMissing: true }
         );
         this.markWorkspaceStopPersisted(id);
-        // A deferred child stream end cancels on this notification (its epoch moved), so its
-        // pending decision cannot hold the latch when the removal below keeps the workspace
-        // (#6920). The Stop and terminate-all paths notify through recordTaskInterrupted.
-        this.notifyAttemptSettlementListeners(id);
       }
     } finally {
       // Phase B: every stop at once, bounded per child and in aggregate; a timed-out stop keeps
