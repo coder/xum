@@ -1723,6 +1723,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         if (editingMessageForUi) {
           return;
         }
+        // #6866: a replace is not typing (see restoreText), with or without files.
+        getDraftStore().markSendEdited(draftScope);
         if (hasFileParts || hasStagedAttachments || hasReviews) {
           restoreDraft(restoredPending);
         } else {

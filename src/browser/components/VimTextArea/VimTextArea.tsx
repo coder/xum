@@ -96,8 +96,10 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
     const insertStartSnapshotRef = useRef<vim.VimHistorySnapshot | null>(null);
     const lastEditRef = useRef<vim.LastEdit | null>(null);
     const cursorRef = useRef<number>(0);
-    // #6866: the DOM caret moves to the Vim cursor in a timeout after each handled key. Until it
-    // does, the next key must read the cursor from cursorRef, not from the DOM selection.
+    // #6866: the DOM caret moves to the Vim cursor in a timeout after each handled key. Until the
+    // newest move runs, the next key must read the cursor from cursorRef, not from the DOM
+    // selection. Each move carries its generation: an older one that runs late does nothing.
+    const selectionGenerationRef = useRef(0);
     const selectionPendingRef = useRef(false);
 
     useAutoResizeTextarea(textareaRef, value, 50, rest.className);
@@ -110,7 +112,11 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
       return { start: el.selectionStart, end: el.selectionEnd };
     };
 
-    const applyDomSelection = (next: Pick<vim.VimState, "cursor" | "mode" | "visualAnchor">) => {
+    const applyDomSelection = (
+      next: Pick<vim.VimState, "cursor" | "mode" | "visualAnchor">,
+      generation: number
+    ) => {
+      if (generation !== selectionGenerationRef.current) return;
       selectionPendingRef.current = false;
       const el = textareaRef.current;
       // Unmounted before the timeout ran.
@@ -257,7 +263,8 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
 
       // Apply DOM selection after React state updates (important for mode transitions)
       selectionPendingRef.current = true;
-      setTimeout(() => applyDomSelection(newState), 0);
+      const generation = ++selectionGenerationRef.current;
+      setTimeout(() => applyDomSelection(newState, generation), 0);
     };
 
     const textareaStyle: React.CSSProperties = {

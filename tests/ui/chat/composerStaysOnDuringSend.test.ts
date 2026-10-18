@@ -249,6 +249,45 @@ describe("composer during an unsettled send (#6259)", () => {
     }
   }, 120_000);
 
+  // Several keys can come before their caret moves run. An older caret move that runs between two
+  // keys must not move the cursor back for the next key.
+  test("an older Vim caret move does not undo a newer one", async () => {
+    const app = await createAppHarness({ branchPrefix: "composer-vim-caret-order" });
+    const realSetTimeout = globalThis.setTimeout;
+    let held: (() => void)[] | null = null;
+    const spy = jest.spyOn(globalThis, "setTimeout").mockImplementation(((
+      callback: () => void,
+      delay?: number
+    ) => {
+      if (held !== null && (delay ?? 0) === 0) {
+        held.push(callback);
+        return 0;
+      }
+      return realSetTimeout(callback, delay);
+    }) as typeof setTimeout);
+    try {
+      act(() => updateUserPreferences({ appearance: { vimEnabled: true } }));
+      await waitFor(() => expect(getUserPreferences().appearance?.vimEnabled).toBe(true), WAIT);
+      await app.chat.typeWithoutSending("abc");
+      held = [];
+      pressVimKeys(app, ["Escape"]);
+      const afterEscape = held;
+      held = [];
+      pressVimKeys(app, ["h"]);
+      const afterH = held;
+      held = null;
+      // Escape's caret move runs, then `x` comes before the move of `h`.
+      act(() => afterEscape.forEach((run) => run()));
+      pressVimKeys(app, ["x"]);
+      act(() => afterH.forEach((run) => run()));
+      expect(composer(app).value).toBe("ac");
+    } finally {
+      spy.mockRestore();
+      act(() => updateUserPreferences({ appearance: { vimEnabled: false } }));
+      await app.dispose();
+    }
+  }, 120_000);
+
   // Commands clear or replace the composer text themselves, so a slash send keeps the lock until
   // it took its draft.
   test("a slash command send still locks typing until it took its draft", async () => {
@@ -360,6 +399,22 @@ describe("composer during an unsettled send (#6259)", () => {
             createCustomEvent(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, {
               text: "yes please",
               mode: "replace",
+            })
+          );
+        });
+      });
+      expect(value).toBe("yes please");
+    }, 120_000);
+
+    // A replace with files (Compact & retry passes the source's file parts) takes another path.
+    test("a replace with a file keeps the whole new text", async () => {
+      const value = await editBeforeTake("yes", () => {
+        act(() => {
+          window.dispatchEvent(
+            createCustomEvent(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, {
+              text: "yes please",
+              mode: "replace",
+              fileParts: [{ url: "data:image/png;base64,iVBORw0KGgo=", mediaType: "image/png" }],
             })
           );
         });
