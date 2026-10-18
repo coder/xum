@@ -1039,8 +1039,10 @@ describe("useAutoScroll", () => {
       clientHeight: 400,
       initialScrollTop: scrollTop,
     });
-    const rectAt = (top: number, height: number) =>
-      ({ top, bottom: top + height, height, left: 0, right: 0, width: 0, x: 0, y: top }) as DOMRect;
+    const rectAt = (top: number, height: number): DOMRect => {
+      const r = { top, bottom: top + height, height, left: 0, right: 0, width: 0, x: 0, y: top };
+      return { ...r, toJSON: () => r };
+    };
     element.getBoundingClientRect = () => rectAt(0, 400);
     const content = document.createElement("div");
     element.append(content);

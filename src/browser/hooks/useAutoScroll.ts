@@ -1,4 +1,11 @@
-import type { KeyboardEvent, MouseEvent, UIEvent, WheelEvent } from "react";
+import type {
+  KeyboardEvent,
+  MouseEvent,
+  MutableRefObject,
+  RefObject,
+  UIEvent,
+  WheelEvent,
+} from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 const BOTTOM_LOCK_EPSILON_PX = 1;
@@ -50,6 +57,35 @@ function findReadingRow(scrollport: HTMLElement): { element: HTMLElement; top: n
   if (!element) return null;
   const top = element.getBoundingClientRect().top;
   return top < view.bottom ? { element, top } : null;
+}
+
+/**
+ * Holds the row the reader sees first while the transcript is released (#6773, see useAutoScroll).
+ * `snapshotReadingRow` records it and its top. `holdReadingRow` moves `scrollTop` by however far
+ * that row moved since, then records again.
+ */
+function useReadingRowHold(
+  contentRef: RefObject<HTMLDivElement | null>,
+  lastScrollTopRef: MutableRefObject<number>
+) {
+  const readingRowRef = useRef<{ element: HTMLElement; top: number } | null>(null);
+  const snapshotReadingRow = useCallback(() => {
+    readingRowRef.current = contentRef.current ? findReadingRow(contentRef.current) : null;
+  }, [contentRef]);
+  const holdReadingRow = useCallback(() => {
+    const scrollContainer = contentRef.current;
+    const reading = readingRowRef.current;
+    if (scrollContainer && reading?.element.isConnected) {
+      const delta = reading.element.getBoundingClientRect().top - reading.top;
+      if (delta !== 0) {
+        scrollContainer.scrollTop += delta;
+        // Not a user scroll toward the bottom: keep handleScroll's direction check neutral.
+        lastScrollTopRef.current = scrollContainer.scrollTop;
+      }
+    }
+    snapshotReadingRow();
+  }, [contentRef, lastScrollTopRef, snapshotReadingRow]);
+  return { snapshotReadingRow, holdReadingRow };
 }
 
 function getMaxScrollTop(element: HTMLElement): number {
@@ -158,24 +194,7 @@ export function useAutoScroll() {
   // what lets a slow wheel-up gesture release the lock on the first tick
   // without the relock heuristic snapping it back to the bottom mid-gesture.
   const lastScrollTopRef = useRef(0);
-  // The row the reader sees first while released (see the doc comment), and its top.
-  const readingRowRef = useRef<{ element: HTMLElement; top: number } | null>(null);
-  const snapshotReadingRow = useCallback(() => {
-    readingRowRef.current = contentRef.current ? findReadingRow(contentRef.current) : null;
-  }, []);
-  const holdReadingRow = useCallback(() => {
-    const scrollContainer = contentRef.current;
-    const reading = readingRowRef.current;
-    if (scrollContainer && reading?.element.isConnected) {
-      const delta = reading.element.getBoundingClientRect().top - reading.top;
-      if (delta !== 0) {
-        scrollContainer.scrollTop += delta;
-        // Not a user scroll toward the bottom: keep handleScroll's direction check neutral.
-        lastScrollTopRef.current = scrollContainer.scrollTop;
-      }
-    }
-    snapshotReadingRow();
-  }, [snapshotReadingRow]);
+  const { snapshotReadingRow, holdReadingRow } = useReadingRowHold(contentRef, lastScrollTopRef);
 
   const setAutoScrollEnabled = useCallback((enabled: boolean) => {
     autoScrollRef.current = enabled;

@@ -42,7 +42,7 @@ class CapturingResizeObserver {
 
 function rect(top: number, height: number): DOMRect {
   const r = { top, bottom: top + height, height, left: 0, right: 800, width: 800, x: 0, y: top };
-  return { ...r, toJSON: () => r } as DOMRect;
+  return { ...r, toJSON: () => r };
 }
 
 describe("Growth inside a partly visible top row while scrolled up (#6773)", () => {
