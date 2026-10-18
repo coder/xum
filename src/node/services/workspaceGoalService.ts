@@ -103,6 +103,30 @@ const GOAL_HISTORY_FILE = "goal-history.jsonl";
 const GOAL_HISTORY_RENDER_CAP = 200;
 
 const MICRO_CENTS_PER_USD = 100 * MICRO_CENTS_PER_CENT;
+
+function ledgerFileUsd(file: SessionUsageFile | undefined): number {
+  return getTotalCost(sumUsageHistory(Object.values(file?.byModel ?? {}))) ?? 0;
+}
+
+/**
+ * A child rolled up after the goal began without being attributed to it (an unrelated
+ * sub-agent removed later) brings its whole history into the parent's byModel: not the
+ * goal's spend. Legacy `true` entries carry no time and predate any goal with a baseline.
+ */
+function unattributedRollupUsd(
+  rolledUpFrom: NonNullable<SessionUsageFile["rolledUpFrom"]>,
+  sinceMs: number,
+  attributedChildren: readonly string[]
+): number {
+  let totalUsd = 0;
+  for (const [childId, entry] of Object.entries(rolledUpFrom)) {
+    if (entry === true || entry.rolledUpAtMs < sinceMs || attributedChildren.includes(childId)) {
+      continue;
+    }
+    totalUsd += entry.totalCostUsd ?? 0;
+  }
+  return totalUsd;
+}
 /** Float noise between a baseline and the cost it was pinned from; far below a cent. */
 const LEDGER_REGRESSION_TOLERANCE_MICRO_CENTS = 1_000;
 
@@ -3284,7 +3308,11 @@ export class WorkspaceGoalService {
     if (baselineUsd === undefined || !this.sessionUsage) {
       return this.applyCostAccounting(goal, fallbackDeltaMicroCents);
     }
-    const { totalUsd, hasLedger } = await this.readGoalLedgerUsd(workspaceId, attributedChildren);
+    const { totalUsd, hasLedger } = await this.readGoalLedgerUsd(
+      workspaceId,
+      goal,
+      attributedChildren
+    );
     // No ledger file (deleted, e.g. by a config migration, until a read rebuilds it): charge
     // this event as before, and measure again once the ledger is back.
     if (!hasLedger) return this.applyCostAccounting(goal, fallbackDeltaMicroCents);
@@ -3314,21 +3342,24 @@ export class WorkspaceGoalService {
    */
   private async readGoalLedgerUsd(
     workspaceId: string,
+    goal: Pick<GoalRecordV1, "createdAtMs">,
     attributedChildren: readonly string[],
     includeLiveStreams = false
   ): Promise<{ totalUsd: number; hasLedger: boolean }> {
     assert(this.sessionUsage, "readGoalLedgerUsd requires the session usage ledger");
-    const usageByWorkspace = await this.sessionUsage.getSessionUsageBatch(
-      [workspaceId, ...attributedChildren],
-      { includeLiveStreams }
-    );
-    const parent = usageByWorkspace[workspaceId];
-    const ledgerUsd = (file: SessionUsageFile | undefined) =>
-      getTotalCost(sumUsageHistory(Object.values(file?.byModel ?? {}))) ?? 0;
-    let totalUsd = ledgerUsd(parent);
-    for (const childId of attributedChildren) {
-      // A rolled-up child is in the parent's byModel already.
-      if (parent?.rolledUpFrom?.[childId] == null) totalUsd += ledgerUsd(usageByWorkspace[childId]);
+    const options = { includeLiveStreams };
+    const parent = (await this.sessionUsage.getSessionUsageBatch([workspaceId], options))[
+      workspaceId
+    ];
+    const rolledUpFrom = parent?.rolledUpFrom ?? {};
+    let totalUsd =
+      ledgerFileUsd(parent) -
+      unattributedRollupUsd(rolledUpFrom, goal.createdAtMs, attributedChildren);
+    // A rolled-up child is in the parent's byModel already; read only the others.
+    const liveChildren = attributedChildren.filter((childId) => rolledUpFrom[childId] == null);
+    if (liveChildren.length > 0) {
+      const children = await this.sessionUsage.getSessionUsageBatch(liveChildren, options);
+      for (const childId of liveChildren) totalUsd += ledgerFileUsd(children[childId]);
     }
     return { totalUsd, hasLedger: parent !== undefined };
   }
@@ -3343,7 +3374,9 @@ export class WorkspaceGoalService {
     const eligible = goal.status === "active" || goal.status === "paused";
     if (!eligible || goal.ledgerBaselineUsd === undefined || !this.sessionUsage) return goal;
     const cost = await this.accountGoalCost(workspaceId, goal, 0);
-    if (cost.costMicroCents === getGoalCostMicroCents(goal)) return goal;
+    const rebased =
+      cost.ledgerBaselineUsd !== undefined && cost.ledgerBaselineUsd !== goal.ledgerBaselineUsd;
+    if (!rebased && cost.costMicroCents === getGoalCostMicroCents(goal)) return goal;
     return GoalRecordV1Schema.parse({ ...goal, ...cost });
   }
 
@@ -3363,6 +3396,7 @@ export class WorkspaceGoalService {
     if (goal.ledgerBaselineUsd !== undefined || !this.sessionUsage) return goal;
     const { totalUsd: ledgerUsd, hasLedger } = await this.readGoalLedgerUsd(
       workspaceId,
+      goal,
       goal.attributedChildren,
       true
     );

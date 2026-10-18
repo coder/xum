@@ -244,6 +244,39 @@ describe("WorkspaceGoalService ledger cost", () => {
     expect(later?.costCents).toBe(250);
   });
 
+  test("an unattributed child rolled up after the goal began is not the goal's spend", async () => {
+    await usage.recordUsage(workspaceId, MODEL, costing(0.1));
+    // The child's spend is older than the goal.
+    await usage.recordUsage(childId, MODEL, costing(4));
+    const service = newGoalService();
+    await setGoalOk(service, { workspaceId, objective: "Unrelated child", budgetCents: 300 });
+    const childUsage = await usage.getSessionUsage(childId);
+    await usage.rollUpUsageIntoParent(workspaceId, childId, childUsage!.byModel);
+    await usage.recordUsage(workspaceId, MODEL, costing(1));
+    const goal = await service.getGoal(workspaceId);
+    expect(goal).toMatchObject({ status: "active", costCents: 100 });
+  });
+
+  test("a rebase on a lower ledger is kept when the cost itself does not change", async () => {
+    await usage.recordUsage(workspaceId, MODEL, costing(5), { skipLastRequestUpdate: true });
+    const service = newGoalService();
+    const created = await setGoalOk(service, { workspaceId, objective: "Rebase" });
+    await usage.recordUsage(workspaceId, MODEL, costing(1));
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    // The ledger is rebuilt lower ($0 here), then a read normalizes the goal.
+    await fs.rm(path.join(config.sessionsDir, workspaceId, "session-usage.json"));
+    await usage.recordUsage(workspaceId, MODEL, costing(0.25), { skipLastRequestUpdate: true });
+    expect((await service.getGoal(workspaceId))?.costCents).toBe(100);
+    // Paused-period (here: headless) spend after the rebase counts.
+    await usage.recordUsage(workspaceId, MODEL, costing(0.5), { skipLastRequestUpdate: true });
+    expect((await service.getGoal(workspaceId))?.costCents).toBe(150);
+  });
+
   test("a goal written before the baseline existed keeps its cost and then follows the ledger", async () => {
     await usage.recordUsage(workspaceId, MODEL, costing(10));
     const service = newGoalService();
