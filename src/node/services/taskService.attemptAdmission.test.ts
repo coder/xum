@@ -3506,16 +3506,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             return Promise.reject(new Error("injected: owned-work probe failed"));
           });
         }
-        // The startup loop has no per-task boundary for a throwing helper: the injected fault
-        // propagates (pre-existing); only the token's disposition is under test here.
-        let thrown: unknown;
-        try {
-          await taskService.recoverInterruptedTasks();
-        } catch (error: unknown) {
-          thrown = error;
-        }
-        expect(thrown).toBeInstanceOf(Error);
-        expect((thrown as Error).message).toContain("injected");
+        // The startup loop contains a throwing re-drive per task (runStartupRedrive); the token's
+        // disposition is what is under test here.
+        await taskService.recoverInterruptedTasks();
         expect(injected).toBe(true);
         expect(rotatedAttemptId).toMatch(ATTEMPT_ID);
         expect(sendMessage).not.toHaveBeenCalled();
