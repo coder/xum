@@ -2900,6 +2900,20 @@ export class StreamManager {
     await this.discardInFlightKey(workspaceId, streamInfo, key);
   }
 
+  /**
+   * A terminal path that recorded no usage (e.g. a completion with no parts) leaves no
+   * in-flight file. An abort is not terminal yet here: cleanupAbortedStream settles it after
+   * processing ends, and until then the file is its only durable record.
+   */
+  private async discardUnsettledSessionUsage(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<void> {
+    if (streamInfo.terminalCompletion != null) {
+      await this.discardInFlightSessionUsage(workspaceId, streamInfo);
+    }
+  }
+
   private async discardInFlightKey(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
@@ -5707,12 +5721,7 @@ export class StreamManager {
       ) {
         this.workspaceStreams.delete(workspaceId);
       }
-      // A terminal path that recorded no usage (e.g. a completion with no parts) leaves no
-      // in-flight file. An abort is not terminal here yet: cleanupAbortedStream settles it
-      // after processing ends, and until then the file is its only durable record.
-      if (streamInfo.terminalCompletion != null) {
-        await this.discardInFlightSessionUsage(workspaceId, streamInfo);
-      }
+      await this.discardUnsettledSessionUsage(workspaceId, streamInfo);
 
       // Lifecycle spine event: emitted from the guaranteed-cleanup path so
       // EVERY terminal outcome (completion, abort/Escape, provider failure)

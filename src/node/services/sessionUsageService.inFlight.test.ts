@@ -159,7 +159,7 @@ describe("SessionUsageService in-flight usage", () => {
 
     expect(await inFlightFiles()).toEqual([]);
     expect((await service.getSessionUsage(workspaceId))?.byModel[MODEL]).toEqual(
-      sumUsageHistory([settled, headless])!
+      sumUsageHistory([settled, headless])
     );
   });
 
@@ -174,7 +174,7 @@ describe("SessionUsageService in-flight usage", () => {
     expect((await readLedgerOnDisk())?.byModel[MODEL]).toEqual(settled);
 
     const folded = await restartedService().getSessionUsage(workspaceId);
-    expect(folded?.byModel[MODEL]).toEqual(sumUsageHistory([settled, running])!);
+    expect(folded?.byModel[MODEL]).toEqual(sumUsageHistory([settled, running]));
   });
 
   it("another live Xum's stream is added to reads but not folded", async () => {

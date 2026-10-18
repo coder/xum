@@ -24,6 +24,7 @@ import {
   SessionUsageTokenStatsCacheSchema,
 } from "@/common/orpc/schemas/chatStats";
 import { isProcessAlive } from "@/node/config/fileLeaseManager";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import type { TokenConsumer } from "@/common/types/chatStats";
 import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
 import type { MuxMessage } from "@/common/types/message";
@@ -139,6 +140,18 @@ interface InFlightUsageEntry {
   file: InFlightUsageFile | undefined;
 }
 
+/** The parsed file; undefined when it is unreadable or malformed. */
+async function readInFlightUsageFile(
+  filePath: string
+): Promise<InFlightUsageFile | undefined | "missing"> {
+  try {
+    const raw: unknown = JSON.parse(await fs.readFile(filePath, "utf-8"));
+    return InFlightUsageFileSchema.safeParse(raw).data;
+  } catch (error) {
+    return isErrnoWithCode(error, "ENOENT") ? "missing" : undefined;
+  }
+}
+
 function addModelUsage(
   byModel: Record<string, ChatUsageDisplay>,
   model: string,
@@ -236,30 +249,18 @@ export class SessionUsageService {
     try {
       names = await fs.readdir(dir);
     } catch (error) {
-      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-        return [];
-      }
+      if (isErrnoWithCode(error, "ENOENT")) return [];
       throw error;
     }
     const entries: InFlightUsageEntry[] = [];
     for (const name of names.sort()) {
       // Skips writeFileAtomic's temp files and anything else that is not ours.
-      if (!name.endsWith(".json")) continue;
-      const key = name.slice(0, -".json".length);
+      const key = name.endsWith(".json") ? name.slice(0, -".json".length) : "";
       if (!IN_FLIGHT_KEY_PATTERN.test(key)) continue;
       const filePath = path.join(dir, name);
-      let file: InFlightUsageFile | undefined;
-      try {
-        file = InFlightUsageFileSchema.safeParse(
-          JSON.parse(await fs.readFile(filePath, "utf-8"))
-        ).data;
-      } catch (error) {
-        if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-          continue; // Settled or discarded since the readdir.
-        }
-        file = undefined;
-      }
-      entries.push({ key, filePath, file });
+      const file = await readInFlightUsageFile(filePath);
+      // "missing": settled or discarded since the readdir.
+      if (file !== "missing") entries.push({ key, filePath, file });
     }
     return entries;
   }
@@ -1033,20 +1034,27 @@ export class SessionUsageService {
       };
     }
 
-    // A leftover in-flight file whose message reached history with usage (its final ledger
-    // write failed after the message was saved) is already counted by this rebuild.
-    for (const entry of await this.readInFlightEntries(workspaceId)) {
-      if (
-        entry.file &&
-        messageIdsWithUsage.has(entry.file.messageId) &&
-        this.isOrphan(workspaceId, entry)
-      ) {
-        withSettledInFlightKey(result, entry.key);
-      }
-    }
+    await this.markInFlightFilesCountedByHistory(workspaceId, result, messageIdsWithUsage);
 
     await this.writeFile(workspaceId, result);
     log.info(`Rebuilt session-usage.json for ${workspaceId} from ${messages.length} messages`);
+  }
+
+  /**
+   * A leftover in-flight file whose message reached history with usage (its final ledger
+   * write failed after the message was saved) is already counted by a rebuild: mark it settled.
+   */
+  private async markInFlightFilesCountedByHistory(
+    workspaceId: string,
+    rebuilt: SessionUsageFile,
+    messageIdsWithUsage: Set<string>
+  ): Promise<void> {
+    for (const entry of await this.readInFlightEntries(workspaceId)) {
+      const messageId = entry.file?.messageId;
+      if (messageId && messageIdsWithUsage.has(messageId) && this.isOrphan(workspaceId, entry)) {
+        withSettledInFlightKey(rebuilt, entry.key);
+      }
+    }
   }
 
   /**
