@@ -3253,9 +3253,10 @@ export class TaskService implements AgentTaskIntegration {
     if (record == null) return;
     record.stopPersisted = true;
     // A deferred child stream end cancels on this notification (the stop is in progress), so its
-    // pending decision cannot hold the latch. Every caller runs after its durable status write,
-    // on every branch, including those that skip recordTaskInterrupted: a terminate whose removal
-    // keeps the workspace (#6920), or a status already interrupted by an archive (#6967).
+    // pending decision cannot hold the latch. Every caller runs after its durable status write, or
+    // where no status is left to write (a removed row, or an already-terminal status that is the
+    // marker), on every branch, including those that skip recordTaskInterrupted: a terminate whose
+    // removal keeps the workspace (#6920), or a status already interrupted by an archive (#6967).
     this.notifyAttemptSettlementListeners(workspaceId);
   }
 
@@ -3693,8 +3694,9 @@ export class TaskService implements AgentTaskIntegration {
    * arbitrateChildGoalAtStreamEnd): accounting completion is authoritative, so nothing is decided
    * from unsettled state and the task is not finalized. The stream's pending decision (held
    * follow-ups keep waiting) moves here; outside the event lock this waits — unbounded — for the
-   * retained receipt to settle, or for the attempt to close / be superseded / be stopped, then
-   * re-runs the original stream end (same event, attempt, turn and stop fences) under the lock.
+   * retained receipt to settle, or for the attempt to close / be superseded / be stopped (or its
+   * row to stop reading running), then re-runs the original stream end (same event, attempt,
+   * turn and stop fences) under the lock.
    */
   private deferChildStreamEnd(
     event: StreamEndEvent,
@@ -3712,7 +3714,12 @@ export class TaskService implements AgentTaskIntegration {
         attemptId == null ||
         !this.attemptAdmissionOpen(taskId, attemptId) ||
         taskOrigin.stopEpoch !== this.getWorkspaceStopEpoch(taskId) ||
-        taskOrigin.executionId !== this.getAgentTaskExecutionId(taskId)
+        taskOrigin.executionId !== this.getAgentTaskExecutionId(taskId) ||
+        // arbitrateChildGoalAtStreamEnd's first gate: a row that no longer reads running (a
+        // report adopted from disk, an archive) can never take a goal turn, so the accounting
+        // decides nothing and the re-run takes the same branch now as after it (#6994).
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace.taskStatus !==
+          "running"
       ) {
         cancelled.resolve();
       }
@@ -14800,6 +14807,9 @@ export class TaskService implements AgentTaskIntegration {
           },
           { allowMissing: true }
         );
+        // After the write resolves, so listeners read the committed `reported`: a deferred child
+        // stream end settles now instead of waiting for its accounting (#6994).
+        this.notifyAttemptSettlementListeners(taskId);
         // Adopting an already-persisted report owns the same terminal cleanup as publication.
         this.clearTaskRecovery(taskId);
         await this.settleChildGoalPause(taskId);
