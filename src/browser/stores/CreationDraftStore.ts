@@ -25,6 +25,7 @@ import { coerceThinkingLevel } from "@/common/types/thinking";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   createDraftId,
+  isDraftTooLargeError,
   sanitizeDraftAttachments,
   summarizeCreationDraft,
 } from "@/common/utils/drafts";
@@ -71,8 +72,8 @@ interface Entry {
   load: CreationDraftLoad;
   /** Whether the backend holds a record: until then, a save sends every field (a create). */
   persisted: boolean;
-  /** A save went out: the backend may hold a record even if the reply was lost, so a clear saves too. */
-  sent: boolean;
+  /** A failed save may still have written the record (its reply was lost), so a clear saves too. */
+  maybeSaved: boolean;
   /** Changed fields not sent yet. */
   pending: CreationDraftPatch;
   /** Never rejects (save records its error). */
@@ -121,7 +122,7 @@ function hasCreationDraftContent(draft: CreationDraft): boolean {
 /** Changes the backend has not got yet that are due to be saved. */
 function hasChangesToSave(entry: Entry): boolean {
   if (!entry.draft || Object.keys(entry.pending).length === 0) return false;
-  return entry.persisted || entry.sent || hasCreationDraftContent(entry.draft);
+  return entry.persisted || entry.maybeSaved || hasCreationDraftContent(entry.draft);
 }
 
 export function createBlankCreationDraft(
@@ -547,7 +548,6 @@ export class CreationDraftStore {
     const client = this.client;
     try {
       if (!client) throw new Error("Not connected.");
-      entry.sent = true;
       await client.drafts.updateCreation({
         scope: { kind: "creation", draftId: id },
         ...patch,
@@ -561,6 +561,8 @@ export class CreationDraftStore {
     } catch (error) {
       entry.saving = false;
       if (this.entries.get(id) !== entry) return;
+      // A refused save wrote nothing; other failures may have.
+      if (client && !isDraftTooLargeError(error)) entry.maybeSaved = true;
       // Later edits win over the fields this save carried.
       entry.pending = { ...patch, ...entry.pending };
       // Lost with a connection that was replaced meanwhile: no error, so flush() saves it again on
@@ -613,7 +615,7 @@ export class CreationDraftStore {
       },
       load,
       persisted,
-      sent: false,
+      maybeSaved: false,
       pending: {},
       inFlight: null,
       saving: false,

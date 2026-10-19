@@ -13,7 +13,8 @@ import {
   getWorkspaceNameStateKey,
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
 } from "@/common/constants/storage";
-import { DRAFT_STORE_READY_TIMEOUT_MS } from "@/constants/drafts";
+import { DRAFT_STORE_READY_TIMEOUT_MS, MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
+import { isDraftTooLargeError } from "@/common/utils/drafts";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { Config } from "@/node/config";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
@@ -204,6 +205,24 @@ describe("CreationDraftStore", () => {
     store.update(id, { text: "" });
     await store.flush(id);
     expect(await service.get(id)).toMatchObject({ text: "" });
+  });
+
+  test("removing the attachment of a refused first save leaves no record", async () => {
+    using tempDir = new TestTempDir("creation-store-refused-first");
+    const harness = await createHarness(tempDir);
+    const { store, service } = harness;
+    await waitFor(() => store.getListState().status === "ready");
+    const id = store.create(PROJECT_A, null);
+    const huge = { ...image, url: `data:image/png;base64,${"A".repeat(MAX_DRAFT_JSON_BYTES)}` };
+    store.update(id, { attachments: [huge] });
+    let refusal: unknown = null;
+    await store.flush(id).catch((error: unknown) => (refusal = error));
+    expect(isDraftTooLargeError(refusal)).toBe(true);
+
+    store.update(id, { attachments: [] });
+    await store.flush(id);
+    expect(await service.get(id)).toBeNull();
+    expect(store.getDraftsByProject()[PROJECT_A]).toBeUndefined();
   });
 
   test("an earlier save reply never replaces a later local edit", async () => {
