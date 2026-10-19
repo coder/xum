@@ -19,7 +19,10 @@ import { ContextManagementService } from "@/node/services/contextManagement/cont
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { InitStateManager } from "@/node/services/initStateManager";
 import type { TurnCompletion } from "@/node/services/streamManager";
-import { readSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
+import {
+  readSubagentReportArtifact,
+  upsertSubagentReportArtifact,
+} from "@/node/services/subagentReportArtifacts";
 import type { TaskService } from "@/node/services/taskService";
 import {
   createTaskServiceStack,
@@ -32,6 +35,7 @@ import {
 } from "@/node/services/taskService.testHarness";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
+import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { WorkspaceService } from "@/node/services/workspaceService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 
@@ -136,7 +140,11 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     for (let i = 0; i < n; i++) await new Promise((resolve) => setTimeout(resolve, 1));
   }
 
-  async function createStack(childId: string, overrides?: Partial<WorkspaceConfigEntry>) {
+  async function createStack(
+    childId: string,
+    overrides?: Partial<WorkspaceConfigEntry>,
+    options?: { workspaceGoalService?: WorkspaceGoalService }
+  ) {
     const { config, historyService } = fixture;
     await fsPromises.mkdir(config.srcDir, { recursive: true });
     const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
@@ -257,6 +265,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       historyService,
       aiService,
       workspaceService: workspaceService as unknown as WorkspaceHost,
+      workspaceGoalService: options?.workspaceGoalService,
     });
     const svc = internals(taskService);
     ledger.svc = svc;
@@ -916,6 +925,97 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await stack.cleanup();
     }
   }, 20_000);
+
+  // #7003: the child's stream end is deferred (its goal accounting has not settled), so the
+  // follow-up queued during that turn is held. Another backend reported the SAME attempt, and the
+  // parent's wait reads its artifact: either the row still reads running and the wait adopts the
+  // report (P1-a), or the other backend's `reported` already landed (P1-b). The held follow-up
+  // must be refused as indeterminate, never dispatched as a new turn of a reported attempt, and
+  // the decision must not wait for the accounting.
+  test.each(["running", "reported"] as const)(
+    "a report read while the stream end is deferred refuses the held follow-up as indeterminate (row %s)",
+    async (rowStatus) => {
+      const childId = rowStatus === "running" ? "holdadopted0001" : "holdadopted0002";
+      const { config, historyService } = fixture;
+      const goals = new WorkspaceGoalService(
+        config,
+        historyService,
+        new ExtensionMetadataService(path.join(config.rootDir, "hold-goal-extension-metadata.json"))
+      );
+      const realWait = goals.waitForStreamAccountingReceipt.bind(goals);
+      spyOn(goals, "waitForStreamAccountingReceipt").mockImplementation((workspaceId, messageId) =>
+        realWait(workspaceId, messageId, 20)
+      );
+      const stack = await createStack(childId, undefined, { workspaceGoalService: goals });
+      const { taskService, svc, workspaceService, completions, sendOptions } = stack;
+      try {
+        expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+        const attemptA = entryOf(config, childId)!.taskAttemptId!;
+        expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+          Ok(undefined)
+        );
+        const onCanceled = mock((_reason: string) => undefined);
+        expect(
+          await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+        ).toEqual(Ok(undefined));
+        // The session opened this stream's accounting receipt; it never settles in this test.
+        goals.beginStreamAccountingReceipt(childId, "assistant-1");
+        stack.endStream(0, {}, true);
+        await until(
+          () => svc.streamEndDecisionsByTaskId.get(childId)?.[0]?.outcome === "pending",
+          "deferred decision"
+        );
+        await yieldMacrotasks(30);
+        expect(svc.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual([
+          "pending",
+        ]);
+        expect(completions).toHaveLength(1);
+
+        if (rowStatus === "reported") {
+          await config.editConfig((cfg) => {
+            for (const project of cfg.projects.values()) {
+              for (const workspace of project.workspaces) {
+                if (workspace.id !== childId) continue;
+                workspace.taskStatus = "reported";
+                workspace.reportedAt = "2026-10-01T00:00:02.000Z";
+              }
+            }
+            return cfg;
+          });
+        }
+        // A variable (not a literal) so the binding field type-checks before it exists.
+        const otherBackendReport = {
+          workspaceId: rootId,
+          workspaceSessionDir: path.join(config.sessionsDir, rootId),
+          childTaskId: childId,
+          parentWorkspaceId: rootId,
+          ancestorWorkspaceIds: [rootId],
+          reportMarkdown: "Report from another backend.",
+          taskAttemptId: attemptA,
+        };
+        await upsertSubagentReportArtifact(otherBackendReport);
+        const report = await taskService.waitForAgentReport(childId, {
+          timeoutMs: 5_000,
+          requestingWorkspaceId: rootId,
+        });
+        expect(report.reportMarkdown).toBe("Report from another backend.");
+        await until(
+          () => svc.streamEndDecisionsByTaskId.get(childId)?.[0]?.outcome !== "pending",
+          "decision settled"
+        );
+        await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
+        await yieldMacrotasks(10);
+
+        expect(completions).toHaveLength(1);
+        expect(stack.heldTexts()).toEqual(["follow-up text"]);
+        expect(stack.heldInputs().map((held) => held.reason)).toEqual(["indeterminate"]);
+        expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
+      } finally {
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
 
   test("while the decision is pending no drain trigger dispatches the held entry and a direct send in preflight is refused; the hold never blocks the session", async () => {
     const childId = "holdtriggers001";

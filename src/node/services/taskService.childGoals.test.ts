@@ -1369,6 +1369,46 @@ describe("TaskService child goals", () => {
     await waitForCondition(() => !internal.streamEndDecisionsByTaskId.has(childId), {
       timeoutMs: 1_000,
     });
+    // Settled, not continued: no goal turn, recovery prompt or report send for the child.
+    expect(t.sends()).toHaveLength(0);
+  });
+
+  // #7003 (item 3): a reported shared-desktop child resumed by markInterruptedTaskRunning runs a
+  // new attempt while its earlier attempt's report artifact stays on disk. The parent's wait must
+  // not adopt that artifact: it would hand back the old report and write `reported` over the
+  // running attempt.
+  test("a resumed shared-desktop child's earlier report artifact is not adopted over its new attempt", async () => {
+    const t = await setup({
+      taskStatus: "reported",
+      reportedAt: "2026-10-01T00:00:00.000Z",
+      taskDesktopOwnerWorkspaceId: parentId,
+    });
+    // A variable (not a literal) so the binding field type-checks before it exists (#7003).
+    const earlierReport = {
+      workspaceId: parentId,
+      workspaceSessionDir: path.join(t.config.sessionsDir, parentId),
+      childTaskId: childId,
+      parentWorkspaceId: parentId,
+      ancestorWorkspaceIds: [parentId],
+      reportMarkdown: "Report from the earlier attempt.",
+      taskAttemptId: "att_00000000000000c1",
+    };
+    await upsertSubagentReportArtifact(earlierReport);
+    expect(await t.taskService.markInterruptedTaskRunning(childId)).toBe(true);
+    const resumedAttemptId = t.child()?.taskAttemptId;
+    expect(resumedAttemptId).not.toBe("att_00000000000000c1");
+    expect(t.child()?.taskStatus).toBe("running");
+
+    const waited = await t.taskService
+      .waitForAgentReport(childId, { timeoutMs: 300, requestingWorkspaceId: parentId })
+      .then(
+        (report) => `resolved: ${report.reportMarkdown}`,
+        () => "still waiting"
+      );
+
+    expect(waited).toBe("still waiting");
+    expect(t.child()?.taskStatus).toBe("running");
+    expect(t.child()?.taskAttemptId).toBe(resumedAttemptId);
   });
 
   // #6994 control: a notification while the row still reads running (no adoption, no stop) keeps
@@ -1376,16 +1416,50 @@ describe("TaskService child goals", () => {
   test("a notification while the child still runs keeps its deferred stream end waiting", async () => {
     const { t, internal } = await deferStreamEndOfOwnedAttempt();
 
+    const listeners = (
+      t.taskService as unknown as {
+        attemptSettlementListenersByTaskId: Map<string, Set<() => void>>;
+        notifyAttemptSettlementListeners: (taskId: string) => void;
+      }
+    ).attemptSettlementListenersByTaskId;
+    expect(listeners.get(childId)?.size).toBe(1);
     (
       t.taskService as unknown as { notifyAttemptSettlementListeners: (taskId: string) => void }
     ).notifyAttemptSettlementListeners(childId);
-    // Let a cancelled deferral re-run under the event lock before checking that none did.
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // A cancelled deferral drops its listener within microtasks; one macrotask drains them all.
+    await new Promise((resolve) => setImmediate(resolve));
 
+    expect(listeners.get(childId)?.size).toBe(1);
     expect(t.child()?.taskStatus).toBe("running");
     expect(internal.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual([
       "pending",
     ]);
+  });
+
+  // #7003: a row moved to awaiting_report while the stream end is deferred (no notify on that
+  // write) cannot take a goal turn either; the next notification re-runs the stream end, which
+  // publishes the stream's final report once, as it would after the accounting.
+  test("a notification after the row moved to awaiting_report publishes the deferred report once", async () => {
+    const { t, internal } = await deferStreamEndOfOwnedAttempt();
+    await t.editChild((workspace) => {
+      workspace.taskStatus = "awaiting_report";
+    });
+
+    (
+      t.taskService as unknown as { notifyAttemptSettlementListeners: (taskId: string) => void }
+    ).notifyAttemptSettlementListeners(childId);
+
+    await waitForCondition(() => !internal.streamEndDecisionsByTaskId.has(childId), {
+      timeoutMs: 1_000,
+    });
+    await t.untilStatus("reported");
+    expect(t.child()?.taskStatus).toBe("reported");
+    // The parent's delivery lands after the status write.
+    for (let i = 0; i < 500 && (await t.parentReports()).length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    expect(await t.parentReports()).toHaveLength(1);
+    expect(t.sends()).toHaveLength(0);
   });
 
   test("unsettled accounting defers the stream end without finalizing; its settlement resumes it", async () => {
