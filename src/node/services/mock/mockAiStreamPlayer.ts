@@ -121,6 +121,22 @@ async function tokenizeWithMockModel(text: string, context: string): Promise<num
 
 const MOCK_PARTIAL_WRITE_THROTTLE_MS = 100;
 
+/** The list a successful canned todo_write wrote, from its tool-start input; null for any other call. */
+function writtenTodoList(
+  parts: MuxMessage["parts"],
+  event: Extract<MockAssistantEvent, { kind: "tool-end" }>
+): TodoItem[] | null {
+  if (event.toolName !== "todo_write") return null;
+  if ((event.result as { success?: unknown } | undefined)?.success !== true) return null;
+  const part = parts.find(
+    (candidate) => candidate.type === "dynamic-tool" && candidate.toolCallId === event.toolCallId
+  );
+  const input = part?.type === "dynamic-tool" ? part.input : undefined;
+  const todos = (input as { todos?: TodoItem[] } | undefined)?.todos;
+  assert(Array.isArray(todos), "mock todo_write call needs args.todos");
+  return todos;
+}
+
 interface MockPlayerDeps {
   aiService: AIService;
   historyService: HistoryService;
@@ -258,14 +274,9 @@ export class MockAiStreamPlayer {
     event: Extract<MockAssistantEvent, { kind: "tool-end" }>
   ): Promise<void> {
     const sessionsDir = this.deps.sessionsDir;
-    if (sessionsDir === undefined || event.toolName !== "todo_write") return;
-    if ((event.result as { success?: unknown } | undefined)?.success !== true) return;
-    const part = active.parts.find(
-      (candidate) => candidate.type === "dynamic-tool" && candidate.toolCallId === event.toolCallId
-    );
-    const input = part?.type === "dynamic-tool" ? part.input : undefined;
-    const todos = (input as { todos?: TodoItem[] } | undefined)?.todos;
-    assert(Array.isArray(todos), "mock todo_write call needs args.todos");
+    if (sessionsDir === undefined) return;
+    const todos = writtenTodoList(active.parts, event);
+    if (todos === null) return;
     await setTodosForSessionDir(workspaceId, path.join(sessionsDir, workspaceId), todos);
   }
 
