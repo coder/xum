@@ -49,7 +49,7 @@ export function plainFolders(base: string, rel: string, create: boolean, seen = 
  * Tracked files, and new files that git does not ignore (a new repro). Ignored files stay out:
  * old .e2e runs, app logs and local env files. Each must be a regular file under plain folders.
  */
-export function stage(root: string, into: string): number {
+export function stage(root: string, into: string, o: { cacheSeed?: boolean } = {}): number {
   // prettier-ignore
   const listArgs = ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--deduplicate"];
   const listed = spawnSync("git", ["-C", root, ...listArgs, "--", ...INPUTS], {
@@ -69,9 +69,10 @@ export function stage(root: string, into: string): number {
     fs.copyFileSync(path.join(root, rel), path.join(into, rel), fs.constants.COPYFILE_EXCL);
     count += 1;
   }
-  // The story replay-cache seed (cacheSeed.ts): git-ignored, so git lists none of it.
+  // The story replay-cache seed (cacheSeed.ts): git-ignored, so git lists none of it. Only a
+  // story job reads it, so no other job copies it (Codex review of #7012).
   const seed = path.join(root, CACHE_SEED);
-  const entries = checkSeed(seed, (reason) => new Refusal(`stage: ${reason}`));
+  const entries = o.cacheSeed ? checkSeed(seed, (reason) => new Refusal(`stage: ${reason}`)) : [];
   if (entries.length > 0) {
     plainFolders(root, path.dirname(CACHE_SEED), false, seen);
     fs.mkdirSync(path.join(into, CACHE_SEED), { recursive: true });

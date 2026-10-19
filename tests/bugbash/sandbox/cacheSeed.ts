@@ -27,6 +27,12 @@ const ENTRY = /^[a-f0-9]{64}\.json$/;
 const MAX_ENTRY_BYTES = 1 << 20;
 /** A cap that keeps the seed small: the export stream allows 10,000 files per job. */
 export const MAX_SEED_ENTRIES = 1000;
+/**
+ * The seed's total size. The job's cache (seed plus new entries) comes back in the export stream
+ * with the reports and videos, under its 1 GiB limit (exportStream.ts), so the seed must leave
+ * most of it free (Codex review of #7012).
+ */
+export const MAX_SEED_BYTES = 128 << 20;
 
 /**
  * The entry names of the seed folder `seed`, checked, or none when it does not exist. Each must
@@ -40,11 +46,15 @@ export function checkSeed(seed: string, fail: (reason: string) => Error): string
   const names = fs.readdirSync(seed).sort();
   if (names.length > MAX_SEED_ENTRIES)
     throw fail(`${CACHE_SEED}: ${names.length} files, more than ${MAX_SEED_ENTRIES}`);
+  let bytes = 0;
   for (const name of names) {
     const entry = fs.lstatSync(path.join(seed, name));
     if (!entry.isFile() || !ENTRY.test(name) || entry.size > MAX_ENTRY_BYTES)
       throw fail(`${CACHE_SEED}/${name}: not an e2e cache entry (<sha256>.json, a regular file)`);
+    bytes += entry.size;
   }
+  if (bytes > MAX_SEED_BYTES)
+    throw fail(`${CACHE_SEED}: ${bytes} bytes, more than ${MAX_SEED_BYTES}`);
   return names;
 }
 

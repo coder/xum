@@ -77,12 +77,16 @@ test.each([
 });
 
 const ENTRY = `${"a".repeat(64)}.json`;
-test("stage copies the git-ignored story cache seed, and only cache entries", () => {
+test("stage copies the git-ignored story cache seed for a story job only", () => {
   write(".gitignore", "tests/bugbash/.e2e/\ntests/stories/.e2e-cache-seed/\n");
   write(`tests/stories/.e2e-cache-seed/${ENTRY}`, "{}");
-  expect(stage(root, into())).toBe(4); // three tracked files and the entry
+  expect(stage(root, into(), { cacheSeed: true })).toBe(4); // three tracked files and the entry
   const seed = path.join(into(), "tests/stories/.e2e-cache-seed");
   expect(fs.readdirSync(seed)).toEqual([ENTRY]);
+  // Any other job: no copy, not even a check of the seed.
+  const other = path.join(path.dirname(into()), "other");
+  expect(stage(root, other)).toBe(3);
+  expect(fs.existsSync(path.join(other, "tests/stories/.e2e-cache-seed"))).toBe(false);
 });
 
 test.each([
@@ -99,7 +103,7 @@ test.each([
 ])("stage refuses a seed with %s and copies no host file", (_name, plant) => {
   fs.mkdirSync(seedPath(""), { recursive: true });
   plant();
-  expect(() => stage(root, into())).toThrow(Refusal);
+  expect(() => stage(root, into(), { cacheSeed: true })).toThrow(Refusal);
   const copied = spawnSync("grep", ["-r", "host secret", into()], { encoding: "utf8" });
   expect(copied.stdout).toBe("");
 });

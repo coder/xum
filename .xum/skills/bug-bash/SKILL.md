@@ -137,9 +137,10 @@ and `tests/bugbash/.e2e/agent-repros-<time>-<pid>/`, each with its `.proxy.jsonl
 Replay cache (`tests/bugbash/sandbox/cacheSeed.ts`): each story job records its verified
 `agent.act` steps (e2e read-write mode) into `<output>/cache/`, which comes back with the output.
 To replay them on the next run without model calls, copy those files into
-`tests/stories/.e2e-cache-seed/`: `cp tests/stories/.e2e/stories-<time>-<pid>/cache/*.json tests/stories/.e2e-cache-seed/`.
+`tests/stories/.e2e-cache-seed/`: `mkdir -p tests/stories/.e2e-cache-seed && cp tests/stories/.e2e/stories-<time>-<pid>/cache/*.json tests/stories/.e2e-cache-seed/`.
 The folder is git-ignored so that no `git add -A` commits it. The launcher stages it into the
-job and refuses any entry that is not a regular `<sha256>.json` file of 1 MiB or less. Each run
+job (a story job only) and refuses any entry that is not a regular `<sha256>.json` file of 1 MiB
+or less, more than 1000 entries, or more than 128 MiB in all. Each run
 summary counts the outcomes (`Cache N replayed`). An empty or missing seed is a cold run.
 To check state across a server restart, a story imports `test` from `tests/stories/fixtures.ts`
 and calls `xum.restartServer()` (same port and XUM_ROOT), then `app.open()`: e2e's

@@ -481,7 +481,7 @@ function checkJob(args: string[], o: LaunchOptions) {
     o.env.BUGBASH_SANDBOX_BUILD_STALE === "1" && (selfCheck || (exactStep && !agentRepros));
   // The job's folder: its cwd in the container, and where its output comes back.
   const dir = stories ? storiesDir : bugbash;
-  return { dir, drivenRun, selfCheck, ai, driven, localBuild };
+  return { dir, drivenRun, selfCheck, ai, driven, localBuild, stories };
 }
 
 /** A job's checks and the Docker check, with no job: `--preflight` (Makefile, before the build). */
@@ -493,7 +493,7 @@ export async function preflight(args: string[], o: LaunchOptions): Promise<Clean
 /** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
 export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
   const log = o.log ?? logLine;
-  const { dir, drivenRun, selfCheck, ai, driven, localBuild } = checkJob(args, o);
+  const { dir, drivenRun, selfCheck, ai, driven, localBuild, stories } = checkJob(args, o);
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
@@ -579,7 +579,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     }
     made = true;
     const staged = path.join(jobDir, "stage");
-    log(`${name} staged ${stage(o.root, staged)} files`);
+    log(`${name} staged ${stage(o.root, staged, { cacheSeed: stories })} files`);
     const nonce = crypto.randomUUID();
     fs.writeFileSync(path.join(staged, ".sandbox-nonce"), nonce, { flag: "wx" });
     const [uid, gid] = [process.getuid!(), process.getgid!()];

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { seedCacheDir } from "./cacheSeed";
+import { checkSeed, MAX_SEED_BYTES, seedCacheDir } from "./cacheSeed";
 
 let tmp = "";
 let seed = "";
@@ -37,4 +37,14 @@ test("a seed with a file that is not an entry throws and leaves no cache dir", (
   fs.writeFileSync(path.join(seed, "notes.txt"), "x");
   expect(() => seedCacheDir(seed, dir)).toThrow("not an e2e cache entry");
   expect(fs.existsSync(dir)).toBe(false);
+});
+
+test("a seed over the total byte cap is refused, so the export keeps room for the run", () => {
+  const entry = 1 << 20; // the largest entry e2e reads
+  for (let i = 0; i * entry <= MAX_SEED_BYTES; i++)
+    fs.writeFileSync(
+      path.join(seed, `${i.toString(16).padStart(64, "0")}.json`),
+      Buffer.alloc(entry)
+    );
+  expect(() => checkSeed(seed, (reason) => new Error(reason))).toThrow("bytes, more than");
 });
