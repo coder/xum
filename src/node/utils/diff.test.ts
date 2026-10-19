@@ -124,6 +124,17 @@ describe("computeDiff", () => {
     expect(isNotice(computeDiff(old.join("\n"), next.join("\n")))).toBe(true);
   });
 
+  test.each([
+    ["appended", 100, 5100],
+    ["removed", 5100, 100],
+  ])(
+    "5000 %s lines (no bisection) still count against the edit-distance limit",
+    (_name, from, to) => {
+      const lines = (count: number) => Array.from({ length: count }, (_, i) => `l${i}`);
+      expect(isNotice(computeDiff(lines(from).join("\n"), lines(to).join("\n")))).toBe(true);
+    }
+  );
+
   test("a search past the step limit returns the notice", () => {
     // Few distinct lines make long equal runs on every diagonal, so the search costs far more
     // steps than the edit distance alone suggests.

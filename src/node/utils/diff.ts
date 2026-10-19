@@ -55,9 +55,8 @@ interface Hunk {
 type LCSMatch = [number, number];
 
 /**
- * About the most lines a diff may remove plus add (each bisection stops after half of it, so
- * the exact cut is a few lines higher). A larger change reaches the model as a notice: such a
- * diff is no more useful than reading the file, and the limit bounds the search below.
+ * Most lines a diff may remove plus add. A larger change reaches the model as a notice: such
+ * a diff is no more useful than reading the file.
  */
 const MAX_EDIT_DISTANCE = 4_000;
 
@@ -142,12 +141,21 @@ function myersMatches(a: Int32Array, b: Int32Array): LCSMatch[] | null {
   const matches: LCSMatch[] = [];
   const budget = { steps: MAX_DIFF_STEPS };
   const ranges: DiffRange[] = [[0, a.length, 0, b.length]];
+  // Lines removed plus added so far: a range with an empty side (a pure insertion or
+  // deletion) or no shared line is all edits, and it skips the bisection's own limit.
+  let edits = 0;
   for (let range = ranges.pop(); range !== undefined; range = ranges.pop()) {
     const [aLo, aHi, bLo, bHi] = trimRange(a, b, range, matches);
-    if (aLo === aHi || bLo === bHi) continue;
-    const split = bisect(a.subarray(aLo, aHi), b.subarray(bLo, bHi), budget);
+    const split =
+      aLo === aHi || bLo === bHi
+        ? "disjoint"
+        : bisect(a.subarray(aLo, aHi), b.subarray(bLo, bHi), budget);
     if (split === null) return null;
-    if (split === "disjoint") continue;
+    if (split === "disjoint") {
+      edits += aHi - aLo + (bHi - bLo);
+      if (edits > MAX_EDIT_DISTANCE) return null;
+      continue;
+    }
     const [x, y] = split;
     assertShrinks(x + y, aHi - aLo + (bHi - bLo));
     ranges.push([aLo, aLo + x, bLo, bLo + y], [aLo + x, aHi, bLo + y, bHi]);
@@ -183,7 +191,7 @@ interface SearchSide {
 
 /**
  * Find a point where the forward and backward searches of a shortest edit path meet: [x, y],
- * "disjoint" when a and b share no line, or null past MAX_EDIT_DISTANCE or the step budget.
+ * "disjoint" when a and b share no line, or null when the step budget runs out.
  */
 function bisect(
   a: Int32Array,
@@ -191,9 +199,7 @@ function bisect(
   budget: { steps: number }
 ): [number, number] | "disjoint" | null {
   const maxD = Math.ceil((a.length + b.length) / 2);
-  // The paths meet after about half the edit distance on each side.
-  const dLimit = Math.min(maxD, Math.ceil(MAX_EDIT_DISTANCE / 2) + 1);
-  const offset = dLimit + 1;
+  const offset = maxD + 1;
   const newSide = (): SearchSide => {
     const v = new Int32Array(2 * offset + 2).fill(-1);
     v[offset + 1] = 0;
@@ -202,14 +208,14 @@ function bisect(
   const forward = newSide();
   const backward = newSide();
   const delta = a.length - b.length;
-  for (let d = 0; d < dLimit; d++) {
+  for (let d = 0; d < maxD; d++) {
     // Not ??: a null (step budget spent) from the forward round must end the search too.
     const forwardMet = searchRound(a, b, d, offset, forward, backward, delta, false, budget);
     if (forwardMet !== undefined) return forwardMet;
     const backwardMet = searchRound(a, b, d, offset, backward, forward, delta, true, budget);
     if (backwardMet !== undefined) return backwardMet;
   }
-  return dLimit < maxD ? null : "disjoint";
+  return "disjoint";
 }
 
 /**
