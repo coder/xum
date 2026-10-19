@@ -10,6 +10,7 @@ import {
   type CommandAction,
 } from "@/browser/contexts/CommandRegistryContext";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { isCommandPaletteTarget } from "@/browser/utils/ui/keybinds";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 // The palette as App.tsx mounts it.
 import { LazyCommandPalette as AppCommandPalette } from "./LazyCommandPalette";
@@ -56,6 +57,32 @@ describe("command palette first open", () => {
     cleanupDom = null;
   });
 
+  // Must stay the first test that opens the palette: React.lazy keeps the loaded module for the
+  // rest of the file, so only this test sees the loading input. No await before the reopen, so
+  // the chunk is still pending throughout.
+  test("while the chunk loads: palette target, and close + reopen recaptures focus", async () => {
+    const view = renderApp({ id: "test:pick", title: "Pick me", section: "Tests", run: mock() });
+    const first = view.getByRole("button", { name: "Open palette" });
+    const second = view.getByRole("button", { name: "Open actions" });
+    first.focus();
+    fireEvent.click(first);
+    const loading = document.activeElement;
+    expect(loading?.getAttribute("role")).not.toBe("combobox");
+    // Focus-moving shortcuts that work in inputs (Ctrl+I) skip palette targets.
+    expect(isCommandPaletteTarget(loading)).toBe(true);
+    fireEvent.keyDown(loading!, { key: "Escape" });
+    expect(document.activeElement).toBe(first);
+
+    second.focus();
+    fireEvent.click(second);
+    await userEvent.setup({ document: view.container.ownerDocument }).keyboard("Pick");
+    const input = await view.findByRole("combobox");
+    expect((input as HTMLInputElement).value).toBe(">Pick");
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("combobox")).toBeNull());
+    expect(document.activeElement).toBe(second);
+  });
+
   test("a command runs through EXECUTE_COMMAND before the palette was ever opened", async () => {
     const run = mock();
     const view = renderApp({ id: "test:run", title: "Run me", section: "Tests", run });
@@ -72,9 +99,7 @@ describe("command palette first open", () => {
       const openerButton = view.getByRole("button", { name: opener });
       openerButton.focus();
       fireEvent.click(openerButton);
-      // Keys go to whatever has focus, as they would right after the shortcut. In the first test
-      // of this file the palette chunk is cold, so they land in the loading input and across the
-      // swap to the loaded palette (the lazy module stays loaded for the rest of the file).
+      // Keys go to whatever has focus, as they would right after the shortcut.
       await userEvent.setup({ document: view.container.ownerDocument }).keyboard("Pick");
       const input = await view.findByRole("combobox");
       const actionsMode = opener === "Open actions";

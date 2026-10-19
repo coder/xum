@@ -13,8 +13,7 @@ import {
   matchesKeybind,
 } from "@/browser/utils/ui/keybinds";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { resolveSlashCommandExperimentValue } from "@/browser/utils/slashCommands/experimentVisibility";
-import { getSlashCommandSuggestions } from "@/browser/utils/slashCommands/suggestions";
+import { paletteSlashCommands } from "./LazyCommandPalette";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
   COMMAND_PALETTE_INPUT_CLASSES,
@@ -25,6 +24,8 @@ import {
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { filterCommandsByPrefix } from "@/browser/utils/commandPaletteFiltering";
 import { rankByPaletteQuery } from "@/browser/utils/commandPaletteRanking";
+
+const { getSlashCommandSuggestions, resolveSlashCommandExperimentValue } = paletteSlashCommands;
 
 interface CommandPaletteProps {
   getSlashContext?: () => { workspaceId?: string };
