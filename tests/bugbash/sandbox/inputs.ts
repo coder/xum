@@ -13,6 +13,7 @@
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { CACHE_SEED, checkSeed } from "./cacheSeed";
 import { Refusal } from "./runner";
 
 /** The git-listed inputs that the container reads. A symlink among them stops the launch. */
@@ -68,6 +69,18 @@ export function stage(root: string, into: string): number {
     fs.copyFileSync(path.join(root, rel), path.join(into, rel), fs.constants.COPYFILE_EXCL);
     count += 1;
   }
+  // The story replay-cache seed (cacheSeed.ts): git-ignored, so git lists none of it.
+  const seed = path.join(root, CACHE_SEED);
+  const entries = checkSeed(seed, (reason) => new Refusal(`stage: ${reason}`));
+  if (entries.length > 0) {
+    plainFolders(root, path.dirname(CACHE_SEED), false, seen);
+    fs.mkdirSync(path.join(into, CACHE_SEED), { recursive: true });
+  }
+  for (const name of entries) {
+    const rel = path.join(CACHE_SEED, name);
+    fs.copyFileSync(path.join(root, rel), path.join(into, rel), fs.constants.COPYFILE_EXCL);
+    count += 1;
+  }
   // Mount points for the read-only build outputs and the job's tmpfs (a story job's output is
   // under tests/stories, every other job's under tests/bugbash).
   for (const dir of ["dist", "node_modules", "tests/bugbash/.e2e", "tests/stories/.e2e"])
@@ -105,10 +118,16 @@ export function containerEnv(
 
 /**
  * The job's own env values. The app log always goes into the output folder, so it comes back
- * with the report: an inherited BUGBASH_APP_LOG (run.ts sets a sibling path) is ignored.
+ * with the report: an inherited BUGBASH_APP_LOG (run.ts sets a sibling path) is ignored. The
+ * replay cache dir too (cacheSeed.ts): only the story config reads it, and its entries come
+ * back with the output.
  */
 export function jobEnv(output: string): Record<string, string> {
-  return { BUGBASH_APP_LOG: `${output}/app.log`, E2E_TELEMETRY_DISABLED: "1" };
+  return {
+    BUGBASH_APP_LOG: `${output}/app.log`,
+    BUGBASH_CACHE_DIR: `${output}/cache`,
+    E2E_TELEMETRY_DISABLED: "1",
+  };
 }
 
 // The `e2e run` options that a repro run may use: selection and output only. Not allowed, among

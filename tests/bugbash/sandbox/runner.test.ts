@@ -1122,6 +1122,16 @@ test("B1: an MCP Apps job reaches the model only through its proxy, with the hos
     /proxy: 1 settled, 0 kept in full, 0 refused \{\}, \$0\.\d+ of \$1\.0000/
   );
   expect(logged.join("\n")).not.toContain(UPSTREAM_KEY);
+  // The job's spend beside its record: the settled cost of both calls, and no key or URL.
+  const spendFile = records.replace(/\.proxy\.jsonl$/, ".spend.json");
+  expect(fs.statSync(spendFile).mode & 0o777).toBe(0o600);
+  const spendText = fs.readFileSync(spendFile, "utf8");
+  const spend = JSON.parse(spendText) as Record<string, unknown>;
+  expect(spend).toMatchObject({ capUsd: 1, settled: 1, kept: 0, refused: 0, released: 0 });
+  expect(spend.spentUsd).toBeGreaterThan(0);
+  expect(spend.spentUsd).toBeLessThan(1);
+  expect(spendText).not.toContain(UPSTREAM_KEY);
+  expect(spendText).not.toContain("127.0.0.1");
   expectNothingLeft(); // the job folder with the proxy socket is gone too
 });
 
@@ -1399,6 +1409,7 @@ test("B2: an explore job spends from the run's ledger and writes its output to t
     expect(upstream.requests).toHaveLength(1);
     expect(lines.join("\n")).toContain("(the run's budget)");
     expect(lines.join("\n")).not.toContain("at list price"); // run.ts reports the run totals once
+    expect(fs.existsSync(path.join(cwd, ".e2e/x.spend.json"))).toBe(false); // nor a spend file
     expect(fs.readFileSync(logFile, "utf8")).toContain("job says hi");
     expectNothingLeft();
   } finally {

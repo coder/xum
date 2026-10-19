@@ -10,8 +10,11 @@
  */
 // First import: the pause refuses before ../bugbash/e2e.config.ts runs (hostPause.ts).
 import "./hostPause";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { E2EConfig } from "e2e";
 import base from "../bugbash/e2e.config";
+import { CACHE_SEED, seedCacheDir } from "../bugbash/sandbox/cacheSeed";
 import { proxyModel } from "../bugbash/sandbox/explorerModel";
 
 // Every command with this config is model-driven (`run` too), so it always gets the model.
@@ -27,6 +30,16 @@ const context = [
   "Do not sign in to any provider, MCP server or external service, and do not enter real secrets.",
   "Tutorial popovers can cover controls: dismiss them with Skip.",
 ].join(" ");
+
+// The replay cache (cacheSeed.ts): the launcher sets BUGBASH_CACHE_DIR to `<output>/cache`, so
+// the cache comes back with the output. read-write: e2e demotes an unset mode to read-only in
+// CI, and this run's recordings are what warms the next one. The main process and each worker
+// load this file; only the first copies the staged seed in. Without the variable, e2e's default.
+const cacheDir = process.env.BUGBASH_CACHE_DIR;
+const here = path.dirname(fileURLToPath(import.meta.url));
+// Resolved against this folder, as e2e resolves cache.dir against the project root.
+const cache = cacheDir != null && cacheDir !== "" ? path.resolve(here, cacheDir) : undefined;
+if (cache != null) seedCacheDir(path.join(here, "../..", CACHE_SEED), cache);
 
 const [web] = base.targets;
 if (web.name !== "web") throw new Error(`the bug-bash config's first target is ${web.name}`);
@@ -57,4 +70,5 @@ export default {
   // Serial: every story shares one seeded app.
   workers: 1,
   agents: { default: { ...base.agents.default, model, context } },
+  ...(cache != null ? { cache: { mode: "read-write", dir: cache } } : {}),
 } satisfies E2EConfig;

@@ -22,10 +22,11 @@
  * that this process runs for the job, on a unix socket that the container gets read-only. The
  * provider key stays here, and BUGBASH_BUDGET_USD caps the spend at list price (not a billing
  * cap: the upstream key's own limit is the backstop); run.ts shares one budget across its jobs.
- * The proxy writes one record per call to `<output>.proxy.jsonl` on the host only. In an explore
- * job with the real app AI (run.ts resolves it with probeApp()), the app reaches
- * BUGBASH_APP_MODEL through the same proxy. The host pause still refuses every model-driven run
- * on the host. There is no host fallback.
+ * The proxy writes one record per call to `<output>.proxy.jsonl` on the host only, and a job with
+ * its own budget writes its spend (settled costs plus kept reservations) to `<output>.spend.json`
+ * at the end. In an explore job with the real app AI (run.ts resolves it with probeApp()), the
+ * app reaches BUGBASH_APP_MODEL through the same proxy. The host pause still refuses every
+ * model-driven run on the host. There is no host fallback.
  * Exit codes: the job's code, 2 refused, 3 the container state is unknown after cleanup, 4 the
  * evidence is incomplete, 5 the proxy reported a fault (a call cost more than its bound, or a
  * call outlived close()), 6 the job itself exited 3 (e2e's infrastructure error, moved so that 3
@@ -496,7 +497,8 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
-  for (const file of [dest, records])
+  const spendFile = `${dest}.spend.json`;
+  for (const file of [dest, records, spendFile])
     if (fs.lstatSync(file, { throwIfNoEntry: false }) != null)
       throw new Refusal(`${path.relative(dir, file)} exists: remove it first`);
   const mounts = () =>
@@ -713,6 +715,28 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
       `${name} proxy: ${settled} settled, ${kept} kept in full, ${refused} refused ` +
         `${JSON.stringify(refusedBy)}${spent}`
     );
+    // The job's spend as a file beside its proxy record, which holds only reservations. Only
+    // with the job's own ledger: a shared ledger's totals are the run's (run.ts). No key or URL.
+    if (!o.ledger) {
+      const spend = {
+        spentUsd: spentNanoUsd / 1e9,
+        capUsd: capNanoUsd / 1e9,
+        settled,
+        kept,
+        refused,
+        released,
+        refusedBy,
+      };
+      try {
+        fs.writeFileSync(spendFile, `${JSON.stringify(spend, null, 2)}\n`, {
+          mode: 0o600,
+          flag: "wx",
+        });
+      } catch (error) {
+        // The errno code only: the message can hold the path. Cleanup must still run.
+        log(`${name} spend: not written (${(error as NodeJS.ErrnoException).code ?? "error"})`);
+      }
+    }
   }
   const cleanup = await session.cleanup();
   if (made) fs.rmSync(jobDir, { recursive: true, force: true });

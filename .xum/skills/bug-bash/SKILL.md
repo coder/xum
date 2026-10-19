@@ -132,7 +132,15 @@ Stories: `make test-stories BUGBASH_BUDGET_USD=3` runs two sandbox jobs with `BU
 `tests/stories/e2e.config.ts`, which reuses the web target of `tests/bugbash/e2e.config.ts`.
 The first run, with one smoke story and no agent repro, spent $0.09 at list price and took about
 2 minutes with the build. Each job's results come back to `tests/stories/.e2e/stories-<time>-<pid>/`
-and `tests/bugbash/.e2e/agent-repros-<time>-<pid>/`, each with its `.proxy.jsonl`.
+and `tests/bugbash/.e2e/agent-repros-<time>-<pid>/`, each with its `.proxy.jsonl` and a
+`.spend.json` (the job's spend at list price, its cap and its proxy call counts).
+Replay cache (`tests/bugbash/sandbox/cacheSeed.ts`): each story job records its verified
+`agent.act` steps (e2e read-write mode) into `<output>/cache/`, which comes back with the output.
+To replay them on the next run without model calls, copy those files into
+`tests/stories/.e2e-cache-seed/`: `cp tests/stories/.e2e/stories-<time>-<pid>/cache/*.json tests/stories/.e2e-cache-seed/`.
+The folder is git-ignored so that no `git add -A` commits it. The launcher stages it into the
+job and refuses any entry that is not a regular `<sha256>.json` file of 1 MiB or less. Each run
+summary counts the outcomes (`Cache N replayed`). An empty or missing seed is a cold run.
 To check state across a server restart, a story imports `test` from `tests/stories/fixtures.ts`
 and calls `xum.restartServer()` (same port and XUM_ROOT), then `app.open()`: e2e's
 `app.restart()` only opens a new page.

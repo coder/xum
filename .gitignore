@@ -104,6 +104,9 @@ tests/e2e/tmp/
 # e2e bug-bash output (reports, videos, unredacted app logs)
 tests/bugbash/.e2e/
 tests/stories/.e2e/
+# The story replay-cache seed (tests/bugbash/sandbox/cacheSeed.ts): ignored, so no `git add -A`
+# commits recorded cache entries.
+tests/stories/.e2e-cache-seed/
 
 # Test temporary directories
 src/test-temp-*/
