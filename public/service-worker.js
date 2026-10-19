@@ -85,17 +85,21 @@ function offlineResponse() {
 /**
  * Network first: store a cacheable answer under `cacheKey`, else answer from this cache.
  * `isCacheable` decides what may be stored. The write runs under `event.waitUntil`, so the
- * browser keeps the worker alive until it ends.
+ * browser keeps the worker alive until it ends. The optional `verify` runs only inside that
+ * write, on the stored copy: the page gets the network response without waiting for it.
  */
-function networkFirst(event, cacheKey, isCacheable) {
+function networkFirst(event, cacheKey, isCacheable, verify) {
   return fetch(event.request)
     .then((response) => {
       if (isCacheable(response)) {
         const responseToCache = response.clone();
         event.waitUntil(
-          caches
-            .open(CACHE_NAME)
-            .then((cache) => cache.put(cacheKey, responseToCache))
+          (verify ? verify(responseToCache) : Promise.resolve(true))
+            .then(
+              (verified) =>
+                verified &&
+                caches.open(CACHE_NAME).then((cache) => cache.put(cacheKey, responseToCache))
+            )
             .catch(() => undefined)
         );
       }
@@ -110,16 +114,25 @@ function networkFirst(event, cacheKey, isCacheable) {
 }
 
 /**
- * Install accepts the shell by the fetch handler's rule, and also only when it is not a redirect
- * and loads this build's entry file: a proxy's 200 sign-in page at "./" is not the shell.
+ * True when the HTML loads this build's entry file. It reads a clone, so `response` stays usable.
+ * #6991: a root navigation stores the shell only then. During a rolling deploy it can reach a
+ * replica of another build, whose shell does not match this worker's precached files.
  */
-function isInstallShell(response) {
-  if (!isShellResponse(response) || response.redirected) return Promise.resolve(false);
+function loadsThisBuild(response) {
   if (ENTRY_FILE === "") return Promise.resolve(true);
   return response
     .clone()
     .text()
     .then((html) => html.includes(ENTRY_FILE));
+}
+
+/**
+ * Install accepts the shell by the fetch handler's rule, and also only when it is not a redirect
+ * and loads this build's entry file: a proxy's 200 sign-in page at "./" is not the shell.
+ */
+function isInstallShell(response) {
+  if (!isShellResponse(response) || response.redirected) return Promise.resolve(false);
+  return loadsThisBuild(response);
 }
 
 function precacheFile(cache, name) {
@@ -147,9 +160,15 @@ self.addEventListener("install", (event) => {
             return cache.put(SHELL_PATH, response);
           })
         );
-        const files = PRECACHE.map((name) => precacheFile(cache, name));
+        // #6991: the entry is required by name. The stamp script lists it in PRECACHE, so the Set
+        // adds no request on a real build.
+        const names = ENTRY_FILE === "" ? PRECACHE : [...new Set([ENTRY_FILE, ...PRECACHE])];
+        const files = names.map((name) => precacheFile(cache, name));
         // Every module of the static first-load graph is required (the entry imports them).
-        const required = [shell, ...files.filter((_, i) => PRECACHE[i].endsWith(".js"))];
+        const required = [
+          shell,
+          ...files.filter((_, i) => names[i] === ENTRY_FILE || names[i].endsWith(".js")),
+        ];
         // Wait for every write first, so the failure delete below never races a late put.
         return Promise.allSettled([shell, ...files]).then(() => Promise.all(required));
       })
@@ -206,7 +225,9 @@ self.addEventListener("fetch", (event) => {
     // the shell for the route it answers: a route-relative <base>, and at the root a redirect and
     // a first-run loader that needs it. So the cached root copy is correct only at the root.
     // Every other navigation (deep routes, popout pages, files) goes to the network untouched.
-    if (path === "") event.respondWith(networkFirst(event, SHELL_PATH, isShellResponse));
+    if (path === "") {
+      event.respondWith(networkFirst(event, SHELL_PATH, isShellResponse, loadsThisBuild));
+    }
     return;
   }
 

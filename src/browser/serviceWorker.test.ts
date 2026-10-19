@@ -255,6 +255,7 @@ describe("service worker caching (#6848)", () => {
 
   test("a no-store navigation refreshes the shell, so offline starts the newest one", async () => {
     const worker = await startWorker(); // installs "shell"
+    // Unstamped (dev, ENTRY_FILE ""), so the #6991 entry check accepts any shell.
     // The server sends the shell with no-store; the shell is the one exception.
     worker.setNetwork(() => html("shell v2", { "Cache-Control": "no-store" }));
     await worker.request(`${ORIGIN}/`, { mode: "navigate" });
@@ -379,6 +380,10 @@ describe("one cache per build (#6867)", () => {
     const worker = await startWorker({ storage, stamp: stampFor("bbbbbbbbbbbb") });
     expect(storage.urlsIn(worker.cacheName)).toEqual(
       [ROOT_SCOPE, `${ORIGIN}/${HASHED_JS}`, `${ORIGIN}/${VENDOR}`, `${ORIGIN}/${CSS}`].sort()
+    );
+    // #6991: one request per file. Requiring the entry by name adds no fetch.
+    expect(storage.fetchLog.map((entry) => entry.url).sort()).toEqual(
+      ["./", HASHED_JS, VENDOR, CSS].sort()
     );
     const priorities = storage.fetchLog.map((entry) => [entry.url, entry.init?.priority]);
     expect(priorities).toContainEqual([HASHED_JS, "low"]);
