@@ -71,6 +71,8 @@ interface Entry {
   load: CreationDraftLoad;
   /** Whether the backend holds a record: until then, a save sends every field (a create). */
   persisted: boolean;
+  /** A save went out: the backend may hold a record even if the reply was lost, so a clear saves too. */
+  sent: boolean;
   /** Changed fields not sent yet. */
   pending: CreationDraftPatch;
   /** Never rejects (save records its error). */
@@ -119,7 +121,7 @@ function hasCreationDraftContent(draft: CreationDraft): boolean {
 /** Changes the backend has not got yet that are due to be saved. */
 function hasChangesToSave(entry: Entry): boolean {
   if (!entry.draft || Object.keys(entry.pending).length === 0) return false;
-  return entry.persisted || hasCreationDraftContent(entry.draft);
+  return entry.persisted || entry.sent || hasCreationDraftContent(entry.draft);
 }
 
 export function createBlankCreationDraft(
@@ -545,6 +547,7 @@ export class CreationDraftStore {
     const client = this.client;
     try {
       if (!client) throw new Error("Not connected.");
+      entry.sent = true;
       await client.drafts.updateCreation({
         scope: { kind: "creation", draftId: id },
         ...patch,
@@ -610,6 +613,7 @@ export class CreationDraftStore {
       },
       load,
       persisted,
+      sent: false,
       pending: {},
       inFlight: null,
       saving: false,

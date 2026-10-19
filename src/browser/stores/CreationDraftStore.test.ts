@@ -187,6 +187,25 @@ describe("CreationDraftStore", () => {
     expect(store.getDraftsByProject()[PROJECT_A]?.map((draft) => draft.draftId)).toEqual([id]);
   });
 
+  test("clearing a draft whose first save reply was lost still saves the clear", async () => {
+    using tempDir = new TestTempDir("creation-store-lost-first");
+    const harness = await createHarness(tempDir);
+    const { store, control, service } = harness;
+    await waitFor(() => store.getListState().status === "ready");
+    const id = store.create(PROJECT_A, null);
+    store.update(id, { text: "fix it" });
+    // The backend writes the record, but the reply is lost.
+    control.loseUpdateReplies = 1;
+    let firstError: unknown = null;
+    await store.flush(id).catch((error: unknown) => (firstError = error));
+    expect(firstError).not.toBeNull();
+    expect(await service.get(id)).toMatchObject({ text: "fix it" });
+
+    store.update(id, { text: "" });
+    await store.flush(id);
+    expect(await service.get(id)).toMatchObject({ text: "" });
+  });
+
   test("an earlier save reply never replaces a later local edit", async () => {
     using tempDir = new TestTempDir("creation-store-order");
     const harness = await createHarness(tempDir);
