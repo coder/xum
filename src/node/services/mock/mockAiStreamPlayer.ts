@@ -20,7 +20,7 @@ import type {
   MockStreamErrorEvent,
   MockStreamStartEvent,
 } from "./mockAiEventTypes";
-import { MockAiRouter, type MockAiRouterReply } from "./mockAiRouter";
+import { MockAiRouter } from "./mockAiRouter";
 import { setTodosForSessionDir } from "@/node/services/tools/todo";
 import type { TodoItem } from "@/common/types/tools";
 import * as path from "node:path";
@@ -248,19 +248,25 @@ export class MockAiStreamPlayer {
   /**
    * Canned tool calls never run, but a successful todo_write must leave the list on disk as the
    * real tool does: AgentSession's turn-end TODO nudge reads it there (needsTodoTurnEndNudge).
-   * Written before any stream event, so stream-end always sees the new list.
+   * Runs in the call's tool-end handler, before its tool-call-end event: a stream stopped before
+   * that point writes nothing, as with a real tool. The queue awaits each handler in order, so
+   * stream-end always sees the new list.
    */
-  private async applyToolSideEffects(workspaceId: string, reply: MockAiRouterReply) {
+  private async applyTodoWriteSideEffect(
+    workspaceId: string,
+    active: ActiveStream,
+    event: Extract<MockAssistantEvent, { kind: "tool-end" }>
+  ): Promise<void> {
     const sessionsDir = this.deps.sessionsDir;
-    if (sessionsDir === undefined) return;
-    for (const call of reply.toolCalls ?? []) {
-      if (call.toolName !== "todo_write") continue;
-      const result = call.result as { success?: unknown } | undefined;
-      if (result?.success !== true) continue;
-      const todos = (call.args as { todos?: TodoItem[] }).todos;
-      assert(Array.isArray(todos), "mock todo_write call needs args.todos");
-      await setTodosForSessionDir(workspaceId, path.join(sessionsDir, workspaceId), todos);
-    }
+    if (sessionsDir === undefined || event.toolName !== "todo_write") return;
+    if ((event.result as { success?: unknown } | undefined)?.success !== true) return;
+    const part = active.parts.find(
+      (candidate) => candidate.type === "dynamic-tool" && candidate.toolCallId === event.toolCallId
+    );
+    const input = part?.type === "dynamic-tool" ? part.input : undefined;
+    const todos = (input as { todos?: TodoItem[] } | undefined)?.todos;
+    assert(Array.isArray(todos), "mock todo_write call needs args.todos");
+    await setTodosForSessionDir(workspaceId, path.join(sessionsDir, workspaceId), todos);
   }
 
   private async waitForStreamStartGate(
@@ -405,8 +411,6 @@ export class MockAiStreamPlayer {
       latestUserMessage: latest,
       latestUserText: latestText,
     });
-
-    await this.applyToolSideEffects(workspaceId, reply);
 
     const messageId = `msg-mock-${this.nextMockMessageId++}`;
     if (reply.waitForStreamStart) {
@@ -991,6 +995,7 @@ export class MockAiStreamPlayer {
         break;
       }
       case "tool-end": {
+        await this.applyTodoWriteSideEffect(workspaceId, active, event);
         const payload: ToolCallEndEvent = {
           type: "tool-call-end",
           workspaceId,

@@ -8,6 +8,9 @@ import type { AIService } from "@/node/services/aiService";
 import type { StreamDeltaEvent, StreamEndEvent, StreamStartEvent } from "@/common/types/stream";
 import { buildMockStreamEventsFromReply } from "./mockAiStreamAdapter";
 import { createTestHistoryService } from "../testHistoryService";
+import { DisposableTempDir } from "@/node/services/tempDir";
+import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import * as path from "node:path";
 
 function readWorkspaceId(payload: unknown): string | undefined {
   if (!payload || typeof payload !== "object") return undefined;
@@ -803,6 +806,43 @@ describe("MockAiStreamPlayer", () => {
       thinkingLevel: "high",
       muxMetadata,
     });
+  });
+
+  test("a canned todo_write writes its list only once its tool call completes", async () => {
+    using sessionsDir = new DisposableTempDir("mock-todo-write");
+    const emitter = new EventEmitter();
+    emitter.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: emitter as unknown as AIService,
+      sessionsDir: sessionsDir.path,
+    });
+    const workspaceId = "workspace-mock-todo-write";
+    const sessionDir = path.join(sessionsDir.path, workspaceId);
+    const user = (id: string, text: string) =>
+      createMuxMessage(id, "user", text, { timestamp: Date.now() });
+
+    // Aborted while its stream start is held: the todo_write never ran, so no list.
+    const abort = new AbortController();
+    const held = player.play(
+      [user("u-held", "[mock:wait-start] [mock:todo-nudge] held")],
+      workspaceId,
+      {
+        abortSignal: abort.signal,
+      }
+    );
+    abort.abort();
+    expect((await held).success).toBe(true);
+    expect(await readTodosForSessionDir(sessionDir)).toEqual([]);
+
+    // A finished stream leaves the list on disk before it ends (the turn-end nudge reads it).
+    const result = await player.play([user("u-done", "[mock:todo-nudge] go")], workspaceId);
+    if (!result.success || !result.data) throw new Error("expected a stream handle");
+    expect(await result.data.completion).toMatchObject({ status: "completed" });
+    expect(await readTodosForSessionDir(sessionDir)).toEqual([
+      { content: "Fixed the bug", status: "completed" },
+      { content: "Verify the fix", status: "pending" },
+    ]);
   });
 
   describe("a reply that holds its tool calls", () => {
