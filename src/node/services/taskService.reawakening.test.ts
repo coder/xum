@@ -944,7 +944,7 @@ describe("TaskService", () => {
       "task-b",
       "wst_stale_overlay",
       "tree-root",
-      "recovered"
+      "reserved"
     );
     const reserved = taskService
       .listTaskTreeAgents("task-a")
@@ -1998,96 +1998,114 @@ describe("TaskService", () => {
     expect(nestedTasks.every((workspace) => workspace.taskStatus === "queued")).toBe(true);
   });
 
-  test("startup mirror reconciliation keeps a reawakening's mirror, so the child can still spawn", async () => {
-    // Live repro: after a restart, startup recovery overlaps early clients (it outlives its step
-    // bound). A parent reawakened its reported child while the reconciliation pass was still
-    // iterating. The pass then rewrote the child's mirror back to the stale terminal handle it had
-    // read before the reawakening, so the child's own turn hit "cannot spawn new tasks after
-    // agent_report" on task and workflow_run.
-    const config = await createTestConfig(rootDir);
-    stubStableIds(config, ["rewakehandle", "rewaketurn", "rewakegrandchild"]);
-    const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-reconcile-rewake";
-    const childTaskId = "child-reconcile-rewake";
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentWorkspaceId),
-        projectWorkspace(projectPath, "child", childTaskId, {
-          runtimeConfig: { type: "local" },
-          parentWorkspaceId,
-          agentId: "explore",
-          agentType: "explore",
-          taskStatus: "reported",
-          reportedAt: "2026-08-10T00:00:00.000Z",
-          taskExecutionId: "wst_stale",
-          taskExecutionStatus: "interrupted",
-        }),
-      ],
-      testTaskSettings()
-    );
-    const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
-      const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
-      await internal?.onAccepted?.();
-      return Ok(undefined);
-    });
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    const { taskHandleStore } = workspaceTurnManagerInternals(taskService);
-    await taskHandleStore.upsertWorkspaceTurn(
-      workspaceTurnRecord(parentWorkspaceId, childTaskId, "wst_stale", "interrupted")
-    );
-
-    // Hold the reconciliation pass after it read its config snapshot and the handle records.
-    let markScanned: (() => void) | undefined;
-    const scanned = new Promise<void>((resolve) => {
-      markScanned = resolve;
-    });
-    let releaseScan: (() => void) | undefined;
-    const scanGate = new Promise<void>((resolve) => {
-      releaseScan = resolve;
-    });
-    const listAll = taskHandleStore.listAllWorkspaceTurns.bind(taskHandleStore);
-    const listSpy = spyOn(taskHandleStore, "listAllWorkspaceTurns").mockImplementationOnce(
-      async (...args) => {
-        const records = await listAll(...args);
-        markScanned?.();
-        await scanGate;
-        return records;
-      }
-    );
-    try {
-      const recovery = taskService.recoverInterruptedTasks();
-      await scanned;
-
-      const reactivated = await taskService.sendMessageToDescendantAgentTask(
-        parentWorkspaceId,
-        childTaskId,
-        "Xum restarted and stopped your turn. Continue.",
-        "tool-end"
+  // "after the scan" is the live repro: after a restart, startup recovery overlapped early clients
+  // (it outlived its step bound). A parent reawakened its reported child while the reconciliation
+  // pass was still iterating. The pass then rewrote the child's mirror back to the stale terminal
+  // handle it had read before the reawakening, so the child's own turn hit "cannot spawn new
+  // tasks after agent_report" on task and workflow_run.
+  // "before the scan" is hardening (F16): a reawakening between the pass's config read and its
+  // handle scan puts the live handle in the scan, and the pass must not downgrade the turn's
+  // accepted registration. Startup ordering keeps clients out of that window today.
+  for (const holdPoint of ["after the scan", "before the scan"] as const) {
+    test(`startup mirror reconciliation keeps a reawakening that lands ${holdPoint}`, async () => {
+      const config = await createTestConfig(rootDir);
+      stubStableIds(config, ["rewakehandle", "rewaketurn", "rewakegrandchild"]);
+      const projectPath = path.join(rootDir, "repo");
+      const parentWorkspaceId = "parent-reconcile-rewake";
+      const childTaskId = "child-reconcile-rewake";
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentWorkspaceId),
+          projectWorkspace(projectPath, "child", childTaskId, {
+            runtimeConfig: { type: "local" },
+            parentWorkspaceId,
+            agentId: "explore",
+            agentType: "explore",
+            taskStatus: "reported",
+            reportedAt: "2026-08-10T00:00:00.000Z",
+            taskExecutionId: "wst_stale",
+            taskExecutionStatus: "interrupted",
+          }),
+        ],
+        testTaskSettings()
       );
-      expect(reactivated).toMatchObject({
-        success: true,
-        data: { delivery: "reactivated", executionTaskId: "wst_rewakehandle" },
+      const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
+        const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+        await internal?.onAccepted?.();
+        return Ok(undefined);
       });
+      const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      const { taskHandleStore } = workspaceTurnManagerInternals(taskService);
+      await taskHandleStore.upsertWorkspaceTurn(
+        workspaceTurnRecord(parentWorkspaceId, childTaskId, "wst_stale", "interrupted")
+      );
 
-      releaseScan?.();
-      await recovery;
-    } finally {
-      releaseScan?.();
-      listSpy.mockRestore();
-    }
+      // Hold the reconciliation pass after its config snapshot, before or after the handle scan.
+      let markScanned: (() => void) | undefined;
+      const scanned = new Promise<void>((resolve) => {
+        markScanned = resolve;
+      });
+      let releaseScan: (() => void) | undefined;
+      const scanGate = new Promise<void>((resolve) => {
+        releaseScan = resolve;
+      });
+      const listAll = taskHandleStore.listAllWorkspaceTurns.bind(taskHandleStore);
+      const listSpy = spyOn(taskHandleStore, "listAllWorkspaceTurns").mockImplementationOnce(
+        async (...args) => {
+          if (holdPoint === "after the scan") {
+            const records = await listAll(...args);
+            markScanned?.();
+            await scanGate;
+            return records;
+          }
+          markScanned?.();
+          await scanGate;
+          return listAll(...args);
+        }
+      );
+      try {
+        const recovery = taskService.recoverInterruptedTasks();
+        await scanned;
 
-    expect(findWorkspaceInConfig(config, childTaskId)).toMatchObject({
-      taskStatus: "reported",
-      taskExecutionId: "wst_rewakehandle",
-      taskExecutionStatus: "running",
+        const reactivated = await taskService.sendMessageToDescendantAgentTask(
+          parentWorkspaceId,
+          childTaskId,
+          "Xum restarted and stopped your turn. Continue.",
+          "tool-end"
+        );
+        expect(reactivated).toMatchObject({
+          success: true,
+          data: { delivery: "reactivated", executionTaskId: "wst_rewakehandle" },
+        });
+
+        releaseScan?.();
+        await recovery;
+      } finally {
+        releaseScan?.();
+        listSpy.mockRestore();
+      }
+
+      expect(findWorkspaceInConfig(config, childTaskId)).toMatchObject({
+        taskStatus: "reported",
+        taskExecutionId: "wst_rewakehandle",
+        taskExecutionStatus: "running",
+      });
+      // The reawakened turn stays accepted, so peers can still address the child.
+      expect(
+        workspaceTurnManagerFor(taskService).getLiveWorkspaceTurnRegistration(childTaskId)
+      ).toEqual({
+        handleId: "wst_rewakehandle",
+        ownerWorkspaceId: parentWorkspaceId,
+        accepted: true,
+      });
+      expect(
+        await createAgentTask(taskService, childTaskId, "Run the cold-reader check")
+      ).toMatchObject({ success: true });
     });
-    expect(
-      await createAgentTask(taskService, childTaskId, "Run the cold-reader check")
-    ).toMatchObject({ success: true });
-  });
+  }
 
   test("does not accept agent_report while task-owned workspace turns are still active", async () => {
     const config = await createTestConfig(rootDir);

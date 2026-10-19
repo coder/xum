@@ -6094,14 +6094,7 @@ export class WorkspaceTurnManager {
           await this.persistRecoveredTerminalExecutionMirror(task.id, task, normalized);
         }
         if (isActiveWorkspaceTurnTaskStatus(normalized.status)) {
-          this.activeWorkspaceTurnHandleByWorkspaceId.set(task.id, {
-            handleId: normalized.handleId,
-            ownerWorkspaceId: normalized.ownerWorkspaceId,
-            // Fail closed: the restart killed any live stream, so this recovered registration
-            // exists for settlement ownership, not peer admission. A revival or a fresh
-            // acceptance re-marks the entry accepted.
-            accepted: false,
-          });
+          this.registerRecoveredWorkspaceTurn(task.id, normalized);
         }
       } catch (error: unknown) {
         // Startup recovery is best-effort: one read-only/corrupt child must not prevent Xum startup
@@ -6113,6 +6106,31 @@ export class WorkspaceTurnManager {
         });
       }
     }
+  }
+
+  /**
+   * Startup reconciliation's registration for an active handle. Fail closed: the restart killed any
+   * live stream, so a recovered registration exists for settlement ownership, not peer admission.
+   * A revival or a fresh acceptance re-marks it accepted. The exception is the same turn already
+   * accepted in this process: a reawakening that lands between the pass's config read and its
+   * handle scan puts its live handle in the scan, and downgrading it would make peers refuse the
+   * running child. Startup ordering keeps clients out of that window today; this guards any later
+   * caller that runs the pass while clients are connected.
+   */
+  private registerRecoveredWorkspaceTurn(
+    workspaceId: string,
+    record: WorkspaceTurnTaskHandleRecord
+  ): void {
+    const existing = this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
+    const acceptedInThisProcess =
+      existing?.handleId === record.handleId &&
+      existing.ownerWorkspaceId === record.ownerWorkspaceId &&
+      existing.accepted;
+    this.activeWorkspaceTurnHandleByWorkspaceId.set(workspaceId, {
+      handleId: record.handleId,
+      ownerWorkspaceId: record.ownerWorkspaceId,
+      accepted: acceptedInThisProcess,
+    });
   }
 
   /**
