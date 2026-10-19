@@ -11,8 +11,48 @@ import { createORPCClient } from "@orpc/client";
 import { RPCLink } from "@orpc/client/fetch";
 import type { RouterClient } from "@orpc/server";
 import type { AppRouter } from "../../../src/node/orpc/router";
+import { TODO_TURN_END_NUDGE } from "../../../src/common/utils/machineTurnPrompts";
+import type { ToolPolicy } from "../../../src/common/utils/tools/toolPolicy";
 
 export const WORKSPACE_TITLE = "Bug bash playground";
+
+function appClient(app: { baseUrl: string | undefined }): RouterClient<AppRouter> {
+  if (app.baseUrl === undefined) throw new Error("The bug-bash target declares no app URL");
+  return createORPCClient(new RPCLink({ origin: new URL(app.baseUrl).origin, url: "/orpc" }));
+}
+
+export interface TodoNudgeToolPolicy {
+  toolPolicy: ToolPolicy | null;
+  retryToolPolicy: ToolPolicy | null;
+}
+
+/**
+ * The tool policies that Xum sent each turn-end TODO nudge with, oldest first: the row's own
+ * `toolPolicy` and the one kept for a restart retry (null when the row has none). Read from the
+ * server's history, not the page: the transcript does not show a row's tool policy.
+ */
+export async function todoNudgeToolPolicies(app: {
+  baseUrl: string | undefined;
+}): Promise<TodoNudgeToolPolicy[]> {
+  const client = appClient(app);
+  const playground = (await client.workspace.list()).filter(
+    (workspace) => workspace.title === WORKSPACE_TITLE
+  );
+  if (playground.length !== 1) {
+    throw new Error(`expected one '${WORKSPACE_TITLE}' workspace, found ${playground.length}`);
+  }
+  const replay = await client.workspace.getFullReplay({ workspaceId: playground[0].id });
+  const rows = replay.flatMap((row) => (row.type === "message-batch" ? row.messages : [row]));
+  return rows.flatMap((row) => {
+    if (row.type !== "message" || row.role !== "user") return [];
+    const text = row.parts.map((part) => (part.type === "text" ? part.text : "")).join("");
+    if (text.trim() !== TODO_TURN_END_NUDGE.trim()) return [];
+    const retry = row.metadata?.retrySendOptions as { toolPolicy?: ToolPolicy } | undefined;
+    return [
+      { toolPolicy: row.metadata?.toolPolicy ?? null, retryToolPolicy: retry?.toolPolicy ?? null },
+    ];
+  });
+}
 
 /**
  * Switches tutorials off on the server before the page loads (one would show over the

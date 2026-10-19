@@ -20,7 +20,10 @@ import type {
   MockStreamErrorEvent,
   MockStreamStartEvent,
 } from "./mockAiEventTypes";
-import { MockAiRouter } from "./mockAiRouter";
+import { MockAiRouter, type MockAiRouterReply } from "./mockAiRouter";
+import { setTodosForSessionDir } from "@/node/services/tools/todo";
+import type { TodoItem } from "@/common/types/tools";
+import * as path from "node:path";
 import { buildMockStreamEventsFromReply } from "./mockAiStreamAdapter";
 import type {
   CompletedMessagePart,
@@ -121,6 +124,8 @@ const MOCK_PARTIAL_WRITE_THROTTLE_MS = 100;
 interface MockPlayerDeps {
   aiService: AIService;
   historyService: HistoryService;
+  /** Where the canned todo_write side effect writes (see applyToolSideEffects); unit tests omit it. */
+  sessionsDir?: string;
 }
 
 interface StreamStartGate {
@@ -238,6 +243,24 @@ export class MockAiStreamPlayer {
     const gate = { promise, resolve };
     this.streamStartGates.set(workspaceId, gate);
     return gate;
+  }
+
+  /**
+   * Canned tool calls never run, but a successful todo_write must leave the list on disk as the
+   * real tool does: AgentSession's turn-end TODO nudge reads it there (needsTodoTurnEndNudge).
+   * Written before any stream event, so stream-end always sees the new list.
+   */
+  private async applyToolSideEffects(workspaceId: string, reply: MockAiRouterReply) {
+    const sessionsDir = this.deps.sessionsDir;
+    if (sessionsDir === undefined) return;
+    for (const call of reply.toolCalls ?? []) {
+      if (call.toolName !== "todo_write") continue;
+      const result = call.result as { success?: unknown } | undefined;
+      if (result?.success !== true) continue;
+      const todos = (call.args as { todos?: TodoItem[] }).todos;
+      assert(Array.isArray(todos), "mock todo_write call needs args.todos");
+      await setTodosForSessionDir(workspaceId, path.join(sessionsDir, workspaceId), todos);
+    }
   }
 
   private async waitForStreamStartGate(
@@ -382,6 +405,8 @@ export class MockAiStreamPlayer {
       latestUserMessage: latest,
       latestUserText: latestText,
     });
+
+    await this.applyToolSideEffects(workspaceId, reply);
 
     const messageId = `msg-mock-${this.nextMockMessageId++}`;
     if (reply.waitForStreamStart) {
