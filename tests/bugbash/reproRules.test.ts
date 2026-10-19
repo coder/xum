@@ -28,26 +28,36 @@ test("the rule catches a suite that drives flows with agent.act", () => {
 });
 
 /**
- * Whether every test in the file has the `agent` tag. A narrow grammar on purpose: each
- * `test(` call must have a literal `tags: [...]` array that holds "agent". Anything else, such
- * as tags from a variable, counts as untagged.
+ * Whether every test in the file has the `agent` tag. A narrow grammar on purpose: comments are
+ * removed first, and then each `test(` call must hold a literal `tags: [...]` array with "agent"
+ * before its callback starts (`=>`). So a tag in a comment, in a helper or on another test does
+ * not count, and tags from a variable count as untagged.
  */
 function agentTagged(source: string): boolean {
-  const tests = source.match(/\btest\s*\(/g)?.length ?? 0;
-  const tagged = [...source.matchAll(/\btags\s*:\s*\[([^\]]*)\]/g)].filter((match) =>
-    /(["'`])agent\1/.test(match[1])
-  ).length;
-  return tests > 0 && tagged === tests;
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  // Not `pattern.test(...)`: only a bare `test(` call declares a test.
+  const calls = [...code.matchAll(/(?<![\w$.])test\s*\(/g)];
+  return (
+    calls.length > 0 &&
+    calls.every((call) => {
+      const head = code.slice(call.index, code.indexOf("=>", call.index) >>> 0);
+      return /\btags\s*:\s*\[[^\]]*(["'`])agent\1/.test(head);
+    })
+  );
 }
 
 test("the agent tag must cover every test of a model-driven file", () => {
   const tagged = 'test("x", { tags: ["bugbash", "agent"] }, async ({ agent }) => {});';
+  const untagged = 'test("y", { tags: ["bugbash"] }, async ({ agent }) => {});';
   expect(agentTagged(tagged)).toBe(true);
-  expect(agentTagged('test("x", { tags: ["bugbash"] }, async ({ agent }) => {});')).toBe(false);
-  expect(agentTagged(`${tagged}\ntest("y", { tags: ["bugbash"] }, async ({ agent }) => {});`)).toBe(
-    false
-  );
+  expect(agentTagged(untagged)).toBe(false);
+  expect(agentTagged(`${tagged}\n${untagged}`)).toBe(false);
   expect(agentTagged('test("x", { tags: TAGS }, async ({ agent }) => {});')).toBe(false);
+  // A tag outside the test call does not count (Codex review of #7006).
+  expect(agentTagged(`// tags: ["agent"]\n${untagged}`)).toBe(false);
+  expect(agentTagged(`const opts = { tags: ["agent"] };\n${untagged}`)).toBe(false);
+  expect(agentTagged(`/* tags: ["agent"] */ ${untagged}`)).toBe(false);
+  expect(agentTagged(`${tagged}\nconst ok = /x/.test("x");`)).toBe(true);
 });
 
 // Every model-driven test file under `dir` that does not tag each of its tests `agent`.
