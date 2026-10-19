@@ -15,7 +15,8 @@
  *    (trusted), one workspace with a few artifacts (one with stored versions), onboarding marked
  *    seen, the artifacts and mcp-apps experiments, and a fake Anthropic provider on a dead loopback port.
  * 3. Stop that server, then serve the same root on `--port`. e2e polls `--port` for readiness,
- *    so no explorer can open the app before seeding has finished.
+ *    so no explorer can open the app before seeding has finished. SIGUSR2 restarts that server
+ *    on the same port and root (serve, appControl.ts).
  *
  * AI mode (aiMode.ts, BUGBASH_AI, default auto): real mode configures the app's provider with the
  * real key and base URL, makes the app model the default, and starts the server with
@@ -44,6 +45,7 @@ import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { type AiMode, AiModeError, resolveAiMode } from "./aiMode";
+import { appControlPath, writeAppControl } from "./appControl";
 import { proxySocketMounted, sandboxShaped } from "./sandbox/inContainer";
 import { startFakeProvider } from "./fakeProvider";
 import { seedMcpChat, writeMcpConfig } from "./mcpapps/seed";
@@ -493,6 +495,82 @@ async function seedVersionedArtifact(
   }
 }
 
+/** What the signal handlers act on: the server that runs now, and what comes after it. */
+export interface ServerSlot {
+  current: ChildProcess | null;
+  /** SIGINT or SIGTERM came: no server starts again. */
+  stopping: boolean;
+  /** serve() runs the app server (seeding is over). */
+  serving: boolean;
+  /** SIGUSR2 came: serve() starts a new server once the current one exits. */
+  restarting: boolean;
+}
+
+/**
+ * e2e stops the app with a signal, possibly while seeding: SIGINT and SIGTERM go to whichever
+ * server runs. SIGUSR2 restarts the app server (appControl.ts): a story checks what survives a
+ * restart, and e2e's `app.restart()` only opens a new page. It is ignored while seeding, so it
+ * cannot cut the seed short, and during a restart.
+ */
+export function handleSignals(slot: ServerSlot): void {
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => {
+      slot.stopping = true;
+      slot.current?.kill(signal);
+    });
+  }
+  process.on("SIGUSR2", () => {
+    if (!slot.serving || slot.stopping || slot.restarting) return;
+    slot.restarting = true;
+    slot.current?.kill("SIGTERM");
+  });
+}
+
+/**
+ * Serves the app on `port` until a server exits without a restart, and returns its exit code.
+ * After each server is healthy it writes the control file (appControl.ts), and it removes the
+ * file at the end. `start` must serve the same env each time.
+ */
+export async function serve(
+  slot: ServerSlot,
+  port: number,
+  start: () => ChildProcess
+): Promise<number | null> {
+  // A crashed earlier run on this port can leave a file that names a dead pid.
+  fs.rmSync(appControlPath(port), { force: true });
+  slot.serving = true;
+  let generation = 0;
+  let code: number | null = null;
+  try {
+    while (!slot.stopping) {
+      slot.restarting = false;
+      const child = start();
+      slot.current = child;
+      // e2e polls the port itself on start; this probe tells a restarting story that the new
+      // server is up. It ends when the server exits, so awaiting both cannot hang.
+      const healthy = waitForHealth(`http://127.0.0.1:${port}`, child).then(
+        () => {
+          if (slot.current === child && !slot.stopping && !slot.restarting) {
+            generation += 1;
+            writeAppControl(port, { pid: process.pid, generation, ready: true });
+          }
+        },
+        (error: unknown) => {
+          if (slot.current === child && !slot.stopping && !slot.restarting) {
+            console.error(error instanceof Error ? error.message : error);
+          }
+        }
+      );
+      [code] = await Promise.all([waitForExit(child), healthy]);
+      if (!slot.restarting) break;
+      console.log(`[bugbash startApp] SIGUSR2: restarting the app server on port ${port}`);
+    }
+  } finally {
+    fs.rmSync(appControlPath(port), { force: true });
+  }
+  return code;
+}
+
 async function main(): Promise<void> {
   const port = parsePort(process.argv.slice(2));
   const mcpApps = process.argv.includes("--mcp-apps");
@@ -550,15 +628,8 @@ async function main(): Promise<void> {
   const unguarded = modelDrivenGuard(env);
   if (unguarded != null) fail(`${unguarded}: the app does not start`);
 
-  // e2e stops the app with a signal, possibly while seeding: pass it to whichever server runs.
-  let current: ChildProcess | null = null;
-  let stopping = false;
-  for (const signal of ["SIGINT", "SIGTERM"] as const) {
-    process.on(signal, () => {
-      stopping = true;
-      current?.kill(signal);
-    });
-  }
+  const slot: ServerSlot = { current: null, stopping: false, serving: false, restarting: false };
+  handleSignals(slot);
 
   let code: number | null = null;
   try {
@@ -569,30 +640,29 @@ async function main(): Promise<void> {
     if (mcpApps) writeMcpConfig(xumRoot);
 
     const seedPort = await getFreePort();
-    current = startServer(seedPort, env);
+    const seedServer = startServer(seedPort, env);
+    slot.current = seedServer;
     let workspaceId: string;
     try {
-      await waitForHealth(`http://127.0.0.1:${seedPort}`, current);
+      await waitForHealth(`http://127.0.0.1:${seedPort}`, seedServer);
       workspaceId = await seed(
         `http://127.0.0.1:${seedPort}`,
         projectPath,
         xumRoot,
-        current,
+        seedServer,
         ai,
         fakeProvider?.origin,
         pluginSources,
         env
       );
     } finally {
-      current.kill("SIGTERM");
-      await waitForExit(current);
+      seedServer.kill("SIGTERM");
+      await waitForExit(seedServer);
     }
     if (mcpApps) seedMcpChat(xumRoot, workspaceId);
 
-    if (!stopping) {
-      current = startServer(port, env);
-      code = await waitForExit(current);
-    }
+    // Every restart serves this same env, XUM_ROOT included: the temp root goes only below.
+    code = await serve(slot, port, () => startServer(port, env));
   } finally {
     fakeProvider?.close();
     fs.rmSync(tempRoot, { recursive: true, force: true });
