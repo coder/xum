@@ -130,7 +130,9 @@ Stories: `make test-stories BUGBASH_BUDGET_USD=3` runs two sandbox jobs with `BU
 (`e2e run --tag agent`, and no other `--tag` or `--tag-mode`). The budget caps each job.
 `STORIES_ARGS` passes e2e arguments to both jobs. A story config change goes in
 `tests/stories/e2e.config.ts`, which reuses the web target of `tests/bugbash/e2e.config.ts`.
-STORY_COST_PLACEHOLDER
+The first run, with one smoke story and no agent repro, spent $0.09 at list price and took about
+2 minutes with the build. Each job's results come back to `tests/stories/.e2e/stories-<time>-<pid>/`
+and `tests/bugbash/.e2e/agent-repros-<time>-<pid>/`, each with its `.proxy.jsonl`.
 
 ## 4. Read the results
 
