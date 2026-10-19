@@ -61,7 +61,7 @@ import { useOpenTerminal } from "./hooks/useOpenTerminal";
 import { useMinThinkingLevels } from "./hooks/useMinThinkingLevels";
 import type { CommandAction } from "./contexts/CommandRegistryContext";
 import { useTheme, type ThemePreference } from "./contexts/ThemeContext";
-import { CommandPalette } from "./components/CommandPalette/CommandPalette";
+import { LazyCommandPalette } from "./components/CommandPalette/LazyCommandPalette";
 import {
   LEFT_SIDEBAR_DEFAULT_WIDTH_PX,
   LEFT_SIDEBAR_MAX_WIDTH_PX,
@@ -1634,7 +1634,9 @@ function AppInner() {
           </PageArea>
         </div>
         <WorkspaceActiveGoalsWarningToast />
-        <CommandPalette getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })} />
+        <LazyCommandPalette
+          getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })}
+        />
         {/* Before SettingsPage so settings opened from analytics stacks above it. */}
         <LazyAnalyticsDashboard />
         <LazySettingsPage />

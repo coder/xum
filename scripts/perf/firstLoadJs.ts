@@ -25,6 +25,8 @@ export const FIRST_LOAD_FORBIDDEN_SOURCES: readonly string[] = [
   "node_modules/recharts/",
   "features/desktop/DesktopPanel",
   "src/common/orpc/schemas/api.ts",
+  "components/CommandPalette/CommandPalette.tsx",
+  "node_modules/cmdk/",
 ];
 
 function fail(message: string): never {

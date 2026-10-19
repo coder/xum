@@ -1,9 +1,10 @@
-import React, { createContext, useCallback, useContext, useMemo, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   COMMAND_PALETTE_RECENT_KEY,
   COMMAND_PALETTE_RECENT_MAX_ENTRIES,
 } from "@/common/constants/storage";
+import { CUSTOM_EVENTS } from "@/common/constants/events";
 
 export interface CommandAction {
   id: string;
@@ -139,6 +140,23 @@ export const CommandRegistryProvider: React.FC<{ children: React.ReactNode }> = 
     }
     return all;
   }, [sources]);
+
+  // EXECUTE_COMMAND runs a command by ID with the palette closed. It lives here, not in the
+  // palette, because the palette module loads only on its first open (#6997).
+  useEffect(() => {
+    const handleExecuteCommand = (e: Event) => {
+      const { commandId } = (e as CustomEvent<{ commandId: string }>).detail;
+      const action = getActions().find((a) => a.id === commandId);
+      if (!action) {
+        console.warn(`Command not found: ${commandId}`);
+        return;
+      }
+      void action.run();
+      addRecent(action.id);
+    };
+    window.addEventListener(CUSTOM_EVENTS.EXECUTE_COMMAND, handleExecuteCommand);
+    return () => window.removeEventListener(CUSTOM_EVENTS.EXECUTE_COMMAND, handleExecuteCommand);
+  }, [getActions, addRecent]);
 
   const value = useMemo(
     () => ({

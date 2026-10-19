@@ -68,4 +68,11 @@ describe("renderer first load", () => {
     expect(closure.has("src/browser/utils/messages/StreamingMessageAggregator.ts")).toBe(true);
     expect(closure.has("src/common/utils/tools/toolDefinitions.ts")).toBe(false);
   }, 60_000);
+
+  // #6997: the palette (and cmdk, which only it imports) loads on its first open.
+  test("the entry's static imports do not reach the command palette", async () => {
+    const closure = await staticImportClosure("src/browser/main.tsx");
+    expect(closure.has("src/browser/components/CommandPalette/LazyCommandPalette.tsx")).toBe(true);
+    expect(closure.has("src/browser/components/CommandPalette/CommandPalette.tsx")).toBe(false);
+  }, 60_000);
 });

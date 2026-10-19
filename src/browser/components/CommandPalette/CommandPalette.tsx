@@ -16,12 +16,20 @@ import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { resolveSlashCommandExperimentValue } from "@/browser/utils/slashCommands/experimentVisibility";
 import { getSlashCommandSuggestions } from "@/browser/utils/slashCommands/suggestions";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import {
+  COMMAND_PALETTE_INPUT_CLASSES,
+  COMMAND_PALETTE_OVERLAY_CLASSES,
+  COMMAND_PALETTE_PANEL_CLASSES,
+  COMMAND_PALETTE_PLACEHOLDER,
+} from "./commandPaletteChrome";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { filterCommandsByPrefix } from "@/browser/utils/commandPaletteFiltering";
 import { rankByPaletteQuery } from "@/browser/utils/commandPaletteRanking";
 
 interface CommandPaletteProps {
   getSlashContext?: () => { workspaceId?: string };
+  /** Focus to restore on close, captured before the first open's loading input took focus. */
+  openOrigin?: HTMLElement | null;
 }
 
 type PromptDef = NonNullable<NonNullable<CommandAction["prompt"]>>;
@@ -29,7 +37,7 @@ type PromptField = PromptDef["fields"][number];
 
 function getCommandInputPlaceholder(field: PromptField | null): string {
   if (!field) {
-    return "Switch workspaces or type > for all commands, / for slash commands…";
+    return COMMAND_PALETTE_PLACEHOLDER;
   }
 
   if (field.type === "text") {
@@ -85,7 +93,7 @@ function PaletteEmptyText(props: { text: string | undefined; alert: boolean }) {
   );
 }
 
-export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext }) => {
+export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext, openOrigin }) => {
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationExperimentEnabled = useExperimentValue(
     EXPERIMENT_IDS.MEMORY_CONSOLIDATION
@@ -96,7 +104,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
   const slashWorkspaceId = slashContext?.workspaceId;
 
   const commandPanelRef = useRef<HTMLDivElement | null>(null);
-  const paletteOpenOriginRef = useRef<HTMLElement | null>(null);
+  const paletteOpenOriginRef = useRef<HTMLElement | null>(openOrigin ?? null);
   const { isOpen, initialQuery, close, getActions, addRecent, recent } = useCommandRegistry();
   const agentSkills = useInvocableSkills(
     isOpen && slashWorkspaceId
@@ -178,27 +186,6 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
       values: {},
     });
   }, []);
-
-  // Listen for EXECUTE_COMMAND events
-  useEffect(() => {
-    const handleExecuteCommand = (e: Event) => {
-      const customEvent = e as CustomEvent<{ commandId: string }>;
-      const { commandId } = customEvent.detail;
-
-      const action = getActions().find((a) => a.id === commandId);
-      if (!action) {
-        console.warn(`Command not found: ${commandId}`);
-        return;
-      }
-
-      // Run the action directly
-      void action.run();
-      addRecent(action.id);
-    };
-
-    window.addEventListener(CUSTOM_EVENTS.EXECUTE_COMMAND, handleExecuteCommand);
-    return () => window.removeEventListener(CUSTOM_EVENTS.EXECUTE_COMMAND, handleExecuteCommand);
-  }, [getActions, startPrompt, addRecent]);
 
   const handlePromptValue = useCallback(
     (value: string) => {
@@ -545,25 +532,17 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
   const hasAnyItems = groupsWithItems.length > 0;
 
   return (
-    <div
-      // Dim painted on a pseudo-element so iOS/iPadOS 26 WebKit's status-bar edge
-      // sampler ignores this fixed overlay (same pattern as Dialog/LeftSidebar).
-      className="fixed inset-0 z-[2000] flex items-start justify-center pt-[10vh] before:absolute before:inset-0 before:bg-black/40"
-      onMouseDown={dismissPalette}
-    >
+    <div className={COMMAND_PALETTE_OVERLAY_CLASSES} onMouseDown={dismissPalette}>
       <Command
         label={currentField?.label ?? "Command palette"}
         ref={commandPanelRef}
-        // relative keeps the panel painted above (and hit-tested before) the wrapper's
-        // absolutely positioned ::before backdrop, so clicks land on the palette instead
-        // of the wrapper's dismiss handler.
-        className="font-primary relative w-[min(720px,92vw)] overflow-hidden rounded-lg border border-[var(--color-command-border)] bg-[var(--color-command-surface)] text-[var(--color-command-foreground)] shadow-[0_10px_40px_rgba(0,0,0,0.4)]"
+        className={COMMAND_PALETTE_PANEL_CLASSES}
         onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
         onKeyDown={trapPromptFocus}
         shouldFilter={false}
       >
         <Command.Input
-          className="w-full border-b border-[var(--color-command-input-border)] bg-[var(--color-command-input)] px-3.5 py-3 text-sm text-[var(--color-command-foreground)] outline-none placeholder:text-[var(--color-command-subdued)]"
+          className={COMMAND_PALETTE_INPUT_CLASSES}
           value={query}
           onValueChange={handleQueryChange}
           placeholder={getCommandInputPlaceholder(currentField)}

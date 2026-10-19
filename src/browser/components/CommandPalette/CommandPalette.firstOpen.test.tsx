@@ -12,7 +12,7 @@ import {
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 // The palette as App.tsx mounts it.
-import { CommandPalette as AppCommandPalette } from "./CommandPalette";
+import { LazyCommandPalette as AppCommandPalette } from "./LazyCommandPalette";
 
 // #6997: the first open after page load must behave like every later open, for both palette
 // shortcuts (App's keydown handler calls `open()` or `open(">")`).
