@@ -55,8 +55,9 @@ interface Hunk {
 type LCSMatch = [number, number];
 
 /**
- * Most lines a diff may remove plus add. A larger change reaches the model as a notice: such
- * a diff is no more useful than reading the file, and the limit bounds the search below.
+ * About the most lines a diff may remove plus add (each bisection stops after half of it, so
+ * the exact cut is a few lines higher). A larger change reaches the model as a notice: such a
+ * diff is no more useful than reading the file, and the limit bounds the search below.
  */
 const MAX_EDIT_DISTANCE = 4_000;
 
@@ -202,10 +203,11 @@ function bisect(
   const backward = newSide();
   const delta = a.length - b.length;
   for (let d = 0; d < dLimit; d++) {
-    const met =
-      searchRound(a, b, d, offset, forward, backward, delta, false, budget) ??
-      searchRound(a, b, d, offset, backward, forward, delta, true, budget);
-    if (met !== undefined) return met;
+    // Not ??: a null (step budget spent) from the forward round must end the search too.
+    const forwardMet = searchRound(a, b, d, offset, forward, backward, delta, false, budget);
+    if (forwardMet !== undefined) return forwardMet;
+    const backwardMet = searchRound(a, b, d, offset, backward, forward, delta, true, budget);
+    if (backwardMet !== undefined) return backwardMet;
   }
   return dLimit < maxD ? null : "disjoint";
 }

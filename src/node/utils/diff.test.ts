@@ -115,8 +115,6 @@ describe("computeDiff", () => {
     expect(diff).toBe([...hunk(FAR_EDITS[0]), ...hunk(FAR_EDITS[1])].join("\n"));
   });
 
-  // Two edits far apart in a 3000-line file: the table spans the whole middle between them
-  // (about 9M cells, which main diffed too), so it must fit the budget.
   const isNotice = (diff: string | null) => diff?.startsWith("(diff omitted") === true;
 
   test("a change past the edit-distance limit returns the notice", () => {
@@ -139,6 +137,8 @@ describe("computeDiff", () => {
     expect(isNotice(computeDiff(old.join("\n"), next.join("\n")))).toBe(true);
   });
 
+  // Two edits far apart in a 3000-line file: the first budget (a table spanning the whole
+  // middle between them) gave the notice here.
   test("edits near both ends of a 3000-line file still get two hunks", () => {
     const old = Array.from({ length: 3000 }, (_, i) => `l${i}`);
     const next = [...old];
