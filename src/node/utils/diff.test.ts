@@ -28,14 +28,23 @@ function diffLargeFiles(kind: "rewrite" | "one-line-edit"): { status: number | n
     const diff = computeDiff(old.join("\\n"), next.join("\\n"));
     process.stdout.write(JSON.stringify({ diff, rssMb: process.memoryUsage().rss / 2 ** 20 }));
   `;
-  const child = spawnSync(
-    "sh",
-    [
-      "-c",
-      'ulimit -v 2621440 2>/dev/null; exec node --max-old-space-size=256 --input-type=module -e "$DIFF_SCRIPT"',
-    ],
-    { encoding: "utf8", timeout: 60_000, env: { ...process.env, DIFF_SCRIPT: script } }
-  );
+  const options = { encoding: "utf8", timeout: 60_000 } as const;
+  // Windows has no POSIX shell or ulimit: there only the heap cap applies.
+  const child =
+    process.platform === "win32"
+      ? spawnSync(
+          "node",
+          ["--max-old-space-size=256", "--input-type=module", "-e", script],
+          options
+        )
+      : spawnSync(
+          "sh",
+          [
+            "-c",
+            'ulimit -v 2621440 2>/dev/null; exec node --max-old-space-size=256 --input-type=module -e "$DIFF_SCRIPT"',
+          ],
+          { ...options, env: { ...process.env, DIFF_SCRIPT: script } }
+        );
   return { status: child.status, out: child.stdout };
 }
 
@@ -73,6 +82,33 @@ describe("computeDiff on large files", () => {
 });
 
 describe("computeDiff", () => {
+  // Two edits far apart in a 3000-line file: the table spans the whole middle between them
+  // (about 9M cells, which main diffed too), so it must fit the budget.
+  test("edits near both ends of a 3000-line file still get two hunks", () => {
+    const old = Array.from({ length: 3000 }, (_, i) => `l${i}`);
+    const next = [...old];
+    next[1] = "a";
+    next[2998] = "b";
+    expect(computeDiff(old.join("\n"), next.join("\n"))).toBe(
+      [
+        "@@ -1,5 +1,5 @@",
+        " l0",
+        "-l1",
+        "+a",
+        " l2",
+        " l3",
+        " l4",
+        "@@ -2996,5 +2996,5 @@",
+        " l2995",
+        " l2996",
+        " l2997",
+        "-l2998",
+        "+b",
+        " l2999",
+      ].join("\n")
+    );
+  });
+
   test("separate changes keep separate hunks, and nearby ones merge", () => {
     const old = Array.from({ length: 30 }, (_, i) => `l${i}`);
     const next = [...old];

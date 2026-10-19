@@ -55,11 +55,13 @@ interface Hunk {
 type LCSMatch = [number, number];
 
 /**
- * Most cells of the LCS table (4 bytes each, so about 16 MB). The table is
- * (changed old lines + 1) x (changed new lines + 1): a full table for two 22.5k-line files
- * was about 4 GB and took the server to its heap limit. Larger changes get a notice.
+ * Most cells of the LCS table (4 bytes each, so 64 MB). The table is
+ * (changed old lines + 1) x (changed new lines + 1), where the changed part spans from the
+ * first edit to the last, so two edits far apart in a 4000-line file still fit. A full table
+ * for two 22.5k-line files was about 4 GB and took the server to its heap limit. Larger
+ * changes get a notice.
  */
-const MAX_LCS_CELLS = 4_000_000;
+const MAX_LCS_CELLS = 16_000_000;
 
 /**
  * Compute longest common subsequence indices.
