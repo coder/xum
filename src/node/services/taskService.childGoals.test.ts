@@ -7,6 +7,7 @@ import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { writeSubagentAttemptSettlementReceipt } from "@/node/services/subagentAttemptSettlements";
+import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import { waitForCondition } from "@/node/services/testDispatchHelpers";
 import type { TaskService } from "@/node/services/taskService";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -1343,6 +1344,32 @@ describe("TaskService child goals", () => {
       expect(internal.streamEndDecisionsByTaskId.has(childId)).toBe(false);
     }
   );
+
+  // #6994: a report artifact on disk while the child runs (written by another backend) is adopted
+  // by the parent's wait, which writes `reported`. The deferred stream end can no longer arbitrate
+  // a goal turn, so it must stop waiting for the accounting (never settled here) and settle.
+  test("a report adopted while the child's stream end is deferred settles the deferral", async () => {
+    const { t, internal } = await deferStreamEndOfOwnedAttempt();
+    await upsertSubagentReportArtifact({
+      workspaceId: parentId,
+      workspaceSessionDir: path.join(t.config.sessionsDir, parentId),
+      childTaskId: childId,
+      parentWorkspaceId: parentId,
+      ancestorWorkspaceIds: [parentId],
+      reportMarkdown: "Report from another backend.",
+    });
+
+    const report = await t.taskService.waitForAgentReport(childId, {
+      timeoutMs: 5_000,
+      requestingWorkspaceId: parentId,
+    });
+
+    expect(report.reportMarkdown).toBe("Report from another backend.");
+    expect(t.child()?.taskStatus).toBe("reported");
+    await waitForCondition(() => !internal.streamEndDecisionsByTaskId.has(childId), {
+      timeoutMs: 1_000,
+    });
+  });
 
   test("unsettled accounting defers the stream end without finalizing; its settlement resumes it", async () => {
     const t = await setup();
