@@ -17,7 +17,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkSeed, isSeedEntry, MAX_SEED_BYTES, MAX_SEED_ENTRIES } from "../bugbash/sandbox/cacheSeed";
+import {
+  checkSeed,
+  isSeedEntry,
+  MAX_SEED_BYTES,
+  MAX_SEED_ENTRIES,
+} from "../bugbash/sandbox/cacheSeed";
 
 /** Where make test-stories puts each job's output folder; the first kind records the cache. */
 const JOB_KINDS = [
