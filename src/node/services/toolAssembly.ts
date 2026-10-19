@@ -160,6 +160,23 @@ function refuseToolForAgent(
 }
 
 /**
+ * Whether a denied tool can stay advertised as a refusal stub. If not, it stays
+ * absent: the tool block then changes on that switch (one cache miss), but the
+ * policy still holds.
+ * - Provider-executed tools (native web_search) and tools without a local
+ *   execute never run the refusal.
+ * - Memory's description carries the memory index, so an agent denied memory
+ *   must not see it (intuition, which reads memory directly, follows memory).
+ * - A refused tool_catalog_search would still make tool search defer the MCP
+ *   tools (prepareToolSearch reads presence), and every search would then be
+ *   refused, leaving those allowed tools unreachable.
+ */
+function canRefuseAtExecution(name: string, tool: Tool): boolean {
+  if (tool.type === "provider" || tool.execute == null) return false;
+  return name !== "memory" && name !== TOOL_SEARCH_TOOL_NAME;
+}
+
+/**
  * One tool set across agent-mode switches (#5253, user decision): every tool
  * some switchable agent allows stays advertised, so switching between exec,
  * plan or a custom agent keeps the tools block and the prompt cache
@@ -181,20 +198,7 @@ function applySwitchableAgentPolicies(
   const result: Record<string, Tool> = {};
   for (const policy of switchablePolicies) {
     for (const [name, tool] of Object.entries(applyToolPolicy(tools, policy))) {
-      if (name in active || name in result) continue;
-      // Provider-executed tools (native web_search) and tools without a local
-      // execute never run the refusal below, so a denied one stays absent:
-      // a switch then changes the tool block, but the policy still holds.
-      if (tool.type === "provider" || tool.execute == null) continue;
-      // Memory's description carries the memory index, so an agent denied
-      // memory must not see it: memory stays absent (and so does intuition,
-      // which reads memory directly). One cache miss on such a switch.
-      if (name === "memory") continue;
-      // A refused tool_catalog_search would still make tool search defer the MCP
-      // tools (prepareToolSearch reads presence), and every search would then be
-      // refused, leaving those allowed tools unreachable. So it stays absent and
-      // the MCP tools stay advertised. One cache miss on such a switch.
-      if (name === TOOL_SEARCH_TOOL_NAME) continue;
+      if (name in active || name in result || !canRefuseAtExecution(name, tool)) continue;
       result[name] = refuseToolForAgent(name, tool, activeAgentId, callerToolPolicy);
     }
   }
