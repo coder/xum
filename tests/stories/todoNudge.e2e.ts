@@ -2,8 +2,8 @@
  * Story: the agent finishes open TODO items after Xum's turn-end nudge. The user asks for work;
  * the mock AI (`[mock:todo-nudge]`, mockAiRouter.ts) writes a TODO list, leaves "Verify the fix"
  * pending and ends its turn. Xum then sends its turn-end TODO nudge, shown as the collapsed row
- * "Asked the agent to update its TODO list". The nudged turn keeps the turn's tools (#7027), so
- * the mock reads README.md and marks the list complete.
+ * "Asked the agent to update its TODO list and finish open items". The nudged turn keeps the
+ * turn's tools (#7027), so the mock reads README.md and marks the list complete.
  *
  * The mock runs no tool, so the exact check reads the nudge row's tool policy from the server: a
  * todo_write-only policy there is the regression (open work waited for the user, and the smaller
@@ -37,9 +37,12 @@ test(
         "wait until the agent stops replying"
     );
     await expect(transcript).toContainText(NUDGE_REPLY, { timeout: 60_000 });
-    await expect(transcript).toContainText("Asked the agent to update its TODO list");
+    await expect(transcript).toContainText(
+      "Asked the agent to update its TODO list and finish open items"
+    );
     await agent.assert(
-      "after a row that says Xum asked the agent to update its TODO list, the agent read a " +
+      "after a row that says Xum asked the agent to update its TODO list and finish open " +
+        "items, the agent read a " +
         "file (README.md) and replied that the TODO list is complete"
     );
 

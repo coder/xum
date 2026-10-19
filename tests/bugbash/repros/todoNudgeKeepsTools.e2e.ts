@@ -11,7 +11,7 @@ import { expect } from "e2e";
 import { openPlayground, sendMessage, todoNudgeToolPolicies } from "./helpers";
 import { applyToolPolicyToNames } from "../../../src/common/utils/tools/toolPolicy";
 
-const NUDGE_ROW = "Asked the agent to update its TODO list";
+const NUDGE_ROW = "Asked the agent to update its TODO list and finish open items";
 const NUDGE_REPLY = "Verified the fix in README.md. The TODO list is complete.";
 const TOOLS = ["bash", "file_read", "todo_write"];
 
