@@ -447,9 +447,12 @@ else:
             ),
             (
                 "a commitless review must not report findings",
+                board.replace(commitless, commitless.replace('"has_any_findings":null', '"has_any_findings":true')),
+            ),
+            (
+                "a commitless review must not report unresolved findings",
                 board.replace(
-                    commitless,
-                    '"commit_sha":null,"has_any_findings":true,"has_unresolved_findings":true,"status":"completed"',
+                    commitless, commitless.replace('"has_unresolved_findings":null', '"has_unresolved_findings":true')
                 ),
             ),
             (

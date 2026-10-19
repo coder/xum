@@ -110,7 +110,7 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
                 # A commitless code review (codex_commitless_code_review_row) has no
                 # findings flags. Its findings are review threads, which the gate
                 # checks on their own.
-                or ($kind == "code_review" and .commit_sha == null
+                or ($kind == "code_review" and .commit_sha == null and .has_any_findings == null
                   and .has_unresolved_findings == null and .status == "completed")))))
             # Unknown security fields or statuses could be authoritative findings.
             # In particular, do not interpret an enabled security merge gate here.
