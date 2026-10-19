@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import ts from "typescript";
 
 // Exact-step repros may run on the host (no model picks an action there), and the host pause
 // (hostPause.ts, #5714) relies on that. A repro that takes the `agent` fixture lets a model pick
@@ -28,22 +29,40 @@ test("the rule catches a suite that drives flows with agent.act", () => {
 });
 
 /**
- * Whether every test in the file has the `agent` tag. A narrow grammar on purpose: comments are
- * removed first, and then each `test(` call must hold a literal `tags: [...]` array with "agent"
- * before its callback starts (`=>`). So a tag in a comment, in a helper or on another test does
- * not count, and tags from a variable count as untagged.
+ * Whether every test in the file has the `agent` tag. It reads the TypeScript syntax tree, not
+ * the text, because text scans kept matching a tag outside the test's own options (a comment,
+ * a helper, the title: three Codex findings on #7006). Each `test(...)` call must have an object
+ * literal as its second argument, with a `tags` array literal that holds the string "agent".
+ * Anything else, such as tags from a variable, counts as untagged.
  */
 function agentTagged(source: string): boolean {
-  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
-  // Not `pattern.test(...)`: only a bare `test(` call declares a test.
-  const calls = [...code.matchAll(/(?<![\w$.])test\s*\(/g)];
-  return (
-    calls.length > 0 &&
-    calls.every((call) => {
-      const head = code.slice(call.index, code.indexOf("=>", call.index) >>> 0);
-      return /\btags\s*:\s*\[[^\]]*(["'`])agent\1/.test(head);
-    })
-  );
+  const file = ts.createSourceFile("repro.e2e.ts", source, ts.ScriptTarget.Latest, true);
+  const calls: ts.CallExpression[] = [];
+  const visit = (node: ts.Node) => {
+    if (
+      ts.isCallExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === "test"
+    )
+      calls.push(node);
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  const tagged = (call: ts.CallExpression) => {
+    const options = call.arguments[1];
+    if (options == null || !ts.isObjectLiteralExpression(options)) return false;
+    return options.properties.some(
+      (property) =>
+        ts.isPropertyAssignment(property) &&
+        ts.isIdentifier(property.name) &&
+        property.name.text === "tags" &&
+        ts.isArrayLiteralExpression(property.initializer) &&
+        property.initializer.elements.some(
+          (element) => ts.isStringLiteralLike(element) && element.text === "agent"
+        )
+    );
+  };
+  return calls.length > 0 && calls.every(tagged);
 }
 
 test("the agent tag must cover every test of a model-driven file", () => {
@@ -58,6 +77,9 @@ test("the agent tag must cover every test of a model-driven file", () => {
   expect(agentTagged(`const opts = { tags: ["agent"] };\n${untagged}`)).toBe(false);
   expect(agentTagged(`/* tags: ["agent"] */ ${untagged}`)).toBe(false);
   expect(agentTagged(`${tagged}\nconst ok = /x/.test("x");`)).toBe(true);
+  expect(
+    agentTagged('test(\'tags: ["agent"]\', { tags: ["bugbash"] }, async ({ agent }) => {});')
+  ).toBe(false);
 });
 
 // Every model-driven test file under `dir` that does not tag each of its tests `agent`.
