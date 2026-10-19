@@ -13,7 +13,6 @@ import type { TodoItem } from "@/common/types/tools";
 import { getTodoFilePath } from "@/node/services/todos/todoStorage";
 import { TURN_STOP_PROMPT_MAX_CHARS } from "./agentPlugins/promptHooks";
 import { TODO_TURN_END_NUDGE } from "@/node/services/agentNotifications/todoTurnEndNudge";
-import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { Ok } from "@/common/types/result";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { AgentSessionAIService } from "./agentSession";
@@ -759,18 +758,16 @@ describe("todo turn-end nudge", () => {
     const { h, streams, requests } = await setup({ parts: row.parts });
     await writeTodos(h, openTodos);
 
-    await h.session.sendMessage("fix the bug", options);
+    // The turn's own policy (a caller deny) must carry over to the nudge turn unchanged.
+    const toolPolicy = [{ regex_match: "file_edit_.*", action: "disable" as const }];
+    await h.session.sendMessage("fix the bug", { ...options, toolPolicy });
     await settle(h);
 
     expect(streams()).toBe(2);
     expect(await userTexts(h)).toEqual(["fix the bug", TODO_TURN_END_NUDGE]);
-    // The nudge turn may only update the list, and never gets a tool its agent denies.
-    const nudgePolicy = requests[1].toolPolicy ?? [];
-    expect(applyToolPolicyToNames(["bash", "file_read", "todo_write"], nudgePolicy)).toEqual([
-      "todo_write",
-    ]);
-    const agentDeny = { regex_match: "todo_write", action: "disable" } as const;
-    expect(applyToolPolicyToNames(["bash", "todo_write"], [agentDeny, ...nudgePolicy])).toEqual([]);
+    // The nudge turn keeps the turn's tools, so it can finish open items, not only update the
+    // list, and it still gets no tool the turn denied.
+    expect(requests[1].toolPolicy).toEqual(toolPolicy);
 
     // The next user turn may be nudged again.
     await h.session.sendMessage("now lint", options);

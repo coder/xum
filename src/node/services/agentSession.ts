@@ -10678,11 +10678,7 @@ export class AgentSession {
       return;
     }
     this.stopHookContinuations++;
-    const continuationOptions = {
-      ...this.stopContinuationOptions(options, provenance),
-      ...continuation.optionOverrides,
-    };
-    this.queueMessage(continuation.prompt, continuationOptions, {
+    this.queueMessage(continuation.prompt, this.stopContinuationOptions(options, provenance), {
       acceptanceOrigin: "automatic",
       synthetic: true,
       ...(provenance.agentInitiated === true ? { agentInitiated: true } : {}),
@@ -10700,7 +10696,7 @@ export class AgentSession {
    * The turn.stop continuation: the plugin hooks' reasons plus Xum's todo nudge, or null when
    * nothing continues. One todo nudge per user turn: only before any continuation (so never after
    * the nudge itself), never against a plugin's halt, and never in Plan mode, where the list is
-   * the plan. A nudge alone may only call todo_write (TODO_TURN_END_NUDGE_TOOL_POLICY).
+   * the plan. The nudged turn keeps the turn's tools, so it can also finish open items.
    */
   private async readTurnStopContinuation(
     payload: StreamEndEvent,
@@ -10719,7 +10715,6 @@ export class AgentSession {
     return mergeTurnStopContinuation({
       hookPrompt: hookOutcome.kind === "continue" ? hookOutcome.prompt : null,
       todoNudge: await this.needsTodoNudge(hookOutcome, options, payload),
-      callerToolPolicy: options?.toolPolicy,
     });
   }
 

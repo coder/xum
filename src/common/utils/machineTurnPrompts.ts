@@ -25,14 +25,15 @@ export const BACKGROUND_WORK_WAKE_OPENINGS = {
  * tool call after a todo_write on, so a model that writes a list, makes a few calls and then
  * ends its turn with text leaves the pinned list stale (pstack dogfood: "1 in progress, 5
  * pending" after a finished fix). AgentSession sends this prompt as a turn.stop continuation, at
- * most once per user turn, so the model can bring the list up to date before the turn ends.
+ * most once per user turn, so the model can bring the list up to date and finish open items it
+ * can still do. The nudged turn keeps the turn's tools, so it can continue normally.
  *
  * The prompt is constant on purpose: the todo text is model-written (a prompt injection can put
  * instructions there), so it must not come back as a user row. The model already sees its own
  * todo_write calls in context.
  */
 export const TODO_TURN_END_NUDGE = `<notification>
-You ended your turn, but your TODO list still has pending or in-progress items. Update it now with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. If an item is still open on purpose, keep it and say why in one sentence. Do not start new work.
+You ended your turn, but your TODO list still has pending or in-progress items. Update it with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. Then continue with the open items that are still in scope and that you can do now. If an item stays open on purpose, for example because it waits for the user, keep it and say why in one sentence.
 </notification>`;
 
 const PROMPT_OPENINGS_BY_KIND: ReadonlyArray<{
