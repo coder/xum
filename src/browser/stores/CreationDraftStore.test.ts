@@ -1,4 +1,5 @@
 import * as path from "path";
+import { ORPCError } from "@orpc/client";
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import { createTestApiClient } from "@/browser/testUtils";
 import type {
@@ -18,7 +19,11 @@ import { isDraftTooLargeError } from "@/common/utils/drafts";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { Config } from "@/node/config";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
-import { CreationDraftService, creationDraftImportId } from "@/node/services/creationDraftService";
+import {
+  CreationDraftRejectedError,
+  CreationDraftService,
+  creationDraftImportId,
+} from "@/node/services/creationDraftService";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { installDom } from "../../../tests/ui/dom";
@@ -42,6 +47,14 @@ afterEach(() => {
   jest.useRealTimers();
   cleanupDom?.();
 });
+
+/** Like the router (rethrowCreationDraftRefusal): a refused save reaches the store as BAD_REQUEST. */
+function rethrowAsRouterRefusal(error: unknown): never {
+  if (error instanceof CreationDraftRejectedError || isDraftTooLargeError(error)) {
+    throw new ORPCError("BAD_REQUEST", { message: (error as Error).message });
+  }
+  throw error;
+}
 
 async function createHarness(
   tempDir: TestTempDir,
@@ -87,7 +100,7 @@ async function createHarness(
         control.failUpdates--;
         throw new Error("connection lost");
       }
-      const reply = await service.update(input);
+      const reply = await service.update(input).catch(rethrowAsRouterRefusal);
       if (control.loseUpdateReplies > 0) {
         control.loseUpdateReplies--;
         throw new Error("connection lost");
@@ -223,6 +236,27 @@ describe("CreationDraftStore", () => {
     await store.flush(id);
     expect(await service.get(id)).toBeNull();
     expect(store.getDraftsByProject()[PROJECT_A]).toBeUndefined();
+  });
+
+  test("clearing a first save refused for its project, then moving it, leaves no record", async () => {
+    using tempDir = new TestTempDir("creation-store-refused-project");
+    const harness = await createHarness(tempDir);
+    const { store, service, config } = harness;
+    await waitFor(() => store.getListState().status === "ready");
+    const id = store.create(PROJECT_A, null);
+    await config.editConfig((cfg) => {
+      cfg.projects.delete(PROJECT_A);
+      return cfg;
+    });
+    store.update(id, { text: "fix it" });
+    let refusal: unknown = null;
+    await store.flush(id).catch((error: unknown) => (refusal = error));
+    expect(String(refusal)).toContain("not registered");
+
+    store.update(id, { text: "", projectPath: PROJECT_B });
+    await store.flush(id);
+    expect(await service.get(id)).toBeNull();
+    expect(store.getDraftsByProject()[PROJECT_B]).toBeUndefined();
   });
 
   test("an earlier save reply never replaces a later local edit", async () => {

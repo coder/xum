@@ -25,7 +25,6 @@ import { coerceThinkingLevel } from "@/common/types/thinking";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   createDraftId,
-  isDraftTooLargeError,
   sanitizeDraftAttachments,
   summarizeCreationDraft,
 } from "@/common/utils/drafts";
@@ -117,6 +116,14 @@ function hasCreationDraftContent(draft: CreationDraft): boolean {
     draft.attachments.length > 0 ||
     draft.manualName.trim().length > 0
   );
+}
+
+/**
+ * The backend refused the save and wrote nothing. The router sends every creation draft refusal
+ * (too large, unregistered project, deleted draft, invalid fields) as BAD_REQUEST.
+ */
+function isSaveRefusal(error: unknown): boolean {
+  return error instanceof Error && (error as { code?: unknown }).code === "BAD_REQUEST";
 }
 
 /** Changes the backend has not got yet that are due to be saved. */
@@ -574,7 +581,7 @@ export class CreationDraftStore {
     error: unknown
   ): void {
     // A refused save wrote nothing; other failures may have.
-    if (client && !isDraftTooLargeError(error)) entry.maybeSaved = true;
+    if (client && !isSaveRefusal(error)) entry.maybeSaved = true;
     // Later edits win over the fields this save carried.
     entry.pending = { ...patch, ...entry.pending };
     // Lost with a connection that was replaced meanwhile: no error, so flush() saves it again on
