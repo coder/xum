@@ -1682,25 +1682,37 @@ describe("WorkspaceStore", () => {
 
   describe("active workspace subscriptions", () => {
     // #6823: on desktop the lazy cards' chunk evaluated after the first rows committed, so tool
-    // rows showed header-only cards for 1-2 frames. Selection starts it before any chat event.
+    // rows showed header-only cards for 1-2 frames. #7004: requesting it on every selection made
+    // chats without tool rows wait for it, so desktop requests it once, at idle after the first
+    // caught-up. The browser never requests it for a chat without tool calls (T3 #5971).
     it.each([
-      ["desktop", true, [0]],
-      ["browser", false, []],
+      ["desktop", true, 1],
+      ["browser", false, 0],
     ] as const)(
-      "requests the tool cards on selection in %s mode",
-      async (_mode, desktop, calls) => {
-        const workspaceId = `tool-cards-on-select-${String(desktop)}`;
-        createAndAddWorkspace(store, workspaceId, {}, false);
+      "requests the tool cards once after the first caught-up in %s mode",
+      async (_mode, desktop, requests) => {
+        mockOnChat.mockImplementation(async function* (_input, options) {
+          yield caughtUpEvent();
+          await waitForAbortSignal(options?.signal);
+        });
+        const [first, second] = [`tool-cards-a-${_mode}`, `tool-cards-b-${_mode}`];
+        createAndAddWorkspace(store, first, {}, false);
+        createAndAddWorkspace(store, second, {}, false);
         await tick(0);
         onChatCallsAtToolCardRequest.length = 0;
         const api = global.window.api as { getIsRosetta?: () => Promise<boolean> };
         if (desktop) api.getIsRosetta = () => Promise.resolve(false);
         try {
-          store.setActiveWorkspaceId(workspaceId);
-          await tick(0);
-          // Desktop: one request, made before the onChat subscription started.
-          expect(onChatCallsAtToolCardRequest).toEqual([...calls]);
-          expect(mockOnChat).toHaveBeenCalled();
+          for (const [index, workspaceId] of [first, second, first].entries()) {
+            store.setActiveWorkspaceId(workspaceId);
+            // Selection itself never requests the cards.
+            expect(onChatCallsAtToolCardRequest).toHaveLength(index === 0 ? 0 : requests);
+            expect(await waitUntil(() => store.isWorkspaceTranscriptCaughtUp(workspaceId))).toBe(
+              true
+            );
+            await tick(0); // the idle fallback (no requestIdleCallback in bun)
+            expect(onChatCallsAtToolCardRequest).toHaveLength(requests);
+          }
         } finally {
           delete api.getIsRosetta;
         }

@@ -1091,6 +1091,7 @@ export class WorkspaceStore {
 
   // Workspace selected in the UI (set from WorkspaceContext routing state).
   private activeWorkspaceId: string | null = null;
+  private toolCardsPreloadScheduled = false;
   // Split tabsets can show several side chats at once. Count their mounted owners so closing
   // one pane never unsubscribes another, without keeping hidden background chats subscribed.
   private pinnedWorkspaces = new Map<string, { count: number }>();
@@ -1867,11 +1868,6 @@ export class WorkspaceStore {
     if (workspaceId) {
       // Chat-switch User Timing origin (#4504): every switch milestone is measured from here.
       markChatSwitchStart(workspaceId);
-      // #6823: on desktop the lazy tool cards' chunk, requested at the first replayed tool row,
-      // evaluated after the first rows committed (header-only cards for 1-2 frames). Request it
-      // before the replay keeps the main thread busy. Not in the browser: a chat without tool
-      // calls must not download the cards there (T3 #5971, see toolCardsStore).
-      if (isDesktopMode()) requestToolCards();
     }
     this.ensureOnChatSubscriptions();
 
@@ -5380,6 +5376,20 @@ export class WorkspaceStore {
       this.states.bump(workspaceId);
       // No-op unless this is the workspace the latest switch targeted.
       markChatSwitchMilestone(workspaceId, "caught-up", { replay });
+      // #6823: on desktop the lazy tool cards' chunk, requested at the first replayed tool row,
+      // evaluated after the first rows committed (header-only cards for 1-2 frames). #7004: a
+      // request on every selection made chats without tool rows wait ~50-100 ms for it. So load
+      // it once, when the renderer is idle after the first transcript caught up; later opens find
+      // it loaded. Not in the browser: a chat without tool calls must not download the cards
+      // there (T3 #5971, see toolCardsStore).
+      if (!this.toolCardsPreloadScheduled && isDesktopMode()) {
+        this.toolCardsPreloadScheduled = true;
+        if (typeof requestIdleCallback === "function") {
+          requestIdleCallback(requestToolCards, { timeout: 2_000 }); // load it even if busy
+        } else {
+          setTimeout(requestToolCards, 0);
+        }
+      }
       this.checkAndBumpRecencyIfChanged(); // Messages loaded, update recency
 
       // Replay resets clear the aggregator before history is rebuilt. Drop the temporary
