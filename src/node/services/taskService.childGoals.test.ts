@@ -1411,6 +1411,98 @@ describe("TaskService child goals", () => {
     expect(t.child()?.taskAttemptId).toBe(resumedAttemptId);
   });
 
+  // #7003 (item 3, in-process): the same resume after the child reported in THIS process. The
+  // parent's wait must not hand back the earlier attempt's cached report either.
+  test("a shared-desktop child resumed after reporting in this process does not return its cached old report", async () => {
+    const t = await setup({ taskDesktopOwnerWorkspaceId: parentId });
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+    await t.untilStatus("reported");
+    expect(t.child()?.taskStatus).toBe("reported");
+    expect(await t.taskService.markInterruptedTaskRunning(childId)).toBe(true);
+    expect(t.child()?.taskStatus).toBe("running");
+
+    const waited = await t.taskService
+      .waitForAgentReport(childId, { timeoutMs: 300, requestingWorkspaceId: parentId })
+      .then(
+        (report) => `resolved: ${report.reportMarkdown}`,
+        () => "still waiting"
+      );
+
+    expect(waited).toBe("still waiting");
+    expect(t.child()?.taskStatus).toBe("running");
+  });
+
+  /** A report artifact in the parent's session dir, bound to `taskAttemptId` when given. */
+  const writeReportArtifact = async (
+    t: { config: Config },
+    reportMarkdown: string,
+    taskAttemptId?: string
+  ) => {
+    // A variable (not a literal) so the binding field type-checks before it exists (#7003).
+    const params = {
+      workspaceId: parentId,
+      workspaceSessionDir: path.join(t.config.sessionsDir, parentId),
+      childTaskId: childId,
+      parentWorkspaceId: parentId,
+      ancestorWorkspaceIds: [parentId],
+      reportMarkdown,
+      ...(taskAttemptId != null ? { taskAttemptId } : {}),
+    };
+    await upsertSubagentReportArtifact(params);
+  };
+
+  // #7003 legacy artifacts (no attempt id, written before the binding): over an active row such an
+  // artifact can only be an earlier attempt's (publication writes `reported` before any artifact),
+  // so it is neither adopted nor allowed to settle the running attempt's deferred decision.
+  test("a legacy report artifact beside a running attempt is not adopted and settles nothing", async () => {
+    const { t, internal } = await deferStreamEndOfOwnedAttempt();
+    await writeReportArtifact(t, "Legacy report.");
+
+    const waited = await t.taskService
+      .waitForAgentReport(childId, { timeoutMs: 300, requestingWorkspaceId: parentId })
+      .then(
+        (report) => `resolved: ${report.reportMarkdown}`,
+        () => "still waiting"
+      );
+
+    expect(waited).toBe("still waiting");
+    expect(t.child()?.taskStatus).toBe("running");
+    expect(internal.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual([
+      "pending",
+    ]);
+  });
+
+  // #7003 legacy artifacts over an interrupted row keep today's self-heal: adopted as the report.
+  test("a legacy report artifact over an interrupted row is still adopted", async () => {
+    const t = await setup({ taskStatus: "interrupted" });
+    await writeReportArtifact(t, "Legacy report.");
+
+    const report = await t.taskService.waitForAgentReport(childId, {
+      timeoutMs: 5_000,
+      requestingWorkspaceId: parentId,
+    });
+
+    expect(report.reportMarkdown).toBe("Legacy report.");
+    expect(t.child()?.taskStatus).toBe("reported");
+  });
+
+  // #7003 behavior change: an interrupted row whose artifact an EARLIER attempt wrote has no report
+  // of its own: the wait rejects as interrupted instead of handing back the old report.
+  test("an interrupted row with an earlier attempt's report artifact rejects as interrupted", async () => {
+    const t = await setup({ taskStatus: "interrupted", taskAttemptId: "att_00000000000000c2" });
+    await writeReportArtifact(t, "Report from the earlier attempt.", "att_00000000000000c1");
+
+    const waited = await t.taskService
+      .waitForAgentReport(childId, { timeoutMs: 5_000, requestingWorkspaceId: parentId })
+      .then(
+        (report) => `resolved: ${report.reportMarkdown}`,
+        (error: unknown) => `rejected: ${error instanceof Error ? error.message : String(error)}`
+      );
+
+    expect(waited).toBe("rejected: Task interrupted");
+    expect(t.child()?.taskStatus).toBe("interrupted");
+  });
+
   // #6994 control: a notification while the row still reads running (no adoption, no stop) keeps
   // the deferral waiting for its accounting; only its settlement may decide the goal turn.
   test("a notification while the child still runs keeps its deferred stream end waiting", async () => {
