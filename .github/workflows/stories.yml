@@ -76,12 +76,14 @@ jobs:
         run: bun tests/stories/summary.ts >> "$GITHUB_STEP_SUMMARY"
       # Every run saves its seed, a failed one too: e2e (read-write mode) saves a recording only
       # once a check after it passed, and deletes an entry that replayed into a failure. When no
-      # job recorded an entry, the restored seed is saved again as it is.
+      # job recorded an entry, the restored seed is saved again as it is. Not in the merge queue:
+      # a cache saved under a temporary queue ref is never restored, and it only takes space
+      # from the caches that main and the dispatched branches use (Codex review of #7013).
       - name: Build the next replay seed
-        if: always()
+        if: always() && github.event_name != 'merge_group'
         run: bun tests/stories/summary.ts --next-seed tests/stories/.e2e-cache-seed
       - name: Save the replay seed
-        if: always()
+        if: always() && github.event_name != 'merge_group'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: tests/stories/.e2e-cache-seed

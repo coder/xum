@@ -147,10 +147,10 @@ CI: the `Stories` workflow (`.github/workflows/stories.yml`) runs one `make test
 and on demand (Actions > Stories > Run workflow, on any branch). It is not part of `Required`, so
 the queue does not wait for it and a failure blocks no merge. It restores the seed with actions/cache
 (this ref's newest, else main's), writes a table of the tests, their cache outcomes and each
-job's spend to the job summary, and saves the next seed: `bun tests/stories/summary.ts
---next-seed <dir>` (the newest story job's cache, at most 1000 entries). GitHub scopes a saved
-cache to its ref (a merge-queue run saves under its own queue ref, which no run restores), so
-only the nightly and on-demand runs on main change what main replays. A PR that changes the sandbox image inputs fails there until main publishes the image.
+job's spend to the job summary, and, except in the merge queue, saves the next seed: `bun
+tests/stories/summary.ts --next-seed <dir>` (the newest story job's cache, at most 1000 entries
+and 128 MiB). GitHub scopes a saved cache to its ref, and a queue ref is temporary, so a
+merge-queue run saves none. Only the nightly and on-demand runs on main change what main replays. A PR that changes the sandbox image inputs fails there until main publishes the image.
 To check state across a server restart, a story imports `test` from `tests/stories/fixtures.ts`
 and calls `xum.restartServer()` (same port and XUM_ROOT), then `app.open()`: e2e's
 `app.restart()` only opens a new page.
