@@ -20,6 +20,7 @@ import {
   type ToolPolicy,
 } from "@/common/utils/tools/toolPolicy";
 import { applyCapabilityGrants } from "@/common/utils/tools/capabilityGrants";
+import { TOOL_SEARCH_TOOL_NAME } from "@/common/utils/tools/toolCatalog";
 import type { CapabilityGrants } from "@/common/types/capabilityGrants";
 // PTC types only — modules lazy-loaded to avoid loading typescript/prettier at startup
 import type {
@@ -189,6 +190,11 @@ function applySwitchableAgentPolicies(
       // memory must not see it: memory stays absent (and so does intuition,
       // which reads memory directly). One cache miss on such a switch.
       if (name === "memory") continue;
+      // A refused tool_catalog_search would still make tool search defer the MCP
+      // tools (prepareToolSearch reads presence), and every search would then be
+      // refused, leaving those allowed tools unreachable. So it stays absent and
+      // the MCP tools stay advertised. One cache miss on such a switch.
+      if (name === TOOL_SEARCH_TOOL_NAME) continue;
       result[name] = refuseToolForAgent(name, tool, activeAgentId, callerToolPolicy);
     }
   }

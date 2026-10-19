@@ -416,6 +416,22 @@ describe("one tool set across agent-mode switches (#5253)", () => {
     expect(calls).toEqual([]);
   });
 
+  test("a refused tool_catalog_search stays absent, so MCP tools are not deferred behind it", async () => {
+    const { allTools } = toolsWithSideEffect();
+    allTools.tool_catalog_search = executableTool("Search the tool catalog");
+    const denySearch = [{ regex_match: "tool_catalog_search", action: "disable" as const }];
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: denySearch,
+      switchableAgentToolPolicies: [[]],
+      callerToolPolicy: denySearch,
+      activeAgentId: "exec",
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(tools.tool_catalog_search).toBeUndefined();
+    expect(tools.mutate).toBeDefined();
+  });
+
   test("a caller policy that leaves no tools sends no tools, not refusal stubs", async () => {
     const { allTools } = toolsWithSideEffect();
     const denyAll = [{ regex_match: ".*", action: "disable" as const }];
