@@ -280,10 +280,16 @@ async function waitForDelayOrAbort(delayMs: number, signal: AbortSignal): Promis
 async function resolveMissingBashTask(
   expiredOwner: string | undefined,
   ids: { processId: string; taskId: string; workspaceId: string },
-  isDescendant: (owner: string) => Promise<boolean>
+  scope: {
+    isDescendant: (owner: string) => Promise<boolean>;
+    isWorkflowOwned: (owner: string) => Promise<boolean>;
+  }
 ) {
   if (expiredOwner == null) return { status: "not_found" as const, taskId: ids.taskId };
-  const inScope = expiredOwner === ids.workspaceId || (await isDescendant(expiredOwner));
+  // The live path's scope rules: workflow-owned children are not directly awaitable.
+  const inScope =
+    expiredOwner === ids.workspaceId ||
+    ((await scope.isDescendant(expiredOwner)) && !(await scope.isWorkflowOwned(expiredOwner)));
   return inScope
     ? {
         status: "expired" as const,
@@ -541,7 +547,10 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             return await resolveMissingBashTask(
               config.backgroundProcessManager.getExpiredProcessWorkspaceId(maybeProcessId),
               { processId: maybeProcessId, taskId, workspaceId },
-              (owner) => taskService.isDescendantAgentTask(workspaceId, owner)
+              {
+                isDescendant: (owner) => taskService.isDescendantAgentTask(workspaceId, owner),
+                isWorkflowOwned: isWorkflowOwnedDescendantAgentTask,
+              }
             );
           }
 

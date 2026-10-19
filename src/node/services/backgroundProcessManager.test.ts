@@ -4,6 +4,7 @@ import { Ok } from "@/common/types/result";
 import {
   BackgroundProcessManager,
   boundTailContent,
+  ExpiredProcessIds,
   parseSpawnRecordMeta,
   type BackgroundProcess,
   type BackgroundProcessMeta,
@@ -3413,6 +3414,63 @@ describe("BackgroundProcessManager", () => {
       },
       timeout
     );
+
+    it(
+      "trims when a batch spawned before any read is read later",
+      async () => {
+        // Every spawn sees the batch still unread, so only the reads can enforce the bound.
+        const batch = await Promise.all(
+          Array.from({ length: limit + 2 }, (_, index) => spawnNamed(`batch-${index}`, "true"))
+        );
+        for (const processId of batch) {
+          while ((await manager.getProcess(processId))?.status === "running") {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        }
+        for (const processId of batch) {
+          const read = await manager.getOutput(
+            processId,
+            undefined,
+            undefined,
+            0,
+            undefined,
+            testWorkspaceId
+          );
+          expect(read).toMatchObject({ success: true, status: "exited", exitCode: 0 });
+        }
+        expect((await exitedIds()).length).toBe(limit);
+      },
+      timeout
+    );
+
+    it("bounds the expired-ID tombstones per workspace and clears them per workspace", () => {
+      const tombstones = new ExpiredProcessIds(2);
+      tombstones.add("a1", "ws-a");
+      tombstones.add("b1", "ws-b");
+      tombstones.add("a2", "ws-a");
+      tombstones.add("a3", "ws-a");
+      // Past the limit, only ws-a's oldest tombstone goes; ws-b's stays.
+      expect(["a1", "a2", "a3", "b1"].map((id) => tombstones.ownerOf(id))).toEqual([
+        undefined,
+        "ws-a",
+        "ws-a",
+        "ws-b",
+      ]);
+      // A re-added ID counts as the newest.
+      tombstones.add("a2", "ws-a");
+      tombstones.add("a4", "ws-a");
+      expect(tombstones.ownerOf("a3")).toBeUndefined();
+      expect(tombstones.ownerOf("a2")).toBe("ws-a");
+
+      tombstones.clearWorkspace("ws-a");
+      expect(tombstones.ownerOf("a2")).toBeUndefined();
+      expect(tombstones.ownerOf("a4")).toBeUndefined();
+      expect(tombstones.ownerOf("b1")).toBe("ws-b");
+      // A cleared workspace starts with a full budget again.
+      tombstones.add("a5", "ws-a");
+      tombstones.add("a6", "ws-a");
+      expect(tombstones.ownerOf("a5")).toBe("ws-a");
+    });
 
     it(
       "bash_output reports an expired process instead of not found",

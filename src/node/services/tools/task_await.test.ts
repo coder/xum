@@ -2426,6 +2426,7 @@ describe("task_await tool", () => {
       own: "parent-workspace",
       child: "child-workspace",
       foreign: "other-workspace",
+      workflow: "workflow-child",
     };
     const backgroundProcessManager = {
       list: mock(() => Promise.resolve([])),
@@ -2434,14 +2435,20 @@ describe("task_await tool", () => {
     } as unknown as BackgroundProcessManager;
     const taskServices = createFakeTaskServices({
       isDescendantAgentTask: mock((_ancestor: string, taskId: string) =>
-        Promise.resolve(taskId === "child-workspace")
+        Promise.resolve(taskId === "child-workspace" || taskId === "workflow-child")
+      ),
+      isWorkflowOwnedDescendantAgentTask: mock((_ancestor: string, taskId: string) =>
+        Promise.resolve(taskId === "workflow-child")
       ),
     });
     const tool = createTaskAwaitTool({ ...baseConfig, backgroundProcessManager, ...taskServices });
 
     const result: unknown = await Promise.resolve(
       tool.execute!(
-        { task_ids: ["bash:own", "bash:child", "bash:foreign", "bash:never"], timeout_secs: 0 },
+        {
+          task_ids: ["bash:own", "bash:child", "bash:foreign", "bash:workflow", "bash:never"],
+          timeout_secs: 0,
+        },
         mockToolCallOptions
       )
     );
@@ -2459,6 +2466,8 @@ describe("task_await tool", () => {
           note: formatExpiredBackgroundProcessMessage("child"),
         },
         { status: "invalid_scope", taskId: "bash:foreign" },
+        // Workflow-owned children stay out of direct task_await scope after expiry too.
+        { status: "invalid_scope", taskId: "bash:workflow" },
         { status: "not_found", taskId: "bash:never" },
       ],
     });
