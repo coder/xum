@@ -84,9 +84,13 @@ test("stage copies the git-ignored story cache seed for a story job only", () =>
   const seed = path.join(into(), "tests/stories/.e2e-cache-seed");
   expect(fs.readdirSync(seed)).toEqual([ENTRY]);
   // Any other job: no copy, not even a check of the seed.
-  const other = path.join(path.dirname(into()), "other");
-  expect(stage(root, other)).toBe(3);
-  expect(fs.existsSync(path.join(other, "tests/stories/.e2e-cache-seed"))).toBe(false);
+  const other = `${into()}-other`; // beside the stage, removed with it below
+  try {
+    expect(stage(root, other)).toBe(3);
+    expect(fs.existsSync(path.join(other, "tests/stories/.e2e-cache-seed"))).toBe(false);
+  } finally {
+    fs.rmSync(other, { recursive: true, force: true });
+  }
 });
 
 test.each([
