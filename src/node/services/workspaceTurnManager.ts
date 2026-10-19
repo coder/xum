@@ -1352,8 +1352,17 @@ export class WorkspaceTurnManager {
       (record) => record.ownerWorkspaceId === ownerWorkspaceId
     );
     const activeAgentCount = this.taskHost.countActiveAgentTasks(cfg);
+    // Closures in this function share one scope, and callbacks handed to sendMessage (onCanceled)
+    // can outlive the turn. Capturing allWorkspaceTurns pinned every owner's records, ~82 MB per
+    // copy in a long-lived server (F29). Capture only the records with an active status: the
+    // count skips every other record before its first await, so the result is the same.
+    const statusActiveWorkspaceTurns = allWorkspaceTurns.filter((record) =>
+      isActiveWorkspaceTurnTaskStatus(record.status)
+    );
     const ensureParallelSlot = async (): Promise<Result<void, string>> => {
-      const activeWorkspaceTurnCount = await this.countActiveWorkspaceTurns(allWorkspaceTurns);
+      const activeWorkspaceTurnCount = await this.countActiveWorkspaceTurns(
+        statusActiveWorkspaceTurns
+      );
       const activeCount = activeAgentCount + activeWorkspaceTurnCount;
       if (activeCount >= taskSettings.maxParallelAgentTasks) {
         return Err(
