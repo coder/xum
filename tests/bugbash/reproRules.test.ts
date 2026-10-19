@@ -5,8 +5,9 @@ import * as path from "path";
 
 // Exact-step repros may run on the host (no model picks an action there), and the host pause
 // (hostPause.ts, #5714) relies on that. A repro that takes the `agent` fixture lets a model pick
-// actions, so it must not exist: it belongs in a model-driven suite. At run time it also fails:
-// e2e.config.ts gives its agents no model during the pause.
+// actions. The user allowed that (a repro can state the bug as a story), but only with the
+// `agent` tag on each of its tests: the free runs (`make test-bugbash-repros`, the sandbox repro
+// job) pass `--exclude-tag agent`, so no such test runs where e2e.config.ts gives no model.
 const REPROS = path.join(import.meta.dir, "repros");
 
 /** Why a test file lets a model pick actions, or null. */
@@ -26,16 +27,40 @@ test("the rule catches a suite that drives flows with agent.act", () => {
   );
 });
 
-// Every model-driven test file under `dir`. Recursive, like the runner's tests glob
-// (e2e.config.ts).
+/**
+ * Whether every test in the file has the `agent` tag. A narrow grammar on purpose: each
+ * `test(` call must have a literal `tags: [...]` array that holds "agent". Anything else, such
+ * as tags from a variable, counts as untagged.
+ */
+function agentTagged(source: string): boolean {
+  const tests = source.match(/\btest\s*\(/g)?.length ?? 0;
+  const tagged = [...source.matchAll(/\btags\s*:\s*\[([^\]]*)\]/g)].filter((match) =>
+    /(["'`])agent\1/.test(match[1])
+  ).length;
+  return tests > 0 && tagged === tests;
+}
+
+test("the agent tag must cover every test of a model-driven file", () => {
+  const tagged = 'test("x", { tags: ["bugbash", "agent"] }, async ({ agent }) => {});';
+  expect(agentTagged(tagged)).toBe(true);
+  expect(agentTagged('test("x", { tags: ["bugbash"] }, async ({ agent }) => {});')).toBe(false);
+  expect(agentTagged(`${tagged}\ntest("y", { tags: ["bugbash"] }, async ({ agent }) => {});`)).toBe(
+    false
+  );
+  expect(agentTagged('test("x", { tags: TAGS }, async ({ agent }) => {});')).toBe(false);
+});
+
+// Every model-driven test file under `dir` that does not tag each of its tests `agent`.
+// Recursive, like the runner's tests glob (e2e.config.ts).
 function modelDrivenFiles(dir: string): string[] {
   const files = fs
     .readdirSync(dir, { recursive: true, encoding: "utf8" })
     .filter((name) => name.endsWith(".e2e.ts"));
   expect(files.length).toBeGreaterThan(0);
   return files.flatMap((name) => {
-    const why = modelDriven(fs.readFileSync(path.join(dir, name), "utf8"));
-    return why == null ? [] : [`${name}: ${why}`];
+    const source = fs.readFileSync(path.join(dir, name), "utf8");
+    const why = modelDriven(source);
+    return why == null || agentTagged(source) ? [] : [`${name}: ${why}`];
   });
 }
 
@@ -44,6 +69,10 @@ test("the scan finds a model-driven repro in a nested folder", () => {
   try {
     fs.mkdirSync(path.join(dir, "group"));
     fs.writeFileSync(path.join(dir, "group/x.e2e.ts"), "test('x', async ({ agent }) => {})");
+    fs.writeFileSync(
+      path.join(dir, "group/tagged.e2e.ts"),
+      "test('y', { tags: ['bugbash', 'agent'] }, async ({ agent }) => {})"
+    );
     expect(modelDrivenFiles(dir)).toEqual([
       `${path.join("group", "x.e2e.ts")}: takes the agent fixture`,
     ]);
@@ -52,6 +81,6 @@ test("the scan finds a model-driven repro in a nested folder", () => {
   }
 });
 
-test("no repro lets a model pick actions", () => {
+test("no repro lets a model pick actions without the agent tag", () => {
   expect(modelDrivenFiles(REPROS)).toEqual([]);
 });

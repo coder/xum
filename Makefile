@@ -254,7 +254,7 @@ bug-bash-sandbox-check: build-main build-renderer build-static ## Check the bug-
 # The repros of fixed bugs through the sandbox launcher, all on the mock app AI (the launcher gives
 # exact-step runs no model). CI's bugbash-sandbox job runs this.
 test-bugbash-repros-sandbox: build-main build-renderer build-static ## Bug-bash repros of fixed bugs in the bug-bash sandbox, mock app AI (no key, no model)
-	@cd tests/bugbash && BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="sandbox repros" bun sandbox/launch.ts -- run --config e2e.config.ts --exclude-tag known-failure --output .e2e/repros-sandbox-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(BUGBASH_REPRO_ARGS)
+	@cd tests/bugbash && BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="sandbox repros" bun sandbox/launch.ts -- run --config e2e.config.ts --exclude-tag known-failure --exclude-tag agent --output .e2e/repros-sandbox-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(BUGBASH_REPRO_ARGS)
 
 # Every sandbox launch lists the job containers that crashed launches of this checkout left
 # (#5882). This removes the ones whose launcher is gone, by ID, and lists the rest.
@@ -262,7 +262,8 @@ bug-bash-sandbox-recover: ## Remove bug-bash sandbox containers of this checkout
 	@cd tests/bugbash && bun sandbox/launch.ts --recover
 
 # Bug-bash repro tests (tests/bugbash/repros/*.e2e.ts): exact UI steps, no model calls, against a
-# seeded `xum server` (tests/bugbash/startApp.ts). e2e needs Node.js 22.22.3+ or 24.8+ (E2E_NODE)
+# seeded `xum server` (tests/bugbash/startApp.ts). Repros tagged `agent` use agent.* steps, so
+# every run here passes --exclude-tag agent: only a model-driven sandbox job can run them. e2e needs Node.js 22.22.3+ or 24.8+ (E2E_NODE)
 # and its own Chromium: `node_modules/.bin/e2e-web install chromium`.
 E2E_NODE ?= node
 BUGBASH_REPRO_RUN = cd tests/bugbash && E2E_TELEMETRY_DISABLED=1 PATH="$$(dirname "$$(command -v $(E2E_NODE))"):$$PATH" $(E2E_NODE) ../../node_modules/.bin/e2e run --config e2e.config.ts
@@ -274,13 +275,13 @@ test-bugbash-repros: build-main build-renderer build-static ## Bug-bash repro te
 	@rm -rf tests/bugbash/.e2e/repros-mock tests/bugbash/.e2e/repros
 	@# [mock:...] prompts and terminals only work against the mock AI, so repros tagged mock-only pin it. Export
 	@# it: a `VAR=x cd ... && e2e` prefix would set it for `cd` only.
-	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="mock-only repros"; $(BUGBASH_REPRO_RUN) --tag mock-only --exclude-tag known-failure --pass-with-no-tests --output .e2e/repros-mock $(BUGBASH_REPRO_ARGS)
+	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="mock-only repros"; $(BUGBASH_REPRO_RUN) --tag mock-only --exclude-tag known-failure --exclude-tag agent --pass-with-no-tests --output .e2e/repros-mock $(BUGBASH_REPRO_ARGS)
 	@# The other repros run on the app AI that BUGBASH_AI picks (default auto: real with a working key).
-	@ai="$$(bun tests/bugbash/aiMode.ts)" || exit 2; eval "$$ai"; $(BUGBASH_REPRO_RUN) --exclude-tag mock-only --exclude-tag known-failure --pass-with-no-tests --output .e2e/repros $(BUGBASH_REPRO_ARGS)
+	@ai="$$(bun tests/bugbash/aiMode.ts)" || exit 2; eval "$$ai"; $(BUGBASH_REPRO_RUN) --exclude-tag mock-only --exclude-tag known-failure --exclude-tag agent --pass-with-no-tests --output .e2e/repros $(BUGBASH_REPRO_ARGS)
 	@bun tests/bugbash/reproSelection.ts tests/bugbash/.e2e/repros-mock/report.json tests/bugbash/.e2e/repros/report.json
 
 test-bugbash-known-failures: build-main build-renderer build-static ## Bug-bash repros of open bugs: each fails until its issue is fixed
-	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="known-failure repros"; $(BUGBASH_REPRO_RUN) --tag known-failure --output .e2e/repros-known $(BUGBASH_REPRO_ARGS)
+	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="known-failure repros"; $(BUGBASH_REPRO_RUN) --tag known-failure --exclude-tag agent --output .e2e/repros-known $(BUGBASH_REPRO_ARGS)
 
 # The MCP Apps suite runs only in the bug-bash sandbox (tests/bugbash/sandbox/launch.ts, #5714).
 # agent.act steps reach BUGBASH_MODEL through a provider proxy for the job, so the host needs

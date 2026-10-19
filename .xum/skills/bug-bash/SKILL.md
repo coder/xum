@@ -160,9 +160,11 @@ Xum rules:
 - Check `findings.md` for the charter's app AI mode. In mock mode, "Mock response: ..." replies
   and "model calls are disabled in mock AI mode" errors are expected, not bugs.
 - Read the source (`src/browser/...`) before keeping a finding. Reject explorer mistakes first.
-- A repro goes in `tests/bugbash/repros/<slug>.e2e.ts` (tracked) with exact `screen`, `browser`
-  and `expect` steps, never `agent.*`. `tests/bugbash/reproRules.test.ts` fails on a repro that
-  takes the `agent` fixture.
+- A repro goes in `tests/bugbash/repros/<slug>.e2e.ts` (tracked). Use exact `screen`, `browser`
+  and `expect` steps where they work. A repro may use `agent.*` steps only when each of its tests
+  has the `agent` tag: `tests/bugbash/reproRules.test.ts` fails on a repro that takes the `agent`
+  fixture without it. Every free repro run passes `--exclude-tag agent`, so only a model-driven
+  sandbox job runs these repros.
 - Prove every repro: put the bug back in a scratch edit, rebuild, see `ASSERTION_FAILED` on the
   bug's own assertion, then remove the edit and see it pass.
 - Tags: `bugbash` plus the bug ID. Add `mock-only` when the test needs a `[mock:...]` prompt or a
