@@ -19,7 +19,8 @@ Xum is the canonical product, package, command, protocol, and local data-directo
 | Project metadata      | `.xum/`                           | `.mux/` read fallback                                     |
 | Worktree ignore file  | `.xumignore`                      | `.muxignore` read fallback                                |
 | Deep links            | `xum://`                          | `mux://`                                                  |
-| Release artifacts     | `xum-*`                           | matching `mux-*` aliases                                  |
+| Release artifacts     | `xum-*` (desktop and `.vsix`)     | matching `mux-*` aliases                                  |
+| Docker image          | `ghcr.io/coder/xum`               | `ghcr.io/coder/mux` (same manifests)                      |
 
 When both a `XUM_*` variable and its `MUX_*` alias are set, the `XUM_*` value wins and is mirrored to child processes under both names.
 

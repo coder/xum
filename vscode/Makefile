@@ -1,8 +1,14 @@
 # VS Code Extension Build System
 # ==============================
-# Isolated build system for the mux VS Code/Cursor extension
+# Isolated build system for the Xum VS Code/Cursor extension
 
 .PHONY: all build install clean test test-integration test-orpc help version
+
+# The Marketplace identity stays coder.mux (package.json "name"), but the packaged file
+# follows the canonical xum-* release artifact naming; the release workflow adds the
+# matching mux-* alias via scripts/create-legacy-mux-artifact-aliases.sh.
+VSIX_VERSION := $(shell node -p "require('./package.json').version")
+VSIX := xum-$(VSIX_VERSION).vsix
 
 # Default target
 all: build
@@ -30,22 +36,22 @@ version:
 ## Build extension package
 build: node_modules/.installed version ## Build VS Code extension (.vsix)
 	@echo "Building VS Code extension with esbuild..."
-	@rm -rf out mux-0.1.0.vsix
+	@rm -rf out *.vsix
 	@bun run compile
-	@npx @vscode/vsce package --no-dependencies
-	@echo "✓ Extension packaged: mux-0.1.0.vsix (bundle size: ~27 KB)"
+	@npx @vscode/vsce package --no-dependencies --out $(VSIX)
+	@echo "✓ Extension packaged: $(VSIX) (bundle size: ~27 KB)"
 
 ## Install extension locally
 install: build ## Build and install extension locally
 	@echo "Installing extension..."
 	@if command -v code >/dev/null 2>&1; then \
-		code --install-extension mux-0.1.0.vsix --force && \
+		code --install-extension $(VSIX) --force && \
 		echo "✓ Extension installed in VS Code"; \
 	else \
 		echo "⚠ VS Code CLI (code) not found, skipping"; \
 	fi
 	@if command -v cursor >/dev/null 2>&1; then \
-		cursor --install-extension mux-0.1.0.vsix --force && \
+		cursor --install-extension $(VSIX) --force && \
 		echo "✓ Extension installed in Cursor"; \
 	else \
 		echo "⚠ Cursor CLI (cursor) not found, skipping"; \
@@ -56,16 +62,16 @@ install: build ## Build and install extension locally
 test: node_modules/.installed ## Run extension unit tests
 	@bun test
 
-## Run extension integration tests (requires running mux server)
-test-integration: node_modules/.installed ## Run extension integration tests (requires mux server)
+## Run extension integration tests (requires running xum server)
+test-integration: node_modules/.installed ## Run extension integration tests (requires xum server)
 	@TEST_INTEGRATION=1 bun test
 
-## Run oRPC connection smoke test (requires running mux server)
-test-orpc: ## Connect to mux server and list workspaces via oRPC
+## Run oRPC connection smoke test (requires running xum server)
+test-orpc: ## Connect to xum server and list workspaces via oRPC
 	@TEST_INTEGRATION=1 bun test ./src/api/orpcConnection.integration.test.ts
 
 ## Clean build artifacts
 clean: ## Clean build artifacts
 	@echo "Cleaning extension build artifacts..."
-	@rm -rf out mux-0.1.0.vsix node_modules/.installed
+	@rm -rf out *.vsix node_modules/.installed
 	@echo "✓ Clean complete"

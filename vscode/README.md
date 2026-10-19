@@ -1,18 +1,18 @@
-# mux VS Code Extension
+# Xum VS Code Extension
 
-Open [mux](https://mux.coder.com) workspaces from VS Code or Cursor.
+Open [Xum](https://mux.coder.com) workspaces from VS Code or Cursor.
 
 ## Installation
 
-Download the latest `.vsix` from [mux releases](https://github.com/coder/mux/releases) and install:
+Download the latest `.vsix` from [Xum releases](https://github.com/coder/mux/releases) and install:
 
 ```bash
-code --install-extension mux-0.1.0.vsix
+code --install-extension xum-*.vsix
 ```
 
 ## Usage
 
-`Cmd+Shift+P` → "mux: Open Workspace" → Select workspace
+`Cmd+Shift+P` → "xum: Open Workspace" → Select workspace
 
 ## Requirements
 

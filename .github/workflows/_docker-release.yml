@@ -69,7 +69,11 @@ jobs:
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
-          images: ghcr.io/coder/mux
+          # ghcr.io/coder/xum is canonical; ghcr.io/coder/mux carries the same
+          # manifests so existing pulls and compose files keep working.
+          images: |
+            ghcr.io/coder/xum
+            ghcr.io/coder/mux
           tags: |
             type=raw,value=${{ inputs.version }}
             type=raw,value=latest,enable=${{ inputs.is_latest }}
@@ -92,7 +96,7 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
           # Push by digest only; push-manifest applies the human-readable tags.
-          outputs: type=image,name=ghcr.io/coder/mux,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/coder/xum,push-by-digest=true,name-canonical=true,push=true
           # Fall back to a native local build while the Depot trust policy
           # still rejects the renamed repo; Depot acceleration resumes
           # automatically once it is updated.
@@ -143,7 +147,11 @@ jobs:
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
-          images: ghcr.io/coder/mux
+          # ghcr.io/coder/xum is canonical; ghcr.io/coder/mux carries the same
+          # manifests so existing pulls and compose files keep working.
+          images: |
+            ghcr.io/coder/xum
+            ghcr.io/coder/mux
           tags: |
             type=raw,value=${{ inputs.version }}
             type=raw,value=latest,enable=${{ inputs.is_latest }}
@@ -158,11 +166,13 @@ jobs:
             args+=(-t "$tag")
           done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           for digest in *; do
-            args+=("ghcr.io/coder/mux@sha256:${digest}")
+            args+=("ghcr.io/coder/xum@sha256:${digest}")
           done
           docker buildx imagetools create "${args[@]}"
 
       - name: Inspect manifest
         env:
           VERSION: ${{ inputs.version }}
-        run: docker buildx imagetools inspect "ghcr.io/coder/mux:${VERSION}"
+        run: |
+          docker buildx imagetools inspect "ghcr.io/coder/xum:${VERSION}"
+          docker buildx imagetools inspect "ghcr.io/coder/mux:${VERSION}"
