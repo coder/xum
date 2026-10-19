@@ -4002,6 +4002,42 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       });
     });
 
+    // A per-turn caller policy (SendMessageOptions.toolPolicy) must not change
+    // the advertised block, or every such turn misses the prompt cache. The
+    // denied tool stays advertised and refuses at execution time instead.
+    it("keeps the tool block byte-identical under a caller disable policy", async () => {
+      using xumHome = new DisposableTempDir("ai-service-caller-policy-tools");
+      const { toolsByAgent, projectPath, harness } = await streamWithRealAgentTools(
+        xumHome.path,
+        {},
+        ["exec"]
+      );
+      const plain = toolsByAgent.exec;
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "hello")],
+        workspaceId: "workspace-stable-agent-tools",
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        agentId: "exec",
+        toolPolicy: [{ regex_match: "bash", action: "disable" }],
+      });
+      expect(result.success).toBe(true);
+      const restricted = harness.startStreamCalls.at(-1)?.tools ?? {};
+
+      expect(plain.bash).toBeDefined();
+      expect(Object.keys(restricted).sort()).toEqual(Object.keys(plain).sort());
+      expect(shape(restricted)).toBe(shape(plain));
+
+      const target = path.join(projectPath, "created-by-denied-bash.txt");
+      expect(
+        await restricted.bash.execute!(
+          { script: `touch ${target}`, timeout_secs: 5, display_name: "t" },
+          callOptions
+        )
+      ).toEqual({ success: false, error: "Tool 'bash' is disabled for this turn." });
+      expect(await fs.stat(target).catch(() => null)).toBeNull();
+    });
+
     // Read-only agents may own research goals: neither explore's tool policy
     // nor the goal handlers may refuse creating or completing one.
     it("lets the read-only explore agent create and complete a goal", async () => {
