@@ -151,7 +151,8 @@ export function summarize(root: string): string {
 /** When e2e recorded the entry (its `createdAt`, e2e cache/store.js), or null if unreadable. */
 function recordedAt(file: string): number | null {
   try {
-    const createdAt = obj(JSON.parse(fs.readFileSync(file, "utf8")))?.createdAt;
+    const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+    const createdAt = obj(parsed)?.createdAt;
     const ms = typeof createdAt === "string" ? Date.parse(createdAt) : NaN;
     return Number.isNaN(ms) ? null : ms;
   } catch {

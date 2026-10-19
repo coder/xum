@@ -149,9 +149,10 @@ test("the next seed is the newest job's cache: valid entries only, at most 1000,
   expect(names.length).toBe(1000);
   expect(names[0]).toBe(entry(2));
   expect(names.at(-1)).toBe(entry(1001));
-  expect(JSON.parse(fs.readFileSync(path.join(seed, entry(500)), "utf8")).createdAt).toBe(
-    new Date(1_500_000).toISOString()
-  );
+  const kept = JSON.parse(fs.readFileSync(path.join(seed, entry(500)), "utf8")) as {
+    createdAt: string;
+  };
+  expect(kept.createdAt).toBe(new Date(1_500_000).toISOString());
   expect(fs.readdirSync(path.dirname(seed)).sort()).toEqual([".e2e", ".e2e-cache-seed"]);
 });
 
