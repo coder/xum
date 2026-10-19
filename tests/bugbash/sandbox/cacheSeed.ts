@@ -34,6 +34,17 @@ export const MAX_SEED_ENTRIES = 1000;
  */
 export const MAX_SEED_BYTES = 128 << 20;
 
+/** Whether `file` (by lstat: no symlink) is an e2e entry that a seed may hold. */
+export function isSeedEntry(file: string): boolean {
+  const entry = fs.lstatSync(file, { throwIfNoEntry: false });
+  return (
+    entry != null &&
+    entry.isFile() &&
+    ENTRY.test(path.basename(file)) &&
+    entry.size <= MAX_ENTRY_BYTES
+  );
+}
+
 /**
  * The entry names of the seed folder `seed`, checked, or none when it does not exist. Each must
  * be a regular file (lstat: no symlink) named like an e2e entry and no bigger than one. Anything
@@ -48,10 +59,10 @@ export function checkSeed(seed: string, fail: (reason: string) => Error): string
     throw fail(`${CACHE_SEED}: ${names.length} files, more than ${MAX_SEED_ENTRIES}`);
   let bytes = 0;
   for (const name of names) {
-    const entry = fs.lstatSync(path.join(seed, name));
-    if (!entry.isFile() || !ENTRY.test(name) || entry.size > MAX_ENTRY_BYTES)
+    const file = path.join(seed, name);
+    if (!isSeedEntry(file))
       throw fail(`${CACHE_SEED}/${name}: not an e2e cache entry (<sha256>.json, a regular file)`);
-    bytes += entry.size;
+    bytes += fs.lstatSync(file).size;
   }
   if (bytes > MAX_SEED_BYTES)
     throw fail(`${CACHE_SEED}: ${bytes} bytes, more than ${MAX_SEED_BYTES}`);

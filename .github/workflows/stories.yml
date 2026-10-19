@@ -1,0 +1,86 @@
+name: Stories
+
+# The agentic story lane (`make test-stories`): the story tests and the agent-tagged repros, each
+# as a model-driven job in the bug-bash sandbox. A workflow of its own, apart from pr.yml, so
+# that the Required job never waits on it: a failure here shows on the PR but blocks no merge.
+#
+# Triggers: change only this block to pick when it runs. The job below works unchanged under
+# pull_request, merge_group, schedule and workflow_dispatch.
+on:
+  # Every push to a same-repo PR (the job skips fork PRs, which get no secrets).
+  pull_request:
+    paths-ignore: ["docs/**"]
+  # One run a night on main: it keeps main's replay cache warm (GitHub evicts a cache that no
+  # run reads for 7 days) and is the one that every PR restores first.
+  schedule:
+    - cron: "0 6 * * *"
+  # On demand, on any branch: Actions > Stories > Run workflow.
+  workflow_dispatch: {}
+
+# One run per PR (or per ref for the other events: a merge-queue entry has its own ref), and a
+# new push cancels the old run, so its model calls stop too.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  stories:
+    name: Test / Stories
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    # Two jobs of at most 30 minutes each (launch.ts DEADLINE_MS) after a build of up to about
+    # 10 minutes, plus the setup, the image pull and the cache steps: 80. A warm run takes a few
+    # minutes; the cap only bounds a hung run.
+    timeout-minutes: 80
+    env:
+      # The cache key's ref: the PR branch on pull_request, else the ref name (a branch, or
+      # gh-readonly-queue/main/pr-<n>-<sha> in the merge queue). In env, not inline in run:.
+      CACHE_REF: ${{ github.head_ref || github.ref_name }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-xum
+      # The replay seed (tests/bugbash/sandbox/cacheSeed.ts): this ref's newest seed, else
+      # main's. GitHub scopes each saved cache to the ref that saved it (refs/pull/<n>/merge for
+      # a PR run), so a PR or the merge queue never changes what main replays. The launcher
+      # checks every entry before it stages the seed into the sandbox.
+      - name: Restore the replay seed
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: tests/stories/.e2e-cache-seed
+          key: stories-cache-${{ env.CACHE_REF }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            stories-cache-${{ env.CACHE_REF }}-
+            stories-cache-main-
+      # make test-stories refuses a stale sandbox image key (a PR that changes the Dockerfile):
+      # BUGBASH_SANDBOX_BUILD_STALE does not apply to model-driven jobs (launch.ts), so such a PR
+      # fails here until main publishes the image and image.json pins it.
+      - name: make test-stories
+        run: make test-stories
+        env:
+          # Only this step gets the key. The launcher keeps it on the host and gives each job a
+          # proxy that caps its spend at list price.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: https://api.anthropic.com
+          BUGBASH_AI: mock
+          # The cap per job, so one run spends at most twice this.
+          BUGBASH_BUDGET_USD: "3"
+      - name: Summary
+        if: always()
+        run: bun tests/stories/summary.ts >> "$GITHUB_STEP_SUMMARY"
+      # Every run saves its seed, a failed one too: e2e (read-write mode) saves a recording only
+      # once a check after it passed, and deletes an entry that replayed into a failure. When no
+      # job recorded an entry, the restored seed is saved again as it is.
+      - name: Build the next replay seed
+        if: always()
+        run: bun tests/stories/summary.ts --next-seed tests/stories/.e2e-cache-seed
+      - name: Save the replay seed
+        if: always()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: tests/stories/.e2e-cache-seed
+          key: stories-cache-${{ env.CACHE_REF }}-${{ github.run_id }}-${{ github.run_attempt }}
