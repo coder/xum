@@ -7,6 +7,7 @@
 import { randomBytes } from "node:crypto";
 import { expect } from "e2e";
 import { test } from "./fixtures";
+import { waitForProjects } from "./helpers";
 
 test(
   "a deep link of a second launch starts a chat in the running app",
@@ -15,9 +16,7 @@ test(
     await app.open();
     // The link only after the app shows its sidebar: e2e first loads about:blank, and a link
     // that arrives before the projects load waits in a buffer (WorkspaceContext handleDeepLink).
-    await expect(screen.getByRole("button", "Expand project demo-app")).toBeVisible({
-      timeout: 30_000,
-    });
+    await waitForProjects(screen);
     // New on each run, so a prompt left from an earlier run (a draft) cannot pass the check.
     const prompt = `deep link ${randomBytes(4).toString("hex")}`;
     await xum.openDeepLink(`xum://chat/new?project=demo-app&prompt=${encodeURIComponent(prompt)}`);
