@@ -8,7 +8,7 @@
  * hook-guard PreToolUse handler only (../bugbash/pluginHookFixtures.ts), so the seeded
  * hook-review-demo plugin, whose PreToolUse hook is already trusted, cannot satisfy them.
  */
-import { expect } from "e2e";
+import { expect, unique } from "e2e";
 import { z } from "zod";
 import { disableTutorials, WORKSPACE_TITLE } from "../bugbash/repros/helpers";
 import { test } from "./fixtures";
@@ -39,9 +39,12 @@ test(
     );
     expect(path).toMatch(/^\/\S+\/plugin-sources\/hook-guard$/);
 
+    // A param, not part of the instruction: the path is a new temp folder on each run, and
+    // unique() keeps it out of the replay cache key, so the recording replays with today's path.
     await agent.act(
-      `open Settings > Plugins, type the path ${path} into the install field (the field takes a ` +
-        "local path), preview it, and install the hook-guard plugin"
+      "open Settings > Plugins, type the path {path} into the install field (the field takes a " +
+        "local path), preview it, and install the hook-guard plugin",
+      { params: { path: unique(path) } }
     );
     await agent.act(
       "in Settings > Plugins, open the hook review of the hook-guard plugin and trust ONLY its " +
