@@ -9,7 +9,7 @@ import { AgentPeerMessage } from "./AgentPeerMessage";
 import { BashMonitorWakeMessage } from "./BashMonitorWakeMessage";
 import { CollapsibleMachineMessage } from "./CollapsibleMachineMessage";
 import { AlertTriangle, ListTodo, MessageSquare } from "lucide-react";
-import { isTodoTurnEndNudgePrompt } from "@/common/utils/machineTurnPrompts";
+import { classifyTodoTurnEndNudgePrompt } from "@/common/utils/machineTurnPrompts";
 import {
   BackgroundWorkWakeMessage,
   getBackgroundWorkWakeSummary,
@@ -111,6 +111,8 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
       case "user": {
         const backgroundWorkWakeSummary =
           message.isSynthetic === true ? getBackgroundWorkWakeSummary(message.content) : null;
+        const todoNudgeKind =
+          message.isSynthetic === true ? classifyTodoTurnEndNudgePrompt(message.content) : null;
         renderedMessage =
           message.contextBudgetWarning != null ? (
             <CollapsibleMachineMessage
@@ -139,14 +141,18 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               marker="agent-peer-message-trigger"
               className={className}
             />
-          ) : message.isSynthetic === true && isTodoTurnEndNudgePrompt(message.content) ? (
+          ) : todoNudgeKind != null ? (
             // Xum's turn-end TODO nudge is constant control text, not user input. Exact match
             // only: a nudge joined to a plugin's turn.stop prompt keeps the full bubble so the
-            // plugin's text stays visible. The nudged turn keeps its tools and can do real work,
-            // so the summary says so instead of presenting it as list bookkeeping only.
+            // plugin's text stays visible. The current nudge keeps the turn's tools and can do real
+            // work, so its summary says so; rows from #6720 were todo_write-only list updates.
             <CollapsibleMachineMessage
               content={message.content}
-              summary="Asked the agent to update its TODO list and finish open items"
+              summary={
+                todoNudgeKind === "current"
+                  ? "Asked the agent to update its TODO list and finish open items"
+                  : "Asked the agent to update its TODO list"
+              }
               icon={<ListTodo aria-hidden="true" className="size-3.5 shrink-0" />}
               marker="todo-turn-end-nudge"
               className={className}

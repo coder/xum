@@ -46,9 +46,13 @@ You ended your turn, but your TODO list still has pending or in-progress items. 
 </notification>`,
 ];
 
-/** Whether `text` is exactly a turn-end TODO nudge prompt, current or legacy. */
-export function isTodoTurnEndNudgePrompt(text: string): boolean {
-  return text === TODO_TURN_END_NUDGE || LEGACY_TODO_TURN_END_NUDGES.includes(text);
+/**
+ * Which turn-end TODO nudge `text` is exactly: "current" (the nudged turn keeps its tools and
+ * finishes open items), "legacy" (a todo_write-only list update), or null for any other text.
+ */
+export function classifyTodoTurnEndNudgePrompt(text: string): "current" | "legacy" | null {
+  if (text === TODO_TURN_END_NUDGE) return "current";
+  return LEGACY_TODO_TURN_END_NUDGES.includes(text) ? "legacy" : null;
 }
 
 const PROMPT_OPENINGS_BY_KIND: ReadonlyArray<{

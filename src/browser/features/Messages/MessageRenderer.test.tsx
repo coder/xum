@@ -736,6 +736,14 @@ describe("MessageRenderer TODO nudge rows", () => {
       "<notification>\nYou ended your turn, but your TODO list still has pending or in-progress items. Update it now with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. If an item is still open on purpose, keep it and say why in one sentence. Do not start new work.\n</notification>";
     const view = renderNudge(legacy, true);
     expect(view.container.querySelector("[data-todo-turn-end-nudge]")).not.toBeNull();
+    // Those turns were todo_write-only: the summary must not claim they finished work.
+    expect(view.getByText("Asked the agent to update its TODO list")).toBeDefined();
+    expect(view.queryByText(/finish open items/)).toBeNull();
+    cleanup();
+    const current = renderNudge(TODO_TURN_END_NUDGE, true);
+    expect(
+      current.getByText("Asked the agent to update its TODO list and finish open items")
+    ).toBeDefined();
   });
 
   test("keeps a full bubble for typed lookalikes and plugin-joined prompts", () => {
