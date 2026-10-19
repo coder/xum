@@ -913,6 +913,31 @@ export class MockAiStreamPlayer {
     return nextParts;
   }
 
+  /** A canned tool call's completion: its side effect first, then the tool-call-end event. */
+  private async dispatchToolEnd(
+    workspaceId: string,
+    active: ActiveStream,
+    event: Extract<MockAssistantEvent, { kind: "tool-end" }>,
+    messageId: string
+  ): Promise<void> {
+    await this.applyTodoWriteSideEffect(workspaceId, active, event);
+    // A Stop during the write cancels the stream: emit no completion into the aborted turn.
+    if (active.cancelled) return;
+    const payload: ToolCallEndEvent = {
+      type: "tool-call-end",
+      workspaceId,
+      messageId,
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      result: event.result,
+      timestamp: this.nextEventTimestamp(active),
+    };
+    this.setToolPartOutput(active, event, payload.timestamp);
+    this.schedulePartialWrite(workspaceId, active);
+    this.deps.aiService.emit("tool-call-end", payload);
+    this.recordReplayableEvent(active, payload);
+  }
+
   private async dispatchEvent(
     workspaceId: string,
     event: MockAssistantEvent,
@@ -1006,22 +1031,7 @@ export class MockAiStreamPlayer {
         break;
       }
       case "tool-end": {
-        await this.applyTodoWriteSideEffect(workspaceId, active, event);
-        // A Stop during the write cancels the stream: emit no completion into the aborted turn.
-        if (active.cancelled) return;
-        const payload: ToolCallEndEvent = {
-          type: "tool-call-end",
-          workspaceId,
-          messageId,
-          toolCallId: event.toolCallId,
-          toolName: event.toolName,
-          result: event.result,
-          timestamp: this.nextEventTimestamp(active),
-        };
-        this.setToolPartOutput(active, event, payload.timestamp);
-        this.schedulePartialWrite(workspaceId, active);
-        this.deps.aiService.emit("tool-call-end", payload);
-        this.recordReplayableEvent(active, payload);
+        await this.dispatchToolEnd(workspaceId, active, event, messageId);
         break;
       }
       case "stream-delta": {
