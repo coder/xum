@@ -1,5 +1,6 @@
 import assert from "@/common/utils/assert";
 import { tool } from "ai";
+import { formatExpiredBackgroundProcessMessage } from "@/constants/backgroundProcesses";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { readSubagentGitPatchArtifact } from "@/node/services/subagentGitPatchArtifacts";
@@ -272,6 +273,26 @@ async function waitForDelayOrAbort(delayMs: number, signal: AbortSignal): Promis
   });
 }
 
+/**
+ * A bash:<id> with no live record: "expired" when Xum dropped its exited record after the agent
+ * read its result (in the same scope as a live read), else "not_found".
+ */
+async function resolveMissingBashTask(
+  expiredOwner: string | undefined,
+  ids: { processId: string; taskId: string; workspaceId: string },
+  isDescendant: (owner: string) => Promise<boolean>
+) {
+  if (expiredOwner == null) return { status: "not_found" as const, taskId: ids.taskId };
+  const inScope = expiredOwner === ids.workspaceId || (await isDescendant(expiredOwner));
+  return inScope
+    ? {
+        status: "expired" as const,
+        taskId: ids.taskId,
+        note: formatExpiredBackgroundProcessMessage(ids.processId),
+      }
+    : { status: "invalid_scope" as const, taskId: ids.taskId };
+}
+
 export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
     description: TOOL_DEFINITIONS.task_await.description,
@@ -517,7 +538,11 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
 
           const proc = await config.backgroundProcessManager.getProcess(maybeProcessId);
           if (!proc) {
-            return { status: "not_found" as const, taskId };
+            return await resolveMissingBashTask(
+              config.backgroundProcessManager.getExpiredProcessWorkspaceId(maybeProcessId),
+              { processId: maybeProcessId, taskId, workspaceId },
+              (owner) => taskService.isDescendantAgentTask(workspaceId, owner)
+            );
           }
 
           const inScope =

@@ -932,6 +932,16 @@ export const TaskAwaitToolNotFoundResultSchema = z
   })
   .strict();
 
+// A bash:<id> whose exited record Xum dropped after its result was read (see
+// MAX_EXITED_BACKGROUND_PROCESSES_PER_WORKSPACE): the output is gone, unlike an unknown ID.
+export const TaskAwaitToolExpiredResultSchema = z
+  .object({
+    status: z.literal("expired"),
+    taskId: z.string(),
+    note: z.string(),
+  })
+  .strict();
+
 export const TaskAwaitToolInvalidScopeResultSchema = z
   .object({
     status: z.literal("invalid_scope"),
@@ -976,6 +986,7 @@ export const TaskAwaitToolResultSchema = z
         TaskAwaitToolCompletedResultSchema,
         TaskAwaitToolActiveResultSchema,
         TaskAwaitToolNotFoundResultSchema,
+        TaskAwaitToolExpiredResultSchema,
         TaskAwaitToolInvalidScopeResultSchema,
         TaskAwaitToolErrorResultSchema,
       ])

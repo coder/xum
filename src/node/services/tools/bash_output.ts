@@ -2,6 +2,7 @@ import { tool } from "ai";
 import type { BashOutputToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import { formatExpiredBackgroundProcessMessage } from "@/constants/backgroundProcesses";
 
 /**
  * Tool for retrieving incremental output from background processes.
@@ -31,6 +32,13 @@ export const createBashOutputTool: ToolFactory = (config: ToolConfiguration) => 
 
       // Verify process belongs to this workspace
       const proc = await config.backgroundProcessManager.getProcess(process_id);
+      if (
+        proc == null &&
+        config.backgroundProcessManager.getExpiredProcessWorkspaceId(process_id) ===
+          config.workspaceId
+      ) {
+        return { success: false, error: formatExpiredBackgroundProcessMessage(process_id) };
+      }
       if (proc?.workspaceId !== config.workspaceId) {
         return {
           success: false,

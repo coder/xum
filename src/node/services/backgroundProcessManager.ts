@@ -1,6 +1,7 @@
 import type { Dirent, Stats } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as nodePath from "node:path";
+import { MAX_EXITED_BACKGROUND_PROCESSES_PER_WORKSPACE } from "@/constants/backgroundProcesses";
 import type {
   Runtime,
   BackgroundHandle,
@@ -1035,6 +1036,21 @@ function formatPollingNote(
   );
 }
 
+/**
+ * Whether nothing still needs an exited record: the agent was shown its terminal status
+ * (task_await or bash_output), and it has no monitor that can still deliver a wake.
+ */
+function isExitedRecordDroppable(proc: BackgroundProcess): boolean {
+  if (!proc.terminalStatusShownToAgent) return false;
+  const monitor = proc.monitor;
+  return (
+    monitor == null ||
+    (monitor.stopped &&
+      monitor.retainedMatches.length === 0 &&
+      monitor.settlementDisposition == null)
+  );
+}
+
 export class BackgroundProcessManager extends EventEmitter<BackgroundProcessManagerEvents> {
   // NOTE: This map is in-memory only. Background processes use nohup/setsid so they
   // could survive app restarts, but we kill all tracked processes on shutdown via
@@ -1042,6 +1058,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   // All per-process state (read position, output lock) is stored in BackgroundProcess
   // so cleanup is automatic when the process is removed from this map.
   private processes = new Map<string, BackgroundProcess>();
+  // Owner workspace of each process ID whose exited record trimExitedProcesses dropped, so a later
+  // read can say the output expired instead of "not found". One short string pair per entry.
+  private readonly expiredProcessWorkspaceIds = new Map<string, string>();
 
   // Process IDs claimed by in-flight spawns that have not yet registered in `processes`.
   // Allocation must be race-free across the awaits between choosing an ID and registering
@@ -2457,7 +2476,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     };
 
     // Store process in map
-    this.processes.set(processId, proc);
+    this.registerProcess(proc);
 
     if (config.monitor && !proc.isForeground) {
       // The fast tick is only affordable when the handle probes host-local record files with
@@ -2593,7 +2612,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     };
 
     // Store process in map
-    this.processes.set(processId, proc);
+    this.registerProcess(proc);
 
     // Write meta.json
     const meta: BackgroundProcessMeta = {
@@ -2671,6 +2690,35 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   /** Return the in-memory process without probing its runtime handle. */
   peekProcess(processId: string): BackgroundProcess | null {
     return this.processes.get(processId) ?? null;
+  }
+
+  /** Adds a record, then bounds the owner's exited records (the spawn is the natural point). */
+  private registerProcess(proc: BackgroundProcess): void {
+    this.expiredProcessWorkspaceIds.delete(proc.id);
+    this.processes.set(proc.id, proc);
+    this.trimExitedProcesses(proc.workspaceId);
+  }
+
+  /**
+   * Keeps every running record and the newest MAX_EXITED_BACKGROUND_PROCESSES_PER_WORKSPACE exited
+   * ones. An older exited record is dropped only when isExitedRecordDroppable says nothing needs it.
+   */
+  private trimExitedProcesses(workspaceId: string): void {
+    // Reverse insertion order first, so the stable sort ranks exact exitTime ties newest-first.
+    const exited = Array.from(this.processes.values())
+      .filter((proc) => proc.workspaceId === workspaceId && proc.status !== "running")
+      .reverse()
+      .sort((a, b) => (b.exitTime ?? b.startTime) - (a.exitTime ?? a.startTime));
+    for (const proc of exited.slice(MAX_EXITED_BACKGROUND_PROCESSES_PER_WORKSPACE)) {
+      if (!isExitedRecordDroppable(proc)) continue;
+      this.processes.delete(proc.id);
+      this.expiredProcessWorkspaceIds.set(proc.id, workspaceId);
+    }
+  }
+
+  /** Owner workspace of a process whose exited record expired, or undefined. */
+  getExpiredProcessWorkspaceId(processId: string): string | undefined {
+    return this.expiredProcessWorkspaceIds.get(processId);
   }
 
   /**
@@ -3742,6 +3790,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       allProcesses.map((p) => this.terminate(p.id, { monitorDisposition: "flush" }))
     );
     this.processes.clear();
+    this.expiredProcessWorkspaceIds.clear();
     log.debug(`Terminated ${allProcesses.length} background process(es)`);
   }
 
@@ -3787,6 +3836,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // BackgroundProcess object, so cleanup is automatic when we delete here.
     for (const p of matching) {
       this.processes.delete(p.id);
+    }
+    for (const [processId, owner] of this.expiredProcessWorkspaceIds) {
+      if (owner === workspaceId) this.expiredProcessWorkspaceIds.delete(processId);
     }
     // Commands refused by the seal meanwhile are still stopping; wait for them too.
     await this.drainPendingAdmissions(workspaceId, drainDeadline);

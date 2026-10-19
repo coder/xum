@@ -1263,6 +1263,14 @@ interface TaskAwaitToolCallProps {
   taskReportLinking?: TaskReportLinking;
 }
 
+/** task_await results that count as failed in the call's summary. */
+const TASK_AWAIT_FAILURE_STATUSES: ReadonlySet<string> = new Set([
+  "error",
+  "invalid_scope",
+  "not_found",
+  "expired",
+]);
+
 export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
   args,
   result,
@@ -1284,9 +1292,7 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
   const completedCount = results.filter((r) => r.status === "completed").length;
   const totalCount = results.length;
   const failedCount = results.filter(
-    (r) =>
-      !isInterruptedTaskAwaitResult(r) &&
-      (r.status === "error" || r.status === "invalid_scope" || r.status === "not_found")
+    (r) => !isInterruptedTaskAwaitResult(r) && TASK_AWAIT_FAILURE_STATUSES.has(r.status)
   ).length;
   const interruptedCount = results.filter(isInterruptedTaskAwaitResult).length;
 

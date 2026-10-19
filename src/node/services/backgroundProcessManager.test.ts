@@ -21,6 +21,10 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
+import {
+  formatExpiredBackgroundProcessMessage,
+  MAX_EXITED_BACKGROUND_PROCESSES_PER_WORKSPACE,
+} from "@/constants/backgroundProcesses";
 import { createBashTool } from "@/node/services/tools/bash";
 import { createBashOutputTool } from "@/node/services/tools/bash_output";
 import { TestTempDir, createTestToolConfig } from "@/node/services/tools/testHelpers";
@@ -3313,6 +3317,124 @@ describe("BackgroundProcessManager", () => {
       expect(exitCode).not.toBeNull();
       expect(exitCode).toBeGreaterThanOrEqual(128); // Signal exit code
     });
+  });
+
+  describe("exited record retention", () => {
+    const limit = MAX_EXITED_BACKGROUND_PROCESSES_PER_WORKSPACE;
+    // Over `limit` real processes per test.
+    const timeout = 60_000;
+
+    async function spawnNamed(name: string, script: string): Promise<string> {
+      const result = await manager.spawn(runtime, testWorkspaceId, script, {
+        cwd: process.cwd(),
+        displayName: name,
+      });
+      if (!result.success) throw new Error(result.error);
+      return result.processId;
+    }
+
+    async function spawnExited(name: string): Promise<string> {
+      const processId = await spawnNamed(name, "true");
+      // getProcess refreshes the status without showing anything to the agent.
+      while ((await manager.getProcess(processId))?.status === "running") {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      return processId;
+    }
+
+    async function spawnExitedAndRead(name: string): Promise<string> {
+      const processId = await spawnExited(name);
+      const read = await manager.getOutput(
+        processId,
+        undefined,
+        undefined,
+        0,
+        undefined,
+        testWorkspaceId
+      );
+      expect(read).toMatchObject({ success: true, status: "exited" });
+      return processId;
+    }
+
+    /**
+     * `limit` read records that exit after everything spawned before, then one more spawn: trimming
+     * runs when a record is added, so the last spawn sees them all exited.
+     */
+    async function fillPastLimit(): Promise<string[]> {
+      const fill = await Promise.all(
+        Array.from({ length: limit }, (_, index) => spawnExitedAndRead(`fill-${index}`))
+      );
+      await spawnNamed("trigger", "sleep 30");
+      return fill;
+    }
+
+    async function exitedIds(): Promise<string[]> {
+      return (await manager.list(testWorkspaceId))
+        .filter((proc) => proc.status !== "running")
+        .map((proc) => proc.id)
+        .sort();
+    }
+
+    it(
+      "keeps only the newest exited records whose result the agent read",
+      async () => {
+        const old: string[] = [];
+        for (let index = 0; index < 3; index++) {
+          old.push(await spawnExitedAndRead(`old-${index}`));
+        }
+        const fill = await fillPastLimit();
+
+        expect(await exitedIds()).toEqual([...fill].sort());
+        for (const expiredId of old) {
+          expect(await manager.getProcess(expiredId)).toBeNull();
+          expect(manager.getExpiredProcessWorkspaceId(expiredId)).toBe(testWorkspaceId);
+        }
+        expect(manager.getExpiredProcessWorkspaceId(fill[0])).toBeUndefined();
+
+        await manager.cleanup(testWorkspaceId);
+        expect(manager.getExpiredProcessWorkspaceId(old[0])).toBeUndefined();
+      },
+      timeout
+    );
+
+    it(
+      "keeps running records and exited records the agent has not read",
+      async () => {
+        const running = await spawnNamed("server", "sleep 30");
+        const unread = [await spawnExited("unread-0"), await spawnExited("unread-1")];
+        const oldRead = await spawnExitedAndRead("old-read");
+        const fill = await fillPastLimit();
+
+        // Beyond the newest `limit` exited records sit the two unread ones and the read one:
+        // only the read one is dropped.
+        expect((await manager.getProcess(running))?.status).toBe("running");
+        expect(await manager.getProcess(oldRead)).toBeNull();
+        expect(await exitedIds()).toEqual([...fill, ...unread].sort());
+      },
+      timeout
+    );
+
+    it(
+      "bash_output reports an expired process instead of not found",
+      async () => {
+        const oldRead = await spawnExitedAndRead("old-read");
+        await fillPastLimit();
+        using tempDir = new TestTempDir("bg-expired-bash-output");
+        const tool = createBashOutputTool({
+          ...createTestToolConfig(tempDir.path, { workspaceId: testWorkspaceId }),
+          backgroundProcessManager: manager,
+        });
+        const result = (await tool.execute!(
+          { process_id: oldRead },
+          { toolCallId: "expired", messages: [], context: undefined }
+        )) as BashOutputToolResult;
+        expect(result).toEqual({
+          success: false,
+          error: formatExpiredBackgroundProcessMessage(oldRead),
+        });
+      },
+      timeout
+    );
   });
 
   describe("getOutput", () => {

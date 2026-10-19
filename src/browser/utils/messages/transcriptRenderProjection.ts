@@ -614,7 +614,10 @@ function hasTaskAwaitResultFailure(message: OperationalBundleMemberMessage): boo
     if (isInterruptedTaskAwaitEntry(entry)) return false;
     if (!("status" in entry) || typeof entry.status !== "string") return false;
     return (
-      entry.status === "error" || entry.status === "invalid_scope" || entry.status === "not_found"
+      entry.status === "error" ||
+      entry.status === "invalid_scope" ||
+      entry.status === "not_found" ||
+      entry.status === "expired"
     );
   });
 }

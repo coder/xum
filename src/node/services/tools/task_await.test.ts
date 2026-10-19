@@ -11,6 +11,7 @@ import {
 } from "@/common/utils/tools/toolDefinitions";
 import type { WorkflowRunRecord, WorkflowRunStatus } from "@/common/types/workflow";
 import { createTaskAwaitTool } from "./task_await";
+import { formatExpiredBackgroundProcessMessage } from "@/constants/backgroundProcesses";
 import { TestTempDir, createFakeWorkspaceTurnManager, createTestToolConfig } from "./testHelpers";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { getSubagentGitPatchArtifactsFilePath } from "@/node/services/subagentGitPatchArtifacts";
@@ -2416,6 +2417,51 @@ describe("task_await tool", () => {
       ],
     });
     expect(waitForAgentReport).toHaveBeenCalledTimes(0);
+  });
+
+  it("reports a bash task whose exited record expired, scoped like a live one", async () => {
+    using tempDir = new TestTempDir("test-task-await-tool-bash-expired");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const expiredOwners: Record<string, string> = {
+      own: "parent-workspace",
+      child: "child-workspace",
+      foreign: "other-workspace",
+    };
+    const backgroundProcessManager = {
+      list: mock(() => Promise.resolve([])),
+      getProcess: mock(() => Promise.resolve(null)),
+      getExpiredProcessWorkspaceId: mock((processId: string) => expiredOwners[processId]),
+    } as unknown as BackgroundProcessManager;
+    const taskServices = createFakeTaskServices({
+      isDescendantAgentTask: mock((_ancestor: string, taskId: string) =>
+        Promise.resolve(taskId === "child-workspace")
+      ),
+    });
+    const tool = createTaskAwaitTool({ ...baseConfig, backgroundProcessManager, ...taskServices });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!(
+        { task_ids: ["bash:own", "bash:child", "bash:foreign", "bash:never"], timeout_secs: 0 },
+        mockToolCallOptions
+      )
+    );
+
+    expect(result).toEqual({
+      results: [
+        {
+          status: "expired",
+          taskId: "bash:own",
+          note: formatExpiredBackgroundProcessMessage("own"),
+        },
+        {
+          status: "expired",
+          taskId: "bash:child",
+          note: formatExpiredBackgroundProcessMessage("child"),
+        },
+        { status: "invalid_scope", taskId: "bash:foreign" },
+        { status: "not_found", taskId: "bash:never" },
+      ],
+    });
   });
 
   it("surfaces a waiter that rejects outside its internal catches without stalling", async () => {
