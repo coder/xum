@@ -157,11 +157,41 @@ describe("CreationDraftStore", () => {
     expect(reloaded.getDraftsByProject()[PROJECT_B]?.map((draft) => draft.draftId)).toEqual([id]);
   });
 
+  test("a new draft is saved and listed only once it has content", async () => {
+    using tempDir = new TestTempDir("creation-store-content");
+    const harness = await createHarness(tempDir);
+    const { store, control, service } = harness;
+    await waitFor(() => store.getListState().status === "ready");
+    // Explicit New, then a model pick and blank text: nothing to save, so no record and no row.
+    const id = store.create(PROJECT_A, null);
+    store.update(id, { ai: { model: "openai:gpt-5" } });
+    store.update(id, { text: "  " });
+    await store.flush(id);
+    expect(control.updates).toEqual([]);
+    expect(store.getView(id).unsaved).toBe(false);
+    // A reconnect relists from the backend plus local copies: still no row for it.
+    const relisted = new Promise<void>((resolve) => {
+      const unsubscribe = store.subscribeList(() => {
+        unsubscribe();
+        resolve();
+      });
+    });
+    store.setClient(harness.newClient());
+    await relisted;
+    expect(store.getDraftsByProject()[PROJECT_A]).toBeUndefined();
+
+    store.update(id, { text: "fix it" });
+    await store.flush(id);
+    // The first save carries the earlier pick too.
+    expect(await service.get(id)).toMatchObject({ text: "fix it", ai: { model: "openai:gpt-5" } });
+    expect(store.getDraftsByProject()[PROJECT_A]?.map((draft) => draft.draftId)).toEqual([id]);
+  });
+
   test("an earlier save reply never replaces a later local edit", async () => {
     using tempDir = new TestTempDir("creation-store-order");
     const harness = await createHarness(tempDir);
     const { store, control } = harness;
-    const id = store.create(PROJECT_A, null, { persist: true });
+    const id = store.create(PROJECT_A, null, { text: "first" });
     await store.flush(id);
     store.update(id, { attachments: [image] });
     await store.flush(id);
@@ -190,7 +220,7 @@ describe("CreationDraftStore", () => {
     using tempDir = new TestTempDir("creation-store-save-failure");
     const harness = await createHarness(tempDir);
     const { store, control } = harness;
-    const id = store.create(PROJECT_A, null, { persist: true });
+    const id = store.create(PROJECT_A, null, { text: "first" });
     await store.flush(id);
 
     control.failUpdates = 1;
@@ -211,7 +241,7 @@ describe("CreationDraftStore", () => {
     using tempDir = new TestTempDir("creation-store-save-across-reconnect");
     const harness = await createHarness(tempDir);
     const { store, control, service } = harness;
-    const id = store.create(PROJECT_A, null, { persist: true });
+    const id = store.create(PROJECT_A, null, { text: "first" });
     await store.flush(id);
     let releaseSave: () => void = () => undefined;
     control.updateGate = new Promise<void>((resolve) => {
@@ -248,7 +278,7 @@ describe("CreationDraftStore", () => {
     using tempDir = new TestTempDir("creation-store-unload");
     const harness = await createHarness(tempDir);
     const { store, service, control } = harness;
-    const id = store.create(PROJECT_A, null, { persist: true });
+    const id = store.create(PROJECT_A, null, { text: "first" });
     await store.flush(id);
     store.update(id, { text: "typed just before reload" });
     const saves = control.updates.length;
@@ -263,7 +293,7 @@ describe("CreationDraftStore", () => {
     using tempDir = new TestTempDir("creation-store-read-failure");
     const harness = await createHarness(tempDir);
     const { store, control } = harness;
-    const id = store.create(PROJECT_A, null, { persist: true });
+    const id = store.create(PROJECT_A, null);
     store.update(id, { text: "saved" });
     await store.flush(id);
 

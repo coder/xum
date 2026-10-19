@@ -19,7 +19,7 @@ import {
   cleanupView,
   openProjectCreationView,
   setupTestDom,
-  waitForLatestDraftId,
+  waitForOpenDraftId,
 } from "../helpers";
 import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 
@@ -53,7 +53,7 @@ async function openCreationView() {
   const view = renderApp({ apiClient: getSharedEnv().orpc });
   const projectPath = await addProjectViaUI(view, getSharedRepoPath());
   await openProjectCreationView(view, projectPath);
-  const draftId = await waitForLatestDraftId(projectPath);
+  const draftId = await waitForOpenDraftId();
   return { view, cleanupDom, draftId };
 }
 

@@ -196,7 +196,7 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
   createWorkspaceDraft: (
     projectPath: string,
     subProjectPath?: string,
-    options?: { replace?: boolean; persist?: boolean }
+    options?: { replace?: boolean }
   ) => void;
   updateWorkspaceDraftSubProject: (
     projectPath: string,
@@ -477,7 +477,6 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           ? payload.prompt
           : undefined;
       const draftId = getCreationDraftStore().create(owningProjectPath, normalizedSubProjectPath, {
-        persist: true,
         text: prompt,
       });
 
@@ -1593,16 +1592,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   );
 
   const createWorkspaceDraft = useCallback(
-    (
-      projectPath: string,
-      subProjectPath?: string,
-      options?: { replace?: boolean; persist?: boolean }
-    ) => {
-      // Explicit New: always a fresh id. `persist` lists its (empty) row at once; without it the
-      // first edit does (the startup "new-chat" composer, so launches do not pile up empty rows).
-      const draftId = getCreationDraftStore().create(projectPath, subProjectPath ?? null, {
-        persist: options?.persist ?? true,
-      });
+    (projectPath: string, subProjectPath?: string, options?: { replace?: boolean }) => {
+      // Explicit New: always a fresh id. Its row appears once the user writes something
+      // (CreationDraftStore), so New clicks and launches do not pile up empty rows.
+      const draftId = getCreationDraftStore().create(projectPath, subProjectPath ?? null);
       navigateToProject(projectPath, draftId, { replace: options?.replace });
     },
     [navigateToProject]
@@ -1647,7 +1640,6 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (behavior === "new-chat") {
         createWorkspaceDraft(fallbackScope.projectPath, fallbackScope.subProjectPath ?? undefined, {
           replace: true,
-          persist: false,
         });
         return;
       }

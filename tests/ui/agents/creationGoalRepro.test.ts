@@ -26,7 +26,7 @@ import {
   cleanupView,
   openProjectCreationView,
   setupTestDom,
-  waitForLatestDraftId,
+  waitForOpenDraftId,
 } from "../helpers";
 import { ChatHarness } from "../harness";
 
@@ -45,7 +45,7 @@ async function setupCreationView() {
   const view = renderApp({ apiClient: env.orpc });
   const projectPath = await addProjectViaUI(view, getSharedRepoPath());
   await openProjectCreationView(view, projectPath);
-  const draftId = await waitForLatestDraftId(projectPath);
+  const draftId = await waitForOpenDraftId();
   const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), {
     kind: "creation",
     draftId,

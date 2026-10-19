@@ -16,7 +16,7 @@ import {
 } from "../../ipc/sendMessageTestHelpers";
 
 import { renderApp } from "../renderReviewPanel";
-import { addProjectViaUI, cleanupView, setupTestDom, waitForLatestDraftId } from "../helpers";
+import { addProjectViaUI, cleanupView, setupTestDom, waitForOpenDraftId } from "../helpers";
 import { ChatHarness } from "../harness";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -173,7 +173,7 @@ async function openCreationViewWithHeldBranches(options?: {
   const held = holdBranchList(env);
   await openCreationViewWhileBranchesLoad(view, projectPath);
   await waitFor(() => expect(held.spy).toHaveBeenCalled(), { timeout: 10_000 });
-  const draftId = await waitForLatestDraftId(projectPath);
+  const draftId = await waitForOpenDraftId();
   const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), {
     kind: "creation",
     draftId,
@@ -267,7 +267,7 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
     try {
       await openCreationViewWhileBranchesLoad(view, projectPath);
       await waitFor(() => expect(reject).toHaveBeenCalled(), { timeout: 10_000 });
-      const draftId = await waitForLatestDraftId(projectPath);
+      const draftId = await waitForOpenDraftId();
       const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), {
         kind: "creation",
         draftId,

@@ -19,7 +19,7 @@ import {
   cleanupView,
   openProjectCreationView,
   setupTestDom,
-  waitForLatestDraftId,
+  waitForOpenDraftId,
 } from "../helpers";
 import { ChatHarness } from "../harness";
 
@@ -52,7 +52,7 @@ async function setupCreationView(): Promise<CreationView> {
   const normalizedProjectPath = await addProjectViaUI(view, projectPath);
   await openProjectCreationView(view, normalizedProjectPath);
 
-  const draftId = await waitForLatestDraftId(normalizedProjectPath);
+  const draftId = await waitForOpenDraftId();
 
   const chat = new ChatHarness(view.container, getDraftScopeId(normalizedProjectPath, draftId), {
     kind: "creation",

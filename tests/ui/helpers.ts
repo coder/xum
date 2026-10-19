@@ -315,18 +315,18 @@ export async function clearWorkspaceDrafts(projectPath: string): Promise<void> {
   );
 }
 
-export async function waitForLatestDraftId(
-  projectPath: string,
-  timeoutMs = 5_000
-): Promise<string> {
+/**
+ * The creation draft the open project page shows (its `draft` route parameter). A new draft is
+ * not listed until it has content, so the route is the only place to read its id from.
+ */
+export async function waitForOpenDraftId(timeoutMs = 5_000): Promise<string> {
   return waitFor(
     () => {
-      const drafts = getWorkspaceDraftIds(projectPath);
-      const latestDraft = drafts[drafts.length - 1];
-      if (!latestDraft) {
-        throw new Error("Draft not registered yet");
+      const draftId = new URLSearchParams(window.location.search).get("draft");
+      if (!draftId) {
+        throw new Error("No draft in the route yet");
       }
-      return latestDraft;
+      return draftId;
     },
     { timeout: timeoutMs }
   );

@@ -19,7 +19,7 @@ import {
   addProjectViaUI,
   openProjectCreationView,
   setupTestDom,
-  waitForLatestDraftId,
+  waitForOpenDraftId,
 } from "../helpers";
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
 import { ChatHarness } from "../harness";
@@ -83,7 +83,7 @@ async function createCreationHarness(options?: {
     const projectPath = await addProjectViaUI(view, repoPath);
     await openProjectCreationView(view, projectPath);
     await waitForSourceBranch(view);
-    const draftId = await waitForLatestDraftId(projectPath);
+    const draftId = await waitForOpenDraftId();
     const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), {
       kind: "creation",
       draftId,

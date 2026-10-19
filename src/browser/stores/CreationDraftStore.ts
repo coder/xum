@@ -104,6 +104,24 @@ function seedAi(projectPath: string): CreationDraft["ai"] {
   };
 }
 
+/**
+ * What the user wrote: text, an attachment or a workspace name. A draft with none of it is not
+ * saved, so New and an untouched composer add no sidebar row (AI and runtime picks wait in memory).
+ */
+function hasCreationDraftContent(draft: CreationDraft): boolean {
+  return (
+    draft.text.trim().length > 0 ||
+    draft.attachments.length > 0 ||
+    draft.manualName.trim().length > 0
+  );
+}
+
+/** Changes the backend has not got yet that are due to be saved. */
+function hasChangesToSave(entry: Entry): boolean {
+  if (!entry.draft || Object.keys(entry.pending).length === 0) return false;
+  return entry.persisted || hasCreationDraftContent(entry.draft);
+}
+
 export function createBlankCreationDraft(
   id: string,
   projectPath: string,
@@ -296,7 +314,7 @@ export class CreationDraftStore {
 
   /**
    * The draft a bare project page opens: the project's newest, else a blank one whose id stays
-   * stable until its first edit saves it (then it is the newest).
+   * stable until it has content and is saved (then it is the newest).
    */
   draftIdForProject(projectPath: string): string {
     const newest = this.newestDraftId(projectPath);
@@ -392,7 +410,7 @@ export class CreationDraftStore {
 
   /**
    * Load a draft for an editor. Found: its record. Absent (never saved, or deleted): a blank draft
-   * of `projectPath`, saved by its first edit. A failed or timed-out read shows Retry and no
+   * of `projectPath`, saved once it has content. A failed or timed-out read shows Retry and no
    * editor: treating it as absent could write over a record this window never saw.
    */
   open(id: string, projectPath: string, subProjectPath: string | null = null): void {
@@ -440,18 +458,14 @@ export class CreationDraftStore {
     });
   }
 
-  /** A new draft with a fresh id (explicit New). `persist` saves its empty row at once. */
-  create(
-    projectPath: string,
-    subProjectPath: string | null,
-    options?: { persist?: boolean; text?: string }
-  ): string {
+  /** A new draft with a fresh id (explicit New). Prefilled text lists its row at once. */
+  create(projectPath: string, subProjectPath: string | null, options?: { text?: string }): string {
     const id = createDraftId();
     const draft = { ...createBlankCreationDraft(id, projectPath, subProjectPath) };
     if (options?.text) draft.text = options.text;
     const entry = this.newEntry(draft, { status: "ready" }, false);
     this.entries.set(id, entry);
-    if (options?.persist === true || draft.text.length > 0) {
+    if (hasCreationDraftContent(draft)) {
       const { id: _id, ...all } = draft;
       entry.pending = all;
       this.summaries.set(id, summarizeCreationDraft(draft));
@@ -497,8 +511,8 @@ export class CreationDraftStore {
         await entry.inFlight;
         continue;
       }
-      // A blank draft nobody edited is never saved (no row until its first edit).
-      if (!entry.draft || Object.keys(entry.pending).length === 0) return;
+      // A draft without content is not saved, so it has no row (hasCreationDraftContent).
+      if (!hasChangesToSave(entry)) return;
       entry.inFlight = this.save(id, entry).finally(() => {
         entry.inFlight = null;
       });
@@ -611,7 +625,7 @@ export class CreationDraftStore {
     return {
       load: entry.load,
       draft: entry.draft,
-      unsaved: entry.saving || entry.timer !== null || Object.keys(entry.pending).length > 0,
+      unsaved: entry.saving || hasChangesToSave(entry),
       saveError: entry.saveError,
     };
   }

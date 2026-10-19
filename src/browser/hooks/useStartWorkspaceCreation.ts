@@ -24,7 +24,7 @@ export function persistWorkspaceCreationPrefill(
     return undefined;
   }
   const store = getCreationDraftStore();
-  const draftId = store.create(projectPath, subProjectPath, { persist: true, text: startMessage });
+  const draftId = store.create(projectPath, subProjectPath, { text: startMessage });
   const draft = store.getView(draftId).draft;
   if (draft && model !== undefined) {
     // A prefilled model is an explicit pick, so it leaves Auto (see setWorkspaceModelWithOrigin).

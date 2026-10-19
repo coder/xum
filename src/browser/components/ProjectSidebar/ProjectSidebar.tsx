@@ -1784,7 +1784,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const scratchDrafts = (workspaceDraftsByProject[SCRATCH_PROJECT_CONFIG_KEY] ?? [])
     .slice()
     .sort((a, b) => b.createdAt - a.createdAt);
-  // Every listed draft shows a row: a draft is listed once its first edit (or New) saved it.
+  // Every listed draft shows a row: a draft is listed once it has content and is saved.
   const getVisibleDraftNumbers = (
     drafts: ReadonlyArray<{ draftId: string }>
   ): Map<string, number> => new Map(drafts.map((draft, index) => [draft.draftId, index + 1]));
