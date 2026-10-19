@@ -131,6 +131,46 @@ test("the agents get the proxy model for `e2e explore` in the sandbox, and never
   ).toThrow(/anthropic/);
 });
 
+// `make test-stories`: the agent repros (`e2e run --tag agent` alone) get the model too, in the
+// CLI and in the worker it forks (with no args; the worker reads its parent's args).
+const WORKER = path.resolve(import.meta.dir, "../../../node_modules/e2e/dist/run/worker/entry.js");
+const AGENT_RUN = ["node", CLI, "run", "--config", "e2e.config.ts", "--tag", "agent", "--exclude-tag", "known-failure"]; // prettier-ignore
+
+test("the agents get the proxy model for `e2e run --tag agent` only in a model-driven sandbox", async () => {
+  const root = await fakeRoot();
+  expect(explorerModel(AGENT_RUN, DRIVEN, root)?.modelId).toBe("claude-sonnet-5-5");
+  expect(explorerModel(["node", CLI, "run", "--tag=agent"], DRIVEN, root)).toBeDefined();
+  // Not on this host, not without the model-driven marker, and not for another tag selection.
+  expect(explorerModel(AGENT_RUN, DRIVEN)).toBeUndefined();
+  expect(explorerModel(AGENT_RUN, { ...DRIVEN, BUGBASH_MODEL_DRIVEN: undefined }, root)).toBe(
+    undefined
+  );
+  for (const tags of [
+    ["--tag", "agent", "--tag", "mock-only"],
+    ["--tag", "agent", "--tag-mode", "any"],
+    ["--tag", "agent,x"],
+    ["--exclude-tag", "agent"],
+  ])
+    expect(explorerModel(["node", CLI, "run", ...tags], DRIVEN, root)).toBeUndefined();
+});
+
+test("a run's worker gets the model only when its parent is `e2e run --tag agent`", async () => {
+  const root = await fakeRoot();
+  const parent = (argv: string[]) => {
+    fs.mkdirSync(path.join(root, "proc/42"), { recursive: true });
+    fs.writeFileSync(path.join(root, "proc/42/cmdline"), `${argv.join("\0")}\0`);
+  };
+  const worker = ["node", WORKER];
+  parent(AGENT_RUN);
+  expect(explorerModel(worker, DRIVEN, root, 42)?.modelId).toBe("claude-sonnet-5-5");
+  expect(explorerModel(worker, DRIVEN, root, 43)).toBeUndefined(); // an unreadable parent
+  parent(["node", CLI, "run", "--config", "e2e.config.ts"]);
+  expect(explorerModel(worker, DRIVEN, root, 42)).toBeUndefined();
+  // Only a worker reads its parent: another script with the same parent gets nothing.
+  parent(AGENT_RUN);
+  expect(explorerModel(["node", "other.js"], DRIVEN, root, 42)).toBeUndefined();
+});
+
 const ALL_OFF = {
   XUM_DISABLE_AGENT_TOOLS: "1",
   XUM_DISABLE_TERMINALS: "1",

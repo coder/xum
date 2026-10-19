@@ -103,6 +103,7 @@ artifacts/
 tests/e2e/tmp/
 # e2e bug-bash output (reports, videos, unredacted app logs)
 tests/bugbash/.e2e/
+tests/stories/.e2e/
 
 # Test temporary directories
 src/test-temp-*/

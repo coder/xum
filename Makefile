@@ -98,7 +98,7 @@ include fmt.mk
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
-.PHONY: benchmark-terminal bench bench-compare first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e generate-phone-chrome check-phone-chrome
+.PHONY: benchmark-terminal bench bench-compare first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
@@ -295,6 +295,25 @@ mcp-apps-e2e: ## MCP Apps e2e suite in the bug-bash sandbox (needs BUGBASH_BUDGE
 	@# The app AI is pinned to the mock, also over an exported BUGBASH_AI_RESOLVED. The shell PID
 	@# keeps two runs that start in the same second apart (their output and proxy record).
 	@$(MCP_APPS_LAUNCH) -- run --config e2e.mcpapps.config.ts --output .e2e/mcp-apps-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(MCP_APPS_E2E_ARGS)
+
+# The story suite (tests/stories, agent.* steps) and the agent-tagged repros run only in the
+# bug-bash sandbox (tests/bugbash/sandbox/launch.ts, #5714), each as its own job. Their agents
+# reach BUGBASH_MODEL (default Sonnet 5.5) through a provider proxy for the job, so the host needs
+# BUGBASH_BUDGET_USD (a list-price cap per job) and ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL. The
+# app AI stays the mock. No agent repro exists yet, so that job may select none. As in
+# mcp-apps-e2e, the checks run before the build, and no build goal may share its make command line.
+STORIES_ENV = BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="story tests"
+STORIES_LAUNCH = cd tests/stories && $(STORIES_ENV) bun ../bugbash/sandbox/launch.ts
+AGENT_REPROS_LAUNCH = cd tests/bugbash && $(STORIES_ENV) bun sandbox/launch.ts
+STORIES_RUN = run --config e2e.config.ts --exclude-tag known-failure
+AGENT_REPROS_RUN = run --config e2e.config.ts --tag agent --exclude-tag known-failure --pass-with-no-tests
+test-stories: ## Story tests and agent-tagged repros in the bug-bash sandbox (needs BUGBASH_BUDGET_USD)
+	@$(STORIES_LAUNCH) --preflight -- $(STORIES_RUN) --output .e2e/stories-preflight $(STORIES_ARGS)
+	@$(AGENT_REPROS_LAUNCH) --preflight -- $(AGENT_REPROS_RUN) --output .e2e/agent-repros-preflight $(STORIES_ARGS)
+	@$(MAKE) --no-print-directory build-main build-renderer build-static
+	@# The shell PID keeps two runs that start in the same second apart (their output and proxy record).
+	@$(STORIES_LAUNCH) -- $(STORIES_RUN) --output .e2e/stories-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(STORIES_ARGS)
+	@$(AGENT_REPROS_LAUNCH) -- $(AGENT_REPROS_RUN) --output .e2e/agent-repros-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(STORIES_ARGS)
 
 rlm-eval: ## Run the RLM lever eval against a running dev-server sandbox (see scripts/rlm-eval/run.ts header)
 	@bun run scripts/rlm-eval/run.ts $(RLM_EVAL_ARGS)

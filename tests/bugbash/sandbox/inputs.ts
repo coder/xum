@@ -16,7 +16,7 @@ import * as path from "node:path";
 import { Refusal } from "./runner";
 
 /** The git-listed inputs that the container reads. A symlink among them stops the launch. */
-export const INPUTS = ["src", "tests/bugbash", "tsconfig.json", "package.json"];
+export const INPUTS = ["src", "tests/bugbash", "tests/stories", "tsconfig.json", "package.json"];
 /** The host env names that e2e.config.ts and startApp.ts read. No other host value passes. */
 // Not BUGBASH_AI_REASON: after a failed probe it holds the provider URL and response text.
 // Not BUGBASH_MODEL: the launcher sets it per job kind, and only for a model-driven job.
@@ -68,8 +68,9 @@ export function stage(root: string, into: string): number {
     fs.copyFileSync(path.join(root, rel), path.join(into, rel), fs.constants.COPYFILE_EXCL);
     count += 1;
   }
-  // Mount points for the read-only build outputs and the job's tmpfs.
-  for (const dir of ["dist", "node_modules", "tests/bugbash/.e2e"])
+  // Mount points for the read-only build outputs and the job's tmpfs (a story job's output is
+  // under tests/stories, every other job's under tests/bugbash).
+  for (const dir of ["dist", "node_modules", "tests/bugbash/.e2e", "tests/stories/.e2e"])
     fs.mkdirSync(path.join(into, dir), { recursive: true });
   return count;
 }
@@ -123,8 +124,9 @@ const RUN_FLAGS = ["--pass-with-no-tests", "--last-failed", "--debug"];
 /**
  * Why these e2e args are not an `e2e run` with `config`, or null. With the default repro config
  * its tests are repros/**, and its agents hold no model (hostPause.ts). The launcher also
- * accepts the MCP Apps config, whose agents get a model only through the job's proxy. e2e
- * resolves --config from its cwd, so the cwd must be tests/bugbash and the config a regular file.
+ * accepts the MCP Apps config and the story config (`dir` tests/stories), whose agents get a
+ * model only through the job's proxy. e2e resolves --config from its cwd, so the cwd must be
+ * `dir` and the config a regular file.
  */
 export function exactStepRefusal(
   args: string[],
@@ -145,7 +147,9 @@ export function exactStepRefusal(
   }
   if (configs.length !== 1 || configs[0] !== config)
     return `--config must be given once as ${config}, got ${JSON.stringify(configs)}`;
-  if (fs.realpathSync(cwd) !== fs.realpathSync(dir)) return `the cwd must be ${dir}, got ${cwd}`;
+  // A missing `dir` (a checkout without tests/stories) refuses instead of throwing.
+  const realDir = fs.existsSync(dir) ? fs.realpathSync(dir) : null;
+  if (fs.realpathSync(cwd) !== realDir) return `the cwd must be ${dir}, got ${cwd}`;
   if (fs.lstatSync(path.join(dir, config), { throwIfNoEntry: false })?.isFile() !== true)
     return `${dir}/${config} is not a regular file (a symlink?)`;
   return null;

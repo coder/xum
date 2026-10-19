@@ -3,6 +3,8 @@
  * Usage, from tests/bugbash, with BUGBASH_AI=mock:
  *   bun sandbox/launch.ts -- run --config e2e.config.ts --output .e2e/<folder> [e2e args...]
  *   bun sandbox/launch.ts -- run --config e2e.mcpapps.config.ts --output .e2e/<folder> [...]
+ *   bun sandbox/launch.ts -- run --config e2e.config.ts --tag agent --output .e2e/<folder> [...]
+ *   from tests/stories: bun ../bugbash/sandbox/launch.ts -- run --config e2e.config.ts --output .e2e/<folder> [...]
  *   bun sandbox/launch.ts -- explore "<goal>" --config e2e.config.ts --output .e2e/<folder> [...]
  *   bun sandbox/launch.ts -- self-check [--export-fixture traversal|oversize] --output .e2e/<folder>
  *     (selfCheckRun.ts, `make bug-bash-sandbox-check`, against a fake upstream)
@@ -13,8 +15,9 @@
  * read-only dist/ and node_modules/ (inputs.ts). Its output folder, the app log included, comes
  * back on its stdout as an export stream (exportStream.ts).
  *
- * Three job kinds run, with the mock app AI unless run.ts resolved the real one for explore. An exact-step repro run gets no model. The MCP
- * Apps suite and an `e2e explore` charter (run.ts, `make bug-bash`) are model-driven: their
+ * These job kinds run, with the mock app AI unless run.ts resolved the real one for explore. An exact-step repro run gets no model. The MCP
+ * Apps suite, the story suite (tests/stories), the agent repros (`--tag agent` alone; both
+ * `make test-stories`) and an `e2e explore` charter (run.ts, `make bug-bash`) are model-driven: their
  * explorer reaches BUGBASH_MODEL (default Sonnet 5.5) only through a provider proxy (proxy.ts)
  * that this process runs for the job, on a unix socket that the container gets read-only. The
  * provider key stays here, and BUGBASH_BUDGET_USD caps the spend at list price (not a billing
@@ -40,6 +43,7 @@ import { startProxy, UNREACHABLE } from "./proxy";
 import { Ledger, priced } from "./proxyPolicy";
 // prettier-ignore
 import { checkMountSource, containerEnv, exactStepRefusal, exploreRefusal, jobEnv, outputDir, plainFolders, stage } from "./inputs";
+import { namesAgentTag, onlyAgentTag } from "../hostPause";
 import { type CleanupState, IMAGE, Refusal, Session, Stopped } from "./runner";
 import { DEFAULT_APP_MODEL } from "../aiMode";
 
@@ -434,34 +438,49 @@ function selfCheckRefusal(args: string[]): string | null {
 
 /** The checks of a job that need no docker command. Throws a Refusal. */
 function checkJob(args: string[], o: LaunchOptions) {
-  const dir = path.join(o.root, "tests/bugbash");
-  const mcpApps = exactStepRefusal(args, o.cwd, dir, MCP_APPS_CONFIG) == null;
+  const bugbash = path.join(o.root, "tests/bugbash");
+  const storiesDir = path.join(o.root, "tests/stories");
+  const mcpApps = exactStepRefusal(args, o.cwd, bugbash, MCP_APPS_CONFIG) == null;
+  // The story suite (`make test-stories`): its own config in tests/stories, model-driven.
+  const stories = exactStepRefusal(args, o.cwd, storiesDir) == null;
+  const exactStep = exactStepRefusal(args, o.cwd, bugbash) == null;
+  // The agent repros (`make test-stories`): the repro config with `--tag agent` alone, so the run
+  // selects only repros whose every step may call a model (reproRules.test.ts).
+  const agentRepros = exactStep && onlyAgentTag(args);
   const selfCheck = args[0] === "self-check";
   if (selfCheck) {
     const notSelfCheck = selfCheckRefusal(args);
     if (notSelfCheck != null) throw new Refusal(`${notSelfCheck} (#5714)`);
   } else if (args[0] === "explore") {
-    const notExplore = exploreRefusal(args, o.cwd, dir);
+    const notExplore = exploreRefusal(args, o.cwd, bugbash);
     if (notExplore != null) throw new Refusal(`${notExplore}: not one explore charter (#5714)`);
-  } else if (!mcpApps) {
-    const notExact = exactStepRefusal(args, o.cwd, dir);
+  } else if (!mcpApps && !stories) {
+    const notExact = exactStepRefusal(args, o.cwd, bugbash);
     if (notExact != null)
       throw new Refusal(
-        `${notExact}: only exact-step repros, the MCP Apps suite and explore charters run (#5714)`
+        `${notExact}: only exact-step repros, the agent repros, the MCP Apps suite, the story suite and explore charters run (#5714)`
       );
+    // Any other selection by the agent tag would run agent repros with no model: each fails.
+    if (!agentRepros && namesAgentTag(args))
+      throw new Refusal("agent repros run only with `--tag agent` alone and no --tag-mode (#5714)");
   }
   // First, before any docker command and before the container env exists.
   const ai = appAi(o.env, args[0] === "explore");
-  const driven = mcpApps || selfCheck || args[0] === "explore" ? modelJob(o.env) : undefined;
+  // A model-driven `e2e run`: every test needs the explorer model, so the launcher probes it.
+  const drivenRun = mcpApps || stories || agentRepros;
+  const driven = drivenRun || selfCheck || args[0] === "explore" ? modelJob(o.env) : undefined;
   // The stale-key local build: CI's bugbash-sandbox job sets BUGBASH_SANDBOX_BUILD_STALE=1, so a pull request that
   // changes the image inputs can pass before main publishes its image. Only the self-check and
   // exact-step repros may use a local build: they reach no real model. By the job kind, not by
-  // `driven`: the self-check counts as model-driven. Explore charters, the MCP Apps suite and
-  // checkDocker (the preflight of make bug-bash and make mcp-apps-e2e) keep the pinned digest.
+  // `driven`: the self-check counts as model-driven. Explore charters, the MCP Apps suite, the
+  // story suite, the agent repros and checkDocker (the preflight of make bug-bash, make
+  // mcp-apps-e2e and make test-stories) keep the pinned digest.
   // A positive check, not "none of the others": a job kind added later must not qualify by default.
-  const exactStep = exactStepRefusal(args, o.cwd, dir) == null;
-  const localBuild = o.env.BUGBASH_SANDBOX_BUILD_STALE === "1" && (selfCheck || exactStep);
-  return { dir, mcpApps, selfCheck, ai, driven, localBuild };
+  const localBuild =
+    o.env.BUGBASH_SANDBOX_BUILD_STALE === "1" && (selfCheck || (exactStep && !agentRepros));
+  // The job's folder: its cwd in the container, and where its output comes back.
+  const dir = stories ? storiesDir : bugbash;
+  return { dir, drivenRun, selfCheck, ai, driven, localBuild };
 }
 
 /** A job's checks and the Docker check, with no job: `--preflight` (Makefile, before the build). */
@@ -473,7 +492,7 @@ export async function preflight(args: string[], o: LaunchOptions): Promise<Clean
 /** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
 export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
   const log = o.log ?? logLine;
-  const { dir, mcpApps, selfCheck, ai, driven, localBuild } = checkJob(args, o);
+  const { dir, drivenRun, selfCheck, ai, driven, localBuild } = checkJob(args, o);
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
@@ -497,7 +516,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   // A call record that could not be written (a full disk): the proxy record is incomplete, so
   // the job must not look successful. The errno code only: the message can hold the path.
   let recordFault: string | undefined;
-  /** The MCP Apps probe's proxy fault: its own proxy, closed before the job's starts. */
+  /** The model-driven run's probe proxy fault: its own proxy, closed before the job's starts. */
   let probeFault: string | undefined;
   // The first proxy fault stops this job at once (its proxy closes with the lifeline), so no
   // more paid calls go out on a wrong cost model or without a record.
@@ -577,10 +596,11 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     };
     const env = containerEnv(o.env, { ...jobEnv(output), ...host, ...modeEnv(ai), ...drivenEnv });
     plainFolders(dir, path.dirname(output), true);
-    // The MCP Apps suite fails every test without its explorer model, so one probe call of that
-    // model, through the job's ledger, refuses a dead upstream or key before the container starts.
-    // run.ts probes before its explore jobs; the self-check has a fake upstream.
-    if (mcpApps && driven) {
+    // A model-driven `e2e run` (the MCP Apps suite, the story suite, the agent repros) fails
+    // every test without its explorer model, so one probe call of that model, through the job's
+    // ledger, refuses a dead upstream or key before the container starts. run.ts probes before
+    // its explore jobs; the self-check has a fake upstream.
+    if (drivenRun && driven) {
       ledger = o.ledger ?? new Ledger(driven.budgetUsd);
       // A bound miss in the probe is a proxy fault like any other: exit 5, and run-wide halt.
       const probe = await probeApp(driven, driven.model, ledger, o.stop).catch((error: Error) => {
@@ -623,23 +643,27 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
       });
       proxyMount.push(...bind(proxyDir, PROXY_DIR));
     }
+    // The job's folder in the container (tests/bugbash, or tests/stories for the story suite): its
+    // cwd, and its writable output tmpfs. entry.ts stays in tests/bugbash/sandbox.
+    const folder = path.relative(o.root, dir);
+    const entry = path.relative(dir, path.join(o.root, "tests/bugbash/sandbox/entry.ts"));
     // prettier-ignore
     const flags = ["--rm", "--interactive", "--init", "--log-driver", "none", "--network", "none",
       "--user", `${uid}:${gid}`, "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
       "--read-only", "--pids-limit", "4096", "--memory", "4g", "--memory-swap", "4g",
       "--tmpfs", "/tmp:rw,nosuid,nodev,size=4g", "--tmpfs", "/home/bugbash:rw,nosuid,nodev,size=1g",
-      "--tmpfs", `/repo/tests/bugbash/.e2e:rw,nosuid,nodev,size=1g,uid=${uid},gid=${gid}`,
+      "--tmpfs", `/repo/${folder}/.e2e:rw,nosuid,nodev,size=1g,uid=${uid},gid=${gid}`,
       ...bind(staged, "/repo"), ...mounts(), ...proxyMount,
       ...bind(path.join(jobDir, "passwd"), "/etc/passwd"), ...bind(path.join(jobDir, "group"), "/etc/group"),
       ...Object.entries(env).flatMap(([key, value]) => ["--env", `${key}=${value}`]),
-      "--workdir", "/repo/tests/bugbash", "--entrypoint", "bun"];
+      "--workdir", `/repo/${folder}`, "--entrypoint", "bun"];
     const fixture = selfCheck && args[1] === "--export-fixture" ? args[2] : undefined;
     const jobCommand = selfCheck
       ? ["bun", "sandbox/selfCheck.ts", output]
       : ["node", "../../node_modules/e2e/dist/cli/bin.js", ...args];
     const command: [string, ...string[]] = [
       image,
-      "sandbox/entry.ts",
+      entry,
       "--export",
       output,
       ...(fixture !== undefined ? ["--export-fixture", fixture] : []),

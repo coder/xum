@@ -668,6 +668,8 @@ function prepare(over: Record<string, string> = {}, leftovers: string[] = []) {
     fs.mkdirSync(path.join(real, dir), { recursive: true });
   fs.writeFileSync(path.join(bin, "containers"), [...FOREIGN, ...leftovers].join("\n") + "\n");
   fs.writeFileSync(path.join(real, "tests/bugbash/e2e.mcpapps.config.ts"), "export default {}");
+  fs.mkdirSync(path.join(real, "tests/stories"), { recursive: true });
+  fs.writeFileSync(path.join(real, "tests/stories/e2e.config.ts"), "export default {}");
   fake({ IMAGES: "sha256:abc", SWAP: path.join(real, "node_modules"), ...over });
   return path.join(real, "tests/bugbash");
 }
@@ -1021,11 +1023,18 @@ test("C2: recover reports an unknown cleanup state (exit 3)", async () => {
 // The MCP Apps suite (plan PR B1): model-driven, through a proxy for the job.
 const MCP_ARGS = ["run", "--config", "e2e.mcpapps.config.ts", "--output", ".e2e/m"];
 const UPSTREAM_KEY = "sk-host-upstream-key-for-the-launch-test";
+/** A model-driven `e2e run` job: its args, and its cwd under the checkout. */
+interface DrivenRun {
+  args: string[];
+  folder: string;
+}
+const MCP_APPS: DrivenRun = { args: MCP_ARGS, folder: "tests/bugbash" };
 async function mcpLaunch(
   over: Record<string, string>,
   env: Record<string, string> = {},
   stop = new AbortController(),
-  upstreamMode?: string
+  upstreamMode?: string,
+  job = MCP_APPS
 ) {
   const upstream = await startFakeUpstream();
   upstream.setMode(upstreamMode);
@@ -1042,9 +1051,9 @@ async function mcpLaunch(
       (line: string) => void logged.push(line)
     );
     try {
-      const cwd = prepare(over);
+      const cwd = path.join(prepare(over), "..", "..", job.folder);
       const options = { root: fs.realpathSync(root), cwd, env: host };
-      const code = await launch(MCP_ARGS, { ...options, stop: stop.signal }).catch(
+      const code = await launch(job.args, { ...options, stop: stop.signal }).catch(
         (e: unknown) => e
       );
       return {
@@ -1114,6 +1123,106 @@ test("B1: an MCP Apps job reaches the model only through its proxy, with the hos
   );
   expect(logged.join("\n")).not.toContain(UPSTREAM_KEY);
   expectNothingLeft(); // the job folder with the proxy socket is gone too
+});
+
+// The story suite and the agent repros (`make test-stories`): model-driven `e2e run` jobs.
+const STORIES: DrivenRun = {
+  args: [
+    "run",
+    "--config",
+    "e2e.config.ts",
+    "--exclude-tag",
+    "known-failure",
+    "--output",
+    ".e2e/m",
+  ],
+  folder: "tests/stories",
+};
+const AGENT_REPROS: DrivenRun = {
+  // prettier-ignore
+  args: ["run", "--config", "e2e.config.ts", "--tag", "agent", "--exclude-tag", "known-failure",
+    "--pass-with-no-tests", "--output", ".e2e/m"],
+  folder: "tests/bugbash",
+};
+
+test.each([
+  ["the story suite", STORIES],
+  ["the agent repros", AGENT_REPROS],
+])("%s is a model-driven job: probe, proxy and model, in its own folder", async (_name, job) => {
+  const { code, requests } = await mcpLaunch({ RUN: "proxycall" }, {}, undefined, undefined, job);
+  expect(code).toBe(7);
+  const run = calls()
+    .split("\n")
+    .find((line) => line.startsWith("run "))!;
+  expect(run).toContain("--env BUGBASH_MODEL=anthropic:claude-sonnet-5-5");
+  expect(run).toContain("--env BUGBASH_MODEL_DRIVEN=1");
+  expect(run).toContain("--env BUGBASH_AI_RESOLVED=mock");
+  expect(run).not.toContain(UPSTREAM_KEY);
+  // Its cwd, its output tmpfs and the export: the job's folder. entry.ts stays in tests/bugbash.
+  expect(run).toContain(`--tmpfs /repo/${job.folder}/.e2e:rw,`);
+  expect(run).toContain(`--workdir /repo/${job.folder} --entrypoint bun`);
+  const entry = job === STORIES ? "../bugbash/sandbox/entry.ts" : "sandbox/entry.ts";
+  expect(run).toMatch(new RegExp(` ${entry.replace(/\./g, "\\.")} --export \\.e2e/m -- node `));
+  expect(fs.readFileSync(path.join(root, job.folder, ".e2e/m/app.log"), "utf8")).toBe("ok");
+  expect(requests).toHaveLength(2); // the probe, then the job's call
+  expectNothingLeft();
+});
+
+test.each([
+  ["the story suite without a budget", STORIES, { BUGBASH_BUDGET_USD: "" }, /BUGBASH_BUDGET_USD/],
+  ["the agent repros without a budget", AGENT_REPROS, { BUGBASH_BUDGET_USD: "" }, /BUDGET/],
+  ["the story suite with the real app AI", STORIES, { BUGBASH_AI: "real" }, /only the mock/],
+  [
+    "the story config from tests/bugbash",
+    {
+      args: ["run", "--config", "../stories/e2e.config.ts", "--output", ".e2e/m"],
+      folder: "tests/bugbash",
+    },
+    {},
+    /--config must be given once/,
+  ],
+  ["the story args from the checkout root", { ...STORIES, folder: "." }, {}, /the cwd must be/],
+  [
+    "the MCP Apps config from tests/stories",
+    { args: MCP_ARGS, folder: "tests/stories" },
+    {},
+    /--config must be given once/,
+  ],
+  [
+    "a story file as an extra positional",
+    { ...STORIES, args: [...STORIES.args, "smoke.e2e.ts"] },
+    {},
+    /the argument "smoke\.e2e\.ts"/,
+  ],
+  [
+    "the agent repros with a second --tag",
+    { ...AGENT_REPROS, args: [...AGENT_REPROS.args, "--tag", "mock-only"] },
+    {},
+    /`--tag agent` alone/,
+  ],
+  [
+    "the agent repros with --tag-mode",
+    { ...AGENT_REPROS, args: [...AGENT_REPROS.args, "--tag-mode", "any"] },
+    {},
+    /`--tag agent` alone/,
+  ],
+  [
+    "the agent tag in a comma list",
+    {
+      ...AGENT_REPROS,
+      args: ["run", "--config", "e2e.config.ts", "--tag=agent,x", "--output", ".e2e/m"],
+    },
+    {},
+    /`--tag agent` alone/,
+  ],
+] as const)("%s refuses before any docker command", async (_name, job, env, message) => {
+  const { code } = await mcpLaunch({}, env, undefined, undefined, {
+    args: [...job.args],
+    folder: job.folder,
+  });
+  expect(code).toBeInstanceOf(Refusal);
+  expect((code as Error).message).toMatch(message);
+  expect(calls()).toBe("");
 });
 
 test("U2: an MCP Apps job whose upstream cannot be reached refuses before the container", async () => {
@@ -1805,15 +1914,22 @@ test.each(["repro", "self-check"] as const)(
 test.each([
   ["an explore charter", "1"],
   ["the MCP Apps suite", "1"],
+  ["the story suite", "1"],
+  ["the agent repros", "1"],
   ["a repro whose opt-in is not exactly 1", "true"],
 ])("local build: %s refuses a stale key, and nothing is built", async (job, value) => {
   lock("0".repeat(64));
   const env = { BUGBASH_SANDBOX_BUILD_STALE: value };
+  const driven: Record<string, DrivenRun> = {
+    "the MCP Apps suite": MCP_APPS,
+    "the story suite": STORIES,
+    "the agent repros": AGENT_REPROS,
+  };
   const error =
     job === "an explore charter"
       ? ((await exploreLaunch({}, env)).outcome as { error: unknown }).error
-      : job === "the MCP Apps suite"
-        ? (await mcpLaunch({}, env)).code
+      : job in driven
+        ? (await mcpLaunch({}, env, undefined, undefined, driven[job])).code
         : await launchIn({}, new AbortController(), { ...HOST_ENV, ...env }).catch(
             (e: unknown) => e
           );

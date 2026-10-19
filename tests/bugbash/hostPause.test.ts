@@ -112,6 +112,14 @@ test.each([
   ],
   // No app AI mode: e2e.config.ts would throw its own error first, without the pause.
   ["e2e list, MCP Apps, no app AI mode", e2e("list", "--config", "e2e.mcpapps.config.ts"), {}],
+  // The story suite (tests/stories, make test-stories): every command refuses, also `run`.
+  ["e2e run, stories", e2e("run", "--config", "../stories/e2e.config.ts"), { BUGBASH_AI: "mock" }],
+  ["e2e list, stories, no app AI mode", e2e("list", "--config", "../stories/e2e.config.ts"), {}],
+  [
+    "e2e run, stories, sandbox env on the host",
+    e2e("run", "--config", "../stories/e2e.config.ts"),
+    { BUGBASH_AI: "mock", BUGBASH_CONTAINER: "1", BUGBASH_MODEL_DRIVEN: "1" },
+  ],
   [
     "e2e explore, real app AI",
     e2e("explore", "--config", "e2e.config.ts", "x"),

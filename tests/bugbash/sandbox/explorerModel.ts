@@ -3,8 +3,10 @@
  * provider proxy. The proxy holds the provider key and allows only this job's models
  * (proxy.ts), so the key here is a placeholder that the proxy drops.
  */
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { createAnthropic } from "@ai-sdk/anthropic";
-import { e2eCommand } from "../hostPause";
+import { e2eCommand, isE2eWorker, onlyAgentTag } from "../hostPause";
 import { modelDrivenSandbox, PROXY_BASE_URL } from "./inContainer";
 
 /** BUGBASH_MODEL (`anthropic:<id>`, set by the launcher) through the proxy. */
@@ -17,16 +19,40 @@ export function proxyModel(env: NodeJS.ProcessEnv = process.env) {
 }
 
 /**
- * The model for e2e.config.ts's agents: only for `e2e explore` in a model-driven sandbox job.
- * Everywhere else, also for `e2e run` with BUGBASH_MODEL set, the agents get no model, so an
- * `agent.*` step in a repro fails with MODEL_UNAVAILABLE before any model request.
+ * The e2e CLI args of this process. An e2e run's worker gets no args (hostPause.ts), so it reads
+ * the args of the CLI run that forked it, its parent: the worker loads the config again, and its
+ * agents must match the CLI's (e2e compares the two config digests). A parent it cannot read
+ * gives no args, so no model. `root` and `ppid` are for tests.
+ */
+function cliArgv(argv: readonly string[], root: string, ppid: number): readonly string[] {
+  if (!isE2eWorker(argv)) return argv;
+  try {
+    return fs
+      .readFileSync(path.join(root, `proc/${ppid}/cmdline`), "utf8")
+      .replace(/\0$/, "")
+      .split("\0");
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The model for e2e.config.ts's agents, only in a model-driven sandbox job: for `e2e explore`,
+ * and for `e2e run` with `--tag agent` alone (the agent repros of `make test-stories`, whose
+ * worker reads that from its parent). Everywhere else, also for any other `e2e run` with
+ * BUGBASH_MODEL set, the agents get no model, so an `agent.*` step in a repro fails with
+ * MODEL_UNAVAILABLE before any model request.
  */
 export function explorerModel(
   argv: readonly string[] = process.argv,
   env: NodeJS.ProcessEnv = process.env,
-  root = "/"
+  root = "/",
+  ppid = process.ppid
 ) {
-  return e2eCommand(argv) === "explore" && modelDrivenSandbox(env, root)
+  if (!modelDrivenSandbox(env, root)) return undefined;
+  const cli = cliArgv(argv, root, ppid);
+  const command = e2eCommand(cli);
+  return command === "explore" || (command === "run" && onlyAgentTag(cli))
     ? proxyModel(env)
     : undefined;
 }

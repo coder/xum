@@ -1,6 +1,6 @@
 ---
 name: bug-bash
-description: Run an agent bug bash of the Xum web UI in the bug-bash sandbox (TesterArmy `e2e explore` charters, each in its own locked-down Docker container with a seeded `xum server`), then verify each finding with a failing repro test. Use when asked to "bug bash" Xum, run e2e explore agents or the MCP Apps suite against the app, or try to break the app with AI explorers.
+description: Run an agent bug bash of the Xum web UI in the bug-bash sandbox (TesterArmy `e2e explore` charters, each in its own locked-down Docker container with a seeded `xum server`), then verify each finding with a failing repro test. Use when asked to "bug bash" Xum, run e2e explore agents, the MCP Apps suite or the story tests against the app, or try to break the app with AI explorers.
 ---
 
 # Bug bash in the sandbox
@@ -17,10 +17,12 @@ Xum harness. Where the two differ, follow this skill.
 ## How the sandbox works
 
 - The host pause (`tests/bugbash/hostPause.ts`) refuses every model-driven e2e process on the host
-  with exit 2: `e2e explore`, and every command with `e2e.mcpapps.config.ts`. Outside the sandbox
+  with exit 2: `e2e explore`, and every command with `e2e.mcpapps.config.ts` or
+  `tests/stories/e2e.config.ts`. Outside the sandbox
   the agents hold no model, so an `agent.*` step fails with `MODEL_UNAVAILABLE`. No override
   exists. `e2e run` and `e2e list` of exact-step repros still run on the host.
-- `make bug-bash` (`tests/bugbash/run.ts`) and `make mcp-apps-e2e` are the launchers. They run
+- `make bug-bash` (`tests/bugbash/run.ts`), `make mcp-apps-e2e` and `make test-stories` are the
+  launchers. They run
   `tests/bugbash/sandbox/launch.ts`, one container per job.
 - The image `ghcr.io/coder/xum-bugbash-sandbox` (about 1.4 GB, linux/amd64) holds only tools:
   Node 22, Bun, git and the Chromium of `@e2e-dev/web`'s playwright-core. The runner pulls it only
@@ -31,7 +33,8 @@ Xum harness. Where the two differ, follow this skill.
   `Test / Bug-bash sandbox` job sets, the self-check and the exact-step repros build the image
   locally with `build.sh` (local tag, no push, no registry login), check its inputs label, and
   print a warning (a `::warning::` annotation in GitHub Actions). Explore charters, the MCP Apps
-  suite and the preflight of `make bug-bash` and `make mcp-apps-e2e` always refuse a stale key.
+  suite, the story tests, the agent repros and the preflight of `make bug-bash`,
+  `make mcp-apps-e2e` and `make test-stories` always refuse a stale key.
 - An image change lands in three steps: the PR that changes the Dockerfile, `build.sh` or
   playwright-core passes CI on a local build. After it merges, a maintainer runs the manual
   workflow "Bug-bash sandbox image" on main. Then a reviewed PR updates `image.json` to pin the
@@ -106,7 +109,7 @@ Options:
   `claude-haiku-5-5`). Adding Opus finds more distinct bugs and needs about $29.
 - `BUGBASH_EFFORT`: low, medium (default), high, xhigh or max. A higher effort raises the
   estimate as a marked guess.
-- `make bug-bash` refuses `BUGBASH_MODEL`, which only `make mcp-apps-e2e` reads.
+- `make bug-bash` refuses `BUGBASH_MODEL`, which only `make mcp-apps-e2e` and `make test-stories` read.
 - Every model-driven job refuses `BUGBASH_SCENARIO`: its `bash-ai-proxy` scenario needs project
   automation, which those jobs turn off.
 
@@ -119,6 +122,15 @@ Suite tests drive flows with `agent.act` in on-screen words and pin each outcome
 `expect`. Use `agent.assert(..., { vision: "only" })` for "is it on screen": the accessibility
 tree also lists off-screen nodes. Prove a new suite test fails on the old `dist/` before the fix
 lands.
+
+Stories: `make test-stories BUGBASH_BUDGET_USD=3` runs two sandbox jobs with `BUGBASH_MODEL`
+(default Sonnet 5.5) and the mock app AI. The first job runs the story tests,
+`tests/stories/*.e2e.ts`: user stories that one plain agent drives with `agent.act` and
+`agent.assert`, each pinned by an exact `expect`. The second job runs the `agent`-tagged repros
+(`e2e run --tag agent`, and no other `--tag` or `--tag-mode`). The budget caps each job.
+`STORIES_ARGS` passes e2e arguments to both jobs. A story config change goes in
+`tests/stories/e2e.config.ts`, which reuses the web target of `tests/bugbash/e2e.config.ts`.
+STORY_COST_PLACEHOLDER
 
 ## 4. Read the results
 
@@ -164,7 +176,7 @@ Xum rules:
   and `expect` steps where they work. A repro may use `agent.*` steps only when each of its tests
   has the `agent` tag: `tests/bugbash/reproRules.test.ts` fails on a repro that takes the `agent`
   fixture without it. Every free repro run passes `--exclude-tag agent`, so only a model-driven
-  sandbox job runs these repros.
+  sandbox job runs these repros: `make test-stories`.
 - Prove every repro: put the bug back in a scratch edit, rebuild, see `ASSERTION_FAILED` on the
   bug's own assertion, then remove the edit and see it pass.
 - Tags: `bugbash` plus the bug ID. Add `mock-only` when the test needs a `[mock:...]` prompt or a

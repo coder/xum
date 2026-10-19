@@ -9,7 +9,8 @@
  * config refuses every e2e command except `run` and `list` as it loads, before any app, browser
  * or model starts. Only inside the bug-bash sandbox with a provider proxy for the job does
  * `explore` pass, and only there do the agents get the explorer model (`BUGBASH_MODEL` through
- * the proxy, sandbox/explorerModel.ts; reasoning `BUGBASH_EFFORT`). Everywhere else they keep
+ * the proxy, sandbox/explorerModel.ts; reasoning `BUGBASH_EFFORT`): for `explore`, and for the
+ * `agent`-tagged repros (`e2e run --tag agent`, `make test-stories`). Everywhere else they keep
  * their personas but hold no model, so an `agent.*` step in a repro fails with
  * MODEL_UNAVAILABLE before any model request.
  */
@@ -152,8 +153,8 @@ const context = scenario === "bash-ai-proxy" ? bashAiProxyContext : mockOrRealCo
 // Exploration steps need large per-step budgets (`e2e guide bug-bash`, step 1).
 // Only the active provider reads its key, so both can be set at once.
 const effort = explorerEffort();
-// A model only for `e2e explore` in a model-driven sandbox job: an agent.* step in a repro must
-// find no model to call (hostPause.ts).
+// A model only for `e2e explore` and `e2e run --tag agent` in a model-driven sandbox job: any
+// other repro's agent.* step must find no model to call (hostPause.ts).
 const model = explorerModel();
 const persona = {
   ...(model && { model }),
