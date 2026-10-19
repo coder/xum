@@ -9,6 +9,8 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import type { APIClient } from "@/browser/contexts/API";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getPlanTabScrollTopKey } from "@/common/constants/storage";
 
 type GetPlanContentResult =
   | { success: true; data: { content: string; path: string } }
@@ -187,6 +189,45 @@ describe("PlanTab", () => {
       expect(other.getByTestId("plan-markdown-core").textContent).toContain("# Long plan");
     });
     expect(other.getByTestId("plan-tab-body").scrollTop).toBe(0);
+  });
+
+  test("a saved scroll offset survives an unmount before the plan loaded", () => {
+    const key = getPlanTabScrollTopKey("workspace-1");
+    updatePersistedState<number>(key, 120, 0);
+    // The read never settles: a slow remote runtime.
+    mockApi = { workspace: { getPlanContent: mock(() => new Promise<never>(() => undefined)) } };
+
+    const view = renderWithApi(<PlanTab workspaceId="workspace-1" />);
+    expect(view.getByText("Loading plan…")).toBeTruthy();
+    view.unmount();
+
+    expect(readPersistedState<number>(key, 0)).toBe(120);
+  });
+
+  test("a re-read that fails clears the shown plan and disables its actions", async () => {
+    let read: GetPlanContentResult = planResult("# Plan");
+    const getPlanContent = mock(() => Promise.resolve(read));
+    mockApi = { workspace: { getPlanContent } };
+
+    const view = renderWithApi(<PlanTab workspaceId="workspace-1" />);
+    await waitFor(() => {
+      expect(view.getByTestId("plan-markdown-core").textContent).toContain("# Plan");
+    });
+
+    // The file was deleted after it was shown.
+    read = { success: false, error: "Plan file not found at /tmp/plan.md" };
+    act(() => {
+      window.dispatchEvent(new window.Event("focus"));
+    });
+
+    await waitFor(() => {
+      expect(view.getByTestId("plan-tab-error").textContent).toContain("Plan file not found");
+    });
+    expect(view.queryByTestId("plan-markdown-core")).toBeNull();
+    expect(view.queryByTestId("plan-tab-path")).toBeNull();
+    expect(view.getByRole("button", { name: "Implement" }).hasAttribute("disabled")).toBe(true);
+    expect(view.getByRole("button", { name: "Edit" }).hasAttribute("disabled")).toBe(true);
+    expect(view.getByRole("button", { name: "Copy" }).hasAttribute("disabled")).toBe(true);
   });
 
   test("renders API-unavailable state when not connected", async () => {
