@@ -424,6 +424,73 @@ else:
             request = comment("@codex review", "maintainer", REQUEST)
             self.assert_gate(10, snapshot([request, old_board], head=NEWER_HEAD), "wait_pr_codex.sh")
 
+    def test_commitless_code_review_counts_beside_a_current_head_security_review(self):
+        # coder/xum#7002: a code review that completed after a failed attempt lost its
+        # commit. The security review on the same board still pins the head.
+        board = FIXTURES["commitless_code_review_summary"]["body"]
+        sha = board_head(board)
+        commitless = '"commit_sha":null,"has_any_findings":null,"has_unresolved_findings":null,"status":"completed"'
+        self.assertIn(commitless, board)
+        with self.subTest("a security review of an older head keeps it in progress"):
+            self.assert_gate(10, snapshot([comment(board)], head=NEWER_HEAD))
+        for name, body in (
+            (
+                "a row without a commit needs a commitless review state",
+                board.replace(
+                    commitless,
+                    f'"commit_sha":"{sha}","has_any_findings":false,"has_unresolved_findings":false,"status":"completed"',
+                ),
+            ),
+            (
+                "only the code review may lose its commit",
+                board.replace(f'"security_review":{{"commit_sha":"{sha}"', '"security_review":{"commit_sha":null'),
+            ),
+            (
+                "a commitless review must not report findings",
+                board.replace(
+                    commitless,
+                    '"commit_sha":null,"has_any_findings":true,"has_unresolved_findings":true,"status":"completed"',
+                ),
+            ),
+            (
+                "a commitless review must have completed",
+                board.replace(commitless, commitless.replace('"completed"', '"running"')),
+            ),
+        ):
+            with self.subTest(name):
+                self.assertNotEqual(body, board)
+                self.assert_gate(1, snapshot([comment(body)]))
+        with self.subTest("its findings are review threads, which still block"):
+            self.assert_gate(1, snapshot([comment(board)], [thread("[P1] Fix authorization")]))
+
+    def test_a_finished_review_supersedes_an_earlier_failure_notice(self):
+        # coder/xum#7002: Codex posted a failure notice, then completed a retried review.
+        notice = FIXTURES["review_failure"]["body"]
+        failure = comment(notice)
+        board = FIXTURES["commitless_code_review_summary"]["body"]
+        for name in ("commitless_code_review_summary", "summary", "review_state_summary"):
+            with self.subTest(board=name):
+                self.assert_gate(0, snapshot([comment(FIXTURES[name]["body"]), failure]))
+        # A running board, or a board of an older head, may still supersede it.
+        running = snapshot([comment(FIXTURES["running_summary"]["body"]), failure])
+        stale = snapshot([comment(board), failure], head=NEWER_HEAD)
+        for name, waiting in (("a running board", running), ("a board for an older head", stale)):
+            head = waiting["data"]["repository"]["pullRequest"]["headRefOid"]
+            completed = snapshot([comment(board_for(FIXTURES["summary"]["body"], head)), failure])
+            with self.subTest(name):
+                self.assert_gate(10, waiting)
+                self.assert_gate(0, [waiting, completed], wait=60)
+                self.assertEqual(self.comment_rounds, 2)
+        for name, data in (
+            ("no board", snapshot([failure])),
+            ("the failed attempt's board", snapshot([comment(FIXTURES["failed_code_review_summary"]["body"]), failure])),
+            ("a minimized board", snapshot([comment(board, minimized=True), failure])),
+            ("a finding beside the notice", snapshot([comment(board), failure, comment("[P1] Fix authorization")])),
+            ("text appended to the notice", snapshot([comment(board), comment(notice + "\n\n[P1] Fix authorization")])),
+        ):
+            with self.subTest(name):
+                self.assert_gate(1, data)
+
     def test_wait_for_review_gives_up_and_never_hides_findings(self):
         running = snapshot([comment(FIXTURES["running_summary"]["body"])])
         completed = snapshot([comment(FIXTURES["summary"]["body"])])

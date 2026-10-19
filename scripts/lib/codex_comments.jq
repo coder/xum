@@ -15,7 +15,13 @@ def codex_without_help:
   | rtrimstr("\n\n<details> <summary>ℹ️ About Codex security reviews in GitHub</summary>\n<br/>\n\n"
     + "This is an experimental Codex feature. Security reviews are triggered when:\n- You comment \"@codex security review\"\n"
     + "- A regular code review gets triggered (for example, \"@codex review\" or when a PR is opened), and you’re opted in so security review runs alongside code review\n\n"
-    + "Once complete, Codex will leave suggestions, or a comment if no findings are found.\n\n\n</details>");
+    + "Once complete, Codex will leave suggestions, or a comment if no findings are found.\n\n\n</details>")
+  # Codex's review failure notice (coder/xum#7002) still carries the older help text.
+  | rtrimstr("\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n"
+    + "[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n"
+    + "- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\n"
+    + "If Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\n"
+    + "Codex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>");
 
 def codex_summary_marker: "<!-- codex-pull-request-review-summary -->";
 
@@ -47,10 +53,16 @@ def codex_resolved_finding_commits($bot):
     {code_review: cleared("code_review"), security_review: cleared("security_review")};
 
 def codex_review_row_prefix: "^\\| [^[:alnum:]|]*\\*\\*(Code|Security) Review\\*\\* \\| [^[:alnum:]|]*\\*\\*";
-def codex_review_row_suffix: " \\| `[0-9a-f]+` \\| (Manual request|New commits|Draft marked ready|PR opened) \\|$";
+def codex_review_triggers: "(Manual request|New commits|Draft marked ready|PR opened)";
+def codex_review_row_suffix: " \\| `[0-9a-f]+` \\| " + codex_review_triggers + " \\|$";
 def codex_relative_time: "<relative-time datetime=\"[0-9TZ:.+-]+\">[0-9TZ:.+-]+</relative-time>";
 def codex_completed_row: codex_review_row_prefix + "Completed\\*\\*( " + codex_relative_time + ")?" + codex_review_row_suffix;
 def codex_running_row: codex_review_row_prefix + "Running\\*\\* since " + codex_relative_time + codex_review_row_suffix;
+# A code review that completes after a failed attempt loses its commit (coder/xum#7002): the row
+# shows "—", and the review state a null commit_sha and null findings flags.
+def codex_commitless_code_review_row:
+  "^\\| [^[:alnum:]|]*\\*\\*Code Review\\*\\* \\| [^[:alnum:]|]*\\*\\*Completed\\*\\*( " + codex_relative_time + ")?"
+  + " \\| — \\| " + codex_review_triggers + " \\|$";
 
 # Parse the review summary board Codex edits in place. Emit "completed" or
 # "running" only when every line has an observed informational shape; emit null
@@ -85,16 +97,21 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
               .key as $kind | .value
               | type == "object"
               and keys == ["commit_sha", "has_any_findings", "has_unresolved_findings", "status"]
-              and (.commit_sha | test("^[0-9a-f]{40}$"))
               and (.has_any_findings | type == "boolean" or type == "null")
-              # Codex sends null only while a review runs; a completed one must say false.
-              and (.has_unresolved_findings == false
-                or (.has_unresolved_findings == null and .status == "running")
-                # Codex keeps true after its threads are resolved, until it reviews
-                # again (coder/xum#6786). Codex posts its threads before it updates
-                # the board, so this review's resolved threads clear it.
-                or (.has_unresolved_findings == true and (.commit_sha | IN($cleared[$kind][]))))
-              and (.status == "completed" or .status == "running"))))
+              and (.status == "completed" or .status == "running")
+              and (((.commit_sha | type == "string" and test("^[0-9a-f]{40}$"))
+                # Codex sends null only while a review runs; a completed one must say false.
+                and (.has_unresolved_findings == false
+                  or (.has_unresolved_findings == null and .status == "running")
+                  # Codex keeps true after its threads are resolved, until it reviews
+                  # again (coder/xum#6786). Codex posts its threads before it updates
+                  # the board, so this review's resolved threads clear it.
+                  or (.has_unresolved_findings == true and (.commit_sha | IN($cleared[$kind][])))))
+                # A commitless code review (codex_commitless_code_review_row) has no
+                # findings flags. Its findings are review threads, which the gate
+                # checks on their own.
+                or ($kind == "code_review" and .commit_sha == null
+                  and .has_unresolved_findings == null and .status == "completed")))))
             # Unknown security fields or statuses could be authoritative findings.
             # In particular, do not interpret an enabled security merge gate here.
             and ($security | type == "object"
@@ -113,6 +130,7 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
               or . == "| --- | --- | --- | --- |"
               or test(codex_completed_row)
               or test(codex_running_row)
+              or (test(codex_commitless_code_review_row) and ($state | any(.code_review.commit_sha == null)))
               # Security advisories stay listed after their review threads are resolved.
               # Codex's Resolved marker can lag or never appear (coder/xum#5045), so a
               # resolved linked thread also clears its bullet. A bullet with neither is a
@@ -125,9 +143,12 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
                 + " · \\*\\*[A-Za-z]+\\*\\*(?<marker> · \\*\\*Resolved\\*\\*)?$")
                 | .marker != null or (.id | IN($resolved[]))) // false)
             ))
+            # A commitless code review counts for the head of the security review beside
+            # it, which must be the current head: Codex starts both reviews together on
+            # each push or request, so an older push's code review cannot sit next to it.
             then (if $security.status == "running" or ($lines[2:] | any(test(codex_running_row)))
                      or $security.headSha != $head
-                     or ($reviews | any(.status == "running" or .commit_sha != $head))
+                     or ($reviews | any(.status == "running" or (.commit_sha // $head) != $head))
                   then "running" else "completed" end)
             else null
             end
@@ -173,3 +194,27 @@ def codex_comment_is_informational($bot; $head; $resolved; $cleared):
           + "\n+_Only the user who started this review can view the report in Codex\\._$"))
       end
   end;
+
+# Codex's notice that a review attempt failed (coder/xum#7002).
+def codex_review_failure($bot):
+  .author.login == $bot
+  and (.body | codex_without_help
+    | test("^Codex Review: Something went wrong\\. Try again later by commenting “@codex review”\\.\n\n```\n[^`\n]+\n```$"));
+
+# Input: PR comment nodes. Output: the Codex comments that block the gate.
+# A failed review attempt blocks until Codex finishes a review: Codex edits its board in place,
+# so a completed board for the current head means a later attempt succeeded. Without one (no
+# board, a failed or running review, another head) the failure notice still blocks.
+def codex_blocking_comments($bot; $head; $resolved; $cleared):
+  any(.[]; .isMinimized == false and codex_summary_status($bot; $head; $resolved; $cleared) == "completed") as $reviewed
+  | [.[]
+    | select(.author.login == $bot and .isMinimized == false)
+    | select(codex_comment_is_informational($bot; $head; $resolved; $cleared) | not)
+    | select(($reviewed and codex_review_failure($bot)) | not)];
+
+# Input: codex_blocking_comments output. Output: how many of them waiting may clear: running
+# boards, and failure notices while a board runs, because a review that completes supersedes them.
+def codex_pending_count($bot; $head; $resolved; $cleared):
+  any(.[]; codex_review_in_progress($bot; $head; $resolved; $cleared)) as $running
+  | [.[] | select(codex_review_in_progress($bot; $head; $resolved; $cleared) or ($running and codex_review_failure($bot)))]
+  | length;
