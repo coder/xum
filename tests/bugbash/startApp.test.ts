@@ -86,7 +86,11 @@ require("http")
  * Runs startApp.ts's signal handlers and serve() in their own process (signals must reach a
  * process of their own), with FAKE_SERVER in place of `xum server`, on a free port.
  */
-async function startSupervisor(): Promise<{ port: number; xumRoot: string; exited: Promise<number | null> }> {
+async function startSupervisor(): Promise<{
+  port: number;
+  xumRoot: string;
+  exited: Promise<number | null>;
+}> {
   tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-serve-test-"));
   const xumRoot = path.join(tempRoot, "xum");
   fs.mkdirSync(xumRoot);
@@ -117,7 +121,9 @@ process.exit((await serve(slot, ${port}, start)) ?? 0);
     stdio: ["ignore", "inherit", "inherit"],
   });
   supervisor = proc;
-  const exited = new Promise<number | null>((resolve) => proc.once("exit", (code) => resolve(code)));
+  const exited = new Promise<number | null>((resolve) =>
+    proc.once("exit", (code) => resolve(code))
+  );
   return { port, xumRoot, exited };
 }
 
