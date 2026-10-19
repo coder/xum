@@ -213,7 +213,9 @@ interface ToolCatalogClassification {
  * names, minus names matched by a policy `require` rule (required tools must
  * stay advertised so the model can satisfy the requirement), minus
  * `tool_catalog_search` itself. Intersection semantics absorb policy-disable and
- * PTC-exclusive removals: absent tools never enter the catalog.
+ * PTC-exclusive removals: absent tools never enter the catalog. Tools that an
+ * agent switch or a caller policy refuses stay in the record as refusal stubs
+ * (toolAssembly), so they do enter it.
  */
 export function buildToolCatalog(inputs: ToolCatalogInputs): ToolCatalogClassification {
   const mcpNameSet = new Set(inputs.mcpToolNames);

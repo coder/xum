@@ -2546,7 +2546,10 @@ export class TurnRequestBuilder {
                     // continuation does not silently drop back to standard.
                     reasoningMode,
                     agentId: effectiveAgentId,
-                    toolPolicy: effectiveToolPolicy,
+                    // The caller's policy, not the composed one: the continuation
+                    // re-resolves the agent, and agent rules sent as caller rules
+                    // would refuse with the caller's text.
+                    toolPolicy,
                     additionalSystemInstructions: scratchpadAdditionalSystemInstructions,
                     maxOutputTokens,
                     providerOptions: effectiveMuxProviderOptions,
@@ -2961,6 +2964,7 @@ export class TurnRequestBuilder {
           extraTools: isSideChat ? undefined : this.dependencies.bindings.extraTools,
           effectiveToolPolicy,
           switchableAgentToolPolicies: switchableAgents?.map((agent) => agent.toolPolicy),
+          callerToolPolicy: toolPolicy,
           activeAgentId: effectiveAgentId,
           // Side chats expose granted reads directly, not an executable PTC/RLM bridge.
           experiments: isSideChat

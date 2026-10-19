@@ -107,12 +107,15 @@ export interface AgentResolutionResult {
   /** Composed tool policy: agent → caller (in application order). */
   effectiveToolPolicy: ToolPolicy | undefined;
   /**
-   * Root workspaces only (#5253): the composed policy of every agent the user
-   * can switch this workspace to, the active one included. Tool assembly
-   * advertises their union and refuses calls the active policy denies, so a
-   * mode switch keeps the tools block, and with it the prompt cache,
-   * byte-identical. Undefined for sub-agents (their agent is fixed, except one
-   * plan-to-exec handoff) and for hidden agents such as compaction.
+   * #5253: the policy of every agent the user can switch this workspace to, the
+   * active one included. Tool assembly advertises their union and refuses calls
+   * the active policy denies, so a mode switch keeps the tools block, and with
+   * it the prompt cache, byte-identical. Sub-agents (their agent is fixed,
+   * except one plan-to-exec handoff) and hidden agents such as compaction get
+   * their own policy only. These policies carry only the caller's `require`
+   * rules: its enable/disable rules stay on `effectiveToolPolicy`, so they
+   * refuse calls instead of changing the tools block. Undefined only when no
+   * policy applies at all.
    */
   switchableAgents: SwitchableAgent[] | undefined;
 }
@@ -215,6 +218,36 @@ function getAgentDiscoveryCandidates(params: {
   }
 
   return candidates;
+}
+
+/**
+ * How a caller's per-turn tool policy combines with agent policies.
+ * - `composeWithCallerPolicy`: the active policy, agent rules then all caller rules.
+ * - `composeForUnion`: a switchable (advertised) policy, agent rules then only the caller's
+ *   `require` rules. The caller's enable and disable rules stay on the active policy, so tool
+ *   assembly refuses those calls at execution time instead of removing the tools: a per-turn
+ *   caller policy (the turn-end TODO nudge used a todo_write-only one) then keeps the tool
+ *   block, and with it the prompt cache, unchanged.
+ * Caller require policies (e.g. task completion enforcement) take precedence in both: agent
+ * require filters are dropped then, to avoid multiple-required-tool conflicts.
+ */
+function createCallerPolicyComposers(callerToolPolicy: ToolPolicy | undefined) {
+  const callerRequireRules =
+    callerToolPolicy?.filter((filter) => filter.action === "require") ?? [];
+  const withoutAgentRequires = (policy: ToolPolicy): ToolPolicy =>
+    callerRequireRules.length > 0 ? policy.filter((filter) => filter.action !== "require") : policy;
+  return {
+    composeWithCallerPolicy: (policy: ToolPolicy): ToolPolicy | undefined => {
+      const forComposition = withoutAgentRequires(policy);
+      return callerToolPolicy || forComposition.length > 0
+        ? [...forComposition, ...(callerToolPolicy ?? [])]
+        : undefined;
+    },
+    composeForUnion: (policy: ToolPolicy): ToolPolicy => [
+      ...withoutAgentRequires(policy),
+      ...callerRequireRules,
+    ],
+  };
 }
 
 export async function resolveAgentForStream(
@@ -542,18 +575,8 @@ export async function resolveAgentForStream(
     disableTaskToolsForDepth: shouldDisableTaskToolsForDepth,
   });
 
-  // Caller require policies (e.g. task completion enforcement) must take precedence.
-  // Drop agent-level require filters in that case to avoid multiple-required-tool conflicts.
-  const callerRequiresTool =
-    callerToolPolicy?.some((filter) => filter.action === "require") === true;
-  const composeWithCallerPolicy = (policy: ToolPolicy): ToolPolicy | undefined => {
-    const forComposition = callerRequiresTool
-      ? policy.filter((filter) => filter.action !== "require")
-      : policy;
-    return callerToolPolicy || forComposition.length > 0
-      ? [...forComposition, ...(callerToolPolicy ?? [])]
-      : undefined;
-  };
+  const { composeWithCallerPolicy, composeForUnion } =
+    createCallerPolicyComposers(callerToolPolicy);
   const effectiveToolPolicy = composeWithCallerPolicy(agentToolPolicy);
 
   let switchableAgents: SwitchableAgent[] | undefined;
@@ -620,14 +643,13 @@ export async function resolveAgentForStream(
             workspaceId,
             cache,
           });
-          const toolPolicy = composeWithCallerPolicy(
+          const toolPolicy = composeForUnion(
             resolveToolPolicyForAgent({
               agents: chain,
               isSubagent: false,
               disableTaskToolsForDepth: shouldDisableTaskToolsForDepth,
             })
           );
-          if (toolPolicy === undefined) return undefined;
           // An invalid tools.add/remove regex would otherwise throw in tool
           // assembly and abort every send, not just a switch to this agent.
           applyToolPolicyToNames([], toolPolicy);
@@ -644,9 +666,14 @@ export async function resolveAgentForStream(
       })
     );
     switchableAgents = [
-      { id: agentDefinition.id, toolPolicy: effectiveToolPolicy },
+      { id: agentDefinition.id, toolPolicy: composeForUnion(agentToolPolicy) },
       ...policies.filter((agent): agent is SwitchableAgent => agent !== undefined),
     ];
+  } else if (effectiveToolPolicy !== undefined) {
+    // Sub-agents and hidden agents: a union of their own policy only, so a caller policy
+    // refuses calls instead of removing tools there too. With no caller policy the union
+    // equals the active policy, and the tool block is the same as before.
+    switchableAgents = [{ id: agentDefinition.id, toolPolicy: composeForUnion(agentToolPolicy) }];
   }
 
   return Ok({

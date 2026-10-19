@@ -94,6 +94,13 @@ export interface ApplyToolPolicyAndExperimentsOptions {
    * `effectiveToolPolicy` denies. See AgentResolutionResult.
    */
   switchableAgentToolPolicies?: ToolPolicy[];
+  /**
+   * The caller's own per-turn policy (SendMessageOptions.toolPolicy), already
+   * composed into `effectiveToolPolicy`. Only names a refusal as the caller's
+   * and detects a no-tools contract: the switchable union does not carry its
+   * enable/disable rules, so a caller-denied tool is refused, not removed.
+   */
+  callerToolPolicy?: ToolPolicy;
   /** Active agent id, named in the refusal of a disallowed call. */
   activeAgentId?: string;
   /** PTC experiment flags. */
@@ -134,13 +141,20 @@ export function persistentSandboxMountsEnabled(): boolean {
 }
 
 /** Same name, description and schema; execute refuses before any side effect (#5253). */
-function refuseToolForAgent(name: string, tool: Tool, activeAgentId: string): Tool {
+function refuseToolForAgent(
+  name: string,
+  tool: Tool,
+  activeAgentId: string,
+  callerToolPolicy: ToolPolicy | undefined
+): Tool {
   const refused = cloneToolPreservingDescriptors(tool);
-  refused.execute = () =>
-    Promise.resolve({
-      success: false,
-      error: `Tool '${name}' is not allowed in ${activeAgentId} mode. Switch agents to use it.`,
-    });
+  // A caller denial lasts for this turn only; switching agents does not lift it.
+  const deniedByCaller =
+    callerToolPolicy !== undefined && applyToolPolicyToNames([name], callerToolPolicy).length === 0;
+  const error = deniedByCaller
+    ? `Tool '${name}' is disabled for this turn.`
+    : `Tool '${name}' is not allowed in ${activeAgentId} mode. Switch agents to use it.`;
+  refused.execute = () => Promise.resolve({ success: false, error });
   return refused;
 }
 
@@ -152,13 +166,15 @@ function refuseToolForAgent(name: string, tool: Tool, activeAgentId: string): To
  * disallowed tool keeps its name, description and schema, but its execute
  * returns a refusal before any side effect. Every channel (direct calls, PTC
  * bridge, MCP) runs this execute, so this is the security boundary that the
- * missing tool used to be.
+ * missing tool used to be. A caller policy's denials ride the same refusal:
+ * the switchable policies do not carry them (see AgentResolutionResult).
  */
 function applySwitchableAgentPolicies(
   tools: Record<string, Tool>,
   activePolicy: ToolPolicy | undefined,
   switchablePolicies: ToolPolicy[],
-  activeAgentId: string
+  activeAgentId: string,
+  callerToolPolicy: ToolPolicy | undefined
 ): Record<string, Tool> {
   const active = applyToolPolicy(tools, activePolicy);
   const result: Record<string, Tool> = {};
@@ -173,7 +189,7 @@ function applySwitchableAgentPolicies(
       // memory must not see it: memory stays absent (and so does intuition,
       // which reads memory directly). One cache miss on such a switch.
       if (name === "memory") continue;
-      result[name] = refuseToolForAgent(name, tool, activeAgentId);
+      result[name] = refuseToolForAgent(name, tool, activeAgentId, callerToolPolicy);
     }
   }
   // Keep the input record's order so the advertised order does not depend on
@@ -184,6 +200,33 @@ function applySwitchableAgentPolicies(
       return tool === undefined ? [] : [[name, tool] as const];
     })
   );
+}
+
+/**
+ * Whether `policy` leaves no tool at all: none of `tools`, and no synthesized
+ * code_execution. Such a policy is a no-tools contract. The synthesized name is
+ * probed explicitly: an allowlist like [disable .*, enable code_execution]
+ * empties the base record yet clearly intends the exclusive entry point to
+ * exist. An undefined policy allows everything, so it never leaves no tools.
+ */
+function policyLeavesNoTools(tools: Record<string, Tool>, policy: ToolPolicy | undefined): boolean {
+  return (
+    Object.keys(applyToolPolicy(tools, policy)).length === 0 &&
+    applyToolPolicyToNames(["code_execution"], policy).length === 0
+  );
+}
+
+/**
+ * mux.load reads files host-side and rides file_read. A refused file_read stays
+ * bridgeable (its stub has an execute), and ToolBridge offers mux.load by that
+ * name alone, so the loader is withheld unless the active policy allows
+ * file_read: a refusal must leave no second way to read files.
+ */
+function kernelFileLoaderAllowedBy(
+  activePolicy: ToolPolicy | undefined,
+  loader: KernelFileLoader | undefined
+): KernelFileLoader | undefined {
+  return applyToolPolicyToNames(["file_read"], activePolicy).length > 0 ? loader : undefined;
 }
 
 /**
@@ -206,18 +249,24 @@ export async function applyToolPolicyAndExperiments(
   const { allTools, extraTools, effectiveToolPolicy, experiments, emitNestedToolEvent, sandbox } =
     opts;
   const applyPolicy = (tools: Record<string, Tool>): Record<string, Tool> =>
-    opts.switchableAgentToolPolicies === undefined
+    opts.switchableAgentToolPolicies === undefined || callerLeavesNoTools
       ? applyToolPolicy(tools, effectiveToolPolicy)
       : applySwitchableAgentPolicies(
           tools,
           effectiveToolPolicy,
           opts.switchableAgentToolPolicies,
-          opts.activeAgentId ?? "the current"
+          opts.activeAgentId ?? "the current",
+          opts.callerToolPolicy
         );
 
   // Merge in extra tools (e.g., CLI-specific tools like set_exit_code).
   // These bypass policy filtering since they're injected by the runtime, not user config.
   const allToolsWithExtra = extraTools ? { ...allTools, ...extraTools } : allTools;
+
+  // A caller policy that leaves no tools (compaction's `.*` disable) is a
+  // no-tools contract: send no tools, not refusal stubs that carry every
+  // schema. Declared before applyPolicy() first runs.
+  const callerLeavesNoTools = policyLeavesNoTools(allToolsWithExtra, opts.callerToolPolicy);
 
   // Capability grants are a ceiling applied before policy: policy can narrow
   // further but can never re-add a non-granted tool.
@@ -253,10 +302,10 @@ export async function applyToolPolicyAndExperiments(
   // code_execution] empties the base record yet clearly intends the exclusive
   // entry point to exist, so the base-tool record alone cannot decide.
   // The ACTIVE policy decides: the advertised union may hold refused tools.
-  const policyLeavesNoTools =
-    Object.keys(applyToolPolicy(allToolsWithExtra, effectiveToolPolicy)).length === 0 &&
-    applyToolPolicyToNames(["code_execution"], effectiveToolPolicy).length === 0;
-  if (experiments?.programmaticToolCalling && !policyLeavesNoTools) {
+  if (
+    experiments?.programmaticToolCalling &&
+    !policyLeavesNoTools(allToolsWithExtra, effectiveToolPolicy)
+  ) {
     try {
       // Lazy-load PTC modules only when experiments are enabled
       const ptc = await getPTCModules();
@@ -343,7 +392,7 @@ export async function applyToolPolicyAndExperiments(
         // mount before honoring it.
         {
           kernelFirst: rlmActive,
-          loadFile: sandbox?.kernelFileLoader,
+          loadFile: kernelFileLoaderAllowedBy(effectiveToolPolicy, sandbox?.kernelFileLoader),
         }
       );
 

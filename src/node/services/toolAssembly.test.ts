@@ -389,6 +389,48 @@ describe("one tool set across agent-mode switches (#5253)", () => {
     expect(shapes[1]).toBe(shapes[0]);
   });
 
+  test("a caller deny keeps the tool block and refuses with the caller's text", async () => {
+    const { allTools, calls } = toolsWithSideEffect();
+    const callerDeny = [{ regex_match: "mutate", action: "disable" as const }];
+    // Agent resolution keeps the caller's disable rules out of the union (#5253).
+    const assembleWithCaller = (callerToolPolicy?: typeof callerDeny) =>
+      applyToolPolicyAndExperiments({
+        allTools,
+        effectiveToolPolicy: [...execPolicy, ...(callerToolPolicy ?? [])],
+        switchableAgentToolPolicies: [execPolicy, planPolicy],
+        callerToolPolicy,
+        activeAgentId: "exec",
+        emitNestedToolEvent: () => undefined,
+      });
+    const plain = await assembleWithCaller();
+    const denied = await assembleWithCaller(callerDeny);
+
+    const shape = (tools: Record<string, Tool>) =>
+      JSON.stringify(Object.entries(tools).map(([name, tool]) => [name, tool.description]));
+    expect(shape(denied)).toBe(shape(plain));
+    const options = { toolCallId: "call-1", messages: [], context: undefined };
+    expect(await denied.mutate.execute!({}, options)).toEqual({
+      success: false,
+      error: "Tool 'mutate' is disabled for this turn.",
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("a caller policy that leaves no tools sends no tools, not refusal stubs", async () => {
+    const { allTools } = toolsWithSideEffect();
+    const denyAll = [{ regex_match: ".*", action: "disable" as const }];
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: [...execPolicy, ...denyAll],
+      switchableAgentToolPolicies: [execPolicy, planPolicy],
+      callerToolPolicy: denyAll,
+      activeAgentId: "exec",
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(tools)).toEqual([]);
+  });
+
   test("PTC code_execution gets the same refusal without the side effect", async () => {
     const { allTools, calls } = toolsWithSideEffect();
     const tools = await assemble(allTools, planPolicy, "plan", true);
@@ -461,6 +503,43 @@ describe("persistent kernel graduation (RLM mode)", () => {
       expect(second.result).toBe(42);
     } finally {
       await sandboxHostService.disposeScope(scopeKey);
+    }
+  });
+
+  test("a refused file_read leaves no mux.load", async () => {
+    using tmp = new DisposableTempDir("tool-assembly-rlm-load-refused");
+    const loaded: string[] = [];
+    const kernelFileLoader = (args: { path: string }) => {
+      loaded.push(args.path);
+      return Promise.resolve({ content: "secret", bytes: 6, lines: 1, preview: "secret" });
+    };
+    const denyFileRead = [{ regex_match: "file_read", action: "disable" as const }];
+    const assembleLoad = async (scopeKey: string, callerToolPolicy?: typeof denyFileRead) => {
+      const tools = await applyToolPolicyAndExperiments({
+        allTools: { file_read: executableTool("Read a file") },
+        effectiveToolPolicy: callerToolPolicy,
+        // The union still allows file_read, so the refused tool stays bridged as a stub.
+        switchableAgentToolPolicies: [[]],
+        callerToolPolicy,
+        activeAgentId: "exec",
+        experiments: { programmaticToolCalling: true, rlm: true },
+        emitNestedToolEvent: () => undefined,
+        sandbox: { workspaceId: scopeKey, sessionDir: tmp.path, kernelFileLoader },
+      });
+      return tools.code_execution;
+    };
+    const allowedKey = "ws-tool-assembly-rlm-load-allowed";
+    const refusedKey = "ws-tool-assembly-rlm-load-refused";
+    try {
+      const allowed = await assembleLoad(allowedKey);
+      expect((await run(allowed, "return typeof mux.load;")).result).toBe("function");
+
+      const refused = await assembleLoad(refusedKey, denyFileRead);
+      expect((await run(refused, "return typeof mux.load;")).result).toBe("undefined");
+      expect(loaded).toEqual([]);
+    } finally {
+      await sandboxHostService.disposeScope(allowedKey);
+      await sandboxHostService.disposeScope(refusedKey);
     }
   });
 

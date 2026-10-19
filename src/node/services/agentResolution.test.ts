@@ -18,6 +18,10 @@ import * as agentDefinitionsService from "./agentDefinitions/agentDefinitionsSer
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { buildStreamSystemContext } from "./turnContextAssembler";
+import { applyToolPolicyAndExperiments } from "./toolAssembly";
+import { applyToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import type { Tool } from "ai";
+import { z } from "zod";
 
 const PARENT_WORKSPACE_ID = "parent-workspace";
 const CHILD_WORKSPACE_ID = "child-workspace";
@@ -1031,5 +1035,145 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
     expect(base.scope).not.toBe("project");
     // Repeated lookups in the same request return the memoized winner.
     expect(await readAgentDefinition(runtime, projectPath, "exec", { cache })).toBe(override);
+  });
+});
+
+describe("resolveAgentForStream caller tool policy keeps the advertised tool set", () => {
+  // A per-turn caller policy must refuse calls, not remove tools: a removed tool changes the
+  // tool block and misses the whole prompt cache (the turn-end TODO nudge did this).
+  const toolNames = ["bash", "file_read", "file_edit_insert", "todo_write", "task", "agent_report"];
+  const fakeTools = (): Record<string, Tool> =>
+    Object.fromEntries(
+      toolNames.map((name) => [
+        name,
+        {
+          description: name,
+          inputSchema: z.object({}),
+          execute: () => Promise.resolve({ success: true }),
+        } as unknown as Tool,
+      ])
+    );
+  const callerDeny: ToolPolicy = [{ regex_match: "bash", action: "disable" }];
+
+  function createConfig(projectPath: string): ProjectsConfig {
+    return {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              { id: PARENT_WORKSPACE_ID, name: PARENT_WORKSPACE_ID, path: projectPath },
+              {
+                id: CHILD_WORKSPACE_ID,
+                name: CHILD_WORKSPACE_ID,
+                path: projectPath,
+                parentWorkspaceId: PARENT_WORKSPACE_ID,
+                agentId: "explore",
+                agentType: "explore",
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+  }
+
+  interface ResolveParams {
+    projectPath: string;
+    subagent: boolean;
+    callerToolPolicy: ToolPolicy | undefined;
+  }
+
+  async function resolve(params: ResolveParams) {
+    const metadata: WorkspaceMetadata = params.subagent
+      ? createSubagentMetadata({ projectPath: params.projectPath, agentId: "explore" })
+      : {
+          id: PARENT_WORKSPACE_ID,
+          name: PARENT_WORKSPACE_ID,
+          projectName: path.basename(params.projectPath),
+          projectPath: params.projectPath,
+          runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+        };
+    const resolved = await resolveAgentForStream({
+      workspaceId: metadata.id,
+      metadata,
+      runtime: new LocalRuntime(params.projectPath),
+      workspacePath: params.projectPath,
+      requestedAgentId: params.subagent ? "explore" : "exec",
+      disableWorkspaceAgents: false,
+      callerToolPolicy: params.callerToolPolicy,
+      cfg: createConfig(params.projectPath),
+      emitError: () => undefined,
+    });
+    if (!resolved.success) throw new Error("agent resolution failed");
+    return resolved.data;
+  }
+
+  async function advertisedTools(params: ResolveParams): Promise<Record<string, Tool>> {
+    const resolved = await resolve(params);
+    return applyToolPolicyAndExperiments({
+      allTools: fakeTools(),
+      effectiveToolPolicy: resolved.effectiveToolPolicy,
+      switchableAgentToolPolicies: resolved.switchableAgents?.map((agent) => agent.toolPolicy),
+      callerToolPolicy: params.callerToolPolicy,
+      activeAgentId: resolved.effectiveAgentId,
+      emitNestedToolEvent: () => undefined,
+    });
+  }
+
+  const callOptions = { toolCallId: "call-1", messages: [], context: undefined };
+
+  test("a root exec turn with a caller deny advertises the same tools and refuses the call", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-caller-policy-root");
+    const projectPath = path.join(tempDir.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const plain = await advertisedTools({
+      projectPath,
+      subagent: false,
+      callerToolPolicy: undefined,
+    });
+    const denied = await advertisedTools({
+      projectPath,
+      subagent: false,
+      callerToolPolicy: callerDeny,
+    });
+
+    expect(plain.bash).toBeDefined();
+    expect(Object.keys(denied)).toEqual(Object.keys(plain));
+    expect(await denied.bash.execute!({}, callOptions)).toEqual({
+      success: false,
+      error: "Tool 'bash' is disabled for this turn.",
+    });
+  });
+
+  test("a sub-agent keeps its tool set under a caller deny, and is unchanged without one", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-caller-policy-subagent");
+    const projectPath = path.join(tempDir.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const plain = await advertisedTools({
+      projectPath,
+      subagent: true,
+      callerToolPolicy: undefined,
+    });
+    const denied = await advertisedTools({
+      projectPath,
+      subagent: true,
+      callerToolPolicy: callerDeny,
+    });
+
+    // Without a caller policy the one-policy union gives the plain policy result.
+    const explorePolicy = (
+      await resolve({ projectPath, subagent: true, callerToolPolicy: undefined })
+    ).effectiveToolPolicy;
+    expect(Object.keys(plain)).toEqual(Object.keys(applyToolPolicy(fakeTools(), explorePolicy)));
+    expect(plain.bash).toBeDefined();
+    expect(Object.keys(denied)).toEqual(Object.keys(plain));
+    expect(await denied.bash.execute!({}, callOptions)).toEqual({
+      success: false,
+      error: "Tool 'bash' is disabled for this turn.",
+    });
   });
 });
