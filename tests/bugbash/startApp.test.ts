@@ -15,7 +15,15 @@ const sockets = new Set<net.Socket>();
 
 afterEach(() => {
   child?.kill("SIGKILL");
-  supervisor?.kill("SIGKILL");
+  // The supervisor leads its own process group, so this also stops the fake server it started
+  // when a test fails before its own SIGTERM. The group is gone already after a clean exit.
+  if (supervisor?.pid != null) {
+    try {
+      process.kill(-supervisor.pid, "SIGKILL");
+    } catch {
+      // ESRCH: the group already exited.
+    }
+  }
   supervisor = undefined;
   if (tempRoot !== undefined) fs.rmSync(tempRoot, { recursive: true, force: true });
   tempRoot = undefined;
@@ -119,6 +127,7 @@ process.exit((await serve(slot, ${port}, start)) ?? 0);
     cwd: import.meta.dir,
     env: { ...process.env, XUM_ROOT: xumRoot },
     stdio: ["ignore", "inherit", "inherit"],
+    detached: true,
   });
   supervisor = proc;
   const exited = new Promise<number | null>((resolve) =>
