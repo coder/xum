@@ -1127,7 +1127,8 @@ test("B1: an MCP Apps job reaches the model only through its proxy, with the hos
   expect(fs.statSync(spendFile).mode & 0o777).toBe(0o600);
   const spendText = fs.readFileSync(spendFile, "utf8");
   const spend = JSON.parse(spendText) as Record<string, unknown>;
-  expect(spend).toMatchObject({ capUsd: 1, settled: 1, kept: 0, refused: 0, released: 0 });
+  // Two settled calls: the probe and the job's call, as in the proxy record (Codex review of #7012).
+  expect(spend).toMatchObject({ capUsd: 1, settled: 2, kept: 0, refused: 0, released: 0 });
   expect(spend.spentUsd).toBeGreaterThan(0);
   expect(spend.spentUsd).toBeLessThan(1);
   expect(spendText).not.toContain(UPSTREAM_KEY);

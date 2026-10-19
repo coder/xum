@@ -520,6 +520,8 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   let recordFault: string | undefined;
   /** The model-driven run's probe proxy fault: its own proxy, closed before the job's starts. */
   let probeFault: string | undefined;
+  /** The probe's call outcomes: it charges the job's ledger through a proxy of its own. */
+  const probeCounts = { settled: 0, kept: 0, refused: 0, released: 0 };
   // The first proxy fault stops this job at once (its proxy closes with the lifeline), so no
   // more paid calls go out on a wrong cost model or without a record.
   let faulted = false;
@@ -610,7 +612,12 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
         fault(probeFault);
         throw error;
       });
-      for (const entry of probe.records) record(entry);
+      for (const entry of probe.records) {
+        record(entry);
+        const outcome = "outcome" in entry ? entry.outcome : undefined;
+        if (typeof outcome === "string" && outcome in probeCounts)
+          probeCounts[outcome as keyof typeof probeCounts] += 1;
+      }
       if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
       if (probe.status !== 200)
         throw new Refusal(
@@ -717,14 +724,15 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     );
     // The job's spend as a file beside its proxy record, which holds only reservations. Only
     // with the job's own ledger: a shared ledger's totals are the run's (run.ts). No key or URL.
+    // The counts add the probe's calls, as spentUsd does (both are in the proxy record).
     if (!o.ledger) {
       const spend = {
         spentUsd: spentNanoUsd / 1e9,
         capUsd: capNanoUsd / 1e9,
-        settled,
-        kept,
-        refused,
-        released,
+        settled: settled + probeCounts.settled,
+        kept: kept + probeCounts.kept,
+        refused: refused + probeCounts.refused,
+        released: released + probeCounts.released,
         refusedBy,
       };
       try {
