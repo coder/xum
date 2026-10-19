@@ -406,6 +406,68 @@ describe("one cache per build (#6867)", () => {
     );
   });
 
+  // #6991: coverage only. The font is optional like the stylesheet, so this passes before the fix.
+  test("install still activates when the font precache fetch fails", async () => {
+    const FONT = "geist-FoNt1234.woff2";
+    const storage = withNetwork((request) => {
+      if (request === FONT) throw new TypeError("Failed to fetch");
+      return release(request);
+    });
+    const worker = await startWorker({
+      storage,
+      stamp: stampFor("bbbbbbbbbbbb", [HASHED_JS, VENDOR, CSS, FONT]),
+    });
+    expect(worker.installed).toBe(true);
+    expect(storage.urlsIn(worker.cacheName)).toEqual(
+      [ROOT_SCOPE, `${ORIGIN}/${HASHED_JS}`, `${ORIGIN}/${VENDOR}`, `${ORIGIN}/${CSS}`].sort()
+    );
+  });
+
+  // #6991: the entry is required because it is the entry, not because it ends in ".js".
+  test("install requires the entry file even when the precache list leaves it out", async () => {
+    const storage = withNetwork((request) =>
+      request === HASHED_JS ? new Response("not found", { status: 404 }) : release(request)
+    );
+    const worker = await startWorker({ storage, stamp: stampFor("bbbbbbbbbbbb", [VENDOR, CSS]) });
+    expect(worker.installed).toBe(false);
+  });
+
+  // #6991: during a rolling deploy a root navigation can reach a replica of another build.
+  test("a root navigation stores only a shell that loads this build's entry file", async () => {
+    const storage = withNetwork(release);
+    const worker = await startWorker({ storage, stamp: stampFor("bbbbbbbbbbbb") });
+    const otherBuildShell = `<html><head><script type="module" src="./main-OldRel01.js"></script></head></html>`;
+    worker.setNetwork(() => html(otherBuildShell, { "Cache-Control": "no-store" }));
+    const { response, waitUntilCalls } = await worker.request(ROOT_SCOPE, { mode: "navigate" });
+    // The page still gets the replica's answer unchanged. Only the cache write is skipped.
+    expect(response?.status).toBe(200);
+    expect(response?.headers.get("Cache-Control")).toBe("no-store");
+    expect(await response?.text()).toBe(otherBuildShell);
+    expect(waitUntilCalls).toBe(1);
+
+    worker.offline();
+    const offline = await worker.request(ROOT_SCOPE, { mode: "navigate" });
+    expect(await offline.response?.text()).toContain(HASHED_JS);
+
+    // A newer copy of this build's shell still refreshes the cache.
+    const refreshedShell = `<html><head><script type="module" src="./${HASHED_JS}"></script><!-- v2 --></head></html>`;
+    worker.setNetwork(() => html(refreshedShell, { "Cache-Control": "no-store" }));
+    await worker.request(ROOT_SCOPE, { mode: "navigate" });
+    worker.offline();
+    const refreshed = await worker.request(ROOT_SCOPE, { mode: "navigate" });
+    expect(await refreshed.response?.text()).toBe(refreshedShell);
+  });
+
+  // #6991: the entry check applies to the root shell only, never to assets.
+  test("a hashed asset is stored although its body does not name the entry file", async () => {
+    const storage = withNetwork(release);
+    const worker = await startWorker({ storage, stamp: stampFor("bbbbbbbbbbbb") });
+    await worker.request(`${ORIGIN}/lazy-LaZy1234.js`);
+    worker.offline();
+    const { response } = await worker.request(`${ORIGIN}/lazy-LaZy1234.js`);
+    expect(await response?.text()).toBe(`file ${ORIGIN}/lazy-LaZy1234.js`);
+  });
+
   const redirectedShell = () => {
     const response = shellPage();
     Object.defineProperty(response, "redirected", { value: true });
