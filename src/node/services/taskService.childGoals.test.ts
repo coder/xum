@@ -1371,6 +1371,23 @@ describe("TaskService child goals", () => {
     });
   });
 
+  // #6994 control: a notification while the row still reads running (no adoption, no stop) keeps
+  // the deferral waiting for its accounting; only its settlement may decide the goal turn.
+  test("a notification while the child still runs keeps its deferred stream end waiting", async () => {
+    const { t, internal } = await deferStreamEndOfOwnedAttempt();
+
+    (
+      t.taskService as unknown as { notifyAttemptSettlementListeners: (taskId: string) => void }
+    ).notifyAttemptSettlementListeners(childId);
+    // Let a cancelled deferral re-run under the event lock before checking that none did.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(t.child()?.taskStatus).toBe("running");
+    expect(internal.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual([
+      "pending",
+    ]);
+  });
+
   test("unsettled accounting defers the stream end without finalizing; its settlement resumes it", async () => {
     const t = await setup();
     await t.setChildGoal();
