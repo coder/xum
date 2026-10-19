@@ -127,10 +127,10 @@ lands.
 Stories: `make test-stories BUGBASH_BUDGET_USD=3` runs three sandbox jobs with `BUGBASH_MODEL`
 (default Sonnet 5.5) and the mock app AI. The first job runs the story tests,
 `tests/stories/*.e2e.ts`: user stories that one plain agent drives with `agent.act` and
-`agent.assert`, each pinned by an exact `expect`. The second job runs the Electron stories,
-`tests/stories/electron/*.e2e.ts` (`tests/stories/e2e.electron.config.ts`), on Xum Electron.
-The third job runs the `agent`-tagged repros (`e2e run --tag agent`, and no other `--tag` or
-`--tag-mode`). The budget and the 30-minute deadline apply to each job. `STORIES_ARGS` passes e2e
+`agent.assert`, each pinned by an exact `expect`. The second job runs the `agent`-tagged repros
+(`e2e run --tag agent`, and no other `--tag` or `--tag-mode`). The third job runs the Electron
+stories, `tests/stories/electron/*.e2e.ts` (`tests/stories/e2e.electron.config.ts`), on Xum
+Electron. `make` stops at the first failed job, so the later jobs then do not run. The budget and the 30-minute deadline apply to each job. `STORIES_ARGS` passes e2e
 arguments to every job. A story config change goes in `tests/stories/e2e.config.ts`, which
 reuses the web target of `tests/bugbash/e2e.config.ts`; both story configs share
 `tests/stories/storyConfig.ts`.
@@ -143,7 +143,9 @@ launcher refuses an Electron job without `node_modules/electron/dist/electron`. 
 (`tests/stories/electronProvider.ts`) starts one Xum Electron per attempt with an allowlisted env:
 the mock AI, agent tools, terminals and project automation off, no HTTP API server, and never
 `XUM_ALLOW_MULTIPLE_INSTANCES`. It refuses to start Electron when a switch is missing. In Electron
-the seeded project starts collapsed: tap "Expand project demo-app" first. `app.clearState()`,
+the seeded project starts collapsed, and every attempt shares the one seeded root, so a story
+sees the UI state that an earlier one left: use `tests/stories/electron/helpers.ts`
+(`openPlayground`), which works from either state. `app.clearState()`,
 extra headers and locale overrides do not work on this target (one fresh app per attempt).
 The first run, with one smoke story and no agent repro, spent $0.09 at list price and took about
 2 minutes with the build. Each job's results come back to `tests/stories/.e2e/stories-<time>-<pid>/`,

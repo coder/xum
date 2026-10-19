@@ -323,8 +323,9 @@ test-stories: electron-binary ## Story tests, Electron stories and agent-tagged 
 	@$(MAKE) --no-print-directory build-main build-preload build-renderer build-static
 	@# The shell PID keeps two runs that start in the same second apart (their output and proxy record).
 	@$(STORIES_LAUNCH) -- $(STORIES_RUN) --output .e2e/stories-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(STORIES_ARGS)
-	@$(STORIES_LAUNCH) -- $(STORIES_ELECTRON_RUN) --output .e2e/stories-electron-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(STORIES_ARGS)
 	@$(AGENT_REPROS_LAUNCH) -- $(AGENT_REPROS_RUN) --output .e2e/agent-repros-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(STORIES_ARGS)
+	@# Last: make stops at the first failed job, so a failed Electron job skips no other job.
+	@$(STORIES_LAUNCH) -- $(STORIES_ELECTRON_RUN) --output .e2e/stories-electron-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(STORIES_ARGS)
 
 rlm-eval: ## Run the RLM lever eval against a running dev-server sandbox (see scripts/rlm-eval/run.ts header)
 	@bun run scripts/rlm-eval/run.ts $(RLM_EVAL_ARGS)
