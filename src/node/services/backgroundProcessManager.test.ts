@@ -3443,6 +3443,101 @@ describe("BackgroundProcessManager", () => {
       timeout
     );
 
+    it(
+      "keeps a capped terminal read readable and drops it once fully read",
+      async () => {
+        const big = await spawnNamed(
+          "big",
+          `head -c ${BASH_MAX_TOTAL_BYTES * 3} /dev/zero | tr '\\0' 'a' | fold -w 100`
+        );
+        while ((await manager.getProcess(big))?.status === "running") {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        const first = await manager.getOutput(
+          big,
+          undefined,
+          undefined,
+          0,
+          undefined,
+          testWorkspaceId
+        );
+        expect(first).toMatchObject({ success: true, status: "exited" });
+        await fillPastLimit();
+        // The capped page told the agent to read on, so the record stays past the bound.
+        expect(await manager.getProcess(big)).not.toBeNull();
+        for (let pages = 0; (await manager.getProcess(big))?.lastReadCapped === true; pages++) {
+          expect(pages).toBeLessThan(10);
+          await manager.getOutput(big, undefined, undefined, 0, undefined, testWorkspaceId);
+        }
+        // Fully read: the read that finished it trimmed it.
+        expect(await manager.getProcess(big)).toBeNull();
+        expect(manager.getExpiredProcessWorkspaceId(big)).toBe(testWorkspaceId);
+      },
+      timeout
+    );
+
+    it(
+      "never hands an expired ID to a later process, in any workspace",
+      async () => {
+        const old = await spawnExitedAndRead("dev server");
+        await fillPastLimit();
+        expect(manager.getExpiredProcessWorkspaceId(old)).toBe(testWorkspaceId);
+        const reused = await manager.spawn(runtime, testWorkspaceId2, "true", {
+          cwd: process.cwd(),
+          displayName: "dev server",
+        });
+        expect(reused.success).toBe(true);
+        if (!reused.success) return;
+        expect(reused.processId).not.toBe(old);
+        expect(manager.getExpiredProcessWorkspaceId(old)).toBe(testWorkspaceId);
+      },
+      timeout
+    );
+
+    it(
+      "drops a read monitored record once its monitor wake is acknowledged",
+      async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'READY\\n'", {
+          cwd: process.cwd(),
+          displayName: "monitored",
+          monitor: { filter: "READY", pattern: /READY/, exclude: false, cooldownMs: 0 },
+        });
+        if (!result.success) throw new Error(result.error);
+        const monitored = result.processId;
+        let signal = manager
+          .pullMonitorWakeSignals(testWorkspaceId)
+          .find((candidate) => candidate.processId === monitored);
+        while (signal?.terminal == null || !signal.retired) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          signal = manager
+            .pullMonitorWakeSignals(testWorkspaceId)
+            .find((candidate) => candidate.processId === monitored);
+        }
+        await manager.getProcess(monitored);
+        const read = await manager.getOutput(
+          monitored,
+          undefined,
+          undefined,
+          0,
+          undefined,
+          testWorkspaceId
+        );
+        expect(read).toMatchObject({ success: true, status: "exited" });
+        await fillPastLimit();
+        // Its wake is still owed, so it stays past the bound.
+        expect(await manager.getProcess(monitored)).not.toBeNull();
+
+        manager.acknowledgeMonitorWake(
+          monitored,
+          Date.parse(signal.createdAt),
+          signal.match?.throughOffset,
+          signal.terminal.settledAt
+        );
+        expect(await manager.getProcess(monitored)).toBeNull();
+      },
+      timeout
+    );
+
     it("bounds the expired-ID tombstones per workspace and clears them per workspace", () => {
       const tombstones = new ExpiredProcessIds(2);
       tombstones.add("a1", "ws-a");

@@ -1098,10 +1098,13 @@ export class ExpiredProcessIds {
 
 /**
  * Whether nothing still needs an exited record: the agent was shown its terminal status
- * (task_await or bash_output), and it has no monitor that can still deliver a wake.
+ * (task_await or bash_output) and all of its output, and it has no monitor that can still deliver
+ * a wake.
  */
 function isExitedRecordDroppable(proc: BackgroundProcess): boolean {
-  if (!proc.terminalStatusShownToAgent) return false;
+  // A capped terminal read tells the agent to page on: the rest must stay readable.
+  if (!proc.terminalStatusShownToAgent || proc.lastReadCapped === true) return false;
+  if (proc.incompleteLineBuffer.length > 0) return false;
   const monitor = proc.monitor;
   return (
     monitor == null ||
@@ -2213,7 +2216,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
     let processId = baseId;
     let suffix = 1;
-    while (this.processes.has(processId) || this.reservedProcessIds.has(processId)) {
+    while (this.isProcessIdTaken(processId)) {
       processId = `${baseId} (${suffix})`;
       suffix++;
     }
@@ -2271,7 +2274,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         do {
           processId = `${displayName} (${suffix})`;
           suffix++;
-        } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+        } while (this.isProcessIdTaken(processId));
         this.reservedProcessIds.add(processId);
       }
     } catch (error) {
@@ -2396,7 +2399,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
           do {
             processId = `${config.displayName} (${suffix})`;
             suffix++;
-          } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+          } while (this.isProcessIdTaken(processId));
           this.reservedProcessIds.add(processId);
         }
       } catch (error) {
@@ -2419,7 +2422,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
           do {
             candidate = `${config.displayName} (${suffix})`;
             suffix++;
-          } while (this.processes.has(candidate) || this.reservedProcessIds.has(candidate));
+          } while (this.isProcessIdTaken(candidate));
           this.reservedProcessIds.add(candidate);
           candidates.push(candidate);
         }
@@ -2443,7 +2446,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         do {
           processId = `${config.displayName} (${suffix})`;
           suffix++;
-        } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+        } while (this.isProcessIdTaken(processId));
         this.reservedProcessIds.add(processId);
       }
     }
@@ -2752,7 +2755,26 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     return this.processes.get(processId) ?? null;
   }
 
-  /** Adds a record, then bounds the owner's exited records (the spawn is the natural point). */
+  /**
+   * An ID is taken while a record, an in-flight spawn or an expired tombstone holds it. Keeping
+   * expired IDs taken stops a later process (possibly in another workspace the reader can see)
+   * from answering a read of the old `bash:<id>`.
+   */
+  private isProcessIdTaken(processId: string): boolean {
+    return (
+      this.processes.has(processId) ||
+      this.reservedProcessIds.has(processId) ||
+      this.expiredProcessIds.ownerOf(processId) != null
+    );
+  }
+
+  /** Re-runs trimming for a record's owner after its monitor wake state was cleared. */
+  private trimOwnerOf(processId: string): void {
+    const owner = this.processes.get(processId)?.workspaceId;
+    if (owner != null) this.trimExitedProcesses(owner);
+  }
+
+  /** Adds a record, then bounds the owner's exited records. */
   private registerProcess(proc: BackgroundProcess): void {
     this.expiredProcessIds.delete(proc.id);
     this.processes.set(proc.id, proc);
@@ -2935,6 +2957,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         proc.monitor.settlementDisposition = undefined;
       }
     }
+    this.trimOwnerOf(processId);
   }
 
   dropRetiredMonitor(processId: string, createdAt: string): void {
@@ -2942,6 +2965,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     if (proc?.monitor?.stopped && proc.monitor.armMetadata.createdAt === createdAt) {
       proc.monitor = undefined;
     }
+    this.trimOwnerOf(processId);
   }
 
   dropMonitorMatchedLineBatchesThrough(
