@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import * as fs from "fs";
+import * as fs from "fs/promises";
 import * as path from "path";
 import { createBashTool } from "./bash";
 import type { BashToolResult } from "@/common/types/tools";
@@ -47,14 +47,22 @@ async function migrateAndExit(
     },
     mockToolCallOptions
   ) as Promise<BashToolResult>;
-  await waitFor(() => fs.existsSync(pidFile), "the command to start");
+  await waitFor(
+    () =>
+      fs.access(pidFile).then(
+        () => true,
+        () => false
+      ),
+    "the command to start"
+  );
   expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
   const result = await resultPromise;
   expect(result.success).toBe(true);
-  const processId = result.success ? result.backgroundProcessId : undefined;
+  const processId =
+    result.success && "backgroundProcessId" in result ? result.backgroundProcessId : undefined;
   if (processId == null) throw new Error("the command must have been sent to the background");
 
-  fs.writeFileSync(goFile, "");
+  await fs.writeFile(goFile, "");
   await waitFor(
     async () => (await (await manager.getProcess(processId))?.handle.getExitCode()) != null,
     "the migrated command to exit"
