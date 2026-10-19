@@ -1007,6 +1007,8 @@ export class MockAiStreamPlayer {
       }
       case "tool-end": {
         await this.applyTodoWriteSideEffect(workspaceId, active, event);
+        // A Stop during the write cancels the stream: emit no completion into the aborted turn.
+        if (active.cancelled) return;
         const payload: ToolCallEndEvent = {
           type: "tool-call-end",
           workspaceId,

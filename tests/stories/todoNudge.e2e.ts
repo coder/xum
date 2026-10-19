@@ -16,10 +16,8 @@ import {
   todoNudgeToolPolicies,
   WORKSPACE_TITLE,
 } from "../bugbash/repros/helpers";
-import { applyToolPolicyToNames } from "../../src/common/utils/tools/toolPolicy";
 
 const NUDGE_REPLY = "Verified the fix in README.md. The TODO list is complete.";
-const TOOLS = ["bash", "file_read", "todo_write"];
 
 test(
   "the agent finishes open TODO items after the turn-end nudge",
@@ -49,7 +47,8 @@ test(
     const nudges = await todoNudgeToolPolicies(app);
     expect(nudges.length).toBe(before + 1);
     const nudge = nudges[nudges.length - 1];
-    expect(applyToolPolicyToNames(TOOLS, nudge.toolPolicy ?? undefined)).toEqual(TOOLS);
-    expect(applyToolPolicyToNames(TOOLS, nudge.retryToolPolicy ?? undefined)).toEqual(TOOLS);
+    // The user turn had no tool policy, so the nudge must carry none: any policy narrows it.
+    expect(nudge.toolPolicy).toBeNull();
+    expect(nudge.retryToolPolicy).toBeNull();
   }
 );

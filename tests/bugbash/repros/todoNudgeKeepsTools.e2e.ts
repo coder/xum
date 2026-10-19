@@ -9,11 +9,9 @@
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import { openPlayground, sendMessage, todoNudgeToolPolicies } from "./helpers";
-import { applyToolPolicyToNames } from "../../../src/common/utils/tools/toolPolicy";
 
 const NUDGE_ROW = "Asked the agent to update its TODO list and finish open items";
 const NUDGE_REPLY = "Verified the fix in README.md. The TODO list is complete.";
-const TOOLS = ["bash", "file_read", "todo_write"];
 
 test(
   "the turn-end TODO nudge keeps the turn's tools",
@@ -27,10 +25,11 @@ test(
     await expect(screen.getByText(NUDGE_ROW).last()).toBeVisible();
 
     const nudges = await todoNudgeToolPolicies(app);
-    // Exactly one nudge for this user turn, and it lets the turn use every tool.
+    // Exactly one nudge for this user turn.
     expect(nudges.length).toBe(before + 1);
     const nudge = nudges[nudges.length - 1];
-    expect(applyToolPolicyToNames(TOOLS, nudge.toolPolicy ?? undefined)).toEqual(TOOLS);
-    expect(applyToolPolicyToNames(TOOLS, nudge.retryToolPolicy ?? undefined)).toEqual(TOOLS);
+    // The user turn had no tool policy, so the nudge must carry none: any policy narrows it.
+    expect(nudge.toolPolicy).toBeNull();
+    expect(nudge.retryToolPolicy).toBeNull();
   }
 );
