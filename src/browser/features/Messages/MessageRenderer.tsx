@@ -9,7 +9,7 @@ import { AgentPeerMessage } from "./AgentPeerMessage";
 import { BashMonitorWakeMessage } from "./BashMonitorWakeMessage";
 import { CollapsibleMachineMessage } from "./CollapsibleMachineMessage";
 import { AlertTriangle, ListTodo, MessageSquare } from "lucide-react";
-import { TODO_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
+import { isTodoTurnEndNudgePrompt } from "@/common/utils/machineTurnPrompts";
 import {
   BackgroundWorkWakeMessage,
   getBackgroundWorkWakeSummary,
@@ -139,7 +139,7 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               marker="agent-peer-message-trigger"
               className={className}
             />
-          ) : message.isSynthetic === true && message.content === TODO_TURN_END_NUDGE ? (
+          ) : message.isSynthetic === true && isTodoTurnEndNudgePrompt(message.content) ? (
             // Xum's turn-end TODO nudge is constant control text, not user input. Exact match
             // only: a nudge joined to a plugin's turn.stop prompt keeps the full bubble so the
             // plugin's text stays visible. The nudged turn keeps its tools and can do real work,

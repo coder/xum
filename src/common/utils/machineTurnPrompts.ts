@@ -33,8 +33,23 @@ export const BACKGROUND_WORK_WAKE_OPENINGS = {
  * todo_write calls in context.
  */
 export const TODO_TURN_END_NUDGE = `<notification>
-You ended your turn, but your TODO list still has pending or in-progress items. Update it with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. Then continue with the open items that are still in scope and that you can do now. If an item stays open on purpose, for example because it waits for the user, keep it and say why in one sentence.
+You ended your turn, but your TODO list still has pending or in-progress items. First finish the open items that are still in scope and that you can do now. Then update the list with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. If an item stays open on purpose, for example because it waits for the user, keep it and say why in one sentence.
 </notification>`;
+
+/**
+ * The nudge text that #6720 shipped (todo_write-only turns). Histories still hold it, so the
+ * transcript keeps rendering those rows as the compact nudge row.
+ */
+const LEGACY_TODO_TURN_END_NUDGES: readonly string[] = [
+  `<notification>
+You ended your turn, but your TODO list still has pending or in-progress items. Update it now with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. If an item is still open on purpose, keep it and say why in one sentence. Do not start new work.
+</notification>`,
+];
+
+/** Whether `text` is exactly a turn-end TODO nudge prompt, current or legacy. */
+export function isTodoTurnEndNudgePrompt(text: string): boolean {
+  return text === TODO_TURN_END_NUDGE || LEGACY_TODO_TURN_END_NUDGES.includes(text);
+}
 
 const PROMPT_OPENINGS_BY_KIND: ReadonlyArray<{
   kind: TimelineEventKind;

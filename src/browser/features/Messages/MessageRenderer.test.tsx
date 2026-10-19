@@ -731,6 +731,13 @@ describe("MessageRenderer TODO nudge rows", () => {
     expect(view.getByText(/todo_write/)).toBeDefined();
   });
 
+  test("collapses a nudge stored with the text that #6720 shipped", () => {
+    const legacy =
+      "<notification>\nYou ended your turn, but your TODO list still has pending or in-progress items. Update it now with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. If an item is still open on purpose, keep it and say why in one sentence. Do not start new work.\n</notification>";
+    const view = renderNudge(legacy, true);
+    expect(view.container.querySelector("[data-todo-turn-end-nudge]")).not.toBeNull();
+  });
+
   test("keeps a full bubble for typed lookalikes and plugin-joined prompts", () => {
     const typed = renderNudge(TODO_TURN_END_NUDGE, false);
     expect(typed.container.querySelector("[data-todo-turn-end-nudge]")).toBeNull();
