@@ -42,6 +42,14 @@ import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundP
 const CAT_FILE_READ_NOTICE =
   "Use the `file_read` tool to read files instead of `cat`, `rg`, or `grep`: bash output may be truncated or auto-filtered, which can hide parts of the file, and file_read supports offset/limit paging.";
 
+/**
+ * Built at module level so the closure captures only the controller, not the tool's execute
+ * scope: a migrated record outlives the turn, and that scope holds the ToolConfiguration.
+ */
+function abortOnKill(controller: AbortController): () => void {
+  return () => controller.abort();
+}
+
 function prependToolNote(existing: string | undefined, extra: string): string {
   if (!existing) {
     return extra;
@@ -1635,7 +1643,7 @@ ${scriptWithEnv}`;
                   existingOutput: lines,
                   // Abort is detached from the tool call once backgrounded, so the wrapped
                   // controller now only fires through the handle's terminate (#4760).
-                  kill: () => wrappedAbortController.abort(),
+                  kill: abortOnKill(wrappedAbortController),
                 },
                 config.backgroundProcessManager.getBgOutputDir()
               );

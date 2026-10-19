@@ -869,13 +869,25 @@ class MigratedBackgroundHandle implements BackgroundHandle {
   private exitCodeValue: number | null = null;
   private consuming = false;
   private outputFd: fs.FileHandle | null = null;
+  // The manager keeps exited records until workspace cleanup, so the handle drops what only a
+  // running command needs. In a long-lived server, 128 finished migrated records kept 1783 MB
+  // alive through `kill` (F29 heap snapshot): its closure scope held the turn's tool
+  // configuration. `kill` goes at exit (the exec already reaps its tree then), `execStream`
+  // once its output is drained too (terminate still cancels a stream held open by a child).
+  private kill: (() => void) | undefined;
+  private execStream: ExecStream | null;
+  private exited = false;
+  private drained = false;
 
   constructor(
-    private readonly execStream: ExecStream,
+    execStream: ExecStream,
     public readonly outputDir: string,
     private readonly outputPath: string,
-    private readonly kill?: () => void
-  ) {}
+    kill?: () => void
+  ) {
+    this.execStream = execStream;
+    this.kill = kill;
+  }
 
   /**
    * Start consuming remaining output from streams and writing to unified file.
@@ -884,29 +896,41 @@ class MigratedBackgroundHandle implements BackgroundHandle {
   startConsuming(): void {
     if (this.consuming) return;
     this.consuming = true;
+    const execStream = this.execStream;
+    assert(execStream != null, "startConsuming runs before the handle releases its stream");
 
     // Open output file once, consume both streams to it
-    void this.consumeStreams();
+    void this.consumeStreams(execStream).finally(() => {
+      this.drained = true;
+      this.releaseIfFinished();
+    });
 
     // Track exit code
-    void this.execStream.exitCode.then((code) => {
+    void execStream.exitCode.then((code) => {
       this.exitCodeValue = code;
+      this.exited = true;
+      this.kill = undefined;
+      this.releaseIfFinished();
       // Write exit code to file
       void this.writeExitCode(code);
     });
   }
 
+  private releaseIfFinished(): void {
+    if (this.exited && this.drained) this.execStream = null;
+  }
+
   /**
    * Consume both stdout and stderr streams and append to unified output file.
    */
-  private async consumeStreams(): Promise<void> {
+  private async consumeStreams(execStream: ExecStream): Promise<void> {
     try {
       this.outputFd = await fs.open(this.outputPath, "a");
 
       // Consume both streams concurrently, both writing to same file
       await Promise.all([
-        this.consumeStream(this.execStream.stdout),
-        this.consumeStream(this.execStream.stderr),
+        this.consumeStream(execStream.stdout),
+        this.consumeStream(execStream.stderr),
       ]);
     } catch (error) {
       log.debug(`MigratedBackgroundHandle.consumeStreams: ${errorMsg(error)}`);
@@ -962,15 +986,18 @@ class MigratedBackgroundHandle implements BackgroundHandle {
     // ExecStream has no kill method, so the foreground exec's abort is passed in. Workspace
     // removal terminates processes before deleting the checkout (#4760), so kill the process
     // and join its exit (bounded: a remote exec may never report one) before returning.
+    // Released only after exit and drain: nothing is left to kill or cancel.
+    const execStream = this.execStream;
+    if (execStream == null) return;
     if (this.kill) {
       this.kill();
-      await raceWithAbortAndTimeout(this.execStream.exitCode, {
+      await raceWithAbortAndTimeout(execStream.exitCode, {
         timeoutMs: MIGRATED_PROCESS_EXIT_JOIN_MS,
       }).catch(() => undefined);
     }
     try {
-      await this.execStream.stdout.cancel();
-      await this.execStream.stderr.cancel();
+      await execStream.stdout.cancel();
+      await execStream.stderr.cancel();
     } catch {
       // Streams may already be closed
     }
