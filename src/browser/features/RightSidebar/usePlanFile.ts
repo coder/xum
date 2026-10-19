@@ -29,8 +29,8 @@ export async function readPlan(api: APIClient, workspaceId: string): Promise<Pla
  * The workspace's plan file, read through `workspace.getPlanContent` and read again whenever
  * `refreshKey` changes (the plan has no push channel). A plan already on screen stays while
  * the next read is in flight, and offline (no client during a reconnect): the new client's
- * read then replaces it in the background. Without a plan on screen, a read shows the loading
- * state first.
+ * read then replaces it in the background. A read that fails clears it. Without a plan on
+ * screen, a read shows the loading state first.
  */
 export function usePlanFile(workspaceId: string, refreshKey = 0) {
   const { api } = useAPI();
@@ -69,7 +69,13 @@ export function usePlanFile(workspaceId: string, refreshKey = 0) {
       }
       setIsLoading(false);
       if (read.status === "error") {
+        // The plan is gone or unreadable now (deleted after it was shown, a runtime that went
+        // away): nothing stale stays behind the error, so the actions disable, and the next read
+        // starts from the loading state.
         setError(read.error);
+        setContent(null);
+        setPath(null);
+        hasPlanRef.current = false;
         return;
       }
       setError(null);

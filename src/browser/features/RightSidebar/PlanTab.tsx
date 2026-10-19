@@ -64,18 +64,18 @@ function PlanTabBody(props: { workspaceId: string }) {
   const hasPlan = content !== null && content.length > 0;
 
   // Leaving the workspace or switching tabs unmounts this body: keep the plan's scroll offset
-  // per workspace. Tracked while scrolling, saved on unmount, restored once the plan renders
-  // (the body has its height only then). A re-read keeps the body, so its offset stays.
+  // per workspace. The ref starts from the saved offset, so an unmount before the plan rendered
+  // (a slow read, no client) saves it back unchanged; scrolling updates it, unmount saves it,
+  // and the restore runs once the plan renders (the body has its height only then). A re-read
+  // keeps the body, so its offset stays.
   const bodyRef = useRef<HTMLDivElement>(null);
-  const scrollTopRef = useRef(0);
+  const [savedScrollTop] = useState(() =>
+    normalizeScrollTop(readPersistedState<unknown>(getPlanTabScrollTopKey(workspaceId), 0))
+  );
+  const scrollTopRef = useRef(savedScrollTop);
   useEffect(() => {
-    if (!hasPlan) return;
-    const saved = normalizeScrollTop(
-      readPersistedState<unknown>(getPlanTabScrollTopKey(workspaceId), 0)
-    );
-    scrollTopRef.current = saved;
-    if (bodyRef.current) bodyRef.current.scrollTop = saved;
-  }, [hasPlan, workspaceId]);
+    if (hasPlan && bodyRef.current) bodyRef.current.scrollTop = scrollTopRef.current;
+  }, [hasPlan]);
   useEffect(() => {
     return () => {
       updatePersistedState<number>(getPlanTabScrollTopKey(workspaceId), scrollTopRef.current, 0);

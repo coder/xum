@@ -25,17 +25,14 @@ Show the workspace's plan next to the chat, with the plan card's main actions.
 2. Re-read it when a turn ends or the window regains focus.
 3. Keep **Implement**, **Edit** and **Copy** one click away.`;
 
-const PlanStoryShell: FC<{ setup: () => APIClient; children: ReactNode }> = ({
-  setup,
-  children,
-}) => {
+const PlanStoryShell: FC<{ setup: () => APIClient; children: ReactNode }> = (props) => {
   const clientRef = useRef<APIClient | null>(null);
-  clientRef.current ??= setup();
+  clientRef.current ??= props.setup();
 
   return (
     <ThemeProvider>
       <TooltipProvider>
-        <APIProvider client={clientRef.current}>{children}</APIProvider>
+        <APIProvider client={clientRef.current}>{props.children}</APIProvider>
       </TooltipProvider>
     </ThemeProvider>
   );
