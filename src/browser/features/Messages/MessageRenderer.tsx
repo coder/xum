@@ -142,10 +142,11 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
           ) : message.isSynthetic === true && message.content === TODO_TURN_END_NUDGE ? (
             // Xum's turn-end TODO nudge is constant control text, not user input. Exact match
             // only: a nudge joined to a plugin's turn.stop prompt keeps the full bubble so the
-            // plugin's text stays visible.
+            // plugin's text stays visible. The nudged turn keeps its tools and can do real work,
+            // so the summary says so instead of presenting it as list bookkeeping only.
             <CollapsibleMachineMessage
               content={message.content}
-              summary="Asked the agent to update its TODO list"
+              summary="Asked the agent to update its TODO list and finish open items"
               icon={<ListTodo aria-hidden="true" className="size-3.5 shrink-0" />}
               marker="todo-turn-end-nudge"
               className={className}
