@@ -561,15 +561,25 @@ export class CreationDraftStore {
     } catch (error) {
       entry.saving = false;
       if (this.entries.get(id) !== entry) return;
-      // A refused save wrote nothing; other failures may have.
-      if (client && !isDraftTooLargeError(error)) entry.maybeSaved = true;
-      // Later edits win over the fields this save carried.
-      entry.pending = { ...patch, ...entry.pending };
-      // Lost with a connection that was replaced meanwhile: no error, so flush() saves it again on
-      // the new one (a Send awaiting it waits for that save instead of failing).
-      entry.saveError = this.client && this.client !== client ? null : getErrorMessage(error);
+      this.keepFailedSave(entry, patch, client, error);
     }
     this.recompute(id, entry);
+  }
+
+  /** A failed save: its fields wait for the next save. */
+  private keepFailedSave(
+    entry: Entry,
+    patch: CreationDraftPatch,
+    client: APIClient | null,
+    error: unknown
+  ): void {
+    // A refused save wrote nothing; other failures may have.
+    if (client && !isDraftTooLargeError(error)) entry.maybeSaved = true;
+    // Later edits win over the fields this save carried.
+    entry.pending = { ...patch, ...entry.pending };
+    // Lost with a connection that was replaced meanwhile: no error, so flush() saves it again on
+    // the new one (a Send awaiting it waits for that save instead of failing).
+    entry.saveError = this.client && this.client !== client ? null : getErrorMessage(error);
   }
 
   /** Delete a draft (Send success, sidebar Delete). Another window's unsent edits go too. */
