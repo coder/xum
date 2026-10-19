@@ -318,6 +318,7 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { StartupRecoveryState } from "@/node/services/startupRecovery";
 import { judgeLifecycleMarkerOwner } from "@/node/services/lifecycleMarkerOwners";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { splitTodoTurnEndNudgePolicy } from "@/node/services/agentNotifications/todoTurnEndNudge";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import {
@@ -2077,6 +2078,27 @@ function isResetBoundaryMessage(message: MuxMessage): boolean {
 
 function isCompactionRequestMessage(message: MuxMessage): boolean {
   return message.metadata?.muxMetadata?.type === "compaction-request";
+}
+
+/**
+ * A user row's persisted toolPolicy as a caller restriction (see
+ * resolveTerminalWakeCallerSendRestrictions). Persisted rows are untrusted disk state: a malformed
+ * policy would throw deep inside send resolution and leave the wake permanently blocked on the
+ * same corrupt row, so it restores nothing (self-healing doctrine) but still counts as present.
+ * A turn-end todo nudge row carries the turn's caller policy plus the nudge's own rule, which
+ * governs the nudge turn only (like a compaction request's policy): only the caller part is a
+ * restriction. Adopting the whole policy left every later wake with todo_write only (#6720).
+ */
+function readPersistedCallerToolPolicy(
+  raw: unknown
+): { kind: "none" } | { kind: "malformed" } | { kind: "policy"; toolPolicy: ToolPolicy } {
+  if (raw == null) return { kind: "none" };
+  const parsed = ToolPolicySchema.safeParse(raw);
+  if (!parsed.success) return { kind: "malformed" };
+  const { callerToolPolicy } = splitTodoTurnEndNudgePolicy(parsed.data);
+  return callerToolPolicy == null
+    ? { kind: "none" }
+    : { kind: "policy", toolPolicy: callerToolPolicy };
 }
 
 function isWorkflowSupersessionMessage(message: MuxMessage): boolean {
@@ -12849,26 +12871,24 @@ export class TaskService implements AgentTaskIntegration {
           ) {
             state.pin = strictAgentResolution != null ? { strictAgentResolution } : {};
           }
+          // A nudge row whose caller part is empty restricts nothing: like any synthetic row
+          // without a policy, it leaves the definition to an older row.
+          const rowPolicy = readPersistedCallerToolPolicy(metadata?.toolPolicy);
           if (
             state.restrictions == null &&
-            (metadata?.toolPolicy != null ||
+            (rowPolicy.kind !== "none" ||
               metadata?.disableWorkspaceAgents != null ||
               metadata?.synthetic !== true)
           ) {
-            // Persisted rows are untrusted disk state: a malformed toolPolicy would throw deep
-            // inside send resolution and leave the wake permanently blocked on the same corrupt
-            // row. Sanitize instead of trusting the JSON shape; an unparseable policy restores
-            // nothing while a valid disable flag still applies (self-healing doctrine).
-            const parsedPolicy =
-              metadata?.toolPolicy != null ? ToolPolicySchema.safeParse(metadata.toolPolicy) : null;
-            if (parsedPolicy != null && !parsedPolicy.success) {
+            // An unparseable policy restores nothing while a valid disable flag still applies.
+            if (rowPolicy.kind === "malformed") {
               log.warn("Ignoring malformed persisted toolPolicy on terminal wake", {
                 ownerWorkspaceId,
                 messageId: message.id,
               });
             }
             state.restrictions = {
-              ...(parsedPolicy?.success ? { toolPolicy: parsedPolicy.data } : {}),
+              ...(rowPolicy.kind === "policy" ? { toolPolicy: rowPolicy.toolPolicy } : {}),
               ...(typeof metadata?.disableWorkspaceAgents === "boolean"
                 ? { disableWorkspaceAgents: metadata.disableWorkspaceAgents }
                 : {}),

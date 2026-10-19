@@ -122,6 +122,7 @@ import { COMPACTION_RETRY_INPUT_BUDGET_SCALE } from "@/constants/continuousCompa
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import {
   mergeTurnStopContinuation,
+  withoutTodoTurnEndNudge,
   needsTodoTurnEndNudge,
   type TurnStopContinuation,
 } from "@/node/services/agentNotifications/todoTurnEndNudge";
@@ -10321,6 +10322,8 @@ export class AgentSession {
     const streamEndPayload = payload;
     const activeStreamGoalKind = this.activeStreamContext?.goalKind;
     const activeStreamOptions = this.activeStreamContext?.options;
+    // What a later turn (turn.stop or goal continuation) inherits from this one.
+    const inheritedStreamOptions = withoutTodoTurnEndNudge(activeStreamOptions);
     // A turn.stop continuation keeps this stream's goal provenance (read before the reset below).
     const activeStreamProvenance = this.readStopContinuationProvenance(payload);
 
@@ -10467,7 +10470,11 @@ export class AgentSession {
       if (!handled && completedCompactionRequest == null && !this.coordinator.editBlocked()) {
         // Before the queue flush: a continuation is queued work, so the flush dispatches it and
         // the goal loop waits for it, and input the user queued meanwhile wins over it.
-        await this.runTurnStopHooks(streamEndPayload, activeStreamOptions, activeStreamProvenance);
+        await this.runTurnStopHooks(
+          streamEndPayload,
+          inheritedStreamOptions,
+          activeStreamProvenance
+        );
         if (
           !this.coordinator.isCurrentTurn(turn) ||
           !this.coordinator.isCurrentOperation(operation)
@@ -10499,7 +10506,7 @@ export class AgentSession {
       ) {
         // The queued turn continues the goal at its own stream end; if it never streams, the
         // continuation is still owed (abandoned automatic work).
-        this.oweGoalAdvancementToQueuedWork(activeStreamOptions);
+        this.oweGoalAdvancementToQueuedWork(inheritedStreamOptions);
       }
       if (
         !handled &&
@@ -10507,7 +10514,7 @@ export class AgentSession {
         !continuousApplyPending &&
         !hadQueuedMessages
       ) {
-        const sendOptions = activeStreamOptions ?? {
+        const sendOptions = inheritedStreamOptions ?? {
           model: streamEndPayload.metadata.model,
           agentId: WORKSPACE_DEFAULTS.agentId,
         };

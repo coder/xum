@@ -6,6 +6,11 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { createMuxMessage } from "@/common/types/message";
+import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import {
+  mergeTurnStopContinuation,
+  splitTodoTurnEndNudgePolicy,
+} from "@/node/services/agentNotifications/todoTurnEndNudge";
 import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import {
@@ -1878,6 +1883,101 @@ describe("TaskService", () => {
       expect.objectContaining({ acceptanceOrigin: "automatic" })
     );
   });
+
+  // #6720: the nudge row carries the caller policy plus the nudge's own todo_write-only rule.
+  // That rule governs the nudge turn alone; a wake that adopted it ran with todo_write only.
+  test.each([
+    { label: "an unrestricted caller", callerPolicy: undefined },
+    { label: "a restricted caller", callerPolicy: [{ regex_match: "^bash$", action: "disable" }] },
+  ] satisfies Array<{ label: string; callerPolicy: ToolPolicy | undefined }>)(
+    "a report wake after a todo nudge restores $label's tools, not the nudge's",
+    async ({ callerPolicy }) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const parentWorkspaceId = "parent-nudge-111";
+      const childTaskId = "task-nudge-222";
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+            aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+          }),
+          {
+            path: path.join(projectPath, "child-task"),
+            id: childTaskId,
+            name: "agent_explore_child",
+            parentWorkspaceId,
+            agentType: "explore",
+            taskStatus: "running",
+            taskModelString: "openai:gpt-5.2",
+            taskThinkingLevel: "medium",
+          },
+        ],
+        testTaskSettings()
+      );
+      const liveTurn = Symbol("parent-turn");
+      const { aiService } = createAIServiceMocks(config, {
+        isStreaming: mock((workspaceId: string) => workspaceId === parentWorkspaceId),
+      });
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+        getActiveTurnGeneration: mock(() => liveTurn),
+      });
+      const { historyService, taskService } = createTaskServiceHarness(config, {
+        aiService,
+        workspaceService,
+      });
+      await historyService.appendToHistory(
+        parentWorkspaceId,
+        createMuxMessage("manual", "user", "coordinate the children", {
+          timestamp: 1_000,
+          ...(callerPolicy != null ? { toolPolicy: callerPolicy } : {}),
+        })
+      );
+      // The policy AgentSession queues the nudge with.
+      const nudge = mergeTurnStopContinuation({
+        hookPrompt: null,
+        todoNudge: true,
+        callerToolPolicy: callerPolicy,
+      });
+      await historyService.appendToHistory(
+        parentWorkspaceId,
+        createMuxMessage("nudge", "user", nudge?.prompt ?? "", {
+          timestamp: 1_100,
+          synthetic: true,
+          toolPolicy: nudge?.optionOverrides?.toolPolicy,
+        })
+      );
+
+      await streamEnd(taskService, {
+        type: "stream-end",
+        workspaceId: childTaskId,
+        messageId: "assistant-child-output",
+        metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "agent-report-call-1",
+            toolName: "agent_report",
+            input: { reportMarkdown: "Hello from child", title: "Result" },
+            state: "output-available",
+            output: {
+              success: true,
+              report: { reportMarkdown: "Hello from child", title: "Result" },
+            },
+          },
+          { type: "text", text: "Hello from child" },
+        ],
+      });
+      await flushTerminalAttentionDrains(taskService);
+
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      const wakeOptions = sendMessage.mock.calls[0]?.[2] as { toolPolicy?: ToolPolicy };
+      expect(wakeOptions.toolPolicy).toEqual(callerPolicy);
+      // The request builder gates execution only for a policy that ends with the nudge's rule.
+      expect(splitTodoTurnEndNudgePolicy(wakeOptions.toolPolicy).executionGate).toBeUndefined();
+    }
+  );
 
   for (const [name, delegated] of [
     ["waits for the turn to end when the parent holds agent messages", false],

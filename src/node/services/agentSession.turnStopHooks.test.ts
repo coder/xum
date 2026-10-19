@@ -13,7 +13,7 @@ import type { TodoItem } from "@/common/types/tools";
 import { getTodoFilePath } from "@/node/services/todos/todoStorage";
 import { TURN_STOP_PROMPT_MAX_CHARS } from "./agentPlugins/promptHooks";
 import { TODO_TURN_END_NUDGE } from "@/node/services/agentNotifications/todoTurnEndNudge";
-import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
+import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { Ok } from "@/common/types/result";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { AgentSessionAIService } from "./agentSession";
@@ -149,7 +149,7 @@ async function settle(h: AgentSessionHarness): Promise<void> {
 }
 
 /** A session with a real goal service and an active goal (the goal loop's bridge is a no-op). */
-async function setupWithGoal() {
+async function setupWithGoal(parts?: (turn: number) => CompletedMessagePart[]) {
   const history = await createTestHistoryService();
   const projectPath = "/tmp/turn-stop-hooks-project";
   await history.config.addWorkspace(projectPath, {
@@ -168,6 +168,7 @@ async function setupWithGoal() {
   const goal = await goalService.setGoal({ workspaceId, objective: "Ship the release" });
   assert(goal.success);
   const session = await setup({
+    parts,
     session: {
       config: history.config,
       historyService: history.historyService,
@@ -776,6 +777,47 @@ describe("todo turn-end nudge", () => {
     await h.session.sendMessage("now lint", options);
     await settle(h);
     expect(streams()).toBe(4);
+  });
+
+  // #6720: the nudge's todo_write-only rule governs the nudge turn alone. A later turn that
+  // inherits the nudge turn's options gets the caller's policy back.
+  const callerPolicy: ToolPolicy = [{ regex_match: "^bash$", action: "disable" }];
+
+  test("a plugin continuation after the nudge gets the caller's tools back", async () => {
+    let continued = false;
+    // Continues once, at the end of the nudge turn.
+    addConsumer((ctx) => {
+      if (!ctx.stopHookActive || continued) return;
+      continued = true;
+      keepGoing(ctx);
+    });
+    const { h, requests } = await setup({ parts: todoWriteThenReply });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage("fix the bug", { ...options, toolPolicy: callerPolicy });
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual([
+      "fix the bug",
+      TODO_TURN_END_NUDGE,
+      "Run the failing tests again.",
+    ]);
+    expect(requests[1].toolPolicy).not.toEqual(callerPolicy);
+    expect(requests[2].toolPolicy).toEqual(callerPolicy);
+  });
+
+  test("the goal continuation after the nudge gets the caller's tools back", async () => {
+    const { h, goalId, goalService } = await setupWithGoal(todoWriteThenReply);
+    const requestContinuation = spyOn(goalService, "requestContinuationAfterStreamEnd");
+    await writeTodos(h, openTodos);
+
+    await sendGoalTurn(h, goalId);
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual(["Continue the goal.", TODO_TURN_END_NUDGE]);
+    // Requested once, at the end of the nudge turn (the queued nudge continued the first).
+    expect(requestContinuation).toHaveBeenCalledTimes(1);
+    expect(requestContinuation.mock.calls[0]?.[0].sendOptions.toolPolicy).toBeUndefined();
   });
 
   test("a plugin continuation and the nudge share one continuation prompt", async () => {

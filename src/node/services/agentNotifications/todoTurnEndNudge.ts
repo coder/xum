@@ -66,6 +66,23 @@ export function splitTodoTurnEndNudgePolicy(policy: ToolPolicy | undefined): Tod
   };
 }
 
+/**
+ * Send options a later turn inherits from one that ended, without the nudge's rules: they
+ * govern the nudge turn alone, like a compaction request's disable-all policy. Inherited, they
+ * left a plugin or goal continuation after a nudge with todo_write only (#6720).
+ */
+export function withoutTodoTurnEndNudge<T extends { toolPolicy?: ToolPolicy }>(
+  options: T | undefined
+): T | undefined {
+  const split = splitTodoTurnEndNudgePolicy(options?.toolPolicy);
+  if (options == null || split.executionGate == null) return options;
+  const inherited = { ...options };
+  // Omitted, not undefined: a spread over persisted options must not clobber their policy.
+  if (split.callerToolPolicy == null) delete inherited.toolPolicy;
+  else inherited.toolPolicy = split.callerToolPolicy;
+  return inherited;
+}
+
 /** The policy that decides what may run: the advertised policy plus the gate's rules. */
 export function withExecutionGate(
   policy: ToolPolicy | undefined,
