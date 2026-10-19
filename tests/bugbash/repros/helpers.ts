@@ -47,10 +47,10 @@ export async function todoNudgeToolPolicies(app: {
     if (row.type !== "message" || row.role !== "user") return [];
     const text = row.parts.map((part) => (part.type === "text" ? part.text : "")).join("");
     if (text.trim() !== TODO_TURN_END_NUDGE.trim()) return [];
+    // The wire schema leaves both untyped.
+    const toolPolicy = row.metadata?.toolPolicy as ToolPolicy | undefined;
     const retry = row.metadata?.retrySendOptions as { toolPolicy?: ToolPolicy } | undefined;
-    return [
-      { toolPolicy: row.metadata?.toolPolicy ?? null, retryToolPolicy: retry?.toolPolicy ?? null },
-    ];
+    return [{ toolPolicy: toolPolicy ?? null, retryToolPolicy: retry?.toolPolicy ?? null }];
   });
 }
 
