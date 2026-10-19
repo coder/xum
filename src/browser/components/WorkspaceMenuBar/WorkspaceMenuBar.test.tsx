@@ -13,6 +13,7 @@ import userEvent from "@testing-library/user-event";
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+import * as RealHeartbeatModalModule from "@/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal";
 import * as APIModule from "@/browser/contexts/API";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
@@ -73,8 +74,6 @@ void mock.module("@/browser/components/Dialog/Dialog", () => ({
   DialogTitle: (props: { children: ReactNode; className?: string }) => (
     <h2 className={props.className}>{props.children}</h2>
   ),
-  DialogPortal: (props: { children: ReactNode }) => <>{props.children}</>,
-  DialogOverlay: () => <div data-testid="dialog-backdrop" />,
 }));
 
 // Captured before any spy is installed so the integration test can render the real modal
@@ -86,6 +85,18 @@ const RealWorkspaceUnrelatedMessagingModal =
 // the "another modal is open" test needs the actual overlay the MCP/heartbeat dialogs render.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const RealDialog = require("../Dialog/Dialog?real=1") as typeof RealDialogModule;
+
+// Counts imports of the heartbeat modal's index, which only the lazy loader in WorkspaceMenuBar
+// does. The factory runs on the first import of the mocked specifier.
+let heartbeatModalImports = 0;
+const realHeartbeatModalIndex = { ...RealHeartbeatModalModule };
+restoreModulesAfterSuite([
+  ["@/browser/components/WorkspaceHeartbeatModal", realHeartbeatModalIndex],
+]);
+void mock.module("@/browser/components/WorkspaceHeartbeatModal", () => {
+  heartbeatModalImports++;
+  return realHeartbeatModalIndex;
+});
 
 let WorkspaceMenuBar!: typeof WorkspaceMenuBarComponent;
 
@@ -1212,24 +1223,45 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
   });
 
-  it("blocks pointer and shortcut access to a second modal while a settings modal is loading", async () => {
-    // The heartbeat modal: no other test opens it, so its lazy chunk is still pending here.
+  it("starts the settings modal imports when the Workspace actions menu opens", async () => {
+    // Runs before any test here opens the heartbeat modal, so its module is not imported yet.
+    // The Workspace actions popover is the one around the WorkspaceActionsMenuContent double.
+    let moreMenuOnOpenChange: ((open: boolean) => void) | undefined;
+    spyOn(PopoverModule, "Popover").mockImplementation(((
+      props: PropsWithChildren<{ onOpenChange?: (open: boolean) => void }>
+    ) => (
+      <div
+        ref={(el) => {
+          if (el?.querySelector('[aria-label="Workspace actions"]'))
+            moreMenuOnOpenChange = props.onOpenChange;
+        }}
+      >
+        {props.children}
+      </div>
+    )) as unknown as typeof PopoverModule.Popover);
+    render(<WorkspaceMenuBar {...defaultProps} />);
+    expect(moreMenuOnOpenChange).toBeDefined();
+    expect(heartbeatModalImports).toBe(0);
+    act(() => {
+      moreMenuOnOpenChange?.(true);
+    });
+    await waitFor(() => expect(heartbeatModalImports).toBe(1));
+  });
+
+  it("shows a loading dialog that blocks a second modal while a settings modal loads", async () => {
     const view = render(<WorkspaceMenuBar {...defaultProps} />);
-    expect(view.queryByTestId("dialog-backdrop")).toBeNull();
     act(() => {
       menuAction("configureHeartbeat")?.(document.body);
     });
-    // Until the chunk arrives, the dialog's backdrop takes the pointer, so a second pick from
-    // Workspace actions cannot reach the menu (happy-dom does not hit-test, so check the backdrop).
-    expect(view.queryByTestId("dialog-backdrop")).not.toBeNull();
-    // The heartbeat dialog's own overlay does not exist yet, only the pending marker.
+    // Until the chunk arrives, a loading dialog holds the place of the heartbeat dialog. Its
+    // backdrop and focus trap (LazySettingsModal.test.tsx) keep pointer and keyboard off the
+    // menu, and the open-overlay marker blocks the global shortcuts.
+    expect(view.queryByText("Loading…")).not.toBeNull();
     act(() => {
       fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
     });
     // The first import of the real heartbeat modal can take over a second here.
-    await waitFor(() => expect(view.queryByTestId("dialog-backdrop")).toBeNull(), {
-      timeout: 10_000,
-    });
+    await waitFor(() => expect(view.queryByText("Loading…")).toBeNull(), { timeout: 10_000 });
     expect(view.getByText("Configure heartbeat")).not.toBeNull();
     expect(messagingDialogOpen()).toBe(false);
   }, 20_000);
