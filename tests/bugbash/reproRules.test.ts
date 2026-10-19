@@ -51,15 +51,21 @@ function agentTagged(source: string): boolean {
   const tagged = (call: ts.CallExpression) => {
     const options = call.arguments[1];
     if (options == null || !ts.isObjectLiteralExpression(options)) return false;
-    return options.properties.some(
-      (property) =>
-        ts.isPropertyAssignment(property) &&
-        ts.isIdentifier(property.name) &&
-        property.name.text === "tags" &&
-        ts.isArrayLiteralExpression(property.initializer) &&
-        property.initializer.elements.some(
-          (element) => ts.isStringLiteralLike(element) && element.text === "agent"
-        )
+    // A spread can overwrite `tags` at run time, so it counts as untagged. Of several `tags`
+    // keys, the last one wins, as in JavaScript.
+    if (options.properties.some(ts.isSpreadAssignment)) return false;
+    const tags = options.properties
+      .filter(
+        (property): property is ts.PropertyAssignment =>
+          ts.isPropertyAssignment(property) &&
+          (ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)) &&
+          property.name.text === "tags"
+      )
+      .at(-1)?.initializer;
+    return (
+      tags != null &&
+      ts.isArrayLiteralExpression(tags) &&
+      tags.elements.some((element) => ts.isStringLiteralLike(element) && element.text === "agent")
     );
   };
   return calls.length > 0 && calls.every(tagged);
@@ -77,6 +83,12 @@ test("the agent tag must cover every test of a model-driven file", () => {
   expect(agentTagged(`const opts = { tags: ["agent"] };\n${untagged}`)).toBe(false);
   expect(agentTagged(`/* tags: ["agent"] */ ${untagged}`)).toBe(false);
   expect(agentTagged(`${tagged}\nconst ok = /x/.test("x");`)).toBe(true);
+  expect(agentTagged('test("x", { tags: ["agent"], ...opts }, async ({ agent }) => {});')).toBe(
+    false
+  );
+  expect(agentTagged('test("x", { tags: ["agent"], tags: ["bugbash"] }, async () => {});')).toBe(
+    false
+  );
   expect(
     agentTagged('test(\'tags: ["agent"]\', { tags: ["bugbash"] }, async ({ agent }) => {});')
   ).toBe(false);
