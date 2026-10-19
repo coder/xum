@@ -22,10 +22,10 @@ test(
 
     await disableTutorials(app);
     await app.open();
-    await agent.act(
-      `open the '${WORKSPACE_TITLE}' workspace in the left sidebar, send the chat message ` +
-        `'${MESSAGE}' and wait for the reply`
-    );
+    // Two steps, not one: the combined step's recorded end state (the sidebar) never matched on
+    // replay, so the agent had to conclude it with a model call on every warm run.
+    await agent.act(`open the '${WORKSPACE_TITLE}' workspace in the left sidebar`);
+    await agent.act(`send the chat message '${MESSAGE}' and wait for the reply`);
     await expect(transcript).toContainText(REPLY, { timeout: 30_000 });
 
     await xum.restartServer();
