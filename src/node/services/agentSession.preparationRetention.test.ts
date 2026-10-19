@@ -35,6 +35,7 @@ describe("AgentSession preparation retention", () => {
       expect(result.success).toBe(true);
       // The stream started. The streamMessage mock keeps its call arguments, standing in for
       // a tool configuration that outlives the turn.
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- a mock, never called here
       expect(h.aiService.streamMessage).toHaveBeenCalledTimes(1);
 
       expect(await collected(callbackScopeRef)).toBe(true);
