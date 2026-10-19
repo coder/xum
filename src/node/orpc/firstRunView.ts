@@ -26,7 +26,7 @@ import { VERSION } from "@/version";
  *   `disabled:opacity-50` made the copy look disabled.
  * - The root is `inert`, so no part of the copy takes focus or clicks before the handoff.
  * - The root is `fixed`, so it is a stacking context: its z-index is the live overlay's 1500
- *   (`z-[1500]`), or the iOS standalone `.ios-status-bar-band` (1001) would paint over the copy.
+ *   (`z-[1500]`).
  * - The left sidebar and the shell header come from the live 1200 px first paint (owner decision
  *   10-14), with runtime attributes and Radix ScrollArea pieces gone. Both sidebar states are here:
  *   the <style> shows the one App.tsx starts with (collapsed at or below
