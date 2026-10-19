@@ -4616,6 +4616,12 @@ export class AgentSession {
         this.activePreparations--;
         // Last: a failed attempt's ids moved to held input above, so they stay pending.
         this.activeSendAttempts.delete(attempt);
+        // Every pre-stream failure settlement for this attempt ran inside `run` or above, so
+        // the callback has no later reader. The attempt itself can outlive the turn: a started
+        // stream's request closures capture it, and a finished background command can keep
+        // those alive. Dropping the callback cuts that chain to the caller's whole send scope
+        // (WorkspaceService's onAcceptedPreStreamFailure, F29 heap snapshot).
+        attempt.onFailure = undefined;
         assert(this.activePreparations >= 0, "turn preparations released more than entered");
         // A preparation that failed before the turn left idle never publishes idle again.
         this.releaseTurnUseLeaseIfIdle();
