@@ -24,6 +24,9 @@ export function computeDiff(oldContent: string, newContent: string): string | nu
 
   // Find all changed line ranges using longest common subsequence approach
   const lcs = computeLCS(oldLines, newLines);
+  if (lcs === null) {
+    return `(diff omitted: the changed region is too large to diff, ${oldLines.length} lines before and ${newLines.length} lines after; read the file for its current content)`;
+  }
   const hunks = buildHunks(oldLines, newLines, lcs, contextSize);
 
   if (hunks.length === 0) {
@@ -52,45 +55,90 @@ interface Hunk {
 type LCSMatch = [number, number];
 
 /**
- * Compute longest common subsequence indices.
- * Returns array of [oldIndex, newIndex] pairs for matching lines.
+ * Most cells of the LCS table (4 bytes each, so about 16 MB). The table is
+ * (changed old lines + 1) x (changed new lines + 1): a full table for two 22.5k-line files
+ * was about 4 GB and took the server to its heap limit. Larger changes get a notice.
  */
-function computeLCS(oldLines: string[], newLines: string[]): LCSMatch[] {
-  const m = oldLines.length;
-  const n = newLines.length;
+const MAX_LCS_CELLS = 4_000_000;
 
-  // Build LCS table
-  const dp: number[][] = Array.from({ length: m + 1 }, () =>
-    Array.from({ length: n + 1 }, () => 0)
+/**
+ * Compute longest common subsequence indices.
+ * Returns array of [oldIndex, newIndex] pairs for matching lines, or null when the changed
+ * middle (after the common start and end) needs more than MAX_LCS_CELLS table cells.
+ */
+function computeLCS(oldLines: string[], newLines: string[]): LCSMatch[] | null {
+  // Lines shared at the start and end always match; only the middle needs the table.
+  const { prefix, suffix } = commonEdges(oldLines, newLines);
+  const m = oldLines.length - prefix - suffix;
+  const n = newLines.length - prefix - suffix;
+  if ((m + 1) * (n + 1) > MAX_LCS_CELLS) return null;
+
+  // Matching pairs, last first: the common end, the middle, the common start
+  const reversed: LCSMatch[] = [];
+  for (let k = 0; k < suffix; k++) {
+    reversed.push([oldLines.length - 1 - k, newLines.length - 1 - k]);
+  }
+  reversed.push(
+    ...middleLCSReversed(
+      oldLines.slice(prefix, prefix + m),
+      newLines.slice(prefix, prefix + n),
+      prefix
+    )
   );
+  for (let k = prefix - 1; k >= 0; k--) reversed.push([k, k]);
+  return reversed.reverse();
+}
 
+/** How many lines both files share at the start, and then at the end. */
+function commonEdges(oldLines: string[], newLines: string[]): { prefix: number; suffix: number } {
+  let prefix = 0;
+  while (
+    prefix < oldLines.length &&
+    prefix < newLines.length &&
+    oldLines[prefix] === newLines[prefix]
+  ) {
+    prefix++;
+  }
+  let suffix = 0;
+  while (
+    suffix < oldLines.length - prefix &&
+    suffix < newLines.length - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+  return { prefix, suffix };
+}
+
+/** Full LCS table over two line ranges (flat: dp[i * width + j]); matches last first, offset. */
+function middleLCSReversed(oldLines: string[], newLines: string[], offset: number): LCSMatch[] {
+  const m = oldLines.length;
+  const width = newLines.length + 1;
+  const dp = new Uint32Array((m + 1) * width);
   for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      if (oldLines[i - 1] === newLines[j - 1]) {
-        dp[i][j] = dp[i - 1][j - 1] + 1;
-      } else {
-        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
-      }
+    for (let j = 1; j < width; j++) {
+      dp[i * width + j] =
+        oldLines[i - 1] === newLines[j - 1]
+          ? dp[(i - 1) * width + j - 1] + 1
+          : Math.max(dp[(i - 1) * width + j], dp[i * width + j - 1]);
     }
   }
 
   // Backtrack to find matching pairs
   const result: LCSMatch[] = [];
   let i = m;
-  let j = n;
-
+  let j = newLines.length;
   while (i > 0 && j > 0) {
     if (oldLines[i - 1] === newLines[j - 1]) {
-      result.unshift([i - 1, j - 1]);
+      result.push([offset + i - 1, offset + j - 1]);
       i--;
       j--;
-    } else if (dp[i - 1][j] > dp[i][j - 1]) {
+    } else if (dp[(i - 1) * width + j] > dp[i * width + j - 1]) {
       i--;
     } else {
       j--;
     }
   }
-
   return result;
 }
 
