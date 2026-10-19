@@ -7,11 +7,12 @@ name: Stories
 # Triggers: change only this block to pick when it runs. The job below works unchanged under
 # pull_request, merge_group, schedule and workflow_dispatch.
 on:
-  # Every push to a same-repo PR (the job skips fork PRs, which get no secrets).
-  pull_request:
-    paths-ignore: ["docs/**"]
+  # Once for each PR in the merge queue, the user's pick over every PR push (about $500 against
+  # $1,700 a month at Phase 2 prices). Not required yet, so the queue does not wait for it.
+  merge_group:
   # One run a night on main: it keeps main's replay cache warm (GitHub evicts a cache that no
-  # run reads for 7 days) and is the one that every PR restores first.
+  # run reads for 7 days). A merge-queue run saves under its own queue ref, which no run
+  # restores, so this run is the one that every other run restores first.
   schedule:
     - cron: "0 6 * * *"
   # On demand, on any branch: Actions > Stories > Run workflow.
