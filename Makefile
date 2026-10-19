@@ -296,8 +296,9 @@ mcp-apps-e2e: ## MCP Apps e2e suite in the bug-bash sandbox (needs BUGBASH_BUDGE
 	@# keeps two runs that start in the same second apart (their output and proxy record).
 	@$(MCP_APPS_LAUNCH) -- run --config e2e.mcpapps.config.ts --output .e2e/mcp-apps-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(MCP_APPS_E2E_ARGS)
 
-# The story suite (tests/stories, agent.* steps) and the agent-tagged repros run only in the
-# bug-bash sandbox (tests/bugbash/sandbox/launch.ts, #5714), each as its own job. Their agents
+# The story suite (tests/stories, agent.* steps), the Electron stories (tests/stories/electron)
+# and the agent-tagged repros run only in the bug-bash sandbox (tests/bugbash/sandbox/launch.ts,
+# #5714), each as its own job with its own 30-minute deadline and budget. Their agents
 # reach BUGBASH_MODEL (default Sonnet 5.5) through a provider proxy for the job, so the host needs
 # BUGBASH_BUDGET_USD (a list-price cap per job) and ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL. The
 # app AI stays the mock. No agent repro exists yet, so that job may select none. As in
@@ -307,12 +308,22 @@ STORIES_LAUNCH = cd tests/stories && $(STORIES_ENV) bun ../bugbash/sandbox/launc
 AGENT_REPROS_LAUNCH = cd tests/bugbash && $(STORIES_ENV) bun sandbox/launch.ts
 STORIES_RUN = run --config e2e.config.ts --exclude-tag known-failure
 AGENT_REPROS_RUN = run --config e2e.config.ts --tag agent --exclude-tag known-failure --pass-with-no-tests
-test-stories: ## Story tests and agent-tagged repros in the bug-bash sandbox (needs BUGBASH_BUDGET_USD)
+STORIES_ELECTRON_RUN = run --config e2e.electron.config.ts --exclude-tag known-failure
+# The Electron binary of node_modules/electron: its postinstall downloads it, and a bun install
+# that skipped it leaves none. The Electron stories mount node_modules read-only, so the host
+# fetches it (launch.ts refuses an Electron job without it). A no-op once it is there.
+.PHONY: electron-binary
+electron-binary: ## Download the Electron binary into node_modules/electron (the Electron stories need it)
+	@node node_modules/electron/install.js
+test-stories: electron-binary ## Story tests, Electron stories and agent-tagged repros in the bug-bash sandbox (needs BUGBASH_BUDGET_USD)
 	@$(STORIES_LAUNCH) --preflight -- $(STORIES_RUN) --output .e2e/stories-preflight $(STORIES_ARGS)
+	@$(STORIES_LAUNCH) --preflight -- $(STORIES_ELECTRON_RUN) --output .e2e/stories-electron-preflight $(STORIES_ARGS)
 	@$(AGENT_REPROS_LAUNCH) --preflight -- $(AGENT_REPROS_RUN) --output .e2e/agent-repros-preflight $(STORIES_ARGS)
-	@$(MAKE) --no-print-directory build-main build-renderer build-static
+	@# build-preload: Xum Electron's windows load dist/preload.js.
+	@$(MAKE) --no-print-directory build-main build-preload build-renderer build-static
 	@# The shell PID keeps two runs that start in the same second apart (their output and proxy record).
 	@$(STORIES_LAUNCH) -- $(STORIES_RUN) --output .e2e/stories-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(STORIES_ARGS)
+	@$(STORIES_LAUNCH) -- $(STORIES_ELECTRON_RUN) --output .e2e/stories-electron-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(STORIES_ARGS)
 	@$(AGENT_REPROS_LAUNCH) -- $(AGENT_REPROS_RUN) --output .e2e/agent-repros-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(STORIES_ARGS)
 
 rlm-eval: ## Run the RLM lever eval against a running dev-server sandbox (see scripts/rlm-eval/run.ts header)

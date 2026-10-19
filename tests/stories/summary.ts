@@ -2,15 +2,18 @@
  * The story lane's CI helper (.github/workflows/stories.yml), after one `make test-stories`.
  *
  * - `bun tests/stories/summary.ts` prints one Markdown table for the job summary: a row per
- *   selected test of every story job (`tests/stories/.e2e/stories-*`) and agent-repros job
+ *   selected test of every story job (`tests/stories/.e2e/stories-*`), Electron story job
+ *   (`tests/stories/.e2e/stories-electron-*`) and agent-repros job
  *   (`tests/bugbash/.e2e/agent-repros-*`), then one line per job with its spend from
  *   `<job>.spend.json` (launch.ts). A missing or broken report gives a row that says so: the
  *   summary runs after a failed run too, and must show what is there.
- * - `--next-seed <dir>` replaces `<dir>` with the replay cache (`<job>/cache/*.json`) of the
- *   newest story job that recorded one, so the next run replays it. That cache already holds
- *   the seed the job started with (seedCacheDir copies it in), so nothing else is merged. Only
- *   names that checkSeed accepts are copied: the newest by `createdAt`, at most MAX_SEED_ENTRIES and
- *   MAX_SEED_BYTES in all, so the next launch never refuses the seed. Without such a job, `<dir>` stays as it is.
+ * - `--next-seed <dir>` replaces `<dir>` with the replay caches (`<job>/cache/*.json`) of the
+ *   newest web story job and the newest Electron story job that recorded one, so the next run
+ *   replays them. Both jobs start from the one seed (seedCacheDir copies it into each cache), so
+ *   the next seed is their union, less each entry of `<dir>` that one of them deleted (e2e deletes
+ *   an entry that replayed into a failure). Only names that checkSeed accepts are copied: the
+ *   newest by `createdAt`, at most MAX_SEED_ENTRIES and MAX_SEED_BYTES in all, so the next launch
+ *   never refuses the seed. Without such a job, `<dir>` stays as it is.
  *
  * No import beyond node and the repo: CI runs it with plain bun.
  */
@@ -24,11 +27,13 @@ import {
   MAX_SEED_ENTRIES,
 } from "../bugbash/sandbox/cacheSeed";
 
-/** Where make test-stories puts each job's output folder; the first kind records the cache. */
+/** Where make test-stories puts each job's output folder; the story kinds record a cache. */
 const JOB_KINDS = [
-  { dir: "tests/stories/.e2e", prefix: "stories-" },
-  { dir: "tests/bugbash/.e2e", prefix: "agent-repros-" },
+  { dir: "tests/stories/.e2e", prefix: "stories-", not: "stories-electron-", cache: true },
+  { dir: "tests/stories/.e2e", prefix: "stories-electron-", cache: true },
+  { dir: "tests/bugbash/.e2e", prefix: "agent-repros-", cache: false },
 ] as const;
+type JobKind = (typeof JOB_KINDS)[number];
 
 type Json = Record<string, unknown>;
 const obj = (v: unknown): Json | undefined =>
@@ -41,12 +46,14 @@ const num = (v: unknown): number | undefined =>
  * The job output folders of one kind, oldest first. The names carry the UTC start time
  * (Makefile), so name order is start order. The preflight's name is not a job.
  */
-function jobFolders(root: string, kind: (typeof JOB_KINDS)[number]): string[] {
+function jobFolders(root: string, kind: JobKind): string[] {
   const base = path.join(root, kind.dir);
   if (!fs.existsSync(base)) return [];
+  const not = "not" in kind ? kind.not : undefined;
   return fs
     .readdirSync(base, { withFileTypes: true })
     .filter((e) => e.isDirectory() && e.name.startsWith(kind.prefix))
+    .filter((e) => not == null || !e.name.startsWith(not))
     .filter((e) => !e.name.endsWith("-preflight"))
     .map((e) => path.join(base, e.name))
     .sort();
@@ -160,12 +167,15 @@ function recordedAt(file: string): number | null {
   }
 }
 
-/**
- * Replaces the seed folder `seed` with the newest story job's cache entries (header). Returns
- * the number of entries, or null when no job recorded one and `seed` was left alone.
- */
-export function nextSeed(root: string, seed: string): number | null {
-  for (const folder of jobFolders(root, JOB_KINDS[0]).reverse()) {
+interface CacheEntry {
+  file: string;
+  recordedMs: number;
+  size: number;
+}
+
+/** The valid entries of the newest job of `kind` whose cache holds one, or null. */
+function newestCache(root: string, kind: JobKind): CacheEntry[] | null {
+  for (const folder of jobFolders(root, kind).reverse()) {
     const cache = path.join(folder, "cache");
     if (!fs.existsSync(cache)) continue;
     const entries = fs
@@ -175,37 +185,67 @@ export function nextSeed(root: string, seed: string): number | null {
       .map((file) => {
         const st = fs.statSync(file);
         return { file, recordedMs: recordedAt(file) ?? st.mtimeMs, size: st.size };
-      })
-      // Newest recording first; the name breaks ties, so the cut is the same on every run. Not the
-      // mtime: each copy into the sandbox and back (seedCacheDir, the export) resets it.
-      .sort((a, b) => b.recordedMs - a.recordedMs || a.file.localeCompare(b.file))
-      .slice(0, MAX_SEED_ENTRIES);
-    // Also within checkSeed()'s byte cap, so the next launch never refuses the seed.
-    let bytes = 0;
-    const kept = entries.findIndex((entry) => (bytes += entry.size) > MAX_SEED_BYTES);
-    if (kept >= 0) entries.splice(kept);
-    if (entries.length === 0) continue;
-    fs.mkdirSync(path.dirname(seed), { recursive: true });
-    // A sibling first, then the swap: a failed copy leaves the old seed in place.
-    const next = fs.mkdtempSync(`${seed}.next-`);
-    try {
-      for (const { file } of entries) {
-        const to = path.join(next, path.basename(file));
-        fs.copyFileSync(file, to, fs.constants.COPYFILE_EXCL);
-      }
-      fs.rmSync(seed, { recursive: true, force: true });
-      fs.renameSync(next, seed);
-    } catch (error) {
-      fs.rmSync(next, { recursive: true, force: true });
-      throw error;
-    }
-    // The launcher runs this same check on the next run: fail here, where the cause is.
-    const names = checkSeed(seed, (reason) => new Error(`next seed: ${reason}`));
-    if (names.length !== entries.length)
-      throw new Error(`next seed: ${names.length} files, expected ${entries.length}`);
-    return names.length;
+      });
+    if (entries.length > 0) return entries;
   }
   return null;
+}
+
+/**
+ * Replaces the seed folder `seed` with the story jobs' cache entries (header). Returns the
+ * number of entries, or null when no job recorded one and `seed` was left alone.
+ */
+export function nextSeed(root: string, seed: string): number | null {
+  const before = fs.existsSync(seed) ? fs.readdirSync(seed) : [];
+  const byName = new Map<string, CacheEntry>();
+  const deleted = new Set<string>();
+  let found = false;
+  for (const kind of JOB_KINDS.filter((k) => k.cache)) {
+    const entries = newestCache(root, kind);
+    if (entries == null) continue;
+    found = true;
+    const names = new Set(entries.map((e) => path.basename(e.file)));
+    // The job's cache started as a copy of this seed: an entry it lacks, e2e deleted.
+    for (const name of before) if (!names.has(name)) deleted.add(name);
+    for (const entry of entries) {
+      const name = path.basename(entry.file);
+      const other = byName.get(name);
+      if (other == null || entry.recordedMs > other.recordedMs) byName.set(name, entry);
+    }
+  }
+  if (!found) return null;
+  for (const name of deleted) byName.delete(name);
+  const entries = [...byName.values()]
+    // Newest recording first; the name breaks ties, so the cut is the same on every run. Not the
+    // mtime: each copy into the sandbox and back (seedCacheDir, the export) resets it.
+    .sort(
+      (a, b) =>
+        b.recordedMs - a.recordedMs || path.basename(a.file).localeCompare(path.basename(b.file))
+    )
+    .slice(0, MAX_SEED_ENTRIES);
+  // Also within checkSeed()'s byte cap, so the next launch never refuses the seed.
+  let bytes = 0;
+  const kept = entries.findIndex((entry) => (bytes += entry.size) > MAX_SEED_BYTES);
+  if (kept >= 0) entries.splice(kept);
+  fs.mkdirSync(path.dirname(seed), { recursive: true });
+  // A sibling first, then the swap: a failed copy leaves the old seed in place.
+  const next = fs.mkdtempSync(`${seed}.next-`);
+  try {
+    for (const { file } of entries) {
+      const to = path.join(next, path.basename(file));
+      fs.copyFileSync(file, to, fs.constants.COPYFILE_EXCL);
+    }
+    fs.rmSync(seed, { recursive: true, force: true });
+    fs.renameSync(next, seed);
+  } catch (error) {
+    fs.rmSync(next, { recursive: true, force: true });
+    throw error;
+  }
+  // The launcher runs this same check on the next run: fail here, where the cause is.
+  const names = checkSeed(seed, (reason) => new Error(`next seed: ${reason}`));
+  if (names.length !== entries.length)
+    throw new Error(`next seed: ${names.length} files, expected ${entries.length}`);
+  return names.length;
 }
 
 if (import.meta.main) {

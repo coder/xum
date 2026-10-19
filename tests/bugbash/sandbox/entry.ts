@@ -15,6 +15,10 @@
  *
  * A model-driven job (BUGBASH_MODEL_DRIVEN=1) also needs the job's provider proxy socket, and it
  * gets a TCP forwarder to it on 127.0.0.1 (inContainer.ts). The app AI stays the mock.
+ *
+ * An Electron story job (BUGBASH_ELECTRON=1, launch.ts) also gets an X server: Xvfb on :99, no
+ * TCP, and DISPLAY=:99 for the job only. It stops with every other process when the job ends
+ * (killAllOthers).
  */
 import { spawn } from "child_process";
 import * as fs from "fs";
@@ -72,6 +76,37 @@ if (modelDriven) {
   await forwardToProxy(); // ends with this process, after the export
 }
 
+const DISPLAY = ":99";
+const X_SOCKETS = "/tmp/.X11-unix";
+
+/**
+ * Starts Xvfb and waits for its socket. /tmp is the job's tmpfs, so the socket folder is made
+ * here, world-writable and sticky as X expects (a non-root Xvfb cannot make it so itself).
+ */
+async function startXvfb(): Promise<void> {
+  fs.mkdirSync(X_SOCKETS, { recursive: true });
+  fs.chmodSync(X_SOCKETS, 0o1777); // the umask clears bits of mkdir's mode
+  const xvfb = spawn("Xvfb", [DISPLAY, "-screen", "0", "1600x1000x24", "-nolisten", "tcp"], {
+    stdio: ["ignore", 2, 2],
+  });
+  let ended: string | undefined;
+  xvfb.on("error", (error) => (ended = error.message));
+  xvfb.on("exit", (code, signal) => (ended = `exited (${code ?? signal})`));
+  const socket = `${X_SOCKETS}/X${DISPLAY.slice(1)}`;
+  for (let i = 0; i < 200 && !fs.existsSync(socket); i++) {
+    if (ended != null) break;
+    await Bun.sleep(50);
+  }
+  if (ended != null || !fs.existsSync(socket)) {
+    console.error(
+      `sandbox entry: Xvfb ${ended ?? "made no socket in 10 s"}, so the job does not run`
+    );
+    process.exit(2);
+  }
+}
+const electronJob = process.env.BUGBASH_ELECTRON === "1";
+if (electronJob) await startXvfb();
+
 /** Linux skips PID 1 and the caller. When this process exits, docker-init exits too. */
 function killAllOthers(): void {
   try {
@@ -103,7 +138,7 @@ let finished = false;
 async function finish(code: number): Promise<void> {
   if (finished) return;
   finished = true;
-  killAllOthers(); // the app and Chromium too: nothing writes to the output after this
+  killAllOthers(); // the app, Chromium, Electron and Xvfb too: nothing writes to the output after this
   await othersGone();
   if (fixture !== undefined) {
     // One frame the host must refuse: a path out of the export folder, or a declared size past
@@ -126,7 +161,10 @@ const done = (code: number): void => {
     process.exit(1);
   });
 };
-const job = spawn(command, commandArgs, { stdio: ["ignore", 2, 2] });
+const job = spawn(command, commandArgs, {
+  stdio: ["ignore", 2, 2],
+  ...(electronJob && { env: { ...process.env, DISPLAY } }),
+});
 job.on("error", (error) => {
   console.error(`sandbox entry: ${command}: ${error.message}`);
   done(127);

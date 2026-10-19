@@ -5,7 +5,7 @@ import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { appControlPath, readAppControl } from "./appControl";
-import { appSwitches, waitForHealth } from "./startApp";
+import { appSwitches, distFile, waitForHealth } from "./startApp";
 
 let server: net.Server | undefined;
 let child: ChildProcess | undefined;
@@ -187,3 +187,12 @@ test("SIGTERM during a restart stops cleanly, with no new server", async () => {
   );
   expect(error).toBeInstanceOf(Error);
 }, 30_000);
+
+test("the Electron renderer server maps URL paths into dist only", () => {
+  const dist = "/repo/dist";
+  expect(distFile(dist, "/")).toBe("/repo/dist/index.html");
+  expect(distFile(dist, "/assets/a%20b.js")).toBe("/repo/dist/assets/a b.js");
+  // A path out of dist (raw or encoded), or one that cannot be decoded, gets no file.
+  for (const outside of ["/../package.json", "/%2e%2e/package.json", "/a/../../x", "/%E0%A4%A"])
+    expect(distFile(dist, outside)).toBeNull();
+});

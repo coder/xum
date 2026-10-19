@@ -5,6 +5,7 @@
  *   bun sandbox/launch.ts -- run --config e2e.mcpapps.config.ts --output .e2e/<folder> [...]
  *   bun sandbox/launch.ts -- run --config e2e.config.ts --tag agent --output .e2e/<folder> [...]
  *   from tests/stories: bun ../bugbash/sandbox/launch.ts -- run --config e2e.config.ts --output .e2e/<folder> [...]
+ *   from tests/stories: bun ../bugbash/sandbox/launch.ts -- run --config e2e.electron.config.ts --output .e2e/<folder> [...]
  *   bun sandbox/launch.ts -- explore "<goal>" --config e2e.config.ts --output .e2e/<folder> [...]
  *   bun sandbox/launch.ts -- self-check [--export-fixture traversal|oversize] --output .e2e/<folder>
  *     (selfCheckRun.ts, `make bug-bash-sandbox-check`, against a fake upstream)
@@ -16,7 +17,8 @@
  * back on its stdout as an export stream (exportStream.ts).
  *
  * These job kinds run, with the mock app AI unless run.ts resolved the real one for explore. An exact-step repro run gets no model. The MCP
- * Apps suite, the story suite (tests/stories), the agent repros (`--tag agent` alone; both
+ * Apps suite, the story suite (tests/stories), the Electron stories (tests/stories/electron,
+ * with Xvfb in the container), the agent repros (`--tag agent` alone; all three
  * `make test-stories`) and an `e2e explore` charter (run.ts, `make bug-bash`) are model-driven: their
  * explorer reaches BUGBASH_MODEL (default Sonnet 5.5) only through a provider proxy (proxy.ts)
  * that this process runs for the job, on a unix socket that the container gets read-only. The
@@ -100,6 +102,10 @@ const modeEnv = (ai: AppAi): Record<string, string> =>
     : { BUGBASH_AI: "real", BUGBASH_AI_RESOLVED: "real", BUGBASH_AI_REASON: ai.reason,
         BUGBASH_APP_MODEL: `anthropic:${ai.model}` }; // prettier-ignore
 const MCP_APPS_CONFIG = "e2e.mcpapps.config.ts";
+/** The Electron stories' config in tests/stories (e2e.electron.config.ts). */
+const ELECTRON_CONFIG = "e2e.electron.config.ts";
+/** The Electron binary that the Electron stories start: `make electron-binary` downloads it. */
+const ELECTRON_BINARY = "node_modules/electron/dist/electron";
 const MCP_APPS_MODEL = "anthropic:claude-sonnet-5-5";
 
 /** The explorer model, the spend cap and the upstream of a model-driven job. */
@@ -444,6 +450,8 @@ function checkJob(args: string[], o: LaunchOptions) {
   const mcpApps = exactStepRefusal(args, o.cwd, bugbash, MCP_APPS_CONFIG) == null;
   // The story suite (`make test-stories`): its own config in tests/stories, model-driven.
   const stories = exactStepRefusal(args, o.cwd, storiesDir) == null;
+  // The Electron stories (`make test-stories`): a config of their own, model-driven, with Xvfb.
+  const electron = exactStepRefusal(args, o.cwd, storiesDir, ELECTRON_CONFIG) == null;
   const exactStep = exactStepRefusal(args, o.cwd, bugbash) == null;
   // The agent repros (`make test-stories`): the repro config with `--tag agent` alone, so the run
   // selects only repros whose every step may call a model (reproRules.test.ts).
@@ -455,20 +463,27 @@ function checkJob(args: string[], o: LaunchOptions) {
   } else if (args[0] === "explore") {
     const notExplore = exploreRefusal(args, o.cwd, bugbash);
     if (notExplore != null) throw new Refusal(`${notExplore}: not one explore charter (#5714)`);
-  } else if (!mcpApps && !stories) {
+  } else if (!mcpApps && !stories && !electron) {
     const notExact = exactStepRefusal(args, o.cwd, bugbash);
     if (notExact != null)
       throw new Refusal(
-        `${notExact}: only exact-step repros, the agent repros, the MCP Apps suite, the story suite and explore charters run (#5714)`
+        `${notExact}: only exact-step repros, the agent repros, the MCP Apps suite, the story suites and explore charters run (#5714)`
       );
     // Any other selection by the agent tag would run agent repros with no model: each fails.
     if (!agentRepros && namesAgentTag(args))
       throw new Refusal("agent repros run only with `--tag agent` alone and no --tag-mode (#5714)");
   }
+  // node_modules is mounted as it is, and bun install leaves the binary out when Electron's
+  // postinstall did not run. Without it every attempt would fail at its first spawn.
+  if (
+    electron &&
+    fs.lstatSync(path.join(o.root, ELECTRON_BINARY), { throwIfNoEntry: false })?.isFile() !== true
+  )
+    throw new Refusal(`${ELECTRON_BINARY} is missing: run make electron-binary`);
   // First, before any docker command and before the container env exists.
   const ai = appAi(o.env, args[0] === "explore");
   // A model-driven `e2e run`: every test needs the explorer model, so the launcher probes it.
-  const drivenRun = mcpApps || stories || agentRepros;
+  const drivenRun = mcpApps || stories || electron || agentRepros;
   const driven = drivenRun || selfCheck || args[0] === "explore" ? modelJob(o.env) : undefined;
   // The stale-key local build: CI's bugbash-sandbox job sets BUGBASH_SANDBOX_BUILD_STALE=1, so a pull request that
   // changes the image inputs can pass before main publishes its image. Only the self-check and
@@ -480,8 +495,9 @@ function checkJob(args: string[], o: LaunchOptions) {
   const localBuild =
     o.env.BUGBASH_SANDBOX_BUILD_STALE === "1" && (selfCheck || (exactStep && !agentRepros));
   // The job's folder: its cwd in the container, and where its output comes back.
-  const dir = stories ? storiesDir : bugbash;
-  return { dir, drivenRun, selfCheck, ai, driven, localBuild, stories };
+  const storyJob = stories || electron;
+  const dir = storyJob ? storiesDir : bugbash;
+  return { dir, drivenRun, selfCheck, ai, driven, localBuild, storyJob, electron };
 }
 
 /** A job's checks and the Docker check, with no job: `--preflight` (Makefile, before the build). */
@@ -493,7 +509,10 @@ export async function preflight(args: string[], o: LaunchOptions): Promise<Clean
 /** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
 export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
   const log = o.log ?? logLine;
-  const { dir, drivenRun, selfCheck, ai, driven, localBuild, stories } = checkJob(args, o);
+  const { dir, drivenRun, selfCheck, ai, driven, localBuild, storyJob, electron } = checkJob(
+    args,
+    o
+  );
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
@@ -581,7 +600,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     }
     made = true;
     const staged = path.join(jobDir, "stage");
-    log(`${name} staged ${stage(o.root, staged, { cacheSeed: stories })} files`);
+    log(`${name} staged ${stage(o.root, staged, { cacheSeed: storyJob })} files`);
     const nonce = crypto.randomUUID();
     fs.writeFileSync(path.join(staged, ".sandbox-nonce"), nonce, { flag: "wx" });
     const [uid, gid] = [process.getuid!(), process.getgid!()];
@@ -598,9 +617,17 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
       BUGBASH_MODEL: `anthropic:${driven.model}`,
       BUGBASH_MODEL_DRIVEN: "1",
     };
-    const env = containerEnv(o.env, { ...jobEnv(output), ...host, ...modeEnv(ai), ...drivenEnv });
+    // entry.ts starts Xvfb for this job only.
+    const electronEnv = electron && { BUGBASH_ELECTRON: "1" };
+    const env = containerEnv(o.env, {
+      ...jobEnv(output),
+      ...host,
+      ...modeEnv(ai),
+      ...drivenEnv,
+      ...electronEnv,
+    });
     plainFolders(dir, path.dirname(output), true);
-    // A model-driven `e2e run` (the MCP Apps suite, the story suite, the agent repros) fails
+    // A model-driven `e2e run` (the MCP Apps suite, the story suites, the agent repros) fails
     // every test without its explorer model, so one probe call of that model, through the job's
     // ledger, refuses a dead upstream or key before the container starts. run.ts probes before
     // its explore jobs; the self-check has a fake upstream.

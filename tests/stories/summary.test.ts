@@ -183,3 +183,43 @@ test("with no recorded entry the seed stays as it was", () => {
   expect(fs.readdirSync(seed)).toEqual([entry(1)]);
   expect(fs.readFileSync(path.join(seed, entry(1)), "utf8")).toBe("old seed");
 });
+
+test("the Electron story job gets its own rows and spend line", () => {
+  const web = "tests/stories/.e2e/stories-20261019T100000Z-1";
+  const electron = "tests/stories/.e2e/stories-electron-20261019T100100Z-1";
+  const result = (title: string) => ({
+    titlePath: [title],
+    status: "passed",
+    attempts: [{ durationMs: 1000, steps: [] }],
+  });
+  write(`${web}/report.json`, { run: { status: "passed", results: [result("web smoke")] } });
+  write(`${electron}/report.json`, {
+    run: { status: "passed", results: [result("electron smoke")] },
+  });
+  write(`${electron}.spend.json`, { spentUsd: 0.5, capUsd: 3, settled: 4, refused: 0 });
+  write("tests/stories/.e2e/stories-electron-preflight/report.json", { run: { results: [] } });
+
+  const summary = summarize(root);
+  expect(row(summary, "web smoke")?.[0]).toBe("`stories-20261019T100000Z-1`");
+  expect(row(summary, "electron smoke")?.[0]).toBe("`stories-electron-20261019T100100Z-1`");
+  // Each job once: the web kind's prefix also starts the Electron folder names.
+  expect(summary.split("\n").filter((line) => line.includes("electron smoke")).length).toBe(1);
+  expect(summary).not.toContain("stories-electron-preflight");
+  expect(summary).toContain(
+    "- `stories-electron-20261019T100100Z-1`: e2e passed. $0.50 spent of the $3.00 cap, 4 calls settled, 0 refused."
+  );
+});
+
+test("the next seed merges both story jobs' caches, less what either deleted", () => {
+  const seed = path.join(root, "tests/stories/.e2e-cache-seed");
+  // The seed both jobs started from: entry 1 replays in both, entry 2 the Electron job deleted.
+  for (const n of [1, 2])
+    write(`tests/stories/.e2e-cache-seed/${entry(n)}`, { createdAt: new Date(n * 1000) });
+  const web = "tests/stories/.e2e/stories-20261019T100000Z-1/cache";
+  const electron = "tests/stories/.e2e/stories-electron-20261019T100100Z-1/cache";
+  for (const n of [1, 2, 10]) write(`${web}/${entry(n)}`, { createdAt: new Date(n * 1000) });
+  for (const n of [1, 20]) write(`${electron}/${entry(n)}`, { createdAt: new Date(n * 1000) });
+
+  expect(nextSeed(root, seed)).toBe(3);
+  expect(fs.readdirSync(seed).sort()).toEqual([entry(1), entry(10), entry(20)]);
+});

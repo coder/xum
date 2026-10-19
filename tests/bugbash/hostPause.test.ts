@@ -120,6 +120,17 @@ test.each([
     e2e("run", "--config", "../stories/e2e.config.ts"),
     { BUGBASH_AI: "mock", BUGBASH_CONTAINER: "1", BUGBASH_MODEL_DRIVEN: "1" },
   ],
+  // The Electron stories (tests/stories/e2e.electron.config.ts): the same pause, first import.
+  [
+    "e2e run, Electron stories",
+    e2e("run", "--config", "../stories/e2e.electron.config.ts"),
+    { BUGBASH_AI: "mock" },
+  ],
+  [
+    "e2e list, Electron stories, no app AI mode",
+    e2e("list", "--config", "../stories/e2e.electron.config.ts"),
+    {},
+  ],
   [
     "e2e explore, real app AI",
     e2e("explore", "--config", "e2e.config.ts", "x"),

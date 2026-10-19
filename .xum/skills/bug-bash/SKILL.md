@@ -17,15 +17,16 @@ Xum harness. Where the two differ, follow this skill.
 ## How the sandbox works
 
 - The host pause (`tests/bugbash/hostPause.ts`) refuses every model-driven e2e process on the host
-  with exit 2: `e2e explore`, and every command with `e2e.mcpapps.config.ts` or
-  `tests/stories/e2e.config.ts`. Outside the sandbox
+  with exit 2: `e2e explore`, and every command with `e2e.mcpapps.config.ts`,
+  `tests/stories/e2e.config.ts` or `tests/stories/e2e.electron.config.ts`. Outside the sandbox
   the agents hold no model, so an `agent.*` step fails with `MODEL_UNAVAILABLE`. No override
   exists. `e2e run` and `e2e list` of exact-step repros still run on the host.
 - `make bug-bash` (`tests/bugbash/run.ts`), `make mcp-apps-e2e` and `make test-stories` are the
   launchers. They run
   `tests/bugbash/sandbox/launch.ts`, one container per job.
 - The image `ghcr.io/coder/xum-bugbash-sandbox` (about 1.4 GB, linux/amd64) holds only tools:
-  Node 22, Bun, git and the Chromium of `@e2e-dev/web`'s playwright-core. The runner pulls it only
+  Node 22, Bun, git, the Chromium of `@e2e-dev/web`'s playwright-core, and Xvfb plus libgtk-3
+  for Xum Electron (the Electron binary comes from the mounted node_modules). The runner pulls it only
   by the digest in `tests/bugbash/sandbox/image.json`. It builds it only in the case below.
 - The inputs key (`make bugbash-sandbox-key`) is a hash of the Dockerfile, `build.sh` and the
   playwright-core version in `bun.lock`. The runner refuses an image whose key differs from the
@@ -123,21 +124,36 @@ Suite tests drive flows with `agent.act` in on-screen words and pin each outcome
 tree also lists off-screen nodes. Prove a new suite test fails on the old `dist/` before the fix
 lands.
 
-Stories: `make test-stories BUGBASH_BUDGET_USD=3` runs two sandbox jobs with `BUGBASH_MODEL`
+Stories: `make test-stories BUGBASH_BUDGET_USD=3` runs three sandbox jobs with `BUGBASH_MODEL`
 (default Sonnet 5.5) and the mock app AI. The first job runs the story tests,
 `tests/stories/*.e2e.ts`: user stories that one plain agent drives with `agent.act` and
-`agent.assert`, each pinned by an exact `expect`. The second job runs the `agent`-tagged repros
-(`e2e run --tag agent`, and no other `--tag` or `--tag-mode`). The budget caps each job.
-`STORIES_ARGS` passes e2e arguments to both jobs. A story config change goes in
-`tests/stories/e2e.config.ts`, which reuses the web target of `tests/bugbash/e2e.config.ts`.
+`agent.assert`, each pinned by an exact `expect`. The second job runs the Electron stories,
+`tests/stories/electron/*.e2e.ts` (`tests/stories/e2e.electron.config.ts`), on Xum Electron.
+The third job runs the `agent`-tagged repros (`e2e run --tag agent`, and no other `--tag` or
+`--tag-mode`). The budget and the 30-minute deadline apply to each job. `STORIES_ARGS` passes e2e
+arguments to every job. A story config change goes in `tests/stories/e2e.config.ts`, which
+reuses the web target of `tests/bugbash/e2e.config.ts`; both story configs share
+`tests/stories/storyConfig.ts`.
+Electron stories: the target first downloads the Electron binary on the host
+(`make electron-binary`, a prerequisite of `make test-stories`; it needs Node.js), and the
+launcher refuses an Electron job without `node_modules/electron/dist/electron`. In the container,
+`sandbox/entry.ts` starts Xvfb (`:99`, no TCP) for that job only. The target's app,
+`startApp.ts --electron`, seeds XUM_ROOT with tutorials off, writes a control file
+(`tests/bugbash/appControl.ts`) and serves the built `dist/` on 127.0.0.1. The provider
+(`tests/stories/electronProvider.ts`) starts one Xum Electron per attempt with an allowlisted env:
+the mock AI, agent tools, terminals and project automation off, no HTTP API server, and never
+`XUM_ALLOW_MULTIPLE_INSTANCES`. It refuses to start Electron when a switch is missing. In Electron
+the seeded project starts collapsed: tap "Expand project demo-app" first. `app.clearState()`,
+extra headers and locale overrides do not work on this target (one fresh app per attempt).
 The first run, with one smoke story and no agent repro, spent $0.09 at list price and took about
-2 minutes with the build. Each job's results come back to `tests/stories/.e2e/stories-<time>-<pid>/`
-and `tests/bugbash/.e2e/agent-repros-<time>-<pid>/`, each with its `.proxy.jsonl` and a
+2 minutes with the build. Each job's results come back to `tests/stories/.e2e/stories-<time>-<pid>/`,
+`tests/stories/.e2e/stories-electron-<time>-<pid>/` (with `electron.log`) and
+`tests/bugbash/.e2e/agent-repros-<time>-<pid>/`, each with its `.proxy.jsonl` and a
 `.spend.json` (the job's spend at list price, its cap and its proxy call counts).
 Replay cache (`tests/bugbash/sandbox/cacheSeed.ts`): each story job records its verified
 `agent.act` steps (e2e read-write mode) into `<output>/cache/`, which comes back with the output.
-To replay them on the next run without model calls, copy those files into
-`tests/stories/.e2e-cache-seed/`: `mkdir -p tests/stories/.e2e-cache-seed && cp tests/stories/.e2e/stories-<time>-<pid>/cache/*.json tests/stories/.e2e-cache-seed/`.
+To replay them on the next run without model calls, copy those files of both story jobs into
+`tests/stories/.e2e-cache-seed/`: `mkdir -p tests/stories/.e2e-cache-seed && cp tests/stories/.e2e/stories-<time>-<pid>/cache/*.json tests/stories/.e2e-cache-seed/` (and the same for `stories-electron-<time>-<pid>`).
 The folder is git-ignored so that no `git add -A` commits it. The launcher stages it into the
 job (a story job only) and refuses any entry that is not a regular `<sha256>.json` file of 1 MiB
 or less, more than 1000 entries, or more than 128 MiB in all. Each run
@@ -148,8 +164,8 @@ and on demand (Actions > Stories > Run workflow, on any branch). It is not part 
 the queue does not wait for it and a failure blocks no merge. It restores the seed with actions/cache
 (this ref's newest, else main's), writes a table of the tests, their cache outcomes and each
 job's spend to the job summary, and, except in the merge queue, saves the next seed: `bun
-tests/stories/summary.ts --next-seed <dir>` (the newest story job's cache, at most 1000 entries
-and 128 MiB). GitHub scopes a saved cache to its ref, and a queue ref is temporary, so a
+tests/stories/summary.ts --next-seed <dir>` (the caches of the newest web and Electron story
+jobs, less the seed entries either one deleted, at most 1000 entries and 128 MiB). GitHub scopes a saved cache to its ref, and a queue ref is temporary, so a
 merge-queue run saves none. Only the nightly and on-demand runs on main change what main replays. A PR that changes the sandbox image inputs fails there until main publishes the image.
 To check state across a server restart, a story imports `test` from `tests/stories/fixtures.ts`
 and calls `xum.restartServer()` (same port and XUM_ROOT), then `app.open()`: e2e's

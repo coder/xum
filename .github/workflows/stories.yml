@@ -1,7 +1,7 @@
 name: Stories
 
-# The agentic story lane (`make test-stories`): the story tests and the agent-tagged repros, each
-# as a model-driven job in the bug-bash sandbox. A workflow of its own, apart from pr.yml, so
+# The agentic story lane (`make test-stories`): the story tests, the Electron stories and the
+# agent-tagged repros, each as a model-driven job in the bug-bash sandbox. A workflow of its own, apart from pr.yml, so
 # that the Required job never waits on it: a failure here shows on the PR but blocks no merge.
 #
 # Triggers: change only this block to pick when it runs. The job below works unchanged under
@@ -33,10 +33,10 @@ jobs:
     # Only for pull_request (off now, see on:): fork and Dependabot PRs get no Actions secrets.
     if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
     runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
-    # Two jobs of at most 30 minutes each (launch.ts DEADLINE_MS) after a build of up to about
-    # 10 minutes, plus the setup, the image pull and the cache steps: 80. A warm run takes a few
+    # Three jobs of at most 30 minutes each (launch.ts DEADLINE_MS) after a build of up to about
+    # 10 minutes, plus the setup, the image pull and the cache steps: 110. A warm run takes a few
     # minutes; the cap only bounds a hung run.
-    timeout-minutes: 80
+    timeout-minutes: 110
     env:
       # The cache key's ref: the PR branch on pull_request, else the ref name (a branch, or
       # gh-readonly-queue/main/pr-<n>-<sha> in the merge queue). In env, not inline in run:.
@@ -58,6 +58,11 @@ jobs:
           restore-keys: |
             stories-cache-${{ env.CACHE_REF }}-
             stories-cache-main-
+      # The Electron stories start node_modules/electron/dist/electron, which the sandbox mounts
+      # read-only. make test-stories runs this too (a prerequisite); a step of its own shows a
+      # failed download apart from the jobs.
+      - name: make electron-binary
+        run: make electron-binary
       # make test-stories refuses a stale sandbox image key (a PR that changes the Dockerfile):
       # BUGBASH_SANDBOX_BUILD_STALE does not apply to model-driven jobs (launch.ts), so such a PR
       # fails here until main publishes the image and image.json pins it.
@@ -69,7 +74,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_BASE_URL: https://api.anthropic.com
           BUGBASH_AI: mock
-          # The cap per job, so one run spends at most twice this.
+          # The cap per job, so one run spends at most three times this.
           BUGBASH_BUDGET_USD: "3"
       - name: Summary
         if: always()

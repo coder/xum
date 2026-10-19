@@ -670,6 +670,7 @@ function prepare(over: Record<string, string> = {}, leftovers: string[] = []) {
   fs.writeFileSync(path.join(real, "tests/bugbash/e2e.mcpapps.config.ts"), "export default {}");
   fs.mkdirSync(path.join(real, "tests/stories"), { recursive: true });
   fs.writeFileSync(path.join(real, "tests/stories/e2e.config.ts"), "export default {}");
+  fs.writeFileSync(path.join(real, "tests/stories/e2e.electron.config.ts"), "export default {}");
   fake({ IMAGES: "sha256:abc", SWAP: path.join(real, "node_modules"), ...over });
   return path.join(real, "tests/bugbash");
 }
@@ -1149,6 +1150,18 @@ const STORIES: DrivenRun = {
   ],
   folder: "tests/stories",
 };
+const ELECTRON_STORIES: DrivenRun = {
+  // prettier-ignore
+  args: ["run", "--config", "e2e.electron.config.ts", "--exclude-tag", "known-failure",
+    "--output", ".e2e/m"],
+  folder: "tests/stories",
+};
+/** The Electron binary that `make electron-binary` downloads. */
+function electronBinary() {
+  const binary = path.join(fs.realpathSync(root), "node_modules/electron/dist/electron");
+  fs.mkdirSync(path.dirname(binary), { recursive: true });
+  fs.writeFileSync(binary, "");
+}
 const AGENT_REPROS: DrivenRun = {
   // prettier-ignore
   args: ["run", "--config", "e2e.config.ts", "--tag", "agent", "--exclude-tag", "known-failure",
@@ -1158,8 +1171,10 @@ const AGENT_REPROS: DrivenRun = {
 
 test.each([
   ["the story suite", STORIES],
+  ["the Electron stories", ELECTRON_STORIES],
   ["the agent repros", AGENT_REPROS],
 ])("%s is a model-driven job: probe, proxy and model, in its own folder", async (_name, job) => {
+  electronBinary();
   const { code, requests } = await mcpLaunch({ RUN: "proxycall" }, {}, undefined, undefined, job);
   expect(code).toBe(7);
   const run = calls()
@@ -1172,7 +1187,10 @@ test.each([
   // Its cwd, its output tmpfs and the export: the job's folder. entry.ts stays in tests/bugbash.
   expect(run).toContain(`--tmpfs /repo/${job.folder}/.e2e:rw,`);
   expect(run).toContain(`--workdir /repo/${job.folder} --entrypoint bun`);
-  const entry = job === STORIES ? "../bugbash/sandbox/entry.ts" : "sandbox/entry.ts";
+  // Only the Electron job gets Xvfb (entry.ts).
+  if (job === ELECTRON_STORIES) expect(run).toContain("--env BUGBASH_ELECTRON=1");
+  else expect(run).not.toContain("BUGBASH_ELECTRON");
+  const entry = job === AGENT_REPROS ? "sandbox/entry.ts" : "../bugbash/sandbox/entry.ts";
   expect(run).toMatch(new RegExp(` ${entry.replace(/\./g, "\\.")} --export \\.e2e/m -- node `));
   expect(fs.readFileSync(path.join(root, job.folder, ".e2e/m/app.log"), "utf8")).toBe("ok");
   expect(requests).toHaveLength(2); // the probe, then the job's call
@@ -1183,6 +1201,12 @@ test.each([
   ["the story suite without a budget", STORIES, { BUGBASH_BUDGET_USD: "" }, /BUGBASH_BUDGET_USD/],
   ["the agent repros without a budget", AGENT_REPROS, { BUGBASH_BUDGET_USD: "" }, /BUDGET/],
   ["the story suite with the real app AI", STORIES, { BUGBASH_AI: "real" }, /only the mock/],
+  [
+    "the Electron stories without the Electron binary",
+    ELECTRON_STORIES,
+    {},
+    /node_modules\/electron\/dist\/electron is missing: run make electron-binary/,
+  ],
   [
     "the story config from tests/bugbash",
     {

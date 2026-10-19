@@ -5,9 +5,10 @@
  * e2e.config.ts runs this as the target's `app.command` with `--port {port}`, so every
  * explorer gets its own app on its own free port, and explorers never see each other's edits.
  *
- * Usage: bun tests/bugbash/startApp.ts --port <port> [--mcp-apps]   (needs `make build`: dist/ +
- *        renderer). --mcp-apps adds an MCP Apps server and a chat with its tool calls
- *        (mcpapps/seed.ts); e2e.mcpapps.config.ts passes it.
+ * Usage: bun tests/bugbash/startApp.ts --port <port> [--mcp-apps | --electron]   (needs `make
+ *        build`: dist/ + renderer). --mcp-apps adds an MCP Apps server and a chat with its tool
+ *        calls (mcpapps/seed.ts); e2e.mcpapps.config.ts passes it. --electron serves no `xum
+ *        server`: see serveElectronApp (tests/stories/e2e.electron.config.ts passes it).
  *
  * Steps:
  * 1. Create a temp root holding XUM_ROOT, HOME and a throwaway git repo.
@@ -45,7 +46,12 @@ import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { type AiMode, AiModeError, resolveAiMode } from "./aiMode";
-import { appControlPath, writeAppControl } from "./appControl";
+import {
+  appControlPath,
+  electronControlPath,
+  writeAppControl,
+  writeElectronControl,
+} from "./appControl";
 import { proxySocketMounted, sandboxShaped } from "./sandbox/inContainer";
 import { startFakeProvider } from "./fakeProvider";
 import { seedMcpChat, writeMcpConfig } from "./mcpapps/seed";
@@ -273,9 +279,17 @@ async function seed(
   ai: AiMode,
   fakeProviderOrigin: string | undefined,
   pluginSources: Map<string, string>,
-  gitEnv: NodeJS.ProcessEnv
+  gitEnv: NodeJS.ProcessEnv,
+  electron: boolean
 ): Promise<string> {
   await api(base, "splashScreens/markSplashScreenViewed", { splashId: "onboarding-wizard-v1" });
+  // Web stories turn tutorials off per test over the app's HTTP API (repros/helpers.ts
+  // disableTutorials). Xum Electron serves no HTTP API (XUM_NO_API_SERVER=1), so its seed does it.
+  if (electron) {
+    await api(base, "config/updateUserPreferences", {
+      patches: [{ ui: { tutorialState: { disabled: true } } }],
+    });
+  }
   await api(base, "experiments/set", { experimentId: "artifacts", enabled: true });
   // MCP App views have their own experiment (#6760); the MCP Apps suite and repros need it.
   await api(base, "experiments/set", { experimentId: "mcp-apps", enabled: true });
@@ -571,9 +585,66 @@ export async function serve(
   return code;
 }
 
+/** The built renderer's file for a URL path, or null when the path leaves `dist`. */
+export function distFile(dist: string, urlPath: string): string | null {
+  let rel: string;
+  try {
+    rel = decodeURIComponent(urlPath);
+  } catch {
+    return null;
+  }
+  const file = path.resolve(dist, `.${rel === "/" ? "/index.html" : rel}`);
+  return file === dist || file.startsWith(`${dist}${path.sep}`) ? file : null;
+}
+
+/**
+ * `--electron`: the app of the Electron story target. The seeded XUM_ROOT stays, and no `xum
+ * server` serves it: Xum Electron (tests/stories/electronProvider.ts) runs the backend in its
+ * main process. This process serves the built renderer on 127.0.0.1:`port` (Electron's
+ * XUM_DEVSERVER_PORT, and the target's app URL that e2e polls), after it wrote the control file
+ * (appControl.ts) that tells the provider the root, the port and the app switches. Not the Vite
+ * dev server: it writes node_modules/.vite, which the sandbox mounts read-only. Not file://: e2e
+ * needs an http app URL. Returns once SIGINT or SIGTERM came.
+ */
+async function serveElectronApp(
+  slot: ServerSlot,
+  port: number,
+  root: string,
+  switches: Record<string, string>
+): Promise<void> {
+  const dist = path.join(REPO_ROOT, "dist");
+  const stopped = new Promise<void>((resolve) => {
+    for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => resolve());
+  });
+  if (slot.stopping) return; // a signal during the seed
+  writeElectronControl({ pid: process.pid, port, root, switches, ready: true });
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port,
+    async fetch(request) {
+      const file = distFile(dist, new URL(request.url).pathname);
+      if (file == null) return new Response("not found", { status: 404 });
+      const found = Bun.file(file);
+      // A client-side route: the renderer's own router resolves it.
+      return (await found.exists())
+        ? new Response(found)
+        : new Response(Bun.file(path.join(dist, "index.html")));
+    },
+  });
+  console.log(`[bugbash startApp] serving ${dist} for Xum Electron on 127.0.0.1:${port}`);
+  try {
+    await stopped;
+  } finally {
+    await server.stop(true);
+    fs.rmSync(electronControlPath(), { force: true });
+  }
+}
+
 async function main(): Promise<void> {
   const port = parsePort(process.argv.slice(2));
   const mcpApps = process.argv.includes("--mcp-apps");
+  const electron = process.argv.includes("--electron");
+  if (mcpApps && electron) fail("--mcp-apps and --electron do not combine");
   if (!fs.existsSync(SERVER_ENTRY) || !fs.existsSync(path.join(REPO_ROOT, "dist/index.html"))) {
     fail("dist/ is missing the server or the renderer: run `make build` first");
   }
@@ -653,7 +724,8 @@ async function main(): Promise<void> {
         ai,
         fakeProvider?.origin,
         pluginSources,
-        env
+        env,
+        electron
       );
     } finally {
       seedServer.kill("SIGTERM");
@@ -661,8 +733,18 @@ async function main(): Promise<void> {
     }
     if (mcpApps) seedMcpChat(xumRoot, workspaceId);
 
-    // Every restart serves this same env, XUM_ROOT included: the temp root goes only below.
-    code = await serve(slot, port, () => startServer(port, env));
+    if (electron) {
+      // XUM_MOCK_AI and the three kill switches: what the server env got from appSwitches.
+      const switches = Object.fromEntries(
+        ["XUM_MOCK_AI", ...SWITCHES].flatMap((name) =>
+          env[name] == null ? [] : [[name, env[name]]]
+        )
+      ) as Record<string, string>;
+      await serveElectronApp(slot, port, xumRoot, switches);
+    } else {
+      // Every restart serves this same env, XUM_ROOT included: the temp root goes only below.
+      code = await serve(slot, port, () => startServer(port, env));
+    }
   } finally {
     fakeProvider?.close();
     fs.rmSync(tempRoot, { recursive: true, force: true });
