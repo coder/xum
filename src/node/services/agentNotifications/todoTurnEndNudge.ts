@@ -1,3 +1,4 @@
+import type { MuxMessage } from "@/common/types/message";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { SendMessageOptions } from "@/common/orpc/types";
@@ -38,16 +39,44 @@ export interface TodoTurnEndNudgeSplit {
 }
 
 /**
- * Splits the nudge's trailing rules off a caller tool policy. Advertising only todo_write
- * changed the tools block, which sits first in the Anthropic prompt cache, so each nudge
- * rewrote the whole cached history twice (once for the nudge, once for the next turn). The
- * request builder now advertises the tools under the rest of the policy and enforces the nudge
- * rules at execution. The rules stay in the persisted policy, so a retried, restarted or
- * compacted nudge (and an older Xum) still narrows.
+ * Whether `message` is the nudge's own user row: synthetic, with exactly the nudge's text (the
+ * transcript renders it by the same test). Provenance, not policy contents: a caller may send
+ * the same todo_write-only rule, and stripping it would lift that caller's restriction.
  */
-export function splitTodoTurnEndNudgePolicy(policy: ToolPolicy | undefined): TodoTurnEndNudgeSplit {
+export function isTodoTurnEndNudgeRow(message: MuxMessage): boolean {
+  if (message.role !== "user" || message.metadata?.synthetic !== true) return false;
+  const text = message.parts.map((part) => (part.type === "text" ? part.text : "")).join("");
+  return text === TODO_TURN_END_NUDGE;
+}
+
+/**
+ * Whether a request's history belongs to a nudge turn: its newest user row with a tool policy
+ * is the nudge row. Rows without one (file-change notices, [CONTINUE] sentinels) do not start
+ * a turn, and a later turn's own row (a wake, a manual send) carries its own policy.
+ */
+export function isTodoTurnEndNudgeTurn(messages: readonly MuxMessage[]): boolean {
+  const turnRow = messages.findLast(
+    (message) => message.role === "user" && message.metadata?.toolPolicy != null
+  );
+  return turnRow != null && isTodoTurnEndNudgeRow(turnRow);
+}
+
+/**
+ * Splits the nudge's trailing rules off the tool policy of a proven nudge turn (`nudgeTurn`).
+ * Advertising only todo_write changed the tools block, which sits first in the Anthropic prompt
+ * cache, so each nudge rewrote the whole cached history twice (once for the nudge, once for
+ * the next turn). The request builder now advertises the tools under the rest of the policy and
+ * enforces the nudge rules at execution. The rules stay in the persisted policy, so a retried,
+ * restarted or compacted nudge (and an older Xum) still narrows. Any other turn keeps its whole
+ * policy, the same rule included.
+ */
+export function splitTodoTurnEndNudgePolicy(
+  policy: ToolPolicy | undefined,
+  nudgeTurn: boolean
+): TodoTurnEndNudgeSplit {
   const ruleCount = TODO_TURN_END_NUDGE_TOOL_POLICY.length;
   const isNudgeTail =
+    nudgeTurn &&
     policy != null &&
     policy.length >= ruleCount &&
     policy
@@ -67,14 +96,15 @@ export function splitTodoTurnEndNudgePolicy(policy: ToolPolicy | undefined): Tod
 }
 
 /**
- * Send options a later turn inherits from one that ended, without the nudge's rules: they
+ * Send options a later turn inherits from a turn that ended, without a nudge turn's rules: they
  * govern the nudge turn alone, like a compaction request's disable-all policy. Inherited, they
  * left a plugin or goal continuation after a nudge with todo_write only (#6720).
  */
 export function withoutTodoTurnEndNudge<T extends { toolPolicy?: ToolPolicy }>(
-  options: T | undefined
+  options: T | undefined,
+  nudgeTurn: boolean
 ): T | undefined {
-  const split = splitTodoTurnEndNudgePolicy(options?.toolPolicy);
+  const split = splitTodoTurnEndNudgePolicy(options?.toolPolicy, nudgeTurn);
   if (options == null || split.executionGate == null) return options;
   const inherited = { ...options };
   // Omitted, not undefined: a spread over persisted options must not clobber their policy.
@@ -83,12 +113,20 @@ export function withoutTodoTurnEndNudge<T extends { toolPolicy?: ToolPolicy }>(
   return inherited;
 }
 
-/** The policy that decides what may run: the advertised policy plus the gate's rules. */
+/**
+ * The policy that decides what may run: the advertised policy plus the gate's rules. A nudge
+ * turn requires no tool: a required tool the gate refuses would keep the turn stepping to
+ * satisfy a call that can never succeed, so its require rules become plain enables.
+ */
 export function withExecutionGate(
   policy: ToolPolicy | undefined,
   gate: TodoTurnEndNudgeSplit["executionGate"]
 ): ToolPolicy | undefined {
-  return gate == null ? policy : [...(policy ?? []), ...gate.policy];
+  if (gate == null) return policy;
+  const enforced = (policy ?? []).map((rule) =>
+    rule.action === "require" ? { ...rule, action: "enable" as const } : rule
+  );
+  return [...enforced, ...gate.policy];
 }
 
 /** A todo_write call that ran and succeeded; a refused or failed call is not a list write. */

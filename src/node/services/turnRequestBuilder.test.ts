@@ -22,11 +22,13 @@ import { createTestHistoryService } from "./testHistoryService";
 import {
   TurnRequestBuilder,
   assembleBudgetCheckedPromptPayload,
+  forcedXaiSearchToolNames,
   prepareProviderRequestMessages,
   resolveMuxProjectRootForHostFs,
   resolveXumToolScope,
   type PrepareModelAttemptOptions,
 } from "./turnRequestBuilder";
+import { TODO_TURN_END_NUDGE_EXECUTION_GATE } from "./agentNotifications/todoTurnEndNudge";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 
 async function createPreparationHarness() {
@@ -720,6 +722,24 @@ describe("TurnRequestBuilder model attempt preparation", () => {
     } finally {
       await harness.cleanup();
     }
+  });
+});
+
+describe("forcedXaiSearchToolNames", () => {
+  // A forced search is a paid provider call: the todo nudge only updates the list.
+  it("forces no xAI search on a todo nudge turn", () => {
+    const input = {
+      routeProvider: "xai" as const,
+      capabilityModelString: "xai:grok-4.5",
+      searchParameters: { mode: "on" as const },
+      tools: { web_search: {}, x_search: {} },
+    };
+    expect(
+      forcedXaiSearchToolNames({ ...input, executionGate: undefined })?.length
+    ).toBeGreaterThan(0);
+    expect(
+      forcedXaiSearchToolNames({ ...input, executionGate: TODO_TURN_END_NUDGE_EXECUTION_GATE })
+    ).toBeUndefined();
   });
 });
 

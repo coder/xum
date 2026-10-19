@@ -9,7 +9,7 @@ import { createMuxMessage } from "@/common/types/message";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
   mergeTurnStopContinuation,
-  splitTodoTurnEndNudgePolicy,
+  TODO_TURN_END_NUDGE_TOOL_POLICY,
 } from "@/node/services/agentNotifications/todoTurnEndNudge";
 import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
@@ -1886,12 +1886,28 @@ describe("TaskService", () => {
 
   // #6720: the nudge row carries the caller policy plus the nudge's own todo_write-only rule.
   // That rule governs the nudge turn alone; a wake that adopted it ran with todo_write only.
+  // Only the nudge's own row loses the rule: any other row that sends it keeps it.
+  const bashOff: ToolPolicy = [{ regex_match: "^bash$", action: "disable" }];
   test.each([
-    { label: "an unrestricted caller", callerPolicy: undefined },
-    { label: "a restricted caller", callerPolicy: [{ regex_match: "^bash$", action: "disable" }] },
-  ] satisfies Array<{ label: string; callerPolicy: ToolPolicy | undefined }>)(
-    "a report wake after a todo nudge restores $label's tools, not the nudge's",
-    async ({ callerPolicy }) => {
+    { label: "a nudge after an unrestricted send", callerPolicy: undefined, newest: "nudge" },
+    { label: "a nudge after a restricted send", callerPolicy: bashOff, newest: "nudge" },
+    {
+      label: "a manual send with the nudge's rule",
+      callerPolicy: TODO_TURN_END_NUDGE_TOOL_POLICY,
+      newest: "none",
+    },
+    {
+      label: "a synthetic non-nudge row with the nudge's rule",
+      callerPolicy: undefined,
+      newest: "other-synthetic",
+    },
+  ] satisfies Array<{
+    label: string;
+    callerPolicy: ToolPolicy | undefined;
+    newest: "nudge" | "other-synthetic" | "none";
+  }>)(
+    "a report wake after $label restores the caller's restriction",
+    async ({ callerPolicy, newest }) => {
       const config = await createTestConfig(rootDir);
       const projectPath = path.join(rootDir, "repo");
       const parentWorkspaceId = "parent-nudge-111";
@@ -1940,14 +1956,28 @@ describe("TaskService", () => {
         todoNudge: true,
         callerToolPolicy: callerPolicy,
       });
-      await historyService.appendToHistory(
-        parentWorkspaceId,
-        createMuxMessage("nudge", "user", nudge?.prompt ?? "", {
-          timestamp: 1_100,
-          synthetic: true,
-          toolPolicy: nudge?.optionOverrides?.toolPolicy,
-        })
-      );
+      if (newest === "nudge") {
+        await historyService.appendToHistory(
+          parentWorkspaceId,
+          createMuxMessage("nudge", "user", nudge?.prompt ?? "", {
+            timestamp: 1_100,
+            synthetic: true,
+            toolPolicy: nudge?.optionOverrides?.toolPolicy,
+          })
+        );
+      }
+      if (newest === "other-synthetic") {
+        await historyService.appendToHistory(
+          parentWorkspaceId,
+          createMuxMessage("other", "user", "Run the failing tests again.", {
+            timestamp: 1_100,
+            synthetic: true,
+            toolPolicy: TODO_TURN_END_NUDGE_TOOL_POLICY,
+          })
+        );
+      }
+      const expectedPolicy =
+        newest === "other-synthetic" ? TODO_TURN_END_NUDGE_TOOL_POLICY : callerPolicy;
 
       await streamEnd(taskService, {
         type: "stream-end",
@@ -1973,9 +2003,7 @@ describe("TaskService", () => {
 
       expect(sendMessage).toHaveBeenCalledTimes(1);
       const wakeOptions = sendMessage.mock.calls[0]?.[2] as { toolPolicy?: ToolPolicy };
-      expect(wakeOptions.toolPolicy).toEqual(callerPolicy);
-      // The request builder gates execution only for a policy that ends with the nudge's rule.
-      expect(splitTodoTurnEndNudgePolicy(wakeOptions.toolPolicy).executionGate).toBeUndefined();
+      expect(wakeOptions.toolPolicy).toEqual(expectedPolicy);
     }
   );
 

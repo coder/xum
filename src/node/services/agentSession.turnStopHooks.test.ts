@@ -12,7 +12,10 @@ import type { CompletedMessagePart } from "@/common/types/stream";
 import type { TodoItem } from "@/common/types/tools";
 import { getTodoFilePath } from "@/node/services/todos/todoStorage";
 import { TURN_STOP_PROMPT_MAX_CHARS } from "./agentPlugins/promptHooks";
-import { TODO_TURN_END_NUDGE } from "@/node/services/agentNotifications/todoTurnEndNudge";
+import {
+  TODO_TURN_END_NUDGE,
+  TODO_TURN_END_NUDGE_TOOL_POLICY,
+} from "@/node/services/agentNotifications/todoTurnEndNudge";
 import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { Ok } from "@/common/types/result";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
@@ -804,6 +807,26 @@ describe("todo turn-end nudge", () => {
     ]);
     expect(requests[1].toolPolicy).not.toEqual(callerPolicy);
     expect(requests[2].toolPolicy).toEqual(callerPolicy);
+  });
+
+  test("a continuation after a manual send with the nudge's rule keeps that rule", async () => {
+    let continued = false;
+    addConsumer((ctx) => {
+      if (continued) return;
+      continued = true;
+      keepGoing(ctx);
+    });
+    // No todo_write call: this turn earns no nudge, it only sends the same rule.
+    const { h, requests } = await setup();
+
+    await h.session.sendMessage("only update the list", {
+      ...options,
+      toolPolicy: TODO_TURN_END_NUDGE_TOOL_POLICY,
+    });
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual(["only update the list", "Run the failing tests again."]);
+    expect(requests[1].toolPolicy).toEqual(TODO_TURN_END_NUDGE_TOOL_POLICY);
   });
 
   test("the goal continuation after the nudge gets the caller's tools back", async () => {

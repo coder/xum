@@ -19,7 +19,9 @@ import { createTestHistoryService } from "./testHistoryService";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
   mergeTurnStopContinuation,
+  TODO_TURN_END_NUDGE,
   TODO_TURN_END_NUDGE_EXECUTION_GATE,
+  TODO_TURN_END_NUDGE_TOOL_POLICY,
 } from "@/node/services/agentNotifications/todoTurnEndNudge";
 import { HistoryService } from "./historyService";
 import { CompactionCancellation } from "./compactionCancellation";
@@ -4115,6 +4117,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       failedMcpServers?: string[];
       agentId?: string;
       toolPolicy?: ToolPolicy;
+      // The turn's own user row (default: a manual "hello").
+      latestUser?: MuxMessage;
       // Earlier turns, sent before the latest user message.
       history?: MuxMessage[];
     }
@@ -4211,7 +4215,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         state = next;
         await harness.config.updateToolSearchEnabled(state.toolSearch === true);
         const result = await harness.service.streamMessage({
-          messages: [...(state.history ?? []), createMuxMessage("latest-user", "user", "hello")],
+          messages: [
+            ...(state.history ?? []),
+            state.latestUser ?? createMuxMessage("latest-user", "user", "hello"),
+          ],
           workspaceId,
           modelString: KNOWN_MODELS.SONNET.id,
           thinkingLevel: "off",
@@ -4319,6 +4326,53 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(stableSystemRow(plan)).not.toBe(stableSystemRow(exec));
     });
 
+    // The nudge turn as AgentSession sends it: its synthetic row carries the nudge text and policy.
+    const nudgeState = (toolPolicy: ToolPolicy | undefined): PrefixState => ({
+      toolPolicy,
+      latestUser: createMuxMessage("nudge-user", "user", TODO_TURN_END_NUDGE, {
+        synthetic: true,
+        toolPolicy,
+      }),
+    });
+
+    // A caller may send the nudge's todo_write-only rule itself. Only the nudge's own
+    // row proves a nudge turn, so that caller keeps the plain policy: tools hidden.
+    it("hides tools for a non-nudge turn that sends the nudge's rule", async () => {
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const {
+        requests: [, manual],
+      } = await streamPair(xumHome.path, [
+        {},
+        {
+          toolPolicy: TODO_TURN_END_NUDGE_TOOL_POLICY,
+          latestUser: createMuxMessage("latest-user", "user", "hello", {
+            toolPolicy: TODO_TURN_END_NUDGE_TOOL_POLICY,
+          }),
+        },
+      ]);
+      expect(Object.keys(manual.tools ?? {})).toEqual(["todo_write"]);
+    });
+
+    // A require rule for a tool the gate refuses would keep the nudge stepping forever.
+    it("drops the turn's required tools from a nudge turn's stream policy", async () => {
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const requireBash: ToolPolicy = [{ regex_match: "bash", action: "require" }];
+      const nudge = mergeTurnStopContinuation({
+        hookPrompt: null,
+        todoNudge: true,
+        callerToolPolicy: requireBash,
+      });
+      const {
+        requests: [turn, nudgeTurn],
+      } = await streamPair(xumHome.path, [
+        { toolPolicy: requireBash },
+        nudgeState(nudge?.optionOverrides?.toolPolicy),
+      ]);
+      expect(toolBlock(nudgeTurn)).toBe(toolBlock(turn));
+      expect(buildRequiredToolPatterns(turn.toolPolicy)).toHaveLength(1);
+      expect(buildRequiredToolPatterns(nudgeTurn.toolPolicy)).toEqual([]);
+    });
+
     // The nudge used to advertise only todo_write, so each nudge rewrote the
     // whole cached history twice: once for itself, once for the next turn.
     it("keeps the request prefix on a turn-end todo nudge and runs only todo_write", async () => {
@@ -4331,7 +4385,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       });
       const {
         requests: [turn, nudgeTurn],
-      } = await streamPair(xumHome.path, [{}, { toolPolicy: nudge?.optionOverrides?.toolPolicy }]);
+      } = await streamPair(xumHome.path, [{}, nudgeState(nudge?.optionOverrides?.toolPolicy)]);
       expect(breakpointTools(turn)).toHaveLength(1);
       expect(toolBlock(nudgeTurn)).toBe(toolBlock(turn));
       expect(stableSystemRow(nudgeTurn)).toBe(stableSystemRow(turn));

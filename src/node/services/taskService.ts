@@ -318,7 +318,10 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { StartupRecoveryState } from "@/node/services/startupRecovery";
 import { judgeLifecycleMarkerOwner } from "@/node/services/lifecycleMarkerOwners";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
-import { splitTodoTurnEndNudgePolicy } from "@/node/services/agentNotifications/todoTurnEndNudge";
+import {
+  isTodoTurnEndNudgeRow,
+  splitTodoTurnEndNudgePolicy,
+} from "@/node/services/agentNotifications/todoTurnEndNudge";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import {
@@ -2088,14 +2091,20 @@ function isCompactionRequestMessage(message: MuxMessage): boolean {
  * A turn-end todo nudge row carries the turn's caller policy plus the nudge's own rule, which
  * governs the nudge turn only (like a compaction request's policy): only the caller part is a
  * restriction. Adopting the whole policy left every later wake with todo_write only (#6720).
+ * Only a proven nudge row (isTodoTurnEndNudgeRow) loses the rule: any other row that carries
+ * the same todo_write-only rule keeps it as its restriction.
  */
 function readPersistedCallerToolPolicy(
-  raw: unknown
+  message: MuxMessage
 ): { kind: "none" } | { kind: "malformed" } | { kind: "policy"; toolPolicy: ToolPolicy } {
+  const raw = message.metadata?.toolPolicy;
   if (raw == null) return { kind: "none" };
   const parsed = ToolPolicySchema.safeParse(raw);
   if (!parsed.success) return { kind: "malformed" };
-  const { callerToolPolicy } = splitTodoTurnEndNudgePolicy(parsed.data);
+  const { callerToolPolicy } = splitTodoTurnEndNudgePolicy(
+    parsed.data,
+    isTodoTurnEndNudgeRow(message)
+  );
   return callerToolPolicy == null
     ? { kind: "none" }
     : { kind: "policy", toolPolicy: callerToolPolicy };
@@ -12873,7 +12882,7 @@ export class TaskService implements AgentTaskIntegration {
           }
           // A nudge row whose caller part is empty restricts nothing: like any synthetic row
           // without a policy, it leaves the definition to an older row.
-          const rowPolicy = readPersistedCallerToolPolicy(metadata?.toolPolicy);
+          const rowPolicy = readPersistedCallerToolPolicy(message);
           if (
             state.restrictions == null &&
             (rowPolicy.kind !== "none" ||

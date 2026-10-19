@@ -231,8 +231,10 @@ import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import { getAnthropicCacheTtl, supportsAnthropicCache } from "@/common/utils/ai/cacheStrategy";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import {
+  isTodoTurnEndNudgeTurn,
   splitTodoTurnEndNudgePolicy,
   withExecutionGate,
+  type TodoTurnEndNudgeSplit,
 } from "./agentNotifications/todoTurnEndNudge";
 import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
 import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
@@ -454,6 +456,24 @@ function mergeProviderExtrasUnderMux(
 
 const WORKFLOW_CONTINUATION_RETRY_DELAY_MS = 1_000;
 const WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE = "Workspace is busy; idle-only send was skipped.";
+
+/**
+ * The xAI search tools forced on a turn's first step (frontier Grok with search mode "on"),
+ * filtered to the tools sent. A todo nudge turn forces none: each forced search is a paid call,
+ * and the nudge only updates the todo list.
+ */
+export function forcedXaiSearchToolNames(input: {
+  routeProvider: ProviderName | undefined;
+  capabilityModelString: string;
+  searchParameters: Parameters<typeof getForcedXaiSearchToolNames>[1];
+  tools: Record<string, unknown>;
+  executionGate: TodoTurnEndNudgeSplit["executionGate"];
+}): string[] | undefined {
+  if (input.routeProvider !== "xai" || input.executionGate != null) return undefined;
+  return getForcedXaiSearchToolNames(input.capabilityModelString, input.searchParameters)?.filter(
+    (toolName) => toolName in input.tools
+  );
+}
 
 function isWorkspaceBusyIdleOnlySend(error: SendMessageError): boolean {
   return error.type === "unknown" && error.raw.includes(WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE);
@@ -1858,7 +1878,10 @@ export class TurnRequestBuilder {
     // One cache per request: resolution, plan handoff, prompt body, and
     // sub-agent discovery share definition reads; the next turn starts fresh.
     const agentDefinitionCache = new AgentDefinitionRequestCache();
-    const todoNudge = splitTodoTurnEndNudgePolicy(toolPolicy);
+    const todoNudge = splitTodoTurnEndNudgePolicy(
+      toolPolicy,
+      isTodoTurnEndNudgeTurn(providerRequestMessages)
+    );
     const resolveAgentForStreamStartedAt = Date.now();
     const agentResult = await resolveAgentForStream({
       workspaceId,
@@ -3217,13 +3240,13 @@ export class TurnRequestBuilder {
         const effectiveAnthropicCacheTtl =
           effectiveMuxProviderOptions.anthropic?.cacheTtl ??
           getAnthropicCacheTtl(preparedAttempt.providerOptions);
-        const forcedFirstStepToolNames =
-          seed.routeProvider === "xai"
-            ? getForcedXaiSearchToolNames(
-                seed.capabilityModelString,
-                effectiveMuxProviderOptions.xai?.searchParameters
-              )?.filter((toolName) => toolName in attemptTools)
-            : undefined;
+        const forcedFirstStepToolNames = forcedXaiSearchToolNames({
+          routeProvider: seed.routeProvider,
+          capabilityModelString: seed.capabilityModelString,
+          searchParameters: effectiveMuxProviderOptions.xai?.searchParameters,
+          tools: attemptTools,
+          executionGate: todoNudge.executionGate,
+        });
         const firstStepToolNames = new Set(
           forcedFirstStepToolNames?.length ? forcedFirstStepToolNames : toolNamesForSentinel
         );

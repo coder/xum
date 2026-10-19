@@ -121,6 +121,7 @@ import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { COMPACTION_RETRY_INPUT_BUDGET_SCALE } from "@/constants/continuousCompaction";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import {
+  isTodoTurnEndNudgeTurn,
   mergeTurnStopContinuation,
   withoutTodoTurnEndNudge,
   needsTodoTurnEndNudge,
@@ -721,6 +722,8 @@ interface StopContinuationProvenance {
    * exit). A continuation queued after stream-end would run after that owner saw the turn end.
    */
   externallyOwnedTurn: boolean;
+  /** The stream was a turn-end todo nudge turn (see AgentSession activeStreamContext). */
+  todoTurnEndNudge: boolean;
 }
 
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
@@ -1861,6 +1864,12 @@ export class AgentSession {
     /** Automatic sub-agent turn provenance, so retries and follow-ups keep it. */
     taskTurnKind?: TaskTurnKind;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+    /**
+     * The request's history proves a turn-end todo nudge turn (isTodoTurnEndNudgeTurn), so
+     * the options later turns inherit drop the nudge's rule. In memory only: the persisted row
+     * is the provenance.
+     */
+    todoTurnEndNudge?: boolean;
   };
 
   private activeCompactionRequest?: {
@@ -8946,6 +8955,7 @@ export class AgentSession {
       // snapshot) would persist non-retryable failures against a row recovery
       // never selects and break the tail match after restart.
       this.activeStreamUserMessageId = lastUserMessage?.id;
+      streamContext.todoTurnEndNudge = isTodoTurnEndNudgeTurn(requestMessages);
 
       this.activeCompactionRequest = this.resolveCompactionRequest(
         requestMessages,
@@ -10322,10 +10332,13 @@ export class AgentSession {
     const streamEndPayload = payload;
     const activeStreamGoalKind = this.activeStreamContext?.goalKind;
     const activeStreamOptions = this.activeStreamContext?.options;
-    // What a later turn (turn.stop or goal continuation) inherits from this one.
-    const inheritedStreamOptions = withoutTodoTurnEndNudge(activeStreamOptions);
     // A turn.stop continuation keeps this stream's goal provenance (read before the reset below).
     const activeStreamProvenance = this.readStopContinuationProvenance(payload);
+    // What a later turn (turn.stop or goal continuation) inherits from this one.
+    const inheritedStreamOptions = withoutTodoTurnEndNudge(
+      activeStreamOptions,
+      activeStreamProvenance.todoTurnEndNudge
+    );
 
     let goalContinuationRequest: {
       sendOptions: SendMessageOptions;
@@ -10755,6 +10768,7 @@ export class AgentSession {
       autoModelRouting: context.autoModelRouting,
       delegatedWorkspaceTurn: context.workspaceTurnMetadata != null,
       externallyOwnedTurn: this.isExternallyOwnedTurn(payload, context.options),
+      todoTurnEndNudge: context.todoTurnEndNudge === true,
     };
   }
 
