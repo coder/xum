@@ -17,7 +17,11 @@ const write = (rel: string, data: unknown) => {
   fs.writeFileSync(file, typeof data === "string" ? data : JSON.stringify(data));
   return file;
 };
-const agentStep = (mode: string) => ({ kind: "agent", cache: { mode, replayedActions: 0 } });
+const agentStep = (mode: string, calls = 0) => ({
+  kind: "agent",
+  cache: { mode, replayedActions: 0 },
+  model: { calls },
+});
 /** The table row whose Test cell is `title`, split into cells. */
 const row = (summary: string, title: string) =>
   summary
@@ -40,8 +44,7 @@ test("a row per selected test with its cache outcomes and model calls, then each
           attempts: [
             {
               durationMs: 1500,
-              calls: 3,
-              steps: [agentStep("self-finalized"), agentStep("missed"), { kind: "expect" }],
+              steps: [agentStep("self-finalized"), agentStep("missed", 3), { kind: "expect" }],
             },
           ],
         },
@@ -50,8 +53,8 @@ test("a row per selected test with its cache outcomes and model calls, then each
           status: "failed",
           selected: true,
           attempts: [
-            { durationMs: 1000, calls: 4, steps: [agentStep("agent-concluded")] },
-            { durationMs: 2000, calls: 5, steps: [agentStep("agent-concluded")] },
+            { durationMs: 1000, steps: [agentStep("agent-concluded", 4)] },
+            { durationMs: 2000, steps: [agentStep("agent-concluded", 5)] },
           ],
         },
         { titlePath: ["known", "bug"], status: "skipped", selected: false, attempts: [] },
@@ -130,10 +133,11 @@ test("the next seed is the newest job's cache: valid entries only, at most 1000,
   const older = "tests/stories/.e2e/stories-20261018T100000Z-1/cache";
   write(`${older}/${entry(77_777)}`, "older job");
   const cache = "tests/stories/.e2e/stories-20261019T100000Z-2/cache";
-  // 1002 entries, entry(i) recorded at second i: the two oldest (0 and 1) fall off the cap.
+  // 1002 entries, entry(i) recorded (createdAt) at second i: the two oldest (0 and 1) fall off
+  // the cap. The mtimes say the opposite, as after a copy: createdAt must win.
   for (let i = 0; i < 1002; i++) {
-    const file = write(`${cache}/${entry(i)}`, `entry ${i}`);
-    fs.utimesSync(file, new Date(), new Date(1_000_000 + i * 1000));
+    const file = write(`${cache}/${entry(i)}`, { createdAt: new Date(1_000_000 + i * 1000) });
+    fs.utimesSync(file, new Date(), new Date(9_000_000 - i * 1000));
   }
   // What checkSeed refuses must not reach the seed: the next launch would refuse it all.
   write(`${cache}/notes.txt`, "x");
@@ -145,9 +149,9 @@ test("the next seed is the newest job's cache: valid entries only, at most 1000,
   expect(names.length).toBe(1000);
   expect(names[0]).toBe(entry(2));
   expect(names.at(-1)).toBe(entry(1001));
-  expect(fs.readFileSync(path.join(seed, entry(500)), "utf8")).toBe("entry 500");
-  // Kept mtimes: the next run cuts the same entries again.
-  expect(fs.statSync(path.join(seed, entry(2))).mtimeMs).toBe(1_002_000);
+  expect(JSON.parse(fs.readFileSync(path.join(seed, entry(500)), "utf8")).createdAt).toBe(
+    new Date(1_500_000).toISOString()
+  );
   expect(fs.readdirSync(path.dirname(seed)).sort()).toEqual([".e2e", ".e2e-cache-seed"]);
 });
 

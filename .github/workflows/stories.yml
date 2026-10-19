@@ -30,7 +30,8 @@ permissions:
 jobs:
   stories:
     name: Test / Stories
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Only for pull_request (off now, see on:): fork and Dependabot PRs get no Actions secrets.
+    if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
     runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
     # Two jobs of at most 30 minutes each (launch.ts DEADLINE_MS) after a build of up to about
     # 10 minutes, plus the setup, the image pull and the cache steps: 80. A warm run takes a few

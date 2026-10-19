@@ -9,7 +9,7 @@
  * - `--next-seed <dir>` replaces `<dir>` with the replay cache (`<job>/cache/*.json`) of the
  *   newest story job that recorded one, so the next run replays it. That cache already holds
  *   the seed the job started with (seedCacheDir copies it in), so nothing else is merged. Only
- *   names that checkSeed accepts are copied: the newest by mtime, at most MAX_SEED_ENTRIES and
+ *   names that checkSeed accepts are copied: the newest by `createdAt`, at most MAX_SEED_ENTRIES and
  *   MAX_SEED_BYTES in all, so the next launch never refuses the seed. Without such a job, `<dir>` stays as it is.
  *
  * No import beyond node and the repo: CI runs it with plain bun.
@@ -79,12 +79,15 @@ function resultRow(result: Json): string[] {
     .map(obj)
     .filter((a) => a != null);
   const durationMs = attempts.reduce((sum, a) => sum + (num(a.durationMs) ?? 0), 0);
-  const calls = attempts.map((a) => num(a.calls)).filter((c) => c != null);
+  // Model calls are per step (`step.model.calls`, e2e run/steps.d.ts StepModelInfo).
+  const calls: number[] = [];
   const cache: Record<string, number> = { "self-finalized": 0, "agent-concluded": 0, missed: 0 };
   for (const attempt of attempts)
     for (const step of list(attempt.steps)) {
       const mode = obj(obj(step)?.cache)?.mode;
       if (typeof mode === "string" && mode in cache) cache[mode] += 1;
+      const stepCalls = num(obj(obj(step)?.model)?.calls);
+      if (stepCalls != null) calls.push(stepCalls);
     }
   const status = typeof result.status === "string" ? result.status : "unknown";
   return [
@@ -145,6 +148,17 @@ export function summarize(root: string): string {
   return `${lines.join("\n")}\n`;
 }
 
+/** When e2e recorded the entry (its `createdAt`, e2e cache/store.js), or null if unreadable. */
+function recordedAt(file: string): number | null {
+  try {
+    const createdAt = obj(JSON.parse(fs.readFileSync(file, "utf8")))?.createdAt;
+    const ms = typeof createdAt === "string" ? Date.parse(createdAt) : NaN;
+    return Number.isNaN(ms) ? null : ms;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Replaces the seed folder `seed` with the newest story job's cache entries (header). Returns
  * the number of entries, or null when no job recorded one and `seed` was left alone.
@@ -159,10 +173,11 @@ export function nextSeed(root: string, seed: string): number | null {
       .filter(isSeedEntry)
       .map((file) => {
         const st = fs.statSync(file);
-        return { file, mtimeMs: st.mtimeMs, size: st.size };
+        return { file, recordedMs: recordedAt(file) ?? st.mtimeMs, size: st.size };
       })
-      // Newest first; the name breaks ties, so the cut is the same on every run.
-      .sort((a, b) => b.mtimeMs - a.mtimeMs || a.file.localeCompare(b.file))
+      // Newest recording first; the name breaks ties, so the cut is the same on every run. Not the
+      // mtime: each copy into the sandbox and back (seedCacheDir, the export) resets it.
+      .sort((a, b) => b.recordedMs - a.recordedMs || a.file.localeCompare(b.file))
       .slice(0, MAX_SEED_ENTRIES);
     // Also within checkSeed()'s byte cap, so the next launch never refuses the seed.
     let bytes = 0;
@@ -173,11 +188,9 @@ export function nextSeed(root: string, seed: string): number | null {
     // A sibling first, then the swap: a failed copy leaves the old seed in place.
     const next = fs.mkdtempSync(`${seed}.next-`);
     try {
-      for (const { file, mtimeMs } of entries) {
+      for (const { file } of entries) {
         const to = path.join(next, path.basename(file));
         fs.copyFileSync(file, to, fs.constants.COPYFILE_EXCL);
-        // Keep the mtime, so the cut on the next run still keeps the newest recordings.
-        fs.utimesSync(to, new Date(), new Date(mtimeMs));
       }
       fs.rmSync(seed, { recursive: true, force: true });
       fs.renameSync(next, seed);
