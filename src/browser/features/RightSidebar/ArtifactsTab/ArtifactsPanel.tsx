@@ -273,6 +273,13 @@ const SELECTION_EXTENDING_KEYS = new Set([
   "PageDown",
 ]);
 
+/** Whether a keyboard selection is in progress after this keydown in the viewer. */
+function selectingAfterKeyDown(selecting: boolean, e: React.KeyboardEvent): boolean {
+  // A held Shift auto-repeats until the arrow press, so only a fresh press resets.
+  if (e.key === "Shift") return e.repeat && selecting;
+  return selecting || (e.shiftKey && SELECTION_EXTENDING_KEYS.has(e.key));
+}
+
 /**
  * The viewer's keyboard path in annotate mode: Shift+Arrow (etc.) extends a selection, and
  * releasing Shift opens the comment box for it. The flag lasts one Shift gesture (#5760): a new
@@ -286,9 +293,7 @@ function keyboardSelectionHandlers(
 ) {
   return {
     onKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => {
-      // A held Shift auto-repeats until the arrow press, so only a fresh press resets.
-      if (e.key === "Shift" && !e.repeat) selectingRef.current = false;
-      else if (e.shiftKey && SELECTION_EXTENDING_KEYS.has(e.key)) selectingRef.current = true;
+      selectingRef.current = selectingAfterKeyDown(selectingRef.current, e);
     },
     onKeyUp: (e: React.KeyboardEvent<HTMLDivElement>) => {
       if (e.key !== "Shift" || !selectingRef.current) return;
