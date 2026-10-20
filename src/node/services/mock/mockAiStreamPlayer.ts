@@ -51,6 +51,18 @@ let tokenizerUnavailableLogged = false;
  */
 let slowTokenizeInFlight: Promise<unknown> | null = null;
 
+function trackSlowTokenize(pending: Promise<unknown>): void {
+  const inFlight = pending.finally(() => {
+    if (slowTokenizeInFlight === inFlight) slowTokenizeInFlight = null;
+  });
+  slowTokenizeInFlight = inFlight;
+}
+
+async function countMockTokens(text: string, context: string): Promise<number> {
+  if (slowTokenizeInFlight !== null) return approximateTokenCount(text);
+  return tokenizeWithMockModel(text, context);
+}
+
 function approximateTokenCount(text: string): number {
   const normalizedLength = text.trim().length;
   if (normalizedLength === 0) {
@@ -65,17 +77,7 @@ async function tokenizeWithMockModel(text: string, context: string): Promise<num
   // Prefer fast approximate token counting in mock mode.
   // We only use the real tokenizer if it's available and responds quickly.
   const approximateTokens = approximateTokenCount(text);
-  if (slowTokenizeInFlight !== null) {
-    return approximateTokens;
-  }
-  return raceMockTokenizer(text, context, approximateTokens);
-}
 
-async function raceMockTokenizer(
-  text: string,
-  context: string,
-  approximateTokens: number
-): Promise<number> {
   let fallbackUsed = false;
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   let tokenizerErrorMessage: string | undefined;
@@ -83,6 +85,7 @@ async function raceMockTokenizer(
   const fallbackPromise = new Promise<number>((resolve) => {
     timeoutId = setTimeout(() => {
       fallbackUsed = true;
+      trackSlowTokenize(actualPromise);
       resolve(approximateTokens);
     }, TOKENIZE_TIMEOUT_MS);
   });
@@ -112,19 +115,13 @@ async function raceMockTokenizer(
     clearTimeout(timeoutId);
   }
 
-  if (fallbackUsed) {
-    const inFlight = actualPromise.finally(() => {
-      if (slowTokenizeInFlight === inFlight) slowTokenizeInFlight = null;
+  if (fallbackUsed && !tokenizerFallbackLogged) {
+    tokenizerFallbackLogged = true;
+    void actualPromise.then((resolvedTokens) => {
+      log.debug(
+        `[MockAiStreamPlayer] Tokenizer fallback used for ${context}; emitted ${approximateTokens}, background tokenizer returned ${resolvedTokens}`
+      );
     });
-    slowTokenizeInFlight = inFlight;
-    if (!tokenizerFallbackLogged) {
-      tokenizerFallbackLogged = true;
-      void actualPromise.then((resolvedTokens) => {
-        log.debug(
-          `[MockAiStreamPlayer] Tokenizer fallback used for ${context}; emitted ${approximateTokens}, background tokenizer returned ${resolvedTokens}`
-        );
-      });
-    }
   }
 
   if (tokenizerErrorMessage && !tokenizerUnavailableLogged) {
@@ -996,7 +993,7 @@ export class MockAiStreamPlayer {
       }
       case "reasoning-delta": {
         // Mock streams use the same tokenization logic as real streams for consistency
-        const tokens = await tokenizeWithMockModel(event.text, "reasoning-delta text");
+        const tokens = await countMockTokens(event.text, "reasoning-delta text");
         if (active.cancelled) return;
         const payload: ReasoningDeltaEvent = {
           type: "reasoning-delta",
@@ -1021,7 +1018,7 @@ export class MockAiStreamPlayer {
         }
         // Mock streams use the same tokenization logic as real streams for consistency
         const inputText = JSON.stringify(event.args);
-        const tokens = await tokenizeWithMockModel(inputText, "tool-call args");
+        const tokens = await countMockTokens(inputText, "tool-call args");
         if (active.cancelled) return;
         const payload: ToolCallStartEvent = {
           type: "tool-call-start",
@@ -1061,7 +1058,7 @@ export class MockAiStreamPlayer {
         // Mock streams use the same tokenization logic as real streams for consistency
         let tokens: number;
         try {
-          tokens = await tokenizeWithMockModel(event.text, "stream-delta text");
+          tokens = await countMockTokens(event.text, "stream-delta text");
         } catch (error) {
           log.error("tokenize failed for stream-delta", error);
           throw error;
