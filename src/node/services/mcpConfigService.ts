@@ -114,6 +114,17 @@ export function acquireGlobalMcpConfigLock(
 /** A config file as read, with what Xum skipped in it (#2060). */
 type ReadMCPConfig = MCPConfig & { problems: MCPConfigProblem[] };
 
+/**
+ * A save rewrites the whole file from the parsed servers, so a skipped entry would be lost: the
+ * user fixes the file first (#2060).
+ */
+function refuseSaveWithProblems(filePath: string, problems: MCPConfigProblem[]): void {
+  const [problem] = problems;
+  if (problem !== undefined) {
+    throw new Error(`Fix ${filePath} first. ${formatMcpConfigProblem(problem)}`);
+  }
+}
+
 /** A fresh value: callers edit the servers they get. */
 const noConfig = (): ReadMCPConfig => ({ servers: {}, enabledPluginServers: [], problems: [] });
 
@@ -484,12 +495,7 @@ export class MCPConfigService {
   /** Caller must hold runExclusive; never acquires the lock itself. */
   private async saveGlobalConfig(config: ReadMCPConfig): Promise<void> {
     const filePath = this.getGlobalConfigPath();
-    // This rewrites the whole file from the parsed servers, so a skipped entry would be lost:
-    // the user fixes the file first (#2060).
-    const [problem] = config.problems;
-    if (problem !== undefined) {
-      throw new Error(`Fix ${filePath} first. ${formatMcpConfigProblem(problem)}`);
-    }
+    refuseSaveWithProblems(filePath, config.problems);
     await this.ensureMuxRootDir();
 
     // Write minimal format:

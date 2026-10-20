@@ -966,7 +966,11 @@ function useInsufficientScopeTicks(
  * so without this a typo made a server vanish with no message. Saves are refused until the
  * file is fixed, because a save rewrites the whole file.
  */
-function MCPConfigProblemsNotice(props: { path: string; problems: MCPConfigProblem[] }) {
+function MCPConfigProblemsNotice(props: {
+  configProblems: { path: string; problems: MCPConfigProblem[] } | null;
+}) {
+  if (props.configProblems === null || props.configProblems.problems.length === 0) return null;
+  const { path, problems } = props.configProblems;
   return (
     <div
       role="alert"
@@ -976,10 +980,10 @@ function MCPConfigProblemsNotice(props: { path: string; problems: MCPConfigProbl
         <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
         <div className="min-w-0">
           <p className="font-medium">
-            Xum skipped part of <code className="break-all">{props.path}</code>
+            Xum skipped part of <code className="break-all">{path}</code>
           </p>
           <ul className="mt-1 space-y-0.5">
-            {props.problems.map((problem, index) => (
+            {problems.map((problem, index) => (
               <li key={index} className="break-words">
                 {formatMcpConfigProblem(problem)}
               </li>
@@ -1493,9 +1497,7 @@ export const MCPSettingsSection: React.FC = () => {
           </div>
         )}
 
-        {configProblems && configProblems.problems.length > 0 && (
-          <MCPConfigProblemsNotice path={configProblems.path} problems={configProblems.problems} />
-        )}
+        <MCPConfigProblemsNotice configProblems={configProblems} />
 
         {/* Server list */}
         <div className="space-y-2">
