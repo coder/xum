@@ -511,7 +511,10 @@ interface RuntimeChoiceContext {
 }
 
 /** The runtime a workspace-type pick switches to, keeping what was entered for that type. */
-function buildRuntimeForChoice(choice: RuntimeChoice, context: RuntimeChoiceContext): ParsedRuntime {
+function buildRuntimeForChoice(
+  choice: RuntimeChoice,
+  context: RuntimeChoiceContext
+): ParsedRuntime {
   const current = context.selectedRuntime;
   switch (choice) {
     case "coder":
@@ -660,16 +663,28 @@ function CreationControlsContent(props: CreationControlsProps) {
     }
 
     // User request: auto-switch away from Settings-disabled runtimes.
-    onSelectedRuntimeChange(buildRuntimeForChoice(firstEnabled, runtimeChoiceContext));
+    // The context is rebuilt here so the effect depends on its fields, not a per-render object.
+    onSelectedRuntimeChange(
+      buildRuntimeForChoice(firstEnabled, {
+        selectedRuntime,
+        sshHostFallback: props.sshHostFallback,
+        coderConfigFallback: props.coderConfigFallback,
+        daytonaConfigFallback: props.daytonaConfigFallback,
+        runtimeAvailabilityState,
+      })
+    );
   }, [
     isDevcontainerMissing,
     isNonGitRepo,
     onSelectedRuntimeChange,
     props.coderProps,
     props.runtimeEnablement,
+    props.sshHostFallback,
+    props.coderConfigFallback,
+    props.daytonaConfigFallback,
+    runtimeAvailabilityState,
     availabilityMap,
     runtimeChoice,
-    runtimeChoiceContext,
     selectedRuntime,
     isCoderAvailable,
   ]);

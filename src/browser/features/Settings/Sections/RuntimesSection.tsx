@@ -773,7 +773,9 @@ export function RuntimesSection() {
                         disabled={rowDisabled || coderAvailability.state !== "available"}
                       />
                     ) : null}
-                    {runtime.id === "daytona" && !selectedProjectPath ? <DaytonaAccessForm /> : null}
+                    {runtime.id === "daytona" && !selectedProjectPath ? (
+                      <DaytonaAccessForm />
+                    ) : null}
                     {runtime.id === "daytona" &&
                     selectedProjectPath &&
                     effectiveEnablement.daytona ? (

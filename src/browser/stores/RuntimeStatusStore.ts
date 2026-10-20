@@ -153,8 +153,7 @@ export class RuntimeStatusStore {
     const workspaceIds = Array.from(this.workspaceMetadata.values())
       .filter((workspace) => {
         return (
-          hasRuntimeStatus(workspace.runtimeConfig) &&
-          this.statuses.hasKeySubscribers(workspace.id)
+          hasRuntimeStatus(workspace.runtimeConfig) && this.statuses.hasKeySubscribers(workspace.id)
         );
       })
       .map((workspace) => workspace.id);

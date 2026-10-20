@@ -274,9 +274,7 @@ const STOPPED_CHIP_CLASS = "bg-muted/15 text-foreground";
  * Only `running` and `stopped` produce a chip; `unknown`, `unsupported`,
  * and null (not yet loaded) suppress the chip to avoid misreporting.
  */
-export function getDevcontainerStatusChip(
-  status: RuntimeStatus | null
-): RuntimeStatusChip | null {
+export function getDevcontainerStatusChip(status: RuntimeStatus | null): RuntimeStatusChip | null {
   switch (status) {
     case "running":
       return {
