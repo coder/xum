@@ -37,7 +37,13 @@ import {
 } from "@/common/constants/ui";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { RuntimeConfigSchema } from "@/common/orpc/schemas";
-import type { OnChatMode, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
+import type {
+  OnChatEvent,
+  OnChatMode,
+  SendMessageOptions,
+  WorkspaceChatMessage,
+} from "@/common/orpc/types";
+import { singleChatEvent } from "@/common/orpc/singleChatEvent";
 import type { AgentSkillDescriptor, AgentSkillListResult } from "@/common/types/agentSkill";
 import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 import type { CompactionRequestData } from "@/common/types/message";
@@ -233,10 +239,7 @@ export class MuxAgent implements Agent {
    */
   private readonly firstCaughtUpBySessionId = new Map<string, Promise<void>>();
   /** Async iterators for active onChat streams so we can cancel on mode switch/eviction. */
-  private readonly chatIteratorsBySessionId = new Map<
-    string,
-    AsyncIterator<WorkspaceChatMessage>
-  >();
+  private readonly chatIteratorsBySessionId = new Map<string, AsyncIterator<OnChatEvent>>();
   private readonly turnCompletions = new Map<string, TurnCompletion>();
   private readonly latestUsageBySessionId = new Map<string, Usage>();
   /** Last activity timestamp (Date.now) per session for idle eviction. */
@@ -1893,7 +1896,7 @@ export class MuxAgent implements Agent {
     // the oRPC subscription until the server eventually closes it.
     const chatIterator = chatStream[Symbol.asyncIterator]();
     this.chatIteratorsBySessionId.set(sessionId, chatIterator);
-    const chatIterable: AsyncIterable<WorkspaceChatMessage> = {
+    const chatIterable: AsyncIterable<OnChatEvent> = {
       [Symbol.asyncIterator]: () => chatIterator,
     };
 
@@ -1902,7 +1905,9 @@ export class MuxAgent implements Agent {
 
     const drainPromise = (async () => {
       try {
-        for await (const event of chatIterable) {
+        for await (const received of chatIterable) {
+          // ACP does not pass batchReplay, so every event is a single one.
+          const event = singleChatEvent(received);
           // Subscription replacement is best-effort; stopChatSubscription can
           // time out waiting for the old iterator to unwind. Guard each event
           // so stale streams cannot mutate active turn state after mode-switch

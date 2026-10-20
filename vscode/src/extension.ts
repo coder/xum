@@ -3,6 +3,7 @@ import assert from "node:assert";
 import { createHash, randomBytes } from "node:crypto";
 
 import { formatRelativeTime } from "xum/browser/utils/ui/dateTime";
+import { singleChatEvent } from "xum/common/orpc/singleChatEvent";
 import {
   enrichAndSort,
   getAllWorkspacesFromFiles,
@@ -1943,7 +1944,9 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         { signal: controller.signal }
       );
 
-      for await (const event of iterator) {
+      for await (const received of iterator) {
+        // This subscription does not pass batchReplay, so every event is a single one.
+        const event = singleChatEvent(received);
         if (controller.signal.aborted) {
           return;
         }

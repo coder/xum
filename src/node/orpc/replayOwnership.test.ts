@@ -5,7 +5,7 @@ import { createAgentSessionHarness } from "../services/agentSession.testHarness"
 import { subscribeWorkspaceChat } from "./routerSubscriptions";
 import type { ORPCContext } from "./context";
 import { createMuxMessage } from "@/common/types/message";
-import type { OnChatMode, WorkspaceChatMessage } from "@/common/orpc/types";
+import type { OnChatMode, OnChatEvent } from "@/common/orpc/types";
 import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import type { TurnCoordinator, OperationId } from "../services/turnCoordinator";
 import { Ok } from "@/common/types/result";
@@ -77,7 +77,7 @@ async function setup(
     const live = Promise.withResolvers<void>();
     const terminal = Promise.withResolvers<void>();
     const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
-    const events: WorkspaceChatMessage[] = [];
+    const events: OnChatEvent[] = [];
     const done = (async () => {
       for await (const event of subscribeWorkspaceChat(
         context,
@@ -213,7 +213,7 @@ test("overlapping replays preserve an existing client's queue and isolate each r
     await a.caught;
     await Promise.all([a.live, b.live]);
     expect(existing.aggregator.getActiveStreams()[0]?.hasQueuedFollowUp).toBe(true);
-    const windows = (events: WorkspaceChatMessage[]) =>
+    const windows = (events: OnChatEvent[]) =>
       events.filter((event) => event.type === "stream-delta").map((event) => event.delta);
     expect(windows(existing.events)).toEqual(["window-0", "live"]);
     expect(windows(a.events)).toEqual(["window-1", "live"]);

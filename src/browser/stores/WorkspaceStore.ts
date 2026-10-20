@@ -15,6 +15,7 @@ import type {
   HistoryEditPrecondition,
   WorkspaceActivitySnapshot,
   WorkspaceChatMessage,
+  OnChatEvent,
   WorkspaceStatsSnapshot,
   OnChatMode,
   ProvidersConfigMap,
@@ -4585,8 +4586,8 @@ export class WorkspaceStore {
       signal,
       // A failed replay still delivers queue snapshots and a caught-up; only a complete
       // replay proves the attempt worked, so only that resets the retry backoff.
-      isSuccessEvent: (event: WorkspaceChatMessage) =>
-        isCaughtUpMessage(event) && event.historyReplayStatus === "complete",
+      isSuccessEvent: (event: OnChatEvent) =>
+        event.type === "caught-up" && event.historyReplayStatus === "complete",
       getClient: async (attemptSignal) => this.client ?? (await this.waitForClient(attemptSignal)),
       getClientChangeSignal: () => this.clientChangeController.signal,
       subscribe: (client, attemptSignal, abortAttempt) =>
@@ -4633,7 +4634,7 @@ export class WorkspaceStore {
     client: RouterClient<AppRouter>,
     attemptSignal: AbortSignal,
     abortAttempt: () => void
-  ): Promise<{ events: AsyncIterable<WorkspaceChatMessage>; context: OnChatAttemptContext }> {
+  ): Promise<{ events: AsyncIterable<OnChatEvent>; context: OnChatAttemptContext }> {
     const transient = this.chatTransientState.get(workspaceId);
     if (transient) {
       transient.caughtUp = false;
@@ -5155,7 +5156,7 @@ export class WorkspaceStore {
 
   private handleChatMessage(
     workspaceId: string,
-    data: WorkspaceChatMessage,
+    data: OnChatEvent,
     attemptContext?: OnChatAttemptContext
   ): void {
     // Replay batch (#4868): consecutive history rows grouped to save one frame per row. Each row

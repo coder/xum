@@ -1,13 +1,11 @@
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { OnChatEvent, WorkspaceChatMessage } from "@/common/orpc/types";
 
 type ReplayBufferedDeltaMessage = Extract<
   WorkspaceChatMessage,
   { type: "stream-delta" | "reasoning-delta" }
 >;
 
-function isReplayBufferedDeltaMessage(
-  message: WorkspaceChatMessage
-): message is ReplayBufferedDeltaMessage {
+function isReplayBufferedDeltaMessage(message: OnChatEvent): message is ReplayBufferedDeltaMessage {
   return message.type === "stream-delta" || message.type === "reasoning-delta";
 }
 
@@ -16,15 +14,13 @@ type ReplayBufferedInitMessage = Extract<
   { type: "init-start" | "init-output" | "init-end" }
 >;
 
-function isReplayBufferedInitMessage(
-  message: WorkspaceChatMessage
-): message is ReplayBufferedInitMessage {
+function isReplayBufferedInitMessage(message: OnChatEvent): message is ReplayBufferedInitMessage {
   return (
     message.type === "init-start" || message.type === "init-output" || message.type === "init-end"
   );
 }
 
-function isReplayMessage(message: WorkspaceChatMessage): boolean {
+function isReplayMessage(message: OnChatEvent): boolean {
   return (message as { replay?: unknown }).replay === true;
 }
 
@@ -55,10 +51,11 @@ function replayBufferedInitKey(message: ReplayBufferedInitMessage): string {
 }
 
 export function createReplayBufferedStreamMessageRelay(
-  push: (message: WorkspaceChatMessage) => void
+  // Replay may hand over an onChat-only `message-batch` (#5102); live session events never do.
+  push: (message: OnChatEvent) => void
 ): {
   handleSessionMessage: (message: WorkspaceChatMessage) => void;
-  handleReplayMessage: (message: WorkspaceChatMessage) => void;
+  handleReplayMessage: (message: OnChatEvent) => void;
   finishReplay: () => void;
 } {
   let isReplaying = true;
@@ -114,7 +111,7 @@ export function createReplayBufferedStreamMessageRelay(
     }
   };
 
-  const handleReplayMessage = (message: WorkspaceChatMessage) => {
+  const handleReplayMessage = (message: OnChatEvent) => {
     if (isReplaying) {
       if (message.type === "stream-start") {
         const startIndex = bufferedLiveSessionMessages.findIndex(

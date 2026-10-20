@@ -8,6 +8,7 @@ import {
   mcp,
   workspace,
 } from "./api";
+import { OnChatEventSchema } from "./stream";
 import { MCP_ICON_LIMITS } from "../../constants/mcpIcon";
 import type { AWSCredentialStatus, ProviderConfigInfo, ProvidersConfigMap } from "../types";
 
@@ -335,5 +336,26 @@ describe("agentPlugins.setComponents schema", () => {
           .expectedImportedComponents
       ).toEqual(expectedImportedComponents);
     }
+  });
+});
+
+// #5102: only onChat sends `message-batch`, so only its event schema admits one.
+describe("message-batch is onChat-only", () => {
+  const row = {
+    type: "message",
+    id: "m1",
+    role: "user",
+    parts: [],
+    metadata: { historySequence: 1 },
+  };
+  const batch = { type: "message-batch", messages: [row] };
+
+  it("the onChat event schema admits a batch", () => {
+    expect(OnChatEventSchema.safeParse(batch).success).toBe(true);
+  });
+
+  it("getFullReplay's output admits the row but refuses the batch", () => {
+    expect(workspace.getFullReplay.output.safeParse([row]).success).toBe(true);
+    expect(workspace.getFullReplay.output.safeParse([batch]).success).toBe(false);
   });
 });

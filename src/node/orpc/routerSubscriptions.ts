@@ -7,6 +7,7 @@ import type {
   UpdateStatus,
   WorkspaceActivitySnapshot,
   WorkspaceChatMessage,
+  OnChatEvent,
   WorkspaceStatsSnapshot,
 } from "@/common/orpc/types";
 import type {
@@ -426,14 +427,16 @@ export function subscribeTimeline(
 }
 
 /**
- * The output validation oRPC's `eventIterator(WorkspaceChatMessageSchema)` applies to each yielded
+ * The output validation oRPC's `eventIterator(OnChatEventSchema)` applies to each yielded
  * onChat event, with the same transform (the schema's parse output is what goes on the wire) and
  * the same error, so disabling it on the procedure changes nothing observable (#4868).
  *
  * No onChat producer attaches oRPC event meta (`withEventMeta`). If one ever does, carry it over
  * with `getEventMeta` like oRPC's `wrapAsyncIteratorPreservingEventMeta`.
  */
-function validateChatEvent(event: WorkspaceChatMessage): WorkspaceChatMessage {
+function validateChatEvent(event: OnChatEvent): WorkspaceChatMessage {
+  // Batch-free schema on purpose (#5102): a `message-batch` only ever comes from the replay, as
+  // already-parsed rows in validatedReplayRows, so every event validated here is a single event.
   const result = WorkspaceChatMessageSchema["~standard"].validate(event);
   // The chat schema has no async refinements; a Promise here would silently skip validation.
   assert(!(result instanceof Promise), "WorkspaceChatMessageSchema validation must be synchronous");
@@ -461,12 +464,12 @@ export function subscribeWorkspaceChat(
    * did when oRPC validated at the procedure boundary.
    */
   options?: { validateOutput?: boolean }
-): AsyncGenerator<WorkspaceChatMessage> {
+): AsyncGenerator<OnChatEvent> {
   // Perf harness (XUM_REPLAY_TAPES, desktop only): a mapped workspace is served from its tape
   // before any session access, so no agent, tool or provider code runs. Not recorded again.
   const tapeReplay = getSessionTapeReplay(input);
   if (tapeReplay) {
-    return runtimeSubscription<WorkspaceChatMessage>(context, {
+    return runtimeSubscription<OnChatEvent>(context, {
       signal,
       // Keeps the client's stall watchdog fed while a large tape loads and after playback.
       heartbeat: { value: { type: "heartbeat" as const } },
@@ -483,9 +486,9 @@ export function subscribeWorkspaceChat(
   // Replay rows the session already parsed with the wire schema (#4868). A WeakSet rather than a
   // Set: `initialize` keeps replaying after a client disconnect, so entries must die with their
   // rows instead of accumulating until the replay finishes.
-  const validatedReplayRows = new WeakSet<WorkspaceChatMessage>();
+  const validatedReplayRows = new WeakSet<OnChatEvent>();
   // Subscribe before replay so the relay can buffer overlapping live deltas.
-  const events = runtimeSubscription<WorkspaceChatMessage>(context, {
+  const events = runtimeSubscription<OnChatEvent>(context, {
     signal,
     heartbeat: { value: { type: "heartbeat" as const } },
     // Replay rows are parsed once (#4868); every other event (live, stream replay, heartbeat,

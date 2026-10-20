@@ -6,7 +6,7 @@
  * - The whole tape is validated before a result carries any event: a tape with one bad line is
  *   rejected as a whole, never replayed up to the bad line, and events are never dropped.
  * - Accepted results keep every recorded event in order, decoded exactly as the client would
- *   have received it: RPC JSON decode (Dates, undefined, ...) then `WorkspaceChatMessageSchema`
+ *   have received it: RPC JSON decode (Dates, undefined, ...) then `OnChatEventSchema`
  *   (its parse output, as the router's self-validating onChat path yields).
  * - `stopped` and `truncated` tapes are accepted but flagged; `error` tapes are always rejected;
  *   truncated tapes are rejected unless the caller opts in.
@@ -14,8 +14,8 @@
  * Pure (no fs): tapes hold full chat content, so callers decide where text comes from.
  */
 import { RPCJsonSerializer } from "@orpc/client";
-import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas/stream";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import { OnChatEventSchema } from "@/common/orpc/schemas/stream";
+import type { OnChatEvent } from "@/common/orpc/types";
 import {
   SESSION_TAPE_MASKING,
   SESSION_TAPE_VERSION,
@@ -34,7 +34,7 @@ export interface SessionTapeEvent {
   t: number;
   /** UTF-8 bytes of the stored event JSON (as recorded). */
   bytes: number;
-  event: WorkspaceChatMessage;
+  event: OnChatEvent;
 }
 
 export interface LoadedSessionTape {
@@ -116,7 +116,7 @@ function decodeEvent(
   text: string,
   raw: unknown,
   line: number
-): { t: number; bytes: number; event: WorkspaceChatMessage } {
+): { t: number; bytes: number; event: OnChatEvent } {
   const parsed = SessionTapeEventLineSchema.safeParse(raw);
   if (!parsed.success) throw new TapeRejection("invalid event line", line);
   const { t, bytes, event, meta } = parsed.data;
@@ -143,7 +143,7 @@ function decodeEvent(
   } catch {
     throw new TapeRejection("event could not be decoded", line);
   }
-  const validated = WorkspaceChatMessageSchema.safeParse(decoded);
+  const validated = OnChatEventSchema.safeParse(decoded);
   if (!validated.success) throw new TapeRejection("event fails the onChat schema", line);
   if (storedBytes !== bytes) {
     throw new TapeRejection("event byte count does not match the stored event", line);

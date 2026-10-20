@@ -11,7 +11,7 @@ import { Effect } from "effect";
 import { TestClock } from "effect/testing";
 import { createMuxMessage } from "@/common/types/message";
 import { isNonRetryableSendError } from "@/common/utils/messages/retryEligibility";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { OnChatEvent } from "@/common/orpc/types";
 import { loadSessionTape } from "@/common/utils/sessionTapes/sessionTapeLoader";
 import {
   isSessionTapeReplayRefusal,
@@ -140,7 +140,7 @@ describe("onChat replay source", () => {
       { validateOutput: true }
     );
     try {
-      const delivered: WorkspaceChatMessage[] = [];
+      const delivered: OnChatEvent[] = [];
       while (delivered.length < events.length) {
         const next = await iterator.next();
         if (next.done) throw new Error("replay ended before the last event");
@@ -300,7 +300,7 @@ describe("onChat replay source", () => {
       { validateOutput: true }
     );
     try {
-      const delivered: WorkspaceChatMessage[] = [];
+      const delivered: OnChatEvent[] = [];
       while (delivered.length < events.length) {
         const next = await iterator.next();
         if (next.done) throw new Error("replay ended before the last event");
@@ -331,7 +331,7 @@ describe("onChat replay source", () => {
     setReplayTapes(JSON.stringify({ [workspaceId]: form(absolute) }));
     const replay = getSessionTapeReplay({ workspaceId });
     if (!replay) throw new Error("the mapped workspace must get a replay");
-    const pushed: WorkspaceChatMessage[] = [];
+    const pushed: OnChatEvent[] = [];
     const error: unknown = await replay
       .play((event) => pushed.push(event))
       .then(
@@ -349,7 +349,7 @@ describe("onChat replay source", () => {
     delete process.env.XUM_REPLAY_HARNESS;
     const replay = getSessionTapeReplay({ workspaceId });
     if (!replay) throw new Error("the mapped workspace must get a replay");
-    const pushed: WorkspaceChatMessage[] = [];
+    const pushed: OnChatEvent[] = [];
     const error: unknown = await replay
       .play((event) => pushed.push(event))
       .then(

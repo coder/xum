@@ -109,6 +109,7 @@ import {
   ToolPolicySchema,
   UpdateStatusSchema,
   WorkspaceChatMessageSchema,
+  OnChatEventSchema,
 } from "./stream";
 import {
   TimelineListInputSchema,
@@ -2590,7 +2591,7 @@ export const workspace = {
       // do not send it get the whole active epoch, as before.
       replayWindow: z.boolean().optional(),
     }),
-    output: eventIterator(WorkspaceChatMessageSchema), // Stream event
+    output: eventIterator(OnChatEventSchema), // Stream event (with onChat-only batches)
   },
   onMetadata: {
     // `archived` selects the snapshot list exactly like `workspace.list`.

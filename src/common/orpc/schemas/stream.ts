@@ -890,6 +890,15 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   ...WorkspaceInitEventSchema.def.options,
   // Chat messages with type discriminator
   ChatMuxMessageSchema,
+]);
+
+/**
+ * onChat's event union: every WorkspaceChatMessage plus `message-batch`. Only onChat sends batches
+ * (to `batchReplay: true` subscribers, #4868), so getFullReplay and history.loadMore keep the
+ * batch-free WorkspaceChatMessageSchema in their spec and types (#5102).
+ */
+export const OnChatEventSchema = z.discriminatedUnion("type", [
+  ...WorkspaceChatMessageSchema.def.options,
   ChatMuxMessageBatchSchema,
 ]);
 

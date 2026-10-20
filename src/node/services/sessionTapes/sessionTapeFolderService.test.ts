@@ -7,7 +7,7 @@ import type { RouterClient } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getXumPerfTapesDir } from "@/common/constants/paths";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { OnChatEvent } from "@/common/orpc/types";
 import type { ORPCContext } from "@/node/orpc/context";
 import { router, type AppRouter } from "@/node/orpc/router";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -16,7 +16,7 @@ import { maybeRecordWorkspaceChat, stopSessionTapeCaptures } from "./sessionTape
 import { syntheticChatEvents } from "./sessionTapes.testFixtures";
 
 /** A full-replay subscription that never ends by itself, recorded with the experiment on. */
-function openCapture(rootDir: string): AsyncGenerator<WorkspaceChatMessage> {
+function openCapture(rootDir: string): AsyncGenerator<OnChatEvent> {
   const [first] = syntheticChatEvents();
   async function* endless() {
     for (;;) {

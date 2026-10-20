@@ -44,6 +44,7 @@ import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { StreamStartEvent, ToolCallStartEvent } from "@/common/types/stream";
 import type {
   WorkspaceActivitySnapshot,
+  OnChatEvent,
   WorkspaceChatMessage,
   WorkspaceStatsSnapshot,
 } from "@/common/orpc/types";
@@ -112,7 +113,7 @@ interface LoadMoreResponse {
 async function* idleOnChat(
   _input?: { workspaceId: string; mode?: unknown },
   options?: { signal?: AbortSignal }
-): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
+): AsyncGenerator<OnChatEvent, void, unknown> {
   // Keep the iterator open until the store aborts it (prevents retry-loop noise in tests).
   await waitForAbortSignal(options?.signal);
 }
@@ -1156,7 +1157,7 @@ describe("WorkspaceStore", () => {
     const context = {
       workspaceService: { getOrCreateSession: () => h.session },
     } as unknown as ORPCContext;
-    const trace: WorkspaceChatMessage[] = [];
+    const trace: OnChatEvent[] = [];
     const consumed = Promise.withResolvers<void>();
     mockOnChat.mockImplementation(async function* (_input, options) {
       for await (const event of subscribeWorkspaceChat(
@@ -1655,12 +1656,12 @@ describe("WorkspaceStore", () => {
     it("applies a message-batch exactly like its rows (#4868)", async () => {
       const replayed = [1, 2, 3].map((seq) => createHistoryMessageEvent(`history-${seq}`, seq));
       const live = [4, 5].map((seq) => createHistoryMessageEvent(`live-${seq}`, seq));
-      const batch = (rows: WorkspaceChatMessage[]): WorkspaceChatMessage => ({
+      const batch = (rows: WorkspaceChatMessage[]): OnChatEvent => ({
         type: "message-batch",
         messages: rows.flatMap((row) => (row.type === "message" ? [row] : [])),
       });
       // Before caught-up the rows go to the replay buffer; after it, down the live path.
-      const scripts: Record<string, WorkspaceChatMessage[]> = {
+      const scripts: Record<string, OnChatEvent[]> = {
         batched: [batch(replayed), fullCaughtUpEvent(3, "history-3"), batch(live)],
         single: [...replayed, fullCaughtUpEvent(3, "history-3"), ...live],
       };

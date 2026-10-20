@@ -156,6 +156,7 @@ export {
   UpdateStatusSchema,
   UsageDeltaEventSchema,
   WorkspaceChatMessageSchema,
+  OnChatEventSchema,
   WorkspaceInitEventSchema,
 } from "./schemas/stream";
 

@@ -1,14 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { OnChatEvent } from "@/common/orpc/types";
 import { createReplayBufferedStreamMessageRelay } from "./replayBufferedStreamMessageRelay";
 
 describe("createReplayBufferedStreamMessageRelay", () => {
   test("keeps early live successor events ordered across independent replay windows", () => {
-    const outputs: WorkspaceChatMessage[][] = [[], []];
+    const outputs: OnChatEvent[][] = [[], []];
     const relays = outputs.map((output) =>
       createReplayBufferedStreamMessageRelay((message) => output.push(message))
     );
-    const start: WorkspaceChatMessage = {
+    const start: OnChatEvent = {
       type: "stream-start",
       workspaceId: "workspace",
       messageId: "B",
@@ -16,7 +16,7 @@ describe("createReplayBufferedStreamMessageRelay", () => {
       historySequence: 1,
       startTime: 1,
     };
-    const delta: WorkspaceChatMessage = {
+    const delta: OnChatEvent = {
       type: "stream-delta",
       workspaceId: "workspace",
       messageId: "B",
@@ -64,7 +64,7 @@ describe("createReplayBufferedStreamMessageRelay", () => {
   });
 
   test("buffers live init events until replay finishes", () => {
-    const pushed: WorkspaceChatMessage[] = [];
+    const pushed: OnChatEvent[] = [];
     const relay = createReplayBufferedStreamMessageRelay((message) => {
       pushed.push(message);
     });
@@ -131,7 +131,7 @@ describe("createReplayBufferedStreamMessageRelay", () => {
   });
 
   test("keeps buffered init lines with the same text/timestamp when lineNumber differs", () => {
-    const pushed: WorkspaceChatMessage[] = [];
+    const pushed: OnChatEvent[] = [];
     const relay = createReplayBufferedStreamMessageRelay((message) => {
       pushed.push(message);
     });
@@ -186,7 +186,7 @@ describe("createReplayBufferedStreamMessageRelay", () => {
   });
 
   test("drops buffered init events that replay already covered", () => {
-    const pushed: WorkspaceChatMessage[] = [];
+    const pushed: OnChatEvent[] = [];
     const relay = createReplayBufferedStreamMessageRelay((message) => {
       pushed.push(message);
     });

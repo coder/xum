@@ -12,6 +12,7 @@ import { detectDefaultTrunkBranch } from "@/node/git";
 import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import { isCaughtUpMessage, isMuxMessage } from "@/common/orpc/types";
+import { singleChatEvent } from "@/common/orpc/singleChatEvent";
 import type { MuxMessage } from "@/common/types/message";
 import type { HistoryService } from "@/node/services/historyService";
 import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";
@@ -40,7 +41,8 @@ async function replayIntoFreshAggregator(
   );
   const rows: MuxMessage[] = [];
   try {
-    for await (const event of iterator) {
+    for await (const received of iterator) {
+      const event = singleChatEvent(received);
       if (isMuxMessage(event)) rows.push(event);
       if (isCaughtUpMessage(event)) break;
     }

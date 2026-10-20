@@ -58,7 +58,7 @@
  *   support. Version 3 tapes have `masking: "none"` (full content).
  * - Parse every line with the line schemas below, decode each event with
  *   `new RPCJsonSerializer().deserialize({ json: line.event, meta: line.meta })`, and validate
- *   the result with `WorkspaceChatMessageSchema`.
+ *   the result with `OnChatEventSchema` (it includes `message-batch`).
  * - Validate every event. If any line or event is invalid, or the trailer is missing, reject the
  *   tape or flag it as invalid. Never drop individual events silently. Flag `truncated`,
  *   `stopped` and `error` tapes explicitly.

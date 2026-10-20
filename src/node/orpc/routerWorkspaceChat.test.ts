@@ -6,7 +6,7 @@ import { subscribeWorkspaceChat } from "./routerSubscriptions";
 import type { ORPCContext } from "./context";
 import { createAgentSessionHarness } from "../services/agentSession.testHarness";
 import { createMuxMessage } from "@/common/types/message";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { OnChatEvent } from "@/common/orpc/types";
 
 test("active-operation reconnect replays the stream envelope and live deltas before terminal", async () => {
   const workspaceId = "live-replay-smoke";
@@ -78,7 +78,7 @@ test("active-operation reconnect replays the stream envelope and live deltas bef
     createMuxMessage("user", "user", "hello")
   );
   const controller = new AbortController();
-  const events: WorkspaceChatMessage[] = [];
+  const events: OnChatEvent[] = [];
   const context = {
     workspaceService: { getOrCreateSession: () => harness.session },
   } as unknown as ORPCContext;

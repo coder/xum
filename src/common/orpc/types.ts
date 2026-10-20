@@ -44,6 +44,8 @@ export type CustomProviderMutationError = z.infer<typeof schemas.CustomProviderM
 export type AddCustomProviderInput = z.infer<typeof schemas.providers.addCustomProvider.input>;
 export type FilePart = z.infer<typeof schemas.FilePartSchema>;
 export type WorkspaceChatMessage = z.infer<typeof schemas.WorkspaceChatMessageSchema>;
+/** An onChat event: a WorkspaceChatMessage or an onChat-only `message-batch` (#5102). */
+export type OnChatEvent = z.infer<typeof schemas.OnChatEventSchema>;
 /** One held input's display data (see HeldInputsChangedEventSchema). */
 export type HeldInput = Extract<
   WorkspaceChatMessage,

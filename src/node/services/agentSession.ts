@@ -107,6 +107,7 @@ import type {
   ChatMuxMessage,
   HeldInput,
   WorkspaceChatMessage,
+  OnChatEvent,
   SendMessageOptions,
   FilePart,
   OnChatMode,
@@ -962,6 +963,16 @@ export interface AgentSessionChatEvent {
   wireMessage?: WorkspaceChatMessage;
 }
 
+/**
+ * A replay event for onChat's batch-capable path (#5102): `message` and `wireMessage` may be a
+ * `message-batch`. Only replayHistory with `batchReplay: true` emits one; every other chat-event
+ * listener gets AgentSessionChatEvent.
+ */
+export type AgentSessionReplayEvent = Omit<AgentSessionChatEvent, "message" | "wireMessage"> & {
+  message: OnChatEvent;
+  wireMessage?: OnChatEvent;
+};
+
 export interface AgentSessionMetadataEvent {
   workspaceId: string;
   metadata: FrontendWorkspaceMetadata | null;
@@ -1407,7 +1418,7 @@ function stopHookModel(
 
 export class AgentSession {
   private readonly replayPublication = new AsyncLocalStorage<{
-    listener: (event: AgentSessionChatEvent) => void;
+    listener: (event: AgentSessionReplayEvent) => void;
     emittedStreamEvents: boolean;
   }>();
   private readonly workspaceId: string;
@@ -2242,13 +2253,28 @@ export class AgentSession {
     listener: (event: AgentSessionChatEvent) => void,
     mode?: OnChatMode,
     beforeReplayCompletion?: () => void,
+    options?: { batchReplay?: false; replayWindow?: boolean }
+  ): Promise<void>;
+  async replayHistory(
+    listener: (event: AgentSessionReplayEvent) => void,
+    mode: OnChatMode | undefined,
+    beforeReplayCompletion: (() => void) | undefined,
+    options: { batchReplay: boolean; replayWindow?: boolean }
+  ): Promise<void>;
+  async replayHistory(
+    listener: ((event: AgentSessionChatEvent) => void) | ((event: AgentSessionReplayEvent) => void),
+    mode?: OnChatMode,
+    beforeReplayCompletion?: () => void,
     options?: { batchReplay?: boolean; replayWindow?: boolean }
   ): Promise<void> {
     this.assertNotDisposed("replayHistory");
     assert(typeof listener === "function", "listener must be a function");
-    await this.replayPublication.run({ listener, emittedStreamEvents: false }, () =>
+    // The overloads pair an AgentSessionChatEvent listener with no batchReplay, and only
+    // batchReplay emits a `message-batch`, so every event this listener gets fits its type.
+    const replayListener = listener as (event: AgentSessionReplayEvent) => void;
+    await this.replayPublication.run({ listener: replayListener, emittedStreamEvents: false }, () =>
       this.emitHistoricalEvents(
-        listener,
+        replayListener,
         mode,
         beforeReplayCompletion,
         options?.batchReplay,
@@ -3768,7 +3794,7 @@ export class AgentSession {
   }
 
   private async emitHistoricalEvents(
-    listener: (event: AgentSessionChatEvent) => void,
+    listener: (event: AgentSessionReplayEvent) => void,
     mode?: OnChatMode,
     beforeReplayCompletion?: () => void,
     batchReplay = false,
@@ -3827,7 +3853,7 @@ export class AgentSession {
         listener({ workspaceId: this.workspaceId, message: messages[0], wireMessage: messages[0] });
         return;
       }
-      const batch: WorkspaceChatMessage = { type: "message-batch", messages };
+      const batch: OnChatEvent = { type: "message-batch", messages };
       listener({ workspaceId: this.workspaceId, message: batch, wireMessage: batch });
     };
     const emitReplayMessage = (message: WorkspaceChatMessage): boolean => {

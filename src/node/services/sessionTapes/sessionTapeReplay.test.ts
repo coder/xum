@@ -15,8 +15,8 @@ import { spawnSync } from "node:child_process";
 import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
-import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import { OnChatEventSchema } from "@/common/orpc/schemas";
+import type { OnChatEvent } from "@/common/orpc/types";
 import {
   loadSessionTape,
   type LoadedSessionTape,
@@ -294,7 +294,7 @@ describe("loadSessionTape", () => {
 
   test("the file reader refuses malformed UTF-8 instead of decoding it to replacement characters", async () => {
     using dir = new DisposableTempDir("session-tape-utf8");
-    const delta = WorkspaceChatMessageSchema.parse({
+    const delta = OnChatEventSchema.parse({
       type: "stream-delta",
       workspaceId: "ws-1",
       messageId: "msg-1",
@@ -410,7 +410,7 @@ describe("replaySessionTape", () => {
     // does not fire under fake timers).
     jest.useFakeTimers();
     const replay = replaySessionTape(tape, { pacing: "fast" });
-    const delivered: WorkspaceChatMessage[] = [];
+    const delivered: OnChatEvent[] = [];
     for (;;) {
       const next = replay.next();
       expect(await settles(next)).toBe(true);
@@ -435,7 +435,7 @@ describe("replaySessionTape", () => {
 });
 
 describe("replayed tapes stay data", () => {
-  function displayedAfter(events: WorkspaceChatMessage[], workspaceId: string) {
+  function displayedAfter(events: OnChatEvent[], workspaceId: string) {
     const aggregator = new StreamingMessageAggregator(new Date(0).toISOString(), workspaceId);
     for (const event of events) {
       const rows = event.type === "message-batch" ? event.messages : [event];
@@ -450,7 +450,7 @@ describe("replayed tapes stay data", () => {
     const tape = expectLoaded(
       loadSessionTape(buildSyntheticSessionTape(events, { offsetMs: () => 0 }))
     );
-    const replayed: WorkspaceChatMessage[] = [];
+    const replayed: OnChatEvent[] = [];
     for await (const event of replaySessionTape(tape, { pacing: "recorded" })) {
       replayed.push(event);
     }
@@ -463,7 +463,7 @@ describe("replayed tapes stay data", () => {
     const workspaceId = "ws-legacy-advisor";
     const events = syntheticReplayTranscript(workspaceId);
     const legacyBase = { workspaceId, toolCallId: "advisor-call", timestamp: 1 };
-    const legacyEvents: WorkspaceChatMessage[] = [
+    const legacyEvents: OnChatEvent[] = [
       { ...legacyBase, type: "advisor-output", text: "Old advice" },
       { ...legacyBase, type: "advisor-reasoning-output", text: "Old reasoning" },
       { ...legacyBase, type: "advisor-phase", phase: "finalizing_result" },
@@ -472,7 +472,7 @@ describe("replayed tapes stay data", () => {
     const tape = expectLoaded(
       loadSessionTape(buildSyntheticSessionTape(recorded, { offsetMs: () => 0 }))
     );
-    const replayed: WorkspaceChatMessage[] = [];
+    const replayed: OnChatEvent[] = [];
     for await (const event of replaySessionTape(tape, { pacing: "recorded" })) {
       replayed.push(event);
     }
@@ -506,7 +506,7 @@ describe("replayed tapes stay data", () => {
       },
     ];
     const events = [
-      ...hostileRows.map((row) => WorkspaceChatMessageSchema.parse(row)),
+      ...hostileRows.map((row) => OnChatEventSchema.parse(row)),
       ...syntheticChatEvents(),
       ...syntheticReplayTranscript(workspaceId),
     ];
@@ -541,7 +541,7 @@ describe("replayed tapes stay data", () => {
     ];
     try {
       const loaded = await readSessionTapeFile(tapePath);
-      const replayed: WorkspaceChatMessage[] = [];
+      const replayed: OnChatEvent[] = [];
       for await (const event of replaySessionTape(expectLoaded(loaded), { pacing: "fast" })) {
         replayed.push(event);
       }

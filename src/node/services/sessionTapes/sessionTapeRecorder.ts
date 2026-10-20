@@ -37,7 +37,7 @@ import { RPCJsonSerializer } from "@orpc/client";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getXumPerfTapesDir } from "@/common/constants/paths";
 import assert from "@/common/utils/assert";
-import type { OnChatMode, WorkspaceChatMessage } from "@/common/orpc/types";
+import type { OnChatEvent, OnChatMode } from "@/common/orpc/types";
 import {
   SESSION_TAPE_MASKING,
   SESSION_TAPE_VERSION,
@@ -165,8 +165,8 @@ export async function stopSessionTapeCaptures(): Promise<{
 export function maybeRecordWorkspaceChat(
   deps: SessionTapeDeps,
   input: SessionTapeSubscriptionInput,
-  events: AsyncGenerator<WorkspaceChatMessage>
-): AsyncGenerator<WorkspaceChatMessage> {
+  events: AsyncGenerator<OnChatEvent>
+): AsyncGenerator<OnChatEvent> {
   if (!isRecordingEnabled(deps)) return events;
   // Only standalone full replays: a since/live subscription is a delta on top of client state
   // that no tape holds, so it cannot be replayed on its own.
@@ -185,7 +185,7 @@ export function maybeRecordWorkspaceChat(
       });
     }
   };
-  const observe = (result: IteratorResult<WorkspaceChatMessage>) => {
+  const observe = (result: IteratorResult<OnChatEvent>) => {
     if (result.done) capture?.finalize("closed");
     else capture?.record(result.value);
     return result;
@@ -196,7 +196,7 @@ export function maybeRecordWorkspaceChat(
   };
   // Pass-through iterator: delegates next/return/throw to the inner generator unchanged and
   // only observes settled results, so cleanup and error semantics stay the inner generator's.
-  const wrapped: AsyncGenerator<WorkspaceChatMessage> = {
+  const wrapped: AsyncGenerator<OnChatEvent> = {
     next: (...args) => {
       start();
       return events.next(...args).then(observe, fail);
@@ -258,7 +258,7 @@ class TapeCapture {
   }
 
   /** Never throws and never awaits: runs synchronously on the event path. */
-  record(event: WorkspaceChatMessage): void {
+  record(event: OnChatEvent): void {
     if (this.finalized) return;
     if (!isRecordingEnabled(this.deps)) {
       // Turned off mid-subscription: keep what was captured and stop here.
