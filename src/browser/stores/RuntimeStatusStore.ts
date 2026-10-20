@@ -79,10 +79,19 @@ export class RuntimeStatusStore {
 
     // Every workspace metadata event (title, tag, AI settings, ...) delivers a new Map, and
     // requestImmediate bypasses the debounce and the hidden-window check (#5573). Refresh only when
-    // a displayed devcontainer workspace appeared or its runtime inputs changed. Subscriptions,
-    // focus and invalidation still refresh.
+    // a displayed devcontainer workspace appeared, its runtime inputs changed, or its task status
+    // changed: launching or resuming a task starts a stopped container, and no other event tells
+    // this store. Subscriptions, focus and invalidation still refresh.
+    const previous = this.workspaceMetadata;
     const isSubscribed = (workspaceId: string) => this.statuses.hasKeySubscribers(workspaceId);
-    const needsRefresh = getStatusInputChanges(this.workspaceMetadata, metadata, isSubscribed).some(
+    const changedWorkspaceIds = getStatusInputChanges(previous, metadata, isSubscribed);
+    for (const [workspaceId, workspace] of metadata) {
+      const before = previous.get(workspaceId);
+      if (before != null && before.taskStatus !== workspace.taskStatus) {
+        changedWorkspaceIds.push(workspaceId);
+      }
+    }
+    const needsRefresh = changedWorkspaceIds.some(
       (workspaceId) =>
         isSubscribed(workspaceId) && isDevcontainerRuntime(metadata.get(workspaceId)?.runtimeConfig)
     );

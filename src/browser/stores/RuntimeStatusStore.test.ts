@@ -89,6 +89,16 @@ describe("RuntimeStatusStore refresh triggers (#5573)", () => {
     expect(getRuntimeStatuses).toHaveBeenCalledTimes(2);
   });
 
+  test("a task status change of a displayed devcontainer workspace refetches", async () => {
+    await setupDisplayed();
+
+    // Launching or resuming a task starts a stopped container; only taskStatus changes.
+    store.syncWorkspaces(new Map([["ws-1", createMetadata("ws-1", { taskStatus: "starting" })]]));
+    await settle();
+
+    expect(getRuntimeStatuses).toHaveBeenCalledTimes(2);
+  });
+
   test("a displayed devcontainer workspace that appears in metadata is fetched", async () => {
     const metadata = await setupDisplayed();
     // Rendered (subscribed) before its metadata arrived: the subscribe-time fetch skips it.
