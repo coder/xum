@@ -473,11 +473,10 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
         // on the left (the Panel clips it) so the collapse button stays visible. With room to
         // spare, the right-end group's ml-auto takes the free space and this has no effect.
         "has-[[data-sidebar-control]]:justify-end",
-        isDesktop && DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
+        // In desktop mode, match the title bar height and make header draggable for window movement
+        isDesktop && [DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS, "titlebar-drag"],
         showDropHighlight && "bg-accent/30",
-        isDraggingFromHere && "bg-accent/10",
-        // In desktop mode, make header draggable for window movement
-        isDesktop && "titlebar-drag"
+        isDraggingFromHere && "bg-accent/10"
       )}
     >
       {/* One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges)
