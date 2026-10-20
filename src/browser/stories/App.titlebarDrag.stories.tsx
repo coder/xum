@@ -8,10 +8,10 @@
  * does the gap between the version text and the sidebar title bar's buttons (macOS layout).
  *
  * WorkspaceCollapsed: the page header spans the window under the toggle bar, and its gap still
- * drags while the bar's buttons do not.
+ * drags while the bar's buttons do not. The header's title edit field (F2) stays clickable.
  */
 
-import { expect, within } from "storybook/test";
+import { expect, userEvent, within } from "storybook/test";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
@@ -138,5 +138,15 @@ export const WorkspaceCollapsed = desktopStory({
     );
     await expectDrags(await bar.findByRole("button", { name: "New chat" }), "New chat", false);
     await expectWorkspaceHeaderGapDrags(canvasElement);
+
+    // F2 edits the title in the header while the sidebar hides the workspace row; a focused
+    // chat input would keep the key.
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    await userEvent.keyboard("{F2}");
+    await expectDrags(
+      await within(canvasElement).findByRole("textbox", { name: "Edit workspace title" }),
+      "Title edit field",
+      false
+    );
   },
 });
