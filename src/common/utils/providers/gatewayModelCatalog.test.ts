@@ -273,6 +273,28 @@ describe("gatewayModelCatalog", () => {
     ).toBe(true);
   });
 
+  // #5660: Anthropic-type gateways list dated snapshot ids only. A dated entry satisfies the
+  // undated id the built-in model sends; removals stay exact, as for the Gemini alias.
+  test("accepts an undated id whose -YYYYMMDD snapshot is in a Coder catalog; removals stay exact", () => {
+    const catalog = ["anthropic/claude-haiku-4-5-20251001"];
+    const check = (modelId: string, removed?: string[]) =>
+      isProviderModelAccessibleFromAuthoritativeCatalog(
+        "coder",
+        modelId,
+        undefined,
+        catalog,
+        removed
+      );
+    expect(check("anthropic/claude-haiku-4-5")).toBe(true);
+    expect(check("anthropic/claude-haiku-4-5-20251001")).toBe(true);
+    // Only a full 8-digit date suffix counts, and only on the same id.
+    expect(check("anthropic/claude-haiku-4")).toBe(false);
+    expect(check("anthropic/claude-haiku-4-5-2025")).toBe(false);
+    expect(check("other/claude-haiku-4-5")).toBe(false);
+    expect(check("anthropic/claude-haiku-4-5", ["anthropic/claude-haiku-4-5"])).toBe(false);
+    expect(check("anthropic/claude-haiku-4-5", ["anthropic/claude-haiku-4-5-20251001"])).toBe(true);
+  });
+
   test("gates Coder routing on the catalog whether models is missing, empty, or manual-only", () => {
     // The catalog verdict must not depend on the shape of `models`: missing
     // (hand-edited config), empty, or holding only unrelated manual entries.

@@ -4164,6 +4164,34 @@ describe("CoderOauthService", () => {
       }
     });
 
+    // #5659: the error names each provider whose model list keeps failing, with its status, so a
+    // user can tell a deployment problem from a Xum problem.
+    it("names the failing provider and its status when one model list keeps failing", async () => {
+      deps.providersConfig = {
+        coder: { deploymentUrl: DEPLOYMENT_URL, coderOauth: validAuth() },
+      };
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(aiProvidersResponse());
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
+          return Promise.resolve(new Response("bad gateway", { status: 502 }));
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/openai/v1/models`) {
+          return Promise.resolve(jsonResponse({ data: [{ id: "gpt-5" }] }));
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      const result = await service.refreshModels();
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toContain("anthropic (HTTP 502)");
+        expect(result.error).not.toContain("openai");
+      }
+    });
+
     it("serializes concurrent refresh runs so a slower run cannot commit stale results", async () => {
       deps.providersConfig = {
         coder: { deploymentUrl: DEPLOYMENT_URL, coderOauth: validAuth() },

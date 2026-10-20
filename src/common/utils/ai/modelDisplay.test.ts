@@ -23,6 +23,15 @@ describe("formatCompactModelDisplayName", () => {
 });
 
 describe("formatModelDisplayName", () => {
+  // #5661: Coder catalog ids carry the gateway provider name, which can look like a model.
+  test("strips a Coder gateway provider prefix and a snapshot date", () => {
+    expect(formatModelDisplayName("claude-aws-us-east-2/claude-haiku-4-5-20251001")).toBe(
+      "Haiku 4.5"
+    );
+    expect(formatModelDisplayName("anthropic/claude-haiku-4-5-20251001")).toBe("Haiku 4.5");
+    expect(formatModelDisplayName("claude-haiku-4-5-20251001")).toBe("Haiku 4.5");
+  });
+
   describe("Claude models", () => {
     test("formats Sonnet models", () => {
       expect(formatModelDisplayName("claude-sonnet-4-5")).toBe("Sonnet 4.5");
