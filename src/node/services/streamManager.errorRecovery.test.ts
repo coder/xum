@@ -617,7 +617,6 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
 
   for (const [statusCode, errorType] of [
     [503, "server_error"],
-    [408, "server_error"],
     [401, "authentication"],
     [429, "rate_limit"],
   ] as const) {
@@ -1288,6 +1287,28 @@ describe("StreamManager - Anthropic mid-stream overload", () => {
       error: "Anthropic is temporarily overloaded (HTTP 529). Please try again later.",
       errorType: "server_error",
     });
+  });
+
+  // #4228: only an error part without an HTTP status or a server-side type is marked, so only
+  // its identical repeats stop auto-retry. The text is the gateway error from the report.
+  const gatewayMessage =
+    "processing error: accumulate event: error converting content block to JSON";
+  test.each([
+    [{ type: "error", message: gatewayMessage }, true],
+    [{ type: "api_error", message: gatewayMessage }, false],
+    [{ type: "overloaded_error", message: "Overloaded" }, false],
+  ])("the stream error part %p marks capIdenticalRepeats: %p", async (error, capped) => {
+    const harness = createRecoveryHarness();
+    const { completion } = await harness.run({
+      workspaceId: "anthropic-error-part",
+      model: anthropicStreamFailingWith(error),
+      modelString: "anthropic:claude-opus-5-5",
+      attempts: [realSdkAttempt],
+    });
+
+    expect(completion.status).toBe("failed");
+    const streamError = completion.status === "failed" ? completion.streamError : undefined;
+    expect(streamError?.capIdenticalRepeats === true).toBe(capped);
   });
 
   // Validation messages can echo request text (a tool description), which can hold an

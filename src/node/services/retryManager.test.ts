@@ -461,14 +461,14 @@ describe("RetryManager", () => {
     expect(onRetry).toHaveBeenCalledTimes(1);
   });
 
-  // #4228: an unrecognized provider error (classified "api") that repeats with the same text is
-  // deterministic, so retrying it forever only resends the same failing request.
-  it("stops retrying after 10 consecutive identical unrecognized provider errors", async () => {
+  // #4228: a provider error part with no HTTP status (marked capIdenticalRepeats) that repeats
+  // with the same text is deterministic, so retrying it forever only resends the failing request.
+  it("stops retrying after 10 consecutive identical capped provider errors", async () => {
     const { manager, onRetry, events } = createRetryManager();
     const message = "processing error: accumulate event: error converting content block to JSON";
 
     for (let failure = 1; failure <= 10; failure++) {
-      manager.handleStreamFailure({ type: "api", message });
+      manager.handleStreamFailure({ type: "api", message, capIdenticalRepeats: true });
       await adjustPastAnyBackoff();
     }
 
@@ -479,41 +479,38 @@ describe("RetryManager", () => {
     expect(last?.type === "auto-retry-abandoned" ? last.reason : "").toContain(message);
   });
 
-  // Outages repeat the same text too: 5xx, rate limits and network errors keep retrying, and so
-  // does an unrecognized error whose text changes between attempts.
+  // Only the capped path stops. Every other failure keeps retrying with the same text, because
+  // an outage repeats its text too (HTTP statuses and transport errors carry no cap marker).
   it.each([
-    ["server_error", () => "503 Service Unavailable"],
-    ["rate_limit", () => "429 Too Many Requests"],
-    ["network", () => "fetch failed"],
-    ["api", (failure: number) => `gateway error ${failure % 2}`],
-    ["api", () => "The server had an error processing your request."],
-    ["api", () => "Model is overloaded, please try again later"],
-    ["api", () => "socket hang up"],
-    ["api", () => "read ECONNRESET"],
-    ["api", () => "upstream connect error or disconnect/reset before headers"],
-    ["api", () => "Bad Gateway"],
-    ["api", () => "Please retry later"],
-  ] as const)("keeps retrying %s failures past 10 attempts", async (type, messageFor) => {
-    const { manager, onRetry, events } = createRetryManager();
+    ["server_error", false, () => "503 Service Unavailable"],
+    ["rate_limit", false, () => "429 Too Many Requests"],
+    ["network", false, () => "socket hang up"],
+    ["api", false, () => "processing error: accumulate event"],
+    ["api", true, (failure: number) => `gateway error ${failure % 2}`],
+  ] as const)(
+    "keeps retrying %s failures (capped=%p) past 10 attempts",
+    async (type, capIdenticalRepeats, messageFor) => {
+      const { manager, onRetry, events } = createRetryManager();
 
-    for (let failure = 1; failure <= 12; failure++) {
-      manager.handleStreamFailure({ type, message: messageFor(failure) });
-      await adjustPastAnyBackoff();
+      for (let failure = 1; failure <= 12; failure++) {
+        manager.handleStreamFailure({ type, message: messageFor(failure), capIdenticalRepeats });
+        await adjustPastAnyBackoff();
+      }
+
+      expect(onRetry).toHaveBeenCalledTimes(12);
+      expect(events.some((event) => event.type === "auto-retry-abandoned")).toBe(false);
     }
-
-    expect(onRetry).toHaveBeenCalledTimes(12);
-    expect(events.some((event) => event.type === "auto-retry-abandoned")).toBe(false);
-  });
+  );
 
   it("a non-retryable failure in between restarts the count of identical unrecognized errors", async () => {
     const { manager, events } = createRetryManager();
 
     for (let failure = 1; failure <= 9; failure++) {
-      manager.handleStreamFailure({ type: "api", message: "same text" });
+      manager.handleStreamFailure({ type: "api", message: "same text", capIdenticalRepeats: true });
       await adjustPastAnyBackoff();
     }
     manager.handleStreamFailure({ type: "authentication", message: "bad key" });
-    manager.handleStreamFailure({ type: "api", message: "same text" });
+    manager.handleStreamFailure({ type: "api", message: "same text", capIdenticalRepeats: true });
 
     expect(events.at(-1)?.type).toBe("auto-retry-scheduled");
   });
@@ -524,7 +521,11 @@ describe("RetryManager", () => {
     try {
       const { manager, onRetry, events } = createRetryManager();
       for (let failure = 1; failure <= 12; failure++) {
-        manager.handleStreamFailure({ type: "api", message: "same text" });
+        manager.handleStreamFailure({
+          type: "api",
+          message: "same text",
+          capIdenticalRepeats: true,
+        });
         await adjustPastAnyBackoff();
       }
       expect(onRetry).toHaveBeenCalledTimes(12);
@@ -539,7 +540,7 @@ describe("RetryManager", () => {
 
     for (let failure = 1; failure <= 15; failure++) {
       if (failure === 8) manager.handleStreamSuccess();
-      manager.handleStreamFailure({ type: "api", message: "same text" });
+      manager.handleStreamFailure({ type: "api", message: "same text", capIdenticalRepeats: true });
       await adjustPastAnyBackoff();
     }
 

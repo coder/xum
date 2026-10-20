@@ -33,6 +33,7 @@ import {
   RetryError,
   StreamProviderError,
 } from "ai";
+import { isRepeatCappedProviderError } from "./utils/providerErrorRepeatCap";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { ProviderOptions } from "@ai-sdk/provider-utils";
 import type { Result } from "@/common/types/result";
@@ -1224,12 +1225,16 @@ function wrappedAnthropicErrorType(error: StreamProviderError): string | undefin
   }
 }
 
-/**
- * A 5xx, or 408 Request Timeout: transient, so it stays out of the generic "api" class, whose
- * identical repeats stop auto-retry (#4228).
- */
-function isTransientHttpStatus(statusCode: number | undefined): boolean {
-  return statusCode === 408 || (statusCode !== undefined && statusCode >= 500);
+/** The payload's capIdenticalRepeats marker: an unrecognized ("api") provider error part. */
+function repeatCapField(
+  errorType: StreamErrorType,
+  error: unknown,
+  actualError: unknown
+): { capIdenticalRepeats?: true } {
+  const capped =
+    errorType === "api" &&
+    (isRepeatCappedProviderError(error) || isRepeatCappedProviderError(actualError));
+  return capped ? { capIdenticalRepeats: true } : {};
 }
 
 function isOverloadedApiCallError(error: APICallError): boolean {
@@ -5903,6 +5908,7 @@ export class StreamManager {
       errorType,
       acpPromptId: streamInfo.initialMetadata?.acpPromptId,
       ...(retryAfterMs != null ? { retryAfterMs } : {}),
+      ...repeatCapField(errorType, error, actualError),
     };
   }
 
@@ -6391,7 +6397,7 @@ export class StreamManager {
           responseBody: error.responseBody,
         });
       }
-      if (isTransientHttpStatus(error.statusCode)) return "server_error";
+      if (error.statusCode && error.statusCode >= 500) return "server_error";
 
       // Check for model_not_found errors (OpenAI and Anthropic)
       // Type guard for error data structure

@@ -170,6 +170,11 @@ export interface StreamErrorPayload {
    */
   retryAfterMs?: number;
   /**
+   * Internal: identical repeats of this failure stop auto-retry (isRepeatCappedProviderError,
+   * #4228). Feeds auto-retry only; not persisted and not part of the renderer wire payload.
+   */
+  capIdenticalRepeats?: true;
+  /**
    * Internal: the model the failed request ran on, which is a refusal fallback after a swap.
    * The compaction context_exceeded retry plans from it. Not part of the renderer wire payload.
    */

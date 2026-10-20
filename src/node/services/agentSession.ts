@@ -9983,6 +9983,8 @@ export class AgentSession {
       await this.handleStreamFailureForAutoRetry({
         type: failureType,
         message: data.error,
+        // RetryManager honors it only together with the "api" type (see retryAfterMs below).
+        capIdenticalRepeats: data.capIdenticalRepeats === true,
         // Only for the final rate_limit class: the rollover/budget rewrites above spread `data`
         // and can replace the error type while an older retryAfterMs survives the spread.
         ...(failureType === "rate_limit" && data.retryAfterMs != null

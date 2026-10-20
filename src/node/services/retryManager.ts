@@ -19,6 +19,8 @@ export interface RetryFailureError {
   message?: string;
   /** Provider-requested wait (Retry-After) for a rate-limited stream; see calculateRetryDelay. */
   retryAfterMs?: number;
+  /** Identical repeats stop auto-retry (with type "api" only; isRepeatCappedProviderError). */
+  capIdenticalRepeats?: boolean;
 }
 
 // Status events emitted during auto-retry lifecycle
@@ -42,16 +44,6 @@ export type RetryStatusEvent =
   | AutoRetryAbandonedEvent;
 
 const MAX_REASON_ERROR_CHARS = 300;
-
-/**
- * Text of an "api"-class error that still reads as an outage: a provider without a mapped
- * status (an OpenAI mid-stream server_error, a non-Anthropic overload) falls back to "api" with
- * constant text, and so do transport failures whose text names no "network" or "fetch"
- * ("socket hang up", "read ECONNRESET", "Bad Gateway"). Those keep unbounded retry like 5xx
- * (#4228). Broad on purpose: a miss here only keeps today's behavior.
- */
-const TRANSIENT_ERROR_TEXT =
-  /overload|server|unavailable|try again|retry|timed? ?out|capacity|busy|internal|socket|hang up|econn|etimedout|eai_again|reset|connection|bad gateway/iu;
 
 function truncateReason(message: string): string {
   return message.length > MAX_REASON_ERROR_CHARS
@@ -257,16 +249,12 @@ export class RetryManager {
   /** Counts `error` into the run of identical unrecognized ("api") failures (#4228). */
   private countIdenticalApiErrorFailure(error: RetryFailureError): number {
     const previous = this.state.lastError;
-    const isApiError =
-      error.type === "api" &&
-      error.message !== undefined &&
-      !TRANSIENT_ERROR_TEXT.test(error.message);
-    const repeats = isApiError && previous?.type === "api" && previous.message === error.message;
-    this.identicalApiErrorFailures = repeats
-      ? this.identicalApiErrorFailures + 1
-      : isApiError
-        ? 1
-        : 0;
+    const counts =
+      error.type === "api" && error.capIdenticalRepeats === true && error.message !== undefined;
+    // A run is live only while the previous failure counted (anything else resets it to 0).
+    const repeats =
+      counts && this.identicalApiErrorFailures > 0 && previous?.message === error.message;
+    this.identicalApiErrorFailures = repeats ? this.identicalApiErrorFailures + 1 : counts ? 1 : 0;
     return this.identicalApiErrorFailures;
   }
 
