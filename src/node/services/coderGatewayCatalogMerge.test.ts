@@ -107,7 +107,7 @@ describe("reconcileProviderCatalog", () => {
       expect(
         reconcileProviderCatalog(
           anthropic,
-          { kind: "error" },
+          { kind: "error", reason: "HTTP 502" },
           prior({ discovered: ["anthropic/a", "openai/b", "anthropicx/c"] }),
           true
         )
@@ -116,7 +116,12 @@ describe("reconcileProviderCatalog", () => {
 
     it("counts stored metadata as prior state even without prior entries", () => {
       expect(
-        reconcileProviderCatalog(custom, { kind: "error" }, prior({ providers: [custom] }), true)
+        reconcileProviderCatalog(
+          custom,
+          { kind: "error", reason: "HTTP 502" },
+          prior({ providers: [custom] }),
+          true
+        )
       ).toEqual({ ids: [], providers: [], inconclusive: false });
     });
 
@@ -124,7 +129,7 @@ describe("reconcileProviderCatalog", () => {
       expect(
         reconcileProviderCatalog(
           custom,
-          { kind: "error" },
+          { kind: "error", reason: "HTTP 502" },
           prior({ providers: [custom], discovered: ["corp/m"] }),
           false
         )
@@ -135,7 +140,7 @@ describe("reconcileProviderCatalog", () => {
       expect(
         reconcileProviderCatalog(
           anthropic,
-          { kind: "error" },
+          { kind: "error", reason: "HTTP 502" },
           prior({ known: false, stale: ["anthropic/s", "openai/t"] }),
           true
         )
@@ -146,7 +151,7 @@ describe("reconcileProviderCatalog", () => {
       expect(
         reconcileProviderCatalog(
           anthropic,
-          { kind: "error" },
+          { kind: "error", reason: "HTTP 502" },
           prior({ discovered: ["openai/b"] }),
           true
         )
@@ -158,7 +163,7 @@ describe("reconcileProviderCatalog", () => {
       expect(
         reconcileProviderCatalog(
           retyped,
-          { kind: "error" },
+          { kind: "error", reason: "HTTP 502" },
           prior({ providers: [custom], discovered: ["corp/m"], stale: ["corp/s"] }),
           true
         )
@@ -171,7 +176,7 @@ describe("reconcileProviderCatalog", () => {
       expect(
         reconcileProviderCatalog(
           { name: "anthropic", type: "openai" },
-          { kind: "error" },
+          { kind: "error", reason: "HTTP 502" },
           prior({ discovered: ["anthropic/a"] }),
           true
         )

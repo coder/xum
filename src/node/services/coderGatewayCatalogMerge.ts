@@ -16,7 +16,8 @@ import type { CoderGatewayProvider } from "@/common/constants/coderOAuth";
 export type CoderProviderCatalogResult =
   | { kind: "ok"; ids: string[] }
   | { kind: "unavailable" }
-  | { kind: "error" };
+  // `reason` names the last attempt's failure for the user-facing error (#5659).
+  | { kind: "error"; reason: string };
 
 /** Catalog state persisted before this refresh, read INSIDE the locked mutation. */
 export interface PriorCoderCatalog {
@@ -184,4 +185,18 @@ export function reconcileProviderCatalog(
   // conclusively serves no catalog), and probe-default names carry no
   // recorded metadata — the route is conclusively absent; drop it.
   return { ids: [], providers: [], inconclusive: false };
+}
+
+/**
+ * The failing providers of a catalog refresh, with each one's last failure, for the user-facing
+ * error: "anthropic (HTTP 502), openai (request failed)" (#5659).
+ */
+export function describeCatalogFailures(
+  results: ReadonlyArray<{ provider: CoderGatewayProvider; result: CoderProviderCatalogResult }>
+): string {
+  return results
+    .flatMap(({ provider, result }) =>
+      result.kind === "error" ? [`${provider.name} (${result.reason})`] : []
+    )
+    .join(", ");
 }

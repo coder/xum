@@ -40,9 +40,11 @@ import type { WindowService } from "@/node/services/windowService";
 import { log } from "@/node/services/log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import {
+  describeCatalogFailures,
   probeCoderGatewayProviders,
   readPriorCoderCatalog,
   reconcileProviderCatalog,
+  type CoderProviderCatalogResult,
 } from "@/node/services/coderGatewayCatalogMerge";
 import {
   isCoderOauthAuthExpired,
@@ -2197,7 +2199,7 @@ export class CoderOauthService {
   private fetchProviderCatalogEffect(
     auth: CoderOauthAuth,
     provider: CoderGatewayProvider
-  ): Effect.Effect<{ kind: "ok"; ids: string[] } | { kind: "unavailable" } | { kind: "error" }> {
+  ): Effect.Effect<CoderProviderCatalogResult> {
     const providerName = provider.name;
     return Effect.gen(function* () {
       const response = yield* Effect.tryPromise({
@@ -2233,7 +2235,7 @@ export class CoderOauthService {
           log.debug(
             `[Coder OAuth] ${providerName} model list failed transiently (${response.status})`
           );
-          return { kind: "error" } as const;
+          return { kind: "error", reason: `HTTP ${response.status}` } as const;
         }
         log.debug(`[Coder OAuth] ${providerName} model list unavailable (${response.status})`);
         return { kind: "unavailable" } as const;
@@ -2245,7 +2247,7 @@ export class CoderOauthService {
       });
       if (!isPlainObject(json) || !Array.isArray(json.data)) {
         log.debug(`[Coder OAuth] ${providerName} model list returned an invalid payload`);
-        return { kind: "error" } as const;
+        return { kind: "error", reason: "invalid response" } as const;
       }
       const ids: string[] = [];
       for (const entry of json.data) {
@@ -2260,7 +2262,7 @@ export class CoderOauthService {
       Effect.catch((message) =>
         Effect.sync(() => {
           log.debug(`[Coder OAuth] Failed to fetch ${providerName} models: ${message}`);
-          return { kind: "error" } as const;
+          return { kind: "error", reason: "request failed" } as const;
         })
       )
     );
@@ -2667,11 +2669,14 @@ export class CoderOauthService {
         log.debug(
           "[Coder OAuth] Catalog refresh inconclusive: provider fetches failed transiently"
         );
+        // Name each failing provider and its status, so a user can tell a deployment problem
+        // (for example a gateway that answers 502) from a Xum problem (#5659).
+        const failures = describeCatalogFailures(results);
         return yield* Effect.fail(
           new CoderOauthError({
             reason: everyFetchFailed
-              ? "Model discovery failed for every AI Gateway provider"
-              : "Model discovery failed for at least one AI Gateway provider; try refreshing again",
+              ? `Model discovery failed for every AI Gateway provider: ${failures}`
+              : `Model discovery failed for AI Gateway providers: ${failures}; try refreshing again`,
           })
         );
       }

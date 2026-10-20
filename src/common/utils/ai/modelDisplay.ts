@@ -46,11 +46,22 @@ export function formatModelDisplayName(modelName: string): string {
     modelName = bedrockParsed;
   }
 
+  // Strip a vendor or gateway provider prefix before any family branch reads the name: a Coder
+  // provider name can look like a model ("claude-aws-us-east-2/claude-haiku-4-5", #5661).
+  const bareModel = withoutGatewayPrefix(modelName);
+  if (bareModel !== undefined) {
+    return formatModelDisplayName(bareModel);
+  }
+
   const lower = modelName.toLowerCase();
 
-  // Claude models - extract the model tier and version
+  // Claude models - extract the model tier and version. A trailing snapshot date
+  // ("claude-haiku-4-5-20251001") is not part of the version.
   if (lower.startsWith("claude-")) {
-    const parts = lower.replace("claude-", "").split("-");
+    const parts = lower
+      .replace("claude-", "")
+      .replace(/-\d{8}$/, "")
+      .split("-");
 
     // Known tiers for Claude models. Fable / Mythos are the Mythos-class tier that
     // sits above Opus (e.g. "claude-fable-5" -> "Fable 5", "claude-mythos-5" -> "Mythos 5").
@@ -211,16 +222,19 @@ export function formatModelDisplayName(modelName: string): string {
     return `${formatted.trim()} (${size.toUpperCase()})`;
   }
 
-  // Gateway-scoped vendor/model pattern (e.g., "meta-llama/llama-3.1-405b")
-  if (modelName.includes("/")) {
-    const slashIdx = modelName.indexOf("/");
-    const bareModel = modelName.slice(slashIdx + 1);
-    // Try formatting the bare model name through existing handlers.
-    return formatModelDisplayName(bareModel);
-  }
-
   // Fallback: capitalize first letter of each dash-separated part
   return modelName.split("-").map(capitalize).join(" ");
+}
+
+/**
+ * The model name after a gateway-scoped "vendor/" or "provider/" prefix
+ * ("meta-llama/llama-3.1-405b" -> "llama-3.1-405b"), or undefined without one. Ollama
+ * "name:tag" ids keep their slash: the tag branch formats them whole.
+ */
+function withoutGatewayPrefix(modelName: string): string | undefined {
+  const slashIdx = modelName.indexOf("/");
+  if (slashIdx <= 0 || modelName.includes(":")) return undefined;
+  return modelName.slice(slashIdx + 1);
 }
 
 /**
