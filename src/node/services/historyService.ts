@@ -3667,12 +3667,20 @@ export class HistoryService {
         : withPartialReplayReceipt(existingMessage, partial);
 
       if (shouldCommit) {
-        const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, partial);
+        const updateResult = await this.updateHistoryUnderWriteLock(
+          workspaceId,
+          partial,
+          assertStillOwned
+        );
         if (!updateResult.success) {
           return updateResult;
         }
       } else if (receiptRow) {
-        const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, receiptRow);
+        const updateResult = await this.updateHistoryUnderWriteLock(
+          workspaceId,
+          receiptRow,
+          assertStillOwned
+        );
         if (!updateResult.success) {
           return updateResult;
         }
@@ -4088,8 +4096,11 @@ export class HistoryService {
   }
 
   async appendToHistory(workspaceId: string, message: MuxMessage): Promise<Result<void>> {
-    return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to append history", () =>
-      this.appendToHistoryUnderWriteLock(workspaceId, message)
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to append history",
+      (assertStillOwned) =>
+        this.appendToHistoryUnderWriteLock(workspaceId, message, assertStillOwned)
     );
   }
 
@@ -4118,7 +4129,7 @@ export class HistoryService {
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to append derived history",
-      async () => {
+      async (assertStillOwned) => {
         // Truncation recovery already ran inside withCrossProcessWriteLock, and the read-side
         // recovery would re-acquire the (non-reentrant) file lock, so read unlocked here.
         const messages: MuxMessage[] = [];
@@ -4132,7 +4143,11 @@ export class HistoryService {
           ).captureGenerationUnderHistoryLock();
         const derived = await derive(messages, { generation });
         if (derived.message !== null) {
-          const appended = await this.appendToHistoryUnderWriteLock(workspaceId, derived.message);
+          const appended = await this.appendToHistoryUnderWriteLock(
+            workspaceId,
+            derived.message,
+            assertStillOwned
+          );
           if (!appended.success) return appended;
         }
         return Ok(derived.value);
@@ -4142,14 +4157,15 @@ export class HistoryService {
 
   private async appendToHistoryUnderWriteLock(
     workspaceId: string,
-    message: MuxMessage
+    message: MuxMessage,
+    assertStillOwned: () => Promise<void>
   ): Promise<Result<void>> {
     await this.refreshSequenceCounterUnderWriteLock(workspaceId);
     const result = await this._appendToHistoryUnlocked(workspaceId, message);
     if (result.success) {
       // A new durable boundary seals the previous epoch — rotate it out of
       // chat.jsonl so subsequent reads/rewrites stay O(active epoch).
-      await this.rotateAfterBoundaryWriteUnlocked(workspaceId, message);
+      await this.rotateAfterBoundaryWriteUnlocked(workspaceId, message, assertStillOwned);
     }
     return result;
   }
@@ -4165,8 +4181,11 @@ export class HistoryService {
    */
   async appendManyToHistory(workspaceId: string, messages: MuxMessage[]): Promise<Result<void>> {
     assert(messages.length > 0, "appendManyToHistory requires at least one message");
-    return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to append history", () =>
-      this.appendManyToHistoryUnderWriteLock(workspaceId, messages)
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to append history",
+      (assertStillOwned) =>
+        this.appendManyToHistoryUnderWriteLock(workspaceId, messages, assertStillOwned)
     );
   }
 
@@ -4575,8 +4594,18 @@ export class HistoryService {
         };
         const written =
           prepared.kind === "append"
-            ? await this.appendManyToHistoryUnderWriteLock(workspaceId, messages, publication)
-            : await this.updateHistoryUnderWriteLock(workspaceId, trigger, publication);
+            ? await this.appendManyToHistoryUnderWriteLock(
+                workspaceId,
+                messages,
+                assertStillOwned,
+                publication
+              )
+            : await this.updateHistoryUnderWriteLock(
+                workspaceId,
+                trigger,
+                assertStillOwned,
+                publication
+              );
         if (accepted) return Ok(accepted);
         if (superseded) return Ok({ kind: "superseded" });
         return written.success
@@ -4800,6 +4829,7 @@ export class HistoryService {
   private async appendManyToHistoryUnderWriteLock(
     workspaceId: string,
     messages: MuxMessage[],
+    assertStillOwned: () => Promise<void>,
     publication?: HistoryPublicationObserver
   ): Promise<Result<void>> {
     try {
@@ -4846,7 +4876,8 @@ export class HistoryService {
       // Publish the entire batch before sealing its previous epoch. Rotation
       // is best-effort: a storage failure must not invite a duplicate batch.
       const boundary = messages.findLast(isDurableContextBoundaryMarker);
-      if (boundary) await this.rotateAfterBoundaryWriteUnlocked(workspaceId, boundary);
+      if (boundary)
+        await this.rotateAfterBoundaryWriteUnlocked(workspaceId, boundary, assertStillOwned);
       return Ok(undefined);
     } catch (error) {
       return Err(`Failed to append to history: ${getErrorMessage(error)}`);
@@ -4875,7 +4906,7 @@ export class HistoryService {
     return this.withRecoveredHistoryWriteResultLock<"appended" | "tail-mismatch">(
       workspaceId,
       "Failed to append history",
-      async () => {
+      async (assertStillOwned) => {
         await this.refreshSequenceCounterUnderWriteLock(workspaceId);
         // Tail check + append under the cross-process lock (r50) so a foreign
         // backend's append cannot land between the check and this write.
@@ -4887,7 +4918,7 @@ export class HistoryService {
         if (!result.success) {
           return Err(result.error);
         }
-        await this.rotateAfterBoundaryWriteUnlocked(workspaceId, message);
+        await this.rotateAfterBoundaryWriteUnlocked(workspaceId, message, assertStillOwned);
         return Ok("appended");
       }
     );
@@ -4909,9 +4940,13 @@ export class HistoryService {
     return this.withRecoveredHistoryWriteResultLock<"appended" | "refused">(
       workspaceId,
       "Failed to append history",
-      async () => {
+      async (assertStillOwned) => {
         if (!admits()) return Ok("refused");
-        const appended = await this.appendToHistoryUnderWriteLock(workspaceId, message);
+        const appended = await this.appendToHistoryUnderWriteLock(
+          workspaceId,
+          message,
+          assertStillOwned
+        );
         if (!appended.success) return Err(appended.error);
         return Ok("appended");
       }
@@ -4927,8 +4962,10 @@ export class HistoryService {
    * never in the sealed archive.
    */
   async updateHistory(workspaceId: string, message: MuxMessage): Promise<Result<void>> {
-    return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to update history", () =>
-      this.updateHistoryUnderWriteLock(workspaceId, message)
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to update history",
+      (assertStillOwned) => this.updateHistoryUnderWriteLock(workspaceId, message, assertStillOwned)
     );
   }
 
@@ -5252,6 +5289,7 @@ export class HistoryService {
   private async updateHistoryUnderWriteLock(
     workspaceId: string,
     message: MuxMessage,
+    assertStillOwned: (() => Promise<void>) | undefined,
     publication?: HistoryPublicationObserver
   ): Promise<Result<void>> {
     invalidateHistoryAppendProvenance();
@@ -5329,7 +5367,7 @@ export class HistoryService {
       // Compaction updates the streamed summary row in-place with boundary
       // metadata — seal the previous epoch once that lands. Check the persisted
       // row (not the incoming message) so preserved boundary metadata counts.
-      await this.rotateAfterBoundaryWriteUnlocked(workspaceId, persistedMessage);
+      await this.rotateAfterBoundaryWriteUnlocked(workspaceId, persistedMessage, assertStillOwned);
 
       return Ok(undefined);
     } catch (error) {

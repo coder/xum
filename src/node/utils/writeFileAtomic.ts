@@ -360,7 +360,7 @@ function fsyncParentDirectorySync(target: string): void {
     fd = fs.openSync(path.dirname(target), "r");
     fs.fsyncSync(fd);
   } catch (error) {
-    log.debug("writeFileAtomic: parent directory fsync failed", {
+    log.debug("parent directory fsync failed", {
       target,
       error: getErrorMessage(error),
     });
