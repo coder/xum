@@ -13,6 +13,7 @@ import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
 import { measureCompactionInputTokens } from "./compactionInputSizing";
 import {
   anthropicBetweenToolsRouteAvailable,
+  anthropicNativeWebFetchRouteAvailable,
   canSwitchToAnthropic1MContext,
   isAnthropic1MEffectivelyEnabled,
 } from "@/common/utils/ai/providerOptions";
@@ -2656,6 +2657,11 @@ export class TurnRequestBuilder {
       capabilityModelString,
       openaiWireFormat: effectiveMuxProviderOptions?.openai?.wireFormat,
       xaiNativeToolsEnabled: routeProvider === "xai",
+      anthropicNativeWebFetchEnabled: anthropicNativeWebFetchRouteAvailable(
+        modelResult.data.rawModelString,
+        routeProvider,
+        requestProvidersConfig
+      ),
       xaiSearchParameters: effectiveMuxProviderOptions.xai?.searchParameters,
       backgroundProcessManager: this.dependencies.backgroundProcessManager,
       hasQueuedMessages,
@@ -2942,6 +2948,11 @@ export class TurnRequestBuilder {
             goalKickoffModel: seed.rawModelString,
             openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
             xaiNativeToolsEnabled: seed.routeProvider === "xai",
+            anthropicNativeWebFetchEnabled: anthropicNativeWebFetchRouteAvailable(
+              seed.rawModelString,
+              seed.routeProvider,
+              seed.providersConfig
+            ),
           },
           workspaceId,
           this.dependencies.initStateManager,

@@ -24,7 +24,8 @@ export function anthropicSupportsFastMode(modelString: string): boolean {
   return /^claude-opus-(?:4-8|5|5-5)(?:-\d{8})?$/.test(stripModelProviderPrefixes(modelString));
 }
 
-function isFirstPartyAnthropicBaseUrl(baseUrl: string): boolean {
+/** True when the base URL is the first-party Claude API host. */
+export function isFirstPartyAnthropicBaseUrl(baseUrl: string): boolean {
   try {
     return new URL(baseUrl.trim()).hostname.toLowerCase() === "api.anthropic.com";
   } catch {

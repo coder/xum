@@ -22,6 +22,7 @@ import {
   resolveProviderOptionsNamespaceKey,
   ANTHROPIC_1M_CONTEXT_HEADER,
   MUX_WORKSPACE_ID_HEADER,
+  anthropicNativeWebFetchRouteAvailable,
 } from "./providerOptions";
 
 // Mock the log module to avoid console noise. The stub covers only what this file
@@ -1370,6 +1371,75 @@ describe("Coder gateway-scoped models (wire-canonical option building)", () => {
     // The string is the custom provider's identity; it must not be rewritten
     // to anthropic:<model> by name convention or gateway metadata.
     expect(options).not.toHaveProperty("anthropic");
+  });
+});
+
+// #2922: Anthropic's native web_fetch is a server tool that only the first-party API runs.
+// Vertex, Bedrock and Anthropic-compatible proxies reject the whole request when it is sent.
+describe("anthropicNativeWebFetchRouteAvailable", () => {
+  const opus = "anthropic:claude-opus-4-6";
+  const anthropic = (
+    overrides: Partial<NonNullable<ProvidersConfigMap["anthropic"]>> = {}
+  ): ProvidersConfigMap => ({
+    anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true, ...overrides },
+  });
+  const coderInstance = (type: string): ProvidersConfigMap => ({
+    coder: {
+      apiKeySet: false,
+      isEnabled: true,
+      isConfigured: true,
+      discoveredProviders: [{ name: "anthropic", type }],
+    },
+  });
+
+  test("offers it on the first-party API and gateways that forward to it", () => {
+    expect(anthropicNativeWebFetchRouteAvailable(opus, "anthropic", anthropic())).toBe(true);
+    expect(
+      anthropicNativeWebFetchRouteAvailable(
+        opus,
+        "anthropic",
+        anthropic({ baseUrl: "https://api.anthropic.com/v1" })
+      )
+    ).toBe(true);
+    expect(anthropicNativeWebFetchRouteAvailable(opus, "mux-gateway", anthropic())).toBe(true);
+    expect(
+      anthropicNativeWebFetchRouteAvailable(
+        "coder:anthropic/claude-opus-4-6",
+        "coder",
+        coderInstance("anthropic")
+      )
+    ).toBe(true);
+  });
+
+  test("withholds it from proxies, Bedrock-backed instances and custom providers", () => {
+    const proxied = [
+      anthropic({ baseUrl: "https://litellm.example.com/v1" }),
+      // An env base URL shows up only as the resolved value.
+      anthropic({ baseUrlResolved: "https://vertex-proxy.example.com", baseUrlSource: "env" }),
+    ];
+    for (const config of proxied) {
+      expect(anthropicNativeWebFetchRouteAvailable(opus, "anthropic", config)).toBe(false);
+    }
+    expect(
+      anthropicNativeWebFetchRouteAvailable(
+        "coder:anthropic/claude-opus-4-6",
+        "coder",
+        coderInstance("bedrock")
+      )
+    ).toBe(false);
+    const custom: ProvidersConfigMap = {
+      litellm: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        isCustom: true,
+        providerType: "anthropic-messages",
+        baseUrl: "https://litellm.example.com",
+      },
+    };
+    expect(
+      anthropicNativeWebFetchRouteAvailable("litellm:claude-opus-4-6", undefined, custom)
+    ).toBe(false);
   });
 });
 

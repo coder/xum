@@ -4574,6 +4574,38 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(initialMetadata.routeProvider).toBe("openrouter");
   });
 
+  it.each([
+    // An explicit base URL: a host ANTHROPIC_BASE_URL would otherwise decide the route.
+    ["the first-party API", "https://api.anthropic.com/v1", true],
+    ["a proxy base URL", "https://litellm.example.com/v1", false],
+  ] as const)(
+    "offers Anthropic native web_fetch only on the first-party route: %s (#2922)",
+    async (_label, baseUrl, expected) => {
+      using xumHome = new DisposableTempDir("ai-service-native-web-fetch");
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const metadata = createLocalWorkspaceMetadata("workspace-native-web-fetch", projectPath);
+      const harness = createHarness(xumHome.path, metadata, { routeProvider: "anthropic" });
+      new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+        anthropic: { apiKey: "test-anthropic-key", baseUrl },
+      });
+
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "fetch a page")],
+        workspaceId: metadata.id,
+        modelString: "anthropic:claude-opus-4-6",
+        thinkingLevel: "off",
+      });
+
+      expect(result.success).toBe(true);
+      const configs = harness.getToolsForModelSpy.mock.calls.map((call) => call[1]);
+      expect(configs.length).toBeGreaterThan(0);
+      expect(configs.map((config) => config.anthropicNativeWebFetchEnabled)).toEqual(
+        configs.map(() => expected)
+      );
+    }
+  );
+
   it("passes muxMetadata into initial stream metadata", async () => {
     using xumHome = new DisposableTempDir("ai-service-mux-metadata");
     const projectPath = path.join(xumHome.path, "project");

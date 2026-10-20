@@ -1035,6 +1035,27 @@ describe("getToolsForModel", () => {
       });
     });
 
+    test("a route that cannot run native fetch gets the client web_fetch (#2922)", async () => {
+      await withProject(async (dir) => {
+        const tools = await getToolsForModel(
+          "anthropic:claude-opus-4-6",
+          {
+            cwd: dir,
+            runtime: new LocalRuntime(dir),
+            runtimeTempDir: dir,
+            workspaceId: "ws-1",
+            trusted: false,
+            anthropicNativeWebFetchEnabled: false,
+          },
+          "ws-1",
+          createInitStateManager()
+        );
+        // Xum's own fetch tool runs locally; native web search stays (proxies accept it).
+        expect((await fetchWith(tools.web_fetch)).error).toContain("Blocked URL");
+        expect(tools.web_search).toMatchObject({ type: "provider" });
+      });
+    });
+
     test("untrusted projects keep the provider-native fetch tools", async () => {
       await withProject(async (dir) => {
         // Hooks never run in untrusted projects, so a hook file changes nothing.
