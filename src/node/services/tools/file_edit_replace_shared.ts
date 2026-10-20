@@ -38,6 +38,29 @@ export type OperationOutcome = OperationResult | OperationError;
 export type StringReplaceArgs = FileEditReplaceStringToolArgs;
 
 /**
+ * The agent-note hint for a search string that is missing from the file only because its
+ * whitespace differs (#2732): tabs vs spaces, trailing spaces or line breaks. It names the
+ * 1-based line where the whitespace-insensitive match starts, so the model can copy the exact
+ * text. The edit itself stays exact: the hint never applies the near match.
+ */
+export function whitespaceMismatchHint(content: string, needle: string): string | undefined {
+  // Without whitespace the needle is a literal that the exact search already missed.
+  if (!/\s/u.test(needle) || needle.trim() === "") return undefined;
+  const tokens = needle.trim().split(/\s+/u);
+  // Each whitespace run in the needle may be any whitespace (or none) in the file. Tokens hold
+  // no whitespace, so no two `\s*` are adjacent and the match cannot backtrack badly.
+  const pattern = new RegExp(tokens.map(escapeRegExp).join("\\s*"), "u");
+  const match = pattern.exec(content);
+  if (match === null) return undefined;
+  const line = content.slice(0, match.index).split("\n").length;
+  return `It matches the text at line ${line} only when whitespace is ignored: the indentation (tabs vs spaces), trailing spaces or line breaks differ. Read the file around line ${line}, copy its exact whitespace, then retry.`;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+/**
  * Handle string-based replacement
  */
 export function handleStringReplace(
@@ -66,7 +89,7 @@ export function handleStringReplace(
     return {
       success: false,
       error: "old_string not found in file. The text to replace must exist in the file.",
-      note: `${EDIT_FAILED_NOTE_PREFIX} The old_string does not exist in the file. ${NOTE_READ_FILE_FIRST_RETRY}`,
+      note: `${EDIT_FAILED_NOTE_PREFIX} The old_string does not exist in the file. ${whitespaceMismatchHint(originalContent, args.old_string) ?? NOTE_READ_FILE_FIRST_RETRY}`,
     };
   }
 
