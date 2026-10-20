@@ -52,6 +52,8 @@ export interface ResolvedWorkflowScript {
   skillName?: SkillName;
   /** Agent Plugins: contributing plugin name (plugin:// scripts only). */
   pluginName?: string;
+  /** Non-built-in skill:// scripts only: the skill's plugin, or `null` outside any plugin (#6826). */
+  skillPluginName?: string | null;
   relativePath?: string;
   resolvedPath?: string;
 }
@@ -232,6 +234,7 @@ async function resolveSkillWorkflowScript(
     sourceKind: "skill",
     scope: resolvedSkill.package.scope,
     skillName: parsed.skillName,
+    skillPluginName: resolvedSkill.pluginName ?? null,
     relativePath: parsed.relativePath,
     resolvedPath,
   });
@@ -453,6 +456,8 @@ export async function assertStoredPluginWorkflowReviewed(
     source: string;
     /** The discovery scope of the plugin the run started from (its descriptor's scope). */
     scope: AgentPluginContainer["scope"];
+    /** skill:// runs: the descriptor's skillPluginName. Absent on legacy records (#6826). */
+    skillPluginName?: string | null;
   }
 ): Promise<void> {
   if (input.scriptPath.startsWith(SKILL_SCRIPT_PATH_PREFIX)) {
@@ -482,13 +487,17 @@ export async function assertStoredPluginWorkflowReviewed(
  * started in, must still vouch for the snapshot. A managed plugin skill checks it against its
  * consent record, as the resolver does. Other skills carry no record and pass. A skill that is
  * gone, or that another scope now serves (an unreviewed plugin skill reads as missing), fails
- * closed: the skill found then is not the one whose script the run snapshotted.
+ * closed: the skill found then is not the one whose script the run snapshotted. So does a skill
+ * whose origin changed (#6826): a same-name user skill that now shadows the plugin skill the run
+ * started from carries no consent record and would pass any snapshot. Legacy records, which do not
+ * store the origin, keep the name + scope check.
  */
 async function assertStoredSkillWorkflowReviewed(
   input: ResolveWorkflowScriptInput & {
     scriptPath: string;
     source: string;
     scope: AgentPluginContainer["scope"];
+    skillPluginName?: string | null;
   }
 ): Promise<void> {
   const parsed = parseSkillWorkflowScriptPath(input.scriptPath);
@@ -507,7 +516,17 @@ async function assertStoredSkillWorkflowReviewed(
       `Skill '${parsed.skillName}' is no longer available in its ${input.scope} scope, so its workflow run cannot resume.`
     );
   }
+  const foundPluginName = skill.pluginName ?? null;
+  if (input.skillPluginName !== undefined && input.skillPluginName !== foundPluginName) {
+    throw new Error(
+      `Skill '${parsed.skillName}' now comes from ${skillOrigin(foundPluginName)}, but its workflow run started from ${skillOrigin(input.skillPluginName)}, so the run cannot resume.`
+    );
+  }
   assertSkillScriptReviewed(skill, parsed.relativePath, input.source);
+}
+
+function skillOrigin(pluginName: string | null): string {
+  return pluginName === null ? "a skill outside any plugin" : `plugin '${pluginName}'`;
 }
 
 /** The stored-run consent gate (#6629): the snapshot itself must match the record. */

@@ -112,6 +112,8 @@ export interface WorkflowServiceOptions {
     scriptPath: string;
     source: string;
     scope: "project" | "global";
+    /** skill:// runs: where the skill came from; absent on legacy records (#6826). */
+    skillPluginName?: string | null;
   }) => Promise<void>;
   onBackgroundRunTerminal?: (event: WorkflowBackgroundRunTerminalEvent) => Promise<void> | void;
   onRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
@@ -951,7 +953,14 @@ export class WorkflowService {
     if (gate === undefined || scriptPath === undefined || scope === "built-in") {
       throw new Error("Xum cannot check this workflow's consent, so the run cannot resume");
     }
-    await gate({ scriptPath, source: run.source, scope });
+    await gate({
+      scriptPath,
+      source: run.source,
+      scope,
+      ...(run.workflow.skillPluginName !== undefined
+        ? { skillPluginName: run.workflow.skillPluginName }
+        : {}),
+    });
   }
 
   /**
@@ -1807,6 +1816,7 @@ export function buildWorkflowScriptDescriptor(
     canonicalScriptPath: script.canonicalScriptPath,
     sourceKind: script.sourceKind,
     sourceHash: script.sourceHash,
+    ...(script.skillPluginName !== undefined ? { skillPluginName: script.skillPluginName } : {}),
     executable: true,
   };
 }

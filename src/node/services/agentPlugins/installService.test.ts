@@ -51,7 +51,14 @@ import {
   resolveWorkflowScript,
 } from "@/node/services/workflows/workflowScriptResolver";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
-import { WorkflowService } from "@/node/services/workflows/WorkflowService";
+import {
+  buildWorkflowScriptDescriptor,
+  WorkflowService,
+} from "@/node/services/workflows/WorkflowService";
+import { WorkflowScriptDescriptorSchema } from "@/common/orpc/schemas/workflow";
+import type { WorkflowScriptDescriptor } from "@/common/types/workflow";
+import { writeGlobalSkill } from "@/node/services/tools/testHelpers";
+import { z } from "zod";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { collectPluginSlashCommands } from "./slashCommands";
 import {
@@ -2030,6 +2037,109 @@ describe("AgentPluginInstallService", () => {
       now: "2026-10-15T00:00:00.000Z",
     });
     await expect(resume("wfr_legacy")).rejects.toThrow("has not been reviewed on this install");
+  });
+
+  test("a stored skill workflow run resumes only while its skill keeps the origin it started from (#6826)", async () => {
+    const source = "export default function workflow() { return {}; }\n";
+    await fsPromises.writeFile(path.join(remoteDir, "skills", "greet", "workflow.js"), source);
+    await commitAll(remoteDir, "add a skill workflow");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(muxRoot, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [pluginsDir()],
+    };
+    const resolveDescriptor = async () =>
+      buildWorkflowScriptDescriptor(
+        await resolveWorkflowScript({
+          scriptPath: "skill://greet/workflow.js",
+          runtime: new LocalRuntime(muxRoot),
+          workspacePath: muxRoot,
+          projectTrusted: true,
+          roots,
+        })
+      );
+    // A same-name user skill shadows the plugin skill in the global scope.
+    const writeUserSkill = () =>
+      writeGlobalSkill(muxRoot, "greet", { files: { "workflow.js": source } });
+    const removeUserSkill = () =>
+      fsPromises.rm(path.join(muxRoot, "skills", "greet"), { recursive: true });
+    await writeUserSkill();
+    const userDescriptor = await resolveDescriptor();
+    await removeUserSkill();
+    const pluginDescriptor = await resolveDescriptor();
+    expect(userDescriptor.skillPluginName).toBeNull();
+    expect(pluginDescriptor.skillPluginName).toBe("demo-plugin");
+
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(muxRoot, "workflow-runs") });
+    const createSkillRun = (id: string, workflow: WorkflowScriptDescriptor) =>
+      runStore.createRun({
+        id,
+        workspaceId: "workspace-1",
+        workflow,
+        source,
+        args: {},
+        now: "2026-10-20T00:00:00.000Z",
+      });
+    const workflows = new WorkflowService({
+      archiveAdmission: { getWorkflowArchiveRefusal: () => null },
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      assertStoredPluginWorkflowReviewed: (stored) =>
+        assertStoredPluginWorkflowReviewed({
+          ...stored,
+          runtime: new LocalRuntime(muxRoot),
+          workspacePath: muxRoot,
+          projectTrusted: true,
+          roots,
+        }),
+      runnerId: "runner-6826",
+    });
+    const resume = async (runId: string) =>
+      (await workflows.resumeRun({ workspaceId: "workspace-1", runId, projectTrusted: true }))
+        .status;
+
+    // A user skill's run: the reviewed plugin skill that now serves the name does not stand in.
+    await createSkillRun("wfr_from_user", userDescriptor);
+    await expect(resume("wfr_from_user")).rejects.toThrow(
+      "Skill 'greet' now comes from plugin 'demo-plugin', but its workflow run started from a skill outside any plugin"
+    );
+    await createSkillRun("wfr_from_plugin", pluginDescriptor);
+    expect(await resume("wfr_from_plugin")).toBe("completed");
+
+    // A plugin skill's run: the user skill that now shadows it carries no consent record.
+    await writeUserSkill();
+    await createSkillRun("wfr_shadowed", pluginDescriptor);
+    await expect(resume("wfr_shadowed")).rejects.toThrow(
+      "Skill 'greet' now comes from a skill outside any plugin, but its workflow run started from plugin 'demo-plugin'"
+    );
+
+    // Legacy records keep today's name + scope check, so the shadowing user skill passes.
+    const { skillPluginName: _origin, ...legacyDescriptor } = pluginDescriptor;
+    await createSkillRun("wfr_legacy", legacyDescriptor);
+    expect(await resume("wfr_legacy")).toBe("completed");
+
+    // Downgrade: an older Xum parses the descriptor with its non-strict schema (no
+    // skillPluginName) and writes the record back without the field, so it resumes as legacy.
+    await createSkillRun("wfr_downgraded", pluginDescriptor);
+    const { skillPluginName: _field, ...olderDescriptorShape } =
+      WorkflowScriptDescriptorSchema.shape;
+    const runFile = path.join(muxRoot, "workflow-runs", "workflows", "wfr_downgraded", "run.json");
+    const written = JSON.parse(await fsPromises.readFile(runFile, "utf8")) as {
+      workflow: unknown;
+    };
+    expect(written.workflow).toMatchObject({ skillPluginName: "demo-plugin" });
+    const olderWorkflow = z.object(olderDescriptorShape).parse(written.workflow);
+    await fsPromises.writeFile(runFile, JSON.stringify({ ...written, workflow: olderWorkflow }));
+    expect((await runStore.getRun("wfr_downgraded")).workflow.skillPluginName).toBeUndefined();
+    expect(await resume("wfr_downgraded")).toBe("completed");
   });
 
   test("review labels show a bidi control in a workflow file name; the identity stays raw (#6629)", async () => {

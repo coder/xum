@@ -116,6 +116,13 @@ export const WorkflowScriptDescriptorSchema = z
     canonicalScriptPath: z.string().min(1).optional(),
     sourceKind: z.enum(["skill", "workspace-file", "inline", "plugin"]).optional(),
     sourceHash: z.string().min(1).optional(),
+    /**
+     * Where a non-built-in `skill://` script came from (#6826): the plugin's name, or `null` for a
+     * skill outside any plugin. A stored run resumes only while the skill of that name still comes
+     * from there. Absent on legacy records and on other sources: those keep the name + scope check.
+     * An older Xum strips it (non-strict object), so its rewrite turns the record legacy.
+     */
+    skillPluginName: z.string().min(1).nullable().optional(),
     executable: z.boolean(),
     blockedReason: z.string().min(1).optional(),
     /**
