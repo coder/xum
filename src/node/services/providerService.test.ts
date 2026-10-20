@@ -968,6 +968,28 @@ describe("ProviderService custom provider mutations", () => {
     });
   });
 
+  it("saves a valid session header name and rejects invalid or reserved ones", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        "local-vllm": localVllmConfig(),
+      });
+
+      for (const name of ["Authorization", "x session"]) {
+        const rejected = await service.setConfig("local-vllm", ["sessionHeader"], name);
+        expect(rejected.success).toBe(false);
+      }
+      expect(service.getConfig()["local-vllm"]?.sessionHeader).toBeUndefined();
+
+      const saved = await service.setConfig("local-vllm", ["sessionHeader"], "x-opencode-session");
+      expect(saved.success).toBe(true);
+      expect(service.getConfig()["local-vllm"]?.sessionHeader).toBe("x-opencode-session");
+
+      // An empty value clears the setting, like every other text field.
+      expect((await service.setConfig("local-vllm", ["sessionHeader"], "")).success).toBe(true);
+      expect(service.getConfig()["local-vllm"]?.sessionHeader).toBeUndefined();
+    });
+  });
+
   it("adds a custom OpenAI-compatible provider and returns provider info", async () => {
     await withTempConfigAsync(async (config, service) => {
       const result = await service.addCustomProvider({

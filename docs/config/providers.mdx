@@ -240,14 +240,15 @@ provider setups continue to use Chat Completions.
 | `openai-responses`   | `@ai-sdk/openai` Responses API | `/v1/responses`        |
 | `anthropic-messages` | `@ai-sdk/anthropic`            | `/v1/messages`         |
 
-| Option         | Required | Description                                                                                        |
-| -------------- | -------- | -------------------------------------------------------------------------------------------------- |
-| `providerType` | Yes      | API format for this custom provider. Use one of the three values above.                            |
-| `baseUrl`      | Yes      | API base URL. Xum normalizes it according to `providerType` before the SDK adds the endpoint path. |
-| `apiKey`       | No       | Optional API key. Keyless local servers do not need a placeholder key.                             |
-| `apiKeyFile`   | No       | Path to a file containing the API key. Supports `~` for home directory.                            |
-| `displayName`  | No       | Optional UI label shown instead of the provider ID.                                                |
-| `models`       | No       | Discovery list shown in the model picker. You can still type any model ID at runtime.              |
+| Option          | Required | Description                                                                                        |
+| --------------- | -------- | -------------------------------------------------------------------------------------------------- |
+| `providerType`  | Yes      | API format for this custom provider. Use one of the three values above.                            |
+| `baseUrl`       | Yes      | API base URL. Xum normalizes it according to `providerType` before the SDK adds the endpoint path. |
+| `apiKey`        | No       | Optional API key. Keyless local servers do not need a placeholder key.                             |
+| `apiKeyFile`    | No       | Path to a file containing the API key. Supports `~` for home directory.                            |
+| `displayName`   | No       | Optional UI label shown instead of the provider ID.                                                |
+| `models`        | No       | Discovery list shown in the model picker. You can still type any model ID at runtime.              |
+| `sessionHeader` | No       | Header name that carries the workspace ID on each chat request. See below.                         |
 
 Base URL normalization depends on the selected format:
 
@@ -261,6 +262,12 @@ Base URL normalization depends on the selected format:
 Base URLs must not contain a query string or fragment: the SDK appends endpoint paths directly to
 the base URL string, so a query would swallow the endpoint path. Pass authentication through
 `apiKey` or `apiKeyFile` instead of query parameters.
+
+Some gateways want one stable ID per conversation in a header that they name. OpenCode Go, for
+example, asks for `x-opencode-session`. Set `sessionHeader` (the **Session header** field in
+Settings) to that name, and Xum sends the workspace ID in it on each chat request. Xum refuses
+names that are not valid HTTP header names, and auth or Xum-owned headers such as `Authorization`
+and `x-api-key`. Background requests, such as title generation, do not carry the header.
 
 To configure a single OpenAI-shaped gateway through the built-in `openai` provider instead, see
 [OpenAI wire format](#openai-wire-format).

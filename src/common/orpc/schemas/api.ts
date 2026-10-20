@@ -419,6 +419,8 @@ export const ProviderConfigInfoSchema = z.object({
   baseUrlSource: z.enum(["config", "env"]).nullish(),
   /** Active base URL for display only. Env values must not be persisted from this field. */
   baseUrlResolved: z.string().nullish(),
+  /** Header name that carries the workspace id on chat requests (see sessionHeader.ts). */
+  sessionHeader: z.string().optional(),
   providerType: z.enum(CUSTOM_PROVIDER_TYPES).optional(),
   displayName: z.string().optional(),
   isCustom: z.boolean().optional(),

@@ -32,6 +32,7 @@ import { PROVIDER_REGISTRY } from "@/common/constants/providers";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
 import {
   buildProviderOptions,
+  buildRequestHeaders,
   resolveProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
 import { Ok } from "@/common/types/result";
@@ -430,6 +431,53 @@ describe("ProviderModelFactory.createModel", () => {
           );
         }
       });
+    }
+  });
+
+  // #4231: a gateway such as OpenCode Go names a header that must carry one
+  // stable id per conversation. The header must reach the wire on every
+  // custom provider adapter, with the workspace id as its value.
+  it("sends the configured session header with the workspace id on every adapter", async () => {
+    const seen: Array<string | null> = [];
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req) {
+        seen.push(req.headers.get("x-opencode-session"));
+        return Response.json({ error: { message: "stop here" } }, { status: 400 });
+      },
+    });
+    try {
+      for (const providerType of CUSTOM_PROVIDER_TYPES) {
+        await withTempConfig(async (config, factory) => {
+          saveLocalVllmConfig(config, {
+            providerType,
+            baseUrl: `${server.url.origin}/v1`,
+            sessionHeader: "x-opencode-session",
+          });
+          const result = await factory.createModelWithPinnedOptions(
+            `local-vllm:${LOCAL_VLLM_MODEL}`,
+            {}
+          );
+          if (!result.success) throw new Error(result.error.type);
+          const before = seen.length;
+          await generateText({
+            model: result.data.model,
+            prompt: "hello",
+            maxRetries: 0,
+            headers: buildRequestHeaders(
+              result.data.optionsModelString,
+              result.data.optionsMuxProviderOptions,
+              "ws-4231",
+              result.data.optionsProvidersConfig,
+              result.data.optionsRouteProvider
+            ),
+          }).catch(() => undefined);
+          expect(seen.slice(before)).toEqual(["ws-4231"]);
+        });
+      }
+    } finally {
+      await server.stop(true);
     }
   });
 

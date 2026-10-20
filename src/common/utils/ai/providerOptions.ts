@@ -59,6 +59,7 @@ import { openaiProModeAvailable } from "./proMode";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { resolveCoderRouteGatewayModelId } from "@/common/utils/providers/gatewayModelCatalog";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
+import { sessionHeaderNameError } from "@/common/utils/providers/sessionHeader";
 import { log } from "@/node/services/log";
 import type { MuxMessage } from "@/common/types/message";
 import {
@@ -1118,6 +1119,21 @@ function toWorkspaceHeaderValue(workspaceId: string): string {
 }
 
 /**
+ * The session header name of the custom provider in `modelString` (custom
+ * providers are always their own direct route). Names that fail validation (a
+ * hand-edited providers.jsonc) are skipped, so they never replace credentials
+ * or make fetch reject the request.
+ */
+function resolveSessionHeaderName(
+  modelString: string,
+  providersConfig: ProvidersConfigMap | null | undefined
+): string | null {
+  const providerConfig = providersConfig?.[modelString.split(":", 1)[0]];
+  const name = isCustomProviderConfig(providerConfig) ? providerConfig.sessionHeader : undefined;
+  return name != null && sessionHeaderNameError(name) == null ? name : null;
+}
+
+/**
  * Build per-request HTTP headers for provider-specific features.
  *
  * These flow through streamText({ headers }) to the provider SDK, which merges
@@ -1136,6 +1152,10 @@ export function buildRequestHeaders(
 
   if (workspaceId != null) {
     headers[MUX_WORKSPACE_ID_HEADER] = toWorkspaceHeaderValue(workspaceId);
+    const sessionHeader = resolveSessionHeaderName(modelString, providersConfig);
+    if (sessionHeader != null) {
+      headers[sessionHeader] = headers[MUX_WORKSPACE_ID_HEADER];
+    }
   }
 
   const normalized = resolveOptionsCanonicalModel(modelString, providersConfig, routeProvider);

@@ -293,6 +293,32 @@ describe("ProvidersSection", () => {
     expect(within(customCard).getByText("Base URL")).toBeTruthy();
   });
 
+  test("refuses an invalid session header name and saves a valid one", async () => {
+    const view = renderProvidersSection();
+    const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
+    fireEvent.click(customButton);
+
+    const field = within(getProviderCard(customButton)).getByText("Session header").parentElement;
+    if (!field) throw new Error("Session header field not found");
+    fireEvent.click(within(field).getByRole("button", { name: "Set" }));
+    const input = within(field).getByRole("textbox");
+
+    // Saving an auth header name would send the workspace id as credentials.
+    await userEvent.type(input, "Authorization{Enter}");
+    expect(within(field).getByText(/cannot be "Authorization"/)).toBeTruthy();
+    expect(view.setProviderConfig).not.toHaveBeenCalled();
+
+    await userEvent.type(input, "x-opencode-session{Enter}", {
+      initialSelectionStart: 0,
+      initialSelectionEnd: "Authorization".length,
+    });
+    expect(view.setProviderConfig).toHaveBeenCalledWith({
+      provider: CUSTOM_PROVIDER_ID,
+      keyPath: ["sessionHeader"],
+      value: "x-opencode-session",
+    });
+  });
+
   test("shows saved Google Vertex AI settings from the provider status", async () => {
     const view = renderProvidersSection({
       "google-vertex": {

@@ -86,6 +86,7 @@ import {
   type CustomProviderType,
 } from "@/common/utils/providers/customProviders";
 import type { AddCustomProviderInput, ProviderConfigInfo } from "@/common/orpc/types";
+import { sessionHeaderNameError } from "@/common/utils/providers/sessionHeader";
 import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/providersConfig";
 import type { Result } from "@/common/types/result";
 import { createOAuthFlowId } from "@/browser/utils/oauth/flowId";
@@ -233,6 +234,15 @@ function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo):
         label: "Base URL",
         placeholder: "https://api.example.com/v1",
         type: "text",
+      },
+      {
+        // Header that carries the workspace id on chat requests, for gateways
+        // that want one stable id per conversation (#4231).
+        key: "sessionHeader",
+        label: "Session header",
+        placeholder: "x-session-id",
+        type: "text",
+        optional: true,
       },
     ];
   }
@@ -389,6 +399,32 @@ function getProviderFieldValue(
   // Standard fields like baseUrl
   const value = providerConfig[field as keyof ProviderConfigInfo];
   return typeof value === "string" ? value : undefined;
+}
+
+/** Why the edited value cannot be saved, or null. Empty clears the field. */
+function getEditFieldError(field: string, value: string): string | null {
+  return field === "sessionHeader" && value !== "" ? sessionHeaderNameError(value) : null;
+}
+
+/** Shows under the input why the edited value cannot be saved. */
+function FieldEditError(props: { field: string; value: string; editing: boolean }) {
+  const error = props.editing ? getEditFieldError(props.field, props.value) : null;
+  return error ? <p className="text-destructive mt-1 text-xs">{error}</p> : null;
+}
+
+/** Optimistic patch for an optional plain-text field: the edited text, empty clears it. */
+function plainTextFieldPatch(field: string, value: string): Partial<ProviderConfigInfo> | null {
+  const next = value || undefined;
+  switch (field) {
+    case "displayName":
+      return { displayName: next };
+    case "apiKeyFile":
+      return { apiKeyFile: next };
+    case "sessionHeader":
+      return { sessionHeader: next };
+    default:
+      return null;
+  }
 }
 
 function isProviderSecretSet(
@@ -1600,15 +1636,18 @@ export function ProvidersSection() {
     if (!editingField || !api) return;
 
     const { provider, field } = editingField;
+    // The input shows the reason; the backend would refuse the write anyway.
+    if (getEditFieldError(field, editValue) != null) return;
 
     // Optimistic update for instant feedback
+    const textPatch = plainTextFieldPatch(field, editValue);
     if (field === "apiKey") {
       updateOptimistically(provider, {
         apiKeySet: editValue !== "",
         apiKeySource: editValue !== "" ? "config" : undefined,
       });
-    } else if (field === "displayName") {
-      updateOptimistically(provider, { displayName: editValue || undefined });
+    } else if (textPatch) {
+      updateOptimistically(provider, textPatch);
     } else if (field === "baseUrl") {
       const nextBaseUrl = editValue || undefined;
       updateOptimistically(provider, {
@@ -1616,8 +1655,6 @@ export function ProvidersSection() {
         baseUrlSource: nextBaseUrl ? "config" : undefined,
         baseUrlResolved: nextBaseUrl,
       });
-    } else if (field === "apiKeyFile") {
-      updateOptimistically(provider, { apiKeyFile: editValue || undefined });
     } else if (field === "deploymentUrl") {
       // The Coder login handler reads config.coder.deploymentUrl; without this
       // optimistic update, clicking Login right after saving would use the
@@ -2501,6 +2538,11 @@ export function ProvidersSection() {
                                 )}
                               </>
                             )}
+                            <FieldEditError
+                              field={fieldConfig.key}
+                              value={editValue}
+                              editing={isEditing}
+                            />
                             {showOpenAIBaseUrlHint && (
                               <p className="text-muted mt-1 text-xs">
                                 The OpenAI provider uses the Responses API by default. For

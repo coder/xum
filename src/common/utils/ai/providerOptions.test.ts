@@ -3889,6 +3889,62 @@ describe("buildRequestHeaders", () => {
     });
   }
 
+  describe("per-provider session header", () => {
+    const zen = (sessionHeader?: string): ProvidersConfigMap => ({
+      zen: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        isCustom: true,
+        providerType: "openai-compatible",
+        ...(sessionHeader != null ? { sessionHeader } : {}),
+      },
+    });
+
+    test("encodes non-header-safe workspace ids the same way", () => {
+      const headers = buildRequestHeaders(
+        "zen:kimi-k3",
+        undefined,
+        "workspace-😀",
+        zen("x-opencode-session")
+      );
+      expect(headers?.["x-opencode-session"]).toBe(headers?.[MUX_WORKSPACE_ID_HEADER]);
+    });
+
+    test("applies only to custom providers", () => {
+      const config: ProvidersConfigMap = {
+        openrouter: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          sessionHeader: "x-router-session",
+        },
+      };
+      expect(
+        buildRequestHeaders("openrouter:openai/gpt-5.2", undefined, "ws-1", config, "openrouter")
+      ).toEqual({ [MUX_WORKSPACE_ID_HEADER]: "ws-1" });
+    });
+
+    test("skips the header without a workspace id or a setting", () => {
+      expect(
+        buildRequestHeaders("zen:kimi-k3", undefined, undefined, zen("x-opencode-session"))
+      ).toBeUndefined();
+      expect(buildRequestHeaders("zen:kimi-k3", undefined, "ws-1", zen())).toEqual({
+        [MUX_WORKSPACE_ID_HEADER]: "ws-1",
+      });
+    });
+
+    // providers.jsonc is hand-editable: an invalid or reserved name must not
+    // overwrite credentials or make fetch reject the request.
+    test("ignores an invalid or reserved name from a hand-edited config", () => {
+      for (const name of ["Authorization", "x-api-key", "bad header"]) {
+        expect(buildRequestHeaders("zen:kimi-k3", undefined, "ws-1", zen(name))).toEqual({
+          [MUX_WORKSPACE_ID_HEADER]: "ws-1",
+        });
+      }
+    });
+  });
+
   test("workspace correlation header uses the mux wire name, not Xum", () => {
     expect(MUX_WORKSPACE_ID_HEADER).toBe("X-Mux-Workspace-Id");
     const headers = buildRequestHeaders("openai:gpt-5.2", undefined, "ws-id");
