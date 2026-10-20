@@ -486,6 +486,8 @@ describe("RetryManager", () => {
     ["rate_limit", () => "429 Too Many Requests"],
     ["network", () => "fetch failed"],
     ["api", (failure: number) => `gateway error ${failure % 2}`],
+    ["api", () => "The server had an error processing your request."],
+    ["api", () => "Model is overloaded, please try again later"],
   ] as const)("keeps retrying %s failures past 10 attempts", async (type, messageFor) => {
     const { manager, onRetry, events } = createRetryManager();
 

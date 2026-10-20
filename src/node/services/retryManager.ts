@@ -42,6 +42,15 @@ export type RetryStatusEvent =
 
 const MAX_REASON_ERROR_CHARS = 300;
 
+/**
+ * Text of an "api"-class error that still reads as an outage: a provider without a mapped
+ * status (an OpenAI mid-stream server_error, a non-Anthropic overload) falls back to "api" with
+ * constant text. Those keep unbounded retry like 5xx (#4228). Broad on purpose: a miss here only
+ * keeps today's behavior.
+ */
+const TRANSIENT_ERROR_TEXT =
+  /overload|server|unavailable|try again|timed? ?out|capacity|busy|internal/iu;
+
 function truncateReason(message: string): string {
   return message.length > MAX_REASON_ERROR_CHARS
     ? `${message.slice(0, MAX_REASON_ERROR_CHARS)}…`
@@ -235,7 +244,10 @@ export class RetryManager {
   /** Counts `error` into the run of identical unrecognized ("api") failures (#4228). */
   private countIdenticalApiErrorFailure(error: RetryFailureError): number {
     const previous = this.state.lastError;
-    const isApiError = error.type === "api" && error.message !== undefined;
+    const isApiError =
+      error.type === "api" &&
+      error.message !== undefined &&
+      !TRANSIENT_ERROR_TEXT.test(error.message);
     const repeats = isApiError && previous?.type === "api" && previous.message === error.message;
     this.identicalApiErrorFailures = repeats
       ? this.identicalApiErrorFailures + 1
