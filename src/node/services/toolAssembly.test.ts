@@ -407,6 +407,9 @@ describe("one tool set across agent-mode switches (#5253)", () => {
 });
 
 describe("turn-end todo nudge execution gate", () => {
+  // Provider-executed: the provider runs it server-side, never a local execute.
+  const providerTool = (id: string) => ({ type: "provider", id, args: {} }) as unknown as Tool;
+
   test("keeps the advertised tools and refuses every call but todo_write, code_execution too", async () => {
     const calls: string[] = [];
     const recordingTool = (name: string): Tool =>
@@ -421,7 +424,7 @@ describe("turn-end todo nudge execution gate", () => {
     const allTools: Record<string, Tool> = {
       mutate: recordingTool("mutate"),
       todo_write: recordingTool("todo_write"),
-      native_search: { type: "provider", id: "test.search", args: {} } as unknown as Tool,
+      web_search: providerTool("anthropic.web_search_20250305"),
     };
     const assemble = (executionGate?: typeof TODO_TURN_END_NUDGE_EXECUTION_GATE) =>
       applyToolPolicyAndExperiments({
@@ -437,7 +440,7 @@ describe("turn-end todo nudge execution gate", () => {
       JSON.stringify(Object.entries(tools).map(([name, tool]) => [name, tool.description]));
     expect(shape(nudge)).toBe(shape(turn));
     // mutate is bridged into code_execution; todo_write stays direct.
-    expect(Object.keys(nudge).sort()).toEqual(["code_execution", "native_search", "todo_write"]);
+    expect(Object.keys(nudge).sort()).toEqual(["code_execution", "todo_write", "web_search"]);
 
     const callOptions = { toolCallId: "test-call-id", messages: [], context: undefined };
     expect(
@@ -448,6 +451,30 @@ describe("turn-end todo nudge execution gate", () => {
     });
     expect(await nudge.todo_write.execute!({}, callOptions)).toEqual({ success: true });
     expect(calls).toEqual(["todo_write"]);
+  });
+
+  // A provider-executed tool has no local execute to refuse. Native searches take a query and
+  // stay; native fetches (and any tool the gate does not know) could send data to a URL the
+  // model picks, so they are omitted.
+  test("keeps native searches and omits native fetches and unknown provider tools", async () => {
+    const searches = {
+      web_search: providerTool("anthropic.web_search_20250305"),
+      google_search: providerTool("google.google_search"),
+      x_search: providerTool("xai.x_search"),
+    };
+    const nudge = await applyToolPolicyAndExperiments({
+      allTools: {
+        ...searches,
+        web_fetch: providerTool("anthropic.web_fetch_20250910"),
+        url_context: providerTool("google.url_context"),
+        unknown_native: providerTool("test.unknown"),
+        todo_write: executableTool("Update the list"),
+      },
+      effectiveToolPolicy: undefined,
+      emitNestedToolEvent: () => undefined,
+      executionGate: TODO_TURN_END_NUDGE_EXECUTION_GATE,
+    });
+    expect(Object.keys(nudge)).toEqual([...Object.keys(searches), "todo_write"]);
   });
 
   // mux.load reads through the kernel loader, not file_read's execute: refusing the bridged

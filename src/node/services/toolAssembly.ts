@@ -101,7 +101,15 @@ export interface ApplyToolPolicyAndExperimentsOptions {
    * the prompt cache) stays the previous turn's: the turn-end todo nudge. A tool this policy
    * denies keeps its name, description and schema; its execute returns `refusal(name)`.
    */
-  executionGate?: { policy: ToolPolicy; refusal: (toolName: string) => string };
+  executionGate?: {
+    policy: ToolPolicy;
+    refusal: (toolName: string) => string;
+    /**
+     * Provider-executed tools (no local execute to refuse) the gate keeps, by provider tool
+     * id. Every other one is omitted, unknown ones included: the gate fails closed.
+     */
+    keptProviderToolIds: ReadonlySet<string>;
+  };
   /** PTC experiment flags. */
   experiments?: {
     tokenBudget?: boolean;
@@ -156,14 +164,14 @@ function applyExecutionGate(
 ): Record<string, Tool> {
   const allowed = new Set(applyToolPolicyToNames(Object.keys(tools), gate.policy));
   return Object.fromEntries(
-    Object.entries(tools).map(([name, tool]) => {
-      // A provider-executed tool (native web_search, web_fetch) has no local execute to
-      // refuse, and removing it would change the tools block. It stays usable: it reads the
-      // web, but cannot run commands or edit files.
-      if (allowed.has(name) || (tool.type === "provider" && tool.execute == null)) {
-        return [name, tool];
+    Object.entries(tools).flatMap(([name, tool]): Array<[string, Tool]> => {
+      if (allowed.has(name)) return [[name, tool]];
+      // A provider-executed tool has no local execute to refuse: keep it only if the gate
+      // lists it (removing one changes the tools block), else omit it.
+      if (tool.type === "provider" && tool.execute == null) {
+        return gate.keptProviderToolIds.has(tool.id) ? [[name, tool]] : [];
       }
-      return [name, refuseTool(tool, gate.refusal(name))];
+      return [[name, refuseTool(tool, gate.refusal(name))]];
     })
   );
 }

@@ -4132,7 +4132,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     async function streamPair(
       xumHomePath: string,
       states: [PrefixState, PrefixState],
-      observe?: Observe
+      observe?: Observe,
+      // Trusted projects can run tool hooks, so they get Xum's local web_fetch, not the native one.
+      options?: { trusted?: boolean }
     ) {
       const projectPath = path.join(xumHomePath, "project");
       await fs.mkdir(projectPath, { recursive: true });
@@ -4154,6 +4156,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         harness.config,
         new MemoryMetaService(xumHomePath)
       );
+      if (options?.trusted === true) {
+        await harness.config.editConfig((cfg) => {
+          cfg.projects.set(projectPath, { trusted: true, workspaces: [] });
+          return cfg;
+        });
+      }
       // Real tools, agent resolution, system prompt and message preparation:
       // the serialized request is under test.
       // Call through, so each request's tool configuration is recorded too.
@@ -4364,13 +4372,34 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       });
       const {
         requests: [turn, nudgeTurn],
-      } = await streamPair(xumHome.path, [
-        { toolPolicy: requireBash },
-        nudgeState(nudge?.optionOverrides?.toolPolicy),
-      ]);
+      } = await streamPair(
+        xumHome.path,
+        [{ toolPolicy: requireBash }, nudgeState(nudge?.optionOverrides?.toolPolicy)],
+        undefined,
+        { trusted: true }
+      );
       expect(toolBlock(nudgeTurn)).toBe(toolBlock(turn));
       expect(buildRequiredToolPatterns(turn.toolPolicy)).toHaveLength(1);
       expect(buildRequiredToolPatterns(nudgeTurn.toolPolicy)).toEqual([]);
+    });
+
+    // Where hooks cannot run, Claude 4.6+ gets Anthropic's native web_fetch. It fetches any URL
+    // server-side, so the nudge omits it (one cache miss) and keeps the native web_search.
+    it("omits native web_fetch from a nudge turn where hooks cannot run", async () => {
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const nudge = mergeTurnStopContinuation({
+        hookPrompt: null,
+        todoNudge: true,
+        callerToolPolicy: undefined,
+      });
+      const {
+        requests: [turn, nudgeTurn],
+      } = await streamPair(xumHome.path, [{}, nudgeState(nudge?.optionOverrides?.toolPolicy)]);
+      expect(turn.tools?.web_fetch?.type).toBe("provider");
+      expect(nudgeTurn.tools?.web_search?.type).toBe("provider");
+      expect(Object.keys(nudgeTurn.tools ?? {})).toEqual(
+        Object.keys(turn.tools ?? {}).filter((name) => name !== "web_fetch")
+      );
     });
 
     // The nudge used to advertise only todo_write, so each nudge rewrote the
@@ -4385,7 +4414,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       });
       const {
         requests: [turn, nudgeTurn],
-      } = await streamPair(xumHome.path, [{}, nudgeState(nudge?.optionOverrides?.toolPolicy)]);
+      } = await streamPair(
+        xumHome.path,
+        [{}, nudgeState(nudge?.optionOverrides?.toolPolicy)],
+        undefined,
+        { trusted: true }
+      );
+      // Xum's local web_fetch: the gate refuses it like any local tool.
+      expect(turn.tools?.web_fetch?.type).not.toBe("provider");
       expect(breakpointTools(turn)).toHaveLength(1);
       expect(toolBlock(nudgeTurn)).toBe(toolBlock(turn));
       expect(stableSystemRow(nudgeTurn)).toBe(stableSystemRow(turn));
