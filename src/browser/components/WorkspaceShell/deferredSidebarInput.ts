@@ -80,11 +80,13 @@ export function holdSidebarInput(held: HeldSidebarInput[]): () => void {
 
 function holdEventInto(held: HeldSidebarInput[]): (e: Event) => void {
   return (e) => {
-    // While the layout hides the sidebar, RightSidebar ignores these two and WorkspaceMenuBar acts
-    // on them. Chromium may already have run the menu bar's listener (window listeners run in
-    // registration order at the window target), so a replay would act twice (#6208).
+    // While the layout hides the sidebar, WorkspaceMenuBar acts on these events (it shows the
+    // tab full-screen). Chromium may already have run the menu bar's listener (window listeners
+    // run in registration order at the window target), so a replay would act twice (#6208).
     const menuBarEvent =
-      e.type === CUSTOM_EVENTS.OPEN_ARTIFACT || e.type === CUSTOM_EVENTS.OPEN_MCP_APP_VIEW;
+      e.type === CUSTOM_EVENTS.OPEN_ARTIFACT ||
+      e.type === CUSTOM_EVENTS.OPEN_MCP_APP_VIEW ||
+      e.type === CUSTOM_EVENTS.OPEN_PLAN_TAB;
     if (
       menuBarEvent &&
       isWorkspaceRightSidebarHidden(document.querySelector("[data-workspace-shell]"))
