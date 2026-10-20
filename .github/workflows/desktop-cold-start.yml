@@ -1,6 +1,7 @@
 name: Desktop Cold Start
 # Desktop cold-start A/B (T3 #5971). The runner script comes from the head tree, so head_sha must
-# contain scripts/perf/desktopColdStart.ts. Use base_sha == head_sha for an A/A run.
+# contain scripts/perf/desktopColdStart.ts. base_sha must contain #5981 (the xum:app-shell-ready
+# mark), or every launch times out waiting for it. Use base_sha == head_sha for an A/A run.
 on:
   workflow_dispatch:
     inputs:

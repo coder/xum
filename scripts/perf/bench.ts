@@ -13,10 +13,23 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
-import { build } from "esbuild";
+import { build, type Plugin } from "esbuild";
 import type { BenchMeta, BenchRuntime } from "./benchReport";
 
 const BENCH_REPORT_PATH = path.join(import.meta.dir, "benchReport.ts");
+
+/**
+ * App modules import stylesheets for the renderer's bundler (katexRehypePlugin.ts imports KaTeX's
+ * CSS). Node cannot load `.css`, and `packages: "external"` would leave a package stylesheet for
+ * Node to import, so the node bundle replaces every `.css` import with an empty module (#5709).
+ */
+const stubCssImports: Plugin = {
+  name: "bench-stub-css",
+  setup(pluginBuild) {
+    pluginBuild.onResolve({ filter: /\.css$/ }, (args) => ({ path: args.path, namespace: "css" }));
+    pluginBuild.onLoad({ filter: /.*/, namespace: "css" }, () => ({ contents: "", loader: "js" }));
+  },
+};
 
 export function git(cwd: string, args: string[]): string {
   const result = spawnSync("git", args, { cwd, encoding: "utf8" });
@@ -118,6 +131,7 @@ export async function prepareBench(
     packages: "external",
     metafile: true,
     logLevel: "error",
+    plugins: [stubCssImports],
     // App sources compile to CommonJS, and some read `__filename`, `__dirname` or `require` at
     // module scope (src/node/utils/main/workerPool.ts). An ESM bundle has no such bindings, so
     // define them for the bundle file.

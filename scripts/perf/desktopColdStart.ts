@@ -61,15 +61,19 @@ function intArg(name: string, raw: string, min: number): number {
   return Number(raw);
 }
 
-/** Checks that the tree is built and returns its own Electron binary. */
-function electronFor(tree: string): string {
+/** Exits with a usage error unless the tree is built. */
+function checkBuilt(tree: string): void {
   const manifest = path.join(tree, "package.json");
   if (!fs.existsSync(manifest)) usageError(`${tree}: no package.json`);
   const { main } = JSON.parse(fs.readFileSync(manifest, "utf8")) as { main?: string };
   for (const rel of [main ?? "<package.json main>", "dist/index.html", "node_modules/electron"]) {
     if (!fs.existsSync(path.join(tree, rel))) usageError(`${tree}: missing ${rel} (make build)`);
   }
-  return createRequire(manifest)("electron") as string;
+}
+
+/** The tree's own Electron binary. Requiring `electron` downloads it when missing. */
+function electronFor(tree: string): string {
+  return createRequire(path.join(tree, "package.json"))("electron") as string;
 }
 
 async function main(): Promise<void> {
@@ -98,6 +102,10 @@ async function main(): Promise<void> {
   const warmups = intArg("warmups", values.warmups, 0);
   const timeout = intArg("timeout-ms", values["timeout-ms"], 1);
   const tree = { base: path.resolve(values.base), head: path.resolve(values.head) };
+  // Check both trees before requiring either Electron, so a bad head tree fails before the base
+  // tree's Electron download (#6003).
+  checkBuilt(tree.base);
+  checkBuilt(tree.head);
   const bin = { base: electronFor(tree.base), head: electronFor(tree.head) };
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "xum-cold-start-"));
   // An exit handler, not `finally`: Playwright can reject outside our await and crash the process.
@@ -172,7 +180,9 @@ async function main(): Promise<void> {
   );
 }
 
-if (fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// argv[1] is undefined under `node -e` and for importers without a script path (#6003).
+const scriptPath = process.argv[1];
+if (scriptPath !== undefined && fs.realpathSync(scriptPath) === fileURLToPath(import.meta.url)) {
   main().catch((error: unknown) => {
     console.error(error instanceof Error ? error.message : error);
     process.exit(1);

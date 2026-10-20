@@ -1,6 +1,19 @@
 import { describe, expect, test } from "bun:test";
+import * as path from "node:path";
 import { Lexer, type Tokens } from "marked";
 import { listItemRanges } from "./streamingMarkdownBlocks";
+
+// listItemRanges cuts lists at item bounds from our `marked` lexer, which must match the blocks
+// Streamdown's own `marked` produces. A Streamdown bump that moves its `marked` version needs the
+// same bump of the root pin (#5709).
+test("the root marked pin is the marked that Streamdown resolves", async () => {
+  const markedVersion = async (fromDir: string): Promise<string> => {
+    const manifest = Bun.resolveSync("marked/package.json", fromDir);
+    return ((await Bun.file(manifest).json()) as { version: string }).version;
+  };
+  const streamdownDir = path.dirname(Bun.resolveSync("streamdown", import.meta.dir));
+  expect(await markedVersion(import.meta.dir)).toBe(await markedVersion(streamdownDir));
+});
 
 function topLevelItems(markdown: string): number {
   // marked's Token union includes a generic `{ type: string }` member, so `type` does not narrow.
