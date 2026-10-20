@@ -61,6 +61,39 @@ test(
   }
 );
 
+// A command typed right after the toggle expands the sidebar onto a terminal runs in the
+// terminal. Left on the toggle, its `a` hit the chat's plain-key focus shortcut and the rest of
+// the line was sent as a chat message.
+// mock-only: real AI mode turns terminals off (XUM_DISABLE_TERMINALS, startApp.ts).
+test(
+  "Expanding the right sidebar onto a terminal hands it the keyboard",
+  { tags: ["bugbash", "right-sidebar-toggle", "mock-only"] },
+  async ({ app, screen, browser }) => {
+    await browser.setViewport({ width: 1600, height: 900 });
+    await openPlayground(app, screen, browser);
+    await screen.getByRole("button", "Expand right sidebar").tap();
+    await screen.getByRole("button", "New terminal").tap();
+    const focusOwner = () =>
+      browser.evaluate(() => {
+        const el = document.activeElement;
+        if (el?.closest(".terminal-view")) return "terminal";
+        return el?.getAttribute("aria-label") ?? el?.tagName ?? "none";
+      });
+    await expect.poll(focusOwner, { timeout: 15_000 }).toBe("terminal");
+
+    await screen.getByRole("button", "Collapse right sidebar").tap();
+    // Closed: the slide is over and the terminal unmounted with the panel.
+    await expect
+      .poll(() => browser.evaluate(() => document.querySelector(".terminal-view") === null))
+      .toBe(true);
+    await screen.getByRole("button", "Expand right sidebar").tap();
+    await expect.poll(focusOwner, { timeout: 15_000 }).toBe("terminal");
+    await browser.keyboard.type("cat README.md");
+
+    expect(await focusOwner()).toBe("terminal");
+  }
+);
+
 test(
   "The workspace actions tooltip uses the button's accessible name",
   { tags: ["bugbash", "5681"] },

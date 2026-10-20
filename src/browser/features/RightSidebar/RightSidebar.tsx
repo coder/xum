@@ -1633,6 +1633,17 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     [focusTerminalTab]
   );
 
+  // Expanding onto a terminal hands it the keyboard, as before the toggle kept its focus: left on
+  // the toggle, a typed command reaches the chat's plain-key shortcuts (`a`/`i` focus the
+  // composer) and is sent as a message. Not in full screen, where a touch keyboard would pop up.
+  // An effect, not a state adjusted during render: a render-phase update here left this
+  // component's persisted `collapsed` subscription deaf to later toggles.
+  const wasCollapsedRef = React.useRef(collapsed);
+  React.useLayoutEffect(() => {
+    if (wasCollapsedRef.current && !collapsed && !fullscreen) focusActiveTerminal(layout);
+    wasCollapsedRef.current = collapsed;
+  }, [collapsed, fullscreen, focusActiveTerminal, layout]);
+
   const setLayout = React.useCallback(
     (updater: (prev: RightSidebarLayoutState) => RightSidebarLayoutState) => {
       if (isSidebarTabDragInProgressRef.current) {
