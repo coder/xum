@@ -1390,10 +1390,6 @@ export const router = (authToken?: string) => {
         .input(schemas.mcp.list.input)
         .output(schemas.mcp.list.output)
         .handler(({ context, input }) => context.mcpConfigService.listForApi(input)),
-      configProblems: t
-        .input(schemas.mcp.configProblems.input)
-        .output(schemas.mcp.configProblems.output)
-        .handler(({ context }) => context.mcpConfigService.getConfigProblems()),
 
       add: t
         .input(schemas.mcp.add.input)

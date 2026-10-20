@@ -192,7 +192,6 @@ import {
   MCPPromptDescriptorSchema,
   MCPRemoveGlobalParamsSchema,
   MCPRemoveParamsSchema,
-  MCPConfigProblemsSchema,
   MCPServerMapSchema,
   MCPSettingsReadInputSchema,
   MCPSettingsReadSnapshotSchema,
@@ -1199,8 +1198,6 @@ export const projects = {
  */
 export const mcp = {
   designStatus: { input: z.void(), output: ClaudeDesignStatusSchema },
-  /** Syntax errors and invalid entries in the global mcp.jsonc (#2060). */
-  configProblems: { input: z.void(), output: MCPConfigProblemsSchema },
   /** OpenAI structured settings of one workspace server (`openai/settings`). */
   settings: {
     read: {

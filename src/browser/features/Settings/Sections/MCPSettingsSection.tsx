@@ -25,7 +25,6 @@ import {
   LogIn,
   ChevronDown,
   ChevronRight,
-  TriangleAlert,
 } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import {
@@ -44,13 +43,11 @@ import { cn } from "@/common/lib/utils";
 import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
 import type {
   CachedMCPTestResult,
-  MCPConfigProblem,
   MCPServerIdentity,
   MCPServerInfo,
   MCPServerTransport,
 } from "@/common/types/mcp";
 import type { MCPOAuthPendingServerConfig } from "@/common/types/mcpOauth";
-import { formatMcpConfigProblem } from "@/common/utils/mcp/configProblem";
 import { useMCPTestCache } from "@/browser/hooks/useMCPTestCache";
 import { MCPHeadersEditor } from "@/browser/components/MCPHeadersEditor/MCPHeadersEditor";
 import {
@@ -961,57 +958,6 @@ function useInsufficientScopeTicks(
   }, [api]);
 }
 
-/**
- * Syntax errors and invalid entries in the global mcp.jsonc (#2060). Xum skips those entries,
- * so without this a typo made a server vanish with no message. Saves are refused until the
- * file is fixed, because a save rewrites the whole file.
- */
-type ConfigProblemsState = { path: string; problems: MCPConfigProblem[] } | null;
-
-const hasConfigProblems = (state: ConfigProblemsState) =>
-  state !== null && state.problems.length > 0;
-
-/**
- * After a save while the notice shows: the save proves the file is fixed, so reload it. Servers
- * it skipped then appear and the notice goes away. Otherwise skip the reload's loading state.
- */
-async function refreshIfProblemsShown(
-  state: ConfigProblemsState,
-  refresh: () => Promise<void>
-): Promise<void> {
-  if (hasConfigProblems(state)) await refresh();
-}
-
-function MCPConfigProblemsNotice(props: { configProblems: ConfigProblemsState }) {
-  if (props.configProblems === null || !hasConfigProblems(props.configProblems)) return null;
-  const { path, problems } = props.configProblems;
-  return (
-    <div
-      role="alert"
-      className="bg-warning/10 border-warning/30 text-warning mb-3 rounded-md border px-3 py-2 text-xs"
-    >
-      <div className="flex items-start gap-2">
-        <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-        <div className="min-w-0">
-          <p className="font-medium">
-            Xum skipped part of <code className="break-all">{path}</code>
-          </p>
-          <ul className="mt-1 space-y-0.5">
-            {problems.map((problem, index) => (
-              <li key={index} className="break-words">
-                {formatMcpConfigProblem(problem)}
-              </li>
-            ))}
-          </ul>
-          <p className="text-content-secondary mt-1">
-            Fix the file to use these servers. Until then, changes here are not saved.
-          </p>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 export const MCPSettingsSection: React.FC = () => {
   const design = useClaudeDesign();
   const refreshRequest = useRef({ id: 0 });
@@ -1021,10 +967,6 @@ export const MCPSettingsSection: React.FC = () => {
   // Global secrets (used for {secret:"KEY"} header values).
   const [globalSecretKeys] = useGlobalSecretKeys(api);
   const [error, setError] = useState<string | null>(null);
-  const [configProblems, setConfigProblems] = useState<{
-    path: string;
-    problems: MCPConfigProblem[];
-  } | null>(null);
 
   // Test state with caching (global MCP config)
   const {
@@ -1082,14 +1024,9 @@ export const MCPSettingsSection: React.FC = () => {
     setBranding({});
     setLoading(true);
     try {
-      const [mcpResult, problems] = await Promise.all([
-        api.mcp.list({}),
-        // The servers still load when this read fails: it only adds the notice.
-        api.mcp.configProblems().catch(() => null),
-      ]);
+      const mcpResult = await api.mcp.list({});
       if (request !== refreshRequest.current.id) return;
       setServers(mcpResult ?? {});
-      setConfigProblems(problems);
       setError(null);
     } catch (err) {
       if (request === refreshRequest.current.id)
@@ -1157,9 +1094,6 @@ export const MCPSettingsSection: React.FC = () => {
           setError(result.error ?? "Failed to update server");
         } else {
           publishGlobalMcpEnablementChanged();
-          // A save succeeds only once mcp.jsonc is fixed: reload it, so servers it skipped
-          // appear and the notice and a stale error go away.
-          await refreshIfProblemsShown(configProblems, refresh);
         }
       } catch (err) {
         // Revert on error
@@ -1170,7 +1104,7 @@ export const MCPSettingsSection: React.FC = () => {
         setError(err instanceof Error ? err.message : "Failed to update server");
       }
     },
-    [api, configProblems, refresh]
+    [api]
   );
 
   const handleTest = useCallback(
@@ -1513,8 +1447,6 @@ export const MCPSettingsSection: React.FC = () => {
             {error}
           </div>
         )}
-
-        <MCPConfigProblemsNotice configProblems={configProblems} />
 
         {/* Server list */}
         <div className="space-y-2">
