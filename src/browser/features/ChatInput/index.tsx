@@ -140,6 +140,7 @@ import {
 import { type ThinkingLevel } from "@/common/types/thinking";
 import { normalizeRuntimeEnablement, RUNTIME_MODE } from "@/common/types/runtime";
 import {
+  type AgentSkillReference,
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
   withAgentSkillRefs,
@@ -299,6 +300,27 @@ async function forEachProviderConfigChange(
  */
 function transcriptBarrierMessage(offline: boolean): string {
   return offline ? CONNECTION_LOST_MESSAGE : TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE;
+}
+
+/**
+ * #4126: /goal sends its objective to the model only as quoted text in the goal kickoff, so a
+ * `$skill` it mentions never loads (a normal message loads it). Refuse with the way to combine
+ * them instead of setting a goal whose skill silently does nothing. With attachments, /goal is
+ * sent as a normal message, which loads the skill, so it passes.
+ */
+function goalSkillMentionToast(
+  parsed: ParsedCommand | null,
+  attachmentCount: number,
+  skillRefs: readonly AgentSkillReference[]
+): Omit<Toast, "id"> | null {
+  const [ref] = skillRefs;
+  if (parsed?.type !== "goal-set" || attachmentCount > 0 || ref === undefined) return null;
+  const name = ref.skillName;
+  return {
+    type: "error",
+    title: "Skills do not load inside /goal",
+    message: `/goal sends $${name} to the model as plain text, so the skill does not run. Set the goal without it, then send /${name} (or a message with $${name}). To keep the text as written, wrap it in backticks.`,
+  };
 }
 
 /** Composer attachments for a restored or edited message (provider files, then staged files). */
@@ -2453,12 +2475,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // a reconnect can close it meanwhile, and handled commands (/compact, /fork, workflow
     // starts, refinement actions) return before the plain-send re-check further down. Same
     // bypass rule as the render-time term, evaluated on the RESOLVED command.
-    if (
+    const transcriptBarrierClosed =
       variant === "workspace" &&
       !commandBypassesTranscriptBarrier(parsed) &&
-      !isTranscriptMutationAllowed(props.workspaceId)
-    ) {
-      pushToast({ type: "error", message: transcriptBarrierMessage(liveApiRef.current == null) });
+      !isTranscriptMutationAllowed(props.workspaceId);
+    const refusal = transcriptBarrierClosed
+      ? { type: "error" as const, message: transcriptBarrierMessage(liveApiRef.current == null) }
+      : goalSkillMentionToast(parsed, attachments.length, combinedSkillRefs);
+    if (refusal) {
+      pushToast(refusal);
       return;
     }
 
