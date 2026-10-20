@@ -704,8 +704,8 @@ function toolTypeArraysToAnyOf(node: unknown, depth: "schema" | "map" = "schema"
 }
 
 /**
- * The wrapped model reports specificationVersion "v4" (ollama-ai-provider-v2 reports "v3"), so
- * DevTools records these requests when it is on, as on the Copilot route. That is intended
+ * The wrapped model reports specificationVersion "v4" (ollama-ai-provider-v2 4.x does too, #5372),
+ * so DevTools records these requests when it is on, as on the Copilot route. That is intended
  * (#6083): recording does not change the request.
  */
 function withToolTypeArraysAsAnyOf(model: Parameters<typeof wrapLanguageModel>[0]["model"]) {

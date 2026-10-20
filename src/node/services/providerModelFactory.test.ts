@@ -6128,6 +6128,77 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
   });
 });
 
+// #5372: ollama-ai-provider-v2 4.x is the release whose peer range accepts ai 7. Generation and
+// streaming must still decode Ollama's /api/chat replies through the factory's model.
+describe("ProviderModelFactory Ollama generate and stream", () => {
+  const chatReply = (content: string, done: boolean) => ({
+    model: "qwen3:8b",
+    created_at: "2026-10-20T00:00:00Z",
+    message: { role: "assistant", content },
+    done,
+    ...(done ? { done_reason: "stop", prompt_eval_count: 7, eval_count: 3 } : {}),
+  });
+  const withOllama = async (
+    reply: (body: Record<string, unknown>) => Response,
+    run: (model: LanguageModel) => Promise<void>
+  ) => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ ollama: { baseUrl: "http://127.0.0.1:11434/api" } });
+      const urls: string[] = [];
+      const fakeFetch = Object.assign((input: RequestInfo | URL, init?: RequestInit) => {
+        urls.push(
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+        );
+        return Promise.resolve(reply(JSON.parse(init?.body as string) as Record<string, unknown>));
+      }, fetch) as typeof fetch;
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("ollama:qwen3:8b");
+        if (!result.success) throw new Error(result.error.type);
+        await run(result.data);
+        expect(urls).toEqual(["http://127.0.0.1:11434/api/chat"]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  };
+
+  it("generates text with token usage", async () => {
+    await withOllama(
+      (body) => {
+        expect(body.stream).toBe(false);
+        return Response.json(chatReply("Hello from Ollama", true));
+      },
+      async (model) => {
+        const result = await generateText({ model, prompt: "hi", maxRetries: 0 });
+        expect(result.text).toBe("Hello from Ollama");
+        expect(result.finishReason).toBe("stop");
+        expect(result.usage).toMatchObject({ inputTokens: 7, outputTokens: 3 });
+      }
+    );
+  });
+
+  it("streams text deltas from newline-delimited chunks", async () => {
+    await withOllama(
+      (body) => {
+        expect(body.stream).toBe(true);
+        const lines = [chatReply("Hel", false), chatReply("lo", false), chatReply("", true)];
+        return new Response(lines.map((line) => JSON.stringify(line) + "\n").join(""), {
+          headers: { "content-type": "application/x-ndjson" },
+        });
+      },
+      async (model) => {
+        const result = streamText({ model, prompt: "hi", maxRetries: 0 });
+        const deltas: string[] = [];
+        for await (const delta of result.textStream) deltas.push(delta);
+        expect(deltas.join("")).toBe("Hello");
+        expect(await result.finishReason).toBe("stop");
+        expect(await result.usage).toMatchObject({ inputTokens: 7, outputTokens: 3 });
+      }
+    );
+  });
+});
+
 describe("ProviderModelFactory Ollama tool schemas", () => {
   // Ollama servers before v0.6.6 parse a tool schema `type` only as a string, so one `type`
   // array fails the whole tool request. zod >= 4.5 emits nullable fields as type arrays, and
