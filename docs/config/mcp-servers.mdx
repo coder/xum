@@ -109,26 +109,26 @@ Claude 4.5 and later models with Anthropic prompt caching, used directly or thro
 
 ## Example: GitHub tools
 
-Xum has no built-in GitHub tools. To let agents search code, read files, and work with issues and pull requests on GitHub, add GitHub's own [GitHub MCP server](https://github.com/github/github-mcp-server). Its local form runs in Docker and reads a [personal access token](https://github.com/settings/personal-access-tokens/new) from the `GITHUB_PERSONAL_ACCESS_TOKEN` environment variable:
+Xum has no built-in GitHub tools. To let agents search code, read files, and work with issues and pull requests on GitHub, add GitHub's own [GitHub MCP server](https://github.com/github/github-mcp-server). Its local form runs in Docker and reads a [personal access token](https://github.com/settings/personal-access-tokens/new) from the `GITHUB_PERSONAL_ACCESS_TOKEN` environment variable. This example reads the token from a file when the server starts, so only the server process gets it:
 
 ```jsonc
 {
   "servers": {
-    // `-e NAME` with no value passes NAME from Xum's environment into the container,
-    // so the token never appears in this file.
-    "github": "docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server",
+    // Xum runs the command with bash. The variable is set for this command only, and
+    // `-e NAME` with no value passes it into the container.
+    "github": "GITHUB_PERSONAL_ACCESS_TOKEN=\"$(cat ~/.config/github-mcp/token)\" docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server",
   },
 }
 ```
 
 1. Install Docker and keep it running.
 2. Create a token with only the permissions you want agents to have.
-3. Set `GITHUB_PERSONAL_ACCESS_TOKEN` where the server starts:
-   - **Local and worktree workspaces:** the server inherits the environment of the Xum process. Export the variable in a terminal and start Xum from that terminal, for example with `xum server`. A desktop app opened from the Dock, Finder, or an app menu does not read your shell profile, so it does not get the variable.
-   - **SSH, Docker, devcontainer, and Coder workspaces:** the server runs in the workspace, and Xum does not pass its own environment there. Set the variable in that workspace.
-4. Check that the server starts. For a local workspace, use **Test** in **Settings → MCP**. **Test** always runs the server on the Xum host, so for a remote workspace run the `docker run` command in that workspace's terminal instead.
+3. Save the token in `~/.config/github-mcp/token` where the server starts, and make the file readable only by you (`chmod 600`). For a local or worktree workspace, that is the Xum host. For an SSH, Docker, devcontainer, or Coder workspace, the server runs in the workspace, so the file must be there.
+4. Check that the server starts. For a local workspace, use **Test** in **Settings → MCP**. **Test** always runs the server on the Xum host, so for a remote workspace run the command in that workspace's terminal instead.
 
-Do not put the token in `mcp.jsonc`. The GitHub MCP server's README lists its other install forms, including a remote server hosted by GitHub, and its toolset options.
+CAUTION: Do not put the token in `mcp.jsonc`, and do not export it in the environment that Xum starts with. Agent bash commands inherit Xum's environment, so a command that a prompt injection asks for could read an exported token. Agent commands run as your OS user and can also read the token file, so give the token only the permissions you accept an agent to use.
+
+The GitHub MCP server's README lists its other install forms, including a remote server hosted by GitHub, and its toolset options.
 
 ## Finding MCP Servers
 
