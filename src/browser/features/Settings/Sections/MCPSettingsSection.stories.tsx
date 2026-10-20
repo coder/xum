@@ -62,7 +62,7 @@ interface MCPSectionStoryOptions {
   preCacheTools?: boolean;
   experiments?: Partial<Record<ExperimentId, boolean>>;
   mcpAppViewDomainsListError?: string;
-  configProblems?: MCPConfigProblem[];
+  configProblems?: MCPConfigProblem[] | (() => MCPConfigProblem[]);
 }
 
 function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): APIClient {
@@ -818,6 +818,41 @@ export const ConfigProblems: Story = {
   ),
   play: async ({ canvasElement }) => {
     await expectConfigProblemsNotice(canvasElement);
+  },
+};
+
+// The user fixes mcp.jsonc outside Xum, then a toggle saves: the notice goes away (Codex review
+// of #7091). The mock reports the problems until the first save.
+export const ConfigProblemsClearAfterSave: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    let fixed = false;
+    const api = setupMCPSettingsSectionStory({
+      servers: {
+        memory: {
+          transport: "stdio",
+          command: "npx -y @modelcontextprotocol/server-memory",
+          disabled: false,
+        },
+      },
+      configProblems: () => (fixed ? [] : CONFIG_PROBLEMS),
+    });
+    const setEnabled = api.mcp.setEnabled.bind(api.mcp);
+    api.mcp.setEnabled = (input) => {
+      fixed = true;
+      return setEnabled(input);
+    };
+    return (
+      <MCPSettingsSectionStoryShell setup={() => api}>
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expectConfigProblemsNotice(canvasElement);
+    await userEvent.click(await canvas.findByRole("switch", { name: "Toggle memory enabled" }));
+    await waitFor(() => expect(canvas.queryByRole("alert")).toBeNull());
   },
 };
 

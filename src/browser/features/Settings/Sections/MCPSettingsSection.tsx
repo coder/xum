@@ -1143,6 +1143,9 @@ export const MCPSettingsSection: React.FC = () => {
           setError(result.error ?? "Failed to update server");
         } else {
           publishGlobalMcpEnablementChanged();
+          // A save succeeds only once mcp.jsonc is fixed: drop a stale error and notice.
+          setError(null);
+          setConfigProblems(await api.mcp.configProblems().catch(() => null));
         }
       } catch (err) {
         // Revert on error

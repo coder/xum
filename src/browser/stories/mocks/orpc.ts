@@ -330,8 +330,8 @@ export interface MockORPCClientOptions {
   >;
   /** Global MCP server configuration (Settings → MCP) */
   globalMcpServers?: Record<string, MCPServerInfo>;
-  /** Problems in the global mcp.jsonc (mcp.configProblems); default: none. */
-  mcpConfigProblems?: MCPConfigProblem[];
+  /** Problems in the global mcp.jsonc (mcp.configProblems); default: none. A function is read per call. */
+  mcpConfigProblems?: MCPConfigProblem[] | (() => MCPConfigProblem[]);
   /** MCP server configuration per project */
   mcpServers?: Map<string, Record<string, MCPServerInfo>>;
   /** Optional OAuth auth status per MCP server URL (serverUrl -> status) */
@@ -1608,7 +1608,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         },
       },
       configProblems: () =>
-        Promise.resolve({ path: "/home/user/.xum/mcp.jsonc", problems: mcpConfigProblems }),
+        Promise.resolve({
+          path: "/home/user/.xum/mcp.jsonc",
+          problems:
+            typeof mcpConfigProblems === "function" ? mcpConfigProblems() : mcpConfigProblems,
+        }),
       list: (input?: { projectPath?: string }) => {
         const projectPath = typeof input?.projectPath === "string" ? input.projectPath.trim() : "";
         if (projectPath) {

@@ -112,7 +112,7 @@ export function acquireGlobalMcpConfigLock(
 }
 
 /** A config file as read, with what Xum skipped in it (#2060). */
-type ReadMCPConfig = MCPConfig & { problems: MCPConfigProblem[] };
+type ReadMCPConfig = MCPConfig & { problems: MCPConfigProblem[]; skipped: string[] };
 
 /**
  * A save rewrites the whole file from the parsed servers, so a skipped entry would be lost: the
@@ -126,7 +126,28 @@ function refuseSaveWithProblems(filePath: string, problems: MCPConfigProblem[]):
 }
 
 /** A fresh value: callers edit the servers they get. */
-const noConfig = (): ReadMCPConfig => ({ servers: {}, enabledPluginServers: [], problems: [] });
+const noConfig = (): ReadMCPConfig => ({
+  servers: {},
+  enabledPluginServers: [],
+  problems: [],
+  skipped: [],
+});
+
+/**
+ * A skipped repo-override entry still shadows the global server of the same name, fail closed:
+ * a typo in the higher layer must not start a different command (#2060).
+ */
+function withSkippedTombstones(
+  servers: Record<string, MCPServerInfo>,
+  skipped: string[]
+): Record<string, MCPServerInfo> {
+  const result = { ...servers };
+  for (const name of skipped) {
+    if (!Object.hasOwn(result, name))
+      result[name] = { transport: "stdio", command: "", disabled: true };
+  }
+  return result;
+}
 
 export class MCPConfigService {
   private readonly config: Config;
@@ -447,7 +468,12 @@ export class MCPConfigService {
         servers[name] = this.normalizeEntry(entry);
       }
       this.warnConfigProblems(filePath, parsed.problems);
-      return { servers, enabledPluginServers, problems: parsed.problems };
+      return {
+        servers,
+        enabledPluginServers,
+        problems: parsed.problems,
+        skipped: parsed.skipped,
+      };
     } catch (error) {
       // Defensive: never crash on startup due to corrupt config.
       log.error("Failed to read MCP config", { filePath, error });
@@ -458,7 +484,7 @@ export class MCPConfigService {
         { line: null, column: null, server: null, message: `Xum cannot read this file (${code})` },
       ];
       this.warnConfigProblems(filePath, problems);
-      return { servers: {}, enabledPluginServers: [], problems };
+      return { ...noConfig(), problems };
     }
   }
 
@@ -777,7 +803,10 @@ export class MCPConfigService {
     return {
       plugin: pluginServers,
       global: globalServers,
-      project: omitReservedPluginKeys(repoCfg.servers, "project"),
+      project: omitReservedPluginKeys(
+        withSkippedTombstones(repoCfg.servers, repoCfg.skipped),
+        "project"
+      ),
     };
   }
 

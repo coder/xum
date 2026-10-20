@@ -1317,6 +1317,24 @@ describe("MCPConfigService config problems", () => {
     expect(await fs.readFile(configPath, "utf-8")).toBe(raw);
   });
 
+  test("a UTF-8 BOM is not a problem, as with jsonc.parse", async () => {
+    await fs.writeFile(configPath, '\uFEFF{"servers":{"a":"echo a"}}');
+    expect(await service.getConfigProblems()).toEqual({ path: configPath, problems: [] });
+    expect(Object.keys(await service.listServers())).toEqual(["a"]);
+  });
+
+  test("a skipped repo-override entry still shadows the global server of that name", async () => {
+    await fs.writeFile(configPath, '{"servers":{"a":"echo global"}}');
+    const projectPath = path.join(tempDir, "repo");
+    await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+    await fs.writeFile(path.join(projectPath, ".xum", "mcp.jsonc"), '{"servers":{"a":42}}');
+    expect((await service.listServers(projectPath, true)).a).toEqual({
+      transport: "stdio",
+      command: "",
+      disabled: true,
+    });
+  });
+
   test("Settings writes refuse a file with problems and leave its bytes alone", async () => {
     const raw = '{"servers":{"a":"echo a", "b":{"command" "echo b"}}}';
     await fs.writeFile(configPath, raw);

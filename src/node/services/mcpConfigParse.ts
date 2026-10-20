@@ -13,11 +13,18 @@ import type { MCPConfigProblem } from "@/common/types/mcp";
 /** The documented example uses comments and trailing commas: both are valid here. */
 const PARSE_OPTIONS: jsonc.ParseOptions = { allowTrailingComma: true, allowEmptyContent: true };
 
-type PlacedProblem = MCPConfigProblem & { offset: number };
+/** A problem at a character offset; positions are computed once at the end (withPositions). */
+interface PlacedProblem {
+  offset: number;
+  server: string | null;
+  message: string;
+}
 
 export interface ParsedMcpServers {
   /** Name and raw value of each usable entry, in file order (a later duplicate wins). */
   entries: Array<[string, unknown]>;
+  /** Names of the entries Xum skipped: a higher layer must still shadow these names. */
+  skipped: string[];
   problems: MCPConfigProblem[];
 }
 
@@ -41,16 +48,21 @@ function describeParseError(code: jsonc.ParseErrorCode): string {
     .toLowerCase();
 }
 
-function problemAt(
-  raw: string,
-  offset: number,
-  server: string | null,
-  message: string
-): PlacedProblem {
-  const before = raw.slice(0, offset);
-  const line = before.split("\n").length;
-  const column = offset - (before.lastIndexOf("\n") + 1) + 1;
-  return { offset, line, column, server, message };
+/** 1-based line and column of every problem, in offset order, in one pass over the text. */
+function withPositions(text: string, problems: PlacedProblem[]): MCPConfigProblem[] {
+  const sorted = [...problems].sort((a, b) => a.offset - b.offset);
+  let line = 1;
+  let lineStart = 0;
+  let scanned = 0;
+  return sorted.map(({ offset, server, message }) => {
+    for (; scanned < offset; scanned++) {
+      if (text.charCodeAt(scanned) === 10) {
+        line += 1;
+        lineStart = scanned + 1;
+      }
+    }
+    return { line, column: offset - lineStart + 1, server, message };
+  });
 }
 
 function propertyName(property: jsonc.Node): string | null {
@@ -62,32 +74,32 @@ function propertyName(property: jsonc.Node): string | null {
  * The value of the last `servers` key: jsonc.parse kept the last of duplicate keys, so that is the
  * block in use. A save would drop the others, so each earlier duplicate is a problem too.
  */
-function lastServersValue(
-  raw: string,
-  root: jsonc.Node,
-  problems: PlacedProblem[]
-): jsonc.Node | undefined {
+function lastServersValue(root: jsonc.Node, problems: PlacedProblem[]): jsonc.Node | undefined {
   const blocks = (root.children ?? []).filter((property) => propertyName(property) === "servers");
   for (const duplicate of blocks.slice(1)) {
-    problems.push(problemAt(raw, duplicate.offset, null, '"servers" appears more than once'));
+    problems.push({
+      offset: duplicate.offset,
+      server: null,
+      message: '"servers" appears more than once',
+    });
   }
   return blocks.at(-1)?.children?.[1];
 }
 
 /** The property nodes of `servers`, or none when the file or `servers` has the wrong shape. */
-function serverProperties(
-  raw: string,
-  root: jsonc.Node | undefined,
-  problems: PlacedProblem[]
-): jsonc.Node[] {
+function serverProperties(root: jsonc.Node | undefined, problems: PlacedProblem[]): jsonc.Node[] {
   if (root === undefined) return [];
   if (root.type !== "object") {
-    problems.push(problemAt(raw, root.offset, null, "the file must hold a JSON object"));
+    problems.push({
+      offset: root.offset,
+      server: null,
+      message: "the file must hold a JSON object",
+    });
     return [];
   }
-  const servers = lastServersValue(raw, root, problems);
+  const servers = lastServersValue(root, problems);
   if (servers !== undefined && servers.type !== "object") {
-    problems.push(problemAt(raw, servers.offset, null, '"servers" must be an object'));
+    problems.push({ offset: servers.offset, server: null, message: '"servers" must be an object' });
     return [];
   }
   return servers?.children ?? [];
@@ -95,7 +107,6 @@ function serverProperties(
 
 /** Reports each syntax error; returns the entries it falls inside, which are skipped. */
 function entriesBrokenBy(
-  raw: string,
   errors: jsonc.ParseError[],
   properties: jsonc.Node[],
   problems: PlacedProblem[]
@@ -107,31 +118,42 @@ function entriesBrokenBy(
     );
     if (property !== undefined) broken.add(property);
     const server = property === undefined ? null : propertyName(property);
-    problems.push(problemAt(raw, error.offset, server, describeParseError(error.error)));
+    problems.push({ offset: error.offset, server, message: describeParseError(error.error) });
   }
   return broken;
 }
 
 export function parseMcpConfigServers(raw: string): ParsedMcpServers {
+  // jsonc.parse ignored a leading UTF-8 BOM (common in files saved on Windows); parseTree
+  // reports it as an invalid symbol.
+  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
   const errors: jsonc.ParseError[] = [];
-  const root = jsonc.parseTree(raw, errors, PARSE_OPTIONS);
+  const root = jsonc.parseTree(text, errors, PARSE_OPTIONS);
   const problems: PlacedProblem[] = [];
-  const properties = serverProperties(raw, root, problems);
+  const properties = serverProperties(root, problems);
   // A syntax error inside an entry breaks that entry only: skip it and name it.
-  const broken = entriesBrokenBy(raw, errors, properties, problems);
+  const broken = entriesBrokenBy(errors, properties, problems);
 
   const entries: Array<[string, unknown]> = [];
+  const skipped: string[] = [];
   for (const property of properties) {
     const name = propertyName(property);
     const valueNode = property.children?.[1];
-    // A key without a value is a syntax error, already reported above.
-    if (broken.has(property) || name === null || valueNode === undefined) continue;
+    if (name === null) continue;
+    // A syntax error (reported above) or a key without a value: nothing usable.
+    if (broken.has(property) || valueNode === undefined) {
+      skipped.push(name);
+      continue;
+    }
     const value: unknown = jsonc.getNodeValue(valueNode);
     const problem = entryProblem(value);
-    if (problem === null) entries.push([name, value]);
-    else problems.push(problemAt(raw, property.offset, name, problem));
+    if (problem === null) {
+      entries.push([name, value]);
+      continue;
+    }
+    problems.push({ offset: property.offset, server: name, message: problem });
+    skipped.push(name);
   }
 
-  problems.sort((a, b) => a.offset - b.offset);
-  return { entries, problems: problems.map(({ offset: _offset, ...problem }) => problem) };
+  return { entries, skipped, problems: withPositions(text, problems) };
 }
