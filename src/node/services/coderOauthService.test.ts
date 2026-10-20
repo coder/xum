@@ -3421,6 +3421,7 @@ describe("CoderOauthService", () => {
     it("stops a committed login's provider discovery on dispose", async () => {
       deps.providersConfig = { coder: { deploymentUrl: DEPLOYMENT_URL } };
       let listingRequests = 0;
+      let listingSignal: AbortSignal | undefined;
       let firstListing!: () => void;
       const listingStarted = new Promise<void>((resolve) => (firstListing = resolve));
       mockFetch(async (input, init) => {
@@ -3450,9 +3451,12 @@ describe("CoderOauthService", () => {
             return new Response("forbidden", { status: 403 });
           }
           listingRequests++;
+          listingSignal = init?.signal ?? undefined;
           firstListing();
-          // Transient: discovery retries it after a delay.
-          return new Response("unavailable", { status: 500 });
+          // Hang until the request is aborted, like a stalled deployment.
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          });
         }
         return new Response(`unexpected url: ${url}`, { status: 500 });
       });
@@ -3470,8 +3474,8 @@ describe("CoderOauthService", () => {
 
       await listingStarted;
       await service.dispose();
-      // The retries run a few hundred ms apart. A stopped discovery makes none of them.
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      // dispose() waits for the interrupted discovery, which aborted its request.
+      expect(listingSignal?.aborted).toBe(true);
       expect(listingRequests).toBe(1);
     });
 

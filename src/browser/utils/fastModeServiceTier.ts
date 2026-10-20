@@ -143,12 +143,12 @@ export function getFastModeUnavailableReason(
     const wireOrigin = customProviderWireOrigin(custom.providerType);
     if (wireOrigin != null) capabilityModel = `${wireOrigin}:${modelString.slice(separator + 1)}`;
   }
-  // An identity that is not a direct provider's model (a generic OpenAI-compatible provider, a
-  // Copilot model, a Coder model of unknown upstream) cannot rule Fast mode out, and the route
-  // text is true for every route without it (#5764).
+  // A gateway or unknown identity (a generic OpenAI-compatible provider, a Copilot model, a Coder
+  // model of unknown upstream) cannot rule Fast mode out, and the route text is true for every
+  // route without it (#5764). A local model (Ollama) has no Fast mode anywhere: the model reason.
   const origin = capabilityModel.slice(0, capabilityModel.indexOf(":"));
   const definition = (PROVIDER_DEFINITIONS as Record<string, { kind: string } | undefined>)[origin];
-  if (definition?.kind !== "direct") return "route";
+  if (definition == null || definition.kind === "gateway") return "route";
   // That model's own provider, called directly, is the route where Fast mode works if the model
   // has it at all. No config here: config gates (missing provider, ZDR) are route reasons too.
   return getFastModeProvider(capabilityModel, { resolvedRouteProvider: "direct" })

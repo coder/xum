@@ -54,6 +54,8 @@ describe("fast mode service tier", () => {
     expect(getFastModeUnavailableReason("team-compat:claude-haiku-4-5", custom)).toBe("route");
     expect(getFastModeUnavailableReason("github-copilot:claude-opus-5-5", null)).toBe("route");
     expect(getFastModeUnavailableReason("coder:claude-opus-5-5", null)).toBe("route");
+    // A local model has no Fast mode on any route.
+    expect(getFastModeUnavailableReason("ollama:llama3", null)).toBe("model");
     // A Coder or Bedrock model with a known upstream keeps the model reason.
     expect(getFastModeUnavailableReason("coder:anthropic/claude-haiku-4-5", null)).toBe("model");
     expect(getFastModeUnavailableReason("bedrock:anthropic.claude-haiku-4-5", null)).toBe("model");
