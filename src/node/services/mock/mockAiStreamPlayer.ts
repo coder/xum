@@ -43,6 +43,13 @@ const MOCK_TOKENIZER_MODEL = KNOWN_MODELS.GPT.id;
 const TOKENIZE_TIMEOUT_MS = 150;
 let tokenizerFallbackLogged = false;
 let tokenizerUnavailableLogged = false;
+/**
+ * A tokenizer call that missed TOKENIZE_TIMEOUT_MS and is still running (cold tokenizer load or
+ * a busy worker). Until it settles, deltas use the approximate count at once: waiting the full
+ * timeout per delta held the event queue for 150 ms per 25 ms delta, and the throttled partial
+ * write queued behind that backlog (partial.json appeared ~1.9 s into a stream, #7065).
+ */
+let slowTokenizeInFlight: Promise<unknown> | null = null;
 
 function approximateTokenCount(text: string): number {
   const normalizedLength = text.trim().length;
@@ -58,6 +65,9 @@ async function tokenizeWithMockModel(text: string, context: string): Promise<num
   // Prefer fast approximate token counting in mock mode.
   // We only use the real tokenizer if it's available and responds quickly.
   const approximateTokens = approximateTokenCount(text);
+  if (slowTokenizeInFlight !== null) {
+    return approximateTokens;
+  }
 
   let fallbackUsed = false;
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -93,6 +103,13 @@ async function tokenizeWithMockModel(text: string, context: string): Promise<num
 
   if (timeoutId !== undefined) {
     clearTimeout(timeoutId);
+  }
+
+  if (fallbackUsed) {
+    const inFlight = actualPromise.finally(() => {
+      if (slowTokenizeInFlight === inFlight) slowTokenizeInFlight = null;
+    });
+    slowTokenizeInFlight = inFlight;
   }
 
   if (fallbackUsed && !tokenizerFallbackLogged) {
