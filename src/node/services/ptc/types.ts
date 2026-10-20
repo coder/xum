@@ -160,8 +160,11 @@ function boundPersistenceCriticalResult(toolName: string, result: unknown): unkn
  * snapshot then trusts the reason over the path, so the path alone must not
  * survive.
  */
-function boundSkillReadResult(result: object, fields: Record<string, unknown>): unknown {
-  const skill = (result as { skill?: unknown }).skill;
+function boundSkillReadResult(
+  result: { skill?: unknown } & Partial<Record<(typeof SKILL_LOCATION_FIELDS)[number], unknown>>,
+  fields: Record<string, unknown>
+): unknown {
+  const skill = result.skill;
   const location = retainSkillLocationFields(result);
   const withLocation = boundSkillReadPackage(skill, { ...fields, ...location });
   if (withLocation !== undefined) return withLocation;
