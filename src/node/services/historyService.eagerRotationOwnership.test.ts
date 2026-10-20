@@ -34,7 +34,7 @@ describe("eager rotation after a boundary write (#5344)", () => {
     await h.cleanup();
   });
 
-  it.each(["append", "appendMany", "appendIfTailMatches", "update"] as const)(
+  it.each(["append", "appendMany", "appendIfTailMatches", "update", "persistBoundary"] as const)(
     "%s: a lock reclaimed before rotation keeps the new owner's row",
     async (path_) => {
       const service = h.historyService;
@@ -81,7 +81,14 @@ describe("eager rotation after a boundary write (#5344)", () => {
               ? await service.appendManyToHistory(workspaceId, [boundary("B")])
               : path_ === "appendIfTailMatches"
                 ? await service.appendToHistoryIfTailMatches(workspaceId, boundary("B"), "S")
-                : await service.updateHistory(workspaceId, boundary("S", placeholderSequence));
+                : path_ === "update"
+                  ? await service.updateHistory(workspaceId, boundary("S", placeholderSequence))
+                  : await service.persistBoundaryWithTailCopies(
+                      workspaceId,
+                      boundary("B"),
+                      [],
+                      false
+                    );
         // The boundary row itself is durable; only the best-effort rotation stops.
         expect(result.success).toBe(true);
         if (path_ === "appendIfTailMatches")

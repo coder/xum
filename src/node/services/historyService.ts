@@ -5409,14 +5409,15 @@ export class HistoryService {
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to persist compaction boundary with tail copies",
-      () =>
+      (assertStillOwned) =>
         this.persistBoundaryWithTailCopiesUnderWriteLock(
           workspaceId,
           summaryMessage,
           tailCopies,
           updateExisting,
           shouldPersist,
-          commit
+          commit,
+          assertStillOwned
         )
     );
   }
