@@ -8,9 +8,20 @@
 const HTTP_TOKEN_PATTERN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
 // The value is the workspace id, so these names would replace credentials or a
-// header Xum (or the SDK) already sets on every request. Lowercase: HTTP header
-// names are case-insensitive.
+// header Xum (or the SDK) already sets on every request. The hop-by-hop names
+// (RFC 7230 section 6.1), expect and content-encoding either make Node fetch
+// refuse the request before network I/O or get stripped or misread on the way.
+// Lowercase: HTTP header names are case-insensitive.
 const RESERVED_SESSION_HEADER_NAMES = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "expect",
+  "content-encoding",
   "authorization",
   "proxy-authorization",
   "x-api-key",
@@ -32,7 +43,7 @@ export function sessionHeaderNameError(name: string): string | null {
     return "Session header must be a valid HTTP header name (letters, digits and !#$%&'*+-.^_`|~, no spaces).";
   }
   if (RESERVED_SESSION_HEADER_NAMES.has(name.toLowerCase())) {
-    return `Session header cannot be "${name}": Xum or the provider already uses it.`;
+    return `Session header cannot be "${name}": it is reserved for credentials or HTTP transport.`;
   }
   return null;
 }
