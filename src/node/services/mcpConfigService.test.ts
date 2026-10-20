@@ -1305,6 +1305,18 @@ describe("MCPConfigService config problems", () => {
     expect(problems[0].server).toBeNull();
   });
 
+  test("a duplicate servers block keeps the last one, as jsonc.parse did, and blocks saves", async () => {
+    const raw = '{"servers":{"old":"echo old"},\n"servers":{"new":"echo new"}}';
+    await fs.writeFile(configPath, raw);
+    expect(Object.keys(await service.listServers())).toEqual(["new"]);
+    const { problems } = await service.getConfigProblems();
+    expect(problems).toEqual([
+      { line: 2, column: 1, server: null, message: '"servers" appears more than once' },
+    ]);
+    expect((await service.addServer("c", { command: "echo c" })).success).toBe(false);
+    expect(await fs.readFile(configPath, "utf-8")).toBe(raw);
+  });
+
   test("Settings writes refuse a file with problems and leave its bytes alone", async () => {
     const raw = '{"servers":{"a":"echo a", "b":{"command" "echo b"}}}';
     await fs.writeFile(configPath, raw);

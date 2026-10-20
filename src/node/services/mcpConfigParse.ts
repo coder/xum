@@ -58,6 +58,22 @@ function propertyName(property: jsonc.Node): string | null {
   return key?.type === "string" && typeof key.value === "string" ? key.value : null;
 }
 
+/**
+ * The value of the last `servers` key: jsonc.parse kept the last of duplicate keys, so that is the
+ * block in use. A save would drop the others, so each earlier duplicate is a problem too.
+ */
+function lastServersValue(
+  raw: string,
+  root: jsonc.Node,
+  problems: PlacedProblem[]
+): jsonc.Node | undefined {
+  const blocks = (root.children ?? []).filter((property) => propertyName(property) === "servers");
+  for (const duplicate of blocks.slice(1)) {
+    problems.push(problemAt(raw, duplicate.offset, null, '"servers" appears more than once'));
+  }
+  return blocks.at(-1)?.children?.[1];
+}
+
 /** The property nodes of `servers`, or none when the file or `servers` has the wrong shape. */
 function serverProperties(
   raw: string,
@@ -69,7 +85,7 @@ function serverProperties(
     problems.push(problemAt(raw, root.offset, null, "the file must hold a JSON object"));
     return [];
   }
-  const servers = jsonc.findNodeAtLocation(root, ["servers"]);
+  const servers = lastServersValue(raw, root, problems);
   if (servers !== undefined && servers.type !== "object") {
     problems.push(problemAt(raw, servers.offset, null, '"servers" must be an object'));
     return [];
