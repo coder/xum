@@ -60,6 +60,26 @@ function normalizeApiUrl(value: string): string {
   return parsed.toString().replace(/\/+$/, "");
 }
 
+const CREDENTIAL_FIELDS = ["apiKey", "apiUrl", "target"] as const;
+
+/** The non-empty string fields of a credentials file, or undefined when it is not an object. */
+function parseStoredCredentials(raw: string): DaytonaStoredCredentials | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const record = parsed as Record<string, unknown>;
+  const stored: DaytonaStoredCredentials = {};
+  for (const field of CREDENTIAL_FIELDS) {
+    const value = nonEmpty(record[field]);
+    if (value) stored[field] = value;
+  }
+  return stored;
+}
+
 export class DaytonaCredentialsStore {
   readonly filePath: string;
   private readonly rootDir: string;
@@ -87,26 +107,12 @@ export class DaytonaCredentialsStore {
       }
       return {};
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
+    const stored = parseStoredCredentials(raw);
+    if (!stored) {
       // Never log the content: it holds the API key.
       log.warn("Ignoring malformed Daytona credentials file", { filePath: this.filePath });
       return {};
     }
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-      log.warn("Ignoring malformed Daytona credentials file", { filePath: this.filePath });
-      return {};
-    }
-    const record = parsed as Record<string, unknown>;
-    const stored: DaytonaStoredCredentials = {};
-    const apiKey = nonEmpty(record.apiKey);
-    const apiUrl = nonEmpty(record.apiUrl);
-    const target = nonEmpty(record.target);
-    if (apiKey) stored.apiKey = apiKey;
-    if (apiUrl) stored.apiUrl = apiUrl;
-    if (target) stored.target = target;
     return stored;
   }
 
@@ -121,8 +127,7 @@ export class DaytonaCredentialsStore {
 
   private async applyUpdate(patch: DaytonaCredentialsPatch): Promise<void> {
     const next = await this.read();
-    const fields = ["apiKey", "apiUrl", "target"] as const;
-    for (const field of fields) {
+    for (const field of CREDENTIAL_FIELDS) {
       const value = patch[field];
       if (value === undefined) continue;
       const trimmed = nonEmpty(value);

@@ -67,8 +67,40 @@ export function mapDaytonaSandboxState(raw: string | undefined): ObservedSandbox
   return (raw ? RAW_STATE_MAP[raw] : undefined) ?? "error";
 }
 
-// Raw states from which `start` brings the sandbox back.
-const STARTABLE_RAW_STATES = new Set(["stopped", "paused", "archived"]);
+// States from which `start` brings the sandbox back (stopped includes paused).
+const STARTABLE_STATES = new Set<ObservedSandboxState>(["stopped", "archived"]);
+
+function sandboxStateError(sandboxId: string, sandbox: DaytonaSandbox): DaytonaApiError {
+  const reason = sandbox.errorReason ? `: ${sandbox.errorReason}` : "";
+  return new DaytonaApiError(
+    "server",
+    `Daytona sandbox ${sandboxId} is in state ${sandbox.state ?? "unknown"}${reason}`
+  );
+}
+
+function startTimeoutError(sandboxId: string, sandbox: DaytonaSandbox): DaytonaApiError {
+  return new DaytonaApiError(
+    "timeout",
+    `Daytona sandbox ${sandboxId} did not start in time (last state: ${sandbox.state ?? "unknown"})`
+  );
+}
+
+/**
+ * One startAndWait step for an observed sandbox: done once started, start it (once) when it is
+ * stopped or archived, otherwise keep waiting. Error states throw.
+ */
+function nextStartStep(
+  sandboxId: string,
+  sandbox: DaytonaSandbox,
+  startRequested: boolean
+): "done" | "start" | "wait" {
+  const state = mapDaytonaSandboxState(sandbox.state);
+  if (state === "started") return "done";
+  if (state === "error") throw sandboxStateError(sandboxId, sandbox);
+  // Start once: Daytona may report the old state for a poll or two after accepting it.
+  if (!startRequested && STARTABLE_STATES.has(state)) return "start";
+  return "wait";
+}
 
 export type DaytonaAvailability = { available: true } | { available: false; reason: string };
 
@@ -279,48 +311,41 @@ export class DaytonaService {
     options: DaytonaStartAndWaitOptions = {}
   ): Promise<DaytonaSandbox> {
     const { client } = await this.getClient();
-    const pollIntervalMs = options.pollIntervalMs ?? DAYTONA_START_POLL_INTERVAL_MS;
     let startRequested = false;
     for (;;) {
-      if (options.signal?.aborted) {
-        throw new DaytonaApiError("timeout", "Waiting for the Daytona sandbox was cancelled");
-      }
-      let sandbox: DaytonaSandbox;
-      try {
-        sandbox = await client.getSandbox(sandboxId, options.signal);
-      } catch (error) {
-        if (isDaytonaNotFound(error)) {
-          throw new DaytonaApiError(
-            "not_found",
-            `Daytona sandbox ${sandboxId} no longer exists (removed outside Xum?)`,
-            404
-          );
-        }
-        throw error;
-      }
-      const state = mapDaytonaSandboxState(sandbox.state);
-      if (state === "started") return sandbox;
-      if (state === "error") {
-        const reason = sandbox.errorReason ? `: ${sandbox.errorReason}` : "";
-        throw new DaytonaApiError(
-          "server",
-          `Daytona sandbox ${sandboxId} is in state ${sandbox.state ?? "unknown"}${reason}`
-        );
-      }
-      // Start once: Daytona may report the old state for a poll or two after accepting it.
-      if (!startRequested && STARTABLE_RAW_STATES.has(sandbox.state ?? "")) {
+      options.signal?.throwIfAborted();
+      const sandbox = await this.getSandboxForStart(client, sandboxId, options.signal);
+      const step = nextStartStep(sandboxId, sandbox, startRequested);
+      if (step === "done") return sandbox;
+      if (step === "start") {
         options.onStarting?.();
         await client.startSandbox(sandboxId, options.signal);
         startRequested = true;
       }
       const remaining = deadline - this.now();
-      if (remaining <= 0) {
+      if (remaining <= 0) throw startTimeoutError(sandboxId, sandbox);
+      await this.sleep(
+        Math.min(options.pollIntervalMs ?? DAYTONA_START_POLL_INTERVAL_MS, remaining)
+      );
+    }
+  }
+
+  private async getSandboxForStart(
+    client: DaytonaClient,
+    sandboxId: string,
+    signal?: AbortSignal
+  ): Promise<DaytonaSandbox> {
+    try {
+      return await client.getSandbox(sandboxId, signal);
+    } catch (error) {
+      if (isDaytonaNotFound(error)) {
         throw new DaytonaApiError(
-          "timeout",
-          `Daytona sandbox ${sandboxId} did not start in time (last state: ${sandbox.state ?? "unknown"})`
+          "not_found",
+          `Daytona sandbox ${sandboxId} no longer exists (removed outside Xum?)`,
+          404
         );
       }
-      await this.sleep(Math.min(pollIntervalMs, remaining));
+      throw error;
     }
   }
 

@@ -161,6 +161,51 @@ function describeStatus(kind: DaytonaErrorKind, status: number): string {
   }
 }
 
+function buildUrl(apiUrl: string, pathName: string, query: RequestOptions["query"] = {}): URL {
+  const url = new URL(`${apiUrl}${pathName}`);
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined) url.searchParams.set(key, String(value));
+  }
+  return url;
+}
+
+function httpError(status: number, bodyText: string, label: string): DaytonaApiError {
+  const kind = kindForStatus(status);
+  const serverMessage = extractServerMessage(bodyText);
+  const base = `${describeStatus(kind, status)} for ${label}`;
+  return new DaytonaApiError(
+    kind,
+    serverMessage ? `${base}: ${serverMessage}` : base,
+    status,
+    serverMessage
+  );
+}
+
+function transportError(
+  error: unknown,
+  context: {
+    label: string;
+    origin: string;
+    timeoutMs: number;
+    timedOut: boolean;
+    cancelled: boolean;
+  }
+): DaytonaApiError {
+  if (context.timedOut) {
+    return new DaytonaApiError(
+      "timeout",
+      `Daytona did not answer ${context.label} within ${Math.round(context.timeoutMs / 1000)}s`
+    );
+  }
+  if (context.cancelled) {
+    return new DaytonaApiError("timeout", `Daytona request ${context.label} was cancelled`);
+  }
+  return new DaytonaApiError(
+    "unreachable",
+    `Could not reach Daytona at ${context.origin} (${getErrorMessage(error)})`
+  );
+}
+
 export class DaytonaClient {
   private readonly apiUrl: string;
   private readonly apiKey?: string;
@@ -179,10 +224,24 @@ export class DaytonaClient {
     pathName: string,
     options: RequestOptions = {}
   ): Promise<unknown> {
-    const url = new URL(`${this.apiUrl}${pathName}`);
-    for (const [key, value] of Object.entries(options.query ?? {})) {
-      if (value !== undefined) url.searchParams.set(key, String(value));
+    const label = `${method} ${pathName}`;
+    const url = buildUrl(this.apiUrl, pathName, options.query);
+    const { response, bodyText } = await this.send(url, label, {
+      method,
+      headers: this.buildHeaders(options),
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      callerSignal: options.signal,
+    });
+    if (!response.ok) throw httpError(response.status, bodyText, label);
+    if (!bodyText) return undefined;
+    try {
+      return JSON.parse(bodyText) as unknown;
+    } catch {
+      throw new DaytonaApiError("server", `Daytona returned invalid JSON for ${label}`);
     }
+  }
+
+  private buildHeaders(options: RequestOptions): Record<string, string> {
     const headers: Record<string, string> = { Accept: "application/json" };
     if (options.auth !== false) {
       if (!this.apiKey) {
@@ -191,7 +250,20 @@ export class DaytonaClient {
       headers.Authorization = `Bearer ${this.apiKey}`;
     }
     if (options.body !== undefined) headers["Content-Type"] = "application/json";
+    return headers;
+  }
 
+  /** fetch with this client's timeout and the caller's signal; transport failures are typed. */
+  private async send(
+    url: URL,
+    label: string,
+    init: {
+      method: string;
+      headers: Record<string, string>;
+      body?: string;
+      callerSignal?: AbortSignal;
+    }
+  ): Promise<{ response: Response; bodyText: string }> {
     // An explicit timer instead of AbortSignal.timeout/any: under Bun an AbortSignal.timeout
     // held only by a hung request's promise chain was seen never to fire. The pending timer
     // keeps the controller reachable, so a hung request is always aborted.
@@ -201,57 +273,29 @@ export class DaytonaClient {
       timedOut = true;
       controller.abort();
     }, this.timeoutMs);
+    const callerSignal = init.callerSignal;
     const abortFromCaller = () => controller.abort();
-    options.signal?.addEventListener("abort", abortFromCaller, { once: true });
-    const label = `${method} ${pathName}`;
-
-    let response: Response;
-    let bodyText: string;
+    callerSignal?.addEventListener("abort", abortFromCaller, { once: true });
     try {
-      if (options.signal?.aborted) controller.abort();
-      response = await this.fetchImpl(url, {
-        method,
-        headers,
-        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      if (callerSignal?.aborted) controller.abort();
+      const response = await this.fetchImpl(url, {
+        method: init.method,
+        headers: init.headers,
+        body: init.body,
         signal: controller.signal,
       });
-      bodyText = await response.text();
+      return { response, bodyText: await response.text() };
     } catch (error) {
-      if (timedOut) {
-        throw new DaytonaApiError(
-          "timeout",
-          `Daytona did not answer ${label} within ${Math.round(this.timeoutMs / 1000)}s`
-        );
-      }
-      if (options.signal?.aborted) {
-        throw new DaytonaApiError("timeout", `Daytona request ${label} was cancelled`);
-      }
-      throw new DaytonaApiError(
-        "unreachable",
-        `Could not reach Daytona at ${url.origin} (${getErrorMessage(error)})`
-      );
+      throw transportError(error, {
+        label,
+        origin: url.origin,
+        timeoutMs: this.timeoutMs,
+        timedOut,
+        cancelled: callerSignal?.aborted === true,
+      });
     } finally {
       clearTimeout(timer);
-      options.signal?.removeEventListener("abort", abortFromCaller);
-    }
-
-    if (!response.ok) {
-      const kind = kindForStatus(response.status);
-      const serverMessage = extractServerMessage(bodyText);
-      const base = `${describeStatus(kind, response.status)} for ${label}`;
-      throw new DaytonaApiError(
-        kind,
-        serverMessage ? `${base}: ${serverMessage}` : base,
-        response.status,
-        serverMessage
-      );
-    }
-
-    if (!bodyText) return undefined;
-    try {
-      return JSON.parse(bodyText) as unknown;
-    } catch {
-      throw new DaytonaApiError("server", `Daytona returned invalid JSON for ${label}`);
+      callerSignal?.removeEventListener("abort", abortFromCaller);
     }
   }
 
