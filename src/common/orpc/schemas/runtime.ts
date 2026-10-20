@@ -55,6 +55,8 @@ export const RuntimeAvailabilitySchema = z.object({
   ssh: RuntimeAvailabilityStatusSchema,
   docker: RuntimeAvailabilityStatusSchema,
   devcontainer: RuntimeAvailabilityStatusSchema,
+  // Daytona is `ssh` + a sub-config, not a RuntimeMode; optional so mode-keyed maps still fit.
+  daytona: RuntimeAvailabilityStatusSchema.optional(),
 });
 export const RuntimeConfigSchema = z.union([
   // Legacy local with srcBaseDir (treated as worktree)

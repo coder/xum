@@ -14,12 +14,15 @@ import type {
   DaytonaResolvedCredentials,
 } from "@/node/config/daytonaCredentialsStore";
 import { loadOrCreateInstallationId } from "@/node/config/installationIdentity";
+import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { log } from "@/node/services/log";
 import {
   DaytonaApiError,
   DaytonaClient,
   isDaytonaNotFound,
+  type DaytonaCreateSandboxRequest,
   type DaytonaGatewayConfig,
+  type DaytonaResizeRequest,
   type DaytonaSandbox,
   type DaytonaSshAccess,
 } from "./daytonaClient";
@@ -33,6 +36,15 @@ export const DAYTONA_SSH_TOKEN_TTL_MINUTES = 60;
 export const DAYTONA_SSH_TOKEN_REFRESH_MARGIN_MS = 15 * 60_000;
 
 export const DAYTONA_START_POLL_INTERVAL_MS = 2_000;
+
+/** Upper bound for bringing a stopped or archived sandbox back (archived restores are slow). */
+export const DAYTONA_START_TIMEOUT_MS = 180_000;
+
+/**
+ * How long a successful readiness check is trusted. Runtimes are recreated per stream start, so
+ * the cache lives here, keyed by sandbox, rather than on a runtime instance.
+ */
+export const DAYTONA_READY_CACHE_MS = 60_000;
 
 type ObservedSandboxState = Exclude<DaytonaSandboxState, "missing">;
 
@@ -108,6 +120,11 @@ export interface DaytonaServiceOptions {
   credentialsStore: DaytonaCredentialsStore;
   /** Xum data root; holds the installation identity used for the `xum.instance` label. */
   rootDir: string;
+  /** Defaults to a writer for the real `~/.ssh/config`; tests pass one aimed at a temp dir. */
+  sshConfigWriter?: Pick<
+    DaytonaSshConfigWriter,
+    "writeSandbox" | "updateToken" | "removeSandbox" | "verifyResolvedUser"
+  >;
   fetch?: typeof fetch;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -118,6 +135,17 @@ export interface DaytonaStartAndWaitOptions {
   onStarting?: () => void;
   pollIntervalMs?: number;
   signal?: AbortSignal;
+}
+
+export interface DaytonaEnsureReadyOptions {
+  /** Called when the sandbox has to be started (it was stopped or archived). */
+  onStarting?: () => void;
+}
+
+interface SandboxReadyRequest {
+  promise: Promise<void>;
+  onStarting: Set<() => void>;
+  starting: boolean;
 }
 
 export interface DaytonaSshTokenOptions {
@@ -171,10 +199,17 @@ export class DaytonaService {
   private gatewayCache?: { apiUrl: string; config: DaytonaGatewayConfig };
   private readonly tokens = new Map<string, DaytonaSshAccess>();
   private readonly tokenRequests = new Map<string, Promise<DaytonaSshAccess>>();
+  private readonly sshConfigWriter: NonNullable<DaytonaServiceOptions["sshConfigWriter"]>;
+  /** Sandboxes whose include block and `~/.ssh/config` block this process has written. */
+  private readonly sshConfigured = new Set<string>();
+  private readonly readyAt = new Map<string, number>();
+  private readonly readyRequests = new Map<string, SandboxReadyRequest>();
 
   constructor(options: DaytonaServiceOptions) {
     this.credentialsStore = options.credentialsStore;
     this.rootDir = options.rootDir;
+    this.sshConfigWriter =
+      options.sshConfigWriter ?? new DaytonaSshConfigWriter({ xumHome: options.rootDir });
     this.fetchImpl = options.fetch;
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? defaultSleep;
@@ -189,6 +224,8 @@ export class DaytonaService {
     // Tokens and gateway data belong to the old account or deployment.
     this.gatewayCache = undefined;
     this.tokens.clear();
+    this.sshConfigured.clear();
+    this.readyAt.clear();
     return this.credentialsStore.getPublicConfig();
   }
 
@@ -347,6 +384,152 @@ export class DaytonaService {
       }
       throw error;
     }
+  }
+
+  /** The default target (region) from Settings > Runtimes, if one is set. */
+  async getDefaultTarget(): Promise<string | undefined> {
+    return (await this.credentialsStore.resolve())?.target;
+  }
+
+  async createSandbox(request: DaytonaCreateSandboxRequest): Promise<DaytonaSandbox> {
+    const { client } = await this.getClient();
+    return client.createSandbox(request);
+  }
+
+  async resizeSandbox(sandboxId: string, request: DaytonaResizeRequest): Promise<void> {
+    const { client } = await this.getClient();
+    this.readyAt.delete(sandboxId);
+    await client.resizeSandbox(sandboxId, request);
+  }
+
+  async stopSandbox(sandboxId: string): Promise<void> {
+    const { client } = await this.getClient();
+    this.readyAt.delete(sandboxId);
+    await client.stopSandbox(sandboxId);
+  }
+
+  /** Stop and wait until Daytona reports the sandbox stopped (a resize of disk needs that). */
+  async stopAndWait(sandboxId: string, deadline: number): Promise<void> {
+    await this.stopSandbox(sandboxId);
+    const { client } = await this.getClient();
+    for (;;) {
+      const sandbox = await this.getSandboxForStart(client, sandboxId);
+      const state = mapDaytonaSandboxState(sandbox.state);
+      if (state === "stopped") return;
+      if (state === "error") throw sandboxStateError(sandboxId, sandbox);
+      const remaining = deadline - this.now();
+      if (remaining <= 0) {
+        throw new DaytonaApiError(
+          "timeout",
+          `Daytona sandbox ${sandboxId} did not stop in time (last state: ${sandbox.state ?? "unknown"})`
+        );
+      }
+      await this.sleep(Math.min(DAYTONA_START_POLL_INTERVAL_MS, remaining));
+    }
+  }
+
+  /**
+   * Delete the sandbox and drop Xum's SSH access to it (token and include block). A sandbox
+   * that is already gone counts as deleted.
+   */
+  async deleteSandbox(sandboxId: string): Promise<void> {
+    const { client } = await this.getClient();
+    // Revoke first: Daytona refuses to revoke a token of a sandbox that no longer exists.
+    await this.releaseSshAccess(sandboxId);
+    try {
+      await client.deleteSandbox(sandboxId);
+    } catch (error) {
+      if (!isDaytonaNotFound(error)) throw error;
+    }
+  }
+
+  async refreshActivity(sandboxId: string): Promise<void> {
+    const { client } = await this.getClient();
+    await client.refreshActivity(sandboxId);
+  }
+
+  /** Whether a readiness check for this sandbox passed within DAYTONA_READY_CACHE_MS. */
+  isSandboxReady(sandboxId: string): boolean {
+    const at = this.readyAt.get(sandboxId);
+    return at !== undefined && this.now() - at < DAYTONA_READY_CACHE_MS;
+  }
+
+  markSandboxReady(sandboxId: string): void {
+    this.readyAt.set(sandboxId, this.now());
+  }
+
+  /**
+   * Bring the sandbox to `started` and make sure Xum can ssh into it (fresh token, include
+   * block). Concurrent callers for one sandbox share a single request; each still gets its own
+   * `onStarting` call. Throws a DaytonaApiError (`not_found` when the sandbox is gone).
+   */
+  ensureSandboxReady(sandboxId: string, options: DaytonaEnsureReadyOptions = {}): Promise<void> {
+    const existing = this.readyRequests.get(sandboxId);
+    if (existing) {
+      if (options.onStarting) {
+        existing.onStarting.add(options.onStarting);
+        if (existing.starting) options.onStarting();
+      }
+      return existing.promise;
+    }
+
+    const request: SandboxReadyRequest = {
+      promise: Promise.resolve(),
+      onStarting: new Set(options.onStarting ? [options.onStarting] : []),
+      starting: false,
+    };
+    request.promise = (async () => {
+      await this.startAndWait(sandboxId, this.now() + DAYTONA_START_TIMEOUT_MS, {
+        onStarting: () => {
+          request.starting = true;
+          for (const listener of request.onStarting) listener();
+        },
+      });
+      await this.ensureSshAccess(sandboxId);
+    })().finally(() => {
+      this.readyRequests.delete(sandboxId);
+    });
+    this.readyRequests.set(sandboxId, request);
+    return request.promise;
+  }
+
+  /**
+   * A valid token in the include file for this sandbox. The first write in this process also
+   * writes known_hosts and the `~/.ssh/config` block and checks that ssh resolves the token as
+   * the user; a refresh rewrites only the include file.
+   */
+  async ensureSshAccess(sandboxId: string): Promise<void> {
+    const gatewayConfig = await this.getGatewayConfig();
+    const gateway = {
+      host: gatewayConfig.sshGatewayHost,
+      port: gatewayConfig.sshGatewayPort,
+      hostKeys: gatewayConfig.sshGatewayHostKeys,
+    };
+    // A cached token was written by the mint that produced it, so only a mint writes files.
+    await this.getSshToken(sandboxId, {
+      onNewToken: async ({ token }) => {
+        if (this.sshConfigured.has(sandboxId)) {
+          await this.sshConfigWriter.updateToken({ sandboxId, token, gateway });
+          return;
+        }
+        await this.sshConfigWriter.writeSandbox({ sandboxId, token, gateway });
+        await this.sshConfigWriter.verifyResolvedUser(sandboxId, token);
+        this.sshConfigured.add(sandboxId);
+      },
+    });
+  }
+
+  /** Whether this process holds a token for the sandbox that is close to expiry. */
+  hasExpiringSshToken(sandboxId: string): boolean {
+    return this.tokens.has(sandboxId) && this.tokenNeedsRefresh(sandboxId);
+  }
+
+  /** Revoke the token and remove the sandbox's include block. */
+  async releaseSshAccess(sandboxId: string): Promise<void> {
+    this.sshConfigured.delete(sandboxId);
+    this.readyAt.delete(sandboxId);
+    await this.forgetSshToken(sandboxId);
+    await this.sshConfigWriter.removeSandbox(sandboxId);
   }
 
   tokenNeedsRefresh(sandboxId: string): boolean {

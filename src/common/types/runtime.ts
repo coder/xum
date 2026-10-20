@@ -266,6 +266,19 @@ export function isSSHRuntime(
 }
 
 /**
+ * A Daytona sandbox Xum created for this workspace alone: not an attached existing sandbox
+ * and not one shared with a fork. Only these may be stopped or deleted with the workspace.
+ */
+export function isDedicatedDaytonaSandbox(config: RuntimeConfig | undefined): boolean {
+  return (
+    isSSHRuntime(config) &&
+    config.daytona != null &&
+    config.daytona.shared !== true &&
+    (config.daytona.sandboxId?.trim() ?? "") !== ""
+  );
+}
+
+/**
  * Type guard to check if a runtime config is Docker
  */
 export function isDockerRuntime(

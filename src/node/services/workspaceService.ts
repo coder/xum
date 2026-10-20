@@ -353,6 +353,7 @@ import {
   hasSrcBaseDir,
   getSrcBaseDir,
   isSSHRuntime,
+  isDedicatedDaytonaSandbox,
   isDockerRuntime,
   isDevcontainerRuntime,
 } from "@/common/types/runtime";
@@ -1075,8 +1076,12 @@ const ARCHIVE_OWN_ACTIVITY_POLICY = {
   backgroundProcesses: "allow",
 } as const;
 
-/** A Coder workspace Xum created for this workspace (not an existing one it connected to). */
+/**
+ * A remote box Xum created for this workspace (not an existing one it connected to): a Coder
+ * workspace, or a Daytona sandbox, which reuses the Coder archive behavior (keep, stop, delete).
+ */
 function isDedicatedCoderRuntime(runtimeConfig: RuntimeConfig | undefined): boolean {
+  if (isDedicatedDaytonaSandbox(runtimeConfig)) return true;
   return (
     runtimeConfig != null &&
     isSSHRuntime(runtimeConfig) &&

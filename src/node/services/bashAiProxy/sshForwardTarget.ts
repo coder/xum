@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { CoderSSHRuntime } from "@/node/runtime/CoderSSHRuntime";
+import { DaytonaSSHRuntime } from "@/node/runtime/DaytonaSSHRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import { ServerLockfile } from "@/node/services/serverLockfile";
@@ -31,7 +32,8 @@ export function createSshForwardTarget(runtime: Runtime): ForwardTarget | undefi
   const config = runtime.getConfig();
   return {
     hostKey: [config.host, config.port ?? 22, config.identityFile ?? ""].join("|"),
-    restoreAtStartup: !(runtime instanceof CoderSSHRuntime),
+    // Managed boxes: restoring a forward at startup would start a stopped (billed) box.
+    restoreAtStartup: !(runtime instanceof CoderSSHRuntime || runtime instanceof DaytonaSSHRuntime),
     openReverseForward: (remotePort, localPort) =>
       runtime.openReverseForward(remotePort, localPort),
     remoteHealth: async (remotePort, nonce) => {

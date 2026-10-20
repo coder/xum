@@ -61,6 +61,14 @@ import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
 import { AgentResourceLimitsService } from "@/node/services/agentResourceLimits/agentResourceLimitsService";
 import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
 import { DaytonaService } from "@/node/services/daytona/daytonaService";
+import {
+  DaytonaReconciler,
+  listDaytonaWorkspaceRefs,
+} from "@/node/services/daytona/daytonaReconciler";
+import { createDaytonaArchiveHook } from "@/node/services/daytona/daytonaLifecycleHooks";
+import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
+import { setGlobalDaytonaService } from "@/node/runtime/runtimeFactory";
+import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { PerfReportService } from "@/node/services/perf/perfReportService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
@@ -165,8 +173,10 @@ import {
   WorkspaceGoal,
   WorkspaceMcpOverrides,
   WorkspaceTurnManagerTag,
+  WorkspaceLifecycleHooksTag,
   type AppTags,
 } from "@/node/services/di/tags";
+import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
 
 /**
  * A startup step of `ServiceContainer.initializeCore()` did not settle within
@@ -290,6 +300,7 @@ export class ServiceContainer {
   public readonly agentResourceLimits: AgentResourceLimitsService;
   // Constructed directly (no DI tag): it needs only the data root and starts no timers.
   public readonly daytonaService: DaytonaService;
+  private readonly daytonaReconciler: DaytonaReconciler;
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
@@ -422,10 +433,36 @@ export class ServiceContainer {
     this.heartbeatService = get(Heartbeat);
     this.agentStatusService = get(AgentStatus);
     this.bashAiProxy = get(BashAiProxy);
+    this.daytonaReconciler = this.wireDaytona(get(WorkspaceLifecycleHooksTag));
     assert(
       new Set(this.startupCoreSteps.map((step) => step.name)).size === this.startupCoreSteps.length,
       "startupCoreSteps names must be unique (they key stepDurationsMs)"
     );
+  }
+
+  /** Daytona runtimes, archive hook and reconciler (DaytonaService is built without DI). */
+  private wireDaytona(lifecycleHooks: WorkspaceLifecycleHooks): DaytonaReconciler {
+    setGlobalDaytonaService(this.daytonaService);
+    lifecycleHooks.registerBeforeArchive(
+      createDaytonaArchiveHook({
+        daytonaService: this.daytonaService,
+        getArchiveBehavior: () =>
+          this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
+          DEFAULT_CODER_ARCHIVE_BEHAVIOR,
+        hasUnsettledRemoteBackgroundJobs: (workspaceMetadata) =>
+          this.backgroundProcessManager.hasUnsettledRemoteSpawnRecords(
+            createRuntimeForWorkspace(workspaceMetadata),
+            workspaceMetadata.id
+          ),
+      })
+    );
+    return new DaytonaReconciler({
+      daytonaService: this.daytonaService,
+      listWorkspaces: () => listDaytonaWorkspaceRefs(this.config.loadConfigOrDefault()),
+      isWorkspaceActive: (workspaceId) =>
+        this.aiService.isStreaming(workspaceId) ||
+        this.backgroundProcessManager.hasRunningBackgroundProcesses(workspaceId),
+    });
   }
 
   async initialize(): Promise<void> {
@@ -666,6 +703,9 @@ export class ServiceContainer {
     this.heartbeatService.start();
     this.startupStepDurationsMs["heartbeatService.start"] = Date.now() - heartbeatStartedAt;
 
+    // Timer only: the first sweep runs one interval later and never blocks startup.
+    this.daytonaReconciler.start();
+
     const agentStatusStartedAt = Date.now();
     this.agentStatusService.start();
     this.startupStepDurationsMs["agentStatusService.start"] = Date.now() - agentStatusStartedAt;
@@ -826,6 +866,7 @@ export class ServiceContainer {
     await this.desktopBridgeServer.stop();
     this.desktopTokenManager.dispose();
     this.heartbeatService.stop();
+    this.daytonaReconciler.stop();
     this.agentStatusService.stop();
     this.perfFlightRecorder.stop();
     await this.perfCaptures.dispose();
@@ -993,6 +1034,7 @@ export class ServiceContainer {
     // generateWorkspaceStatus against services that are about to be torn
     // down below.
     shutdownStep("agentStatusService.stop", () => this.agentStatusService.stop());
+    shutdownStep("daytonaReconciler.stop", () => this.daytonaReconciler.stop());
     shutdownStep("perfFlightRecorder.stop", () => this.perfFlightRecorder.stop());
     await shutdownStep("perfCaptures.dispose", () => this.perfCaptures.dispose());
     shutdownStep("agentResourceLimits.dispose", () => this.agentResourceLimits.dispose());
