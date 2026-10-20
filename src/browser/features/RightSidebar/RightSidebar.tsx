@@ -222,6 +222,128 @@ function findWidthTransition(element: HTMLElement | null): CSSTransition | undef
 }
 
 /**
+ * Calls `settle` once the container's width transition ends, or at once when none runs.
+ * Returns the cleanup, after which a late end no longer settles (a newer phase took over).
+ */
+function settleAfterWidthTransition(container: HTMLElement | null, settle: () => void) {
+  // getAnimations() flushes styles, so it sees the transition the current commit just started.
+  const transition = findWidthTransition(container);
+  if (transition == null) {
+    settle();
+    return undefined;
+  }
+  let current = true;
+  const settleIfCurrent = () => {
+    if (current) settle();
+  };
+  transition.finished.then(settleIfCurrent, (error: unknown) => {
+    // A newer phase (the cleanup ran) or a layout change (display:none) canceled it.
+    if (!isAbortError(error)) throw error;
+    settleIfCurrent();
+  });
+  return () => {
+    current = false;
+  };
+}
+
+/**
+ * The slide phase, adjusted during render when `collapsed` flips (react-effects: state derived
+ * from a prop change), so the first frame of a slide already renders both the panel and the
+ * card. Settles once the container's width transition ends; where none runs (drag resizes,
+ * display:none, reduced or disabled transitions, happy-dom) it settles before the frame paints.
+ */
+function useSidebarSlidePhase(
+  collapsed: boolean,
+  containerRef: React.RefObject<HTMLDivElement>
+): SidebarSlidePhase {
+  const [phase, setPhase] = React.useState<SidebarSlidePhase>(collapsed ? "closed" : "open");
+  const [phaseCollapsed, setPhaseCollapsed] = React.useState(collapsed);
+  if (phaseCollapsed !== collapsed) {
+    setPhaseCollapsed(collapsed);
+    setPhase(collapsed ? "closing" : "opening");
+  }
+
+  React.useLayoutEffect(() => {
+    if (phase !== "closing" && phase !== "opening") return;
+    const settled = phase === "closing" ? "closed" : "open";
+    return settleAfterWidthTransition(containerRef.current, () => setPhase(settled));
+  }, [containerRef, phase]);
+
+  return phase;
+}
+
+/** Marks the container inert while immersive review covers it. */
+function useInertWhile(ref: React.RefObject<HTMLElement>, inert: boolean): void {
+  React.useEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    if (inert) {
+      element.setAttribute("inert", "");
+    } else {
+      element.removeAttribute("inert");
+    }
+    return () => element.removeAttribute("inert");
+  }, [ref, inert]);
+}
+
+/** The collapsed sidebar's overview card, mounted while the sidebar is closing or closed. */
+const SidebarCardFrame: React.FC<{
+  phase: SidebarSlidePhase;
+  isDesktop?: boolean;
+  render: () => React.ReactNode;
+}> = (props) => {
+  if (props.phase !== "closing" && props.phase !== "closed") return null;
+  return (
+    <div
+      className={cn(
+        // Positioned against WorkspaceShell. The height cap keeps the card clear of the
+        // composer on short windows; overflowing content scrolls inside the card.
+        "bg-surface-secondary border-border-light absolute z-10 flex flex-col overflow-x-hidden overflow-y-auto rounded-lg border shadow-lg",
+        // globals.css owns the card's width and right inset (the chat reserves exactly that
+        // room beside it) and shows it only where it fits beside the transcript.
+        "right-sidebar-overview-card",
+        // The 7rem floor keeps the stats row and a section reachable even in a window too
+        // short for the composer clearance.
+        "max-h-[max(7rem,min(32rem,calc(100%-12rem)))]",
+        // Below the header (h-9 on desktop, h-8 otherwise) by the card's right inset
+        // (0.75rem), so it sits evenly in the corner.
+        props.isDesktop ? "top-12" : "top-11"
+      )}
+    >
+      {props.render()}
+    </div>
+  );
+};
+
+/** The docked panel, mounted unless the sidebar is closed. */
+const SidebarPanelFrame: React.FC<{
+  phase: SidebarSlidePhase;
+  fullscreen: boolean;
+  width: string;
+  render: () => React.ReactNode;
+}> = (props) => {
+  if (props.phase === "closed") return null;
+  return (
+    <div
+      className={cn(
+        "bg-surface-primary flex min-h-0 min-w-0 flex-1 flex-row",
+        !props.fullscreen && "border-border-light border-l",
+        // On coarse pointers the resize handle is a wider strip that draws the divider line
+        // on its right edge, where the tab strip's bottom border meets it.
+        "[@media(pointer:coarse)]:has-[[data-sidebar-resize-handle]]:border-l-0",
+        // After the card in the DOM, so it paints over the card it slides off.
+        props.phase === "closing" && "relative z-10"
+      )}
+      // A fixed width while the container's width slides: the panel moves with the
+      // container's left edge instead of reflowing (terminals, review) on every frame.
+      style={props.phase === "open" ? undefined : { width: props.width }}
+    >
+      {props.render()}
+    </div>
+  );
+};
+
+/**
  * SidebarContainer - Main sidebar wrapper with dynamic width
  *
  * Always the docked flex item, so shortcut handlers and visibility checks see one element
@@ -230,140 +352,48 @@ function findWidthTransition(element: HTMLElement | null): CSSTransition | undef
  *    top-right corner (positioned against WorkspaceShell, so this element's clip spares it)
  * 2. customWidth - From drag-resize (unified width from AIView)
  * 3. default (400px) - Fallback when no custom width set
+ *
+ * Collapsing and expanding slide the width (see SidebarSlidePhase).
  */
-const SidebarContainer: React.FC<SidebarContainerProps> = ({
-  collapsed,
-  customWidth,
-  isResizing,
-  isDesktop,
-  immersiveHidden = false,
-  fullscreen = false,
-  containerRef,
-  header,
-  renderPanel,
-  renderCard,
-  role,
-  "aria-label": ariaLabel,
-}) => {
-  const width = customWidth ? `${customWidth}px` : "400px";
-
-  // Adjusted during render when `collapsed` flips (react-effects: state derived from a prop
-  // change), so the first frame of a slide already renders both the panel and the card.
-  const [phase, setPhase] = React.useState<SidebarSlidePhase>(collapsed ? "closed" : "open");
-  const [phaseCollapsed, setPhaseCollapsed] = React.useState(collapsed);
-  if (phaseCollapsed !== collapsed) {
-    setPhaseCollapsed(collapsed);
-    setPhase(collapsed ? "closing" : "opening");
-  }
+const SidebarContainer: React.FC<SidebarContainerProps> = (props) => {
+  const width = props.customWidth ? `${props.customWidth}px` : "400px";
+  const immersiveHidden = props.immersiveHidden === true;
+  const phase = useSidebarSlidePhase(props.collapsed, props.containerRef);
   const sliding = phase === "closing" || phase === "opening";
-
-  // Settle once the width transition ends. No transition runs while drag-resizing (the drag
-  // collapses and reopens the sidebar), where the browser skips it (display:none, reduced or
-  // disabled transitions) or has none (happy-dom): settle before the frame paints.
-  React.useLayoutEffect(() => {
-    if (phase !== "closing" && phase !== "opening") return;
-    const settled = phase === "closing" ? "closed" : "open";
-    // getAnimations() flushes styles, so it sees the transition this commit just started.
-    const transition = findWidthTransition(containerRef.current);
-    if (transition == null) {
-      setPhase(settled);
-      return;
-    }
-    let current = true;
-    transition.finished.then(
-      () => {
-        if (current) setPhase(settled);
-      },
-      (error: unknown) => {
-        // A newer phase (the cleanup below ran) or a layout change (display:none) canceled it.
-        if (!isAbortError(error)) throw error;
-        if (current) setPhase(settled);
-      }
-    );
-    return () => {
-      current = false;
-    };
-  }, [containerRef, phase]);
-
-  React.useEffect(() => {
-    const container = containerRef.current;
-    if (!container) {
-      return;
-    }
-
-    if (immersiveHidden) {
-      container.setAttribute("inert", "");
-    } else {
-      container.removeAttribute("inert");
-    }
-
-    return () => {
-      container.removeAttribute("inert");
-    };
-  }, [containerRef, immersiveHidden]);
+  useInertWhile(props.containerRef, immersiveHidden);
 
   return (
     <div
-      ref={containerRef}
+      ref={props.containerRef}
       aria-hidden={immersiveHidden || undefined}
       className={cn(
         "bg-surface-primary flex flex-shrink-0 flex-col",
-        // clip, not hidden, while sliding: the panel is wider than this box then, and focus() or
-        // scrollIntoView inside it must not scroll this box.
-        sliding ? "overflow-clip" : "overflow-hidden",
-        // Drag resizes and window-resize clamps follow the pointer or the window at once.
-        sliding && !isResizing && "transition-[width] duration-200",
+        // While sliding: clip, not hidden (the panel is wider than this box then, and focus() or
+        // scrollIntoView inside it must not scroll this box), and animate the width. Drag
+        // resizes and window-resize clamps follow the pointer or the window at once.
+        sliding
+          ? ["overflow-clip", !props.isResizing && "transition-[width] duration-200"]
+          : "overflow-hidden",
         // Hide on mobile touch devices - too narrow for useful interaction
         "mobile-hide-right-sidebar",
         // globals.css shows the hidden sidebar full-screen, only while the narrow layout hides it.
-        fullscreen && "right-sidebar-fullscreen",
+        props.fullscreen && "right-sidebar-fullscreen",
         // Immersive review renders its own full-screen overlay, so hiding the underlying
         // sidebar container cuts layout/paint cost without discarding its React state.
         immersiveHidden && "hidden"
       )}
-      style={{ width: collapsed ? 0 : width, maxWidth: "100%" }}
-      role={role}
-      aria-label={ariaLabel}
+      style={{ width: props.collapsed ? 0 : width, maxWidth: "100%" }}
+      role={props.role}
+      aria-label={props["aria-label"]}
     >
-      {header}
-      {(phase === "closing" || phase === "closed") && (
-        <div
-          className={cn(
-            // Positioned against WorkspaceShell. The height cap keeps the card clear of the
-            // composer on short windows; overflowing content scrolls inside the card.
-            "bg-surface-secondary border-border-light absolute z-10 flex flex-col overflow-x-hidden overflow-y-auto rounded-lg border shadow-lg",
-            // globals.css owns the card's width and right inset (the chat reserves exactly that
-            // room beside it) and shows it only where it fits beside the transcript.
-            "right-sidebar-overview-card",
-            // The 7rem floor keeps the stats row and a section reachable even in a window too
-            // short for the composer clearance.
-            "max-h-[max(7rem,min(32rem,calc(100%-12rem)))]",
-            // Below the header (h-9 on desktop, h-8 otherwise) by the card's right inset
-            // (0.75rem), so it sits evenly in the corner.
-            isDesktop ? "top-12" : "top-11"
-          )}
-        >
-          {renderCard()}
-        </div>
-      )}
-      {phase !== "closed" && (
-        <div
-          className={cn(
-            "bg-surface-primary flex min-h-0 min-w-0 flex-1 flex-row",
-            !fullscreen && "border-border-light border-l",
-            // On coarse pointers the resize handle is a wider strip that draws the divider line
-            // on its right edge, where the tab strip's bottom border meets it.
-            "[@media(pointer:coarse)]:has-[[data-sidebar-resize-handle]]:border-l-0",
-            // After the card in the DOM, so it paints over the card it slides off.
-            phase === "closing" && "relative z-10"
-          )}
-          // A fixed width while the container's width slides: the panel moves with the
-          // container's left edge instead of reflowing (terminals, review) on every frame.
-          style={sliding ? { width } : undefined}
-        >
-          {renderPanel()}
-        </div>
-      )}
+      {props.header}
+      <SidebarCardFrame phase={phase} isDesktop={props.isDesktop} render={props.renderCard} />
+      <SidebarPanelFrame
+        phase={phase}
+        fullscreen={props.fullscreen === true}
+        width={width}
+        render={props.renderPanel}
+      />
     </div>
   );
 };

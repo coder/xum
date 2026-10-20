@@ -345,7 +345,10 @@ const StripEndControls: React.FC<{
   onAddNewTab: () => void;
   reservesSidebarToggle: boolean;
 }> = (props) => (
-  <div className="ml-auto flex shrink-0 items-center gap-1">
+  <div
+    className="ml-auto flex shrink-0 items-center gap-1"
+    data-sidebar-toggle-room={props.reservesSidebarToggle || undefined}
+  >
     <TabListMenu items={props.items} isDesktop={props.isDesktop} onAddNewTab={props.onAddNewTab} />
     {props.reservesSidebarToggle && <RightSidebarToggleSpacer />}
   </div>
@@ -389,7 +392,7 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
   ariaLabel = "Sidebar views",
   tabsetId,
   onAddNewTab,
-  reservesSidebarToggle = false,
+  reservesSidebarToggle,
 }) => {
   const { active } = useDndContext();
   const activeData = active?.data.current as TabDragData | undefined;
@@ -444,7 +447,7 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
         // With the toggle's room, a pane at its minimum width cannot fit all controls: overflow on
         // the left (the Panel clips it) so the room under the toggle stays at the end. With room
         // to spare, the right-end group's ml-auto takes the free space and this has no effect.
-        reservesSidebarToggle && "justify-end",
+        "has-[[data-sidebar-toggle-room]]:justify-end",
         showDropHighlight && "bg-accent/30",
         isDraggingFromHere && "bg-accent/10",
         // In desktop mode, make header draggable for window movement
@@ -474,7 +477,7 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
         items={items}
         isDesktop={isDesktop}
         onAddNewTab={onAddNewTab}
-        reservesSidebarToggle={reservesSidebarToggle}
+        reservesSidebarToggle={reservesSidebarToggle === true}
       />
     </div>
   );

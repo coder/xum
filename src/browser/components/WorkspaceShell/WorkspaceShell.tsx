@@ -255,6 +255,21 @@ function LazyRightSidebar(
   );
 }
 
+/**
+ * The right sidebar's toggle. Outside the lazy sidebar, so it works while the sidebar chunk loads
+ * (RightSidebar listens to the same persisted key). Immersive review covers the sidebar it
+ * toggles, so it is not there then.
+ */
+function ShellRightSidebarToggle(props: { collapsed: boolean; immersive: boolean }) {
+  if (props.immersive) return null;
+  return (
+    <RightSidebarToggle
+      collapsed={props.collapsed}
+      onToggle={() => updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, !props.collapsed)}
+    />
+  );
+}
+
 const WorkspacePlaceholder: React.FC<{
   title: string;
   description?: string;
@@ -522,16 +537,8 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         sidebarFullscreen={sidebarFullscreen}
       />
 
-      {/* Between the chat and the sidebar, for Tab order. Outside the lazy sidebar, so it works
-          while the sidebar chunk loads (RightSidebar listens to the same persisted key). */}
-      {!isReviewImmersive && (
-        <RightSidebarToggle
-          collapsed={rightSidebarCollapsed}
-          onToggle={() =>
-            updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, !rightSidebarCollapsed)
-          }
-        />
-      )}
+      {/* Between the chat and the sidebar, for Tab order. */}
+      <ShellRightSidebarToggle collapsed={rightSidebarCollapsed} immersive={isReviewImmersive} />
 
       <LazyRightSidebar
         held={heldSidebarInput}
