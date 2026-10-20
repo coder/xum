@@ -383,6 +383,36 @@ const StripEndControls: React.FC<{
   </div>
 );
 
+/**
+ * One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges) while the
+ * controls after it stay in view. Its wrapper holds the desktop no-drag box over the row's
+ * visible part (see the strip's drag regions).
+ */
+const TabScrollRow: React.FC<{
+  rowRef: React.RefObject<HTMLDivElement>;
+  ariaLabel: string;
+  items: RightSidebarTabStripItem[];
+  tabsetId: string;
+  isDesktop: boolean;
+}> = (props) => (
+  <div className="relative flex min-w-0">
+    {props.isDesktop && (
+      <div aria-hidden className="titlebar-no-drag pointer-events-none absolute inset-0" />
+    )}
+    <div
+      ref={props.rowRef}
+      data-tab-scroll-row
+      role="tablist"
+      aria-label={props.ariaLabel}
+      className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
+    >
+      {props.items.map((item, index) => (
+        <SortableTab key={item.id} item={item} index={index} tabsetId={props.tabsetId} />
+      ))}
+    </div>
+  </div>
+);
+
 /** Width of the `.scroll-fade-x` edge fade (scrollbar-none.css): a tab under it looks cut off. */
 const SCROLL_FADE_PX = 24;
 
@@ -487,24 +517,13 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
       {isDesktop && (
         <div aria-hidden className="titlebar-drag pointer-events-none absolute inset-0" />
       )}
-      <div className="relative flex min-w-0">
-        {isDesktop && (
-          <div aria-hidden className="titlebar-no-drag pointer-events-none absolute inset-0" />
-        )}
-        {/* One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges)
-            while the controls after it stay in view. */}
-        <div
-          ref={scrollRowRef}
-          data-tab-scroll-row
-          role="tablist"
-          aria-label={ariaLabel}
-          className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
-        >
-          {items.map((item, index) => (
-            <SortableTab key={item.id} item={item} index={index} tabsetId={tabsetId} />
-          ))}
-        </div>
-      </div>
+      <TabScrollRow
+        rowRef={scrollRowRef}
+        ariaLabel={ariaLabel}
+        items={items}
+        tabsetId={tabsetId}
+        isDesktop={isDesktop}
+      />
       <StripEndControls
         items={items}
         isDesktop={isDesktop}
