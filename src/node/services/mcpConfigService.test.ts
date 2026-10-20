@@ -14,6 +14,7 @@ import { MCPServerManager } from "./mcpServerManager";
 import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import type { MCPServerInfo, WorkspaceMCPOverrides } from "@/common/types/mcp";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { TelemetryEventPayload } from "@/common/telemetry/payload";
 
 describe("MCPConfigService", () => {
   let tempDir: string;
@@ -304,8 +305,8 @@ describe("MCPConfigService", () => {
   // #5755: the existing-server lookup must not read Object.prototype.constructor.
   test("adding a server named after an Object.prototype key records an add", async () => {
     const actions: unknown[] = [];
-    const capture = mock((payload: { properties?: { action?: unknown } }) => {
-      actions.push(payload.properties?.action);
+    const capture = mock((payload: TelemetryEventPayload) => {
+      if (payload.event === "mcp_server_config_changed") actions.push(payload.properties.action);
     });
     const apiService = new MCPConfigService(config, { telemetryService: { capture } });
     await apiService.addForApi({ name: "constructor", command: "node server.js" });
