@@ -1,5 +1,6 @@
-// #5671: after Ctrl+Shift+D and Escape, focus returns to the Workspace details button. The button
-// stopped every key, so global shortcuts did nothing until you clicked elsewhere.
+// #5671: after the Workspace details shortcut opens the popover and the dismiss key closes it,
+// focus returns to the Workspace details button. The button stopped every key, so global
+// shortcuts did nothing until you clicked elsewhere.
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import {
@@ -32,13 +33,26 @@ test(
     // The precondition of the bug: Radix returns focus to the trigger.
     await expect(screen.getByRole("button", "Workspace details")).toBeFocused();
 
-    // Any global shortcut shows it; this one toggles notifications (see notificationsShortcut).
-    await browser.keyboard.press("Control+Shift+Comma");
-    await expectNotifyOnAllResponses(screen, browser, true);
-
-    // Every repro in a run shares this workspace: turn the setting back off.
-    await screen.getByRole("textbox", "Message").tap();
-    await browser.keyboard.press("Control+Shift+Comma");
-    await expectNotifyOnAllResponses(screen, browser, false);
+    try {
+      // Any global shortcut shows it; this one toggles notifications (see notificationsShortcut).
+      await browser.keyboard.press("Control+Shift+Comma");
+      await expectNotifyOnAllResponses(screen, browser, true);
+    } finally {
+      // Every repro in a run shares this workspace: turn the setting back off, also after a
+      // failure, or later repros fail as knock-on failures (#5761). The shortcut may not have
+      // turned it on, so toggle only when the bell says it is on.
+      const notifying = await browser.evaluate(
+        () =>
+          document
+            .querySelector('[data-testid="notify-on-response-button"]')
+            ?.getAttribute("aria-description")
+            ?.endsWith(": on") ?? false
+      );
+      if (notifying) {
+        await screen.getByRole("textbox", "Message").tap();
+        await browser.keyboard.press("Control+Shift+Comma");
+        await expectNotifyOnAllResponses(screen, browser, false);
+      }
+    }
   }
 );

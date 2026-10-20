@@ -136,12 +136,14 @@ const RetryButton: React.FC<{ disabled: boolean; onRetry: () => void }> = (props
 
   return (
     <button
-      className="bg-warning font-primary text-background cursor-pointer rounded border-none px-4 py-2 text-xs font-semibold whitespace-nowrap transition-all duration-200 hover:-translate-y-px hover:brightness-120 active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
+      className="bg-warning font-primary text-background cursor-pointer rounded border-none px-4 py-2 text-xs font-semibold transition-all duration-200 hover:-translate-y-px hover:brightness-120 active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
       disabled={props.disabled}
       onClick={props.onRetry}
     >
+      {/* The hint wraps under "Retry" as a whole, so the button fits the retry card in the
+          narrowest VS Code sidebar (#5645). */}
       Retry{" "}
-      <span aria-hidden="true" className="mobile-hide-shortcut-hints">
+      <span aria-hidden="true" className="mobile-hide-shortcut-hints whitespace-nowrap">
         ({formatKeybind(KEYBINDS.RESUME_STREAM)})
       </span>
     </button>

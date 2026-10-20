@@ -2527,7 +2527,7 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
 });
 
 describe("Right Sidebar: Add Tool palette action (#5767)", () => {
-  test("Stats also asks for the Stats dialog; other tools do not", async () => {
+  test("Stats also asks to show the Stats tab full-screen; other tools do not", async () => {
     await withTestWindow(async () => {
       const action = getActions().find(
         (candidate) => candidate.id === CommandIds.navRightSidebarAddTool()

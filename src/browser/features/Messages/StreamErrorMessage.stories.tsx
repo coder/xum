@@ -13,6 +13,8 @@ type StreamErrorRow = Extract<DisplayedMessage, { type: "stream-error" }>;
 
 /** About the narrowest VS Code sidebar the webview transcript was measured at (#5151). */
 const NARROW_PANE_WIDTH = 200;
+/** VS Code's minimum sidebar width: the narrowest pane the webview can get (#5645). */
+const VSCODE_MIN_SIDEBAR_WIDTH = 170;
 
 const OVERLOADED: StreamErrorRow = {
   type: "stream-error",
@@ -43,7 +45,9 @@ function NarrowPane() {
   const [client] = useState(() => createMockORPCClient());
   return (
     <APIProvider client={client}>
-      <div data-narrow-pane style={{ width: NARROW_PANE_WIDTH, padding: 0 }}>
+      {/* p-3: the VS Code webview transcript's padding (vscode/src/webview/App.tsx), so the cards
+          get the width they have there (#5645). */}
+      <div data-narrow-pane className="p-3" style={{ width: NARROW_PANE_WIDTH }}>
         <StreamErrorMessage message={OVERLOADED} />
         <StreamErrorMessage message={REPEATED_QUOTA} />
         <RetryBarrierContent
@@ -68,8 +72,8 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 /**
- * Narrow-pane contract (#5151): the error cards' header actions and the retry card's Retry wrap
- * instead of overflowing a VS Code sidebar-sized pane. The pane has a fixed width, so the fit
+ * Narrow-pane contract (#5151, #5645): the error cards' header actions and the retry card's Retry
+ * wrap instead of overflowing a VS Code sidebar-sized pane with the transcript's padding. The pane has a fixed width, so the fit
  * holds at any window size, including the desktop-sized test-runner; Pixel pins the phone viewport.
  */
 export const NarrowPane200: Story = {
@@ -88,14 +92,44 @@ export const NarrowPane200: Story = {
     if (paneRect.width !== NARROW_PANE_WIDTH) {
       throw new Error(`Pane is ${paneRect.width}px wide; expected ${NARROW_PANE_WIDTH}px`);
     }
-    for (const element of pane.querySelectorAll<HTMLElement>("*")) {
-      const rect = element.getBoundingClientRect();
-      if (rect.width > 0 && rect.right > paneRect.right + 0.5) {
-        throw new Error(
-          `<${element.tagName.toLowerCase()} class="${element.className.toString()}"> ends at ` +
-            `${rect.right}px, past the ${NARROW_PANE_WIDTH}px pane (right edge ${paneRect.right}px)`
-        );
+    // Nothing may reach into its parent's right padding. In the webview, Retry with its shortcut
+    // hint ran into the retry card's padding in a narrow sidebar (#5645), so the retry card is also
+    // checked at the narrowest sidebar; then the width is restored for the snapshot.
+    const retryCard = [...pane.children].at(-1);
+    if (!(retryCard instanceof HTMLElement) || !retryCard.textContent?.includes("Retry")) {
+      throw new Error("The retry card is not the pane's last child");
+    }
+    const overflows = (root: HTMLElement) => {
+      for (const element of root.querySelectorAll<HTMLElement>("*")) {
+        const rect = element.getBoundingClientRect();
+        const parent = element.parentElement;
+        if (rect.width === 0 || !parent) continue;
+        const parentStyle = getComputedStyle(parent);
+        const contentRight =
+          parent.getBoundingClientRect().right -
+          parseFloat(parentStyle.paddingRight) -
+          parseFloat(parentStyle.borderRightWidth);
+        if (rect.right > contentRight + 0.5) {
+          return (
+            `${pane.style.width} pane: <${element.tagName.toLowerCase()} ` +
+            `class="${element.className.toString()}"> ends at ${rect.right}px, past its parent's ` +
+            `content box (right edge ${contentRight}px)`
+          );
+        }
       }
+      return null;
+    };
+    try {
+      for (const [width, root] of [
+        [NARROW_PANE_WIDTH, pane],
+        [VSCODE_MIN_SIDEBAR_WIDTH, retryCard],
+      ] as const) {
+        pane.style.width = `${width}px`;
+        const overflow = overflows(root);
+        if (overflow) throw new Error(overflow);
+      }
+    } finally {
+      pane.style.width = `${NARROW_PANE_WIDTH}px`;
     }
   },
 };

@@ -103,7 +103,7 @@ export function useAIViewKeybinds({
           return;
         }
 
-        // An open overlay (tutorial, narrow-screen drawer) takes this Escape to close itself.
+        // An open overlay (the narrow-screen drawer) takes this Escape to close itself.
         if (interruptKeybind === KEYBINDS.INTERRUPT_STREAM_NORMAL && isEscapeDismissOverlayOpen()) {
           return;
         }

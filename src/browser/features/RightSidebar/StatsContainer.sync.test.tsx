@@ -8,8 +8,8 @@ import * as ContextUsageSectionModule from "./ContextUsageSection";
 import * as StatsTabModule from "./StatsTab";
 import { StatsContainer } from "./StatsContainer";
 
-// While the right sidebar is CSS-hidden it stays mounted with its Stats tab, and the Stats dialog
-// (#5767) mounts a second StatsContainer. A choice made in one must show in the other.
+// Two mounted StatsContainers share the sub-tab choice: a choice made in one must show in the
+// other. The Stats dialog that needed this is gone (#6140); the sync stays for any second mount.
 describe("StatsContainer copies", () => {
   let cleanupDom: (() => void) | null = null;
 

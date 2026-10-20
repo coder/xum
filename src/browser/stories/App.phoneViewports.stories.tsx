@@ -553,15 +553,15 @@ export const IPhone17ProMaxTouchReviewImmersive: AppStory = {
   },
 };
 
-const TIMELINE_DIALOG_WORKSPACE_ID = "ws-iphone-16e-timeline";
-const TIMELINE_DIALOG_BASE_TS = Date.UTC(2020, 0, 15, 15, 0, 0);
-const TIMELINE_DIALOG_EVENTS: TimelineEvent[] = [
+const TIMELINE_FULLSCREEN_WORKSPACE_ID = "ws-iphone-16e-timeline";
+const TIMELINE_FULLSCREEN_BASE_TS = Date.UTC(2020, 0, 15, 15, 0, 0);
+const TIMELINE_FULLSCREEN_EVENTS: TimelineEvent[] = [
   {
     v: 1,
     id: "turn-completed",
     kind: "turn.completed",
     seq: 3,
-    ts: TIMELINE_DIALOG_BASE_TS,
+    ts: TIMELINE_FULLSCREEN_BASE_TS,
     source: { system: "chat" },
     status: "completed",
     data: { model: "anthropic/claude-sonnet-4", mode: "exec", durationMs: 84_000 },
@@ -572,10 +572,10 @@ const TIMELINE_DIALOG_EVENTS: TimelineEvent[] = [
     id: "agent-milestone",
     kind: "agent.event",
     seq: 2,
-    ts: TIMELINE_DIALOG_BASE_TS - 45_000,
+    ts: TIMELINE_FULLSCREEN_BASE_TS - 45_000,
     source: { system: "agent", key: "timeline-event:milestone" },
     data: {
-      description: "Wired the mobile timeline dialog behind the workspace actions menu",
+      description: "Opened the Timeline tab full-screen from the workspace actions menu",
       category: "milestone",
     },
   },
@@ -584,7 +584,7 @@ const TIMELINE_DIALOG_EVENTS: TimelineEvent[] = [
     id: "goal-set",
     kind: "goal.set",
     seq: 1,
-    ts: TIMELINE_DIALOG_BASE_TS - 90_000,
+    ts: TIMELINE_FULLSCREEN_BASE_TS - 90_000,
     source: { system: "goal" },
     status: "started",
     data: { digest: "Make the timeline reachable at phone widths" },
@@ -604,11 +604,11 @@ export const IPhone16eTimeline: AppStory = {
     <AppWithMocks
       setup={() => {
         const client = setupSimpleChatStory({
-          workspaceId: TIMELINE_DIALOG_WORKSPACE_ID,
+          workspaceId: TIMELINE_FULLSCREEN_WORKSPACE_ID,
           workspaceName: "mobile-timeline",
           projectName: "mux",
           messages: [...MESSAGES],
-          timelineEvents: TIMELINE_DIALOG_EVENTS,
+          timelineEvents: TIMELINE_FULLSCREEN_EVENTS,
         });
         return client;
       }}
@@ -635,7 +635,7 @@ export const IPhone16eTimeline: AppStory = {
     const sidebar = await canvas.findByRole("complementary", { name: "Workspace insights" });
     await userEvent.click(await within(sidebar).findByRole("button", { name: /^Timeline/ }));
     await within(sidebar).findByText(
-      "Wired the mobile timeline dialog behind the workspace actions menu",
+      "Opened the Timeline tab full-screen from the workspace actions menu",
       undefined,
       { timeout: 10_000 }
     );

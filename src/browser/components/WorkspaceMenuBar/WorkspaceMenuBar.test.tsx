@@ -25,6 +25,7 @@ import * as PersistedStateModule from "@/browser/hooks/usePersistedState";
 import * as PopoverErrorHookModule from "@/browser/hooks/usePopoverError";
 import * as DesktopTitlebarModule from "@/browser/hooks/useDesktopTitlebar";
 import * as TutorialContextModule from "@/browser/contexts/TutorialContext";
+import * as AppConfigStoreModule from "@/browser/stores/AppConfigStore";
 import * as ChatCommandsModule from "@/browser/utils/chatCommands";
 import * as FeedbackToastModule from "@/browser/utils/feedbackToast";
 import type { WorkspaceMenuBar as WorkspaceMenuBarComponent } from "./WorkspaceMenuBar";
@@ -1058,6 +1059,24 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     });
   });
 
+  it("tells screen readers whether the bell notifies on all responses", () => {
+    // A click only opens the settings, so the state cannot be a pressed state (#5761).
+    const bellDescription = () =>
+      render(<WorkspaceMenuBar {...defaultProps} />)
+        .getByRole("button", { name: "Notifications" })
+        .getAttribute("aria-description");
+    expect(bellDescription()).toBe("Notify on all responses: off");
+    cleanup();
+
+    const on = {
+      notifications: { notifyOnResponseByWorkspace: { [defaultProps.workspaceId]: true } },
+    };
+    spyOn(AppConfigStoreModule, "useUserPreferences").mockImplementation(((
+      select: (preferences: typeof on) => unknown
+    ) => select(on)) as unknown as typeof AppConfigStoreModule.useUserPreferences);
+    expect(bellDescription()).toBe("Notify on all responses: on");
+  });
+
   it("lets global shortcuts through while the Workspace details button has focus", () => {
     const seen: string[] = [];
     const recordKey = (e: KeyboardEvent) => seen.push(e.key);
@@ -1068,7 +1087,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       details.focus();
 
       // Radix returns focus here when the popover closes; window shortcuts must still see keys,
-      // Escape included (it interrupts a stream).
+      // the stream-interrupt shortcut included.
       fireEvent.keyDown(details, { key: ",", code: "Comma", ctrlKey: true, shiftKey: true });
       fireEvent.keyDown(details, { key: "Escape" });
       // A modified Enter is another shortcut (run the latest plan), not the button's activation.
