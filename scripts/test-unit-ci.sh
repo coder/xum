@@ -75,6 +75,14 @@ isolated_unit_tests=(
   # reliable in its own process. Took the merge queue down on 2026-08-29
   # when runner file enumeration order changed.
   src/browser/components/ChatPane/WorkspaceFooterBar.test.tsx
+  # Its lazy-import test counts calls of a mock.module factory for the heartbeat
+  # modal. When an earlier file in the shared process (AgentListItem.test.tsx)
+  # already imported that module, Bun runs the factory at registration, so the
+  # count is 1 before the menu opens. The size-balanced shard split decides
+  # whether such a file runs first: a PR that only added Node tests moved
+  # AgentListItem.test.tsx into the same shard and failed the merge queue
+  # (#7029, #7031). Verified on origin/main with a two-file run.
+  src/browser/components/WorkspaceMenuBar/WorkspaceMenuBar.test.tsx
   # Post-login catalog refreshes can outlive their test and hit a later global fetch mock,
   # making catalog-call assertions order-dependent in the shared process.
   src/node/services/coderOauthService.test.ts
