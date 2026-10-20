@@ -559,14 +559,29 @@ describe("in-page links", () => {
       <details id="closed"><summary>Closed</summary><div><h3 id="in-details">Inside</h3></div></details>
       <details id="summary-only"><summary id="summary">Summary</summary><p>Body</p></details>
       <div id="until-found" hidden="until-found"><h3 id="found">Found it</h3></div>
+      <a id="to-kept" href="#kept">Kept</a>
+      <details id="outer-kept"><div id="keeps" hidden="until-found"><h3 id="kept">Kept</h3></div></details>
+      <a id="to-slotted" href="#slotted">Slotted</a>
+      <div id="host"><h3 id="slotted">In slot</h3></div>
       <h3 id="a%20b">Encoded</h3><h3 id="a b">Spaced</h3><h3 id="\uFFFDt\u00e9">Replaced</h3>`;
     const scrolled: string[] = [];
     for (const element of Array.from(doc.querySelectorAll("h3, summary"))) {
       element.scrollIntoView = () => scrolled.push(element.textContent);
     }
+    // A shadow tree that renders the light-DOM target in a slot under a closed <details>.
+    const shadow = doc.getElementById("host")!.attachShadow({ mode: "open" });
+    shadow.innerHTML = `<details id="shadow-details"><summary>S</summary><slot></slot></details>`;
+    // Happy DOM has no assignedSlot; a browser reports the slot the node renders in.
+    Object.defineProperty(doc.getElementById("slotted")!, "assignedSlot", {
+      value: shadow.querySelector("slot"),
+    });
     const beforematch: string[] = [];
     doc.body.addEventListener("beforematch", (event) => {
       if (event.target instanceof win.HTMLElement) beforematch.push(event.target.id);
+      // An artifact that keeps this one hidden: plain hidden, so no reveal goes on.
+      if (event.target instanceof win.HTMLElement && event.target.id === "keeps") {
+        event.target.setAttribute("hidden", "");
+      }
     });
     // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
     const run = new Function("window", "document", "CustomEvent", script) as (
@@ -592,6 +607,13 @@ describe("in-page links", () => {
     expect(click("to-found")).toEqual(["Found it"]);
     expect(doc.getElementById("until-found")!.hasAttribute("hidden")).toBe(false);
     expect(beforematch).toEqual(["until-found"]);
+    // The handler kept it hidden: the reveal stops there, and no outer <details> opens.
+    click("to-kept");
+    expect(doc.getElementById("keeps")!.getAttribute("hidden")).toBe("");
+    expect(doc.getElementById("outer-kept")!.hasAttribute("open")).toBe(false);
+    // The flat tree: the slotted target's rendered <details> is in the shadow tree.
+    expect(click("to-slotted")).toEqual(["In slot"]);
+    expect(shadow.getElementById("shadow-details")!.hasAttribute("open")).toBe(true);
     // "#a b" parses to "a%20b", which HTML tries before the decoded "a b".
     expect(click("space")).toEqual(["Encoded"]);
     // %E9 alone is not UTF-8: it decodes to U+FFFD, as in a browser.

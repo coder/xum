@@ -334,14 +334,20 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
       }
       return new TextDecoder("utf-8", { ignoreBOM: true }).decode(new Uint8Array(out));
     }
+    // The parent in the flat tree, where a slotted node renders: its slot, or a shadow root's host.
+    function flatParent(node) {
+      if (node.assignedSlot) return node.assignedSlot;
+      var parent = node.parentNode;
+      return parent && parent.nodeType === 11 ? parent.host : parent;
+    }
     // HTML's ancestor revealing steps: open each closed <details> the target sits in (outside
-    // its summary, which shows anyway) and reveal each hidden="until-found" ancestor.
+    // its summary, which shows anyway) and reveal each hidden="until-found" ancestor. Like HTML,
+    // it stops when a beforematch handler kept the element hidden or removed it.
     function reveal(target) {
-      // The target comes from document lookups, so its ancestors are all in the document tree.
-      for (var node = target; node && node.nodeType === 1; node = node.parentNode) {
-        var hidden = node.getAttribute("hidden");
-        if (hidden !== null && hidden.toLowerCase() === "until-found") {
+      for (var node = target; node && node.nodeType === 1; node = flatParent(node)) {
+        if (isUntilFound(node)) {
           node.dispatchEvent(new window.Event("beforematch", { bubbles: true }));
+          if (!node.isConnected || !isUntilFound(node)) return;
           node.removeAttribute("hidden");
         }
         var parent = node.parentElement;
@@ -353,6 +359,10 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
           if (node !== summary) parent.setAttribute("open", "");
         }
       }
+    }
+    function isUntilFound(node) {
+      var hidden = node.getAttribute("hidden");
+      return hidden !== null && hidden.toLowerCase() === "until-found";
     }
     // HTML's "find a potential indicated element": an id first, then an <a name>.
     function findTarget(fragment) {
