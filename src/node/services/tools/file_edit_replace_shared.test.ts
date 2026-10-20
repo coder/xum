@@ -66,3 +66,21 @@ test("file_edit_replace_string names no line when nothing matches even ignoring 
   expect(result.success).toBe(false);
   if (!result.success) expect(result.note).not.toMatch(/line \d+/u);
 });
+
+test.each([
+  ["has no whitespace", "fooBar", "x = fooBaz\n"],
+  ["matches twice when whitespace is ignored", "a  =  1", "a = 1\nb = 2\na =1\n"],
+  [
+    "is too long to search",
+    Array.from({ length: 201 }, (_, i) => `t${i}`).join("  "),
+    Array.from({ length: 201 }, (_, i) => `t${i}`).join(" "),
+  ],
+])("file_edit_replace_string names no line when old_string %s", (_name, oldString, content) => {
+  const result = handleStringReplace(
+    { path: "f.txt", old_string: oldString, new_string: "x" },
+    content
+  );
+
+  expect(result.success).toBe(false);
+  if (!result.success) expect(result.note).not.toMatch(/line \d+/u);
+});
