@@ -32,6 +32,19 @@ describe("sessionHeaderNameError", () => {
     }
   });
 
+  // The Fetch spec's forbidden names and prefixes: fetch owns or overwrites
+  // them (Sec-Fetch-Mode becomes "cors"), so the gateway never sees the id.
+  test("rejects Fetch-forbidden names and the proxy-/sec- prefixes", () => {
+    for (const name of ["Origin", "Via", "Referer", "Sec-Fetch-Mode", "sec-x", "Proxy-Foo"]) {
+      expect(sessionHeaderNameError(name)).not.toBeNull();
+    }
+  });
+
+  // A valid token, but assigning it to a plain object hits the prototype setter.
+  test("rejects __proto__", () => {
+    expect(sessionHeaderNameError("__proto__")).not.toBeNull();
+  });
+
   test("rejects auth and Xum-owned headers in any case", () => {
     for (const name of ["Authorization", "x-api-key", "X-Goog-Api-Key", "x-mux-workspace-id"]) {
       expect(sessionHeaderNameError(name)).not.toBeNull();
