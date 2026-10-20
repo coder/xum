@@ -97,6 +97,19 @@ const CpuProfileSchema = z.object({
 
 type CpuProfile = z.infer<typeof CpuProfileSchema>;
 
+/**
+ * The first sample's weight is the time from the profile's start to that sample. For a backend
+ * capture that is mostly `Profiler.start` itself (V8 logs every code object first, 0.2-0.8 s on a
+ * long-running backend), which would otherwise rank as self time of whatever ran next, such as
+ * `post` in node:inspector (#5554). So the first sample becomes this synthetic frame.
+ */
+export const PROFILER_START_FRAME: Frame = {
+  functionName: "(profiler start)",
+  url: "",
+  lineNumber: -1,
+  columnNumber: -1,
+};
+
 function isRootFrame(frame: Frame): boolean {
   return frame.functionName === "(root)" && frame.url === "";
 }
@@ -176,6 +189,7 @@ export function readCpuProfile(json: unknown, label: string): ProfileRead {
   const weightUs = new Float64Array(profile.nodes.length);
   const counts = new Uint32Array(profile.nodes.length);
   let negativeDeltas = 0;
+  let profilerStartUs = 0;
   for (const [i, sample] of profile.samples.entries()) {
     const nodeIndex = index.get(sample);
     if (nodeIndex === undefined) return fail(`sample ${i} references unknown node ${sample}`);
@@ -185,6 +199,10 @@ export function readCpuProfile(json: unknown, label: string): ProfileRead {
     if (delta < 0) {
       negativeDeltas++;
       delta = 0;
+    }
+    if (i === 0) {
+      profilerStartUs = delta;
+      continue;
     }
     weightUs[nodeIndex] += delta;
     counts[nodeIndex]++;
@@ -201,6 +219,9 @@ export function readCpuProfile(json: unknown, label: string): ProfileRead {
     }
     frames.reverse();
     stacks.push({ frames, weightUs: weightUs[i], count: counts[i] });
+  }
+  if (profilerStartUs > 0) {
+    stacks.push({ frames: [PROFILER_START_FRAME], weightUs: profilerStartUs, count: 1 });
   }
   const warnings =
     negativeDeltas > 0
@@ -259,7 +280,9 @@ function classifyFrame(frame: { functionName: string; url: string; source?: stri
   const { functionName, url } = frame;
   if (url === "") {
     if (functionName === "(garbage collector)") return "gc";
-    if (functionName === "(program)") return "program";
+    if (functionName === "(program)" || functionName === PROFILER_START_FRAME.functionName) {
+      return "program";
+    }
     if (functionName === "(idle)") return "idle";
     // V8 natives (`RegExp: ...`) and injected evaluate() code have no script URL.
     return "internal";

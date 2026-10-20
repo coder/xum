@@ -33,6 +33,7 @@ import {
   FLIGHT_RECORDER_RENDERER_LOAF_CAPACITY,
   FLIGHT_RECORDER_RETENTION_MS,
   FLIGHT_RECORDER_SAMPLE_INTERVAL_MS,
+  FLIGHT_RECORDER_SLOW_RPC_TRIP_EXEMPT_PATHS,
   FLIGHT_RECORDER_TRIP_CAPACITY,
 } from "@/constants/perfFlightRecorder";
 import { log } from "@/node/services/log";
@@ -221,7 +222,8 @@ export class FlightRecorder {
     this.now = options.now ?? perfEpochNowMs;
     this.rpc = new RpcRecorder({
       now: this.now,
-      onSlowCall: (span) =>
+      onSlowCall: (span) => {
+        if (FLIGHT_RECORDER_SLOW_RPC_TRIP_EXEMPT_PATHS.has(span.path)) return;
         this.recordTrip({
           kind: "slow-rpc",
           atMs: span.endMs,
@@ -229,7 +231,8 @@ export class FlightRecorder {
           startMs: span.startMs,
           durationMs: span.endMs - span.startMs,
           ok: span.ok,
-        }),
+        });
+      },
     });
   }
 

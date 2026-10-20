@@ -620,6 +620,20 @@ describe("FlightRecorder", () => {
       expect(slowCalls.every((slow) => slow.path === "a.slow" && slow.ok)).toBe(true);
     });
 
+    test("calls that are slow by design keep their spans but do not trip slow-rpc", () => {
+      const { recorder, call } = makeRecorder();
+      const trips: unknown[] = [];
+      recorder.onTrip((trip) => trips.push(trip));
+      recorder.setEnabled(true);
+      call("perfCaptures.captureNow", 8000);
+      call("workspace.executeBash", 2500);
+      expect(trips).toEqual([]);
+      expect(recorder.getSnapshot().rpc.slowCalls.map((span) => span.path)).toEqual([
+        "perfCaptures.captureNow",
+        "workspace.executeBash",
+      ]);
+    });
+
     test("distinct paths are capped and the full snapshot still fits the schema", () => {
       const { recorder, call } = makeRecorder();
       recorder.setEnabled(true);
