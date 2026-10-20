@@ -86,6 +86,13 @@ isolated_unit_tests=(
   # Post-login catalog refreshes can outlive their test and hit a later global fetch mock,
   # making catalog-call assertions order-dependent in the shared process.
   src/node/services/coderOauthService.test.ts
+  # Asserts that forced full GCs collect a WeakRef target. In the shared process,
+  # other suites' state or conservative stack scanning can keep it alive: it failed
+  # 3 of 3 CI runs once the size-balanced split moved it into a different shard
+  # (#7057), and in a merge group whose tree passed PR CI (#7061), but passes alone.
+  # Coverage stays on: the failures were in coverage processes, and it passes in
+  # its own one.
+  src/node/services/agentSession.preparationRetention.test.ts
   # Loads the native sharp/libvips addon into the test process. In the shared
   # coverage process Bun hit an allocator panic ("pas panic: deallocation did
   # fail", exit 133) as this file started on main run 35782976621, with zero
