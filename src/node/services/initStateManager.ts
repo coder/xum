@@ -468,16 +468,22 @@ export class InitStateManager extends EventEmitter {
         // ran it is gone and the checkout may be empty or partial. Record the failure once so
         // this and every later replay show the creation as failed.
         const endTime = Date.now();
-        await this.store.persist(workspaceId, {
-          ...persisted,
-          status: "error",
-          exitCode: -1,
-          endTime,
-          lines: [
-            ...(persisted.lines ?? []),
-            { line: INTERRUPTED_INIT_LINE, isError: true, timestamp: endTime },
-          ],
-        });
+        await this.store.persist(
+          workspaceId,
+          {
+            ...persisted,
+            status: "error",
+            exitCode: -1,
+            endTime,
+            lines: [
+              ...(persisted.lines ?? []),
+              { line: INTERRUPTED_INIT_LINE, isError: true, timestamp: endTime },
+            ],
+          },
+          // #5391: a startInit that began during this replay owns the record now; its
+          // "running" must not be overwritten by the crashed run's failure.
+          { shouldWrite: () => !this.store.hasState(workspaceId) }
+        );
       }
     }
     // Pass workspaceId as context for serialization
