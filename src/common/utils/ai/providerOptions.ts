@@ -459,7 +459,18 @@ export function anthropicNativeWebFetchRouteAvailable(
   if (isCustomProviderConfig(providersConfig?.[prefix])) return false;
   if (routeProvider === "mux-gateway") return true;
   if (routeProvider === "coder") return anthropicTypedCoderRoute(modelString, providersConfig);
-  if (routeProvider !== undefined && routeProvider !== "anthropic") return false;
+  // No resolved route is the built-in provider; any other gateway transforms the request.
+  return isBuiltInAnthropicRoute(routeProvider) && anthropicBaseUrlIsFirstParty(providersConfig);
+}
+
+function isBuiltInAnthropicRoute(routeProvider: ProviderName | undefined): boolean {
+  return routeProvider === undefined || routeProvider === "anthropic";
+}
+
+/** True when the built-in Anthropic provider has no base URL or the first-party one. */
+function anthropicBaseUrlIsFirstParty(
+  providersConfig: ProvidersConfigMap | null | undefined
+): boolean {
   const anthropicConfig = providersConfig?.anthropic;
   const baseUrl = anthropicConfig?.baseUrlResolved ?? anthropicConfig?.baseUrl;
   return baseUrl == null || baseUrl.trim() === "" || isFirstPartyAnthropicBaseUrl(baseUrl);
