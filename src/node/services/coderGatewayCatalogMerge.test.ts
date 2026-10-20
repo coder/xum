@@ -7,6 +7,7 @@ import {
   probeCoderGatewayProviders,
   readPriorCoderCatalog,
   reconcileProviderCatalog,
+  type CoderProviderCatalogResult,
   type PriorCoderCatalog,
 } from "./coderGatewayCatalogMerge";
 
@@ -235,9 +236,9 @@ describe("reconcileProviderCatalog", () => {
 describe("catalogRefreshFailureMessage", () => {
   // #5659: name each failing provider and its last failure.
   it("names the failing providers and their status", () => {
-    const results = [
-      { provider: anthropic, result: { kind: "error", reason: "HTTP 502" } as const },
-      { provider: custom, result: { kind: "ok", ids: [] } as const },
+    const results: Array<{ provider: CoderGatewayProvider; result: CoderProviderCatalogResult }> = [
+      { provider: anthropic, result: { kind: "error", reason: "HTTP 502" } },
+      { provider: custom, result: { kind: "ok", ids: [] } },
     ];
     expect(catalogRefreshFailureMessage(results, false)).toBe(
       "Model discovery failed for AI Gateway providers: anthropic (HTTP 502); try refreshing again"
