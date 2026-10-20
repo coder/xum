@@ -49,7 +49,7 @@ export function runtimeModeSupportsSharedTaskWorkspace(mode: RuntimeMode | undef
 
 /**
  * Runtime IDs that can be enabled/disabled in Settings → Runtimes.
- * Note: includes "coder" which is a UI-level choice (not a RuntimeMode).
+ * Note: includes "coder" and "daytona", UI-level choices (both are `ssh` under the hood, not RuntimeModes).
  */
 export const RUNTIME_ENABLEMENT_IDS = RuntimeEnablementIdSchema.options;
 
@@ -57,11 +57,23 @@ export type RuntimeEnablementId = z.infer<typeof RuntimeEnablementIdSchema>;
 
 export type RuntimeEnablement = Record<RuntimeEnablementId, boolean>;
 
+/** The RuntimeMode each enablement ID runs as: Coder and Daytona are `ssh` plus a sub-config. */
+export const RUNTIME_MODE_FOR_ENABLEMENT_ID: Record<RuntimeEnablementId, RuntimeMode> = {
+  local: RUNTIME_MODE.LOCAL,
+  worktree: RUNTIME_MODE.WORKTREE,
+  ssh: RUNTIME_MODE.SSH,
+  coder: RUNTIME_MODE.SSH,
+  daytona: RUNTIME_MODE.SSH,
+  docker: RUNTIME_MODE.DOCKER,
+  devcontainer: RUNTIME_MODE.DEVCONTAINER,
+};
+
 export const DEFAULT_RUNTIME_ENABLEMENT: RuntimeEnablement = {
   local: true,
   worktree: true,
   ssh: true,
   coder: true,
+  daytona: true,
   docker: true,
   devcontainer: true,
 };

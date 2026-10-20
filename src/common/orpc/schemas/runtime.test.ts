@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { RuntimeAvailabilityStatusSchema } from "./runtime";
+import { RuntimeAvailabilityStatusSchema, RuntimeConfigSchema } from "./runtime";
 import { getDevcontainerConfigs, type RuntimeAvailabilityStatus } from "@/common/types/runtime";
 
 describe("RuntimeAvailabilityStatusSchema", () => {
@@ -80,5 +80,23 @@ describe("getDevcontainerConfigs", () => {
     const configs = getDevcontainerConfigs(status);
 
     expect(configs).toEqual([]);
+  });
+});
+
+describe("RuntimeConfigSchema ssh backends", () => {
+  const ssh = { type: "ssh", host: "sb-1.xum--daytona", srcBaseDir: "~/xum" } as const;
+
+  test("keeps the daytona sub-config through a persist round-trip", () => {
+    const daytona = { sandboxId: "sb-1", cpu: 2, memoryGiB: 4, diskGiB: 10, shared: true };
+    expect(RuntimeConfigSchema.parse({ ...ssh, daytona })).toEqual({ ...ssh, daytona });
+  });
+
+  test("rejects a config that names both Coder and Daytona", () => {
+    const result = RuntimeConfigSchema.safeParse({
+      ...ssh,
+      coder: { workspaceName: "ws" },
+      daytona: { sandboxId: "sb-1" },
+    });
+    expect(result.success).toBe(false);
   });
 });

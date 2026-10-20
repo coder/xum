@@ -1,6 +1,7 @@
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
+import { DaytonaSshConfigWriter } from "./daytonaSshConfig";
 import { resolveSSHConfig } from "./sshConfigParser";
 
 describe("resolveSSHConfig", () => {
@@ -82,5 +83,66 @@ describe("resolveSSHConfig", () => {
 
       await fs.rm(tempDir, { recursive: true, force: true });
     }
+  });
+
+  async function withTempHome(fn: (homeDir: string) => Promise<void>): Promise<void> {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-ssh-config-"));
+    const previousUserProfile = process.env.USERPROFILE;
+    process.env.USERPROFILE = tempDir;
+    try {
+      await fs.mkdir(path.join(tempDir, ".ssh"), { recursive: true });
+      await fn(tempDir);
+    } finally {
+      if (previousUserProfile === undefined) {
+        delete process.env.USERPROFILE;
+      } else {
+        process.env.USERPROFILE = previousUserProfile;
+      }
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  test("resolves a Daytona sandbox through the managed Host-scoped Include", async () => {
+    await withTempHome(async (homeDir) => {
+      await fs.writeFile(path.join(homeDir, ".ssh", "config"), "Host work\n  User me\n", "utf8");
+      const writer = new DaytonaSshConfigWriter({
+        xumHome: path.join(homeDir, ".xum"),
+        sshConfigPath: path.join(homeDir, ".ssh", "config"),
+      });
+      await writer.writeSandbox({
+        sandboxId: "sb-1",
+        token: "tokenA",
+        gateway: { host: "ssh.daytona.test", port: 2222, hostKeys: ["ssh-ed25519 AAAA"] },
+      });
+
+      const resolved = await resolveSSHConfig("sb-1.xum--daytona");
+
+      expect(resolved.user).toBe("tokenA");
+      expect(resolved.hostName).toBe("ssh.daytona.test");
+      expect(resolved.port).toBe(2222);
+      expect((await resolveSSHConfig("work")).user).toBe("me");
+    });
+  });
+
+  test("resolves relative and wildcard Includes and keeps later lines in the enclosing block", async () => {
+    await withTempHome(async (homeDir) => {
+      await fs.mkdir(path.join(homeDir, ".ssh", "conf.d"));
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "conf.d", "10-box.conf"),
+        // Lines before the first Host apply to the enclosing block, as in OpenSSH.
+        "HostName 10.0.0.5\nHost other\n  User otheruser\n",
+        "utf8"
+      );
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        ["Host box", "  Include conf.d/*.conf", "  User boxuser", ""].join("\n"),
+        "utf8"
+      );
+
+      const resolved = await resolveSSHConfig("box");
+
+      expect(resolved.hostName).toBe("10.0.0.5");
+      expect(resolved.user).toBe("boxuser");
+    });
   });
 });

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect } from "react";
 import * as SelectPrimitive from "@radix-ui/react-select";
 import {
+  normalizeRuntimeEnablement,
   RUNTIME_MODE,
   type CoderWorkspaceConfig,
   type ParsedRuntime,
@@ -1092,19 +1093,23 @@ export function CreationControls(props: CreationControlsProps) {
   const runtimeWorktree = props.runtimeEnablement?.worktree;
   const runtimeSsh = props.runtimeEnablement?.ssh;
   const runtimeCoder = props.runtimeEnablement?.coder;
+  const runtimeDaytona = props.runtimeEnablement?.daytona;
   const runtimeDocker = props.runtimeEnablement?.docker;
   const runtimeDevcontainer = props.runtimeEnablement?.devcontainer;
   const hasRuntimeEnablement = props.runtimeEnablement != null;
   const runtimeEnablement = !hasRuntimeEnablement
     ? undefined
-    : {
-        local: runtimeLocal ?? true,
-        worktree: runtimeWorktree ?? true,
-        ssh: runtimeSsh ?? true,
-        coder: runtimeCoder ?? true,
-        docker: runtimeDocker ?? true,
-        devcontainer: runtimeDevcontainer ?? true,
-      };
+    : // Rebuilt from primitives so a fresh-but-equal prop object keeps the memoized value;
+      // missing keys default to enabled.
+      normalizeRuntimeEnablement({
+        local: runtimeLocal,
+        worktree: runtimeWorktree,
+        ssh: runtimeSsh,
+        coder: runtimeCoder,
+        daytona: runtimeDaytona,
+        docker: runtimeDocker,
+        devcontainer: runtimeDevcontainer,
+      });
   const nameState = {
     name: props.nameState.name,
     title: props.nameState.title,

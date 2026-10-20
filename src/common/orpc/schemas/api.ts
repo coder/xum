@@ -1460,6 +1460,7 @@ export const secrets = {
 
 // Re-export Coder schemas from dedicated file
 export { coder } from "./coder";
+export { daytona } from "./daytona";
 
 // Workspace
 const DebugLlmRequestSnapshotSchema = z

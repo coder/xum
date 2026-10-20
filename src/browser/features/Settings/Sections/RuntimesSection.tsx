@@ -39,7 +39,11 @@ import {
 import type { CoderWorkspaceConfig } from "@/common/orpc/schemas/coder";
 import { cn } from "@/common/lib/utils";
 import type { ProjectConfig } from "@/common/types/project";
-import { normalizeRuntimeEnablement, RUNTIME_MODE } from "@/common/types/runtime";
+import {
+  normalizeRuntimeEnablement,
+  RUNTIME_MODE,
+  RUNTIME_MODE_FOR_ENABLEMENT_ID,
+} from "@/common/types/runtime";
 import type {
   RuntimeAvailabilityStatus,
   RuntimeEnablement,
@@ -664,8 +668,7 @@ export function RuntimesSection() {
             const isLastEnabled = effectiveEnablement[runtime.id] && enabledRuntimeCount <= 1;
             const switchDisabled = rowDisabled || isLastEnabled;
             const optionSpec = getRuntimeOptionField(runtime.id);
-            const optionRuntimeMode: RuntimeMode =
-              runtime.id === "coder" ? RUNTIME_MODE.SSH : runtime.id;
+            const optionRuntimeMode = RUNTIME_MODE_FOR_ENABLEMENT_ID[runtime.id];
             const switchControl = (
               <Switch
                 checked={effectiveEnablement[runtime.id]}

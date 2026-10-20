@@ -66,12 +66,23 @@ function countOccurrences(content: string, marker: string): number {
   return content.split(marker).length - 1;
 }
 
-function replaceMuxBlock(existingContent: string, nextMuxBlock: string): string {
-  const startMarkerIndex = existingContent.indexOf(MUX_CODER_SSH_BLOCK_START);
-  const endMarkerIndex = existingContent.indexOf(MUX_CODER_SSH_BLOCK_END, startMarkerIndex);
+export interface ManagedBlockMarkers {
+  start: string;
+  end: string;
+  /** Names the block in corruption errors (e.g. "Coder"). */
+  label: string;
+}
+
+function replaceMuxBlock(
+  existingContent: string,
+  nextMuxBlock: string,
+  markers: ManagedBlockMarkers
+): string {
+  const startMarkerIndex = existingContent.indexOf(markers.start);
+  const endMarkerIndex = existingContent.indexOf(markers.end, startMarkerIndex);
 
   if (startMarkerIndex === -1 || endMarkerIndex === -1 || endMarkerIndex < startMarkerIndex) {
-    throw new Error("Corrupted SSH config: invalid Xum Coder SSH marker order.");
+    throw new Error(`Corrupted SSH config: invalid Xum ${markers.label} SSH marker order.`);
   }
 
   const lineStartIndex = existingContent.lastIndexOf("\n", startMarkerIndex);
@@ -219,9 +230,17 @@ async function writeConfigAtomically(
   }
 }
 
-export async function ensureMuxCoderSSHConfigFile(
-  opts: EnsureMuxCoderSSHConfigFileOptions
-): Promise<void> {
+/**
+ * Write (or replace in place) one Xum-managed, marker-delimited block in the user's ssh config,
+ * leaving every other line untouched. Shared by the Coder and Daytona providers.
+ */
+export async function ensureManagedSSHConfigBlock(opts: {
+  markers: ManagedBlockMarkers;
+  /** Full block text, markers included. */
+  block: string;
+  sshConfigPath?: string;
+}): Promise<void> {
+  const { markers } = opts;
   const configuredSSHConfigPath = opts.sshConfigPath ?? path.join(os.homedir(), ".ssh", "config");
   // Preserve users' symlinked ~/.ssh/config setups by writing to the symlink target,
   // rather than replacing the symlink path itself.
@@ -233,22 +252,31 @@ export async function ensureMuxCoderSSHConfigFile(
   const { content: existingContent, mode: existingMode } =
     await loadSSHConfigContent(sshConfigPath);
 
-  const startMarkerCount = countOccurrences(existingContent, MUX_CODER_SSH_BLOCK_START);
-  const endMarkerCount = countOccurrences(existingContent, MUX_CODER_SSH_BLOCK_END);
+  const startMarkerCount = countOccurrences(existingContent, markers.start);
+  const endMarkerCount = countOccurrences(existingContent, markers.end);
 
   if (startMarkerCount > 1 || endMarkerCount > 1) {
-    throw new Error("Corrupted SSH config: duplicate Xum Coder SSH markers detected.");
+    throw new Error(`Corrupted SSH config: duplicate Xum ${markers.label} SSH markers detected.`);
   }
 
   if (startMarkerCount !== endMarkerCount) {
-    throw new Error("Corrupted SSH config: mismatched Xum Coder SSH markers detected.");
+    throw new Error(`Corrupted SSH config: mismatched Xum ${markers.label} SSH markers detected.`);
   }
 
-  const nextMuxBlock = renderMuxBlock(opts.coderBinaryPath);
   const nextContent =
     startMarkerCount === 1
-      ? replaceMuxBlock(existingContent, nextMuxBlock)
-      : appendMuxBlock(existingContent, nextMuxBlock);
+      ? replaceMuxBlock(existingContent, opts.block, markers)
+      : appendMuxBlock(existingContent, opts.block);
 
   await writeConfigAtomically(sshConfigPath, nextContent, existingMode);
+}
+
+export async function ensureMuxCoderSSHConfigFile(
+  opts: EnsureMuxCoderSSHConfigFileOptions
+): Promise<void> {
+  await ensureManagedSSHConfigBlock({
+    markers: { start: MUX_CODER_SSH_BLOCK_START, end: MUX_CODER_SSH_BLOCK_END, label: "Coder" },
+    block: renderMuxBlock(opts.coderBinaryPath),
+    sshConfigPath: opts.sshConfigPath,
+  });
 }

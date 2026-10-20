@@ -1814,6 +1814,28 @@ export const router = (authToken?: string) => {
         .output(schemas.coder.listWorkspaces.output)
         .handler(async ({ context }) => context.coderService.listWorkspaces()),
     },
+    daytona: {
+      getConfig: t
+        .input(schemas.daytona.getConfig.input)
+        .output(schemas.daytona.getConfig.output)
+        .handler(async ({ context }) => context.daytonaService.getPublicConfig()),
+      setConfig: t
+        .input(schemas.daytona.setConfig.input)
+        .output(schemas.daytona.setConfig.output)
+        .handler(async ({ context, input }) => context.daytonaService.setConfig(input)),
+      testConnection: t
+        .input(schemas.daytona.testConnection.input)
+        .output(schemas.daytona.testConnection.output)
+        .handler(async ({ context }) => context.daytonaService.testConnection()),
+      listSandboxes: t
+        .input(schemas.daytona.listSandboxes.input)
+        .output(schemas.daytona.listSandboxes.output)
+        .handler(async ({ context }) => context.daytonaService.listSandboxes()),
+      listSnapshots: t
+        .input(schemas.daytona.listSnapshots.input)
+        .output(schemas.daytona.listSnapshots.output)
+        .handler(async ({ context }) => context.daytonaService.listSnapshots()),
+    },
     artifacts: {
       list: t
         .input(schemas.artifacts.list.input)

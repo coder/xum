@@ -248,13 +248,110 @@ function toStringArray(value: ComputedConfigValue | undefined): string[] {
   return [];
 }
 
+// OpenSSH's READCONF_MAX_DEPTH.
+const MAX_INCLUDE_DEPTH = 16;
+const INCLUDE_LINE_PATTERN = /^\s*include(?:\s*=\s*|\s+)(.+?)\s*$/i;
+const SECTION_LINE_PATTERN = /^\s*(?:host|match)(?:\s*=\s*|\s+)\S/i;
+
+function splitIncludeArgs(value: string): string[] {
+  const args: string[] = [];
+  const pattern = /"([^"]*)"|(\S+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(value)) !== null) {
+    const arg = match[1] ?? match[2];
+    if (arg) args.push(arg);
+  }
+  return args;
+}
+
+async function resolveIncludePaths(value: string, homeDir: string): Promise<string[]> {
+  const files: string[] = [];
+  for (const arg of splitIncludeArgs(value)) {
+    const expanded = expandHomePath(arg, homeDir);
+    // OpenSSH resolves relative user-config Include paths against ~/.ssh.
+    const absolute = path.isAbsolute(expanded) ? expanded : path.join(homeDir, ".ssh", expanded);
+    const baseName = path.basename(absolute);
+    if (!/[*?]/.test(baseName)) {
+      files.push(absolute);
+      continue;
+    }
+    // Wildcards are supported in the file name only (OpenSSH globs the whole path).
+    try {
+      const entries = await fs.readdir(path.dirname(absolute));
+      files.push(
+        ...entries
+          .filter((entry) => glob([baseName], entry))
+          .sort()
+          .map((entry) => path.join(path.dirname(absolute), entry))
+      );
+    } catch (error) {
+      log.debug("Failed to expand SSH config Include", {
+        include: absolute,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+  return files;
+}
+
+/** The expanded content of each file one Include line names, in order. */
+async function readIncludedFiles(value: string, homeDir: string, depth: number): Promise<string[]> {
+  const contents: string[] = [];
+  for (const file of await resolveIncludePaths(value, homeDir)) {
+    try {
+      contents.push(await expandIncludes(await fs.readFile(file, "utf8"), homeDir, depth));
+    } catch (error) {
+      // OpenSSH skips missing include files silently.
+      if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") {
+        log.debug("Failed to read SSH config Include", {
+          include: file,
+          error: getErrorMessage(error),
+        });
+      }
+    }
+  }
+  return contents;
+}
+
+/**
+ * Inline `Include` directives, which the ssh-config package does not resolve (Xum's Daytona
+ * block relies on one). An Include inside a Host/Match block is followed by that block's header
+ * again, so later lines of the block stay scoped to it as in OpenSSH. Approximation: Host blocks
+ * inside the included file are not additionally gated by the enclosing block's pattern.
+ */
+async function expandIncludes(content: string, homeDir: string, depth: number): Promise<string> {
+  const out: string[] = [];
+  let sectionHeader: string | undefined;
+  for (const line of content.split(/\r?\n/)) {
+    if (SECTION_LINE_PATTERN.test(line)) {
+      sectionHeader = line.trim();
+      out.push(line);
+      continue;
+    }
+    const includeMatch = INCLUDE_LINE_PATTERN.exec(line);
+    if (!includeMatch) {
+      out.push(line);
+      continue;
+    }
+    if (depth >= MAX_INCLUDE_DEPTH) {
+      log.debug("SSH config Include nesting too deep; ignoring", { include: includeMatch[1] });
+      continue;
+    }
+    out.push(...(await readIncludedFiles(includeMatch[1], homeDir, depth + 1)));
+    if (sectionHeader) {
+      out.push(sectionHeader);
+    }
+  }
+  return out.join("\n");
+}
+
 async function loadSSHConfig(): Promise<SSHConfig | null> {
   const homeDir = getHomeDir();
   const configPath = path.join(homeDir, ".ssh", "config");
 
   try {
     const content = await fs.readFile(configPath, "utf8");
-    const parsed = SSHConfig.parse(content);
+    const parsed = SSHConfig.parse(await expandIncludes(content, homeDir, 0));
     return parsed;
   } catch (error) {
     if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") {

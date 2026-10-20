@@ -59,6 +59,8 @@ import {
 import { createBackendCpuProfiler } from "@/node/services/perf/backendCpuProfiler";
 import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
 import { AgentResourceLimitsService } from "@/node/services/agentResourceLimits/agentResourceLimitsService";
+import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
+import { DaytonaService } from "@/node/services/daytona/daytonaService";
 import { PerfReportService } from "@/node/services/perf/perfReportService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
@@ -286,6 +288,8 @@ export class ServiceContainer {
   public readonly sessionTapes: SessionTapeFolderService;
   // Constructed directly (no DI tag): it needs only the config and holds one config listener.
   public readonly agentResourceLimits: AgentResourceLimitsService;
+  // Constructed directly (no DI tag): it needs only the data root and starts no timers.
+  public readonly daytonaService: DaytonaService;
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
@@ -331,6 +335,10 @@ export class ServiceContainer {
     this.workflowRuntimeFactory = get(QuickJSRuntimeFactoryTag);
     this.config = get(ConfigTag);
     this.agentResourceLimits = new AgentResourceLimitsService(this.config);
+    this.daytonaService = new DaytonaService({
+      credentialsStore: new DaytonaCredentialsStore(this.config.rootDir),
+      rootDir: this.config.rootDir,
+    });
     this.perfCaptures = new PerfCaptureService({
       dir: getXumPerfCapturesDir(this.config.rootDir),
       recorder: this.perfFlightRecorder,
@@ -797,6 +805,7 @@ export class ServiceContainer {
       browserControlService: this.browserControlService,
       browserSessionStateHub: this.browserSessionStateHub,
       coderService: this.coderService,
+      daytonaService: this.daytonaService,
       serverAuthService: this.serverAuthService,
       sshPromptService: this.sshPromptService,
       desktopSessionManager: this.desktopSessionManager,

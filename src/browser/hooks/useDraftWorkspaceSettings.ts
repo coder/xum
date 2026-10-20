@@ -287,7 +287,9 @@ export function useDraftWorkspaceSettings(
     Boolean(projectConfig?.runtimeEnablement) ||
     projectConfig?.defaultRuntime !== undefined;
   const settingsDefaultRuntime: RuntimeChoice = hasProjectRuntimeOverrides
-    ? (projectConfig?.defaultRuntime ?? globalDefaultRuntime ?? RUNTIME_MODE.WORKTREE)
+    ? (normalizeRuntimeChoice(projectConfig?.defaultRuntime) ??
+      globalDefaultRuntime ??
+      RUNTIME_MODE.WORKTREE)
     : (globalDefaultRuntime ?? RUNTIME_MODE.WORKTREE);
 
   const parsedDefault = buildRuntimeFromChoice(settingsDefaultRuntime);
