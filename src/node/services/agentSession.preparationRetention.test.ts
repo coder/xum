@@ -20,18 +20,21 @@ describe("AgentSession preparation retention", () => {
   test("a started stream's request closures do not keep the pre-stream failure callback alive", async () => {
     const h = await createAgentSessionHarness({ workspaceId: "preparation-retention" });
     try {
-      // Built in a separate frame, so only the WeakRef reaches this one.
-      const { callbackScopeRef, onAcceptedPreStreamFailure } = (() => {
+      // The callback and its scope live only in this helper's frame, which has finished
+      // before the GC check, so only the WeakRef reaches this one. A callback held in a
+      // local of this async test would stay alive across its awaits whenever JSC keeps
+      // dead locals (interpreter or baseline tiers): the test then failed by chance in
+      // the shared CI shard, and in 2 of 5 runs with BUN_JSC_useJIT=0 (#7061).
+      const { callbackScopeRef, result } = await (async () => {
         const callbackScope = { payload: new Array<number>(1000).fill(1) };
         return {
           callbackScopeRef: new WeakRef(callbackScope),
-          onAcceptedPreStreamFailure: () => void callbackScope.payload.length,
+          result: await h.session.sendMessage("hello", options, {
+            acceptanceOrigin: "automatic",
+            onAcceptedPreStreamFailure: () => void callbackScope.payload.length,
+          }),
         };
       })();
-      const result = await h.session.sendMessage("hello", options, {
-        acceptanceOrigin: "automatic",
-        onAcceptedPreStreamFailure,
-      });
       expect(result.success).toBe(true);
       // The stream started. The streamMessage mock keeps its call arguments, standing in for
       // a tool configuration that outlives the turn.
