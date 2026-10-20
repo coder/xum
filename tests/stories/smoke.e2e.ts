@@ -15,9 +15,6 @@ test(
     await disableTutorials(app);
     await app.open();
     await agent.act(`open the '${WORKSPACE_TITLE}' workspace in the left sidebar`);
-    await agent.assert(
-      `the chat of the '${WORKSPACE_TITLE}' workspace is shown, with its message box`
-    );
     // The workspace header's bell shows only once a workspace is open (repros/helpers.ts).
     await expect(screen.getByRole("button", "Notifications")).toBeVisible({ timeout: 15_000 });
     // e2e has no `log` role query, so CSS: the transcript is ChatPane's role="log" element.
@@ -25,5 +22,10 @@ test(
       browser.locator('[role="log"][aria-label="Conversation transcript"]')
     ).toBeVisible();
     await expect(screen.getByRole("textbox", "Message")).toBeVisible();
+    // The judge last: a replayed act ends in about a second, before the workspace has loaded,
+    // and a judge that sees "Opening page..." cannot decide (ASSERTION_INCONCLUSIVE, first run).
+    await agent.assert(
+      `the chat of the '${WORKSPACE_TITLE}' workspace is shown, with its message box`
+    );
   }
 );
