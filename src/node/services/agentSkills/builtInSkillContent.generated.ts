@@ -10394,6 +10394,8 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- In Markdown, JSON, CSV, text and canvases, select text and add a comment.",
       "- In HTML and SVG, click to drop a pin.",
       "",
+      "With the keyboard, press `Tab` to move into the artifact text, then extend the selection with `Shift` and the arrow keys. The comment box opens when you release `Shift`. The artifact text is not an editable field, so `Shift` and the arrow keys select text only when caret browsing is on (`F7` in Chrome and Edge) or when a screen reader is running.",
+      "",
       "Comments attach to your next message, with the artifact, its version and the anchor, so the agent can find the spot.",
       "",
       "## Goal status board",

@@ -1388,6 +1388,86 @@ describe("ArtifactsPanel", () => {
     expect(popover.textContent).toContain("grew 12%");
   });
 
+  // #5760: the "Shift+Arrow seen" flag outlived the selection gesture. After focus left the viewer
+  // or annotate mode turned off and on, the next bare Shift release opened the comment box.
+  test("annotate mode: a Shift release opens the box only after a Shift+Arrow in the same gesture", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
+      { versions: { "report.md": [version(2, null, "report.md")] } }
+    );
+    const view = renderPanel("ws-annotate-stale-shift");
+    const panel = view.getByTestId("artifacts-panel");
+    const paragraph = await view.findByText("Revenue grew 12% this quarter.");
+    const viewer = view.getByTestId("artifact-viewer-scroll");
+    fireEvent.keyDown(panel, { key: "c" });
+    const range = document.createRange();
+    range.setStart(paragraph.firstChild!, 8);
+    range.setEnd(paragraph.firstChild!, 16);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    const noBox = () => expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+
+    // Focus leaves the viewer with Shift still down; Shift is released elsewhere.
+    fireEvent.keyDown(viewer, { key: "ArrowRight", shiftKey: true });
+    fireEvent.blur(viewer);
+    fireEvent.keyUp(document.body, { key: "Shift" });
+    fireEvent.keyUp(viewer, { key: "Shift" });
+    noBox();
+
+    // A Shift+Arrow, then annotate mode off and on, then a new bare Shift press and release.
+    fireEvent.keyDown(viewer, { key: "ArrowRight", shiftKey: true });
+    fireEvent.keyDown(panel, { key: "c" });
+    fireEvent.keyDown(panel, { key: "c" });
+    fireEvent.keyDown(viewer, { key: "Shift", shiftKey: true });
+    fireEvent.keyUp(viewer, { key: "Shift" });
+    noBox();
+
+    // A real keyboard selection still opens the box.
+    fireEvent.keyDown(viewer, { key: "Shift", shiftKey: true });
+    fireEvent.keyDown(viewer, { key: "ArrowRight", shiftKey: true });
+    fireEvent.keyUp(viewer, { key: "Shift" });
+    expect((await view.findByTestId("artifact-annotation-popover")).textContent).toContain(
+      "grew 12%"
+    );
+  });
+
+  // #5760: frame-rendered kinds take pins from the frame bridge, so the viewer around the frame
+  // gets no tab stop of its own in annotate mode.
+  test.each<[string, ArtifactEntry["kind"], string]>([
+    ["page.html", "html", "<p>hi</p>"],
+    ["pic.svg", "svg", '<svg xmlns="http://www.w3.org/2000/svg"><text>hi</text></svg>'],
+  ])("annotate mode: the viewer around a %s frame is not a tab stop", async (path, kind, text) => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry(path, 1, kind)],
+        truncated: false,
+      },
+      { [path]: textFile(path, kind, text) }
+    );
+    // Frame kinds read the theme (renderPanel has no ThemeProvider).
+    const view = render(<ArtifactsPanel workspaceId={`ws-annotate-tabstop-${kind}`} />, {
+      wrapper: (props: { children: ReactNode }) => (
+        <ThemeProvider forcedTheme="dark">
+          <ApiWrapper>{props.children}</ApiWrapper>
+        </ThemeProvider>
+      ),
+    });
+    await view.findByTestId("artifact-frame");
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "c" });
+    expect(view.getByRole("button", { name: "Stop annotating" }).getAttribute("aria-pressed")).toBe(
+      "true"
+    );
+    expect(view.getByTestId("artifact-viewer-scroll").hasAttribute("tabindex")).toBe(false);
+  });
+
   test("the default selection prefers a versioned file over newer other files", async () => {
     fake = createFakeArtifactsApi(
       {
