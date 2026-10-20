@@ -34,6 +34,9 @@ describe("formatModelDisplayName", () => {
     expect(formatModelDisplayName("claude-3-haiku-20240307")).toBe("Haiku 3");
     expect(formatModelDisplayName("claude-3-opus-20240229")).toBe("Opus 3");
     expect(formatModelDisplayName("claude-3-5-sonnet-20241022")).toBe("Sonnet 3.5");
+    // A stray leading or trailing slash in a hand-entered id never gives an empty label.
+    expect(formatModelDisplayName("/claude-haiku-4-5")).toBe("Haiku 4.5");
+    expect(formatModelDisplayName("claude-haiku-4-5/")).not.toBe("");
   });
 
   describe("Claude models", () => {

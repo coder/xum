@@ -233,7 +233,10 @@ export function formatModelDisplayName(modelName: string): string {
  */
 function withoutGatewayPrefix(modelName: string): string | undefined {
   const slashIdx = modelName.indexOf("/");
-  if (slashIdx <= 0 || modelName.includes(":")) return undefined;
+  // A trailing slash leaves no model name: format the id as it is, not as an empty label.
+  if (slashIdx === -1 || slashIdx === modelName.length - 1 || modelName.includes(":")) {
+    return undefined;
+  }
   return modelName.slice(slashIdx + 1);
 }
 

@@ -297,6 +297,12 @@ describe("gatewayModelCatalog", () => {
         "corp/gpt-6.1-sol-20260930",
       ])
     ).toBe(false);
+    // A bare Claude id (no gateway provider name).
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog("coder", "claude-haiku-4-5", undefined, [
+        "claude-haiku-4-5-20251001",
+      ])
+    ).toBe(true);
     // A custom gateway provider name before the Claude id.
     expect(
       isProviderModelAccessibleFromAuthoritativeCatalog(
