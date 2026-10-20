@@ -255,21 +255,22 @@ function settleAfterWidthTransition(container: HTMLElement | null, settle: () =>
 function useSidebarSlidePhase(
   collapsed: boolean,
   containerRef: React.RefObject<HTMLDivElement>
-): SidebarSlidePhase {
+): { phase: SidebarSlidePhase; sliding: boolean } {
   const [phase, setPhase] = React.useState<SidebarSlidePhase>(collapsed ? "closed" : "open");
   const [phaseCollapsed, setPhaseCollapsed] = React.useState(collapsed);
   if (phaseCollapsed !== collapsed) {
     setPhaseCollapsed(collapsed);
     setPhase(collapsed ? "closing" : "opening");
   }
+  const sliding = phase === "closing" || phase === "opening";
 
   React.useLayoutEffect(() => {
-    if (phase !== "closing" && phase !== "opening") return;
+    if (!sliding) return;
     const settled = phase === "closing" ? "closed" : "open";
     return settleAfterWidthTransition(containerRef.current, () => setPhase(settled));
-  }, [containerRef, phase]);
+  }, [containerRef, phase, sliding]);
 
-  return phase;
+  return { phase, sliding };
 }
 
 /** Marks the container inert while immersive review covers it. */
@@ -358,8 +359,7 @@ const SidebarPanelFrame: React.FC<{
 const SidebarContainer: React.FC<SidebarContainerProps> = (props) => {
   const width = props.customWidth ? `${props.customWidth}px` : "400px";
   const immersiveHidden = props.immersiveHidden === true;
-  const phase = useSidebarSlidePhase(props.collapsed, props.containerRef);
-  const sliding = phase === "closing" || phase === "opening";
+  const { phase, sliding } = useSidebarSlidePhase(props.collapsed, props.containerRef);
   const animating = sliding && !props.isResizing;
   useInertWhile(props.containerRef, immersiveHidden);
 
