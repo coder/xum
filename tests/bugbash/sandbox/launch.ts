@@ -194,7 +194,7 @@ export async function probeApp(
   onRecord?: (entry: CallRecord) => void
 ) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-probe-"));
-  const records: CallRecord[] = [];
+  const records: object[] = [];
   try {
     fs.chmodSync(dir, 0o700);
     const proxy = await startProxy({
