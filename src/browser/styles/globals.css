@@ -1205,6 +1205,15 @@ body,
   }
 }
 
+/* The room eases only with the sidebar's width slide (RightSidebar marks the sidebar then), so
+   the transcript column does not squeeze the moment the sidebar starts collapsing. A window
+   resize across the breakpoint, or a drag that snaps the sidebar closed, moves it at once. */
+[data-workspace-shell]:has(> [data-right-sidebar-animating]) .chat-reserved-inline-end-scrollport {
+  transition-property: padding-right;
+  transition-duration: 200ms;
+  transition-timing-function: var(--default-transition-timing-function);
+}
+
 /*
  * iPadOS/iOS keyboard accessory bar fix
  *

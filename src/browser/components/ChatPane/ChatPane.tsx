@@ -1642,10 +1642,10 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             // collapsed right sidebar's overview card, see globals.css). Padding by it centers the
             // column, and the composer under it, in the space left of the overlay, so the column
             // sits as far from the overlay as from the left edge. The transcript container query
-            // measures the content box, so the plan TOC sees the narrower gutters too. The
-            // padding eases with the sidebar's width slide, so the column does not squeeze
-            // the moment the sidebar starts collapsing.
-            className="@container/transcript flex h-full flex-col overflow-x-hidden overflow-y-auto pt-[15px] pr-[calc(15px+var(--chat-reserved-inline-end,0px))] pl-[15px] leading-[1.5] break-words whitespace-pre-wrap transition-[padding-right] duration-200"
+            // measures the content box, so the plan TOC sees the narrower gutters too.
+            // `chat-reserved-inline-end-scrollport`: globals.css eases the padding with the
+            // sidebar's width slide.
+            className="chat-reserved-inline-end-scrollport @container/transcript flex h-full flex-col overflow-x-hidden overflow-y-auto pt-[15px] pr-[calc(15px+var(--chat-reserved-inline-end,0px))] pl-[15px] leading-[1.5] break-words whitespace-pre-wrap"
           >
             <div
               // While locked, opt the whole transcript subtree out of scroll

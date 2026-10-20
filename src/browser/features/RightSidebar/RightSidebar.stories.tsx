@@ -1944,11 +1944,54 @@ export const CollapsedOverviewYieldsToTranscript: Story = {
   },
 };
 
+/** The chat scrollport, whose right padding is the room the transcript leaves for the card. */
+function getChatScrollport(canvasElement: HTMLElement): HTMLElement {
+  return canvasElement.querySelector<HTMLElement>(".chat-reserved-inline-end-scrollport")!;
+}
+
+function getPaddingRight(element: HTMLElement): number {
+  return parseFloat(getComputedStyle(element).paddingRight);
+}
+
+/**
+ * A window resize across the card's breakpoint moves the transcript's room for the card at once:
+ * only the sidebar's own slide eases it.
+ */
+export const CollapsedOverviewRoomFollowsResize: Story = {
+  ...CollapsedOverview,
+  decorators: [
+    (Story: ComponentType) => (
+      <div data-testid="shell-frame" style={{ width: 1600, height: "100%" }}>
+        <Story />
+      </div>
+    ),
+  ],
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const sidebar = await canvas.findByRole(
+      "complementary",
+      { name: "Workspace insights" },
+      { timeout: 15_000 }
+    );
+    await waitFor(() =>
+      expect(sidebar.querySelector(".right-sidebar-overview-card")).not.toBeNull()
+    );
+    const scrollport = getChatScrollport(canvasElement);
+    await waitFor(() => expect(getPaddingRight(scrollport)).toBeGreaterThan(100));
+
+    canvas.getByTestId("shell-frame").style.width = "1000px";
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await expect(getPaddingRight(scrollport)).toBe(15);
+  },
+};
+
 interface ToggleFrame {
   toggle: DOMRect;
   sidebarWidth: number;
   card: boolean;
   panel: boolean;
+  chatPadding: number;
 }
 
 /** Samples the toggle and the sidebar on every animation frame while `act` runs, and after. */
@@ -1959,6 +2002,7 @@ async function sampleToggleFrames(
   const canvas = within(canvasElement);
   const toggle = canvas.getByTestId("right-sidebar-toggle-bar").querySelector("button")!;
   const sidebar = canvas.getByRole("complementary", { name: "Workspace insights" });
+  const scrollport = getChatScrollport(canvasElement);
   const frames: ToggleFrame[] = [];
   let sampling = true;
   const sample = () => {
@@ -1967,6 +2011,7 @@ async function sampleToggleFrames(
       sidebarWidth: sidebar.getBoundingClientRect().width,
       card: sidebar.querySelector(".right-sidebar-overview-card") != null,
       panel: sidebar.querySelector('[role="tablist"]') != null,
+      chatPadding: getPaddingRight(scrollport),
     });
     if (sampling) requestAnimationFrame(sample);
   };
@@ -2037,6 +2082,13 @@ export const ToggleStaysPutWhileSliding: Story = {
     ).toBe(true);
     // The card is revealed under the panel as it slides out.
     await expect(closing.some((frame) => frame.card && frame.panel)).toBe(true);
+    // The transcript's room for the card eases in with the slide instead of squeezing the
+    // column the moment the sidebar starts collapsing.
+    const reservedPadding = closing[closing.length - 1].chatPadding;
+    await expect(reservedPadding).toBeGreaterThan(100);
+    await expect(
+      closing.some((frame) => frame.chatPadding > 16 && frame.chatPadding < reservedPadding - 1)
+    ).toBe(true);
     await expect(closing[closing.length - 1].panel).toBe(false);
   },
 };

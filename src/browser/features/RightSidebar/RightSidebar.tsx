@@ -360,19 +360,22 @@ const SidebarContainer: React.FC<SidebarContainerProps> = (props) => {
   const immersiveHidden = props.immersiveHidden === true;
   const phase = useSidebarSlidePhase(props.collapsed, props.containerRef);
   const sliding = phase === "closing" || phase === "opening";
+  const animating = sliding && !props.isResizing;
   useInertWhile(props.containerRef, immersiveHidden);
 
   return (
     <div
       ref={props.containerRef}
       aria-hidden={immersiveHidden || undefined}
+      // globals.css eases the chat's room for the overview card only while this is set.
+      data-right-sidebar-animating={animating || undefined}
       className={cn(
         "bg-surface-primary flex flex-shrink-0 flex-col",
         // While sliding: clip, not hidden (the panel is wider than this box then, and focus() or
         // scrollIntoView inside it must not scroll this box), and animate the width. Drag
         // resizes and window-resize clamps follow the pointer or the window at once.
         sliding
-          ? ["overflow-clip", !props.isResizing && "transition-[width] duration-200"]
+          ? ["overflow-clip", animating && "transition-[width] duration-200"]
           : "overflow-hidden",
         // Hide on mobile touch devices - too narrow for useful interaction
         "mobile-hide-right-sidebar",
