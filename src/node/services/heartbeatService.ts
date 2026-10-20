@@ -387,8 +387,9 @@ export class HeartbeatService {
    * (scheduleUpdatedAt) loses to the edit: the live path re-anchored the fixed cadence at
    * the edit, so an idle-era or old-interval firing must not pull the restart deadline
    * earlier. Workspaces with no recorded firing (never fired, or the record was compacted
-   * away) fall back to the activity-recency approximation used by idle triggers, which is
-   * never earlier than the edit anchor because setHeartbeatSettings persists that recency.
+   * away) fall back to the activity-recency approximation used by idle triggers, bounded by
+   * the edit anchor: setHeartbeatSettings persists that recency, but a global default change
+   * only stamps scheduleUpdatedAt.
    */
   private async deriveInitialIntervalNextEligibleAt(
     now: number,
@@ -449,7 +450,17 @@ export class HeartbeatService {
       });
     }
 
-    return this.deriveInitialNextEligibleAt(now, workspaceId, trackingIntervalMs, activity);
+    const recencyDeadline = this.deriveInitialNextEligibleAt(
+      now,
+      workspaceId,
+      trackingIntervalMs,
+      activity
+    );
+    // A global default change stamps scheduleUpdatedAt without touching activity recency
+    // (a per-workspace edit persists both), so the edit anchor bounds this fallback too (#5741).
+    return editAnchor != null
+      ? Math.max(recencyDeadline, editAnchor + trackingIntervalMs)
+      : recencyDeadline;
   }
 
   private deriveInitialNextEligibleAt(

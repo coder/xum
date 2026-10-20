@@ -2073,6 +2073,32 @@ describe("HeartbeatService", () => {
       expect(internals.nextEligibleAtByWorkspaceId.get(testWorkspaceId)).toBe(recency + intervalMs);
     });
 
+    test("with no firing on record, a newer schedule edit still anchors the deadline (#5741)", async () => {
+      // A global default change stamps scheduleUpdatedAt but does not touch activity recency
+      // (a per-workspace edit persists both), so the recency fallback alone could fire at once.
+      const internals = getInternals();
+      const intervalMs = 30 * 60 * 1000;
+      const now = 4 * 60 * 60 * 1000;
+      const recency = now - 2 * 60 * 60 * 1000;
+      const scheduleUpdatedAt = now - 5 * 60 * 1000;
+      await setProjectsConfig(
+        makeProjectsConfig([
+          makeWorkspaceEntry({
+            heartbeat: { enabled: true, intervalMs, trigger: "interval", scheduleUpdatedAt },
+          }),
+        ])
+      );
+      getAllSnapshotsMock.mockResolvedValueOnce(
+        makeSnapshotMap([[testWorkspaceId, makeSnapshot({ recency, streaming: false })]])
+      );
+
+      await internals.resyncFromConfig(now);
+
+      expect(internals.nextEligibleAtByWorkspaceId.get(testWorkspaceId)).toBe(
+        scheduleUpdatedAt + intervalMs
+      );
+    });
+
     test("makes overdue workspaces eligible on the first post-start check", async () => {
       service.start();
       const internals = getInternals();

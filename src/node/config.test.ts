@@ -6432,23 +6432,24 @@ describe("Config", () => {
         });
         return cfg;
       });
-      const stamps = () =>
-        Object.fromEntries(
-          (
-            new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.workspaces ?? []
-          ).map((workspace) => [workspace.name, workspace.heartbeat?.scheduleUpdatedAt])
-        );
+      const stamps = () => {
+        const byName: Record<string, number | null | undefined> = {};
+        const project = new Config(tempDir).loadConfigOrDefault().projects.get(projectPath);
+        for (const workspace of project?.workspaces ?? []) {
+          byName[workspace.name ?? workspace.path] = workspace.heartbeat?.scheduleUpdatedAt;
+        }
+        return byName;
+      };
 
       const before = Date.now();
       await config.updateHeartbeatDefaultIntervalMs(45 * 60_000);
       const afterChange = stamps();
       expect(afterChange.follows).toBeGreaterThanOrEqual(before);
-      expect({ ...afterChange, follows: oldStamp }).toEqual({
-        follows: oldStamp,
-        ownInterval: oldStamp,
-        idle: oldStamp,
-        disabled: oldStamp,
-      });
+      expect([afterChange.ownInterval, afterChange.idle, afterChange.disabled]).toEqual([
+        oldStamp,
+        oldStamp,
+        oldStamp,
+      ]);
 
       // The same value again is no schedule change, so nothing is stamped.
       await config.updateHeartbeatDefaultIntervalMs(45 * 60_000);
