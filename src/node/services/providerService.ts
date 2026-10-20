@@ -97,7 +97,9 @@ function buildCustomProviderConfigInfo(config: BaseProviderConfig): ProviderConf
     apiKeyFile,
     apiKeySource: apiKeySet ? "config" : apiKeyFile ? "file" : "keyless",
     baseUrl,
-    sessionHeader: config.sessionHeader,
+    // providers.jsonc loads without schema validation; a non-string would
+    // throw in the request path (see sessionHeader.ts).
+    sessionHeader: typeof config.sessionHeader === "string" ? config.sessionHeader : undefined,
     models,
     displayName: config.displayName,
     providerType: config.providerType ?? "openai-compatible",
