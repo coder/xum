@@ -56,6 +56,11 @@ export function whitespaceMismatchHint(content: string, needle: string): string 
   return `It matches the text at line ${line} only when whitespace is ignored: the indentation (tabs vs spaces), trailing spaces or line breaks differ. Read the file around line ${line}, copy its exact whitespace, then retry.`;
 }
 
+function oldStringNotFoundNote(content: string, oldString: string): string {
+  const next = whitespaceMismatchHint(content, oldString) ?? NOTE_READ_FILE_FIRST_RETRY;
+  return `${EDIT_FAILED_NOTE_PREFIX} The old_string does not exist in the file. ${next}`;
+}
+
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
@@ -89,7 +94,7 @@ export function handleStringReplace(
     return {
       success: false,
       error: "old_string not found in file. The text to replace must exist in the file.",
-      note: `${EDIT_FAILED_NOTE_PREFIX} The old_string does not exist in the file. ${whitespaceMismatchHint(originalContent, args.old_string) ?? NOTE_READ_FILE_FIRST_RETRY}`,
+      note: oldStringNotFoundNote(originalContent, args.old_string),
     };
   }
 
