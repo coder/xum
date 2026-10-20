@@ -61,7 +61,12 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import type { NameGenerationError } from "@/common/types/errors";
 import type { Secret } from "@/common/types/secrets";
-import type { MCPHttpServerInfo, MCPServerIdentity, MCPServerInfo } from "@/common/types/mcp";
+import type {
+  MCPConfigProblem,
+  MCPHttpServerInfo,
+  MCPServerIdentity,
+  MCPServerInfo,
+} from "@/common/types/mcp";
 import type {
   AgentPluginInstallPreview,
   AgentPluginListItem,
@@ -325,6 +330,8 @@ export interface MockORPCClientOptions {
   >;
   /** Global MCP server configuration (Settings → MCP) */
   globalMcpServers?: Record<string, MCPServerInfo>;
+  /** Problems in the global mcp.jsonc (mcp.configProblems); default: none. */
+  mcpConfigProblems?: MCPConfigProblem[];
   /** MCP server configuration per project */
   mcpServers?: Map<string, Record<string, MCPServerInfo>>;
   /** Optional OAuth auth status per MCP server URL (serverUrl -> status) */
@@ -523,6 +530,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     projectSecrets = new Map<string, Secret[]>(),
     terminalSessions: initialTerminalSessions = [],
     globalMcpServers = {},
+    mcpConfigProblems = [],
     agentPlugins: agentPluginsMock,
     mcpServers = new Map<string, MockMcpServers>(),
     mcpOverrides = new Map<string, MockMcpOverrides>(),
@@ -1599,6 +1607,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           };
         },
       },
+      configProblems: () =>
+        Promise.resolve({ path: "/home/user/.xum/mcp.jsonc", problems: mcpConfigProblems }),
       list: (input?: { projectPath?: string }) => {
         const projectPath = typeof input?.projectPath === "string" ? input.projectPath.trim() : "";
         if (projectPath) {

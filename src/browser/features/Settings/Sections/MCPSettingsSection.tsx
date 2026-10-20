@@ -25,6 +25,7 @@ import {
   LogIn,
   ChevronDown,
   ChevronRight,
+  TriangleAlert,
 } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import {
@@ -43,11 +44,13 @@ import { cn } from "@/common/lib/utils";
 import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
 import type {
   CachedMCPTestResult,
+  MCPConfigProblem,
   MCPServerIdentity,
   MCPServerInfo,
   MCPServerTransport,
 } from "@/common/types/mcp";
 import type { MCPOAuthPendingServerConfig } from "@/common/types/mcpOauth";
+import { formatMcpConfigProblem } from "@/common/utils/mcp/configProblem";
 import { useMCPTestCache } from "@/browser/hooks/useMCPTestCache";
 import { MCPHeadersEditor } from "@/browser/components/MCPHeadersEditor/MCPHeadersEditor";
 import {
@@ -958,6 +961,39 @@ function useInsufficientScopeTicks(
   }, [api]);
 }
 
+/**
+ * Syntax errors and invalid entries in the global mcp.jsonc (#2060). Xum skips those entries,
+ * so without this a typo made a server vanish with no message. Saves are refused until the
+ * file is fixed, because a save rewrites the whole file.
+ */
+function MCPConfigProblemsNotice(props: { path: string; problems: MCPConfigProblem[] }) {
+  return (
+    <div
+      role="alert"
+      className="bg-warning/10 border-warning/30 text-warning mb-3 rounded-md border px-3 py-2 text-xs"
+    >
+      <div className="flex items-start gap-2">
+        <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        <div className="min-w-0">
+          <p className="font-medium">
+            Xum skipped part of <code className="break-all">{props.path}</code>
+          </p>
+          <ul className="mt-1 space-y-0.5">
+            {props.problems.map((problem, index) => (
+              <li key={index} className="break-words">
+                {formatMcpConfigProblem(problem)}
+              </li>
+            ))}
+          </ul>
+          <p className="text-content-secondary mt-1">
+            Fix the file to use these servers. Until then, changes here are not saved.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export const MCPSettingsSection: React.FC = () => {
   const design = useClaudeDesign();
   const refreshRequest = useRef({ id: 0 });
@@ -967,6 +1003,10 @@ export const MCPSettingsSection: React.FC = () => {
   // Global secrets (used for {secret:"KEY"} header values).
   const [globalSecretKeys] = useGlobalSecretKeys(api);
   const [error, setError] = useState<string | null>(null);
+  const [configProblems, setConfigProblems] = useState<{
+    path: string;
+    problems: MCPConfigProblem[];
+  } | null>(null);
 
   // Test state with caching (global MCP config)
   const {
@@ -1024,9 +1064,14 @@ export const MCPSettingsSection: React.FC = () => {
     setBranding({});
     setLoading(true);
     try {
-      const mcpResult = await api.mcp.list({});
+      const [mcpResult, problems] = await Promise.all([
+        api.mcp.list({}),
+        // The servers still load when this read fails: it only adds the notice.
+        api.mcp.configProblems().catch(() => null),
+      ]);
       if (request !== refreshRequest.current.id) return;
       setServers(mcpResult ?? {});
+      setConfigProblems(problems);
       setError(null);
     } catch (err) {
       if (request === refreshRequest.current.id)
@@ -1446,6 +1491,10 @@ export const MCPSettingsSection: React.FC = () => {
             <XCircle className="h-4 w-4 shrink-0" />
             {error}
           </div>
+        )}
+
+        {configProblems && configProblems.problems.length > 0 && (
+          <MCPConfigProblemsNotice path={configProblems.path} problems={configProblems.problems} />
         )}
 
         {/* Server list */}

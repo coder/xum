@@ -333,6 +333,24 @@ export const MCPToolCallDisplaySchema = z
   })
   .superRefine(enforceUtf8ByteBudget(MCP_IDENTITY_LIMITS.displaySnapshotMaxBytes));
 
+/**
+ * Something in the global mcp.jsonc that Xum could not use (#2060): a JSONC syntax error or an
+ * entry that is not a server. Xum skips the broken entry and keeps the valid ones.
+ */
+export const MCPConfigProblemSchema = z.object({
+  /** 1-based position in the file; null when the problem has no position (an unreadable file). */
+  line: z.number().int().positive().nullable(),
+  column: z.number().int().positive().nullable(),
+  /** The server entry Xum skipped; null for a problem outside any entry. */
+  server: z.string().nullable(),
+  message: z.string(),
+});
+
+export const MCPConfigProblemsSchema = z.object({
+  path: z.string(),
+  problems: z.array(MCPConfigProblemSchema),
+});
+
 export const MCPTestResultSchema = z.discriminatedUnion("success", [
   z.object({
     success: z.literal(true),
