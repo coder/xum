@@ -303,6 +303,28 @@ function transcriptBarrierMessage(offline: boolean): string {
 }
 
 /**
+ * The toast that refuses a resolved send before any command runs, or null. The transcript
+ * barrier comes first (see the call site), then a skill mention inside /goal.
+ */
+function sendRefusalToast(input: {
+  parsed: ParsedCommand | null;
+  workspaceVariant: boolean;
+  transcriptAllowed: boolean;
+  offline: boolean;
+  attachmentCount: number;
+  skillRefs: readonly AgentSkillReference[];
+}): Omit<Toast, "id"> | null {
+  if (
+    input.workspaceVariant &&
+    !commandBypassesTranscriptBarrier(input.parsed) &&
+    !input.transcriptAllowed
+  ) {
+    return { type: "error", message: transcriptBarrierMessage(input.offline) };
+  }
+  return goalSkillMentionToast(input.parsed, input.attachmentCount, input.skillRefs);
+}
+
+/**
  * #4126: /goal sends its objective to the model only as quoted text in the goal kickoff, so a
  * `$skill` it mentions never loads (a normal message loads it). Refuse with the way to combine
  * them instead of setting a goal whose skill silently does nothing. With attachments, /goal is
@@ -2475,13 +2497,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // a reconnect can close it meanwhile, and handled commands (/compact, /fork, workflow
     // starts, refinement actions) return before the plain-send re-check further down. Same
     // bypass rule as the render-time term, evaluated on the RESOLVED command.
-    const transcriptBarrierClosed =
-      variant === "workspace" &&
-      !commandBypassesTranscriptBarrier(parsed) &&
-      !isTranscriptMutationAllowed(props.workspaceId);
-    const refusal = transcriptBarrierClosed
-      ? { type: "error" as const, message: transcriptBarrierMessage(liveApiRef.current == null) }
-      : goalSkillMentionToast(parsed, attachments.length, combinedSkillRefs);
+    const refusal = sendRefusalToast({
+      parsed,
+      workspaceVariant: variant === "workspace",
+      transcriptAllowed: isTranscriptMutationAllowed(props.workspaceId),
+      offline: liveApiRef.current == null,
+      attachmentCount: attachments.length,
+      skillRefs: combinedSkillRefs,
+    });
     if (refusal) {
       pushToast(refusal);
       return;
