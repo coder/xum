@@ -21,7 +21,11 @@ import {
   writeProjectSkill,
 } from "@/node/services/tools/testHelpers";
 import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
-import { resolveWorkflowScript } from "./workflowScriptResolver";
+import { RuntimeError } from "@/node/runtime/Runtime";
+import {
+  assertStoredPluginWorkflowReviewed,
+  resolveWorkflowScript,
+} from "./workflowScriptResolver";
 
 async function writeWorkflowFile(
   root: string,
@@ -572,6 +576,52 @@ describe("resolveWorkflowScript", () => {
       await expect(
         resolveWorkflowScript({ ...input, scriptPath: "plugin://my-plugin/private/hidden.js" })
       ).rejects.toThrow("top-level");
+    });
+  });
+
+  // #6826: the stored-run gate of a skill:// run (resume, checkpoint retry, crash recovery).
+  describe("assertStoredPluginWorkflowReviewed for skill:// runs", () => {
+    const source = "export default function workflow() { return {}; }\n";
+    const storedRun = (tempDir: TestTempDir, runtime = new LocalRuntime(tempDir.path)) => ({
+      scriptPath: "skill://research/workflow.js",
+      source,
+      scope: "project" as const,
+      runtime,
+      workspacePath: tempDir.path,
+      projectTrusted: true,
+    });
+
+    test("a plain (non-plugin) skill's run resumes: no consent record applies", async () => {
+      using tempDir = new TestTempDir("stored-skill-run-plain");
+      await writeProjectSkill(tempDir.path, "research", { files: { "workflow.js": source } });
+
+      await expect(assertStoredPluginWorkflowReviewed(storedRun(tempDir))).resolves.toBeUndefined();
+    });
+
+    test("a deleted skill's run refuses to resume", async () => {
+      using tempDir = new TestTempDir("stored-skill-run-deleted");
+
+      await expect(assertStoredPluginWorkflowReviewed(storedRun(tempDir))).rejects.toThrow(
+        "Skill 'research' is no longer available in its project scope"
+      );
+    });
+
+    test("a transient read failure refuses as retryable, not as a missing skill", async () => {
+      using tempDir = new TestTempDir("stored-skill-run-transport");
+      await writeProjectSkill(tempDir.path, "research", { files: { "workflow.js": source } });
+      const runtime = new LocalRuntime(tempDir.path);
+      spyOn(runtime, "stat").mockRejectedValue(
+        new RuntimeError("ssh: connect to host example port 22: Connection refused", "network")
+      );
+
+      const refusal = await assertStoredPluginWorkflowReviewed(storedRun(tempDir, runtime)).then(
+        () => "resumed",
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+
+      expect(refusal).toContain("could not be read");
+      expect(refusal).toContain("Connection refused");
+      expect(refusal).not.toContain("no longer available");
     });
   });
 });
