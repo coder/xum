@@ -50,6 +50,11 @@ const SUBAGENT_REPORT_DIR_NAME = "subagent-reports";
 const SUBAGENT_REPORT_FILE_NAME = "report.json";
 export const CHARS_PER_TOKEN_ESTIMATE = 4;
 
+/** An attempt id read back from disk: a non-empty string, else unbound. */
+function coerceAttemptId(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((v) => typeof v === "string");
 }
@@ -193,10 +198,6 @@ export async function readSubagentReportArtifactStrict(
     const workflowOwnedAncestorWorkspaceIds = isStringArray(obj.workflowOwnedAncestorWorkspaceIds)
       ? obj.workflowOwnedAncestorWorkspaceIds
       : undefined;
-    const taskAttemptId =
-      typeof obj.taskAttemptId === "string" && obj.taskAttemptId.length > 0
-        ? obj.taskAttemptId
-        : undefined;
 
     if (meta) {
       // Trust the index file for metadata (versioned), but allow per-task file to override title.
@@ -213,10 +214,7 @@ export async function readSubagentReportArtifactStrict(
           structuredOutput: obj.structuredOutput,
           planFilePath: planFilePath ?? meta.planFilePath,
           // The body and the index are written together; an older Xum's rewrite drops both.
-          taskAttemptId:
-            typeof meta.taskAttemptId === "string" && meta.taskAttemptId.length > 0
-              ? meta.taskAttemptId
-              : taskAttemptId,
+          taskAttemptId: coerceAttemptId(meta.taskAttemptId),
           reportMarkdown,
         },
       };
@@ -249,7 +247,7 @@ export async function readSubagentReportArtifactStrict(
         workflowOwnedAncestorWorkspaceIds,
         structuredOutput: obj.structuredOutput,
         planFilePath,
-        taskAttemptId,
+        taskAttemptId: coerceAttemptId(obj.taskAttemptId),
         reportMarkdown,
       },
     };
@@ -374,7 +372,7 @@ export async function upsertSubagentReportArtifact(params: {
       planFilePath,
       structuredOutput: params.structuredOutput,
       ancestorWorkspaceIds: params.ancestorWorkspaceIds,
-      ...(params.taskAttemptId != null ? { taskAttemptId: params.taskAttemptId } : {}),
+      taskAttemptId: params.taskAttemptId,
     };
     updated.reportTokenEstimate = Math.ceil(
       params.reportMarkdown.length / CHARS_PER_TOKEN_ESTIMATE
